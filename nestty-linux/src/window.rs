@@ -217,8 +217,12 @@ impl NesttyWindow {
         // metadata, module definitions, and command lists for UI
         // rendering — that's manifest-only, not lifecycle.
 
-        // Socket server (per-instance, so multiple nestty windows don't collide)
-        let socket_path = format!("/tmp/nestty-{}.sock", std::process::id());
+        // Socket server (per-instance, so multiple nestty windows don't
+        // collide). Lives under `runtime_dir()` (owner-only 0700) since
+        // Step 5b.4 — fs-level perms gate `connect(2)`.
+        let socket_path = nestty_core::paths::gui_socket_path(std::process::id())
+            .to_string_lossy()
+            .into_owned();
         let socket_rx = socket::start_server(&socket_path, event_bus.clone());
 
         // Always attempt to attach to nesttyd. Daemon-absent is fine:

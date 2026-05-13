@@ -1,5 +1,4 @@
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -35,10 +34,32 @@ pub fn broadcast(bus: &EventBus, event: &Event) {
 pub fn start_server(socket_path: &str, event_bus: EventBus) -> mpsc::Receiver<SocketCommand> {
     let (tx, rx) = mpsc::channel();
 
-    // Remove stale socket
-    let _ = std::fs::remove_file(socket_path);
+    // Defer to the daemon's hardened prep: it atomically creates the
+    // parent at 0700, REFUSES if the existing dir isn't owner-owned by
+    // us (DirBuilder::mode only sets perms on fresh creates — an
+    // attacker-pre-created lax-perms dir would otherwise slip through),
+    // and unlinks a stale socket only after a `ConnectionRefused`
+    // connect probe. Identical bind side as `daemon::bind_listener` —
+    // chmod 0600 the bound socket so fs-perms gate `connect(2)`.
+    let path = std::path::Path::new(socket_path);
+    match nestty_daemon::socket::prepare_socket_path(path) {
+        nestty_daemon::socket::SocketPrep::Fresh
+        | nestty_daemon::socket::SocketPrep::StaleCleared => {}
+        nestty_daemon::socket::SocketPrep::InUse => {
+            eprintln!("[nestty] gui socket {socket_path} already in use by another instance");
+            return rx;
+        }
+        nestty_daemon::socket::SocketPrep::NotSocket => {
+            eprintln!("[nestty] gui socket path {socket_path} exists but is not a socket");
+            return rx;
+        }
+        nestty_daemon::socket::SocketPrep::Error(msg) => {
+            eprintln!("[nestty] gui socket prep failed: {msg}");
+            return rx;
+        }
+    }
 
-    let listener = match UnixListener::bind(socket_path) {
+    let listener = match nestty_daemon::socket::bind_listener(path) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[nestty] failed to bind socket at {socket_path}: {e}");

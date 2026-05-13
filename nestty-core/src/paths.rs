@@ -74,13 +74,37 @@ pub fn daemon_socket_path() -> Option<PathBuf> {
 
 fn is_legacy_per_instance_socket(p: &std::path::Path) -> bool {
     let s = p.to_string_lossy();
-    let Some(rest) = s.strip_prefix("/tmp/nestty-") else {
-        return false;
-    };
-    let Some(num) = rest.strip_suffix(".sock") else {
-        return false;
-    };
-    !num.is_empty() && num.chars().all(|c| c.is_ascii_digit())
+    // Legacy form: `/tmp/nestty-{PID}.sock` (pre-Step-5b.4 GUI socket).
+    if let Some(rest) = s.strip_prefix("/tmp/nestty-")
+        && let Some(num) = rest.strip_suffix(".sock")
+        && !num.is_empty()
+        && num.chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+    // Hardened form: `<runtime_dir>/gui-{PID}.sock` (Step-5b.4 onward).
+    // Same shape but owner-only directory. The point of this check is to
+    // recognize it as a per-instance GUI socket, NOT the daemon socket
+    // (which is `<runtime_dir>/socket`), so `daemon_socket_path()` can
+    // fall back appropriately when a child shell inherits `NESTTY_SOCKET`.
+    if let Some(parent) = p.parent()
+        && parent == runtime_dir()
+        && let Some(name) = p.file_name().and_then(|n| n.to_str())
+        && let Some(rest) = name.strip_prefix("gui-")
+        && let Some(num) = rest.strip_suffix(".sock")
+        && !num.is_empty()
+        && num.chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+    false
+}
+
+/// GUI per-instance socket path. Lives under the trusted runtime dir so
+/// fs-level permissions (parent 0700 + socket 0600) gate `connect(2)`.
+/// One file per nestty instance; PID-named for collision-free coexistence.
+pub fn gui_socket_path(pid: u32) -> PathBuf {
+    runtime_dir().join(format!("gui-{pid}.sock"))
 }
 
 /// Persistent state (handoffs, indices) — Linux `~/.local/state/nestty/`,
@@ -266,6 +290,34 @@ mod tests {
         }
         let _ = std::fs::remove_dir(&dir);
         assert!(p.is_none(), "untrusted runtime dir must yield None");
+    }
+
+    #[test]
+    fn gui_socket_path_is_pid_named_under_runtime_dir() {
+        // Lock against the env-mutating tests that briefly set
+        // XDG_RUNTIME_DIR — runtime_dir() reads it.
+        let _g = ENV_LOCK.lock().unwrap();
+        let p = gui_socket_path(12345);
+        assert!(p.starts_with(runtime_dir()));
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, "gui-12345.sock");
+    }
+
+    #[test]
+    fn daemon_socket_ignores_hardened_gui_pattern() {
+        // A GUI socket from a parent nestty (`runtime_dir/gui-{PID}.sock`)
+        // must not be mistaken for the daemon socket when a child shell
+        // inherits `NESTTY_SOCKET`.
+        let _g = ENV_LOCK.lock().unwrap();
+        let gui = gui_socket_path(99999);
+        unsafe {
+            env::set_var("NESTTY_SOCKET", &gui);
+        }
+        let p = daemon_socket_path();
+        assert_ne!(p, Some(gui));
+        unsafe {
+            env::remove_var("NESTTY_SOCKET");
+        }
     }
 
     #[test]

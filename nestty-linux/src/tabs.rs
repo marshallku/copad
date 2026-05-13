@@ -1335,7 +1335,9 @@ fn spawn_command(command: &str) {
     let cmd = command.strip_prefix("spawn:").unwrap_or(command);
 
     let expanded = shellexpand::tilde(cmd).to_string();
-    let socket_path = format!("/tmp/nestty-{}.sock", std::process::id());
+    let socket_path = nestty_core::paths::gui_socket_path(std::process::id())
+        .to_string_lossy()
+        .into_owned();
 
     std::thread::spawn(move || {
         let _ = std::process::Command::new("sh")

@@ -135,7 +135,9 @@ impl StatusBar {
     pub fn new(config: &NesttyConfig, plugins: &[LoadedPlugin]) -> Self {
         let theme = Theme::by_name(&config.theme.name).unwrap_or_default();
         let height = config.statusbar.height;
-        let socket_path = format!("/tmp/nestty-{}.sock", std::process::id());
+        let socket_path = nestty_core::paths::gui_socket_path(std::process::id())
+            .to_string_lossy()
+            .into_owned();
 
         apply_theme_css(&theme, height, &config.statusbar.position);
 
@@ -245,7 +247,9 @@ impl StatusBar {
         apply_theme_css(&theme, config.statusbar.height, &config.statusbar.position);
 
         // Re-collect modules with updated socket/plugin info
-        let socket_path = format!("/tmp/nestty-{}.sock", std::process::id());
+        let socket_path = nestty_core::paths::gui_socket_path(std::process::id())
+            .to_string_lossy()
+            .into_owned();
 
         // Clear existing labels from the bar sections
         let mut child = self.bar.first_child();

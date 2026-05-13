@@ -112,7 +112,10 @@ impl TerminalPanel {
 
         // Spawn shell
         let shell = config.terminal.shell.clone();
-        let socket_env = format!("NESTTY_SOCKET=/tmp/nestty-{}.sock", std::process::id());
+        let socket_env = format!(
+            "NESTTY_SOCKET={}",
+            nestty_core::paths::gui_socket_path(std::process::id()).display()
+        );
         let child_pid: Rc<Cell<i32>> = Rc::new(Cell::new(-1));
         let pid_cell = child_pid.clone();
         // Resolve cwd once upfront. We pass `Option<&str>` to
