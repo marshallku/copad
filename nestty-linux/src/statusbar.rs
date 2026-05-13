@@ -1,6 +1,9 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::rc::Rc;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use gtk4::glib;
@@ -8,14 +11,15 @@ use gtk4::prelude::*;
 
 use nestty_core::config::NesttyConfig;
 use nestty_core::plugin::LoadedPlugin;
+use nestty_core::protocol::{Request, Response};
 use nestty_core::theme::Theme;
+use serde_json::json;
 
 struct ModuleHandle {
     label: gtk4::Label,
-    exec: String,
+    plugin: String,
+    module: String,
     interval: u64,
-    plugin_dir: std::path::PathBuf,
-    socket_path: String,
 }
 
 pub struct StatusBar {
@@ -39,44 +43,51 @@ fn parse_output(output: &str) -> (String, Option<String>) {
     (trimmed.to_string(), None)
 }
 
-/// Run a module's exec command in a thread, send result back via channel.
-fn run_module_exec(
-    exec: &str,
-    plugin_dir: &std::path::Path,
-    socket_path: &str,
-) -> std::sync::mpsc::Receiver<String> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    let exec = exec.to_string();
-    let dir = plugin_dir.to_path_buf();
-    let sock = socket_path.to_string();
-
+/// Fire a `_module.run` RPC to nesttyd and yield the module's stdout
+/// through a channel. Daemon owns the shell exec now; the GUI keeps
+/// the per-module timer and label update. On connect/transport failure
+/// (no daemon, slow daemon) the channel receives an empty string —
+/// same UX as the legacy "module errored → blank label".
+fn run_module_via_daemon(plugin: &str, module: &str) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    let plugin = plugin.to_string();
+    let module = module.to_string();
     std::thread::spawn(move || {
-        let output = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(&exec)
-            .current_dir(&dir)
-            .env("NESTTY_SOCKET", &sock)
-            .env("NESTTY_PLUGIN_DIR", &dir)
-            .output();
-
-        match output {
-            Ok(out) if out.status.success() => {
-                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                let _ = tx.send(stdout);
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                eprintln!("[nestty] statusbar module error: {stderr}");
-                let _ = tx.send(String::new());
-            }
-            Err(e) => {
-                eprintln!("[nestty] statusbar module exec failed: {e}");
-                let _ = tx.send(String::new());
-            }
-        }
+        let _ = tx.send(invoke_module(&plugin, &module).unwrap_or_default());
     });
-
     rx
+}
+
+fn invoke_module(plugin: &str, module: &str) -> Option<String> {
+    // `daemon_socket_path()` (vs `socket_path()`) skips an inherited
+    // per-GUI NESTTY_SOCKET override and refuses untrusted runtime dirs
+    // — same guard `gui_client` uses. None on no-daemon → blank label.
+    let socket_path = nestty_core::paths::daemon_socket_path()?;
+    let stream = UnixStream::connect(&socket_path).ok()?;
+    // Module ticks must not stall: bound both directions on the
+    // daemon's MODULE_RUN_TIMEOUT (8 s) + a small margin.
+    let timeout = Duration::from_secs(10);
+    stream.set_read_timeout(Some(timeout)).ok()?;
+    stream.set_write_timeout(Some(timeout)).ok()?;
+    let mut write = stream.try_clone().ok()?;
+    let req = Request::new(
+        "sb",
+        "_module.run",
+        json!({ "plugin": plugin, "module": module }),
+    );
+    let line = serde_json::to_string(&req).ok()?;
+    writeln!(write, "{line}").ok()?;
+    let mut reader = BufReader::new(stream);
+    let mut buf = String::new();
+    reader.read_line(&mut buf).ok()?;
+    let resp: Response = serde_json::from_str(buf.trim()).ok()?;
+    if !resp.ok {
+        return None;
+    }
+    resp.result?
+        .get("stdout")
+        .and_then(|v| v.as_str())
+        .map(String::from)
 }
 
 /// Separator goes on the edge facing the notebook (`top` → bottom-edge,
@@ -135,9 +146,6 @@ impl StatusBar {
     pub fn new(config: &NesttyConfig, plugins: &[LoadedPlugin]) -> Self {
         let theme = Theme::by_name(&config.theme.name).unwrap_or_default();
         let height = config.statusbar.height;
-        let socket_path = nestty_core::paths::gui_socket_path(std::process::id())
-            .to_string_lossy()
-            .into_owned();
 
         apply_theme_css(&theme, height, &config.statusbar.position);
 
@@ -149,7 +157,21 @@ impl StatusBar {
         let labels: Rc<RefCell<HashMap<String, gtk4::Label>>> =
             Rc::new(RefCell::new(HashMap::new()));
 
-        for plugin in plugins {
+        // Dedup duplicate plugin names so the bar reflects the same
+        // winner as daemon `_module.run` resolution.
+        // rev → filter (sorted-last wins) → rev again to restore the
+        // sorted slice's original traversal order. Without the second
+        // rev, equal-`order` modules would render reversed across the
+        // plugin list.
+        let mut seen = std::collections::HashSet::new();
+        let mut winners: Vec<&LoadedPlugin> = plugins
+            .iter()
+            .rev()
+            .filter(|p| seen.insert(p.manifest.plugin.name.as_str()))
+            .collect();
+        winners.reverse();
+
+        for plugin in winners.iter() {
             for module in &plugin.manifest.modules {
                 let dom_id = format!("mod-{}-{}", plugin.manifest.plugin.name, module.name);
 
@@ -170,10 +192,9 @@ impl StatusBar {
                 labels.borrow_mut().insert(dom_id.clone(), label.clone());
                 modules.borrow_mut().push(ModuleHandle {
                     label,
-                    exec: module.exec.clone(),
+                    plugin: plugin.manifest.plugin.name.clone(),
+                    module: module.name.clone(),
                     interval: module.interval,
-                    plugin_dir: plugin.dir.clone(),
-                    socket_path: socket_path.clone(),
                 });
             }
         }
@@ -246,11 +267,6 @@ impl StatusBar {
         let theme = Theme::by_name(&config.theme.name).unwrap_or_default();
         apply_theme_css(&theme, config.statusbar.height, &config.statusbar.position);
 
-        // Re-collect modules with updated socket/plugin info
-        let socket_path = nestty_core::paths::gui_socket_path(std::process::id())
-            .to_string_lossy()
-            .into_owned();
-
         // Clear existing labels from the bar sections
         let mut child = self.bar.first_child();
         while let Some(section) = child {
@@ -271,7 +287,19 @@ impl StatusBar {
         self.modules.borrow_mut().clear();
         self.labels.borrow_mut().clear();
 
-        for plugin in plugins {
+        // rev → filter (sorted-last wins) → rev again to restore the
+        // sorted slice's original traversal order. Without the second
+        // rev, equal-`order` modules would render reversed across the
+        // plugin list.
+        let mut seen = std::collections::HashSet::new();
+        let mut winners: Vec<&LoadedPlugin> = plugins
+            .iter()
+            .rev()
+            .filter(|p| seen.insert(p.manifest.plugin.name.as_str()))
+            .collect();
+        winners.reverse();
+
+        for plugin in winners.iter() {
             for module in &plugin.manifest.modules {
                 let dom_id = format!("mod-{}-{}", plugin.manifest.plugin.name, module.name);
 
@@ -294,10 +322,9 @@ impl StatusBar {
                     .insert(dom_id.clone(), label.clone());
                 self.modules.borrow_mut().push(ModuleHandle {
                     label,
-                    exec: module.exec.clone(),
+                    plugin: plugin.manifest.plugin.name.clone(),
+                    module: module.name.clone(),
                     interval: module.interval,
-                    plugin_dir: plugin.dir.clone(),
-                    socket_path: socket_path.clone(),
                 });
             }
         }
@@ -349,16 +376,13 @@ fn schedule_modules(modules: &Rc<RefCell<Vec<ModuleHandle>>>) {
     );
     for module in modules_ref.iter() {
         eprintln!(
-            "[nestty] statusbar: module {} exec={} interval={}s",
-            module.label.widget_name(),
-            module.exec,
-            module.interval,
+            "[nestty] statusbar: module {}.{} interval={}s",
+            module.plugin, module.module, module.interval,
         );
         let ctx = ModuleRunCtx {
             label: module.label.clone(),
-            exec: module.exec.clone(),
-            plugin_dir: module.plugin_dir.clone(),
-            socket_path: module.socket_path.clone(),
+            plugin: module.plugin.clone(),
+            module: module.module.clone(),
             interval: module.interval,
         };
         run_and_schedule(ctx);
@@ -368,40 +392,36 @@ fn schedule_modules(modules: &Rc<RefCell<Vec<ModuleHandle>>>) {
 #[derive(Clone)]
 struct ModuleRunCtx {
     label: gtk4::Label,
-    exec: String,
-    plugin_dir: std::path::PathBuf,
-    socket_path: String,
+    plugin: String,
+    module: String,
     interval: u64,
 }
 
 fn run_and_schedule(ctx: ModuleRunCtx) {
-    let rx = run_module_exec(&ctx.exec, &ctx.plugin_dir, &ctx.socket_path);
+    let rx = run_module_via_daemon(&ctx.plugin, &ctx.module);
 
-    glib::timeout_add_local(Duration::from_millis(50), move || {
-        match rx.try_recv() {
-            Ok(output) => {
-                let (text, tooltip) = parse_output(&output);
-                eprintln!(
-                    "[nestty] statusbar: {} -> {:?}",
-                    ctx.label.widget_name(),
-                    text
-                );
+    glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
+        Ok(output) => {
+            let (text, tooltip) = parse_output(&output);
+            eprintln!(
+                "[nestty] statusbar: {} -> {:?}",
+                ctx.label.widget_name(),
+                text
+            );
 
-                ctx.label.set_text(&text);
-                if let Some(tt) = &tooltip {
-                    ctx.label.set_tooltip_text(Some(tt));
-                }
-
-                // Schedule next run
-                let next = ctx.clone();
-                glib::timeout_add_local_once(Duration::from_secs(ctx.interval), move || {
-                    run_and_schedule(next);
-                });
-
-                glib::ControlFlow::Break
+            ctx.label.set_text(&text);
+            if let Some(tt) = &tooltip {
+                ctx.label.set_tooltip_text(Some(tt));
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+
+            let next = ctx.clone();
+            glib::timeout_add_local_once(Duration::from_secs(ctx.interval), move || {
+                run_and_schedule(next);
+            });
+
+            glib::ControlFlow::Break
         }
+        Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+        Err(mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
     });
 }
