@@ -39,18 +39,14 @@ pub fn run() {
         // ServiceSupervisor::shutdown_all() through the existing
         // graceful path.
         //
-        // Caveat: the SIGKILL / segfault case is NOT covered. We
-        // originally armed `PR_SET_PDEATHSIG(SIGTERM)` in each
-        // plugin's spawn `pre_exec` to reap orphans on
-        // unrecoverable parent crashes, but the kernel signal
-        // fires on fork-thread exit (not parent-process exit), so
-        // every plugin spawned from `spawn_service_async`'s
-        // worker thread received SIGTERM moments after init
-        // succeeded. The pdeathsig path was removed; on
-        // unrecoverable nestty crash, plugin children become
-        // init-reparented orphans. See `service_supervisor.rs`
-        // for the path back to crash-safe reaping (long-lived
-        // spawner thread or `pidfd_open`).
+        // SIGKILL / segfault: re-armed in step 2c of the daemon-first
+        // migration via the long-lived `nestty-spawner` thread (see
+        // `nestty-daemon::service_supervisor`). Every plugin spawn now
+        // forks from the spawner, so `PR_SET_PDEATHSIG(SIGTERM)` armed
+        // in the child's `pre_exec` fires only when nestty actually
+        // dies. Cooperative shutdown still goes through `shutdown_all`
+        // (this handler triggers it via `close_all_windows →
+        // connect_destroy`); pdeathsig is the crash-safety net.
         let signal_app = app.downgrade();
         glib::unix_signal_add_local(libc::SIGTERM, move || {
             if let Some(app) = signal_app.upgrade() {
