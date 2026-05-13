@@ -22,7 +22,7 @@ const WALLPAPER_CACHE: &str = ".cache/terminal-wallpapers.txt";
 const BG_MODE_FILE: &str = ".cache/nestty-bg-mode";
 const BUS_SOURCE_NESTTY_LINUX: &str = "nestty-linux";
 
-pub use nestty_daemon::socket::{EventBus, LEGACY_DISPATCH_METHODS, SocketCommand, new_event_bus};
+pub use nestty_daemon::socket::{EventBus, SocketCommand, new_event_bus};
 
 pub fn broadcast(bus: &EventBus, event: &Event) {
     bus.publish(BusEvent::new(
@@ -105,10 +105,7 @@ pub fn start_server(socket_path: &str, event_bus: EventBus) -> mpsc::Receiver<So
                         // Unbounded: external wire contract must not drop events on slow clients.
                         let rx = event_bus.subscribe_unbounded("*");
                         while let Some(ev) = rx.recv() {
-                            let wire = Event {
-                                event_type: ev.kind,
-                                data: ev.payload,
-                            };
+                            let wire = Event::new(ev.kind, ev.payload).with_source(ev.source);
                             let json = match serde_json::to_string(&wire) {
                                 Ok(j) => j,
                                 Err(_) => continue,
@@ -528,11 +525,12 @@ pub fn dispatch(
         }
 
         _ => {
-            let _ = cmd.reply.send(Response::error(
-                req.id.clone(),
-                "unknown_method",
-                &format!("Unknown method: {}", req.method),
-            ));
+            // Step 5b: in-process supervisor is gone. Plugin actions
+            // and daemon-hosted methods fall through to here; proxy
+            // them to nesttyd on a worker thread so the GTK timer
+            // never blocks. Reply lands on cmd.reply asynchronously
+            // with the daemon's response (or no_daemon / overloaded).
+            crate::daemon_forward::forward(cmd.request.clone(), cmd.reply.clone());
         }
     }
 }

@@ -21,7 +21,6 @@ use nestty_daemon::socket::{
 use nestty_daemon::trigger_sink::TRIGGER_ONLY_RESERVED_METHODS;
 use serde_json::json;
 
-const ENV_HOST_PLUGINS: &str = "NESTTYD_HOST_PLUGINS";
 const ENV_E2E_ACTIONS: &str = "NESTTYD_E2E_TEST_ACTIONS";
 const ENV_POOL_WORKERS: &str = "NESTTYD_POOL_WORKERS";
 const ENV_POOL_QUEUE: &str = "NESTTYD_POOL_QUEUE";
@@ -74,26 +73,20 @@ fn main() -> ExitCode {
         }
     };
 
-    let supervisor_guard: Option<Arc<ServiceSupervisor>> = if env_flag_enabled(ENV_HOST_PLUGINS) {
-        Some(activate_supervisor(&actions, &event_bus))
-    } else {
-        log::info!(
-            "plugin host disabled (set {ENV_HOST_PLUGINS}=1 to activate plugins from this daemon)"
-        );
-        None
-    };
+    // Step 5b: daemon is the sole plugin host. The legacy in-process
+    // supervisor in nestty-linux is gone (was a transitional double-
+    // spawn risk during the 4→5 migration).
+    let supervisor_guard: Arc<ServiceSupervisor> = activate_supervisor(&actions, &event_bus);
 
-    let state = DaemonState::new(actions);
+    let state = DaemonState::new(actions, event_bus.clone());
 
     log::info!("nesttyd listening on {}", socket_path.display());
     socket::run_accept_loop(listener, state);
 
     // Arc::drop does not call shutdown_all; we must invoke it explicitly
     // for cooperative plugin shutdown before unlinking the socket.
-    if let Some(sup) = supervisor_guard.as_ref() {
-        log::info!("shutting down supervised plugins");
-        sup.shutdown_all();
-    }
+    log::info!("shutting down supervised plugins");
+    supervisor_guard.shutdown_all();
     // Explicit pool shutdown breaks any registry↔handler↔supervisor Arc
     // cycle that would otherwise prevent the pool's Drop from running.
     pool.shutdown();
@@ -161,7 +154,7 @@ fn register_builtins(actions: &Arc<ActionRegistry>) {
         serde_json::to_value(serde_json::json!({
             "daemon": "nesttyd",
             "version": env!("CARGO_PKG_VERSION"),
-            "host_plugins": env_flag_enabled(ENV_HOST_PLUGINS),
+            "host_plugins": true,
             "pool": stats.map(|s| serde_json::json!({
                 "workers": s.workers,
                 "capacity": s.capacity,

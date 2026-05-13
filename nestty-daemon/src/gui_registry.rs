@@ -4,12 +4,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::os::unix::net::UnixStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use nestty_core::protocol::{Invoke, Response, ResponseError};
+use nestty_core::event_bus::{EventBus, RecvOutcome};
+use nestty_core::protocol::{Event as WireEvent, Invoke, Response, ResponseError};
 use serde_json::{Value, json};
 
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -82,6 +84,10 @@ pub struct GuiClient {
     /// daemon's reader EOF too, so a heartbeat-triggered unregister
     /// terminates the connection and lets the GUI reconnect_loop fire.
     shutdown_handle: Mutex<Option<UnixStream>>,
+    /// Flag set by `unregister` so the event forwarder thread exits at
+    /// its next `recv_timeout` tick. Without this the forwarder would
+    /// keep holding an `EventBus` subscriber slot after disconnect.
+    forwarder_stop: Arc<AtomicBool>,
 }
 
 impl GuiClient {
@@ -159,6 +165,9 @@ impl GuiClient {
     /// the GUI's reader both see EOF — the GUI's reconnect_loop then
     /// fires.
     pub fn fail_all_pending(&self, err: ResponseError) {
+        // Stop the event forwarder first so it doesn't push more lines
+        // through writer_tx after the connection is being torn down.
+        self.forwarder_stop.store(true, Ordering::SeqCst);
         let drained = self.pending.lock().unwrap().take();
         if let Some(map) = drained {
             for (id, tx) in map {
@@ -216,6 +225,7 @@ impl GuiRegistry {
             writer_tx,
             pending: Mutex::new(Some(HashMap::new())),
             shutdown_handle: Mutex::new(shutdown_handle),
+            forwarder_stop: Arc::new(AtomicBool::new(false)),
         });
         let weak_client = Arc::downgrade(&client);
         let mut clients = self.clients.lock().unwrap();
@@ -301,6 +311,71 @@ impl GuiRegistry {
 
     pub fn get(&self, client_id: &str) -> Option<Arc<GuiClient>> {
         self.clients.lock().unwrap().get(client_id).cloned()
+    }
+
+    /// Starts a per-client thread that drains the daemon EventBus and
+    /// forwards each event over the GUI's writer channel as a wire
+    /// `Event` line. Per protocol § Resolved decisions #1, GUI auto-
+    /// subscribes to all events on register.
+    ///
+    /// Call site MUST be `handle_gui_register` AFTER `send_line(&writer_tx,
+    /// &resp)` has shipped the registration ack — starting the forwarder
+    /// earlier races with the ack and lets the GUI's `await_register_ack`
+    /// see an Event line before the Response (Step 5b plan-round-3 C1).
+    pub fn start_event_forwarder(&self, client_id: &str, bus: Arc<EventBus>) {
+        let Some(client) = self.get(client_id) else {
+            return;
+        };
+        let weak_client = Arc::downgrade(&client);
+        let stop = client.forwarder_stop.clone();
+        let cid = client_id.to_string();
+        // Subscribe to every event ("*" matches all kinds — see EventBus
+        // pattern semantics) with a bounded queue so a wedged writer
+        // can't accumulate unbounded memory.
+        let rx = bus.subscribe("*");
+        let _ = thread::Builder::new()
+            .name(format!(
+                "nestty-event-forwarder-{}",
+                &cid[..8.min(cid.len())]
+            ))
+            .spawn(move || forwarder_loop(weak_client, rx, stop));
+    }
+}
+
+fn forwarder_loop(
+    weak_client: Weak<GuiClient>,
+    rx: nestty_core::event_bus::EventReceiver,
+    stop: Arc<AtomicBool>,
+) {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            RecvOutcome::Event(ev) => {
+                let Some(client) = weak_client.upgrade() else {
+                    return;
+                };
+                // Carry `source` across the wire so the GUI side can
+                // republish with the same provenance — required for
+                // `TriggerEngine::try_promote_or_drop_preflight` to
+                // accept `<action>.completed` from daemon-hosted plugins.
+                let wire = WireEvent::new(ev.kind, ev.payload).with_source(ev.source);
+                let line = match serde_json::to_string(&wire) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("event forwarder serialize: {e}");
+                        continue;
+                    }
+                };
+                if client.writer_tx.send(line).is_err() {
+                    // Writer thread gone; the connection is dead. Exit.
+                    return;
+                }
+            }
+            RecvOutcome::Timeout => continue,
+            RecvOutcome::Disconnected => return,
+        }
     }
 }
 
@@ -547,5 +622,69 @@ mod tests {
         let resp = handle.join().unwrap();
         assert!(!resp.ok);
         assert_eq!(resp.error.unwrap().code, "gui_disconnected");
+    }
+
+    #[test]
+    fn event_forwarder_writes_bus_events_to_writer() {
+        // Publish a bus event AFTER starting the forwarder; assert the
+        // GUI's writer_tx receives a wire `Event` line with matching kind
+        // + payload.
+        let reg = GuiRegistry::new();
+        let bus = Arc::new(EventBus::new());
+        let (writer_tx, writer_rx) = channel::<String>();
+        let (cid, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
+        reg.start_event_forwarder(&cid, bus.clone());
+        // Give the forwarder a tick to enter recv_timeout.
+        thread::sleep(Duration::from_millis(50));
+        bus.publish(nestty_core::event_bus::Event::new(
+            "todo.create.completed",
+            "test",
+            json!({ "id": "t-1" }),
+        ));
+        let line = writer_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("forwarder should have written within 1s");
+        let parsed: WireEvent = serde_json::from_str(&line).expect("valid Event wire shape");
+        assert_eq!(parsed.event_type, "todo.create.completed");
+        assert_eq!(parsed.data["id"], json!("t-1"));
+    }
+
+    #[test]
+    fn event_forwarder_stops_on_unregister() {
+        // After unregister, no more events flow even if the bus keeps
+        // publishing. (forwarder_stop flag flipped by fail_all_pending.)
+        let reg = GuiRegistry::new();
+        let bus = Arc::new(EventBus::new());
+        let (writer_tx, writer_rx) = channel::<String>();
+        let (cid, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
+        reg.start_event_forwarder(&cid, bus.clone());
+        thread::sleep(Duration::from_millis(50));
+        bus.publish(nestty_core::event_bus::Event::new(
+            "before.unreg",
+            "test",
+            json!({}),
+        ));
+        // Drain the pre-unregister event.
+        writer_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first event delivered");
+        reg.unregister(&cid);
+        // Give the forwarder time to observe the stop flag (one
+        // recv_timeout tick is ≤200ms).
+        thread::sleep(Duration::from_millis(300));
+        bus.publish(nestty_core::event_bus::Event::new(
+            "after.unreg",
+            "test",
+            json!({}),
+        ));
+        // Either Disconnected (writer Receiver dropped) or Timeout —
+        // never Ok with an "after.unreg" line.
+        if let Ok(line) = writer_rx.recv_timeout(Duration::from_millis(300)) {
+            let parsed: WireEvent = serde_json::from_str(&line).unwrap();
+            assert_ne!(
+                parsed.event_type, "after.unreg",
+                "forwarder must NOT deliver events post-unregister"
+            );
+        }
     }
 }

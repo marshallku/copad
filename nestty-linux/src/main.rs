@@ -1,5 +1,6 @@
 mod app;
 mod background;
+mod daemon_forward;
 mod gui_client;
 mod panel;
 mod plugin_panel;

@@ -15,7 +15,6 @@ use nestty_core::context::ContextService;
 use nestty_core::event_bus::{Event as BusEvent, EventBus as CoreEventBus, EventReceiver};
 use nestty_core::trigger::{Trigger, TriggerEngine, TriggerSink, covering_patterns};
 
-use nestty_daemon::service_supervisor::ServiceSupervisor;
 use nestty_daemon::trigger_sink::LiveTriggerSink;
 
 use crate::background::BackgroundLayer;
@@ -32,10 +31,6 @@ pub struct NesttyWindow {
     statusbar: Rc<StatusBar>,
     #[allow(dead_code)]
     background: Rc<BackgroundLayer>,
-    /// Held to keep `Arc` count ≥ 1 (so runtime threads aren't orphaned)
-    /// and to invoke `shutdown_all` from `connect_destroy`.
-    #[allow(dead_code)]
-    service_supervisor: Arc<ServiceSupervisor>,
     /// Hidden 1×1 zero-opacity WebView that loads a stub at window
     /// construction time, warming WebKit's auxiliary services
     /// (xdg-desktop-portal activation, bubblewrap sandbox, document-portal
@@ -215,36 +210,12 @@ impl NesttyWindow {
             );
         }
 
-        // Service plugins: spawn long-running supervised subprocesses for
-        // every `[[services]]` declaration. The supervisor walks every
-        // manifest to resolve `provides` conflicts BEFORE spawning so
-        // ownership stays deterministic (lexical name wins). Built-ins
-        // already in the registry (system.ping, system.log,
-        // context.snapshot) are reserved against plugin override.
-        // Approved actions register through the same registry as
-        // built-ins, so socket dispatch and triggers reach service
-        // plugins identically. The Arc is stored on the window struct
-        // so the lifetime is explicit.
-        // Reserve both the socket legacy match-arm names AND the
-        // trigger-only intercept names so service plugins can't claim
-        // either via `provides[]`. See comments on each constant for
-        // why both are needed and why they're separate.
-        let reserved_methods: Vec<&str> = socket::LEGACY_DISPATCH_METHODS
-            .iter()
-            .copied()
-            .chain(
-                nestty_daemon::trigger_sink::TRIGGER_ONLY_RESERVED_METHODS
-                    .iter()
-                    .copied(),
-            )
-            .collect();
-        let service_supervisor = ServiceSupervisor::new(
-            event_bus.clone(),
-            actions.clone(),
-            &plugins,
-            env!("CARGO_PKG_VERSION"),
-            &reserved_methods,
-        );
+        // Step 5b: service plugin hosting moved to nesttyd. GUI no
+        // longer spawns or supervises plugin subprocesses; it talks to
+        // them via the daemon socket. Plugin manifests are still
+        // discovered above (line 210) because the GUI needs panel
+        // metadata, module definitions, and command lists for UI
+        // rendering — that's manifest-only, not lifecycle.
 
         // Socket server (per-instance, so multiple nestty windows don't collide)
         let socket_path = format!("/tmp/nestty-{}.sock", std::process::id());
@@ -255,7 +226,10 @@ impl NesttyWindow {
         // the GUI runs fully through its own in-process supervisor/socket
         // in the meantime. When a daemon eventually shows up, the GUI
         // auto-registers and starts serving daemon→GUI Invokes too.
-        crate::gui_client::spawn(dispatch_tx.clone());
+        // event_bus is passed so daemon-published events (chained
+        // workflow completions, plugin events) bridge into the GUI bus
+        // and feed the local TriggerEngine.
+        crate::gui_client::spawn(dispatch_tx.clone(), event_bus.clone());
 
         let tab_manager = TabManager::new(
             config,
@@ -440,10 +414,8 @@ impl NesttyWindow {
         // stdin closes on EOF), and SIGKILLs anything still alive
         // after a brief grace window — children don't outlive the GUI.
         let socket_path_cleanup = socket_path.clone();
-        let supervisor_cleanup = service_supervisor.clone();
         let prewarm_path_cleanup = prewarm_path.clone();
         window.connect_destroy(move |_| {
-            supervisor_cleanup.shutdown_all();
             socket::cleanup(&socket_path_cleanup);
             let _ = std::fs::remove_file(&prewarm_path_cleanup);
         });
@@ -453,7 +425,6 @@ impl NesttyWindow {
             tab_manager,
             statusbar,
             background,
-            service_supervisor,
             prewarm_webview,
         }
     }

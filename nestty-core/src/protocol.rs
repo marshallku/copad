@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 pub const PROTOCOL_VERSION: u32 = 1;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
     pub id: String,
     pub method: String,
@@ -35,6 +35,14 @@ pub struct Event {
     #[serde(rename = "type")]
     pub event_type: String,
     pub data: serde_json::Value,
+    /// Provenance string — carried across the wire so the GUI's
+    /// `TriggerEngine::try_promote_or_drop_preflight` can match on it.
+    /// In particular, the action-registry-synthesized completion stamp
+    /// (`nestty.action`) must survive the daemon→GUI round-trip so
+    /// chained workflows advance after a daemon-hosted plugin replies.
+    /// Absent on older wire clients; deserialized as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Daemon → GUI request. Discriminated from `Request` by the `invoke`
@@ -61,7 +69,13 @@ impl Event {
         Self {
             event_type: event_type.into(),
             data,
+            source: None,
         }
+    }
+
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
     }
 
     /// Stamp `data._origin` with the provenance. Plugin-supplied

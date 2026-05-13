@@ -14,7 +14,8 @@ use std::sync::mpsc::{Sender, channel};
 use std::thread;
 use std::time::Duration;
 
-use nestty_core::protocol::{Invoke, Request, Response};
+use nestty_core::event_bus::{Event as BusEvent, EventBus};
+use nestty_core::protocol::{Event as WireEvent, Invoke, Request, Response};
 use nestty_core::thread_pool::Cancelable;
 use serde_json::Value;
 
@@ -52,7 +53,7 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// handles Invokes until the daemon connection drops; then waits a
 /// backoff interval and retries. Backoff resets to 1s after a successful
 /// register.
-pub fn spawn(dispatch_tx: Sender<SocketCommand>) {
+pub fn spawn(dispatch_tx: Sender<SocketCommand>, event_bus: Arc<EventBus>) {
     thread::Builder::new()
         .name("nestty-gui-client".into())
         .spawn(move || {
@@ -70,7 +71,7 @@ pub fn spawn(dispatch_tx: Sender<SocketCommand>) {
             // instead of dispatching the side-effecting method.
             let pool = nestty_core::thread_pool::ThreadPool::new(POOL_WORKERS, POOL_QUEUE);
             let generation = Arc::new(AtomicU64::new(0));
-            reconnect_loop(dispatch_tx, pool, generation);
+            reconnect_loop(dispatch_tx, pool, generation, event_bus);
         })
         .expect("spawn nestty-gui-client");
 }
@@ -79,6 +80,7 @@ fn reconnect_loop(
     dispatch_tx: Sender<SocketCommand>,
     pool: std::sync::Arc<nestty_core::thread_pool::ThreadPool>,
     generation: Arc<AtomicU64>,
+    event_bus: Arc<EventBus>,
 ) {
     let mut backoff = BACKOFF_INITIAL;
     loop {
@@ -103,6 +105,7 @@ fn reconnect_loop(
             pool.clone(),
             generation.clone(),
             registered.clone(),
+            event_bus.clone(),
         ) {
             // log::debug so a daemon-never-starts run stays silent on
             // stderr — the loop polls at most every 30s anyway, but a
@@ -129,6 +132,7 @@ fn run(
     pool: std::sync::Arc<nestty_core::thread_pool::ThreadPool>,
     generation: Arc<AtomicU64>,
     registered: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    event_bus: Arc<EventBus>,
 ) -> Result<(), String> {
     // Bump generation on entry AND on every exit (Drop guard). The exit
     // bump is the critical one: between EOF and the next `run()` call
@@ -204,8 +208,20 @@ fn run(
             // Response to our gui.register or a heartbeat reply later.
             log::debug!("[nestty] gui_client response: {value}");
         } else if value.get("type").is_some() {
-            // Auto-subscribed Event stream — not consumed yet.
-            log::trace!("[nestty] gui_client event: {value}");
+            // Auto-subscribed Event stream. Bridge to the local bus so
+            // GUI-side triggers can await on daemon-published events
+            // (chained workflows). Wire carries `source` — preserve it
+            // so the trigger engine's preflight-await promotion (which
+            // gates on COMPLETION_EVENT_SOURCE) accepts forwarded
+            // `<action>.completed` events from daemon-hosted plugins.
+            // Falls back to "daemon" when an older daemon omits source.
+            match serde_json::from_value::<WireEvent>(value) {
+                Ok(wire) => {
+                    let source = wire.source.unwrap_or_else(|| "daemon".to_string());
+                    event_bus.publish(BusEvent::new(wire.event_type, source, wire.data));
+                }
+                Err(e) => log::debug!("[nestty] gui_client malformed Event: {e}"),
+            }
         } else {
             log::debug!("[nestty] gui_client ignoring: {line:.200}");
         }

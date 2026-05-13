@@ -201,13 +201,19 @@ pub fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
 pub struct DaemonState {
     pub actions: Arc<ActionRegistry>,
     pub gui: Arc<GuiRegistry>,
+    /// Reference held for the event-bridge to subscribe to. Each GUI gets
+    /// a forwarder thread (started in `handle_gui_register` AFTER the ack
+    /// is sent) that drains an `event_bus.subscribe("*")` and writes
+    /// `protocol::Event` lines to the GUI's writer channel.
+    pub event_bus: EventBus,
 }
 
 impl DaemonState {
-    pub fn new(actions: Arc<ActionRegistry>) -> Arc<Self> {
+    pub fn new(actions: Arc<ActionRegistry>, event_bus: EventBus) -> Arc<Self> {
         Arc::new(Self {
             actions,
             gui: GuiRegistry::new(),
+            event_bus,
         })
     }
 }
@@ -293,6 +299,13 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
                     );
                     send_line(&writer_tx, &resp);
                     if let Some(cid) = new_client_id {
+                        // Start AFTER the ack has been queued. Starting
+                        // earlier would race with the registration
+                        // Response line and break `await_register_ack`
+                        // on the GUI (Step 5b round-3 C1 fix).
+                        state
+                            .gui
+                            .start_event_forwarder(&cid, state.event_bus.clone());
                         registered_client_id = Some(cid);
                     }
                     continue;
@@ -526,7 +539,7 @@ mod tests {
     fn mk_state_with_ping() -> Arc<DaemonState> {
         let actions = Arc::new(ActionRegistry::new());
         actions.register_silent("system.ping", |_| Ok(json!({"status": "ok"})));
-        DaemonState::new(actions)
+        DaemonState::new(actions, new_event_bus())
     }
 
     #[test]
@@ -564,7 +577,7 @@ mod tests {
     fn dispatch_routes_to_registered_action() {
         let actions = Arc::new(ActionRegistry::new());
         actions.register("greet", |_| Ok(json!({"hi": true})));
-        let state = DaemonState::new(actions);
+        let state = DaemonState::new(actions, new_event_bus());
         let req = Request::new("g-1", "greet", json!({}));
         let resp = dispatch(&req, &state);
         assert!(resp.ok);

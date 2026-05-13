@@ -29,6 +29,11 @@ export RUST_LOG="${RUST_LOG:-info}"
 export NESTTYD_POOL_WORKERS=2
 export NESTTYD_POOL_QUEUE=2
 export NESTTYD_E2E_TEST_ACTIONS=1
+# Isolate plugin discovery: daemon is the sole plugin host since Step
+# 5b, so without this it would spawn every plugin from the user's real
+# ~/.config/nestty/plugins/ during the test.
+mkdir -p "$WORK/xdg-config/nestty/plugins"
+export XDG_CONFIG_HOME="$WORK/xdg-config"
 
 DAEMON_PID=""
 GUI_PID=""
@@ -144,7 +149,10 @@ def serve(f):
             f.write((json.dumps(resp) + "\n").encode())
             if method != "_ping":
                 log(f"echoed invoke: {method}")
-        # ignore everything else
+        # Event from the daemon's auto-subscribe-all forwarder.
+        elif "type" in msg and "data" in msg:
+            src = msg.get("source", "")
+            log(f"event: type={msg['type']} source={src}")
 
 backoff = 1.0
 while True:
@@ -206,7 +214,26 @@ client_2=$(grep -oE 'gui registered: client_id=[^ ]+' "$DAEMON_LOG" | tail -n1 |
 [[ "$client_2" != "$client_1" ]] || fail "client_id reused after restart (got $client_2)"
 pass "re-registered; new client_id=${client_2:0:8}…"
 
-step 5 "frozen GUI → heartbeat-miss unregister"
+step 5 "event bridge — completion forwarded to GUI"
+# Fire a plain (non-GUI) connection that invokes __test.slow_blocking;
+# the daemon's ActionRegistry publishes `<action>.completed` on its bus
+# after the handler returns. The mock GUI (still registered from step 4)
+# must observe that wire Event via the auto-subscribe-all forwarder —
+# this is the chained-trigger preservation contract for Step 5b.
+python3 - "$SOCKET" >/dev/null 2>&1 <<'PY'
+import json, socket, sys, uuid
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sys.argv[1])
+f = s.makefile("rwb", buffering=0)
+req = {"id": str(uuid.uuid4()), "method": "__test.slow_blocking", "params": {"ms": 50}}
+f.write((json.dumps(req) + "\n").encode())
+f.readline()  # ignore response
+PY
+wait_for 'event: type=__test\.slow_blocking\.completed source=nestty\.action' "$GUI_LOG" 5 \
+    || fail "event bridge: completion event missing or source field stripped (need source=nestty.action so chained triggers fire)"
+pass "event bridge delivered __test.slow_blocking.completed with source=nestty.action"
+
+step 6 "frozen GUI → heartbeat-miss unregister"
 kill -STOP "$GUI_PID"
 # Two misses: interval(10s) + timeout(5s) ×2 ≈ 30s. Give it 40.
 wait_for "consecutive misses on $client_2" "$DAEMON_LOG" 40 \
@@ -217,12 +244,12 @@ pass "heartbeat-miss path fired and unregistered ${client_2:0:8}…"
 
 # Resume so wait in cleanup doesn't hang
 kill -CONT "$GUI_PID" 2>/dev/null || true
-# Mock GUI is done with its part; let it exit so step 6's burst doesn't
+# Mock GUI is done with its part; let it exit so the burst doesn't
 # fight a half-attached client over the same socket.
 kill -KILL "$GUI_PID" 2>/dev/null || true
 GUI_PID=""
 
-step 6 "pool saturation → overloaded"
+step 7 "pool saturation → overloaded"
 # Daemon's per-connection handler dispatches synchronously (recv_timeout
 # 120s), so concurrency comes from concurrent connections, not concurrent
 # requests on one socket. Fire N independent connections and assert ≥ 6
