@@ -7,4 +7,6 @@
 //!
 //! Wire protocol invariants are spelled out in `docs/gui-daemon-protocol.md`.
 
+pub mod service_supervisor;
 pub mod socket;
+pub mod trigger_sink;

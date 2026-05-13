@@ -9,10 +9,96 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 
+use nestty_core::action_registry::ActionRegistry;
+use nestty_core::event_bus::EventBus as CoreEventBus;
 use nestty_core::protocol::{Request, Response};
-use serde_json::json;
+
+/// Convenience alias for the shared event bus. Mirrors the type nestty-linux
+/// has been passing around as `crate::socket::EventBus`; lifted here so both
+/// the GUI shell and `nesttyd` can use the same handle type without
+/// duplicating the alias.
+pub type EventBus = Arc<CoreEventBus>;
+
+/// Methods served by the legacy `dispatch` match arm in nestty-linux's
+/// socket module (GUI-owned actions: `tab.*`, `webview.*`, `terminal.*`,
+/// `background.*`, `statusbar.*`, `agent.approve`, `claude.start`,
+/// `theme.list`, `plugin.list`, `plugin.open`, `session.*`).
+///
+/// Lives here in the daemon crate because `ServiceSupervisor::new` reserves
+/// these names against plugin `provides[]` claims — without that reservation
+/// a plugin could shadow a GUI-handled method, and the supervisor needs to
+/// know the legacy list whether or not the GUI is actually running. The
+/// GUI re-exports this constant so its own dispatch match still reads
+/// `socket::LEGACY_DISPATCH_METHODS`.
+///
+/// Remove an entry when its method migrates into `ActionRegistry`.
+/// `event.subscribe` is excluded — it owns the connection for the stream's
+/// lifetime, not a one-shot action.
+pub const LEGACY_DISPATCH_METHODS: &[&str] = &[
+    "background.set",
+    "background.clear",
+    "background.next",
+    "background.toggle",
+    "background.set_tint",
+    "tab.new",
+    "tab.close",
+    "tab.list",
+    "tab.info",
+    "tab.rename",
+    "tabs.toggle_bar",
+    "split.horizontal",
+    "split.vertical",
+    "session.list",
+    "session.info",
+    "webview.open",
+    "webview.navigate",
+    "webview.back",
+    "webview.forward",
+    "webview.reload",
+    "webview.execute_js",
+    "webview.get_content",
+    "webview.screenshot",
+    "webview.query",
+    "webview.query_all",
+    "webview.get_styles",
+    "webview.click",
+    "webview.fill",
+    "webview.scroll",
+    "webview.page_info",
+    "webview.devtools",
+    "terminal.read",
+    "terminal.state",
+    "terminal.exec",
+    "terminal.feed",
+    "terminal.history",
+    "terminal.context",
+    "agent.approve",
+    "claude.start",
+    "theme.list",
+    "plugin.list",
+    "plugin.open",
+    "statusbar.show",
+    "statusbar.hide",
+    "statusbar.toggle",
+];
+
+pub fn new_event_bus() -> EventBus {
+    Arc::new(CoreEventBus::new())
+}
+
+/// A socket request paired with a reply channel for the GTK main-loop
+/// pump (in the GUI) or for `nesttyd`-internal handlers. The data shape
+/// is platform-neutral — both nestty-linux and nestty-daemon share it,
+/// which is why it lives here in the daemon crate (the daemon's
+/// `ServiceSupervisor` + `LiveTriggerSink` need it too).
+pub struct SocketCommand {
+    pub request: Request,
+    pub reply: mpsc::Sender<Response>,
+}
 
 /// Owner-only permissions for the daemon's runtime directory.
 /// `XDG_RUNTIME_DIR` is already 0700 by the XDG spec; the `/tmp/nestty-{uid}/`
@@ -163,6 +249,19 @@ pub fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
     Ok(listener)
 }
 
+/// State carried across the accept loop and into each connection thread.
+/// Owns the per-process `ActionRegistry` (and, optionally, a held reference
+/// to the `ServiceSupervisor` keeping plugin children alive).
+pub struct DaemonState {
+    pub actions: Arc<ActionRegistry>,
+}
+
+impl DaemonState {
+    pub fn new(actions: Arc<ActionRegistry>) -> Arc<Self> {
+        Arc::new(Self { actions })
+    }
+}
+
 /// Accept loop. Spawns one OS thread per connection. Returns when the
 /// listener yields a fatal error so the caller can run `cleanup_socket`.
 ///
@@ -171,11 +270,12 @@ pub fn bind_listener(path: &Path) -> std::io::Result<UnixListener> {
 /// bad listener fd, etc.). Swallowing them would turn a real fault into
 /// a tight warning loop and leave the socket inode on disk because
 /// cleanup never reaches.
-pub fn run_accept_loop(listener: UnixListener) {
+pub fn run_accept_loop(listener: UnixListener, state: Arc<DaemonState>) {
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => {
-                thread::spawn(move || handle_connection(stream));
+                let s = state.clone();
+                thread::spawn(move || handle_connection(stream, s));
             }
             Err(e) => {
                 log::error!(
@@ -187,7 +287,7 @@ pub fn run_accept_loop(listener: UnixListener) {
     }
 }
 
-fn handle_connection(stream: UnixStream) {
+fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
     let read_half = match stream.try_clone() {
         Ok(s) => s,
         Err(e) => {
@@ -211,7 +311,7 @@ fn handle_connection(stream: UnixStream) {
         }
 
         let response = match serde_json::from_str::<Request>(&line) {
-            Ok(req) => dispatch(&req),
+            Ok(req) => dispatch(&req, &state),
             Err(e) => Response::error(
                 String::new(),
                 "invalid_request",
@@ -232,25 +332,66 @@ fn handle_connection(stream: UnixStream) {
     }
 }
 
-/// Dispatch a single Request → Response. v0 handles only `system.ping`
-/// (the method `nestctl ping` issues, registered as a low-frequency synchronous
-/// action in the GUI today via `ActionRegistry::register_silent`). Everything
-/// else is `unknown_method`. Follow-up commits fold in supervisor and the
-/// rest of registry dispatch.
-pub fn dispatch(req: &Request) -> Response {
-    match req.method.as_str() {
-        "system.ping" => Response::success(
+/// Dispatch a single Request → Response.
+///
+/// Routing order:
+/// 1. Anything registered in `state.actions` (including the built-in
+///    `system.ping` plus all plugin-provided action names) → dispatched
+///    through the registry. Sync handlers return inline; blocking ones
+///    run on a worker thread and the connection thread blocks on a
+///    one-shot channel (bounded by `ACTION_TIMEOUT`).
+/// 2. Anything else → `unknown_method`. `LEGACY_DISPATCH_METHODS`
+///    (GUI-owned) is not handled here yet — the daemon currently has no
+///    GUI client protocol to proxy to. That arrives with migration step 4.
+pub fn dispatch(req: &Request, state: &Arc<DaemonState>) -> Response {
+    if state.actions.has(&req.method) {
+        return dispatch_via_registry(req, &state.actions);
+    }
+
+    let hint = if LEGACY_DISPATCH_METHODS.contains(&req.method.as_str()) {
+        " (GUI-owned method; daemon does not yet proxy these — start the GUI or wait for migration step 4)"
+    } else {
+        ""
+    };
+    Response::error(
+        req.id.clone(),
+        "unknown_method",
+        &format!("nesttyd has no action named {}{hint}", req.method),
+    )
+}
+
+/// Sync bridge: `try_dispatch` is callback-based to support blocking
+/// handlers without parking the registry; nesttyd's connection thread is
+/// itself already off-main and can wait, so we collect the callback
+/// result through a oneshot mpsc.
+fn dispatch_via_registry(req: &Request, actions: &Arc<ActionRegistry>) -> Response {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let req_id = req.id.clone();
+    actions.try_dispatch(
+        &req.method,
+        req.params.clone(),
+        Box::new(move |result| {
+            let resp = match result {
+                Ok(v) => Response::success(req_id, v),
+                Err(err) => Response {
+                    id: req_id,
+                    ok: false,
+                    result: None,
+                    error: Some(err),
+                },
+            };
+            // Send may fail if the recv side is gone (timeout already
+            // returned `action_timeout`). That's fine — we just drop the
+            // late reply.
+            let _ = tx.send(resp);
+        }),
+    );
+    match rx.recv_timeout(std::time::Duration::from_secs(120)) {
+        Ok(resp) => resp,
+        Err(_) => Response::error(
             req.id.clone(),
-            json!({
-                "status": "ok",
-                "daemon": "nesttyd",
-                "version": env!("CARGO_PKG_VERSION"),
-            }),
-        ),
-        other => Response::error(
-            req.id.clone(),
-            "unknown_method",
-            &format!("nesttyd v0 only handles system.ping; got {other}"),
+            "action_timeout",
+            "nesttyd action did not complete within 120s",
         ),
     }
 }
@@ -268,6 +409,7 @@ pub fn cleanup_socket(path: &PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
 
@@ -288,24 +430,57 @@ mod tests {
         dir
     }
 
+    fn mk_state_with_ping() -> Arc<DaemonState> {
+        let actions = Arc::new(ActionRegistry::new());
+        actions.register_silent("system.ping", |_| Ok(json!({"status": "ok"})));
+        DaemonState::new(actions)
+    }
+
     #[test]
     fn dispatch_system_ping_returns_ok() {
+        let state = mk_state_with_ping();
         let req = Request::new("abc", "system.ping", json!({}));
-        let resp = dispatch(&req);
+        let resp = dispatch(&req, &state);
         assert!(resp.ok);
         assert_eq!(resp.id, "abc");
         let body = resp.result.expect("result");
         assert_eq!(body["status"], json!("ok"));
-        assert_eq!(body["daemon"], json!("nesttyd"));
     }
 
     #[test]
     fn dispatch_unknown_method_returns_error() {
+        let state = mk_state_with_ping();
         let req = Request::new("xyz", "nothing.here", json!({}));
-        let resp = dispatch(&req);
+        let resp = dispatch(&req, &state);
         assert!(!resp.ok);
         let err = resp.error.expect("error");
         assert_eq!(err.code, "unknown_method");
+    }
+
+    #[test]
+    fn dispatch_legacy_gui_method_returns_unknown_with_hint() {
+        let state = mk_state_with_ping();
+        let req = Request::new("xyz", "tab.new", json!({}));
+        let resp = dispatch(&req, &state);
+        assert!(!resp.ok);
+        let err = resp.error.expect("error");
+        assert_eq!(err.code, "unknown_method");
+        assert!(
+            err.message.contains("GUI-owned"),
+            "should hint at GUI-owned classification, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn dispatch_routes_to_registered_action() {
+        let actions = Arc::new(ActionRegistry::new());
+        actions.register("greet", |_| Ok(json!({"hi": true})));
+        let state = DaemonState::new(actions);
+        let req = Request::new("g-1", "greet", json!({}));
+        let resp = dispatch(&req, &state);
+        assert!(resp.ok);
+        assert_eq!(resp.result.unwrap()["hi"], json!(true));
     }
 
     #[test]
@@ -398,9 +573,10 @@ mod tests {
         let path = tmp_socket();
         let _ = std::fs::remove_file(&path);
         let listener = bind_listener(&path).expect("bind");
+        let state = mk_state_with_ping();
 
         let path_clone = path.clone();
-        let _server = thread::spawn(move || run_accept_loop(listener));
+        let _server = thread::spawn(move || run_accept_loop(listener, state));
 
         // Give the accept loop a moment to call into thread::spawn.
         // Conservative: 50ms is plenty for local Unix sockets.

@@ -9,7 +9,7 @@ use gtk4::ApplicationWindow;
 use serde_json::json;
 
 use nestty_core::action_registry::ActionRegistry;
-use nestty_core::event_bus::{Event as BusEvent, EventBus as CoreEventBus};
+use nestty_core::event_bus::Event as BusEvent;
 use nestty_core::protocol::{Event, Request, Response};
 
 use vte4::prelude::*;
@@ -22,69 +22,11 @@ const WALLPAPER_CACHE: &str = ".cache/terminal-wallpapers.txt";
 const BG_MODE_FILE: &str = ".cache/nestty-bg-mode";
 const BUS_SOURCE_NESTTY_LINUX: &str = "nestty-linux";
 
-/// Methods served by the legacy `dispatch` match arm (not yet migrated
-/// into `ActionRegistry`). Second source of truth for "core action names
-/// a service plugin must not shadow"; remove an entry when its method
-/// migrates into the registry. `event.subscribe` is excluded — it owns
-/// the connection for the stream's lifetime, not a one-shot action.
-pub const LEGACY_DISPATCH_METHODS: &[&str] = &[
-    "background.set",
-    "background.clear",
-    "background.next",
-    "background.toggle",
-    "background.set_tint",
-    "tab.new",
-    "tab.close",
-    "tab.list",
-    "tab.info",
-    "tab.rename",
-    "tabs.toggle_bar",
-    "split.horizontal",
-    "split.vertical",
-    "session.list",
-    "session.info",
-    "webview.open",
-    "webview.navigate",
-    "webview.back",
-    "webview.forward",
-    "webview.reload",
-    "webview.execute_js",
-    "webview.get_content",
-    "webview.screenshot",
-    "webview.query",
-    "webview.query_all",
-    "webview.get_styles",
-    "webview.click",
-    "webview.fill",
-    "webview.scroll",
-    "webview.page_info",
-    "webview.devtools",
-    "terminal.read",
-    "terminal.state",
-    "terminal.exec",
-    "terminal.feed",
-    "terminal.history",
-    "terminal.context",
-    "agent.approve",
-    "claude.start",
-    "theme.list",
-    "plugin.list",
-    "plugin.open",
-    "statusbar.show",
-    "statusbar.hide",
-    "statusbar.toggle",
-];
-
-pub type EventBus = Arc<CoreEventBus>;
-
-pub struct SocketCommand {
-    pub request: Request,
-    pub reply: std::sync::mpsc::Sender<Response>,
-}
-
-pub fn new_event_bus() -> EventBus {
-    Arc::new(CoreEventBus::new())
-}
+// Shared transport types + legacy method list now live in nestty-daemon —
+// see step 2b of the daemon-first migration. Re-export so existing
+// `crate::socket::{EventBus, SocketCommand, LEGACY_DISPATCH_METHODS, …}`
+// callsites in nestty-linux keep working without further churn.
+pub use nestty_daemon::socket::{EventBus, LEGACY_DISPATCH_METHODS, SocketCommand, new_event_bus};
 
 pub fn broadcast(bus: &EventBus, event: &Event) {
     bus.publish(BusEvent::new(

@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 nestty-core = { path = "../nestty-core" }
+nestty-daemon = { path = "../nestty-daemon" }
 gtk4 = { version = "0.9", features = ["gnome_46"] }
 vte4 = { version = "0.8", features = ["v0_76"] }
 serde_json = "1"

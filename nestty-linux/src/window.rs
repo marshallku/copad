@@ -15,9 +15,10 @@ use nestty_core::context::ContextService;
 use nestty_core::event_bus::{Event as BusEvent, EventBus as CoreEventBus, EventReceiver};
 use nestty_core::trigger::{Trigger, TriggerEngine, TriggerSink, covering_patterns};
 
+use nestty_daemon::service_supervisor::ServiceSupervisor;
+use nestty_daemon::trigger_sink::LiveTriggerSink;
+
 use crate::background::BackgroundLayer;
-use crate::service_supervisor::ServiceSupervisor;
-use crate::trigger_sink::LiveTriggerSink;
 
 use crate::panel::Panel;
 use crate::socket;
@@ -232,7 +233,7 @@ impl NesttyWindow {
             .iter()
             .copied()
             .chain(
-                crate::trigger_sink::TRIGGER_ONLY_RESERVED_METHODS
+                nestty_daemon::trigger_sink::TRIGGER_ONLY_RESERVED_METHODS
                     .iter()
                     .copied(),
             )

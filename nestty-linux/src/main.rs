@@ -3,16 +3,19 @@ mod background;
 mod panel;
 mod plugin_panel;
 mod search;
-mod service_supervisor;
-
 mod socket;
 mod split;
 mod statusbar;
 mod tabs;
 mod terminal;
-mod trigger_sink;
 mod webview;
 mod window;
+
+// service_supervisor and trigger_sink now live in `nestty-daemon` (step 2b
+// of the daemon-first migration). nestty-linux imports them via the
+// `nestty_daemon::{service_supervisor, trigger_sink}` paths; `crate::socket`
+// re-exports the shared transport types so callsites in plugin_panel/tabs
+// keep working without further churn.
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();

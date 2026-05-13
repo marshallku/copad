@@ -1656,6 +1656,7 @@ dependencies = [
  "nestty-core",
  "serde",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
@@ -1676,6 +1677,7 @@ dependencies = [
  "libc",
  "log",
  "nestty-core",
+ "nestty-daemon",
  "serde",
  "serde_json",
  "shellexpand",
