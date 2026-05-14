@@ -18,6 +18,7 @@ use std::sync::mpsc;
 use std::thread;
 
 use nestty_core::action_registry::{ActionRegistry, ActionResult, internal_error, invalid_params};
+use nestty_core::protocol::Response;
 use nestty_core::trigger::TriggerSink;
 use serde_json::{Value, json};
 
@@ -42,12 +43,17 @@ pub struct DaemonTriggerSink {
 }
 
 impl DaemonTriggerSink {
-    pub fn new(registry: Arc<ActionRegistry>, gui: Arc<GuiRegistry>) -> Self {
+    pub fn new(
+        registry: Arc<ActionRegistry>,
+        gui: Arc<GuiRegistry>,
+        event_bus: Arc<nestty_core::event_bus::EventBus>,
+    ) -> Self {
         let (tx, rx) = mpsc::sync_channel::<(String, Value)>(FALLTHROUGH_QUEUE);
         let gui_for_worker = gui.clone();
+        let bus_for_worker = event_bus;
         thread::Builder::new()
             .name("nestty-trigger-fallthrough".into())
-            .spawn(move || fallthrough_worker(rx, gui_for_worker))
+            .spawn(move || fallthrough_worker(rx, gui_for_worker, bus_for_worker))
             .expect("spawn trigger fallthrough worker");
         Self {
             registry,
@@ -156,24 +162,35 @@ impl TriggerSink for DaemonTriggerSink {
     }
 }
 
-fn fallthrough_worker(rx: mpsc::Receiver<(String, Value)>, gui: Arc<GuiRegistry>) {
+fn fallthrough_worker(
+    rx: mpsc::Receiver<(String, Value)>,
+    gui: Arc<GuiRegistry>,
+    event_bus: Arc<nestty_core::event_bus::EventBus>,
+) {
     while let Ok((action, params)) = rx.recv() {
-        match gui.route(&action, None) {
+        let resp = match gui.route(&action, None) {
             Ok(client) => {
                 let timeout = method_invoke_timeout(&action);
                 let resp = client.invoke(&action, params, timeout);
                 if !resp.ok {
                     let (code, message) = resp
                         .error
-                        .map(|e| (e.code, e.message))
+                        .as_ref()
+                        .map(|e| (e.code.clone(), e.message.clone()))
                         .unwrap_or_else(|| ("unknown".into(), String::new()));
                     log::warn!("trigger fallthrough action={action} failed: {code}: {message}");
                 }
+                resp
             }
             Err(reason) => {
                 log::warn!("trigger fallthrough action={action} unroutable: {reason}");
+                Response::error(String::new(), reason, &format!("no GUI to handle {action}"))
             }
-        }
+        };
+        // Same vouch-publish as `dispatch_via_gui`: daemon-side chained
+        // triggers see `<action>.completed`/`.failed` whether the GUI
+        // ran the action successfully or the route/invoke itself failed.
+        crate::socket::publish_legacy_completion(&event_bus, &action, false, &resp);
     }
 }
 
@@ -185,7 +202,8 @@ mod tests {
     fn mk_sink() -> (Arc<ActionRegistry>, Arc<GuiRegistry>, DaemonTriggerSink) {
         let reg = Arc::new(ActionRegistry::new());
         let gui = GuiRegistry::new();
-        let sink = DaemonTriggerSink::new(reg.clone(), gui.clone());
+        let bus = Arc::new(nestty_core::event_bus::EventBus::new());
+        let sink = DaemonTriggerSink::new(reg.clone(), gui.clone(), bus);
         (reg, gui, sink)
     }
 

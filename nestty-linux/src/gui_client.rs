@@ -523,6 +523,11 @@ fn handle_invoke(
     let cmd = SocketCommand {
         request: Request::new(inv.id.clone(), &inv.invoke, inv.params),
         reply: reply_tx,
+        // Daemon-Invoke proxies suppress local completion publish; daemon's
+        // dispatch_via_gui publishes on its own bus and the daemon→GUI
+        // forwarder brings it back so GUI-side triggers see exactly one
+        // completion event.
+        silent_completion: true,
     };
     if dispatch_tx.send(cmd).is_err() {
         return Err("GTK dispatch channel closed".into());

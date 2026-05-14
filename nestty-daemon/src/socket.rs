@@ -23,6 +23,66 @@ use crate::gui_registry::{GuiRegistry, method_capability, method_invoke_timeout}
 
 pub type EventBus = Arc<CoreEventBus>;
 
+/// Legacy match-arm methods whose `<method>.completed` publication would
+/// dwarf real workflow events on the bus. These are read-only / agent-
+/// polled paths; their "completion" is the response itself. Mirror of
+/// `register_silent` for the legacy dispatch surface. nestty-linux's
+/// socket::dispatch wrapper + the daemon-side `dispatch_via_gui` publish
+/// helper both consult this list before emitting.
+pub const LEGACY_SILENT_METHODS: &[&str] = &[
+    "terminal.read",
+    "terminal.state",
+    "terminal.history",
+    "terminal.context",
+    "tab.list",
+    "tab.info",
+    "session.list",
+    "session.info",
+];
+
+pub fn is_legacy_silent(method: &str) -> bool {
+    LEGACY_SILENT_METHODS.contains(&method)
+}
+
+impl SocketCommand {
+    /// Publish `<method>.completed` / `<method>.failed` on `bus` (when
+    /// the command is not marked silent and the method is not in
+    /// [`LEGACY_SILENT_METHODS`]) and forward `resp` to the original
+    /// caller. Convenience wrapper used by every nestty-linux
+    /// `socket::dispatch` legacy match arm so chained triggers see
+    /// completion events uniformly across registry and legacy actions.
+    pub fn reply_with_completion(&self, bus: &EventBus, resp: Response) {
+        publish_legacy_completion(bus, &self.request.method, self.silent_completion, &resp);
+        let _ = self.reply.send(resp);
+    }
+}
+
+/// Free-function variant of [`SocketCommand::reply_with_completion`]'s
+/// publish step. Used by callback-deferred handlers (webview JS exec,
+/// agent.approve dialog) that move `cmd.reply` into a closure and can no
+/// longer reach the SocketCommand method.
+pub fn publish_legacy_completion(bus: &EventBus, method: &str, silent: bool, resp: &Response) {
+    if silent || is_legacy_silent(method) {
+        return;
+    }
+    let result = response_to_action_result(resp);
+    nestty_core::action_registry::publish_completion_unconditional(bus, method, &result);
+}
+
+fn response_to_action_result(resp: &Response) -> nestty_core::action_registry::ActionResult {
+    if resp.ok {
+        Ok(resp.result.clone().unwrap_or(serde_json::Value::Null))
+    } else {
+        Err(resp
+            .error
+            .clone()
+            .unwrap_or_else(|| nestty_core::protocol::ResponseError {
+                code: "unknown".into(),
+                message: String::new(),
+            }))
+    }
+}
+
 /// GUI-owned methods that `ServiceSupervisor::new` reserves against plugin
 /// `provides[]` claims so a plugin can't shadow a GUI handler. nestty-linux
 /// re-exports for its own dispatch match. Remove an entry when its method
@@ -84,6 +144,14 @@ pub fn new_event_bus() -> EventBus {
 pub struct SocketCommand {
     pub request: Request,
     pub reply: mpsc::Sender<Response>,
+    /// Set true when this SocketCommand was constructed by
+    /// `gui_client::handle_invoke` (i.e., a daemon-Invoke proxy reaching
+    /// the GUI's local dispatch). The dispatch wrapper skips local
+    /// completion publishing in that case — the daemon already publishes
+    /// on its own bus after `client.invoke` returns, and the daemon→GUI
+    /// event forwarder bridges that event back so GUI-side triggers see
+    /// it exactly once.
+    pub silent_completion: bool,
 }
 
 const RUNTIME_DIR_MODE: u32 = 0o700;
@@ -763,7 +831,18 @@ pub fn dispatch(req: &Request, state: &Arc<DaemonState>) -> Response {
     }
 
     if method_capability(&req.method).is_some() {
-        return dispatch_via_gui(req, &state.gui);
+        let resp = dispatch_via_gui(req, &state.gui);
+        // Daemon vouches that the GUI-owned action returned this
+        // response; publish `<method>.completed`/`.failed` on the
+        // daemon bus so daemon-side chained triggers fire. The
+        // GUI suppresses local publish for daemon-Invoke origins
+        // (`silent_completion=true` set by `handle_invoke`), and the
+        // daemon→GUI forwarder bridges this event back so GUI-side
+        // triggers also see it exactly once. Failure paths (no_gui,
+        // unknown_client, invoke timeout) emit `<method>.failed`
+        // identically.
+        publish_legacy_completion(&state.event_bus, &req.method, false, &resp);
+        return resp;
     }
 
     Response::error(

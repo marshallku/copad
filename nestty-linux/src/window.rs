@@ -353,11 +353,11 @@ impl NesttyWindow {
             // same batch (e.g. `context.snapshot`) must see those events
             // applied to ContextService.
             while let Ok(cmd) = socket_rx.try_recv() {
-                socket::dispatch(cmd, &mgr, &win, &sb, &bg, &act);
+                socket::dispatch(cmd, &mgr, &win, &sb, &bg, &act, &bus_for_timer);
                 pump_state_timer.borrow().drain_context_only(&ctx_pump);
             }
             while let Ok(cmd) = plugin_dispatch_rx.try_recv() {
-                socket::dispatch(cmd, &mgr, &win, &sb, &bg, &act);
+                socket::dispatch(cmd, &mgr, &win, &sb, &bg, &act, &bus_for_timer);
                 pump_state_timer.borrow().drain_context_only(&ctx_pump);
             }
             glib::ControlFlow::Continue

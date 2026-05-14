@@ -325,6 +325,15 @@ impl Cancelable for DispatchJob {
 
 fn publish_completion(bus: Option<&EventBus>, action: &str, result: &ActionResult) {
     let Some(bus) = bus else { return };
+    publish_completion_unconditional(bus, action, result);
+}
+
+/// `<action>.completed` / `<action>.failed` with source `nestty.action`.
+/// Identical shape to the registry's auto-publish — exposed so the legacy
+/// dispatch surfaces (nestty-linux's `socket::dispatch` legacy match arms,
+/// nestty-daemon's `dispatch_via_gui`) can fan out completion events
+/// without copy-pasting the formatting logic.
+pub fn publish_completion_unconditional(bus: &EventBus, action: &str, result: &ActionResult) {
     let (kind, payload) = match result {
         Ok(value) => (format!("{action}.completed"), value.clone()),
         Err(err) => (

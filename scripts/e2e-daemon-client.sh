@@ -852,6 +852,131 @@ types=$(python3 -c "import sys,json; d=json.load(open(sys.argv[1])); print(','.j
     || fail "expected only 'e2e.sub.match.fire' across the wire; got '$types'"
 pass "event.subscribe filtered out non-matching kind, delivered match"
 
+step 14 "dispatch_via_gui publishes <method>.completed on daemon bus"
+# Inline short-lived mock GUI (all capabilities, primary) so this step
+# is independent of the persistent mock's reconnect backoff after prior
+# daemon restarts. The mock serves invokes for 8s — plenty of time for
+# the test to dispatch tab.new and observe the completion event.
+DISPATCH_GUI_LOG=$WORK/dispatch_gui.log
+python3 - "$SOCKET" "$DISPATCH_GUI_LOG" <<'PY' &
+import json, socket, sys, time, uuid
+sock_path, log_path = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock_path)
+f = s.makefile("rwb", buffering=0)
+reg_id = str(uuid.uuid4())
+reg = {"id": reg_id, "method": "gui.register",
+       "params": {
+           "capabilities": ["tab","split","terminal","webview","background",
+                            "statusbar","agent.ui","plugin.open","session","search"],
+           "want_primary": True,
+           "protocol_version": 1,
+       }}
+f.write((json.dumps(reg) + "\n").encode())
+# Drain until ack lands; ignore any forwarded event frames in between.
+ack = None
+while True:
+    line = f.readline().decode().strip()
+    if not line:
+        break
+    msg = json.loads(line)
+    if msg.get("id") == reg_id:
+        ack = msg
+        break
+with open(log_path, "a") as fh:
+    fh.write(f"register_ok={(ack or {}).get('ok')}\n")
+# Blocking serve loop: echo every Invoke. Exits when the test kills us
+# or the daemon closes the connection.
+for raw in f:
+    line = raw.decode().strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    if "invoke" in msg:
+        resp = {"id": msg["id"], "ok": True, "result": msg.get("params", {})}
+        f.write((json.dumps(resp) + "\n").encode())
+        with open(log_path, "a") as fh:
+            fh.write(f"echoed_invoke={msg['invoke']}\n")
+PY
+DISPATCH_GUI_PID=$!
+# Wait for the register ack to be observed by the mock.
+deadline=$(( SECONDS + 4 ))
+while (( SECONDS < deadline )); do
+    grep -q "register_ok=True" "$DISPATCH_GUI_LOG" 2>/dev/null && break
+    sleep 0.1
+done
+grep -q "register_ok=True" "$DISPATCH_GUI_LOG" 2>/dev/null \
+    || { kill -KILL "$DISPATCH_GUI_PID" 2>/dev/null; fail "step 14 inline mock did not register: $(cat $DISPATCH_GUI_LOG 2>/dev/null)"; }
+DISPATCH_LOG=$WORK/dispatch_via_gui.json
+python3 - "$SOCKET" "$DISPATCH_LOG" <<'PY' &
+import json, socket, sys, time, uuid
+
+sock_path, out_path = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock_path)
+s.settimeout(1.0)
+f = s.makefile("rwb", buffering=0)
+sub_id = str(uuid.uuid4())
+sub = {"id": sub_id, "method": "event.subscribe",
+       "params": {"patterns": ["tab.new.completed", "tab.new.failed"]}}
+f.write((json.dumps(sub) + "\n").encode())
+
+ack = None
+events = []
+got_ack = False
+deadline = time.time() + 4.0
+while time.time() < deadline:
+    try:
+        line = f.readline()
+    except (TimeoutError, socket.timeout):
+        continue
+    if not line:
+        break
+    trimmed = line.strip()
+    if not trimmed:
+        continue
+    msg = json.loads(trimmed)
+    if not got_ack and msg.get("id") == sub_id:
+        ack = msg
+        got_ack = True
+        continue
+    if "type" in msg:
+        events.append(msg)
+        break
+
+with open(out_path, "w") as fh:
+    json.dump({"ack_ok": (ack or {}).get("ok"), "events": events}, fh)
+PY
+SUB_PID=$!
+sleep 0.4
+
+DISPATCH_RPC_LOG=$WORK/dispatch_via_gui_rpc.json
+python3 - "$SOCKET" "$DISPATCH_RPC_LOG" >/dev/null <<'PY'
+import json, socket, sys, uuid
+sock_path, out = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock_path)
+s.settimeout(10.0)
+f = s.makefile("rwb", buffering=0)
+req_id = str(uuid.uuid4())
+req = {"id": req_id, "method": "tab.new", "params": {"hint": "e2e"}}
+f.write((json.dumps(req) + "\n").encode())
+line = f.readline().decode().strip()
+with open(out, "w") as fh:
+    fh.write(line)
+PY
+
+wait $SUB_PID 2>/dev/null || true
+[[ -s "$DISPATCH_LOG" ]] || fail "dispatch_via_gui subscriber wrote nothing"
+ack_ok=$(python3 -c "import sys,json; print(json.load(open(sys.argv[1]))['ack_ok'])" "$DISPATCH_LOG")
+[[ "$ack_ok" == "True" ]] || fail "subscriber ack not OK: $(cat $DISPATCH_LOG)"
+ev_type=$(python3 -c "import sys,json; d=json.load(open(sys.argv[1])); print((d['events'][0] if d['events'] else {}).get('type',''))" "$DISPATCH_LOG")
+[[ "$ev_type" == "tab.new.completed" ]] \
+    || fail "expected 'tab.new.completed' on daemon bus (rpc=$(cat $DISPATCH_RPC_LOG 2>/dev/null), gui_log=$(cat $DISPATCH_GUI_LOG 2>/dev/null)), got '$ev_type'"
+pass "tab.new.completed published on daemon bus after dispatch_via_gui"
+kill -KILL "$DISPATCH_GUI_PID" 2>/dev/null || true
+wait "$DISPATCH_GUI_PID" 2>/dev/null || true
+
 echo
 echo "=== AUTO E2E COMPLETE ==="
 echo

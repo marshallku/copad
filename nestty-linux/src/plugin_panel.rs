@@ -221,6 +221,7 @@ impl PluginPanel {
                         let cmd = SocketCommand {
                             request,
                             reply: reply_tx,
+                            silent_completion: false,
                         };
                         if tx.send(cmd).is_ok() {
                             let reply_clone = reply.clone();

@@ -142,6 +142,7 @@ pub fn start_server(socket_path: &str, event_bus: EventBus) -> mpsc::Receiver<So
                     let cmd = SocketCommand {
                         request,
                         reply: reply_tx,
+                        silent_completion: false,
                     };
 
                     if tx.send(cmd).is_err() {
@@ -173,6 +174,7 @@ pub fn dispatch(
     statusbar: &Rc<crate::statusbar::StatusBar>,
     background: &Rc<BackgroundLayer>,
     actions: &Arc<ActionRegistry>,
+    event_bus: &EventBus,
 ) {
     let req = &cmd.request;
 
@@ -209,30 +211,37 @@ pub fn dispatch(
         return;
     }
 
+    // Legacy match-arm path: every reply funnels through
+    // `cmd.reply_with_completion` so chained triggers see
+    // `<action>.completed` / `<action>.failed` uniformly across registry
+    // and legacy actions. `silent_completion = true` (set by
+    // `gui_client::handle_invoke` for daemon-proxied Invokes) suppresses
+    // local publish — daemon publishes on its own bus for those.
+
     match req.method.as_str() {
         "background.set" => {
             let resp = handle_bg_set(req, background);
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "background.clear" => {
             let resp = handle_bg_clear(req, background);
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "background.next" => {
             let resp = handle_bg_next(req, background);
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "background.toggle" => {
             let resp = handle_bg_toggle(req, background);
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "background.set_tint" => {
             let resp = handle_bg_set_tint(req, background);
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "tab.new" => {
@@ -252,10 +261,13 @@ pub fn dispatch(
         "tab.list" => {
             let count = mgr.tab_count();
             let current = mgr.current_tab();
-            let _ = cmd.reply.send(Response::success(
-                req.id.clone(),
-                json!({ "count": count, "current": current }),
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::success(
+                    req.id.clone(),
+                    json!({ "count": count, "current": current }),
+                ),
+            );
         }
 
         "tab.info" => {
@@ -279,10 +291,10 @@ pub fn dispatch(
         }
 
         "session.list" => {
-            let _ = cmd.reply.send(Response::success(
-                req.id.clone(),
-                json!(mgr.all_panels_info()),
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::success(req.id.clone(), json!(mgr.all_panels_info())),
+            );
         }
 
         "session.info" => {
@@ -297,18 +309,18 @@ pub fn dispatch(
                 },
                 None => Response::error(req.id.clone(), "invalid_params", "Missing 'id' param"),
             };
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         // -- WebView commands --
         "webview.open" => {
             let resp = handle_webview_open(req, mgr, window);
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "webview.navigate" => {
             let resp = handle_webview_navigate(req, mgr);
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "webview.back" => {
@@ -316,7 +328,7 @@ pub fn dispatch(
                 wv.go_back();
                 Response::success(req.id.clone(), json!({ "status": "ok" }))
             });
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "webview.forward" => {
@@ -324,7 +336,7 @@ pub fn dispatch(
                 wv.go_forward();
                 Response::success(req.id.clone(), json!({ "status": "ok" }))
             });
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "webview.reload" => {
@@ -332,71 +344,71 @@ pub fn dispatch(
                 wv.reload();
                 Response::success(req.id.clone(), json!({ "status": "ok" }))
             });
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "webview.execute_js" => {
-            handle_webview_execute_js(cmd, mgr);
+            handle_webview_execute_js(cmd, mgr, event_bus);
             // Response sent from callback
         }
 
         "webview.get_content" => {
-            handle_webview_get_content(cmd, mgr);
+            handle_webview_get_content(cmd, mgr, event_bus);
             // Response sent from callback
         }
 
         "webview.screenshot" => {
-            handle_webview_screenshot(cmd, mgr);
+            handle_webview_screenshot(cmd, mgr, event_bus);
             // Response sent from callback
         }
 
         "webview.query" => {
-            handle_webview_query(cmd, mgr);
+            handle_webview_query(cmd, mgr, event_bus);
             // Response sent from callback
         }
 
         "webview.query_all" => {
-            handle_webview_query_all(cmd, mgr);
+            handle_webview_query_all(cmd, mgr, event_bus);
             // Response sent from callback
         }
 
         "webview.get_styles" => {
-            handle_webview_get_styles(cmd, mgr);
+            handle_webview_get_styles(cmd, mgr, event_bus);
             // Response sent from callback
         }
 
         "webview.click" => {
-            handle_webview_click(cmd, mgr);
+            handle_webview_click(cmd, mgr, event_bus);
             // Response sent from callback
         }
 
         "webview.fill" => {
-            handle_webview_fill(cmd, mgr);
+            handle_webview_fill(cmd, mgr, event_bus);
             // Response sent from callback
         }
 
         "webview.scroll" => {
-            handle_webview_scroll(cmd, mgr);
+            handle_webview_scroll(cmd, mgr, event_bus);
             // Response sent from callback
         }
 
         "webview.page_info" => {
-            handle_webview_page_info(cmd, mgr);
+            handle_webview_page_info(cmd, mgr, event_bus);
             // Response sent from callback
         }
 
         "webview.devtools" => {
             let resp = handle_webview_devtools(req, mgr);
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         // -- Tab bar commands --
         "tabs.toggle_bar" => {
             let visible = mgr.toggle_tab_bar();
-            let _ = cmd.reply.send(Response::success(
-                req.id.clone(),
-                json!({ "visible": visible }),
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::success(req.id.clone(), json!({ "visible": visible })),
+            );
         }
 
         "tab.rename" => {
@@ -421,56 +433,59 @@ pub fn dispatch(
                     "Missing 'id' and/or 'title' param",
                 ),
             };
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         // -- Terminal agent commands --
         "terminal.read" => {
             let resp = handle_terminal_read(req, mgr);
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "terminal.state" => {
             let resp = handle_terminal_state(req, mgr);
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "terminal.exec" => {
             let resp = handle_terminal_exec(req, mgr);
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "terminal.feed" => {
             let resp = handle_terminal_feed(req, mgr);
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "terminal.history" => {
             let resp = handle_terminal_history(req, mgr);
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "terminal.context" => {
             let resp = handle_terminal_context(req, mgr);
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "agent.approve" => {
-            handle_agent_approve(cmd, window);
+            handle_agent_approve(cmd, window, event_bus);
         }
 
         "claude.start" => {
             let resp = handle_claude_start(req, mgr, window);
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "theme.list" => {
             let themes: Vec<&str> = nestty_core::theme::Theme::list().to_vec();
             let current = mgr.current_theme_name();
-            let _ = cmd.reply.send(Response::success(
-                req.id.clone(),
-                json!({ "themes": themes, "current": current }),
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::success(
+                    req.id.clone(),
+                    json!({ "themes": themes, "current": current }),
+                ),
+            );
         }
 
         "plugin.list" => {
@@ -501,39 +516,39 @@ pub fn dispatch(
                     })
                 })
                 .collect();
-            let _ = cmd.reply.send(Response::success(
-                req.id.clone(),
-                json!({ "plugins": plugins }),
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::success(req.id.clone(), json!({ "plugins": plugins })),
+            );
         }
 
         "plugin.open" => {
             let resp = handle_plugin_open(req, mgr);
-            let _ = cmd.reply.send(resp);
+            cmd.reply_with_completion(event_bus, resp);
         }
 
         "statusbar.show" => {
             statusbar.set_visible(true);
-            let _ = cmd.reply.send(Response::success(
-                req.id.clone(),
-                json!({ "visible": true }),
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::success(req.id.clone(), json!({ "visible": true })),
+            );
         }
 
         "statusbar.hide" => {
             statusbar.set_visible(false);
-            let _ = cmd.reply.send(Response::success(
-                req.id.clone(),
-                json!({ "visible": false }),
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::success(req.id.clone(), json!({ "visible": false })),
+            );
         }
 
         "statusbar.toggle" => {
             let visible = statusbar.toggle();
-            let _ = cmd.reply.send(Response::success(
-                req.id.clone(),
-                json!({ "visible": visible }),
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::success(req.id.clone(), json!({ "visible": visible })),
+            );
         }
 
         _ => {
@@ -701,27 +716,25 @@ fn with_webview_panel(
     }
 }
 
-fn handle_webview_execute_js(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+fn handle_webview_execute_js(cmd: SocketCommand, mgr: &Rc<TabManager>, event_bus: &EventBus) {
     let req = &cmd.request;
     let id = match req.params.get("id").and_then(|v| v.as_str()) {
         Some(id) => id.to_string(),
         None => {
-            let _ = cmd.reply.send(Response::error(
-                req.id.clone(),
-                "invalid_params",
-                "Missing 'id' param",
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(req.id.clone(), "invalid_params", "Missing 'id' param"),
+            );
             return;
         }
     };
     let code = match req.params.get("code").and_then(|v| v.as_str()) {
         Some(c) => c.to_string(),
         None => {
-            let _ = cmd.reply.send(Response::error(
-                req.id.clone(),
-                "invalid_params",
-                "Missing 'code' param",
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(req.id.clone(), "invalid_params", "Missing 'code' param"),
+            );
             return;
         }
     };
@@ -729,47 +742,52 @@ fn handle_webview_execute_js(cmd: SocketCommand, mgr: &Rc<TabManager>) {
     let panel = match mgr.find_panel_by_id(&id) {
         Some(p) => p,
         None => {
-            let _ = cmd.reply.send(Response::error(
-                req.id.clone(),
-                "not_found",
-                &format!("Panel not found: {id}"),
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(
+                    req.id.clone(),
+                    "not_found",
+                    &format!("Panel not found: {id}"),
+                ),
+            );
             return;
         }
     };
     let wv = match panel.as_webview() {
         Some(wv) => wv,
         None => {
-            let _ = cmd.reply.send(Response::error(
-                req.id.clone(),
-                "wrong_panel_type",
-                "Panel is not a webview",
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(req.id.clone(), "wrong_panel_type", "Panel is not a webview"),
+            );
             return;
         }
     };
 
     let req_id = req.id.clone();
+    let method = req.method.clone();
+    let silent = cmd.silent_completion;
+    let bus = event_bus.clone();
     let reply = cmd.reply;
     wv.execute_js(&code, move |result| {
         let resp = match result {
             Ok(value) => Response::success(req_id, json!({ "result": value })),
             Err(e) => Response::error(req_id, "js_error", &e),
         };
+        nestty_daemon::socket::publish_legacy_completion(&bus, &method, silent, &resp);
         let _ = reply.send(resp);
     });
 }
 
-fn handle_webview_get_content(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+fn handle_webview_get_content(cmd: SocketCommand, mgr: &Rc<TabManager>, event_bus: &EventBus) {
     let req = &cmd.request;
     let id = match req.params.get("id").and_then(|v| v.as_str()) {
         Some(id) => id.to_string(),
         None => {
-            let _ = cmd.reply.send(Response::error(
-                req.id.clone(),
-                "invalid_params",
-                "Missing 'id' param",
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(req.id.clone(), "invalid_params", "Missing 'id' param"),
+            );
             return;
         }
     };
@@ -786,47 +804,52 @@ fn handle_webview_get_content(cmd: SocketCommand, mgr: &Rc<TabManager>) {
     let panel = match mgr.find_panel_by_id(&id) {
         Some(p) => p,
         None => {
-            let _ = cmd.reply.send(Response::error(
-                req.id.clone(),
-                "not_found",
-                &format!("Panel not found: {id}"),
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(
+                    req.id.clone(),
+                    "not_found",
+                    &format!("Panel not found: {id}"),
+                ),
+            );
             return;
         }
     };
     let wv = match panel.as_webview() {
         Some(wv) => wv,
         None => {
-            let _ = cmd.reply.send(Response::error(
-                req.id.clone(),
-                "wrong_panel_type",
-                "Panel is not a webview",
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(req.id.clone(), "wrong_panel_type", "Panel is not a webview"),
+            );
             return;
         }
     };
 
     let req_id = req.id.clone();
+    let method = req.method.clone();
+    let silent = cmd.silent_completion;
+    let bus = event_bus.clone();
     let reply = cmd.reply;
     wv.execute_js(&js_code, move |result| {
         let resp = match result {
             Ok(content) => Response::success(req_id, json!({ "content": content })),
             Err(e) => Response::error(req_id, "js_error", &e),
         };
+        nestty_daemon::socket::publish_legacy_completion(&bus, &method, silent, &resp);
         let _ = reply.send(resp);
     });
 }
 
-fn handle_webview_screenshot(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+fn handle_webview_screenshot(cmd: SocketCommand, mgr: &Rc<TabManager>, event_bus: &EventBus) {
     let req = &cmd.request;
     let id = match req.params.get("id").and_then(|v| v.as_str()) {
         Some(id) => id.to_string(),
         None => {
-            let _ = cmd.reply.send(Response::error(
-                req.id.clone(),
-                "invalid_params",
-                "Missing 'id' param",
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(req.id.clone(), "invalid_params", "Missing 'id' param"),
+            );
             return;
         }
     };
@@ -834,27 +857,32 @@ fn handle_webview_screenshot(cmd: SocketCommand, mgr: &Rc<TabManager>) {
     let panel = match mgr.find_panel_by_id(&id) {
         Some(p) => p,
         None => {
-            let _ = cmd.reply.send(Response::error(
-                req.id.clone(),
-                "not_found",
-                &format!("Panel not found: {id}"),
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(
+                    req.id.clone(),
+                    "not_found",
+                    &format!("Panel not found: {id}"),
+                ),
+            );
             return;
         }
     };
     let wv = match panel.as_webview() {
         Some(wv) => wv,
         None => {
-            let _ = cmd.reply.send(Response::error(
-                req.id.clone(),
-                "wrong_panel_type",
-                "Panel is not a webview",
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(req.id.clone(), "wrong_panel_type", "Panel is not a webview"),
+            );
             return;
         }
     };
 
     let req_id = req.id.clone();
+    let method = req.method.clone();
+    let silent = cmd.silent_completion;
+    let bus = event_bus.clone();
     let reply = cmd.reply;
     let path = req
         .params
@@ -880,21 +908,21 @@ fn handle_webview_screenshot(cmd: SocketCommand, mgr: &Rc<TabManager>) {
             }
             Err(e) => Response::error(req_id, "snapshot_error", &e),
         };
+        nestty_daemon::socket::publish_legacy_completion(&bus, &method, silent, &resp);
         let _ = reply.send(resp);
     });
 }
 
 /// Helper: run a JS snippet from webview::js module on a webview panel, send result via reply
-fn run_js_command(cmd: SocketCommand, mgr: &Rc<TabManager>, js_code: String) {
+fn run_js_command(cmd: SocketCommand, mgr: &Rc<TabManager>, js_code: String, event_bus: &EventBus) {
     let req = &cmd.request;
     let id = match req.params.get("id").and_then(|v| v.as_str()) {
         Some(id) => id.to_string(),
         None => {
-            let _ = cmd.reply.send(Response::error(
-                req.id.clone(),
-                "invalid_params",
-                "Missing 'id' param",
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(req.id.clone(), "invalid_params", "Missing 'id' param"),
+            );
             return;
         }
     };
@@ -902,27 +930,32 @@ fn run_js_command(cmd: SocketCommand, mgr: &Rc<TabManager>, js_code: String) {
     let panel = match mgr.find_panel_by_id(&id) {
         Some(p) => p,
         None => {
-            let _ = cmd.reply.send(Response::error(
-                req.id.clone(),
-                "not_found",
-                &format!("Panel not found: {id}"),
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(
+                    req.id.clone(),
+                    "not_found",
+                    &format!("Panel not found: {id}"),
+                ),
+            );
             return;
         }
     };
     let wv = match panel.as_webview() {
         Some(wv) => wv,
         None => {
-            let _ = cmd.reply.send(Response::error(
-                req.id.clone(),
-                "wrong_panel_type",
-                "Panel is not a webview",
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(req.id.clone(), "wrong_panel_type", "Panel is not a webview"),
+            );
             return;
         }
     };
 
     let req_id = req.id.clone();
+    let method = req.method.clone();
+    let silent = cmd.silent_completion;
+    let bus = event_bus.clone();
     let reply = cmd.reply;
     wv.execute_js(&js_code, move |result| {
         let resp = match result {
@@ -935,35 +968,42 @@ fn run_js_command(cmd: SocketCommand, mgr: &Rc<TabManager>, js_code: String) {
             }
             Err(e) => Response::error(req_id, "js_error", &e),
         };
+        nestty_daemon::socket::publish_legacy_completion(&bus, &method, silent, &resp);
         let _ = reply.send(resp);
     });
 }
 
-fn handle_webview_query(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+fn handle_webview_query(cmd: SocketCommand, mgr: &Rc<TabManager>, event_bus: &EventBus) {
     let selector = match cmd.request.params.get("selector").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
-            let _ = cmd.reply.send(Response::error(
-                cmd.request.id.clone(),
-                "invalid_params",
-                "Missing 'selector' param",
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(
+                    cmd.request.id.clone(),
+                    "invalid_params",
+                    "Missing 'selector' param",
+                ),
+            );
             return;
         }
     };
     let js = crate::webview::js::query_selector(&selector);
-    run_js_command(cmd, mgr, js);
+    run_js_command(cmd, mgr, js, event_bus);
 }
 
-fn handle_webview_query_all(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+fn handle_webview_query_all(cmd: SocketCommand, mgr: &Rc<TabManager>, event_bus: &EventBus) {
     let selector = match cmd.request.params.get("selector").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
-            let _ = cmd.reply.send(Response::error(
-                cmd.request.id.clone(),
-                "invalid_params",
-                "Missing 'selector' param",
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(
+                    cmd.request.id.clone(),
+                    "invalid_params",
+                    "Missing 'selector' param",
+                ),
+            );
             return;
         }
     };
@@ -974,18 +1014,21 @@ fn handle_webview_query_all(cmd: SocketCommand, mgr: &Rc<TabManager>) {
         .and_then(|v| v.as_u64())
         .unwrap_or(50) as u32;
     let js = crate::webview::js::query_selector_all(&selector, limit);
-    run_js_command(cmd, mgr, js);
+    run_js_command(cmd, mgr, js, event_bus);
 }
 
-fn handle_webview_get_styles(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+fn handle_webview_get_styles(cmd: SocketCommand, mgr: &Rc<TabManager>, event_bus: &EventBus) {
     let selector = match cmd.request.params.get("selector").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
-            let _ = cmd.reply.send(Response::error(
-                cmd.request.id.clone(),
-                "invalid_params",
-                "Missing 'selector' param",
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(
+                    cmd.request.id.clone(),
+                    "invalid_params",
+                    "Missing 'selector' param",
+                ),
+            );
             return;
         }
     };
@@ -997,53 +1040,62 @@ fn handle_webview_get_styles(cmd: SocketCommand, mgr: &Rc<TabManager>) {
         .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
         .unwrap_or_default();
     let js = crate::webview::js::get_styles(&selector, &properties);
-    run_js_command(cmd, mgr, js);
+    run_js_command(cmd, mgr, js, event_bus);
 }
 
-fn handle_webview_click(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+fn handle_webview_click(cmd: SocketCommand, mgr: &Rc<TabManager>, event_bus: &EventBus) {
     let selector = match cmd.request.params.get("selector").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
-            let _ = cmd.reply.send(Response::error(
-                cmd.request.id.clone(),
-                "invalid_params",
-                "Missing 'selector' param",
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(
+                    cmd.request.id.clone(),
+                    "invalid_params",
+                    "Missing 'selector' param",
+                ),
+            );
             return;
         }
     };
     let js = crate::webview::js::click(&selector);
-    run_js_command(cmd, mgr, js);
+    run_js_command(cmd, mgr, js, event_bus);
 }
 
-fn handle_webview_fill(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+fn handle_webview_fill(cmd: SocketCommand, mgr: &Rc<TabManager>, event_bus: &EventBus) {
     let selector = match cmd.request.params.get("selector").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
-            let _ = cmd.reply.send(Response::error(
-                cmd.request.id.clone(),
-                "invalid_params",
-                "Missing 'selector' param",
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(
+                    cmd.request.id.clone(),
+                    "invalid_params",
+                    "Missing 'selector' param",
+                ),
+            );
             return;
         }
     };
     let value = match cmd.request.params.get("value").and_then(|v| v.as_str()) {
         Some(v) => v.to_string(),
         None => {
-            let _ = cmd.reply.send(Response::error(
-                cmd.request.id.clone(),
-                "invalid_params",
-                "Missing 'value' param",
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(
+                    cmd.request.id.clone(),
+                    "invalid_params",
+                    "Missing 'value' param",
+                ),
+            );
             return;
         }
     };
     let js = crate::webview::js::fill(&selector, &value);
-    run_js_command(cmd, mgr, js);
+    run_js_command(cmd, mgr, js, event_bus);
 }
 
-fn handle_webview_scroll(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+fn handle_webview_scroll(cmd: SocketCommand, mgr: &Rc<TabManager>, event_bus: &EventBus) {
     let selector = cmd
         .request
         .params
@@ -1063,12 +1115,12 @@ fn handle_webview_scroll(cmd: SocketCommand, mgr: &Rc<TabManager>) {
         .and_then(|v| v.as_i64())
         .unwrap_or(0) as i32;
     let js = crate::webview::js::scroll(selector.as_deref(), x, y);
-    run_js_command(cmd, mgr, js);
+    run_js_command(cmd, mgr, js, event_bus);
 }
 
-fn handle_webview_page_info(cmd: SocketCommand, mgr: &Rc<TabManager>) {
+fn handle_webview_page_info(cmd: SocketCommand, mgr: &Rc<TabManager>, event_bus: &EventBus) {
     let js = crate::webview::js::page_info();
-    run_js_command(cmd, mgr, js);
+    run_js_command(cmd, mgr, js, event_bus);
 }
 
 fn handle_webview_devtools(req: &Request, mgr: &Rc<TabManager>) -> Response {
@@ -1705,7 +1757,7 @@ fn shell_single_quote(s: &str) -> String {
     out
 }
 
-fn handle_agent_approve(cmd: SocketCommand, window: &ApplicationWindow) {
+fn handle_agent_approve(cmd: SocketCommand, window: &ApplicationWindow, event_bus: &EventBus) {
     let req = &cmd.request;
     let title = req
         .params
@@ -1715,11 +1767,10 @@ fn handle_agent_approve(cmd: SocketCommand, window: &ApplicationWindow) {
     let message = match req.params.get("message").and_then(|v| v.as_str()) {
         Some(m) => m,
         None => {
-            let _ = cmd.reply.send(Response::error(
-                req.id.clone(),
-                "invalid_params",
-                "Missing 'message' param",
-            ));
+            cmd.reply_with_completion(
+                event_bus,
+                Response::error(req.id.clone(), "invalid_params", "Missing 'message' param"),
+            );
             return;
         }
     };
@@ -1744,6 +1795,10 @@ fn handle_agent_approve(cmd: SocketCommand, window: &ApplicationWindow) {
         .build();
 
     let req_id = req.id.clone();
+    let method = req.method.clone();
+    let silent = cmd.silent_completion;
+    let bus = event_bus.clone();
+    let reply = cmd.reply;
     let actions_clone = actions.clone();
     dialog.choose(Some(window), gtk4::gio::Cancellable::NONE, move |result| {
         let resp = match result {
@@ -1771,7 +1826,8 @@ fn handle_agent_approve(cmd: SocketCommand, window: &ApplicationWindow) {
                 }),
             ),
         };
-        let _ = cmd.reply.send(resp);
+        nestty_daemon::socket::publish_legacy_completion(&bus, &method, silent, &resp);
+        let _ = reply.send(resp);
     });
 }
 

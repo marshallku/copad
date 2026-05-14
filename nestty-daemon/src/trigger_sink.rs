@@ -178,6 +178,7 @@ impl TriggerSink for LiveTriggerSink {
                 params,
             ),
             reply: self.reply_tx.clone(),
+            silent_completion: false,
         };
         self.dispatch_tx
             .send(cmd)

@@ -232,7 +232,11 @@ fn build_trigger_engine(
     event_bus: &Arc<nestty_core::event_bus::EventBus>,
     triggers_cfg: &[Trigger],
 ) -> Arc<TriggerEngine> {
-    let sink: Arc<dyn TriggerSink> = Arc::new(DaemonTriggerSink::new(actions.clone(), gui.clone()));
+    let sink: Arc<dyn TriggerSink> = Arc::new(DaemonTriggerSink::new(
+        actions.clone(),
+        gui.clone(),
+        event_bus.clone(),
+    ));
     let engine = Arc::new(TriggerEngine::with_publish_bus(sink, event_bus.clone()));
     engine.set_triggers(triggers_cfg.to_vec());
     let ctx_for_snapshot = context.clone();
