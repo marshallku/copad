@@ -767,6 +767,91 @@ done
     || fail "system.spawn child did not see GUI env (expected 'e2e-fake-hypr-sig', got '$captured')"
 pass "system.spawn child inherited HYPRLAND_INSTANCE_SIGNATURE from primary GUI's gui_env"
 
+step 13 "daemon event.subscribe pattern filtering"
+# Subscribe with patterns=["e2e.sub.*"], publish two events (one match,
+# one non-match), assert only the match crossed the wire.
+SUB_LOG=$WORK/event_subscribe.json
+python3 - "$SOCKET" "$SUB_LOG" <<'PY' &
+import json, socket, sys, threading, time, uuid
+
+sock_path, out_path = sys.argv[1], sys.argv[2]
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock_path)
+s.settimeout(1.0)
+f = s.makefile("rwb", buffering=0)
+
+sub_id = str(uuid.uuid4())
+sub = {"id": sub_id, "method": "event.subscribe",
+       "params": {"patterns": ["e2e.sub.match.*"]}}
+f.write((json.dumps(sub) + "\n").encode())
+
+ack = None
+events = []
+deadline = time.time() + 4.0
+got_ack = False
+while time.time() < deadline:
+    try:
+        line = f.readline()
+    except (TimeoutError, socket.timeout):
+        continue
+    if not line:
+        break
+    trimmed = line.strip()
+    if not trimmed:
+        continue
+    msg = json.loads(trimmed)
+    if not got_ack and msg.get("id") == sub_id:
+        ack = msg
+        got_ack = True
+        continue
+    if "type" in msg and "data" in msg:
+        events.append(msg)
+        # We only expect one match; stop once we have it.
+        if msg.get("type", "").startswith("e2e.sub.match."):
+            break
+
+out = {"ack_ok": (ack or {}).get("ok"), "events": events}
+with open(out_path, "w") as fh:
+    json.dump(out, fh)
+PY
+SUB_PID=$!
+# Let the subscriber establish before publishing.
+sleep 0.5
+
+publish_event() {
+    local kind=$1
+    python3 - "$SOCKET" "$kind" <<'PY'
+import json, socket, sys, uuid
+sock_path, kind = sys.argv[1], sys.argv[2]
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect(sock_path)
+f = s.makefile("rwb", buffering=0)
+req_id = str(uuid.uuid4())
+req = {"id": req_id, "method": "events.publish",
+       "params": {"kind": kind, "payload": {"k": kind}}}
+f.write((json.dumps(req) + "\n").encode())
+print(f.readline().decode().strip())
+PY
+}
+
+# Non-matching event first → must NOT appear in the subscriber's output.
+publish_event "e2e.sub.skip.first" >/dev/null
+# Matching event second → must appear.
+publish_event "e2e.sub.match.fire" >/dev/null
+
+wait $SUB_PID 2>/dev/null || true
+[[ -s "$SUB_LOG" ]] || fail "event.subscribe subscriber wrote no output"
+
+ack_ok=$(python3 -c "import sys,json; d=json.load(open(sys.argv[1])); print(d['ack_ok'])" "$SUB_LOG")
+[[ "$ack_ok" == "True" ]] || fail "event.subscribe ack not OK: $(cat "$SUB_LOG")"
+pass "event.subscribe ack succeeded"
+
+types=$(python3 -c "import sys,json; d=json.load(open(sys.argv[1])); print(','.join(e.get('type','') for e in d['events']))" "$SUB_LOG")
+[[ "$types" == "e2e.sub.match.fire" ]] \
+    || fail "expected only 'e2e.sub.match.fire' across the wire; got '$types'"
+pass "event.subscribe filtered out non-matching kind, delivered match"
+
 echo
 echo "=== AUTO E2E COMPLETE ==="
 echo

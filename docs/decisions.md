@@ -285,3 +285,21 @@ The 7-key whitelist (`HYPRLAND_INSTANCE_SIGNATURE`, `DISPLAY`, `WAYLAND_DISPLAY`
 Curated whitelist drift is the maintenance hazard. New keys added to the list need an audit: each one is a vector if someone misconfigures a trigger to spawn shell-quoted user input that interpolates an env var.
 
 **See:** `nestty-daemon/src/gui_registry.rs` (`GUI_ENV_ALLOWED_KEYS`, `filter_gui_env`, `GuiClient.gui_env`, `primary_gui_env`), `nestty-linux/src/gui_client.rs` (`GUI_ENV_CURATED_KEYS`, `capture_gui_env`), `nestty-daemon/src/daemon_trigger_sink.rs` (`handle_system_spawn` env merge), and e2e step 12 in `scripts/e2e-daemon-client.sh`.
+
+## 25. Daemon `event.subscribe` Bus Projection (Phase 8 closing)
+
+**Problem:** The GUI special-cased `event.subscribe` as a `bus.subscribe_unbounded("*")` projection (nestty-linux/src/socket.rs), but the daemon returned `unknown_method`. `nestctl event subscribe` against the daemon socket failed, and service-plugin authors expecting the documented `event.subscribe { patterns: [...] }` shape had no daemon-side handler.
+
+**Decision:** Mirror the GUI's projection at the daemon's `handle_connection`. One `bus.subscribe_unbounded("*")` per connection, filtering deferred to the handler via `pattern_matches` OR'd across `params.patterns`. `params.patterns` is documented protocol; `None`/`[]` means "all".
+
+Single-subscriber + handler-side filter beats N-subscribers + N-forwarder-threads because cross-pattern event ordering is trivially preserved (FIFO from one receiver) and the bus's `pattern_matches` is sub-microsecond per event. The tradeoff is wasted CPU on the daemon when a narrow pattern is requested — acceptable at typical event rates (≪ 1k/sec); profile-driven optimization can switch to bus-level multi-pattern subscribers later if needed.
+
+**Disconnect detection during quiet bus periods (codex round 2 C1):** the GUI's projection has a latent leak — `rx.recv()` blocks indefinitely with no event, so a client that disconnects during a quiet stretch keeps the connection thread + unbounded bus subscriber alive until the next event lands. The daemon's implementation closes this with `recv_timeout(15s)` + a no-op `writer_tx.send(String::new())` on timeout. The writer thread writes an empty line on the wire, which probes EPIPE: closed socket → writeln fails → writer thread exits → writer_rx drops → subscriber's `send` returns Err → handler returns. `nestctl`'s subscribe reader (`nestty-cli/src/client.rs:69`) already skips empty lines, so the keep-alive is wire-compatible.
+
+**Registered-GUI rejection (codex round 2 I2):** registered GUI connections already receive events via `start_event_forwarder` (Stage A). Running both pumps on one socket duplicates every event. The daemon rejects `event.subscribe` on a registered connection with `error.code = "invalid_request"` and instructs the caller to use `gui.subscribe`/`gui.unsubscribe`. `docs/gui-daemon-protocol.md` reconciled to spell out the exception explicitly.
+
+**Subscribe-before-ack ordering (codex review C1):** the bus subscription is created BEFORE the ack is queued on `writer_tx`. If the ack were queued first, a publisher on a separate connection could publish a matching event between the client receiving the ack and the daemon's reader thread reaching `subscribe_unbounded("*")` — a lost event that violates the "lossless projection" contract. Ordering is `bus.subscribe_unbounded → send ack → enter recv loop`; the receiver is now active by the time the client can act on the ack.
+
+**Tradeoff:** Once `event.subscribe` is active the connection is subscribe-only — the reader thread enters the recv loop and never returns to the request loop. Same contract as the GUI's projection. A second connection is required for further RPC. The "lossless" delivery contract from workflow-runtime.md (`subscribe_unbounded`) means a stuck client lets the bus subscriber's mpsc grow unbounded; the upstream `writer_tx(512)` caps it (full writer_tx blocks the subscriber loop, which lets further events accumulate in the unbounded receiver while the writer is wedged). Pathological case recoverable by killing the client — kernel eventually fails the writer's write → chain unwinds.
+
+**See:** `nestty-daemon/src/socket.rs` (`run_event_subscribe`, `parse_subscribe_patterns`, `SUBSCRIBE_KEEPALIVE`), and e2e step 13 in `scripts/e2e-daemon-client.sh`.

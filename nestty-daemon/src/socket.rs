@@ -9,11 +9,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use nestty_core::action_registry::{ActionRegistry, COMPLETION_EVENT_SOURCE};
-use nestty_core::event_bus::{Event as BusEvent, EventBus as CoreEventBus, next_bridge_id};
+use nestty_core::event_bus::{
+    Event as BusEvent, EventBus as CoreEventBus, RecvOutcome, next_bridge_id, pattern_matches,
+};
 use nestty_core::plugin::LoadedPlugin;
-use nestty_core::protocol::{PROTOCOL_VERSION, Request, Response};
+use nestty_core::protocol::{Event as WireEvent, PROTOCOL_VERSION, Request, Response};
 use serde_json::Value;
 
 use crate::gui_registry::{GuiRegistry, method_capability, method_invoke_timeout};
@@ -404,6 +407,43 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
                     send_line(&writer_tx, &resp);
                     continue;
                 }
+                if req.method == "event.subscribe" {
+                    // Registered GUIs already receive events via
+                    // start_event_forwarder. Allowing a second pump
+                    // here would duplicate every event.
+                    if registered_client_id.is_some() {
+                        send_line(
+                            &writer_tx,
+                            &Response::error(
+                                req.id.clone(),
+                                "invalid_request",
+                                "registered GUI connections receive events automatically; use gui.subscribe / gui.unsubscribe to narrow",
+                            ),
+                        );
+                        continue;
+                    }
+                    let patterns = match parse_subscribe_patterns(&req) {
+                        Ok(p) => p,
+                        Err(resp) => {
+                            send_line(&writer_tx, &resp);
+                            continue;
+                        }
+                    };
+                    // Subscribe BEFORE the ack so an event published on
+                    // another connection between the client receiving
+                    // the ack and the daemon entering the recv loop is
+                    // never dropped on the floor.
+                    let rx = state.event_bus.subscribe_unbounded("*");
+                    send_line(
+                        &writer_tx,
+                        &Response::success(
+                            req.id.clone(),
+                            serde_json::json!({ "status": "subscribed" }),
+                        ),
+                    );
+                    run_event_subscribe(rx, &writer_tx, patterns);
+                    return;
+                }
                 let resp = dispatch(&req, &state);
                 send_line(&writer_tx, &resp);
             }
@@ -574,6 +614,81 @@ fn handle_events_publish(req: &Request, state: &Arc<DaemonState>, peer: Option<u
         .event_bus
         .publish(nestty_core::event_bus::Event::new(kind, source, payload));
     Response::success(req.id.clone(), serde_json::json!({ "queued": true }))
+}
+
+fn parse_subscribe_patterns(req: &Request) -> Result<Vec<String>, Response> {
+    let Some(value) = req.params.get("patterns") else {
+        return Ok(vec!["*".to_string()]);
+    };
+    let arr = match value.as_array() {
+        Some(a) => a,
+        None => {
+            return Err(Response::error(
+                req.id.clone(),
+                "invalid_params",
+                "event.subscribe `patterns` must be an array of strings",
+            ));
+        }
+    };
+    if arr.is_empty() {
+        return Ok(vec!["*".to_string()]);
+    }
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        match item.as_str() {
+            Some(s) if !s.is_empty() => out.push(s.to_string()),
+            _ => {
+                return Err(Response::error(
+                    req.id.clone(),
+                    "invalid_params",
+                    "event.subscribe `patterns` entries must be non-empty strings",
+                ));
+            }
+        }
+    }
+    Ok(out)
+}
+
+const SUBSCRIBE_KEEPALIVE: Duration = Duration::from_secs(15);
+
+/// Runs until the socket dies or the bus is dropped. `bus.subscribe_unbounded("*")`
+/// honors the lossless contract for external `event.subscribe`; pattern filtering
+/// happens here via [`pattern_matches`] OR'd across `patterns`. The 15s
+/// keep-alive probe is the disconnect detector during quiet bus periods:
+/// `writer_tx.send(String::new())` makes the writer thread write a `\n`, which
+/// fails with EPIPE once the client has closed the socket and unwinds this
+/// loop. nestctl's subscribe reader already skips empty lines.
+fn run_event_subscribe(
+    rx: nestty_core::event_bus::EventReceiver,
+    writer_tx: &mpsc::SyncSender<String>,
+    patterns: Vec<String>,
+) {
+    loop {
+        match rx.recv_timeout(SUBSCRIBE_KEEPALIVE) {
+            RecvOutcome::Event(ev) => {
+                if !patterns.iter().any(|p| pattern_matches(p, &ev.kind)) {
+                    continue;
+                }
+                let wire = WireEvent::new(ev.kind, ev.payload).with_source(ev.source);
+                let line = match serde_json::to_string(&wire) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        log::warn!("event.subscribe serialize error: {e}");
+                        continue;
+                    }
+                };
+                if writer_tx.send(line).is_err() {
+                    return;
+                }
+            }
+            RecvOutcome::Timeout => {
+                if writer_tx.send(String::new()).is_err() {
+                    return;
+                }
+            }
+            RecvOutcome::Disconnected => return,
+        }
+    }
 }
 
 fn handle_gui_register(
@@ -1346,6 +1461,179 @@ mod tests {
         let r = client_resp.result.expect("result");
         assert_eq!(r["count"], json!(2));
         assert_eq!(r["current"], json!(0));
+
+        let _ = std::fs::remove_file(&path_clone);
+    }
+
+    #[test]
+    fn parse_subscribe_patterns_missing_defaults_to_star() {
+        let req = Request::new("a", "event.subscribe", json!({}));
+        assert_eq!(parse_subscribe_patterns(&req).unwrap(), vec!["*"]);
+    }
+
+    #[test]
+    fn parse_subscribe_patterns_empty_array_defaults_to_star() {
+        let req = Request::new("a", "event.subscribe", json!({ "patterns": [] }));
+        assert_eq!(parse_subscribe_patterns(&req).unwrap(), vec!["*"]);
+    }
+
+    #[test]
+    fn parse_subscribe_patterns_accepts_string_list() {
+        let req = Request::new(
+            "a",
+            "event.subscribe",
+            json!({ "patterns": ["claude.*", "system.heartbeat"] }),
+        );
+        let got = parse_subscribe_patterns(&req).unwrap();
+        assert_eq!(got, vec!["claude.*", "system.heartbeat"]);
+    }
+
+    #[test]
+    fn parse_subscribe_patterns_rejects_non_array() {
+        let req = Request::new("a", "event.subscribe", json!({ "patterns": "claude.*" }));
+        let err = parse_subscribe_patterns(&req).unwrap_err();
+        assert_eq!(err.error.unwrap().code, "invalid_params");
+    }
+
+    #[test]
+    fn parse_subscribe_patterns_rejects_empty_string_entry() {
+        let req = Request::new(
+            "a",
+            "event.subscribe",
+            json!({ "patterns": ["claude.*", ""] }),
+        );
+        let err = parse_subscribe_patterns(&req).unwrap_err();
+        assert_eq!(err.error.unwrap().code, "invalid_params");
+    }
+
+    #[test]
+    fn parse_subscribe_patterns_rejects_non_string_entry() {
+        let req = Request::new(
+            "a",
+            "event.subscribe",
+            json!({ "patterns": ["claude.*", 42] }),
+        );
+        let err = parse_subscribe_patterns(&req).unwrap_err();
+        assert_eq!(err.error.unwrap().code, "invalid_params");
+    }
+
+    #[test]
+    fn event_subscribe_streams_filtered_events_over_socket() {
+        let path = tmp_socket();
+        let _ = std::fs::remove_file(&path);
+        let listener = bind_listener(&path).expect("bind");
+        let state = mk_state_with_ping();
+        let bus_handle = state.event_bus.clone();
+        let path_clone = path.clone();
+        let _server = thread::spawn(move || run_accept_loop(listener, state));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let stream = UnixStream::connect(&path_clone).expect("connect");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .ok();
+        let mut writer = stream.try_clone().expect("clone");
+        let mut reader = BufReader::new(stream);
+
+        let req = Request::new(
+            "sub-1",
+            "event.subscribe",
+            json!({ "patterns": ["unit.test.*"] }),
+        );
+        writer
+            .write_all((serde_json::to_string(&req).unwrap() + "\n").as_bytes())
+            .expect("write");
+
+        let mut ack = String::new();
+        reader.read_line(&mut ack).expect("ack");
+        let ack_resp: Response = serde_json::from_str(ack.trim()).expect("parse ack");
+        assert!(ack_resp.ok);
+        assert_eq!(ack_resp.id, "sub-1");
+
+        // Publish a non-matching event followed by a matching one. The
+        // first must not show up; the second must.
+        bus_handle.publish(BusEvent::new("other.kind", "test", json!({ "skip": true })));
+        bus_handle.publish(BusEvent::new(
+            "unit.test.fire",
+            "test",
+            json!({ "hello": "world" }),
+        ));
+
+        let mut delivered: Option<WireEvent> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let ev: WireEvent = serde_json::from_str(trimmed).expect("parse event");
+            delivered = Some(ev);
+            break;
+        }
+        let ev = delivered.expect("matching event delivered");
+        assert_eq!(ev.event_type, "unit.test.fire");
+        assert_eq!(ev.data["hello"], json!("world"));
+        assert_eq!(ev.source.as_deref(), Some("test"));
+
+        let _ = std::fs::remove_file(&path_clone);
+    }
+
+    #[test]
+    fn event_subscribe_rejected_on_registered_connection() {
+        let path = tmp_socket();
+        let _ = std::fs::remove_file(&path);
+        let listener = bind_listener(&path).expect("bind");
+        let state = mk_state_with_ping();
+        let path_clone = path.clone();
+        let _server = thread::spawn(move || run_accept_loop(listener, state));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let stream = UnixStream::connect(&path_clone).expect("connect");
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .ok();
+        let mut writer = stream.try_clone().expect("clone");
+        let mut reader = BufReader::new(stream);
+
+        let reg = Request::new(
+            "reg-1",
+            "gui.register",
+            json!({
+                "capabilities": ["test.*"],
+                "want_primary": true,
+                "protocol_version": PROTOCOL_VERSION,
+            }),
+        );
+        writer
+            .write_all((serde_json::to_string(&reg).unwrap() + "\n").as_bytes())
+            .expect("write reg");
+        let mut ack = String::new();
+        reader.read_line(&mut ack).expect("reg ack");
+
+        let sub = Request::new("sub-1", "event.subscribe", json!({}));
+        writer
+            .write_all((serde_json::to_string(&sub).unwrap() + "\n").as_bytes())
+            .expect("write sub");
+        let mut line = String::new();
+        loop {
+            line.clear();
+            reader.read_line(&mut line).expect("read response");
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let resp: Response = serde_json::from_str(trimmed).expect("parse response");
+            assert!(!resp.ok);
+            assert_eq!(resp.id, "sub-1");
+            assert_eq!(resp.error.unwrap().code, "invalid_request");
+            break;
+        }
 
         let _ = std::fs::remove_file(&path_clone);
     }

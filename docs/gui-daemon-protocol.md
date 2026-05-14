@@ -130,10 +130,14 @@ gui disconnect (or heartbeat timeout)
 A connection BECOMES a GUI at the moment its `gui.register` call succeeds.
 Before that, it is treated as a generic client — it can call any
 daemon-owned method, subscribe to events via `event.subscribe`, etc.
-Daemon-side state for that connection (pending subscriptions, in-flight
-requests) carries over unchanged when `gui.register` succeeds; the daemon
-just additionally records `client_id` and capabilities, and is now allowed
-to issue `Invoke` on the connection.
+Daemon-side state for that connection (in-flight requests) carries over
+unchanged when `gui.register` succeeds; the daemon just additionally records
+`client_id` and capabilities, and is now allowed to issue `Invoke` on the
+connection. **Exception**: `event.subscribe` is rejected on a registered
+connection (`error.code = "invalid_request"`) — registered GUIs receive
+events automatically via the auto-subscribe path described under
+"Subscriptions" and `gui.subscribe`/`gui.unsubscribe`. Running both pumps
+on one socket would deliver every event twice.
 
 There is no "must send register as first message" constraint — a hook
 script that opens a socket, publishes an event, and disconnects is a
