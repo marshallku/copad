@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -79,7 +79,7 @@ pub fn start_server(socket_path: &str, event_bus: EventBus) -> mpsc::Receiver<So
             let tx = tx.clone();
             let event_bus = event_bus.clone();
             std::thread::spawn(move || {
-                let reader = match stream.try_clone() {
+                let mut reader = match stream.try_clone() {
                     Ok(s) => BufReader::new(s),
                     Err(e) => {
                         eprintln!("[nestty] socket clone error: {e}");
@@ -87,10 +87,32 @@ pub fn start_server(socket_path: &str, event_bus: EventBus) -> mpsc::Receiver<So
                     }
                 };
                 let mut writer = stream;
+                let mut frame_buf: Vec<u8> = Vec::with_capacity(8192);
 
-                for line in reader.lines() {
-                    let line = match line {
-                        Ok(l) => l,
+                loop {
+                    let line = match nestty_daemon::socket::read_line_capped(
+                        &mut reader,
+                        &mut frame_buf,
+                    ) {
+                        Ok(Some(l)) => l,
+                        Ok(None) => break,
+                        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                            let err =
+                                Response::error(String::new(), "frame_too_large", &e.to_string());
+                            let _ = writeln!(writer, "{}", serde_json::to_string(&err).unwrap());
+                            let _ = writer.flush();
+                            // Fail-fast: helper never consumed the cap-overflow
+                            // bytes, so the next call would loop on the same
+                            // data. Close the connection.
+                            break;
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                            let err =
+                                Response::error(String::new(), "invalid_utf8", &e.to_string());
+                            let _ = writeln!(writer, "{}", serde_json::to_string(&err).unwrap());
+                            let _ = writer.flush();
+                            break;
+                        }
                         Err(_) => break,
                     };
                     if line.is_empty() {

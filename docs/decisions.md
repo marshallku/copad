@@ -323,3 +323,25 @@ Single-subscriber + handler-side filter beats N-subscribers + N-forwarder-thread
 **Known boundary**: when `host_triggers=true`, the GUI's `TriggerEngine` is cleared and the GUI bus completion events from direct nestctl→GUI calls have no consumer. Symmetrically, the daemon's `TriggerEngine` doesn't see nestctl→GUI-direct completions (the GUI→daemon forwarder allowlist excludes `.completed`). Users running triggers should connect through the daemon socket (the default for `nestctl` discovery) so the completion event lands where the trigger engine is reading.
 
 **See:** `nestty-daemon/src/socket.rs` (`LEGACY_SILENT_METHODS`, `is_legacy_silent`, `SocketCommand::reply_with_completion`, `publish_legacy_completion`, `dispatch_via_gui` publish call), `nestty-daemon/src/daemon_trigger_sink.rs` (`fallthrough_worker` publish call), `nestty-linux/src/socket.rs` (legacy match arms calling `cmd.reply_with_completion`, webview callbacks + agent.approve calling `publish_legacy_completion`), `nestty-linux/src/gui_client.rs` (`silent_completion=true` on daemon-Invoke SocketCommand), and e2e step 14 in `scripts/e2e-daemon-client.sh`.
+
+## 27. Per-Frame Memory Caps + GUI-Client Bounded Writer (5b.2 Stage B follow-ups)
+
+**Problem:** Two hazards codex flagged on the Step 5b.2 reviews that landed as deferred follow-ups, not blockers:
+- `BufRead::lines()` on both daemon (`nestty-daemon/src/socket.rs` `handle_connection`) and GUI (`nestty-linux/src/socket.rs` `start_server`) calls `read_until` internally with no upper bound. A peer (legitimately misbehaving or hostile) that streams bytes without `\n` would force the daemon/GUI to buffer the entire stream in memory until either OOM or socket close.
+- The GUI-side daemon-client (`nestty-linux/src/gui_client.rs` `spawn`/`run`) uses `mpsc::channel::<String>()` (unbounded) for its writer queue, while the daemon-side equivalent was bounded to `sync_channel(512)` in Step 5b R2 INFO. A wedged daemon socket reader would stall the GUI's writer thread, and the outgoing event forwarder + RPC reply path would accumulate strings without limit.
+
+**Decision:**
+- `MAX_FRAME_BYTES = 1 MiB` constant + `pub fn read_line_capped(reader, buf) -> io::Result<Option<String>>` helper in `nestty-daemon/src/socket.rs`. Returns `Ok(None)` on EOF, `Ok(Some(s))` on a full line, `Err(InvalidData)` AS SOON AS the running total would exceed the cap. No resync attempt — codex review C1 surfaced that a peer streaming bytes without `\n` would let any resync loop block on `fill_buf` indefinitely, defeating the cap's purpose. The helper fail-fasts; both callers (daemon `handle_connection`, GUI `start_server`) send a wire-level `frame_too_large` reply (id `""`) and then close the connection. The reasoning: a 1 MiB+ unterminated frame is either a misbehaving client or an attack, and the trust band (0600 socket, one user) doesn't justify a partial recovery path that adds blocking risk.
+- GUI-client writer changed to `mpsc::sync_channel::<String>(512)` — matches the daemon side. `register`, `handle_ping`, `write_overloaded`, `handle_invoke`, the outgoing event forwarder, and the test channels all switched from `Sender<String>` to `SyncSender<String>`. Recovery semantics unchanged from the daemon side: writer thread `writeln` fails on a dead socket → exits → writer_rx drops → `send` returns Err → forwarder/jobs surface as `Disconnected`.
+
+**Tradeoff:** 1 MiB cap is well above any legitimate JSON frame we ship today (webview content reads ~256 KiB max, screenshots base64 below ~1 MiB but typically under). Chunked transfer of very large payloads would need to be split across multiple actions — explicit at the cap. The 512 writer buffer matches the daemon side's empirically-validated bound; same recovery loop.
+
+**Test coverage:** 4 new unit tests on `read_line_capped`:
+- `returns_full_line` — two consecutive frames, then EOF
+- `rejects_oversized_frame_fail_fast` — 1 MiB+32 bytes of `x` without `\n`; asserts `InvalidData` returns promptly (would block forever if any resync logic existed)
+- `rejects_overflow_even_when_newline_eventually_arrives` — payload at cap+1 followed by `\n`; asserts the cap is enforced strictly (the helper doesn't peek past the cap to confirm)
+- `handles_no_trailing_newline_at_eof` — final partial frame at EOF
+
+The oversized tests use a worker thread to write the payload over `UnixStream::pair` because Linux unix-socket buffers (~208 KiB default) deadlock a synchronous `write_all` if the reader isn't draining concurrently — the test's own write strategy is a microcosm of the production concern.
+
+**See:** `nestty-daemon/src/socket.rs` (`MAX_FRAME_BYTES`, `read_line_capped`, capped reader in `handle_connection`), `nestty-linux/src/socket.rs` (capped reader in `start_server`), `nestty-linux/src/gui_client.rs` (`GUI_CLIENT_WRITER_BUFFER`, all `SyncSender<String>` sites, capped reader in the daemon→GUI receive loop AND `await_register_ack`).

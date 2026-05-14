@@ -3,11 +3,11 @@
 //! requests through the existing dispatch pump. A missing daemon is
 //! benign — the reconnect loop polls quietly with capped backoff.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{Sender, SyncSender, channel, sync_channel};
 use std::thread;
 use std::time::Duration;
 
@@ -44,6 +44,11 @@ const GUI_TO_DAEMON_FORWARD_KINDS: &[&str] = &[
 /// matching events have arrived. 100 ms is responsive enough for
 /// reconnect (~3 cycles per backoff tick) without burning CPU.
 const FORWARDER_POLL: Duration = Duration::from_millis(100);
+
+/// Bound on the daemon-client writer channel. Mirror of the daemon
+/// side's 512-cap from Step 5b R2 INFO; same purpose, same recovery
+/// path.
+const GUI_CLIENT_WRITER_BUFFER: usize = 512;
 
 /// Workers spend most of their time waiting on the GTK reply channel,
 /// so the cap is concurrency-limiting, not throughput-tuning.
@@ -188,7 +193,15 @@ fn run(
         .try_clone()
         .map_err(|e| format!("clone stream: {e}"))?;
 
-    let (writer_tx, writer_rx) = channel::<String>();
+    // Bounded for the same reason the daemon side is bounded (Step 5b
+    // R2 INFO): a wedged daemon-side reader stalls the writer thread,
+    // and an unbounded sender lets the outgoing event forwarder
+    // (start_gui_event_forwarder) accumulate events without limit.
+    // 512 absorbs normal bursts; when full, senders block, which
+    // backpressures the bus subscriber. Recovery: daemon disconnect →
+    // writeln fails → writer thread exits → writer_rx drops →
+    // subsequent send returns Err and the forwarder shuts down.
+    let (writer_tx, writer_rx) = sync_channel::<String>(GUI_CLIENT_WRITER_BUFFER);
     thread::spawn(move || {
         let mut writer = write_stream;
         while let Ok(line) = writer_rx.recv() {
@@ -226,8 +239,17 @@ fn run(
     let _ht_guard = HostTriggersGuard(host_triggers_tx.clone());
     let _ = host_triggers_tx.send(ack.host_triggers);
 
-    for line in reader.lines() {
-        let line = line.map_err(|e| format!("read: {e}"))?;
+    let mut frame_buf: Vec<u8> = Vec::with_capacity(8192);
+    loop {
+        let line = match nestty_daemon::socket::read_line_capped(&mut reader, &mut frame_buf) {
+            Ok(Some(l)) => l,
+            Ok(None) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                log::warn!("gui_client rejecting oversized/invalid frame from daemon: {e}");
+                return Err(format!("daemon frame too large: {e}"));
+            }
+            Err(e) => return Err(format!("read: {e}")),
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -282,7 +304,6 @@ fn run(
             log::debug!("[nestty] gui_client ignoring: {line:.200}");
         }
     }
-    Ok(())
 }
 
 /// Drop-guard for the forwarder shutdown flag. Mirrors the existing
@@ -321,7 +342,7 @@ impl Drop for HostTriggersGuard {
 /// loop is broken on the GUI side.
 fn start_gui_event_forwarder(
     event_bus: Arc<EventBus>,
-    writer_tx: Sender<String>,
+    writer_tx: SyncSender<String>,
     stop: Arc<AtomicBool>,
 ) {
     for kind in GUI_TO_DAEMON_FORWARD_KINDS {
@@ -342,7 +363,7 @@ fn start_gui_event_forwarder(
 fn gui_forwarder_loop(
     kind: String,
     rx: nestty_core::event_bus::EventReceiver,
-    writer_tx: Sender<String>,
+    writer_tx: SyncSender<String>,
     stop: Arc<AtomicBool>,
 ) {
     loop {
@@ -385,7 +406,7 @@ fn gui_forwarder_loop(
     }
 }
 
-fn register(writer_tx: &Sender<String>) -> Result<String, String> {
+fn register(writer_tx: &SyncSender<String>) -> Result<String, String> {
     let window_id = uuid::Uuid::new_v4().to_string();
     let req_id = uuid::Uuid::new_v4().to_string();
     let req = Request::new(
@@ -420,15 +441,13 @@ fn await_register_ack(
     reader: &mut BufReader<UnixStream>,
     register_id: &str,
 ) -> Result<RegisterAck, String> {
-    let mut line = String::new();
-    if reader
-        .read_line(&mut line)
-        .map_err(|e| format!("read register ack: {e}"))?
-        == 0
-    {
-        return Err("daemon closed connection before register ack".into());
-    }
-    let resp: Response = serde_json::from_str(line.trim())
+    let mut buf: Vec<u8> = Vec::with_capacity(8192);
+    let line = match nestty_daemon::socket::read_line_capped(reader, &mut buf) {
+        Ok(Some(l)) => l,
+        Ok(None) => return Err("daemon closed connection before register ack".into()),
+        Err(e) => return Err(format!("read register ack: {e}")),
+    };
+    let resp: Response = serde_json::from_str(&line)
         .map_err(|e| format!("parse register ack: {e} (line={line:.200})"))?;
     if resp.id != register_id {
         return Err(format!(
@@ -452,7 +471,7 @@ fn await_register_ack(
     Ok(RegisterAck { host_triggers })
 }
 
-fn handle_ping(value: Value, writer_tx: &Sender<String>) -> Result<(), String> {
+fn handle_ping(value: Value, writer_tx: &SyncSender<String>) -> Result<(), String> {
     let inv: Invoke = serde_json::from_value(value).map_err(|e| format!("parse ping: {e}"))?;
     let resp = Response::success(inv.id, inv.params);
     let encoded = serde_json::to_string(&resp).map_err(|e| format!("serialize ping: {e}"))?;
@@ -464,7 +483,7 @@ fn handle_ping(value: Value, writer_tx: &Sender<String>) -> Result<(), String> {
 struct GuiInvokeJob {
     value: Value,
     dispatch_tx: Sender<SocketCommand>,
-    writer_tx: Sender<String>,
+    writer_tx: SyncSender<String>,
     /// Connection-generation gate: a worker that picks up a job after
     /// its admitting connection died MUST NOT dispatch side-effecting
     /// methods through GTK — the daemon has already failed the pending
@@ -474,7 +493,7 @@ struct GuiInvokeJob {
 }
 
 impl GuiInvokeJob {
-    fn write_overloaded(value: &Value, writer_tx: &Sender<String>) {
+    fn write_overloaded(value: &Value, writer_tx: &SyncSender<String>) {
         // Best-effort id extraction — `cancel` MUST NOT panic on
         // malformed input.
         let id = value
@@ -516,7 +535,7 @@ impl Cancelable for GuiInvokeJob {
 fn handle_invoke(
     value: Value,
     dispatch_tx: &Sender<SocketCommand>,
-    writer_tx: &Sender<String>,
+    writer_tx: &SyncSender<String>,
 ) -> Result<(), String> {
     let inv: Invoke = serde_json::from_value(value).map_err(|e| format!("parse Invoke: {e}"))?;
     let (reply_tx, reply_rx) = channel::<Response>();
@@ -560,7 +579,7 @@ mod tests {
     fn mk_job(
         value: Value,
         dispatch_tx: Sender<SocketCommand>,
-        writer_tx: Sender<String>,
+        writer_tx: SyncSender<String>,
         generation: Arc<AtomicU64>,
         admitted_gen: u64,
     ) -> Box<GuiInvokeJob> {
@@ -576,7 +595,7 @@ mod tests {
     #[test]
     fn run_dispatches_and_writes_reply() {
         let (dispatch_tx, dispatch_rx) = channel::<SocketCommand>();
-        let (writer_tx, writer_rx) = channel::<String>();
+        let (writer_tx, writer_rx) = sync_channel::<String>(64);
         let dispatcher = thread::spawn(move || {
             let cmd = dispatch_rx
                 .recv_timeout(Duration::from_secs(1))
@@ -606,7 +625,7 @@ mod tests {
     #[test]
     fn cancel_writes_overloaded_response() {
         let (dispatch_tx, dispatch_rx) = channel::<SocketCommand>();
-        let (writer_tx, writer_rx) = channel::<String>();
+        let (writer_tx, writer_rx) = sync_channel::<String>(64);
         let generation = Arc::new(AtomicU64::new(1));
         let job = mk_job(
             invoke_value("inv-2", "webview.eval"),
@@ -632,7 +651,7 @@ mod tests {
     #[test]
     fn cancel_with_missing_id_still_replies() {
         let (dispatch_tx, _dispatch_rx) = channel::<SocketCommand>();
-        let (writer_tx, writer_rx) = channel::<String>();
+        let (writer_tx, writer_rx) = sync_channel::<String>(64);
         let generation = Arc::new(AtomicU64::new(1));
         let job = mk_job(
             json!({ "invoke": "webview.eval", "params": {} }),
@@ -653,7 +672,7 @@ mod tests {
     #[test]
     fn forwarder_emits_bus_publish_for_native_event() {
         let bus = Arc::new(EventBus::new());
-        let (writer_tx, writer_rx) = channel::<String>();
+        let (writer_tx, writer_rx) = sync_channel::<String>(64);
         let stop = Arc::new(AtomicBool::new(false));
         start_gui_event_forwarder(bus.clone(), writer_tx, stop.clone());
         // Give the per-kind subscriber threads a tick to enter
@@ -678,7 +697,7 @@ mod tests {
     #[test]
     fn forwarder_skips_bridged_event() {
         let bus = Arc::new(EventBus::new());
-        let (writer_tx, writer_rx) = channel::<String>();
+        let (writer_tx, writer_rx) = sync_channel::<String>(64);
         let stop = Arc::new(AtomicBool::new(false));
         start_gui_event_forwarder(bus.clone(), writer_tx, stop.clone());
         thread::sleep(Duration::from_millis(50));
@@ -716,7 +735,7 @@ mod tests {
         // run() must skip handle_invoke (no command on dispatch_tx) and
         // write back an overloaded response.
         let (dispatch_tx, dispatch_rx) = channel::<SocketCommand>();
-        let (writer_tx, writer_rx) = channel::<String>();
+        let (writer_tx, writer_rx) = sync_channel::<String>(64);
         let generation = Arc::new(AtomicU64::new(2));
         let job = mk_job(
             invoke_value("inv-stale", "tab.new"),

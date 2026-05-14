@@ -2,7 +2,7 @@
 //! route requests through `ActionRegistry`.
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -408,13 +408,35 @@ fn handle_connection(stream: UnixStream, state: Arc<DaemonState>) {
         }
     });
 
-    let reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream);
     let mut registered_client_id: Option<String> = None;
     let mut shutdown_stream = shutdown_stream;
+    let mut frame_buf: Vec<u8> = Vec::with_capacity(8192);
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
+    loop {
+        let line = match read_line_capped(&mut reader, &mut frame_buf) {
+            Ok(Some(l)) => l,
+            Ok(None) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+                log::warn!("nesttyd rejecting oversized frame, closing: {e}");
+                send_line(
+                    &writer_tx,
+                    &Response::error(String::new(), "frame_too_large", &e.to_string()),
+                );
+                // Connection-fatal: read_line_capped fail-fasts on cap
+                // overflow without consuming the offending bytes, so
+                // continuing would re-trigger on the same data. Drop
+                // the connection instead.
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+                log::warn!("nesttyd rejecting non-utf8 frame, closing: {e}");
+                send_line(
+                    &writer_tx,
+                    &Response::error(String::new(), "invalid_utf8", &e.to_string()),
+                );
+                break;
+            }
             Err(e) => {
                 log::debug!("nesttyd connection read err: {e}");
                 break;
@@ -719,6 +741,77 @@ fn parse_subscribe_patterns(req: &Request) -> Result<Vec<String>, Response> {
 
 const SUBSCRIBE_KEEPALIVE: Duration = Duration::from_secs(15);
 
+/// Maximum bytes accepted for a single newline-delimited frame on the
+/// daemon socket. `BufRead::lines` / `read_until` would otherwise buffer
+/// without bound — a malicious or stuck client that streams bytes
+/// without `\n` could exhaust daemon memory. 1 MiB is well above any
+/// legitimate JSON frame (the largest action payloads we ship —
+/// webview content reads, screenshot base64 — stay below ~256 KiB);
+/// callers should chunk anything bigger over multiple actions.
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Reads one newline-delimited frame, refusing to grow the buffer past
+/// [`MAX_FRAME_BYTES`]. Returns `Ok(None)` on clean EOF, `Ok(Some(s))`
+/// on a full line, `Err(InvalidData)` AS SOON AS the running total
+/// would exceed the cap — no resync attempt, because a peer that never
+/// sends `\n` would otherwise pin the helper indefinitely. Callers
+/// must treat `InvalidData` as a connection-fatal signal (send a
+/// `frame_too_large` reply, then drop the connection). Reused by
+/// nestty-linux's per-connection socket reader.
+pub fn read_line_capped(
+    reader: &mut std::io::BufReader<UnixStream>,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Option<String>> {
+    use std::io::BufRead;
+    buf.clear();
+    let mut total = 0usize;
+    loop {
+        let avail = match reader.fill_buf() {
+            Ok([]) => {
+                if buf.is_empty() {
+                    return Ok(None);
+                }
+                break;
+            }
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let (chunk, found_newline) = match avail.iter().position(|b| *b == b'\n') {
+            Some(idx) => (&avail[..=idx], true),
+            None => (avail, false),
+        };
+        if total + chunk.len() > MAX_FRAME_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("frame exceeds {MAX_FRAME_BYTES} bytes"),
+            ));
+        }
+        let take = chunk.len();
+        buf.extend_from_slice(chunk);
+        total += take;
+        reader.consume(take);
+        if found_newline {
+            break;
+        }
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop();
+        if buf.last() == Some(&b'\r') {
+            buf.pop();
+        }
+    }
+    match String::from_utf8(std::mem::take(buf)) {
+        Ok(s) => Ok(Some(s)),
+        // `InvalidInput` distinguishes "decode failed" from `InvalidData`'s
+        // "frame too large" so callers can pick precise wire error codes.
+        Err(e) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid utf-8: {e}"),
+        )),
+    }
+}
+
 /// Runs until the socket dies or the bus is dropped. `bus.subscribe_unbounded("*")`
 /// honors the lossless contract for external `event.subscribe`; pattern filtering
 /// happens here via [`pattern_matches`] OR'd across `patterns`. The 15s
@@ -926,6 +1019,7 @@ pub fn cleanup_socket(path: &PathBuf) {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::io::BufRead;
     use std::os::unix::net::UnixStream;
     use std::path::PathBuf;
 
@@ -1715,5 +1809,68 @@ mod tests {
         }
 
         let _ = std::fs::remove_file(&path_clone);
+    }
+
+    fn capped_reader_for(input: &[u8]) -> BufReader<UnixStream> {
+        let (mut a, b) = UnixStream::pair().expect("pair");
+        // Linux unix-socket buffers default to ~208 KiB; oversized-frame
+        // test inputs run past 1 MiB, so writing must happen on a thread
+        // alongside the reader to avoid kernel-buffer deadlock.
+        let payload = input.to_vec();
+        std::thread::spawn(move || {
+            let _ = a.write_all(&payload);
+            // a dropped on thread exit → reader sees EOF after data
+        });
+        BufReader::new(b)
+    }
+
+    #[test]
+    fn read_line_capped_returns_full_line() {
+        let mut r = capped_reader_for(b"hello world\nnext\n");
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_line_capped(&mut r, &mut buf).unwrap(),
+            Some("hello world".to_string())
+        );
+        assert_eq!(
+            read_line_capped(&mut r, &mut buf).unwrap(),
+            Some("next".to_string())
+        );
+        assert_eq!(read_line_capped(&mut r, &mut buf).unwrap(), None);
+    }
+
+    #[test]
+    fn read_line_capped_rejects_oversized_frame_fail_fast() {
+        // Stream past MAX_FRAME_BYTES with no newline. Helper must
+        // fail-fast (NOT block draining toward a newline that never
+        // arrives). Caller is responsible for closing the connection.
+        let oversized: Vec<u8> = std::iter::repeat_n(b'x', MAX_FRAME_BYTES + 32).collect();
+        let mut r = capped_reader_for(&oversized);
+        let mut buf = Vec::new();
+        let err = read_line_capped(&mut r, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_line_capped_rejects_overflow_even_when_newline_eventually_arrives() {
+        // Even if the peer DOES send a newline past the cap, fail-fast —
+        // we don't read past the cap to confirm.
+        let mut input: Vec<u8> = std::iter::repeat_n(b'y', MAX_FRAME_BYTES + 1).collect();
+        input.push(b'\n');
+        let mut r = capped_reader_for(&input);
+        let mut buf = Vec::new();
+        let err = read_line_capped(&mut r, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn read_line_capped_handles_no_trailing_newline_at_eof() {
+        let mut r = capped_reader_for(b"final line no newline");
+        let mut buf = Vec::new();
+        assert_eq!(
+            read_line_capped(&mut r, &mut buf).unwrap(),
+            Some("final line no newline".to_string())
+        );
+        assert_eq!(read_line_capped(&mut r, &mut buf).unwrap(), None);
     }
 }
