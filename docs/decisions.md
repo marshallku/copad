@@ -345,3 +345,30 @@ Single-subscriber + handler-side filter beats N-subscribers + N-forwarder-thread
 The oversized tests use a worker thread to write the payload over `UnixStream::pair` because Linux unix-socket buffers (~208 KiB default) deadlock a synchronous `write_all` if the reader isn't draining concurrently — the test's own write strategy is a microcosm of the production concern.
 
 **See:** `nestty-daemon/src/socket.rs` (`MAX_FRAME_BYTES`, `read_line_capped`, capped reader in `handle_connection`), `nestty-linux/src/socket.rs` (capped reader in `start_server`), `nestty-linux/src/gui_client.rs` (`GUI_CLIENT_WRITER_BUFFER`, all `SyncSender<String>` sites, capped reader in the daemon→GUI receive loop AND `await_register_ack`).
+
+## 28. Supervisor Waiter Pool (Phase 9.5 follow-up)
+
+**Problem:** Phase 9.4 introduced a bounded `ThreadPool` for `ActionRegistry` blocking handlers, but the corresponding waiter on the supervisor side — `ServiceSupervisor::dispatch_invocation`'s `thread::spawn(move || resp_rx.recv_timeout(120s))` — was left as per-call thread spawning. Roadmap entry 240 flagged this as a known limitation: under burst load (many concurrent service invocations) the daemon could accumulate one OS thread per in-flight invoke, each pinned for up to `action_timeout` (default 120s). Not a hot spot today because trigger configs rate-limit invocations, but unbounded growth is a latent footgun for chained workflows that fan out.
+
+**Decision:** Counter-based admission control over per-call `thread::spawn`. `ServiceSupervisor.waiter_active: Arc<AtomicUsize>` tracks concurrent in-flight waiters; `waiter_max` (default 64, env-configurable via `NESTTYD_WAITER_MAX`) caps the count. Each admitted invocation:
+1. `fetch_add` on the counter; if pre-increment value ≥ max, decrement back and reply `overloaded` synchronously (no invoke sent).
+2. Insert the `pending_responses` entry.
+3. Send `action.invoke` synchronously on the caller's thread.
+4. `thread::spawn` a waiter that holds a `WaiterPermit` drop-guard; the permit decrements the counter on thread exit (success, timeout, or panic).
+
+We considered using the existing `nestty_core::thread_pool::ThreadPool` (the same primitive that backs the Phase 9.4 ActionRegistry pool), but rejected it after two codex rounds: the pool's bounded queue introduces a "queued but not running" state where a waiter job sits with `resp_rx` ready to receive while no thread is parked to forward to `reply`. A fast service response (or a synthetic send-failure response) can land in `resp_rx` buffered until a worker frees, by which time the caller's `invoke_remote(action_timeout)` has already returned `action_timeout`. The counter primitive avoids this by spawning a thread on every admit — there is no queueing window.
+
+Tradeoff: per-call thread::spawn cost (~30 µs) instead of pool worker reuse. For waiters that spend their lifetime blocked on `recv_timeout`, reuse saves no real work — the cost being saved would be µs of spawn overhead on work units that take ms-to-seconds. Worth it for the simpler ordering story.
+
+**Ordering invariant (resolved across three codex review iterations):**
+- v1 (initial): `handle.send(invoke)` BEFORE pool admission. Saturation → caller sees `overloaded` while the service had already executed the action.
+- v2: move the send INSIDE the pool worker. Queued workers stale-send long after the caller's `invoke_remote` already returned `action_timeout` and the workflow retried.
+- v3 (counter-based, final): drop the pool's queue entirely. Counter admission + immediate `thread::spawn`. Saturation rejects without sending; admission spawns a thread instantly so there is no "queued but not running" state where a response can be buffered into an unattended `resp_rx`.
+
+Under the final design, the SERVICE sees each invoke exactly once across the full saturation × caller-timeout × send-failure matrix. Caller's `reply_rx.recv_timeout(action_timeout)` and waiter's `resp_rx.recv_timeout(action_timeout)` operate on the same clock (both start near `dispatch_invocation` entry); a service reply propagates through reader → resp_tx → resp_rx → waiter → reply → reply_rx. If caller times out first, waiter's `reply.send` returns Err harmlessly. If `handle.send` fails after admission, the caller's thread short-circuits: removes the pending_responses entry, replies the error directly, and lets the permit drop (slot released for the next caller).
+
+`daemon.info` does NOT yet surface the waiter counter / max — could be added; not blocking.
+
+**Test coverage:** 3 unit tests on the admission primitives — `waiter_permit_decrements_on_drop`, `waiter_permit_decrements_once_even_under_panic` (panic-unwind preserves the slot release), and `env_waiter_max_falls_back_to_default_on_invalid` (env parse + zero rejection). The full dispatch_invocation path is exercised by the existing e2e (step 5 heartbeat survival, step 7 pool saturation, step 8 plugin RPC round-trip) which transitively cover the counter admission and waiter-thread lifecycle.
+
+**See:** `nestty-daemon/src/service_supervisor.rs` (`waiter_active` counter, `waiter_max` cap, `WaiterPermit` drop-guard, `env_waiter_max` helper, `dispatch_invocation` admission + send + spawn).

@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
@@ -276,6 +276,18 @@ pub struct ServiceSupervisor {
     /// death rather than per-spawn worker exit. `None` post-shutdown.
     spawner_tx: Mutex<Option<Sender<SpawnRequest>>>,
     spawner_thread: Mutex<Option<JoinHandle<()>>>,
+    /// Bound on concurrent in-flight waiters for `dispatch_invocation`.
+    /// Pre-Phase 9.5: each invocation `thread::spawn`'d an unbounded
+    /// waiter. Now admission goes through a counter (atomic) — saturation
+    /// returns `overloaded` immediately without sending the invoke to the
+    /// service. NOT a queueing pool: every admitted waiter spawns a thread
+    /// instantly, so the daemon never buffers a response behind a
+    /// not-yet-picked-up job. Counter-bounded `thread::spawn` is the
+    /// right primitive here because waiters spend their lifetime blocked
+    /// on `recv_timeout` — pool worker reuse would just add scheduling
+    /// latency without saving real work.
+    waiter_active: Arc<AtomicUsize>,
+    waiter_max: usize,
 }
 
 impl ServiceSupervisor {
@@ -400,6 +412,8 @@ impl ServiceSupervisor {
             shutting_down: AtomicBool::new(false),
             spawner_tx: Mutex::new(None),
             spawner_thread: Mutex::new(None),
+            waiter_active: Arc::new(AtomicUsize::new(0)),
+            waiter_max: env_waiter_max("NESTTYD_WAITER_MAX", 64),
         });
 
         // Spawner must be alive before any onEvent / onStartup activation
@@ -1084,8 +1098,29 @@ impl ServiceSupervisor {
         handle: Arc<ServiceHandle>,
         pending: PendingInvocation,
     ) {
+        // Counter admission: every admitted waiter spawns its own thread
+        // immediately, so there's no buffered "queued but not running"
+        // state where a service response could land into a parked
+        // `resp_rx` faster than the waiter thread is up to receive it.
+        // Pre-fix this was unbounded `thread::spawn` per invoke; the
+        // counter caps growth without introducing the buffering hazard
+        // that ThreadPool's queue would.
+        let cur = self.waiter_active.fetch_add(1, Ordering::SeqCst);
+        if cur >= self.waiter_max {
+            self.waiter_active.fetch_sub(1, Ordering::SeqCst);
+            let _ = pending.reply.send(Err(ResponseError {
+                code: "overloaded".into(),
+                message: format!(
+                    "supervisor waiter capacity {} reached; {} invocation rejected",
+                    self.waiter_max,
+                    handle.fq_name(),
+                ),
+            }));
+            return;
+        }
+        let _permit = WaiterPermit::new(self.waiter_active.clone());
+
         let req_id = handle.next_request_id();
-        // Send-side of the response channel; reader thread routes here.
         let (resp_tx, resp_rx) = channel::<Response>();
         handle
             .pending_responses
@@ -1093,6 +1128,9 @@ impl ServiceSupervisor {
             .unwrap()
             .insert(req_id.clone(), resp_tx);
 
+        // Send the invoke synchronously on the caller's thread. Admission
+        // is reserved (permit held by `_permit`), so saturation cannot
+        // race the send.
         let invoke_request = Request::new(
             req_id.clone(),
             "action.invoke",
@@ -1104,45 +1142,70 @@ impl ServiceSupervisor {
         if let Err(e) = handle.send(OutgoingFrame::Request(invoke_request)) {
             handle.pending_responses.lock().unwrap().remove(&req_id);
             let _ = pending.reply.send(Err(e));
-            return;
+            return; // permit drops, slot released
         }
 
-        // Wait for the response on a worker thread so this method can
-        // return promptly. The `reply` sender unblocks the original
-        // `invoke_remote` caller. On timeout we ALSO drop the entry
-        // from `pending_responses` so a permanently-hung service
-        // doesn't accumulate one stale sender per timed-out call.
+        // Spawn the waiter thread. Permit moves into the thread; counter
+        // decrements on thread exit (success, timeout, or panic). Clone
+        // `reply` so we can wake the caller from the caller's own thread
+        // if `thread::Builder::spawn` itself fails (e.g. system thread
+        // limit). Without the fallback, the service might still run the
+        // action but the caller would wait the full `action_timeout`
+        // before hearing back, possibly retrying and double-firing.
         let reply = pending.reply;
+        let reply_fallback = reply.clone();
         let timeout = self.action_timeout;
         let svc_label = handle.fq_name();
         let cleanup_handle = handle.clone();
         let cleanup_id = req_id.clone();
-        thread::spawn(move || {
-            let outcome = match resp_rx.recv_timeout(timeout) {
-                Ok(resp) => {
-                    if resp.ok {
-                        Ok(resp.result.unwrap_or(Value::Null))
-                    } else {
-                        Err(resp.error.unwrap_or_else(|| ResponseError {
-                            code: "service_error".into(),
-                            message: format!("{svc_label} returned error without detail"),
-                        }))
+        let permit = _permit;
+        let spawn_handle = handle.clone();
+        let spawn_id = req_id.clone();
+        if let Err(e) = thread::Builder::new()
+            .name("nestty-supervisor-waiter".into())
+            .spawn(move || {
+                let _permit_drop = permit;
+                let outcome = match resp_rx.recv_timeout(timeout) {
+                    Ok(resp) => {
+                        if resp.ok {
+                            Ok(resp.result.unwrap_or(Value::Null))
+                        } else {
+                            Err(resp.error.unwrap_or_else(|| ResponseError {
+                                code: "service_error".into(),
+                                message: format!("{svc_label} returned error without detail"),
+                            }))
+                        }
                     }
-                }
-                Err(_) => {
-                    cleanup_handle
-                        .pending_responses
-                        .lock()
-                        .unwrap()
-                        .remove(&cleanup_id);
-                    Err(ResponseError {
-                        code: "action_timeout".into(),
-                        message: format!("no response from {svc_label} within {timeout:?}"),
-                    })
-                }
-            };
-            let _ = reply.send(outcome);
-        });
+                    Err(_) => {
+                        cleanup_handle
+                            .pending_responses
+                            .lock()
+                            .unwrap()
+                            .remove(&cleanup_id);
+                        Err(ResponseError {
+                            code: "action_timeout".into(),
+                            message: format!("no response from {svc_label} within {timeout:?}"),
+                        })
+                    }
+                };
+                let _ = reply.send(outcome);
+            })
+        {
+            // Closure was consumed (and so was the permit → slot
+            // released). The pending_responses entry stays in case the
+            // service replies anyway (reader logs an "unknown id" warn
+            // on receipt). Wake the caller immediately rather than
+            // letting it block on reply_rx for action_timeout.
+            spawn_handle
+                .pending_responses
+                .lock()
+                .unwrap()
+                .remove(&spawn_id);
+            let _ = reply_fallback.send(Err(ResponseError {
+                code: "spawn_failed".into(),
+                message: format!("supervisor failed to spawn waiter thread: {e}"),
+            }));
+        }
     }
 
     /// Called by the reader thread when the service produces a frame.
@@ -1307,6 +1370,30 @@ impl ServiceSupervisor {
                 kill_child(pid);
             }
         }
+    }
+}
+
+fn env_waiter_max(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n: &usize| *n >= 1)
+        .unwrap_or(default)
+}
+
+/// Drop guard for the `waiter_active` counter — released when the
+/// waiter thread exits (regardless of success / timeout / panic).
+struct WaiterPermit(Arc<AtomicUsize>);
+
+impl WaiterPermit {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        Self(counter)
+    }
+}
+
+impl Drop for WaiterPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -1849,6 +1936,46 @@ mod tests {
             .invoke_remote(&svc, "kb.search", json!({}))
             .expect_err("kb.search should be gated post-init");
         assert_eq!(err.code, "service_degraded");
+    }
+
+    #[test]
+    fn waiter_permit_decrements_on_drop() {
+        let counter = Arc::new(AtomicUsize::new(5));
+        {
+            let _p = WaiterPermit::new(counter.clone());
+            // Mimic the dispatch_invocation increment (caller bumped to 6
+            // before constructing the permit; permit's role is to undo
+            // exactly one increment on drop).
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 4);
+    }
+
+    #[test]
+    fn waiter_permit_decrements_once_even_under_panic() {
+        let counter = Arc::new(AtomicUsize::new(1));
+        let c2 = counter.clone();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _p = WaiterPermit::new(c2);
+            panic!("simulated worker panic");
+        }));
+        assert!(result.is_err());
+        // Drop fired on unwind → decrement happened.
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn env_waiter_max_falls_back_to_default_on_invalid() {
+        // Default path (env not set).
+        let n = env_waiter_max("__NESTTYD_WAITER_MAX_NOT_SET_AAA", 64);
+        assert_eq!(n, 64);
+        // Filter rejects 0 — would otherwise allow zero concurrency.
+        unsafe { std::env::set_var("__NESTTYD_WAITER_MAX_TEST_ZERO", "0") };
+        let n = env_waiter_max("__NESTTYD_WAITER_MAX_TEST_ZERO", 64);
+        assert_eq!(n, 64);
+        // Valid override.
+        unsafe { std::env::set_var("__NESTTYD_WAITER_MAX_TEST_OK", "12") };
+        let n = env_waiter_max("__NESTTYD_WAITER_MAX_TEST_OK", 64);
+        assert_eq!(n, 12);
     }
 
     #[test]
