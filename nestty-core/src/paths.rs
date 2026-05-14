@@ -183,26 +183,60 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    /// Serializes env-mutating tests so they don't race under
-    /// `cargo test`'s default parallel runner.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    #[test]
-    fn socket_path_respects_env_override() {
-        let _g = ENV_LOCK.lock().unwrap();
-        // SAFETY: ENV_LOCK serializes our env-mutating tests; other tests
-        // in this module that read NESTTY_SOCKET take the same lock.
-        unsafe {
-            env::set_var("NESTTY_SOCKET", "/custom/path/sock");
+    /// RAII guard: captures the pre-test value of an env var and restores
+    /// it on `Drop`, so a panicking test (or one that ran with a prior
+    /// value already set in the environment) doesn't pollute the rest of
+    /// the test binary. Caller must hold [`ENV_LOCK`] for the duration of
+    /// the guard's lifetime — the unsafe env mutation is only sound under
+    /// that serialization.
+    struct EnvVar {
+        name: &'static str,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVar {
+        fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let prior = env::var_os(name);
+            unsafe {
+                env::set_var(name, value);
+            }
+            Self { name, prior }
         }
-        assert_eq!(socket_path(), PathBuf::from("/custom/path/sock"));
-        unsafe {
-            env::remove_var("NESTTY_SOCKET");
+
+        fn unset(name: &'static str) -> Self {
+            let prior = env::var_os(name);
+            unsafe {
+                env::remove_var(name);
+            }
+            Self { name, prior }
+        }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prior.take() {
+                    Some(v) => env::set_var(self.name, v),
+                    None => env::remove_var(self.name),
+                }
+            }
         }
     }
 
     #[test]
+    fn socket_path_respects_env_override() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _sock = EnvVar::set("NESTTY_SOCKET", "/custom/path/sock");
+        assert_eq!(socket_path(), PathBuf::from("/custom/path/sock"));
+    }
+
+    #[test]
     fn runtime_dir_returns_nonempty() {
+        // runtime_dir() reads XDG_RUNTIME_DIR, which other tests mutate
+        // under ENV_LOCK — take the lock here too or we race against them.
+        let _g = ENV_LOCK.lock().unwrap();
         let dir = runtime_dir();
         assert!(!dir.as_os_str().is_empty());
         assert!(dir.to_string_lossy().contains("nestty"));
@@ -236,36 +270,23 @@ mod tests {
     #[test]
     fn daemon_socket_ignores_legacy_per_instance_pattern() {
         let _g = ENV_LOCK.lock().unwrap();
-        unsafe {
-            env::set_var("NESTTY_SOCKET", "/tmp/nestty-3090.sock");
-        }
-        // Either Some(trusted-fallback) or None (untrusted runtime_dir).
-        // What matters: NEVER the legacy per-instance path.
+        let _sock = EnvVar::set("NESTTY_SOCKET", "/tmp/nestty-3090.sock");
         let p = daemon_socket_path();
         assert_ne!(p, Some(PathBuf::from("/tmp/nestty-3090.sock")));
-        unsafe {
-            env::remove_var("NESTTY_SOCKET");
-        }
     }
 
     #[test]
     fn daemon_socket_honors_genuine_override() {
         let _g = ENV_LOCK.lock().unwrap();
-        unsafe {
-            env::set_var("NESTTY_SOCKET", "/tmp/my-custom-daemon.sock");
-        }
+        let _sock = EnvVar::set("NESTTY_SOCKET", "/tmp/my-custom-daemon.sock");
         let p = daemon_socket_path();
         assert_eq!(p, Some(PathBuf::from("/tmp/my-custom-daemon.sock")));
-        unsafe {
-            env::remove_var("NESTTY_SOCKET");
-        }
     }
 
     #[test]
     fn daemon_socket_returns_none_for_untrusted_runtime_dir() {
-        // Construct a 0755 dir and point XDG_RUNTIME_DIR at it so the
-        // fallback path roots there. is_trusted_dir rejects 0755, so
-        // daemon_socket_path must return None.
+        // 0755 XDG_RUNTIME_DIR exercises is_trusted_dir's rejection path
+        // without needing root to chown a real /run/user dir.
         use std::os::unix::fs::PermissionsExt;
         let _g = ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!(
@@ -278,22 +299,15 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("mkdir");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).expect("loosen");
-        unsafe {
-            env::remove_var("NESTTY_SOCKET");
-            env::set_var("XDG_RUNTIME_DIR", &dir);
-        }
+        let _sock = EnvVar::unset("NESTTY_SOCKET");
+        let _xdg = EnvVar::set("XDG_RUNTIME_DIR", &dir);
         let p = daemon_socket_path();
-        unsafe {
-            env::remove_var("XDG_RUNTIME_DIR");
-        }
         let _ = std::fs::remove_dir(&dir);
         assert!(p.is_none(), "untrusted runtime dir must yield None");
     }
 
     #[test]
     fn gui_socket_path_is_pid_named_under_runtime_dir() {
-        // Lock against the env-mutating tests that briefly set
-        // XDG_RUNTIME_DIR — runtime_dir() reads it.
         let _g = ENV_LOCK.lock().unwrap();
         let p = gui_socket_path(12345);
         assert!(p.starts_with(runtime_dir()));
@@ -303,31 +317,43 @@ mod tests {
 
     #[test]
     fn daemon_socket_ignores_hardened_gui_pattern() {
-        // A GUI socket from a parent nestty (`runtime_dir/gui-{PID}.sock`)
-        // must not be mistaken for the daemon socket when a child shell
-        // inherits `NESTTY_SOCKET`.
         let _g = ENV_LOCK.lock().unwrap();
         let gui = gui_socket_path(99999);
-        unsafe {
-            env::set_var("NESTTY_SOCKET", &gui);
-        }
+        let _sock = EnvVar::set("NESTTY_SOCKET", &gui);
         let p = daemon_socket_path();
         assert_ne!(p, Some(gui));
-        unsafe {
-            env::remove_var("NESTTY_SOCKET");
-        }
     }
 
     #[test]
     fn paths_are_distinct() {
         let _g = ENV_LOCK.lock().unwrap();
-        unsafe {
-            env::remove_var("NESTTY_SOCKET");
-        }
+        let _sock = EnvVar::unset("NESTTY_SOCKET");
         let sock = socket_path();
         let state = state_dir();
         let cache = cache_dir();
         assert_ne!(sock, state);
         assert_ne!(state, cache);
+    }
+
+    #[test]
+    fn env_var_guard_restores_prior_value() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _seed = EnvVar::set("NESTTY_TEST_SEED", "prior");
+        {
+            let _inner = EnvVar::set("NESTTY_TEST_SEED", "temp");
+            assert_eq!(env::var("NESTTY_TEST_SEED").as_deref(), Ok("temp"));
+        }
+        assert_eq!(env::var("NESTTY_TEST_SEED").as_deref(), Ok("prior"));
+    }
+
+    #[test]
+    fn env_var_guard_restores_absence() {
+        let _g = ENV_LOCK.lock().unwrap();
+        let _seed = EnvVar::unset("NESTTY_TEST_ABSENT");
+        {
+            let _inner = EnvVar::set("NESTTY_TEST_ABSENT", "temp");
+            assert!(env::var("NESTTY_TEST_ABSENT").is_ok());
+        }
+        assert!(env::var("NESTTY_TEST_ABSENT").is_err());
     }
 }
