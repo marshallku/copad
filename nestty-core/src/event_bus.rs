@@ -1,10 +1,24 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender, TrySendError, channel, sync_channel};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SUBSCRIBER_BUFFER: usize = 256;
+
+/// Monotonic per-process counter for bridge crossings. Each
+/// `_bus.publish` ingest (daemon side) and each daemon→GUI receive
+/// (GUI side) calls [`next_bridge_id`] to stamp the event; the
+/// symmetric outgoing forwarder skips events whose `bridge_id` is
+/// `Some`. Starts at 1 so `Some(0)` stays available for tests.
+static NEXT_BRIDGE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Issue a fresh bridge id. Wraparound takes ~10⁹ years at any
+/// realistic event rate; not worth a leak-safe variant.
+pub fn next_bridge_id() -> u64 {
+    NEXT_BRIDGE_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
@@ -397,6 +411,14 @@ mod tests {
             back.bridge_id.is_none(),
             "bridge_id must default to None on deserialization"
         );
+    }
+
+    #[test]
+    fn next_bridge_id_is_monotonic_and_nonzero() {
+        let a = next_bridge_id();
+        let b = next_bridge_id();
+        assert!(a >= 1, "starts at 1 or later");
+        assert!(b > a, "monotonically increasing");
     }
 
     #[test]

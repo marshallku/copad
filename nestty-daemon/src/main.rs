@@ -83,7 +83,8 @@ fn main() -> ExitCode {
     let actions =
         Arc::new(ActionRegistry::with_completion_bus(event_bus.clone())).with_pool(pool.clone());
     let plugins = discover_and_sort_plugins();
-    register_builtins(&actions, &plugins);
+    let host_triggers = env_flag_enabled(ENV_HOST_TRIGGERS);
+    register_builtins(&actions, &plugins, host_triggers);
     register_plugin_commands(&actions, &plugins, &socket_path);
     if env_flag_enabled(ENV_E2E_ACTIONS) {
         register_e2e_actions(&actions);
@@ -96,7 +97,6 @@ fn main() -> ExitCode {
     let context = Arc::new(ContextService::new());
     let triggers_cfg = load_triggers_config();
     let pump = build_trigger_engine(&actions, &gui, &context, &event_bus, &triggers_cfg);
-    let host_triggers = env_flag_enabled(ENV_HOST_TRIGGERS);
     log::info!(
         "trigger engine: {} configured | {} bus pattern(s) | dispatch={}",
         triggers_cfg.len(),
@@ -130,6 +130,7 @@ fn main() -> ExitCode {
         event_bus.clone(),
         plugins,
         socket_path.clone(),
+        host_triggers,
     );
 
     log::info!("nesttyd listening on {}", socket_path.display());
@@ -386,6 +387,7 @@ fn map_shell_error(err: ShellError) -> ResponseError {
 fn register_builtins(
     actions: &Arc<ActionRegistry>,
     plugins: &Arc<Vec<nestty_core::plugin::LoadedPlugin>>,
+    host_triggers: bool,
 ) {
     actions.register_silent("system.ping", |_| Ok(json!({ "status": "ok" })));
     actions.register("system.log", |params| {
@@ -404,6 +406,7 @@ fn register_builtins(
             "daemon": "nesttyd",
             "version": env!("CARGO_PKG_VERSION"),
             "host_plugins": true,
+            "host_triggers": host_triggers,
             "pool": stats.map(|s| serde_json::json!({
                 "workers": s.workers,
                 "capacity": s.capacity,

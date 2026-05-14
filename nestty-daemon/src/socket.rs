@@ -213,6 +213,12 @@ pub struct DaemonState {
     /// `NESTTY_SOCKET` to plugin shell children in the next commit;
     /// currently unused by dispatch.
     pub socket_path: PathBuf,
+    /// Daemon-side dispatch authority signal. Set from
+    /// `NESTTYD_HOST_TRIGGERS` at startup; advertised in
+    /// `gui.register` ack + `daemon.info`. When `true`, the daemon's
+    /// pump thread drives trigger dispatch; the GUI is expected
+    /// (Stage C) to empty its local engine in response.
+    pub host_triggers: bool,
 }
 
 impl DaemonState {
@@ -222,6 +228,7 @@ impl DaemonState {
         event_bus: EventBus,
         plugins: Arc<Vec<LoadedPlugin>>,
         socket_path: PathBuf,
+        host_triggers: bool,
     ) -> Arc<Self> {
         Arc::new(Self {
             actions,
@@ -229,6 +236,7 @@ impl DaemonState {
             event_bus,
             plugins,
             socket_path,
+            host_triggers,
         })
     }
 
@@ -243,6 +251,7 @@ impl DaemonState {
             event_bus,
             Arc::new(Vec::new()),
             PathBuf::from("/tmp/nesttyd-test-placeholder.sock"),
+            false,
         )
     }
 }
@@ -448,6 +457,7 @@ fn handle_gui_register(
             "primary": is_primary,
             "daemon_version": env!("CARGO_PKG_VERSION"),
             "protocol_version": PROTOCOL_VERSION,
+            "host_triggers": state.host_triggers,
         }),
     );
     (resp, Some(client_id))
@@ -719,6 +729,48 @@ mod tests {
     }
 
     #[test]
+    fn gui_register_ack_advertises_host_triggers_true_when_enabled() {
+        let path = tmp_socket();
+        let _ = std::fs::remove_file(&path);
+        let listener = bind_listener(&path).expect("bind");
+        let actions = Arc::new(ActionRegistry::new());
+        let state = DaemonState::new(
+            actions,
+            GuiRegistry::new(),
+            new_event_bus(),
+            Arc::new(Vec::new()),
+            path.clone(),
+            true,
+        );
+        let path_clone = path.clone();
+        let _server = thread::spawn(move || run_accept_loop(listener, state));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let gui_stream = UnixStream::connect(&path_clone).expect("connect");
+        let mut gui_write = gui_stream.try_clone().expect("clone");
+        let mut gui_read = BufReader::new(gui_stream);
+        let reg_req = Request::new(
+            "reg-ht",
+            "gui.register",
+            json!({
+                "window_id": "test-ht",
+                "capabilities": ["tab"],
+                "want_primary": true,
+                "protocol_version": 1
+            }),
+        );
+        gui_write
+            .write_all((serde_json::to_string(&reg_req).unwrap() + "\n").as_bytes())
+            .expect("write");
+        let mut line = String::new();
+        gui_read.read_line(&mut line).expect("read");
+        let resp: Response = serde_json::from_str(line.trim()).expect("parse");
+        let result = resp.result.expect("result");
+        assert_eq!(result["host_triggers"], json!(true));
+        let _ = std::fs::remove_file(&path_clone);
+    }
+
+    #[test]
     fn end_to_end_gui_register_and_invoke_roundtrip() {
         let path = tmp_socket();
         let _ = std::fs::remove_file(&path);
@@ -752,6 +804,9 @@ mod tests {
         let result = reg_resp.result.expect("register has result");
         assert_eq!(result["primary"], json!(true));
         assert!(result["client_id"].is_string());
+        // host_triggers from the ack must reflect daemon state (false here
+        // — `new_for_test` defaults to false).
+        assert_eq!(result["host_triggers"], json!(false));
 
         // 2) Separate client invokes tab.list. Daemon must route to our GUI.
         let client_stream = UnixStream::connect(&path_clone).expect("connect client");
