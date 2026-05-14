@@ -11,7 +11,7 @@ use std::sync::mpsc::{Sender, channel};
 use std::thread;
 use std::time::Duration;
 
-use nestty_core::event_bus::{Event as BusEvent, EventBus};
+use nestty_core::event_bus::{Event as BusEvent, EventBus, next_bridge_id};
 use nestty_core::protocol::{Event as WireEvent, Invoke, Request, Response};
 use nestty_core::thread_pool::Cancelable;
 use serde_json::Value;
@@ -181,10 +181,17 @@ fn run(
             // `source` must round-trip — the local trigger engine's
             // preflight-promotion gates on COMPLETION_EVENT_SOURCE for
             // daemon-hosted plugin completions.
+            //
+            // Stage B: stamp `bridge_id` on the republish so the
+            // GUI→daemon forwarder (Stage C) recognizes this as
+            // "already crossed once" and doesn't echo it back.
             match serde_json::from_value::<WireEvent>(value) {
                 Ok(wire) => {
                     let source = wire.source.unwrap_or_else(|| "daemon".to_string());
-                    event_bus.publish(BusEvent::new(wire.event_type, source, wire.data));
+                    event_bus.publish_bridged(
+                        BusEvent::new(wire.event_type, source, wire.data),
+                        next_bridge_id(),
+                    );
                 }
                 Err(e) => log::debug!("[nestty] gui_client malformed Event: {e}"),
             }

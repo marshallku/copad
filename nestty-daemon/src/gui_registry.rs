@@ -337,6 +337,14 @@ fn forwarder_loop(
         }
         match rx.recv_timeout(Duration::from_millis(200)) {
             RecvOutcome::Event(ev) => {
+                // Echo prevention: an event whose bridge_id is already
+                // set was lifted off the GUI→daemon `_bus.publish`
+                // ingest. Re-bridging it back to the originating GUI
+                // would form a loop. Stage C will use the symmetric
+                // skip on the GUI side.
+                if ev.bridge_id.is_some() {
+                    continue;
+                }
                 let Some(client) = weak_client.upgrade() else {
                     return;
                 };
@@ -668,6 +676,43 @@ mod tests {
             start.elapsed()
         );
         assert_eq!(resp.error.unwrap().code, "gui_disconnected");
+    }
+
+    #[test]
+    fn event_forwarder_skips_bridged_events() {
+        // Events whose `bridge_id` is set were ingested via the
+        // daemon's `_bus.publish` from the GUI side; the daemon→GUI
+        // forwarder must not echo them back to the originating GUI.
+        let reg = GuiRegistry::new();
+        let bus = Arc::new(EventBus::new());
+        let (writer_tx, writer_rx) = sync_channel::<String>(64);
+        let (cid, _) = reg.register(mk_caps(&["tab"]), true, writer_tx, None);
+        reg.start_event_forwarder(&cid, bus.clone());
+        thread::sleep(Duration::from_millis(50));
+        // Publish a BRIDGED event — should be skipped.
+        bus.publish_bridged(
+            nestty_core::event_bus::Event::new("bridged.kind", "src", json!({})),
+            42,
+        );
+        // Publish a NON-bridged event — should flow through.
+        bus.publish(nestty_core::event_bus::Event::new(
+            "native.kind",
+            "src",
+            json!({}),
+        ));
+        let line = writer_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("forwarder should deliver the native event");
+        let parsed: WireEvent = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed.event_type, "native.kind");
+        // Allow one more tick; the bridged event must NOT arrive.
+        match writer_rx.recv_timeout(Duration::from_millis(200)) {
+            Err(_) => {}
+            Ok(extra) => {
+                let parsed: WireEvent = serde_json::from_str(&extra).unwrap();
+                panic!("forwarder leaked bridged event: {}", parsed.event_type);
+            }
+        }
     }
 
     #[test]
