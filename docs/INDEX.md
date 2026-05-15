@@ -8,6 +8,7 @@
 | [linux-app.md](./linux-app.md)             | GTK4 + VTE4 Linux app internals             | Working on nestty-linux                     |
 | [macos-app.md](./macos-app.md)             | Swift/AppKit + SwiftTerm macOS app          | Working on nestty-macos                     |
 | [macos-parity-plan.md](./macos-parity-plan.md) | Tiered plan to bring macOS to Linux parity (codex-reviewed) | Picking next macOS work item |
+| [macos-daemon-migration-plan.md](./macos-daemon-migration-plan.md) | 7-PR plan to migrate macOS from monolithic to daemon-client (codex round 1/2/3 reflected) | After parity-plan Tier 4; this is the next architectural gate |
 | [core-lib.md](./core-lib.md)               | Shared Rust core library modules            | Working on nestty-core                      |
 | [cli.md](./cli.md)                         | CLI tool (nestctl) and D-Bus interface      | Working on remote control features        |
 | [config.md](./config.md)                   | Configuration format and defaults           | Adding config options                     |
