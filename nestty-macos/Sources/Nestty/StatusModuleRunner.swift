@@ -1,53 +1,45 @@
 import AppKit
 import Foundation
 
-/// Tier 4.2 — runs one status-bar module's `exec` shell command on a repeating
-/// timer and pushes the parsed output into its label.
+/// Status-bar module timer that fires `_module.run` against the daemon
+/// instead of spawning the module's `exec` directly. Daemon owns shell
+/// spawn + env injection (`NESTTY_SOCKET`, `NESTTY_PLUGIN_DIR`) so macOS
+/// and Linux observe the same module behavior.
 ///
-/// Threading:
-/// - Timer fires on a serial DispatchQueue per module so a slow-running
-///   command on one module can't stall the others.
-/// - Process completion handler (`terminationHandler`) reads stdout off the
-///   timer queue, parses, then hops to main to update the label.
+/// **In-flight gate**: a slow daemon RPC (or wedged plugin shell) must
+/// not let timer ticks pile up — overlapping `_module.run` calls would
+/// see stale responses overwrite newer label values. `runOnce` skips
+/// silently when the previous tick is still in-flight.
 ///
-/// Output protocol (matches `nestty-linux/src/statusbar.rs::parse_output`):
-/// - JSON `{"text": "...", "tooltip": "..."}` — both fields optional, text
-///   defaults to the raw stdout if missing.
-/// - Plain text — used as-is.
-/// `@unchecked Sendable` because the timer fires on a background queue while
-/// the label is touched from main; we route label writes through
-/// `DispatchQueue.main.async` so the cross-actor hop is explicit. The mutable
-/// `stopped` and `timer` fields are guarded by the same serial queue that
-/// owns `runOnce`, plus `start`/`stop` are only called from main during
-/// view setup + teardown.
+/// `@unchecked Sendable` because the timer fires on a background queue
+/// and the daemon-forward completion may fire from any thread; label
+/// writes hop to main explicitly via `DispatchQueue.main.async`.
 final class StatusModuleRunner: @unchecked Sendable {
     private nonisolated(unsafe) weak var label: NSTextField?
-    private let pluginDir: URL
+    private let pluginName: String
     private let moduleName: String
-    private let exec: String
     private let interval: Int
-    private let socketPath: String
+    private let daemonClient: DaemonClient
     private let queue: DispatchQueue
     private var timer: DispatchSourceTimer?
     private nonisolated(unsafe) var stopped = false
 
+    private let inFlightLock = NSLock()
+    private var inFlight = false
+
     init(
         label: NSTextField,
-        pluginDir: URL,
+        pluginName: String,
         moduleName: String,
-        exec: String,
         interval: Int,
-        socketPath: String,
+        daemonClient: DaemonClient,
     ) {
         self.label = label
-        self.pluginDir = pluginDir
+        self.pluginName = pluginName
         self.moduleName = moduleName
-        self.exec = exec
         self.interval = max(1, interval)
-        self.socketPath = socketPath
-        // Serial queue per module so terminationHandler completion can't
-        // race with the next timer tick on the same module.
-        queue = DispatchQueue(label: "nestty.statusbar.\(moduleName)", qos: .utility)
+        self.daemonClient = daemonClient
+        queue = DispatchQueue(label: "nestty.statusbar.\(pluginName).\(moduleName)", qos: .utility)
     }
 
     func start() {
@@ -66,61 +58,48 @@ final class StatusModuleRunner: @unchecked Sendable {
         timer = nil
     }
 
-    /// One iteration: spawn `sh -c <exec>`, capture stdout, parse, update label.
-    /// Runs on the module's serial queue. Process spawn errors fall through
-    /// to a stderr log + label kept at last value (no flicker on transient
-    /// failures). Long-running commands that exceed `interval` will queue up
-    /// the next tick on the same queue — by design (we won't run two copies
-    /// of a slow command concurrently for the same module).
+    /// Skip-on-busy: the previous RPC's completion clears the gate. A
+    /// long-running module won't queue ticks — stale labels are worse
+    /// than missed updates.
     private func runOnce() {
         if stopped { return }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/sh")
-        process.arguments = ["-c", exec]
-        process.currentDirectoryURL = pluginDir
-        var env = ProcessInfo.processInfo.environment
-        env["NESTTY_SOCKET"] = socketPath
-        env["NESTTY_PLUGIN_DIR"] = pluginDir.path
-        process.environment = env
+        inFlightLock.lock()
+        guard !inFlight else { inFlightLock.unlock(); return }
+        inFlight = true
+        inFlightLock.unlock()
 
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
-
-        do {
-            try process.run()
-        } catch {
-            FileHandle.standardError.write(Data("[nestty] statusbar \(moduleName) spawn failed: \(error)\n".utf8))
-            return
-        }
-
-        // Block this serial queue until the child exits. Process bookkeeping
-        // is cheap; the timer interval is what controls actual throughput.
-        process.waitUntilExit()
-
-        let outData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-        let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-        if process.terminationStatus != 0 {
-            let errStr = String(data: errData, encoding: .utf8) ?? "<binary>"
-            FileHandle.standardError.write(Data("[nestty] statusbar \(moduleName) exec error: \(errStr)\n".utf8))
-            return
-        }
-
-        let raw = String(data: outData, encoding: .utf8) ?? ""
-        let (text, tooltip) = Self.parseOutput(raw)
         let labelBox = SendableBox(label)
-        DispatchQueue.main.async {
-            guard let label = labelBox.value else { return }
-            label.stringValue = text
-            label.toolTip = tooltip
+        let plugin = pluginName
+        let module = moduleName
+        daemonClient.forward(
+            method: "_module.run",
+            params: ["plugin": plugin, "module": module],
+        ) { [weak self] result in
+            defer {
+                self?.inFlightLock.lock()
+                self?.inFlight = false
+                self?.inFlightLock.unlock()
+            }
+            // RPCError → log + keep last label value (transient failures
+            // shouldn't flicker the bar).
+            if let err = result as? RPCError {
+                FileHandle.standardError.write(Data("[nestty] statusbar \(plugin).\(module) daemon-forward failed: \(err.code) — \(err.message)\n".utf8))
+                return
+            }
+            guard let dict = result as? [String: Any],
+                  let stdout = dict["stdout"] as? String
+            else { return }
+            let (text, tooltip) = Self.parseOutput(stdout)
+            DispatchQueue.main.async {
+                guard let label = labelBox.value else { return }
+                label.stringValue = text
+                label.toolTip = tooltip
+            }
         }
     }
 
-    /// `{text, tooltip}` JSON or plain text. `serde_json::Value` parsing
-    /// matches `nestty-linux/src/statusbar.rs::parse_output` byte-for-byte:
-    /// trim whitespace, attempt JSON only when the trimmed string looks
-    /// like an object (starts with `{`).
+    /// `{text, tooltip}` JSON or plain text. Matches
+    /// `nestty-linux/src/statusbar.rs::parse_output`.
     static func parseOutput(_ raw: String) -> (String, String?) {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.hasPrefix("{"),

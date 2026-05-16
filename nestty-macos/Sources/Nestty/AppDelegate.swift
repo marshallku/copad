@@ -16,7 +16,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// "apply-before-dispatch" ordering rationale (matches Linux's
     /// `Pump::pump_all` pattern).
     private let contextService = ContextService()
-    private lazy var pluginSupervisor = PluginSupervisor(registry: actionRegistry, eventBus: eventBus)
     /// PR 5c — Rust trigger engine via FFI. Lazy because the underlying
     /// nestty_engine_create() must run AFTER process startup; constructing it
     /// at property-init time risks a cold-launch race. Created the first
@@ -58,9 +57,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // will register additional actions through this same path.
         registerBuiltinActions()
 
-        // Daemon owns plugin host + registry; in-process `PluginSupervisor`
-        // is no longer started. Daemon-down ⇒ plugin/registry actions
-        // surface `daemon_unavailable` (the local engine still fires
+        // Daemon owns plugin host + registry. Daemon-down ⇒ plugin/registry
+        // actions surface `daemon_unavailable` (local engine still fires
         // GUI-only triggers).
         daemonClient = DaemonClient(
             socket: NesttyPaths.daemonSocket(),
@@ -227,9 +225,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // initial exec doesn't race a nestctl command that depends on
         // module state. PluginManifestStore.discover() ran inside the
         // supervisor too — second walk is cheap.
-        if let bar = vc.statusBar {
+        if let bar = vc.statusBar, let client = daemonClient {
             let manifests = PluginManifestStore.discover()
-            bar.loadModules(manifests, socketPath: socketServer.path)
+            bar.loadModules(manifests, daemonClient: client)
         }
 
         startSocketServer()
@@ -255,7 +253,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // 3. Socket — stops accepting new nestctl connections.
         // 4. Config watcher — stops file watching.
         nesttyEngine.shutdown()
-        pluginSupervisor.shutdown()
         tabVC?.statusBar?.shutdown()
         socketServer.stop()
         configWatcher?.stop()
@@ -549,11 +546,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let newConfig = NesttyConfig.load()
         let newTheme = NesttyTheme.byName(newConfig.themeName) ?? .catppuccinMocha
         tabVC?.applyConfig(newConfig, theme: newTheme)
-        // Reload triggers — engine swap is atomic; old await state drops
-        // (matches Linux core-lib.md docs: "all-or-nothing reload").
-        let triggerJSON = NesttyConfig.triggersJSON(from: newConfig)
-        if let count = nesttyEngine.setTriggers(triggerJSON) {
-            FileHandle.standardError.write(Data("[nestty-engine] reloaded \(count) trigger(s) on config.toml change\n".utf8))
+        // Skip local trigger reload while daemon owns triggers. Daemon
+        // runs its own config watcher and would race our setTriggers.
+        // Local engine retains its previous trigger set, ready for cut-over
+        // restore on daemon disconnect.
+        if daemonClient?.hostTriggersActive == true {
+            FileHandle.standardError.write(Data("[nestty-engine] skipping local trigger reload — daemon owns triggers (host_triggers=true)\n".utf8))
+        } else {
+            let triggerJSON = NesttyConfig.triggersJSON(from: newConfig)
+            if let count = nesttyEngine.setTriggers(triggerJSON) {
+                FileHandle.standardError.write(Data("[nestty-engine] reloaded \(count) trigger(s) on config.toml change\n".utf8))
+            }
         }
         // Reload keybindings — hot-swap into the existing monitor's snapshot.
         applyKeybindings(newConfig.keybindings)
@@ -1026,17 +1029,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
 
-        // Tier 4.3 — theme + plugin introspection.
-        case "theme.list":
-            // Hardcoded list mirrors NesttyTheme.byName's switch arms. Keep
-            // in sync when adding themes — no static array on NesttyTheme yet.
-            let themes = [
-                "catppuccin-mocha", "catppuccin-latte", "catppuccin-frappe", "catppuccin-macchiato",
-                "dracula", "nord", "tokyo-night", "gruvbox-dark", "one-dark", "solarized-dark",
-            ]
-            let current = NesttyConfig.load().themeName
-            completion(["themes": themes, "current": current])
-
         case "plugin.open":
             // params: name (plugin name), panel (default "main"), mode
             // (default "tab", also supports "split_h"/"split_v"). Mirrors
@@ -1103,52 +1095,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             } else {
                 completion(["visible": false, "note": "statusbar disabled in config"])
             }
-
-        case "plugin.list":
-            // Walk the same discovery path the supervisor uses at startup.
-            // Returns manifest snapshots + per-service metadata. Doesn't
-            // surface live runtime status (running/lazy/failed) yet —
-            // that'd be a `plugin.status` follow-up if useful.
-            let manifests = PluginManifestStore.discover()
-            let plugins: [[String: Any]] = manifests.map { loaded in
-                let m = loaded.manifest
-                return [
-                    "name": m.plugin.name,
-                    "title": m.plugin.title,
-                    "version": m.plugin.version,
-                    "description": m.plugin.description ?? NSNull(),
-                    "services": m.services.map { s in
-                        [
-                            "name": s.name,
-                            "exec": s.exec,
-                            "activation": s.activation,
-                            "provides": s.provides,
-                            "subscribes": s.subscribes,
-                        ] as [String: Any]
-                    },
-                    // Tier 4.1 — surface panel defs so `nestctl call plugin.list`
-                    // tells callers what's openable via plugin.open.
-                    "panels": m.panels.map { p in
-                        [
-                            "name": p.name,
-                            "title": p.title,
-                            "file": p.file,
-                            "icon": p.icon ?? NSNull(),
-                        ] as [String: Any]
-                    },
-                    // Tier 4.2 — surface module defs for diagnostics.
-                    "modules": m.modules.map { mo in
-                        [
-                            "name": mo.name,
-                            "exec": mo.exec,
-                            "interval": mo.interval,
-                            "position": mo.position,
-                            "order": mo.order,
-                        ] as [String: Any]
-                    },
-                ] as [String: Any]
-            }
-            completion(["plugins": plugins])
 
         default:
             if allowFallback {

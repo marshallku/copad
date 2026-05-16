@@ -89,9 +89,7 @@ final class StatusBarView: NSView {
     /// Build module labels + start their runners. Called once at app launch
     /// from `TabViewController.loadView`. Each `LoadedPluginManifest` may
     /// contribute zero or more modules.
-    func loadModules(_ plugins: [LoadedPluginManifest], socketPath: String) {
-        // Group + sort within each zone by `order` so manifest ordering
-        // doesn't dictate display position. Linux does the same.
+    func loadModules(_ plugins: [LoadedPluginManifest], daemonClient: DaemonClient) {
         var byZone: [String: [(plugin: LoadedPluginManifest, module: PluginModuleDef)]] = [
             "left": [], "center": [], "right": [],
         ]
@@ -100,9 +98,6 @@ final class StatusBarView: NSView {
                 let zone = ["left", "center", "right"].contains(module.position) ? module.position : "right"
                 byZone[zone, default: []].append((plugin, module))
             }
-        }
-        for (_, _) in byZone {
-            // No-op for empty zones; sort in-place by order.
         }
         for zone in ["left", "center", "right"] {
             let entries = byZone[zone, default: []].sorted { $0.module.order < $1.module.order }
@@ -117,11 +112,10 @@ final class StatusBarView: NSView {
                 labels[key] = label
                 let runner = StatusModuleRunner(
                     label: label,
-                    pluginDir: plugin.dir,
-                    moduleName: key,
-                    exec: module.exec,
+                    pluginName: plugin.manifest.plugin.name,
+                    moduleName: module.name,
                     interval: module.interval,
-                    socketPath: socketPath,
+                    daemonClient: daemonClient,
                 )
                 runner.start()
                 runners.append(runner)

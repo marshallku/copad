@@ -21,6 +21,16 @@ final class DaemonClient: @unchecked Sendable {
         return connected
     }
 
+    /// True only when currently connected AND last ack reported
+    /// `host_triggers=true`. Drop guard re-enables the local engine on
+    /// disconnect but doesn't clear `lastAck`, so a bare `lastAck.hostTriggers`
+    /// check would stay true after disconnect and incorrectly suppress
+    /// local-engine-side reload.
+    var hostTriggersActive: Bool {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return connected && (lastAck?.hostTriggers ?? false)
+    }
+
     private(set) var lastAck: RegisterAck?
 
     /// Forwarder needs subscribe access on the bus, not just publish, so
@@ -249,6 +259,11 @@ final class DaemonClient: @unchecked Sendable {
                 "want_primary": true,
                 "version": "0.1.0",
                 "protocol_version": 1,
+                // Daemon's `GUI_ENV_ALLOWED_KEYS` is currently a Linux/
+                // Wayland-only set (HYPRLAND_INSTANCE_SIGNATURE,
+                // WAYLAND_DISPLAY, ...). None apply on macOS, so an empty
+                // dict is the correct contract until daemon-side allowlist
+                // grows macOS keys (separate trust-boundary review).
                 "gui_env": [:] as [String: String],
             ],
         ]
@@ -475,27 +490,32 @@ final class DaemonClient: @unchecked Sendable {
     }
 
     private func handleDisconnect() {
-        // Drop guard: re-enable local engine FIRST so GUI-only triggers
-        // (terminal.cwd_changed → local action) keep firing through the
-        // reconnect-backoff window. Mirror of Linux HostTriggersGuard
-        // Drop impl.
-        let hadForwarder = forwarderChannel != nil
-        if hadForwarder {
-            cutoverHandler?(false)
-        }
-        forwarderChannel?.close()
-
-        // Bump generation FIRST so a stale reply that races in is dropped
-        // by handleResponse's gen check before we drain.
+        // Flip `connected = false` BEFORE notifying the cutover handler so
+        // any concurrent `hostTriggersActive` reader (e.g. ConfigWatcher
+        // racing with disconnect) sees the new state. Otherwise local
+        // trigger reload would skip during the gap between cutover restore
+        // and the connected flip, leaving the engine running stale config.
+        // Bump generation here too so a stale reply racing in is dropped
+        // by handleResponse's gen check.
         stateLock.lock()
+        let hadForwarder = forwarderChannel != nil
         connected = false
         generation &+= 1
         let drained = pending
         pending.removeAll()
         currentWriter?.shutdown()
         currentWriter = nil
+        let closingForwarder = forwarderChannel
         forwarderChannel = nil
         stateLock.unlock()
+
+        // Drop guard: re-enable local engine so GUI-only triggers keep
+        // firing through the reconnect-backoff window. Mirror of Linux
+        // HostTriggersGuard Drop impl.
+        if hadForwarder {
+            cutoverHandler?(false)
+        }
+        closingForwarder?.close()
 
         for (_, entry) in drained {
             entry.completion(RPCError(code: "daemon_unavailable", message: "daemon disconnected mid-flight"))

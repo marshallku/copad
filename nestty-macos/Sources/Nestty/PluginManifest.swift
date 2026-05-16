@@ -1,17 +1,22 @@
 import Foundation
 import TOMLKit
 
-/// Mirrors `nestty-core::plugin::PluginManifest` for macOS — only the
-/// pieces PR 3 needs. PR 4+ will grow this as panels/commands/modules
-/// come online.
+/// Mirrors `nestty-core::plugin::PluginManifest` for macOS.
 ///
-/// Discovery walks two roots and unions the result. macOS-native first
-/// (`~/Library/Application Support/nestty/plugins/`), then the XDG path
-/// (`~/.config/nestty/plugins/`) for users who share dotfiles across
-/// Linux/macOS. Last-write-wins on duplicate plugin names; the macOS
-/// path takes precedence intentionally so a per-OS override works.
+/// Discovery walks the single macOS plugin root that `nesttyd` also reads
+/// (`dirs::config_dir()/nestty/plugins` = `~/Library/Application Support/
+/// nestty/plugins` on macOS). Same root on both sides means daemon
+/// `_module.run` and macOS-side panel/statusbar lookups agree on which
+/// plugin wins.
+///
+/// Winner rule on duplicate plugin names: sort by `(name, dir.path)` then
+/// take the sorted-last entry. Mirrors `nestty-core::plugin::
+/// discover_sorted_plugins` + `resolve_by_name`. With a single root the
+/// tie-break is trivial; the rule still must match for futureproofing.
 enum PluginManifestStore {
     /// Top-level macOS plugin directory. Created lazily by the installer.
+    /// Same path as `dirs::config_dir()/nestty/plugins` on macOS — keeps
+    /// daemon and GUI on the same plugin universe.
     static var macOSRoot: URL {
         FileManager.default
             .homeDirectoryForCurrentUser
@@ -21,29 +26,32 @@ enum PluginManifestStore {
             .appendingPathComponent("plugins")
     }
 
-    /// XDG-style fallback (matches `dirs::config_dir()` on Linux). Lets
-    /// users with a Linux/macOS shared dotfile setup install once.
-    static var xdgRoot: URL {
-        FileManager.default
-            .homeDirectoryForCurrentUser
-            .appendingPathComponent(".config")
-            .appendingPathComponent("nestty")
-            .appendingPathComponent("plugins")
-    }
-
-    /// Walk both plugin roots, parse every `plugin.toml`, dedupe by
-    /// plugin name (macOS root wins). Parse errors are logged to stderr
-    /// and skipped — one bad manifest does not break discovery.
+    /// Walk the plugin root, parse every `plugin.toml`, dedupe by plugin
+    /// name using the sort-by-(name, dir-path) + sorted-last rule. Returns
+    /// winners in their sorted order so panel/statusbar traversal stays
+    /// stable across runs. Parse errors are logged to stderr and skipped.
     static func discover() -> [LoadedPluginManifest] {
-        var byName: [String: LoadedPluginManifest] = [:]
-        // XDG first so macOS root entries can overwrite duplicates.
-        for root in [xdgRoot, macOSRoot] {
-            for entry in directories(in: root) {
-                guard let loaded = parse(at: entry) else { continue }
-                byName[loaded.manifest.plugin.name] = loaded
-            }
+        var entries: [(LoadedPluginManifest, URL)] = []
+        for entry in directories(in: macOSRoot) {
+            guard let loaded = parse(at: entry) else { continue }
+            entries.append((loaded, entry))
         }
-        return Array(byName.values)
+        entries.sort { lhs, rhs in
+            let lname = lhs.0.manifest.plugin.name
+            let rname = rhs.0.manifest.plugin.name
+            if lname != rname { return lname < rname }
+            return lhs.1.path < rhs.1.path
+        }
+        // Build winners from the sorted array so traversal order is
+        // deterministic + stable. `byName` overwrite gives sorted-last.
+        var byName: [String: LoadedPluginManifest] = [:]
+        var order: [String] = []
+        for (loaded, _) in entries {
+            let name = loaded.manifest.plugin.name
+            if byName[name] == nil { order.append(name) }
+            byName[name] = loaded
+        }
+        return order.compactMap { byName[$0] }
     }
 
     private static func directories(in root: URL) -> [URL] {

@@ -102,36 +102,56 @@ final class SocketServer: @unchecked Sendable {
         }
     }
 
+    /// 1 MiB matches `nestty-daemon::socket::read_line_capped` and the
+    /// `DaemonClient` cap. Single-frame ceiling guards against unbounded
+    /// growth on a buggy or malicious client that never sends a newline.
+    private static let maxFrameBytes = 1024 * 1024
+
     private func handleClient(_ fd: Int32) {
         defer { close(fd) }
 
         var buffer = Data()
         var chunk = [UInt8](repeating: 0, count: 4096)
 
-        while true {
+        outer: while true {
             let n = read(fd, &chunk, chunk.count)
             if n <= 0 { break }
             buffer.append(contentsOf: chunk[..<n])
 
-            while let nlIdx = buffer.firstIndex(of: UInt8(ascii: "\n")) {
-                let line = Data(buffer[..<nlIdx])
-                buffer = Data(buffer[buffer.index(after: nlIdx)...])
+            while true {
+                if let nlIdx = buffer.firstIndex(of: UInt8(ascii: "\n")) {
+                    let frameBytes = buffer.distance(from: buffer.startIndex, to: nlIdx) + 1
+                    if frameBytes > Self.maxFrameBytes {
+                        FileHandle.standardError.write(Data("[nestty-socket] frame cap exceeded (\(frameBytes) > \(Self.maxFrameBytes)) — closing client\n".utf8))
+                        break outer
+                    }
+                    let line = Data(buffer[..<nlIdx])
+                    buffer = Data(buffer[buffer.index(after: nlIdx)...])
 
-                // event.subscribe: stay connected and stream events
-                if let json = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-                   let id = json["id"] as? String,
-                   (json["method"] as? String) == "event.subscribe"
-                {
-                    var resp = success(id: id, result: ["status": "subscribed"])
-                    resp.append(UInt8(ascii: "\n"))
-                    _ = resp.withUnsafeBytes { write(fd, $0.baseAddress!, $0.count) }
-                    streamEvents(fd: fd)
-                    return
+                    // event.subscribe: stay connected and stream events
+                    if let json = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
+                       let id = json["id"] as? String,
+                       (json["method"] as? String) == "event.subscribe"
+                    {
+                        var resp = success(id: id, result: ["status": "subscribed"])
+                        resp.append(UInt8(ascii: "\n"))
+                        _ = resp.withUnsafeBytes { write(fd, $0.baseAddress!, $0.count) }
+                        streamEvents(fd: fd)
+                        return
+                    }
+
+                    var response = dispatch(line)
+                    response.append(UInt8(ascii: "\n"))
+                    _ = response.withUnsafeBytes { write(fd, $0.baseAddress!, $0.count) }
+                } else {
+                    // No newline yet. Reject if accumulated buffer would
+                    // never assemble a valid frame.
+                    if buffer.count > Self.maxFrameBytes {
+                        FileHandle.standardError.write(Data("[nestty-socket] partial frame exceeds cap (\(buffer.count) > \(Self.maxFrameBytes)) — closing client\n".utf8))
+                        break outer
+                    }
+                    break // need more bytes
                 }
-
-                var response = dispatch(line)
-                response.append(UInt8(ascii: "\n"))
-                _ = response.withUnsafeBytes { write(fd, $0.baseAddress!, $0.count) }
             }
         }
     }
