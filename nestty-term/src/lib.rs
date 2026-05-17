@@ -35,7 +35,7 @@ use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty::{self, Options as TtyOptions, Pty, Shell};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor};
 
 /// Mirrors §D3 of the migration plan. `#[repr(C)]` so the layout is
 /// stable across the FFI boundary. Per-cell allocation is avoided by
@@ -253,15 +253,29 @@ pub extern "C" fn nestty_term_snapshot(handle: *mut NesttyHandle) -> *mut Nestty
     }
 
     let cursor_point = term.grid().cursor.point;
+    // `cursor_style()` honors DECSCUSR + vi-mode overrides; SHOW_CURSOR
+    // gates whether anything renders. HollowBlock collapses to Block
+    // here — the renderer draws hollow-on-blur as a separate concern
+    // (window focus state, not a TUI request).
+    let cs = term.cursor_style();
+    let show_cursor = term
+        .mode()
+        .contains(alacritty_terminal::term::TermMode::SHOW_CURSOR);
+    let style = if !show_cursor {
+        0
+    } else {
+        match cs.shape {
+            CursorShape::Hidden => 0,
+            CursorShape::Block | CursorShape::HollowBlock => 1,
+            CursorShape::Beam => 2,
+            CursorShape::Underline => 3,
+        }
+    };
     let cursor = NesttyCursor {
         row: cursor_point.line.0.max(0) as u16,
         col: cursor_point.column.0 as u16,
-        style: if term.mode().contains(alacritty_terminal::term::TermMode::SHOW_CURSOR) {
-            1 // block; DECSCUSR style refinement lands with the renderer in Phase 3
-        } else {
-            0
-        },
-        blink: 0,
+        style,
+        blink: if cs.blinking { 1 } else { 0 },
         _reserved: 0,
     };
 

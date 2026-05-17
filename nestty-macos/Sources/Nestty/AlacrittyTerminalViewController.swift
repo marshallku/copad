@@ -227,6 +227,14 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         ctx.setFillColor(theme.background.nsColor.cgColor)
         ctx.fill(bounds)
 
+        // Cursor first (under the text), so block-style cursor
+        // shows its character on top via the text loop. Hidden
+        // (style=0) — short-circuit. Phase 3.4 will overlay the
+        // character with `caretTextColor` when the cursor cell is a
+        // block; for now the foreground glyph just draws over the
+        // accent fill.
+        drawCursor(snap.cursor)
+
         // CTLineDraw uses CoreGraphics-native y-up glyph orientation.
         // Our view is `isFlipped = true` (so row 0 is at the top
         // visually) — without this textMatrix flip the glyphs render
@@ -244,6 +252,50 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             let utf8 = snap.rowUtf8(row)
             guard runs.count > 0, utf8.count > 0 else { continue }
             drawRow(row: row, runs: runs, utf8: utf8, textColor: textColor, ctx: ctx)
+        }
+    }
+
+    /// Cursor render. Style 0 = hidden (skip). Block (1) fills the
+    /// whole cell. Beam (2) is a 2-px vertical bar at the cell's
+    /// leading edge. Underline (3) is a 2-px horizontal bar at the
+    /// cell's bottom. When the window isn't key (e.g. user switched
+    /// apps), block style draws as a hollow outline so the user can
+    /// tell the terminal won't receive input — Terminal.app + iTerm2
+    /// do the same.
+    private func drawCursor(_ cursor: NesttyCursor) {
+        guard cursor.style != 0,
+              let ctx = NSGraphicsContext.current?.cgContext
+        else { return }
+        let x = CGFloat(cursor.col) * cellWidth
+        let y = CGFloat(cursor.row) * cellHeight
+        let cell = CGRect(x: x, y: y, width: cellWidth, height: cellHeight)
+        let isKey = window?.isKeyWindow ?? false
+        let color = theme.accent.nsColor.cgColor
+
+        switch cursor.style {
+        case 1: // block
+            if isKey {
+                ctx.setFillColor(color)
+                ctx.fill(cell)
+            } else {
+                ctx.setStrokeColor(color)
+                ctx.setLineWidth(1)
+                // Stroke is centered on the path; inset by half so
+                // it stays inside the cell rect.
+                ctx.stroke(cell.insetBy(dx: 0.5, dy: 0.5))
+            }
+        case 2: // beam (bar)
+            let barWidth: CGFloat = 2
+            let rect = CGRect(x: x, y: y, width: barWidth, height: cellHeight)
+            ctx.setFillColor(color)
+            ctx.fill(rect)
+        case 3: // underline
+            let barHeight: CGFloat = 2
+            let rect = CGRect(x: x, y: y + cellHeight - barHeight, width: cellWidth, height: barHeight)
+            ctx.setFillColor(color)
+            ctx.fill(rect)
+        default:
+            break
         }
     }
 
