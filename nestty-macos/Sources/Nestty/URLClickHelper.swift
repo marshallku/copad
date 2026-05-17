@@ -93,4 +93,11 @@ enum URLClickHelper {
         guard let last = s.last, trailingPunct.contains(last) else { return s }
         return String(s.dropLast())
     }
+
+    /// Exposed for callers that already have the candidate URL string
+    /// (alacritty renderer path operates on snapshot utf8 directly,
+    /// bypasses `findURL`). Same single-trailing-punct strip.
+    static func trimURLTrailingPunctuation(_ s: String) -> String {
+        trimTrailingPunctuation(s)
+    }
 }

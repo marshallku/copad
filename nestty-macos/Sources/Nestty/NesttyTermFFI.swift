@@ -157,6 +157,23 @@ enum NesttyTermFFI {
             guard let ptr else { return false }
             return nestty_term_bracketed_paste_active(ptr)
         }
+
+        /// Take the latest pending OSC 52 clipboard write request as a
+        /// Swift string, or nil if nothing is pending. The renderer
+        /// gates the actual NSPasteboard write on the user's policy.
+        /// An empty-string write IS a valid OSC 52 request ("clear
+        /// clipboard") and should reach the gate, so we don't filter
+        /// on length here — only the Rust-side NULL "nothing pending"
+        /// sentinel maps to Swift nil.
+        func takeClipboardRequest() -> String? {
+            guard let ptr else { return nil }
+            guard let sPtr = nestty_term_take_clipboard_request(ptr) else { return nil }
+            defer { nestty_string_destroy(sPtr) }
+            var len = 0
+            guard let bytes = nestty_string_bytes(sPtr, &len) else { return "" }
+            let buf = UnsafeBufferPointer(start: bytes, count: len)
+            return String(bytes: buf, encoding: .utf8) ?? ""
+        }
     }
 
     /// Wraps a Rust-owned snapshot pointer. Borrowed runs/utf8 are
@@ -221,6 +238,19 @@ enum NesttyTermFFI {
             var out = empty
             nestty_snapshot_selection(ptr, &out)
             return out
+        }
+
+        /// OSC 8 URI for the given 1-based hyperlink id (the value
+        /// `NesttyRun.hyperlink_id` carries). Returns nil for id == 0
+        /// or an out-of-range id. Bytes are copied out before the
+        /// snapshot's storage is reused.
+        func hyperlinkURI(_ hyperlinkID: UInt32) -> String? {
+            guard let ptr, hyperlinkID > 0 else { return nil }
+            var len = 0
+            guard let bytes = nestty_snapshot_hyperlink_uri(ptr, hyperlinkID, &len), len > 0
+            else { return nil }
+            let buf = UnsafeBufferPointer(start: bytes, count: len)
+            return String(bytes: buf, encoding: .utf8)
         }
     }
 }

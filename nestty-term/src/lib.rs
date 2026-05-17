@@ -28,10 +28,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
-use alacritty_terminal::event::{VoidListener, WindowSize};
+use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::Side;
 use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags as CellFlags;
@@ -39,8 +41,6 @@ use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty::{self, Options as TtyOptions, Pty, Shell};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor};
-use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
-use alacritty_terminal::index::Side;
 
 /// Mirrors §D3 of the migration plan. `#[repr(C)]` so the layout is
 /// stable across the FFI boundary. Per-cell allocation is avoided by
@@ -59,6 +59,9 @@ pub struct NesttyRun {
     pub underline_style: u8,
     pub reserved: u8,
     pub underline_color_rgba: u32,
+    /// 1-based index into the snapshot's `hyperlinks` vec; 0 means no
+    /// OSC 8 link on this run. Renderer resolves the URI via
+    /// `nestty_snapshot_hyperlink_uri`.
     pub hyperlink_id: u32,
 }
 
@@ -116,6 +119,42 @@ pub struct NesttyString {
     data: Box<[u8]>,
 }
 
+/// Custom `EventListener` for `alacritty_terminal::Term`. Captures
+/// the events the renderer actually needs to react to (OSC 52
+/// clipboard writes for now; OSC 52 reads, title changes, and bell
+/// can land here later). Most events are dropped on purpose —
+/// alacritty fires them frequently and our renderer doesn't need
+/// most of them.
+#[derive(Clone)]
+struct NesttyListener {
+    /// Most-recent OSC 52 clipboard-store request. Single-slot is
+    /// fine: bursts of OSC 52 are rare, and the renderer polls every
+    /// vsync. Older pending requests get coalesced — matches the
+    /// "last write wins" semantics most emulators have.
+    pending_clipboard: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl NesttyListener {
+    fn new() -> Self {
+        Self {
+            pending_clipboard: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+}
+
+impl EventListener for NesttyListener {
+    fn send_event(&self, event: Event) {
+        if let Event::ClipboardStore(_kind, text) = event {
+            // Drop the previous pending request if any (last write
+            // wins). The renderer takes it on the next tick via
+            // `nestty_term_take_clipboard_request`.
+            *self.pending_clipboard.lock().unwrap() = Some(text);
+        }
+        // Other events (Title, Bell, MouseCursorDirty, …) are
+        // intentionally dropped — the renderer doesn't react to them.
+    }
+}
+
 struct Row {
     utf8: Vec<u8>,
     runs: Vec<NesttyRun>,
@@ -125,13 +164,16 @@ pub struct NesttyHandle {
     /// Shared between the PTY reader thread (alacritty's EventLoop)
     /// and snapshot callers. Lock duration must stay short on the
     /// snapshot path so the reader thread isn't starved.
-    term: Arc<FairMutex<Term<VoidListener>>>,
+    term: Arc<FairMutex<Term<NesttyListener>>>,
+    /// Listener clone we keep here so the FFI can poll for pending
+    /// OSC 52 / future events without having to lock the term.
+    listener: NesttyListener,
     /// Sender into the event loop's mpsc — drives input writes,
     /// resize, and shutdown.
     sender: EventLoopSender,
     /// Reader thread that owns the PTY + parser loop. Joined in
     /// `nestty_term_destroy` after sending `Msg::Shutdown`.
-    io_thread: Option<JoinHandle<(EventLoop<Pty, VoidListener>, State)>>,
+    io_thread: Option<JoinHandle<(EventLoop<Pty, NesttyListener>, State)>>,
     /// Last observed hash of the cursor row's renderable content plus
     /// cursor metadata (style/blink/show). Used by
     /// `nestty_term_take_damage` to catch three classes of changes the
@@ -149,6 +191,11 @@ pub struct NesttySnapshot {
     rows: Vec<Row>,
     cursor: NesttyCursor,
     selection: NesttySelectionRange,
+    /// OSC 8 hyperlink URIs visible in this snapshot. The per-run
+    /// `hyperlink_id` is 1-based index into this vec (0 = no link).
+    /// Deduped by alacritty's `Hyperlink::id` so a hyperlink spanning
+    /// many cells only stores its URI once.
+    hyperlinks: Vec<String>,
 }
 
 /// Create a terminal handle: spawn a PTY running the requested shell
@@ -201,10 +248,11 @@ pub unsafe extern "C" fn nestty_term_create(
     };
 
     let term_size = TermSize::new(safe_cols as usize, safe_rows as usize);
-    let term = Term::new(Config::default(), &term_size, VoidListener);
+    let listener = NesttyListener::new();
+    let term = Term::new(Config::default(), &term_size, listener.clone());
     let term = Arc::new(FairMutex::new(term));
 
-    let event_loop = match EventLoop::new(Arc::clone(&term), VoidListener, pty, false, false) {
+    let event_loop = match EventLoop::new(Arc::clone(&term), listener.clone(), pty, false, false) {
         Ok(el) => el,
         Err(_) => return ptr::null_mut(),
     };
@@ -213,6 +261,7 @@ pub unsafe extern "C" fn nestty_term_create(
 
     Box::into_raw(Box::new(NesttyHandle {
         term,
+        listener,
         sender,
         io_thread: Some(io_thread),
         last_redraw_state_hash: AtomicU64::new(0),
@@ -337,9 +386,7 @@ pub unsafe extern "C" fn nestty_term_take_damage(handle: *mut NesttyHandle) -> b
     // and (4) selection start/extend/clear that doesn't touch any
     // cell content.
     let state_hash = hash_redraw_state(&term, cursor_point);
-    let prev_hash = h
-        .last_redraw_state_hash
-        .swap(state_hash, Ordering::Relaxed);
+    let prev_hash = h.last_redraw_state_hash.swap(state_hash, Ordering::Relaxed);
     let state_changed = state_hash != prev_hash;
 
     let real_damage = match term.damage() {
@@ -366,7 +413,7 @@ pub unsafe extern "C" fn nestty_term_take_damage(handle: *mut NesttyHandle) -> b
 /// Caller already holds the term lock — no extra synchronization
 /// needed. Out-of-range cursor returns a fixed sentinel so the
 /// comparison is still stable.
-fn hash_redraw_state(term: &Term<VoidListener>, cursor: Point) -> u64 {
+fn hash_redraw_state(term: &Term<NesttyListener>, cursor: Point) -> u64 {
     let line = cursor.line;
     if line.0 < 0 || (line.0 as usize) >= term.screen_lines() {
         return 0;
@@ -392,10 +439,16 @@ fn hash_redraw_state(term: &Term<VoidListener>, cursor: Point) -> u64 {
             if let Some(uc) = cell.underline_color() {
                 color_to_rgba(uc).hash(&mut hasher);
             }
-            // Hyperlink: just hash presence — the renderer treats any
-            // non-None as `hyperlink_id = 1` (placeholder until Phase 4
-            // wires real IDs).
-            u8::from(cell.hyperlink().is_some()).hash(&mut hasher);
+            // Hyperlink: hash (id, uri) — id alone isn't enough
+            // because OSC 8's explicit `id=` parameter survives
+            // unchanged across distinct URIs, so a same-id-new-uri
+            // transition would slip past the gate.
+            if let Some(h) = cell.hyperlink() {
+                h.id().hash(&mut hasher);
+                h.uri().hash(&mut hasher);
+            } else {
+                0u8.hash(&mut hasher);
+            }
         }
     }
     // Cursor metadata. Movement is technically caught by the line-bounds
@@ -443,10 +496,25 @@ pub unsafe extern "C" fn nestty_term_snapshot(handle: *mut NesttyHandle) -> *mut
     let rows_count = term.screen_lines() as u16;
     let grid = term.grid();
 
+    // Hyperlink dedup map: `(id, uri)` → 1-based index into
+    // `hyperlinks`. Keying by id alone is unsafe because explicit
+    // OSC 8 ids ARE preserved by alacritty (only missing ids get
+    // auto-generated unique values), so two distinct URIs can share
+    // an id. Pairing them in the key keeps each URI its own slot.
+    let mut hyperlinks: Vec<String> = Vec::new();
+    let mut hyperlink_index_by_key: std::collections::HashMap<(String, String), u32> =
+        std::collections::HashMap::new();
+
     let mut snapshot_rows = Vec::with_capacity(rows_count as usize);
     for line_idx in 0..rows_count as i32 {
         let line = Line(line_idx);
-        let row = walk_row(grid, line, cols);
+        let row = walk_row(
+            grid,
+            line,
+            cols,
+            &mut hyperlinks,
+            &mut hyperlink_index_by_key,
+        );
         snapshot_rows.push(row);
     }
 
@@ -486,6 +554,7 @@ pub unsafe extern "C" fn nestty_term_snapshot(handle: *mut NesttyHandle) -> *mut
         rows: snapshot_rows,
         cursor,
         selection,
+        hyperlinks,
     }))
 }
 
@@ -493,7 +562,7 @@ pub unsafe extern "C" fn nestty_term_snapshot(handle: *mut NesttyHandle) -> *mut
 /// bounds struct the renderer paints from. Returns the default
 /// (present=0) when there's no selection or it doesn't resolve to a
 /// range (e.g. empty drag, viewport scrolled past the selection).
-fn selection_range_for_ffi(term: &Term<VoidListener>) -> NesttySelectionRange {
+fn selection_range_for_ffi(term: &Term<NesttyListener>) -> NesttySelectionRange {
     let Some(sel) = term.selection.as_ref() else {
         return NesttySelectionRange::default();
     };
@@ -518,6 +587,8 @@ fn walk_row(
     grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
     line: Line,
     cols: u16,
+    hyperlinks: &mut Vec<String>,
+    hyperlink_index_by_key: &mut std::collections::HashMap<(String, String), u32>,
 ) -> Row {
     let mut utf8: Vec<u8> = Vec::new();
     let mut runs: Vec<NesttyRun> = Vec::new();
@@ -584,7 +655,19 @@ fn walk_row(
             underline_style,
             reserved: 0,
             underline_color_rgba: underline_color,
-            hyperlink_id: cell.hyperlink().map_or(0, |_| 1),
+            hyperlink_id: cell
+                .hyperlink()
+                .map(|h| {
+                    let key = (h.id().to_owned(), h.uri().to_owned());
+                    if let Some(idx) = hyperlink_index_by_key.get(&key) {
+                        return *idx;
+                    }
+                    hyperlinks.push(key.1.clone());
+                    let new_idx = hyperlinks.len() as u32; // 1-based
+                    hyperlink_index_by_key.insert(key, new_idx);
+                    new_idx
+                })
+                .unwrap_or(0),
         });
 
         col += span_cols as u16;
@@ -834,10 +917,14 @@ const SELECTION_LINES: u8 = 2;
 const SIDE_LEFT: u8 = 0;
 
 fn parse_side(side: u8) -> Side {
-    if side == SIDE_LEFT { Side::Left } else { Side::Right }
+    if side == SIDE_LEFT {
+        Side::Left
+    } else {
+        Side::Right
+    }
 }
 
-fn selection_point(term: &Term<VoidListener>, row: u16, col: u16) -> Point {
+fn selection_point(term: &Term<NesttyListener>, row: u16, col: u16) -> Point {
     // Clamp into the visible viewport. `selection.update()` tolerates
     // out-of-range points but the resulting highlight looks odd; let
     // the snapshot-time `to_range` clip it cleanly instead.
@@ -1039,6 +1126,83 @@ pub unsafe extern "C" fn nestty_term_bracketed_paste_active(handle: *mut NesttyH
         .lock()
         .mode()
         .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
+}
+
+/// Take the most-recent pending OSC 52 clipboard-store request (the
+/// `\e]52;c;<base64>\a` sequence programs use to push text into the
+/// system clipboard). Returns NULL if nothing is pending. Caller
+/// frees the returned string with `nestty_string_destroy` and gates
+/// the actual NSPasteboard write on the user's `[security] osc52`
+/// policy. Single-slot semantics: bursts coalesce to "last write
+/// wins" — matches how VTE and iTerm2 handle the same case.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `nestty_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_term_take_clipboard_request(
+    handle: *mut NesttyHandle,
+) -> *mut NesttyString {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return ptr::null_mut();
+    };
+    let Some(text) = h.listener.pending_clipboard.lock().unwrap().take() else {
+        return ptr::null_mut();
+    };
+    Box::into_raw(Box::new(NesttyString {
+        data: text.into_bytes().into_boxed_slice(),
+    }))
+}
+
+/// Number of distinct OSC 8 hyperlink URIs visible in this snapshot.
+/// IDs handed back to the renderer in `NesttyRun.hyperlink_id` are
+/// 1-based indices in `[1, count]`; 0 means "no hyperlink".
+///
+/// # Safety
+///
+/// `snap` must be NULL or a valid pointer returned by
+/// `nestty_term_snapshot` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_snapshot_hyperlink_count(snap: *const NesttySnapshot) -> u32 {
+    let Some(s) = (unsafe { snap.as_ref() }) else {
+        return 0;
+    };
+    s.hyperlinks.len() as u32
+}
+
+/// Borrowed pointer to the URI bytes for the given 1-based hyperlink
+/// id. Returns NULL + sets `*out_len = 0` when the id is out of
+/// range. Lifetime matches the snapshot — copy out before calling
+/// `nestty_snapshot_destroy`.
+///
+/// # Safety
+///
+/// `out_len` must point to writable storage for one `usize`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_snapshot_hyperlink_uri(
+    snap: *const NesttySnapshot,
+    hyperlink_id: u32,
+    out_len: *mut usize,
+) -> *const u8 {
+    if out_len.is_null() {
+        return ptr::null();
+    }
+    let Some(s) = (unsafe { snap.as_ref() }) else {
+        unsafe { *out_len = 0 };
+        return ptr::null();
+    };
+    if hyperlink_id == 0 {
+        unsafe { *out_len = 0 };
+        return ptr::null();
+    }
+    let idx = (hyperlink_id as usize).saturating_sub(1);
+    let Some(uri) = s.hyperlinks.get(idx) else {
+        unsafe { *out_len = 0 };
+        return ptr::null();
+    };
+    unsafe { *out_len = uri.len() };
+    uri.as_ptr()
 }
 
 #[unsafe(no_mangle)]

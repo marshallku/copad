@@ -133,6 +133,20 @@ void nestty_string_destroy(NesttyString* s);
 bool nestty_term_mouse_mode_active(NesttyHandle* handle);
 bool nestty_term_bracketed_paste_active(NesttyHandle* handle);
 
+// Drain the most-recent pending OSC 52 clipboard-store request.
+// Returns NULL when nothing pending. Caller frees with
+// nestty_string_destroy and gates the system clipboard write on
+// the user's [security] osc52 policy.
+NesttyString* nestty_term_take_clipboard_request(NesttyHandle* handle);
+
+// OSC 8 hyperlink URI lookup. `hyperlink_id` is the run's 1-based
+// index from the snapshot; 0 means "no hyperlink". URI bytes are
+// borrowed from snapshot storage — copy before destroy.
+uint32_t nestty_snapshot_hyperlink_count(const NesttySnapshot* snap);
+const uint8_t* nestty_snapshot_hyperlink_uri(const NesttySnapshot* snap,
+                                              uint32_t hyperlink_id,
+                                              size_t* out_len);
+
 // Static string, no free required.
 const char* nestty_term_version(void);
 

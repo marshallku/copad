@@ -300,6 +300,16 @@ final class PaneManager {
             term.applyFont(family: newConfig.fontFamily, baseSize: CGFloat(newConfig.fontSize))
             term.applyOSC52Policy(newConfig.osc52)
         }
+        // Fan out the security policy to alacritty panes too so a flip
+        // from `allow` → `deny` takes effect immediately. Theme/font
+        // hot-reload for the alacritty backend is wider scope (it'd
+        // need to rebuild the palette cache + font derivatives) and
+        // is deferred to a later phase.
+        for pane in root.allLeaves() {
+            if let alac = pane as? AlacrittyTerminalViewController {
+                alac.applyOSC52Policy(newConfig.osc52)
+            }
+        }
     }
 
     // MARK: - View Hierarchy

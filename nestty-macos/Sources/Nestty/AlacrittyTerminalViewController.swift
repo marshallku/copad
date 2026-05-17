@@ -44,7 +44,9 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
     /// Focus target for `panel.focusTarget` — callers like PaneManager
     /// that activate a pane (`makeFirstResponder`) need the renderView,
     /// not the layout container.
-    var focusTarget: NSView { renderView ?? view }
+    var focusTarget: NSView {
+        renderView ?? view
+    }
 
     init(config: NesttyConfig, theme: NesttyTheme, cwd: String? = nil, initialInput: String? = nil) {
         self.config = config
@@ -98,6 +100,7 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
             theme: theme,
             font: resolveFont(family: config.fontFamily, size: CGFloat(config.fontSize)),
             transparentDefaultBg: config.transparentDefaultBg,
+            osc52Policy: config.osc52,
         )
         render.frame = container.bounds
         render.autoresizingMask = [.width, .height]
@@ -143,6 +146,13 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
         if let render = renderView {
             view.window?.makeFirstResponder(render)
         }
+    }
+
+    /// Config hot-reload: flip the OSC 52 policy on the live render
+    /// view so already-open alacritty panes start honoring the new
+    /// `[security] osc52` setting without needing to be recreated.
+    func applyOSC52Policy(_ policy: OSC52Policy) {
+        renderView?.setOSC52Policy(policy)
     }
 
     // MARK: - NesttyPanel — background
@@ -250,6 +260,17 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     private let transparentDefaultBg: Bool
     private var imageBackgroundActive = false
 
+    /// OSC 52 policy from config. `.deny` (default) drops the request
+    /// with a stderr warning; `.allow` writes to NSPasteboard.general.
+    /// `var` so config hot-reload can flip it without re-creating the
+    /// pane — matches `TerminalViewController.applyOSC52Policy`.
+    private var osc52Policy: OSC52Policy
+
+    /// Setter for the controller to forward `applyConfig` updates.
+    func setOSC52Policy(_ policy: OSC52Policy) {
+        osc52Policy = policy
+    }
+
     /// Cursor-blink state. Honored only when the TUI/shell actually
     /// asks for it via DECSCUSR (`cursor.blink == 1` on the snapshot).
     /// When idle with blink on, the display-link callback forces a
@@ -259,7 +280,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     private var lastBlinkToggle = Date.distantPast
     private let blinkInterval: TimeInterval = 0.5
 
-    init(theme: NesttyTheme, font: NSFont, transparentDefaultBg: Bool) {
+    init(theme: NesttyTheme, font: NSFont, transparentDefaultBg: Bool, osc52Policy: OSC52Policy) {
         self.theme = theme
         self.font = font
         boldFont = Self.deriveTrait(font, mask: .boldFontMask)
@@ -267,6 +288,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         boldItalicFont = Self.deriveTrait(font, mask: [.boldFontMask, .italicFontMask])
         paletteCache = Self.buildPalette(theme: theme)
         self.transparentDefaultBg = transparentDefaultBg
+        self.osc52Policy = osc52Policy
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = theme.background.nsColor.cgColor
@@ -443,9 +465,12 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// on `takeDamage` so an idle terminal pays only the FFI bool
     /// query (sub-microsecond) instead of a full snapshot + redraw.
     /// When a TUI-driven blinking cursor is active, an additional
-    /// 2 Hz tick forces a redraw to advance the blink phase.
+    /// 2 Hz tick forces a redraw to advance the blink phase. Also
+    /// drains the OSC 52 clipboard-request queue so paste requests
+    /// from inside the terminal flow through the policy gate.
     @objc private func displayLinkFired(_: CADisplayLink) {
         guard let handle = termHandle else { return }
+        drainClipboardRequests(handle)
         let damaged = handle.takeDamage()
         let blinkPhaseChanged = advanceBlinkPhase()
         guard damaged || blinkPhaseChanged else { return }
@@ -453,6 +478,25 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             snapshotCache = handle.snapshot()
         }
         needsDisplay = true
+    }
+
+    /// Apply the user's OSC 52 policy to any pending clipboard write
+    /// request. `.allow` writes through to NSPasteboard.general;
+    /// `.deny` (the secure default) drops with a stderr warning so a
+    /// rogue program in the terminal can't silently overwrite the
+    /// user's clipboard. Matches the SwiftTerm path's behavior.
+    private func drainClipboardRequests(_ handle: NesttyTermFFI.Handle) {
+        guard let text = handle.takeClipboardRequest() else { return }
+        switch osc52Policy {
+        case .allow:
+            let pb = NSPasteboard.general
+            pb.declareTypes([.string], owner: nil)
+            pb.setString(text, forType: .string)
+        case .deny:
+            let msg = "[nestty] OSC 52 clipboard write blocked (\(text.utf8.count) bytes). "
+                + "Set `[security] osc52 = \"allow\"` to opt in.\n"
+            FileHandle.standardError.write(Data(msg.utf8))
+        }
     }
 
     /// Toggle the cursor visibility once per `blinkInterval` whenever
@@ -791,6 +835,18 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         // the click also starts a selection — otherwise the subsequent
         // Cmd+C / keyboard interaction has no responder target.
         window?.makeFirstResponder(self)
+
+        // Cmd+click takes priority over selection: try OSC 8 hyperlink
+        // first, fall back to plain-text URL regex on the clicked row.
+        // Matches iTerm2 / Terminal.app / SwiftTerm path behavior.
+        if event.modifierFlags.contains(.command) {
+            if openURLAtClick(event) {
+                return
+            }
+            // No URL at that point — fall through to normal mouseDown
+            // so the user gets a selection start instead of nothing.
+        }
+
         guard shouldHandleAsSelection(event) else {
             super.mouseDown(with: event)
             return
@@ -801,6 +857,54 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         }
         h.selectionStart(row: row, col: col, side: side, kind: selectionKind(for: event))
         needsDisplay = true
+    }
+
+    /// Resolve the URL at a Cmd+click point and hand it to NSWorkspace.
+    /// Returns true when a URL was opened (so mouseDown can short-
+    /// circuit). Checks OSC 8 first via the snapshot's hyperlink table,
+    /// then falls back to URLClickHelper's plain-text regex.
+    private func openURLAtClick(_ event: NSEvent) -> Bool {
+        guard let snap = snapshotCache,
+              let (row, col, _) = gridLocation(for: event)
+        else { return false }
+
+        // OSC 8: walk the row's runs for one whose hyperlink_id !=0 and
+        // whose `start_col..<end_col` covers the clicked column.
+        let runs = snap.rowRuns(row)
+        for i in 0 ..< runs.count {
+            let r = runs[i]
+            if r.hyperlink_id != 0, col >= r.start_col, col < r.end_col,
+               let uri = snap.hyperlinkURI(r.hyperlink_id),
+               let url = URL(string: uri)
+            {
+                NSWorkspace.shared.open(url)
+                return true
+            }
+        }
+
+        // Plain text: decode the row's utf8 and find a regex match
+        // containing the clicked column. NSRegularExpression operates
+        // on UTF-16 units; ASCII-dominant URL text lines up with the
+        // column index, so range.contains(col) works for the common
+        // case. Wide chars upstream shift the offset — accept that
+        // mismatch (URLClickHelper takes the same trade-off).
+        let utf8 = snap.rowUtf8(row)
+        guard utf8.count > 0,
+              let lineText = String(bytes: UnsafeBufferPointer(start: utf8.baseAddress, count: utf8.count), encoding: .utf8)
+        else { return false }
+
+        let ns = lineText as NSString
+        let fullRange = NSRange(location: 0, length: ns.length)
+        let matches = URLClickHelper.urlRegex.matches(in: lineText, options: [], range: fullRange)
+        for match in matches where match.range.contains(Int(col)) {
+            let candidate = ns.substring(with: match.range)
+            let trimmed = URLClickHelper.trimURLTrailingPunctuation(candidate)
+            if let url = URL(string: trimmed) {
+                NSWorkspace.shared.open(url)
+                return true
+            }
+        }
+        return false
     }
 
     override func mouseDragged(with event: NSEvent) {
