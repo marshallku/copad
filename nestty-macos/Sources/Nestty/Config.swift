@@ -44,9 +44,15 @@ struct StatusBarConfig {
 }
 
 /// Selects which terminal-emulation core renders a pane.
-/// `swiftterm` is the historical default; `alacritty` is the in-progress
-/// replacement (see docs/macos-renderer-migration-plan.md). Read once per
-/// pane at construction time — flipping the config requires a restart
+/// `alacritty` is the current default after Phase 3-6 reached feature
+/// parity with the SwiftTerm path on the slice that matters for daily
+/// use (cells/colors/cursor/image bg/transparency/damage gating,
+/// selection + clipboard + OSC 52/8 + URL click, scrollback +
+/// mouse wheel + Cmd nav, IME preedit, font/theme hot-reload).
+/// `swiftterm` is retained as an explicit fallback while the
+/// alacritty path dogfoods — drop it via Phase 10b once we're
+/// confident nothing daily falls back. Read once per pane at
+/// construction time — flipping the config requires a restart
 /// (or a new tab) for the change to apply.
 enum RendererBackend: String {
     case swiftterm
@@ -54,8 +60,12 @@ enum RendererBackend: String {
 
     static func parse(_ raw: String?) -> RendererBackend {
         switch raw?.lowercased() {
-        case "alacritty": .alacritty
-        default: .swiftterm
+        case "swiftterm": .swiftterm
+        // Default to alacritty — an unspecified or unknown value
+        // gets the active production backend rather than the legacy
+        // fallback. Users who explicitly want SwiftTerm set
+        // `[renderer] backend = "swiftterm"`.
+        default: .alacritty
         }
     }
 }
@@ -72,9 +82,11 @@ struct NesttyConfig {
     let backgroundOpacity: Double
     let osc52: OSC52Policy
     /// `[renderer] backend = "swiftterm" | "alacritty"`. Defaults to
-    /// swiftterm until the alacritty renderer reaches Linux-parity quality
-    /// and Phase 10 flips the default. Per-pane: each new tab/split reads
-    /// the live config value at construction time.
+    /// `alacritty` after Phase 10a; SwiftTerm stays as a one-flag-flip
+    /// fallback during dogfooding. Per-pane: each new tab/split reads
+    /// the live config value at construction time (changing it doesn't
+    /// affect already-open panes — they keep whichever backend they
+    /// were spawned with).
     let rendererBackend: RendererBackend
     /// `[renderer] transparent_default_bg = true` makes default-bg cells
     /// transparent on the alacritty backend, so a configured background
@@ -174,7 +186,7 @@ struct NesttyConfig {
             backgroundTint: 0.6,
             backgroundOpacity: 1.0,
             osc52: .deny,
-            rendererBackend: .swiftterm,
+            rendererBackend: .alacritty,
             transparentDefaultBg: false,
             tabsPosition: .top,
             statusBar: .defaults,

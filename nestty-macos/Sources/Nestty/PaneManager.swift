@@ -160,9 +160,9 @@ final class PaneManager {
     }
 
     /// Factory: pick the terminal renderer based on `[renderer] backend`.
-    /// SwiftTerm is the production default; alacritty is the in-progress
-    /// replacement and only renders a scaffold until Phase 3.2 wires
-    /// its CoreText draw loop.
+    /// `alacritty` is the production default after Phase 10a (the
+    /// alacritty path reached parity through Phases 3–6); `swiftterm`
+    /// stays as an explicit opt-in fallback during dogfooding.
     static func makeTerminalPanel(
         config: NesttyConfig,
         theme: NesttyTheme,

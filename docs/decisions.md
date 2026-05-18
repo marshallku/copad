@@ -608,4 +608,17 @@ Both are documented v2 work. The fallback behavior is "next launch has a smaller
 
 **Test coverage:** 6 EventBus tests (`history_records_recent_in_arrival_order`, `history_drops_oldest_when_capacity_exceeded`, `history_filters_by_since_ms`, `history_filters_by_kind_glob`, `history_min_capacity_clamped_to_one`, plus the existing pattern tests carry into the glob path). 5 CLI tests cover `parse_duration_seconds` (units + garbage) and `payload_preview` (flat object, long-string truncation, non-object fallback).
 
+
+## 36. macOS default renderer = alacritty (Phase 10a)
+
+**Problem:** Phases 3 – 6 reached behavioral parity between the alacritty-backed pane (`AlacrittyTerminalViewController` + `nestty-term` FFI) and the SwiftTerm path on the slice that matters for daily use: text + cursor + colors + image bg + transparency + Zed materialize + damage-gated CADisplayLink + italic/strike/blink + mouse selection + Cmd+A/C/V + OSC 52 policy gate + OSC 8 hyperlinks + plain URL Cmd+click + scrollback + mouse wheel + Cmd nav + IME preedit + theme/font/security hot-reload. With parity in place, leaving `swiftterm` as the silent default meant new sessions never dogfooded the new path.
+
+**Decision:** Flip `[renderer] backend` default from `swiftterm` → `alacritty` in `RendererBackend.parse` and `NesttyConfig.defaults`. Keep SwiftTerm in the codebase as an explicit opt-in fallback (`backend = "swiftterm"`); a Phase 10b removal lands once dogfooding turns up no daily blocker.
+
+- **Why a one-flag fallback, not removal yet:** the alacritty path has known limitations — mouse-mode TUI forwarding (`vim set mouse=a`, `less`, `htop`), no Cmd+/- zoom, no block selection, and a few coordinate edge cases that won't surface until real workloads hit them. The fallback path keeps users unblocked while we iterate.
+- **Per-pane semantics, not global:** `rendererBackend` is read at pane-construction time. Flipping the config doesn't re-spawn open panes — they keep their original backend. Matches what every other per-pane config (theme/font/osc52) does on this codebase.
+- **Hot-reload prerequisite:** Phase 4b left `applyTheme` / `applyFont` unwired on the alacritty path, which would've been a regression vs SwiftTerm post-flip. Wired both in the preceding commit so editing config feels the same on either backend.
+
+**Posture:** Don't remove SwiftTerm until a confidence period passes (probably a few weeks of daily use with no fallback escapes). When removing, prune `SwiftTerm` Package.swift dep, `NesttyTerminalView`, `TerminalViewController`, `URLClickHelper` (currently shared between paths but can absorb into the alacritty renderer or get its own helper module), `applyClampedCursorStyle` and other SwiftTerm-only patches, and the `swiftterm` enum case.
+
 **See:** `nestty-core/src/event_bus.rs` (`history` field + `history()` method + `with_capacities` constructor), `nestty-linux/src/window.rs` (silent `event.history` registration), `nestty-cli/src/plugin_cmds/recent.rs` (CLI + duration parser + payload renderer).
