@@ -280,6 +280,20 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     private var lastBlinkToggle = Date.distantPast
     private let blinkInterval: TimeInterval = 0.5
 
+    /// IME composition state. While the user is composing (Korean
+    /// 2-Set, Japanese kana → kanji, Pinyin, …) the system delivers
+    /// `setMarkedText` with the in-progress string; nothing flows to
+    /// the PTY until the IME commits via `insertText`. We paint the
+    /// marked text as an overlay at the cursor cell so the user can
+    /// see what they're composing without it ever touching the
+    /// terminal buffer.
+    ///
+    /// `markedSelectedRange` is the IME-highlighted sub-range inside
+    /// the marked text (e.g. the active syllable on a multi-syllable
+    /// composition). Drawn with a stronger underline.
+    private var markedText: String?
+    private var markedSelectedRange: NSRange = .init(location: 0, length: 0)
+
     init(theme: NesttyTheme, font: NSFont, transparentDefaultBg: Bool, osc52Policy: OSC52Policy) {
         self.theme = theme
         self.font = font
@@ -568,6 +582,63 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         // ~0.4 alpha keeps the underlying text legible while clearly
         // marking the range.
         paintSelection(snap.selection, ctx: ctx)
+
+        // IME preedit overlay (Korean / Japanese / Chinese composition).
+        // Paints OVER everything else at the cursor cell — what the
+        // user is composing, before any of it touches the PTY.
+        paintMarkedText(snap.cursor, ctx: ctx)
+    }
+
+    /// Paint the in-progress IME composition at the cursor cell.
+    /// Fills the underlying cells with theme.background opaque so the
+    /// preedit is legible regardless of what was there before, then
+    /// draws the marked string with an underline (single line for the
+    /// whole composition; the IME-highlighted sub-range gets a thicker
+    /// double underline).
+    private func paintMarkedText(_ cursor: NesttyCursor, ctx: CGContext) {
+        guard let marked = markedText, !marked.isEmpty,
+              cellWidth > 0, cellHeight > 0 else { return }
+
+        let baseAttrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor(cgColor: theme.foreground.nsColor.cgColor) ?? .white,
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+            .underlineColor: NSColor(cgColor: theme.accent.nsColor.cgColor) ?? .yellow,
+        ]
+        let attr = NSMutableAttributedString(string: marked, attributes: baseAttrs)
+        // Thicker double underline on the IME-highlighted sub-range
+        // so the user can see which syllable / kana is "active" in a
+        // multi-segment composition.
+        if markedSelectedRange.length > 0,
+           markedSelectedRange.location + markedSelectedRange.length <= (marked as NSString).length
+        {
+            attr.addAttribute(
+                .underlineStyle,
+                value: NSUnderlineStyle([.double, .thick]).rawValue,
+                range: markedSelectedRange,
+            )
+        }
+
+        let line = CTLineCreateWithAttributedString(attr)
+        // Typographic width tells us how many cells the preedit covers;
+        // round up to a whole cell so the bg fill aligns with the grid.
+        var ascentT: CGFloat = 0
+        var descentT: CGFloat = 0
+        var leadingT: CGFloat = 0
+        let width = CGFloat(CTLineGetTypographicBounds(line, &ascentT, &descentT, &leadingT))
+        let cellsCovered = max(1, Int(ceil(width / cellWidth)))
+        let pxWidth = CGFloat(cellsCovered) * cellWidth
+
+        let x = CGFloat(cursor.col) * cellWidth
+        let y = CGFloat(cursor.row) * cellHeight
+        ctx.setFillColor(theme.background.nsColor.cgColor)
+        ctx.fill(CGRect(x: x, y: y, width: pxWidth, height: cellHeight))
+
+        // CTLineDraw needs the text matrix flip that the main row loop
+        // already applied; we're inside its scope (the defer-restore
+        // hasn't fired yet) so `textPosition` + draw is correct.
+        ctx.textPosition = CGPoint(x: x, y: y + ascent)
+        CTLineDraw(line, ctx)
     }
 
     /// Paint a translucent `theme.surface2` overlay across the cells
@@ -1024,6 +1095,14 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         if let s = string as? String { text = s }
         else if let a = string as? NSAttributedString { text = a.string }
         else { return }
+        // IME commit: the system normally calls unmarkText() before
+        // delivering the committed string, but some IMEs (and some
+        // commit paths) skip that. Clear here too so the preedit
+        // overlay doesn't linger after the bytes land in the PTY.
+        if markedText != nil {
+            markedText = nil
+            needsDisplay = true
+        }
         guard !text.isEmpty else { return }
         termHandle?.input(Array(text.utf8))
     }
@@ -1065,35 +1144,99 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         }
     }
 
-    // Stubs — Phase 6 implements preedit rendering and candidate
-    // window positioning via these methods.
+    // IME preedit support. NSTextInputClient hands us the in-progress
+    // composition via setMarkedText; we store it and paint it as an
+    // overlay at the cursor cell in `draw(_:)`. Nothing flows to the
+    // PTY until the IME calls `insertText` with the committed string.
 
-    func setMarkedText(_: Any, selectedRange _: NSRange, replacementRange _: NSRange) {}
-    func unmarkText() {}
+    func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange _: NSRange) {
+        let text: String = if let s = string as? String { s }
+        else if let a = string as? NSAttributedString { a.string }
+        else { "" }
+        if text.isEmpty {
+            markedText = nil
+        } else {
+            markedText = text
+            // Clamp the IME-highlighted sub-range to the actual length
+            // — some IMEs (and dictation) send ranges that extend past
+            // the marked string. Drawing with an out-of-range index
+            // would crash CoreText.
+            let utf16Count = (text as NSString).length
+            let loc = max(0, min(selectedRange.location, utf16Count))
+            let len = max(0, min(selectedRange.length, utf16Count - loc))
+            markedSelectedRange = NSRange(location: loc, length: len)
+        }
+        needsDisplay = true
+    }
+
+    func unmarkText() {
+        guard markedText != nil else { return }
+        markedText = nil
+        markedSelectedRange = NSRange(location: 0, length: 0)
+        needsDisplay = true
+    }
+
+    /// IMEs query this to know where the caret sits inside the
+    /// "document." We don't have a real text buffer, so report a
+    /// zero-length range at the start — Korean / Japanese IMEs
+    /// accept this and key off `markedRange` + `firstRect` instead.
+    /// Returning NSNotFound here breaks several IMEs (no input).
     func selectedRange() -> NSRange {
-        NSRange(location: NSNotFound, length: 0)
+        NSRange(location: 0, length: 0)
     }
 
     func markedRange() -> NSRange {
-        NSRange(location: NSNotFound, length: 0)
+        guard let text = markedText else {
+            return NSRange(location: NSNotFound, length: 0)
+        }
+        return NSRange(location: 0, length: (text as NSString).length)
     }
 
     func hasMarkedText() -> Bool {
-        false
+        markedText != nil
     }
 
+    /// We don't expose the terminal buffer to the IME (it'd be
+    /// awkward to map cell coordinates to NSRange offsets). Returning
+    /// nil is fine — used mostly by accessibility / dictation paths
+    /// that gracefully degrade.
     func attributedSubstring(forProposedRange _: NSRange, actualRange _: NSRangePointer?) -> NSAttributedString? {
         nil
     }
 
+    /// Minimal set of attribute keys the IME can include in marked
+    /// text. We honor underline via our own painting and ignore
+    /// segment styles — sufficient for Korean/Japanese/Chinese IMEs.
     func validAttributesForMarkedText() -> [NSAttributedString.Key] {
-        []
+        [.underlineStyle, .underlineColor]
     }
 
+    /// Where the IME should anchor its candidate window. Returns the
+    /// cursor cell's rect in *screen* coordinates — AppKit's IME
+    /// pipeline expects screen-space here, not view or window. Without
+    /// this the candidate popup floats at (0, 0) on the main display.
+    /// View is `isFlipped == true` but `convert(_:to:)` already
+    /// handles the flip between the view's top-left origin and the
+    /// window's bottom-left origin — passing local flipped coords
+    /// directly is correct (manually inverting y here double-flips
+    /// and anchors the candidate window at the mirror row).
     func firstRect(forCharacterRange _: NSRange, actualRange _: NSRangePointer?) -> NSRect {
-        .zero
+        guard let snap = snapshotCache, cellWidth > 0, cellHeight > 0 else { return .zero }
+        let cursor = snap.cursor
+        let cellRect = NSRect(
+            x: CGFloat(cursor.col) * cellWidth,
+            y: CGFloat(cursor.row) * cellHeight,
+            width: cellWidth,
+            height: cellHeight,
+        )
+        guard let win = window else { return .zero }
+        let windowRect = convert(cellRect, to: nil)
+        return win.convertToScreen(windowRect)
     }
 
+    /// Hit-test for clicking into a preedit composition — we don't
+    /// support it, but returning a deterministic NSNotFound keeps
+    /// the IME from probing further.
     func characterIndex(for _: NSPoint) -> Int {
         NSNotFound
     }
