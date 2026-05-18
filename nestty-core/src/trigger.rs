@@ -21,7 +21,7 @@
 use crate::action_registry::{ActionRegistry, ActionResult};
 use crate::condition;
 use crate::context::Context;
-use crate::event_bus::{Event, EventBus, pattern_matches};
+use crate::event_bus::{Event, EventBus, Origin, pattern_matches};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::sync::{Arc, RwLock};
@@ -52,6 +52,36 @@ pub struct Trigger {
     /// docs/workflow-runtime.md "Async correlation".
     #[serde(default)]
     pub r#await: Option<AwaitClause>,
+    /// Trust-boundary opt-ins. Absent block = both flags `false`:
+    /// trigger ignores `External`-origin events and refuses to invoke
+    /// privileged actions. See `docs/harness-integration.md`
+    /// § "Trust boundary".
+    #[serde(default)]
+    pub security: SecurityBlock,
+}
+
+/// Two-axis trust opt-in. Default-deny: a freshly authored trigger
+/// fires only on internal events and cannot run privileged actions.
+/// Wiring a hook-published event to a `system.spawn` action requires
+/// the user to explicitly flip both flags, making the trust decision
+/// visible in the trigger TOML diff.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SecurityBlock {
+    #[serde(default)]
+    pub accept_external: bool,
+    #[serde(default)]
+    pub allow_privileged: bool,
+}
+
+/// Static list of action names that may execute arbitrary code or
+/// mutate state outside the daemon's sandbox. Triggers may invoke
+/// these only if `[security] allow_privileged = true`. Initial set
+/// is just `system.spawn` (intercepted before the registry —
+/// see `daemon_trigger_sink::handle_system_spawn`); extend as new
+/// privileged actions land (e.g. `git.worktree_add` with arbitrary
+/// paths, `kb.write` outside the KB root).
+pub fn is_privileged_action(action: &str) -> bool {
+    matches!(action, "system.spawn")
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -241,11 +271,26 @@ impl TriggerEngine {
     /// `<action>.failed` on the bus; silent registry actions and legacy
     /// match-arm sinks log instead).
     pub fn dispatch(&self, event: &Event, context: Option<&Context>) -> usize {
-        // Await-state passes run BEFORE iterating triggers: a trigger that
-        // fires action X on this event must not have its fresh preflight
-        // consumed by the same `X.completed` event we just used to promote.
-        self.try_promote_or_drop_preflight(event);
-        self.try_match_pending_awaits(event);
+        // External-origin events are kept out of the await state
+        // machine entirely. Without this, a socket-driven `events.publish`
+        // could satisfy a pending await whose originating trigger never
+        // opted into `accept_external = true`, and the resulting
+        // synthesized `<trigger>.awaited` event (always tagged Internal)
+        // would let downstream triggers chain on external data without
+        // any opt-in. Per-pending origin policy (let external events
+        // satisfy awaits whose creator opted in) is a follow-up —
+        // tracked in docs/harness-integration.md known gaps.
+        // `.completed`/`.failed` events from the daemon's action
+        // registry are always Internal, so promotion isn't blocked by
+        // this gate.
+        if event.origin != Origin::External {
+            // Await-state passes run BEFORE iterating triggers: a trigger
+            // that fires action X on this event must not have its fresh
+            // preflight consumed by the same `X.completed` event we just
+            // used to promote.
+            self.try_promote_or_drop_preflight(event);
+            self.try_match_pending_awaits(event);
+        }
 
         // Snapshot the trigger list under a short read lock so a concurrent
         // `set_triggers` can't observe partial iteration. Triggers are small
@@ -255,6 +300,25 @@ impl TriggerEngine {
         for ct in &snapshot {
             let trigger = &ct.trigger;
             if !trigger.matches(event) {
+                continue;
+            }
+            // Trust-boundary gates run BEFORE the user-supplied `condition`
+            // expression — a misconfigured condition that always returns true
+            // must still not subvert the origin/privilege opt-ins.
+            if event.origin == Origin::External && !trigger.security.accept_external {
+                log::debug!(
+                    "trigger {:?} skipping External-origin event {:?}: accept_external not set",
+                    trigger.name,
+                    event.kind
+                );
+                continue;
+            }
+            if is_privileged_action(&trigger.action) && !trigger.security.allow_privileged {
+                log::warn!(
+                    "trigger {:?} refused privileged action {:?}: allow_privileged not set",
+                    trigger.name,
+                    trigger.action
+                );
                 continue;
             }
             // Eval error is treated as no-match — safer than firing on a
@@ -808,6 +872,7 @@ mod tests {
             params: Value::Null,
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         };
         assert!(t.matches(&evt("calendar.event_imminent", json!({}))));
         assert!(!t.matches(&evt("calendar.event_started", json!({}))));
@@ -825,6 +890,7 @@ mod tests {
             params: Value::Null,
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         };
         assert!(t.matches(&evt("calendar.event_imminent", json!({}))));
         assert!(t.matches(&evt("calendar.event_created", json!({}))));
@@ -847,6 +913,7 @@ mod tests {
             params: Value::Null,
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         };
         assert!(t.matches(&evt(
             "slack.mention",
@@ -871,6 +938,7 @@ mod tests {
             }),
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         };
         let result = t.interpolate(
             &evt(
@@ -902,6 +970,7 @@ mod tests {
             }),
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         };
         let result = t.interpolate(
             &evt(
@@ -934,6 +1003,7 @@ mod tests {
             params: json!({"v": "{event.missing.path}"}),
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         };
         let result = t.interpolate(&evt("any", json!({"present": 1})), None);
         assert_eq!(result["v"], json!("{event.missing.path}"));
@@ -951,6 +1021,7 @@ mod tests {
             params: json!({"cmd": "echo {context.active_cwd} :: {context.active_panel}"}),
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         };
         let ctx = Context {
             active_panel: Some("panel-1".into()),
@@ -977,6 +1048,7 @@ mod tests {
             }),
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         };
         let result = t.interpolate(&evt("any", json!({})), None);
         assert_eq!(result["a"], json!("{event.missing}"));
@@ -1001,6 +1073,7 @@ mod tests {
             }),
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         };
         let event = Event::new("plugin.hello.done", "plugin.hello", json!({}));
         let stamp = event.timestamp_ms;
@@ -1022,6 +1095,7 @@ mod tests {
             params: json!({"s": "{event.source}"}),
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         };
         let result = t.interpolate(
             &Event::new("k", "real-source", json!({"source": "payload-source"})),
@@ -1056,6 +1130,7 @@ mod tests {
             }),
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         };
         let result = t.interpolate(&evt("any", json!({"a": "A", "b": "B"})), None);
         assert_eq!(result["list"][0], json!("A"));
@@ -1086,6 +1161,7 @@ mod tests {
             params: json!({"id": "{event.id}"}),
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         }]);
         let fired = engine.dispatch(
             &evt("calendar.event_imminent", json!({"id": "evt-9"})),
@@ -1118,6 +1194,7 @@ mod tests {
             params: Value::Null,
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         }]);
         engine.dispatch(&evt("calendar.event_imminent", json!({})), None);
         engine.dispatch(&evt("terminal.cwd_changed", json!({})), None);
@@ -1140,6 +1217,7 @@ mod tests {
             params: Value::Null,
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         }]);
         // Should not panic. fired count is 0 because the action returned Err.
         let fired = engine.dispatch(&evt("any", json!({})), None);
@@ -1159,6 +1237,7 @@ mod tests {
             params: Value::Null,
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         }]);
         let fired = engine.dispatch(&evt("any", json!({})), None);
         assert_eq!(fired, 0);
@@ -1177,6 +1256,7 @@ mod tests {
             params: Value::Null,
             condition: condition.map(str::to_string),
             r#await: None,
+            security: SecurityBlock::default(),
         }
     }
 
@@ -1335,6 +1415,7 @@ mod tests {
             params: Value::Null,
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         };
         engine.set_triggers(vec![make("a"), make("b")]);
         assert_eq!(engine.count(), 2);
@@ -1462,6 +1543,7 @@ mod tests {
                 params: json!({ "id": "{event.id}" }),
                 condition: None,
                 r#await: None,
+                security: SecurityBlock::default(),
             },
             Trigger {
                 name: "trigger-b".into(),
@@ -1473,6 +1555,7 @@ mod tests {
                 params: json!({ "marker": "{event.marker}" }),
                 condition: None,
                 r#await: None,
+                security: SecurityBlock::default(),
             },
         ]);
 
@@ -1535,6 +1618,7 @@ mod tests {
                 params: Value::Null,
                 condition: None,
                 r#await: None,
+                security: SecurityBlock::default(),
             },
             Trigger {
                 name: "on-fail".into(),
@@ -1546,6 +1630,7 @@ mod tests {
                 params: Value::Null,
                 condition: None,
                 r#await: None,
+                security: SecurityBlock::default(),
             },
         ]);
 
@@ -1661,6 +1746,7 @@ mod tests {
                 }),
                 condition: Some("event.linked_jira != null".to_string()),
                 r#await: None,
+                security: SecurityBlock::default(),
             },
             Trigger {
                 name: "without-jira".into(),
@@ -1675,6 +1761,7 @@ mod tests {
                 }),
                 condition: Some("event.linked_jira == null".to_string()),
                 r#await: None,
+                security: SecurityBlock::default(),
             },
             Trigger {
                 name: "claude-after-worktree".into(),
@@ -1686,6 +1773,7 @@ mod tests {
                 params: json!({"workspace_path": "{event.path}"}),
                 condition: None,
                 r#await: None,
+                security: SecurityBlock::default(),
             },
         ]);
 
@@ -1791,6 +1879,7 @@ mod tests {
                 }),
                 condition: Some("event.linked_jira != null".to_string()),
                 r#await: None,
+                security: SecurityBlock::default(),
             },
             Trigger {
                 name: "without-jira".into(),
@@ -1805,6 +1894,7 @@ mod tests {
                 }),
                 condition: Some("event.linked_jira == null".to_string()),
                 r#await: None,
+                security: SecurityBlock::default(),
             },
             Trigger {
                 name: "claude-after-worktree".into(),
@@ -1816,6 +1906,7 @@ mod tests {
                 params: json!({"workspace_path": "{event.path}"}),
                 condition: None,
                 r#await: None,
+                security: SecurityBlock::default(),
             },
         ]);
 
@@ -1924,6 +2015,7 @@ mod tests {
                 params: json!({"workspace": "x", "branch": "y"}),
                 condition: None,
                 r#await: None,
+                security: SecurityBlock::default(),
             },
             Trigger {
                 name: "claude-after-worktree".into(),
@@ -1935,6 +2027,7 @@ mod tests {
                 params: Value::Null,
                 condition: None,
                 r#await: None,
+                security: SecurityBlock::default(),
             },
         ]);
 
@@ -1993,6 +2086,7 @@ mod tests {
             params: Value::Null,
             condition: None,
             r#await: Some(aw),
+            security: SecurityBlock::default(),
         }
     }
 
@@ -2742,5 +2836,281 @@ mod tests {
             other => panic!("ask-a.awaited should NOT fire: {other:?}"),
         }
         assert_eq!(engine.pending_await_count(), 1);
+    }
+
+    // ----- Trust-boundary gates -----
+
+    fn trig_for_action(name: &str, action: &str, kind: &str, security: SecurityBlock) -> Trigger {
+        Trigger {
+            name: name.into(),
+            when: WhenSpec {
+                event_kind: kind.into(),
+                payload_match: Map::new(),
+            },
+            action: action.into(),
+            params: Value::Null,
+            condition: None,
+            r#await: None,
+            security,
+        }
+    }
+
+    fn external_evt(kind: &str) -> Event {
+        Event::new(kind, "client.42", json!({})).with_origin(Origin::External)
+    }
+
+    #[test]
+    fn external_origin_event_is_dropped_when_accept_external_false() {
+        let (reg, engine) = mk_engine();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        reg.register("noop", move |_p| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({}))
+        });
+        engine.set_triggers(vec![trig_for_action(
+            "t",
+            "noop",
+            "claude.tool_used",
+            SecurityBlock::default(),
+        )]);
+        let fired = engine.dispatch(&external_evt("claude.tool_used"), None);
+        assert_eq!(fired, 0, "external event must not fire by default");
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn external_origin_event_fires_when_accept_external_true() {
+        let (reg, engine) = mk_engine();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        reg.register("noop", move |_p| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({}))
+        });
+        engine.set_triggers(vec![trig_for_action(
+            "t",
+            "noop",
+            "claude.tool_used",
+            SecurityBlock {
+                accept_external: true,
+                allow_privileged: false,
+            },
+        )]);
+        let fired = engine.dispatch(&external_evt("claude.tool_used"), None);
+        assert_eq!(fired, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn internal_origin_event_fires_without_accept_external() {
+        // Default-deny applies to External only; the absence of a
+        // security block must not break in-tree triggers that consume
+        // plugin-published events (which are always Internal).
+        let (reg, engine) = mk_engine();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        reg.register("noop", move |_p| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({}))
+        });
+        engine.set_triggers(vec![trig_for_action(
+            "t",
+            "noop",
+            "calendar.event_imminent",
+            SecurityBlock::default(),
+        )]);
+        let fired = engine.dispatch(&evt("calendar.event_imminent", json!({})), None);
+        assert_eq!(fired, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn privileged_action_dropped_when_allow_privileged_false() {
+        // system.spawn is not in the registry — it's intercepted by
+        // daemon_trigger_sink. The fan-out gate must drop BEFORE the
+        // sink even sees the action, so the privilege check works
+        // regardless of which sink is wired in.
+        let (reg, engine) = mk_engine();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        reg.register("system.spawn", move |_p| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({}))
+        });
+        engine.set_triggers(vec![trig_for_action(
+            "t",
+            "system.spawn",
+            "calendar.event_imminent",
+            SecurityBlock::default(),
+        )]);
+        let fired = engine.dispatch(&evt("calendar.event_imminent", json!({})), None);
+        assert_eq!(fired, 0, "privileged action must not fire by default");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "sink must not be called for refused privileged action"
+        );
+    }
+
+    #[test]
+    fn privileged_action_fires_when_allow_privileged_true() {
+        let (reg, engine) = mk_engine();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        reg.register("system.spawn", move |_p| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({}))
+        });
+        engine.set_triggers(vec![trig_for_action(
+            "t",
+            "system.spawn",
+            "calendar.event_imminent",
+            SecurityBlock {
+                accept_external: false,
+                allow_privileged: true,
+            },
+        )]);
+        let fired = engine.dispatch(&evt("calendar.event_imminent", json!({})), None);
+        assert_eq!(fired, 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn external_and_privileged_require_both_opt_ins() {
+        // Hook event → system.spawn is the canonical dangerous combo
+        // from harness-integration.md. Verify the two gates compose:
+        // only when BOTH flags are true does the action fire.
+        let (reg, engine) = mk_engine();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        reg.register("system.spawn", move |_p| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({}))
+        });
+        let combos = [
+            (false, false, 0),
+            (true, false, 0),
+            (false, true, 0),
+            (true, true, 1),
+        ];
+        for (ax, ap, expected) in combos {
+            calls.store(0, Ordering::SeqCst);
+            engine.set_triggers(vec![trig_for_action(
+                "t",
+                "system.spawn",
+                "claude.commit_blocked",
+                SecurityBlock {
+                    accept_external: ax,
+                    allow_privileged: ap,
+                },
+            )]);
+            engine.dispatch(&external_evt("claude.commit_blocked"), None);
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                expected,
+                "combo ax={ax} ap={ap} expected fires={expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn security_block_defaults_when_absent_in_toml() {
+        // Triggers authored without `[security]` must round-trip with
+        // both flags false — matches the documented "default-deny"
+        // posture.
+        let t: Trigger = toml::from_str(
+            r#"
+            name = "t"
+            action = "noop"
+            [when]
+            event_kind = "k"
+            "#,
+        )
+        .unwrap();
+        assert!(!t.security.accept_external);
+        assert!(!t.security.allow_privileged);
+    }
+
+    #[test]
+    fn security_block_parses_when_present() {
+        let t: Trigger = toml::from_str(
+            r#"
+            name = "t"
+            action = "system.spawn"
+            [when]
+            event_kind = "claude.commit_blocked"
+            [security]
+            accept_external = true
+            allow_privileged = true
+            "#,
+        )
+        .unwrap();
+        assert!(t.security.accept_external);
+        assert!(t.security.allow_privileged);
+    }
+
+    #[test]
+    fn is_privileged_action_recognizes_system_spawn() {
+        assert!(is_privileged_action("system.spawn"));
+        assert!(!is_privileged_action("system.spawn.completed"));
+        assert!(!is_privileged_action("slack.post_message"));
+        assert!(!is_privileged_action(""));
+    }
+
+    #[test]
+    fn external_event_cannot_satisfy_pending_await() {
+        // Codex round-3 C1: without this gate, a socket-driven publish
+        // could match a pending await registered by an internal trigger
+        // chain, synthesizing an Internal-origin `<trigger>.awaited`
+        // event that downstream non-accept_external triggers would
+        // happily fire on.
+        let bus = Arc::new(crate::event_bus::EventBus::new());
+        let reg = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
+        reg.register("noop", |_p| Ok(json!({})));
+        let engine = TriggerEngine::with_publish_bus(reg, bus.clone());
+        let mut pm = Map::new();
+        pm.insert("id".into(), Value::String("{event.id}".into()));
+        engine.set_triggers(vec![trig_with_await(
+            "ask",
+            "noop",
+            "todo.start",
+            AwaitClause {
+                event_kind: "reply".into(),
+                payload_match: pm,
+                timeout_seconds: 60,
+                on_timeout: TimeoutPolicy::Abort,
+            },
+        )]);
+        let rx_awaited = bus.subscribe("ask.awaited");
+        let completed_rx = bus.subscribe("noop.completed");
+        engine.dispatch(&evt("todo.start", json!({"id": "X"})), None);
+        let c = completed_rx.try_recv().expect("noop.completed");
+        engine.dispatch(&c, None);
+        assert_eq!(engine.pending_await_count(), 1);
+
+        // External `reply` matching the pending's payload should NOT
+        // satisfy the await. Pending stays alive; no awaited event
+        // fires.
+        let external_reply =
+            Event::new("reply", "client.99", json!({"id": "X"})).with_origin(Origin::External);
+        engine.dispatch(&external_reply, None);
+        match rx_awaited.recv_timeout(Duration::from_millis(20)) {
+            crate::event_bus::RecvOutcome::Timeout => {}
+            other => panic!("external event must not satisfy pending await: {other:?}"),
+        }
+        assert_eq!(
+            engine.pending_await_count(),
+            1,
+            "pending must remain unconsumed when only external events arrive"
+        );
+
+        // Sanity: an Internal reply still works.
+        engine.dispatch(&evt("reply", json!({"id": "X"})), None);
+        match rx_awaited.recv_timeout(Duration::from_millis(50)) {
+            crate::event_bus::RecvOutcome::Event(_) => {}
+            other => panic!("internal event should satisfy await: {other:?}"),
+        }
+        assert_eq!(engine.pending_await_count(), 0);
     }
 }

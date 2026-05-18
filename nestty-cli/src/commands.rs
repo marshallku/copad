@@ -202,6 +202,8 @@ pub enum EventCommand {
     /// Publish an event onto the daemon's bus. Useful for firing
     /// `[[triggers]]` from shell scripts. Source is daemon-stamped
     /// (`client.<pid>` via SO_PEERCRED); timestamp is daemon-stamped.
+    /// Events from this entry point are tagged `External` origin and
+    /// reach only triggers with `[security] accept_external = true`.
     Publish {
         /// Event kind (e.g. `panel.focused`, `my.custom`). Cannot end
         /// in `.completed` or `.failed` — those are reserved for the
@@ -210,6 +212,13 @@ pub enum EventCommand {
         /// Optional JSON payload. Defaults to `{}`. Use shell quoting
         /// (single quotes) to pass spaces / nested JSON.
         payload: Option<String>,
+        /// Silence transport errors and exit 0 when the daemon socket
+        /// is missing or unreachable. Intended for shell hook callers
+        /// that should never break the host command when nesttyd is
+        /// down. Schema errors (invalid JSON, reserved kind) still
+        /// exit non-zero.
+        #[arg(long, default_value_t = false)]
+        quiet: bool,
     },
 }
 

@@ -692,6 +692,8 @@ action = "system.spawn"
 params = { argv = ["/bin/sh", "-c", "echo \"\$HYPRLAND_INSTANCE_SIGNATURE\" > $ENV_MARKER"] }
 [triggers.when]
 event_kind = "e2e.envspawn"
+[triggers.security]
+allow_privileged = true
 TOML
 wait_for_count 'trigger config reloaded' "$DAEMON_LOG" "$(( ENV_RELOAD_COUNT_BEFORE + 1 ))" 8 \
     || fail "daemon's config watcher did not pick up the env-spawn trigger"

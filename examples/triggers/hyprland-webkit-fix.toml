@@ -69,6 +69,13 @@ action = "system.spawn"
 [triggers.when]
 event_kind = "window.restored"
 
+# `system.spawn` is a privileged action — every trigger that wires
+# it needs the explicit opt-in. See `docs/harness-integration.md`
+# § Trust boundary. Origin gate stays default (`accept_external`
+# false) since `window.restored` is plugin-published (Internal).
+[triggers.security]
+allow_privileged = true
+
 [triggers.params]
 # Two cure shape decisions, both empirical (observed reliably,
 # mechanism for #2 not fully characterized):

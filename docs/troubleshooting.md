@@ -141,6 +141,12 @@ params = { argv = ["sh", "-c", "hyprctl dispatch resizewindowpixel '1 0,class:co
 
 [triggers.when]
 event_kind = "window.restored"
+
+# `system.spawn` is a privileged action and triggers must
+# explicitly opt in. See `docs/harness-integration.md` § Trust
+# boundary.
+[triggers.security]
+allow_privileged = true
 ```
 
 **Two empirical decisions baked into that snippet** (observed behaviors on Hyprland 0.54.3 — the underlying mechanism for the second one is not fully characterized, but the behavior reproduced reliably across dozens of cycles):

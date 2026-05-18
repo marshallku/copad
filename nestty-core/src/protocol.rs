@@ -55,15 +55,6 @@ pub struct Invoke {
     pub params: serde_json::Value,
 }
 
-/// Provenance of a bus event. Consumed by the trigger engine's security
-/// gate (see `harness-integration.md` § Trust boundary).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EventOrigin {
-    Internal,
-    External,
-}
-
 impl Event {
     pub fn new(event_type: impl Into<String>, data: serde_json::Value) -> Self {
         Self {
@@ -75,18 +66,6 @@ impl Event {
 
     pub fn with_source(mut self, source: impl Into<String>) -> Self {
         self.source = Some(source.into());
-        self
-    }
-
-    /// Stamp `data._origin` with the provenance. Plugin-supplied
-    /// `_origin` keys are overwritten.
-    pub fn with_origin(mut self, origin: EventOrigin) -> Self {
-        let key = "_origin";
-        if let Some(obj) = self.data.as_object_mut() {
-            obj.insert(key.into(), serde_json::json!(origin));
-        } else {
-            self.data = serde_json::json!({ key: origin, "value": self.data });
-        }
         self
     }
 }
@@ -180,20 +159,5 @@ mod tests {
         let s = serde_json::to_string(&inv).unwrap();
         assert!(s.contains("\"invoke\":\"tab.list\""));
         assert!(!s.contains("\"method\""));
-    }
-
-    #[test]
-    fn event_with_origin_overwrites_existing_key() {
-        let ev = Event::new("x", json!({ "_origin": "fake", "k": 1 }))
-            .with_origin(EventOrigin::External);
-        assert_eq!(ev.data["_origin"], json!("external"));
-        assert_eq!(ev.data["k"], json!(1));
-    }
-
-    #[test]
-    fn event_with_origin_wraps_non_object_data() {
-        let ev = Event::new("x", json!(42)).with_origin(EventOrigin::Internal);
-        assert_eq!(ev.data["_origin"], json!("internal"));
-        assert_eq!(ev.data["value"], json!(42));
     }
 }

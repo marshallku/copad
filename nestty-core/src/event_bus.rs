@@ -20,6 +20,23 @@ pub fn next_bridge_id() -> u64 {
     NEXT_BRIDGE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Provenance of a bus event. Consulted by `TriggerEngine` fan-out to
+/// decide whether a trigger may fire on it. `Internal` covers everything
+/// the daemon itself produces (plugin stdio publishes, action completion
+/// events, time-based wakeups, bridge-relayed events from another local
+/// bus). `External` covers events that entered via socket
+/// `events.publish` — i.e. arbitrary same-UID processes including
+/// SSH-forwarded hook callers. See `docs/harness-integration.md`
+/// § "Trust boundary" and the trigger `[security] accept_external`
+/// opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+    #[default]
+    Internal,
+    External,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     pub kind: String,
@@ -34,6 +51,13 @@ pub struct Event {
     /// loop back through the other direction's forwarder.
     #[serde(skip, default)]
     pub bridge_id: Option<u64>,
+    /// Trust-boundary provenance. Serde default = `Internal` so that
+    /// older wire formats deserialize as the safe default (treated as
+    /// trusted), and constructors that don't explicitly set it stay
+    /// trusted. The single chokepoint that flips this to `External`
+    /// is the daemon's `events.publish` handler.
+    #[serde(default)]
+    pub origin: Origin,
 }
 
 impl Event {
@@ -44,11 +68,17 @@ impl Event {
             timestamp_ms: now_millis(),
             payload,
             bridge_id: None,
+            origin: Origin::default(),
         }
     }
 
     pub fn with_bridge_id(mut self, id: u64) -> Self {
         self.bridge_id = Some(id);
+        self
+    }
+
+    pub fn with_origin(mut self, origin: Origin) -> Self {
+        self.origin = origin;
         self
     }
 }
@@ -524,6 +554,35 @@ mod tests {
         let jira_only = bus.history(None, Some("jira.*"));
         let kinds: Vec<&str> = jira_only.iter().map(|e| e.kind.as_str()).collect();
         assert_eq!(kinds, vec!["jira.assigned", "jira.commented"]);
+    }
+
+    #[test]
+    fn fresh_event_defaults_to_internal_origin() {
+        let e = Event::new("x", "y", json!({}));
+        assert_eq!(e.origin, Origin::Internal);
+    }
+
+    #[test]
+    fn with_origin_overrides_default() {
+        let e = Event::new("x", "y", json!({})).with_origin(Origin::External);
+        assert_eq!(e.origin, Origin::External);
+    }
+
+    #[test]
+    fn origin_round_trips_through_serde() {
+        let e = Event::new("x", "y", json!({"a": 1})).with_origin(Origin::External);
+        let json_str = serde_json::to_string(&e).unwrap();
+        let back: Event = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(back.origin, Origin::External);
+    }
+
+    #[test]
+    fn origin_deserializes_as_internal_when_missing() {
+        // Forward-compat with older serialized payloads that don't
+        // carry the field at all.
+        let raw = r#"{"kind":"k","source":"s","timestamp_ms":0,"payload":null}"#;
+        let e: Event = serde_json::from_str(raw).unwrap();
+        assert_eq!(e.origin, Origin::Internal);
     }
 
     #[test]

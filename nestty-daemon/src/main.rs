@@ -737,7 +737,7 @@ fn activate_supervisor(
 mod tests {
     use super::*;
     use nestty_core::event_bus::EventBus;
-    use nestty_core::trigger::WhenSpec;
+    use nestty_core::trigger::{SecurityBlock, WhenSpec};
     use serde_json::Value;
 
     fn mk_trigger(name: &str, kind: &str) -> Trigger {
@@ -751,6 +751,7 @@ mod tests {
             params: Value::Null,
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         }
     }
 

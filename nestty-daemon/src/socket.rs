@@ -700,9 +700,15 @@ fn handle_events_publish(req: &Request, state: &Arc<DaemonState>, peer: Option<u
         Some(pid) => format!("client.{pid}"),
         None => "client.unknown".into(),
     };
-    state
-        .event_bus
-        .publish(nestty_core::event_bus::Event::new(kind, source, payload));
+    // `events.publish` is the trust-boundary chokepoint for socket-driven
+    // event injection — any same-UID process holding the daemon socket
+    // (including SSH-forwarded harness hooks) can reach here. Tag the
+    // event `External` so `TriggerEngine` fan-out skips it for any
+    // trigger that didn't opt in via `[security] accept_external = true`.
+    state.event_bus.publish(
+        nestty_core::event_bus::Event::new(kind, source, payload)
+            .with_origin(nestty_core::event_bus::Origin::External),
+    );
     Response::success(req.id.clone(), serde_json::json!({ "queued": true }))
 }
 
@@ -1431,6 +1437,11 @@ mod tests {
         );
         assert_eq!(ev.payload, json!({"hi": true}));
         assert!(ev.timestamp_ms > 0, "daemon-assigned timestamp present");
+        assert_eq!(
+            ev.origin,
+            nestty_core::event_bus::Origin::External,
+            "events.publish is the trust-boundary chokepoint; events injected here MUST be tagged External"
+        );
         let _ = std::fs::remove_file(&path_clone);
     }
 

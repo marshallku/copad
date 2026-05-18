@@ -152,7 +152,7 @@ impl Default for TriggerSubscriptions {
 mod tests {
     use super::*;
     use nestty_core::event_bus::Event;
-    use nestty_core::trigger::{AwaitClause, TimeoutPolicy, Trigger, WhenSpec};
+    use nestty_core::trigger::{AwaitClause, SecurityBlock, TimeoutPolicy, Trigger, WhenSpec};
     use serde_json::{Map, Value, json};
 
     fn mk_trigger(name: &str, kind: &str, action: &str) -> Trigger {
@@ -166,6 +166,7 @@ mod tests {
             params: Value::Null,
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         }
     }
 
@@ -185,6 +186,7 @@ mod tests {
                 timeout_seconds: 30,
                 on_timeout: TimeoutPolicy::Abort,
             }),
+            security: SecurityBlock::default(),
         }
     }
 

@@ -569,17 +569,65 @@ params = { prompt_file = "${state_dir}/last-review.md" }
 
 ### Implementation notes
 
-- `EventBus::publish` gets an `Origin` parameter; existing callsites pass
-  `Internal`. Socket dispatch for `event.publish` passes `External`.
-- `TriggerEngine::fan_out` reads `origin` from the bus record and consults
-  the trigger's `[security]` block.
-- Privileged-action list maintained in `ActionRegistry` as a `privileged: bool`
-  flag per registration. `system.spawn` is the canonical example; audit
-  others (`git.worktree_add`, `kb.write` outside KB root, etc.).
-- Migration: existing triggers without `[security]` keep current behavior
-  (internal-only). No breakage.
+- `event_bus::Origin { Internal, External }` lives as a field on
+  `event_bus::Event` (not as a publish argument) — `TriggerEngine` reads
+  the origin off the `&Event` it dispatches against. Default = `Internal`;
+  the daemon's `handle_events_publish` is the single chokepoint that
+  stamps `External`.
+- `TriggerEngine::dispatch` gates BEFORE evaluating user-supplied
+  `condition`: a misconfigured condition that always returns true must
+  not subvert the two opt-ins.
+- Privileged-action list lives in `nestty_core::trigger::is_privileged_action`
+  — a static `matches!(action, "system.spawn")` for now. Registry-marked
+  privileged actions (via `ActionRegistry::register_privileged`) are a
+  follow-up; the canonical dangerous action (`system.spawn`) is intercepted
+  outside the registry today and only needs the static check.
+- Migration: existing triggers without `[security]` parse cleanly as
+  `SecurityBlock::default()` (both flags false). No breakage.
+- `nestctl event publish --quiet` exits 0 on transport failures so hook
+  scripts don't break when nesttyd is down. Schema errors still exit 1
+  even under `--quiet` — a malformed publish call is a caller bug, not a
+  transport failure.
 
-~100 LOC + audit. Effort: S (~half day).
+#### Known gaps (follow-up tickets)
+
+These were flagged during plan review (`/codex-plan` round 2 + /cross-review
+round 3-4) and deliberately scoped out of the first slice:
+
+- **Bridge wire origin propagation.** `protocol::Event` (the wire format
+  for daemon ↔ GUI bridge) doesn't carry an origin field. An external
+  event published on the daemon bus crosses to the GUI bus without
+  origin info and reaches GUI-side triggers as `Internal`. Acceptable
+  for Option A's threat model (the dangerous action — `system.spawn` —
+  lives daemon-side), but a Linux GUI-side trigger that calls a
+  privileged action on a hook-originated event would NOT be gated.
+- **External events cannot satisfy ANY pending await.** Conservative
+  workaround for the laundering risk: without per-pending origin
+  tracking, an external event satisfying an internal trigger's
+  `await` clause would publish an `Internal`-tagged `<trigger>.awaited`
+  event, and downstream triggers without `accept_external` could chain
+  on external-derived data. We close the laundering hole today by
+  skipping the await state machine entirely for `External` events at
+  `TriggerEngine::dispatch`. The trade-off: a legitimate
+  external-accepting trigger (e.g. accept_external=true, awaits a
+  follow-up `slack.dm`) cannot complete via an externally-published
+  follow-up event either. Fix when needed: store `origin` on
+  `PendingAwait` + propagate to the synthesized `.awaited` event, then
+  drop only when policy mismatches.
+- **Causal taint for `.completed` events.** Action `.completed` events
+  from the registry default to `Internal` regardless of the originating
+  trigger's input event origin. A trigger with `accept_external = true`
+  can fire an action; the resulting `.completed` is `Internal`, and
+  downstream triggers without `accept_external` can chain on it.
+  Mitigation if exploited: rewrite the completion stamper to inherit
+  origin from the causal chain (same fix shape as `.awaited`).
+- **macOS FFI origin plumbing.** `nestty-ffi` and the Swift `BusEvent`
+  don't carry origin. Out of scope while macOS shell stays a stub.
+- **Registry-marked privileged actions.** `ActionRegistry::register_privileged`
+  is not wired yet. The static `is_privileged_action` list is the only
+  privileged set today.
+
+~200 LOC + audit. Effort: M (~1 day). Done in commit-of-record below.
 
 ## SSH considerations
 

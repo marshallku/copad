@@ -699,6 +699,40 @@ User-explicit gap. Same shape as Slack (Phase 11) — a long-lived WebSocket plu
 - [ ] OAuth redirect flow as alternative to bot-token paste — needs a localhost listener; defer until env+keyring proves insufficient (same posture as Slack).
 - [ ] **Voice / slash command surface**: not in scope — text-channel ingestion + send is the messenger-style use case nestty cares about.
 
+### Phase 21: Harness integration (docs/harness-integration.md)
+
+Track lives in `docs/harness-integration.md`. Sequenced 1–16. Pending the heavy lifting in steps 10+ (claude/codex/browser adapters), but the trust-boundary substrate is now in place.
+
+**Shipped from sequencing:**
+
+- [x] **Step 1** — GUI ↔ daemon protocol spec (`docs/gui-daemon-protocol.md`).
+- [x] **Step 2 (2a–2c)** — `nestty-daemon` crate + `nesttyd` binary; supervisor + trigger_sink relocated; pdeathsig / orphan reaping restored.
+- [x] **Step 4** — `service_supervisor.rs` + `trigger_sink.rs` moved out of `nestty-linux`.
+- [x] **Step 5** — `socket.rs` split into daemon-owned + GUI-owned dispatch; dual-dispatch behind feature flag.
+- [x] **Step 6** — Daemon-attached default; `--standalone` retained.
+- [x] **Step 8 (partial)** — `event.history` ring buffer + `nestctl recent` (decisions.md #35), `events.publish` socket surface + `nestctl event publish` (existing).
+- [x] **Step 9 (this slice)** — Trust boundary: `event_bus::Origin` field + `[security] { accept_external, allow_privileged }` trigger schema + `is_privileged_action(system.spawn)` engine-level gate + `nestctl event publish --quiet`. Daemon-side coverage only — bridge wire propagation, causal taint, macOS FFI, registry-marked privileged actions tracked as known gaps. See decisions.md #37.
+
+**Outstanding (in sequencing order):**
+
+- [ ] **Step 3** — Phase 9.4 bounded thread pool (already in tree; verify no `try_dispatch` paths still spawn unbounded).
+- [ ] **Step 7** — `nestty-daemon.service` systemd unit + macOS `launchd` plist + `--with-daemon` flag on install scripts.
+- [ ] **Step 8 remainder** — `notify.show` action backed by `Notifier` trait (libnotify on Linux, `osascript` on macOS).
+- [ ] **Step 10 — Option A (`claude` plugin)** — Hook scripts publish `claude.tool_used`, `claude.commit_blocked`, `claude.review_approved`, `claude.session_stopped`; plugin exposes `claude.session_state`, `claude.list_dirty`, `claude.last_handoff`, `claude.list_sessions`. Unblocked by step 9.
+- [ ] **Step 11 — Option I (cron triggers)** — `tokio-cron-scheduler` (or hand-rolled with `chrono-tz`) + `[[triggers]]` TOML cron field + missed-run policy + dedupe on config reload + per-trigger named `time.<trigger_name>` events.
+- [ ] **Step 12 — Option H (life-assistant bridge)** — `lifeassistant` plugin + ~30 LOC patch to life-assistant scheduler pushing `nestctl event publish lifeassistant.job_completed` (External origin; consumed by triggers with `accept_external = true`).
+- [ ] **Step 13 — Option B (monitor panel)** — composition of A + E + H.
+- [ ] **Step 14 — Option C (`browser` plugin)** — RPC adapter over ai-browser daemon socket.
+- [ ] **Step 15 — Option E (`codex` plugin)** — RPC adapter over codex broker; `codex.job_completed` events.
+- [ ] **Step 16 — Option D (`/handoff` + `/catchup` ↔ KB)** — slash skills call `nestctl call kb.ensure` instead of direct `Write`; `event.history` already in place.
+
+**Known gaps surfaced during step 9 plan review** (codex-plan round 2):
+
+- Bridge wire format (`protocol::Event`) carries no origin field. External events crossing daemon → GUI bus arrive as Internal. Daemon-side gate is sufficient for the canonical Option A threat model (system.spawn lives daemon-side) but a Linux GUI-side trigger that calls a privileged action on a hook-originated event would not be gated.
+- Causal taint: `<trigger>.awaited` and action `.completed` events default to Internal regardless of upstream origin. A chained downstream trigger without `accept_external` can fire on completion events caused by external-tagged upstream events.
+- macOS FFI / Swift `BusEvent` lack origin (out of scope while macOS shell is a stub).
+- `ActionRegistry::register_privileged` is not wired. The privileged set is the static `matches!(action, "system.spawn")` only.
+
 ## Pending Cleanup
 
 - [x] ~~Remove nestty-core/pty.rs and state.rs (VTE handles PTY on Linux, SwiftTerm on macOS)~~

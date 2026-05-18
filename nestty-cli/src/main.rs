@@ -24,8 +24,13 @@ fn main() {
     // `socket_path` resolution so an invalid JSON payload fails
     // without ever touching a socket (the generic resolver probes
     // NESTTY_SOCKET + discover_socket as a side effect).
-    if let Command::Event(EventCommand::Publish { kind, payload }) = &cli.command {
-        std::process::exit(dispatch_publish(kind, payload.as_deref(), cli.json));
+    if let Command::Event(EventCommand::Publish {
+        kind,
+        payload,
+        quiet,
+    }) = &cli.command
+    {
+        std::process::exit(dispatch_publish(kind, payload.as_deref(), cli.json, *quiet));
     }
 
     let socket_path = cli.socket.clone().unwrap_or_else(|| {
@@ -172,9 +177,22 @@ fn best_connectable_with_prefix(
     None
 }
 
-fn dispatch_publish(kind: &str, payload: Option<&str>, json: bool) -> i32 {
-    // Local JSON parse so a malformed payload fails before opening the
-    // daemon socket. Defaults to `{}` when omitted.
+fn dispatch_publish(kind: &str, payload: Option<&str>, json: bool, quiet: bool) -> i32 {
+    // Schema checks run BEFORE socket resolution so `--quiet` doesn't
+    // mask caller bugs: a hook script publishing `foo.completed` (a
+    // reserved suffix the daemon would reject) must surface as exit 1
+    // even when nesttyd is down, otherwise the hook author never sees
+    // that their publish call can never succeed.
+    if kind.is_empty() {
+        eprintln!("Error [invalid_params]: kind must not be empty");
+        return 1;
+    }
+    if kind.ends_with(".completed") || kind.ends_with(".failed") {
+        eprintln!(
+            "Error [invalid_params]: events.publish refuses reserved `.completed`/`.failed` kinds — those are the action-registry completion contract"
+        );
+        return 1;
+    }
     let payload_value: serde_json::Value = match payload {
         Some(raw) => match serde_json::from_str(raw) {
             Ok(v) => v,
@@ -186,10 +204,12 @@ fn dispatch_publish(kind: &str, payload: Option<&str>, json: bool) -> i32 {
         None => serde_json::json!({}),
     };
     let Some(socket_path) = nestty_core::paths::daemon_socket_path() else {
-        eprintln!(
-            "Error [no_daemon]: daemon socket path is untrusted or runtime dir missing; is nesttyd running?"
-        );
-        return 1;
+        if !quiet {
+            eprintln!(
+                "Error [no_daemon]: daemon socket path is untrusted or runtime dir missing; is nesttyd running?"
+            );
+        }
+        return if quiet { 0 } else { 1 };
     };
     let params = serde_json::json!({
         "kind": kind,
@@ -207,6 +227,10 @@ fn dispatch_publish(kind: &str, payload: Option<&str>, json: bool) -> i32 {
                 }
                 0
             } else if let Some(err) = response.error {
+                // Schema errors from the daemon (e.g. reserved-kind
+                // rejection) still surface even under --quiet: the
+                // hook author wrote a publish call that can't ever
+                // succeed and the silent path would hide that forever.
                 eprintln!("Error [{}]: {}", err.code, err.message);
                 1
             } else {
@@ -215,8 +239,10 @@ fn dispatch_publish(kind: &str, payload: Option<&str>, json: bool) -> i32 {
             }
         }
         Err(e) => {
-            eprintln!("Failed to connect: {e}");
-            1
+            if !quiet {
+                eprintln!("Failed to connect: {e}");
+            }
+            if quiet { 0 } else { 1 }
         }
     }
 }

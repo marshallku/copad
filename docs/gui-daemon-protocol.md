@@ -79,10 +79,18 @@ Four additions, no removals:
    daemon to a registered GUI. The GUI replies with a normal `Response`
    carrying the matching `id`. This is how `tab.*` / `webview.*` etc. reach
    the GUI after the migration.
-3. **Event `origin` field** — `Event.data` gains a top-level
-   `_origin: "internal" | "external"` key, consumed by the trigger engine's
-   security gate. CLI consumers can ignore it; existing JSON parsing keeps
-   working.
+3. **Event `origin` tagging** — server-side only, on `event_bus::Event`
+   (not on the wire `protocol::Event`). The trigger engine reads
+   `event.origin` to gate fan-out against the trigger's `[security]`
+   block. CLI consumers and `event.subscribe` clients see the same JSON
+   shape they see today; no `_origin` key is added to wire payloads.
+   An earlier draft of this doc proposed stamping `_origin` into
+   `Event.data` — that approach was abandoned because the trigger
+   engine sees the internal `event_bus::Event`, not the wire form, and
+   making clients aware of provenance would expand the public contract
+   without solving the security gate. Bridge-wire propagation across
+   daemon ↔ GUI is a documented follow-up (`harness-integration.md`
+   § Known gaps).
 4. **Optional `target_client_id` on `Request`** — a new top-level optional
    field (serde-skip-if-none, default `None`) lets a caller address a
    specific registered GUI for GUI-owned methods. Existing serializers
@@ -390,38 +398,32 @@ field before forwarding to plugin stdio so plugin protocol stays unchanged.
 
 ## Events with origin
 
-Existing `Event { type, data }` shape unchanged on the wire. The daemon adds
-a stable key to `data`:
+The wire `Event { type, data }` shape is unchanged. Origin lives on the
+internal `event_bus::Event` struct (`Internal | External`, `serde` default
+= `Internal`) and is consulted by `TriggerEngine` at fan-out — it is
+NOT exposed on the subscribe wire today. Subscribers see exactly the
+same JSON they always did.
 
-```jsonc
-{
-  "type": "claude.commit_blocked",
-  "data": {
-    "_origin": "external",           // or "internal"
-    "session_id": "abc-123",
-    "repo": "/home/marshall/dev/nestty",
-    "reason": "missing-review"
-  }
-}
-```
+The chokepoint that stamps `External` is the daemon's `events.publish`
+socket handler — every event that crosses the socket boundary in that
+direction is tagged. All other publishes (plugin stdio, action
+completion fan-out, time-based wakeups) default to `Internal`.
 
-`_origin` is one of:
+Bus-record schema (Rust, not wire):
 
-- `internal` — plugin stdio publishes; daemon-internal code (Phase 14
-  chained `<action>.completed`, cron `time.*`, action-result events).
-- `external` — events arriving via `nestctl event publish`, including hook
-  fires, life-assistant bridge, manual CLI invocations.
+- `internal` — plugin stdio publishes; daemon-internal code (chained
+  `<action>.completed`, cron `time.*`, action-result events).
+- `external` — events arriving via `nestctl event publish`, including
+  hook fires, life-assistant bridge, manual CLI invocations.
 
-`_origin` is set by the daemon at publish time; clients cannot fake it.
-
-TriggerEngine consults `_origin` against each trigger's `[security]` clause
-(see `harness-integration.md` § Trust boundary). Subscribers see `_origin`
-verbatim in the event payload — useful for the monitor panel to badge
-external vs internal flows distinctly.
-
-The reserved `_`-prefix on `_origin` is to avoid collision with plugin event
-payload keys. Plugins are not allowed to set `_origin`; the daemon
-overrides any client-supplied value.
+`TriggerEngine` consults the bus-record `origin` against each trigger's
+`[security]` clause (see `harness-integration.md` § Trust boundary).
+Surfacing origin to `event.subscribe` consumers (so the monitor panel
+can badge external vs internal flows distinctly) is a separable, purely
+additive change tracked as a follow-up. Bridge-wire propagation
+(daemon ↔ GUI carrying origin through `_bus.publish` / event-subscribe
+streaming) is also a documented follow-up — see
+`harness-integration.md` § Known gaps.
 
 ## Subscriptions
 
@@ -522,11 +524,14 @@ participate in Invoke. Concretely:
 
 - `nestctl tab new` → daemon proxies to primary GUI → reply forwarded back.
   Looks identical to today from the CLI's view.
-- `nestctl event subscribe` → daemon streams Events, including `_origin`
-  field which CLI may surface or ignore. Existing parsers that read only
-  `type` + `data` keep working.
-- `nestctl event publish foo.x --json '{"k":"v"}'` (new) → daemon tags origin
-  external, publishes on bus.
+- `nestctl event subscribe` → daemon streams Events. Wire shape is the
+  same `{ type, data, source? }` it always was — origin lives on the
+  server-side bus record, not on the wire. Existing parsers that read
+  only `type` + `data` keep working unchanged.
+- `nestctl event publish foo.x '{"k":"v"}'` (positional JSON payload, optional)
+  → daemon stamps the event `External` on the bus record. `--quiet`
+  exits 0 on transport failures so hook scripts don't break when nesttyd
+  is down.
 
 CLI clients never need to know `client_id` or `gui.register` unless they
 explicitly want to address a specific GUI (`--target_client_id`).

@@ -811,7 +811,7 @@ impl Default for TriggerSubscriptions {
 mod tests {
     use super::*;
     use nestty_core::action_registry::ActionRegistry;
-    use nestty_core::trigger::{TriggerEngine, TriggerSink, WhenSpec};
+    use nestty_core::trigger::{SecurityBlock, TriggerEngine, TriggerSink, WhenSpec};
     use serde_json::Value;
     use std::sync::mpsc::channel;
 
@@ -826,6 +826,7 @@ mod tests {
             params: Value::Null,
             condition: None,
             r#await: None,
+            security: SecurityBlock::default(),
         }
     }
 
