@@ -155,6 +155,30 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
         renderView?.setOSC52Policy(policy)
     }
 
+    /// Config hot-reload: swap the theme on a running pane. Mirrors
+    /// `TerminalViewController.applyTheme` so `PaneManager.applyConfig`
+    /// can fan out theme changes uniformly across both backends.
+    func applyTheme(_ newTheme: NesttyTheme) {
+        theme = newTheme
+        renderView?.setTheme(newTheme)
+    }
+
+    /// Config hot-reload: swap the font family/size on a running pane.
+    /// When the new face changes cell metrics, also resize the term
+    /// grid so the PTY's winsize matches what the renderer will draw.
+    /// (We don't preserve an independent zoom level the way SwiftTerm
+    /// does — alacritty path has no Cmd+/- yet, so baseSize IS the
+    /// active size.)
+    func applyFont(family: String, baseSize: CGFloat) {
+        let newFont = resolveFont(family: family, size: baseSize)
+        guard let render = renderView else { return }
+        let metricsChanged = render.setFont(newFont)
+        if metricsChanged {
+            let (cols, rows) = render.computeGrid()
+            termHandle?.resize(cols: cols, rows: rows)
+        }
+    }
+
     // MARK: - NesttyPanel — background
 
     /// Wire an image background + tint overlay. The render view's layer
@@ -219,7 +243,10 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
 /// and keeping cell math straightforward.
 @MainActor
 private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClient {
-    private let theme: NesttyTheme
+    /// `var` so `setTheme(_:)` can hot-swap on config reload. Draw
+    /// paths read it directly each frame, so a swap takes effect on
+    /// the next paint without further plumbing.
+    private var theme: NesttyTheme
     private var font: NSFont
     private var boldFont: NSFont
     private var italicFont: NSFont
@@ -231,8 +258,9 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// Cached CGColor for the 16-color ANSI palette + xterm 256
     /// extension. Indices 0-15 from `theme.palette` (so theme changes
     /// reflect the right color); 16-231 from the 6×6×6 cube; 232-255
-    /// from the grayscale ramp.
-    private let paletteCache: [CGColor]
+    /// from the grayscale ramp. `var` so `setTheme(_:)` can rebuild it
+    /// on hot-reload — the 256-entry rebuild is cheap.
+    private var paletteCache: [CGColor]
 
     private weak var termHandle: NesttyTermFFI.Handle?
     /// CADisplayLink fires once per display refresh (typically 60 Hz,
@@ -317,6 +345,39 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         // CADisplayLink can't be created until the view has a window
         // (the link binds to the display showing the view). Hooked up
         // in `viewDidMoveToWindow`.
+    }
+
+    /// Hot-reload: swap the theme and rebuild the palette cache.
+    /// Draw paths read `theme` and `paletteCache` directly each frame,
+    /// so the next paint picks up the new colors. Also touches the
+    /// layer bg so a theme change while no image is active flips the
+    /// underlying clear-vs-themed layer (matches what
+    /// `setImageBackgroundActive` does for the image-on path).
+    func setTheme(_ newTheme: NesttyTheme) {
+        theme = newTheme
+        paletteCache = Self.buildPalette(theme: newTheme)
+        if !imageBackgroundActive {
+            layer?.backgroundColor = newTheme.background.nsColor.cgColor
+        }
+        needsDisplay = true
+    }
+
+    /// Hot-reload: swap the font (regular face) and rebuild the bold /
+    /// italic / bold-italic derivatives and cell metrics. Returns true
+    /// when the cell size actually changed so the caller can resize
+    /// the term grid to match — without that, the PTY keeps sending
+    /// content sized to the old grid.
+    @discardableResult
+    func setFont(_ newFont: NSFont) -> Bool {
+        font = newFont
+        boldFont = Self.deriveTrait(newFont, mask: .boldFontMask)
+        italicFont = Self.deriveTrait(newFont, mask: .italicFontMask)
+        boldItalicFont = Self.deriveTrait(newFont, mask: [.boldFontMask, .italicFontMask])
+        let oldW = cellWidth
+        let oldH = cellHeight
+        recomputeCellMetrics()
+        needsDisplay = true
+        return cellWidth != oldW || cellHeight != oldH
     }
 
     /// Called by the controller when `applyBackground` / `clearBackground`

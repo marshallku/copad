@@ -300,13 +300,13 @@ final class PaneManager {
             term.applyFont(family: newConfig.fontFamily, baseSize: CGFloat(newConfig.fontSize))
             term.applyOSC52Policy(newConfig.osc52)
         }
-        // Fan out the security policy to alacritty panes too so a flip
-        // from `allow` → `deny` takes effect immediately. Theme/font
-        // hot-reload for the alacritty backend is wider scope (it'd
-        // need to rebuild the palette cache + font derivatives) and
-        // is deferred to a later phase.
+        // Fan out theme/font/security to alacritty panes too. Phase 10
+        // flips the default backend, so an existing user editing their
+        // config expects the same hot-reload UX on either renderer.
         for pane in root.allLeaves() {
             if let alac = pane as? AlacrittyTerminalViewController {
+                alac.applyTheme(newTheme)
+                alac.applyFont(family: newConfig.fontFamily, baseSize: CGFloat(newConfig.fontSize))
                 alac.applyOSC52Policy(newConfig.osc52)
             }
         }
