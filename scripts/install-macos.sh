@@ -175,14 +175,21 @@ cat > "$CONTENTS/Info.plist" <<'EOF'
 </plist>
 EOF
 
-# 4. Install — replace any prior bundle in one rename so a partially-failed
+# 4. Sign the staging bundle with a stable self-signed cert. Without
+#    this, swift's ad-hoc linker signature gives a fresh cdhash on every
+#    build, so macOS TCC treats each install as a different app and
+#    re-prompts for every permission grant. Signing at staging means
+#    --system installs don't need sudo for codesign.
+"$REPO_ROOT/scripts/codesign-dev.sh" "$STAGING"
+
+# 5. Install — replace any prior bundle in one rename so a partially-failed
 #    install never leaves $APP_DEST in a broken state.
 echo "==> installing $APP_NAME to $APP_DEST"
 mkdir -p "$APP_DEST" 2>/dev/null || $SUDO_APP mkdir -p "$APP_DEST"
 $SUDO_APP rm -rf "$APP_DEST/$APP_NAME"
 $SUDO_APP mv "$STAGING" "$APP_DEST/$APP_NAME"
 
-# 5. Install nestctl via cargo install (writes to ~/.cargo/bin). This
+# 6. Install nestctl via cargo install (writes to ~/.cargo/bin). This
 #    is the canonical CLI install path on macOS — `cargo install nestty-cli`
 #    fails (not on crates.io) and `cargo install --path .` fails (workspace
 #    root is a virtual manifest), so we wrap the correct invocation here.
@@ -191,7 +198,7 @@ if $DO_NESTCTL; then
     cargo install --path "$REPO_ROOT/nestty-cli"
 fi
 
-# 6. Build + install macOS-buildable plugins. PluginSupervisor (PR 3) reads
+# 7. Build + install macOS-buildable plugins. PluginSupervisor (PR 3) reads
 #    ~/Library/Application Support/nestty/plugins/<name>/ at startup; we
 #    cargo-build the binary and copy the manifest. Manifest's
 #    `services.exec` is resolved against the plugin dir first, so we drop

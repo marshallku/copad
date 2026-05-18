@@ -63,6 +63,12 @@ cat > "$CONTENTS/Info.plist" << 'EOF'
 </plist>
 EOF
 
+# Sign the bundle with a stable self-signed identity so macOS TCC keeps
+# remembering granted permissions (Accessibility, Input Monitoring, …)
+# across rebuilds. Without this step swift's ad-hoc linker signature
+# changes cdhash every build and TCC re-prompts.
+"$SCRIPT_DIR/../scripts/codesign-dev.sh" "$APP_DIR"
+
 # Kill any running instance first so the rebuilt binary is used
 pkill -x Nestty 2>/dev/null || true
 sleep 0.3
