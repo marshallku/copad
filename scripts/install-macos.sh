@@ -51,6 +51,7 @@ SYSTEM_INSTALL=false
 DO_NESTCTL=true
 DO_NESTTYD=true
 DO_PLUGINS=true
+DO_DAEMON=true
 DO_LAUNCH=false
 
 # macOS-buildable plugins. All first-party plugins now compile on macOS:
@@ -78,6 +79,8 @@ while [[ $# -gt 0 ]]; do
         --no-nestctl)  DO_NESTCTL=false ; shift ;;
         --no-nesttyd)  DO_NESTTYD=false ; shift ;;
         --no-plugins)  DO_PLUGINS=false ; shift ;;
+        --no-daemon)   DO_DAEMON=false ; shift ;;
+        --with-daemon) DO_DAEMON=true ; shift ;;
         --launch)      DO_LAUNCH=true ; shift ;;
         -h|--help)
             sed -n '2,/^set -euo/p' "$0" | grep -E '^# ' | sed 's/^# \?//'
@@ -248,6 +251,59 @@ if $DO_PLUGINS; then
         chmod 755 "$plugin_dir/$crate"
         echo "ok    plugin $name → $plugin_dir/"
     done
+fi
+
+# 8. Install the LaunchAgent plist so nesttyd auto-starts at login
+#    (and `KeepAlive=true` restarts it on crash). The plist template
+#    in dist/launchd/ uses HOME_PLACEHOLDER tokens because launchd
+#    does not expand `~` — we rewrite them with the user's actual
+#    HOME during install. `launchctl bootstrap` is the modern
+#    replacement for `launchctl load`; we `bootout` first to make
+#    this idempotent across re-runs.
+if $DO_DAEMON; then
+    if command -v launchctl >/dev/null 2>&1 && $DO_NESTTYD; then
+        PLIST_SRC="$REPO_ROOT/dist/launchd/com.marshall.nestty.daemon.plist"
+        PLIST_DST="$HOME/Library/LaunchAgents/com.marshall.nestty.daemon.plist"
+        if [[ ! -f "$PLIST_SRC" ]]; then
+            echo "warn: $PLIST_SRC missing — skipping LaunchAgent install" >&2
+        else
+            echo "==> installing LaunchAgent plist into $PLIST_DST"
+            mkdir -p "$(dirname "$PLIST_DST")"
+            # XML-escape `$HOME` then drop it into the plist. Two
+            # bash-version pitfalls compound here:
+            # 1. Bash 5.3+ defaults `patsub_replacement` ON, which
+            #    expands `&` in `${var//pat/repl}` replacements to
+            #    the matched substring. That breaks BOTH the
+            #    escape passes below (`&amp;`/`&lt;`/`&gt;` all
+            #    contain `&`) AND the final HOME_PLACEHOLDER
+            #    substitution. Disable it FIRST so every later
+            #    substitution treats `repl` as literal text.
+            #    Codex C1 step 7 rounds 2-3 + round 5.
+            # 2. plist `<string>...</string>` is XML — raw `&`/`<`
+            #    breaks plistlib. Order escapes so the `&` we
+            #    inject for `&amp;` is not re-escaped by later
+            #    passes. Codex C1 step 7 round 4.
+            shopt -u patsub_replacement 2>/dev/null || true
+            HOME_ESC=$HOME
+            HOME_ESC=${HOME_ESC//&/&amp;}
+            HOME_ESC=${HOME_ESC//</&lt;}
+            HOME_ESC=${HOME_ESC//>/&gt;}
+            PLIST_TEXT=$(cat "$PLIST_SRC")
+            PLIST_TEXT=${PLIST_TEXT//HOME_PLACEHOLDER/$HOME_ESC}
+            printf '%s\n' "$PLIST_TEXT" > "$PLIST_DST"
+            chmod 644 "$PLIST_DST"
+            launchctl bootout "gui/$UID/com.marshall.nestty.daemon" 2>/dev/null || true
+            launchctl bootstrap "gui/$UID" "$PLIST_DST"
+            echo "    launchctl list | grep nestty       # to inspect"
+            echo "    tail ~/Library/Logs/nestty-daemon.{out,err}.log  # logs"
+        fi
+    else
+        if ! command -v launchctl >/dev/null 2>&1; then
+            echo "warn: launchctl not on PATH; skipping LaunchAgent install."
+        elif ! $DO_NESTTYD; then
+            echo "note: skipping LaunchAgent install because --no-nesttyd was passed."
+        fi
+    fi
 fi
 
 if $DO_LAUNCH; then

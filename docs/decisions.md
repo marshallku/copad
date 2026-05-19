@@ -701,3 +701,38 @@ The garbage-bias-enabled rule is deliberate: a typo like `NESTTYD_HOST_TRIGGERS=
 **Test coverage:** 3 unit tests on the pure parser (unset enables, disable-token list, garbage enables). Existing tests for hot reload + trigger dispatch unchanged.
 
 **See:** `nestty-daemon/src/main.rs` (`env_flag_default_on` parser + call-site swap + 3 unit tests in `mod tests`), `examples/triggers/claude-hooks.toml` (trigger blocks + hook-script copy-paste guide), `docs/harness-integration.md` § Sequencing step 10 (Option A slice 1A marked done).
+
+
+## 40. `nesttyd` auto-start via systemd `--user` / launchd (harness-integration step 7)
+
+**Problem:** Through #37 / #38 / #39, the harness loop wires up: hook → `nestctl event publish` → trust-boundary gate → trigger → `notify.show` → toast. But `nesttyd` itself had no production install path — running it required `nohup ~/.local/bin/nesttyd &` from a live shell, and a reboot or fresh SSH session reached a daemon-less host where every `--quiet`-flagged publish silently no-op'd. User asked: "이게 있어야 그냥 ssh로 세션 시작해도 바로 작업할 수 있는 거 아니야?" — exactly. Step 7 closes that gap.
+
+**Decision:** Ship two service templates + wire install scripts to drop them and enable the unit:
+
+- **Linux**: `dist/systemd/nestty-daemon.service` (user-level unit). `install-dev.sh` (default `--with-daemon` on) copies it to `~/.config/systemd/user/`, runs `daemon-reload` + `enable` + `restart`. The explicit `restart` (rather than `enable --now`) covers re-installs where the binary changed but the unit was already active — `--now` is a no-op for a running service and would silently keep the old binary executing. `ExecStart` carries a `NESTTYD_BIN_PATH` placeholder rewritten at copy time so `--user` and `--system` installs both point at the right path. systemd restarts on crash (`Restart=on-failure`, `RestartSec=10`), pipes logs through the journal at `RUST_LOG=info`.
+
+- **macOS**: `dist/launchd/com.marshall.nestty.daemon.plist`. `install-macos.sh` (default `--with-daemon` on) rewrites `HOME_PLACEHOLDER` tokens to `$HOME`, drops the plist at `~/Library/LaunchAgents/`, runs `launchctl bootout` (idempotent) then `launchctl bootstrap gui/$UID`. `KeepAlive=true` + `RunAtLoad=true` gives the same crash-restart + login-start semantics. `ProcessType=Interactive` matches Aqua-app scheduler priority so trigger pump latency stays human-acceptable.
+
+**Key decisions in the unit/plist text:**
+- **`Restart=on-failure` not `always`** — exit 0 (graceful `systemctl stop`) shouldn't restart. Mirrors KeepAlive's "always running" but only on unexpected exit; deliberate manual stop is honored.
+- **`After=default.target` (Linux)** — wait until the user session has `XDG_RUNTIME_DIR` mounted + DBus address set before the daemon tries to bind its socket / talk to plugins.
+- **`%h` placeholders in systemd, `HOME_PLACEHOLDER` rewrite in plist** — systemd resolves `%h` at unit load; launchd doesn't expand `~` and has no equivalent specifier, so the install script must substitute. Same shape — different mechanism per platform.
+- **`LimitNOFILE=4096`** on Linux — defense in depth against a runaway plugin fork-bomb landing through the supervisor. The daemon's own thread pool is already bounded; this is the kernel-level ceiling.
+- **Logs go to journal (Linux) / `~/Library/Logs/nestty-daemon.{out,err}.log` (macOS)** — matches what users already know to look at on each platform. `tail` works on macOS; `journalctl --user -u nestty-daemon -f` works on Linux. Avoid forcing a custom log path on either.
+
+**Bundled `nesttyd` install fix.** `install-dev.sh` previously only installed `nestty` + `nestctl` — the daemon binary was an orphan that users had to `cp target/release/nesttyd ~/.local/bin/` by hand. The script now bundles it (the for-loop iterates `nestty nestctl nesttyd`), so a single `install-dev.sh` invocation gives the full GUI + CLI + daemon set. Pre-existing manual installs are silently overwritten; the daemon owns no on-disk state beyond the socket file (recreated on bind), so no state migration is needed.
+
+**Linger left as user policy.** `loginctl enable-linger <user>` is documented + reminded by `install-dev.sh` when it's OFF, but not auto-enabled. The choice ON vs OFF is meaningful — boot-time start (linger ON) vs first-login start (linger OFF). Each has trade-offs: linger ON wastes resources for users who don't open SSH while logged out; linger OFF means cron / background jobs can't publish events to the daemon. Document the choice; user opts in if they need it.
+
+**SSH `RemoteForward` documented** in `docs/harness-hooks.md` § "SSH + daemon lifecycle". Cross-machine hook flow: workstation runs `nesttyd`, remote box forwards `$XDG_RUNTIME_DIR/nestty/socket` via SSH config, hooks on remote publish events that land on the workstation's bus, triggers fire there, toasts appear on the workstation desktop. The trust boundary (#37) handles SSH-forwarded events the same as local socket publishes — `External` origin uniformly — so no special-case SSH plumbing was needed in the daemon.
+
+**Live verification (Linux):**
+- `systemd-analyze --user verify dist/systemd/nestty-daemon.service` clean (no output).
+- `install-dev.sh --with-daemon` against a running prior daemon: killed the manual `nesttyd`, copied the unit, `daemon-reload` + `enable` + `restart` brought up a new one. `nestctl ping` returned OK against the systemd-managed instance. Re-install verified PID change (`MainPID` 2147258 → 2210576).
+- `kill -9 $(systemctl --user show -p MainPID --value nestty-daemon)` triggered the 10s back-off, then systemd respawned. Verified by polling `systemctl --user is-active`.
+
+**macOS** — plist passed `xmllint` + Python's `plistlib.loads`. First install on a real macOS box is left to the user (same trust-the-template model as `install-macos.sh`'s existing flow).
+
+**Out of scope (followups):** `install-macos.sh` currently uses `cargo install --path nestty-daemon`, which always lands the binary at `~/.cargo/bin/nesttyd` regardless of the `--system` flag (`--system` only flips the `.app` destination between `~/Applications` and `/Applications`). The plist matches that — `ProgramArguments` hardcodes `~/.cargo/bin/nesttyd`. If a future macOS install path migrates nesttyd to a global location (`/usr/local/bin` or `/opt/`), the plist needs a parallel path placeholder. Auto-enable linger on Linux — declined; per-user policy.
+
+**See:** `dist/systemd/nestty-daemon.service`, `dist/launchd/com.marshall.nestty.daemon.plist`, `scripts/install-dev.sh` (`--with-daemon`/`--no-daemon` + `nesttyd` in the binary loop), `scripts/install-macos.sh` (same flag pair + LaunchAgent install block), `docs/harness-hooks.md` § "SSH + daemon lifecycle".

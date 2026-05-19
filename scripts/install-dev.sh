@@ -18,6 +18,7 @@
 #   ./scripts/install-dev.sh --system       # install to /usr/local/bin (requires sudo)
 #   ./scripts/install-dev.sh --no-build     # skip cargo build (use existing target/release)
 #   ./scripts/install-dev.sh --no-plugins   # skip the plugin install step
+#   ./scripts/install-dev.sh --no-daemon    # skip the systemd --user unit install
 #   ./scripts/install-dev.sh --restart      # also `pkill -x nestty` afterwards
 #
 # By default this is a USER install (`~/.local/bin`, no sudo). User
@@ -36,6 +37,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET="$REPO_ROOT/target/release"
 DO_BUILD=true
 DO_PLUGINS=true
+DO_DAEMON=true
 DO_RESTART=false
 USER_INSTALL=true
 
@@ -45,6 +47,8 @@ while [ "$#" -gt 0 ]; do
         --system)      USER_INSTALL=false ; shift ;;
         --no-build)    DO_BUILD=false ; shift ;;
         --no-plugins)  DO_PLUGINS=false ; shift ;;
+        --no-daemon)   DO_DAEMON=false ; shift ;;
+        --with-daemon) DO_DAEMON=true ; shift ;;       # explicit; default is on
         --restart)     DO_RESTART=true ; shift ;;
         -h|--help)
             sed -n '2,/^set -euo/p' "$0" | grep -E '^# ' | sed 's/^# \?//'
@@ -74,7 +78,7 @@ if $DO_BUILD; then
     cargo build --release --workspace --manifest-path "$REPO_ROOT/Cargo.toml"
 fi
 
-for bin in nestty nestctl; do
+for bin in nestty nestctl nesttyd; do
     src="$TARGET/$bin"
     if [ ! -x "$src" ]; then
         echo "error: $src not built — run with default flags or 'cargo build --release'" >&2
@@ -82,15 +86,20 @@ for bin in nestty nestctl; do
     fi
 done
 
-echo "==> installing nestty + nestctl into $INSTALL_DIR"
+echo "==> installing nestty + nestctl + nesttyd into $INSTALL_DIR"
 if [ -n "$SUDO" ]; then
     # `install -m755` on existing files just rewrites; safe to repeat.
+    # nesttyd is the always-on daemon for trigger dispatch + plugin
+    # supervision — bundling it here means a single install gives
+    # the user the full GUI + CLI + daemon set.
     $SUDO install -Dm755 "$TARGET/nestty" "$INSTALL_DIR/nestty"
     $SUDO install -Dm755 "$TARGET/nestctl" "$INSTALL_DIR/nestctl"
+    $SUDO install -Dm755 "$TARGET/nesttyd" "$INSTALL_DIR/nesttyd"
 else
     mkdir -p "$INSTALL_DIR"
     install -Dm755 "$TARGET/nestty" "$INSTALL_DIR/nestty"
     install -Dm755 "$TARGET/nestctl" "$INSTALL_DIR/nestctl"
+    install -Dm755 "$TARGET/nesttyd" "$INSTALL_DIR/nesttyd"
 fi
 
 echo "==> installing desktop entry + hicolor icons into ${DESKTOP_DIR%/applications} / $ICON_BASE"
@@ -141,6 +150,67 @@ fi
 if $DO_PLUGINS; then
     echo "==> installing first-party plugin manifests + binary symlinks"
     bash "$REPO_ROOT/scripts/install-plugins.sh"
+fi
+
+if $DO_DAEMON; then
+    # `systemd --user` unit install. Without this, nesttyd never starts
+    # automatically — every reboot or new SSH session leaves the user
+    # with no daemon, and harness publishes silently no-op via the
+    # --quiet path. The block below copies the unit + does
+    # daemon-reload / enable / restart so the binary is picked up on
+    # both first install and subsequent re-installs (where the unit
+    # is already active and `enable --now` would no-op the start).
+    # On systems with `loginctl enable-linger <user>` set, the daemon
+    # also survives logout. See docs/harness-hooks.md "SSH + daemon
+    # lifecycle".
+    if command -v systemctl >/dev/null 2>&1; then
+        UNIT_DST="$HOME/.config/systemd/user"
+        UNIT_SRC="$REPO_ROOT/dist/systemd/nestty-daemon.service"
+        if [ ! -f "$UNIT_SRC" ]; then
+            echo "warn: $UNIT_SRC missing — skipping daemon service install" >&2
+        else
+            echo "==> installing systemd --user unit into $UNIT_DST"
+            mkdir -p "$UNIT_DST"
+            # Rewrite NESTTYD_BIN_PATH to the actual install location.
+            # Bash 5.3+ defaults `patsub_replacement` ON, which makes
+            # unescaped `&` in `${var//pat/repl}` expand to the
+            # matched text — same hazard as sed/awk. Disable the
+            # shopt so the replacement is guaranteed literal. The
+            # shopt name was introduced in bash 5.3 so the unset
+            # error-no-ops on older bash. Codex C1 step 7 rounds 2-3.
+            shopt -u patsub_replacement 2>/dev/null || true
+            UNIT_TEXT=$(cat "$UNIT_SRC")
+            UNIT_TEXT=${UNIT_TEXT//NESTTYD_BIN_PATH/$INSTALL_DIR/nesttyd}
+            printf '%s\n' "$UNIT_TEXT" > "$UNIT_DST/nestty-daemon.service"
+            chmod 644 "$UNIT_DST/nestty-daemon.service"
+            # daemon-reload picks up the unit. `enable` creates the
+            # WantedBy symlink so the unit starts on next user-session
+            # boot. `restart` covers BOTH the first-install case
+            # (restart of an inactive unit ≡ start) AND the re-install
+            # case where the binary changed and we need the running
+            # daemon to pick it up. `enable --now` would silently
+            # leave the old binary in place if the unit was already
+            # active. Codex C1 step 7 round 6.
+            systemctl --user daemon-reload
+            systemctl --user enable nestty-daemon.service
+            systemctl --user restart nestty-daemon.service
+            echo "    systemctl --user status nestty-daemon  # to inspect"
+            echo "    journalctl --user -u nestty-daemon -f  # to tail logs"
+            # Linger reminder — not enabled automatically (per-user
+            # policy decision). Without it, daemon dies on last logout.
+            if ! loginctl show-user "$USER" --property=Linger 2>/dev/null | grep -q '^Linger=yes$'; then
+                echo
+                echo "note: linger is OFF for $USER — nesttyd will die on last logout."
+                echo "      to keep it running across logout (so boot starts the daemon"
+                echo "      and SSH connects to an already-running instance):"
+                echo "          sudo loginctl enable-linger $USER"
+            fi
+        fi
+    else
+        echo "warn: systemctl not on PATH; skipping daemon service install."
+        echo "warn: on non-systemd systems, run nesttyd via your own init"
+        echo "warn: (OpenRC / runit / direct nohup ~/.local/bin/nesttyd)."
+    fi
 fi
 
 if $DO_RESTART; then

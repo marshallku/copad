@@ -1,0 +1,37 @@
+[Unit]
+Description=nestty daemon (action registry, trigger engine, plugin supervisor)
+Documentation=https://github.com/marshallku/nestty
+Documentation=file:%h/dev/nestty/docs/harness-integration.md
+# Wait for the user session to be fully up so DBUS_SESSION_BUS_ADDRESS
+# resolves and XDG_RUNTIME_DIR is mounted. default.target is the
+# user-instance equivalent of multi-user.target.
+After=default.target
+
+[Service]
+Type=simple
+# `NESTTYD_BIN_PATH` is rewritten by `scripts/install-dev.sh` at copy
+# time to match the install location (`--user` → ~/.local/bin/nesttyd,
+# `--system` → /usr/local/bin/nesttyd). Systemd does not expand `~`
+# or `$HOME` and has no specifier that picks between user vs system
+# install dirs, so sed substitution on the template is the simplest
+# way to keep one unit file in tree. Codex C1 step 7.
+ExecStart=NESTTYD_BIN_PATH
+# Restart on crash but not on intentional `systemctl stop` (success).
+Restart=on-failure
+# 10s back-off lets the daemon settle if a transient cause (socket
+# path busy on rapid restart) is the trigger; tighter values risk
+# tight restart loops on persistent config errors.
+RestartSec=10
+# Pump nesttyd info-level logs into the journal. Set RUST_LOG=debug
+# in `systemctl --user edit nestty-daemon` to override per-deployment.
+Environment=RUST_LOG=info
+# Limit runaway memory + thread pool damage. nesttyd's own thread
+# pool is bounded; this is a defense in depth against plugin
+# fork-bombs landing through the supervisor.
+LimitNOFILE=4096
+
+[Install]
+# user-instance equivalent of multi-user.target — `systemctl --user
+# enable nestty-daemon` creates the WantedBy symlink under
+# ~/.config/systemd/user/default.target.wants/.
+WantedBy=default.target

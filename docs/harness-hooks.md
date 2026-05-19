@@ -274,6 +274,83 @@ If the toast doesn't appear:
 - **`nestctl: command not found`** → install nestty
   (`./scripts/install-dev.sh`) or check PATH.
 
+## SSH + daemon lifecycle
+
+For the hook → toast loop to work in a fresh shell (especially an SSH
+session), `nesttyd` must already be running. The systemd `--user` unit
+shipped at `dist/systemd/nestty-daemon.service` (installed by
+`install-dev.sh` by default) wires this up. macOS users get the
+matching LaunchAgent plist at `dist/launchd/com.marshall.nestty.daemon.plist`
+through `install-macos.sh`.
+
+### Linux: linger choice
+
+systemd starts the user-instance on the first login and stops it on
+the last logout — by default. That means:
+
+- **linger OFF (default)**: daemon comes up on first SSH (or graphical
+  login) and dies when every login session exits. A fresh SSH after
+  full logout starts a new daemon. Fine for most setups.
+- **linger ON**: daemon starts at boot, survives logout, stays up
+  across SSH disconnects. Required if you want hook events from a
+  cron / background job that never had an interactive login.
+
+Enable linger if you want boot-time start:
+
+```bash
+sudo loginctl enable-linger "$USER"
+```
+
+Verify with `loginctl show-user $USER --property=Linger` (`Linger=yes`).
+
+`install-dev.sh` prints a reminder when linger is off so you don't
+get blindsided by "daemon disappears after SSH disconnect".
+
+### Cross-machine: SSH `RemoteForward`
+
+When Claude Code runs on a remote box (and the hooks fire there), the
+hook scripts need a daemon socket. Forward the workstation's socket
+via SSH:
+
+```sshconfig
+# ~/.ssh/config
+Host my-remote
+    RemoteForward /run/user/1000/nestty/socket /run/user/1000/nestty/socket
+```
+
+`/run/user/1000` resolves to `$XDG_RUNTIME_DIR` for UID 1000; adjust if
+your UID differs (`id -u`). After connecting:
+
+- Hooks on `my-remote` see a Unix socket at the same path locally.
+- Events publish over that socket to the workstation's daemon.
+- Trust boundary tags them `External` origin (same as local hook
+  events — the SSH transport is irrelevant to the trust model).
+- Triggers with `accept_external = true` fire on the workstation;
+  the toast appears on the local desktop.
+
+If the forward fails (path occupied, permission denied), `nestctl`
+just falls back to "no daemon" and `--quiet` exits 0 silently. Hooks
+don't break.
+
+### Troubleshooting
+
+- **`systemctl --user status nestty-daemon` → "not loaded"** →
+  `install-dev.sh` wasn't run with `--with-daemon` (or it ran on a
+  system without systemd). Re-run, or manually copy
+  `dist/systemd/nestty-daemon.service` to `~/.config/systemd/user/`.
+
+- **"daemon dies on logout"** → linger off. Enable per above.
+
+- **SSH login does NOT auto-start the daemon** → linger on (the user
+  instance is already running, no first-login event to trigger the
+  unit). Restart manually: `systemctl --user restart nestty-daemon`.
+  OR: linger off but unit not enabled — `systemctl --user enable --now
+  nestty-daemon`.
+
+- **`nestctl event publish ...` from a remote SSH session times out**
+  → `RemoteForward` not set in `~/.ssh/config`, or
+  `$XDG_RUNTIME_DIR/nestty/socket` doesn't exist on the workstation.
+
 ## Trust boundary recap
 
 Events published from these hooks are tagged `Origin::External` by the
