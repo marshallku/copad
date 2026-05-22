@@ -1263,6 +1263,52 @@ pub unsafe extern "C" fn nestty_term_mouse_encoding(handle: *mut NesttyHandle) -
     }
 }
 
+pub const NESTTY_MOUSE_LEVEL_NONE: u8 = 0;
+pub const NESTTY_MOUSE_LEVEL_CLICK: u8 = 1;
+pub const NESTTY_MOUSE_LEVEL_DRAG: u8 = 2;
+pub const NESTTY_MOUSE_LEVEL_MOTION: u8 = 3;
+
+/// Highest mouse-reporting level currently negotiated by the TUI.
+/// The three xterm modes are mutually exclusive on the TUI side
+/// (turning one on clears the others), so we collapse to a single
+/// scalar instead of exposing the flag bitmask:
+///
+///   0 = NONE (no reporting; renderer keeps mouse for selection)
+///   1 = CLICK   — `\e[?1000h` — press + release only
+///   2 = DRAG    — `\e[?1002h` — adds motion ONLY while a button is held
+///   3 = MOTION  — `\e[?1003h` — all motion, even with no buttons down
+///
+/// `MOTION` implies `DRAG` implies `CLICK` for forwarding purposes —
+/// the renderer should always send press/release when any level is on,
+/// drag events at DRAG/MOTION, and bare-cursor motion only at MOTION.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `nestty_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_term_mouse_report_level(handle: *mut NesttyHandle) -> u8 {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return NESTTY_MOUSE_LEVEL_NONE;
+    };
+    let term = h.term.lock();
+    use alacritty_terminal::term::TermMode as M;
+    let mode = term.mode();
+    // Highest active wins. alacritty_terminal masks the previous mode
+    // when a new one is enabled (see TermMode::set_named_private_mode),
+    // so in practice only one bit is set — but checking highest-first
+    // keeps the renderer robust against any future overlap.
+    if mode.contains(M::MOUSE_MOTION) {
+        NESTTY_MOUSE_LEVEL_MOTION
+    } else if mode.contains(M::MOUSE_DRAG) {
+        NESTTY_MOUSE_LEVEL_DRAG
+    } else if mode.contains(M::MOUSE_REPORT_CLICK) {
+        NESTTY_MOUSE_LEVEL_CLICK
+    } else {
+        NESTTY_MOUSE_LEVEL_NONE
+    }
+}
+
 /// True if the terminal has bracketed paste mode enabled (`\e[?2004h`).
 /// Renderer wraps Cmd+V'd text in `\e[200~ … \e[201~` when this is
 /// true so paste-aware programs (zsh, neovim with `set paste`, etc.)

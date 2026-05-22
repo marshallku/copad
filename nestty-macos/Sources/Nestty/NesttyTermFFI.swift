@@ -167,6 +167,22 @@ enum NesttyTermFFI {
             return MouseEncoding(rawValue: nestty_term_mouse_encoding(ptr)) ?? .none
         }
 
+        /// Highest mouse-reporting level negotiated by the TUI. Tiers
+        /// stack: `.motion` ⊇ `.drag` ⊇ `.click`. Renderer uses this
+        /// to gate event forwarding — press/release at any level,
+        /// drag-with-button-held at `.drag`+, bare-motion at `.motion`.
+        enum MouseReportLevel: UInt8 {
+            case none = 0
+            case click = 1
+            case drag = 2
+            case motion = 3
+        }
+
+        var mouseReportLevel: MouseReportLevel {
+            guard let ptr else { return .none }
+            return MouseReportLevel(rawValue: nestty_term_mouse_report_level(ptr)) ?? .none
+        }
+
         /// True when the terminal has `\e[?2004h` bracketed paste on.
         var bracketedPasteActive: Bool {
             guard let ptr else { return false }

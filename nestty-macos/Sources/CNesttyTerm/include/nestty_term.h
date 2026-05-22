@@ -143,6 +143,16 @@ bool nestty_term_bracketed_paste_active(NesttyHandle* handle);
 #define NESTTY_MOUSE_ENC_UTF8   3
 uint8_t nestty_term_mouse_encoding(NesttyHandle* handle);
 
+// Highest mouse-reporting level the TUI has enabled. Tiers stack:
+// MOTION ⊇ DRAG ⊇ CLICK. Renderer uses this to gate which AppKit
+// mouse events should forward (press/release always at CLICK+,
+// drag-while-button-held at DRAG+, bare motion at MOTION).
+#define NESTTY_MOUSE_LEVEL_NONE   0
+#define NESTTY_MOUSE_LEVEL_CLICK  1
+#define NESTTY_MOUSE_LEVEL_DRAG   2
+#define NESTTY_MOUSE_LEVEL_MOTION 3
+uint8_t nestty_term_mouse_report_level(NesttyHandle* handle);
+
 // Drain the most-recent pending OSC 52 clipboard-store request.
 // Returns NULL when nothing pending. Caller frees with
 // nestty_string_destroy and gates the system clipboard write on

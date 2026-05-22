@@ -1080,14 +1080,125 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     }
 
     /// When a TUI has any mouse-reporting mode on (`vim` with
-    /// `set mouse=a`, `less`, `htop`, …), plain drag goes to the TUI
-    /// — Shift held overrides so the user can still grab text. The
-    /// renderer doesn't *forward* mouse events to the PTY yet
-    /// (deferred to a future phase), so plain drag in mouse-mode
-    /// apps is a no-op until forwarding lands.
+    /// `set mouse=a`, `less`, `htop`, tmux with `set -g mouse on`,
+    /// …), the click/drag goes to the TUI — Shift held overrides so
+    /// the user can still grab text into the host selection.
+    /// Forwarding (`forwardMouseEvent`) covers wheel + press/release +
+    /// drag-with-button-held; bare-cursor MOTION-level forwarding
+    /// (`\e[?1003h`) is not wired yet — rare in practice, deferred.
     private func shouldHandleAsSelection(_ event: NSEvent) -> Bool {
         if event.modifierFlags.contains(.shift) { return true }
         return !(termHandle?.mouseModeActive ?? false)
+    }
+
+    // MARK: - Mouse event forwarding (mouse-mode TUIs)
+
+    /// "press" emits SGR `M` (or legacy press byte); "release" emits
+    /// SGR `m` (or legacy button=3 release-marker); "motion" emits
+    /// SGR `M` with the motion bit (32) set in the button code. Used
+    /// only when a TUI has mouse reporting on AND Shift is not held.
+    private enum MouseForwardKind { case press, release, motion }
+
+    /// Last cell forwarded by a motion event. -1 = sentinel meaning
+    /// "next motion will emit unconditionally". Reset on every
+    /// press/release so the first drag-tick after a fresh click fires
+    /// even when the cursor hasn't crossed a cell boundary. Without
+    /// this, dragging within a single cell would never publish.
+    private var lastMotionCol: Int = -1
+    private var lastMotionRow: Int = -1
+
+    private func forwardMouseEvent(event: NSEvent, button: Int, kind: MouseForwardKind) {
+        guard let h = termHandle else { return }
+        let encoding = h.mouseEncoding
+        guard encoding != .none else { return }
+        let (col, row) = mouseCellCoord(for: event)
+        if kind == .motion {
+            // Cell-granularity throttle. Motion events fire every few
+            // pixels on the trackpad — the TUI doesn't care about
+            // sub-cell precision, so dedupe by grid coord.
+            guard col != lastMotionCol || row != lastMotionRow else { return }
+            lastMotionCol = col
+            lastMotionRow = row
+        } else {
+            lastMotionCol = -1
+            lastMotionRow = -1
+        }
+        let modBits = mouseModifierBits(event)
+        let motionBit = (kind == .motion) ? 32 : 0
+        // SGR carries the button identity through release; legacy /
+        // UTF8 collapse all releases to button-code 3 (xterm convention).
+        let buttonCode: Int = switch (encoding, kind) {
+        case (.legacy, .release), (.utf8, .release):
+            3 | modBits
+        default:
+            button | modBits | motionBit
+        }
+        sendMouseBytes(
+            buttonCode: buttonCode,
+            col: col, row: row, kind: kind,
+            encoding: encoding, handle: h,
+        )
+    }
+
+    /// 1-based grid coords clamped to the *visible grid extent* (not
+    /// just UInt16). AppKit emits dragged events with coordinates
+    /// outside the view bounds when the user drags past the edge —
+    /// without clamping to (cols, rows), the TUI receives a report
+    /// for e.g. row 65000 and silently ignores it instead of treating
+    /// it as a drag-to-edge. Anchored at the mouse position — same
+    /// convention as `forwardWheel`.
+    private func mouseCellCoord(for event: NSEvent) -> (col: Int, row: Int) {
+        guard cellWidth > 0, cellHeight > 0 else { return (1, 1) }
+        let local = convert(event.locationInWindow, from: nil)
+        let maxCol = max(1, Int(bounds.width / cellWidth))
+        let maxRow = max(1, Int(bounds.height / cellHeight))
+        let col = max(1, min(Int((local.x / cellWidth).rounded(.down)) + 1, maxCol))
+        let row = max(1, min(Int((local.y / cellHeight).rounded(.down)) + 1, maxRow))
+        return (col, row)
+    }
+
+    /// xterm mouse-mode modifier bits: 4=shift, 8=alt/meta, 16=ctrl.
+    /// Shift is intentionally never set — Shift held already bypasses
+    /// forwarding entirely (`shouldHandleAsSelection`), so the bit
+    /// value is moot for our wire output and excluding it keeps the
+    /// "Shift = host selection" contract crisp on the TUI side.
+    private func mouseModifierBits(_ event: NSEvent) -> Int {
+        var bits = 0
+        if event.modifierFlags.contains(.option) { bits |= 8 }
+        if event.modifierFlags.contains(.control) { bits |= 16 }
+        return bits
+    }
+
+    private func sendMouseBytes(
+        buttonCode: Int,
+        col: Int, row: Int, kind: MouseForwardKind,
+        encoding: NesttyTermFFI.Handle.MouseEncoding,
+        handle: NesttyTermFFI.Handle,
+    ) {
+        switch encoding {
+        case .sgr:
+            let suffix = (kind == .release) ? "m" : "M"
+            let s = "\u{1B}[<\(buttonCode);\(col);\(row)\(suffix)"
+            handle.input(Array(s.utf8))
+        case .legacy, .utf8:
+            // Single-byte coord cap at 223 (mouse-spec); +32 offset
+            // matches `forwardWheel`'s legacy path.
+            let cb = UInt8(min(255, buttonCode + 32))
+            let cc = UInt8(min(255, col + 32))
+            let cr = UInt8(min(255, row + 32))
+            handle.input([0x1B, 0x5B, 0x4D, cb, cc, cr])
+        case .none:
+            return
+        }
+    }
+
+    /// Whether a drag event should forward as a motion report. CLICK
+    /// level only wants press/release; DRAG and MOTION want drag too.
+    private func shouldForwardDragMotion() -> Bool {
+        switch termHandle?.mouseReportLevel ?? .none {
+        case .drag, .motion: true
+        case .none, .click: false
+        }
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -1109,8 +1220,8 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             // so the user gets a selection start instead of nothing.
         }
 
-        guard shouldHandleAsSelection(event) else {
-            super.mouseDown(with: event)
+        if !shouldHandleAsSelection(event) {
+            forwardMouseEvent(event: event, button: 0, kind: .press)
             return
         }
         guard let (row, col, side) = gridLocation(for: event), let h = termHandle else {
@@ -1119,6 +1230,62 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         }
         h.selectionStart(row: row, col: col, side: side, kind: selectionKind(for: event))
         needsDisplay = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if !shouldHandleAsSelection(event) {
+            forwardMouseEvent(event: event, button: 0, kind: .release)
+            return
+        }
+        super.mouseUp(with: event)
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        if !shouldHandleAsSelection(event) {
+            forwardMouseEvent(event: event, button: 2, kind: .press)
+            return
+        }
+        super.rightMouseDown(with: event)
+    }
+
+    override func rightMouseUp(with event: NSEvent) {
+        if !shouldHandleAsSelection(event) {
+            forwardMouseEvent(event: event, button: 2, kind: .release)
+            return
+        }
+        super.rightMouseUp(with: event)
+    }
+
+    override func rightMouseDragged(with event: NSEvent) {
+        if !shouldHandleAsSelection(event), shouldForwardDragMotion() {
+            forwardMouseEvent(event: event, button: 2, kind: .motion)
+            return
+        }
+        super.rightMouseDragged(with: event)
+    }
+
+    override func otherMouseDown(with event: NSEvent) {
+        if !shouldHandleAsSelection(event) {
+            forwardMouseEvent(event: event, button: 1, kind: .press)
+            return
+        }
+        super.otherMouseDown(with: event)
+    }
+
+    override func otherMouseUp(with event: NSEvent) {
+        if !shouldHandleAsSelection(event) {
+            forwardMouseEvent(event: event, button: 1, kind: .release)
+            return
+        }
+        super.otherMouseUp(with: event)
+    }
+
+    override func otherMouseDragged(with event: NSEvent) {
+        if !shouldHandleAsSelection(event), shouldForwardDragMotion() {
+            forwardMouseEvent(event: event, button: 1, kind: .motion)
+            return
+        }
+        super.otherMouseDragged(with: event)
     }
 
     /// Resolve the URL at a Cmd+click point and hand it to NSWorkspace.
@@ -1170,8 +1337,13 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     }
 
     override func mouseDragged(with event: NSEvent) {
-        guard shouldHandleAsSelection(event) else {
-            super.mouseDragged(with: event)
+        if !shouldHandleAsSelection(event) {
+            // TUI owns the drag — forward as a motion-with-button-1
+            // when the TUI subscribed to DRAG / MOTION level. CLICK-
+            // level subscribers only see press/release, never drag.
+            if shouldForwardDragMotion() {
+                forwardMouseEvent(event: event, button: 0, kind: .motion)
+            }
             return
         }
         guard let (row, col, side) = gridLocation(for: event), let h = termHandle else {
