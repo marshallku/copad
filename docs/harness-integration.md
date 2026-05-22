@@ -377,7 +377,9 @@ silent-fail on missing socket. Tags every emitted event with
 
 Rationale for not building the `notify-webhook` abstract sink plugin yet: Rule of Three. Build the abstract surface when the second integration (ntfy/Slack/PagerDuty) shows what actually differs from Discord. Today the `discord.send_message` action already handles bot auth, ratelimits, and failure shapes — duplicating that path through a webhook indirection for the single Discord case would be premature abstraction.
 
-State lives in existing harness files; no duplicate cache. Slice 1A + 1B effort: ~2 days total. Remaining `claude.*` data-surfacing actions (`claude.session_state` / `claude.list_dirty` / `claude.last_handoff` / `claude.list_sessions`) deferred to Slice 2.
+**Slice 1B+ — presence detector recipes (`examples/presence/`).** What flips `presence` is **policy that varies per user** (compositor, lockscreen choice, work patterns), so nestty itself stays policy-free. `examples/presence/` ships four starter recipes — `hypridle-listener.conf` (Hyprland), `swayidle.sh` (any wlroots), `loginctl-poll.sh` (DE-agnostic systemd), `darwin-pmset.sh` (macOS) — with a README that explains threshold-vs-latency trade-offs and how to wire each one to systemd-user / Hyprland exec-once / LaunchAgent. Users edit-to-taste; promotion to a first-party `plugins/presence-<backend>/` is reserved for backends that stabilise into something the user has run for months and would recommend to others.
+
+State lives in existing harness files; no duplicate cache. Slice 1A + 1B effort: ~2 days total. Remaining `claude.*` data-surfacing actions (`claude.session_state` / `claude.list_dirty` / `claude.last_handoff` / `claude.list_sessions`) deferred to a later slice.
 
 ### C. ai-browser → `browser` plugin
 
