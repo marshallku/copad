@@ -181,6 +181,57 @@ final class TabViewController: NSViewController {
         newTab()
     }
 
+    // MARK: - Session persistence
+
+    /// Build a wire snapshot of every live tab. Tabs that boil down to
+    /// zero terminal panels (webview-only or all-plugin) are skipped —
+    /// matches Linux's `snapshot_session` filter. The `current_tab`
+    /// index is remapped onto the surviving tab list so the restored
+    /// session lands on the same logical tab even when others were
+    /// elided.
+    func snapshotSession() -> Session.Snapshot {
+        var tabs: [Session.TabSnap] = []
+        var currentTab = 0
+        let activeIdx = activeIndex
+        for (idx, manager) in paneManagers.enumerated() {
+            guard let root = manager.snapshotTree() else { continue }
+            if idx == activeIdx {
+                currentTab = tabs.count
+            } else if idx < activeIdx {
+                // Active tab might be elided itself — the closest
+                // surviving tab BEFORE it is the best fallback.
+                currentTab = tabs.count
+            }
+            tabs.append(Session.TabSnap(customTitle: manager.customTabTitle(), root: root))
+        }
+        let clamped = max(0, min(currentTab, tabs.count - 1))
+        return Session.Snapshot(version: Session.version, tabs: tabs, currentTab: clamped)
+    }
+
+    /// Build tabs + splits to mirror `snap`. Caller (AppDelegate) is
+    /// responsible for falling back to `openInitialTab` if this is a
+    /// no-op (snap has zero tabs). Restored panels start fresh — we
+    /// can't replay shell history or process state, just cwd + layout.
+    func restoreSession(_ snap: Session.Snapshot) {
+        for tabSnap in snap.tabs {
+            let leftmost = Session.leftmostCwd(tabSnap.root)
+            let manager = PaneManager(
+                config: config,
+                theme: theme,
+                initialPanel: .terminalSeed(cwd: leftmost, initialInput: nil),
+            )
+            addTab(manager: manager)
+            manager.restoreSplits(into: manager.activePane, from: tabSnap.root)
+            if let title = tabSnap.customTitle {
+                manager.setCustomTitle(title)
+            }
+        }
+        let clamped = max(0, min(snap.currentTab, paneManagers.count - 1))
+        if paneManagers.indices.contains(clamped) {
+            switchTab(to: clamped)
+        }
+    }
+
     // MARK: - Tab Operations
 
     func newTab() {

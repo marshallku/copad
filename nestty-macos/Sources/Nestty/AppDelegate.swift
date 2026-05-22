@@ -242,7 +242,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         startSocketServer()
         startConfigWatcher()
-        vc.openInitialTab()
+        // Session-persistence restore: if a snapshot exists, replay
+        // tabs + splits + per-leaf cwd; otherwise seed a single
+        // default terminal tab. MUST happen before the daemon starts
+        // (next line) so GUI-owned Invokes (tab.list, split.*) see
+        // the restored layout, and before any save-on-terminate path
+        // can overwrite the persisted snapshot with an empty one.
+        // Mirrors `nestty-linux/src/window.rs` post-build sequence.
+        if let snap = Session.load() {
+            vc.restoreSession(snap)
+        } else {
+            vc.openInitialTab()
+        }
 
         // Start AFTER the initial tab exists so daemon Invokes for
         // GUI-owned methods (tab.list, terminal.exec, split.*) resolve
@@ -255,6 +266,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_: Notification) {
+        // Persist tabs + splits + cwd BEFORE engine shutdown so
+        // snapshot reads land while panels are still live. An empty
+        // snapshot (no terminal tabs left) clears any prior file so
+        // a stale layout doesn't surface on next launch — same
+        // contract as `nestty-linux/src/window.rs`'s close handler.
+        if let snap = tabVC?.snapshotSession() {
+            if snap.tabs.isEmpty {
+                Session.clear()
+            } else {
+                Session.save(snap)
+            }
+        }
         // Order matters:
         // 1. Engine first — clears the C action callback so no in-flight
         //    plugin event.publish can fire into a stale ActionRegistry.

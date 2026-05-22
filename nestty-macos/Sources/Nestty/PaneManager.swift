@@ -279,6 +279,92 @@ final class PaneManager {
         (activePane as? TerminalViewController)?.setCustomTitle(title)
     }
 
+    // MARK: - Session persistence
+
+    /// Build a wire snapshot of this tab's split tree. Returns nil
+    /// when no terminal panel survived the walk (webview-only or
+    /// plugin-only tabs are skipped to keep parity with Linux —
+    /// `panel.as_terminal()` filter in `tabs.rs::snapshot_session`).
+    func snapshotTree() -> Session.SplitSnap? {
+        Self.buildSnap(node: root)
+    }
+
+    /// First non-nil custom title in DFS order. Mirrors Linux's
+    /// per-tab custom-title lookup (collect panels, find_map). Returns
+    /// nil if no panel has a custom title — restored tab falls back to
+    /// the live title (cwd / process name) on reopen.
+    func customTabTitle() -> String? {
+        for panel in allPanels() {
+            if let t = panel as? TerminalViewController, let title = t.customTitle {
+                return title
+            }
+        }
+        return nil
+    }
+
+    /// Replay a saved snap onto an existing leaf panel. Walks the
+    /// snap depth-first: every Branch turns into one new panel
+    /// (seeded with the leftmost cwd of `second`, matching Linux's
+    /// `restore_split`), pushed into the live tree via the same
+    /// `SplitNode.splitting` call that the interactive split path
+    /// uses. Terminal leaves are no-ops — the target leaf already
+    /// represents that cell.
+    func restoreSplits(into target: any NesttyPanel, from snap: Session.SplitSnap) {
+        guard case let .branch(orientation, _, first, second) = snap else { return }
+        let cwd = Session.leftmostCwd(second)
+        let newPanel = Self.makeTerminalPanel(config: config, theme: theme, cwd: cwd)
+        assignEventBus(to: newPanel)
+        wirePanel(newPanel)
+        let oriented: SplitOrientation = (orientation == .horizontal) ? .horizontal : .vertical
+        root = root.splitting(target, with: .leaf(newPanel), orientation: oriented)
+        rebuildViewHierarchy()
+        newPanel.startIfNeeded()
+        restoreSplits(into: target, from: first)
+        restoreSplits(into: newPanel, from: second)
+    }
+
+    private static func buildSnap(node: SplitNode) -> Session.SplitSnap? {
+        switch node {
+        case let .leaf(panel):
+            // Both terminal backends carry a `currentCwd`; alacritty's
+            // is initialCwd-only for v1 (no OSC 7 surface yet — see
+            // macos-post-renderer-catchup.md).
+            if let t = panel as? TerminalViewController {
+                return .terminal(cwd: t.currentCwd)
+            }
+            if let a = panel as? AlacrittyTerminalViewController {
+                return .terminal(cwd: a.currentCwd)
+            }
+            return nil
+        case let .branch(orientation, children):
+            let snaps = children.compactMap { buildSnap(node: $0) }
+            return chainBinary(orientation: orientation, snaps: snaps)
+        }
+    }
+
+    /// macOS SplitNode is n-ary; in practice the user can only build
+    /// 2-child branches (Cmd+D / Cmd+Shift+D). Collapse a higher arity
+    /// (which would only happen from a future programmatic API) into
+    /// a left-leaning binary chain so the on-disk schema stays
+    /// pairwise. `position: 0` is the "not tracked" sentinel —
+    /// EqualSplitView re-equalizes on restore. Tracking real divider
+    /// positions would mean walking the live NSSplitView tree
+    /// alongside the SplitNode; deferred for v1.
+    private static func chainBinary(
+        orientation: SplitOrientation,
+        snaps: [Session.SplitSnap],
+    ) -> Session.SplitSnap? {
+        let wire: Session.SplitOrientation = (orientation == .horizontal) ? .horizontal : .vertical
+        switch snaps.count {
+        case 0: return nil
+        case 1: return snaps[0]
+        default:
+            let rest = Array(snaps.dropFirst())
+            let tail = chainBinary(orientation: orientation, snaps: rest) ?? rest[0]
+            return .branch(orientation: wire, position: 0, first: snaps[0], second: tail)
+        }
+    }
+
     func applyBackground(path: String, tint: Double, opacity: Double) {
         allPanels().forEach { $0.applyBackground(path: path, tint: tint, opacity: opacity) }
     }

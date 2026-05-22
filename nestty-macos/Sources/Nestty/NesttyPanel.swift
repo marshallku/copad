@@ -39,5 +39,7 @@ extension NesttyPanel {
     /// root view IS the input-handling view) just hand back `view`.
     /// Override on panels whose root view is a layout container that
     /// shouldn't itself receive keyboard focus.
-    var focusTarget: NSView { view }
+    var focusTarget: NSView {
+        view
+    }
 }

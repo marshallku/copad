@@ -183,7 +183,10 @@ class TerminalViewController: NSViewController, NesttyPanel {
     /// (wrapped here as `NesttyTerminalView`) is the actual keyboard
     /// receiver; the controller's `view` is just a layout container
     /// with background + tint subviews.
-    var focusTarget: NSView { terminalView ?? view }
+    var focusTarget: NSView {
+        terminalView ?? view
+    }
+
     private var backgroundView: NSImageView?
     private var tintView: NSView?
     private var currentFontSize: CGFloat
@@ -194,9 +197,16 @@ class TerminalViewController: NSViewController, NesttyPanel {
     private var configFontSize: CGFloat
 
     private(set) var currentTitle: String = "Terminal"
-    private var customTitle: String?
+    private(set) var customTitle: String?
     private var shellStarted = false
     var onProcessTerminated: (() -> Void)?
+
+    /// Last cwd reported by OSC 7 (hostCurrentDirectoryUpdate). Seeded
+    /// at startShell with `currentDirectory`, then updated on every
+    /// OSC 7. Used by the session-persistence snapshot so a restart
+    /// drops the user back into the same directory. nil when neither
+    /// OSC 7 nor an explicit start cwd has fired.
+    private(set) var currentCwd: String?
 
     /// Set by AppDelegate after EventBus is created.
     weak var eventBus: EventBus?
@@ -220,6 +230,7 @@ class TerminalViewController: NSViewController, NesttyPanel {
         currentFontSize = baseFontSize
         currentFontFamily = config.fontFamily
         initialCwd = cwd
+        currentCwd = cwd
         self.initialInput = initialInput
         super.init(nibName: nil, bundle: nil)
     }
@@ -660,6 +671,7 @@ extension TerminalViewController: LocalProcessTerminalViewDelegate {
         }
         let id = panelID
         Task { @MainActor in
+            self.currentCwd = cwd
             eventBus?.broadcast(event: "terminal.cwd_changed", data: ["panel_id": id, "cwd": cwd])
         }
     }

@@ -186,7 +186,7 @@ final class DaemonClient: @unchecked Sendable {
         }
     }
 
-    private func openConnection() -> Session? {
+    private func openConnection() -> ConnectedSession? {
         guard let fd = UnixSocket.connect(path: socketURL.path(percentEncoded: false)) else {
             return nil
         }
@@ -216,7 +216,7 @@ final class DaemonClient: @unchecked Sendable {
             cutoverHandler?(true)
         }
 
-        return Session(fd: fd, writer: writer)
+        return ConnectedSession(fd: fd, writer: writer)
     }
 
     private func startForwarder(writer: WriterChannel) -> TypedEventChannel {
@@ -300,7 +300,7 @@ final class DaemonClient: @unchecked Sendable {
         )
     }
 
-    private func runReader(session: Session) {
+    private func runReader(session: ConnectedSession) {
         let fd = session.fd
         var buf = Data()
         let chunkSize = 8192
@@ -594,7 +594,10 @@ struct RegisterAck {
     let hostTriggers: Bool
 }
 
-private struct Session {
+/// Live socket-connection bundle for the GUI ↔ daemon connection.
+/// Renamed from `Session` to avoid clashing with the module-level
+/// `enum Session` introduced for tab-layout persistence.
+private struct ConnectedSession {
     let fd: Int32
     let writer: WriterChannel
 }

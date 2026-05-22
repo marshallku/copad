@@ -12,7 +12,9 @@ final class WebViewController: NSViewController, NesttyPanel {
     /// Focus target for `panel.focusTarget` — the WKWebView is the
     /// actual keyboard receiver; the controller's `view` is a layout
     /// container holding the URL bar + back/forward/reload + webView.
-    var focusTarget: NSView { webView ?? view }
+    var focusTarget: NSView {
+        webView ?? view
+    }
 
     private(set) var currentTitle: String = "Web"
     private var startURL: URL?

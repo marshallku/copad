@@ -41,6 +41,16 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
         didSet { renderView?.eventBus = eventBus }
     }
 
+    /// v1 cwd snapshot for session persistence. Only reflects the
+    /// startup cwd passed at construction — the alacritty backend
+    /// doesn't surface OSC 7 / cwd_changed yet (alacritty_terminal as
+    /// a library has no cwd state, no `CurrentDirectoryUrl` event in
+    /// its Event enum). Restored panels reopen at this cwd; users who
+    /// `cd` away mid-session won't see the new dir on restart. Lifting
+    /// the limit needs a custom OSC 7 sniffer in nestty-term + an FFI
+    /// callback — tracked in macos-post-renderer-catchup.md.
+    private(set) var currentCwd: String?
+
     private let config: NesttyConfig
     private var theme: NesttyTheme
     private let initialCwd: String?
@@ -63,6 +73,7 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
         self.config = config
         self.theme = theme
         initialCwd = cwd
+        currentCwd = cwd
         self.initialInput = initialInput
         super.init(nibName: nil, bundle: nil)
     }
