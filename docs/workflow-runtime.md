@@ -109,16 +109,15 @@ Centralized read model of "what is the user doing right now." Services contribut
 
 ```rust
 pub struct Context {
-    pub active_panel: Option<PanelRef>,       // terminal / webview / plugin
-    pub active_cwd: Option<PathBuf>,
-    pub active_shell_cmd: Option<String>,     // last preexec'd command
-    pub recent_commits: Vec<CommitRef>,       // cwd-scoped, populated lazily
-    pub upcoming_events: Vec<CalendarEvent>,  // next few hours
-    pub unread_mentions: Vec<MentionRef>,     // slack / discord
-    pub open_documents: Vec<DocRef>,          // notion / obsidian recent
-    // extensible — each contributor registers a provider
+    pub active_panel: Option<String>,         // panel_id of focused panel
+    pub active_cwd: Option<PathBuf>,          // cwd of active_panel (per-panel cache)
+    pub presence: Presence,                   // Active | Away — manual toggle
 }
 ```
+
+v1 carries only fields with confirmed event-stream sources or daemon-state writers. The grand-vision shape (recent commits, upcoming calendar events, unread mentions, open documents) lives in this doc as design intent — providers land incrementally as they prove their event-stream is reliable.
+
+`presence` is daemon-state, not event-derived: `nestctl presence away|active` flips it via the `presence.set` socket method, and the daemon publishes `presence.changed { previous, current }` on each non-noop flip so triggers + GUI status indicators can react. Default on daemon boot is `Active`. Surface in trigger conditions: `context.presence == "away"` (double-quoted; serialized form is lowercase string). See decisions.md #41.
 
 ### Contributors
 

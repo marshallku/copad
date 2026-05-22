@@ -736,3 +736,45 @@ The garbage-bias-enabled rule is deliberate: a typo like `NESTTYD_HOST_TRIGGERS=
 **Out of scope (followups):** `install-macos.sh` currently uses `cargo install --path nestty-daemon`, which always lands the binary at `~/.cargo/bin/nesttyd` regardless of the `--system` flag (`--system` only flips the `.app` destination between `~/Applications` and `/Applications`). The plist matches that — `ProgramArguments` hardcodes `~/.cargo/bin/nesttyd`. If a future macOS install path migrates nesttyd to a global location (`/usr/local/bin` or `/opt/`), the plist needs a parallel path placeholder. Auto-enable linger on Linux — declined; per-user policy.
 
 **See:** `dist/systemd/nestty-daemon.service`, `dist/launchd/com.marshall.nestty.daemon.plist`, `scripts/install-dev.sh` (`--with-daemon`/`--no-daemon` + `nesttyd` in the binary loop), `scripts/install-macos.sh` (same flag pair + LaunchAgent install block), `docs/harness-hooks.md` § "SSH + daemon lifecycle".
+
+
+## 41. Presence-aware harness routing (harness-integration Slice 1 — Discord)
+
+**Problem:** After #39 (host_triggers ON) + #40 (daemon auto-start), the harness loop `hook → publish → trigger → toast` works locally. But the toast is invisible the moment the user leaves the keyboard — a Claude session that blocks on commit review while the user is at lunch is silent until they walk back to the desk. The grand vision was a `notify-webhook` first-party plugin (universal HTTP POST sink, secret URL via `${ENV_VAR}` expansion), explicitly so the second sink (ntfy/Slack/PagerDuty) would cost near-zero to add — the Rule-of-Three abstraction priced in up front.
+
+**Decision:** Cancel the `notify-webhook` plugin scaffolding for Slice 1. Reuse the existing `plugins/discord/` plugin (already shipping v0.3.0 with a Gateway WebSocket + `discord.send_message` action + bot-token keyring) and gate it behind a new `Context.presence` field. Concretely:
+
+- **`nestty-core/src/context.rs`** — new `Presence { Active, Away }` enum (serde `rename_all = "lowercase"`). `Context` gains a `presence: Presence` field. `ContextService` exposes `presence() -> Presence` + `set_presence(Presence) -> Presence` (returns previous, so callers can skip no-op broadcasts).
+- **`nestty-core/src/condition.rs`** — `context.presence` joins `context.active_panel` / `context.active_cwd` as a supported reference root. Resolves to the lowercase string `"active"` / `"away"`. Grammar unchanged; only the resolver matches a new field name. Codex round 1 caught the bare-root version (`presence == "away"`) violating the existing `context.X` / `event.X`-only root rule.
+- **`nestty-daemon/src/main.rs`** — registers two new silent actions next to `context.snapshot`: `presence.set { state: "active" | "away" } -> { previous, current }` and `presence.get { } -> "active" | "away"`. On a non-noop `set`, publishes `presence.changed { previous, current }` on the bus (source `daemon`) so downstream triggers / GUI indicators can react. `presence.get` returns a bare JSON string (not `{ state: "..." }`) so `nestctl presence status` lands a single word on stdout — shell-script friendly.
+- **`nestty-cli`** — `nestctl presence away | active | status`. The first two POST to `presence.set`; `status` POSTs to `presence.get` and the existing `print_result` handles the bare-string response naturally.
+- **User config** — each presence-gated trigger is a **second `[[triggers]]` block** for the same event_kind, with `action = "discord.send_message"` + `condition = 'context.presence == "away"'`. The local `notify.show` trigger stays without condition, so toasts fire unconditionally. `examples/triggers/claude-hooks.toml` ships the pattern with `REPLACE_WITH_YOUR_CHANNEL_ID` placeholders + setup notes pointing at `plugins/discord/plugin.toml` for bot auth.
+
+**Why not the abstract sink plugin (Rule of Three):**
+
+- Discord plugin already exists, already authed, already keyring-managed, already gateway-connected. Building a parallel `notify-webhook` sink would duplicate that path for zero immediate gain — the user wanted Discord, not ntfy.
+- `discord.send_message` is a richer action surface than raw webhook (failure code shape per Discord API, bot-aware routing, ratelimit handling). A first-class plugin owning that complexity is the right home.
+- Universal sink abstraction was a guess about a future second sink. We don't have it yet. Rule of Three says wait for the second real case — ntfy / Slack incoming webhook / PagerDuty — and let the second integration reveal the actual common shape. Premature abstraction would have shipped a string-template engine that the second sink might not even want.
+- Trigger interpolation already does NOT expand `${ENV_VAR}` — channel id is a literal string in user config. Discord channel id is not a secret (it's user-discoverable in any client with Developer Mode on); bot token is, and that's already in keyring via `nestty-plugin-discord auth`. So the "secrets in env" motivation for the abstract sink was solving a non-problem in the discord path.
+
+**Trade-offs accepted:**
+
+- Second sink (ntfy) adds friction — when it lands, we'll need to either (a) build the abstract sink then, or (b) ship a `plugins/notify-ntfy/` mirror with the same gating idiom (`condition = 'context.presence == "away"'`). Option (b) wins until we see what differs between Discord and ntfy in the actual payload shape needs.
+- Presence is process-memory only — daemon restart resets to `Active`. Acceptable for v1; persistence is a follow-up if user reports surprising silence after a daemon respawn.
+- Presence is **manual toggle only** — Hyprland idle / nestty window-focus auto-detect is Slice 2 (driven by a `presence.suggest` event source feeding into the same `set_presence` path).
+
+**Live verification (e2e, 2026-05-23, session 265e30d2):**
+- Phase 1 — `presence=active` baseline + `nestctl event publish claude.review_approved` → `claude.review_approved` event landed on bus, **zero** `discord.send_message.completed` events. Gate works.
+- Phase 2 — `nestctl presence away` → `presence.changed { previous: "active", current: "away" }` on bus, `nestctl presence status` prints `away` to stdout. Re-publish → `discord.send_message.completed { channel_id: 1507255807132176394, message_id: 1507424078598766792 }` on bus, message arrived in the user's Discord channel (visual confirmation).
+- Phase 3 — `nestctl presence active` → `presence.changed { previous: "away", current: "active" }`, re-publish → zero new `discord.send_message.completed`. Gate flips both directions cleanly.
+- Edge — `nestctl event publish claude.commit_blocked --quiet '{}'` (empty payload) processes without panic. Missing `event.reason` / `event.repo` resolve to literal-tokens in the interpolated content per existing `trigger::interpolate_string` semantics.
+- All 207 + 114 + 7 workspace unit tests pass (`nestty-core` + `nestty-daemon` + `nestty-linux`). `cargo fmt` + `cargo clippy --workspace --all-targets -- -D warnings` clean.
+
+**Out of scope (Slice 2/3 backlog):**
+- Presence auto-detect (Hyprland idle hint + nestty window-focus event). Source: `hyprctl activeworkspace` watcher OR `swayidle`-style daemon. Sinks into `presence.set` via the same socket method.
+- HTTP/WS dashboard server (`plugins/web-bridge/`). Two-way control surface — pane capture live stream + `tmux send-keys` injection from remote browser. Slice 3.
+- Universal sink abstraction (`plugins/notify-webhook/`). Defer until second-sink case (ntfy/Slack/etc.) materializes — design from the diff between the two actual integrations, not from speculation.
+- Webhook retry / back-off / dead-letter queue. Discord plugin's existing `discord.send_message.failed` event suffices for first-version observability.
+- Presence persistence across daemon restarts.
+
+**See:** `nestty-core/src/context.rs` (`Presence` enum + `Context.presence` + `ContextService::set_presence/presence`), `nestty-core/src/condition.rs` (`context.presence` resolver arm + doc comment), `nestty-daemon/src/main.rs` (`presence.set` / `presence.get` action registrations next to `context.snapshot`), `nestty-cli/src/commands.rs` (`PresenceCommand` enum + method/params dispatch), `examples/triggers/claude-hooks.toml` (second trigger block per event with `condition = 'context.presence == "away"'`), session intent `~/docs/sources/sessions/nestty/2026-05-23-session-265e30d2.md`.

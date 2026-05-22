@@ -1026,6 +1026,7 @@ mod tests {
         let ctx = Context {
             active_panel: Some("panel-1".into()),
             active_cwd: Some(PathBuf::from("/tmp/work")),
+            ..Default::default()
         };
         let result = t.interpolate(&evt("any", json!({})), Some(&ctx));
         assert_eq!(result["cmd"], json!("echo /tmp/work :: panel-1"));
@@ -1368,6 +1369,7 @@ mod tests {
         let ctx_other = Context {
             active_panel: Some("panel-9".into()),
             active_cwd: None,
+            ..Default::default()
         };
         engine.dispatch(&evt("calendar.event_imminent", json!({})), Some(&ctx_other));
         assert_eq!(count.load(Ordering::SeqCst), 0);
@@ -1375,6 +1377,7 @@ mod tests {
         let ctx = Context {
             active_panel: Some("panel-1".into()),
             active_cwd: None,
+            ..Default::default()
         };
         engine.dispatch(&evt("calendar.event_imminent", json!({})), Some(&ctx));
         assert_eq!(count.load(Ordering::SeqCst), 1);
@@ -2474,6 +2477,7 @@ mod tests {
         let ctx = Context {
             active_panel: Some("term-7".into()),
             active_cwd: None,
+            ..Default::default()
         };
         let completed_rx = bus.subscribe("noop.completed");
         engine.dispatch(&evt("todo.start_requested", json!({})), Some(&ctx));

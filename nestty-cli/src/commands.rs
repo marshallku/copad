@@ -39,6 +39,12 @@ pub enum Command {
         full: bool,
     },
 
+    /// Manual at-keyboard / away toggle. `away` opens external-sink
+    /// trigger actions (Discord notifications etc.); `active` closes
+    /// them. `status` prints `active` or `away` for shell scripting.
+    #[command(subcommand)]
+    Presence(PresenceCommand),
+
     /// Panel management
     #[command(subcommand)]
     Session(SessionCommand),
@@ -138,6 +144,16 @@ pub enum UpdateCommand {
         #[arg(long)]
         version: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+pub enum PresenceCommand {
+    /// Mark presence as away — external-sink trigger actions fire.
+    Away,
+    /// Mark presence as active — external-sink trigger actions stay quiet.
+    Active,
+    /// Print the current presence (`active` or `away`) on stdout.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -483,6 +499,11 @@ impl Cli {
         match &self.command {
             Command::Ping => "system.ping".to_string(),
             Command::Context { .. } => "context.snapshot".to_string(),
+            Command::Presence(cmd) => match cmd {
+                PresenceCommand::Away | PresenceCommand::Active => "presence.set",
+                PresenceCommand::Status => "presence.get",
+            }
+            .to_string(),
             Command::Session(cmd) => match cmd {
                 SessionCommand::List => "session.list",
                 SessionCommand::Info { .. } => "session.info",
@@ -592,6 +613,11 @@ impl Cli {
         match &self.command {
             Command::Ping => json!({}),
             Command::Context { .. } => json!({}),
+            Command::Presence(cmd) => match cmd {
+                PresenceCommand::Away => json!({ "state": "away" }),
+                PresenceCommand::Active => json!({ "state": "active" }),
+                PresenceCommand::Status => json!({}),
+            },
             Command::Session(cmd) => match cmd {
                 SessionCommand::List => json!({}),
                 SessionCommand::Info { id } => json!({ "id": id }),

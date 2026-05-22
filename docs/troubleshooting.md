@@ -213,6 +213,50 @@ WAYLAND_DISPLAY` must show the wayland-N socket and the toast path
 works. Full write-up in `docs/harness-hooks.md` § "Graphical-session
 prerequisites".
 
+### Harness Discord trigger fires but no message lands in the channel
+
+**Symptom:** `nestctl recent --kind discord.send_message.completed`
+shows the completion event, but the Discord channel stays empty.
+
+**Cause:** Most common is wrong channel id. The id is a literal in
+user config (`~/.config/nestty/config.toml`) — trigger interpolation
+does NOT do `${ENV_VAR}` expansion. The id must be a Discord
+**channel id**, not a server id, message id, or application id. In
+the Discord client: Settings → Advanced → Developer Mode ON, then
+right-click the channel → Copy Channel ID. Less common: the bot
+isn't a member of the server holding that channel, or the bot lacks
+`Send Messages` in that specific channel (server-wide permission is
+overridden by channel-level role/permission grants).
+
+**Diagnose:**
+
+```
+nestctl recent --kind discord.send_message.failed   # if .failed exists, error_code is the API response
+nestctl call discord.send_message --params '{"channel_id":"<your-id>","content":"manual probe"}'
+```
+
+If the manual probe also lands a `.failed` with `403` / `50001`,
+it's a permission/membership issue — re-invite the bot via OAuth2
+URL Generator with the right scopes (`bot` + `Send Messages` at
+minimum). If `404` / `10003`, the channel id is wrong.
+
+### `nestctl presence away` set but Discord still silent
+
+**Symptom:** `nestctl presence status` correctly prints `away`, the
+local `notify.show` toast fires, but no `discord.send_message.*`
+event appears.
+
+**Cause:** The presence-gated trigger isn't in user config. Slice 1B
+ships **two** `[[triggers]]` blocks per harness event in
+`examples/triggers/claude-hooks.toml` — the first runs `notify.show`
+unconditionally, the second runs `discord.send_message` with
+`condition = 'context.presence == "away"'`. Copying only the toast
+block (the pre-slice-1B copy) means presence has nothing to gate.
+Re-copy the discord blocks from the current example file, replace
+`REPLACE_WITH_YOUR_CHANNEL_ID` with your channel id, and either
+restart `nesttyd` or wait ~2s for the config watcher to pick up
+the change.
+
 ---
 
 ## macOS App Issues

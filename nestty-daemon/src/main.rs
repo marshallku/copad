@@ -13,7 +13,7 @@ use std::thread;
 
 use nestty_core::action_registry::{ActionRegistry, internal_error, invalid_params};
 use nestty_core::config::NesttyConfig;
-use nestty_core::context::ContextService;
+use nestty_core::context::{ContextService, Presence};
 use nestty_core::paths;
 use nestty_core::plugin::LoadedPlugin;
 use nestty_core::protocol::ResponseError;
@@ -248,6 +248,46 @@ fn build_trigger_engine(
     actions.register_silent("context.snapshot", move |_| {
         serde_json::to_value(ctx_for_snapshot.snapshot())
             .map_err(|e| internal_error(format!("context snapshot serialize: {e}")))
+    });
+    let ctx_for_presence_set = context.clone();
+    let bus_for_presence = event_bus.clone();
+    actions.register_silent("presence.set", move |params| {
+        let state_str = params
+            .get("state")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                invalid_params("presence.set requires `state` (\"active\" or \"away\")")
+            })?;
+        let new_presence = match state_str {
+            "active" => Presence::Active,
+            "away" => Presence::Away,
+            other => {
+                return Err(invalid_params(format!(
+                    "presence.set `state` must be \"active\" or \"away\", got {other:?}"
+                )));
+            }
+        };
+        let prev = ctx_for_presence_set.set_presence(new_presence);
+        if prev != new_presence {
+            bus_for_presence.publish(nestty_core::event_bus::Event::new(
+                "presence.changed",
+                "daemon",
+                serde_json::json!({
+                    "previous": prev.as_str(),
+                    "current": new_presence.as_str(),
+                }),
+            ));
+        }
+        Ok(serde_json::json!({
+            "previous": prev.as_str(),
+            "current": new_presence.as_str(),
+        }))
+    });
+    let ctx_for_presence_get = context.clone();
+    actions.register_silent("presence.get", move |_params| {
+        Ok(serde_json::Value::String(
+            ctx_for_presence_get.presence().as_str().to_string(),
+        ))
     });
     // `event.history` mirrors the GUI's registration. Both processes
     // host their own EventBus (bridge-forwarded events land on both),

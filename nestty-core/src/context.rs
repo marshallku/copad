@@ -4,17 +4,37 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Presence {
+    #[default]
+    Active,
+    Away,
+}
+
+impl Presence {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Presence::Active => "active",
+            Presence::Away => "away",
+        }
+    }
+}
+
 /// "What the user is currently doing" — v1 carries only the two fields
 /// with confirmed event-stream sources. See `docs/workflow-runtime.md`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Context {
     pub active_panel: Option<String>,
     pub active_cwd: Option<PathBuf>,
+    #[serde(default)]
+    pub presence: Presence,
 }
 
 struct Inner {
     active_panel: Option<String>,
     cwd_by_panel: HashMap<String, PathBuf>,
+    presence: Presence,
 }
 
 /// Caller drains an `EventBus` subscription into `apply_event`.
@@ -28,6 +48,7 @@ impl ContextService {
             inner: RwLock::new(Inner {
                 active_panel: None,
                 cwd_by_panel: HashMap::new(),
+                presence: Presence::default(),
             }),
         }
     }
@@ -41,6 +62,7 @@ impl ContextService {
         Context {
             active_panel: inner.active_panel.clone(),
             active_cwd,
+            presence: inner.presence,
         }
     }
 
@@ -54,6 +76,19 @@ impl ContextService {
             .active_panel
             .as_ref()
             .and_then(|p| inner.cwd_by_panel.get(p).cloned())
+    }
+
+    pub fn presence(&self) -> Presence {
+        self.inner.read().unwrap().presence
+    }
+
+    /// Returns the previous presence so callers can decide whether to
+    /// broadcast a `presence.changed` event (avoid emitting on no-op).
+    pub fn set_presence(&self, presence: Presence) -> Presence {
+        let mut inner = self.inner.write().unwrap();
+        let prev = inner.presence;
+        inner.presence = presence;
+        prev
     }
 
     pub fn apply_event(&self, event: &Event) {
@@ -125,6 +160,51 @@ mod tests {
         let snap = ctx.snapshot();
         assert!(snap.active_panel.is_none());
         assert!(snap.active_cwd.is_none());
+        assert_eq!(snap.presence, Presence::Active);
+    }
+
+    #[test]
+    fn presence_default_is_active() {
+        let ctx = ContextService::new();
+        assert_eq!(ctx.presence(), Presence::Active);
+        assert_eq!(ctx.snapshot().presence, Presence::Active);
+    }
+
+    #[test]
+    fn set_presence_round_trip_and_returns_previous() {
+        let ctx = ContextService::new();
+        let prev = ctx.set_presence(Presence::Away);
+        assert_eq!(prev, Presence::Active);
+        assert_eq!(ctx.presence(), Presence::Away);
+        assert_eq!(ctx.snapshot().presence, Presence::Away);
+        let prev = ctx.set_presence(Presence::Active);
+        assert_eq!(prev, Presence::Away);
+        assert_eq!(ctx.presence(), Presence::Active);
+    }
+
+    #[test]
+    fn presence_orthogonal_to_panel_state() {
+        let ctx = ContextService::new();
+        ctx.apply_event(&evt("panel.focused", json!({"panel_id": "p1"})));
+        ctx.set_presence(Presence::Away);
+        let snap = ctx.snapshot();
+        assert_eq!(snap.active_panel.as_deref(), Some("p1"));
+        assert_eq!(snap.presence, Presence::Away);
+        ctx.apply_event(&evt("panel.exited", json!({"panel_id": "p1"})));
+        assert_eq!(ctx.presence(), Presence::Away);
+    }
+
+    #[test]
+    fn presence_serde_lowercase_strings() {
+        assert_eq!(
+            serde_json::to_string(&Presence::Active).unwrap(),
+            "\"active\""
+        );
+        assert_eq!(serde_json::to_string(&Presence::Away).unwrap(), "\"away\"");
+        let active: Presence = serde_json::from_str("\"active\"").unwrap();
+        let away: Presence = serde_json::from_str("\"away\"").unwrap();
+        assert_eq!(active, Presence::Active);
+        assert_eq!(away, Presence::Away);
     }
 
     #[test]

@@ -368,7 +368,16 @@ silent-fail on missing socket. Tags every emitted event with
 - `claude.review_approved` → `kb.append` to a daily log
 - `claude.session_stopped` → `todo.create` for in-progress items
 
-State lives in existing harness files; no duplicate cache. ~400 LOC plugin + ~10 hook script edits. Effort: M (1–2 days).
+**Slice 1B — presence-gated routing (shipped 2026-05-23, see decisions.md #41).** The toasts above fire locally regardless of whether the user is at the keyboard, which means they're invisible the moment they walk away. Slice 1B adds:
+
+- `Context.presence` (`Active | Away`) — daemon-state, manual toggle via `nestctl presence away|active|status`.
+- `context.presence` as a third trigger condition root (alongside `context.active_panel` / `context.active_cwd`). Resolves to the lowercase string `"active"` / `"away"`.
+- Reuse of the existing `plugins/discord/` plugin's `discord.send_message` — no new sink plugin. Each presence-gated trigger is a **second `[[triggers]]` block** for the same `event_kind` with `condition = 'context.presence == "away"'`. Local toast trigger stays unconditional.
+- `examples/triggers/claude-hooks.toml` ships the full pattern with placeholder channel ids + setup notes.
+
+Rationale for not building the `notify-webhook` abstract sink plugin yet: Rule of Three. Build the abstract surface when the second integration (ntfy/Slack/PagerDuty) shows what actually differs from Discord. Today the `discord.send_message` action already handles bot auth, ratelimits, and failure shapes — duplicating that path through a webhook indirection for the single Discord case would be premature abstraction.
+
+State lives in existing harness files; no duplicate cache. Slice 1A + 1B effort: ~2 days total. Remaining `claude.*` data-surfacing actions (`claude.session_state` / `claude.list_dirty` / `claude.last_handoff` / `claude.list_sessions`) deferred to Slice 2.
 
 ### C. ai-browser → `browser` plugin
 

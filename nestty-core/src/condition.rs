@@ -31,9 +31,10 @@
 //! - `event.X.Y` traverses the JSON payload by key. A missing path
 //!   resolves to `null` (so `event.missing_field == "x"` is `false`,
 //!   not an error).
-//! - `context.active_panel` / `context.active_cwd` are the only
-//!   supported context paths (no nesting; matches the
-//!   `{context.X}` interpolation surface).
+//! - `context.active_panel` / `context.active_cwd` / `context.presence`
+//!   are the supported context paths (no nesting; matches the
+//!   `{context.X}` interpolation surface). `context.presence` resolves
+//!   to the string `"active"` or `"away"`.
 //! - `&&` / `||` short-circuit; both sides must produce bool when
 //!   actually evaluated, else error.
 //! - `!` negates a bool, else error.
@@ -531,6 +532,7 @@ fn resolve_ref(path: &[String], event: &Event, context: Option<&Context>) -> Val
                     .as_ref()
                     .map(|p| Value::String(p.to_string_lossy().to_string()))
                     .unwrap_or(Value::Null),
+                "presence" => Value::String(ctx.presence.as_str().to_string()),
                 _ => Value::Null,
             }
         }
@@ -594,6 +596,7 @@ mod tests {
         Context {
             active_panel: panel.map(str::to_string),
             active_cwd: cwd.map(PathBuf::from),
+            ..Default::default()
         }
     }
 
@@ -749,6 +752,23 @@ mod tests {
         let e = evt(json!({}));
         let c = ctx(None, None);
         assert!(p_eval("context.active_panel == null", &e, Some(&c)).unwrap());
+    }
+
+    #[test]
+    fn context_presence_resolves_active_by_default() {
+        let e = evt(json!({}));
+        let c = ctx(None, None);
+        assert!(p_eval(r#"context.presence == "active""#, &e, Some(&c)).unwrap());
+        assert!(!p_eval(r#"context.presence == "away""#, &e, Some(&c)).unwrap());
+    }
+
+    #[test]
+    fn context_presence_away_matches_string_literal() {
+        let e = evt(json!({}));
+        let mut c = ctx(None, None);
+        c.presence = crate::context::Presence::Away;
+        assert!(p_eval(r#"context.presence == "away""#, &e, Some(&c)).unwrap());
+        assert!(!p_eval(r#"context.presence == "active""#, &e, Some(&c)).unwrap());
     }
 
     #[test]

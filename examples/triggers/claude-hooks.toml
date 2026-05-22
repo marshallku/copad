@@ -1,8 +1,11 @@
-# Claude Code harness hook → desktop toast triggers.
+# Claude Code harness hook → desktop toast + presence-gated Discord
+# triggers.
 #
 # Wires `nestctl event publish claude.<event>` calls made from your
-# `~/.claude/scripts/*.sh` hooks to a `notify.show` toast on the
-# desktop. Demonstrates the documented Option A flow from
+# `~/.claude/scripts/*.sh` hooks to a `notify.show` toast (always) and
+# `discord.send_message` (only when `nestctl presence away` is set, so
+# you don't get Discord-spammed while sitting at the keyboard).
+# Demonstrates the documented Option A flow from
 # `docs/harness-integration.md`.
 #
 # How to use:
@@ -13,7 +16,19 @@
 #    triggers ignore socket-published events by default (see
 #    decisions.md #37 trust boundary).
 #
-# 2. Patch your hook scripts to publish events. Examples below;
+# 2. Replace `REPLACE_WITH_YOUR_CHANNEL_ID` below with the Discord
+#    channel id you want harness pings to land in. Trigger
+#    interpolation does NOT do `${ENV_VAR}` expansion — the channel
+#    id is a literal string baked into your user config. To find it:
+#    Discord settings → Advanced → Developer Mode ON, then right-click
+#    the channel → Copy Channel ID.
+#
+# 3. Make sure the discord plugin is authed
+#    (`nestctl call discord.auth_status` → `authenticated: true`) and
+#    the bot is a member of the server holding that channel. Setup
+#    guide: `plugins/discord/plugin.toml`.
+#
+# 4. Patch your hook scripts to publish events. Examples below;
 #    none of these need any change to nestty itself, just one line
 #    appended per hook. `--quiet` makes the publish silent when
 #    nesttyd isn't running, so hooks never break the host command.
@@ -35,11 +50,18 @@
 #                "{\"session\": \"$SESSION_ID\"}" &
 #        fi
 #
-# 3. Restart nesttyd (or wait for the 2s config-watcher to pick up
+# 5. Restart nesttyd (or wait for the 2s config-watcher to pick up
 #    your edited config.toml — daemon reloads triggers in-place).
 #
-# 4. Verify: `nestctl event publish claude.commit_blocked --quiet \
-#    '{"reason": "test", "repo": "demo"}'` should pop a toast.
+# 6. Verify (local toast):
+#       nestctl event publish claude.commit_blocked --quiet \
+#         '{"reason": "test", "repo": "demo"}'
+#    A toast should pop. Now toggle presence and re-fire:
+#       nestctl presence away
+#       nestctl event publish claude.commit_blocked --quiet \
+#         '{"reason": "test", "repo": "demo"}'
+#    The toast AND a Discord message should both arrive. Reset:
+#       nestctl presence active
 
 
 # Hook event:   pre-commit-gate.sh on commit refusal
@@ -55,12 +77,37 @@ event_kind = "claude.commit_blocked"
 accept_external = true
 
 
+# Same event, second trigger: only fires when you've toggled
+# `nestctl presence away`. Keeps your phone quiet while you're at
+# the keyboard, pings Discord when you've stepped out.
+[[triggers]]
+name = "claude-commit-blocked-discord"
+action = "discord.send_message"
+params = { channel_id = "REPLACE_WITH_YOUR_CHANNEL_ID", content = ":no_entry: commit blocked in `{event.repo}`: {event.reason}" }
+condition = 'context.presence == "away"'
+[triggers.when]
+event_kind = "claude.commit_blocked"
+[triggers.security]
+accept_external = true
+
+
 # Hook event:   codex-review.sh on VERDICT: APPROVED
 # Useful in the absence of a panel — confirms cross-review is done.
 [[triggers]]
 name = "claude-review-approved-toast"
 action = "notify.show"
 params = { title = "Codex review approved", body = "session {event.session}", level = "info" }
+[triggers.when]
+event_kind = "claude.review_approved"
+[triggers.security]
+accept_external = true
+
+
+[[triggers]]
+name = "claude-review-approved-discord"
+action = "discord.send_message"
+params = { channel_id = "REPLACE_WITH_YOUR_CHANNEL_ID", content = ":white_check_mark: codex review APPROVED (session `{event.session}`)" }
+condition = 'context.presence == "away"'
 [triggers.when]
 event_kind = "claude.review_approved"
 [triggers.security]
