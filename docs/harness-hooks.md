@@ -269,8 +269,10 @@ If the toast doesn't appear:
 - **Log line present but no toast** → `notify.show` subprocess
   failure. Run the same call directly: `nestctl call notify.show
   --params '{"title":"t","body":"b"}'` and check daemon logs for
-  `notify subprocess` errors. Notification server (dunst/mako/
-  gnome-shell) misconfiguration is the usual cause.
+  `notify subprocess` errors. The usual cause on a wlroots-based
+  Wayland session is dunst crashing because `WAYLAND_DISPLAY` never
+  reached the D-Bus activation env — see § "Graphical-session
+  prerequisites" below for the two-line compositor fix.
 - **`nestctl: command not found`** → install nestty
   (`./scripts/install-dev.sh`) or check PATH.
 
@@ -350,6 +352,56 @@ don't break.
 - **`nestctl event publish ...` from a remote SSH session times out**
   → `RemoteForward` not set in `~/.ssh/config`, or
   `$XDG_RUNTIME_DIR/nestty/socket` doesn't exist on the workstation.
+
+## Graphical-session prerequisites (Linux / Wayland)
+
+`notify.show` ultimately calls `notify-send` → libnotify → D-Bus
+`org.freedesktop.Notifications`. When no notification daemon is
+running, D-Bus auto-activates one (typically dunst). That
+auto-activated daemon inherits its environment from the **D-Bus
+activation env**, NOT from the compositor — so if the compositor
+hasn't pushed `WAYLAND_DISPLAY` into the bus, dunst falls back to X11,
+fails to open a display, and crashes. Symptoms:
+
+```
+nesttyd: notify.show failed: notifier exited exit status: 1:
+  Failed to show notification:
+  GDBus.Error:org.freedesktop.DBus.Error.NameHasNoOwner:
+  Could not activate remote peer 'org.freedesktop.Notifications':
+  startup job failed
+```
+
+The fix is two lines in your compositor autostart that propagate
+`WAYLAND_DISPLAY` into both systemd `--user` (for `PartOf=
+graphical-session.target` units) and D-Bus activation (for
+dbus-activated services like dunst):
+
+```hyprlang
+# ~/.config/hypr/hyprland.conf — before any GUI autostart
+exec-once = systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE
+exec-once = dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE
+```
+
+Sway / river / Niri have the same need; replace
+`HYPRLAND_INSTANCE_SIGNATURE` with the compositor's equivalent (or
+drop it — only `WAYLAND_DISPLAY` and `XDG_CURRENT_DESKTOP` matter for
+dunst). KDE Plasma and GNOME do this automatically; bare wlroots
+compositors do not.
+
+Verify after relogin:
+
+```bash
+systemctl --user show-environment | grep WAYLAND_DISPLAY    # must show wayland-N
+dbus-send --session --print-reply --dest=org.freedesktop.DBus \
+    /org/freedesktop/DBus org.freedesktop.DBus.GetConnectionUnixProcessID \
+    string:org.freedesktop.Notifications                    # must return a PID
+nestctl event publish notify.show '{"title":"t","body":"b"}' --quiet
+# Toast should appear immediately.
+```
+
+The same root cause hits anything else dbus-activated from a fresh
+nesttyd context (xdg-desktop-portal, gnome-keyring helpers). Wiring
+the two `exec-once` lines once fixes them all.
 
 ## Trust boundary recap
 

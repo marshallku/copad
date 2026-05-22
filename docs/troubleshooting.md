@@ -173,6 +173,48 @@ The diagnostic signal hooks (`load_changed` / `load_failed` / `web_process_termi
 
 ---
 
+### `notify.show` toast silently fails under systemd-managed nesttyd (Wayland)
+
+**Symptom:** `nestctl event publish claude.review_approved` returns
+`{"queued": true}`, daemon log shows the trigger firing
+`notify.show`, but no toast appears. Journal contains:
+
+```
+GDBus.Error:org.freedesktop.DBus.Error.NameHasNoOwner:
+  Could not activate remote peer 'org.freedesktop.Notifications':
+  startup job failed
+
+dunst[*]: WARNING: Cannot open X11 display.
+dunst[*]: CRITICAL: Couldn't initialize X11 output. Aborting...
+```
+
+**Mechanism:** `notify.show` runs `notify-send` as a subprocess →
+libnotify → D-Bus `org.freedesktop.Notifications`. If no notification
+daemon is registered on the bus, D-Bus auto-activates one (dunst on
+Arch). The dbus-activated daemon inherits its env from the **D-Bus
+activation env**, not from the compositor — so on a wlroots-based
+Wayland session (Hyprland, Sway, river, Niri) where the compositor
+doesn't push `WAYLAND_DISPLAY` into the bus by default, dunst tries
+its X11 backend, finds no `DISPLAY` either, and exits 1.
+
+**Fix:** Add two lines to the compositor autostart so it propagates
+the display env into both systemd `--user` AND the D-Bus activation
+context:
+
+```hyprlang
+# ~/.config/hypr/hyprland.conf
+exec-once = systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE
+exec-once = dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE
+```
+
+KDE Plasma and GNOME do this automatically; bare wlroots compositors
+don't. After re-login, `systemctl --user show-environment | grep
+WAYLAND_DISPLAY` must show the wayland-N socket and the toast path
+works. Full write-up in `docs/harness-hooks.md` § "Graphical-session
+prerequisites".
+
+---
+
 ## macOS App Issues
 
 ### SwiftTerm: `processTerminated` never called after shell exits
