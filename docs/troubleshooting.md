@@ -240,6 +240,76 @@ it's a permission/membership issue — re-invite the bot via OAuth2
 URL Generator with the right scopes (`bot` + `Send Messages` at
 minimum). If `404` / `10003`, the channel id is wrong.
 
+### web-bridge plugin exits immediately with "refusing to start"
+
+**Symptom:** journal `[plugin:web-bridge::main:stderr]` shows
+`NESTTY_WEB_BRIDGE_TOKEN is not set` or `is too short`, then the
+supervisor logs `service web-bridge::main exited`.
+
+**Cause:** web-bridge fail-closes if the token env is missing or
+shorter than 32 characters. The token gates every `/api/*` and `/ws/*`
+request and the WS subprotocol — without it the plugin's HTTP surface
+would be open on `127.0.0.1:7575` to anyone with local access (and
+worse if you bind a Tailscale IP). Refusing to start is the correct
+posture.
+
+**Fix:** generate a 64-char token, inject it into the daemon's env,
+restart:
+
+```
+TOKEN=$(openssl rand -hex 32)         # 64 hex chars
+systemctl --user set-environment NESTTY_WEB_BRIDGE_TOKEN="$TOKEN"
+systemctl --user restart nestty-daemon
+```
+
+For persistence across reboots, drop the token into
+`~/.config/nestty/outputs.env` (the same EnvironmentFile the
+discord plugin uses for its bot token) and the systemd unit will
+pick it up at every start.
+
+### web-bridge dashboard shows "nestty GUI is not running" banner
+
+**Symptom:** the dashboard loads, presence toggle works, recent events
+feed updates — but the pane list is empty and the input textarea is
+disabled with a banner reading "nestty GUI is not running — only
+presence + events work".
+
+**Cause:** `terminal.read` / `terminal.feed` / `tab.list` /
+`session.list` are GUI-owned methods routed by the daemon through
+`GuiRegistry`. With no GUI registered (no `nestty` process attached
+to `nesttyd`), those methods return `no_gui`. The plugin maps
+`no_gui` to HTTP 503 and the UI banner. Presence + event endpoints
+are daemon-owned, so those still work.
+
+**Fix:** start the nestty GUI on the host so `nesttyd` has a
+registered client:
+
+- Locally: launch nestty as usual (desktop entry / shell).
+- Cold-boot via SSH-only: the user's Hyprland config adds
+  `exec-once = /home/marshall/.local/bin/nestty` so after autologin
+  the GUI is attached automatically. Without autologin + greetd, a
+  fresh boot reached only via SSH has no graphical session at all —
+  nestty cannot start without a Wayland/X display, and `no_gui` is
+  the correct failure mode. See decisions.md #42 and harness-integration.md
+  for the case-(3) discussion.
+
+### web-bridge sees zero events on `/ws/events`
+
+**Symptom:** the dashboard's "recent events" feed stays empty, but
+`nestctl event subscribe` from a shell receives `presence.changed`
+fine.
+
+**Cause (one known instance):** the original `daemon_client::subscribe`
+used `tokio::net::UnixStream + into_split`. Connect + write succeeded,
+but the read side never produced any line — not even the daemon's
+`{"status":"subscribed"}` ack. The same socket protocol works with
+`std::os::unix::net::UnixStream` (which `nestctl client.rs` uses).
+Current code runs the subscribe loop inside `tokio::task::spawn_blocking`
+with the sync UnixStream and works correctly; if you swap it back to
+tokio async be ready to chase this. RPC (one-shot request/response)
+on tokio async UnixStream works fine — the bug is specific to the
+long-lived subscribe path.
+
 ### `nestctl presence away` set but Discord still silent
 
 **Symptom:** `nestctl presence status` correctly prints `away`, the

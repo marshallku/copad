@@ -778,3 +778,62 @@ The garbage-bias-enabled rule is deliberate: a typo like `NESTTYD_HOST_TRIGGERS=
 - Presence persistence across daemon restarts.
 
 **See:** `nestty-core/src/context.rs` (`Presence` enum + `Context.presence` + `ContextService::set_presence/presence`), `nestty-core/src/condition.rs` (`context.presence` resolver arm + doc comment), `nestty-daemon/src/main.rs` (`presence.set` / `presence.get` action registrations next to `context.snapshot`), `nestty-cli/src/commands.rs` (`PresenceCommand` enum + method/params dispatch), `examples/triggers/claude-hooks.toml` (second trigger block per event with `condition = 'context.presence == "away"'`), session intent `~/docs/sources/sessions/nestty/2026-05-23-session-265e30d2.md`.
+
+
+## 42. `plugins/web-bridge/` — HTTP+WS broker as a first-party plugin (harness-integration Slice 3.0)
+
+**Problem:** Slice 1B closed the outbound half of the remote-harness loop (Discord alerts when `presence == away`), but coming back the other way still required SSH into the box and `nestctl` from the phone — a real-world phone interface needs *both* a live view of what nestty is doing AND a way to send a one-liner back without a separate ssh session. Slice 3 builds that as the inbound half. The plan, after codex-plan round 1 + 2, was a first-class plugin under `plugins/web-bridge/` that brokers nesttyd's socket surface (terminal.* / session.list / presence.set / event.subscribe) over HTTP+WebSocket.
+
+**Architecture decision — option (δ) over (α), (β), (γ).** Four architectures were on the table:
+
+- **(α) Standalone binary + systemd `--user` unit.** `plugins/web-bridge/` Cargo crate but no `plugin.toml`; install scripts grow to ship a unit. Lifecycle owned by systemd. Single-OS (Linux) without parallel launchd handling.
+- **(β) Daemon-embedded axum listener thread.** Smallest LOC; HTTP/WS deps and remote-control attack surface land permanently in `nesttyd`. Codex round 2 flagged this hard against: a daemon with no plugin isolation owns the bridge forever.
+- **(γ) New plugin-model variant.** Extend `plugin.toml` with a long-running-listener service type that skips stdio RPC. Cleanest abstraction, but pays a `nestty-core` model change for the first listener-plugin instance. Codex: abstraction before evidence.
+- **(δ) Service plugin with both stdio RPC and own HTTP listener + raw daemon-socket client.** web-bridge IS a service plugin like discord/todo, implements the existing stdio RPC handshake minimally (initialize handshake + idle), AND in the same process runs an axum HTTP+WS listener, AND opens raw daemon-socket connections (mirroring `nestctl`'s sync `UnixStream` client) so requests flow through the normal daemon `dispatch()` path including `GuiRegistry` routing.
+
+Codex round 2 hard-recommended (δ). Discord plugin already proves the "stdio RPC + long-running outbound network thread" pattern: `plugins/discord/src/main.rs:7/130/166/186/218` (RPC loop + Gateway WebSocket spawn). Generic clients hit `dispatch()` → `GuiRegistry` cleanly with no `gui.register` required ([socket.rs:537/927](/home/marshall/dev/nestty/nestty-daemon/src/socket.rs:537)); Unix socket 0600 is the only auth gate.
+
+**Two corrections vs. naïve (δ):**
+
+1. **`NESTTY_SOCKET` env inject is NOT a one-liner.** `ServiceSupervisor::new` had no socket-path field. The fix threads `socket_path: PathBuf` through the constructor, stores it on the struct, and injects `NESTTY_SOCKET=<path>` into the child env alongside the existing plugin metadata env (`NESTTY_PLUGIN_NAME` / `NESTTY_PLUGIN_DIR` / `NESTTY_SERVICE_NAME`). 10 test call-sites updated with a placeholder path. Future listener-style plugins (ntfy bridge, prometheus exporter, …) get the same env for free.
+
+2. **`event.subscribe` takes over its socket connection** ([socket.rs:500](/home/marshall/dev/nestty/nestty-daemon/src/socket.rs:500)). A single connection cannot serve both RPC and subscription. The plugin uses TWO daemon-socket connections: one per-request RPC (open-write-read-close) and one long-lived subscription (open-write-read-forever). Both connections from the same plugin process; the daemon has no `target_client_id` to distinguish, but it doesn't need to — each is a generic client.
+
+**Implementation shape:**
+
+- `plugins/web-bridge/` — Cargo crate (`nestty-plugin-web-bridge`), `plugin.toml` (`onStartup`, `provides=[]`), `src/main.rs` (stdio handshake + tokio runtime spawn on dedicated thread), `src/daemon_client.rs` (RPC + subscribe), `static/index.html` (inlined SPA via `include_str!`).
+- Auth: `Authorization: Bearer <token>` for `/api/*`, `Sec-WebSocket-Protocol: bearer.<token>` for `/ws/*`. **Query-string token is never accepted** — leak path via referrer/access logs. Token must be ≥32 chars; missing/short → plugin exits before binding (fail-closed). `NESTTY_WEB_BRIDGE_TOKEN` env. `NESTTY_WEB_BRIDGE_BIND` env (default `127.0.0.1:7575`).
+- HTTP endpoints: `GET /` (SPA), `GET /healthz` (public), `GET/POST /api/presence`, `GET /api/panes` (wraps `session.list`), `GET /api/panes/:id/recent?lines=N` (wraps `terminal.history`, clamps 1..=200), `POST /api/panes/:id/input` (wraps `terminal.feed`), `GET /api/events?since_ms=N&kind=...` (wraps `event.history`).
+- WS `/ws/events`: holds one daemon `event.subscribe` connection with patterns `["presence.*", "claude.*", "discord.send_message.*", "notify.show.*"]`; forwards each event line through a `tokio::sync::mpsc(64)` channel to the WS client. Slow clients (channel full) drop the connection. RFC6455-compliant subprotocol echo (`bearer.<token>` echoed back so browsers don't close on handshake).
+- UI: vanilla HTML/CSS/JS (~270 LOC), mobile-first, dark theme. Header with presence toggle. Pane list + recent-output viewer + input textarea + send button. Live event feed sidebar (WS). `no_gui` banner when nestty GUI isn't running (presence + events still work; pane control disabled).
+
+**Subscribe implementation note (sync over `spawn_blocking`).** The initial implementation used `tokio::net::UnixStream + into_split` for the subscribe connection. Connect + write succeeded, but the read side never observed any line (not even the daemon's `{"status":"subscribed"}` ack). The same socket protocol works fine with `std::os::unix::net::UnixStream` (which is exactly what `nestctl-cli/src/client.rs` uses). Rather than chase a tokio I/O scheduling issue mid-slice, the subscribe path now runs inside `tokio::task::spawn_blocking` with the std sync UnixStream — same pattern as the validated CLI client. RPC (one-shot request/response) still uses tokio async UnixStream because *that* path works. Root-causing the async subscribe failure is a follow-up task.
+
+**Live verification (e2e, 2026-05-23, dev box):**
+
+- `curl -H "Authorization: Bearer <token>" http://127.0.0.1:7575/api/presence` → `{"state":"active"}`.
+- `curl -X POST -d '{"state":"away"}'` → `{"current":"away","previous":"active"}`; `nestctl presence status` confirms `away`. Reverse flip works.
+- `curl http://127.0.0.1:7575/api/panes` (with bearer) → real panel array `[{focused, id, tab, title, type}]` (GUI was running). Without bearer → 401.
+- `claude.review_approved` publish during `presence==away` → `discord.send_message.completed` lands in test channel (Slice 1B routing intact through the new HTTP entry point).
+- WS handshake to `/ws/events` with `Sec-WebSocket-Protocol: bearer.<token>` → HTTP 101 + `sec-websocket-protocol` echo. Holding the connection open while flipping presence yielded 3 WS frames: `{status:"subscribed"}` ack + 2 `presence.changed` events.
+- Query-string token (`?token=…`) on `/api/presence` or `/ws/events` → 401. WS without `bearer.*` subprotocol → 401.
+- `cargo fmt --all` clean. `cargo clippy --workspace --all-targets -- -D warnings` clean. 9 unit tests (bearer middleware + WS subprotocol parser + constant-time eq).
+
+**Trade-offs accepted:**
+
+- Path A only (web-native chat-style UI). Full PTY xterm.js + mobile keyboard toolbar is Slice 3.1, layered on the same plugin. Decision: ship the Discord-reply-style closed loop fast, see what's actually missing before adding a 60-cell xterm.js viewer on a phone screen.
+- Single registered GUI assumption (primary). Multi-GUI `target_client_id` routing is a follow-up — when the user runs multiple nestty windows simultaneously this matters.
+- No retry/back-off on daemon-socket connection failures. WS subscription drop → reconnect is the user's responsibility (the dashboard's JS already reconnects every 2 s on close).
+- Token rotation = env-var change + daemon restart. No revocation UI.
+- HTTPS termination is the user's perimeter responsibility — Tailscale, cloudflared, or `ssh -L`. The plugin only binds localhost by default.
+
+**Out of scope (Slice 3.1+ backlog):**
+
+- Full PTY xterm.js + mobile keyboard toolbar (`Esc Tab Ctrl / | ↑↓←→`).
+- Pane stream via `terminal.output` event WS (currently UI polls `/api/panes/:id/recent` on demand).
+- PWA manifest + service worker + Web Push.
+- Multi-pane split view.
+- `terminal.exec` (output-waiting) endpoint.
+- Multi-GUI explicit `target_client_id` routing.
+
+**See:** `plugins/web-bridge/` (crate + plugin.toml + static SPA), `nestty-daemon/src/service_supervisor.rs` (NESTTY_SOCKET env inject + socket_path field), `nestty-daemon/src/main.rs` (`activate_supervisor` socket_path threading), `docs/harness-integration.md` § A Slice 3.0, session intents `~/docs/sources/sessions/nestty/2026-05-23-session-3a87a228.md`.

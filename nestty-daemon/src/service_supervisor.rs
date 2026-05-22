@@ -267,6 +267,15 @@ pub struct ServiceSupervisor {
     registry: Arc<ActionRegistry>,
     services: Mutex<Vec<Arc<ServiceHandle>>>,
     nestty_version: String,
+    /// Bound daemon socket path. Injected into every service plugin
+    /// child as `NESTTY_SOCKET=<path>` so plugins that need raw
+    /// daemon-socket access (the path that goes through `dispatch()`
+    /// → `GuiRegistry` for GUI-owned methods like `terminal.read`)
+    /// can connect without rediscovery. Standard service-plugin RPC
+    /// (stdin/stdout) does not require this — it's purely for the
+    /// long-running listener pattern (web-bridge, future ntfy bridge,
+    /// prometheus exporter, …).
+    socket_path: PathBuf,
     init_timeout: Duration,
     action_timeout: Duration,
     on_event_rules: Vec<(String, Arc<ServiceHandle>)>,
@@ -297,6 +306,7 @@ impl ServiceSupervisor {
         plugins: &[LoadedPlugin],
         nestty_version: impl Into<String>,
         extra_reserved: &[&str],
+        socket_path: PathBuf,
     ) -> Arc<Self> {
         // Snapshot the registry AND any additional reserved names BEFORE
         // walking the manifests. Two sources are needed because action
@@ -406,6 +416,7 @@ impl ServiceSupervisor {
             registry,
             services: Mutex::new(services),
             nestty_version: nestty_version.into(),
+            socket_path,
             init_timeout: DEFAULT_INIT_TIMEOUT,
             action_timeout: DEFAULT_ACTION_TIMEOUT,
             on_event_rules,
@@ -556,6 +567,7 @@ impl ServiceSupervisor {
                 handle.plugin_dir.to_string_lossy().as_ref(),
             )
             .env("NESTTY_SERVICE_NAME", &handle.service_name)
+            .env("NESTTY_SOCKET", self.socket_path.to_string_lossy().as_ref())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1680,7 +1692,14 @@ mod tests {
     fn spawner_thread_started_on_new_and_joined_on_shutdown() {
         let bus = Arc::new(EventBus::new());
         let registry = Arc::new(ActionRegistry::new());
-        let sup = ServiceSupervisor::new(bus, registry, &[], "test", &[]);
+        let sup = ServiceSupervisor::new(
+            bus,
+            registry,
+            &[],
+            "test",
+            &[],
+            PathBuf::from("/tmp/nesttyd-test-placeholder.sock"),
+        );
         assert!(
             sup.spawner_tx.lock().unwrap().is_some(),
             "spawner sender stored on supervisor::new"
@@ -1704,7 +1723,14 @@ mod tests {
     fn shutdown_all_is_idempotent() {
         let bus = Arc::new(EventBus::new());
         let registry = Arc::new(ActionRegistry::new());
-        let sup = ServiceSupervisor::new(bus, registry, &[], "test", &[]);
+        let sup = ServiceSupervisor::new(
+            bus,
+            registry,
+            &[],
+            "test",
+            &[],
+            PathBuf::from("/tmp/nesttyd-test-placeholder.sock"),
+        );
         sup.shutdown_all();
         sup.shutdown_all(); // must not panic
         assert!(sup.spawner_tx.lock().unwrap().is_none());
@@ -1721,7 +1747,14 @@ mod tests {
             "rogue",
             vec![mk_service("main", &["system.ping", "rogue.do"])],
         );
-        let _sup = ServiceSupervisor::new(bus, registry.clone(), &[plugin], "test", &[]);
+        let _sup = ServiceSupervisor::new(
+            bus,
+            registry.clone(),
+            &[plugin],
+            "test",
+            &[],
+            PathBuf::from("/tmp/nesttyd-test-placeholder.sock"),
+        );
         // Built-in is untouched; plugin's other action still registers.
         assert_eq!(
             registry.invoke("system.ping", json!({})).unwrap(),
@@ -1762,8 +1795,14 @@ mod tests {
             vec![mk_service("main", &["plugin.hello.greet", "rogue.do"])],
         );
 
-        let _sup =
-            ServiceSupervisor::new(bus, registry.clone(), &[cmds_plugin, rogue], "test", &[]);
+        let _sup = ServiceSupervisor::new(
+            bus,
+            registry.clone(),
+            &[cmds_plugin, rogue],
+            "test",
+            &[],
+            PathBuf::from("/tmp/nesttyd-test-placeholder.sock"),
+        );
         // The shell-command name stays unclaimed in the registry so
         // `socket::dispatch` falls through to `handle_plugin_command`.
         assert!(!registry.has("plugin.hello.greet"));
@@ -1779,7 +1818,14 @@ mod tests {
         // `tab.new` lives in `socket::dispatch`'s match arm, not in the
         // registry, but must still be reserved so a plugin can't shadow
         // it via the registry-first dispatch lookup.
-        let _sup = ServiceSupervisor::new(bus, registry.clone(), &[plugin], "test", &["tab.new"]);
+        let _sup = ServiceSupervisor::new(
+            bus,
+            registry.clone(),
+            &[plugin],
+            "test",
+            &["tab.new"],
+            PathBuf::from("/tmp/nesttyd-test-placeholder.sock"),
+        );
         assert!(!registry.has("tab.new"));
         assert!(registry.has("rogue.do"));
     }
@@ -1801,8 +1847,14 @@ mod tests {
             "rogue",
             vec![mk_service("main", &["system.spawn", "rogue.do"])],
         );
-        let _sup =
-            ServiceSupervisor::new(bus, registry.clone(), &[plugin], "test", &["system.spawn"]);
+        let _sup = ServiceSupervisor::new(
+            bus,
+            registry.clone(),
+            &[plugin],
+            "test",
+            &["system.spawn"],
+            PathBuf::from("/tmp/nesttyd-test-placeholder.sock"),
+        );
         assert!(
             !registry.has("system.spawn"),
             "system.spawn MUST stay trigger-only — supervisor should drop the conflicting provide"
@@ -1826,7 +1878,14 @@ mod tests {
                 subscribes: vec![],
             }],
         );
-        let sup = ServiceSupervisor::new(bus, registry, &[plugin], "test", &[]);
+        let sup = ServiceSupervisor::new(
+            bus,
+            registry,
+            &[plugin],
+            "test",
+            &[],
+            PathBuf::from("/tmp/nesttyd-test-placeholder.sock"),
+        );
         let svc = sup.services.lock().unwrap()[0].clone();
         // onAction services don't auto-spawn at boot; state should be
         // Stopped, but be defensive against future changes.
@@ -1871,7 +1930,14 @@ mod tests {
                 subscribes: vec![],
             }],
         );
-        let sup = ServiceSupervisor::new(bus, registry, &[plugin], "test", &[]);
+        let sup = ServiceSupervisor::new(
+            bus,
+            registry,
+            &[plugin],
+            "test",
+            &[],
+            PathBuf::from("/tmp/nesttyd-test-placeholder.sock"),
+        );
         let svc = sup.services.lock().unwrap()[0].clone();
         wait_for_stopped_or_failed(&svc);
         let err = sup
@@ -1896,7 +1962,14 @@ mod tests {
                 subscribes: vec![],
             }],
         );
-        let sup = ServiceSupervisor::new(bus, registry, &[plugin], "test", &[]);
+        let sup = ServiceSupervisor::new(
+            bus,
+            registry,
+            &[plugin],
+            "test",
+            &[],
+            PathBuf::from("/tmp/nesttyd-test-placeholder.sock"),
+        );
         let svc = sup.services.lock().unwrap()[0].clone();
         // onEvent never auto-spawns at boot, but be defensive.
         wait_for_stopped_or_failed(&svc);
@@ -1922,7 +1995,14 @@ mod tests {
                 subscribes: vec![],
             }],
         );
-        let sup = ServiceSupervisor::new(bus, registry.clone(), &[plugin], "test", &[]);
+        let sup = ServiceSupervisor::new(
+            bus,
+            registry.clone(),
+            &[plugin],
+            "test",
+            &[],
+            PathBuf::from("/tmp/nesttyd-test-placeholder.sock"),
+        );
         // Both manifest-approved actions are registered.
         assert!(registry.has("kb.search"));
         assert!(registry.has("kb.read"));

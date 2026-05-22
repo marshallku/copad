@@ -368,6 +368,8 @@ silent-fail on missing socket. Tags every emitted event with
 - `claude.review_approved` → `kb.append` to a daily log
 - `claude.session_stopped` → `todo.create` for in-progress items
 
+**Slice 3.0 — `plugins/web-bridge/` (shipped 2026-05-23, see decisions.md #42).** First-party plugin that brokers nesttyd's socket surface over HTTP+WebSocket so a phone or laptop on the user's Tailscale (or via SSH tunnel) can drive the local harness. Architecture is the (δ) variant: web-bridge is a service plugin running the supervisor's stdio RPC handshake minimally AND in the same process spawning an axum HTTP+WS listener AND opening raw daemon-socket connections so requests go through `dispatch()` → `GuiRegistry`. Slice 3.0 ships a web-native chat-style UI (Path A) — pane status snapshot + recent-output viewer + live event feed + textarea command input + presence toggle. xterm.js full-PTY + mobile keyboard toolbar (Path B) is layered on top in Slice 3.1+. The only nestty-daemon change beyond the plugin itself is `ServiceSupervisor` injecting `NESTTY_SOCKET` into every service-plugin child env — a one-spot edit that every future listener-style plugin (ntfy bridge, prometheus exporter, …) inherits.
+
 **Slice 1B — presence-gated routing (shipped 2026-05-23, see decisions.md #41).** The toasts above fire locally regardless of whether the user is at the keyboard, which means they're invisible the moment they walk away. Slice 1B adds:
 
 - `Context.presence` (`Active | Away`) — daemon-state, manual toggle via `nestctl presence away|active|status`.

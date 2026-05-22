@@ -45,14 +45,26 @@ nestty/
 │   │                                # delete; mirrors KB security posture), watcher.rs
 │   │                                # (poll-based diff emitting todo.created/changed/
 │   │                                # completed/deleted)
-│   └── git/                  # First-party git workspace + worktree plugin
-│       │                            # (lightweight: argv-vector shell-outs to `git`, no
-│       │                            # external API, no keyring; cross-platform Linux+macOS)
-│       └── src/                    # main.rs (RPC + actions + worktree_add.completed event),
-│                                    # config.rs (~/.config/nestty/workspaces.toml loader with
-│                                    # canonicalization), git.rs (current_branch, list_worktrees
-│                                    # porcelain v2 parser, worktree_add/remove, status v2 parser,
-│                                    # validate_branch_name)
+│   ├── git/                  # First-party git workspace + worktree plugin
+│   │   │                            # (lightweight: argv-vector shell-outs to `git`, no
+│   │   │                            # external API, no keyring; cross-platform Linux+macOS)
+│   │   └── src/                    # main.rs (RPC + actions + worktree_add.completed event),
+│   │                                # config.rs (~/.config/nestty/workspaces.toml loader with
+│   │                                # canonicalization), git.rs (current_branch, list_worktrees
+│   │                                # porcelain v2 parser, worktree_add/remove, status v2 parser,
+│   │                                # validate_branch_name)
+│   └── web-bridge/           # First-party HTTP+WS broker plugin (Slice 3.0 remote-harness).
+│       │                            # Service-plugin model (stdio RPC minimal) + own axum
+│       │                            # tokio listener + raw daemon-socket client (RPC + subscribe)
+│       │                            # via NESTTY_SOCKET (supervisor-injected). Bearer-token
+│       │                            # auth (Authorization header / Sec-WebSocket-Protocol).
+│       │                            # Localhost bind by default — external access (Tailscale /
+│       │                            # SSH tunnel / cloudflared) is the user's perimeter.
+│       │── src/main.rs        # stdio handshake + token validation + tokio runtime spawn
+│       │── src/daemon_client.rs   # rpc() async UnixStream; subscribe() sync UnixStream via
+│       │                            # spawn_blocking (matches nestctl wire model)
+│       │── plugin.toml        # onStartup, provides=[], env docs
+│       └── static/index.html  # mobile-first vanilla SPA — include_str!'d into binary
 # claude.start: nestty-internal socket action (lives in nestty-linux/src/socket.rs).
 # Spawns a tab whose terminal cwd is the worktree, feeds
 # `tmux new-session -A -s <name> 'claude [--resume <id>]'` into it.

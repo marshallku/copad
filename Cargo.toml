@@ -17,6 +17,7 @@ members = [
     "plugins/discord",
     "plugins/bookmark",
     "plugins/jira",
+    "plugins/web-bridge",
 ]
 
 [workspace.package]

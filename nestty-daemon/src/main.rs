@@ -140,7 +140,7 @@ fn main() -> ExitCode {
     };
 
     let supervisor_guard: Arc<ServiceSupervisor> =
-        activate_supervisor(&actions, &event_bus, &plugins);
+        activate_supervisor(&actions, &event_bus, &plugins, socket_path.clone());
 
     let pump_stop = Arc::new(AtomicBool::new(false));
     let pump_thread = pump_state.as_ref().map(|p| {
@@ -845,6 +845,7 @@ fn activate_supervisor(
     actions: &Arc<ActionRegistry>,
     event_bus: &Arc<nestty_core::event_bus::EventBus>,
     plugins: &Arc<Vec<nestty_core::plugin::LoadedPlugin>>,
+    socket_path: PathBuf,
 ) -> Arc<ServiceSupervisor> {
     let reserved: Vec<&str> = LEGACY_DISPATCH_METHODS
         .iter()
@@ -857,6 +858,7 @@ fn activate_supervisor(
         plugins,
         env!("CARGO_PKG_VERSION"),
         &reserved,
+        socket_path,
     )
 }
 
