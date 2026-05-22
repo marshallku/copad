@@ -43,3 +43,14 @@ extension NesttyPanel {
         view
     }
 }
+
+/// Cmd+= / Cmd+- / Cmd+0 surface. Both terminal backends conform;
+/// non-terminal panels (WebView, plugin) don't — AppDelegate uses
+/// `activePane as? Zoomable` so the menu items become silent no-ops
+/// when focus is on a non-terminal pane.
+@MainActor
+protocol Zoomable {
+    func zoomIn()
+    func zoomOut()
+    func zoomReset()
+}

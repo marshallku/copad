@@ -51,6 +51,15 @@ final class TabViewController: NSViewController {
         activePaneManager?.activeWebView()
     }
 
+    /// Polymorphic zoom dispatch — covers both terminal backends
+    /// without AppDelegate needing to know which one is in front.
+    /// Returns nil for non-terminal panes (webview, plugin) so the
+    /// View → Zoom menu items become no-ops there, matching what
+    /// the SwiftTerm-only `activeTerminal` path used to do.
+    var activeZoomable: (any Zoomable)? {
+        activePaneManager?.activePane as? Zoomable
+    }
+
     /// Cross-tab panel lookup by stable UUID. Used by socket commands that take an
     /// `id` param (parity with Linux's `find_panel_by_id`). Walks every tab's split
     /// tree — O(N panels) but N is small in practice.

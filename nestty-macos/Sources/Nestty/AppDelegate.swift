@@ -472,15 +472,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Zoom Actions
 
     @objc private func zoomIn() {
-        tabVC?.activeTerminal?.zoomIn()
+        tabVC?.activeZoomable?.zoomIn()
     }
 
     @objc private func zoomOut() {
-        tabVC?.activeTerminal?.zoomOut()
+        tabVC?.activeZoomable?.zoomOut()
     }
 
     @objc private func zoomReset() {
-        tabVC?.activeTerminal?.zoomReset()
+        tabVC?.activeZoomable?.zoomReset()
     }
 
     // MARK: - Action Registry

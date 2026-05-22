@@ -26,7 +26,7 @@ import Foundation
 /// - Damage tracking + selection + IME + ligatures + automation
 ///   parity (Phases 3.6, 4, 5, 6, 7)
 @MainActor
-final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
+final class AlacrittyTerminalViewController: NSViewController, NesttyPanel, Zoomable {
     let panelID: String = UUID().uuidString
     private(set) var currentTitle: String = "Terminal (alacritty)"
 
@@ -62,6 +62,15 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
     private var tintView: NSView?
     private var shellStarted = false
 
+    /// Active font size for Cmd+= / Cmd+- / Cmd+0 zoom. Mirror of
+    /// `TerminalViewController.currentFontSize`. Decoupled from
+    /// `configFontSize` so a live zoom-in survives a config hot-
+    /// reload (matches SwiftTerm path: applyFont updates the
+    /// baseline but the user's current zoom level stays).
+    private var currentFontSize: CGFloat
+    private var configFontSize: CGFloat
+    private var currentFontFamily: String
+
     /// Focus target for `panel.focusTarget` — callers like PaneManager
     /// that activate a pane (`makeFirstResponder`) need the renderView,
     /// not the layout container.
@@ -75,6 +84,10 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
         initialCwd = cwd
         currentCwd = cwd
         self.initialInput = initialInput
+        let base = CGFloat(config.fontSize)
+        configFontSize = base
+        currentFontSize = base
+        currentFontFamily = config.fontFamily
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -194,19 +207,54 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel {
     }
 
     /// Config hot-reload: swap the font family/size on a running pane.
-    /// When the new face changes cell metrics, also resize the term
-    /// grid so the PTY's winsize matches what the renderer will draw.
-    /// (We don't preserve an independent zoom level the way SwiftTerm
-    /// does — alacritty path has no Cmd+/- yet, so baseSize IS the
-    /// active size.)
+    /// Updates the baseline `configFontSize` for `zoomReset`, but
+    /// leaves `currentFontSize` alone if the user has an active zoom
+    /// in flight — matches `TerminalViewController.applyFont` so a
+    /// live Cmd++ doesn't get clobbered by saving config.toml.
     func applyFont(family: String, baseSize: CGFloat) {
-        let newFont = resolveFont(family: family, size: baseSize)
+        configFontSize = baseSize
+        currentFontFamily = family
+        // Re-apply at the *current* (possibly zoomed) size so the
+        // user's zoom level survives the config reload.
+        applyFontInternal(family: family, size: currentFontSize)
+    }
+
+    private func applyFontInternal(family: String, size: CGFloat) {
+        let newFont = resolveFont(family: family, size: size)
         guard let render = renderView else { return }
         let metricsChanged = render.setFont(newFont)
         if metricsChanged {
             let (cols, rows) = render.computeGrid()
             termHandle?.resize(cols: cols, rows: rows)
         }
+    }
+
+    // MARK: - Zoom (Cmd+= / Cmd+- / Cmd+0)
+
+    /// Zoom in / out / reset. Same step + clamp values as the
+    /// SwiftTerm path so users get identical behavior across the two
+    /// backends. `currentFontSize` is the source of truth; on every
+    /// step we re-call `applyFontInternal` which recomputes cell
+    /// metrics and resizes the PTY grid (smaller font → more cells fit
+    /// → SIGWINCH so shells can re-wrap).
+    func zoomIn() {
+        let newSize = min(currentFontSize + 1, 72)
+        setFontSize(newSize)
+    }
+
+    func zoomOut() {
+        let newSize = max(currentFontSize - 1, 6)
+        setFontSize(newSize)
+    }
+
+    func zoomReset() {
+        setFontSize(configFontSize)
+    }
+
+    private func setFontSize(_ size: CGFloat) {
+        guard size != currentFontSize else { return }
+        currentFontSize = size
+        applyFontInternal(family: currentFontFamily, size: size)
     }
 
     // MARK: - NesttyPanel — background

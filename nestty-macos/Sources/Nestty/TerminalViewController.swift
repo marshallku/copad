@@ -168,7 +168,7 @@ private final class NesttyTerminalDelegate: NSObject, @preconcurrency TerminalVi
 // MARK: - TerminalViewController
 
 @MainActor
-class TerminalViewController: NSViewController, NesttyPanel {
+class TerminalViewController: NSViewController, NesttyPanel, Zoomable {
     let panelID: String = UUID().uuidString
 
     private let config: NesttyConfig
