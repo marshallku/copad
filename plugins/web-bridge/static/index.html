@@ -4,6 +4,9 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
   <title>nestty</title>
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <meta name="theme-color" content="#1e1e2e">
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css"
         crossorigin="anonymous">
   <style>
@@ -73,6 +76,12 @@
     .attention-row[data-kind^="codex"] .kind { color: var(--accent-warn); border-color: var(--accent-warn); }
     .attention-row .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .attention-row .age { color: var(--fg-dim); font-size: 0.7rem; flex-shrink: 0; }
+    /* Push toggle in header — same chip chassis as presence.
+       Push settings expand below cards when subscribed. */
+    .push-settings { background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.65rem; padding: 0.55rem 0.85rem; font-size: 0.75rem; color: var(--fg-dim); display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+    .push-settings label { display: inline-flex; gap: 0.3rem; align-items: center; color: var(--fg); cursor: pointer; }
+    .push-settings input[type="checkbox"] { accent-color: var(--accent); }
+    .push-settings .err { color: var(--accent-err); }
     .empty { padding: 1.2rem; color: var(--fg-dim); text-align: center; font-size: 0.85rem; border: 1px dashed var(--border); border-radius: 0.55rem; }
     .events-strip { background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.65rem; overflow: hidden; }
     .event-row { padding: 0.4rem 0.85rem; border-bottom: 1px solid var(--border); font-size: 0.74rem; color: var(--fg); display: flex; gap: 0.5rem; align-items: baseline; }
@@ -153,7 +162,32 @@
       term: null,               // xterm.js Terminal instance
       fit: null,                // FitAddon
       ctrlSticky: false,
+      // PWA push notification state. `status`:
+      //   "unsupported" — browser missing serviceWorker / PushManager
+      //   "denied" — Notification.permission === "denied"
+      //   "off" — supported but user hasn't subscribed
+      //   "on" — subscribed; server has a stored Subscription
+      // kinds is the user-selected filter (empty = receive every kind);
+      // we default to a sensible "useful Claude/Codex" set.
+      push: {
+        status: "unsupported",
+        kinds: ["notification", "stop", "codex-turn"],
+        subId: null,
+        error: "",
+      },
     };
+
+    // URL-safe base64 → Uint8Array. PushManager.subscribe wants the
+    // VAPID public key as a Uint8Array, but we transport it as the
+    // url-safe base64 string the spec uses.
+    function urlB64ToUint8Array(b64) {
+      const pad = "=".repeat((4 - b64.length % 4) % 4);
+      const norm = (b64 + pad).replace(/-/g, "+").replace(/_/g, "/");
+      const raw = atob(norm);
+      const out = new Uint8Array(raw.length);
+      for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
+      return out;
+    }
 
     function escapeHtml(s) {
       return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
@@ -271,13 +305,30 @@
               </div>
               <div class="card-cwd">interactive UI deferred to Slice 3.2 — see Slice 3.0 endpoints</div>
             </div>`).join("")}</div>`;
+      const pushChip = (() => {
+        if (state.push.status === "unsupported") return `<button class="chip" id="push-toggle" disabled>push: n/a</button>`;
+        if (state.push.status === "denied") return `<button class="chip warn" id="push-toggle">push: denied</button>`;
+        if (state.push.status === "on") return `<button class="chip ok" id="push-toggle">push: on</button>`;
+        return `<button class="chip" id="push-toggle">push: off</button>`;
+      })();
       root.innerHTML = `
         <header>
           <h1>nestty <span class="dim">— remote bridge</span></h1>
+          ${pushChip}
           <button class="chip ${state.presence === "away" ? "warn" : "ok"}" id="presence-toggle">${state.presence || "…"}</button>
         </header>
         ${state.noGui ? `<div class="banner" style="margin: 0.5rem 0.6rem;">nestty GUI not running — only tmux + presence + events work</div>` : ""}
         <main class="overview">
+          ${state.push.status === "on" ? `
+            <div class="push-settings">
+              <span>push kinds:</span>
+              ${["notification", "stop", "codex-turn"].map(k => `
+                <label><input type="checkbox" data-push-kind="${escapeHtml(k)}" ${state.push.kinds.includes(k) ? "checked" : ""}> ${escapeHtml(k)}</label>
+              `).join("")}
+              <span style="color:var(--fg-dim);">(empty = all kinds)</span>
+            </div>
+          ` : ""}
+          ${state.push.error ? `<div class="push-settings"><span class="err">push: ${escapeHtml(state.push.error)}</span></div>` : ""}
           ${state.attention.length === 0 ? "" : `
             <div class="section-title">attention <span style="text-transform:none; color:var(--fg-dim);">${state.attention.length}</span></div>
             <div class="attention-strip">${state.attention.slice(0, 5).map(a => `
@@ -305,6 +356,11 @@
         </main>
       `;
       document.getElementById("presence-toggle").addEventListener("click", togglePresence);
+      const pushBtn = document.getElementById("push-toggle");
+      if (pushBtn && !pushBtn.disabled) pushBtn.addEventListener("click", togglePush);
+      document.querySelectorAll(".push-settings input[data-push-kind]").forEach(el => {
+        el.addEventListener("change", () => updatePushKinds(el.dataset.pushKind, el.checked));
+      });
       document.querySelectorAll(".card[data-pane]").forEach(el => {
         el.addEventListener("click", () => enterAttach(el.dataset.pane));
       });
@@ -539,6 +595,130 @@
       ws.onerror = () => { try { ws.close(); } catch {} };
     }
 
+    /* ==== push notifications ==== */
+    async function initPush() {
+      // iOS Safari pre-16.4 has no Push API. Android Chrome / FF /
+      // Safari 16.4+ / desktop are fine. Plain HTTP (other than
+      // localhost) is also blocked — service worker requires secure
+      // context.
+      if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
+        state.push.status = "unsupported";
+        return;
+      }
+      try {
+        await navigator.serviceWorker.register("/sw.js");
+        const reg = await navigator.serviceWorker.ready;
+        const existing = await reg.pushManager.getSubscription();
+        if (existing) {
+          state.push.status = "on";
+          // Load kinds preference from local storage (sticky across
+          // reloads). Server is source of truth on next mutate.
+          try {
+            const k = JSON.parse(localStorage.getItem("nestty.push.kinds") || "null");
+            if (Array.isArray(k)) state.push.kinds = k;
+          } catch {}
+        } else {
+          state.push.status = Notification.permission === "denied" ? "denied" : "off";
+        }
+      } catch (e) {
+        state.push.status = "off";
+        state.push.error = String(e && e.message || e);
+      }
+    }
+
+    async function togglePush() {
+      if (state.push.status === "unsupported") return;
+      if (state.push.status === "on") return disablePush();
+      return enablePush();
+    }
+
+    async function enablePush() {
+      try {
+        const perm = await Notification.requestPermission();
+        if (perm !== "granted") {
+          state.push.status = "denied";
+          state.push.error = "permission " + perm;
+          render();
+          return;
+        }
+        const { public_key } = await api("/api/push/vapid-public");
+        const reg = await navigator.serviceWorker.ready;
+        const sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlB64ToUint8Array(public_key),
+        });
+        const subJson = sub.toJSON();
+        const r = await api("/api/push/subscribe", {
+          method: "POST",
+          body: JSON.stringify({
+            endpoint: subJson.endpoint,
+            keys: subJson.keys,
+            kinds: state.push.kinds,
+          }),
+        });
+        state.push.status = "on";
+        state.push.subId = r.id;
+        state.push.error = "";
+        localStorage.setItem("nestty.push.kinds", JSON.stringify(state.push.kinds));
+        render();
+      } catch (e) {
+        state.push.error = "subscribe failed: " + String(e && e.message || e);
+        render();
+      }
+    }
+
+    async function disablePush() {
+      try {
+        const reg = await navigator.serviceWorker.ready;
+        const sub = await reg.pushManager.getSubscription();
+        if (sub) {
+          // Best-effort server prune by sha256(endpoint) id. The
+          // browser-side unsubscribe is the auth-of-record though.
+          try {
+            const enc = new TextEncoder().encode(sub.endpoint);
+            const digest = await crypto.subtle.digest("SHA-256", enc);
+            const hex = Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, "0")).join("");
+            await api(`/api/push/subscribe/${hex}`, { method: "DELETE" });
+          } catch {}
+          await sub.unsubscribe();
+        }
+        state.push.status = "off";
+        state.push.subId = null;
+        state.push.error = "";
+        render();
+      } catch (e) {
+        state.push.error = "unsubscribe failed: " + String(e && e.message || e);
+        render();
+      }
+    }
+
+    async function updatePushKinds(kind, on) {
+      const cur = new Set(state.push.kinds);
+      if (on) cur.add(kind); else cur.delete(kind);
+      state.push.kinds = Array.from(cur);
+      localStorage.setItem("nestty.push.kinds", JSON.stringify(state.push.kinds));
+      // Re-subscribe with new kinds (server dedupes by sha256(endpoint)
+      // id, so this is idempotent rather than creating a second row).
+      if (state.push.status !== "on") return;
+      try {
+        const reg = await navigator.serviceWorker.ready;
+        const sub = await reg.pushManager.getSubscription();
+        if (!sub) return;
+        const subJson = sub.toJSON();
+        await api("/api/push/subscribe", {
+          method: "POST",
+          body: JSON.stringify({
+            endpoint: subJson.endpoint,
+            keys: subJson.keys,
+            kinds: state.push.kinds,
+          }),
+        });
+      } catch (e) {
+        state.push.error = "kinds update failed: " + String(e && e.message || e);
+        render();
+      }
+    }
+
     /* ==== actions ==== */
     async function bootstrap() {
       state.presence = "…";
@@ -556,6 +736,7 @@
         if (e && e.code === "no_gui") state.noGui = true;
         state.nesttyPanels = [];
       }
+      await initPush();
       render();
       openEventStream();
       openOverviewStream();

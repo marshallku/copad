@@ -24,6 +24,7 @@
 
 mod agents;
 mod daemon_client;
+mod push;
 mod tmux;
 
 use std::io::{BufRead, BufReader, Write};
@@ -234,6 +235,13 @@ struct AppState {
     /// shell-outs per click; once the snapshot is built we serve it
     /// from memory until the TTL expires.
     tmux_cache: Arc<tokio::sync::Mutex<Option<TmuxCacheEntry>>>,
+    /// VAPID config from env. `None` disables the push endpoints (501).
+    push_config: Arc<Option<push::PushConfig>>,
+    /// Loaded subscription list — serialised through this Mutex on
+    /// every read/write so the file-on-disk and the in-memory mirror
+    /// stay consistent. Pruning on 410 Gone happens through the same
+    /// guard from the push-trigger task.
+    push_subs: Arc<tokio::sync::Mutex<Vec<push::Subscription>>>,
 }
 
 #[derive(Clone)]
@@ -255,10 +263,18 @@ async fn run_server(
         routing::{get, post},
     };
 
+    let push_config = push::PushConfig::from_env();
+    if push_config.is_none() {
+        eprintln!(
+            "[web-bridge] NESTTY_WEB_BRIDGE_VAPID_PRIVATE/PUBLIC not set — push notifications disabled"
+        );
+    }
     let state = AppState {
         daemon: DaemonClient::new(socket_path),
         token: Arc::new(token.to_string()),
         tmux_cache: Arc::new(tokio::sync::Mutex::new(None)),
+        push_config: Arc::new(push_config),
+        push_subs: Arc::new(tokio::sync::Mutex::new(push::load_subscriptions())),
         default_subscribe_patterns: Arc::new(vec![
             "presence.*".to_string(),
             "claude.*".to_string(),
@@ -284,6 +300,16 @@ async fn run_server(
         .route("/ws/tmux/overview", get(handle_ws_tmux_overview))
         .route("/ws/tmux/attach/:pane_id", get(handle_ws_tmux_attach))
         .route("/ws/events", get(handle_ws_events))
+        .route("/api/push/vapid-public", get(handle_push_vapid_public))
+        .route("/api/push/subscribe", post(handle_push_subscribe))
+        .route(
+            "/api/push/subscribe/:id",
+            axum::routing::delete(handle_push_unsubscribe),
+        )
+        .route("/api/push/test", post(handle_push_test))
+        .route("/manifest.webmanifest", get(handle_manifest))
+        .route("/sw.js", get(handle_service_worker))
+        .route("/icon.svg", get(handle_icon))
         .layer(axum::middleware::from_fn(
             move |req: axum::extract::Request, next: Next| {
                 let token = auth_state.token.clone();
@@ -292,8 +318,17 @@ async fn run_server(
                     // SPA root + health are unauthenticated so the
                     // dashboard HTML loads before JS injects the token
                     // into the Authorization header on subsequent
-                    // /api/* / /ws/* calls.
-                    let public = path == "/" || path == "/healthz";
+                    // /api/* / /ws/* calls. PWA manifest + service
+                    // worker + icon are unauthenticated for the same
+                    // reason — the browser fetches them on install
+                    // without an Authorization header. None of these
+                    // expose data (manifest is metadata, sw.js owns
+                    // only post-permission push notifications).
+                    let public = path == "/"
+                        || path == "/healthz"
+                        || path == "/manifest.webmanifest"
+                        || path == "/sw.js"
+                        || path == "/icon.svg";
                     let upgrades = path.starts_with("/ws/");
                     if public {
                         return next.run(req).await;
@@ -310,12 +345,160 @@ async fn run_server(
                 }
             },
         ))
-        .with_state(state);
+        .with_state(state.clone());
+
+    // Push trigger task. Polls the attention queue every 5 s. Anything
+    // strictly newer than the last seen ts gets fanned out to every
+    // subscription whose kinds filter accepts the event. 410 Gone /
+    // 404 Not Found endpoints are pruned in-place. On startup we
+    // anchor at the latest ts in the queue so we don't push the user's
+    // entire backlog at boot. No-op when VAPID isn't configured.
+    if state.push_config.is_some() {
+        let push_state = state.clone();
+        tokio::spawn(async move { push_loop(push_state).await });
+    }
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     eprintln!("[web-bridge] listening on {bind}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn push_loop(state: AppState) {
+    let cfg = match state.push_config.as_ref().as_ref() {
+        Some(c) => c.clone(),
+        None => return,
+    };
+    // Per-entry fingerprint dedup instead of just `ts > last_seen`.
+    // The bash hooks write second-granularity timestamps so two events
+    // appended in the same second would collide on `ts` alone — we
+    // need to know each entry by its content, not just its time. Set
+    // capacity grows then GCs to the latest N when overflowing.
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut seen_order: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+    const SEEN_CAP: usize = 1024;
+    // Pre-seed with the existing backlog so boot doesn't dump it.
+    for e in agents::read_attention_queue(3600) {
+        let fp = attention_fingerprint(&e);
+        if seen.insert(fp) {
+            seen_order.push_back(fp);
+        }
+    }
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        // 5 min window for "fresh" — the queue file is bounded by the
+        // bash hooks but no point scanning further back than push
+        // services would deliver anyway.
+        let entries = agents::read_attention_queue(300);
+        let mut new_entries: Vec<agents::AttentionEntry> = entries
+            .into_iter()
+            .filter(|e| !seen.contains(&attention_fingerprint(e)))
+            .collect();
+        if new_entries.is_empty() {
+            continue;
+        }
+        // Walk oldest first so notifications arrive in chronological
+        // order on the device.
+        new_entries.sort_by_key(|e| e.ts);
+
+        let subs_snapshot = state.push_subs.lock().await.clone();
+        // Mark as seen unconditionally so a no-subscriber tick still
+        // advances the dedup state.
+        for e in &new_entries {
+            let fp = attention_fingerprint(e);
+            if seen.insert(fp) {
+                seen_order.push_back(fp);
+            }
+        }
+        while seen.len() > SEEN_CAP {
+            if let Some(old) = seen_order.pop_front() {
+                seen.remove(&old);
+            } else {
+                break;
+            }
+        }
+        if subs_snapshot.is_empty() {
+            continue;
+        }
+        let mut pruned_ids: Vec<String> = Vec::new();
+        for entry in &new_entries {
+            for sub in &subs_snapshot {
+                if !sub.matches_kind(&entry.kind) {
+                    continue;
+                }
+                let url = if entry.tmux_target.is_empty() {
+                    "/".to_string()
+                } else {
+                    format!("/#attention/{}", urlenc(&entry.tmux_target))
+                };
+                let title = if entry.title.is_empty() {
+                    "nestty".to_string()
+                } else {
+                    entry.title.clone()
+                };
+                let body = if entry.body.is_empty() {
+                    entry.kind.clone()
+                } else {
+                    entry.body.clone()
+                };
+                let tag = format!("nestty-{}", entry.kind);
+                let payload = push::PushPayload {
+                    title: &title,
+                    body: &body,
+                    tag: &tag,
+                    kind: &entry.kind,
+                    url: &url,
+                };
+                if let Err(e) = push::send_to(&cfg, sub, &payload).await {
+                    if push::is_terminal_error(&e) {
+                        pruned_ids.push(sub.id.clone());
+                    } else {
+                        eprintln!("[web-bridge] push send error (kept): {e:?}");
+                    }
+                }
+            }
+        }
+        if !pruned_ids.is_empty() {
+            let mut subs = state.push_subs.lock().await;
+            subs.retain(|s| !pruned_ids.contains(&s.id));
+            if let Err(e) = push::save_subscriptions(&subs) {
+                eprintln!("[web-bridge] push save_subscriptions failed: {e}");
+            }
+        }
+    }
+}
+
+/// Fingerprint an attention entry across (ts, kind, title, body,
+/// session_id). Stable hasher choice doesn't matter — we never persist
+/// the value across restarts, just dedup within one push_loop lifetime.
+fn attention_fingerprint(e: &agents::AttentionEntry) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    e.ts.hash(&mut h);
+    e.kind.hash(&mut h);
+    e.title.hash(&mut h);
+    e.body.hash(&mut h);
+    e.session_id.hash(&mut h);
+    h.finish()
+}
+
+/// Minimal URL-encoder for the path-segment subset we emit. Avoids
+/// pulling in `urlencoding` for one call site.
+fn urlenc(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        let is_safe = b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b':');
+        if is_safe {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write;
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 async fn handle_index() -> axum::response::Response {
@@ -330,6 +513,167 @@ async fn handle_index() -> axum::response::Response {
 
 async fn handle_healthz() -> &'static str {
     "ok\n"
+}
+
+async fn handle_manifest() -> axum::response::Response {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+    (
+        [(header::CONTENT_TYPE, "application/manifest+json")],
+        include_str!("../static/manifest.webmanifest"),
+    )
+        .into_response()
+}
+
+async fn handle_service_worker() -> axum::response::Response {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+    (
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        include_str!("../static/sw.js"),
+    )
+        .into_response()
+}
+
+async fn handle_icon() -> axum::response::Response {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+    (
+        [(header::CONTENT_TYPE, "image/svg+xml")],
+        include_str!("../static/icon.svg"),
+    )
+        .into_response()
+}
+
+async fn handle_push_vapid_public(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Result<axum::Json<Value>, AppError> {
+    let cfg = state
+        .push_config
+        .as_ref()
+        .as_ref()
+        .ok_or_else(|| AppError::custom("push_disabled", "VAPID env not configured"))?;
+    Ok(axum::Json(
+        json!({ "public_key": cfg.vapid_public_b64.clone() }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct PushSubscribeBody {
+    endpoint: String,
+    keys: PushKeys,
+    #[serde(default)]
+    kinds: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct PushKeys {
+    p256dh: String,
+    auth: String,
+}
+
+async fn handle_push_subscribe(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::Json(body): axum::Json<PushSubscribeBody>,
+) -> Result<axum::Json<Value>, AppError> {
+    if state.push_config.as_ref().is_none() {
+        return Err(AppError::custom(
+            "push_disabled",
+            "VAPID env not configured",
+        ));
+    }
+    let id = push::subscription_id_for(&body.endpoint);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let new_sub = push::Subscription {
+        id: id.clone(),
+        endpoint: body.endpoint,
+        p256dh: body.keys.p256dh,
+        auth: body.keys.auth,
+        kinds: body.kinds,
+        created_at_ms: now_ms,
+    };
+    {
+        let mut subs = state.push_subs.lock().await;
+        subs.retain(|s| s.id != id);
+        subs.push(new_sub);
+        push::save_subscriptions(&subs)
+            .map_err(|e| AppError::custom("persist", &format!("save subs: {e}")))?;
+    }
+    Ok(axum::Json(json!({ "id": id, "ok": true })))
+}
+
+async fn handle_push_unsubscribe(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<axum::Json<Value>, AppError> {
+    if state.push_config.as_ref().is_none() {
+        return Err(AppError::custom(
+            "push_disabled",
+            "VAPID env not configured",
+        ));
+    }
+    let removed = {
+        let mut subs = state.push_subs.lock().await;
+        let before = subs.len();
+        subs.retain(|s| s.id != id);
+        let after = subs.len();
+        if before != after {
+            push::save_subscriptions(&subs)
+                .map_err(|e| AppError::custom("persist", &format!("save subs: {e}")))?;
+        }
+        before != after
+    };
+    Ok(axum::Json(json!({ "removed": removed })))
+}
+
+async fn handle_push_test(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Result<axum::Json<Value>, AppError> {
+    let cfg = state
+        .push_config
+        .as_ref()
+        .as_ref()
+        .ok_or_else(|| AppError::custom("push_disabled", "VAPID env not configured"))?;
+    let subs_snapshot = state.push_subs.lock().await.clone();
+    let mut sent = 0usize;
+    let mut pruned_ids: Vec<String> = Vec::new();
+    for sub in subs_snapshot.into_iter() {
+        let payload = push::PushPayload {
+            title: "nestty",
+            body: "test push from web-bridge",
+            tag: "nestty-test",
+            kind: "test",
+            url: "/",
+        };
+        match push::send_to(cfg, &sub, &payload).await {
+            Ok(_) => {
+                sent += 1;
+            }
+            Err(e) if push::is_terminal_error(&e) => {
+                pruned_ids.push(sub.id.clone());
+            }
+            Err(e) => {
+                eprintln!("[web-bridge] push send error (kept): {e:?}");
+            }
+        }
+    }
+    // Retain-by-id instead of full replace so a concurrent subscribe
+    // landed during the send fan-out isn't clobbered. Save only when
+    // we actually pruned to avoid a no-op disk write per test.
+    let pruned = pruned_ids.len();
+    if pruned > 0 {
+        let mut subs = state.push_subs.lock().await;
+        subs.retain(|s| !pruned_ids.contains(&s.id));
+        push::save_subscriptions(&subs)
+            .map_err(|e| AppError::custom("persist", &format!("save subs: {e}")))?;
+    }
+    Ok(axum::Json(json!({ "sent": sent, "pruned": pruned })))
 }
 
 async fn handle_presence_get(
@@ -958,8 +1302,14 @@ impl axum::response::IntoResponse for AppError {
                 (status, code, message)
             }
             AppError::Custom { code, message } => {
+                // Map known codes to specific status. push_disabled =
+                // 503 (Service Unavailable — feature exists but not
+                // configured); tmux_error = 502 (upstream tmux
+                // failed); anything else falls through to 500.
                 let status = if code == "tmux_error" {
                     StatusCode::BAD_GATEWAY
+                } else if code == "push_disabled" {
+                    StatusCode::SERVICE_UNAVAILABLE
                 } else {
                     StatusCode::INTERNAL_SERVER_ERROR
                 };
