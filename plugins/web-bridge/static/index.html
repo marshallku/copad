@@ -46,7 +46,29 @@
     .card-name { font-size: 0.85rem; color: var(--fg); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .card-meta { font-size: 0.7rem; color: var(--fg-dim); white-space: nowrap; }
     .card-cwd { font-size: 0.72rem; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* Status row sits between the head and the preview; small inline
+       chips for agent state + freshness. The colors track the chip
+       palette: busy/working → warn (mid-turn, draw eye), idle/ready →
+       ok (parked at prompt, calm), waiting → err (user blocked). */
+    .card-status { display: flex; gap: 0.3rem; flex-wrap: wrap; align-items: center; }
+    .card-status .pill { font-size: 0.65rem; padding: 0.12rem 0.4rem; border-radius: 0.35rem; border: 1px solid var(--border); color: var(--fg-dim); white-space: nowrap; line-height: 1.3; }
+    .card-status .pill.busy { color: var(--accent-warn); border-color: var(--accent-warn); }
+    .card-status .pill.idle { color: var(--accent-ok); border-color: var(--accent-ok); }
+    .card-status .pill.waiting { color: var(--accent-err); border-color: var(--accent-err); }
+    .card-status .pill.age { color: var(--fg-dim); }
     .card-preview { font-size: 0.72rem; color: var(--fg); background: var(--bg-3); padding: 0.4rem 0.55rem; border-radius: 0.4rem; line-height: 1.35; max-height: 5.5em; overflow: hidden; white-space: pre-wrap; word-break: break-all; }
+    /* Attention strip — same chassis as events strip but kind-color
+       coded. notification = accent (info), stop = ok (done), codex* =
+       warn (response ready / awaits user). Hidden via JS when empty. */
+    .attention-strip { background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.65rem; overflow: hidden; }
+    .attention-row { padding: 0.45rem 0.85rem; border-bottom: 1px solid var(--border); font-size: 0.74rem; color: var(--fg); display: flex; gap: 0.5rem; align-items: baseline; }
+    .attention-row:last-child { border-bottom: none; }
+    .attention-row .kind { flex-shrink: 0; font-size: 0.65rem; padding: 0.1rem 0.35rem; border-radius: 0.3rem; border: 1px solid var(--border); color: var(--fg-dim); }
+    .attention-row[data-kind="notification"] .kind { color: var(--accent); border-color: var(--accent); }
+    .attention-row[data-kind="stop"] .kind { color: var(--accent-ok); border-color: var(--accent-ok); }
+    .attention-row[data-kind^="codex"] .kind { color: var(--accent-warn); border-color: var(--accent-warn); }
+    .attention-row .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .attention-row .age { color: var(--fg-dim); font-size: 0.7rem; flex-shrink: 0; }
     .empty { padding: 1.2rem; color: var(--fg-dim); text-align: center; font-size: 0.85rem; border: 1px dashed var(--border); border-radius: 0.55rem; }
     .events-strip { background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.65rem; overflow: hidden; }
     .event-row { padding: 0.4rem 0.85rem; border-bottom: 1px solid var(--border); font-size: 0.74rem; color: var(--fg); display: flex; gap: 0.5rem; align-items: baseline; }
@@ -118,6 +140,7 @@
       mode: "overview",         // "overview" | "attach"
       presence: null,
       tmuxPanes: [],
+      attention: [],
       nesttyPanels: [],
       events: [],
       noGui: false,
@@ -133,6 +156,25 @@
     }
     function stripAnsi(s) { return String(s).replace(/\x1b\[[0-9;]*[a-zA-Z]/g, ""); }
     function fmtTs(ms) { if (!ms) return ""; return new Date(ms).toTimeString().slice(0,8); }
+    // Relative-age string matching tmx's human_age / attention-picker.sh.
+    // `ms` is epoch-millis; `tsSec` is epoch-seconds. Returns "5s"/"3m"/
+    // "2h"/"1d" or "" when missing so callers can chain conditionally.
+    function humanAgeMs(ms) {
+      if (!ms) return "";
+      const secs = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+      return humanAgeSecs(secs);
+    }
+    function humanAgeFromEpochSec(tsSec) {
+      if (!tsSec) return "";
+      const secs = Math.max(0, Math.floor(Date.now() / 1000 - tsSec));
+      return humanAgeSecs(secs);
+    }
+    function humanAgeSecs(secs) {
+      if (secs < 60) return `${secs}s`;
+      if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+      if (secs < 86400) return `${Math.floor(secs / 3600)}h`;
+      return `${Math.floor(secs / 86400)}d`;
+    }
     function summarize(e) {
       const p = e.data || e.payload || {};
       if (typeof p === "string") return p;
@@ -170,15 +212,28 @@
     function renderOverview() {
       const tmuxBlock = state.tmuxPanes.length === 0
         ? `<div class="empty">no tmux panes. start a tmux session (or use the non-tmux fallback below).</div>`
-        : `<div class="cards">${state.tmuxPanes.map(p => `
+        : `<div class="cards">${state.tmuxPanes.map(p => {
+            const a = p.agent;
+            const statusPill = (a && a.status)
+              ? `<span class="pill ${escapeHtml(a.status)}">${escapeHtml(a.name || "agent")}: ${escapeHtml(a.status)}</span>`
+              : (a ? `<span class="pill">${escapeHtml(a.name || "agent")}</span>` : "");
+            const agePill = (a && a.updated_at_ms)
+              ? `<span class="pill age">${escapeHtml(humanAgeMs(a.updated_at_ms))} ago</span>`
+              : "";
+            const statusRow = (statusPill || agePill)
+              ? `<div class="card-status">${statusPill}${agePill}</div>`
+              : "";
+            return `
             <div class="card${p.pane_active ? " active-pane" : ""}" data-pane="${escapeHtml(p.pane_id)}">
               <div class="card-head">
                 <div class="card-name">${escapeHtml(p.session)} : ${escapeHtml(p.window_name || p.window_index)} (${escapeHtml(p.pane_id)})</div>
                 <div class="card-meta">${p.pane_active ? "● active" : ""}</div>
               </div>
               <div class="card-cwd">${escapeHtml(p.cwd || "")}</div>
+              ${statusRow}
               <div class="card-preview">${escapeHtml(stripAnsi((p.last_lines || []).join("\n")).trim() || "(empty)")}</div>
-            </div>`).join("")}</div>`;
+            </div>`;
+          }).join("")}</div>`;
       const nesttyBlock = state.nesttyPanels.length === 0
         ? `<div class="empty">no nestty panels${state.noGui ? " — nestty GUI not running" : ""}</div>`
         : `<div class="cards">${state.nesttyPanels.map(p => `
@@ -196,6 +251,15 @@
         </header>
         ${state.noGui ? `<div class="banner" style="margin: 0.5rem 0.6rem;">nestty GUI not running — only tmux + presence + events work</div>` : ""}
         <main class="overview">
+          ${state.attention.length === 0 ? "" : `
+            <div class="section-title">attention <span style="text-transform:none; color:var(--fg-dim);">${state.attention.length}</span></div>
+            <div class="attention-strip">${state.attention.slice(0, 5).map(a => `
+              <div class="attention-row" data-kind="${escapeHtml(a.kind || "?")}">
+                <span class="kind">${escapeHtml(a.kind || "?")}</span>
+                <span class="title">${escapeHtml(a.title || a.body || "")}</span>
+                <span class="age">${escapeHtml(a.tmux_session || "")} ${escapeHtml(humanAgeFromEpochSec(a.ts))}</span>
+              </div>`).join("")}</div>
+          `}
           <div class="section-title">tmux panes <span style="text-transform:none; color:var(--fg-dim);">${state.tmuxPanes.length}</span></div>
           ${tmuxBlock}
           <div class="section-title">nestty panels <span style="text-transform:none; color:var(--fg-dim);">${state.nesttyPanels.length}</span></div>
@@ -378,7 +442,16 @@
       state.ws.overview = ws;
       ws.onmessage = (msg) => {
         try {
-          state.tmuxPanes = JSON.parse(msg.data);
+          const snap = JSON.parse(msg.data);
+          // New shape is {panes, attention}; tolerate the old plain-
+          // array shape so a stale cached page transient doesn't blank
+          // the dashboard during the deploy window.
+          if (Array.isArray(snap)) {
+            state.tmuxPanes = snap;
+          } else {
+            state.tmuxPanes = snap.panes || [];
+            state.attention = snap.attention || [];
+          }
           if (state.mode === "overview") render();
         } catch {}
       };

@@ -22,6 +22,7 @@
 //! from `NESTTY_WEB_BRIDGE_TOKEN` env and must be ≥32 chars; if
 //! missing/short the plugin exits before binding.
 
+mod agents;
 mod daemon_client;
 mod tmux;
 
@@ -477,13 +478,19 @@ async fn handle_tmux_send(
     Ok(axum::Json(json!({ "ok": true })))
 }
 
-/// Sync helper used inside `spawn_blocking`. Builds the full overview
-/// JSON: `[{session, window_id, window_index, window_name, pane_id,
-/// pane_active, cwd, last_lines}]`. Capture failures per pane don't
-/// abort the snapshot — they show up as `last_lines: []` so the UI
-/// still renders the card.
+/// Sync helper used inside `spawn_blocking`. Builds the overview JSON
+/// `{panes: [...], attention: [...]}`. Each pane carries `last_lines`
+/// (capture-pane), and — when a `claude` / `codex` descendant is found
+/// rooted at `pane_pid` — an `agent: {pid, name, status, session_id,
+/// updated_at_ms}` summary read from `~/.claude/sessions/<pid>.json`.
+/// Capture or enrichment failures degrade individual fields, never
+/// abort the snapshot.
 fn build_tmux_snapshot() -> Result<Value, AppError> {
     let panes = tmux::list_panes().map_err(|msg| AppError::custom("tmux_error", &msg))?;
+    // Single ProcSnapshot for the whole tick — refreshing /proc once
+    // per pane would be wasteful + risks inconsistent reads across
+    // panes. sysinfo's refresh is sub-millisecond per call.
+    let proc_snap = agents::ProcSnapshot::new();
     let rows: Vec<Value> = panes
         .into_iter()
         .map(|p| {
@@ -497,6 +504,17 @@ fn build_tmux_snapshot() -> Result<Value, AppError> {
                     lines
                 })
                 .unwrap_or_default();
+            let agent = p.pane_pid.and_then(|root| {
+                let proc = proc_snap.find_descendant(root, &["claude", "codex"])?;
+                let meta = agents::read_session_meta(proc.pid);
+                Some(json!({
+                    "pid": proc.pid,
+                    "name": proc.name,
+                    "status": meta.as_ref().map(|m| m.status),
+                    "session_id": meta.as_ref().map(|m| m.session_id.clone()),
+                    "updated_at_ms": meta.as_ref().map(|m| m.updated_at_ms),
+                }))
+            });
             json!({
                 "session": p.session,
                 "window_id": p.window_id,
@@ -506,10 +524,19 @@ fn build_tmux_snapshot() -> Result<Value, AppError> {
                 "pane_active": p.pane_active,
                 "cwd": p.cwd,
                 "last_lines": last,
+                "agent": agent,
             })
         })
         .collect();
-    Ok(Value::Array(rows))
+    // 60-minute window matches `attention-picker.sh`'s default so the
+    // dashboard and the fzf picker agree on "what's pending right
+    // now". Cap at 20 entries to keep frames small + cards readable.
+    let mut attention: Vec<agents::AttentionEntry> = agents::read_attention_queue(3600);
+    attention.truncate(20);
+    Ok(json!({
+        "panes": rows,
+        "attention": attention,
+    }))
 }
 
 async fn handle_pane_input(

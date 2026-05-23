@@ -30,3 +30,8 @@ futures-util = { version = "0.3", default-features = false, features = [
     "sink",
 ] }
 portable-pty = "0.9"
+# Process tree walking for agent detection (claude/codex descendant of
+# tmux pane PID). `system` feature is the minimum — we read name + cwd
+# + start_time, no disks/network. Matches ~/dev/tmx's dependency.
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+dirs = "5"

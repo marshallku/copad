@@ -28,6 +28,11 @@ pub struct TmuxPane {
     pub pane_id: String,
     pub pane_active: bool,
     pub cwd: String,
+    /// PID of the pane's foreground process group leader (the shell, or
+    /// whatever the user spawned in the pane). `None` only if tmux
+    /// emitted an empty string, which shouldn't happen in practice.
+    /// Used as the root for `find_descendant("claude" | "codex")`.
+    pub pane_pid: Option<u32>,
 }
 
 /// `tmux list-panes -a -F …` — all panes across all sessions in one
@@ -39,7 +44,7 @@ pub fn list_panes() -> Result<Vec<TmuxPane>, String> {
             "list-panes",
             "-a",
             "-F",
-            "#{session_name}\t#{window_id}\t#{window_index}\t#{window_name}\t#{pane_id}\t#{pane_active}\t#{pane_current_path}",
+            "#{session_name}\t#{window_id}\t#{window_index}\t#{window_name}\t#{pane_id}\t#{pane_active}\t#{pane_current_path}\t#{pane_pid}",
         ])
         .output()
         .map_err(|e| format!("spawn tmux: {e}"))?;
@@ -59,7 +64,7 @@ pub fn parse_list_panes(stdout: &str) -> Vec<TmuxPane> {
         .lines()
         .filter(|l| !l.is_empty())
         .filter_map(|line| {
-            let mut cols = line.splitn(7, '\t');
+            let mut cols = line.splitn(8, '\t');
             let session = cols.next()?.to_string();
             let window_id = cols.next()?.to_string();
             let window_index = cols.next()?.parse().ok()?;
@@ -67,6 +72,10 @@ pub fn parse_list_panes(stdout: &str) -> Vec<TmuxPane> {
             let pane_id = cols.next()?.to_string();
             let pane_active = cols.next()? == "1";
             let cwd = cols.next()?.to_string();
+            // pane_pid is best-effort — an empty or non-numeric value
+            // means we skip agent enrichment for this pane but keep the
+            // row so it still appears in the overview.
+            let pane_pid = cols.next().and_then(|s| s.parse::<u32>().ok());
             Some(TmuxPane {
                 session,
                 window_id,
@@ -75,6 +84,7 @@ pub fn parse_list_panes(stdout: &str) -> Vec<TmuxPane> {
                 pane_id,
                 pane_active,
                 cwd,
+                pane_pid,
             })
         })
         .collect()
@@ -147,8 +157,8 @@ mod tests {
 
     #[test]
     fn parse_list_panes_two_panes() {
-        let sample = "main\t@0\t0\twork\t%0\t1\t/home/marshall/dev/nestty\n\
-                     main\t@1\t1\tlogs\t%1\t0\t/var/log\n";
+        let sample = "main\t@0\t0\twork\t%0\t1\t/home/marshall/dev/nestty\t12345\n\
+                     main\t@1\t1\tlogs\t%1\t0\t/var/log\t12346\n";
         let panes = parse_list_panes(sample);
         assert_eq!(panes.len(), 2);
         assert_eq!(panes[0].session, "main");
@@ -158,8 +168,10 @@ mod tests {
         assert_eq!(panes[0].pane_id, "%0");
         assert!(panes[0].pane_active);
         assert_eq!(panes[0].cwd, "/home/marshall/dev/nestty");
+        assert_eq!(panes[0].pane_pid, Some(12345));
         assert_eq!(panes[1].pane_id, "%1");
         assert!(!panes[1].pane_active);
+        assert_eq!(panes[1].pane_pid, Some(12346));
     }
 
     #[test]
@@ -170,23 +182,37 @@ mod tests {
 
     #[test]
     fn parse_list_panes_skips_malformed_lines() {
-        // Missing the trailing cwd column — drop the row, keep good ones.
-        let sample = "ok\t@0\t0\tn\t%0\t1\t/a\n\
+        // Missing required columns up to and including cwd — drop the
+        // row. A missing trailing pid is tolerated (becomes None).
+        let sample = "ok\t@0\t0\tn\t%0\t1\t/a\t111\n\
                      bad\t@1\t1\tn\t%1\t1\n\
-                     ok2\t@2\t2\tn\t%2\t0\t/b\n";
+                     ok2\t@2\t2\tn\t%2\t0\t/b\t222\n";
         let panes = parse_list_panes(sample);
         assert_eq!(panes.len(), 2);
         assert_eq!(panes[0].pane_id, "%0");
+        assert_eq!(panes[0].pane_pid, Some(111));
         assert_eq!(panes[1].pane_id, "%2");
+        assert_eq!(panes[1].pane_pid, Some(222));
+    }
+
+    #[test]
+    fn parse_list_panes_missing_pane_pid_column_tolerated() {
+        // Old-format rows without the trailing pid column still parse;
+        // pane_pid is None and downstream agent enrichment skips them.
+        let sample = "s\t@0\t0\tn\t%0\t1\t/a\n";
+        let panes = parse_list_panes(sample);
+        assert_eq!(panes.len(), 1);
+        assert_eq!(panes[0].pane_pid, None);
     }
 
     #[test]
     fn parse_list_panes_session_name_with_spaces() {
         // session_name can contain spaces; tab-separation must survive.
-        let sample = "my session\t@0\t0\tw\t%0\t1\t/home\n";
+        let sample = "my session\t@0\t0\tw\t%0\t1\t/home\t99\n";
         let panes = parse_list_panes(sample);
         assert_eq!(panes.len(), 1);
         assert_eq!(panes[0].session, "my session");
+        assert_eq!(panes[0].pane_pid, Some(99));
     }
 
     #[test]
@@ -200,6 +226,7 @@ mod tests {
                 pane_id: "%0".into(),
                 pane_active: true,
                 cwd: "/".into(),
+                pane_pid: Some(100),
             },
             TmuxPane {
                 session: "s".into(),
@@ -209,6 +236,7 @@ mod tests {
                 pane_id: "%5".into(),
                 pane_active: false,
                 cwd: "/tmp".into(),
+                pane_pid: Some(200),
             },
         ];
         assert_eq!(find_pane(&panes, "%5").map(|p| p.window_index), Some(1));
