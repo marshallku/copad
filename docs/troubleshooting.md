@@ -267,6 +267,53 @@ For persistence across reboots, drop the token into
 discord plugin uses for its bot token) and the systemd unit will
 pick it up at every start.
 
+### web-bridge tmux overview is empty even with active tmux sessions
+
+**Symptom:** `/api/tmux/panes` returns `[]`, the SPA's "tmux panes"
+section shows "no tmux panes" placeholder, but `tmux ls` on the shell
+lists active sessions.
+
+**Cause one (most common):** `tmux` is not on the daemon process's
+PATH. nestty-daemon is started by `systemctl --user`, which has a
+narrower PATH than your interactive shell. If `which tmux` from your
+shell returns `~/.local/bin/tmux` or another non-system path, the
+daemon's child plugins won't find it.
+
+**Fix:** verify with `systemctl --user show-environment | grep PATH`.
+Add the missing dir via `systemctl --user set-environment
+PATH=$PATH:$HOME/.local/bin && systemctl --user restart nestty-daemon`.
+For persistence, drop the right `Environment=PATH=…` line into the
+user unit (or rely on `systemctl --user import-environment PATH` from
+your shell rc).
+
+**Cause two:** No tmux server is actually running (despite the user
+thinking otherwise — `tmux ls` from a stale shell can mislead). The
+endpoint returns `[]` instead of erroring; this is deliberate so the
+SPA renders the empty state cleanly.
+
+### web-bridge attach mode shows a black xterm screen forever
+
+**Symptom:** Tapping a tmux pane card transitions to attach mode but
+the xterm viewport stays black; no PTY output ever arrives.
+
+**Cause one:** xterm.js failed to load (CDN unreachable / browser
+blocked the `<script>`). Open browser devtools → Network tab → look
+for `xterm.js` 200. If 0/blocked: check ad-blockers + CSP. The
+`xterm.css` block is loaded via `<link>` so a black bg without xterm
+DOM nodes points to the JS failing.
+
+**Cause two:** the `tmux attach-session` child failed (the target
+session was killed between `list-panes` and `attach`, or `tmux` not
+on PATH — see the previous entry). The plugin logs the error to
+stderr; check `journalctl --user -u nestty-daemon --since '2 min ago'
+| grep web-bridge`. The fix is to refresh the overview (the WS push
+will drop the dead pane on the next tick).
+
+**Cause three:** PTY child exited but the WS stayed open (rare).
+Click "← overview" to disconnect; the next attach spawns a fresh
+PTY. If this recurs, daemon log will show `attach session ended`
+followed by the underlying portable-pty error.
+
 ### web-bridge dashboard shows "nestty GUI is not running" banner
 
 **Symptom:** the dashboard loads, presence toggle works, recent events

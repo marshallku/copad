@@ -2,13 +2,16 @@
 <html lang="en">
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
   <title>nestty</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css"
+        crossorigin="anonymous">
   <style>
     :root {
       color-scheme: dark;
       --bg: #1e1e2e;
       --bg-2: #181825;
+      --bg-3: #11111b;
       --fg: #cdd6f4;
       --fg-dim: #a6adc8;
       --accent: #89b4fa;
@@ -18,45 +21,66 @@
       --border: #313244;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: ui-monospace, "JetBrains Mono", "SF Mono", monospace; }
-    body { background: var(--bg); color: var(--fg); padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); display: flex; flex-direction: column; min-height: 100vh; }
-    header { display: flex; align-items: center; justify-content: space-between; padding: 0.75rem 1rem; border-bottom: 1px solid var(--border); background: var(--bg-2); position: sticky; top: 0; z-index: 10; }
-    header h1 { font-size: 1rem; font-weight: 500; }
+    body { background: var(--bg); color: var(--fg); padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); min-height: 100vh; overflow: hidden; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; padding: 0.6rem 0.9rem; border-bottom: 1px solid var(--border); background: var(--bg-2); position: sticky; top: 0; z-index: 10; }
+    header h1 { font-size: 0.95rem; font-weight: 500; }
     header h1 .dim { color: var(--fg-dim); }
-    .presence { display: flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0.75rem; border-radius: 0.5rem; border: 1px solid var(--border); cursor: pointer; background: var(--bg); color: var(--fg); font-size: 0.85rem; }
-    .presence[data-state="away"] { color: var(--accent-warn); border-color: var(--accent-warn); }
-    .presence[data-state="active"] { color: var(--accent-ok); border-color: var(--accent-ok); }
-    .presence::before { content: "●"; }
-    main { display: flex; flex-direction: column; gap: 1rem; padding: 1rem; flex: 1; max-width: 800px; width: 100%; margin: 0 auto; }
-    section { background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.75rem; overflow: hidden; }
-    section header { padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); background: var(--bg-2); font-size: 0.8rem; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.05em; position: static; }
-    .pane-list { display: flex; flex-direction: column; }
-    .pane-row { padding: 0.75rem 1rem; border-bottom: 1px solid var(--border); cursor: pointer; display: flex; justify-content: space-between; align-items: center; gap: 0.5rem; font-size: 0.9rem; }
-    .pane-row:last-child { border-bottom: none; }
-    .pane-row:hover, .pane-row.focused { background: rgba(137, 180, 250, 0.08); }
-    .pane-row .title { color: var(--fg); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .pane-row .meta { color: var(--fg-dim); font-size: 0.75rem; }
-    .recent { padding: 0.75rem 1rem; font-size: 0.85rem; max-height: 30vh; overflow: auto; white-space: pre-wrap; word-break: break-all; }
-    .events { display: flex; flex-direction: column; max-height: 35vh; overflow: auto; }
-    .event { padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); font-size: 0.8rem; }
-    .event:last-child { border-bottom: none; }
-    .event .kind { color: var(--accent); margin-right: 0.5rem; }
-    .event .ts { color: var(--fg-dim); font-size: 0.7rem; margin-left: 0.5rem; }
-    .event[data-kind^="claude.commit_blocked"] .kind { color: var(--accent-err); }
-    .event[data-kind^="claude.review_approved"] .kind { color: var(--accent-ok); }
-    .input-row { padding: 0.75rem 1rem; display: flex; gap: 0.5rem; align-items: flex-end; border-top: 1px solid var(--border); background: var(--bg-2); position: sticky; bottom: 0; }
-    .input-row textarea { flex: 1; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 0.5rem; padding: 0.5rem 0.75rem; resize: none; font-size: 0.9rem; min-height: 2.5rem; max-height: 12rem; }
-    .input-row button { background: var(--accent); color: var(--bg); border: none; border-radius: 0.5rem; padding: 0.5rem 1rem; font-size: 0.9rem; cursor: pointer; }
-    .input-row button:disabled { opacity: 0.4; cursor: not-allowed; }
-    .banner { background: var(--accent-warn); color: var(--bg); padding: 0.5rem 1rem; font-size: 0.85rem; text-align: center; }
-    .banner.error { background: var(--accent-err); }
-    .empty { padding: 1rem; color: var(--fg-dim); text-align: center; font-size: 0.85rem; }
-    .setup { padding: 1.5rem; }
-    .setup input { display: block; width: 100%; padding: 0.5rem 0.75rem; margin: 0.5rem 0; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 0.5rem; font-size: 0.9rem; }
-    .setup button { padding: 0.5rem 1rem; background: var(--accent); color: var(--bg); border: none; border-radius: 0.5rem; cursor: pointer; }
+    .chip { padding: 0.3rem 0.65rem; border-radius: 0.5rem; border: 1px solid var(--border); cursor: pointer; background: var(--bg); color: var(--fg); font-size: 0.78rem; line-height: 1; }
+    .chip.active { background: var(--accent); color: var(--bg-3); border-color: var(--accent); }
+    .chip.warn { color: var(--accent-warn); border-color: var(--accent-warn); }
+    .chip.ok { color: var(--accent-ok); border-color: var(--accent-ok); }
+    .chip[disabled] { opacity: 0.45; cursor: not-allowed; }
+
+    /* ==== overview mode ==== */
+    main.overview { display: flex; flex-direction: column; gap: 0.6rem; padding: 0.6rem; max-width: 800px; margin: 0 auto; height: calc(100vh - 50px); overflow-y: auto; }
+    .section-title { font-size: 0.72rem; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.08em; padding: 0 0.2rem; margin-top: 0.25rem; display: flex; justify-content: space-between; align-items: center; }
+    .cards { display: grid; grid-template-columns: 1fr; gap: 0.5rem; }
+    @media (min-width: 600px) { .cards { grid-template-columns: 1fr 1fr; } }
+    .card { background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.65rem; padding: 0.7rem 0.85rem; cursor: pointer; display: flex; flex-direction: column; gap: 0.35rem; }
+    .card:hover { border-color: var(--accent); }
+    .card.active-pane { border-color: var(--accent-ok); }
+    .card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
+    .card-name { font-size: 0.85rem; color: var(--fg); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .card-meta { font-size: 0.7rem; color: var(--fg-dim); white-space: nowrap; }
+    .card-cwd { font-size: 0.72rem; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .card-preview { font-size: 0.72rem; color: var(--fg); background: var(--bg-3); padding: 0.4rem 0.55rem; border-radius: 0.4rem; line-height: 1.35; max-height: 5.5em; overflow: hidden; white-space: pre-wrap; word-break: break-all; }
+    .empty { padding: 1.2rem; color: var(--fg-dim); text-align: center; font-size: 0.85rem; border: 1px dashed var(--border); border-radius: 0.55rem; }
+    .events-strip { background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.65rem; overflow: hidden; }
+    .event-row { padding: 0.4rem 0.85rem; border-bottom: 1px solid var(--border); font-size: 0.74rem; color: var(--fg); display: flex; gap: 0.5rem; align-items: baseline; }
+    .event-row:last-child { border-bottom: none; }
+    .event-kind { color: var(--accent); flex-shrink: 0; }
+    .event-row[data-kind^="claude.commit_blocked"] .event-kind { color: var(--accent-err); }
+    .event-row[data-kind^="claude.review_approved"] .event-kind { color: var(--accent-ok); }
+    .banner { background: var(--accent-warn); color: var(--bg-3); padding: 0.4rem 0.85rem; font-size: 0.78rem; border-radius: 0.5rem; text-align: center; }
+
+    /* ==== attach mode ==== */
+    main.attach { display: flex; flex-direction: column; height: calc(100vh - 50px); }
+    .attach-bar { display: flex; gap: 0.4rem; padding: 0.4rem 0.6rem; background: var(--bg-2); border-bottom: 1px solid var(--border); align-items: center; }
+    .attach-bar .back { padding: 0.3rem 0.55rem; }
+    .attach-bar .title { flex: 1; font-size: 0.8rem; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #term-host { flex: 1; background: var(--bg-3); padding: 0.3rem; overflow: hidden; }
+    #term-host .xterm { height: 100%; }
+    /* mobile keyboard toolbar */
+    .kbd-bar { display: flex; flex-wrap: wrap; gap: 0.3rem; padding: 0.4rem; background: var(--bg-2); border-top: 1px solid var(--border); }
+    .kbd-bar button { flex: 1 0 auto; min-width: 2.5rem; padding: 0.5rem 0.5rem; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 0.35rem; font-size: 0.78rem; cursor: pointer; }
+    .kbd-bar button.sticky { background: var(--accent); color: var(--bg-3); }
+    .kbd-bar button:active { background: var(--accent); color: var(--bg-3); }
+
+    /* ==== setup ==== */
+    .setup { max-width: 380px; margin: 3rem auto 0; padding: 1.5rem; background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.75rem; }
+    .setup p { font-size: 0.82rem; color: var(--fg-dim); margin-bottom: 0.5rem; }
+    .setup input { display: block; width: 100%; padding: 0.55rem 0.75rem; margin: 0.5rem 0; background: var(--bg-3); color: var(--fg); border: 1px solid var(--border); border-radius: 0.45rem; font-size: 0.9rem; }
+    .setup button { padding: 0.55rem 1rem; background: var(--accent); color: var(--bg-3); border: none; border-radius: 0.45rem; cursor: pointer; font-weight: 500; }
   </style>
 </head>
 <body>
   <div id="root"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js"
+          crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"
+          crossorigin="anonymous"></script>
+
   <script>
   (() => {
     const root = document.getElementById("root");
@@ -65,22 +89,17 @@
     function api(path, opts = {}) {
       opts.headers = Object.assign({}, opts.headers || {}, {
         "Authorization": "Bearer " + token,
-        "Content-Type": opts.body ? "application/json" : undefined,
       });
+      if (opts.body && !opts.headers["Content-Type"]) opts.headers["Content-Type"] = "application/json";
       return fetch(path, opts).then(async (r) => {
         if (r.status === 401) {
-          token = "";
-          sessionStorage.removeItem("nestty.token");
+          token = ""; sessionStorage.removeItem("nestty.token");
           render();
           throw new Error("unauthorized");
         }
-        const body = r.headers.get("content-type")?.includes("json")
-          ? await r.json()
-          : await r.text();
+        const body = r.headers.get("content-type")?.includes("json") ? await r.json() : await r.text();
         if (!r.ok) {
-          const err = body && body.error
-            ? body.error
-            : { code: String(r.status), message: typeof body === "string" ? body : "" };
+          const err = body && body.error ? body.error : { code: String(r.status), message: typeof body === "string" ? body : "" };
           throw err;
         }
         return body;
@@ -88,169 +107,300 @@
     }
 
     const state = {
+      mode: "overview",         // "overview" | "attach"
       presence: null,
-      panes: [],
-      focusedPaneId: null,
-      recent: [],
+      tmuxPanes: [],
+      nesttyPanels: [],
       events: [],
       noGui: false,
-      input: "",
-      ws: null,
+      activePane: null,         // pane_id while in attach mode
+      ws: { events: null, overview: null, attach: null },
+      term: null,               // xterm.js Terminal instance
+      fit: null,                // FitAddon
+      ctrlSticky: false,
     };
 
-    function renderSetup() {
-      root.innerHTML = `
-        <header><h1>nestty <span class="dim">— remote bridge</span></h1></header>
-        <main>
-          <section>
-            <header>Setup</header>
-            <div class="setup">
-              <p style="font-size:0.85rem; color:var(--fg-dim); margin-bottom:0.5rem;">
-                Paste the bearer token from <code>$NESTTY_WEB_BRIDGE_TOKEN</code>.
-                Stored in sessionStorage — cleared when you close the tab.
-              </p>
-              <input id="tok" type="password" placeholder="bearer token (≥32 chars)" autocomplete="off">
-              <button id="connect">connect</button>
-            </div>
-          </section>
-        </main>
-      `;
-      const inp = document.getElementById("tok");
-      const btn = document.getElementById("connect");
-      inp.focus();
-      const submit = () => {
-        const t = inp.value.trim();
-        if (t.length < 32) { inp.style.borderColor = "var(--accent-err)"; return; }
-        token = t;
-        sessionStorage.setItem("nestty.token", t);
-        bootstrap();
-      };
-      btn.addEventListener("click", submit);
-      inp.addEventListener("keydown", (e) => { if (e.key === "Enter") submit(); });
-    }
-
-    function render() {
-      if (!token) { renderSetup(); return; }
-      root.innerHTML = `
-        <header>
-          <h1>nestty <span class="dim">— remote bridge</span></h1>
-          <button class="presence" id="presence-toggle" data-state="${state.presence || "?"}">${state.presence || "..."}</button>
-        </header>
-        ${state.noGui ? `<div class="banner">nestty GUI is not running — only presence + events work</div>` : ""}
-        <main>
-          <section>
-            <header>panes</header>
-            <div class="pane-list" id="panes">
-              ${state.panes.length === 0
-                ? `<div class="empty">no panes</div>`
-                : state.panes.map((p) => `
-                    <div class="pane-row${p.id === state.focusedPaneId ? " focused" : ""}" data-id="${p.id}">
-                      <div class="title">${escapeHtml(p.title || p.id)}</div>
-                      <div class="meta">${escapeHtml(p.type || "?")}${p.focused ? " · focused" : ""}</div>
-                    </div>`).join("")}
-            </div>
-            <div class="recent" id="recent">${state.recent.length === 0 ? "(select a pane to load recent output)" : state.recent.map(escapeHtml).join("\n")}</div>
-            <div class="input-row">
-              <textarea id="input" placeholder="${state.focusedPaneId ? "type a command — Enter to send, Shift+Enter for newline" : "select a pane first"}" rows="1" ${state.focusedPaneId ? "" : "disabled"}></textarea>
-              <button id="send" ${state.focusedPaneId ? "" : "disabled"}>send</button>
-            </div>
-          </section>
-          <section>
-            <header>recent events</header>
-            <div class="events" id="events">
-              ${state.events.length === 0
-                ? `<div class="empty">waiting for events…</div>`
-                : state.events.slice().reverse().map((e) => `
-                    <div class="event" data-kind="${escapeAttr(e.type || e.kind || "?")}">
-                      <span class="kind">${escapeHtml(e.type || e.kind || "?")}</span>
-                      ${escapeHtml(summarize(e))}
-                      <span class="ts">${fmtTs(e.timestamp_ms)}</span>
-                    </div>`).join("")}
-            </div>
-          </section>
-        </main>
-      `;
-      document.getElementById("presence-toggle").addEventListener("click", togglePresence);
-      document.querySelectorAll(".pane-row").forEach((el) => {
-        el.addEventListener("click", () => selectPane(el.dataset.id));
-      });
-      const ta = document.getElementById("input");
-      const send = document.getElementById("send");
-      if (ta && !ta.disabled) {
-        ta.value = state.input;
-        ta.addEventListener("input", (e) => { state.input = e.target.value; });
-        ta.addEventListener("keydown", (e) => {
-          if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); doSend(); }
-        });
-      }
-      if (send && !send.disabled) send.addEventListener("click", doSend);
-    }
-
     function escapeHtml(s) {
-      return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({
-        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
-      })[c]);
+      return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;" }[c]));
     }
-    function escapeAttr(s) { return escapeHtml(s).replace(/`/g, "&#96;"); }
-    function fmtTs(ms) {
-      if (!ms) return "";
-      const d = new Date(ms);
-      return d.toTimeString().slice(0, 8);
-    }
+    function stripAnsi(s) { return String(s).replace(/\x1b\[[0-9;]*[a-zA-Z]/g, ""); }
+    function fmtTs(ms) { if (!ms) return ""; return new Date(ms).toTimeString().slice(0,8); }
     function summarize(e) {
       const p = e.data || e.payload || {};
       if (typeof p === "string") return p;
       const keys = Object.keys(p);
       if (keys.length === 0) return "";
-      const pick = keys.slice(0, 2).map((k) => `${k}=${JSON.stringify(p[k]).slice(0, 60)}`).join(" ");
-      return pick;
+      return keys.slice(0,2).map(k => `${k}=${JSON.stringify(p[k]).slice(0,50)}`).join(" ");
     }
 
+    function renderSetup() {
+      root.innerHTML = `
+        <header><h1>nestty <span class="dim">— remote bridge</span></h1></header>
+        <div class="setup">
+          <p>Paste the bearer token from <code>$NESTTY_WEB_BRIDGE_TOKEN</code>. Stored in sessionStorage; cleared on tab close.</p>
+          <input id="tok" type="password" placeholder="bearer token (≥32 chars)" autocomplete="off">
+          <button id="connect">connect</button>
+        </div>
+      `;
+      const inp = document.getElementById("tok");
+      const btn = document.getElementById("connect");
+      inp.focus();
+      const go = () => {
+        const t = inp.value.trim();
+        if (t.length < 32) { inp.style.borderColor = "var(--accent-err)"; return; }
+        token = t; sessionStorage.setItem("nestty.token", t);
+        bootstrap();
+      };
+      btn.addEventListener("click", go);
+      inp.addEventListener("keydown", e => { if (e.key === "Enter") go(); });
+    }
+
+    function renderOverview() {
+      const tmuxBlock = state.tmuxPanes.length === 0
+        ? `<div class="empty">no tmux panes. start a tmux session (or use the non-tmux fallback below).</div>`
+        : `<div class="cards">${state.tmuxPanes.map(p => `
+            <div class="card${p.pane_active ? " active-pane" : ""}" data-pane="${escapeHtml(p.pane_id)}">
+              <div class="card-head">
+                <div class="card-name">${escapeHtml(p.session)} : ${escapeHtml(p.window_name || p.window_index)} (${escapeHtml(p.pane_id)})</div>
+                <div class="card-meta">${p.pane_active ? "● active" : ""}</div>
+              </div>
+              <div class="card-cwd">${escapeHtml(p.cwd || "")}</div>
+              <div class="card-preview">${escapeHtml(stripAnsi((p.last_lines || []).join("\n")).trim() || "(empty)")}</div>
+            </div>`).join("")}</div>`;
+      const nesttyBlock = state.nesttyPanels.length === 0
+        ? `<div class="empty">no nestty panels${state.noGui ? " — nestty GUI not running" : ""}</div>`
+        : `<div class="cards">${state.nesttyPanels.map(p => `
+            <div class="card" data-nestty-pane="${escapeHtml(p.id)}">
+              <div class="card-head">
+                <div class="card-name">${escapeHtml(p.title || p.id)}</div>
+                <div class="card-meta">${escapeHtml(p.type || "?")}</div>
+              </div>
+              <div class="card-cwd">interactive UI deferred to Slice 3.2 — see Slice 3.0 endpoints</div>
+            </div>`).join("")}</div>`;
+      root.innerHTML = `
+        <header>
+          <h1>nestty <span class="dim">— remote bridge</span></h1>
+          <button class="chip ${state.presence === "away" ? "warn" : "ok"}" id="presence-toggle">${state.presence || "…"}</button>
+        </header>
+        ${state.noGui ? `<div class="banner" style="margin: 0.5rem 0.6rem;">nestty GUI not running — only tmux + presence + events work</div>` : ""}
+        <main class="overview">
+          <div class="section-title">tmux panes <span style="text-transform:none; color:var(--fg-dim);">${state.tmuxPanes.length}</span></div>
+          ${tmuxBlock}
+          <div class="section-title">nestty panels <span style="text-transform:none; color:var(--fg-dim);">${state.nesttyPanels.length}</span></div>
+          ${nesttyBlock}
+          <div class="section-title">recent events</div>
+          <div class="events-strip">${
+            state.events.length === 0
+              ? `<div class="empty" style="border:none; padding:0.7rem;">waiting…</div>`
+              : state.events.slice().reverse().slice(0, 20).map(e => `
+                  <div class="event-row" data-kind="${escapeHtml(e.type || e.kind || "?")}">
+                    <span class="event-kind">${escapeHtml(e.type || e.kind || "?")}</span>
+                    <span>${escapeHtml(summarize(e))}</span>
+                    <span style="margin-left:auto; color:var(--fg-dim); font-size:0.7rem;">${fmtTs(e.timestamp_ms)}</span>
+                  </div>`).join("")
+          }</div>
+        </main>
+      `;
+      document.getElementById("presence-toggle").addEventListener("click", togglePresence);
+      document.querySelectorAll(".card[data-pane]").forEach(el => {
+        el.addEventListener("click", () => enterAttach(el.dataset.pane));
+      });
+    }
+
+    function renderAttach() {
+      const pane = state.tmuxPanes.find(p => p.pane_id === state.activePane);
+      const title = pane ? `${pane.session} : ${pane.window_name || pane.window_index} (${pane.pane_id})` : state.activePane;
+      root.innerHTML = `
+        <header>
+          <button class="chip back" id="back">← overview</button>
+          <div class="card-meta" style="flex:1; text-align:center; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${escapeHtml(title)}</div>
+          <button class="chip ${state.presence === "away" ? "warn" : "ok"}" id="presence-toggle">${state.presence || "…"}</button>
+        </header>
+        <main class="attach">
+          <div id="term-host"></div>
+          <div class="kbd-bar">
+            <button data-bytes="\\x1b">Esc</button>
+            <button data-bytes="\\t">Tab</button>
+            <button id="ctrl">Ctrl</button>
+            <button data-bytes="/">/</button>
+            <button data-bytes="|">|</button>
+            <button data-bytes="\\x1b[A">↑</button>
+            <button data-bytes="\\x1b[B">↓</button>
+            <button data-bytes="\\x1b[D">←</button>
+            <button data-bytes="\\x1b[C">→</button>
+            <button data-bytes="\\x03">^C</button>
+            <button data-bytes="\\x04">^D</button>
+            <button data-bytes="\\x1a">^Z</button>
+          </div>
+        </main>
+      `;
+      document.getElementById("back").addEventListener("click", leaveAttach);
+      document.getElementById("presence-toggle").addEventListener("click", togglePresence);
+      document.querySelectorAll(".kbd-bar button[data-bytes]").forEach(btn => {
+        btn.addEventListener("click", () => sendKbdBytes(btn.dataset.bytes));
+      });
+      document.getElementById("ctrl").addEventListener("click", () => {
+        state.ctrlSticky = !state.ctrlSticky;
+        document.getElementById("ctrl").classList.toggle("sticky", state.ctrlSticky);
+      });
+      openTerminal();
+    }
+
+    function render() {
+      if (!token) { renderSetup(); return; }
+      if (state.mode === "attach") { renderAttach(); return; }
+      renderOverview();
+    }
+
+    /* ==== xterm.js attach mode ==== */
+    function openTerminal() {
+      // Idempotent: re-renders triggered by unrelated state changes
+      // (e.g. presence toggle in attach mode) must not spawn a fresh
+      // WS / xterm while the previous one is still live. leaveAttach
+      // is the only legitimate teardown.
+      if (state.term || state.ws.attach) return;
+      const host = document.getElementById("term-host");
+      const term = new window.Terminal({
+        fontSize: 13,
+        fontFamily: 'ui-monospace, "JetBrains Mono", "SF Mono", monospace',
+        cursorBlink: true,
+        scrollback: 5000,
+        convertEol: false,
+        theme: { background: "#11111b", foreground: "#cdd6f4" },
+      });
+      const FitAddon = window.FitAddon?.FitAddon;
+      const fit = FitAddon ? new FitAddon() : null;
+      if (fit) term.loadAddon(fit);
+      term.open(host);
+      if (fit) fit.fit();
+      state.term = term;
+      state.fit = fit;
+
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${proto}://${location.host}/ws/tmux/attach/${encodeURIComponent(state.activePane)}`, [`bearer.${token}`]);
+      ws.binaryType = "arraybuffer";
+      state.ws.attach = ws;
+
+      ws.onopen = () => {
+        if (fit) {
+          fit.fit();
+          ws.send(JSON.stringify({ type: "resize", rows: term.rows, cols: term.cols }));
+        }
+      };
+      ws.onmessage = (msg) => {
+        if (msg.data instanceof ArrayBuffer) term.write(new Uint8Array(msg.data));
+        else term.write(String(msg.data));
+      };
+      ws.onclose = () => {
+        if (state.mode === "attach") {
+          term.writeln("\r\n\x1b[33m[disconnected]\x1b[0m");
+        }
+      };
+      ws.onerror = () => { try { ws.close(); } catch {} };
+
+      term.onData((data) => {
+        if (state.ctrlSticky && data.length === 1 && data >= " " && data <= "~") {
+          const code = data.charCodeAt(0);
+          const ctrlByte = code & 0x1f;
+          data = String.fromCharCode(ctrlByte);
+          state.ctrlSticky = false;
+          const el = document.getElementById("ctrl");
+          if (el) el.classList.remove("sticky");
+        }
+        if (ws.readyState === WebSocket.OPEN) ws.send(new TextEncoder().encode(data));
+      });
+
+      // Resize on viewport change.
+      const onResize = () => {
+        if (!state.fit || !state.term || !state.ws.attach) return;
+        try {
+          state.fit.fit();
+          if (state.ws.attach.readyState === WebSocket.OPEN) {
+            state.ws.attach.send(JSON.stringify({ type: "resize", rows: state.term.rows, cols: state.term.cols }));
+          }
+        } catch {}
+      };
+      window.addEventListener("resize", onResize);
+      state._removeResize = () => window.removeEventListener("resize", onResize);
+    }
+
+    function sendKbdBytes(escape) {
+      const ws = state.ws.attach;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      // unescape sequences typed in the data-bytes attribute
+      let bytes = escape.replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+                        .replace(/\\t/g, "\t");
+      // Sticky-Ctrl path: if toolbar Ctrl is armed and the next
+      // toolbar tap is a single printable byte, fold it via the
+      // 0x1f mask (Ctrl-A = 0x01, Ctrl-/ = 0x1f, etc.). Without
+      // this `Ctrl` then `/` sends a literal slash — the intent's
+      // sticky-modifier contract is broken on the toolbar path.
+      if (state.ctrlSticky && bytes.length === 1 && bytes >= " " && bytes <= "~") {
+        bytes = String.fromCharCode(bytes.charCodeAt(0) & 0x1f);
+        state.ctrlSticky = false;
+        const el = document.getElementById("ctrl");
+        if (el) el.classList.remove("sticky");
+      }
+      ws.send(new TextEncoder().encode(bytes));
+    }
+
+    /* ==== overview WS ==== */
+    function openOverviewStream() {
+      if (state.ws.overview) { try { state.ws.overview.close(); } catch {} }
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${proto}://${location.host}/ws/tmux/overview`, [`bearer.${token}`]);
+      state.ws.overview = ws;
+      ws.onmessage = (msg) => {
+        try {
+          state.tmuxPanes = JSON.parse(msg.data);
+          if (state.mode === "overview") render();
+        } catch {}
+      };
+      ws.onclose = () => { state.ws.overview = null; if (token) setTimeout(openOverviewStream, 2000); };
+      ws.onerror = () => { try { ws.close(); } catch {} };
+    }
+
+    function openEventStream() {
+      if (state.ws.events) { try { state.ws.events.close(); } catch {} }
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${proto}://${location.host}/ws/events`, [`bearer.${token}`]);
+      state.ws.events = ws;
+      ws.onmessage = (msg) => {
+        try {
+          const ev = JSON.parse(msg.data);
+          state.events.push(ev);
+          if (state.events.length > 50) state.events.shift();
+          if ((ev.type || ev.kind) === "presence.changed") {
+            const cur = ev.data?.current || ev.payload?.current;
+            if (cur) state.presence = cur;
+          }
+          if (state.mode === "overview") render();
+        } catch {}
+      };
+      ws.onclose = () => { state.ws.events = null; if (token) setTimeout(openEventStream, 2000); };
+      ws.onerror = () => { try { ws.close(); } catch {} };
+    }
+
+    /* ==== actions ==== */
     async function bootstrap() {
+      state.presence = "…";
       try {
-        const presence = await api("/api/presence");
-        state.presence = presence.state;
+        const p = await api("/api/presence");
+        state.presence = p.state;
         state.noGui = false;
       } catch (e) {
         if (e && e.code === "unauthorized") return;
         state.presence = "?";
       }
       try {
-        const panes = await api("/api/panes");
-        state.panes = Array.isArray(panes) ? panes : (panes?.panels || []);
-        if (state.panes.length > 0 && !state.focusedPaneId) {
-          state.focusedPaneId = state.panes.find((p) => p.focused)?.id || state.panes[0].id;
-          loadRecent();
-        }
+        state.nesttyPanels = await api("/api/panes");
       } catch (e) {
         if (e && e.code === "no_gui") state.noGui = true;
-        state.panes = [];
+        state.nesttyPanels = [];
       }
       render();
       openEventStream();
-    }
-
-    function openEventStream() {
-      if (state.ws) try { state.ws.close(); } catch {}
-      const proto = location.protocol === "https:" ? "wss" : "ws";
-      const url = `${proto}://${location.host}/ws/events`;
-      const ws = new WebSocket(url, [`bearer.${token}`]);
-      state.ws = ws;
-      ws.onmessage = (msg) => {
-        try {
-          const event = JSON.parse(msg.data);
-          state.events.push(event);
-          if (state.events.length > 50) state.events.shift();
-          // If presence changed, reflect it.
-          if ((event.type || event.kind) === "presence.changed") {
-            const cur = event.data?.current || event.payload?.current;
-            if (cur) state.presence = cur;
-          }
-          render();
-        } catch {}
-      };
-      ws.onclose = () => { state.ws = null; setTimeout(openEventStream, 2000); };
-      ws.onerror = () => { try { ws.close(); } catch {} };
+      openOverviewStream();
     }
 
     async function togglePresence() {
@@ -258,56 +408,39 @@
       try {
         const r = await api("/api/presence", { method: "POST", body: JSON.stringify({ state: next }) });
         state.presence = r.current || next;
-        render();
-      } catch (e) {
-        alert(`presence flip failed: ${e.code || ""} ${e.message || ""}`);
-      }
-    }
-
-    async function selectPane(id) {
-      state.focusedPaneId = id;
-      await loadRecent();
-      render();
-    }
-
-    async function loadRecent() {
-      if (!state.focusedPaneId) return;
-      try {
-        const r = await api(`/api/panes/${encodeURIComponent(state.focusedPaneId)}/recent?lines=20`);
-        state.recent = (r.lines || []).slice();
-        state.noGui = false;
-      } catch (e) {
-        if (e && e.code === "no_gui") {
-          // GUI vanished mid-session — clear pane focus so the
-          // input/textarea disable-check (`!state.focusedPaneId`)
-          // takes effect, and let render() show the no_gui banner.
-          state.noGui = true;
-          state.recent = [];
-          state.focusedPaneId = null;
+        // In attach mode, patch the chip in-place rather than calling
+        // render() — full rerender would re-trigger openTerminal and,
+        // even with its idempotent guard, would needlessly thrash the
+        // xterm host element. Overview mode goes through render() as
+        // normal so the chip + downstream UI stay consistent.
+        if (state.mode === "attach") {
+          const el = document.getElementById("presence-toggle");
+          if (el) {
+            el.textContent = state.presence;
+            el.className = "chip " + (state.presence === "away" ? "warn" : "ok");
+          }
         } else {
-          state.recent = [`(error: ${e.code || ""} ${e.message || ""})`];
+          render();
         }
+      } catch (e) {
+        alert(`presence: ${e.code || ""} ${e.message || ""}`);
       }
+    }
+
+    function enterAttach(paneId) {
+      state.activePane = paneId;
+      state.mode = "attach";
       render();
     }
 
-    async function doSend() {
-      const text = state.input;
-      if (!text || !state.focusedPaneId) return;
-      try {
-        await api(`/api/panes/${encodeURIComponent(state.focusedPaneId)}/input`, {
-          method: "POST",
-          body: JSON.stringify({ text: text + "\n" }),
-        });
-        state.input = "";
-        render();
-        // Short delay then refresh recent output (loadRecent owns its
-        // own render() call so the post-send view updates without a
-        // separate trigger).
-        setTimeout(loadRecent, 200);
-      } catch (e) {
-        alert(`send failed: ${e.code || ""} ${e.message || ""}`);
-      }
+    function leaveAttach() {
+      if (state.ws.attach) { try { state.ws.attach.close(); } catch {} state.ws.attach = null; }
+      if (state.term) { try { state.term.dispose(); } catch {} state.term = null; }
+      state.fit = null;
+      if (state._removeResize) { state._removeResize(); state._removeResize = null; }
+      state.activePane = null;
+      state.mode = "overview";
+      render();
     }
 
     if (token) bootstrap(); else render();

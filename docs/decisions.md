@@ -837,3 +837,53 @@ Codex round 2 hard-recommended (δ). Discord plugin already proves the "stdio RP
 - Multi-GUI explicit `target_client_id` routing.
 
 **See:** `plugins/web-bridge/` (crate + plugin.toml + static SPA), `nestty-daemon/src/service_supervisor.rs` (NESTTY_SOCKET env inject + socket_path field), `nestty-daemon/src/main.rs` (`activate_supervisor` socket_path threading), `docs/harness-integration.md` § A Slice 3.0, session intents `~/docs/sources/sessions/nestty/2026-05-23-session-3a87a228.md`.
+
+
+## 43. `plugins/web-bridge` Slice 3.1 — tmux as data model + xterm.js attach (harness-integration Slice 3.1)
+
+**Problem:** Slice 3.0 shipped a Discord-reply-style chat UI but it was unusable for the actual remote-harness loop. User feedback: "어떤 명령들이 진행되는지도 안 보이고 상태도 안 보이고 아무것도 보이는 게 없어서 아예 쓸 수가 없는 상태." Snapshot-only `terminal.history` polling can't surface what's happening in real time, and Path A's chat input is too narrow for actual interactive work (vim, claude session, tmux).
+
+**Architecture pivot.** The first try at Slice 3.1 (full xterm.js attach to nestty's PTY) hit codex-plan round 1 hard blockers (decisions.md #42 trade-off list): `terminal.output` is a keystroke-publish event not PTY child output, no `terminal.resize` socket method, GUI-to-daemon event forwarding explicitly excludes terminal events, and the event wire is JSON not raw bytes. A real "nestty PTY in the browser" path would need 2-3 weeks of daemon + GUI surface work.
+
+**Pivot: tmux is the data model.** 99% of the user's actual work runs inside tmux (they built `~/dev/tmx` for it). Web-bridge shells out to tmux directly — `tmux list-panes -a` for overview state, `capture-pane` for per-pane previews, `attach-session` (inside a portable-pty PTY pair) for live bidirectional xterm.js, `paste-buffer` for one-shot text injection. No nestty/daemon changes; tmux's multi-client model handles the shared view between nestty's GUI client and the mobile web-bridge attach.
+
+**Codex round 1 of this revised plan caught 7 design issues** — all reflected:
+- `pane != window`: tmux windows can hold multiple panes. Switched to `%pane_id` as primary key (`tmux list-panes -a`, not `list-windows`).
+- `attach-session` is session-oriented; per-window attach is not a real model. Slice 3.1 attaches to the session and pre-positions via `tmux select-pane -t %N` so the new client lands on the right pane; multi-client view is shared with the existing nestty GUI client (acceptable for "two views of one work" use case; grouped sessions for independent views are Slice 3.2).
+- `send-keys "<text>"` is unsafe for multiline / quoted / special-char input. Switched to `tmux load-buffer -b <name> -` (stdin) + `paste-buffer -p -d -b <name> -t <target>` — same pattern `nestty-linux::socket::handle_claude_start` (socket.rs:1710) uses for prompt seeding.
+- WS Text frames for PTY bytes corrupt multi-byte sequences at chunk boundaries. Slice 3.1 uses **WS Binary frames** for PTY (both directions); **WS Text frames** carry JSON control (`{type:"resize",rows,cols}` only for now).
+- Dropping PTY bytes on backpressure corrupts xterm state permanently. Bounded `tokio::sync::mpsc<Vec<u8>>(256)` (~4 MiB worst case at 16 KiB chunks) — when full, close the WS rather than drop. NEVER drop terminal bytes.
+- Overview diff protocol has rename/close/cwd-change edge cases. Slice 3.1 pushes a full snapshot every 5 s instead — simple, correct, no tombstones needed for a refresh-rate use case.
+- `/api/tmux/panes` had an N+1 risk (per-session list-windows + per-window capture-pane). Slice 3.1 does `list-panes -a` in ONE shell-out, plus per-pane `capture-pane` (still N but proportional, not N×M). 2 s in-plugin cache.
+
+**Implementation shape:**
+- New `plugins/web-bridge/src/tmux.rs` module: `list_panes` (single `-F` shell-out), `capture_pane(pane_id, last_n)`, `send_text(target, text)` via load-buffer + paste-buffer, `find_pane` lookup helper.
+- New HTTP endpoints: `GET /api/tmux/panes` (composite list + per-pane previews with 2 s TTL cache), `POST /api/tmux/send` (target + text).
+- New WS routes: `GET /ws/tmux/overview` (5 s timer → full snapshot JSON push; bails on client close via select), `GET /ws/tmux/attach/:pane_id` (Binary frames bidirectional PTY + Text frames for resize control).
+- Attach lifecycle: pre-spawn `tmux select-pane -t :pane_id` to position; spawn `tmux attach-session -t <session>` inside portable-pty PtyPair; reader on `spawn_blocking` task → `mpsc(256)` → WS Binary; writer wrapped in `Arc<Mutex<>>` driven from `spawn_blocking` per client byte burst; resize routed through a dedicated `spawn_blocking` task that owns the `Box<dyn MasterPty + Send>` (the trait is `Send + !Sync` so it can't cross awaits).
+- SPA: two modes (`overview` | `attach`). Overview = card grid (`tmux panes` section + Slice 3.0 `nestty panels` section as fallback) + recent-events strip + presence toggle. Attach = `xterm.js` (CDN `@xterm/xterm@5.5.0` + `@xterm/addon-fit@0.10.0`, no SRI — accepted as Slice 3.2 follow-up) + mobile keyboard toolbar (`Esc Tab Ctrl(sticky) / | ↑↓←→ ^C ^D ^Z`).
+
+**Live verification (e2e, 2026-05-23):**
+- `tmux ls` showed 7 sessions × multiple windows; `curl /api/tmux/panes` returned **19 panes** with cwd + last 5 lines (ANSI escapes preserved via `capture-pane -e`).
+- WS `/ws/tmux/overview` opened, received 2 snapshots in 7 s window (initial + one timer fire), 19 panes each.
+- WS `/ws/tmux/attach/%1`: HTTP 101 + Sec-WebSocket-Protocol echo + 5 binary frames (~6.2 KB total) on the first second. Sending a WS Close frame from the client → `tmux list-clients` count returned to baseline (no leaked attach client).
+- `POST /api/tmux/send` with `{"target":"%1","text":"echo nestty-web-bridge-e2e\n"}` → `tmux capture-pane -t %1` showed the literal string at the prompt. Bracketed-paste behavior intentional: the text appears but the shell does not auto-execute, matching the `paste-buffer -p` safety contract.
+- 17 unit tests pass (5 new in tmux::tests). `cargo fmt` clean, `cargo clippy --workspace --all-targets -- -D warnings` clean. `cargo build --release` clean.
+
+**Trade-offs accepted:**
+- Shared view with existing nestty GUI client (selecting pane on mobile changes nestty's active pane too). Acceptable for "I left my desk; checking from phone" — Slice 3.2 may add grouped sessions for independent per-client views.
+- Non-tmux nestty pane attach is still Slice 3.0-style snapshot-only. A user not running tmux loses the live experience — recommended workflow is `tmux new-session` before stepping away.
+- xterm.js CDN without SRI in Slice 3.1. User accepted internet-on-mobile assumption. Adding SRI hashes is a single follow-up commit (compute sha384 of the pinned CDN files, paste into the `integrity=` attribute) — wasn't included in 3.1 because the placeholder hashes were wrong and brokering the actual hash computation mid-implementation would have stalled.
+- Slow-client close on overflow uses WS code 1000 (normal close) from axum's default close path, not 1011 with `slow_client` reason. Explicit 1011 + custom reason requires custom close-frame emission; the `try_send → break` pattern produces functional disconnect-on-overflow but the close code is generic.
+- `paste-buffer -p` (bracketed paste) means `/api/tmux/send` text doesn't auto-execute on Enter — user must press Enter in the receiving shell. Safety-first default; an `auto_execute: true` field could send `\r` via `send-keys -t target Enter` separately if needed later.
+
+**Out of scope (Slice 3.2+ backlog):**
+- tmux control mode (`tmux -CC`) for iTerm2-grade multi-window streaming on one connection.
+- Grouped/independent sessions per attached client (each gets their own visible window/pane).
+- Non-tmux nestty pane attach via daemon-side PTY child output forwarding.
+- xterm.js SRI hashes.
+- Explicit WS code 1011 + `slow_client` reason on overflow.
+- PWA manifest + service worker + Web Push.
+- One-shot send UI in overview mode. The endpoint exists; SPA only exposes attach-mode input for v1.
+
+**See:** `plugins/web-bridge/src/tmux.rs` (new module), `plugins/web-bridge/src/main.rs` (4 new endpoints + AppError::Custom variant + AppState.tmux_cache + handle_ws_tmux_overview/attach + run_attach lifecycle), `plugins/web-bridge/static/index.html` (mode-switching SPA + xterm.js + keyboard toolbar), session intent `~/docs/sources/sessions/nestty/2026-05-23-session-30a6e5d6.md`.

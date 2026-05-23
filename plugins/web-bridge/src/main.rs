@@ -23,6 +23,7 @@
 //! missing/short the plugin exits before binding.
 
 mod daemon_client;
+mod tmux;
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::ExitCode;
@@ -227,6 +228,17 @@ struct AppState {
     daemon: DaemonClient,
     token: Arc<String>,
     default_subscribe_patterns: Arc<Vec<String>>,
+    /// In-process 2 s TTL cache for `/api/tmux/panes`. Multiple
+    /// dashboard tabs hitting refresh shouldn't fan out as N tmux
+    /// shell-outs per click; once the snapshot is built we serve it
+    /// from memory until the TTL expires.
+    tmux_cache: Arc<tokio::sync::Mutex<Option<TmuxCacheEntry>>>,
+}
+
+#[derive(Clone)]
+struct TmuxCacheEntry {
+    at: std::time::Instant,
+    value: Value,
 }
 
 async fn run_server(
@@ -245,6 +257,7 @@ async fn run_server(
     let state = AppState {
         daemon: DaemonClient::new(socket_path),
         token: Arc::new(token.to_string()),
+        tmux_cache: Arc::new(tokio::sync::Mutex::new(None)),
         default_subscribe_patterns: Arc::new(vec![
             "presence.*".to_string(),
             "claude.*".to_string(),
@@ -265,6 +278,10 @@ async fn run_server(
         .route("/api/panes/:id/recent", get(handle_pane_recent))
         .route("/api/panes/:id/input", post(handle_pane_input))
         .route("/api/events", get(handle_events_history))
+        .route("/api/tmux/panes", get(handle_tmux_panes))
+        .route("/api/tmux/send", post(handle_tmux_send))
+        .route("/ws/tmux/overview", get(handle_ws_tmux_overview))
+        .route("/ws/tmux/attach/:pane_id", get(handle_ws_tmux_attach))
         .route("/ws/events", get(handle_ws_events))
         .layer(axum::middleware::from_fn(
             move |req: axum::extract::Request, next: Next| {
@@ -413,6 +430,88 @@ struct InputBody {
     text: String,
 }
 
+/// Composite tmux overview: `tmux list-panes -a` + per-pane
+/// `capture-pane` for the last 5 lines. Cached for 2 s in-plugin.
+/// Empty array (NOT error) when no tmux server is running — the SPA
+/// renders a "no tmux sessions yet" empty state.
+async fn handle_tmux_panes(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Result<axum::Json<Value>, AppError> {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(2);
+    {
+        let cache = state.tmux_cache.lock().await;
+        if let Some(entry) = cache.as_ref()
+            && entry.at.elapsed() < TTL
+        {
+            return Ok(axum::Json(entry.value.clone()));
+        }
+    }
+    let snapshot = tokio::task::spawn_blocking(build_tmux_snapshot)
+        .await
+        .map_err(|e| AppError::custom("internal", &format!("tmux snapshot task: {e}")))??;
+    {
+        let mut cache = state.tmux_cache.lock().await;
+        *cache = Some(TmuxCacheEntry {
+            at: std::time::Instant::now(),
+            value: snapshot.clone(),
+        });
+    }
+    Ok(axum::Json(snapshot))
+}
+
+#[derive(Deserialize)]
+struct TmuxSendBody {
+    target: String,
+    text: String,
+}
+
+async fn handle_tmux_send(
+    axum::Json(body): axum::Json<TmuxSendBody>,
+) -> Result<axum::Json<Value>, AppError> {
+    let target = body.target;
+    let text = body.text;
+    tokio::task::spawn_blocking(move || tmux::send_text(&target, &text))
+        .await
+        .map_err(|e| AppError::custom("internal", &format!("tmux send task: {e}")))?
+        .map_err(|msg| AppError::custom("tmux_error", &msg))?;
+    Ok(axum::Json(json!({ "ok": true })))
+}
+
+/// Sync helper used inside `spawn_blocking`. Builds the full overview
+/// JSON: `[{session, window_id, window_index, window_name, pane_id,
+/// pane_active, cwd, last_lines}]`. Capture failures per pane don't
+/// abort the snapshot — they show up as `last_lines: []` so the UI
+/// still renders the card.
+fn build_tmux_snapshot() -> Result<Value, AppError> {
+    let panes = tmux::list_panes().map_err(|msg| AppError::custom("tmux_error", &msg))?;
+    let rows: Vec<Value> = panes
+        .into_iter()
+        .map(|p| {
+            let last = tmux::capture_pane(&p.pane_id, 5)
+                .ok()
+                .map(|raw| {
+                    let mut lines: Vec<String> = raw.split('\n').map(|s| s.to_string()).collect();
+                    while lines.last().map(|s| s.is_empty()).unwrap_or(false) {
+                        lines.pop();
+                    }
+                    lines
+                })
+                .unwrap_or_default();
+            json!({
+                "session": p.session,
+                "window_id": p.window_id,
+                "window_index": p.window_index,
+                "window_name": p.window_name,
+                "pane_id": p.pane_id,
+                "pane_active": p.pane_active,
+                "cwd": p.cwd,
+                "last_lines": last,
+            })
+        })
+        .collect();
+    Ok(Value::Array(rows))
+}
+
 async fn handle_pane_input(
     axum::extract::State(state): axum::extract::State<AppState>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -426,6 +525,263 @@ async fn handle_pane_input(
         .rpc("terminal.feed", json!({ "id": id, "text": body.text }))
         .await?;
     Ok(axum::Json(v))
+}
+
+/// `WS /ws/tmux/overview` — push a full tmux pane snapshot every 5 s
+/// as a single JSON Text frame. No diff protocol; SPA re-renders the
+/// card grid from each snapshot. Lifecycle: WS close → polling task
+/// returns on next tick (channel closed); we don't need StopOnDrop
+/// because the task itself drives the loop (vs blocking on a daemon
+/// socket).
+async fn handle_ws_tmux_overview(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    ws: axum::extract::WebSocketUpgrade,
+) -> impl axum::response::IntoResponse {
+    let proto = format!("bearer.{}", &state.token);
+    ws.protocols([proto]).on_upgrade(move |socket| async move {
+        use axum::extract::ws::Message;
+        use futures_util::{SinkExt, StreamExt};
+        let (mut sink, mut stream) = futures_split(socket);
+        // Initial snapshot immediately on connect so the UI doesn't
+        // wait 5 s for the first paint.
+        loop {
+            let snapshot = match tokio::task::spawn_blocking(build_tmux_snapshot).await {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    eprintln!("[web-bridge] tmux overview snapshot failed: {e:?}");
+                    Value::Array(vec![])
+                }
+                Err(e) => {
+                    eprintln!("[web-bridge] tmux overview task join failed: {e}");
+                    Value::Array(vec![])
+                }
+            };
+            let payload = serde_json::to_string(&snapshot).unwrap_or_else(|_| "[]".into());
+            if sink.send(Message::Text(payload)).await.is_err() {
+                break;
+            }
+            // Sleep 5 s, but bail early if the client sends a close
+            // frame so reconnects don't pile up dead overview tasks.
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                msg = stream.next() => {
+                    match msg {
+                        None | Some(Err(_)) | Some(Ok(Message::Close(_))) => break,
+                        Some(Ok(_)) => { /* ignore client-pushed frames */ }
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// `WS /ws/tmux/attach/:pane_id` — bidirectional xterm.js attach.
+/// Validate pane id → spawn `tmux attach-session -t <session>` inside
+/// a portable_pty PTY pair → forward PTY bytes as WS Binary frames
+/// and WS Binary frames back into PTY stdin. Text/JSON frames carry
+/// `{type:"resize",rows,cols}` control messages.
+async fn handle_ws_tmux_attach(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(pane_id): axum::extract::Path<String>,
+    ws: axum::extract::WebSocketUpgrade,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let panes = match tokio::task::spawn_blocking(tmux::list_panes).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
+            return (StatusCode::BAD_GATEWAY, format!("tmux list-panes: {e}\n")).into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("task join: {e}\n"),
+            )
+                .into_response();
+        }
+    };
+    let Some(pane) = tmux::find_pane(&panes, &pane_id).cloned() else {
+        return (StatusCode::NOT_FOUND, format!("pane {pane_id} not found\n")).into_response();
+    };
+    let proto = format!("bearer.{}", &state.token);
+    ws.protocols([proto])
+        .on_upgrade(move |socket| async move {
+            if let Err(e) = run_attach(socket, pane).await {
+                eprintln!("[web-bridge] attach session ended: {e}");
+            }
+        })
+        .into_response()
+}
+
+/// Owns the lifecycle of one attach WS: PTY spawn + bidirectional
+/// pump + child kill on close. Errors bubble up so the wrapping
+/// `on_upgrade` future can log them with the pane context.
+async fn run_attach(
+    socket: axum::extract::ws::WebSocket,
+    pane: tmux::TmuxPane,
+) -> Result<(), String> {
+    use axum::extract::ws::Message;
+    use futures_util::{SinkExt, StreamExt};
+    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("openpty: {e}"))?;
+
+    // `tmux attach-session -t <session>` then `select-pane` via a
+    // chained command. tmux supports `\;` as a command separator, but
+    // doing two shell-outs in sequence inside the PTY isn't possible
+    // (the PTY runs ONE command). Instead use `attach-session -t` +
+    // pre-position the active pane via a separate `tmux select-pane`
+    // shell-out BEFORE spawning the PTY. The session's notion of
+    // "active pane" survives the new attach (multi-client tmux model).
+    // Position BOTH the active window and the active pane in the
+    // target session BEFORE attach. select-pane alone does not
+    // reliably promote the containing window to active across all
+    // tmux versions, so a multi-window session can land the new
+    // attach client on the wrong window. Do them in order: window
+    // first, then pane.
+    let win_status = std::process::Command::new("tmux")
+        .args(["select-window", "-t", &pane.window_id])
+        .status()
+        .map_err(|e| format!("spawn tmux select-window: {e}"))?;
+    if !win_status.success() {
+        return Err(format!(
+            "tmux select-window {} failed: {win_status}",
+            pane.window_id
+        ));
+    }
+    let pane_status = std::process::Command::new("tmux")
+        .args(["select-pane", "-t", &pane.pane_id])
+        .status()
+        .map_err(|e| format!("spawn tmux select-pane: {e}"))?;
+    if !pane_status.success() {
+        return Err(format!(
+            "tmux select-pane {} failed: {pane_status}",
+            pane.pane_id
+        ));
+    }
+
+    let mut cmd = CommandBuilder::new("tmux");
+    cmd.args(["attach-session", "-t", pane.session.as_str()]);
+    if let Ok(term) = std::env::var("TERM") {
+        cmd.env("TERM", term);
+    } else {
+        cmd.env("TERM", "xterm-256color");
+    }
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("spawn tmux attach: {e}"))?;
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("clone PTY reader: {e}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("take PTY writer: {e}"))?;
+    let writer = std::sync::Arc::new(std::sync::Mutex::new(writer));
+
+    // MasterPty is `Send + !Sync`, so holding it across an await would
+    // make the upgrade future non-Send (axum::on_upgrade requires
+    // Send). Hand the master to a dedicated blocking task that owns
+    // it; main loop sends resize requests via a channel.
+    let (resize_tx, mut resize_rx) = tokio::sync::mpsc::channel::<(u16, u16)>(8);
+    let master_box = pair.master;
+    let resize_task = tokio::task::spawn_blocking(move || {
+        while let Some((rows, cols)) = resize_rx.blocking_recv() {
+            let _ = master_box.resize(portable_pty::PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
+    });
+
+    // PTY → WS Binary. Read on a blocking task, push chunks through
+    // a bounded mpsc<Vec<u8>>. Buffer 256 entries × ≤16 KiB = ~4 MiB
+    // worst case. On overflow we close the WS rather than drop bytes
+    // (corrupts xterm state).
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(256);
+    let read_task = tokio::task::spawn_blocking(move || {
+        // Box<dyn Read + Send> returns from portable-pty; we need the
+        // Read trait method `read()` in scope. BufRead's use up top
+        // doesn't bring it in — explicit import here is for clarity
+        // even though older rustc allowed the call without it.
+        use std::io::Read;
+        let mut buf = [0u8; 16 * 1024];
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                break;
+            }
+        }
+    });
+
+    let (mut sink, mut stream) = futures_split(socket);
+    loop {
+        tokio::select! {
+            chunk = rx.recv() => {
+                match chunk {
+                    Some(bytes) => {
+                        if sink.send(Message::Binary(bytes)).await.is_err() { break; }
+                    }
+                    None => break, // reader task ended (PTY closed)
+                }
+            }
+            msg = stream.next() => {
+                match msg {
+                    None => break,
+                    Some(Err(_)) => break,
+                    Some(Ok(Message::Close(_))) => break,
+                    Some(Ok(Message::Binary(bytes))) => {
+                        // raw keystrokes / mouse → PTY stdin
+                        let writer_arc = writer.clone();
+                        let send = tokio::task::spawn_blocking(move || {
+                            let mut g = writer_arc.lock().unwrap_or_else(|p| p.into_inner());
+                            g.write_all(&bytes).and_then(|_| g.flush())
+                        }).await;
+                        if matches!(send, Err(_) | Ok(Err(_))) { break; }
+                    }
+                    Some(Ok(Message::Text(t))) => {
+                        // JSON control frame — only {type:"resize",rows,cols} for now.
+                        if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&t)
+                            && obj.get("type").and_then(Value::as_str) == Some("resize")
+                            && let (Some(rows), Some(cols)) = (
+                                obj.get("rows").and_then(Value::as_u64),
+                                obj.get("cols").and_then(Value::as_u64),
+                            )
+                        {
+                            let _ = resize_tx.try_send((rows as u16, cols as u16));
+                        }
+                    }
+                    Some(Ok(_)) => { /* Ping/Pong handled by axum, others ignored */ }
+                }
+            }
+        }
+    }
+    // Tear down: kill the tmux attach child (detaches the client from
+    // the session — multi-attach model preserves the session itself).
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(resize_tx); // signals resize task to exit
+    read_task.abort();
+    resize_task.abort();
+    Ok(())
 }
 
 async fn handle_ws_events(
@@ -493,32 +849,50 @@ fn futures_split(
 }
 
 #[derive(Debug)]
-struct AppError(daemon_client::DaemonError);
+enum AppError {
+    Daemon(daemon_client::DaemonError),
+    /// Anything outside the daemon path — tmux shell-outs, internal
+    /// task join failures, etc. Carries `(code, message)` directly so
+    /// `IntoResponse` can route to the right HTTP status.
+    Custom {
+        code: String,
+        message: String,
+    },
+}
+
+impl AppError {
+    fn custom(code: &str, message: &str) -> Self {
+        AppError::Custom {
+            code: code.to_string(),
+            message: message.to_string(),
+        }
+    }
+}
 
 impl From<daemon_client::DaemonError> for AppError {
     fn from(e: daemon_client::DaemonError) -> Self {
-        AppError(e)
+        AppError::Daemon(e)
     }
 }
 
 impl axum::response::IntoResponse for AppError {
     fn into_response(self) -> axum::response::Response {
         use axum::http::StatusCode;
-        let (status, code, message) = match &self.0 {
-            daemon_client::DaemonError::Io(e) => {
+        let (status, code, message) = match self {
+            AppError::Daemon(daemon_client::DaemonError::Io(e)) => {
                 (StatusCode::BAD_GATEWAY, "io".to_string(), e.to_string())
             }
-            daemon_client::DaemonError::Serde(e) => (
+            AppError::Daemon(daemon_client::DaemonError::Serde(e)) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "serde".to_string(),
                 e.to_string(),
             ),
-            daemon_client::DaemonError::Closed => (
+            AppError::Daemon(daemon_client::DaemonError::Closed) => (
                 StatusCode::BAD_GATEWAY,
                 "closed".to_string(),
                 "daemon closed connection".to_string(),
             ),
-            daemon_client::DaemonError::Daemon { code, message } => {
+            AppError::Daemon(daemon_client::DaemonError::Daemon { code, message }) => {
                 // no_gui is the most common expected daemon error
                 // (the UI surfaces it as a banner, not a 5xx), so
                 // map it to 503 to make that distinguishable.
@@ -527,7 +901,15 @@ impl axum::response::IntoResponse for AppError {
                 } else {
                     StatusCode::BAD_GATEWAY
                 };
-                (status, code.clone(), message.clone())
+                (status, code, message)
+            }
+            AppError::Custom { code, message } => {
+                let status = if code == "tmux_error" {
+                    StatusCode::BAD_GATEWAY
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                (status, code, message)
             }
         };
         (

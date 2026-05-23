@@ -60,11 +60,16 @@ nestty/
 │       │                            # auth (Authorization header / Sec-WebSocket-Protocol).
 │       │                            # Localhost bind by default — external access (Tailscale /
 │       │                            # SSH tunnel / cloudflared) is the user's perimeter.
-│       │── src/main.rs        # stdio handshake + token validation + tokio runtime spawn
+│       │── src/main.rs        # stdio handshake + token validation + tokio runtime spawn +
+│       │                            # all axum routes (REST + WS overview + WS attach)
 │       │── src/daemon_client.rs   # rpc() async UnixStream; subscribe() sync UnixStream via
 │       │                            # spawn_blocking (matches nestctl wire model)
+│       │── src/tmux.rs        # Slice 3.1 — list_panes, capture_pane, send_text (load-buffer +
+│       │                            # paste-buffer), find_pane lookup. Single-shellout list-panes -a
+│       │                            # avoids N+1; capture_pane keeps ANSI via -e.
 │       │── plugin.toml        # onStartup, provides=[], env docs
-│       └── static/index.html  # mobile-first vanilla SPA — include_str!'d into binary
+│       └── static/index.html  # mobile-first vanilla SPA — two modes (overview cards + xterm
+│                                    # attach via CDN xterm.js@5.5.0); include_str!'d into binary
 # claude.start: nestty-internal socket action (lives in nestty-linux/src/socket.rs).
 # Spawns a tab whose terminal cwd is the worktree, feeds
 # `tmux new-session -A -s <name> 'claude [--resume <id>]'` into it.
