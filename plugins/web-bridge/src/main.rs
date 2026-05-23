@@ -669,7 +669,34 @@ async fn run_attach(
     }
 
     let mut cmd = CommandBuilder::new("tmux");
-    cmd.args(["attach-session", "-t", pane.session.as_str()]);
+    // `-u` forces UTF-8 even when the spawned tmux client can't detect
+    // it from locale. Without this, any non-ASCII byte renders as `?`
+    // in panes whose programs (vim, less, fzf) trust tmux's notion of
+    // UTF-8 support over their own locale.
+    cmd.args(["-u", "attach-session", "-t", pane.session.as_str()]);
+    // CommandBuilder starts with an EMPTY env. Forward the variables
+    // that tmux + its child shells need for UTF-8 + path resolution +
+    // sensible behaviour. Without LANG/LC_CTYPE the child shell falls
+    // back to C locale and mangles every multibyte character; without
+    // PATH it can't find non-builtin binaries.
+    for var in [
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "HOME",
+        "USER",
+        "SHELL",
+        "COLORTERM",
+    ] {
+        if let Ok(v) = std::env::var(var) {
+            cmd.env(var, v);
+        }
+    }
+    // Fallback locale if the parent env had none — guarantees UTF-8.
+    if std::env::var("LANG").is_err() && std::env::var("LC_ALL").is_err() {
+        cmd.env("LANG", "C.UTF-8");
+    }
     if let Ok(term) = std::env::var("TERM") {
         cmd.env("TERM", term);
     } else {

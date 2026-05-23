@@ -32,11 +32,14 @@
     .chip[disabled] { opacity: 0.45; cursor: not-allowed; }
 
     /* ==== overview mode ==== */
-    main.overview { display: flex; flex-direction: column; gap: 0.6rem; padding: 0.6rem; max-width: 800px; margin: 0 auto; height: calc(100vh - 50px); overflow-y: auto; }
+    main.overview { display: flex; flex-direction: column; gap: 0.6rem; padding: 0.6rem; max-width: 800px; margin: 0 auto; height: calc(100vh - 50px); overflow-y: auto; overflow-x: hidden; }
     .section-title { font-size: 0.72rem; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.08em; padding: 0 0.2rem; margin-top: 0.25rem; display: flex; justify-content: space-between; align-items: center; }
-    .cards { display: grid; grid-template-columns: 1fr; gap: 0.5rem; }
+    /* min-width: 0 on the grid + items lets nowrap+ellipsis actually
+       shrink the cell instead of pushing the grid wider than the
+       viewport (default min-width: auto = min-content). */
+    .cards { display: grid; grid-template-columns: 1fr; gap: 0.5rem; min-width: 0; }
     @media (min-width: 600px) { .cards { grid-template-columns: 1fr 1fr; } }
-    .card { background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.65rem; padding: 0.7rem 0.85rem; cursor: pointer; display: flex; flex-direction: column; gap: 0.35rem; }
+    .card { background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.65rem; padding: 0.7rem 0.85rem; cursor: pointer; display: flex; flex-direction: column; gap: 0.35rem; min-width: 0; }
     .card:hover { border-color: var(--accent); }
     .card.active-pane { border-color: var(--accent-ok); }
     .card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
@@ -62,7 +65,12 @@
     #term-host .xterm { height: 100%; }
     /* mobile keyboard toolbar */
     .kbd-bar { display: flex; flex-wrap: wrap; gap: 0.3rem; padding: 0.4rem; background: var(--bg-2); border-top: 1px solid var(--border); }
-    .kbd-bar button { flex: 1 0 auto; min-width: 2.5rem; padding: 0.5rem 0.5rem; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 0.35rem; font-size: 0.78rem; cursor: pointer; }
+    /* touch-action: manipulation suppresses double-tap zoom; user-select
+       prevents long-press text selection on iOS. Combined with the
+       mousedown/touchstart preventDefault below, this keeps focus on
+       xterm's hidden textarea so the toolbar Ctrl+key combo works
+       without re-tapping the terminal between keys. */
+    .kbd-bar button { flex: 1 0 auto; min-width: 2.5rem; padding: 0.5rem 0.5rem; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 0.35rem; font-size: 0.78rem; cursor: pointer; touch-action: manipulation; -webkit-user-select: none; user-select: none; }
     .kbd-bar button.sticky { background: var(--accent); color: var(--bg-3); }
     .kbd-bar button:active { background: var(--accent); color: var(--bg-3); }
 
@@ -149,6 +157,10 @@
         const t = inp.value.trim();
         if (t.length < 32) { inp.style.borderColor = "var(--accent-err)"; return; }
         token = t; sessionStorage.setItem("nestty.token", t);
+        // honor `#pane/<id>` deep-links that arrived through the
+        // pre-auth login flow — without this, a phone shortcut to a
+        // specific pane drops you on overview after the first login.
+        bootFromHash();
         bootstrap();
       };
       btn.addEventListener("click", go);
@@ -236,12 +248,26 @@
       `;
       document.getElementById("back").addEventListener("click", leaveAttach);
       document.getElementById("presence-toggle").addEventListener("click", togglePresence);
+      // preventDefault on mousedown/touchstart stops the button from
+      // stealing focus away from xterm's hidden textarea. Without
+      // this, every toolbar tap blurs the terminal and the user has
+      // to click the terminal again before the next key works — the
+      // sticky-Ctrl combo becomes "Ctrl, click terminal, type letter"
+      // instead of "Ctrl, letter". After the click fires we still
+      // call term.focus() as a belt-and-braces refocus in case any
+      // platform quirk drained the textarea.
+      const refocus = () => { try { state.term && state.term.focus(); } catch {} };
+      document.querySelectorAll(".kbd-bar button").forEach(btn => {
+        btn.addEventListener("mousedown", e => e.preventDefault());
+        btn.addEventListener("touchstart", e => e.preventDefault(), { passive: false });
+      });
       document.querySelectorAll(".kbd-bar button[data-bytes]").forEach(btn => {
-        btn.addEventListener("click", () => sendKbdBytes(btn.dataset.bytes));
+        btn.addEventListener("click", () => { sendKbdBytes(btn.dataset.bytes); refocus(); });
       });
       document.getElementById("ctrl").addEventListener("click", () => {
         state.ctrlSticky = !state.ctrlSticky;
         document.getElementById("ctrl").classList.toggle("sticky", state.ctrlSticky);
+        refocus();
       });
       openTerminal();
     }
@@ -430,20 +456,76 @@
     function enterAttach(paneId) {
       state.activePane = paneId;
       state.mode = "attach";
+      // Push a history entry so the platform back button (Android
+      // gesture / browser ←) detaches instead of leaving the page.
+      // popstate is the single source of truth for transitions —
+      // both this push and the in-app `← overview` button route
+      // through it, so the URL and `state.mode` never diverge.
+      history.pushState({ mode: "attach", pane: paneId }, "", `#pane/${encodeURIComponent(paneId)}`);
       render();
     }
 
-    function leaveAttach() {
+    // Tear down attach resources without touching history — used both
+    // by user-initiated back and by popstate handler. Caller controls
+    // whether to push/pop the history entry to avoid double-entries.
+    function teardownAttach() {
       if (state.ws.attach) { try { state.ws.attach.close(); } catch {} state.ws.attach = null; }
       if (state.term) { try { state.term.dispose(); } catch {} state.term = null; }
       state.fit = null;
       if (state._removeResize) { state._removeResize(); state._removeResize = null; }
       state.activePane = null;
       state.mode = "overview";
-      render();
     }
 
-    if (token) bootstrap(); else render();
+    function leaveAttach() {
+      // Delegate to platform back so popstate fires + URL pops in
+      // the same path as the OS back gesture. popstate handler
+      // does the actual teardown + render.
+      if (history.state && history.state.mode === "attach") {
+        history.back();
+      } else {
+        teardownAttach();
+        render();
+      }
+    }
+
+    window.addEventListener("popstate", (e) => {
+      const target = (e.state && e.state.mode) || "overview";
+      if (target === "attach" && e.state.pane) {
+        // Forward navigation back into an attach URL — only act if
+        // we're not already attached to the same pane.
+        if (state.mode !== "attach" || state.activePane !== e.state.pane) {
+          if (state.mode === "attach") teardownAttach();
+          state.activePane = e.state.pane;
+          state.mode = "attach";
+          render();
+        }
+      } else {
+        if (state.mode === "attach") {
+          teardownAttach();
+          render();
+        }
+      }
+    });
+
+    // Boot path: honor `#pane/<id>` deep-links on first load so a
+    // bookmarked attach URL goes straight to the terminal.
+    function bootFromHash() {
+      const m = location.hash.match(/^#pane\/(.+)$/);
+      if (m) {
+        const paneId = decodeURIComponent(m[1]);
+        // Seed history with overview as the anchor so first back
+        // press returns to overview rather than leaving the page.
+        history.replaceState({ mode: "overview" }, "", location.pathname + location.search);
+        history.pushState({ mode: "attach", pane: paneId }, "", `#pane/${encodeURIComponent(paneId)}`);
+        state.activePane = paneId;
+        state.mode = "attach";
+      } else {
+        history.replaceState({ mode: "overview" }, "", location.pathname + location.search + location.hash);
+      }
+    }
+
+    if (token) { bootFromHash(); bootstrap(); } else render();
   })();
   </script>
 </body>
