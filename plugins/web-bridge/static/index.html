@@ -61,7 +61,11 @@
        coded. notification = accent (info), stop = ok (done), codex* =
        warn (response ready / awaits user). Hidden via JS when empty. */
     .attention-strip { background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.65rem; overflow: hidden; }
-    .attention-row { padding: 0.45rem 0.85rem; border-bottom: 1px solid var(--border); font-size: 0.74rem; color: var(--fg); display: flex; gap: 0.5rem; align-items: baseline; }
+    /* Rows are interactive — tapping routes to the originating pane.
+       Hover hint + cursor pointer signals the affordance. Rows without
+       a resolvable target still render but the click is a no-op. */
+    .attention-row { padding: 0.45rem 0.85rem; border-bottom: 1px solid var(--border); font-size: 0.74rem; color: var(--fg); display: flex; gap: 0.5rem; align-items: baseline; cursor: pointer; }
+    .attention-row:hover { background: var(--bg-3); }
     .attention-row:last-child { border-bottom: none; }
     .attention-row .kind { flex-shrink: 0; font-size: 0.65rem; padding: 0.1rem 0.35rem; border-radius: 0.3rem; border: 1px solid var(--border); color: var(--fg-dim); }
     .attention-row[data-kind="notification"] .kind { color: var(--accent); border-color: var(--accent); }
@@ -209,10 +213,33 @@
       inp.addEventListener("keydown", e => { if (e.key === "Enter") go(); });
     }
 
+    // Stable sort key — lower = higher on the page. Order: waiting
+    // (user-blocking) > busy (actively running) > idle (parked) > no
+    // agent (plain shell). Tier 4 panes preserve tmux's own order; tier
+    // 0-2 are tie-broken by newer updated_at_ms so the most recently
+    // active session of a tier floats up.
+    function paneSortRank(p) {
+      const status = p.agent && p.agent.status;
+      if (status === "waiting") return 0;
+      if (status === "busy") return 1;
+      if (status === "idle") return 2;
+      return 4;
+    }
+    function paneSorted(panes) {
+      return panes.slice().sort((a, b) => {
+        const ra = paneSortRank(a), rb = paneSortRank(b);
+        if (ra !== rb) return ra - rb;
+        const ua = (a.agent && a.agent.updated_at_ms) || 0;
+        const ub = (b.agent && b.agent.updated_at_ms) || 0;
+        return ub - ua;
+      });
+    }
+
     function renderOverview() {
-      const tmuxBlock = state.tmuxPanes.length === 0
+      const sortedPanes = paneSorted(state.tmuxPanes);
+      const tmuxBlock = sortedPanes.length === 0
         ? `<div class="empty">no tmux panes. start a tmux session (or use the non-tmux fallback below).</div>`
-        : `<div class="cards">${state.tmuxPanes.map(p => {
+        : `<div class="cards">${sortedPanes.map(p => {
             const a = p.agent;
             const statusPill = (a && a.status)
               ? `<span class="pill ${escapeHtml(a.status)}">${escapeHtml(a.name || "agent")}: ${escapeHtml(a.status)}</span>`
@@ -254,7 +281,7 @@
           ${state.attention.length === 0 ? "" : `
             <div class="section-title">attention <span style="text-transform:none; color:var(--fg-dim);">${state.attention.length}</span></div>
             <div class="attention-strip">${state.attention.slice(0, 5).map(a => `
-              <div class="attention-row" data-kind="${escapeHtml(a.kind || "?")}">
+              <div class="attention-row" data-kind="${escapeHtml(a.kind || "?")}" data-target="${escapeHtml(a.tmux_target || "")}" data-session="${escapeHtml(a.tmux_session || "")}">
                 <span class="kind">${escapeHtml(a.kind || "?")}</span>
                 <span class="title">${escapeHtml(a.title || a.body || "")}</span>
                 <span class="age">${escapeHtml(a.tmux_session || "")} ${escapeHtml(humanAgeFromEpochSec(a.ts))}</span>
@@ -281,6 +308,38 @@
       document.querySelectorAll(".card[data-pane]").forEach(el => {
         el.addEventListener("click", () => enterAttach(el.dataset.pane));
       });
+      document.querySelectorAll(".attention-row").forEach(el => {
+        el.addEventListener("click", () => {
+          const pid = resolveAttentionTargetPane(el.dataset.target, el.dataset.session);
+          if (pid) enterAttach(pid);
+        });
+      });
+    }
+
+    // Resolve a "session:window_idx" tmux_target (or bare session name)
+    // to a concrete pane_id from the current snapshot. Preference order:
+    // active pane in the exact window → first pane in the window → any
+    // pane in the session. Null when nothing matches (stale entry whose
+    // session has since died).
+    function resolveAttentionTargetPane(target, session) {
+      const panes = state.tmuxPanes || [];
+      if (target) {
+        const [sess, widx] = target.split(":");
+        const widxNum = Number.parseInt(widx, 10);
+        if (sess && !Number.isNaN(widxNum)) {
+          const inWindow = panes.filter(p => p.session === sess && p.window_index === widxNum);
+          const active = inWindow.find(p => p.pane_active);
+          if (active) return active.pane_id;
+          if (inWindow.length > 0) return inWindow[0].pane_id;
+        }
+      }
+      if (session) {
+        const inSession = panes.filter(p => p.session === session);
+        const active = inSession.find(p => p.pane_active);
+        if (active) return active.pane_id;
+        if (inSession.length > 0) return inSession[0].pane_id;
+      }
+      return null;
     }
 
     function renderAttach() {

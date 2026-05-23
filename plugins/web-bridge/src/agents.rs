@@ -147,6 +147,10 @@ pub struct AttentionEntry {
     pub body: String,
     pub session_id: String,
     pub tmux_session: String,
+    /// `session:window_idx` form written by the bash hooks. Lets the
+    /// SPA route a tap on this row to the originating pane via the
+    /// existing attach flow (parse → lookup in tmuxPanes → enterAttach).
+    pub tmux_target: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -164,6 +168,8 @@ struct RawAttention {
     session_id: String,
     #[serde(default)]
     tmux_session: String,
+    #[serde(default)]
+    tmux_target: String,
 }
 
 fn attention_queue_path() -> Option<PathBuf> {
@@ -207,6 +213,7 @@ fn parse_attention(bytes: &[u8], cutoff: i64) -> Vec<AttentionEntry> {
             body: r.body,
             session_id: r.session_id,
             tmux_session: r.tmux_session,
+            tmux_target: r.tmux_target,
         })
         .collect();
     entries.sort_by_key(|e| std::cmp::Reverse(e.ts));
