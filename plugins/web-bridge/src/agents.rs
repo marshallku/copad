@@ -199,6 +199,142 @@ pub fn read_attention_queue(cutoff_secs: i64) -> Vec<AttentionEntry> {
     parse_attention(&bytes, cutoff)
 }
 
+/// One active codex-companion background job, read from
+/// `~/.claude/state/codex-companion/state/<workspace>/state.json`.
+/// Mirrors tmx's `state::CodexJob` schema so the SPA can display
+/// jobs (running / queued) alongside tmux panes.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CodexJob {
+    pub id: String,
+    pub title: String,
+    pub kind_label: String,
+    pub workspace_root: String,
+    pub status: String,
+    pub started_at_ms: Option<i64>,
+    pub updated_at_ms: Option<i64>,
+    pub pid: Option<u32>,
+}
+
+impl CodexJob {
+    /// True for any non-terminal status. codex-companion's terminal
+    /// set is `completed | failed | cancelled | canceled`; anything
+    /// else (running, queued, missing) counts as still doing work.
+    pub fn is_active(&self) -> bool {
+        !matches!(
+            self.status.as_str(),
+            "completed" | "failed" | "cancelled" | "canceled"
+        )
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct CodexStateFile {
+    jobs: Option<Vec<RawCodexJob>>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawCodexJob {
+    id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(rename = "kindLabel", default)]
+    kind_label: String,
+    #[serde(rename = "workspaceRoot", default)]
+    workspace_root: String,
+    #[serde(default)]
+    status: String,
+    #[serde(rename = "startedAt", default)]
+    started_at: String,
+    #[serde(rename = "updatedAt", default)]
+    updated_at: String,
+    #[serde(default)]
+    pid: Option<u32>,
+}
+
+/// Enumerate active codex-companion jobs from every workspace dir.
+/// Returns newest-started first. Missing root dir → empty Vec.
+pub fn read_codex_jobs() -> Vec<CodexJob> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
+    };
+    read_codex_jobs_in(&home.join(".claude/state/codex-companion/state"))
+}
+
+fn read_codex_jobs_in(dir: &std::path::Path) -> Vec<CodexJob> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut jobs: Vec<CodexJob> = Vec::new();
+    for entry in read.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        jobs.extend(read_workspace_codex_jobs(&entry.path()));
+    }
+    jobs.retain(CodexJob::is_active);
+    jobs.sort_by_key(|j| std::cmp::Reverse(j.started_at_ms));
+    jobs
+}
+
+fn read_workspace_codex_jobs(workspace_dir: &std::path::Path) -> Vec<CodexJob> {
+    let state_path = workspace_dir.join("state.json");
+    let Ok(bytes) = std::fs::read(&state_path) else {
+        return Vec::new();
+    };
+    let Ok(file): Result<CodexStateFile, _> = serde_json::from_slice(&bytes) else {
+        return Vec::new();
+    };
+    file.jobs
+        .unwrap_or_default()
+        .into_iter()
+        .map(|j| CodexJob {
+            id: j.id,
+            title: j.title,
+            kind_label: j.kind_label,
+            workspace_root: j.workspace_root,
+            status: j.status,
+            started_at_ms: parse_iso8601_millis(&j.started_at),
+            updated_at_ms: parse_iso8601_millis(&j.updated_at),
+            pid: j.pid,
+        })
+        .collect()
+}
+
+/// Minimal ISO-8601 → epoch-millis parser tuned for codex-companion's
+/// `YYYY-MM-DDTHH:MM:SS.fffZ` output. Mirrors tmx's parser (same fmt
+/// is the only one the companion writes today).
+fn parse_iso8601_millis(s: &str) -> Option<i64> {
+    if s.len() < 20 {
+        return None;
+    }
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let month: u32 = s.get(5..7)?.parse().ok()?;
+    let day: u32 = s.get(8..10)?.parse().ok()?;
+    let hour: i64 = s.get(11..13)?.parse().ok()?;
+    let min: i64 = s.get(14..16)?.parse().ok()?;
+    let sec: i64 = s.get(17..19)?.parse().ok()?;
+    let mut millis: i64 = 0;
+    if s.get(19..20) == Some(".")
+        && let Some(frac) = s.get(20..23)
+    {
+        millis = frac.parse().ok()?;
+    }
+    let days = days_from_civil(year, month, day) - 719_468;
+    let secs = days * 86_400 + hour * 3600 + min * 60 + sec;
+    Some(secs * 1000 + millis)
+}
+
+/// Howard Hinnant's days_from_civil — exact + alloc-free.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = (y - era * 400) as u32;
+    let m_adj = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * m_adj + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe as i64
+}
+
 fn parse_attention(bytes: &[u8], cutoff: i64) -> Vec<AttentionEntry> {
     let mut entries: Vec<AttentionEntry> = bytes
         .split(|b| *b == b'\n')
@@ -311,6 +447,69 @@ mod tests {
         let entries = parse_attention(raw, 0);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].body, "ok");
+    }
+
+    #[test]
+    fn codex_job_is_active_excludes_terminal_states() {
+        let base = CodexJob {
+            id: "x".into(),
+            title: String::new(),
+            kind_label: String::new(),
+            workspace_root: String::new(),
+            status: "running".into(),
+            started_at_ms: None,
+            updated_at_ms: None,
+            pid: None,
+        };
+        assert!(base.is_active());
+        for s in ["completed", "failed", "cancelled", "canceled"] {
+            assert!(
+                !CodexJob {
+                    status: s.into(),
+                    ..base.clone()
+                }
+                .is_active()
+            );
+        }
+    }
+
+    #[test]
+    fn codex_jobs_in_filters_active_and_sorts() {
+        use std::fs;
+        use tempfile::tempdir;
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path().join("nestty-abcd");
+        fs::create_dir_all(&ws).unwrap();
+        let state = r#"{
+            "jobs": [
+                {"id":"old-done","status":"completed","workspaceRoot":"/x","startedAt":"2026-05-18T01:00:00.000Z","updatedAt":"2026-05-18T01:00:01.000Z"},
+                {"id":"new-run","status":"running","workspaceRoot":"/y","startedAt":"2026-05-20T01:00:00.000Z","updatedAt":"2026-05-20T01:01:00.000Z","pid":12345}
+            ]
+        }"#;
+        fs::write(ws.join("state.json"), state).unwrap();
+        let jobs = read_codex_jobs_in(tmp.path());
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, "new-run");
+        assert_eq!(jobs[0].pid, Some(12345));
+    }
+
+    #[test]
+    fn codex_jobs_in_missing_dir_empty() {
+        assert!(read_codex_jobs_in(std::path::Path::new("/nope/xyz")).is_empty());
+    }
+
+    #[test]
+    fn parse_iso8601_known_value_round_trips() {
+        let ms = parse_iso8601_millis("2026-05-19T01:56:52.454Z").unwrap();
+        let days = days_from_civil(2026, 5, 19) - 719_468;
+        let secs = days * 86_400 + 3600 + 56 * 60 + 52;
+        assert_eq!(ms, secs * 1000 + 454);
+    }
+
+    #[test]
+    fn parse_iso8601_rejects_short_string() {
+        assert!(parse_iso8601_millis("").is_none());
+        assert!(parse_iso8601_millis("2026-05-19").is_none());
     }
 
     #[test]

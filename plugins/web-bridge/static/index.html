@@ -154,6 +154,7 @@
       presence: null,
       tmuxPanes: [],
       attention: [],
+      codexJobs: [],
       nesttyPanels: [],
       events: [],
       noGui: false,
@@ -337,6 +338,31 @@
                 <span class="title">${escapeHtml(a.title || a.body || "")}</span>
                 <span class="age">${escapeHtml(a.tmux_session || "")} ${escapeHtml(humanAgeFromEpochSec(a.ts))}</span>
               </div>`).join("")}</div>
+          `}
+          ${state.codexJobs.length === 0 ? "" : `
+            <div class="section-title">codex jobs <span style="text-transform:none; color:var(--fg-dim);">${state.codexJobs.length}</span></div>
+            <div class="cards">${state.codexJobs.map(j => {
+              const wsName = (j.workspace_root || "").split("/").filter(Boolean).pop() || "";
+              // Only `running` gets a colored pill (warn/orange via the
+              // existing `busy` style). Every other status — queued,
+              // unknown, etc — uses the bare neutral pill class so we
+              // don't accidentally pick up `.idle`/`.waiting` colors
+              // when the raw status string happens to match those names.
+              const statusPill = j.status === "running"
+                ? `<span class="pill busy">${escapeHtml(j.status)}</span>`
+                : `<span class="pill">${escapeHtml(j.status || "?")}</span>`;
+              const agePill = j.updated_at_ms ? `<span class="pill age">${escapeHtml(humanAgeMs(j.updated_at_ms))} ago</span>` : "";
+              const pidPart = j.pid ? `pid ${j.pid}` : "";
+              return `
+                <div class="card">
+                  <div class="card-head">
+                    <div class="card-name">${escapeHtml(j.title || j.id)}</div>
+                    <div class="card-meta">${escapeHtml(pidPart)}</div>
+                  </div>
+                  <div class="card-cwd">${escapeHtml(wsName)}${j.kind_label ? " · " + escapeHtml(j.kind_label) : ""}</div>
+                  <div class="card-status">${statusPill}${agePill}</div>
+                </div>`;
+            }).join("")}</div>
           `}
           <div class="section-title">tmux panes <span style="text-transform:none; color:var(--fg-dim);">${state.tmuxPanes.length}</span></div>
           ${tmuxBlock}
@@ -566,6 +592,7 @@
           } else {
             state.tmuxPanes = snap.panes || [];
             state.attention = snap.attention || [];
+            state.codexJobs = snap.codex_jobs || [];
           }
           if (state.mode === "overview") render();
         } catch {}

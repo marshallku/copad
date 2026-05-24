@@ -877,9 +877,14 @@ fn build_tmux_snapshot() -> Result<Value, AppError> {
     // now". Cap at 20 entries to keep frames small + cards readable.
     let mut attention: Vec<agents::AttentionEntry> = agents::read_attention_queue(3600);
     attention.truncate(20);
+    // codex-companion background jobs (filtered to non-terminal status
+    // by the reader). Rendered as a separate section in the SPA — they
+    // aren't pane-attached so they shouldn't sort into the pane grid.
+    let codex_jobs = agents::read_codex_jobs();
     Ok(json!({
         "panes": rows,
         "attention": attention,
+        "codex_jobs": codex_jobs,
     }))
 }
 

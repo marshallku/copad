@@ -7,6 +7,7 @@
 | [architecture.md](./architecture.md)       | Project structure, crate layout, tech stack | Starting work, understanding the codebase |
 | [linux-app.md](./linux-app.md)             | GTK4 + VTE4 Linux app internals             | Working on nestty-linux                     |
 | [macos-app.md](./macos-app.md)             | Swift/AppKit + SwiftTerm macOS app          | Working on nestty-macos                     |
+| [macos-porting-guide.md](./macos-porting-guide.md) | Onboarding guide for picking up macOS work on a Mac (current state, build/dev loop, paths, phased TODO) | First session on the Mac, or coming back after Linux-only stretch |
 | [macos-parity-plan.md](./macos-parity-plan.md) | Tiered plan to bring macOS to Linux parity (codex-reviewed) | Picking next macOS work item |
 | [macos-daemon-migration-plan.md](./macos-daemon-migration-plan.md) | 7-PR plan to migrate macOS from monolithic to daemon-client (codex round 1/2/3 reflected) | After parity-plan Tier 4; this is the next architectural gate |
 | [macos-renderer-migration-plan.md](./macos-renderer-migration-plan.md) | Vertical-slice plan to replace SwiftTerm with alacritty_terminal + custom AppKit/CoreText renderer (decision #31) | After daemon migration; the long-running 3-6 month effort that addresses SwiftTerm's structural limits |
