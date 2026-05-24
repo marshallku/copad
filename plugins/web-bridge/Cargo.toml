@@ -30,16 +30,12 @@ futures-util = { version = "0.3", default-features = false, features = [
     "sink",
 ] }
 portable-pty = "0.9"
-# Process tree walking for agent detection (claude/codex descendant of
-# tmux pane PID). `system` feature is the minimum — we read name + cwd
-# + start_time, no disks/network. Matches ~/dev/tmx's dependency.
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+# `dirs::home_dir` for the push subscriptions JSONL path.
 dirs = "5"
 # Web Push (RFC 8030) for the PWA notification path. Server holds the
 # VAPID key pair from env, fans out to stored subscriptions when an
 # attention-queue entry matches the subscription's `kinds` filter.
 web-push = "0.11"
-base64 = "0.22"
 sha2 = "0.10"
 
 [dev-dependencies]

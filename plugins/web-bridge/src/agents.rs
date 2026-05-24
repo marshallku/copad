@@ -1,209 +1,108 @@
-//! Agent state surface. Reads Claude/Codex UI status from the
-//! undocumented `~/.claude/sessions/<PID>.json` file, walks the process
-//! tree to find the claude/codex descendant of a tmux pane, and reads
-//! the cross-tool `~/.cache/claude-attention/queue.jsonl` notification
-//! inbox.
+//! Shell-out to `tmx agents --json` for the agent + attention +
+//! codex-job snapshot. tmx 1.x is the source of truth; we just parse
+//! its JSON and surface what the dashboard needs.
 //!
-//! Logic mirrors `~/dev/tmx/src/agents/` (session_meta + proc + attention
-//! modules) but trimmed to just the data layer — no UI, no aggregation.
-//! When tmx adds a JSON output mode this whole module becomes a shell-out.
-//! Until then we re-implement the same lookups so the web dashboard
-//! doesn't have to spawn `tmx` per overview tick.
+//! Why a shell-out instead of inline:
+//!   * Single source of truth — tmx's Claude/Codex classification,
+//!     process-tree walk, zombie filtering, repo-marker scanning, and
+//!     attention queue parsing all live in one project and evolve
+//!     together. Re-implementing them here would drift.
+//!   * No `~/.claude/sessions/*.json` schema coupling — when Claude
+//!     renames a field, tmx absorbs the breakage and we get an
+//!     unchanged JSON shape.
+//!
+//! On `tmx` not installed / not on PATH: `read_snapshot` returns
+//! `Err`; callers degrade gracefully (panes still render from
+//! `tmux list-panes`, agent enrichment + attention strip simply
+//! show empty).
 
-use std::fs;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use serde::{Deserialize, Serialize};
+use std::process::Command;
 
-use sysinfo::{Pid, Process, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SessionStatus {
-    Busy,
-    Idle,
-    Waiting,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct SessionMeta {
-    pub status: SessionStatus,
-    pub session_id: String,
-    pub updated_at_ms: i64,
-}
-
-#[derive(serde::Deserialize)]
-struct RawSession {
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TmxSnapshot {
     #[serde(default)]
-    status: String,
-    #[serde(default, rename = "sessionId")]
-    session_id: String,
-    #[serde(default, rename = "updatedAt")]
-    updated_at: i64,
+    pub agents: Vec<Agent>,
+    #[serde(default)]
+    pub attention: Vec<Attention>,
+    #[serde(default)]
+    pub global_blocked: u32,
+    #[serde(default)]
+    pub captured_at_ms: i64,
+    /// Populated by `enrich_codex_jobs` after the shell-out — tmx's
+    /// `agents --json` doesn't include codex-companion jobs yet, so we
+    /// still read them locally and stuff them into the snapshot here.
+    #[serde(default, skip)]
+    pub codex_jobs: Vec<CodexJob>,
 }
 
-fn session_path(pid: u32) -> Option<PathBuf> {
-    Some(dirs::home_dir()?.join(format!(".claude/sessions/{pid}.json")))
-}
-
-pub fn read_session_meta(pid: u32) -> Option<SessionMeta> {
-    let bytes = fs::read(session_path(pid)?).ok()?;
-    parse_session(&bytes)
-}
-
-fn parse_session(bytes: &[u8]) -> Option<SessionMeta> {
-    let raw: RawSession = serde_json::from_slice(bytes).ok()?;
-    let status = match raw.status.as_str() {
-        "busy" => SessionStatus::Busy,
-        "idle" => SessionStatus::Idle,
-        "waiting" => SessionStatus::Waiting,
-        _ => return None,
-    };
-    Some(SessionMeta {
-        status,
-        session_id: raw.session_id,
-        updated_at_ms: raw.updated_at,
-    })
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct AgentProc {
-    pub pid: u32,
-    pub name: String,
-}
-
-pub struct ProcSnapshot {
-    sys: System,
-}
-
-impl ProcSnapshot {
-    pub fn new() -> Self {
-        let mut sys = System::new();
-        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, Self::refresh_kind());
-        Self { sys }
-    }
-
-    fn refresh_kind() -> ProcessRefreshKind {
-        ProcessRefreshKind::nothing()
-            .with_exe(UpdateKind::OnlyIfNotSet)
-            .with_cmd(UpdateKind::OnlyIfNotSet)
-    }
-
-    /// BFS over descendants of `root_pid`. Returns the most recently
-    /// started descendant whose process name matches one of `targets`.
-    /// `None` when the root has no matching descendant (the normal case
-    /// for a shell-only pane).
-    pub fn find_descendant(&self, root_pid: u32, targets: &[&str]) -> Option<AgentProc> {
-        let mut best: Option<&Process> = None;
-        let mut stack = vec![Pid::from_u32(root_pid)];
-        while let Some(pid) = stack.pop() {
-            for (other_pid, proc) in self.sys.processes() {
-                if proc.parent() != Some(pid) {
-                    continue;
-                }
-                if let Some(name) = exe_basename(proc)
-                    && targets.contains(&name)
-                {
-                    best = match best {
-                        None => Some(proc),
-                        Some(prev) if proc.start_time() > prev.start_time() => Some(proc),
-                        Some(_) => best,
-                    };
-                }
-                stack.push(*other_pid);
-            }
-        }
-        best.map(|p| AgentProc {
-            pid: p.pid().as_u32(),
-            name: exe_basename(p).unwrap_or_default().to_string(),
-        })
-    }
-}
-
-impl Default for ProcSnapshot {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-fn exe_basename(proc: &Process) -> Option<&str> {
-    // Prefer the kernel-set comm name (`/proc/<pid>/comm`) over the
-    // exe path basename — Claude Code's exe is at
-    // `.../versions/<semver>/cli.js` so `file_name()` yields the
-    // version string instead of `claude`. See tmx's proc.rs for the
-    // detailed rationale.
-    proc.name().to_str().or_else(|| {
-        proc.exe()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-    })
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct AttentionEntry {
-    pub ts: i64,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Agent {
+    pub id: String,
+    pub pane: AgentPane,
+    /// `claude` / `codex` / `shell` / `other`. tmx classifies — we
+    /// just relay so the SPA can color cards or filter.
     pub kind: String,
+    /// `ready` / `busy` / `waiting` / `idle` / `unknown`. tmx's
+    /// vocabulary; SPA maps to pill colors.
+    pub status: String,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub repo_name: String,
+    #[serde(default)]
+    pub flags: AgentFlags,
+    /// Free-text extra (e.g. "pid 12345"); for display only.
+    #[serde(default)]
+    pub extra: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentPane {
+    pub session: String,
+    pub window: u32,
+    pub pane: u32,
+    /// Pane PID = what `tmux list-panes -F '#{pane_pid}'` would
+    /// return. We join on this when matching tmx agents back to our
+    /// own `tmux list-panes` results, since tmx doesn't emit `%N`
+    /// pane ids.
+    #[serde(default)]
+    pub pane_pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AgentFlags {
+    #[serde(default)]
+    pub has_intent: bool,
+    #[serde(default)]
+    pub blocked: bool,
+    #[serde(default)]
+    pub reviewed_fresh: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attention {
+    pub ts: i64,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
     pub source: String,
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
     pub body: String,
+    #[serde(default)]
     pub session_id: String,
-    pub tmux_session: String,
-    /// `session:window_idx` form written by the bash hooks. Lets the
-    /// SPA route a tap on this row to the originating pane via the
-    /// existing attach flow (parse → lookup in tmuxPanes → enterAttach).
+    #[serde(default)]
     pub tmux_target: String,
+    #[serde(default)]
+    pub tmux_session: String,
 }
 
-#[derive(serde::Deserialize)]
-struct RawAttention {
-    ts: i64,
-    #[serde(default)]
-    kind: String,
-    #[serde(default)]
-    source: String,
-    #[serde(default)]
-    title: String,
-    #[serde(default)]
-    body: String,
-    #[serde(default)]
-    session_id: String,
-    #[serde(default)]
-    tmux_session: String,
-    #[serde(default)]
-    tmux_target: String,
-}
-
-fn attention_queue_path() -> Option<PathBuf> {
-    // Match the shell hooks (notify-stop.sh etc.) exactly: they fall
-    // back to $HOME/.cache even on macOS, NOT ~/Library/Caches. So
-    // we deliberately don't use dirs::cache_dir().
-    let cache = std::env::var("XDG_CACHE_HOME")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".cache")))?;
-    Some(cache.join("claude-attention/queue.jsonl"))
-}
-
-pub fn read_attention_queue(cutoff_secs: i64) -> Vec<AttentionEntry> {
-    let Some(path) = attention_queue_path() else {
-        return Vec::new();
-    };
-    let Ok(bytes) = fs::read(&path) else {
-        return Vec::new();
-    };
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    let cutoff = now.saturating_sub(cutoff_secs);
-    parse_attention(&bytes, cutoff)
-}
-
-/// One active codex-companion background job, read from
-/// `~/.claude/state/codex-companion/state/<workspace>/state.json`.
-/// Mirrors tmx's `state::CodexJob` schema so the SPA can display
-/// jobs (running / queued) alongside tmux panes.
-#[derive(Debug, Clone, serde::Serialize)]
+/// codex-companion background job. Surfaced in the overview as its own
+/// card section. tmx's `agents --json` doesn't yet emit these so we
+/// keep the local reader of `~/.claude/state/codex-companion/state/*`.
+#[derive(Debug, Clone, Serialize)]
 pub struct CodexJob {
     pub id: String,
     pub title: String,
@@ -216,9 +115,8 @@ pub struct CodexJob {
 }
 
 impl CodexJob {
-    /// True for any non-terminal status. codex-companion's terminal
-    /// set is `completed | failed | cancelled | canceled`; anything
-    /// else (running, queued, missing) counts as still doing work.
+    /// True for any non-terminal status (running / queued / unknown).
+    /// tmx's terminal set: completed | failed | cancelled | canceled.
     pub fn is_active(&self) -> bool {
         !matches!(
             self.status.as_str(),
@@ -227,12 +125,12 @@ impl CodexJob {
     }
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Deserialize)]
 struct CodexStateFile {
     jobs: Option<Vec<RawCodexJob>>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Deserialize)]
 struct RawCodexJob {
     id: String,
     #[serde(default)]
@@ -251,8 +149,9 @@ struct RawCodexJob {
     pid: Option<u32>,
 }
 
-/// Enumerate active codex-companion jobs from every workspace dir.
-/// Returns newest-started first. Missing root dir → empty Vec.
+/// Walk `~/.claude/state/codex-companion/state/<workspace>/state.json`,
+/// concat all `jobs` arrays, keep non-terminal only, newest-started
+/// first. Empty Vec on missing dir.
 pub fn read_codex_jobs() -> Vec<CodexJob> {
     let Some(home) = dirs::home_dir() else {
         return Vec::new();
@@ -301,8 +200,7 @@ fn read_workspace_codex_jobs(workspace_dir: &std::path::Path) -> Vec<CodexJob> {
 }
 
 /// Minimal ISO-8601 → epoch-millis parser tuned for codex-companion's
-/// `YYYY-MM-DDTHH:MM:SS.fffZ` output. Mirrors tmx's parser (same fmt
-/// is the only one the companion writes today).
+/// `YYYY-MM-DDTHH:MM:SS.fffZ` output. Mirrors tmx's parser.
 fn parse_iso8601_millis(s: &str) -> Option<i64> {
     if s.len() < 20 {
         return None;
@@ -324,7 +222,6 @@ fn parse_iso8601_millis(s: &str) -> Option<i64> {
     Some(secs * 1000 + millis)
 }
 
-/// Howard Hinnant's days_from_civil — exact + alloc-free.
 fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
@@ -335,122 +232,145 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     era * 146_097 + doe as i64
 }
 
-fn parse_attention(bytes: &[u8], cutoff: i64) -> Vec<AttentionEntry> {
-    let mut entries: Vec<AttentionEntry> = bytes
-        .split(|b| *b == b'\n')
-        .filter(|line| !line.is_empty())
-        .filter_map(|line| serde_json::from_slice::<RawAttention>(line).ok())
-        .filter(|r| r.ts >= cutoff)
-        .map(|r| AttentionEntry {
-            ts: r.ts,
-            kind: r.kind,
-            source: r.source,
-            title: r.title,
-            body: r.body,
-            session_id: r.session_id,
-            tmux_session: r.tmux_session,
-            tmux_target: r.tmux_target,
-        })
-        .collect();
-    entries.sort_by_key(|e| std::cmp::Reverse(e.ts));
-    entries
+/// Shell out to `tmx agents --json` and parse the snapshot. Returns
+/// `Err` if tmx is missing, the call fails, or the JSON doesn't
+/// parse — caller treats this as "agent enrichment unavailable" and
+/// degrades to plain pane rendering.
+///
+/// systemd user units start with a stripped PATH that often omits
+/// `~/.local/bin` and `~/.cargo/bin` — the two places `tmx` is
+/// typically installed. We try the PATH lookup first, then fall back
+/// to those candidate paths so the plugin works without the user
+/// having to edit their user unit's environment.
+pub fn read_snapshot() -> Result<TmxSnapshot, String> {
+    let mut candidates: Vec<String> = vec!["tmx".to_string()];
+    if let Some(home) = dirs::home_dir() {
+        candidates.push(home.join(".local/bin/tmx").to_string_lossy().into_owned());
+        candidates.push(home.join(".cargo/bin/tmx").to_string_lossy().into_owned());
+    }
+    let mut last_err = String::from("no candidate tried");
+    for bin in &candidates {
+        match Command::new(bin).args(["agents", "--json"]).output() {
+            Ok(out) if out.status.success() => return parse_snapshot(&out.stdout),
+            Ok(out) => {
+                last_err = format!(
+                    "{bin} exit={:?}: {}",
+                    out.status.code(),
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+            }
+            Err(e) => last_err = format!("{bin}: {e}"),
+        }
+    }
+    Err(last_err)
+}
+
+fn parse_snapshot(bytes: &[u8]) -> Result<TmxSnapshot, String> {
+    serde_json::from_slice(bytes).map_err(|e| format!("parse tmx snapshot: {e}"))
+}
+
+impl TmxSnapshot {
+    /// O(N) lookup of an agent by the pane PID it was observed
+    /// running in. Returns the first match — there shouldn't ever be
+    /// duplicates since `pane_pid` is unique per pane.
+    pub fn agent_for_pane_pid(&self, pid: u32) -> Option<&Agent> {
+        self.agents.iter().find(|a| a.pane.pane_pid == Some(pid))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Captured from live `tmx agents --json` 2026-05-24. Uses the
+    /// real vocabulary (`working`/`awaiting-decision`/`ready`/`idle`)
+    /// and the real top-level fields (no `codex_jobs` — tmx doesn't
+    /// emit it; we populate that locally via `read_codex_jobs`).
+    const SAMPLE: &str = r#"{
+        "agents": [
+            {
+                "id": "pane:nestty:0.0",
+                "pane": {"session":"nestty","window":0,"pane":0,"pane_pid":99},
+                "kind": "claude",
+                "status": "working",
+                "cwd": "/home/me/dev/nestty",
+                "repo_name": "nestty",
+                "flags": {"has_intent": true, "blocked": false, "reviewed_fresh": true},
+                "extra": "pid 12345"
+            },
+            {
+                "id": "pane:docs:0.0",
+                "pane": {"session":"docs","window":0,"pane":0,"pane_pid":100},
+                "kind": "shell",
+                "status": "idle",
+                "cwd": "/home/me/docs",
+                "repo_name": "docs",
+                "flags": {"has_intent": false, "blocked": false, "reviewed_fresh": false},
+                "extra": ""
+            }
+        ],
+        "attention": [
+            {"ts": 1700000000, "kind": "stop", "source": "claude", "title": "Claude · nestty", "body": "Turn finished",
+             "session_id": "sid-1", "tmux_target": "nestty:0", "tmux_session": "nestty"}
+        ],
+        "global_blocked": 2,
+        "captured_at_ms": 1700000000000,
+        "panes_error": null
+    }"#;
+
     #[test]
-    fn parse_session_known_busy() {
-        let json = br#"{"pid":1,"sessionId":"s-1","status":"busy","updatedAt":1700000000000}"#;
-        let m = parse_session(json).expect("parses");
-        assert_eq!(m.status, SessionStatus::Busy);
-        assert_eq!(m.session_id, "s-1");
-        assert_eq!(m.updated_at_ms, 1700000000000);
+    fn parse_full_snapshot_all_fields() {
+        let s = parse_snapshot(SAMPLE.as_bytes()).expect("parses");
+        assert_eq!(s.agents.len(), 2);
+        assert_eq!(s.attention.len(), 1);
+        assert_eq!(s.global_blocked, 2);
+        assert_eq!(s.captured_at_ms, 1700000000000);
+
+        let claude = &s.agents[0];
+        assert_eq!(claude.id, "pane:nestty:0.0");
+        assert_eq!(claude.kind, "claude");
+        assert_eq!(claude.status, "working");
+        assert_eq!(claude.cwd, "/home/me/dev/nestty");
+        assert_eq!(claude.repo_name, "nestty");
+        assert_eq!(claude.extra, "pid 12345");
+        assert!(claude.flags.has_intent);
+        assert!(!claude.flags.blocked);
+        assert!(claude.flags.reviewed_fresh);
+        assert_eq!(claude.pane.session, "nestty");
+        assert_eq!(claude.pane.window, 0);
+        assert_eq!(claude.pane.pane, 0);
+        assert_eq!(claude.pane.pane_pid, Some(99));
+
+        let att = &s.attention[0];
+        assert_eq!(att.ts, 1700000000);
+        assert_eq!(att.kind, "stop");
+        assert_eq!(att.source, "claude");
+        assert_eq!(att.title, "Claude · nestty");
+        assert_eq!(att.body, "Turn finished");
+        assert_eq!(att.session_id, "sid-1");
+        assert_eq!(att.tmux_target, "nestty:0");
+        assert_eq!(att.tmux_session, "nestty");
     }
 
     #[test]
-    fn parse_session_known_idle_and_waiting() {
-        let m = parse_session(br#"{"status":"idle"}"#).unwrap();
-        assert_eq!(m.status, SessionStatus::Idle);
-        let m = parse_session(br#"{"status":"waiting"}"#).unwrap();
-        assert_eq!(m.status, SessionStatus::Waiting);
+    fn agent_for_pane_pid_finds_match() {
+        let s = parse_snapshot(SAMPLE.as_bytes()).unwrap();
+        let a = s.agent_for_pane_pid(99).unwrap();
+        assert_eq!(a.kind, "claude");
+        assert!(s.agent_for_pane_pid(7777).is_none());
     }
 
     #[test]
-    fn parse_session_unknown_status_returns_none() {
-        // Future Claude versions might add states; refuse to guess.
-        assert!(parse_session(br#"{"status":"thinking"}"#).is_none());
+    fn parse_handles_missing_optional_top_keys() {
+        let minimal = r#"{"agents":[],"attention":[]}"#;
+        let s = parse_snapshot(minimal.as_bytes()).expect("parses");
+        assert!(s.agents.is_empty());
+        assert!(s.codex_jobs.is_empty()); // local-populated, default empty
+        assert_eq!(s.global_blocked, 0);
     }
 
     #[test]
-    fn parse_session_malformed_returns_none() {
-        assert!(parse_session(b"").is_none());
-        assert!(parse_session(b"not json").is_none());
-        assert!(parse_session(br#"{"status":"bu"#).is_none());
-    }
-
-    #[test]
-    fn parse_session_missing_status_returns_none() {
-        assert!(parse_session(br#"{"sessionId":"s"}"#).is_none());
-    }
-
-    #[test]
-    fn parse_session_tolerates_extra_fields() {
-        let json = br#"{"pid":22650,"sessionId":"31e571fa","cwd":"/x","startedAt":1779149382456,"version":"2.1.143","status":"busy","updatedAt":1779165593130}"#;
-        let m = parse_session(json).unwrap();
-        assert_eq!(m.session_id, "31e571fa");
-    }
-
-    fn att_line(ts: i64, kind: &str, body: &str) -> String {
-        format!(
-            r#"{{"ts":{ts},"kind":"{kind}","source":"claude","title":"t","body":"{body}","session_id":"sid","tmux_session":"s"}}"#
-        )
-    }
-
-    #[test]
-    fn parse_attention_drops_below_cutoff_sorts_desc() {
-        let now: i64 = 10_000;
-        let cutoff = now - 3600;
-        let raw = format!(
-            "{}\n{}\n{}\n",
-            att_line(now - 60, "notification", "fresh"),
-            att_line(now - 7200, "stop", "stale"),
-            att_line(now - 300, "codex-turn", "mid"),
-        );
-        let entries = parse_attention(raw.as_bytes(), cutoff);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].body, "fresh");
-        assert_eq!(entries[1].body, "mid");
-    }
-
-    #[test]
-    fn parse_attention_skips_malformed_lines() {
-        let raw = b"{\"ts\":100,\"kind\":\"notification\",\"body\":\"ok\"}\nnot-json\n{\"ts\":200,\"kind\":\"stop\",\"body\":\"ok2\"}\n";
-        let entries = parse_attention(raw, 0);
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].body, "ok2");
-    }
-
-    #[test]
-    fn parse_attention_empty_and_blank() {
-        assert!(parse_attention(b"", 0).is_empty());
-        assert!(parse_attention(b"\n\n", 0).is_empty());
-    }
-
-    #[test]
-    fn parse_attention_missing_ts_skipped() {
-        // ts has no #[serde(default)] — required.
-        let raw = br#"{"kind":"stop","body":"no-ts"}
-{"ts":42,"kind":"stop","body":"ok"}
-"#;
-        let entries = parse_attention(raw, 0);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].body, "ok");
-    }
-
-    #[test]
-    fn codex_job_is_active_excludes_terminal_states() {
+    fn codex_job_is_active_excludes_terminal() {
         let base = CodexJob {
             id: "x".into(),
             title: String::new(),
@@ -474,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_jobs_in_filters_active_and_sorts() {
+    fn read_codex_jobs_in_filters_active_and_sorts() {
         use std::fs;
         use tempfile::tempdir;
         let tmp = tempdir().unwrap();
@@ -491,15 +411,16 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id, "new-run");
         assert_eq!(jobs[0].pid, Some(12345));
+        assert!(jobs[0].started_at_ms.is_some());
     }
 
     #[test]
-    fn codex_jobs_in_missing_dir_empty() {
+    fn read_codex_jobs_in_missing_dir_empty() {
         assert!(read_codex_jobs_in(std::path::Path::new("/nope/xyz")).is_empty());
     }
 
     #[test]
-    fn parse_iso8601_known_value_round_trips() {
+    fn parse_iso8601_round_trip() {
         let ms = parse_iso8601_millis("2026-05-19T01:56:52.454Z").unwrap();
         let days = days_from_civil(2026, 5, 19) - 719_468;
         let secs = days * 86_400 + 3600 + 56 * 60 + 52;
@@ -507,15 +428,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_iso8601_rejects_short_string() {
-        assert!(parse_iso8601_millis("").is_none());
-        assert!(parse_iso8601_millis("2026-05-19").is_none());
+    fn parse_rejects_invalid_json() {
+        assert!(parse_snapshot(b"not json").is_err());
+        assert!(parse_snapshot(b"").is_err());
     }
 
     #[test]
-    fn proc_snapshot_no_target_returns_none() {
-        let snap = ProcSnapshot::new();
-        let me = std::process::id();
-        assert!(snap.find_descendant(me, &["nonexistent_xyz_abc"]).is_none());
+    fn parse_attention_required_ts_only() {
+        // ts is the only required attention field — rest default to "".
+        let raw = r#"{"agents":[],"attention":[{"ts":42}]}"#;
+        let s = parse_snapshot(raw.as_bytes()).unwrap();
+        assert_eq!(s.attention.len(), 1);
+        assert_eq!(s.attention[0].ts, 42);
+        assert_eq!(s.attention[0].title, "");
     }
 }

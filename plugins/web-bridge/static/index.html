@@ -253,21 +253,35 @@
     // agent (plain shell). Tier 4 panes preserve tmux's own order; tier
     // 0-2 are tie-broken by newer updated_at_ms so the most recently
     // active session of a tier floats up.
+    // tmx 1.x status vocabulary (verified against live snapshot):
+    //   working           — mid-turn (was: busy)
+    //   awaiting-decision — permission / selection dialog (was: waiting)
+    //   ready             — at chat prompt
+    //   idle              — plain shell / no signal
+    // `blocked` flag overrides everything — it means the harness has
+    // stop-blocked the session, the user must look.
     function paneSortRank(p) {
-      const status = p.agent && p.agent.status;
-      if (status === "waiting") return 0;
-      if (status === "busy") return 1;
-      if (status === "idle") return 2;
+      const a = p.agent;
+      if (a && a.flags && a.flags.blocked) return 0;
+      const status = a && a.status;
+      if (status === "awaiting-decision") return 0;
+      if (status === "working") return 1;
+      if (status === "ready") return 2;
+      if (status === "idle" && a && (a.kind === "claude" || a.kind === "codex")) return 2;
       return 4;
     }
+    // Map tmx status → existing pill CSS class. Keeps the warn/err/ok
+    // palette consistent without renaming the underlying styles.
+    function statusToPillClass(s) {
+      if (s === "working") return "busy";
+      if (s === "awaiting-decision") return "waiting";
+      if (s === "ready" || s === "idle") return "idle";
+      return "";
+    }
     function paneSorted(panes) {
-      return panes.slice().sort((a, b) => {
-        const ra = paneSortRank(a), rb = paneSortRank(b);
-        if (ra !== rb) return ra - rb;
-        const ua = (a.agent && a.agent.updated_at_ms) || 0;
-        const ub = (b.agent && b.agent.updated_at_ms) || 0;
-        return ub - ua;
-      });
+      // tmx no longer surfaces a per-agent updated_at, so within a
+      // tier we fall back to tmux's natural order (stable sort).
+      return panes.slice().sort((a, b) => paneSortRank(a) - paneSortRank(b));
     }
 
     function renderOverview() {
@@ -276,14 +290,20 @@
         ? `<div class="empty">no tmux panes. start a tmux session (or use the non-tmux fallback below).</div>`
         : `<div class="cards">${sortedPanes.map(p => {
             const a = p.agent;
-            const statusPill = (a && a.status)
-              ? `<span class="pill ${escapeHtml(a.status)}">${escapeHtml(a.name || "agent")}: ${escapeHtml(a.status)}</span>`
-              : (a ? `<span class="pill">${escapeHtml(a.name || "agent")}</span>` : "");
-            const agePill = (a && a.updated_at_ms)
-              ? `<span class="pill age">${escapeHtml(humanAgeMs(a.updated_at_ms))} ago</span>`
+            // Skip the status row entirely for shell/other panes — no
+            // signal to show beyond cwd + preview. Only claude / codex
+            // (or anything with explicit flags) gets pills.
+            const isAgentKind = a && (a.kind === "claude" || a.kind === "codex");
+            const statusPill = isAgentKind
+              ? `<span class="pill ${escapeHtml(statusToPillClass(a.status))}">${escapeHtml(a.kind)}: ${escapeHtml(a.status)}</span>`
               : "";
-            const statusRow = (statusPill || agePill)
-              ? `<div class="card-status">${statusPill}${agePill}</div>`
+            const flagPills = a && a.flags ? [
+              a.flags.blocked ? `<span class="pill waiting">blocked</span>` : "",
+              a.flags.has_intent ? `<span class="pill">intent</span>` : "",
+              a.flags.reviewed_fresh ? `<span class="pill idle">reviewed</span>` : "",
+            ].join("") : "";
+            const statusRow = (statusPill || flagPills)
+              ? `<div class="card-status">${statusPill}${flagPills}</div>`
               : "";
             return `
             <div class="card${p.pane_active ? " active-pane" : ""}" data-pane="${escapeHtml(p.pane_id)}">

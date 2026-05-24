@@ -378,21 +378,29 @@ async fn push_loop(state: AppState) {
     let mut seen_order: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
     const SEEN_CAP: usize = 1024;
     // Pre-seed with the existing backlog so boot doesn't dump it.
-    for e in agents::read_attention_queue(3600) {
-        let fp = attention_fingerprint(&e);
-        if seen.insert(fp) {
-            seen_order.push_back(fp);
+    if let Ok(boot) = agents::read_snapshot() {
+        for e in &boot.attention {
+            let fp = attention_fingerprint(e);
+            if seen.insert(fp) {
+                seen_order.push_back(fp);
+            }
         }
     }
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
-        // 5 min window for "fresh" — the queue file is bounded by the
-        // bash hooks but no point scanning further back than push
-        // services would deliver anyway.
-        let entries = agents::read_attention_queue(300);
-        let mut new_entries: Vec<agents::AttentionEntry> = entries
+        // Pull a fresh tmx snapshot for its attention array. tmx
+        // applies a 60-min cutoff; we just diff against `seen`.
+        let snap = match agents::read_snapshot() {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[web-bridge] push_loop: tmx snapshot failed: {e}");
+                continue;
+            }
+        };
+        let mut new_entries: Vec<agents::Attention> = snap
+            .attention
             .into_iter()
             .filter(|e| !seen.contains(&attention_fingerprint(e)))
             .collect();
@@ -473,7 +481,7 @@ async fn push_loop(state: AppState) {
 /// Fingerprint an attention entry across (ts, kind, title, body,
 /// session_id). Stable hasher choice doesn't matter — we never persist
 /// the value across restarts, just dedup within one push_loop lifetime.
-fn attention_fingerprint(e: &agents::AttentionEntry) -> u64 {
+fn attention_fingerprint(e: &agents::Attention) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
@@ -823,18 +831,24 @@ async fn handle_tmux_send(
 }
 
 /// Sync helper used inside `spawn_blocking`. Builds the overview JSON
-/// `{panes: [...], attention: [...]}`. Each pane carries `last_lines`
-/// (capture-pane), and — when a `claude` / `codex` descendant is found
-/// rooted at `pane_pid` — an `agent: {pid, name, status, session_id,
-/// updated_at_ms}` summary read from `~/.claude/sessions/<pid>.json`.
-/// Capture or enrichment failures degrade individual fields, never
-/// abort the snapshot.
+/// `{panes, attention, codex_jobs}` by joining our `tmux list-panes`
+/// rows against `tmx agents --json`. tmx owns the agent classification,
+/// process-tree walk, attention queue read, and codex-job scan; we own
+/// pane preview (`capture-pane`) and the join by `pane_pid`.
+///
+/// Failure modes degrade rather than abort:
+///   * tmx not installed / fails → panes still render, `agent` is null
+///     on every card, attention + codex_jobs are empty.
+///   * Per-pane capture-pane failure → that card's `last_lines: []`.
 fn build_tmux_snapshot() -> Result<Value, AppError> {
     let panes = tmux::list_panes().map_err(|msg| AppError::custom("tmux_error", &msg))?;
-    // Single ProcSnapshot for the whole tick — refreshing /proc once
-    // per pane would be wasteful + risks inconsistent reads across
-    // panes. sysinfo's refresh is sub-millisecond per call.
-    let proc_snap = agents::ProcSnapshot::new();
+    let mut tmx_snap = agents::read_snapshot().unwrap_or_else(|e| {
+        eprintln!("[web-bridge] tmx snapshot unavailable, degrading: {e}");
+        agents::TmxSnapshot::default()
+    });
+    // tmx 1.x doesn't surface codex-companion jobs in its snapshot
+    // yet; populate them locally from `~/.claude/state/codex-companion/`.
+    tmx_snap.codex_jobs = agents::read_codex_jobs();
     let rows: Vec<Value> = panes
         .into_iter()
         .map(|p| {
@@ -848,16 +862,23 @@ fn build_tmux_snapshot() -> Result<Value, AppError> {
                     lines
                 })
                 .unwrap_or_default();
-            let agent = p.pane_pid.and_then(|root| {
-                let proc = proc_snap.find_descendant(root, &["claude", "codex"])?;
-                let meta = agents::read_session_meta(proc.pid);
-                Some(json!({
-                    "pid": proc.pid,
-                    "name": proc.name,
-                    "status": meta.as_ref().map(|m| m.status),
-                    "session_id": meta.as_ref().map(|m| m.session_id.clone()),
-                    "updated_at_ms": meta.as_ref().map(|m| m.updated_at_ms),
-                }))
+            // Join on pane_pid — that's the one identifier tmx + our
+            // list_panes both surface. Falls back to None when either
+            // side is missing the pid (old tmx without pane_pid in its
+            // JSON, or a non-numeric pane_pid from the tmux format).
+            let agent = p.pane_pid.and_then(|pid| tmx_snap.agent_for_pane_pid(pid));
+            let agent_json = agent.map(|a| {
+                json!({
+                    "kind": a.kind,
+                    "status": a.status,
+                    "repo_name": a.repo_name,
+                    "extra": a.extra,
+                    "flags": {
+                        "has_intent": a.flags.has_intent,
+                        "blocked": a.flags.blocked,
+                        "reviewed_fresh": a.flags.reviewed_fresh,
+                    },
+                })
             });
             json!({
                 "session": p.session,
@@ -868,23 +889,18 @@ fn build_tmux_snapshot() -> Result<Value, AppError> {
                 "pane_active": p.pane_active,
                 "cwd": p.cwd,
                 "last_lines": last,
-                "agent": agent,
+                "agent": agent_json,
             })
         })
         .collect();
-    // 60-minute window matches `attention-picker.sh`'s default so the
-    // dashboard and the fzf picker agree on "what's pending right
-    // now". Cap at 20 entries to keep frames small + cards readable.
-    let mut attention: Vec<agents::AttentionEntry> = agents::read_attention_queue(3600);
+    // Attention + codex_jobs come straight from tmx — same window /
+    // zombie-filter / classification it uses for its TUI.
+    let mut attention = tmx_snap.attention;
     attention.truncate(20);
-    // codex-companion background jobs (filtered to non-terminal status
-    // by the reader). Rendered as a separate section in the SPA — they
-    // aren't pane-attached so they shouldn't sort into the pane grid.
-    let codex_jobs = agents::read_codex_jobs();
     Ok(json!({
         "panes": rows,
         "attention": attention,
-        "codex_jobs": codex_jobs,
+        "codex_jobs": tmx_snap.codex_jobs,
     }))
 }
 
