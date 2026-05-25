@@ -469,6 +469,85 @@ pub unsafe extern "C" fn nestty_ffi_theme_get(name: *const c_char) -> *mut c_cha
 }
 
 // ============================================================================
+// Notify FFI surface
+//
+// Lets macOS's in-process `ActionRegistry` reach the same `osascript`
+// notifier the daemon uses (`nestty_core::notifier::platform_notifier`),
+// so `nestctl call notify.show` works whether or not the daemon is up.
+// Mirrors Linux's `register_blocking_silent("notify.show", ...)` in
+// `nestty-linux/src/window.rs`.
+// ============================================================================
+
+/// Show a desktop notification via the platform notifier. `level` is
+/// 0=info (default), 1=warn, 2=error; anything else treated as info.
+/// Returns 0 on success, 1 when no notifier is available for this
+/// platform (silent no-op), -1 on validation / subprocess error (see
+/// `nestty_ffi_last_error`).
+///
+/// # Safety
+///
+/// `title` must be a non-NULL NUL-terminated UTF-8 string. `body` may
+/// be NULL (treated as empty).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_ffi_notify_show(
+    title: *const c_char,
+    body: *const c_char,
+    level: i32,
+) -> i32 {
+    if title.is_null() {
+        set_last_error("nestty_ffi_notify_show: title is NULL");
+        return -1;
+    }
+    // SAFETY: caller contract.
+    let title_str = match unsafe { CStr::from_ptr(title) }.to_str() {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(format!(
+                "nestty_ffi_notify_show: title is not valid UTF-8: {e}"
+            ));
+            return -1;
+        }
+    };
+    if title_str.is_empty() {
+        set_last_error("nestty_ffi_notify_show: title must be non-empty");
+        return -1;
+    }
+    let body_str = if body.is_null() {
+        ""
+    } else {
+        // SAFETY: caller contract.
+        match unsafe { CStr::from_ptr(body) }.to_str() {
+            Ok(s) => s,
+            Err(e) => {
+                set_last_error(format!(
+                    "nestty_ffi_notify_show: body is not valid UTF-8: {e}"
+                ));
+                return -1;
+            }
+        }
+    };
+    let lvl = match level {
+        1 => nestty_core::notifier::Level::Warn,
+        2 => nestty_core::notifier::Level::Error,
+        _ => nestty_core::notifier::Level::Info,
+    };
+    let Some(notifier) = nestty_core::notifier::platform_notifier() else {
+        clear_last_error();
+        return 1;
+    };
+    match notifier.notify(title_str, body_str, lvl) {
+        Ok(()) => {
+            clear_last_error();
+            0
+        }
+        Err(e) => {
+            set_last_error(format!("nestty_ffi_notify_show: {e}"));
+            -1
+        }
+    }
+}
+
+// ============================================================================
 // Plugin manifest FFI surface
 //
 // Validation only — discovery (directory enumeration, duplicate-name winner

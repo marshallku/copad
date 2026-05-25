@@ -92,6 +92,22 @@ int nestty_engine_dispatch_event(
 int nestty_engine_count_triggers(EngineHandle *handle);
 
 // ---------------------------------------------------------------------------
+// Notify FFI
+//
+// Wraps `nestty_core::notifier::platform_notifier()` so macOS in-process
+// callers (the `notify.show` registry handler) reach the same osascript
+// notifier the daemon uses. Validation / truncation / subprocess spawn
+// all live in core.
+// ---------------------------------------------------------------------------
+
+/// Show a desktop notification. `level` is 0=info (default), 1=warn,
+/// 2=error. Returns 0 on success, 1 when no notifier is available on
+/// this platform, -1 on validation / subprocess error (see
+/// `nestty_ffi_last_error`). `title` is required non-empty; `body` may
+/// be NULL (treated as empty).
+int nestty_ffi_notify_show(const char *title, const char *body, int level);
+
+// ---------------------------------------------------------------------------
 // Plugin manifest FFI
 //
 // Validation only — directory walk / duplicate-name winner / dir

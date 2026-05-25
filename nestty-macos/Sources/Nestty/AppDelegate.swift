@@ -1,4 +1,5 @@
 import AppKit
+import CNesttyFFI
 import SwiftTerm
 @preconcurrency import WebKit
 
@@ -563,6 +564,83 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             ClaudeStart.dispatch(params: params, tabVC: tabVC, completion: completion)
+        }
+
+        // notify.show — mirror of Linux daemon registration
+        // (`nestty-linux/src/window.rs:218`) so the macOS GUI's in-process
+        // trigger engine reaches the same `osascript` notifier even when
+        // the daemon isn't running. Silent: a desktop toast is a side-
+        // effect, not a workflow step; chained triggers should not depend
+        // on `notify.show.completed`.
+        actionRegistry.registerSilent("notify.show") { params, completion in
+            guard let title = params["title"] as? String, !title.isEmpty else {
+                completion(RPCError(
+                    code: "invalid_params",
+                    message: "notify.show requires non-empty `title` string",
+                ))
+                return
+            }
+            let body: String
+            switch params["body"] {
+            case nil, is NSNull: body = ""
+            case let s as String: body = s
+            default:
+                completion(RPCError(
+                    code: "invalid_params",
+                    message: "notify.show `body` must be a string",
+                ))
+                return
+            }
+            let level: Int32
+            switch params["level"] {
+            case nil, is NSNull: level = 0
+            case let s as String:
+                switch s {
+                case "info": level = 0
+                case "warn": level = 1
+                case "error": level = 2
+                default:
+                    completion(RPCError(
+                        code: "invalid_params",
+                        message: "notify.show `level` must be one of `info`, `warn`, `error`",
+                    ))
+                    return
+                }
+            default:
+                completion(RPCError(
+                    code: "invalid_params",
+                    message: "notify.show `level` must be a string",
+                ))
+                return
+            }
+            // osascript spawn is sync (~10 ms) — offload off the main
+            // thread so the toast doesn't stall any concurrent UI work,
+            // then bounce the completion back to main where the socket
+            // server expects it. LAST_ERROR is thread-local, so it must
+            // be read on the same thread that called the FFI.
+            DispatchQueue.global(qos: .userInitiated).async {
+                let rc = title.withCString { titlePtr in
+                    body.withCString { bodyPtr in
+                        nestty_ffi_notify_show(titlePtr, bodyPtr, level)
+                    }
+                }
+                let err: String? = rc < 0
+                    ? nestty_ffi_last_error().map { String(cString: $0) }
+                    : nil
+                DispatchQueue.main.async {
+                    switch rc {
+                    case 0:
+                        completion(["shown": true])
+                    case 1:
+                        completion(["shown": false, "reason": "no_notifier"])
+                    default:
+                        completion(RPCError(
+                            code: "internal_error",
+                            message: "notify subprocess: \(err ?? "<unknown>")",
+                        ))
+                    }
+                }
+            }
         }
     }
 
