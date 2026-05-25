@@ -80,12 +80,17 @@ int nestty_engine_set_triggers(EngineHandle *handle, const char *triggers_json);
 /// ({active_panel: string?, active_cwd: string?}). NULL → engine
 /// dispatches with no context (interpolation tokens preserved literally,
 /// condition references resolve to null).
+/// `origin` is the trust-boundary tag (0 = Internal, 1 = External;
+/// anything else defaults to Internal). Bridge consumers republishing a
+/// daemon-forwarded event MUST pass through the wire `origin` so
+/// `[security] accept_external` gating doesn't silently leak.
 int nestty_engine_dispatch_event(
     EngineHandle *handle,
     const char *event_kind,
     const char *source,
     const char *context_json,
-    const char *payload_json
+    const char *payload_json,
+    int origin
 );
 
 /// Diagnostic: number of triggers currently loaded.

@@ -180,9 +180,10 @@ impl EventListener for NesttyListener {
                 // TextAreaSizeRequest / CursorBlinkingChange / Wakeup
                 // / Exit / ChildExit — intentionally dropped; the
                 // renderer doesn't react to them today. ColorRequest
-                // in particular is a structural gap (apps querying
-                // `OSC 4 ; n ; ?` get no reply) but no one has hit
-                // it yet.
+                // (OSC 4 ;n; ?) carries a callback that needs an `Rgb`
+                // value materialized from the active theme palette
+                // before alacritty produces the reply string —
+                // separate work item, see catchup doc.
             }
         }
     }

@@ -216,6 +216,7 @@ final class NesttyEngine: @unchecked Sendable {
         source: String = "macos.eventbus",
         context: [String: Any]? = nil,
         payload: Any?,
+        origin: Origin = .internal,
     ) -> Int {
         enableLock.lock()
         let isEnabled = enabled
@@ -243,6 +244,7 @@ final class NesttyEngine: @unchecked Sendable {
         } else {
             nil
         }
+        let originTag: Int32 = (origin == .external) ? 1 : 0
         return kind.withCString { kindPtr in
             source.withCString { sourcePtr in
                 payloadStr.withCString { payloadPtr in
@@ -253,6 +255,7 @@ final class NesttyEngine: @unchecked Sendable {
                             sourcePtr,
                             ctxPtr,
                             payloadPtr,
+                            originTag,
                         )
                     }
                     let n: Int32 = if let ctx = contextStr {

@@ -46,11 +46,15 @@ final class EventBus: @unchecked Sendable {
     /// into the trigger engine without making EventBus aware of `NesttyEngine`.
     /// `source` carries the trust stamp the engine's
     /// `try_promote_or_drop_preflight` gates on (`COMPLETION_EVENT_SOURCE` =
-    /// `"nestty.action"`).
+    /// `"nestty.action"`); `origin` carries the trust-boundary tag the
+    /// engine's `[security] accept_external` gate consumes. Both MUST be
+    /// forwarded — defaulting `origin` to `.internal` here would launder
+    /// daemon-forwarded `External` events into trusted local triggers.
     nonisolated(unsafe) var onBroadcast: (@Sendable (
         _ kind: String,
         _ source: String,
         _ data: Any?,
+        _ origin: Origin,
     ) -> Void)?
 
     func subscribe() -> EventChannel {
@@ -97,7 +101,7 @@ final class EventBus: @unchecked Sendable {
 
         // Engine hop first so a chained broadcast from a trigger callback
         // lands in the same logical tick.
-        onBroadcast?(event, source, data)
+        onBroadcast?(event, source, data, origin)
 
         // Snapshot under lock so subscribers can reentrantly broadcast
         // without deadlock. Identity-based pruning so a concurrent

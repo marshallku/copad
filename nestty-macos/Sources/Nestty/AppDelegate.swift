@@ -170,7 +170,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // plugin actions on the very first event, config must be loaded so
         // the [[triggers]] array is available.
         nesttyEngine.actionRegistry = actionRegistry
-        eventBus.onBroadcast = { [weak nesttyEngine, contextService] kind, source, data in
+        eventBus.onBroadcast = { [weak nesttyEngine, contextService] kind, source, data, origin in
             // EventBus.broadcast can fire from any thread (plugin reader
             // thread for event.publish, main actor for tab.opened, etc.).
             // dispatchEvent enters the Rust engine which has its own
@@ -193,7 +193,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // are safe.
             contextService.apply(eventKind: kind, data: data)
             let context = contextService.snapshot()
-            let n = nesttyEngine?.dispatchEvent(kind: kind, source: source, context: context, payload: data) ?? 0
+            let n = nesttyEngine?.dispatchEvent(
+                kind: kind,
+                source: source,
+                context: context,
+                payload: data,
+                origin: origin,
+            ) ?? 0
             if n > 0 {
                 FileHandle.standardError.write(Data("[nestty-engine] event \(kind) fired \(n) trigger(s)\n".utf8))
             }

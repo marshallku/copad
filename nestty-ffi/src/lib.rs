@@ -334,6 +334,13 @@ pub unsafe extern "C" fn nestty_engine_set_triggers(
 /// to `"macos.eventbus"`, which is correct for plain bus events but wrong
 /// for completion-event synthesis.
 ///
+/// `origin` carries the trust-boundary tag the engine's `[security]
+/// accept_external` gate consumes (0 = Internal, 1 = External; any other
+/// value defaults to Internal as the safe choice). When the macOS GUI
+/// republishes a daemon-forwarded event, this MUST match the wire
+/// `origin` parsed from the bridge — otherwise an `External` event
+/// would launder into a trusted local trigger and bypass the gate.
+///
 /// `context_json` is a `nestty_core::context::Context` snapshot
 /// (`{active_panel: String?, active_cwd: String?}`); NULL or empty means
 /// no context (literal `{context.X}` tokens, null condition refs). Bad
@@ -351,6 +358,7 @@ pub unsafe extern "C" fn nestty_engine_dispatch_event(
     source: *const c_char,
     context_json: *const c_char,
     payload_json: *const c_char,
+    origin: i32,
 ) -> i32 {
     if handle.is_null() || event_kind.is_null() {
         set_last_error("nestty_engine_dispatch_event: NULL pointer");
@@ -390,7 +398,15 @@ pub unsafe extern "C" fn nestty_engine_dispatch_event(
         let s = unsafe { CStr::from_ptr(payload_json) }.to_string_lossy();
         serde_json::from_str(&s).unwrap_or(Value::Null)
     };
-    let event = Event::new(kind, source_str, payload);
+    let origin_tag = match origin {
+        1 => nestty_core::event_bus::Origin::External,
+        // 0 + any unknown value → safe default. Refusing the dispatch on
+        // a malformed origin would silently drop events at a protocol
+        // bump; routing to Internal keeps local triggers firing while
+        // the External path stays opt-in.
+        _ => nestty_core::event_bus::Origin::Internal,
+    };
+    let event = Event::new(kind, source_str, payload).with_origin(origin_tag);
     let fired = h.engine.dispatch(&event, context.as_ref());
     clear_last_error();
     fired as i32
