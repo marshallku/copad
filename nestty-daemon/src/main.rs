@@ -61,7 +61,41 @@ const PUMP_TICK: Duration = Duration::from_millis(50);
 /// editing.
 const WATCHER_TICK: Duration = Duration::from_secs(2);
 
+fn print_help() {
+    println!(
+        "nesttyd {version} — nestty daemon
+
+USAGE:
+    nesttyd [OPTIONS]
+
+OPTIONS:
+    -h, --help       Show this help and exit
+    -V, --version    Show version and exit
+
+ENVIRONMENT:
+    NESTTY_SOCKET           Override the daemon socket path
+    NESTTY_HOST_TRIGGERS    Enable / disable trigger pump (default on; off|0|false to disable)
+    NESTTY_E2E_ACTIONS      Register end-to-end test actions (1|true to enable)",
+        version = env!("CARGO_PKG_VERSION"),
+    );
+}
+
 fn main() -> ExitCode {
+    // Short-circuit read-only flags BEFORE env_logger init / socket bind.
+    // Without this, `nesttyd --version` invoked while a daemon is running
+    // would fail with "socket already bound" from `prepare_socket_path`
+    // (decisions.md #40 notes auto-start happens behind the user's back —
+    // a second invocation for `--version` is the normal way to check it).
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("nesttyd {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        print_help();
+        return ExitCode::SUCCESS;
+    }
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let socket_path: PathBuf = paths::socket_path();
