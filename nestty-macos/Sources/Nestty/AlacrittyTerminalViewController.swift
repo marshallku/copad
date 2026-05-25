@@ -265,24 +265,52 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel, Zoom
 
     // MARK: - NesttyPanel — background
 
+    /// Monotonic token bumped on every `applyBackground` / `clearBackground`
+    /// so an async image decode finishing late (slow Gatekeeper scan,
+    /// quarantine attribute review, etc.) doesn't clobber a newer load's
+    /// visual state with a stale image. Lives on the main actor; no lock.
+    private var backgroundLoadToken: UInt64 = 0
+
     /// Wire an image background + tint overlay. The render view's layer
     /// goes transparent so the image layer underneath composites
     /// through. `transparent_default_bg` config decides whether default
     /// cells fill opaquely on top (image hidden behind text area, cursor
     /// always visible) or stay transparent (image visible through blank
     /// cells, cursor visibility depends on accent vs image contrast).
+    ///
+    /// `NSImage(contentsOfFile:)` can stall the main thread for tens to
+    /// hundreds of ms while Gatekeeper/XProtect inspects an unscanned
+    /// wallpaper file on first open. We offload the decode to a global
+    /// queue and bounce only the swap back to main; if a newer
+    /// applyBackground / clearBackground races ahead, the late decode
+    /// gets dropped via the token check.
     func applyBackground(path: String, tint: Double, opacity: Double) {
-        guard let image = NSImage(contentsOfFile: path) else { return }
-        backgroundView?.image = image
-        backgroundView?.alphaValue = CGFloat(opacity)
-        backgroundView?.isHidden = false
-        tintView?.layer?.backgroundColor = NSColor.black.withAlphaComponent(CGFloat(tint)).cgColor
-        tintView?.isHidden = opacity == 0
-        renderView?.setImageBackgroundActive(true)
-        renderView?.needsDisplay = true
+        backgroundLoadToken &+= 1
+        let token = backgroundLoadToken
+        DispatchQueue.global(qos: .userInitiated).async {
+            let image = NSImage(contentsOfFile: path)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                // Stale: another applyBackground/clearBackground happened
+                // while we were decoding. The newer call owns the visual
+                // state; silently drop this image.
+                guard token == backgroundLoadToken else { return }
+                guard let image else { return }
+                backgroundView?.image = image
+                backgroundView?.alphaValue = CGFloat(opacity)
+                backgroundView?.isHidden = false
+                tintView?.layer?.backgroundColor = NSColor.black.withAlphaComponent(CGFloat(tint)).cgColor
+                tintView?.isHidden = opacity == 0
+                renderView?.setImageBackgroundActive(true)
+                renderView?.needsDisplay = true
+            }
+        }
     }
 
     func clearBackground() {
+        // Token bump cancels any in-flight applyBackground decode — the
+        // late callback's token mismatch makes it a no-op.
+        backgroundLoadToken &+= 1
         backgroundView?.image = nil
         backgroundView?.isHidden = true
         tintView?.isHidden = true
