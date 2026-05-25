@@ -855,6 +855,14 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// is a 2-px horizontal bar at the cell's bottom. When the window
     /// isn't key (e.g. user switched apps), block style draws as a
     /// hollow outline — Terminal.app + iTerm2 do the same.
+    ///
+    /// On busy wallpapers the accent block can blend into a low-
+    /// contrast wallpaper pixel (Catppuccin mauve on a dark-purple
+    /// image, for instance), so when an image background is active we
+    /// edge every variant with a 1-px theme.background outline. The
+    /// dark frame is invisible against the normal background but
+    /// guarantees the cursor stays distinguishable from any wallpaper
+    /// pixel underneath.
     private func drawCursor(snap: NesttyTermFFI.Snapshot, ctx: CGContext) {
         let cursor = snap.cursor
         guard cursor.style != 0,
@@ -870,18 +878,26 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         let cell = CGRect(x: x, y: y, width: cellWidth, height: cellHeight)
         let isKey = window?.isKeyWindow ?? false
         let color = theme.accent.nsColor.cgColor
+        let needsOutline = imageBackgroundActive
+        let outlineColor = theme.background.nsColor.cgColor
 
         switch cursor.style {
         case 1: // block
             if isKey {
                 ctx.setFillColor(color)
                 ctx.fill(cell)
+                if needsOutline {
+                    ctx.setStrokeColor(outlineColor)
+                    ctx.setLineWidth(1)
+                    // Stroke straddles the path; inset so the dark
+                    // frame lands inside the just-filled cell rather
+                    // than bleeding into neighbouring cells.
+                    ctx.stroke(cell.insetBy(dx: 0.5, dy: 0.5))
+                }
                 redrawCursorGlyph(snap: snap, ctx: ctx)
             } else {
                 ctx.setStrokeColor(color)
                 ctx.setLineWidth(1)
-                // Stroke is centered on the path; inset by half so
-                // it stays inside the cell rect.
                 ctx.stroke(cell.insetBy(dx: 0.5, dy: 0.5))
             }
         case 2: // beam (bar)
@@ -889,11 +905,21 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             let rect = CGRect(x: x, y: y, width: barWidth, height: cellHeight)
             ctx.setFillColor(color)
             ctx.fill(rect)
+            if needsOutline {
+                ctx.setStrokeColor(outlineColor)
+                ctx.setLineWidth(1)
+                ctx.stroke(rect.insetBy(dx: 0.5, dy: 0.5))
+            }
         case 3: // underline
             let barHeight: CGFloat = 2
             let rect = CGRect(x: x, y: y + cellHeight - barHeight, width: cellWidth, height: barHeight)
             ctx.setFillColor(color)
             ctx.fill(rect)
+            if needsOutline {
+                ctx.setStrokeColor(outlineColor)
+                ctx.setLineWidth(1)
+                ctx.stroke(rect.insetBy(dx: 0.5, dy: 0.5))
+            }
         default:
             break
         }
