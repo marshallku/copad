@@ -131,28 +131,35 @@ struct NesttyConfig {
             .appendingPathComponent("config.toml")
     }
 
-    static func load() -> NesttyConfig {
+    /// Read + parse `~/.config/nestty/config.toml`. Returns `.defaults`
+    /// when the file is absent (first run) — matches the Linux
+    /// `NesttyConfig::load_from` contract. Throws on parse failure so
+    /// the caller can decide whether to start with defaults (initial
+    /// launch) or preserve the previously rendered live config (hot
+    /// reload).
+    static func load() throws -> NesttyConfig {
         let configURL = configPath()
         guard let contents = try? String(contentsOf: configURL, encoding: .utf8) else {
             return .defaults
         }
-        return parse(contents)
+        return try parse(contents)
     }
 
-    /// Decode a TOML config string into NesttyConfig. Falls back to `.defaults` if the
-    /// document is malformed; the parse error is written to stderr so the user can
-    /// fix it. Unknown sections (e.g. `[[triggers]]`, `[keybindings]`, `[statusbar]`
-    /// from the Linux schema) are tolerated — we only decode the fields the macOS
-    /// app currently uses, and the rest stay intact for future parity work.
-    static func parse(_ contents: String) -> NesttyConfig {
+    /// Decode a TOML config string into NesttyConfig. Throws on
+    /// malformed input; the parse error is written to stderr so the
+    /// user sees the line/column. Unknown sections (e.g. `[[triggers]]`,
+    /// `[keybindings]`, `[statusbar]` from the Linux schema) are
+    /// tolerated — we only decode the fields the macOS app currently
+    /// uses, and the rest stay intact for future parity work.
+    static func parse(_ contents: String) throws -> NesttyConfig {
         let decoder = TOMLDecoder()
         let raw: RawConfig
         do {
             raw = try decoder.decode(RawConfig.self, from: contents)
         } catch {
-            let msg = "[nestty] config.toml parse failed: \(error.localizedDescription) — using defaults\n"
+            let msg = "[nestty] config.toml parse failed: \(error.localizedDescription)\n"
             FileHandle.standardError.write(Data(msg.utf8))
-            return .defaults
+            throw error
         }
 
         let defaults = NesttyConfig.defaults

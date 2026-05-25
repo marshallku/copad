@@ -153,7 +153,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // arriving before the GUI state is ready would silently no-op
         // through the `guard let vc = tabVC` arm.
 
-        let config = NesttyConfig.load()
+        // Initial load: parse failure falls back to `.defaults` so the
+        // app still starts — better than refusing to launch on a typo
+        // in the user's config. `handleConfigChange` (hot reload) takes
+        // the stricter path and preserves the previous live config.
+        let config = (try? NesttyConfig.load()) ?? .defaults
         let theme = NesttyTheme.byName(config.themeName) ?? .default
 
         // PR 5c (Tier 2.4) trigger engine via FFI — wire EventBus broadcasts
@@ -580,7 +584,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleConfigChange() {
-        let newConfig = NesttyConfig.load()
+        // Match Linux's reload semantics (`window.rs::connect_changed`):
+        // on parse failure, log and return early — the live config keeps
+        // rendering instead of getting reset to defaults on a typo.
+        let newConfig: NesttyConfig
+        do {
+            newConfig = try NesttyConfig.load()
+        } catch {
+            let msg = "[nestty] config reload error: \(error.localizedDescription) — keeping previous config\n"
+            FileHandle.standardError.write(Data(msg.utf8))
+            return
+        }
         let newTheme = NesttyTheme.byName(newConfig.themeName) ?? .default
         tabVC?.applyConfig(newConfig, theme: newTheme)
         // Skip local trigger reload while daemon owns triggers. Daemon
