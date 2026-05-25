@@ -852,7 +852,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         // Block (rectangular) selection: each row paints the same column
         // span. is_block flows from alacritty's `SelectionRange.is_block`
         // through the snapshot wire; the FFI start-kind is what put us
-        // in block mode (Cmd+Option+drag). Span endpoints come in
+        // in block mode (Option+drag). Span endpoints come in
         // pre-normalized — start_col ≤ end_col already.
         if sel.is_block == 1 {
             let firstCol = max(0, min(startCol, lastCol))

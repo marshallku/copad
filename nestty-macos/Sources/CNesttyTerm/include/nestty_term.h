@@ -71,7 +71,7 @@ typedef struct {
 
 // Selection-start kind discriminator for nestty_term_selection_start.
 // BLOCK is the rectangular (column-major) variant tied to
-// Cmd+Option+drag in the renderer — alacritty's SelectionType::Block.
+// Option+drag in the renderer (Terminal.app / iTerm2 native gesture; Cmd is reserved for URL click) — alacritty's SelectionType::Block.
 // Snapshot reports `NesttySelectionRange.is_block = 1` so the renderer
 // can paint a rectangle instead of the row-wrapped span.
 #define NESTTY_SELECTION_SIMPLE   0
