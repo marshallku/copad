@@ -283,9 +283,13 @@ fn run(
         } else if value.get("ok").is_some() {
             log::debug!("[nestty] gui_client response: {value}");
         } else if value.get("type").is_some() {
-            // `source` must round-trip — the local trigger engine's
+            // `source` round-trips so the local trigger engine's
             // preflight-promotion gates on COMPLETION_EVENT_SOURCE for
-            // daemon-hosted plugin completions.
+            // daemon-hosted plugin completions. `origin` round-trips for
+            // the same reason on the trust-boundary axis — a daemon
+            // `External` tag (set at events.publish ingest) MUST survive
+            // the crossing or `[security] accept_external` triggers
+            // silently fire on hook-published events.
             //
             // Stage B: stamp `bridge_id` on the republish so the
             // GUI→daemon forwarder (Stage C) recognizes this as
@@ -293,8 +297,9 @@ fn run(
             match serde_json::from_value::<WireEvent>(value) {
                 Ok(wire) => {
                     let source = wire.source.unwrap_or_else(|| "daemon".to_string());
+                    let origin = wire.origin;
                     event_bus.publish_bridged(
-                        BusEvent::new(wire.event_type, source, wire.data),
+                        BusEvent::new(wire.event_type, source, wire.data).with_origin(origin),
                         next_bridge_id(),
                     );
                 }
