@@ -92,6 +92,20 @@ int nestty_engine_dispatch_event(
 int nestty_engine_count_triggers(EngineHandle *handle);
 
 // ---------------------------------------------------------------------------
+// Plugin manifest FFI
+//
+// Validation only — directory walk / duplicate-name winner / dir
+// retention stays on the caller side. JSON wire shape matches
+// `nestty_core::plugin::PluginManifest` (raw enum strings for
+// `activation` / `restart`).
+// ---------------------------------------------------------------------------
+
+/// Read + validate `plugin.toml` at `path`. Returns a heap-allocated JSON
+/// string the caller MUST free with `nestty_ffi_free_string`. Returns NULL
+/// on IO / parse failure; see `nestty_ffi_last_error`.
+char *nestty_ffi_plugin_validate_toml(const char *path);
+
+// ---------------------------------------------------------------------------
 // Background FFI
 //
 // Read/write helpers over `nestty_core::background` for wallpaper rotation.

@@ -1,5 +1,5 @@
+import CNesttyFFI
 import Foundation
-import TOMLKit
 
 /// Mirrors `nestty-core::plugin::PluginManifest` for macOS.
 ///
@@ -65,16 +65,37 @@ enum PluginManifestStore {
         }
     }
 
+    /// TOML parse + validation runs in `nestty-core::plugin` via FFI;
+    /// Swift only decodes the returned JSON into the local model. Keeps
+    /// the manifest schema, default values, and enum-string syntax
+    /// (`onAction:kb.*` / `on-crash`) as the single source of truth on
+    /// the Rust side.
     private static func parse(at dir: URL) -> LoadedPluginManifest? {
         let manifestURL = dir.appendingPathComponent("plugin.toml")
-        guard let contents = try? String(contentsOf: manifestURL, encoding: .utf8) else {
+        // Skip subdirectories that aren't plugins — same pre-check Linux
+        // `discover_plugins` uses (`manifest_path.exists()`). Without
+        // this, every non-plugin dir under the plugin root would trigger
+        // a `failed to read … No such file` log line from `validate_toml`.
+        guard FileManager.default.fileExists(atPath: manifestURL.path) else {
             return nil
         }
+        guard let cstr = manifestURL.path.withCString({ nestty_ffi_plugin_validate_toml($0) }) else {
+            let err = nestty_ffi_last_error().map { String(cString: $0) } ?? "<unknown>"
+            let msg = "[nestty] plugin manifest \(manifestURL.path): \(err)\n"
+            FileHandle.standardError.write(Data(msg.utf8))
+            return nil
+        }
+        defer { nestty_ffi_free_string(cstr) }
+        let json = String(cString: cstr)
+        guard let data = json.data(using: .utf8) else { return nil }
         do {
-            let manifest = try TOMLDecoder().decode(PluginManifest.self, from: contents)
+            let manifest = try JSONDecoder().decode(PluginManifest.self, from: data)
             return LoadedPluginManifest(manifest: manifest, dir: dir)
         } catch {
-            let msg = "[nestty] failed to parse \(manifestURL.path): \(error)\n"
+            // Should not happen — core just emitted this JSON. If it
+            // does, Swift's Codable and serde's `PluginManifest`
+            // diverged.
+            let msg = "[nestty] plugin manifest decode (from core JSON) failed for \(manifestURL.path): \(error)\n"
             FileHandle.standardError.write(Data(msg.utf8))
             return nil
         }

@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use nestty_core::action_registry::ActionResult;
 use nestty_core::background::{self, BackgroundPaths};
 use nestty_core::event_bus::Event;
+use nestty_core::plugin;
 use nestty_core::protocol::ResponseError;
 use nestty_core::session::Session;
 use nestty_core::theme::Theme;
@@ -459,6 +460,60 @@ pub unsafe extern "C" fn nestty_ffi_theme_get(name: *const c_char) -> *mut c_cha
         Err(e) => {
             set_last_error(format!(
                 "nestty_ffi_theme_get: serialized JSON contained NUL byte: {e}"
+            ));
+            return ptr::null_mut();
+        }
+    };
+    clear_last_error();
+    cs.into_raw()
+}
+
+// ============================================================================
+// Plugin manifest FFI surface
+//
+// Validation only — discovery (directory enumeration, duplicate-name winner
+// pick, dir retention for relative `exec` / panel files) stays on the
+// caller side because it varies per platform (Linux daemon vs macOS GUI
+// scan their own roots). Wire shape is `nestty_core::plugin::PluginManifest`
+// serialized to JSON; `Activation` / `RestartPolicy` round-trip as the raw
+// `"onAction:kb.*"` / `"on-crash"` strings (see custom Serialize impls).
+// ============================================================================
+
+/// Read `plugin.toml` at `path`, parse + validate against
+/// `nestty_core::plugin::PluginManifest`. Returns a heap-allocated JSON
+/// string the caller must free with `nestty_ffi_free_string`. Returns
+/// NULL on IO / parse failure with the diagnostic in `LAST_ERROR`.
+///
+/// # Safety
+///
+/// `path` must be a NUL-terminated UTF-8 pointer valid for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_ffi_plugin_validate_toml(path: *const c_char) -> *mut c_char {
+    let Some(p) = (unsafe { cstr_to_pathbuf(path) }) else {
+        set_last_error("nestty_ffi_plugin_validate_toml: path is NULL or invalid UTF-8");
+        return ptr::null_mut();
+    };
+    let manifest = match plugin::validate_toml(&p) {
+        Ok(m) => m,
+        Err(e) => {
+            set_last_error(format!("nestty_ffi_plugin_validate_toml: {e}"));
+            return ptr::null_mut();
+        }
+    };
+    let serialized = match serde_json::to_string(&manifest) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(format!(
+                "nestty_ffi_plugin_validate_toml: serialize failed: {e}"
+            ));
+            return ptr::null_mut();
+        }
+    };
+    let cs = match CString::new(serialized) {
+        Ok(c) => c,
+        Err(e) => {
+            set_last_error(format!(
+                "nestty_ffi_plugin_validate_toml: serialized JSON contained NUL byte: {e}"
             ));
             return ptr::null_mut();
         }

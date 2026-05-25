@@ -1,8 +1,8 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PluginManifest {
     pub plugin: PluginMeta,
     #[serde(default)]
@@ -15,7 +15,7 @@ pub struct PluginManifest {
     pub services: Vec<PluginServiceDef>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PluginMeta {
     pub name: String,
     pub title: String,
@@ -23,7 +23,7 @@ pub struct PluginMeta {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PluginPanelDef {
     pub name: String,
     pub title: String,
@@ -31,7 +31,7 @@ pub struct PluginPanelDef {
     pub icon: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PluginCommandDef {
     pub name: String,
     pub exec: String,
@@ -50,7 +50,7 @@ fn default_module_interval() -> u64 {
     10
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PluginModuleDef {
     pub name: String,
     /// Shell command. stdout becomes module text — or, if it's JSON with a
@@ -73,7 +73,7 @@ pub struct PluginModuleDef {
 /// Supervised stdio-RPC subprocess. `provides`/`subscribes` are the
 /// pre-spawn conflict-resolution + init-reply-subset check inputs;
 /// see `service_supervisor`'s module preamble.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PluginServiceDef {
     /// Service identifier within the plugin (a single plugin may host
     /// multiple services, though one is the common case).
@@ -178,6 +178,48 @@ pub fn parse_restart(raw: &str) -> Result<RestartPolicy, String> {
     }
 }
 
+// The Activation / RestartPolicy enums round-trip through TOML as the raw
+// `"onAction:kb.*"` / `"on-crash"` strings, not as serde's auto-derived
+// `{ type: "OnAction", ... }`. Custom Serialize impls keep the round-trip
+// shape stable so an FFI consumer (currently macOS) reads back the same
+// string the user wrote in `plugin.toml`.
+impl Serialize for Activation {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let raw = match self {
+            Activation::OnStartup => "onStartup".to_string(),
+            Activation::OnAction(glob) => format!("onAction:{glob}"),
+            Activation::OnEvent(glob) => format!("onEvent:{glob}"),
+        };
+        s.serialize_str(&raw)
+    }
+}
+
+impl Serialize for RestartPolicy {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            RestartPolicy::OnCrash => "on-crash",
+            RestartPolicy::Always => "always",
+            RestartPolicy::Never => "never",
+        })
+    }
+}
+
+/// Parse + validate a `plugin.toml` from disk. Returns the manifest on
+/// success, or a one-line error string on IO / parse failure. Used by
+/// both the Linux discovery loop and the macOS FFI bridge so the
+/// validation rules — including enum string syntax — only exist in core.
+pub fn validate_toml(path: &Path) -> Result<PluginManifest, String> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+    validate_toml_str(&contents)
+}
+
+/// String-taking variant of `validate_toml`. Used in tests and by FFI
+/// callers that already have the manifest body in memory.
+pub fn validate_toml_str(toml_str: &str) -> Result<PluginManifest, String> {
+    toml::from_str(toml_str).map_err(|e| e.to_string())
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadedPlugin {
     pub manifest: PluginManifest,
@@ -207,11 +249,7 @@ pub fn discover_plugins() -> Vec<LoadedPlugin> {
         if !manifest_path.exists() {
             continue;
         }
-        let Ok(content) = std::fs::read_to_string(&manifest_path) else {
-            eprintln!("[nestty] failed to read {}", manifest_path.display());
-            continue;
-        };
-        match toml::from_str::<PluginManifest>(&content) {
+        match validate_toml(&manifest_path) {
             Ok(manifest) => {
                 plugins.push(LoadedPlugin {
                     manifest,
@@ -219,7 +257,7 @@ pub fn discover_plugins() -> Vec<LoadedPlugin> {
                 });
             }
             Err(e) => {
-                eprintln!("[nestty] failed to parse {}: {e}", manifest_path.display());
+                eprintln!("[nestty] {e}");
             }
         }
     }
@@ -397,5 +435,47 @@ mod tests {
         "#;
         let m: PluginManifest = toml::from_str(toml_src).unwrap();
         assert!(m.services.is_empty());
+    }
+
+    #[test]
+    fn activation_json_round_trip_preserves_raw_string() {
+        // Custom Serialize must produce the same string parse_activation
+        // accepts, so a manifest serialized for the macOS FFI consumer
+        // round-trips through serde unchanged.
+        for raw in ["onStartup", "onAction:kb.*", "onEvent:slack.*"] {
+            let a = parse_activation(raw).unwrap();
+            let json = serde_json::to_string(&a).unwrap();
+            assert_eq!(json, format!("\"{raw}\""));
+        }
+    }
+
+    #[test]
+    fn restart_json_round_trip_preserves_raw_string() {
+        for (variant, raw) in [
+            (RestartPolicy::OnCrash, "on-crash"),
+            (RestartPolicy::Always, "always"),
+            (RestartPolicy::Never, "never"),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, format!("\"{raw}\""));
+        }
+    }
+
+    #[test]
+    fn validate_toml_str_returns_error_for_bad_syntax() {
+        let bad = "this is not [valid toml = =";
+        assert!(validate_toml_str(bad).is_err());
+    }
+
+    #[test]
+    fn validate_toml_str_accepts_minimal_manifest() {
+        let ok = r#"
+            [plugin]
+            name = "x"
+            title = "X"
+            version = "0.1.0"
+        "#;
+        let m = validate_toml_str(ok).unwrap();
+        assert_eq!(m.plugin.name, "x");
     }
 }
