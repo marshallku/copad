@@ -1,4 +1,5 @@
 pub mod action_registry;
+pub mod background;
 pub mod condition;
 pub mod config;
 pub mod context;

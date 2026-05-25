@@ -14,12 +14,14 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nestty_core::action_registry::ActionResult;
+use nestty_core::background::{self, BackgroundPaths};
 use nestty_core::event_bus::Event;
 use nestty_core::protocol::ResponseError;
 use nestty_core::session::Session;
 use nestty_core::theme::Theme;
 use nestty_core::trigger::{Trigger, TriggerEngine, TriggerSink};
 use serde_json::{Value, json};
+use std::path::PathBuf;
 
 thread_local! {
     /// Per-thread last-error slot. Set by entry points whose failure modes
@@ -463,6 +465,104 @@ pub unsafe extern "C" fn nestty_ffi_theme_get(name: *const c_char) -> *mut c_cha
     };
     clear_last_error();
     cs.into_raw()
+}
+
+// ============================================================================
+// Background FFI surface
+//
+// Read/write helpers over `nestty_core::background`. Callers pass the
+// resolved paths so each platform keeps its own conventions
+// (Linux `~/.cache/...` legacy XDG vs macOS `~/Library/Caches/nestty/...`).
+// ============================================================================
+
+/// Construct a PathBuf from a C string pointer. NULL → None; invalid
+/// UTF-8 → None (matches the existing FFI convention of rejecting bad
+/// UTF-8 quietly rather than asserting).
+unsafe fn cstr_to_pathbuf(p: *const c_char) -> Option<PathBuf> {
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: caller contract — `p` is a NUL-terminated string valid for the call.
+    let s = unsafe { CStr::from_ptr(p) }.to_str().ok()?;
+    Some(PathBuf::from(s))
+}
+
+/// Pick a random image path from `primary_list`, falling back to
+/// `fallback_list` when primary is missing/unreadable (pass NULL for no
+/// fallback). Returns a heap-allocated NUL-terminated path the caller
+/// must free with `nestty_ffi_free_string`. Returns NULL when neither
+/// list exists or every line is blank.
+///
+/// # Safety
+///
+/// Both `primary_list` (required) and `fallback_list` (optional, may be
+/// NULL) must be valid NUL-terminated UTF-8 for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_ffi_background_next_random(
+    primary_list: *const c_char,
+    fallback_list: *const c_char,
+) -> *mut c_char {
+    let Some(primary) = (unsafe { cstr_to_pathbuf(primary_list) }) else {
+        set_last_error("nestty_ffi_background_next_random: primary_list is NULL or invalid UTF-8");
+        return ptr::null_mut();
+    };
+    let fallback = unsafe { cstr_to_pathbuf(fallback_list) };
+    let paths = BackgroundPaths {
+        primary_list: primary,
+        fallback_list: fallback,
+        // Unused for this call — mode_file only matters for is_active /
+        // toggle. Pass an empty path rather than threading a third arg.
+        mode_file: PathBuf::new(),
+    };
+    let Some(picked) = background::pick_random(&paths) else {
+        clear_last_error();
+        return ptr::null_mut();
+    };
+    let cs = match CString::new(picked) {
+        Ok(c) => c,
+        Err(e) => {
+            set_last_error(format!(
+                "nestty_ffi_background_next_random: path contained NUL byte: {e}"
+            ));
+            return ptr::null_mut();
+        }
+    };
+    clear_last_error();
+    cs.into_raw()
+}
+
+/// Returns 1 if rotation mode is active, 0 if deactive, -1 on NULL /
+/// invalid UTF-8 (see `nestty_ffi_last_error`). Missing mode file →
+/// active (1), matches Linux default.
+///
+/// # Safety
+///
+/// `mode_file` must be a NUL-terminated UTF-8 pointer valid for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_ffi_background_is_active(mode_file: *const c_char) -> i32 {
+    let Some(path) = (unsafe { cstr_to_pathbuf(mode_file) }) else {
+        set_last_error("nestty_ffi_background_is_active: mode_file is NULL or invalid UTF-8");
+        return -1;
+    };
+    clear_last_error();
+    if background::is_active(&path) { 1 } else { 0 }
+}
+
+/// Flip the rotation mode bit and persist. Returns the new state:
+/// 1 if now active, 0 if now deactive, -1 on NULL / invalid UTF-8.
+/// Creates the parent directory if missing.
+///
+/// # Safety
+///
+/// `mode_file` must be a NUL-terminated UTF-8 pointer valid for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_ffi_background_toggle(mode_file: *const c_char) -> i32 {
+    let Some(path) = (unsafe { cstr_to_pathbuf(mode_file) }) else {
+        set_last_error("nestty_ffi_background_toggle: mode_file is NULL or invalid UTF-8");
+        return -1;
+    };
+    clear_last_error();
+    if background::toggle(&path) { 1 } else { 0 }
 }
 
 // ============================================================================

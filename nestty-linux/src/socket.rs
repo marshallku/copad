@@ -1180,35 +1180,25 @@ fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
-fn select_random_image() -> Option<String> {
-    let cache_path = home_dir().join(WALLPAPER_CACHE);
-    let content = std::fs::read_to_string(cache_path).ok()?;
-    let lines: Vec<&str> = content.lines().filter(|l| !l.is_empty()).collect();
-    if lines.is_empty() {
-        return None;
+fn bg_paths() -> nestty_core::background::BackgroundPaths {
+    let home = home_dir();
+    nestty_core::background::BackgroundPaths {
+        primary_list: home.join(WALLPAPER_CACHE),
+        fallback_list: None,
+        mode_file: home.join(BG_MODE_FILE),
     }
-    use std::time::SystemTime;
-    let seed = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as usize;
-    Some(lines[seed % lines.len()].to_string())
+}
+
+fn select_random_image() -> Option<String> {
+    nestty_core::background::pick_random(&bg_paths())
 }
 
 fn is_bg_active() -> bool {
-    let mode_path = home_dir().join(BG_MODE_FILE);
-    match std::fs::read_to_string(mode_path) {
-        Ok(s) => s.trim() != "deactive",
-        Err(_) => true,
-    }
+    nestty_core::background::is_active(&bg_paths().mode_file)
 }
 
 fn toggle_bg_mode() -> bool {
-    let mode_path = home_dir().join(BG_MODE_FILE);
-    let new_active = !is_bg_active();
-    let mode = if new_active { "active" } else { "deactive" };
-    let _ = std::fs::write(mode_path, mode);
-    new_active
+    nestty_core::background::toggle(&bg_paths().mode_file)
 }
 
 pub fn cleanup(socket_path: &str) {

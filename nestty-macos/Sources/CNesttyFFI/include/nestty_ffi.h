@@ -92,6 +92,33 @@ int nestty_engine_dispatch_event(
 int nestty_engine_count_triggers(EngineHandle *handle);
 
 // ---------------------------------------------------------------------------
+// Background FFI
+//
+// Read/write helpers over `nestty_core::background` for wallpaper rotation.
+// Callers pass the resolved paths so each platform keeps its native cache
+// dir conventions. Returned image paths are owned and must be freed with
+// `nestty_ffi_free_string`; bool-ish results use 1/0 with -1 for errors.
+// ---------------------------------------------------------------------------
+
+/// Pick a random image path from `primary_list`, falling back to
+/// `fallback_list` (may be NULL) when primary is missing or unreadable.
+/// Returns a heap-allocated path string the caller MUST free with
+/// `nestty_ffi_free_string`. Returns NULL when neither list yields a
+/// non-empty line.
+char *nestty_ffi_background_next_random(
+    const char *primary_list,
+    const char *fallback_list
+);
+
+/// 1 if rotation is active, 0 if deactive, -1 on NULL / invalid UTF-8.
+/// Missing mode file = active (default).
+int nestty_ffi_background_is_active(const char *mode_file);
+
+/// Flip the mode bit and persist. Returns new state (1 active, 0 deactive)
+/// or -1 on NULL / invalid UTF-8.
+int nestty_ffi_background_toggle(const char *mode_file);
+
+// ---------------------------------------------------------------------------
 // Session FFI
 //
 // Argless persistence over `nestty_core::session`. Wire shape matches the
