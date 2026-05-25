@@ -153,12 +153,51 @@ struct NesttyListener {
     palette: Arc<std::sync::Mutex<HashMap<usize, Rgb>>>,
 }
 
+/// Catppuccin Mocha defaults — same palette
+/// `nestty_core::theme::Theme::default()` exposes. Duplicated here as
+/// `(index, r, g, b)` rows to avoid pulling nestty-core into the
+/// otherwise-lean nestty-term crate. Used to pre-seed the palette
+/// inside `NesttyListener::new` so a child shell that emits an OSC 4
+/// query in the race window between `nestty_term_create` returning
+/// and Swift calling `nestty_term_set_palette_entry` still gets a
+/// reasonable answer (Mocha colors) rather than no-reply. Host
+/// override-on-theme-apply still wins.
+#[rustfmt::skip]
+const DEFAULT_PALETTE_ROWS: &[(usize, u8, u8, u8)] = &[
+    // 0-7 normal ANSI
+    (0,  0x45, 0x47, 0x5a),
+    (1,  0xf3, 0x8b, 0xa8),
+    (2,  0xa6, 0xe3, 0xa1),
+    (3,  0xf9, 0xe2, 0xaf),
+    (4,  0x89, 0xb4, 0xfa),
+    (5,  0xf5, 0xc2, 0xe7),
+    (6,  0x94, 0xe2, 0xd5),
+    (7,  0xba, 0xc2, 0xde),
+    // 8-15 bright
+    (8,  0x58, 0x5b, 0x70),
+    (9,  0xf3, 0x8b, 0xa8),
+    (10, 0xa6, 0xe3, 0xa1),
+    (11, 0xf9, 0xe2, 0xaf),
+    (12, 0x89, 0xb4, 0xfa),
+    (13, 0xf5, 0xc2, 0xe7),
+    (14, 0x94, 0xe2, 0xd5),
+    (15, 0xa6, 0xad, 0xc8),
+    // NamedColor::Foreground / Background / Cursor (vte indices)
+    (256, 0xcd, 0xd6, 0xf4),
+    (257, 0x1e, 0x1e, 0x2e),
+    (258, 0x89, 0xb4, 0xfa),
+];
+
 impl NesttyListener {
     fn new() -> Self {
+        let mut palette = HashMap::with_capacity(DEFAULT_PALETTE_ROWS.len());
+        for &(idx, r, g, b) in DEFAULT_PALETTE_ROWS {
+            palette.insert(idx, Rgb { r, g, b });
+        }
         Self {
             pending_clipboard: Arc::new(std::sync::Mutex::new(None)),
             sender: Arc::new(std::sync::Mutex::new(None)),
-            palette: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            palette: Arc::new(std::sync::Mutex::new(palette)),
         }
     }
 
