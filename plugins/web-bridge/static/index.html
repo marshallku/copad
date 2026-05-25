@@ -128,16 +128,33 @@
   (() => {
     const root = document.getElementById("root");
     let token = sessionStorage.getItem("nestty.token") || "";
+    // Auth mode is decided by /api/whoami on boot. tailscale-mode
+    // skips the token setup page entirely + omits the Authorization
+    // header from /api/* calls + the bearer.<token> subprotocol from
+    // /ws/* upgrades (the middleware trusts Tailscale-User-Login).
+    let authMode = "bearer";  // "bearer" | "tailscale"
+    let tsIdentity = null;     // { login, name } when authMode === "tailscale"
 
     function api(path, opts = {}) {
-      opts.headers = Object.assign({}, opts.headers || {}, {
-        "Authorization": "Bearer " + token,
-      });
+      opts.headers = Object.assign({}, opts.headers || {});
+      // Only send the Bearer header in bearer mode — in tailscale
+      // mode we have no token and the server would 401 on an empty
+      // bearer anyway.
+      if (authMode === "bearer" && token) {
+        opts.headers["Authorization"] = "Bearer " + token;
+      }
       if (opts.body && !opts.headers["Content-Type"]) opts.headers["Content-Type"] = "application/json";
       return fetch(path, opts).then(async (r) => {
         if (r.status === 401) {
-          token = ""; sessionStorage.removeItem("nestty.token");
-          render();
+          // Only the bearer path treats 401 as "token went bad,
+          // reprompt". In tailscale mode a 401 means the proxy lost
+          // the header — surface it as a generic error rather than
+          // dropping the user back to a setup page that doesn't
+          // apply to them.
+          if (authMode === "bearer") {
+            token = ""; sessionStorage.removeItem("nestty.token");
+            render();
+          }
           throw new Error("unauthorized");
         }
         const body = r.headers.get("content-type")?.includes("json") ? await r.json() : await r.text();
@@ -188,6 +205,24 @@
       const out = new Uint8Array(raw.length);
       for (let i = 0; i < raw.length; i++) out[i] = raw.charCodeAt(i);
       return out;
+    }
+
+    // Subprotocol list for WebSocket constructors. The server's
+    // upgrade handshake auth checks the `bearer.<token>` subprotocol
+    // when a token is present; in tailscale mode there's no token, so
+    // we omit the second argument and let the Tailscale-User-Login
+    // header (injected on the upgrade request like any HTTP request)
+    // satisfy the middleware.
+    function wsProtocols() {
+      return (authMode === "bearer" && token) ? [`bearer.${token}`] : undefined;
+    }
+    // True when the SPA still has a way to authenticate the next
+    // reconnect attempt — tailscale mode is always-eligible since
+    // the proxy keeps injecting the header; bearer mode needs the
+    // cached token. Used by overview/events WS onclose handlers so
+    // tailscale sessions don't silently stop reconnecting.
+    function canReconnect() {
+      return authMode === "tailscale" || !!token;
     }
 
     function escapeHtml(s) {
@@ -332,9 +367,13 @@
         if (state.push.status === "on") return `<button class="chip ok" id="push-toggle">push: on</button>`;
         return `<button class="chip" id="push-toggle">push: off</button>`;
       })();
+      const authChip = authMode === "tailscale"
+        ? `<span class="chip ok" title="Authenticated via Tailscale serve">ts: ${escapeHtml((tsIdentity && (tsIdentity.login || tsIdentity.name)) || "ok")}</span>`
+        : "";
       root.innerHTML = `
         <header>
           <h1>nestty <span class="dim">— remote bridge</span></h1>
+          ${authChip}
           ${pushChip}
           <button class="chip ${state.presence === "away" ? "warn" : "ok"}" id="presence-toggle">${state.presence || "…"}</button>
         </header>
@@ -498,7 +537,9 @@
     }
 
     function render() {
-      if (!token) { renderSetup(); return; }
+      // Tailscale mode never needs a token — go straight to the app.
+      // Bearer mode needs one; otherwise show the setup prompt.
+      if (authMode !== "tailscale" && !token) { renderSetup(); return; }
       if (state.mode === "attach") { renderAttach(); return; }
       renderOverview();
     }
@@ -528,7 +569,7 @@
       state.fit = fit;
 
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      const ws = new WebSocket(`${proto}://${location.host}/ws/tmux/attach/${encodeURIComponent(state.activePane)}`, [`bearer.${token}`]);
+      const ws = new WebSocket(`${proto}://${location.host}/ws/tmux/attach/${encodeURIComponent(state.activePane)}`, wsProtocols());
       ws.binaryType = "arraybuffer";
       state.ws.attach = ws;
 
@@ -599,7 +640,7 @@
     function openOverviewStream() {
       if (state.ws.overview) { try { state.ws.overview.close(); } catch {} }
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      const ws = new WebSocket(`${proto}://${location.host}/ws/tmux/overview`, [`bearer.${token}`]);
+      const ws = new WebSocket(`${proto}://${location.host}/ws/tmux/overview`, wsProtocols());
       state.ws.overview = ws;
       ws.onmessage = (msg) => {
         try {
@@ -617,14 +658,14 @@
           if (state.mode === "overview") render();
         } catch {}
       };
-      ws.onclose = () => { state.ws.overview = null; if (token) setTimeout(openOverviewStream, 2000); };
+      ws.onclose = () => { state.ws.overview = null; if (canReconnect()) setTimeout(openOverviewStream, 2000); };
       ws.onerror = () => { try { ws.close(); } catch {} };
     }
 
     function openEventStream() {
       if (state.ws.events) { try { state.ws.events.close(); } catch {} }
       const proto = location.protocol === "https:" ? "wss" : "ws";
-      const ws = new WebSocket(`${proto}://${location.host}/ws/events`, [`bearer.${token}`]);
+      const ws = new WebSocket(`${proto}://${location.host}/ws/events`, wsProtocols());
       state.ws.events = ws;
       ws.onmessage = (msg) => {
         try {
@@ -638,7 +679,7 @@
           if (state.mode === "overview") render();
         } catch {}
       };
-      ws.onclose = () => { state.ws.events = null; if (token) setTimeout(openEventStream, 2000); };
+      ws.onclose = () => { state.ws.events = null; if (canReconnect()) setTimeout(openEventStream, 2000); };
       ws.onerror = () => { try { ws.close(); } catch {} };
     }
 
@@ -885,7 +926,31 @@
       }
     }
 
-    if (token) { bootFromHash(); bootstrap(); } else render();
+    // Boot order:
+    //   1. ask /api/whoami WITHOUT any auth header — if Tailscale
+    //      serve injected its identity header, the middleware lets
+    //      us through and the SPA skips the bearer setup page.
+    //   2. otherwise fall back to the cached bearer token (sessionStorage)
+    //      or render the setup page.
+    (async () => {
+      try {
+        const r = await fetch("/api/whoami");
+        if (r.ok) {
+          const w = await r.json();
+          if (w.auth === "tailscale") {
+            authMode = "tailscale";
+            tsIdentity = { login: w.login || "", name: w.name || "" };
+          }
+        }
+      } catch {}
+      if (authMode === "tailscale") {
+        bootFromHash(); bootstrap();
+      } else if (token) {
+        bootFromHash(); bootstrap();
+      } else {
+        render();
+      }
+    })();
   })();
   </script>
 </body>

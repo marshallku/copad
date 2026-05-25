@@ -229,6 +229,12 @@ fn write_frame(stdout: &StdoutHandle, frame: &Value) {
 struct AppState {
     daemon: DaemonClient,
     token: Arc<String>,
+    /// True only when the HTTP listener is bound to a loopback
+    /// address. Header-based Tailscale auth (`Tailscale-User-Login`)
+    /// is unsafe on non-loopback binds because any reachable caller
+    /// could forge the header — so we disable that path entirely
+    /// when bound to a routable interface and require bearer auth.
+    allow_tailscale_header: bool,
     default_subscribe_patterns: Arc<Vec<String>>,
     /// In-process 2 s TTL cache for `/api/tmux/panes`. Multiple
     /// dashboard tabs hitting refresh shouldn't fan out as N tmux
@@ -250,6 +256,20 @@ struct TmuxCacheEntry {
     value: Value,
 }
 
+/// True when `bind` resolves to a loopback address (`127.0.0.0/8`
+/// for IPv4 or `::1` for IPv6). Header-based Tailscale auth is only
+/// safe under that invariant — see `AppState::allow_tailscale_header`.
+/// Returns false for unparseable bind strings (fail-closed).
+fn bind_is_loopback(bind: &str) -> bool {
+    use std::net::SocketAddr;
+    let parsed: Option<SocketAddr> = bind.parse().ok();
+    match parsed {
+        Some(SocketAddr::V4(a)) => a.ip().is_loopback(),
+        Some(SocketAddr::V6(a)) => a.ip().is_loopback(),
+        None => false,
+    }
+}
+
 async fn run_server(
     bind: &str,
     token: &str,
@@ -269,9 +289,16 @@ async fn run_server(
             "[web-bridge] NESTTY_WEB_BRIDGE_VAPID_PRIVATE/PUBLIC not set — push notifications disabled"
         );
     }
+    let allow_tailscale_header = bind_is_loopback(bind);
+    if !allow_tailscale_header {
+        eprintln!(
+            "[web-bridge] bind={bind} is not loopback; disabling Tailscale-User-Login header auth (bearer token required)"
+        );
+    }
     let state = AppState {
         daemon: DaemonClient::new(socket_path),
         token: Arc::new(token.to_string()),
+        allow_tailscale_header,
         tmux_cache: Arc::new(tokio::sync::Mutex::new(None)),
         push_config: Arc::new(push_config),
         push_subs: Arc::new(tokio::sync::Mutex::new(push::load_subscriptions())),
@@ -284,6 +311,7 @@ async fn run_server(
     };
 
     let auth_state = state.clone();
+    let allow_ts_header = state.allow_tailscale_header;
     let app = Router::new()
         .route("/", get(handle_index))
         .route("/healthz", get(handle_healthz))
@@ -300,6 +328,7 @@ async fn run_server(
         .route("/ws/tmux/overview", get(handle_ws_tmux_overview))
         .route("/ws/tmux/attach/:pane_id", get(handle_ws_tmux_attach))
         .route("/ws/events", get(handle_ws_events))
+        .route("/api/whoami", get(handle_whoami))
         .route("/api/push/vapid-public", get(handle_push_vapid_public))
         .route("/api/push/subscribe", post(handle_push_subscribe))
         .route(
@@ -331,6 +360,25 @@ async fn run_server(
                         || path == "/icon.svg";
                     let upgrades = path.starts_with("/ws/");
                     if public {
+                        return next.run(req).await;
+                    }
+                    // Tailscale serve injects `Tailscale-User-Login`
+                    // (and `-User-Name`) on every request that came
+                    // through it. Our plugin only binds 127.0.0.1, so
+                    // any external attacker would need to be in the
+                    // tailnet AND going through serve to reach us —
+                    // trust the header. Anyone with raw localhost
+                    // access already has the bearer token in env / on
+                    // disk, so per-process header forgery is a
+                    // theoretical not a real attack here.
+                    let ts_authed = allow_ts_header
+                        && req
+                            .headers()
+                            .get("tailscale-user-login")
+                            .and_then(|h| h.to_str().ok())
+                            .map(|s| !s.is_empty())
+                            .unwrap_or(false);
+                    if ts_authed {
                         return next.run(req).await;
                     }
                     if upgrades {
@@ -521,6 +569,31 @@ async fn handle_index() -> axum::response::Response {
 
 async fn handle_healthz() -> &'static str {
     "ok\n"
+}
+
+/// `GET /api/whoami` — surfaces which auth path the caller is on.
+/// SPA hits this once on load (without an Authorization header) to
+/// decide whether to skip the token-input page entirely. Tailscale
+/// serve injects `Tailscale-User-Login` on every proxied request;
+/// bearer-token requests show that fallback. Anything else gets 401
+/// from the middleware before reaching here.
+async fn handle_whoami(headers: axum::http::HeaderMap) -> axum::Json<Value> {
+    let login = headers
+        .get("tailscale-user-login")
+        .and_then(|h| h.to_str().ok())
+        .filter(|s| !s.is_empty());
+    let name = headers
+        .get("tailscale-user-name")
+        .and_then(|h| h.to_str().ok())
+        .filter(|s| !s.is_empty());
+    if let Some(login) = login {
+        return axum::Json(json!({
+            "auth": "tailscale",
+            "login": login,
+            "name": name,
+        }));
+    }
+    axum::Json(json!({ "auth": "bearer" }))
 }
 
 async fn handle_manifest() -> axum::response::Response {

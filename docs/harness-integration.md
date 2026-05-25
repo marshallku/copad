@@ -368,6 +368,16 @@ silent-fail on missing socket. Tags every emitted event with
 - `claude.review_approved` → `kb.append` to a daily log
 - `claude.session_stopped` → `todo.create` for in-progress items
 
+**Tailscale-serve auth (shipped 2026-05-25).** With Tailscale installed and `tailscale serve` proxying the plugin, the dashboard no longer requires manual bearer-token input. The plugin's auth middleware lets requests through when `Tailscale-User-Login` is present on the incoming headers; `GET /api/whoami` returns `{auth: "tailscale", login, name}` on those requests, and the SPA boots straight into overview mode (no setup page). Bearer-token mode is preserved for ssh-tunnel / localhost-only workflows. Header trust is safe because the plugin still binds 127.0.0.1 only — any caller who can reach localhost already has access to the on-disk bearer token, so header forgery from "outside" is impossible by construction.
+
+One-time setup (per machine, after `tailscale up`):
+
+```
+tailscale serve --bg --https=443 http://localhost:7575
+```
+
+This makes the dashboard reachable at `https://<machine>.<tailnet>.ts.net/` from any device on the tailnet, with Tailscale terminating TLS + injecting the identity headers. To unwind: `tailscale serve --bg --https=443 off`. Verify status with `tailscale serve status`.
+
 **Slice 3.1 — "tmx web edition" (shipped 2026-05-23, see decisions.md #43).** Slice 3.0's chat-style snapshot UI proved unusable in practice — no live state, no real interactive control. Slice 3.1 pivots to tmux as the primary data model (the user's actual work mostly runs inside tmux anyway). New endpoints: `GET /api/tmux/panes` (single `list-panes -a` + per-pane `capture-pane`, 2 s cache), `POST /api/tmux/send` (`load-buffer` + `paste-buffer -p -d` for multiline-safe injection), `WS /ws/tmux/overview` (5 s full-snapshot push), `WS /ws/tmux/attach/:pane_id` (bidirectional xterm.js via portable-pty + `tmux attach-session`). SPA gets two modes (overview + attach) + mobile keyboard toolbar (`Esc Tab Ctrl(sticky) / | ↑↓←→ ^C ^D ^Z`). Zero changes to nestty/daemon; tmux's multi-client model handles the shared view between nestty's GUI and the mobile attach. Slice 3.0's `nestty-panels` section stays as a snapshot-only fallback for work happening outside tmux.
 
 **Slice 3.0 — `plugins/web-bridge/` (shipped 2026-05-23, see decisions.md #42).** First-party plugin that brokers nesttyd's socket surface over HTTP+WebSocket so a phone or laptop on the user's Tailscale (or via SSH tunnel) can drive the local harness. Architecture is the (δ) variant: web-bridge is a service plugin running the supervisor's stdio RPC handshake minimally AND in the same process spawning an axum HTTP+WS listener AND opening raw daemon-socket connections so requests go through `dispatch()` → `GuiRegistry`. Slice 3.0 ships a web-native chat-style UI (Path A) — pane status snapshot + recent-output viewer + live event feed + textarea command input + presence toggle. xterm.js full-PTY + mobile keyboard toolbar (Path B) is layered on top in Slice 3.1+. The only nestty-daemon change beyond the plugin itself is `ServiceSupervisor` injecting `NESTTY_SOCKET` into every service-plugin child env — a one-spot edit that every future listener-style plugin (ntfy bridge, prometheus exporter, …) inherits.
