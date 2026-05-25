@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use nestty_core::action_registry::ActionResult;
 use nestty_core::event_bus::Event;
 use nestty_core::protocol::ResponseError;
+use nestty_core::session::Session;
 use nestty_core::theme::Theme;
 use nestty_core::trigger::{Trigger, TriggerEngine, TriggerSink};
 use serde_json::{Value, json};
@@ -462,6 +463,92 @@ pub unsafe extern "C" fn nestty_ffi_theme_get(name: *const c_char) -> *mut c_cha
     };
     clear_last_error();
     cs.into_raw()
+}
+
+// ============================================================================
+// Session FFI surface
+//
+// Argless persistence over `nestty_core::session`. Path is resolved in core
+// (`paths::state_dir() / "session.json"`), so both Linux and macOS land on
+// the platform's correct state dir without the wrapper having to thread a
+// path string through.
+// ============================================================================
+
+/// Load the persisted session. Returns a heap-allocated JSON string the
+/// caller must free with `nestty_ffi_free_string`. Returns NULL when no
+/// session file exists, the file fails to parse, version is unknown, or
+/// the saved tab list is empty — matching `nestty_core::session::load`.
+#[unsafe(no_mangle)]
+pub extern "C" fn nestty_ffi_session_load() -> *mut c_char {
+    let Some(session) = nestty_core::session::load() else {
+        clear_last_error();
+        return ptr::null_mut();
+    };
+    let serialized = match serde_json::to_string(&session) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(format!("nestty_ffi_session_load: serialize failed: {e}"));
+            return ptr::null_mut();
+        }
+    };
+    let cs = match CString::new(serialized) {
+        Ok(c) => c,
+        Err(e) => {
+            set_last_error(format!(
+                "nestty_ffi_session_load: serialized JSON contained NUL byte: {e}"
+            ));
+            return ptr::null_mut();
+        }
+    };
+    clear_last_error();
+    cs.into_raw()
+}
+
+/// Persist a session snapshot. `json` must match the
+/// `nestty_core::session::Session` schema. Returns 0 on success, -1 on
+/// NULL / non-UTF-8 / JSON parse failure (diagnostics via
+/// `nestty_ffi_last_error`). Underlying IO errors are logged by core to
+/// stderr but still return 0 — matches Linux's best-effort save semantics.
+///
+/// # Safety
+///
+/// `json` must be a NUL-terminated UTF-8 pointer valid for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_ffi_session_save(json: *const c_char) -> i32 {
+    if json.is_null() {
+        set_last_error("nestty_ffi_session_save: json pointer is NULL");
+        return -1;
+    }
+    // SAFETY: caller contract.
+    let bytes = unsafe { CStr::from_ptr(json) }.to_bytes();
+    let json_str = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(format!(
+                "nestty_ffi_session_save: input is not valid UTF-8: {e}"
+            ));
+            return -1;
+        }
+    };
+    let session: Session = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error(format!("nestty_ffi_session_save: JSON parse error: {e}"));
+            return -1;
+        }
+    };
+    nestty_core::session::save(&session);
+    clear_last_error();
+    0
+}
+
+/// Remove the persisted session file (idempotent — `NotFound` is treated
+/// as success). Always returns 0; IO failures are logged to stderr.
+#[unsafe(no_mangle)]
+pub extern "C" fn nestty_ffi_session_clear() -> i32 {
+    nestty_core::session::clear();
+    clear_last_error();
+    0
 }
 
 /// Return a JSON array of built-in theme names. Caller must free the

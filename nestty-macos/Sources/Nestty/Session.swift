@@ -1,109 +1,63 @@
+import CNesttyFFI
 import Foundation
 
-/// Persisted tab/split layout. Port of `nestty-linux/src/session.rs`:
-/// same JSON wire shape (snake_case keys, `type`-tagged SplitSnap
-/// variants, `lowercase` orientation strings), same `state_dir()`
-/// resolution (macOS = `~/Library/Application Support/nestty/`,
-/// matches `nestty_core::paths::state_dir()`), same versioning
-/// contract — unknown versions are rejected instead of best-effort
-/// parsed so a future schema does not produce a half-restored state.
+/// Persisted tab/split layout. Wire shape mirrors `nestty_core::session::Session`
+/// exactly (snake_case keys, `type`-tagged `SplitSnap` variants, lowercase
+/// orientation strings). Load / save / clear are owned by core and reached
+/// through `nestty-ffi`; this file only encodes / decodes JSON and walks
+/// the in-memory tree (`leftmostCwd`).
 enum Session {
     static let version: Int = 1
 
-    /// Path duplicated from `nestty_core::paths::state_dir()`'s macOS
-    /// branch. If that branch changes upstream this file lands at the
-    /// wrong path; keep the two in lock-step (same notes as
-    /// `NesttyConfig.configPath()`).
-    static func filePath() -> URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appending(path: "Library/Application Support/nestty/session.json")
-    }
-
-    /// Read + decode + version-check. nil on absence, parse failure,
-    /// version mismatch, or empty-tabs payload. Logs failures to
-    /// stderr so the user sees why a restore was skipped.
+    /// Returns nil on absence, parse failure, version mismatch, or
+    /// empty-tabs payload — core decides and logs the reason to stderr.
     static func load() -> Snapshot? {
-        let path = filePath()
-        guard let data = try? Data(contentsOf: path) else { return nil }
-        let decoder = JSONDecoder()
-        let snap: Snapshot
+        guard let cstr = nestty_ffi_session_load() else { return nil }
+        defer { nestty_ffi_free_string(cstr) }
+        let json = String(cString: cstr)
+        guard let data = json.data(using: .utf8) else { return nil }
         do {
-            snap = try decoder.decode(Snapshot.self, from: data)
+            return try JSONDecoder().decode(Snapshot.self, from: data)
         } catch {
+            // Should not happen — core just produced this JSON. Surfacing
+            // here means Swift's Codable and serde's `Session` drifted.
             FileHandle.standardError.write(
-                Data("[nestty] session parse failed: \(error)\n".utf8),
+                Data("[nestty] session decode (from core JSON) failed: \(error)\n".utf8),
             )
             return nil
         }
-        guard snap.version == version else {
-            FileHandle.standardError.write(
-                Data("[nestty] session version mismatch (file=\(snap.version), expected=\(version)) — ignoring\n".utf8),
-            )
-            return nil
-        }
-        if snap.tabs.isEmpty { return nil }
-        return snap
     }
 
-    /// Atomic write via `.tmp` rename so a crash mid-write doesn't
-    /// leave a truncated session.json on disk.
     static func save(_ snap: Snapshot) {
-        let path = filePath()
-        let parent = path.deletingLastPathComponent()
-        do {
-            try FileManager.default.createDirectory(
-                at: parent, withIntermediateDirectories: true,
-            )
-        } catch {
-            FileHandle.standardError.write(
-                Data("[nestty] session save: mkdir \(parent.path) failed: \(error)\n".utf8),
-            )
-            return
-        }
         let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let data: Data
-        do { data = try encoder.encode(snap) } catch {
+        do {
+            data = try encoder.encode(snap)
+        } catch {
             FileHandle.standardError.write(
-                Data("[nestty] session serialize failed: \(error)\n".utf8),
+                Data("[nestty] session encode failed: \(error)\n".utf8),
             )
             return
         }
-        // `Data.write(.atomic)` writes to a sibling temp under the same
-        // parent and renames over the final path — atomic from any
-        // concurrent reader's perspective, and works whether the final
-        // path already exists or not. (Earlier draft layered a
-        // `replaceItemAt` on top, but that helper REQUIRES the
-        // destination to pre-exist, so it blew up on first launch /
-        // after `Session.clear()`.)
-        do {
-            try data.write(to: path, options: .atomic)
-        } catch {
+        let json = String(decoding: data, as: UTF8.self)
+        let rc = json.withCString { nestty_ffi_session_save($0) }
+        if rc != 0 {
+            let msg = nestty_ffi_last_error().map { String(cString: $0) } ?? "<unknown>"
             FileHandle.standardError.write(
-                Data("[nestty] session write \(path.path) failed: \(error)\n".utf8),
+                Data("[nestty] session save failed: \(msg)\n".utf8),
             )
         }
     }
 
-    /// Remove the persisted session file. Called on close when the
-    /// snapshot would be empty — keeping a stale file would surface
-    /// vanished tabs on the next launch.
     static func clear() {
-        let path = filePath()
-        do {
-            try FileManager.default.removeItem(at: path)
-        } catch CocoaError.fileNoSuchFile, CocoaError.fileReadNoSuchFile {
-            // Idempotent: nothing to clear.
-        } catch {
-            FileHandle.standardError.write(
-                Data("[nestty] session clear failed: \(error)\n".utf8),
-            )
-        }
+        _ = nestty_ffi_session_clear()
     }
 
-    /// Walk a SplitSnap and return the cwd of the leftmost (DFS pre-
-    /// order) Terminal leaf. Mirrors Linux's `leftmost_cwd` — used at
-    /// restore-time so each new panel seeds with the right cwd.
+    /// Walk a SplitSnap and return the cwd of the leftmost (DFS pre-order)
+    /// Terminal leaf. Used at restore time so each new panel seeds with the
+    /// right cwd. Kept in Swift because callers (`TabViewController`,
+    /// `PaneManager`) already hold the decoded tree and only need the leaf
+    /// cwd — no FFI round-trip warranted.
     static func leftmostCwd(_ snap: SplitSnap) -> String? {
         switch snap {
         case let .terminal(cwd): cwd
@@ -113,6 +67,11 @@ enum Session {
 }
 
 // MARK: - Wire model
+//
+// PaneManager / TabViewController construct + consume these types in-
+// process. The FFI surface only ever crosses serialized JSON, so the
+// Swift types stay as the canonical in-memory shape for the rest of the
+// macOS codebase.
 
 extension Session {
     struct Snapshot: Codable, Equatable {
@@ -137,10 +96,9 @@ extension Session {
         }
     }
 
-    /// Wire-compatible with Linux's `serde(tag = "type", rename_all =
-    /// "snake_case")` SplitSnap enum. Manual Codable: Swift's auto-
-    /// derived Codable for an enum with associated values uses a
-    /// different on-disk layout (and isn't `tag`-flat to begin with).
+    /// Wire-compatible with serde's `#[serde(tag = "type", rename_all =
+    /// "snake_case")]` SplitSnap enum. Manual Codable because Swift's
+    /// auto-derived enum Codable picks a different on-disk layout.
     indirect enum SplitSnap: Equatable {
         case terminal(cwd: String?)
         case branch(orientation: SplitOrientation, position: Int, first: SplitSnap, second: SplitSnap)
@@ -178,9 +136,9 @@ extension Session.SplitSnap: Codable {
         switch self {
         case let .terminal(cwd):
             try c.encode("terminal", forKey: .type)
-            // Encode null explicitly when absent so the wire shape
-            // matches Linux's `Option<String>` serializer (which emits
-            // `"cwd": null` rather than dropping the key).
+            // Explicit null instead of omitted key — matches serde's
+            // `Option<String>` serializer so a Swift-written snapshot
+            // round-trips through core unchanged.
             try c.encode(cwd, forKey: .cwd)
         case let .branch(orientation, position, first, second):
             try c.encode("branch", forKey: .type)
@@ -193,10 +151,9 @@ extension Session.SplitSnap: Codable {
 }
 
 extension Session {
-    /// Mirror of Linux's `SplitOrientation` enum (the Swift one in
-    /// `SplitNode.swift` is renderer-facing; this one is wire-facing
-    /// and shares the `"horizontal"`/`"vertical"` rename_all=lowercase
-    /// strings).
+    /// Wire-facing orientation (the one in `SplitNode.swift` is
+    /// renderer-facing). Both share the `"horizontal"`/`"vertical"`
+    /// strings serde's `rename_all="lowercase"` produces.
     enum SplitOrientation: String, Codable, Equatable {
         case horizontal
         case vertical

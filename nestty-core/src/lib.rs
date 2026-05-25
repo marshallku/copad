@@ -9,6 +9,7 @@ pub mod notifier;
 pub mod paths;
 pub mod plugin;
 pub mod protocol;
+pub mod session;
 pub mod theme;
 pub mod thread_pool;
 pub mod trigger;

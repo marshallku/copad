@@ -92,6 +92,31 @@ int nestty_engine_dispatch_event(
 int nestty_engine_count_triggers(EngineHandle *handle);
 
 // ---------------------------------------------------------------------------
+// Session FFI
+//
+// Argless persistence over `nestty_core::session`. Wire shape matches the
+// crate's serde `Session` struct (snake_case keys, type-tagged SplitSnap,
+// lowercase orientation strings). Path is resolved in core
+// (`paths::state_dir() / "session.json"`).
+// ---------------------------------------------------------------------------
+
+/// Load the persisted session, if any. Returns a heap-allocated JSON string
+/// the caller MUST free with `nestty_ffi_free_string`. Returns NULL when no
+/// session exists, the file fails to parse, version is unknown, or saved
+/// tab list is empty.
+char *nestty_ffi_session_load(void);
+
+/// Persist a session snapshot. JSON must match the `Session` schema.
+/// Returns 0 on success, -1 on NULL / non-UTF-8 / parse error (see
+/// `nestty_ffi_last_error`). IO errors during write are logged to stderr
+/// but still return 0 — best-effort, matches Linux semantics.
+int nestty_ffi_session_save(const char *json);
+
+/// Remove the persisted session file. Idempotent (NotFound is success).
+/// Always returns 0; IO failures are logged to stderr.
+int nestty_ffi_session_clear(void);
+
+// ---------------------------------------------------------------------------
 // Theme FFI
 //
 // Read-only getters over `nestty_core::theme::Theme`. Wire shape is the
