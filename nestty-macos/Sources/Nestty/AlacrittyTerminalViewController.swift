@@ -179,6 +179,11 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel, Zoom
             shell: initialCwd != nil ? config.shell : nil,
             cwd: initialCwd,
         )
+        // Push the active palette so the first OSC 4 / 10 / 11 / 12
+        // query (often part of nvim / fish prompt init) gets the color
+        // we actually render. applyTheme reapplies on every theme
+        // hot-reload — same code path keeps the two in sync.
+        termHandle?.applyPaletteFromTheme(theme)
         if let initialInput {
             termHandle?.input(Array(initialInput.utf8))
         }
@@ -204,6 +209,7 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel, Zoom
     func applyTheme(_ newTheme: NesttyTheme) {
         theme = newTheme
         renderView?.setTheme(newTheme)
+        termHandle?.applyPaletteFromTheme(newTheme)
     }
 
     /// Config hot-reload: swap the font family/size on a running pane.

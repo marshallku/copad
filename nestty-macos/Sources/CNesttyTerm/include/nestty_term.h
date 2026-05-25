@@ -85,6 +85,18 @@ NesttyHandle* nestty_term_create(uint16_t cols, uint16_t rows,
 void nestty_term_destroy(NesttyHandle* handle);
 
 void nestty_term_input(NesttyHandle* handle, const uint8_t* bytes, size_t len);
+
+/// Populate one entry of the OSC color-query palette. Index follows
+/// `vte::ansi::NamedColor`: 0-15 ANSI (normal + bright), 16-255 256-color,
+/// 256 foreground, 257 background, 258 cursor. Re-call for the same
+/// index to overwrite on theme hot-reload. Indices never set make
+/// `Event::ColorRequest` (OSC 4/10/11/12) a silent no-op — apps fall
+/// back to defaults rather than getting a color we don't draw.
+/// Returns 0 on success, -1 on NULL handle.
+int nestty_term_set_palette_entry(NesttyHandle* handle,
+                                   uint16_t index,
+                                   uint8_t r, uint8_t g, uint8_t b);
+
 void nestty_term_resize(NesttyHandle* handle, uint16_t cols, uint16_t rows);
 
 // Returns true if the grid has any pending damage since the last call;

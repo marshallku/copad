@@ -84,6 +84,30 @@ enum NesttyTermFFI {
             }
         }
 
+        /// Push one entry into the OSC color-query palette consulted by
+        /// `Event::ColorRequest`. Index follows `vte::ansi::NamedColor`:
+        /// 0-15 ANSI, 256 = foreground, 257 = background, 258 = cursor.
+        /// Call from `applyTheme` so an OSC 4/10/11/12 query gets the
+        /// color we actually render.
+        func setPaletteEntry(_ index: UInt16, _ rgb: RGBColor) {
+            guard let ptr else { return }
+            _ = nestty_term_set_palette_entry(ptr, index, rgb.r, rgb.g, rgb.b)
+        }
+
+        /// Bulk push the standard subset (16 ANSI + foreground +
+        /// background + cursor). Cursor uses `theme.accent` because
+        /// NesttyTheme doesn't have a dedicated cursor color — same
+        /// choice the alacritty renderer makes for cursor block fill.
+        func applyPaletteFromTheme(_ theme: NesttyTheme) {
+            for (i, color) in theme.palette.enumerated() where i < 16 {
+                setPaletteEntry(UInt16(i), color)
+            }
+            // NamedColor::Foreground = 256, Background = 257, Cursor = 258
+            setPaletteEntry(256, theme.foreground)
+            setPaletteEntry(257, theme.background)
+            setPaletteEntry(258, theme.accent)
+        }
+
         func snapshot() -> Snapshot? {
             guard let ptr, let snap = nestty_term_snapshot(ptr) else { return nil }
             return Snapshot(ptr: snap)

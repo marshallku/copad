@@ -20,6 +20,7 @@
 //! lock briefly, copy out the visible rows, then release; renderers
 //! consume them without holding the lock.
 
+use std::collections::HashMap;
 use std::ffi::{CStr, c_char};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -40,7 +41,7 @@ use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::tty::{self, Options as TtyOptions, Pty, Shell};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, NamedColor, Rgb};
 
 /// Mirrors §D3 of the migration plan. `#[repr(C)]` so the layout is
 /// stable across the FFI boundary. Per-cell allocation is avoided by
@@ -140,6 +141,16 @@ struct NesttyListener {
     /// events are dropped, which is correct (no listener wired yet
     /// means no startup queries to answer).
     sender: Arc<std::sync::Mutex<Option<EventLoopSender>>>,
+    /// Active palette for OSC 4 (`\e]4;n;?\e\\`) and OSC 10/11/12
+    /// (foreground / background / cursor) color queries. Indexed by
+    /// `vte::ansi::NamedColor as usize` — 0-15 = ANSI 8 normal + 8
+    /// bright, 16-255 = 256-color cube, 256 = foreground, 257 =
+    /// background, 258 = cursor. Entries the host hasn't populated
+    /// (`nestty_term_set_palette_entry`) make `ColorRequest` no-op
+    /// instead of replying with a stale alacritty default — apps then
+    /// fall back to their own defaults rather than getting a wrong
+    /// answer.
+    palette: Arc<std::sync::Mutex<HashMap<usize, Rgb>>>,
 }
 
 impl NesttyListener {
@@ -147,11 +158,22 @@ impl NesttyListener {
         Self {
             pending_clipboard: Arc::new(std::sync::Mutex::new(None)),
             sender: Arc::new(std::sync::Mutex::new(None)),
+            palette: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
     fn set_sender(&self, sender: EventLoopSender) {
         *self.sender.lock().unwrap() = Some(sender);
+    }
+
+    /// Common path used by `Event::PtyWrite` + `Event::ColorRequest`
+    /// to write bytes back to the child shell. Silent no-op when the
+    /// sender hasn't been injected yet (extremely early-boot only —
+    /// no query reaches us before `nestty_term_create` returns).
+    fn send_to_pty(&self, bytes: Vec<u8>) {
+        if let Some(sender) = self.sender.lock().unwrap().as_ref() {
+            let _ = sender.send(Msg::Input(bytes.into()));
+        }
     }
 }
 
@@ -167,23 +189,35 @@ impl EventListener for NesttyListener {
             Event::PtyWrite(reply) => {
                 // alacritty_terminal already formatted the reply
                 // (`\e[<row>;<col>R` for DSR 6n, `\e[?6c` for DA 0c,
-                // OSC color responses, etc.) — we just forward the
-                // bytes back to the child. Without this hop nvim
-                // logs `"Did not detect DSR response from terminal"`
-                // on startup and falls back to slower paths.
-                if let Some(sender) = self.sender.lock().unwrap().as_ref() {
-                    let _ = sender.send(Msg::Input(reply.into_bytes().into()));
+                // etc.) — we just forward the bytes back to the child.
+                // Without this hop nvim logs `"Did not detect DSR
+                // response from terminal"` on startup and falls back
+                // to slower paths.
+                self.send_to_pty(reply.into_bytes());
+            }
+            Event::ColorRequest(index, format_reply) => {
+                // OSC 4 / 10 / 11 / 12 — apps query "what color does
+                // index N actually render as?" so they can pick
+                // contrast (e.g. nvim's `&background=dark`). alacritty
+                // hands us the formatter; we resolve the index against
+                // the host-supplied palette and feed the result back
+                // via the same Msg::Input path PtyWrite uses.
+                //
+                // No reply on miss: better than answering with a stale
+                // alacritty default that doesn't match what we actually
+                // draw on screen. Apps treat no-reply as "use my
+                // built-in default".
+                let rgb = self.palette.lock().unwrap().get(&index).copied();
+                if let Some(rgb) = rgb {
+                    let reply = format_reply(rgb);
+                    self.send_to_pty(reply.into_bytes());
                 }
             }
             _ => {
-                // Title / Bell / MouseCursorDirty / ColorRequest /
-                // TextAreaSizeRequest / CursorBlinkingChange / Wakeup
-                // / Exit / ChildExit — intentionally dropped; the
-                // renderer doesn't react to them today. ColorRequest
-                // (OSC 4 ;n; ?) carries a callback that needs an `Rgb`
-                // value materialized from the active theme palette
-                // before alacritty produces the reply string —
-                // separate work item, see catchup doc.
+                // Title / Bell / MouseCursorDirty / TextAreaSizeRequest /
+                // CursorBlinkingChange / Wakeup / Exit / ChildExit —
+                // intentionally dropped; the renderer doesn't react to
+                // them today.
             }
         }
     }
@@ -359,6 +393,51 @@ pub unsafe extern "C" fn nestty_term_input(
 ///
 /// `handle` must be NULL or a valid pointer returned by
 /// `nestty_term_create` and not yet destroyed.
+/// Populate one entry in the OSC color-query palette consulted by
+/// `Event::ColorRequest` replies. Index follows `vte::ansi::NamedColor`:
+/// 0-15 ANSI (normal + bright), 16-255 256-color cube, 256 foreground,
+/// 257 background, 258 cursor. Re-calling for the same index overwrites
+/// the previous value (use on theme hot-reload). Indices the host never
+/// populates produce no reply on OSC 4 / 10 / 11 / 12 — apps then fall
+/// back to their built-in defaults, which is safer than answering with
+/// a color we don't actually draw.
+///
+/// # Safety
+///
+/// `handle` must come from `nestty_term_create`. Color components are
+/// 8-bit linear RGB.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_term_set_palette_entry(
+    handle: *mut NesttyHandle,
+    index: u16,
+    r: u8,
+    g: u8,
+    b: u8,
+) -> i32 {
+    if handle.is_null() {
+        return -1;
+    }
+    // SAFETY: caller contract — handle came from `nestty_term_create`
+    // and has not been freed.
+    let h = unsafe { &*handle };
+    h.listener
+        .palette
+        .lock()
+        .unwrap()
+        .insert(index as usize, Rgb { r, g, b });
+    0
+}
+
+/// Resize the terminal grid. Clamps zero dimensions to 1 so the PTY
+/// always sees a positive `winsize`. Pixel dimensions reuse the cell
+/// count as a coarse approximation — alacritty only cares about the
+/// cell grid for input handling; pixel-aware apps (`stty size`-style
+/// queries) get column/row values and ignore the px fields.
+///
+/// # Safety
+///
+/// `handle` must come from `nestty_term_create` and not have been
+/// freed. Safe to pass NULL — returns early in that case.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn nestty_term_resize(handle: *mut NesttyHandle, cols: u16, rows: u16) {
     let Some(h) = (unsafe { handle.as_ref() }) else {
