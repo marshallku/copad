@@ -91,6 +91,24 @@ int nestty_engine_dispatch_event(
 /// Diagnostic: number of triggers currently loaded.
 int nestty_engine_count_triggers(EngineHandle *handle);
 
+// ---------------------------------------------------------------------------
+// Theme FFI
+//
+// Read-only getters over `nestty_core::theme::Theme`. Wire shape is the
+// struct's serde JSON: `{name, foreground, background, palette[16],
+// surface0/1/2, overlay0, text, subtext0/1, accent, red}` with hex string
+// colors. Swift maps via a private `ThemeWire: Decodable`.
+// ---------------------------------------------------------------------------
+
+/// Look up a built-in theme by name. Returns a heap-allocated NUL-terminated
+/// JSON string the caller MUST free with `nestty_ffi_free_string`. Returns
+/// NULL on unknown name; see `nestty_ffi_last_error`.
+char *nestty_ffi_theme_get(const char *name);
+
+/// Return a JSON array of built-in theme names. Caller MUST free with
+/// `nestty_ffi_free_string`.
+char *nestty_ffi_theme_list(void);
+
 #ifdef __cplusplus
 }
 #endif

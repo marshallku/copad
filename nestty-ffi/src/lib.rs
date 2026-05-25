@@ -16,6 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use nestty_core::action_registry::ActionResult;
 use nestty_core::event_bus::Event;
 use nestty_core::protocol::ResponseError;
+use nestty_core::theme::Theme;
 use nestty_core::trigger::{Trigger, TriggerEngine, TriggerSink};
 use serde_json::{Value, json};
 
@@ -404,4 +405,91 @@ pub unsafe extern "C" fn nestty_engine_count_triggers(handle: *mut EngineHandle)
     // SAFETY: caller contract.
     let h = unsafe { &*handle };
     h.engine.count() as i32
+}
+
+// ============================================================================
+// Theme FFI surface
+//
+// Read-only getters over `nestty_core::theme::Theme`. Wire shape is the
+// struct's serde JSON (hex string colors); ownership follows the existing
+// `nestty_ffi_free_string` convention.
+// ============================================================================
+
+/// Look up a built-in theme by name and return its JSON representation.
+/// Returns NULL on unknown name with the name echoed in `LAST_ERROR`.
+///
+/// # Safety
+///
+/// `name` must be a NUL-terminated UTF-8 pointer valid for the call. The
+/// returned pointer (if non-null) must be passed to `nestty_ffi_free_string`
+/// exactly once.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_ffi_theme_get(name: *const c_char) -> *mut c_char {
+    if name.is_null() {
+        set_last_error("nestty_ffi_theme_get: name pointer is NULL");
+        return ptr::null_mut();
+    }
+    // SAFETY: caller contract.
+    let bytes = unsafe { CStr::from_ptr(name) }.to_bytes();
+    let name_str = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(format!(
+                "nestty_ffi_theme_get: name is not valid UTF-8: {e}"
+            ));
+            return ptr::null_mut();
+        }
+    };
+    let Some(theme) = Theme::by_name(name_str) else {
+        set_last_error(format!("nestty_ffi_theme_get: unknown theme {name_str:?}"));
+        return ptr::null_mut();
+    };
+    let serialized = match serde_json::to_string(&theme) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(format!("nestty_ffi_theme_get: serialize failed: {e}"));
+            return ptr::null_mut();
+        }
+    };
+    let cs = match CString::new(serialized) {
+        Ok(c) => c,
+        Err(e) => {
+            set_last_error(format!(
+                "nestty_ffi_theme_get: serialized JSON contained NUL byte: {e}"
+            ));
+            return ptr::null_mut();
+        }
+    };
+    clear_last_error();
+    cs.into_raw()
+}
+
+/// Return a JSON array of built-in theme names. Caller must free the
+/// returned pointer with `nestty_ffi_free_string`.
+///
+/// # Safety
+///
+/// No input pointers; returned pointer is owned by Rust and must be freed
+/// exactly once.
+#[unsafe(no_mangle)]
+pub extern "C" fn nestty_ffi_theme_list() -> *mut c_char {
+    let names = Theme::list();
+    let serialized = match serde_json::to_string(names) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(format!("nestty_ffi_theme_list: serialize failed: {e}"));
+            return ptr::null_mut();
+        }
+    };
+    let cs = match CString::new(serialized) {
+        Ok(c) => c,
+        Err(e) => {
+            set_last_error(format!(
+                "nestty_ffi_theme_list: serialized JSON contained NUL byte: {e}"
+            ));
+            return ptr::null_mut();
+        }
+    };
+    clear_last_error();
+    cs.into_raw()
 }

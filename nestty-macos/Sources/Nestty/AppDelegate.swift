@@ -154,7 +154,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // through the `guard let vc = tabVC` arm.
 
         let config = NesttyConfig.load()
-        let theme = NesttyTheme.byName(config.themeName) ?? .catppuccinMocha
+        let theme = NesttyTheme.byName(config.themeName) ?? .default
 
         // PR 5c (Tier 2.4) trigger engine via FFI — wire EventBus broadcasts
         // (including plugin event.publish forwards) into the Rust trigger
@@ -581,7 +581,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func handleConfigChange() {
         let newConfig = NesttyConfig.load()
-        let newTheme = NesttyTheme.byName(newConfig.themeName) ?? .catppuccinMocha
+        let newTheme = NesttyTheme.byName(newConfig.themeName) ?? .default
         tabVC?.applyConfig(newConfig, theme: newTheme)
         // Skip local trigger reload while daemon owns triggers. Daemon
         // runs its own config watcher and would race our setTriggers.
