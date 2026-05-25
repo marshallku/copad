@@ -400,9 +400,16 @@ fn forwarder_loop(
                 let Some(client) = weak_client.upgrade() else {
                     return;
                 };
-                // `source` MUST round-trip — the GUI trigger engine's
-                // preflight-promotion gates on it.
-                let wire = WireEvent::new(ev.kind, ev.payload).with_source(ev.source);
+                // Both `source` and `origin` MUST round-trip. The trigger
+                // engine's preflight-promotion gates on `source`
+                // (`nestty.action` for completion-stamped events) and the
+                // `[security] accept_external` gate on `origin`. Without
+                // origin propagation a daemon-side `External` tag (set at
+                // `events.publish` ingest) silently downgrades to `Internal`
+                // on the GUI bus.
+                let wire = WireEvent::new(ev.kind, ev.payload)
+                    .with_source(ev.source)
+                    .with_origin(ev.origin);
                 let line = match serde_json::to_string(&wire) {
                     Ok(s) => s,
                     Err(e) => {

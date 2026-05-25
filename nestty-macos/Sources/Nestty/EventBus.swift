@@ -1,5 +1,16 @@
 import Foundation
 
+/// Mirror of `nestty-core::event_bus::Origin`. Trust-boundary provenance.
+/// `external` is set on events that crossed the daemon's `events.publish`
+/// trust-boundary chokepoint; the trigger engine's `[security]
+/// accept_external` gate runs on this field. Default `internal` matches
+/// serde's `#[default]` so wire frames lacking the field deserialize as
+/// the safe default. See decisions.md #37.
+enum Origin: String, Codable {
+    case `internal`
+    case external
+}
+
 /// Mirror of `nestty-core::event_bus::Event`. `data` is `serde_json::Value`-
 /// shaped — object, array, scalar, or null all valid.
 struct BusEvent {
@@ -11,6 +22,11 @@ struct BusEvent {
     /// daemon side. Outbound forwarders (PR 4b) skip events with bridgeId
     /// set to break echo loops.
     let bridgeId: String?
+    /// Trust-boundary tag — `external` for events that came through the
+    /// daemon's `events.publish` ingest; `internal` for everything else.
+    /// Surfaces to subscribers (e.g. trigger engine) that gate on
+    /// `[security] accept_external`. See `Origin` above.
+    let origin: Origin
 }
 
 /// Local broadcast hub. Subscribers fall into two flavors:
@@ -67,9 +83,17 @@ final class EventBus: @unchecked Sendable {
         data: Any? = nil,
         bridgeId: String? = nil,
         timestampMs: UInt64? = nil,
+        origin: Origin = .internal,
     ) {
         let ts = timestampMs ?? UInt64(Date().timeIntervalSince1970 * 1000)
-        let busEvent = BusEvent(type: event, source: source, data: data, timestampMs: ts, bridgeId: bridgeId)
+        let busEvent = BusEvent(
+            type: event,
+            source: source,
+            data: data,
+            timestampMs: ts,
+            bridgeId: bridgeId,
+            origin: origin,
+        )
 
         // Engine hop first so a chained broadcast from a trigger callback
         // lands in the same logical tick.

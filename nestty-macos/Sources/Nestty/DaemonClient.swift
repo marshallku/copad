@@ -125,8 +125,16 @@ final class DaemonClient: @unchecked Sendable {
     /// re-broadcasts on the local `EventBus` with a fresh `bridgeId` so PR 4b's
     /// outbound forwarder can echo-skip. `data` mirrors `serde_json::Value`
     /// (object/array/scalar/NSNull); the daemon wire has no `timestamp_ms`,
-    /// so the local broadcast assigns one.
-    typealias InboundEventHandler = @Sendable (_ type: String, _ source: String, _ data: Any?) -> Void
+    /// so the local broadcast assigns one. `origin` carries the daemon-side
+    /// trust-boundary tag — `external` for events that crossed the
+    /// `events.publish` ingest, `internal` otherwise. The GUI trigger engine's
+    /// `[security] accept_external` gate consumes this.
+    typealias InboundEventHandler = @Sendable (
+        _ type: String,
+        _ source: String,
+        _ data: Any?,
+        _ origin: Origin,
+    ) -> Void
     var inboundEventHandler: InboundEventHandler?
 
     private static let invokeQueueCap = 32 // mirrors Linux POOL_QUEUE
@@ -366,10 +374,18 @@ final class DaemonClient: @unchecked Sendable {
         }
         if let type = value["type"] as? String {
             let source = (value["source"] as? String) ?? "daemon"
+            // Wire shape: `{type, data, source?, origin?}`. Older daemons
+            // (pre-protocol-Event-origin) omit `origin`; treat as the safe
+            // default `internal` matching serde's `#[default]`. Unknown
+            // origin strings also fall through to `internal` rather than
+            // refusing the event — drop-on-unknown would silently lose
+            // events at a protocol bump.
+            let origin: Origin = (value["origin"] as? String)
+                .flatMap(Origin.init(rawValue:)) ?? .internal
             // `data` may be NSNull / array / scalar / dict — pass through
             // verbatim. AppDelegate's handler stamps a fresh bridge_id and
             // republishes onto local EventBus.
-            inboundEventHandler?(type, source, value["data"])
+            inboundEventHandler?(type, source, value["data"], origin)
             return
         }
         log("ignoring unknown line: \(line.prefix(200))")

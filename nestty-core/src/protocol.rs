@@ -43,6 +43,15 @@ pub struct Event {
     /// Absent on older wire clients; deserialized as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Trust-boundary provenance. Mirrors `event_bus::Event.origin` so a
+    /// daemon-side `External` tag (set at `events.publish` ingest)
+    /// survives the daemon→GUI bridge crossing. Without this the GUI's
+    /// trigger engine couldn't gate `[security] accept_external` on
+    /// hook-published events — they'd arrive looking trusted. Serde
+    /// `#[default]` = `Internal` so older wire frames keep parsing as
+    /// the safe default. See decisions.md #37.
+    #[serde(default)]
+    pub origin: crate::event_bus::Origin,
 }
 
 /// Daemon → GUI request. Discriminated from `Request` by the `invoke`
@@ -61,11 +70,17 @@ impl Event {
             event_type: event_type.into(),
             data,
             source: None,
+            origin: crate::event_bus::Origin::default(),
         }
     }
 
     pub fn with_source(mut self, source: impl Into<String>) -> Self {
         self.source = Some(source.into());
+        self
+    }
+
+    pub fn with_origin(mut self, origin: crate::event_bus::Origin) -> Self {
+        self.origin = origin;
         self
     }
 }

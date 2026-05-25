@@ -836,7 +836,12 @@ fn run_event_subscribe(
                 if !patterns.iter().any(|p| pattern_matches(p, &ev.kind)) {
                     continue;
                 }
-                let wire = WireEvent::new(ev.kind, ev.payload).with_source(ev.source);
+                // `origin` round-trips alongside `source` so subscribers
+                // (e.g. nestctl wrappers, future GUI bridges) can see the
+                // trust-boundary tag set at `events.publish` ingest.
+                let wire = WireEvent::new(ev.kind, ev.payload)
+                    .with_source(ev.source)
+                    .with_origin(ev.origin);
                 let line = match serde_json::to_string(&wire) {
                     Ok(s) => s,
                     Err(e) => {

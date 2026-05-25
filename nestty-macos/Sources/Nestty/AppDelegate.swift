@@ -105,12 +105,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // invoked from `DaemonClient`'s reader thread. `EventBus` is
         // `@unchecked Sendable` and broadcast is thread-safe.
         let bus = eventBus
-        daemonClient?.inboundEventHandler = { type, source, data in
+        daemonClient?.inboundEventHandler = { type, source, data, origin in
             bus.broadcast(
                 event: type,
                 source: source,
                 data: data,
                 bridgeId: UUID().uuidString,
+                origin: origin,
             )
         }
         // Install invoke handler BEFORE start() so the first inbound Invoke
