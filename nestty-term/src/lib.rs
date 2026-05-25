@@ -132,26 +132,59 @@ struct NesttyListener {
     /// vsync. Older pending requests get coalesced — matches the
     /// "last write wins" semantics most emulators have.
     pending_clipboard: Arc<std::sync::Mutex<Option<String>>>,
+    /// Late-bound sender into the PTY write path. Used to forward
+    /// `Event::PtyWrite` (terminal replies — DSR cursor position,
+    /// DA terminal attributes, color queries, etc.) back to the
+    /// child process. `None` until `nestty_term_create` injects the
+    /// sender after `EventLoop::channel()` — until then PtyWrite
+    /// events are dropped, which is correct (no listener wired yet
+    /// means no startup queries to answer).
+    sender: Arc<std::sync::Mutex<Option<EventLoopSender>>>,
 }
 
 impl NesttyListener {
     fn new() -> Self {
         Self {
             pending_clipboard: Arc::new(std::sync::Mutex::new(None)),
+            sender: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    fn set_sender(&self, sender: EventLoopSender) {
+        *self.sender.lock().unwrap() = Some(sender);
     }
 }
 
 impl EventListener for NesttyListener {
     fn send_event(&self, event: Event) {
-        if let Event::ClipboardStore(_kind, text) = event {
-            // Drop the previous pending request if any (last write
-            // wins). The renderer takes it on the next tick via
-            // `nestty_term_take_clipboard_request`.
-            *self.pending_clipboard.lock().unwrap() = Some(text);
+        match event {
+            Event::ClipboardStore(_kind, text) => {
+                // Drop the previous pending request if any (last write
+                // wins). The renderer takes it on the next tick via
+                // `nestty_term_take_clipboard_request`.
+                *self.pending_clipboard.lock().unwrap() = Some(text);
+            }
+            Event::PtyWrite(reply) => {
+                // alacritty_terminal already formatted the reply
+                // (`\e[<row>;<col>R` for DSR 6n, `\e[?6c` for DA 0c,
+                // OSC color responses, etc.) — we just forward the
+                // bytes back to the child. Without this hop nvim
+                // logs `"Did not detect DSR response from terminal"`
+                // on startup and falls back to slower paths.
+                if let Some(sender) = self.sender.lock().unwrap().as_ref() {
+                    let _ = sender.send(Msg::Input(reply.into_bytes().into()));
+                }
+            }
+            _ => {
+                // Title / Bell / MouseCursorDirty / ColorRequest /
+                // TextAreaSizeRequest / CursorBlinkingChange / Wakeup
+                // / Exit / ChildExit — intentionally dropped; the
+                // renderer doesn't react to them today. ColorRequest
+                // in particular is a structural gap (apps querying
+                // `OSC 4 ; n ; ?` get no reply) but no one has hit
+                // it yet.
+            }
         }
-        // Other events (Title, Bell, MouseCursorDirty, …) are
-        // intentionally dropped — the renderer doesn't react to them.
     }
 }
 
@@ -257,6 +290,13 @@ pub unsafe extern "C" fn nestty_term_create(
         Err(_) => return ptr::null_mut(),
     };
     let sender = event_loop.channel();
+    // Late-bind the listener's reply path. `EventLoop::channel()` is
+    // only available after `EventLoop::new` succeeds, so the listener
+    // can't carry the sender at construction time. PtyWrite events
+    // fired before this line (extremely unlikely — the event loop is
+    // still on `spawn()`) silently drop, which is harmless because no
+    // child shell has produced a query yet.
+    listener.set_sender(sender.clone());
     let io_thread = event_loop.spawn();
 
     Box::into_raw(Box::new(NesttyHandle {
