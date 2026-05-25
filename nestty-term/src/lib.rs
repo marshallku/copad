@@ -768,20 +768,34 @@ fn selection_range_for_ffi(term: &Term<NesttyListener>) -> NesttySelectionRange 
         return NesttySelectionRange::default();
     }
 
-    // Clip the off-viewport endpoint columns: when the selection
-    // extends BEFORE row 0, the visible start logically begins at
-    // column 0 of row 0 (the "before viewport" portion is invisible).
-    // Likewise when it extends past `last_row`, the visible end is the
-    // last column of `last_row`. Without this, a multi-line selection
-    // scrolled partway out would paint with the off-screen endpoint's
-    // column index, producing wrong clip widths on the boundary row.
+    // Clip the off-viewport endpoint columns: when a row-wrapped
+    // selection extends BEFORE row 0, the visible start logically
+    // begins at column 0 of row 0 (the "before viewport" portion is
+    // invisible). Likewise when it extends past `last_row`, the
+    // visible end is the last column of `last_row`. Without this, a
+    // multi-line selection scrolled partway out would paint with the
+    // off-screen endpoint's column index, producing wrong clip widths
+    // on the boundary row.
+    //
+    // Block selections are column-major — every row paints the SAME
+    // column span — so column-edge clipping would expand the visible
+    // band to the viewport width and over-highlight. For block we keep
+    // the original column values on both endpoints; only the rows clip.
     let (start_row, start_col) = if start_view < 0 {
-        (0u16, 0u16)
+        if range.is_block {
+            (0u16, range.start.column.0 as u16)
+        } else {
+            (0u16, 0u16)
+        }
     } else {
         (start_view as u16, range.start.column.0 as u16)
     };
     let (end_row, end_col) = if end_view > last_row {
-        (last_row as u16, last_col)
+        if range.is_block {
+            (last_row as u16, range.end.column.0 as u16)
+        } else {
+            (last_row as u16, last_col)
+        }
     } else {
         (end_view as u16, range.end.column.0 as u16)
     };

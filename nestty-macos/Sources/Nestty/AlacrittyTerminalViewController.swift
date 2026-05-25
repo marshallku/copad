@@ -1197,9 +1197,10 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
 
     /// 1-click → simple drag selection, 2 → semantic (word), 3+ →
     /// lines. Matches the iTerm2 / Terminal.app convention. Option held
-    /// on a single click flips to rectangular (block) selection — also
-    /// iTerm2's convention; word / line selection ignore the modifier
-    /// because they're keyed off click count, not drag region.
+    /// on a single click flips to rectangular (block) selection —
+    /// matches both Terminal.app and iTerm2 (Option-drag, no Cmd; Cmd
+    /// is reserved for URL-click). Word / line selection ignore the
+    /// modifier because they're keyed off click count, not drag region.
     private func selectionKind(for event: NSEvent) -> NesttyTermFFI.Handle.SelectionKind {
         switch event.clickCount {
         case 2: .word
