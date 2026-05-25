@@ -127,6 +127,7 @@ enum NesttyTermFFI {
             case simple = 0 // NESTTY_SELECTION_SIMPLE
             case word = 1 // NESTTY_SELECTION_SEMANTIC
             case line = 2 // NESTTY_SELECTION_LINES
+            case block = 3 // NESTTY_SELECTION_BLOCK — rectangular (Cmd+Option+drag)
         }
 
         enum CellSide: UInt8 {

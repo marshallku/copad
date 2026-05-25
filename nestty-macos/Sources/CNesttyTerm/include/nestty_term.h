@@ -70,9 +70,14 @@ typedef struct {
 } NesttySelectionRange;
 
 // Selection-start kind discriminator for nestty_term_selection_start.
+// BLOCK is the rectangular (column-major) variant tied to
+// Cmd+Option+drag in the renderer — alacritty's SelectionType::Block.
+// Snapshot reports `NesttySelectionRange.is_block = 1` so the renderer
+// can paint a rectangle instead of the row-wrapped span.
 #define NESTTY_SELECTION_SIMPLE   0
 #define NESTTY_SELECTION_SEMANTIC 1
 #define NESTTY_SELECTION_LINES    2
+#define NESTTY_SELECTION_BLOCK    3
 
 // Side discriminator (which side of the cell the click landed on).
 #define NESTTY_SIDE_LEFT  0

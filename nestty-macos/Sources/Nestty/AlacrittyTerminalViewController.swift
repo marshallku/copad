@@ -849,6 +849,24 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         let cols = max(1, Int(bounds.width / cellWidth))
         let lastCol = cols - 1
 
+        // Block (rectangular) selection: each row paints the same column
+        // span. is_block flows from alacritty's `SelectionRange.is_block`
+        // through the snapshot wire; the FFI start-kind is what put us
+        // in block mode (Cmd+Option+drag). Span endpoints come in
+        // pre-normalized — start_col ≤ end_col already.
+        if sel.is_block == 1 {
+            let firstCol = max(0, min(startCol, lastCol))
+            let finalCol = max(0, min(endCol, lastCol))
+            guard firstCol <= finalCol else { return }
+            let x = CGFloat(firstCol) * cellWidth
+            let w = CGFloat(finalCol - firstCol + 1) * cellWidth
+            for row in startRow ... endRow {
+                let y = CGFloat(row) * cellHeight
+                ctx.fill(CGRect(x: x, y: y, width: w, height: cellHeight))
+            }
+            return
+        }
+
         for row in startRow ... endRow {
             // Single-row selection: only the start_col..=end_col span.
             // Multi-row: start_row covers start_col..=lastCol, end_row
@@ -1178,12 +1196,15 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     }
 
     /// 1-click → simple drag selection, 2 → semantic (word), 3+ →
-    /// lines. Matches the iTerm2 / Terminal.app convention.
+    /// lines. Matches the iTerm2 / Terminal.app convention. Option held
+    /// on a single click flips to rectangular (block) selection — also
+    /// iTerm2's convention; word / line selection ignore the modifier
+    /// because they're keyed off click count, not drag region.
     private func selectionKind(for event: NSEvent) -> NesttyTermFFI.Handle.SelectionKind {
         switch event.clickCount {
         case 2: .word
         case let n where n >= 3: .line
-        default: .simple
+        default: event.modifierFlags.contains(.option) ? .block : .simple
         }
     }
 

@@ -1166,6 +1166,7 @@ pub unsafe extern "C" fn nestty_snapshot_selection(
 const SELECTION_SIMPLE: u8 = 0;
 const SELECTION_SEMANTIC: u8 = 1;
 const SELECTION_LINES: u8 = 2;
+const SELECTION_BLOCK: u8 = 3;
 
 /// Side discriminator: 0 = Left of cell, 1 = Right. Mirrors
 /// alacritty's `Side` enum so the renderer can compute it from the
@@ -1219,6 +1220,7 @@ pub unsafe extern "C" fn nestty_term_selection_start(
     let ty = match kind {
         SELECTION_SEMANTIC => SelectionType::Semantic,
         SELECTION_LINES => SelectionType::Lines,
+        SELECTION_BLOCK => SelectionType::Block,
         _ => SelectionType::Simple,
     };
     term.selection = Some(Selection::new(ty, point, parse_side(side)));
