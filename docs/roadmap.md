@@ -187,7 +187,7 @@ Goal: full Linux feature parity. Phase 1 MVP complete; porting remaining Linux f
 
 **Phase 5 — Distribution & Ecosystem**
 
-- [ ] Session persistence / restore — Linux landed in commit `8a1312a` (`nestty-linux/src/session.rs`, auto-save + auto-restore on launch); macOS port pending. See [macos-post-renderer-catchup.md §B](./macos-post-renderer-catchup.md).
+- [x] Session persistence / restore — Linux landed in commit `8a1312a` (`nestty-linux/src/session.rs`, auto-save + auto-restore on launch); macOS port + subsequent core-unify in commit `372ae3d` (schema now lives in `nestty-core/src/session.rs`, both platforms reach it via FFI / re-export). See [decisions.md #44](./decisions.md#44-core-unify-via-nestty-ffi--shared-wire-formats--validation-between-linux-and-macos).
 - [x] Clipboard integration (OSC 52) — `NesttyTerminalDelegate` proxy gates SwiftTerm's `clipboardCopy` on `[security] osc52` (default `deny`, opt-in `allow`). Closes the prior unconditional-write security regression on macOS. Linux (VTE) already deny-by-default. See [macos-parity-plan.md Tier 0.3](./macos-parity-plan.md) and [troubleshooting.md](./troubleshooting.md#macos-osc-52-clipboard-write-was-unconditional-security-regression).
 - [x] URL detection + click-to-open (OSC 8 hyperlinks via SwiftTerm `requestOpenLink`; plain-text URLs via `URLClickHelper` regex + cell-coord mapping with Cmd+click — see [macos-parity-plan.md Tier 1.5](./macos-parity-plan.md))
 - [x] Plugin system (HTML/JS panels via `WKScriptMessageHandlerWithReply` bridge + daemon-routed plugin host; native-Swift `PluginSupervisor` was deleted in macOS daemon-migration PR 5, commit `2913441` — daemon owns the supervisor. All 10 first-party plugins build + install — see [macos-parity-plan.md Tier 4.1 / Tier 3](./macos-parity-plan.md))
@@ -214,6 +214,16 @@ Tracked in [macos-post-renderer-catchup.md](./macos-post-renderer-catchup.md). H
 - Renderer polish (alacritty path): `terminal.output` event (now unblocked), mouse click/drag forwarding, DSR response for nvim, NSImage async, Cmd+/- zoom, block selection, cursor contrast on busy wallpapers.
 - Linux-parity catch-up: session persistence (above), GUI in-process `notify.show` registration, Swift `BusEvent.origin` field for trust-boundary parity, `nesttyd --version` short-circuit.
 - Test hygiene: `paths::tests::*` 7-failure env-var race on macOS.
+
+**Phase 8 — Core-unify via `nestty-ffi` ✅** (commits `3e7aae8` → `d7d5eb8`)
+
+Single source of truth for the wire formats and validation that previously had hand-mirrored Swift copies. Future Linux schema changes auto-inherit on macOS. See [decisions.md #44](./decisions.md#44-core-unify-via-nestty-ffi--shared-wire-formats--validation-between-linux-and-macos) for the rationale + per-phase commit list.
+
+- [x] **1B Theme** — `nestty_ffi_theme_get` / `_list`; macOS `Theme.swift` drops the hardcoded 10-palette switch
+- [x] **1A Session** — schema + persistence moved to `nestty-core/src/session.rs`; argless FFI; Linux `session.rs` reduced to a 6-line re-export
+- [x] **1C Background** — new `nestty-core/src/background.rs` with `BackgroundPaths` struct; paths stay platform-native
+- [x] **2A Config reload policy** — macOS now matches Linux: parse failure preserves the live config (was: reset to defaults)
+- [x] **2B Plugin manifest** — `nestty_core::plugin::validate_toml` is the single canonical validator; both Linux discovery and macOS FFI consumer route through it; `Activation`/`RestartPolicy` custom Serialize emits raw strings for cross-language round-trip
 
 ### Phase WR: Hyprland WebKit freeze automatic cure ✅
 

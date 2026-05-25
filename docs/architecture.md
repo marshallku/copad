@@ -76,22 +76,43 @@ nestty/
 # Returns {panel_id, tab, tmux_session, workspace_path}.
 # Slice 1 ships without `prompt` seeding (interactive REPL stdin is
 # tricky); pass `prompt` and you'll get not_implemented.
-├── nestty-core/            # Shared Rust library
+├── nestty-core/            # Shared Rust library — canonical wire formats and validation
+│   │                            # for everything that crosses the Linux/macOS boundary.
 │   └── src/
 │       ├── lib.rs              # Module declarations
+│       ├── action_registry.rs  # Name → handler map (sync + blocking variants)
+│       ├── background.rs       # Wallpaper-rotation primitives (BackgroundPaths,
+│       │                       #   pick_random, is_active, toggle) — shared by Linux
+│       │                       #   socket.rs and macOS BackgroundRotator via FFI
+│       ├── condition.rs        # Trigger condition DSL parser/evaluator
 │       ├── config.rs           # TOML config loading/defaults
-│       ├── plugin.rs           # Plugin manifest types + discovery
-│       ├── protocol.rs         # cmux V2 JSON protocol types
+│       ├── context.rs          # ContextService — active panel, cwd cache, snapshots
 │       ├── error.rs            # Error types (thiserror)
 │       ├── event_bus.rs        # Pub/sub bus with glob patterns + subscriber receivers
-│       ├── action_registry.rs  # Name → handler map (sync + blocking variants)
-│       ├── context.rs          # ContextService — active panel, cwd cache, snapshots
-│       ├── trigger.rs          # TriggerEngine + TriggerSink trait + condition matching
-│       ├── condition.rs        # Trigger condition DSL parser/evaluator
+│       ├── fs_atomic.rs        # Cross-platform atomic-create-or-fail rename
+│       │                       #   (Linux: renameat2(RENAME_NOREPLACE);
+│       │                       #    macOS: renamex_np(RENAME_EXCL))
+│       ├── notifier.rs         # Desktop notifier trait + libnotify (Linux) / osascript
+│       │                       #   (macOS) impls
+│       ├── paths.rs            # state_dir / cache_dir / runtime_dir / socket paths
+│       ├── plugin.rs           # Plugin manifest types, validate_toml, discovery
+│       ├── protocol.rs         # cmux V2 JSON protocol types
+│       ├── session.rs          # Snapshot persistence (load/save/clear, Snapshot/
+│       │                       #   TabSnap/SplitSnap types) — shared by Linux session.rs
+│       │                       #   and macOS Session.swift via FFI
 │       ├── theme.rs            # 10 built-in Catppuccin/Solarized/etc. palettes
-│       └── fs_atomic.rs        # Cross-platform atomic-create-or-fail rename
-│                               #   (Linux: renameat2(RENAME_NOREPLACE);
-│                               #    macOS: renamex_np(RENAME_EXCL))
+│       ├── thread_pool.rs      # Bounded worker pool for blocking action handlers
+│       └── trigger.rs          # TriggerEngine + TriggerSink trait + condition matching
+├── nestty-ffi/             # C-ABI bridge from nestty-core to platform UIs that can't
+│   │                            # link Rust directly (currently nestty-macos). One staticlib
+│   │                            # `libnestty_ffi.a` linked into Nestty.app; hand-mirrored C
+│   │                            # header at nestty-macos/Sources/CNesttyFFI/include/nestty_ffi.h.
+│   │                            # Ownership convention: owned strings cross as `*mut c_char`
+│   │                            # (caller frees with `nestty_ffi_free_string`), bool-ish
+│   │                            # returns use 1/0/-1, diagnostics via thread-local
+│   │                            # `nestty_ffi_last_error`. See decisions.md #44.
+│   └── src/lib.rs              # Exported surfaces: engine (TriggerEngine + ActionRegistry +
+│                               #   EventBus), theme, session, background, plugin validation.
 ├── nestty-linux/           # GTK4 + VTE4 native terminal
 │   ├── src/
 │   │   ├── main.rs          # Entry point, CLI flags (--init-config, --config-path)
@@ -130,8 +151,23 @@ nestty/
         ├── WebViewController.swift  # WKWebView wrapper, NesttyPanel impl
         ├── EventBus.swift           # Event broadcast hub + per-subscriber channel
         ├── SocketServer.swift       # POSIX Unix socket server (async completion handler)
-        ├── Config.swift             # TOML config parser (shell, font, theme, background)
-        └── Theme.swift              # 10 built-in themes (mirrors nestty-core/theme.rs)
+        ├── Config.swift             # TOML config parser (macOS-extension fields:
+        │                                  # osc52 policy, renderer backend, transparent_default_bg,
+        │                                  # tabs position constrained to top/bottom).
+        │                                  # Reload semantics match Linux: parse failure preserves
+        │                                  # the previous live config.
+        ├── Session.swift            # Tab/split snapshot wire model. Persistence (load/save/
+        │                                  # clear) delegates to `nestty_ffi_session_*`; in-memory
+        │                                  # Codable types stay Swift-side because PaneManager
+        │                                  # builds and consumes them.
+        ├── BackgroundRotator.swift  # Path resolution stays here; reader/entropy/mode-toggle
+        │                                  # routes through `nestty_ffi_background_*`.
+        ├── PluginManifest.swift     # Discovery + dir retention + duplicate-name winner pick
+        │                                  # stay Swift-side; TOML parse + schema validation
+        │                                  # delegate to `nestty_ffi_plugin_validate_toml`.
+        └── Theme.swift              # Thin FFI wrapper around `nestty_core::theme::Theme`
+                                          # (fetched via `nestty_ffi_theme_get/_list`). Hex-string
+                                          # `Wire: Decodable` → existing RGBColor/NesttyTheme model.
 ```
 
 ## Tech Stack
