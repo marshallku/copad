@@ -325,45 +325,36 @@ class TerminalViewController: NSViewController, NesttyPanel, Zoomable {
     /// no lock needed.
     private var backgroundLoadToken: UInt64 = 0
 
-    /// Async image decode + main-bounce. `NSImage(contentsOfFile:)` can
-    /// stall the main thread for tens to hundreds of ms during the
-    /// first Gatekeeper/XProtect scan of an unseen wallpaper file.
-    /// Stale loads (a newer applyBackground/clearBackground raced ahead)
-    /// drop via the token check.
+    // TEMPORARILY REVERTED — synchronous decode while we re-diagnose
+    // the wallpaper regression A4 introduced. Token field stays for
+    // the clearBackground side, but no race / weak-self in the sync
+    // path so the previous flow is restored verbatim.
     func applyBackground(path: String, tint: Double, opacity: Double) {
         backgroundLoadToken &+= 1
-        let token = backgroundLoadToken
-        DispatchQueue.global(qos: .userInitiated).async {
-            let image = NSImage(contentsOfFile: path)
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                guard token == backgroundLoadToken else { return }
-                guard let image else { return }
-                backgroundView?.image = image
-                // Use alphaValue (not isHidden) to control opacity so applyTheme always
-                // sees the background as "active" (isHidden == false) and keeps
-                // nativeBackgroundColor = .clear. Hiding via isHidden corrupts SwiftTerm's
-                // internal cell buffer: applyTheme fills it with the solid theme color,
-                // and setting nativeBackgroundColor back to .clear does not clear cells.
-                backgroundView?.alphaValue = CGFloat(opacity)
-                backgroundView?.isHidden = false
-                tintView?.layer?.backgroundColor = NSColor.black.withAlphaComponent(CGFloat(tint)).cgColor
-                tintView?.isHidden = opacity == 0
-                // Make terminal layer non-opaque so the image layers composite through.
-                // nativeBackgroundColor = .clear tells SwiftTerm not to fill the bg rect.
-                terminalView?.layer?.isOpaque = false
-                terminalView?.layer?.backgroundColor = NSColor.clear.cgColor
-                terminalView?.nativeBackgroundColor = .clear
-                if let tv = terminalView {
-                    applyCaretColors(tv: tv, theme: theme)
-                }
-                // Apply the bar→block clamp now that nativeBackgroundColor flipped
-                // to .clear; otherwise an already-active bar cursor stays invisible
-                // until the next DECSCUSR from the TUI.
-                terminalView?.applyClampedCursorStyle()
-                terminalView?.needsDisplay = true
-            }
+        guard let image = NSImage(contentsOfFile: path) else { return }
+        backgroundView?.image = image
+        // Use alphaValue (not isHidden) to control opacity so applyTheme always
+        // sees the background as "active" (isHidden == false) and keeps
+        // nativeBackgroundColor = .clear. Hiding via isHidden corrupts SwiftTerm's
+        // internal cell buffer: applyTheme fills it with the solid theme color,
+        // and setting nativeBackgroundColor back to .clear does not clear cells.
+        backgroundView?.alphaValue = CGFloat(opacity)
+        backgroundView?.isHidden = false
+        tintView?.layer?.backgroundColor = NSColor.black.withAlphaComponent(CGFloat(tint)).cgColor
+        tintView?.isHidden = opacity == 0
+        // Make terminal layer non-opaque so the image layers composite through.
+        // nativeBackgroundColor = .clear tells SwiftTerm not to fill the bg rect.
+        terminalView?.layer?.isOpaque = false
+        terminalView?.layer?.backgroundColor = NSColor.clear.cgColor
+        terminalView?.nativeBackgroundColor = .clear
+        if let tv = terminalView {
+            applyCaretColors(tv: tv, theme: theme)
         }
+        // Apply the bar→block clamp now that nativeBackgroundColor flipped
+        // to .clear; otherwise an already-active bar cursor stays invisible
+        // until the next DECSCUSR from the TUI.
+        terminalView?.applyClampedCursorStyle()
+        terminalView?.needsDisplay = true
     }
 
     func clearBackground() {

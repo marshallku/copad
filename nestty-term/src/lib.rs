@@ -225,32 +225,18 @@ impl EventListener for NesttyListener {
                 // `nestty_term_take_clipboard_request`.
                 *self.pending_clipboard.lock().unwrap() = Some(text);
             }
-            Event::PtyWrite(reply) => {
-                // alacritty_terminal already formatted the reply
-                // (`\e[<row>;<col>R` for DSR 6n, `\e[?6c` for DA 0c,
-                // etc.) — we just forward the bytes back to the child.
-                // Without this hop nvim logs `"Did not detect DSR
-                // response from terminal"` on startup and falls back
-                // to slower paths.
-                self.send_to_pty(reply.into_bytes());
-            }
-            Event::ColorRequest(index, format_reply) => {
-                // OSC 4 / 10 / 11 / 12 — apps query "what color does
-                // index N actually render as?" so they can pick
-                // contrast (e.g. nvim's `&background=dark`). alacritty
-                // hands us the formatter; we resolve the index against
-                // the host-supplied palette and feed the result back
-                // via the same Msg::Input path PtyWrite uses.
-                //
-                // No reply on miss: better than answering with a stale
-                // alacritty default that doesn't match what we actually
-                // draw on screen. Apps treat no-reply as "use my
-                // built-in default".
-                let rgb = self.palette.lock().unwrap().get(&index).copied();
-                if let Some(rgb) = rgb {
-                    let reply = format_reply(rgb);
-                    self.send_to_pty(reply.into_bytes());
-                }
+            // TEMPORARILY DISABLED — A3 (PtyWrite forward) + OSC4
+            // (ColorRequest reply) wired the alacritty Event arms to
+            // write back through `Msg::Input`, but real-world prompts
+            // (zsh + powerlevel10k / oh-my-zsh) trip a double-echo +
+            // `'network': unknown terminal type` regression on the
+            // user's box. Disabling the arms while we isolate; falls
+            // through to the catch-all drop. nvim DSR warning + OSC
+            // color answers regress for now, accepted trade-off until
+            // the root cause is found.
+            #[allow(unreachable_patterns)]
+            Event::PtyWrite(_) | Event::ColorRequest(_, _) => {
+                // intentional silent drop while diagnosing
             }
             _ => {
                 // Title / Bell / MouseCursorDirty / TextAreaSizeRequest /
@@ -326,6 +312,18 @@ pub unsafe extern "C" fn nestty_term_create(
     let safe_rows = rows.max(1);
 
     let mut tty_opts = TtyOptions::default();
+    // Force a known-good TERM for the child shell. Without this we
+    // inherit whatever the parent process had (e.g. `xterm-ghostty`
+    // when Nestty.app was launched from a Ghostty-bootstrapped GUI
+    // session). Foreign terminfo entries that aren't in the macOS
+    // system DB make zsh fall back through unrelated entries
+    // (`'network': unknown terminal type` on this user's box) and
+    // can mis-emit cursor / clear sequences, surfacing as duplicated
+    // keystrokes on screen. xterm-256color is always present, gives
+    // us 256-colour support, and is what every other terminal
+    // emulator we ship alongside (alacritty / iterm2 / Terminal.app)
+    // exports by default.
+    tty_opts.env.insert("TERM".into(), "xterm-256color".into());
     if !shell.is_null() {
         // SAFETY: caller contract — non-null pointer is a NUL-terminated C string.
         if let Ok(s) = unsafe { CStr::from_ptr(shell) }.to_str() {
