@@ -181,9 +181,22 @@ pub fn is_trusted_dir(path: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, MutexGuard};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Poison-tolerant guard acquisition. A single panicking test (often
+    /// a platform-specific behaviour mismatch like the macOS path of
+    /// `daemon_socket_returns_none_for_untrusted_runtime_dir` below)
+    /// would otherwise poison `ENV_LOCK` and cascade-fail every other
+    /// env-touching test in the module. Poison just means a prior
+    /// holder panicked; the actual env state is still serialized by
+    /// the mutex, so taking `into_inner` is sound for this use.
+    fn lock_env() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 
     /// RAII guard: captures the pre-test value of an env var and restores
     /// it on `Drop`, so a panicking test (or one that ran with a prior
@@ -227,7 +240,7 @@ mod tests {
 
     #[test]
     fn socket_path_respects_env_override() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_env();
         let _sock = EnvVar::set("NESTTY_SOCKET", "/custom/path/sock");
         assert_eq!(socket_path(), PathBuf::from("/custom/path/sock"));
     }
@@ -236,7 +249,7 @@ mod tests {
     fn runtime_dir_returns_nonempty() {
         // runtime_dir() reads XDG_RUNTIME_DIR, which other tests mutate
         // under ENV_LOCK — take the lock here too or we race against them.
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_env();
         let dir = runtime_dir();
         assert!(!dir.as_os_str().is_empty());
         assert!(dir.to_string_lossy().contains("nestty"));
@@ -269,7 +282,7 @@ mod tests {
 
     #[test]
     fn daemon_socket_ignores_legacy_per_instance_pattern() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_env();
         let _sock = EnvVar::set("NESTTY_SOCKET", "/tmp/nestty-3090.sock");
         let p = daemon_socket_path();
         assert_ne!(p, Some(PathBuf::from("/tmp/nestty-3090.sock")));
@@ -277,18 +290,25 @@ mod tests {
 
     #[test]
     fn daemon_socket_honors_genuine_override() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_env();
         let _sock = EnvVar::set("NESTTY_SOCKET", "/tmp/my-custom-daemon.sock");
         let p = daemon_socket_path();
         assert_eq!(p, Some(PathBuf::from("/tmp/my-custom-daemon.sock")));
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    // `runtime_dir()` only honors `XDG_RUNTIME_DIR` on Linux; macOS always
+    // returns `~/Library/Caches/nestty/`, which is a sandboxed user dir
+    // (trusted by `is_trusted_dir`). Gating the test under target_os keeps
+    // it meaningful where the override exists and stops the assert-failure
+    // panic from poisoning `ENV_LOCK` for every other env-touching test on
+    // macOS — see `lock_env`.
     fn daemon_socket_returns_none_for_untrusted_runtime_dir() {
         // 0755 XDG_RUNTIME_DIR exercises is_trusted_dir's rejection path
         // without needing root to chown a real /run/user dir.
         use std::os::unix::fs::PermissionsExt;
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_env();
         let dir = std::env::temp_dir().join(format!(
             "nestty-untrusted-{}-{}",
             std::process::id(),
@@ -308,7 +328,7 @@ mod tests {
 
     #[test]
     fn gui_socket_path_is_pid_named_under_runtime_dir() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_env();
         let p = gui_socket_path(12345);
         assert!(p.starts_with(runtime_dir()));
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
@@ -317,7 +337,7 @@ mod tests {
 
     #[test]
     fn daemon_socket_ignores_hardened_gui_pattern() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_env();
         let gui = gui_socket_path(99999);
         let _sock = EnvVar::set("NESTTY_SOCKET", &gui);
         let p = daemon_socket_path();
@@ -326,7 +346,7 @@ mod tests {
 
     #[test]
     fn paths_are_distinct() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_env();
         let _sock = EnvVar::unset("NESTTY_SOCKET");
         let sock = socket_path();
         let state = state_dir();
@@ -337,7 +357,7 @@ mod tests {
 
     #[test]
     fn env_var_guard_restores_prior_value() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_env();
         let _seed = EnvVar::set("NESTTY_TEST_SEED", "prior");
         {
             let _inner = EnvVar::set("NESTTY_TEST_SEED", "temp");
@@ -348,7 +368,7 @@ mod tests {
 
     #[test]
     fn env_var_guard_restores_absence() {
-        let _g = ENV_LOCK.lock().unwrap();
+        let _g = lock_env();
         let _seed = EnvVar::unset("NESTTY_TEST_ABSENT");
         {
             let _inner = EnvVar::set("NESTTY_TEST_ABSENT", "temp");

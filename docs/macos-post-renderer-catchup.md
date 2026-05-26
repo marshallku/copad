@@ -71,7 +71,7 @@ Tracked in [`harness-integration.md`](./harness-integration.md); these are pure-
 
 ## E. Test hygiene
 
-- [ ] **`paths::tests::*` — 7 failures on macOS** with `--test-threads=1` and parallel. Env-var parallel race; pre-existing on `master`, blocks `cargo test -p nestty-core --lib` from being green on macOS CI. Either gate the env-touching tests behind `serial_test::serial` (extra dev-dep) or shell out to a subprocess per test for the env-scoped checks (no new deps).
+- [x] **`paths::tests::*` — 7 failures on macOS** root-caused: not actually an env-var parallel race. `daemon_socket_returns_none_for_untrusted_runtime_dir` assumed `runtime_dir()` honors `XDG_RUNTIME_DIR`, but `runtime_dir()`'s macOS branch is hard-wired to `~/Library/Caches/nestty/` (a sandboxed user dir that `is_trusted_dir` accepts) and ignores XDG entirely. The test asserts `None` → panics on macOS → `ENV_LOCK.lock().unwrap()` poisons → every other env-touching test cascade-fails. Two-layer fix: `#[cfg(target_os = "linux")]` on the XDG-dependent test, and a `lock_env()` helper that does `unwrap_or_else(PoisonError::into_inner)` so any future test panic doesn't cascade. `cargo test -p nestty-core` now reports 220 passed / 0 failed / 0 ignored on macOS for the first time. No new dev-deps.
 
 ---
 
