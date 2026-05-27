@@ -281,6 +281,13 @@ pub struct NesttyHandle {
     /// Reader thread that owns the PTY + parser loop. Joined in
     /// `nestty_term_destroy` after sending `Msg::Shutdown`.
     io_thread: Option<JoinHandle<(EventLoop<Pty, NesttyListener>, State)>>,
+    /// PID of the PTY's child process (typically the user's login
+    /// shell). Captured at handle construction so `nestty_term_child_cwd`
+    /// can query the kernel for the shell's current working directory
+    /// without having to thread the Pty handle out of the alacritty
+    /// EventLoop. Falls stale if the shell exits — `proc_pidinfo`
+    /// returns an error in that case and the FFI returns NULL.
+    child_pid: i32,
     /// Last observed hash of the cursor row's renderable content plus
     /// cursor metadata (style/blink/show). Used by
     /// `nestty_term_take_damage` to catch three classes of changes the
@@ -365,6 +372,12 @@ pub unsafe extern "C" fn nestty_term_create(
         Ok(p) => p,
         Err(_) => return ptr::null_mut(),
     };
+    // Capture child PID before handing pty to EventLoop. EventLoop
+    // consumes pty (and reaps the child on Shutdown), but the PID we
+    // capture here stays valid for `proc_pidinfo` queries until the
+    // shell actually exits — at which point the syscall just returns
+    // an error and `nestty_term_child_cwd` returns NULL.
+    let child_pid = pty.child().id() as i32;
 
     let term_size = TermSize::new(safe_cols as usize, safe_rows as usize);
     let listener = NesttyListener::new();
@@ -390,8 +403,83 @@ pub unsafe extern "C" fn nestty_term_create(
         listener,
         sender,
         io_thread: Some(io_thread),
+        child_pid,
         last_redraw_state_hash: AtomicU64::new(0),
     }))
+}
+
+/// macOS only — query the PTY child's current working directory via
+/// `proc_pidinfo(PROC_PIDVNODEPATHINFO)`. Returns a heap-allocated
+/// NUL-terminated UTF-8 string the caller must free with
+/// `nestty_string_destroy`, or NULL if the shell has exited / the
+/// syscall failed / the platform isn't macOS. Cheaper than parsing
+/// OSC 7 from the PTY byte stream (which alacritty_terminal's vte
+/// handler doesn't currently surface) and works even when the shell
+/// doesn't emit OSC 7 at all — the kernel always knows the cwd of
+/// any live process.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a pointer returned by `nestty_term_create`
+/// and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nestty_term_child_cwd(handle: *mut NesttyHandle) -> *mut NesttyString {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return ptr::null_mut();
+    };
+    #[cfg(target_os = "macos")]
+    {
+        // EPERM on un-entitled dev builds — `proc_pidinfo(
+        // PROC_PIDVNODEPATHINFO)` requires either same audit token,
+        // root, or `com.apple.private.security.proc-info` (Apple-
+        // signed only). Falls through to caller's initialCwd fallback
+        // until install-macos.sh embeds an entitlement plist.
+        let Some(cwd) = macos_child_cwd(h.child_pid) else {
+            return ptr::null_mut();
+        };
+        Box::into_raw(Box::new(NesttyString {
+            data: cwd.into_bytes().into_boxed_slice(),
+        }))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = h;
+        ptr::null_mut()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_child_cwd(pid: i32) -> Option<String> {
+    use libc::{PROC_PIDVNODEPATHINFO, proc_pidinfo, proc_vnodepathinfo};
+    use std::ffi::c_void;
+    use std::mem;
+    let mut info: proc_vnodepathinfo = unsafe { mem::zeroed() };
+    let n = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDVNODEPATHINFO,
+            0,
+            (&mut info as *mut proc_vnodepathinfo).cast::<c_void>(),
+            mem::size_of::<proc_vnodepathinfo>() as i32,
+        )
+    };
+    if n <= 0 {
+        return None;
+    }
+    // `vip_path` is `[[c_char; 32]; 32]` — flatten then trim at the
+    // first NUL. The kernel guarantees NUL-termination within
+    // MAXPATHLEN (1024) bytes.
+    let raw: &[u8] = unsafe {
+        std::slice::from_raw_parts(
+            info.pvi_cdir.vip_path.as_ptr().cast::<u8>(),
+            mem::size_of_val(&info.pvi_cdir.vip_path),
+        )
+    };
+    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+    if end == 0 {
+        return None;
+    }
+    std::str::from_utf8(&raw[..end]).ok().map(str::to_owned)
 }
 
 /// Free a handle. Sends `Msg::Shutdown`, joins the reader thread,

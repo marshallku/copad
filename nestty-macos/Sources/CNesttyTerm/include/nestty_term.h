@@ -91,6 +91,15 @@ void nestty_term_destroy(NesttyHandle* handle);
 
 void nestty_term_input(NesttyHandle* handle, const uint8_t* bytes, size_t len);
 
+/// macOS only — query the PTY child's current working directory via
+/// `proc_pidinfo(PROC_PIDVNODEPATHINFO)`. Returns a `NesttyString*` the
+/// caller MUST free with `nestty_string_destroy`, or NULL if the shell
+/// has exited / the syscall failed / not running on macOS. Cheaper than
+/// parsing OSC 7 from PTY output and works even when the shell doesn't
+/// emit OSC 7. Used by Swift session-snapshot to capture the cwd a
+/// restored tab should land in.
+NesttyString* nestty_term_child_cwd(NesttyHandle* handle);
+
 /// Populate one entry of the OSC color-query palette. Index follows
 /// `vte::ansi::NamedColor`: 0-15 ANSI (normal + bright), 16-255 256-color,
 /// 256 foreground, 257 background, 258 cursor. Re-call for the same

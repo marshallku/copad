@@ -242,6 +242,20 @@ enum NesttyTermFFI {
             nestty_term_scroll(ptr, UInt8(NESTTY_SCROLL_BOTTOM), 0)
         }
 
+        /// Current working directory of the PTY's child process,
+        /// queried at call time via `proc_pidinfo` (macOS only). Returns
+        /// nil when the shell has exited or the syscall failed. Cheap
+        /// enough to call on every session-snapshot; no caching needed.
+        func childCwd() -> String? {
+            guard let ptr else { return nil }
+            guard let sPtr = nestty_term_child_cwd(ptr) else { return nil }
+            defer { nestty_string_destroy(sPtr) }
+            var len = 0
+            guard let bytes = nestty_string_bytes(sPtr, &len), len > 0 else { return nil }
+            let buf = UnsafeBufferPointer(start: bytes, count: len)
+            return String(bytes: buf, encoding: .utf8)
+        }
+
         /// Take the latest pending OSC 52 clipboard write request as a
         /// Swift string, or nil if nothing is pending. The renderer
         /// gates the actual NSPasteboard write on the user's policy.

@@ -21,3 +21,10 @@ crate-type = ["staticlib", "rlib"]
 # `tty::new` + `EventLoop::new` + `Term::renderable_content` API
 # shape; see decision #31 R1.
 alacritty_terminal = "0.26"
+
+# macOS-only `proc_pidinfo` bindings for `nestty_term_child_cwd`.
+# Already a transitive dep via alacritty_terminal; declared
+# explicitly here so the dependency surface is visible. Linux gates
+# the syscall behind `#[cfg(target_os = "macos")]`.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
