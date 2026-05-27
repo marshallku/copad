@@ -11,7 +11,8 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  build-linux:
+    name: Build Linux x86_64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -33,31 +34,194 @@ jobs:
       - name: Bundle tarball
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          ARCHIVE="nestty-v${VERSION}-x86_64-linux.tar.gz"
+          ARCHIVE="copad-v${VERSION}-x86_64-linux.tar.gz"
           mkdir -p dist
-          cp target/release/nestty dist/
-          cp target/release/nestctl dist/
+          cp target/release/copad dist/
+          cp target/release/coctl dist/
           # Desktop file basename matches the GTK app_id so Wayland
           # compositors map running windows to this launcher entry.
-          cp nestty-linux/com.marshall.nestty.desktop dist/
+          cp copad-linux/com.marshall.copad.desktop dist/
           # Carry the hicolor icon set so install.sh can lay it out
           # under share/icons/hicolor/<size>/apps/. The shape mirrors
-          # the in-repo nestty-linux/icons/ tree exactly.
-          cp -r nestty-linux/icons dist/icons
+          # the in-repo copad-linux/icons/ tree exactly.
+          cp -r copad-linux/icons dist/icons
           tar -czf "${ARCHIVE}" -C dist .
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
-          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-x86_64
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macOS arm64
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # copad-linux depends on GTK4/VTE so `cargo build --workspace` fails
+      # on Darwin. List the macOS-buildable crates explicitly. Keep the
+      # plugin set in sync with install-macos.sh's MACOS_PLUGINS array.
+      - name: Build Rust crates (workspace minus copad-linux)
+        run: |
+          cargo build --release \
+            -p copad-ffi \
+            -p copad-term \
+            -p copad-cli \
+            -p copad-daemon \
+            -p copad-plugin-echo \
+            -p copad-plugin-git \
+            -p copad-plugin-llm \
+            -p copad-plugin-calendar \
+            -p copad-plugin-kb \
+            -p copad-plugin-todo \
+            -p copad-plugin-bookmark \
+            -p copad-plugin-slack \
+            -p copad-plugin-discord \
+            -p copad-plugin-jira
+
+      - name: Build Swift app
+        working-directory: copad-macos
+        run: swift build -c release
+
+      - name: Stage Copad.app + ad-hoc codesign + assemble tarball
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          ARCHIVE="copad-v${VERSION}-aarch64-apple-darwin.tar.gz"
+
+          REPO_ROOT="$(pwd)"
+          DIST="$REPO_ROOT/dist-macos"
+          rm -rf "$DIST"
+          mkdir -p "$DIST"
+
+          # ---- Copad.app bundle ----
+          STAGING="$DIST/Copad.app"
+          MACOS_DIR="$STAGING/Contents/MacOS"
+          RESOURCES="$STAGING/Contents/Resources"
+          mkdir -p "$MACOS_DIR" "$RESOURCES"
+          cp copad-macos/.build/release/Copad "$MACOS_DIR/Copad"
+          if [[ -f copad-macos/Resources/AppIcon.icns ]]; then
+            cp copad-macos/Resources/AppIcon.icns "$RESOURCES/AppIcon.icns"
+          fi
+
+          # Info.plist gets the release tag's version baked into both
+          # CFBundleVersion and CFBundleShortVersionString. LSMinimumSystemVersion
+          # mirrors install-macos.sh.
+          cat > "$STAGING/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleExecutable</key>
+              <string>Copad</string>
+              <key>CFBundleIconFile</key>
+              <string>AppIcon</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.marshall.copad</string>
+              <key>CFBundleName</key>
+              <string>copad</string>
+              <key>CFBundleDisplayName</key>
+              <string>copad</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>14.0</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>NSPrincipalClass</key>
+              <string>NSApplication</string>
+          </dict>
+          </plist>
+          EOF
+
+          # Ad-hoc sign for distribution. scripts/codesign-dev.sh uses a
+          # login-keychain self-signed cert to keep TCC grants stable across
+          # local rebuilds; that's a dev-loop concern, not a distribution
+          # one. Cask removes quarantine on install, so an ad-hoc signature
+          # is enough for Gatekeeper to let the app launch.
+          codesign --force --deep --sign - --timestamp=none "$STAGING"
+          codesign -dv "$STAGING" 2>&1 | head -5 || true
+
+          # ---- Top-level CLI binaries ----
+          cp target/release/coctl "$DIST/coctl"
+          cp target/release/copadd "$DIST/copadd"
+
+          # ---- Plugins (binary + plugin.toml + panel.html / triggers.example.toml) ----
+          # Layout matches what install-macos.sh writes into
+          # ~/Library/Application Support/copad/plugins/<name>/. PluginSupervisor
+          # resolves `services.exec` against the plugin dir first, so the
+          # binary co-located with the manifest wins over $PATH lookup.
+          mkdir -p "$DIST/plugins"
+          for name in echo git llm calendar kb todo bookmark slack discord jira; do
+            crate="copad-plugin-$name"
+            src_dir="plugins/$name"
+            bin_src="target/release/$crate"
+            plugin_dir="$DIST/plugins/$name"
+            mkdir -p "$plugin_dir"
+            find "$src_dir" -maxdepth 1 -type f ! -name 'Cargo.toml' \
+              -exec cp -f {} "$plugin_dir/" \;
+            cp -f "$bin_src" "$plugin_dir/$crate"
+            chmod 755 "$plugin_dir/$crate"
+          done
+
+          # ---- Shell hooks (live-cwd tracking for session restore) ----
+          mkdir -p "$DIST/shell-hooks"
+          cp copad-macos/shell-hooks/copad-cwd.* "$DIST/shell-hooks/"
+
+          # ---- LaunchAgent plist (HOME_PLACEHOLDER unexpanded; downstream
+          #      consumers — install-macos.sh and the brew cask postflight —
+          #      substitute their own path, since launchd does not expand `~`) ----
+          cp dist/launchd/com.marshall.copad.daemon.plist "$DIST/com.marshall.copad.daemon.plist"
+
+          # ---- Pack ----
+          # Strip the dist-macos/ prefix so consumers see Copad.app / coctl / …
+          # at the tarball root.
+          tar -czf "$ARCHIVE" -C "$DIST" .
+          echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-aarch64
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
 
       - name: Install git-cliff
         run: cargo install git-cliff --locked
 
       - name: Generate release notes
-        run: |
-          git-cliff --latest --strip header -o RELEASE_NOTES.md
+        run: git-cliff --latest --strip header -o RELEASE_NOTES.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           body_path: RELEASE_NOTES.md
-          files: ${{ env.ARCHIVE }}
+          files: |
+            artifacts/linux-x86_64/*.tar.gz
+            artifacts/macos-aarch64/*.tar.gz
           generate_release_notes: false

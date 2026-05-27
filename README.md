@@ -122,6 +122,16 @@ Options: `--version vX.Y.Z` to pin a release, `--system` to install to `/usr/loc
 
 Builds a release binary, installs the desktop entry, and lays down all first-party plugins via `install-plugins.sh`.
 
+### macOS — Homebrew (recommended)
+
+```bash
+brew install --cask marshallku/copad/copad
+```
+
+Installs `Copad.app` to `/Applications`, `coctl` + `copadd` into `$(brew --prefix)/bin`, and lays out the 10 macOS plugins, shell hooks, and the `copadd` LaunchAgent (auto-starts at login). Requires macOS 14+ (Sonoma) on Apple Silicon.
+
+The tap repo is [marshallku/homebrew-copad](https://github.com/marshallku/homebrew-copad).
+
 ### macOS — From source
 
 ```bash
@@ -130,7 +140,7 @@ Builds a release binary, installs the desktop entry, and lays down all first-par
 ./scripts/install-macos.sh --launch    # open Copad.app after installing
 ```
 
-Builds `libcopad_ffi.a` (Rust staticlib) → links into the SwiftPM release build → stages and atomically installs `Copad.app` → installs `coctl` via `cargo install --path copad-cli`.
+Builds `libcopad_ffi.a` (Rust staticlib) → links into the SwiftPM release build → stages and atomically installs `Copad.app` → installs `coctl` via `cargo install --path copad-cli`. Use this on Intel Macs (the Homebrew cask is arm64-only) or when iterating on the working tree.
 
 ### Plugins only
 

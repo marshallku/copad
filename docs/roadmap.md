@@ -104,6 +104,7 @@ Make copad a first-class environment for AI coding agents.
 - [x] Curl-pipeable install script (`install.sh`)
 - [x] Self-update via `coctl update check/apply`
 - [x] cargo-release + git-cliff config for versioning and changelogs
+- [x] macOS release artifact (arm64) + Homebrew cask at `marshallku/homebrew-copad` (decision #45)
 
 ### Phase 5.5: Tab Bar Controls
 

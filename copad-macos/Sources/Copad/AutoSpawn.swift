@@ -68,10 +68,16 @@ enum AutoSpawn {
         let env = ProcessInfo.processInfo.environment
         let pathString = env["PATH"] ?? "/usr/local/bin:/usr/bin:/bin"
         var dirs = pathString.split(separator: ":").map { String($0) }
-        // `~/.cargo/bin` is the common Rust install dir but isn't on the
-        // PATH a `.app` inherits from Finder/Dock.
-        let cargoBin = NSHomeDirectory() + "/.cargo/bin"
-        if !dirs.contains(cargoBin) { dirs.append(cargoBin) }
+        // Augment with the two install dirs that a Finder-launched .app
+        // does NOT inherit from the user's shell env:
+        // - `~/.cargo/bin` for the `scripts/install-macos.sh` path
+        //   (cargo install --path copad-daemon).
+        // - `/opt/homebrew/bin` for the Homebrew cask path. Intel Macs use
+        //   `/usr/local/bin`, which is already in the `pathString` fallback
+        //   above, so this only needs to add the arm64 prefix.
+        for extra in ["\(NSHomeDirectory())/.cargo/bin", "/opt/homebrew/bin"] {
+            if !dirs.contains(extra) { dirs.append(extra) }
+        }
         let fm = FileManager.default
         for dir in dirs {
             let candidate = URL(fileURLWithPath: dir).appending(path: "copadd")

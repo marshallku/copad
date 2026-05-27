@@ -922,3 +922,40 @@ Codex round 2 hard-recommended (δ). Discord plugin already proves the "stdio RP
 **Volume:** ~610 LOC moved into core (theme.rs already counted), ~318 LOC removed from macOS Swift, 11 new FFI functions across 5 surfaces. Five commits between `3e7aae8` and `d7d5eb8`.
 
 **See:** `copad-core/src/{background,session}.rs` (new modules), `copad-core/src/{plugin,theme}.rs` (Serialize additions for plugin, no change for theme), `copad-ffi/src/lib.rs` (5 new FFI surfaces appended), `copad-macos/Sources/CCopadFFI/include/copad_ffi.h` (matching declarations), `copad-macos/Sources/Copad/{Theme,Session,BackgroundRotator,PluginManifest,Config,AppDelegate}.swift` (thinned to FFI wrappers or semantics-aligned).
+
+## 45. macOS distribution via Homebrew tap — single cask, arm64, ad-hoc signed
+
+**Problem:** macOS users had only `scripts/install-macos.sh` (build-from-source: `swift build -c release` + `cargo install --path copad-cli` + `cargo install --path copad-daemon` + per-plugin cargo build × 10 + LaunchAgent + shell hooks). Cold build is ~10 min and requires Rust + Xcode CLT + a clone of the repo. There was no path for a user who just wants the app to run.
+
+**Decision:** Ship a Homebrew tap at `marshallku/homebrew-copad` with one **cask** (not a formula + cask split). `brew install --cask marshallku/copad/copad` lands everything `install-macos.sh` does: `Copad.app` → `/Applications`, `coctl` + `copadd` → `$(brew --prefix)/bin`, 10 plugin binaries + manifests → `~/Library/Application Support/copad/plugins/<name>/`, shell hooks → `~/.config/copad/shell-hooks/`, LaunchAgent plist → `~/Library/LaunchAgents/`. The release artifact is a single pre-built tarball produced by `.github/workflows/release.yml`'s new `build-macos` job (macos-14 runner / arm64).
+
+**Why a single cask and not formula + cask:** The conventional split is "cask = GUI, formula = CLI". Here it's structurally wrong: `copadd` (daemon) is required for status bar + plugin runtime + workflow triggers, plugins live in a per-user dir the GUI reads at launch, and `coctl` only makes sense if `copadd` is up. Splitting would let a user `brew install --cask copad` (GUI only) and get a half-broken install where the status bar warns about a missing daemon. One cask, one install, all-or-nothing.
+
+**Why arm64-only for now:** macos-14 arm64 GH runner produces the artifact; macos-13 x86_64 would double CI time (~20–30 min added) and the user base for Intel Macs on a brand-new tool is negligible. Intel users fall back to `scripts/install-macos.sh` from source. `depends_on arch: :arm64` in the cask makes the failure mode explicit (`brew install` refuses with a clear message) instead of a runtime crash. Revisit when there's actual Intel-user demand.
+
+**Why ad-hoc signed (not Developer ID + notarization):** Apple Developer is $99/yr and the notarization round-trip adds latency to every release. Homebrew Cask removes the quarantine xattr on install (`xattr -dr com.apple.quarantine`), so Gatekeeper lets an ad-hoc-signed app launch on first run via brew. Users who download the `.tar.gz` directly from GitHub Releases still need to manually clear quarantine — that's a known cost. Decision #45 is "brew is the recommended macOS install path"; direct-download is a fallback for source-builders or CI consumers. Upgrade to Developer ID when (a) macOS 15+ further tightens ad-hoc enforcement enough to break the brew path, or (b) we want a `.dmg` download UX that matches non-brew users' expectations.
+
+**LaunchAgent plist — why the cask writes it inline rather than reusing `dist/launchd/com.marshall.copad.daemon.plist`:** The in-repo plist uses `HOME_PLACEHOLDER` because `install-macos.sh` installs `copadd` to `$HOME/.cargo/bin/copadd` (a path launchd can't expand via `~`). The cask installs `copadd` via the `binary` stanza, which symlinks into `HOMEBREW_PREFIX/bin/` — a different path entirely, and one that varies by Mac (arm64: `/opt/homebrew/bin/`). The cask's `postflight` block writes a plist fresh on each install with `#{HOMEBREW_PREFIX}/bin/copadd` substituted at install time. The two installers (script vs cask) ending up with semantically equivalent plists but pointing at different absolute paths is acceptable — both are correct for their own install layout.
+
+**Tarball layout (canonical):** `build-macos` in `.github/workflows/release.yml` emits `copad-v<ver>-aarch64-apple-darwin.tar.gz` with this structure at the root (no wrapping dir):
+
+```
+Copad.app/                          (ad-hoc signed)
+coctl
+copadd
+plugins/<name>/{copad-plugin-<name>, plugin.toml, panel.html?, triggers.example.toml?}
+shell-hooks/copad-cwd.{bash,zsh,fish}
+com.marshall.copad.daemon.plist     (HOME_PLACEHOLDER unsubstituted — cask ignores; only install-macos.sh consumes)
+```
+
+The cask postflight reads from `staged_path` and lays this out into the per-user destinations. The plist at the tarball root is dead weight for the cask path; keeping it in the tarball is cheap and means a hypothetical "download tarball and run a script" install path could reuse the same artifact.
+
+**Uninstall contract:** `brew uninstall --cask copad` boots out the LaunchAgent (via `launchctl:` stanza, which kills the daemon), quits the GUI app (`quit:` Apple Event to `com.marshall.copad`), deletes the plist (since brew doesn't auto-track files written in postflight), and removes the cask-installed artifacts. **User state survives** (`~/Library/Application Support/copad`, `~/.config/copad`, etc.) until `brew uninstall --cask --zap copad`, which trashes them via the `zap trash:` stanza.
+
+**Trade-offs accepted:**
+
+- No `brew test` integration. The cask isn't tested by Homebrew CI; we rely on the release.yml build job to produce a sane tarball + a manual `brew install --cask` smoke test before publishing the sha256 update to the tap. If the tarball is structurally broken, the cask install fails at postflight, not at install time — the failure mode is "GUI installed but daemon never starts" rather than "install errored." Mitigation: keep the postflight Ruby small and fail-loud (writes are atomic, missing source dirs propagate as exceptions).
+- No formula path for headless `coctl` use. A user who wants only the CLI (e.g., scripting against a remote `copadd`) still has to install the full cask. Acceptable for now — the CLI is small and the daemon is already on the same machine in every real use case.
+- The tap repo lives at `marshallku/homebrew-copad`, not in `homebrew-cask` proper. Submitting to the official cask repo requires version stability + community traction; not where we are yet. Personal tap is the standard staging ground.
+
+**See:** `.github/workflows/release.yml` (`build-macos` job), `marshallku/homebrew-copad/Casks/copad.rb`, `scripts/install-macos.sh` (source-build counterpart that this decision does not replace), `dist/launchd/com.marshall.copad.daemon.plist` (script-install plist with `HOME_PLACEHOLDER`).
