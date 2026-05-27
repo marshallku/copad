@@ -278,22 +278,34 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel, Zoom
     /// always visible) or stay transparent (image visible through blank
     /// cells, cursor visibility depends on accent vs image contrast).
     ///
-    /// Wire an image background + tint overlay. A4 explored a
-    /// `DispatchQueue.global` decode to dodge Gatekeeper main-thread
-    /// stalls; reverted to sync because the off-main path produced a
-    /// "wallpaper never appears" regression we couldn't pin without
-    /// more time. Re-attempt with a fully Swift-Concurrency-modelled
-    /// version when we can sit with it.
+    /// Wire an image background + tint overlay. `NSImage(contentsOfFile:)`
+    /// can stall the main thread for tens to hundreds of ms during the
+    /// first Gatekeeper / XProtect scan of a newly-seen wallpaper file;
+    /// we offload the decode to a global queue and bounce the visual
+    /// swap back to main. `backgroundLoadToken` guards against a stale
+    /// decode landing after a newer applyBackground / clearBackground
+    /// took ownership of the visual state.
     func applyBackground(path: String, tint: Double, opacity: Double) {
         backgroundLoadToken &+= 1
-        guard let image = NSImage(contentsOfFile: path) else { return }
-        backgroundView?.image = image
-        backgroundView?.alphaValue = CGFloat(opacity)
-        backgroundView?.isHidden = false
-        tintView?.layer?.backgroundColor = NSColor.black.withAlphaComponent(CGFloat(tint)).cgColor
-        tintView?.isHidden = opacity == 0
-        renderView?.setImageBackgroundActive(true)
-        renderView?.needsDisplay = true
+        let token = backgroundLoadToken
+        DispatchQueue.global(qos: .userInitiated).async {
+            let image = NSImage(contentsOfFile: path)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                // Stale: newer applyBackground / clearBackground won
+                // the race; drop this decode to keep the latest visual
+                // state authoritative.
+                guard token == backgroundLoadToken else { return }
+                guard let image else { return }
+                backgroundView?.image = image
+                backgroundView?.alphaValue = CGFloat(opacity)
+                backgroundView?.isHidden = false
+                tintView?.layer?.backgroundColor = NSColor.black.withAlphaComponent(CGFloat(tint)).cgColor
+                tintView?.isHidden = opacity == 0
+                renderView?.setImageBackgroundActive(true)
+                renderView?.needsDisplay = true
+            }
+        }
     }
 
     func clearBackground() {
