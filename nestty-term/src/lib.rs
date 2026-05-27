@@ -328,11 +328,33 @@ pub unsafe extern "C" fn nestty_term_create(
     rows: u16,
     shell: *const c_char,
     cwd: *const c_char,
+    panel_id: *const c_char,
+    socket_path: *const c_char,
 ) -> *mut NesttyHandle {
     let safe_cols = cols.max(1);
     let safe_rows = rows.max(1);
 
     let mut tty_opts = TtyOptions::default();
+    // Stamp panel identity + GUI socket into the child shell's env.
+    // Pair: `NESTTY_PANEL_ID` lets the in-shell `nestty-cwd` hook
+    // route `chpwd` notifications to the right panel; `NESTTY_SOCKET`
+    // tells `nestctl` which Unix socket to dial. Without the socket
+    // env the hook short-circuits because `nestctl` would otherwise
+    // hit the well-known daemon path (not our per-instance GUI socket
+    // owning the panel).
+    if !panel_id.is_null() {
+        // SAFETY: caller contract — panel_id, if non-null, is a NUL-
+        // terminated UTF-8 string valid for the call.
+        if let Ok(s) = unsafe { CStr::from_ptr(panel_id) }.to_str() {
+            tty_opts.env.insert("NESTTY_PANEL_ID".into(), s.to_owned());
+        }
+    }
+    if !socket_path.is_null() {
+        // SAFETY: caller contract.
+        if let Ok(s) = unsafe { CStr::from_ptr(socket_path) }.to_str() {
+            tty_opts.env.insert("NESTTY_SOCKET".into(), s.to_owned());
+        }
+    }
     // Force a known-good TERM for the child shell. Without this we
     // inherit whatever the parent process had (e.g. `xterm-ghostty`
     // when Nestty.app was launched from a Ghostty-bootstrapped GUI

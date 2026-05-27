@@ -203,10 +203,17 @@ class TerminalViewController: NSViewController, NesttyPanel, Zoomable {
 
     /// Last cwd reported by OSC 7 (hostCurrentDirectoryUpdate). Seeded
     /// at startShell with `currentDirectory`, then updated on every
-    /// OSC 7. Used by the session-persistence snapshot so a restart
-    /// drops the user back into the same directory. nil when neither
-    /// OSC 7 nor an explicit start cwd has fired.
+    /// OSC 7 *or* on each `panel.report_cwd` shell-hook tick. Used by
+    /// the session-persistence snapshot so a restart drops the user
+    /// back into the same directory.
     private(set) var currentCwd: String?
+
+    /// Called from the `panel.report_cwd` registry handler when the
+    /// in-shell `nestty-cwd` hook reports a new cwd. Same setter the
+    /// OSC 7 path uses — last-write-wins between the two.
+    func setReportedCwd(_ cwd: String) {
+        currentCwd = cwd
+    }
 
     /// Set by AppDelegate after EventBus is created.
     weak var eventBus: EventBus?
@@ -518,6 +525,7 @@ class TerminalViewController: NSViewController, NesttyPanel, Zoomable {
         env.append("TERM=xterm-256color")
         env.append("COLORTERM=truecolor")
         env.append("NESTTY_SOCKET=\(socketPath)")
+        env.append("NESTTY_PANEL_ID=\(panelID)")
 
         tv.startProcess(
             executable: config.shell,

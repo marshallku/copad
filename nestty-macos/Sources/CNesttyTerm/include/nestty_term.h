@@ -85,8 +85,16 @@ typedef struct {
 
 // --- Terminal lifecycle ---
 
+/// `panel_id` may be NULL; when set, it's exported to the child shell
+/// as `NESTTY_PANEL_ID` so the nestty-cwd shell hook can target the
+/// right panel via `nestctl call panel.report_cwd`.
+/// `socket_path` may be NULL; when set, it's exported as
+/// `NESTTY_SOCKET` so `nestctl` dials the GUI per-instance socket
+/// owning the panel (not the well-known daemon path).
 NesttyHandle* nestty_term_create(uint16_t cols, uint16_t rows,
-                                  const char* shell, const char* cwd);
+                                  const char* shell, const char* cwd,
+                                  const char* panel_id,
+                                  const char* socket_path);
 void nestty_term_destroy(NesttyHandle* handle);
 
 void nestty_term_input(NesttyHandle* handle, const uint8_t* bytes, size_t len);

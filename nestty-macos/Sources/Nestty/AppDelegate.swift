@@ -573,6 +573,44 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             ClaudeStart.dispatch(params: params, tabVC: tabVC, completion: completion)
         }
 
+        // panel.report_cwd — Linux/VTE equivalent: shells emit OSC 7 and
+        // VTE captures it natively. macOS alacritty backend doesn't
+        // surface OSC 7 + proc_pidinfo is EPERM on un-entitled builds,
+        // so the in-shell `nestty-cwd` hook calls this action on every
+        // `chpwd` instead. params: `{"panel_id": "...", "cwd": "..."}`.
+        // Silent: shell prompts fire `chpwd` constantly; broadcasting
+        // `.completed` per cd would flood the bus.
+        actionRegistry.registerSilent("panel.report_cwd") { [weak self] params, completion in
+            guard let self else {
+                completion(RPCError(code: "no_app", message: "AppDelegate gone"))
+                return
+            }
+            guard let panelID = params["panel_id"] as? String, !panelID.isEmpty else {
+                completion(RPCError(
+                    code: "invalid_params",
+                    message: "panel.report_cwd requires non-empty `panel_id` string",
+                ))
+                return
+            }
+            guard let cwd = params["cwd"] as? String, !cwd.isEmpty else {
+                completion(RPCError(
+                    code: "invalid_params",
+                    message: "panel.report_cwd requires non-empty `cwd` string",
+                ))
+                return
+            }
+            guard let tabVC else {
+                completion(RPCError(code: "no_app", message: "TabViewController gone"))
+                return
+            }
+            // Find the panel by id across all tabs / splits and update
+            // its tracked cwd. Both terminal backends carry a setter;
+            // non-terminal panels (webview, plugin) are silently
+            // ignored — the shell hook is shell-only by definition.
+            let updated = tabVC.applyReportedCwd(panelID: panelID, cwd: cwd)
+            completion(["updated": updated])
+        }
+
         // notify.show — mirror of Linux daemon registration
         // (`nestty-linux/src/window.rs:218`) so the macOS GUI's in-process
         // trigger engine reaches the same `osascript` notifier even when

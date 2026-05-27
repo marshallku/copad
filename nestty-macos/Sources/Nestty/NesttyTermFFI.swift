@@ -56,10 +56,14 @@ enum NesttyTermFFI {
         /// no thread-affinity.
         private nonisolated(unsafe) var ptr: OpaquePointer?
 
-        init?(cols: UInt16, rows: UInt16, shell: String? = nil, cwd: String? = nil) {
+        init?(cols: UInt16, rows: UInt16, shell: String? = nil, cwd: String? = nil, panelID: String? = nil, socketPath: String? = nil) {
             let p = shell.withCStringOrNull { shellPtr in
                 cwd.withCStringOrNull { cwdPtr in
-                    nestty_term_create(cols, rows, shellPtr, cwdPtr)
+                    panelID.withCStringOrNull { panelPtr in
+                        socketPath.withCStringOrNull { socketPtr in
+                            nestty_term_create(cols, rows, shellPtr, cwdPtr, panelPtr, socketPtr)
+                        }
+                    }
                 }
             }
             guard let p else { return nil }

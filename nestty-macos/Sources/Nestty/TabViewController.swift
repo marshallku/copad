@@ -72,6 +72,24 @@ final class TabViewController: NSViewController {
         return nil
     }
 
+    /// Push a shell-reported cwd onto the matching terminal panel.
+    /// Returns true when the panel was found and updated; false for
+    /// unknown id or non-terminal target. Called from the
+    /// `panel.report_cwd` registry handler.
+    @discardableResult
+    func applyReportedCwd(panelID: String, cwd: String) -> Bool {
+        guard let p = panel(id: panelID) else { return false }
+        if let t = p as? TerminalViewController {
+            t.setReportedCwd(cwd)
+            return true
+        }
+        if let a = p as? AlacrittyTerminalViewController {
+            a.setReportedCwd(cwd)
+            return true
+        }
+        return false
+    }
+
     func webView(id: String) -> WebViewController? {
         panel(id: id) as? WebViewController
     }

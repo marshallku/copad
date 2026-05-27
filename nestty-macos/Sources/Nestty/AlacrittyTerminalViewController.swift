@@ -45,13 +45,26 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel, Zoom
     /// startup cwd passed at construction — the alacritty backend
     /// doesn't surface OSC 7 / cwd_changed yet (alacritty_terminal as
     /// a library has no cwd state, no `CurrentDirectoryUrl` event in
-    /// Tracked cwd. Initialised from `initialCwd`; refreshed on every
-    /// access from the PTY child via `termHandle?.childCwd()`
-    /// (`proc_pidinfo` syscall, ~10 µs when permitted). Falls back to
-    /// `initialCwd` when the child has exited or the syscall failed
-    /// (EPERM on un-entitled macOS dev builds — see catchup B1).
+    /// Most recent cwd reported by the in-shell `nestty-cwd` hook
+    /// (`nestctl call panel.report_cwd`). Updated synchronously via
+    /// `setReportedCwd(_:)` on every `chpwd` notification. Preferred
+    /// over the `proc_pidinfo` fallback because shell hooks see the
+    /// authoritative cwd without needing macOS entitlements.
+    private(set) var reportedCwd: String?
+
+    /// Tracked cwd. Priority: shell-reported (via `panel.report_cwd`)
+    /// → `proc_pidinfo` syscall (EPERM on un-entitled macOS dev
+    /// builds) → spawn-time `initialCwd`. Mirrors the 3-layer
+    /// fallback Linux gets via VTE + `/proc/<pid>/cwd` + last_cwd.
     var currentCwd: String? {
-        termHandle?.childCwd() ?? initialCwd
+        reportedCwd ?? termHandle?.childCwd() ?? initialCwd
+    }
+
+    /// Called from the `panel.report_cwd` registry handler when the
+    /// in-shell hook reports a new cwd. Idempotent — same value just
+    /// overwrites.
+    func setReportedCwd(_ cwd: String) {
+        reportedCwd = cwd
     }
 
     private let config: NesttyConfig
@@ -175,11 +188,18 @@ final class AlacrittyTerminalViewController: NSViewController, NesttyPanel, Zoom
         guard !shellStarted else { return }
         shellStarted = true
         let (cols, rows) = renderView?.computeGrid() ?? (80, 24)
+        // SwiftTerm path uses the legacy `/tmp/nestty-<pid>.sock`
+        // pattern for its per-instance GUI socket — match it here so
+        // `nestctl call` from the in-shell hook hits this exact GUI
+        // (not the well-known daemon at `~/Library/Caches/nestty/socket`).
+        let socketPath = "/tmp/nestty-\(ProcessInfo.processInfo.processIdentifier).sock"
         termHandle = NesttyTermFFI.Handle(
             cols: cols,
             rows: rows,
             shell: initialCwd != nil ? config.shell : nil,
             cwd: initialCwd,
+            panelID: panelID,
+            socketPath: socketPath,
         )
         // Push the active palette so the first OSC 4 / 10 / 11 / 12
         // query (often part of nvim / fish prompt init) gets the color

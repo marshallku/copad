@@ -306,6 +306,21 @@ if $DO_DAEMON; then
     fi
 fi
 
+# Shell hooks for live-cwd reporting. macOS alacritty backend can't
+# capture OSC 7 (no vte handler) and proc_pidinfo is EPERM under
+# hardened runtime; the in-shell hook calls `nestctl call
+# panel.report_cwd` on every chpwd instead. Files land under
+# ~/.config/nestty/shell-hooks/; users source one from their rc file.
+SHELL_HOOK_SRC="$REPO_ROOT/nestty-macos/shell-hooks"
+SHELL_HOOK_DEST="$HOME/.config/nestty/shell-hooks"
+if [[ -d "$SHELL_HOOK_SRC" ]]; then
+    mkdir -p "$SHELL_HOOK_DEST"
+    for f in "$SHELL_HOOK_SRC"/nestty-cwd.*; do
+        [[ -f "$f" ]] || continue
+        cp -f "$f" "$SHELL_HOOK_DEST/$(basename "$f")"
+    done
+fi
+
 if $DO_LAUNCH; then
     open "$APP_DEST/$APP_NAME"
 fi
@@ -335,4 +350,15 @@ Next:
     (Many users alias `nestty` to that binary so `nestty --config-path` works.)
   - Verify a plugin is alive: `nestctl call echo.ping --params '{"hi":"there"}'`
   - Tail recent daemon events:    `nestctl recent`
+  - Live-cwd tracking (so session restore lands at your current dir,
+    not the spawn-time one). macOS hardened runtime blocks the
+    proc_pidinfo path Linux/VTE gets for free; the workaround is a
+    shell hook installed under ~/.config/nestty/shell-hooks/. Add ONE
+    of these lines to your shell rc file:
+        zsh   ~/.zshrc       source ~/.config/nestty/shell-hooks/nestty-cwd.zsh
+        bash  ~/.bashrc      source ~/.config/nestty/shell-hooks/nestty-cwd.bash
+        fish  ~/.config/fish/config.fish
+                             source ~/.config/nestty/shell-hooks/nestty-cwd.fish
+    No-op when the shell isn't running inside a nestty PTY, so it's
+    safe to source unconditionally.
 EOF
