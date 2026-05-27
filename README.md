@@ -122,15 +122,15 @@ Options: `--version vX.Y.Z` to pin a release, `--system` to install to `/usr/loc
 
 Builds a release binary, installs the desktop entry, and lays down all first-party plugins via `install-plugins.sh`.
 
-### macOS — Homebrew (recommended)
+### macOS — Homebrew
 
 ```bash
 brew install --cask marshallku/copad/copad
 ```
 
-Installs `Copad.app` to `/Applications`, `coctl` + `copadd` into `$(brew --prefix)/bin`, and lays out the 10 macOS plugins, shell hooks, and the `copadd` LaunchAgent (auto-starts at login). Requires macOS 14+ (Sonoma) on Apple Silicon.
+Installs `Copad.app` to `/Applications`, `coctl` + `copadd` into `$(brew --prefix)/bin`, and lays out the 10 macOS plugins, shell hooks, and the `copadd` LaunchAgent (auto-starts at login). Requires Apple Silicon. The tap repo is [marshallku/homebrew-copad](https://github.com/marshallku/homebrew-copad).
 
-The tap repo is [marshallku/homebrew-copad](https://github.com/marshallku/homebrew-copad).
+**Supported macOS versions:** 14 (Sonoma), 15 (Sequoia). On **macOS 26 (Tahoe) and later** the brew install path is currently broken — Tahoe's tightened App Verification policy deletes ad-hoc-signed executables on first `launchd` spawn, which removes `copadd` and the plugin binaries the cask ships. Tahoe users should install from source via `scripts/install-macos.sh` (next section), which signs the binaries with a locally-trusted self-signed identity (`scripts/codesign-dev.sh`) and survives Tahoe's policy. Proper fix for the brew path is Apple Developer ID + notarization; tracked as follow-up work.
 
 ### macOS — From source
 
