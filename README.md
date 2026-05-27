@@ -148,6 +148,47 @@ coctl update check    # check for new versions
 coctl update apply    # download and install latest (Linux only — macOS users re-run install-macos.sh)
 ```
 
+### Daemon autostart (Linux)
+
+`copadd` is the background daemon (trigger dispatch, plugin supervision, web-bridge). It runs as a **systemd user unit** — `install-dev.sh` and `install.sh` both install, enable, and start `copad-daemon.service` for you. The GUI (`copad`) is separate and is typically launched by your compositor (e.g. `exec-once = /home/marshall/.local/bin/copad` in `hyprland.conf`).
+
+```bash
+systemctl --user status copad-daemon    # inspect
+journalctl --user -u copad-daemon -f    # tail logs
+systemctl --user restart copad-daemon   # apply a new binary or env override
+```
+
+**When does it start on boot?**
+
+| Scenario | Daemon starts on boot? |
+|---|---|
+| Display manager autologin (SDDM/GDM with `User=…`) | Yes — user session activates `systemd --user`, which starts the enabled unit |
+| Manual login on TTY/greeter | Yes — at login |
+| Headless boot, no login yet | No — daemon waits for first user session |
+| All sessions logged out | Daemon stops with the last session |
+
+For a **single-user desktop with autologin**, the default is enough.
+
+**Want the daemon up from boot without any login, and surviving all logouts?** Enable linger:
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+With linger on:
+
+- `systemd --user@<uid>` starts at boot regardless of login state.
+- The daemon stays alive across logouts.
+- SSH / web-bridge / remote-control reach a daemon that is already running, not one that starts on first contact.
+
+`PATH` note: spawn-style keybindings (e.g. `spawn:~/copad-random-bg.sh --next`) shell out to `coctl`. If you installed to `~/.local/bin` and your Hyprland/systemd session `PATH` does not include it, the spawned child cannot find `coctl`. Fix once with:
+
+```bash
+mkdir -p ~/.config/environment.d
+printf 'PATH=%s/.local/bin:${PATH}\n' "$HOME" > ~/.config/environment.d/10-local-bin.conf
+# Re-login (or `systemctl --user import-environment PATH` + restart compositor) to apply.
+```
+
 ## Configuration
 
 Config file: `~/.config/copad/config.toml` (entirely optional — all fields have defaults).
