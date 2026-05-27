@@ -287,6 +287,7 @@ pub struct CopadHandle {
     /// without having to thread the Pty handle out of the alacritty
     /// EventLoop. Falls stale if the shell exits — `proc_pidinfo`
     /// returns an error in that case and the FFI returns NULL.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     child_pid: i32,
     /// Last observed hash of the cursor row's renderable content plus
     /// cursor metadata (style/blink/show). Used by
