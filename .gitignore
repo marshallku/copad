@@ -2,6 +2,7 @@ target/
 .DS_Store
 *.swp
 *.swo
+.claude/
 nestty-macos/.build/
 nestty-macos/DerivedData/
 # Catch SwiftPM build dirs anywhere in the workspace (Phase 0 spike
