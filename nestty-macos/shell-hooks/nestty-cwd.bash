@@ -5,11 +5,19 @@
 # also catches cwd changes done programmatically (not just `cd`).
 
 if [[ -n "$NESTTY_PANEL_ID" && -n "$NESTTY_SOCKET" ]] && command -v nestctl >/dev/null 2>&1; then
+    _nestty_json_escape() {
+        local s=${1//\\/\\\\}
+        s=${s//\"/\\\"}
+        printf '%s' "${s//$'\n'/\\n}"
+    }
     _nestty_report_cwd() {
         if [[ "$PWD" != "$_NESTTY_LAST_REPORTED_CWD" ]]; then
             _NESTTY_LAST_REPORTED_CWD=$PWD
+            local pid_esc cwd_esc
+            pid_esc=$(_nestty_json_escape "$NESTTY_PANEL_ID")
+            cwd_esc=$(_nestty_json_escape "$PWD")
             nestctl call panel.report_cwd \
-                --params "{\"panel_id\":\"$NESTTY_PANEL_ID\",\"cwd\":\"$PWD\"}" \
+                --params "{\"panel_id\":\"$pid_esc\",\"cwd\":\"$cwd_esc\"}" \
                 >/dev/null 2>&1 &
             disown 2>/dev/null
         fi

@@ -56,7 +56,7 @@ unsafe fn row_text(snap: *mut NesttySnapshot, row: u16) -> String {
 #[ignore]
 fn printf_round_trip() {
     let shell = CString::new("/bin/sh").unwrap();
-    let handle = unsafe { nestty_term_create(80, 24, shell.as_ptr(), std::ptr::null()) };
+    let handle = unsafe { nestty_term_create(80, 24, shell.as_ptr(), std::ptr::null(), std::ptr::null(), std::ptr::null()) };
     assert!(!handle.is_null(), "shell spawn failed");
 
     let cmd = b"printf 'nestty-phase2-marker'\n";
@@ -76,7 +76,7 @@ fn printf_round_trip() {
 #[ignore]
 fn resize_round_trip() {
     let shell = CString::new("/bin/sh").unwrap();
-    let handle = unsafe { nestty_term_create(80, 24, shell.as_ptr(), std::ptr::null()) };
+    let handle = unsafe { nestty_term_create(80, 24, shell.as_ptr(), std::ptr::null(), std::ptr::null(), std::ptr::null()) };
     assert!(!handle.is_null());
 
     // Initial geometry visible in snapshot.
