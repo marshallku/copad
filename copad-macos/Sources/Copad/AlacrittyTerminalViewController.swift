@@ -151,6 +151,7 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
             font: resolveFont(family: config.fontFamily, size: CGFloat(config.fontSize)),
             transparentDefaultBg: config.transparentDefaultBg,
             osc52Policy: config.osc52,
+            optionAsAlt: config.optionAsAlt,
         )
         render.frame = container.bounds
         render.autoresizingMask = [.width, .height]
@@ -444,6 +445,12 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         osc52Policy = policy
     }
 
+    /// When true, Option+key bypasses the IME path and writes
+    /// `ESC + base_char` to the PTY so tmux/zsh/readline Meta bindings
+    /// fire. Off → the system delivers `¡™£¢`-style chars to `insertText`
+    /// and Alt-bindings never see the keystroke.
+    private let optionAsAlt: Bool
+
     /// Cursor-blink state. Honored only when the TUI/shell actually
     /// asks for it via DECSCUSR (`cursor.blink == 1` on the snapshot).
     /// When idle with blink on, the display-link callback forces a
@@ -485,7 +492,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// a new cascade list.
     private var fallbackCache: [UInt32: NSFont] = [:]
 
-    init(theme: CopadTheme, font: NSFont, transparentDefaultBg: Bool, osc52Policy: OSC52Policy) {
+    init(theme: CopadTheme, font: NSFont, transparentDefaultBg: Bool, osc52Policy: OSC52Policy, optionAsAlt: Bool) {
         self.theme = theme
         self.font = font
         boldFont = Self.deriveTrait(font, mask: .boldFontMask)
@@ -494,6 +501,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         paletteCache = Self.buildPalette(theme: theme)
         self.transparentDefaultBg = transparentDefaultBg
         self.osc52Policy = osc52Policy
+        self.optionAsAlt = optionAsAlt
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = theme.background.nsColor.cgColor
@@ -1797,7 +1805,43 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             sendInput(bytes)
             return
         }
+        // Option-as-Alt: route Option+key as `ESC + base_char` so tmux /
+        // zsh / readline see the Meta prefix instead of the macOS
+        // dead-key composition that turns Option+1 into `¡` via the IME.
+        // Shift is allowed to coexist (Option+Shift+1 → ESC `!`); Cmd /
+        // Ctrl combinations already returned above so they don't reach
+        // here. Non-printable keys (arrows, delete, function keys) fall
+        // through to interpretKeyEvents so the existing
+        // moveWordLeft/Right / deleteWordBackward bindings keep working.
+        if optionAsAlt,
+           mods.subtracting(.shift) == .option,
+           let bytes = optionAltBytes(for: event)
+        {
+            scrollToBottomOnInput()
+            sendInput(bytes)
+            return
+        }
         interpretKeyEvents([event])
+    }
+
+    /// Build the `ESC + utf8(base_char)` byte sequence for an
+    /// Option-modified keystroke. `charactersIgnoringModifiers` already
+    /// applies Shift but ignores Option, so Option+1 → `"1"` and
+    /// Option+Shift+1 → `"!"` — the exact byte we want to follow ESC
+    /// with. Returns nil for non-printable keys (arrows, fn keys,
+    /// control chars) so they fall back to the IME / doCommand path.
+    private func optionAltBytes(for event: NSEvent) -> [UInt8]? {
+        guard
+            let chars = event.charactersIgnoringModifiers,
+            let scalar = chars.unicodeScalars.first
+        else { return nil }
+        // Skip ASCII control range and the NSFunctionKey block
+        // (0xF700+: arrows, F-keys, page up/down, ...).
+        let v = scalar.value
+        if v < 0x20 || v == 0x7F || v >= 0xF700 { return nil }
+        var out: [UInt8] = [0x1B]
+        out.append(contentsOf: Array(chars.utf8))
+        return out
     }
 
     /// macOS virtual key codes for the keys we own as scroll shortcuts.

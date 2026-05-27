@@ -74,6 +74,13 @@ struct CopadConfig {
     let shell: String
     let fontFamily: String
     let fontSize: Int
+    /// macOS-only: when true, Option+key sends `ESC + key` to the PTY
+    /// instead of routing through the system IME (which produces
+    /// `¡™£¢`-style special chars on Option+1/2/3/4). Required for
+    /// tmux/zsh/readline Meta bindings to fire. Default `true` because
+    /// this is a dev terminal — users who need Option for diacritics
+    /// can set `option_as_alt = false`.
+    let optionAsAlt: Bool
     let themeName: String
     let backgroundPath: String?
     let backgroundTint: Double
@@ -170,6 +177,7 @@ struct CopadConfig {
             shell: raw.terminal?.shell ?? defaults.shell,
             fontFamily: raw.terminal?.fontFamily ?? defaults.fontFamily,
             fontSize: raw.terminal?.fontSize ?? defaults.fontSize,
+            optionAsAlt: raw.terminal?.optionAsAlt ?? defaults.optionAsAlt,
             themeName: raw.theme?.name ?? defaults.themeName,
             backgroundPath: bgPath,
             backgroundTint: clamp01(raw.background?.tint ?? defaults.backgroundTint),
@@ -208,6 +216,7 @@ struct CopadConfig {
             shell: ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh",
             fontFamily: "JetBrains Mono",
             fontSize: 14,
+            optionAsAlt: true,
             themeName: "catppuccin-mocha",
             backgroundPath: nil,
             backgroundTint: 0.6,
@@ -348,11 +357,13 @@ private struct TerminalSection: Decodable {
     var shell: String?
     var fontFamily: String?
     var fontSize: Int?
+    var optionAsAlt: Bool?
 
     enum CodingKeys: String, CodingKey {
         case shell
         case fontFamily = "font_family"
         case fontSize = "font_size"
+        case optionAsAlt = "option_as_alt"
     }
 }
 
