@@ -57,9 +57,20 @@ jobs:
 
   build-macos:
     name: Build macOS arm64
-    runs-on: macos-14
+    # macos-15 = arm64 + Xcode 16 (Swift 6.0+). copad-macos/Package.swift
+    # declares swift-tools-version 6.0, so macos-14 (Swift 5.10) errors out
+    # at the package manifest parse step.
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+
+      # Pin to the latest stable Xcode on the runner image. macos-15 ships
+      # multiple Xcode versions; without an explicit select, `swift build`
+      # picks whichever is symlinked at /Applications/Xcode.app — which can
+      # drift when GitHub rotates runner images.
+      - name: Select latest stable Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+        continue-on-error: true
 
       - uses: dtolnay/rust-toolchain@stable
 
