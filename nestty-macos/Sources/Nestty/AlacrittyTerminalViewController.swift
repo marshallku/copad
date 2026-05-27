@@ -474,6 +474,17 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     private var markedText: String?
     private var markedSelectedRange: NSRange = .init(location: 0, length: 0)
 
+    /// Codepoint → fallback NSFont cache. Populated lazily by
+    /// `resolveRunFont` whenever a run contains a non-ASCII scalar; the
+    /// all-ASCII fast path skips the lookup entirely so the hot
+    /// rendering loop stays unchanged for the common case. Keyed by
+    /// the run's first non-ASCII scalar — runs come from
+    /// `nestty-term::walk_row` which already groups by attribute, and
+    /// a run with both Hangul and Powerline glyphs is unreachable in
+    /// practice. Invalidated on `setFont` since a new base font means
+    /// a new cascade list.
+    private var fallbackCache: [UInt32: NSFont] = [:]
+
     init(theme: NesttyTheme, font: NSFont, transparentDefaultBg: Bool, osc52Policy: OSC52Policy) {
         self.theme = theme
         self.font = font
@@ -518,6 +529,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         boldFont = Self.deriveTrait(newFont, mask: .boldFontMask)
         italicFont = Self.deriveTrait(newFont, mask: .italicFontMask)
         boldItalicFont = Self.deriveTrait(newFont, mask: [.boldFontMask, .italicFontMask])
+        fallbackCache.removeAll(keepingCapacity: true)
         let oldW = cellWidth
         let oldH = cellHeight
         recomputeCellMetrics()
@@ -548,6 +560,40 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             return variant
         }
         return regular
+    }
+
+    /// Resolve the actual font for a single run, with system cascade
+    /// fallback for codepoints the base font doesn't cover. Without this
+    /// `CTLineCreateWithAttributedString` would draw `.notdef` glyphs
+    /// (boxes / `_`) for anything outside the user's monospace face —
+    /// CJK, Nerd Font Powerline glyphs (PUA U+E000-F8FF), emoji, …
+    /// — because `.font` attribute pins the run to one font with no
+    /// implicit cascade. SwiftTerm got this for free; the alacritty
+    /// custom renderer has to do it explicitly.
+    ///
+    /// ASCII fast path: skip when *every* scalar in the run is ASCII
+    /// (covered by any monospace base). We can't bail on just the first
+    /// scalar because a run can mix ASCII with non-ASCII combining
+    /// marks (e.g. `a` + U+0301) — `walk_row` groups by attribute, not
+    /// by script. Cache key is the first non-ASCII scalar in the run:
+    /// it's the one that drives cascade selection in
+    /// `CTFontCreateForString`, and runs in practice are script-
+    /// homogenous beyond the ASCII portion.
+    private func resolveRunFont(_ str: String, base: NSFont) -> NSFont {
+        var key: UInt32?
+        for scalar in str.unicodeScalars where scalar.value >= 0x80 {
+            key = scalar.value
+            break
+        }
+        guard let cp = key else { return base }
+        if let cached = fallbackCache[cp] { return cached }
+        let resolved = CTFontCreateForString(
+            base as CTFont,
+            str as CFString,
+            CFRange(location: 0, length: (str as NSString).length),
+        ) as NSFont
+        fallbackCache[cp] = resolved
+        return resolved
     }
 
     /// 256-color ANSI table, computed once at view init. Indices 0-15
@@ -819,6 +865,24 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             .underlineColor: NSColor(cgColor: theme.accent.nsColor.cgColor) ?? .yellow,
         ]
         let attr = NSMutableAttributedString(string: marked, attributes: baseAttrs)
+        // IME preedit is overwhelmingly CJK/Hangul — the very thing the
+        // base monospace face doesn't cover. Walk composed character
+        // sequences (so e.g. a half-typed Hangul syllable stays one
+        // unit) and swap `.font` per cluster when cascade picks a
+        // different face.
+        var loc = 0
+        marked.enumerateSubstrings(
+            in: marked.startIndex ..< marked.endIndex,
+            options: .byComposedCharacterSequences,
+        ) { cluster, _, _, _ in
+            guard let cluster else { return }
+            let len = (cluster as NSString).length
+            let resolved = self.resolveRunFont(cluster, base: self.font)
+            if resolved !== self.font {
+                attr.addAttribute(.font, value: resolved, range: NSRange(location: loc, length: len))
+            }
+            loc += len
+        }
         // Thicker double underline on the IME-highlighted sub-range
         // so the user can see which syllable / kana is "active" in a
         // multi-segment composition.
@@ -1053,12 +1117,13 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
 
         let isBold = run.flags & flagBold != 0
         let isItalic = run.flags & flagItalic != 0
-        let runFont: NSFont = switch (isBold, isItalic) {
+        let baseRunFont: NSFont = switch (isBold, isItalic) {
         case (true, true): boldItalicFont
         case (true, false): boldFont
         case (false, true): italicFont
         case (false, false): font
         }
+        let runFont = resolveRunFont(str, base: baseRunFont)
 
         let attrs: [NSAttributedString.Key: Any] = [
             .font: runFont,
@@ -1154,12 +1219,13 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
 
             let isBold = run.flags & flagBold != 0
             let isItalic = run.flags & flagItalic != 0
-            let runFont: NSFont = switch (isBold, isItalic) {
+            let baseRunFont: NSFont = switch (isBold, isItalic) {
             case (true, true): boldItalicFont
             case (true, false): boldFont
             case (false, true): italicFont
             case (false, false): font
             }
+            let runFont = resolveRunFont(str, base: baseRunFont)
             var attrs: [NSAttributedString.Key: Any] = [
                 .font: runFont,
                 .foregroundColor: NSColor(cgColor: fg) ?? .white,
