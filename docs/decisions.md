@@ -923,6 +923,7 @@ Codex round 2 hard-recommended (δ). Discord plugin already proves the "stdio RP
 
 **See:** `copad-core/src/{background,session}.rs` (new modules), `copad-core/src/{plugin,theme}.rs` (Serialize additions for plugin, no change for theme), `copad-ffi/src/lib.rs` (5 new FFI surfaces appended), `copad-macos/Sources/CCopadFFI/include/copad_ffi.h` (matching declarations), `copad-macos/Sources/Copad/{Theme,Session,BackgroundRotator,PluginManifest,Config,AppDelegate}.swift` (thinned to FFI wrappers or semantics-aligned).
 
+<<<<<<< Updated upstream
 ## 45. macOS distribution via Homebrew tap — single cask, arm64, ad-hoc signed
 
 **Problem:** macOS users had only `scripts/install-macos.sh` (build-from-source: `swift build -c release` + `cargo install --path copad-cli` + `cargo install --path copad-daemon` + per-plugin cargo build × 10 + LaunchAgent + shell hooks). Cold build is ~10 min and requires Rust + Xcode CLT + a clone of the repo. There was no path for a user who just wants the app to run.
@@ -969,3 +970,59 @@ The trade-off baked into decision #45 ("ad-hoc + brew quarantine strip is enough
 The README now documents this — Tahoe users are pointed at `scripts/install-macos.sh`, which uses `scripts/codesign-dev.sh` to sign with a trusted self-signed cert in the user's login keychain. Tahoe spares trusted-identity-signed binaries from the deletion path; the in-keychain trust + designated-requirement match is what TCC has always cared about, and Tahoe's verification path piggybacks on the same trust anchors.
 
 **Proper fix (deferred):** Apple Developer ID ($99/yr) + notarize the release artifacts in CI. The `build-macos` workflow gets a `codesign --sign "Developer ID Application: ..."` step + `xcrun notarytool submit --wait`. Probably wait until either (a) the project has Tahoe users actually filing issues, or (b) Sonoma/Sequoia hit their EOL window and Tahoe-share crosses ~50%. Until then the dual-path (brew for legacy macOS, install-macos.sh for Tahoe+) is acceptable — the cost of $99/yr + notarization plumbing outweighs the current single-Tahoe-user impact.
+=======
+## 45. Context bridge — OSC + shell hook over `coctl event publish` polling (Phase 22.1)
+
+**Problem.** Phase 22 needs the active pane's context (host, cwd, git remote, branch, tmux session, foreground command) to flow into copad's bus so the dossier panel can re-render whenever the user changes directory or switches branches. The pane is often a remote shell over SSH inside a tmux session — copad has no process visibility into it. The only signals that survive both layers untouched are PTY-stream bytes.
+
+**Decision.** Emit a custom OSC sequence (default candidate `OSC 6500 ; v1 ; <json> ST`) from the shell's prompt-command hook on every prompt redraw. The local copad GUI's terminal layer (VTE on Linux, `copad-term`/alacritty_terminal on macOS) decodes it through the same callback path it already uses for OSC 7 (CWD reporting) and publishes a `pane.context_changed` event onto the bus. Design details in [docs/context-bridge.md](./context-bridge.md).
+
+**Why OSC over alternatives:**
+
+- **`coctl event publish` polling**: doesn't survive SSH (CLI not on remote host) or tmux without bidirectional plumbing; per-prompt cost is an RPC round-trip; needs a daemon on the remote.
+- **inotify on remote FS / git hooks**: doesn't cover cwd changes that aren't filesystem events; needs a remote watcher daemon; storms on monorepos.
+- **OSC**: works through SSH and tmux unchanged (OSC 7 already proves this in production); per-prompt cost is one PTY write of a few hundred bytes; no remote-side daemon required; reuses the OSC dispatcher copad already has for OSC 7 / OSC 52 / OSC 133.
+
+**Trust boundary mitigation.** OSC bytes are part of the PTY stream, so a child process inside the user's shell could otherwise inject a fake context mid-execution. The captured intent specified "only honor OSC at prompt-command time, not mid-output"; the shipped design enforces that with a **prompt-boundary state machine driven by OSC 133** as the primary mitigation, with HMAC and a timestamp window as defense-in-depth. HMAC alone is insufficient because `$COPAD_CONTEXT_SECRET` is inherited by child processes via the standard env copy — a child could read it and emit a valid MAC from mid-output. Only state-machine gating on OSC 133 actually distinguishes "emitted at prompt time" from "emitted during command execution."
+
+The three layers:
+1. **OSC 133 state machine** (primary): per-pane state initialized `idle`; transition to `at-prompt` on `OSC 133 ; A` or `OSC 133 ; P`; transition back to `idle` on `OSC 133 ; B` or `OSC 133 ; C`. OSC 6500 honored only in `at-prompt`. Shell init that copad ships emits OSC 133 alongside `__copad_context` in the same precmd hook so the marks are state-machine-ordered.
+2. **HMAC-SHA256** (defense-in-depth): per-session secret `$COPAD_CONTEXT_SECRET`. Catches malicious data files (`cat injected.txt`) that emit OSC 6500 without access to the secret. Does not replace mitigation 1 because env-var inheritance allows children to compute valid MACs from mid-output.
+3. **Timestamp window** (replay protection): reject payloads more than 5 minutes off the local clock.
+
+**Opt-outs** are explicitly documented as security-relaxing: `[context_bridge] require_prompt_boundary = false` for shells that genuinely can't emit OSC 133 (re-opens mid-output injection — bounded only by HMAC); `[context_bridge] require_hmac = false` for shells copad didn't spawn. Both off simultaneously is a startup warning. Secret distribution over SSH uses `SendEnv`/`AcceptEnv` for trusted hosts and the opt-out for untrusted ones.
+
+**Explicitly deferred (until a real need surfaces):**
+
+- Binary wire format. JSON keeps shell-init scripts trivial; binary would shave microseconds at the cost of debuggability. Revisit only if a measurable bottleneck appears.
+- Payload encryption. HMAC gives authenticity; the content (cwd, repo name) is not confidential in any practical threat model. Encrypted `v2` is possible later if needed.
+- Bidirectional protocol (copad → shell pushes). One-way is sufficient; if a future feature needs to push to the remote shell, that goes through `coctl` over SSH, not OSC.
+
+**See:** [docs/context-bridge.md](./context-bridge.md) (full design), [docs/roadmap.md § Phase 22.1](./roadmap.md#phase-22-context-aware-workstation-hub) (checklist).
+
+## 46. life-assistant absorption stance — selective native reimplementation, not embedding (Phase 22.3)
+
+**Problem.** `~/dev/life-assistant` (Go server + React/Vite SPA dashboard) has grown into a personal-automation hub covering agent state, goals, missions, pipelines, scheduled jobs, a run ledger, notes, plus a long tail of Discord-bot / finance-feed / external-polling modules. As Phase 22's vision pushes copad toward "the only tool the user opens for a dev workday," the question is what to do about that overlapping surface. Three rejected options surfaced during planning:
+
+1. **Embed the SPA in a copad WebView panel** — rejected. The SPA isn't standalone; it's bound to the Go server's endpoints, auth, and storage. Pointing a WebView at the dashboard origin gives a viewer-only window with no copad-side reactivity.
+2. **Migrate the whole Go server into copad as a daemon plugin** — rejected. Wrong language (Go vs Rust workspace), wrong runtime (server is designed to run 24/7 receiving external webhooks; copad is a workstation tool), and most modules don't even belong on the workstation (Discord-bot listener, finance feeds, weather/news pollers).
+3. **Leave them as separate apps** — rejected. The user explicitly wants single-tool coverage of the dev workday on the workstation. Two-app status quo is the failure mode Phase 22 is designed to fix.
+
+**Decision: absorption-by-reimplementation, applied selectively.**
+
+- **Absorb into copad** (workstation-local, dev-workflow-shaped): `agent`, `brain`, `goal`, `mission`, `pipeline`, `runledger`, `scheduler`, `notes`. Each becomes either a copad plugin (`plugins/<name>/`) or a copad-core extension, sharing the existing EventBus / ActionRegistry / TriggerEngine instead of running a parallel Go runtime. Each port lands as its own phase (Phase 23.x or later, one per module), only after the design in 22.3's inventory doc and a Rule-of-Three usage threshold.
+- **Keep on the life-assistant server**: `discord`, `bot`, `tossauth`, `tossinvest`, `trading`, `expense`, `finance`, `investment`, `portfolio`, `weather`, `newsdigest`, `google` polling, plus the cron infrastructure backing the news/weather/finance jobs. These need 24/7 uptime, external webhook reception, or finance-feed authentication — none of which fits a workstation tool that the user closes at end-of-day.
+- **Obsolete-by-copad** (don't port; already covered): anything covered by existing copad plugins — `calendar` (Phase 10), `kb` (Phase 9.3), `todo` (Phase 15).
+
+**Coordination with Phase 21 step 12** (existing 30-LOC `lifeassistant` plugin idea). That plugin is an *event publisher* — a server-side scheduler completion publishes `lifeassistant.job_completed` onto the copad bus, consumed by triggers. Absorption is *independent*: as workstation-local modules migrate, the server's responsibility for those modules shrinks, but the bridge keeps firing for the modules that stay on the server. No conflict; the two tracks coexist.
+
+**Phase 22.3 produces design only.** No life-assistant Go code is touched in this phase. The `inventory + per-module port design` document lives at `docs/life-assistant-absorption.md` (to be created in the 22.3 work session). Actual ports are subsequent phases (Phase 23.1 onward).
+
+**Trade-offs accepted:**
+
+- Some short-term duplication: the user runs both apps until enough modules have been ported to retire the server pieces. Worth it because lift-and-shifting the whole Go server would have committed copad to long-tail polling/webhook responsibilities it shouldn't own.
+- Rust reimplementation of Go logic costs upfront work per module. Mitigated by the Rule-of-Three gate — modules that don't get used three times don't get ported.
+- `agent` and `brain` are the largest, most copad-flavored absorbs; design quality on those is the gating risk for the whole track. The inventory doc must produce a defensible action surface for them or the absorption stalls.
+
+**See:** [docs/roadmap.md § Phase 22.3](./roadmap.md#phase-22-context-aware-workstation-hub), [docs/harness-integration.md § step 12](./harness-integration.md) (the coexisting thin-bridge track), forthcoming `docs/life-assistant-absorption.md` (inventory + per-module designs).
+>>>>>>> Stashed changes

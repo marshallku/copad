@@ -13,6 +13,13 @@ Concretely the user wants flows like:
 
 Flows 1–2 are end-to-end working today (with the LLM step in 2 deferred). Flows 3–4 require composite/chained workflows + Todo + Jira + git plugins, all currently missing — see Phases 14–18.
 
+### End-state ambition (Phase 22 onward)
+
+The Phase 1–21 work concentrates on making each integration *possible*. Phase 22 onward concentrates on making copad *the only tool the user opens for a dev workday*. Two framings drive it:
+
+1. **copad is the live context sidebar that follows the active pane wherever it runs** — local terminal, tmux pane, or SSH session. A small per-prompt OSC payload (`host / cwd / git_remote / branch / tmux_session / pane_cmd`) flows through SSH and tmux unchanged, so the GUI's dossier panel reflects whichever shell the user is actually working in. This is the wedge over `tmux + tiling browser`: tmux can't render rich panels, and a sibling browser has no signal from the remote pane — only copad can carry both halves.
+2. **copad alone should cover any reasonable dev-workflow need.** Today the user runs `~/dev/life-assistant` (Go server + SPA) alongside copad to manage agent state / goals / missions / pipelines / scheduled jobs / a run ledger. Phase 22.3 inventories which of those modules are workstation-local (vs server-only / 24-7 polling) and lays out a path to **reimplement them natively in copad** rather than embed life-assistant's UI. The Go server stays where it is for things that must run unattended; workstation-local pieces become copad plugins or copad-core extensions, sharing the existing EventBus / ActionRegistry / TriggerEngine instead of running a parallel runtime.
+
 ## Implementation Phases
 
 ### Phase 1: MVP Terminal ✅
@@ -770,6 +777,36 @@ Track lives in `docs/harness-integration.md`. Sequenced 1–16. Pending the heav
 - Causal taint: `<trigger>.awaited` and action `.completed` events default to Internal regardless of upstream origin. A chained downstream trigger without `accept_external` can fire on completion events caused by external-tagged upstream events.
 - macOS FFI / Swift `BusEvent` lack origin (out of scope while macOS shell is a stub).
 - `ActionRegistry::register_privileged` is not wired. The privileged set is the static `matches!(action, "system.spawn")` only.
+
+### Phase 22: Context-Aware Workstation Hub
+
+User-explicit gap. The terminal core is mature and the plugin substrate is rich, but the owner — an SSH/tmux-heavy developer who runs `~/dev/tmx` as their canonical session manager — barely uses any non-terminal surface today. Discord-integration framing is dead (they don't live there), and `tmx` already does session/worktree management excellently in plain tmux, so copad needs a wedge over "tmux + tiling browser" to be worth opening on its own. Phase 22 commits to that wedge: **a live work-journal sidebar that follows the active pane wherever it runs, including over SSH, surfacing the structured artifacts the user already produces (Claude intent files, codex review verdicts, ~/docs SourceItems, todos, daily logs) right next to the shell that produced them.** Once the foundational signal exists, the second half of the phase inventories `~/dev/life-assistant` and lays out which modules to absorb natively so the user no longer needs both apps for daily work. See [context-bridge.md](./context-bridge.md) for the 22.1 design.
+
+**Phase 22.1 — Context bridge (foundational signal)**
+
+- [ ] **OSC sequence spec**: pick a concrete OSC kind (shortlist in [context-bridge.md](./context-bridge.md)) carrying a small JSON payload — `{host, cwd, git_remote, branch, tmux_session, pane_cmd, timestamp_ms}`. Emitted by shell-init at prompt-command time only (not mid-output) so untrusted command output cannot inject context.
+- [ ] **copad OSC handler**: VTE on Linux + `alacritty_terminal` on macOS both accept custom OSC dispatchers. Wire one that decodes the payload, validates the trust boundary (prompt-command time only), and publishes a `pane.context_changed` event onto the bus with the panel id as `source`.
+- [ ] **EventBus event kind** `pane.context_changed`: documented in [workflow-runtime.md](./workflow-runtime.md). Payload schema fixed in [context-bridge.md](./context-bridge.md). Subscribers: ContextService (for live snapshot), 22.2 dossier panel (for re-render), future triggers (for `condition = '{pane.git_remote} == "marshallku/copad"'`-style routing).
+- [ ] **ContextService extension**: gain a per-panel context map keyed by panel id; `context.snapshot` (existing socket method, see Phase 19.2) gains a `pane_context` field with the latest payload for the active panel.
+- [ ] **tmx integration**: tmx's `shell_init.rs` already injects init scripts. Add one line emitting the OSC at every prompt-redraw (`precmd` for zsh, `PROMPT_COMMAND` for bash). Lands as a separate tmx PR — referenced from this phase but not in-tree.
+- [ ] **SSH + tmux pass-through verification**: OSC 7 already traverses both layers in production; the new sequence rides the same path. Add an integration check in 22.1 that an `ssh remote → tmux → shell` chain delivers a payload to the local copad bus within one prompt cycle.
+
+**Phase 22.2 — Session dossier panel (consumes 22.1)**
+
+- [ ] **New plugin** `copad-plugin-dossier`: HTML/JS panel that subscribes to `pane.context_changed` via `copad.on()` and re-renders on every change. Single side panel (default: right edge, slim).
+- [ ] **Section 1 — current intent**: read `~/docs/sources/sessions/<repo-slug>/` for the most recent intent SourceItem whose `repo:` frontmatter matches the active pane's `git_remote`. Render `goal` + `acceptance_criteria` + an "ack stale?" badge (compared with the `intent-acks/` marker mtime).
+- [ ] **Section 2 — codex review status**: read the per-repo `reviewed-<hash>` marker (`~/.claude/state/`) and the latest codex verdict (parsed from review-output if present). Three-state badge: APPROVED / changes-requested / no-recent-review.
+- [ ] **Section 3 — kb / docs**: call `kb.search` (existing plugin) scoped by `repo:` tag against the active pane's `git_remote`; render the top 5 hits with relative paths. Click-to-open via `webview.open` or `terminal.exec` (open in `$EDITOR`).
+- [ ] **Section 4 — open todos**: call `todo.list --workspace <resolved>` for the active pane's workspace; render open + in_progress items as compact rows with status pills.
+- [ ] **Section 5 — daily log scratch box**: text area + "append to today's daily" button → `kb.append` to `~/docs/daily/<YYYY-MM-DD>.md`. One-key append with timestamp prefix.
+
+**Phase 22.3 — life-assistant feature absorption (design-only)**
+
+- [ ] **Inventory doc** at `docs/life-assistant-absorption.md`: walk every `internal/<module>/` of `~/dev/life-assistant`. For each, classify as `absorb-into-copad` / `keep-on-server` / `bridge-via-Phase-21-step-12` / `obsolete-by-something-copad-already-has`. Initial mapping (subject to revision): absorb = `agent / brain / goal / mission / pipeline / runledger / scheduler / notes`; keep-on-server = `discord / bot / tossauth / tossinvest / trading / expense / finance / investment / portfolio / weather / newsdigest / google` (polling, finance feeds, or external webhook receivers); obsolete = anything covered by existing copad plugins (calendar, kb, todo).
+- [ ] **Per-module port designs**: for each `absorb-into-copad` module, a sub-section listing target shape — copad plugin (`plugins/<name>/`) vs copad-core extension, action surface (`<name>.*` actions), event kinds published, storage format and source-of-truth (sqlite ledger vs filesystem vs ~/docs SourceItem), what `~/dev/life-assistant`'s data needs to migrate, what stays in life-assistant for cron polling.
+- [ ] **Coordination with Phase 21 step 12** — the existing 30-LOC `lifeassistant` plugin idea is an *event publisher* (server-side scheduler completion → bus). It stays compatible with absorption: as a module is fully reimplemented in copad, server-side responsibility for that module shrinks; the bridge keeps firing for the modules still on the server.
+- [ ] **Rule-of-Three check**: only port a module after it's been used through `coctl` or a copad UI three times — design first, port lazily.
+- [ ] **Phase 23.x slots**: each port becomes its own phase (e.g., `Phase 23.1: scheduler port`, `Phase 23.2: runledger port`, etc.). Phase 22 fixes the order — likeliest first: `notes` (already filesystem-shaped) → `runledger` (sqlite, well-bounded) → `scheduler` (depends on Phase 21 Step 11 cron triggers, may merge with it) → `goal/mission` (shared store) → `agent/brain` (largest, most copad-flavored, ports as a copad plugin powering an "agents" panel).
 
 ## Pending Cleanup
 
