@@ -176,7 +176,14 @@ struct NesttyConfig {
             backgroundOpacity: clamp01(raw.background?.opacity ?? defaults.backgroundOpacity),
             osc52: raw.security?.osc52 ?? defaults.osc52,
             rendererBackend: RendererBackend.parse(raw.renderer?.backend),
-            transparentDefaultBg: raw.renderer?.transparentDefaultBg ?? defaults.transparentDefaultBg,
+            // Smart default: a wallpaper config implies the user wants
+            // to see the wallpaper, so default to transparent-default-
+            // bg unless they explicitly say otherwise. Without this the
+            // alacritty backend's opaque-default-fill design means the
+            // wallpaper is invisible to anyone who didn't separately
+            // know to set `[renderer] transparent_default_bg = true`.
+            transparentDefaultBg: raw.renderer?.transparentDefaultBg
+                ?? (bgPath != nil ? true : defaults.transparentDefaultBg),
             tabsPosition: raw.tabs?.position.map(TabsPosition.parse) ?? defaults.tabsPosition,
             statusBar: StatusBarConfig(
                 enabled: raw.statusbar?.enabled ?? defaults.statusBar.enabled,
