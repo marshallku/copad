@@ -21,6 +21,7 @@ pub struct PumpState {
     ctx_focused: EventReceiver,
     ctx_exited: EventReceiver,
     ctx_cwd: EventReceiver,
+    ctx_pane_context: EventReceiver,
     trigger_subs: TriggerSubscriptions,
 }
 
@@ -30,6 +31,7 @@ impl PumpState {
             ctx_focused: bus.subscribe("panel.focused"),
             ctx_exited: bus.subscribe("panel.exited"),
             ctx_cwd: bus.subscribe("terminal.cwd_changed"),
+            ctx_pane_context: bus.subscribe("pane.context_changed"),
             trigger_subs: TriggerSubscriptions::new(),
         }
     }
@@ -42,6 +44,9 @@ impl PumpState {
             ctx.apply_event(&event);
         }
         while let Some(event) = self.ctx_cwd.try_recv() {
+            ctx.apply_event(&event);
+        }
+        while let Some(event) = self.ctx_pane_context.try_recv() {
             ctx.apply_event(&event);
         }
     }

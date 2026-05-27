@@ -21,6 +21,33 @@ impl Presence {
     }
 }
 
+/// Per-pane context payload published by the local shell's precmd hook via
+/// `coctl event publish pane.context_changed '<json>'`. Trust note: events
+/// stamped `Origin::External` by the daemon socket (see decision #46) — any
+/// same-UID process can publish, so callers downstream of `ContextService`
+/// must treat this as best-effort display data.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PaneContext {
+    #[serde(default)]
+    pub panel_id: String,
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub git_remote: String,
+    #[serde(default)]
+    pub branch: String,
+    #[serde(default)]
+    pub tmux_session: String,
+    #[serde(default)]
+    pub pane_cmd: String,
+    #[serde(default)]
+    pub timestamp_ms: i64,
+    #[serde(default)]
+    pub v: u32,
+}
+
 /// "What the user is currently doing" — v1 carries only the two fields
 /// with confirmed event-stream sources. See `docs/workflow-runtime.md`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -29,11 +56,14 @@ pub struct Context {
     pub active_cwd: Option<PathBuf>,
     #[serde(default)]
     pub presence: Presence,
+    #[serde(default)]
+    pub pane_context: Option<PaneContext>,
 }
 
 struct Inner {
     active_panel: Option<String>,
     cwd_by_panel: HashMap<String, PathBuf>,
+    pane_context_by_panel: HashMap<String, PaneContext>,
     presence: Presence,
 }
 
@@ -48,6 +78,7 @@ impl ContextService {
             inner: RwLock::new(Inner {
                 active_panel: None,
                 cwd_by_panel: HashMap::new(),
+                pane_context_by_panel: HashMap::new(),
                 presence: Presence::default(),
             }),
         }
@@ -59,10 +90,15 @@ impl ContextService {
             .active_panel
             .as_ref()
             .and_then(|p| inner.cwd_by_panel.get(p).cloned());
+        let pane_context = inner
+            .active_panel
+            .as_ref()
+            .and_then(|p| inner.pane_context_by_panel.get(p).cloned());
         Context {
             active_panel: inner.active_panel.clone(),
             active_cwd,
             presence: inner.presence,
+            pane_context,
         }
     }
 
@@ -76,6 +112,23 @@ impl ContextService {
             .active_panel
             .as_ref()
             .and_then(|p| inner.cwd_by_panel.get(p).cloned())
+    }
+
+    pub fn pane_context(&self, panel_id: &str) -> Option<PaneContext> {
+        self.inner
+            .read()
+            .unwrap()
+            .pane_context_by_panel
+            .get(panel_id)
+            .cloned()
+    }
+
+    pub fn active_pane_context(&self) -> Option<PaneContext> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .active_panel
+            .as_ref()
+            .and_then(|p| inner.pane_context_by_panel.get(p).cloned())
     }
 
     pub fn presence(&self) -> Presence {
@@ -108,6 +161,7 @@ impl ContextService {
                 if let Some(panel_id) = panel_id_of(event) {
                     let mut inner = self.inner.write().unwrap();
                     inner.cwd_by_panel.remove(&panel_id);
+                    inner.pane_context_by_panel.remove(&panel_id);
                     if inner.active_panel.as_deref() == Some(panel_id.as_str()) {
                         inner.active_panel = None;
                     }
@@ -123,6 +177,26 @@ impl ContextService {
                         .unwrap()
                         .cwd_by_panel
                         .insert(panel_id, PathBuf::from(cwd));
+                }
+            }
+            "pane.context_changed" => {
+                match serde_json::from_value::<PaneContext>(event.payload.clone()) {
+                    Ok(ctx) if !ctx.panel_id.is_empty() => {
+                        let panel_id = ctx.panel_id.clone();
+                        self.inner
+                            .write()
+                            .unwrap()
+                            .pane_context_by_panel
+                            .insert(panel_id, ctx);
+                    }
+                    Ok(_) => {
+                        log::debug!("context: dropped pane.context_changed with empty panel_id");
+                    }
+                    Err(e) => {
+                        log::debug!(
+                            "context: dropped pane.context_changed (deserialize failed): {e}"
+                        );
+                    }
                 }
             }
             _ => {}
@@ -354,5 +428,125 @@ mod tests {
         reader.join().unwrap();
         let cwd = ctx.active_cwd().unwrap();
         assert!(cwd.to_string_lossy().starts_with("/x"));
+    }
+
+    fn sample_pane_context(panel_id: &str) -> PaneContext {
+        PaneContext {
+            panel_id: panel_id.into(),
+            host: "arch".into(),
+            cwd: "/home/marshall/dev/copad".into(),
+            git_remote: "marshallku/copad".into(),
+            branch: "master".into(),
+            tmux_session: "".into(),
+            pane_cmd: "zsh".into(),
+            timestamp_ms: 1_748_419_200_000,
+            v: 1,
+        }
+    }
+
+    #[test]
+    fn pane_context_changed_records_payload_per_panel() {
+        let ctx = ContextService::new();
+        let pc = sample_pane_context("p1");
+        ctx.apply_event(&evt(
+            "pane.context_changed",
+            serde_json::to_value(&pc).unwrap(),
+        ));
+        assert_eq!(ctx.pane_context("p1").unwrap(), pc);
+        // Other panels unaffected
+        assert!(ctx.pane_context("p2").is_none());
+    }
+
+    #[test]
+    fn pane_context_replaces_on_second_event() {
+        let ctx = ContextService::new();
+        let mut pc = sample_pane_context("p1");
+        ctx.apply_event(&evt(
+            "pane.context_changed",
+            serde_json::to_value(&pc).unwrap(),
+        ));
+        pc.cwd = "/tmp".into();
+        pc.git_remote = "".into();
+        pc.timestamp_ms += 1_000;
+        ctx.apply_event(&evt(
+            "pane.context_changed",
+            serde_json::to_value(&pc).unwrap(),
+        ));
+        let stored = ctx.pane_context("p1").unwrap();
+        assert_eq!(stored.cwd, "/tmp");
+        assert_eq!(stored.git_remote, "");
+    }
+
+    #[test]
+    fn active_pane_context_resolves_via_active_panel() {
+        let ctx = ContextService::new();
+        let pc = sample_pane_context("p1");
+        ctx.apply_event(&evt(
+            "pane.context_changed",
+            serde_json::to_value(&pc).unwrap(),
+        ));
+        // No active panel yet
+        assert!(ctx.active_pane_context().is_none());
+        ctx.apply_event(&evt("panel.focused", json!({"panel_id": "p1"})));
+        assert_eq!(ctx.active_pane_context().unwrap(), pc);
+        // Snapshot mirrors the active query
+        assert_eq!(ctx.snapshot().pane_context.unwrap(), pc);
+    }
+
+    #[test]
+    fn panel_exited_drops_pane_context_entry() {
+        let ctx = ContextService::new();
+        ctx.apply_event(&evt(
+            "pane.context_changed",
+            serde_json::to_value(sample_pane_context("p1")).unwrap(),
+        ));
+        ctx.apply_event(&evt("panel.focused", json!({"panel_id": "p1"})));
+        ctx.apply_event(&evt("panel.exited", json!({"panel_id": "p1"})));
+        assert!(ctx.pane_context("p1").is_none());
+        assert!(ctx.active_pane_context().is_none());
+    }
+
+    #[test]
+    fn pane_context_empty_panel_id_is_dropped() {
+        let ctx = ContextService::new();
+        let mut pc = sample_pane_context("");
+        pc.cwd = "/somewhere".into();
+        ctx.apply_event(&evt(
+            "pane.context_changed",
+            serde_json::to_value(&pc).unwrap(),
+        ));
+        // Nothing recorded
+        assert!(ctx.pane_context("").is_none());
+        assert!(ctx.active_pane_context().is_none());
+    }
+
+    #[test]
+    fn pane_context_forward_compat_extra_fields_ignored() {
+        let ctx = ContextService::new();
+        let payload = json!({
+            "panel_id": "p1",
+            "cwd": "/x",
+            "git_remote": "owner/repo",
+            "timestamp_ms": 1_000,
+            "v": 1,
+            "future_field": "ignored",
+            "another": 42
+        });
+        ctx.apply_event(&evt("pane.context_changed", payload));
+        let stored = ctx.pane_context("p1").unwrap();
+        assert_eq!(stored.cwd, "/x");
+        assert_eq!(stored.git_remote, "owner/repo");
+    }
+
+    #[test]
+    fn pane_context_missing_fields_default_empty() {
+        let ctx = ContextService::new();
+        let payload = json!({"panel_id": "p1"});
+        ctx.apply_event(&evt("pane.context_changed", payload));
+        let stored = ctx.pane_context("p1").unwrap();
+        assert_eq!(stored.cwd, "");
+        assert_eq!(stored.git_remote, "");
+        assert_eq!(stored.timestamp_ms, 0);
+        assert_eq!(stored.v, 0);
     }
 }

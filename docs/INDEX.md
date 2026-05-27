@@ -24,7 +24,7 @@
 | [roadmap.md](./roadmap.md)                 | Implementation phases, pending work         | Planning next steps                       |
 | [harness-integration.md](./harness-integration.md) | Daemon-first pivot + integrations with the user's external harness/tools (~/dotfiles/claude, ~/dev/browser, codex-plugin-cc, life-assistant) | Picking next harness-coupled work |
 | [gui-daemon-protocol.md](./gui-daemon-protocol.md) | GUI ↔ daemon wire protocol spec (Invoke, gui.register, capabilities, origin tagging) | Implementing daemon-first migration step 1+ |
-| [context-bridge.md](./context-bridge.md) | OSC + shell-hook bridge that pipes the active pane's host/cwd/git/branch/tmux context (incl. SSH) into the bus — design for Phase 22.1 | Implementing the context bridge; designing dossier-panel consumers; reasoning about OSC trust boundary |
+| [context-bridge.md](./context-bridge.md) | Shell-precmd → `coctl event publish` design piping the active local pane's host/cwd/git/branch/tmux into the bus (Phase 22.1); also archives the SSH OSC design in a revival section | Implementing the bridge on other shells/platforms; designing dossier-panel consumers; reasoning about origin-tagged trust |
 
 ## Quick Reference
 

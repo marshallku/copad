@@ -120,12 +120,19 @@ impl TerminalPanel {
         });
         terminal.add_controller(zoom_controller);
 
-        // Spawn shell
+        // Spawn shell. Panel id is allocated here (not in the
+        // `Self { id, ... }` initializer below) so it can be
+        // injected into the child env BEFORE spawn — the shell's
+        // precmd hook reads `$COPAD_PANEL_ID` to attribute
+        // `pane.context_changed` events back to this pane. macOS
+        // already follows this pattern in TerminalViewController.swift.
+        let id = uuid::Uuid::new_v4().to_string();
         let shell = config.terminal.shell.clone();
         let socket_env = format!(
             "COPAD_SOCKET={}",
             copad_core::paths::gui_socket_path(std::process::id()).display()
         );
+        let panel_id_env = format!("COPAD_PANEL_ID={id}");
         let child_pid: Rc<Cell<i32>> = Rc::new(Cell::new(-1));
         let pid_cell = child_pid.clone();
         // Resolve cwd once upfront. We pass `Option<&str>` to
@@ -151,7 +158,7 @@ impl TerminalPanel {
             vte4::PtyFlags::DEFAULT,
             cwd_arg,
             &[&shell],
-            &[&socket_env],
+            &[&socket_env, &panel_id_env],
             gtk4::glib::SpawnFlags::DEFAULT,
             || {},
             -1,
@@ -205,7 +212,7 @@ impl TerminalPanel {
         let last_cwd = Rc::new(std::cell::RefCell::new(cwd_str.clone()));
 
         Self {
-            id: uuid::Uuid::new_v4().to_string(),
+            id,
             overlay,
             terminal,
             child_pid,

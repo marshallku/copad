@@ -280,6 +280,7 @@ impl CopadWindow {
             ctx_focused: event_bus.subscribe("panel.focused"),
             ctx_exited: event_bus.subscribe("panel.exited"),
             ctx_cwd: event_bus.subscribe("terminal.cwd_changed"),
+            ctx_pane_context: event_bus.subscribe("pane.context_changed"),
             trigger_subs: TriggerSubscriptions::new(),
         }));
         pump_state
@@ -734,11 +735,12 @@ pub struct PumpState {
     ctx_focused: EventReceiver,
     ctx_exited: EventReceiver,
     ctx_cwd: EventReceiver,
+    ctx_pane_context: EventReceiver,
     trigger_subs: TriggerSubscriptions,
 }
 
 impl PumpState {
-    /// Order across the three is commutative for ContextService's state.
+    /// Order across the receivers is commutative for ContextService's state.
     pub fn drain_context_only(&self, ctx: &ContextService) {
         while let Some(event) = self.ctx_focused.try_recv() {
             ctx.apply_event(&event);
@@ -747,6 +749,9 @@ impl PumpState {
             ctx.apply_event(&event);
         }
         while let Some(event) = self.ctx_cwd.try_recv() {
+            ctx.apply_event(&event);
+        }
+        while let Some(event) = self.ctx_pane_context.try_recv() {
             ctx.apply_event(&event);
         }
     }
@@ -909,6 +914,7 @@ mod tests {
             ctx_focused: bus.subscribe("panel.focused"),
             ctx_exited: bus.subscribe("panel.exited"),
             ctx_cwd: bus.subscribe("terminal.cwd_changed"),
+            ctx_pane_context: bus.subscribe("pane.context_changed"),
             trigger_subs: TriggerSubscriptions::new(),
         };
         pump.reconcile_triggers(&bus, &cached);
@@ -930,6 +936,7 @@ mod tests {
             ctx_focused: bus.subscribe("panel.focused"),
             ctx_exited: bus.subscribe("panel.exited"),
             ctx_cwd: bus.subscribe("terminal.cwd_changed"),
+            ctx_pane_context: bus.subscribe("pane.context_changed"),
             trigger_subs: TriggerSubscriptions::new(),
         };
         // Start in cut-over (daemon-authoritative) state.

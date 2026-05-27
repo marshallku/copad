@@ -969,34 +969,33 @@ The trade-off baked into decision #45 ("ad-hoc + brew quarantine strip is enough
 The README now documents this — Tahoe users are pointed at `scripts/install-macos.sh`, which uses `scripts/codesign-dev.sh` to sign with a trusted self-signed cert in the user's login keychain. Tahoe spares trusted-identity-signed binaries from the deletion path; the in-keychain trust + designated-requirement match is what TCC has always cared about, and Tahoe's verification path piggybacks on the same trust anchors.
 
 **Proper fix (deferred):** Apple Developer ID ($99/yr) + notarize the release artifacts in CI. The `build-macos` workflow gets a `codesign --sign "Developer ID Application: ..."` step + `xcrun notarytool submit --wait`. Probably wait until either (a) the project has Tahoe users actually filing issues, or (b) Sonoma/Sequoia hit their EOL window and Tahoe-share crosses ~50%. Until then the dual-path (brew for legacy macOS, install-macos.sh for Tahoe+) is acceptable — the cost of $99/yr + notarization plumbing outweighs the current single-Tahoe-user impact.
-## 46. Context bridge — OSC + shell hook over `coctl event publish` polling (Phase 22.1)
+## 46. Context bridge — `coctl event publish` from shell precmd (local-only, Phase 22.1)
 
-**Problem.** Phase 22 needs the active pane's context (host, cwd, git remote, branch, tmux session, foreground command) to flow into copad's bus so the dossier panel can re-render whenever the user changes directory or switches branches. The pane is often a remote shell over SSH inside a tmux session — copad has no process visibility into it. The only signals that survive both layers untouched are PTY-stream bytes.
+**Problem.** Phase 22 needs the active pane's context (host, cwd, git remote, branch, tmux session, foreground command) to flow into copad's bus so the dossier panel can re-render whenever the user changes directory or switches branches. The shell knows all of this; the question is what transport to use to get it onto copad's EventBus.
 
-**Decision.** Emit a custom OSC sequence from the shell's prompt-command hook on every prompt redraw. The exact OSC number is **TBD with shortlist** (see [context-bridge.md § Wire format](./context-bridge.md) for the three ranked candidates) and finalized at Phase 22.1 implementation time; the rest of this entry refers to it abstractly as "OSC <N>" with `OSC 6500` used as a placeholder example only in code-shaped illustrations. The local copad GUI's terminal layer (VTE on Linux, `copad-term`/alacritty_terminal on macOS) decodes it through the same callback path it already uses for OSC 7 (CWD reporting) and publishes a `pane.context_changed` event onto the bus. Design details in [docs/context-bridge.md](./context-bridge.md).
+**Decision.** For local copad-spawned shells, the precmd hook calls `coctl event publish pane.context_changed '<json>'` with a flat `PaneContext` payload — no OSC capture, no HMAC, no prompt-boundary state machine. SSH / cross-host coverage is **explicitly scoped out** of Phase 22; the OSC-based design that would have enabled it is preserved in [context-bridge.md § Out of scope but designed for revival](./context-bridge.md) for if/when SSH support returns. Implementation details in [docs/context-bridge.md](./context-bridge.md).
 
-**Why OSC over alternatives:**
+**Why `coctl event publish` over alternatives:**
 
-- **`coctl event publish` polling**: doesn't survive SSH (CLI not on remote host) or tmux without bidirectional plumbing; per-prompt cost is an RPC round-trip; needs a daemon on the remote.
-- **inotify on remote FS / git hooks**: doesn't cover cwd changes that aren't filesystem events; needs a remote watcher daemon; storms on monorepos.
-- **OSC**: works through SSH and tmux unchanged (OSC 7 already proves this in production); per-prompt cost is one PTY write of a few hundred bytes; no remote-side daemon required; reuses the OSC dispatcher copad already has for OSC 7 / OSC 52 / OSC 133.
+- **OSC bytes through PTY** (the original design): the only mechanism that survives SSH and tmux pass-through unchanged — but `vte4` 0.8.x exposes no custom-OSC subscribe API in its Rust bindings, so capture would need a VTE FFI shim, and the trust boundary needs OSC 133 prompt-boundary gating + HMAC + per-session secret distribution. All justified when SSH is in scope. For local-only, the shell already has `$COPAD_SOCKET` and `$COPAD_PANEL_ID` injected, so an in-process IPC is strictly simpler.
+- **inotify on FS / git hooks**: doesn't cover cwd changes that aren't filesystem events; storms on monorepos.
+- **`coctl event publish`**: shell already has socket + panel id env vars; per-prompt cost is ~10-30ms (one `coctl` invocation, detached to background subshell so it doesn't block the prompt); no new wire format; no crypto.
 
-**Trust boundary mitigation.** OSC bytes are part of the PTY stream, so a child process inside the user's shell could otherwise inject a fake context mid-execution. The captured intent specified "only honor OSC at prompt-command time, not mid-output"; the shipped design enforces that with a **prompt-boundary state machine driven by OSC 133** as the primary mitigation, with HMAC and a timestamp window as defense-in-depth. HMAC alone is insufficient because `$COPAD_CONTEXT_SECRET` is inherited by child processes via the standard env copy — a child could read it and emit a valid MAC from mid-output. Only state-machine gating on OSC 133 actually distinguishes "emitted at prompt time" from "emitted during command execution."
+**Clarification (load-bearing for future debug):** `coctl event publish` dials the daemon socket at `daemon_socket_path()` directly — it does NOT use `$COPAD_SOCKET` as the transport. The env var is presence-only ("am I in a copad shell?") for the hook to gate emission on. Daemon availability is therefore a hard prerequisite; with `copadd` down, the hook silently no-ops.
 
-The three layers:
-1. **OSC 133 state machine** (primary): per-pane state initialized `idle`; transition to `at-prompt` on `OSC 133 ; A` or `OSC 133 ; P`; transition back to `idle` on `OSC 133 ; B` or `OSC 133 ; C`. OSC 6500 honored only in `at-prompt`. Shell init that copad ships emits OSC 133 alongside `__copad_context` in the same precmd hook so the marks are state-machine-ordered.
-2. **HMAC-SHA256** (defense-in-depth): per-session secret `$COPAD_CONTEXT_SECRET`. Catches malicious data files (`cat injected.txt`) that emit OSC 6500 without access to the secret. Does not replace mitigation 1 because env-var inheritance allows children to compute valid MACs from mid-output.
-3. **Timestamp window** (replay protection): reject payloads more than 5 minutes off the local clock.
+**Trust boundary.** `events.publish` over the daemon socket carries `SO_PEERCRED` source stamping (decision #23), and the daemon marks the resulting events `Origin::External` (decision #37). That gating model is the entire application-layer security model — there is no HMAC, no per-session secret, no state machine. Consequence: **any same-UID process can publish `pane.context_changed` with an arbitrary `panel_id`.** The dossier panel (Phase 22.2) treats this as best-effort display data.
 
-**Opt-outs** are explicitly documented as security-relaxing: `[context_bridge] require_prompt_boundary = false` for shells that genuinely can't emit OSC 133 (re-opens mid-output injection — bounded only by HMAC); `[context_bridge] require_hmac = false` for shells copad didn't spawn. Both off simultaneously is a startup warning. Secret distribution over SSH uses `SendEnv`/`AcceptEnv` for trusted hosts and the opt-out for untrusted ones.
+**Load-bearing future-work caveat (trigger interpolation surface):** The current `TriggerEngine` exposes `context.active_panel` / `context.active_cwd` / `context.presence` to conditions and payload-match interpolation, **but NOT `context.pane_context.*` fields**. When a future engine extension adds that surfacing, `accept_external = true` alone won't be sufficient: it gates the *firing* event's origin, not the provenance of context state. A same-UID-spoofed `pane.context_changed` could poison `ContextService`, then a later `Origin::Internal` event with `accept_external` defaulted to `false` could interpolate the poisoned state. The future extension must enforce origin-aware reads of context fields, not just origin-aware firing.
 
-**Explicitly deferred (until a real need surfaces):**
+**Explicitly deferred (preserved in revival design):**
 
-- Binary wire format. JSON keeps shell-init scripts trivial; binary would shave microseconds at the cost of debuggability. Revisit only if a measurable bottleneck appears.
-- Payload encryption. HMAC gives authenticity; the content (cwd, repo name) is not confidential in any practical threat model. Encrypted `v2` is possible later if needed.
-- Bidirectional protocol (copad → shell pushes). One-way is sufficient; if a future feature needs to push to the remote shell, that goes through `coctl` over SSH, not OSC.
+- OSC capture from PTY stream (the only way to handle non-copad-spawned remote shells over SSH).
+- HMAC-SHA256 with per-session secret + `$COPAD_CONTEXT_SECRET` env injection.
+- OSC 133 prompt-boundary state machine — the only mechanism that genuinely distinguishes "emitted at prompt time" from "emitted mid-execution" (env-var-inherited HMAC does not).
+- Bidirectional protocol (copad → shell pushes).
+- `SSH SendEnv` / `AcceptEnv` configuration for secret distribution.
 
-**See:** [docs/context-bridge.md](./context-bridge.md) (full design), [docs/roadmap.md § Phase 22.1](./roadmap.md#phase-22-context-aware-workstation-hub) (checklist).
+**See:** [docs/context-bridge.md](./context-bridge.md) (full design including revival section), [docs/roadmap.md § Phase 22.1](./roadmap.md#phase-22-context-aware-workstation-hub) (shipped checklist).
 
 ## 47. life-assistant absorption stance — selective native reimplementation, not embedding (Phase 22.3)
 
