@@ -53,7 +53,7 @@ enum AutoSpawn {
         }
 
         guard let copaddPath = locateBinary() else {
-            log("copadd binary not found in PATH or ~/.cargo/bin — install via `cargo install --path copad-daemon`")
+            log("copadd binary not found in PATH, ~/.cargo/bin, or /opt/homebrew/bin — install via `cargo install --path copad-daemon` or `brew install --cask marshallku/copad/copad`")
             return false
         }
         if !spawnDetached(path: copaddPath) {
