@@ -10,10 +10,10 @@
 #   copad-macos/Resources/AppIcon.icns                        — multi-res .icns (PNG-encoded entries)
 #
 # Run this whenever the master PNG changes, then commit the regenerated
-# files. Optimization choice: -type Palette -colors 256 squashes the
-# essentially-grayscale icon ~5–10x with no visible loss; -strip kills
-# all ancillary chunks. Source PNG is assumed grayscale-on-black; if
-# you swap in a colorful icon, drop the palette flags.
+# files. -strip kills all ancillary chunks. Source PNG is a colorful
+# raster (coffee mug + terminal prompt); palette quantization would
+# visibly band the brown gradients, so we keep full truecolor with
+# alpha and rely on PNG filter/compression for size.
 #
 # Requires: ImageMagick 7 (`magick`), Python 3 (for the .icns assembly
 # — ImageMagick's icns coder writes a single-image .icns, which Finder
@@ -38,7 +38,6 @@ fi
 
 PNG_OPTS=(
     -strip
-    -type Palette -colors 256
     -define png:compression-level=9
     -define png:compression-filter=5
     -define png:compression-strategy=1
