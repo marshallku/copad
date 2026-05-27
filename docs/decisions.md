@@ -923,7 +923,6 @@ Codex round 2 hard-recommended (δ). Discord plugin already proves the "stdio RP
 
 **See:** `copad-core/src/{background,session}.rs` (new modules), `copad-core/src/{plugin,theme}.rs` (Serialize additions for plugin, no change for theme), `copad-ffi/src/lib.rs` (5 new FFI surfaces appended), `copad-macos/Sources/CCopadFFI/include/copad_ffi.h` (matching declarations), `copad-macos/Sources/Copad/{Theme,Session,BackgroundRotator,PluginManifest,Config,AppDelegate}.swift` (thinned to FFI wrappers or semantics-aligned).
 
-<<<<<<< Updated upstream
 ## 45. macOS distribution via Homebrew tap — single cask, arm64, ad-hoc signed
 
 **Problem:** macOS users had only `scripts/install-macos.sh` (build-from-source: `swift build -c release` + `cargo install --path copad-cli` + `cargo install --path copad-daemon` + per-plugin cargo build × 10 + LaunchAgent + shell hooks). Cold build is ~10 min and requires Rust + Xcode CLT + a clone of the repo. There was no path for a user who just wants the app to run.
@@ -970,12 +969,11 @@ The trade-off baked into decision #45 ("ad-hoc + brew quarantine strip is enough
 The README now documents this — Tahoe users are pointed at `scripts/install-macos.sh`, which uses `scripts/codesign-dev.sh` to sign with a trusted self-signed cert in the user's login keychain. Tahoe spares trusted-identity-signed binaries from the deletion path; the in-keychain trust + designated-requirement match is what TCC has always cared about, and Tahoe's verification path piggybacks on the same trust anchors.
 
 **Proper fix (deferred):** Apple Developer ID ($99/yr) + notarize the release artifacts in CI. The `build-macos` workflow gets a `codesign --sign "Developer ID Application: ..."` step + `xcrun notarytool submit --wait`. Probably wait until either (a) the project has Tahoe users actually filing issues, or (b) Sonoma/Sequoia hit their EOL window and Tahoe-share crosses ~50%. Until then the dual-path (brew for legacy macOS, install-macos.sh for Tahoe+) is acceptable — the cost of $99/yr + notarization plumbing outweighs the current single-Tahoe-user impact.
-=======
-## 45. Context bridge — OSC + shell hook over `coctl event publish` polling (Phase 22.1)
+## 46. Context bridge — OSC + shell hook over `coctl event publish` polling (Phase 22.1)
 
 **Problem.** Phase 22 needs the active pane's context (host, cwd, git remote, branch, tmux session, foreground command) to flow into copad's bus so the dossier panel can re-render whenever the user changes directory or switches branches. The pane is often a remote shell over SSH inside a tmux session — copad has no process visibility into it. The only signals that survive both layers untouched are PTY-stream bytes.
 
-**Decision.** Emit a custom OSC sequence (default candidate `OSC 6500 ; v1 ; <json> ST`) from the shell's prompt-command hook on every prompt redraw. The local copad GUI's terminal layer (VTE on Linux, `copad-term`/alacritty_terminal on macOS) decodes it through the same callback path it already uses for OSC 7 (CWD reporting) and publishes a `pane.context_changed` event onto the bus. Design details in [docs/context-bridge.md](./context-bridge.md).
+**Decision.** Emit a custom OSC sequence from the shell's prompt-command hook on every prompt redraw. The exact OSC number is **TBD with shortlist** (see [context-bridge.md § Wire format](./context-bridge.md) for the three ranked candidates) and finalized at Phase 22.1 implementation time; the rest of this entry refers to it abstractly as "OSC <N>" with `OSC 6500` used as a placeholder example only in code-shaped illustrations. The local copad GUI's terminal layer (VTE on Linux, `copad-term`/alacritty_terminal on macOS) decodes it through the same callback path it already uses for OSC 7 (CWD reporting) and publishes a `pane.context_changed` event onto the bus. Design details in [docs/context-bridge.md](./context-bridge.md).
 
 **Why OSC over alternatives:**
 
@@ -1000,7 +998,7 @@ The three layers:
 
 **See:** [docs/context-bridge.md](./context-bridge.md) (full design), [docs/roadmap.md § Phase 22.1](./roadmap.md#phase-22-context-aware-workstation-hub) (checklist).
 
-## 46. life-assistant absorption stance — selective native reimplementation, not embedding (Phase 22.3)
+## 47. life-assistant absorption stance — selective native reimplementation, not embedding (Phase 22.3)
 
 **Problem.** `~/dev/life-assistant` (Go server + React/Vite SPA dashboard) has grown into a personal-automation hub covering agent state, goals, missions, pipelines, scheduled jobs, a run ledger, notes, plus a long tail of Discord-bot / finance-feed / external-polling modules. As Phase 22's vision pushes copad toward "the only tool the user opens for a dev workday," the question is what to do about that overlapping surface. Three rejected options surfaced during planning:
 
@@ -1025,4 +1023,3 @@ The three layers:
 - `agent` and `brain` are the largest, most copad-flavored absorbs; design quality on those is the gating risk for the whole track. The inventory doc must produce a defensible action surface for them or the absorption stalls.
 
 **See:** [docs/roadmap.md § Phase 22.3](./roadmap.md#phase-22-context-aware-workstation-hub), [docs/harness-integration.md § step 12](./harness-integration.md) (the coexisting thin-bridge track), forthcoming `docs/life-assistant-absorption.md` (inventory + per-module designs).
->>>>>>> Stashed changes
