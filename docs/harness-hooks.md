@@ -1,7 +1,7 @@
-# Harness hooks ↔ nestty bus
+# Harness hooks ↔ copad bus
 
 How to wire Claude Code's hook scripts (`~/.claude/hooks/*.sh`,
-`~/.claude/scripts/*.sh`) to the nestty event bus so triggers fire on
+`~/.claude/scripts/*.sh`) to the copad event bus so triggers fire on
 real harness events (commit blocked, codex review approved, session
 stopped, …).
 
@@ -15,12 +15,12 @@ the hook scripts deliver those events.
 Hook scripts live in **your** dotfiles, so the patcher cannot guess the
 right place to insert a publish call. You mark the call site with a
 sentinel comment; the patcher just expands the sentinel into a real
-`nestctl event publish` line. The patch is idempotent and reversible.
+`coctl event publish` line. The patch is idempotent and reversible.
 
 ### Sentinel format
 
 ```
-# NESTTY_HOOK_PUBLISH: <event-kind> [<json-payload>]
+# COPAD_HOOK_PUBLISH: <event-kind> [<json-payload>]
 ```
 
 - `<event-kind>` is the bus event name (e.g. `claude.commit_blocked`).
@@ -37,15 +37,15 @@ sentinel comment; the patcher just expands the sentinel into a real
 For each sentinel, `install-claude-hooks.sh` injects:
 
 ```
-command -v nestctl >/dev/null && nestctl event publish <kind> --quiet "<payload>" &
-# NESTTY_HOOK_PUBLISH_END
+command -v coctl >/dev/null && coctl event publish <kind> --quiet "<payload>" &
+# COPAD_HOOK_PUBLISH_END
 ```
 
 immediately after the sentinel line. Three properties matter:
 
-- `command -v nestctl` short-circuits when nestctl isn't installed —
+- `command -v coctl` short-circuits when coctl isn't installed —
   the hook never breaks on a fresh machine.
-- `--quiet` makes `nestctl` exit 0 on transport failure (nesttyd down,
+- `--quiet` makes `coctl` exit 0 on transport failure (copadd down,
   socket missing). Schema errors still surface — your sentinel won't
   silently misbehave.
 - `&` makes the publish fire-and-forget so the hook continues
@@ -67,16 +67,16 @@ Put the sentinel one line **above** that final jq:
 ```bash
 # … existing logic that resolves $REASON …
 
-# NESTTY_HOOK_PUBLISH: claude.commit_blocked {"reason":"$REASON","repo":"$REPO"}
+# COPAD_HOOK_PUBLISH: claude.commit_blocked {"reason":"$REASON","repo":"$REPO"}
 jq -n --arg msg "$REASON" '{permissionDecision: "deny", message: $msg}'
 ```
 
 After `install-claude-hooks.sh`:
 
 ```bash
-# NESTTY_HOOK_PUBLISH: claude.commit_blocked {"reason":"$REASON","repo":"$REPO"}
-command -v nestctl >/dev/null && nestctl event publish claude.commit_blocked --quiet "{\"reason\":\"$REASON\",\"repo\":\"$REPO\"}" &
-# NESTTY_HOOK_PUBLISH_END
+# COPAD_HOOK_PUBLISH: claude.commit_blocked {"reason":"$REASON","repo":"$REPO"}
+command -v coctl >/dev/null && coctl event publish claude.commit_blocked --quiet "{\"reason\":\"$REASON\",\"repo\":\"$REPO\"}" &
+# COPAD_HOOK_PUBLISH_END
 jq -n --arg msg "$REASON" '{permissionDecision: "deny", message: $msg}'
 ```
 
@@ -95,7 +95,7 @@ case "$VERDICT_LINE" in
         if [[ "$MODE" != "files" ]]; then
             mark_repo_reviewed
         fi
-        # NESTTY_HOOK_PUBLISH: claude.review_approved {"session":"$SESSION","mode":"$MODE"}
+        # COPAD_HOOK_PUBLISH: claude.review_approved {"session":"$SESSION","mode":"$MODE"}
         exit 0
         ;;
 ```
@@ -122,17 +122,17 @@ slice 2, the recommended placement docs here will expand.
 
 ```bash
 # Default — scan ~/.claude/hooks and ~/.claude/scripts.
-bash ~/dev/nestty/scripts/install-claude-hooks.sh
+bash ~/dev/copad/scripts/install-claude-hooks.sh
 
 # Dry-run — print diffs without writing.
-bash ~/dev/nestty/scripts/install-claude-hooks.sh --dry-run
+bash ~/dev/copad/scripts/install-claude-hooks.sh --dry-run
 
 # Remove all injected publish blocks (leaves sentinels in place for
 # easy re-install).
-bash ~/dev/nestty/scripts/install-claude-hooks.sh --uninstall
+bash ~/dev/copad/scripts/install-claude-hooks.sh --uninstall
 
 # Use a non-default hook layout.
-bash ~/dev/nestty/scripts/install-claude-hooks.sh --hooks-dir ~/dotfiles/claude/hooks
+bash ~/dev/copad/scripts/install-claude-hooks.sh --hooks-dir ~/dotfiles/claude/hooks
 ```
 
 The patcher's self-test (`--self-test`) runs in a tmpdir and never
@@ -146,7 +146,7 @@ written. Copy them into your hook by hand:
 
 ```bash
 # Just below the place the event fires, paste:
-command -v nestctl >/dev/null && nestctl event publish \
+command -v coctl >/dev/null && coctl event publish \
     claude.commit_blocked --quiet \
     "{\"reason\":\"$REASON\",\"repo\":\"$REPO\"}" &
 ```
@@ -165,7 +165,7 @@ the resulting JSON is broken:
 
 ```bash
 # Sentinel:
-# NESTTY_HOOK_PUBLISH: claude.commit_blocked {"reason":"$REASON"}
+# COPAD_HOOK_PUBLISH: claude.commit_blocked {"reason":"$REASON"}
 # Patched line:
 ... --quiet "{\"reason\":\"$REASON\"}" &
 # At fire time with REASON='bad "value':
@@ -193,7 +193,7 @@ JSON-safe builder:
 
 ```bash
 # Sentinel:
-# NESTTY_HOOK_PUBLISH: claude.commit_blocked $(jq -n --arg r "$REASON" --arg p "$REPO" '{reason:$r,repo:$p}')
+# COPAD_HOOK_PUBLISH: claude.commit_blocked $(jq -n --arg r "$REASON" --arg p "$REPO" '{reason:$r,repo:$p}')
 # Patched line:
 ... --quiet "$(jq -n --arg r "$REASON" --arg p "$REPO" '{reason:$r,repo:$p}')" &
 ```
@@ -208,7 +208,7 @@ Add this once at the top of your hook script:
 
 ```bash
 # JSON-encode "k=v" pairs into a single object, escaping `"`/`\`/CR/LF.
-nestty_json() {
+copad_json() {
     local out='{' first=1 kv k v esc
     while [[ $# -gt 0 ]]; do
         kv="$1"; shift
@@ -227,7 +227,7 @@ Then:
 
 ```bash
 # Sentinel:
-# NESTTY_HOOK_PUBLISH: claude.commit_blocked $(nestty_json "reason=$REASON" "repo=$REPO")
+# COPAD_HOOK_PUBLISH: claude.commit_blocked $(copad_json "reason=$REASON" "repo=$REPO")
 ```
 
 Both keep the patch idempotent (the `$(...)` substitution is captured
@@ -235,11 +235,11 @@ by the patcher verbatim).
 
 - The `jq` path is fully safe — every JSON-special and control char
   is escaped by `jq -n --arg`.
-- The zero-deps `nestty_json` helper covers the common cases (`"`,
+- The zero-deps `copad_json` helper covers the common cases (`"`,
   `\`, LF, CR). Other control bytes (literal tab, NUL, etc.) end up
   in the JSON unescaped, which is a spec violation. Hooks that may
   capture raw control bytes (e.g. ANSI-stripped subprocess output)
-  should prefer `jq` or extend `nestty_json` with the `printf
+  should prefer `jq` or extend `copad_json` with the `printf
   '\\u%04x'` pattern for `$'\x00'..$'\x1f'`.
 
 ## Verifying the flow end-to-end
@@ -248,16 +248,16 @@ After patching, you can simulate without waiting for a real hook fire:
 
 ```bash
 # 1. Confirm the trigger is loaded.
-nestctl recent --since 1m --kind 'system.*'
+coctl recent --since 1m --kind 'system.*'
 
 # 2. Publish the event yourself.
-nestctl event publish claude.commit_blocked --quiet \
+coctl event publish claude.commit_blocked --quiet \
     '{"reason":"manual test","repo":"demo"}'
 
 # 3. Watch for the toast (notify-send / osascript fires it).
 # Also check daemon logs for the trigger fire line:
-journalctl --user -u nesttyd --since "10s ago" 2>/dev/null \
-    || tail -n 20 /tmp/nesttyd*.log
+journalctl --user -u copadd --since "10s ago" 2>/dev/null \
+    || tail -n 20 /tmp/copadd*.log
 # Expected: trigger "claude-commit-blocked-toast" fired action "notify.show"
 ```
 
@@ -267,22 +267,22 @@ If the toast doesn't appear:
   event_kind` matches the kind you published, and `[triggers.security]
   accept_external = true` is present.
 - **Log line present but no toast** → `notify.show` subprocess
-  failure. Run the same call directly: `nestctl call notify.show
+  failure. Run the same call directly: `coctl call notify.show
   --params '{"title":"t","body":"b"}'` and check daemon logs for
   `notify subprocess` errors. The usual cause on a wlroots-based
   Wayland session is dunst crashing because `WAYLAND_DISPLAY` never
   reached the D-Bus activation env — see § "Graphical-session
   prerequisites" below for the two-line compositor fix.
-- **`nestctl: command not found`** → install nestty
+- **`coctl: command not found`** → install copad
   (`./scripts/install-dev.sh`) or check PATH.
 
 ## SSH + daemon lifecycle
 
 For the hook → toast loop to work in a fresh shell (especially an SSH
-session), `nesttyd` must already be running. The systemd `--user` unit
-shipped at `dist/systemd/nestty-daemon.service` (installed by
+session), `copadd` must already be running. The systemd `--user` unit
+shipped at `dist/systemd/copad-daemon.service` (installed by
 `install-dev.sh` by default) wires this up. macOS users get the
-matching LaunchAgent plist at `dist/launchd/com.marshall.nestty.daemon.plist`
+matching LaunchAgent plist at `dist/launchd/com.marshall.copad.daemon.plist`
 through `install-macos.sh`.
 
 ### Linux: linger choice
@@ -317,7 +317,7 @@ via SSH:
 ```sshconfig
 # ~/.ssh/config
 Host my-remote
-    RemoteForward /run/user/1000/nestty/socket /run/user/1000/nestty/socket
+    RemoteForward /run/user/1000/copad/socket /run/user/1000/copad/socket
 ```
 
 `/run/user/1000` resolves to `$XDG_RUNTIME_DIR` for UID 1000; adjust if
@@ -330,28 +330,28 @@ your UID differs (`id -u`). After connecting:
 - Triggers with `accept_external = true` fire on the workstation;
   the toast appears on the local desktop.
 
-If the forward fails (path occupied, permission denied), `nestctl`
+If the forward fails (path occupied, permission denied), `coctl`
 just falls back to "no daemon" and `--quiet` exits 0 silently. Hooks
 don't break.
 
 ### Troubleshooting
 
-- **`systemctl --user status nestty-daemon` → "not loaded"** →
+- **`systemctl --user status copad-daemon` → "not loaded"** →
   `install-dev.sh` wasn't run with `--with-daemon` (or it ran on a
   system without systemd). Re-run, or manually copy
-  `dist/systemd/nestty-daemon.service` to `~/.config/systemd/user/`.
+  `dist/systemd/copad-daemon.service` to `~/.config/systemd/user/`.
 
 - **"daemon dies on logout"** → linger off. Enable per above.
 
 - **SSH login does NOT auto-start the daemon** → linger on (the user
   instance is already running, no first-login event to trigger the
-  unit). Restart manually: `systemctl --user restart nestty-daemon`.
+  unit). Restart manually: `systemctl --user restart copad-daemon`.
   OR: linger off but unit not enabled — `systemctl --user enable --now
-  nestty-daemon`.
+  copad-daemon`.
 
-- **`nestctl event publish ...` from a remote SSH session times out**
+- **`coctl event publish ...` from a remote SSH session times out**
   → `RemoteForward` not set in `~/.ssh/config`, or
-  `$XDG_RUNTIME_DIR/nestty/socket` doesn't exist on the workstation.
+  `$XDG_RUNTIME_DIR/copad/socket` doesn't exist on the workstation.
 
 ## Graphical-session prerequisites (Linux / Wayland)
 
@@ -364,7 +364,7 @@ hasn't pushed `WAYLAND_DISPLAY` into the bus, dunst falls back to X11,
 fails to open a display, and crashes. Symptoms:
 
 ```
-nesttyd: notify.show failed: notifier exited exit status: 1:
+copadd: notify.show failed: notifier exited exit status: 1:
   Failed to show notification:
   GDBus.Error:org.freedesktop.DBus.Error.NameHasNoOwner:
   Could not activate remote peer 'org.freedesktop.Notifications':
@@ -395,12 +395,12 @@ systemctl --user show-environment | grep WAYLAND_DISPLAY    # must show wayland-
 dbus-send --session --print-reply --dest=org.freedesktop.DBus \
     /org/freedesktop/DBus org.freedesktop.DBus.GetConnectionUnixProcessID \
     string:org.freedesktop.Notifications                    # must return a PID
-nestctl event publish notify.show '{"title":"t","body":"b"}' --quiet
+coctl event publish notify.show '{"title":"t","body":"b"}' --quiet
 # Toast should appear immediately.
 ```
 
 The same root cause hits anything else dbus-activated from a fresh
-nesttyd context (xdg-desktop-portal, gnome-keyring helpers). Wiring
+copadd context (xdg-desktop-portal, gnome-keyring helpers). Wiring
 the two `exec-once` lines once fixes them all.
 
 ## Trust boundary recap

@@ -1,8 +1,8 @@
 # macOS Porting Guide
 
-**Heads-up:** `nestty-macos/` is *not* a stub. The root `CLAUDE.md` and
+**Heads-up:** `copad-macos/` is *not* a stub. The root `CLAUDE.md` and
 project memory still call it one, but that's stale — the macOS app
-already runs at near-parity with `nestty-linux/`. Renderer migration
+already runs at near-parity with `copad-linux/`. Renderer migration
 (SwiftTerm → `alacritty_terminal`) flipped the default in commit
 `e0ddf31` (Phase 10a). Daemon-first migration (PRs 1–8, see
 `docs/macos-daemon-migration-plan.md`) is shipped. 10 first-party plugins
@@ -20,37 +20,37 @@ change.
 
 ## 1. Current macOS state
 
-Tree shape: `nestty-macos/Package.swift` (SwiftPM, macOS 14+, Swift 6) +
-`nestty-macos/run.sh` (dev launcher) + `nestty-macos/Sources/` containing
+Tree shape: `copad-macos/Package.swift` (SwiftPM, macOS 14+, Swift 6) +
+`copad-macos/run.sh` (dev launcher) + `copad-macos/Sources/` containing
 three SPM targets:
 
-- **`Nestty/`** — 31 Swift files, ~7800 LOC. The full app: `NesttyApp` /
+- **`Copad/`** — 31 Swift files, ~7800 LOC. The full app: `CopadApp` /
   `AppDelegate` / tab+split tree (`TabViewController`, `PaneManager`,
-  `SplitNode`, `NesttyPanel`) / two terminal backends
+  `SplitNode`, `CopadPanel`) / two terminal backends
   (`TerminalViewController` = SwiftTerm fallback,
-  `AlacrittyTerminalViewController` = `nestty-term` default) /
+  `AlacrittyTerminalViewController` = `copad-term` default) /
   `WebViewController` / `PluginPanelController` / `SocketServer` /
   `DaemonClient` / `ActionRegistry` / `ContextService` / `EventBus` /
   `CommandPalette` / `Session` / `StatusBarView` + `StatusModuleRunner` /
   `BackgroundRotator` / `Keybindings` / `ClaudeStart` / `Config` +
   `ConfigWatcher` / `Theme` / `URLClickHelper` / `WebViewJS` /
-  `FFIBridge` (libnestty_ffi) / `NesttyTermFFI` (libnestty_term) /
-  `NesttyPaths` / `PluginManifest` plus a few small helpers
+  `FFIBridge` (libcopad_ffi) / `CopadTermFFI` (libcopad_term) /
+  `CopadPaths` / `PluginManifest` plus a few small helpers
   (`FileLock`, `UnixSocket`, `SendableBox`). Use `ls
-  nestty-macos/Sources/Nestty/` for the live list.
-- **`CNesttyFFI/`** — clang module wrapping `libnestty_ffi.a` (trigger
+  copad-macos/Sources/Copad/` for the live list.
+- **`CCopadFFI/`** — clang module wrapping `libcopad_ffi.a` (trigger
   engine + JSON round-trip). Header + module.modulemap + a `dummy.c`
   to force SPM to emit an object so linker settings flow through.
-- **`CNesttyTerm/`** — same shape, wrapping `libnestty_term.a`
+- **`CCopadTerm/`** — same shape, wrapping `libcopad_term.a`
   (alacritty_terminal grid + damage snapshot for the custom renderer).
 
-How it builds today is `./nestty-macos/run.sh` (debug, dev iteration)
+How it builds today is `./copad-macos/run.sh` (debug, dev iteration)
 or `./scripts/install-macos.sh` (release install to `~/Applications`).
 Both wrap the same two-step pipeline because SwiftPM can't call cargo
 as a prebuild step:
 
 ```
-cargo build --release -p nestty-ffi -p nestty-term     # → target/release/libnestty_{ffi,term}.a
+cargo build --release -p copad-ffi -p copad-term     # → target/release/libcopad_{ffi,term}.a
 swift build -c release                                  # links the .a via Package.swift's linkerSettings
 ```
 
@@ -66,31 +66,31 @@ Linux feature, this is its macOS equivalent and current status.
 
 | Concern | Linux source | macOS source | Status |
 |---|---|---|---|
-| PTY + terminal grid | VTE 0.84 owns PTY (`nestty-linux/src/tabs.rs`) | `AlacrittyTerminalViewController` via `libnestty_term.a` (default); SwiftTerm `TerminalViewController` (fallback) | done; SwiftTerm removal pending (Phase 10b) |
+| PTY + terminal grid | VTE 0.84 owns PTY (`copad-linux/src/tabs.rs`) | `AlacrittyTerminalViewController` via `libcopad_term.a` (default); SwiftTerm `TerminalViewController` (fallback) | done; SwiftTerm removal pending (Phase 10b) |
 | Renderer | VTE | Custom AppKit/CoreText draw + `CADisplayLink` damage gate | done (decision #36) |
-| Socket server | `nestty-linux/src/socket.rs` (1961 LOC) | `SocketServer.swift` + `AppDelegate.handleCommand` | done |
-| Daemon (`nesttyd`) | wired (`83c5122`) | `DaemonClient.swift` auto-spawns + connects | done |
+| Socket server | `copad-linux/src/socket.rs` (1961 LOC) | `SocketServer.swift` + `AppDelegate.handleCommand` | done |
+| Daemon (`copadd`) | wired (`83c5122`) | `DaemonClient.swift` auto-spawns + connects | done |
 | Tabs + splits | `tabs.rs` (2050 LOC), `split.rs` (376 LOC) | `TabViewController` + `PaneManager` + `SplitNode` + `EqualSplitView` | done |
 | Webview pane | `webview.rs` (526 LOC, webkit6) | `WebViewController` (WKWebView) + `WebViewJS` | done |
 | Plugin HTML/JS panel | `plugin_panel.rs` (411 LOC) | `PluginPanelController` w/ `WKScriptMessageHandlerWithReply` | done |
-| Trigger engine | `nestty-core::trigger` (Rust SoT); Linux wires `LiveTriggerSink` in `window.rs` | FFI via `nestty-ffi` + `FFIBridge.NesttyEngine` (Swift trampoline) | done (PR 5c) |
-| Action registry | `nestty-core::action_registry` | `ActionRegistry.swift` (no `register_blocking` yet) | done for parity scope |
-| ContextService | `nestty-core::context` | `ContextService.swift` mirrors apply rules | done (PR 9) |
+| Trigger engine | `copad-core::trigger` (Rust SoT); Linux wires `LiveTriggerSink` in `window.rs` | FFI via `copad-ffi` + `FFIBridge.CopadEngine` (Swift trampoline) | done (PR 5c) |
+| Action registry | `copad-core::action_registry` | `ActionRegistry.swift` (no `register_blocking` yet) | done for parity scope |
+| ContextService | `copad-core::context` | `ContextService.swift` mirrors apply rules | done (PR 9) |
 | Background images | `background.rs` (184 LOC) | `BackgroundRotator.swift` | done |
 | Status bar | `statusbar.rs` (427 LOC) | `StatusBarView` + `StatusModuleRunner` | done (Tier 4.2); `top` position deferred |
 | Command palette | `command_palette.rs` (332 LOC) | `CommandPalette.swift` | done |
 | Session persistence | `session.rs` (201 LOC) | `Session.swift` | done |
-| Theme | `nestty-core::theme` | `Theme.swift` (10 themes; 8→16-bit RGB conversion for SwiftTerm) | done |
-| Plugin supervisor | `nestty-daemon::ServiceSupervisor` (single SoT) | daemon owns it; Swift's prior native supervisor was deleted in PR 5 (commit `2913441`) | done |
+| Theme | `copad-core::theme` | `Theme.swift` (10 themes; 8→16-bit RGB conversion for SwiftTerm) | done |
+| Plugin supervisor | `copad-daemon::ServiceSupervisor` (single SoT) | daemon owns it; Swift's prior native supervisor was deleted in PR 5 (commit `2913441`) | done |
 | Custom keybindings | `tabs.rs:1413` `spawn_command` | `Keybindings.swift` via `NSEvent.addLocalMonitorForEvents` | done |
 | `notify.show` | core `Notifier` trait; both daemon + GUI register | daemon registers (osascript); GUI in-process **not yet wired** | gap (catchup §B) |
 | `BusEvent.origin` | shipped (`d03a01a`) | Swift struct missing the field | gap (catchup §B) |
 | `terminal.output` event | VTE `connect_commit` | `AlacrittyTerminalViewController.sendInput` helper | done on alacritty path; impossible on SwiftTerm |
-| D-Bus | `com.marshall.nestty` session bus | n/a — Unix socket only | out of scope (don't add) |
+| D-Bus | `com.marshall.copad` session bus | n/a — Unix socket only | out of scope (don't add) |
 
 The "out of scope" row matters. Nothing on the macOS side talks D-Bus.
-The `nestctl` ↔ daemon and GUI ↔ daemon paths are the only IPC, and both
-run over `~/Library/Caches/nestty/socket` (mode 0600).
+The `coctl` ↔ daemon and GUI ↔ daemon paths are the only IPC, and both
+run over `~/Library/Caches/copad/socket` (mode 0600).
 
 ---
 
@@ -99,21 +99,21 @@ run over `~/Library/Caches/nestty/socket` (mode 0600).
 **Fastest iteration:**
 
 ```bash
-cd nestty-macos
+cd copad-macos
 ./run.sh         # cargo + swift + bundle .app + open -n
 ```
 
 `run.sh` re-stages `Info.plist`, code-signs via `scripts/codesign-dev.sh`,
-`pkill -x Nestty`, and `open -n`s a fresh debug bundle.
+`pkill -x Copad`, and `open -n`s a fresh debug bundle.
 
 **Just build:**
 
 ```bash
-(cd .. && cargo build --release -p nestty-ffi -p nestty-term) && swift build -c release
+(cd .. && cargo build --release -p copad-ffi -p copad-term) && swift build -c release
 ```
 
 If you only changed Swift you can skip the cargo step. If you changed
-Rust in `nestty-ffi/` or `nestty-term/`, you still need both — SwiftPM
+Rust in `copad-ffi/` or `copad-term/`, you still need both — SwiftPM
 caches the link result.
 
 **Real install to `/Applications`-style:**
@@ -122,77 +122,77 @@ caches the link result.
 ./scripts/install-macos.sh              # ~/Applications + ~/.cargo/bin (no sudo)
 ./scripts/install-macos.sh --system     # /Applications (sudo)
 ./scripts/install-macos.sh --launch     # open after install
-./scripts/install-macos.sh --no-build   # if .build/release/Nestty already exists
+./scripts/install-macos.sh --no-build   # if .build/release/Copad already exists
 ./scripts/install-macos.sh --no-plugins # skip the 10-plugin cargo+install loop
-./scripts/install-macos.sh --no-nesttyd # skip daemon install
-./scripts/install-macos.sh --no-daemon  # skip LaunchAgent install (still installs nesttyd binary)
+./scripts/install-macos.sh --no-copadd # skip daemon install
+./scripts/install-macos.sh --no-daemon  # skip LaunchAgent install (still installs copadd binary)
 ```
 
 This is the dogfood path. The script cargo-builds both staticlibs + all
 plugins, swift-builds the app, stages in tmp, signs, atomic `mv` into
-`$APP_DEST`, `cargo install --path nestty-cli` + `--path nestty-daemon`,
+`$APP_DEST`, `cargo install --path copad-cli` + `--path copad-daemon`,
 copies each plugin manifest + binary into `~/Library/Application
-Support/nestty/plugins/<name>/`, and writes + bootstraps
-`~/Library/LaunchAgents/com.marshall.nestty.daemon.plist`.
+Support/copad/plugins/<name>/`, and writes + bootstraps
+`~/Library/LaunchAgents/com.marshall.copad.daemon.plist`.
 
-**nestctl / nesttyd alone:**
+**coctl / copadd alone:**
 
 ```bash
-cargo install --path nestty-cli       # → ~/.cargo/bin/nestctl
-cargo install --path nestty-daemon    # → ~/.cargo/bin/nesttyd
+cargo install --path copad-cli       # → ~/.cargo/bin/coctl
+cargo install --path copad-daemon    # → ~/.cargo/bin/copadd
 ```
 
-`cargo install nestty-cli` and `cargo install --path .` from the repo
+`cargo install copad-cli` and `cargo install --path .` from the repo
 root both fail. Always pass `--path <crate-dir>`.
 
 **Code signing:** `scripts/codesign-dev.sh` creates a stable self-signed
-`Nestty Dev` cert in your login keychain on first run, then re-signs
+`Copad Dev` cert in your login keychain on first run, then re-signs
 every build with the same identity. Without it, every rebuild gets a
 fresh cdhash and TCC re-prompts for Accessibility / Input Monitoring.
 Both `run.sh` and `install-macos.sh` call it automatically.
 
 **Universal binary:** currently host-arch only.
 `cargo build --target {aarch64,x86_64}-apple-darwin … && lipo -create …
--output target/release/libnestty_ffi.a` is the recipe; deferred until a
+-output target/release/libcopad_ffi.a` is the recipe; deferred until a
 real x86_64 user appears.
 
 ---
 
 ## 4. IPC contract + macOS paths
 
-JSON-RPC over Unix socket. `nestty-core::protocol` is the cross-platform
+JSON-RPC over Unix socket. `copad-core::protocol` is the cross-platform
 SoT (newline-delimited JSON, `{method, params, id?}` request /
-`{ok, result|error, id}` response). `nestctl` is platform-neutral.
+`{ok, result|error, id}` response). `coctl` is platform-neutral.
 
 **macOS paths:**
 
 | Purpose | Path |
 |---|---|
-| GUI per-process socket | `/tmp/nestty-{PID}.sock` (mode 0600) |
-| Daemon socket | `~/Library/Caches/nestty/socket` (mode 0600) |
-| Daemon PID file | `~/Library/Caches/nestty/daemon.pid` |
-| LaunchAgent plist | `~/Library/LaunchAgents/com.marshall.nestty.daemon.plist` |
-| Daemon logs | `~/Library/Logs/nestty-daemon.{out,err}.log` |
-| Config | `~/.config/nestty/config.toml` (same as Linux — dotfile sharing) |
-| Session state | `~/Library/Application Support/nestty/session.json` |
-| Plugin install dir | `~/Library/Application Support/nestty/plugins/<name>/` |
-| Plugin XDG fallback | `~/.config/nestty/plugins/<name>/` (read also; macOS-root wins) |
-| Wallpapers list | `~/Library/Caches/nestty/wallpapers.txt` (XDG fallback: `~/.cache/terminal-wallpapers.txt`) |
-| Background mode flag | `~/Library/Caches/nestty/bg-mode` |
+| GUI per-process socket | `/tmp/copad-{PID}.sock` (mode 0600) |
+| Daemon socket | `~/Library/Caches/copad/socket` (mode 0600) |
+| Daemon PID file | `~/Library/Caches/copad/daemon.pid` |
+| LaunchAgent plist | `~/Library/LaunchAgents/com.marshall.copad.daemon.plist` |
+| Daemon logs | `~/Library/Logs/copad-daemon.{out,err}.log` |
+| Config | `~/.config/copad/config.toml` (same as Linux — dotfile sharing) |
+| Session state | `~/Library/Application Support/copad/session.json` |
+| Plugin install dir | `~/Library/Application Support/copad/plugins/<name>/` |
+| Plugin XDG fallback | `~/.config/copad/plugins/<name>/` (read also; macOS-root wins) |
+| Wallpapers list | `~/Library/Caches/copad/wallpapers.txt` (XDG fallback: `~/.cache/terminal-wallpapers.txt`) |
+| Background mode flag | `~/Library/Caches/copad/bg-mode` |
 
-`nesttyd`'s socket path is computed by
-`nestty-core::paths::daemon_socket_path()`. `nestctl` auto-discovers it.
+`copadd`'s socket path is computed by
+`copad-core::paths::daemon_socket_path()`. `coctl` auto-discovers it.
 GUI's `DaemonClient.connectAndRegister`:
 
 1. `connect(2)` to the daemon socket.
 2. On `ECONNREFUSED`/`ENOENT`, take the single-flight lock
-   (`~/Library/Caches/nestty/.spawn-lock` via `FileLock.swift`),
-   `posix_spawn` `nesttyd`, wait ~1s for socket, retry.
+   (`~/Library/Caches/copad/.spawn-lock` via `FileLock.swift`),
+   `posix_spawn` `copadd`, wait ~1s for socket, retry.
 3. Send `gui.register` with `bridge_id`, GUI env, capabilities.
 
-If `nesttyd` is not in `$PATH` for the shell that launched `Nestty.app`,
+If `copadd` is not in `$PATH` for the shell that launched `Copad.app`,
 auto-spawn fails gracefully — status bar disappears, plugins go quiet,
-GUI keeps working. Pre-install `nesttyd` via cargo to avoid this.
+GUI keeps working. Pre-install `copadd` via cargo to avoid this.
 
 ---
 
@@ -205,14 +205,14 @@ All 10 first-party plugins build + install on macOS. Status:
 | `echo` | works | Protocol sanity-check. |
 | `git` | works | No platform-specific deps; shells out to `git`. |
 | `llm` | works (read) | `keyring` `apple-native` → Keychain. Write path needs real API key. |
-| `calendar` | works (graceful) | OAuth device-code via `nestty-plugin-calendar auth`. Without creds, RPC returns `not_authenticated`. |
-| `kb` / `todo` / `bookmark` | works | `renameat2(RENAME_NOREPLACE)` was Linux-only; PR 6 extracted `nestty_core::fs_atomic` which uses `renamex_np(RENAME_EXCL)` on macOS. |
+| `calendar` | works (graceful) | OAuth device-code via `copad-plugin-calendar auth`. Without creds, RPC returns `not_authenticated`. |
+| `kb` / `todo` / `bookmark` | works | `renameat2(RENAME_NOREPLACE)` was Linux-only; PR 6 extracted `copad_core::fs_atomic` which uses `renamex_np(RENAME_EXCL)` on macOS. |
 | `slack` / `discord` / `jira` | installs, needs auth | Same `keyring` story. Each has an `auth` subcommand for token setup. |
 
 `MACOS_PLUGINS` in `scripts/install-macos.sh` is currently
 `(echo git llm calendar kb todo bookmark slack discord jira)`. Adding a
 plugin = append to that array; the loop does `cargo build --release -p
-nestty-plugin-<name>` and copies manifest + binary into the plugin dir.
+copad-plugin-<name>` and copies manifest + binary into the plugin dir.
 
 **`web-bridge` is not in `MACOS_PLUGINS` yet** — recent addition
 (commits b8a2226 etc.). Review the plugin's `Cargo.toml` for
@@ -220,18 +220,18 @@ Linux-only deps before adding; the panel + Web Push code is portable.
 
 **Webview substitution:** `webkit6` (Linux) and `WKWebView` (macOS) are
 interchangeable at the plugin-bridge level. JS contract
-`window.nestty.call(method, params) → Promise` is byte-for-byte
+`window.copad.call(method, params) → Promise` is byte-for-byte
 identical; both sides use reply-capable handlers
 (`WebKitUserContentManager` reply on Linux,
 `WKScriptMessageHandlerWithReply` on macOS). The bridge JS is built by
-`PluginPanelController.swift` matching `nestty-linux/src/plugin_panel.rs:74`'s
+`PluginPanelController.swift` matching `copad-linux/src/plugin_panel.rs:74`'s
 `build_bridge_js`. No `#[cfg]` guards needed in plugin code.
 
 **Discovery order** (both Swift `PluginManifestStore.discover()` and
 daemon Rust `ServiceSupervisor::discover`):
 
-1. `~/Library/Application Support/nestty/plugins/<name>/plugin.toml`
-2. `~/.config/nestty/plugins/<name>/plugin.toml`
+1. `~/Library/Application Support/copad/plugins/<name>/plugin.toml`
+2. `~/.config/copad/plugins/<name>/plugin.toml`
 
 macOS path wins on conflict.
 
@@ -246,7 +246,7 @@ The macOS app is past the original parity plan. Active queue is in
 
 1. **DSR (Device Status Report)** — nvim warns at startup because
    `CSI 6n` (cursor pos) and `CSI 0c` (attrs) are ignored. Two reply
-   handlers in `nestty-term`'s input loop. ~1 hour.
+   handlers in `copad-term`'s input loop. ~1 hour.
 2. **NSImage async loading** — wallpaper open on main thread can stall
    during Gatekeeper/XProtect scan. Move `NSImage(contentsOfFile:)` to
    a background queue + progressive reveal.
@@ -262,14 +262,14 @@ The macOS app is past the original parity plan. Active queue is in
 **B. Linux-parity catch-up** — Linux landed these, macOS hasn't:
 
 1. **GUI in-process `notify.show`** — daemon has it; GUI doesn't.
-   `nestctl call notify.show` works only when daemon is up. Mirror
-   `nestty-linux/src/window.rs:218`'s `register_blocking_silent` in
+   `coctl call notify.show` works only when daemon is up. Mirror
+   `copad-linux/src/window.rs:218`'s `register_blocking_silent` in
    Swift, call `UNUserNotificationCenter`. ~2 hours.
 2. **Swift `BusEvent.origin` field** — trust-boundary parity. Origin
    tagging shipped on Rust side (`d03a01a`, decision #37); Swift's
    `BusEvent` struct doesn't carry it. Limits Swift-side privileged-action
    gating.
-3. **`nesttyd --version` short-circuit** — daemon binds socket before
+3. **`copadd --version` short-circuit** — daemon binds socket before
    parsing argv, so a second invocation while one is running errors
    out even for `--version`. Parse `--version`/`--help` first.
 
@@ -278,13 +278,13 @@ dogfooding on alacritty with no regressions, delete the SwiftTerm path
 entirely. File list in `docs/macos-post-renderer-catchup.md` §C. Biggest
 code-simplification win available; do it when there's confidence.
 
-**D. Cross-platform daemon work** — pure-Rust changes in `nestty-daemon`
+**D. Cross-platform daemon work** — pure-Rust changes in `copad-daemon`
 or plugins; macOS daemon auto-spawned via LaunchAgent picks them up for
 free. Tracked in `docs/harness-integration.md` and `docs/service-plugins.md`.
 No Swift work required.
 
 **E. Test hygiene** — `paths::tests::*` has 7 env-var-race failures on
-macOS in `cargo test -p nestty-core --lib`. Either `serial_test::serial`
+macOS in `cargo test -p copad-core --lib`. Either `serial_test::serial`
 gate or subprocess-per-test.
 
 **Recommended starting point:** **A1 (DSR)** for a tiny first commit, or
@@ -299,7 +299,7 @@ item to start with cold is the SwiftTerm path (C) — leave it last.
 Read before touching the relevant subsystem. Linked to canonical doc.
 
 - **OSC 52 clipboard write** was unconditional on macOS until Tier 0.3.
-  `NesttyTerminalDelegate` proxy gates `clipboardCopy` on
+  `CopadTerminalDelegate` proxy gates `clipboardCopy` on
   `[security] osc52` (default `deny`). Mirrored on alacritty path.
   See `docs/troubleshooting.md`.
 - **SwiftTerm `becomeFirstResponder` non-overridable** — `public` not
@@ -315,7 +315,7 @@ Read before touching the relevant subsystem. Linked to canonical doc.
   `scripts/codesign-dev.sh`. Don't bypass; you'll waste 5 minutes
   re-granting Accessibility per rebuild.
 - **`startProcess(environment:)` replaces parent env** — manually inherit
-  + append `TERM`, `COLORTERM`, `NESTTY_SOCKET`. See
+  + append `TERM`, `COLORTERM`, `COPAD_SOCKET`. See
   `TerminalViewController.startIfNeeded()`.
 - **`startShellIfNeeded()` timing** — must call after
   `layoutSubtreeIfNeeded()` or SwiftTerm computes cols/rows = 0.
@@ -333,7 +333,7 @@ Read before touching the relevant subsystem. Linked to canonical doc.
   instead of forking SwiftTerm or waiting for libghostty. Required
   context if you ever think "why not just upgrade SwiftTerm".
 - **Decisions #12, #13, #14, #15** — macOS split-pane layout +
-  NSSplitViewDelegate + async socket via DispatchSemaphore + `NesttyPanel`
+  NSSplitViewDelegate + async socket via DispatchSemaphore + `CopadPanel`
   protocol. The "why" behind a lot of the current architecture.
 - **`docs/macos-daemon-migration-plan.md` PR 4a/4b** — non-obvious
   wire-shape compat constraints if you touch `EventBus` ↔ daemon
@@ -364,17 +364,17 @@ After porting or landing something, run through the relevant subset.
 Manual verification matters more than unit tests at this layer.
 
 **Daemon round-trip**
-- [ ] `Nestty.app` launches, status bar visible at window bottom.
-- [ ] `nestctl call system.ping` → `{"status":"ok"}`.
-- [ ] `nestctl call system.list_actions` lists registered actions.
-- [ ] `nestctl recent` shows recent daemon events.
-- [ ] Quit `Nestty`, daemon log keeps growing (`KeepAlive=true`).
+- [ ] `Copad.app` launches, status bar visible at window bottom.
+- [ ] `coctl call system.ping` → `{"status":"ok"}`.
+- [ ] `coctl call system.list_actions` lists registered actions.
+- [ ] `coctl recent` shows recent daemon events.
+- [ ] Quit `Copad`, daemon log keeps growing (`KeepAlive=true`).
 
 **Plugin alive**
-- [ ] `nestctl call echo.ping --params '{"hi":"there"}'`
-      → `{"echoed":{"hi":"there"},"from":"nestty-plugin-echo"}`.
-- [ ] `nestctl call git.list_workspaces` returns `[]` or your workspaces.
-- [ ] `nestctl call llm.auth_status` → `{store_kind: "keyring", ...}`
+- [ ] `coctl call echo.ping --params '{"hi":"there"}'`
+      → `{"echoed":{"hi":"there"},"from":"copad-plugin-echo"}`.
+- [ ] `coctl call git.list_workspaces` returns `[]` or your workspaces.
+- [ ] `coctl call llm.auth_status` → `{store_kind: "keyring", ...}`
       (confirms Keychain reachable).
 
 **Terminal pane**
@@ -393,26 +393,26 @@ Manual verification matters more than unit tests at this layer.
 - [ ] Quit shell (Ctrl+D) → pane removed, neighbor expands.
 
 **Webview pane**
-- [ ] `nestctl call webview.open --params '{"url":"https://example.com"}'`
+- [ ] `coctl call webview.open --params '{"url":"https://example.com"}'`
       opens a tab with toolbar (back / forward / reload / URL field /
       devtools).
-- [ ] `nestctl call webview.execute_js --params '{"code":"document.title"}'`
+- [ ] `coctl call webview.execute_js --params '{"code":"document.title"}'`
       → `"Example Domain"`.
-- [ ] `nestctl call webview.screenshot` returns base64 PNG.
+- [ ] `coctl call webview.screenshot` returns base64 PNG.
 
 **Plugin panel**
-- [ ] `nestctl call plugin.open --params '{"name":"todo","panel":"main"}'`
+- [ ] `coctl call plugin.open --params '{"name":"todo","panel":"main"}'`
       opens the plugin's HTML panel.
 
 **Triggers (Vision Flow 3 critical path)**
-- [ ] Add to `~/.config/nestty/config.toml`:
+- [ ] Add to `~/.config/copad/config.toml`:
       `[[triggers]] name = "test" action = "system.list_actions"`
       `[triggers.when] event_kind = "echo.ping.completed"`
-- [ ] `nestctl call echo.ping --params '{"hi":"x"}'` — daemon log shows
+- [ ] `coctl call echo.ping --params '{"hi":"x"}'` — daemon log shows
       `event echo.ping.completed fired 1 trigger(s)`.
 
 **Session persistence**
-- [ ] 3 tabs with different cwds. `Cmd+Q`. Re-open `Nestty.app`. All 3
+- [ ] 3 tabs with different cwds. `Cmd+Q`. Re-open `Copad.app`. All 3
       restored at the same cwd. (Split positions re-equalize to 50/50
       — divider position not tracked in v1.)
 
@@ -421,9 +421,9 @@ Manual verification matters more than unit tests at this layer.
 - [ ] Change `[background] tint`, save. Image alpha updates live.
 
 **Keychain write**
-- [ ] `ANTHROPIC_API_KEY=sk-... nestty-plugin-llm auth` — first run may
+- [ ] `ANTHROPIC_API_KEY=sk-... copad-plugin-llm auth` — first run may
       produce a Keychain prompt. After approve,
-      `nestctl call llm.auth_status` → `authenticated: true`.
+      `coctl call llm.auth_status` → `authenticated: true`.
 
 ---
 
@@ -435,7 +435,7 @@ Manual verification matters more than unit tests at this layer.
 - `docs/macos-daemon-migration-plan.md` — daemon-first split. Read for
   `DaemonClient` / `EventBus` / daemon-forward changes.
 - `docs/macos-renderer-migration-plan.md` — alacritty renderer. Read
-  for `AlacrittyTerminalViewController` or `nestty-term` changes.
+  for `AlacrittyTerminalViewController` or `copad-term` changes.
 - `docs/macos-post-renderer-catchup.md` — active backlog.
 - `docs/troubleshooting.md` macOS section — re-discovering fixes is
   wasted time.

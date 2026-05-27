@@ -1,9 +1,9 @@
-//! Mock service plugin for nestty.
+//! Mock service plugin for copad.
 //!
 //! Useful as both a wire-protocol smoke test and a debug heartbeat.
 //! Exposes a single action (`echo.ping`) that round-trips its params and
 //! publishes a `system.heartbeat` event on a configurable interval
-//! (`NESTTY_ECHO_HEARTBEAT_SECS`, defaulting to 30s — short during E2E,
+//! (`COPAD_ECHO_HEARTBEAT_SECS`, defaulting to 30s — short during E2E,
 //! long enough not to spam logs in normal use).
 
 use std::io::{BufRead, BufReader, Write};
@@ -38,9 +38,9 @@ fn main() {
 
     // Heartbeat publisher. Sleeps then sends — and gates on the
     // `initialized` notification flag so heartbeat events never leak
-    // out before nestty has finished the handshake.
+    // out before copad has finished the handshake.
     let initialized = Arc::new(AtomicBool::new(false));
-    let interval_secs: u64 = std::env::var("NESTTY_ECHO_HEARTBEAT_SECS")
+    let interval_secs: u64 = std::env::var("COPAD_ECHO_HEARTBEAT_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(30);
@@ -58,7 +58,7 @@ fn main() {
                     "params": {
                         "kind": "system.heartbeat",
                         "payload": {
-                            "source": "nestty-plugin-echo",
+                            "source": "copad-plugin-echo",
                             "timestamp_ms": now_millis(),
                         }
                     }
@@ -139,7 +139,7 @@ fn handle_frame(value: &Value, tx: &Sender<String>, initialized: &AtomicBool) {
                     send_response(
                         tx,
                         id,
-                        json!({ "echoed": action_params, "from": "nestty-plugin-echo" }),
+                        json!({ "echoed": action_params, "from": "copad-plugin-echo" }),
                     );
                 }
                 other => {
@@ -154,7 +154,7 @@ fn handle_frame(value: &Value, tx: &Sender<String>, initialized: &AtomicBool) {
         }
         "event.dispatch" => {
             // The echo plugin doesn't subscribe to anything, but the
-            // protocol allows nestty to forward events for future
+            // protocol allows copad to forward events for future
             // configurations; ignore quietly.
         }
         "shutdown" => {

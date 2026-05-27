@@ -11,7 +11,7 @@
 # Filesystem-driven events (`git.worktree_created`,
 # `git.worktree_removed`, `git.branch_created`, `git.branch_deleted`,
 # `git.checkout`) ship in Phase 17 slice 2 and are now published by
-# the per-workspace polling watcher (`NESTTY_GIT_POLL_MS` tunable,
+# the per-workspace polling watcher (`COPAD_GIT_POLL_MS` tunable,
 # default 2000 ms). Payload: `{workspace, head}` for checkout,
 # `{workspace, name}` otherwise.
 

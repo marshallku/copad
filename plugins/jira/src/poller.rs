@@ -2,13 +2,13 @@
 //!
 //! Loop:
 //! 1. Wait until the supervisor has sent `initialized` (so events
-//!    don't leak before nestty has finished the handshake).
+//!    don't leak before copad has finished the handshake).
 //! 2. First tick runs IMMEDIATELY (no leading sleep), then sleep
 //!    `poll_interval` between subsequent ticks. Same posture as
 //!    calendar's poller.
 //! 3. If `fatal_error` is set OR neither env nor store has usable
 //!    credentials, skip silently — the user can fix the env or run
-//!    `nestty-plugin-jira auth` while nestty is already running and
+//!    `copad-plugin-jira auth` while copad is already running and
 //!    the next tick picks up the new state.
 //! 4. Fetch ticket pages via `jira::search` (ORDER BY updated DESC,
 //!    JQL: `(assignee = currentUser() OR watcher = currentUser()) AND
@@ -143,7 +143,7 @@ impl Poller {
         // etc.). Trade-off: ~5-10× larger response than the explicit
         // field list. Acceptable for v1 — typical workspaces have a
         // few dozen tickets in the lookback window. If response size
-        // becomes a real cost we can add `NESTTY_JIRA_LEAN_PAYLOAD=1`
+        // becomes a real cost we can add `COPAD_JIRA_LEAN_PAYLOAD=1`
         // to opt out, but only when someone actually reports it.
         let fields = ["*all"];
         let (tickets, truncated) = self.fetch_all_tickets(creds_borrow, &jql, &fields)?;
@@ -204,7 +204,7 @@ impl Poller {
             if page + 1 == MAX_PAGES {
                 eprintln!(
                     "[jira] search truncated after {MAX_PAGES} pages ({} tickets so far); \
-                     consider narrowing NESTTY_JIRA_LOOKBACK_HOURS or NESTTY_JIRA_PROJECTS",
+                     consider narrowing COPAD_JIRA_LOOKBACK_HOURS or COPAD_JIRA_PROJECTS",
                     all.len()
                 );
             }
@@ -851,7 +851,7 @@ mod tests {
     #[test]
     fn account_id_cache_invalidates_on_credential_change() {
         // Codex round-9 C2: re-auth to a different Atlassian account
-        // while nestty stays up must invalidate the cached
+        // while copad stays up must invalidate the cached
         // my_account_id (and snapshots, since the prior account's
         // assigned-to-me set is irrelevant). Otherwise mention
         // detection would compare against the old account

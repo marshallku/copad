@@ -1,14 +1,14 @@
 //! Workspace configuration for the git plugin.
 //!
-//! Loaded from `~/.config/nestty/workspaces.toml` (override with
-//! `NESTTY_GIT_WORKSPACES_FILE`):
+//! Loaded from `~/.config/copad/workspaces.toml` (override with
+//! `COPAD_GIT_WORKSPACES_FILE`):
 //!
 //! ```toml
 //! [[workspace]]
-//! name = "nestty"
-//! path = "/home/marshall/dev/nestty"
+//! name = "copad"
+//! path = "/home/marshall/dev/copad"
 //! default_base = "master"
-//! worktree_root = "/home/marshall/dev/nestty-worktrees"  # optional
+//! worktree_root = "/home/marshall/dev/copad-worktrees"  # optional
 //!
 //! [[workspace]]
 //! name = "site"
@@ -81,7 +81,7 @@ impl Config {
         Self::from_path(config_path())
     }
 
-    /// Test seam — `NESTTY_GIT_WORKSPACES_FILE` is process-wide and
+    /// Test seam — `COPAD_GIT_WORKSPACES_FILE` is process-wide and
     /// would race under parallel tests.
     pub fn from_path(path: PathBuf) -> Self {
         let mut errors: Vec<String> = Vec::new();
@@ -343,14 +343,14 @@ fn default_worktree_root(workspace_path: &Path) -> PathBuf {
 }
 
 fn config_path() -> PathBuf {
-    if let Ok(s) = std::env::var("NESTTY_GIT_WORKSPACES_FILE")
+    if let Ok(s) = std::env::var("COPAD_GIT_WORKSPACES_FILE")
         && !s.is_empty()
     {
         return PathBuf::from(s);
     }
     config_home()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("nestty")
+        .join("copad")
         .join("workspaces.toml")
 }
 

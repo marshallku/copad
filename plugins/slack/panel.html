@@ -37,8 +37,8 @@
   --slack-rxn:   #94e2d5;   /* reaction rail: teal */
 
   /* Type rails — modifier-driven, defaults to grey overlay */
-  --rail-default: var(--nestty-overlay0);
-  --rail-mention: var(--nestty-accent);
+  --rail-default: var(--copad-overlay0);
+  --rail-mention: var(--copad-accent);
   --rail-dm:      var(--slack-info);
   --rail-rxn:     var(--slack-rxn);
 
@@ -73,7 +73,7 @@ body {
   font-feature-settings: "tnum", "ss02", "calt";
   font-size: var(--fs-body);
   line-height: 1.45;
-  color: var(--nestty-text);
+  color: var(--copad-text);
   /* Body MUST stay transparent — host paints window-level wallpaper. */
   background: transparent;
 }
@@ -93,39 +93,39 @@ body {
   gap: var(--s-3);
   height: 36px;
   padding-inline: var(--s-4);
-  background: color-mix(in oklab, var(--nestty-surface0) 60%, transparent);
-  border-bottom: 1px solid var(--nestty-overlay0);
+  background: color-mix(in oklab, var(--copad-surface0) 60%, transparent);
+  border-bottom: 1px solid var(--copad-overlay0);
   flex-shrink: 0;
 }
 .slack-header__dot {
   width: 8px; height: 8px; border-radius: 50%;
-  background: var(--nestty-overlay0);
+  background: var(--copad-overlay0);
   flex-shrink: 0;
 }
 .slack-header__dot--ok   { background: var(--slack-ok);   animation: signalPulse 2.4s ease-out infinite; }
 .slack-header__dot--warn { background: var(--slack-warn); }
-.slack-header__dot--err  { background: var(--nestty-red);   }
+.slack-header__dot--err  { background: var(--copad-red);   }
 .slack-header__workspace {
   font-size: var(--fs-head);
   font-weight: 500;
-  color: var(--nestty-text);
+  color: var(--copad-text);
   letter-spacing: -0.005em;
 }
 .slack-header__meta {
   display: flex; gap: var(--s-3);
   font-size: var(--fs-meta);
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-style: italic;
 }
 .slack-header__meta strong {
   font-weight: 400; font-style: normal;
-  color: var(--nestty-subtext1);
+  color: var(--copad-subtext1);
 }
 .slack-header__spacer { flex: 1; }
 .slack-header__refresh {
   background: transparent;
-  border: 1px solid var(--nestty-surface2);
-  color: var(--nestty-subtext1);
+  border: 1px solid var(--copad-surface2);
+  color: var(--copad-subtext1);
   font: inherit;
   font-size: var(--fs-meta);
   padding: 4px 10px;
@@ -135,8 +135,8 @@ body {
   transition: background var(--t-fast), color var(--t-fast);
 }
 .slack-header__refresh:hover {
-  background: var(--nestty-surface1);
-  color: var(--nestty-text);
+  background: var(--copad-surface1);
+  color: var(--copad-text);
 }
 .slack-header__refresh:active { transform: scale(0.97); }
 .slack-header__refresh:disabled { opacity: 0.4; cursor: progress; }
@@ -148,13 +148,13 @@ body {
   align-items: center;
   height: 32px;
   padding-inline: var(--s-4);
-  border-bottom: 1px solid var(--nestty-overlay0);
+  border-bottom: 1px solid var(--copad-overlay0);
   flex-shrink: 0;
 }
 .slack-filter__chip {
   background: transparent;
   border: 0;
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font: inherit;
   font-size: var(--fs-meta);
   letter-spacing: 0.04em;
@@ -165,18 +165,18 @@ body {
   transition: background var(--t-fast), color var(--t-fast);
 }
 .slack-filter__chip:hover {
-  background: color-mix(in oklab, var(--nestty-surface0) 40%, transparent);
+  background: color-mix(in oklab, var(--copad-surface0) 40%, transparent);
 }
 .slack-filter__chip--active {
-  color: var(--nestty-accent);
+  color: var(--copad-accent);
 }
 .slack-filter__count {
   margin-left: 4px;
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-variant-numeric: tabular-nums;
 }
 .slack-filter__chip--active .slack-filter__count {
-  color: color-mix(in oklab, var(--nestty-accent) 70%, var(--nestty-subtext1));
+  color: color-mix(in oklab, var(--copad-accent) 70%, var(--copad-subtext1));
 }
 
 /* §6 FEED --------------------------------------------------------------- */
@@ -192,14 +192,14 @@ body {
 .slack-feed::-webkit-scrollbar { width: 8px; }
 .slack-feed::-webkit-scrollbar-track { background: transparent; }
 .slack-feed::-webkit-scrollbar-thumb {
-  background: var(--nestty-surface1);
+  background: var(--copad-surface1);
   border-radius: 4px;
 }
-.slack-feed::-webkit-scrollbar-thumb:hover { background: var(--nestty-surface2); }
+.slack-feed::-webkit-scrollbar-thumb:hover { background: var(--copad-surface2); }
 
 .slack-feed__empty {
   margin: var(--s-7) auto;
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-style: italic;
   font-size: var(--fs-body);
   text-align: center;
@@ -207,12 +207,12 @@ body {
 .slack-feed__empty::before {
   content: "··· ";
   letter-spacing: 0.2em;
-  color: var(--nestty-overlay0);
+  color: var(--copad-overlay0);
 }
 .slack-feed__empty::after {
   content: " ···";
   letter-spacing: 0.2em;
-  color: var(--nestty-overlay0);
+  color: var(--copad-overlay0);
 }
 
 /* §7 CARD --------------------------------------------------------------- */
@@ -226,7 +226,7 @@ body {
   align-items: start;
   gap: 0 var(--s-3);
   padding: var(--s-2) var(--s-3) var(--s-2) var(--s-2);
-  background: color-mix(in oklab, var(--nestty-surface0) 60%, transparent);
+  background: color-mix(in oklab, var(--copad-surface0) 60%, transparent);
   border-left: var(--rail-w) solid var(--rail-color);
   border-left-color: color-mix(in oklab, var(--rail-color) 40%, transparent);
   border-radius: 0 4px 4px 0;
@@ -235,17 +235,17 @@ body {
               transform var(--t-fast), padding var(--t-med);
 }
 .slack-card:hover {
-  background: color-mix(in oklab, var(--nestty-surface1) 85%, transparent);
+  background: color-mix(in oklab, var(--copad-surface1) 85%, transparent);
   border-left-color: var(--rail-color);
   transform: translateY(-1px);
 }
 .slack-card:active { transform: translateY(0) scale(0.997); }
 .slack-card:focus-visible {
-  outline: 1px solid var(--nestty-accent);
+  outline: 1px solid var(--copad-accent);
   outline-offset: 2px;
 }
 .slack-card--expanded {
-  background: var(--nestty-surface1);
+  background: var(--copad-surface1);
   border-left-color: var(--rail-color);
   padding-block: var(--s-3) var(--s-4);
   cursor: default;
@@ -264,12 +264,12 @@ body {
   font-size: var(--fs-meta);
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: color-mix(in oklab, var(--rail-color) 80%, var(--nestty-text));
+  color: color-mix(in oklab, var(--rail-color) 80%, var(--copad-text));
   font-weight: 600;
 }
 .slack-card__ts {
   font-size: var(--fs-meta);
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-variant-numeric: tabular-nums;
   font-style: italic;
   white-space: nowrap;
@@ -290,15 +290,15 @@ body {
   font-size: var(--fs-id);
 }
 .slack-card__channel {
-  color: var(--nestty-text);
+  color: var(--copad-text);
   font-weight: 600;
 }
 .slack-card__user {
-  color: var(--nestty-subtext1);
+  color: var(--copad-subtext1);
   font-weight: 400;
 }
 .slack-card__rel {
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-style: italic;
   font-size: var(--fs-meta);
   margin-left: auto;
@@ -306,7 +306,7 @@ body {
   white-space: nowrap;
 }
 .slack-card__preview {
-  color: var(--nestty-subtext1);
+  color: var(--copad-subtext1);
   font-size: var(--fs-body);
   white-space: nowrap;
   overflow: hidden;
@@ -316,7 +316,7 @@ body {
 .slack-card--expanded .slack-card__preview {
   white-space: pre-wrap;
   overflow: visible;
-  color: var(--nestty-text);
+  color: var(--copad-text);
   word-break: break-word;
 }
 
@@ -338,7 +338,7 @@ body {
 .slack-card__action {
   background: transparent;
   border: 0;
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font: inherit;
   font-size: var(--fs-meta);
   letter-spacing: 0.04em;
@@ -348,8 +348,8 @@ body {
   transition: background var(--t-fast), color var(--t-fast);
 }
 .slack-card__action:hover {
-  background: var(--nestty-surface2);
-  color: var(--nestty-text);
+  background: var(--copad-surface2);
+  color: var(--copad-text);
 }
 
 /* Expand-only zone — reply composer, fetched body, reacted-on body */
@@ -386,20 +386,20 @@ body {
 }
 .slack-card--rxn .slack-card__preview::before {
   content: "↳ on: ";
-  color: var(--nestty-overlay0);
+  color: var(--copad-overlay0);
 }
 .slack-card__rxn-body {
   font-size: var(--fs-body);
-  color: var(--nestty-subtext1);
-  background: color-mix(in oklab, var(--nestty-surface0) 80%, transparent);
-  border-left: 2px solid var(--nestty-overlay0);
+  color: var(--copad-subtext1);
+  background: color-mix(in oklab, var(--copad-surface0) 80%, transparent);
+  border-left: 2px solid var(--copad-overlay0);
   padding: var(--s-2) var(--s-3);
   white-space: pre-wrap;
   word-break: break-word;
   font-style: italic;
 }
 .slack-card__rxn-body--loading {
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-style: italic;
 }
 
@@ -407,8 +407,8 @@ body {
 .slack-composer {
   display: flex;
   flex-direction: column;
-  background: color-mix(in oklab, var(--nestty-surface2) 92%, transparent);
-  border-top: 1px solid var(--nestty-overlay0);
+  background: color-mix(in oklab, var(--copad-surface2) 92%, transparent);
+  border-top: 1px solid var(--copad-overlay0);
   padding: var(--s-2) var(--s-4);
   flex-shrink: 0;
   transition: padding var(--t-fast);
@@ -421,14 +421,14 @@ body {
 }
 .slack-composer__row::before {
   content: "›";
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-size: var(--fs-id);
   flex-shrink: 0;
 }
 .slack-composer__channel {
-  background: var(--nestty-surface0);
-  border: 1px solid var(--nestty-surface2);
-  color: var(--nestty-text);
+  background: var(--copad-surface0);
+  border: 1px solid var(--copad-surface2);
+  color: var(--copad-text);
   font: inherit;
   font-size: var(--fs-body);
   padding: 4px 8px;
@@ -438,9 +438,9 @@ body {
   letter-spacing: 0.02em;
 }
 .slack-composer__channel:focus {
-  outline: 1px solid var(--nestty-accent);
+  outline: 1px solid var(--copad-accent);
   outline-offset: 1px;
-  border-color: var(--nestty-accent);
+  border-color: var(--copad-accent);
 }
 .slack-composer__channel:read-only {
   opacity: 0.7;
@@ -449,14 +449,14 @@ body {
 .slack-composer__divider {
   width: 1px;
   height: 16px;
-  background: var(--nestty-overlay0);
+  background: var(--copad-overlay0);
   flex-shrink: 0;
 }
 .slack-composer__textarea {
   flex: 1;
-  background: var(--nestty-surface0);
-  border: 1px solid var(--nestty-surface2);
-  color: var(--nestty-text);
+  background: var(--copad-surface0);
+  border: 1px solid var(--copad-surface2);
+  color: var(--copad-text);
   font: inherit;
   font-size: var(--fs-body);
   padding: 4px 8px;
@@ -468,19 +468,19 @@ body {
   transition: height var(--t-fast), border-color var(--t-fast);
 }
 .slack-composer__textarea::placeholder {
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-style: italic;
 }
 .slack-composer__textarea:focus {
-  outline: 1px solid var(--nestty-accent);
+  outline: 1px solid var(--copad-accent);
   outline-offset: 1px;
-  border-color: var(--nestty-accent);
+  border-color: var(--copad-accent);
   height: 96px;
 }
 .slack-composer__send {
   background: transparent;
-  border: 1px solid var(--nestty-surface2);
-  color: var(--nestty-subtext1);
+  border: 1px solid var(--copad-surface2);
+  color: var(--copad-subtext1);
   font: inherit;
   font-size: var(--fs-meta);
   padding: 0 10px;
@@ -491,9 +491,9 @@ body {
   flex-shrink: 0;
 }
 .slack-composer__send:hover {
-  background: var(--nestty-accent);
-  color: var(--nestty-bg);
-  border-color: var(--nestty-accent);
+  background: var(--copad-accent);
+  color: var(--copad-bg);
+  border-color: var(--copad-accent);
 }
 .slack-composer__send:disabled {
   opacity: 0.4;
@@ -501,7 +501,7 @@ body {
 }
 .slack-composer__hint {
   font-size: var(--fs-meta);
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-style: italic;
   padding-top: 4px;
   padding-left: 18px;
@@ -514,8 +514,8 @@ body {
 
 /* Inline reply variant — same DOM shape, different scope */
 .slack-card__expand .slack-composer {
-  background: color-mix(in oklab, var(--nestty-surface0) 80%, transparent);
-  border: 1px solid var(--nestty-overlay0);
+  background: color-mix(in oklab, var(--copad-surface0) 80%, transparent);
+  border: 1px solid var(--copad-overlay0);
   border-radius: 4px;
   padding: var(--s-2);
 }
@@ -533,9 +533,9 @@ body {
   pointer-events: none;
 }
 .slack-toast__item {
-  background: color-mix(in oklab, var(--nestty-surface2) 95%, transparent);
-  color: var(--nestty-text);
-  border-left: 4px solid var(--nestty-red);
+  background: color-mix(in oklab, var(--copad-surface2) 95%, transparent);
+  color: var(--copad-text);
+  border-left: 4px solid var(--copad-red);
   border-radius: 3px;
   padding: var(--s-2) var(--s-3);
   font-size: var(--fs-body);
@@ -547,7 +547,7 @@ body {
 .slack-toast__code {
   display: block;
   font-size: var(--fs-meta);
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   letter-spacing: 0.04em;
   text-transform: uppercase;
   margin-bottom: 2px;
@@ -570,22 +570,22 @@ body {
 }
 .slack-setup__title {
   font-size: var(--fs-head);
-  color: var(--nestty-text);
+  color: var(--copad-text);
   font-weight: 500;
   letter-spacing: -0.005em;
   margin: 0;
 }
 .slack-setup__body {
-  color: var(--nestty-subtext1);
+  color: var(--copad-subtext1);
   font-size: var(--fs-body);
   line-height: 1.6;
 }
 .slack-setup__error {
-  border-left: 3px solid var(--nestty-red);
-  background: color-mix(in oklab, var(--nestty-red) 8%, transparent);
+  border-left: 3px solid var(--copad-red);
+  background: color-mix(in oklab, var(--copad-red) 8%, transparent);
   padding: var(--s-3) var(--s-4);
   border-radius: 0 3px 3px 0;
-  color: var(--nestty-text);
+  color: var(--copad-text);
   font-size: var(--fs-body);
   white-space: pre-wrap;
   word-break: break-word;
@@ -593,7 +593,7 @@ body {
 .slack-setup__error strong {
   display: block;
   font-weight: 600;
-  color: var(--nestty-red);
+  color: var(--copad-red);
   margin-bottom: 4px;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -612,7 +612,7 @@ body {
   counter-increment: step;
   padding-left: var(--s-7);
   position: relative;
-  color: var(--nestty-subtext1);
+  color: var(--copad-subtext1);
 }
 .slack-setup__steps li::before {
   content: counter(step);
@@ -621,19 +621,19 @@ body {
   top: 0;
   width: 24px;
   height: 24px;
-  border: 1px solid var(--nestty-overlay0);
+  border: 1px solid var(--copad-overlay0);
   border-radius: 50%;
   display: grid;
   place-items: center;
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-size: var(--fs-meta);
 }
 .slack-setup__cmd {
   display: block;
   margin-top: var(--s-2);
-  background: var(--nestty-surface0);
-  color: var(--nestty-text);
-  border: 1px solid var(--nestty-surface2);
+  background: var(--copad-surface0);
+  color: var(--copad-text);
+  border: 1px solid var(--copad-surface2);
   border-radius: 3px;
   padding: var(--s-2) var(--s-3);
   font-size: var(--fs-body);
@@ -643,7 +643,7 @@ body {
 }
 .slack-setup__cmd::before {
   content: "$ ";
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
 }
 
 /* §11 MOTION ------------------------------------------------------------ */
@@ -680,7 +680,7 @@ body {
   cursor: pointer;
   padding: 0;
 }
-.copy-id:hover { color: var(--nestty-accent); }
+.copy-id:hover { color: var(--copad-accent); }
 </style>
 </head>
 <body>
@@ -739,14 +739,14 @@ body {
 
 /* ========================================================================
    slack/panel.html — JS
-   - Bridge: window.nestty.call / .on (host-injected)
+   - Bridge: window.copad.call / .on (host-injected)
    - Single-pass full-feed render (200 cap → ~5ms cost). Throttled by RAF.
    - localStorage keys:
      * slack-filter           "all"|"mention"|"dm"|"reaction"
      * slack-expanded         JSON Set<eventId>
      * slack-composer-draft   string
    - Events arriving before init() finishes are queued. The bridge starts
-     pumping as soon as `nestty.on(...)` is registered, but the auth-status
+     pumping as soon as `copad.on(...)` is registered, but the auth-status
      call may not have returned yet — buffer until UI ready.
    ======================================================================== */
 
@@ -812,7 +812,7 @@ function tsClock(tsStr) {
 async function refreshAuth() {
   dom.refresh.disabled = true;
   try {
-    state.auth = await nestty.call('slack.auth_status', {});
+    state.auth = await copad.call('slack.auth_status', {});
     state.authError = null;
   } catch (err) {
     // Distinguish "the call itself failed" from "the call returned
@@ -892,7 +892,7 @@ function renderTransportError() {
       The <code>slack.auth_status</code> call failed before the plugin
       could respond. The supervisor probably hasn't started the slack
       service, or the IPC connection broke. Try refresh after a moment;
-      if it persists, check nestty's stderr (e.g. <code>journalctl --user -u nestty</code>
+      if it persists, check copad's stderr (e.g. <code>journalctl --user -u copad</code>
       or the launching terminal's output) for service-supervisor messages.
     </p>
     <section class="slack-setup__error">
@@ -910,8 +910,8 @@ function renderSetup() {
       <strong>fatal_error</strong>${esc(fatal)}
     </section>` : '';
   const status = a.configured
-    ? `Slack plugin is configured but no credentials are signed in (<code>credentials_source = ${esc(a.credentials_source || 'none')}</code>). Run the auth command below and restart nestty.`
-    : `Slack plugin is not configured. Required env vars are missing or invalid; run the auth command below and restart nestty.`;
+    ? `Slack plugin is configured but no credentials are signed in (<code>credentials_source = ${esc(a.credentials_source || 'none')}</code>). Run the auth command below and restart copad.`
+    : `Slack plugin is not configured. Required env vars are missing or invalid; run the auth command below and restart copad.`;
   dom.main.className = 'slack-setup';
   dom.main.innerHTML = `
     <h1 class="slack-setup__title">slack plugin · setup</h1>
@@ -923,9 +923,9 @@ function renderSetup() {
       <li>Add bot scopes: <code>app_mentions:read</code>, <code>im:history</code>, <code>users:read</code>, <code>chat:write</code>, <code>reactions:read</code>, <code>channels:history</code>.</li>
       <li>Install to your workspace; copy the Bot User OAuth Token (<code>xoxb-…</code>).</li>
       <li>Persist the credentials and verify against Slack:
-        <code class="slack-setup__cmd">NESTTY_SLACK_BOT_TOKEN=xoxb-… NESTTY_SLACK_APP_TOKEN=xapp-… nestty-plugin-slack auth</code>
+        <code class="slack-setup__cmd">COPAD_SLACK_BOT_TOKEN=xoxb-… COPAD_SLACK_APP_TOKEN=xapp-… copad-plugin-slack auth</code>
       </li>
-      <li>Restart nestty. The Socket Mode loop reconnects automatically.</li>
+      <li>Restart copad. The Socket Mode loop reconnects automatically.</li>
     </ol>
   `;
 }
@@ -1086,7 +1086,7 @@ async function fetchReactionBody(channel, ts) {
   if (state.bodies.has(key)) return;
   state.bodies.set(key, undefined);  // placeholder = "in flight"
   try {
-    const msg = await nestty.call('slack.get_message', { channel, ts });
+    const msg = await copad.call('slack.get_message', { channel, ts });
     const body = (msg && (msg.text || msg.messages?.[0]?.text)) || '(no text)';
     state.bodies.set(key, body);
   } catch (err) {
@@ -1112,7 +1112,7 @@ function toast(code, msg, ttl = 4000) {
 async function sendMessage(channel, text, threadTs, sourceEv) {
   if (!channel || !text.trim()) return;
   try {
-    await nestty.call('slack.post_message', {
+    await copad.call('slack.post_message', {
       channel,
       text,
       ...(threadTs ? { thread_ts: threadTs } : {}),
@@ -1271,11 +1271,11 @@ async function init() {
   bindComposer();
 
   // Buffer events that arrive before auth_status returns. The bridge
-  // pump starts immediately on `nestty.on`, but the panel isn't visually
+  // pump starts immediately on `copad.on`, but the panel isn't visually
   // ready until refreshAuth() resolves.
-  nestty.on('slack.mention',  ev => ingestEvent('mention',  ev));
-  nestty.on('slack.dm',       ev => ingestEvent('dm',       ev));
-  nestty.on('slack.reaction', ev => ingestEvent('reaction', ev));
+  copad.on('slack.mention',  ev => ingestEvent('mention',  ev));
+  copad.on('slack.dm',       ev => ingestEvent('dm',       ev));
+  copad.on('slack.reaction', ev => ingestEvent('reaction', ev));
 
   await refreshAuth();
   setInterval(refreshRelTimes, 30 * 1000);

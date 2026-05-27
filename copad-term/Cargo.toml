@@ -1,0 +1,30 @@
+[package]
+name = "copad-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust terminal emulator core + C-ABI bridge for copad-macos. Phase 1 ships a stubbed surface; alacritty_terminal lands in Phase 2 (see docs/macos-renderer-migration-plan.md)."
+repository.workspace = true
+
+[lib]
+name = "copad_term"
+# staticlib so libcopad_term.a embeds into Copad.app at link time
+# alongside the existing libcopad_ffi.a — proven not to collide by
+# the Phase 0 spike. `rlib` lets Rust integration tests link the
+# crate normally (without it, tests can't `use copad_term::*`).
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Pinned to a specific minor version because Alacritty maintainers
+# don't support external use of this crate as a library
+# (alacritty/alacritty#2132). Bumping requires re-verifying the
+# `tty::new` + `EventLoop::new` + `Term::renderable_content` API
+# shape; see decision #31 R1.
+alacritty_terminal = "0.26"
+
+# macOS-only `proc_pidinfo` bindings for `copad_term_child_cwd`.
+# Already a transitive dep via alacritty_terminal; declared
+# explicitly here so the dependency surface is visible. Linux gates
+# the syscall behind `#[cfg(target_os = "macos")]`.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

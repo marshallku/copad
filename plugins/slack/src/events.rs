@@ -1,5 +1,5 @@
 //! Map raw Slack `events_api` payloads to `slack.mention` /
-//! `slack.dm` / `slack.reaction` nestty events.
+//! `slack.dm` / `slack.reaction` copad events.
 //!
 //! Slack delivers a wide variety of message types over Socket Mode:
 //! channel messages, DMs, edits, deletions, joins, bot messages,
@@ -189,7 +189,7 @@ fn classify_event(
     let event_type = event.get("type")?.as_str()?;
     match event_type {
         "reaction_added" => {
-            // Only message reactions reach nestty. File-level reactions
+            // Only message reactions reach copad. File-level reactions
             // (`item.type == "file"`) go nowhere — there's no
             // canonical "fetch the body" symmetry for files in the
             // current trigger DSL, and surfacing them would just
@@ -253,7 +253,7 @@ fn classify_event(
             // Filter aggressively. Slack sends edits, deletions, joins,
             // pinned-messages, and bot-broadcasts all under
             // `type=message` — only DMs from a real user without a
-            // subtype should reach nestty as `slack.dm`.
+            // subtype should reach copad as `slack.dm`.
             //
             // - `subtype` present → edit / delete / join / file_share
             //   etc. Skip; users can layer in handling later via the

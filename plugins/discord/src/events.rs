@@ -1,8 +1,8 @@
-//! Map Discord DISPATCH payloads to nestty-shaped `discord.*` events.
+//! Map Discord DISPATCH payloads to copad-shaped `discord.*` events.
 //!
 //! Two DISPATCH event types are handled:
 //!
-//! 1. `MESSAGE_CREATE` — fans out to up to two nestty events:
+//! 1. `MESSAGE_CREATE` — fans out to up to two copad events:
 //!    - `discord.raw` — always emitted (full firehose for archive triggers)
 //!    - `discord.message` — regular guild channel message (filtered)
 //!    - `discord.dm` — DM-channel message (no `guild_id`)
@@ -28,7 +28,7 @@
 //!
 //! Slice 2 (now 2.5 with reactions) restricts the allowlist; UPDATE,
 //! DELETE, REACTION_REMOVE, GUILD_CREATE, PRESENCE_UPDATE etc. arrive
-//! on the gateway but produce no nestty events. Discord's DISPATCH
+//! on the gateway but produce no copad events. Discord's DISPATCH
 //! variety (especially PRESENCE_UPDATE bursts) would flood downstream
 //! triggers without value, so we keep the allowlist explicit.
 //!
@@ -443,7 +443,7 @@ mod tests {
         let out = dispatch(
             "MESSAGE_CREATE",
             message_data(json!({
-                "mentions": [{"id": "BOT_USER_ID", "username": "nestty"}],
+                "mentions": [{"id": "BOT_USER_ID", "username": "copad"}],
                 "content": "<@BOT_USER_ID> ping?",
             })),
         );
@@ -502,7 +502,7 @@ mod tests {
             "MESSAGE_CREATE",
             message_data(json!({
                 "guild_id": Value::Null,
-                "mentions": [{"id": "BOT_USER_ID", "username": "nestty"}],
+                "mentions": [{"id": "BOT_USER_ID", "username": "copad"}],
             })),
         );
         match &out[1] {
@@ -517,7 +517,7 @@ mod tests {
     #[test]
     fn non_message_create_dispatch_returns_empty() {
         // Slice 2 only handles MESSAGE_CREATE. PRESENCE_UPDATE,
-        // GUILD_CREATE, etc. produce no nestty event.
+        // GUILD_CREATE, etc. produce no copad event.
         let out = dispatch("PRESENCE_UPDATE", json!({"foo": "bar"}));
         assert!(out.is_empty());
     }

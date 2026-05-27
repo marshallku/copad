@@ -1,7 +1,7 @@
-//! First-party KB service plugin for nestty.
+//! First-party KB service plugin for copad.
 //!
 //! Implements `kb.search` / `kb.read` / `kb.append` / `kb.ensure` over a
-//! filesystem root (default `~/docs`, overridable via `NESTTY_KB_ROOT`).
+//! filesystem root (default `~/docs`, overridable via `COPAD_KB_ROOT`).
 //! Search is grep-and-filename only — Phase 13 will swap in an FTS5
 //! index without touching the protocol surface.
 //!
@@ -19,12 +19,12 @@
 //!
 //! Unix-only: relies on `O_NOFOLLOW` plus a kernel atomic-create-or-fail
 //! primitive (Linux `renameat2(RENAME_NOREPLACE)` / macOS
-//! `renamex_np(RENAME_EXCL)`) routed through `nestty_core::fs_atomic`.
+//! `renamex_np(RENAME_EXCL)`) routed through `copad_core::fs_atomic`.
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!(
-    "nestty-plugin-kb supports Linux and macOS. Other Unixes need a \
-     backend-specific atomic-create primitive — extend nestty_core::fs_atomic."
+    "copad-plugin-kb supports Linux and macOS. Other Unixes need a \
+     backend-specific atomic-create primitive — extend copad_core::fs_atomic."
 );
 
 mod kb;

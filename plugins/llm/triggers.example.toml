@@ -26,26 +26,26 @@
 # action that wraps llm.complete + kb.append), NOT for surfacing a
 # generated response back to the user.
 #
-# For ad-hoc summarization with visible output, use nestctl:
-#   nestctl call llm.complete --params '{"prompt":"summarize this thread: ..."}'
+# For ad-hoc summarization with visible output, use coctl:
+#   coctl call llm.complete --params '{"prompt":"summarize this thread: ..."}'
 #
 # Phase 12.3 (deferred) addresses the result-handling gap with a
 # chained-trigger / composite-action mechanism.
 # ---------------------------------------------------------------------
 
 # ---------------------------------------------------------------------
-# 1. Daily usage report (manual via nestctl)
-#    nestctl call llm.usage --params '{"since":"2026-04-27T00:00:00Z"}'
+# 1. Daily usage report (manual via coctl)
+#    coctl call llm.usage --params '{"since":"2026-04-27T00:00:00Z"}'
 #    → {calls, input_tokens, output_tokens, by_model: {...},
 #       parse_errors, since, until}
 #
 #    Slice by model:
-#    nestctl call llm.usage --params '{"by_model":"claude-sonnet-4-6"}'
+#    coctl call llm.usage --params '{"by_model":"claude-sonnet-4-6"}'
 #
 #    Slice by trigger source: aggregator doesn't filter by `source`
 #    in v1 (just `model` + time). Use the JSONL file directly:
 #    jq -s 'group_by(.source) | map({source: .[0].source, calls: length})' \
-#       ~/.local/share/nestty/llm-usage-default.jsonl
+#       ~/.local/share/copad/llm-usage-default.jsonl
 # ---------------------------------------------------------------------
 
 # ---------------------------------------------------------------------

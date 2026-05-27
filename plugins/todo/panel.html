@@ -9,7 +9,7 @@
      placeholder colors, and crucially the open dropdown of <select>. */
   :root { color-scheme: dark; }
   body { padding: 12px 16px; font-size: 0.92rem; }
-  h1 { font-size: 1.05rem; margin: 0 0 12px; color: var(--nestty-subtext1);
+  h1 { font-size: 1.05rem; margin: 0 0 12px; color: var(--copad-subtext1);
        font-weight: 500; letter-spacing: 0.02em; }
 
   /* Toolbar — every control is exactly 30px tall via box-sizing +
@@ -30,32 +30,32 @@
   .toolbar > input.new-input { flex: 1 1 240px; min-width: 180px; }
   .toolbar > input,
   .toolbar > select {
-    background: var(--nestty-surface0); color: var(--nestty-text);
-    border: 1px solid var(--nestty-surface2);
+    background: var(--copad-surface0); color: var(--copad-text);
+    border: 1px solid var(--copad-surface2);
     padding: 0 10px;
   }
-  .toolbar > input::placeholder { color: var(--nestty-subtext0); }
+  .toolbar > input::placeholder { color: var(--copad-subtext0); }
   .toolbar > input:disabled { opacity: 0.6; }
   .toolbar > button {
-    background: var(--nestty-accent); color: var(--nestty-bg);
+    background: var(--copad-accent); color: var(--copad-bg);
     border: 0; padding: 0 12px; cursor: pointer;
   }
   .toolbar > button.ghost {
-    background: transparent; color: var(--nestty-subtext1);
-    border: 1px solid var(--nestty-surface2);
+    background: transparent; color: var(--copad-subtext1);
+    border: 1px solid var(--copad-surface2);
   }
   .toolbar > button:hover { filter: brightness(1.1); }
   .toolbar > label.toggle {
     display: inline-flex; align-items: center; gap: 6px;
     padding: 0 10px;
-    border: 1px solid var(--nestty-surface2);
-    color: var(--nestty-subtext1);
+    border: 1px solid var(--copad-surface2);
+    color: var(--copad-subtext1);
     cursor: pointer; user-select: none;
   }
   .toolbar > label.toggle input[type="checkbox"] {
     /* Native checkbox: don't inherit the toolbar input sizing. */
     height: auto; width: auto; margin: 0;
-    accent-color: var(--nestty-accent);
+    accent-color: var(--copad-accent);
   }
 
   /* Board: 3 columns, collapses to 2 when Done is hidden. */
@@ -68,19 +68,19 @@
 
   .col {
     display: flex; flex-direction: column; min-height: 140px; min-width: 0;
-    background: var(--nestty-surface0);
-    border: 1px solid var(--nestty-surface1);
+    background: var(--copad-surface0);
+    border: 1px solid var(--copad-surface1);
     border-radius: 6px;
   }
   .col-head {
     display: flex; align-items: center; justify-content: space-between;
     padding: 8px 10px;
-    color: var(--nestty-subtext1);
+    color: var(--copad-subtext1);
     font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em;
-    border-bottom: 1px solid var(--nestty-surface1);
+    border-bottom: 1px solid var(--copad-surface1);
   }
   .col-head .count {
-    background: var(--nestty-surface2); color: var(--nestty-subtext1);
+    background: var(--copad-surface2); color: var(--copad-subtext1);
     font-size: 0.7rem; padding: 1px 7px; border-radius: 999px;
     text-transform: none; letter-spacing: 0; min-width: 22px; text-align: center;
   }
@@ -90,22 +90,22 @@
     transition: background-color 80ms ease-out, box-shadow 80ms ease-out;
   }
   .col-body.drag-over {
-    background: var(--nestty-surface1);
-    box-shadow: inset 0 0 0 1px var(--nestty-accent);
+    background: var(--copad-surface1);
+    box-shadow: inset 0 0 0 1px var(--copad-accent);
   }
   .col-empty {
-    color: var(--nestty-subtext0); font-size: 0.8rem;
+    color: var(--copad-subtext0); font-size: 0.8rem;
     text-align: center; padding: 14px 6px;
     font-style: italic;
-    border: 1px dashed var(--nestty-surface2);
+    border: 1px dashed var(--copad-surface2);
     border-radius: 4px;
     pointer-events: none;
   }
 
   /* Card */
   .card {
-    background: var(--nestty-surface1);
-    border: 1px solid var(--nestty-surface2);
+    background: var(--copad-surface1);
+    border: 1px solid var(--copad-surface2);
     border-radius: 4px;
     padding: 8px 10px;
     cursor: grab; user-select: none;
@@ -121,8 +121,8 @@
     box-shadow: 0 8px 22px rgba(0,0,0,0.55);
     transform: rotate(-2deg) scale(1.02);
     opacity: 0.7;
-    border: 1px solid var(--nestty-accent);
-    background: var(--nestty-surface2);
+    border: 1px solid var(--copad-accent);
+    background: var(--copad-surface2);
   }
   /* While a drag is in flight, kill text selection across the whole
      panel — without this, the pointer-event sweep would also
@@ -136,12 +136,12 @@
   }
   .card.drag-ghost .actions { display: none !important; }
   .card .title { line-height: 1.3; word-break: break-word; padding-right: 70px; }
-  .card.done .title { color: var(--nestty-subtext0); text-decoration: line-through; }
+  .card.done .title { color: var(--copad-subtext0); text-decoration: line-through; }
   .card .body-preview {
-    color: var(--nestty-subtext0);
+    color: var(--copad-subtext0);
     font-size: 0.78rem; line-height: 1.4;
     /* Two-line clamp. -webkit-line-clamp is supported in WebKit,
-       which is the only renderer that runs panel.html — nestty is
+       which is the only renderer that runs panel.html — copad is
        linux/webkit6 today, macos webkit later. */
     display: -webkit-box;
     -webkit-line-clamp: 2;
@@ -149,7 +149,7 @@
     overflow: hidden;
     word-break: break-word;
   }
-  .card.done .body-preview { color: var(--nestty-overlay0); }
+  .card.done .body-preview { color: var(--copad-overlay0); }
   .card .meta { display: flex; flex-wrap: wrap; gap: 4px; font-size: 0.75em; }
   /* Actions are always visible (not hover-revealed) — Start is the
      primary workflow trigger; hiding it behind hover wrecked
@@ -160,7 +160,7 @@
   }
   .card.drag-ghost .actions { display: none !important; }
   .card .actions button {
-    background: var(--nestty-accent); color: var(--nestty-bg);
+    background: var(--copad-accent); color: var(--copad-bg);
     border: 0;
     border-radius: 3px;
     padding: 3px 10px; font-size: 0.75em;
@@ -171,14 +171,14 @@
 
   .badge {
     font-size: 0.72em; padding: 1px 6px; border-radius: 4px;
-    background: var(--nestty-surface2); color: var(--nestty-subtext1);
+    background: var(--copad-surface2); color: var(--copad-subtext1);
     line-height: 1.4;
   }
-  .badge.high { background: var(--nestty-red); color: var(--nestty-bg); }
-  .badge.blocked { background: var(--nestty-red); color: var(--nestty-bg); }
+  .badge.high { background: var(--copad-red); color: var(--copad-bg); }
+  .badge.blocked { background: var(--copad-red); color: var(--copad-bg); }
 
-  .err { color: var(--nestty-red); padding: 12px; }
-  .loading { color: var(--nestty-subtext0); padding: 12px; font-style: italic; }
+  .err { color: var(--copad-red); padding: 12px; }
+  .loading { color: var(--copad-subtext0); padding: 12px; font-style: italic; }
 
   /* Edit modal — opens on card click (not on Start, not after drag).
      A backdrop layer + a centered panel; Esc / backdrop click cancel.
@@ -195,31 +195,31 @@
   .modal-backdrop.open { display: flex; }
   .modal {
     width: min(720px, 100%);
-    background: var(--nestty-bg);
-    border: 1px solid var(--nestty-surface2);
+    background: var(--copad-bg);
+    border: 1px solid var(--copad-surface2);
     border-radius: 6px;
     padding: 18px 20px 16px;
     display: flex; flex-direction: column; gap: 12px;
     box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
   }
   .modal h2 {
-    margin: 0; font-size: 0.95rem; color: var(--nestty-subtext1);
+    margin: 0; font-size: 0.95rem; color: var(--copad-subtext1);
     font-weight: 500; letter-spacing: 0.02em;
   }
   .modal .meta-line {
-    color: var(--nestty-subtext0); font-size: 0.75em;
+    color: var(--copad-subtext0); font-size: 0.75em;
     font-family: ui-monospace, monospace;
   }
   .modal label {
     display: flex; flex-direction: column; gap: 4px;
-    font-size: 0.78em; color: var(--nestty-subtext1);
+    font-size: 0.78em; color: var(--copad-subtext1);
     text-transform: uppercase; letter-spacing: 0.05em;
   }
   .modal input[type="text"],
   .modal select,
   .modal textarea {
-    background: var(--nestty-surface0); color: var(--nestty-text);
-    border: 1px solid var(--nestty-surface2);
+    background: var(--copad-surface0); color: var(--copad-text);
+    border: 1px solid var(--copad-surface2);
     border-radius: 4px;
     padding: 9px 12px;
     font: inherit;
@@ -256,7 +256,7 @@
   .modal input[type="text"]:focus,
   .modal select:focus,
   .modal textarea:focus {
-    border-color: var(--nestty-accent); outline: none;
+    border-color: var(--copad-accent); outline: none;
     box-shadow: 0 0 0 2px rgba(203, 166, 247, 0.2);
   }
   .modal .row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
@@ -264,7 +264,7 @@
     display: flex; justify-content: space-between; gap: 8px;
     margin-top: 6px;
     padding-top: 12px;
-    border-top: 1px solid var(--nestty-surface1);
+    border-top: 1px solid var(--copad-surface1);
   }
   .modal .actions-bar .right { display: flex; gap: 8px; }
   .modal button {
@@ -272,7 +272,7 @@
     border-radius: 4px; font: inherit; line-height: 1; cursor: pointer;
   }
   .modal button.primary {
-    background: var(--nestty-accent); color: var(--nestty-bg); border: 0;
+    background: var(--copad-accent); color: var(--copad-bg); border: 0;
     font-weight: 500;
   }
   .modal button.primary:hover { filter: brightness(1.1); }
@@ -281,23 +281,23 @@
   }
   .modal button:disabled:hover { filter: none; }
   .modal button.ghost {
-    background: transparent; color: var(--nestty-subtext1);
-    border: 1px solid var(--nestty-surface2);
+    background: transparent; color: var(--copad-subtext1);
+    border: 1px solid var(--copad-surface2);
   }
-  .modal button.ghost:hover { color: var(--nestty-text); border-color: var(--nestty-overlay0); }
+  .modal button.ghost:hover { color: var(--copad-text); border-color: var(--copad-overlay0); }
   .modal button.danger {
-    background: transparent; color: var(--nestty-red);
-    border: 1px solid var(--nestty-red);
+    background: transparent; color: var(--copad-red);
+    border: 1px solid var(--copad-red);
   }
-  .modal button.danger:hover { background: var(--nestty-red); color: var(--nestty-bg); }
+  .modal button.danger:hover { background: var(--copad-red); color: var(--copad-bg); }
   .modal .delete-confirm {
     display: none; align-items: center; gap: 8px;
-    color: var(--nestty-red); font-size: 0.85em;
+    color: var(--copad-red); font-size: 0.85em;
   }
   .modal.confirming-delete .delete-confirm { display: flex; }
   .modal.confirming-delete .danger-launch { display: none; }
   .modal .err {
-    color: var(--nestty-red); font-size: 0.85em; padding: 0;
+    color: var(--copad-red); font-size: 0.85em; padding: 0;
   }
 </style>
 </head>
@@ -383,7 +383,7 @@
 const $ = (sel, root = document) => root.querySelector(sel);
 const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
 
-const HIDE_KEY = "nestty-todo-hide-done";
+const HIDE_KEY = "copad-todo-hide-done";
 const COLUMNS = ["open", "in_progress", "done"];
 // Items with status "blocked" don't have their own column. They live
 // in the Todo column with a red badge. Set blocked via vim-only
@@ -428,7 +428,7 @@ async function load({ retry = false } = {}) {
     if (attempts[i]) await new Promise(r => setTimeout(r, attempts[i]));
     if (myGen !== loadGen) return;
     try {
-      const { todos } = await nestty.call("todo.list", {});
+      const { todos } = await copad.call("todo.list", {});
       if (myGen !== loadGen) return;
       render(todos);
       return;
@@ -669,7 +669,7 @@ async function performDrop(card, targetStatus) {
   const workspace = card.dataset.workspace;
   moveCardOptimistic(card, targetStatus);
   try {
-    await nestty.call("todo.set_status", { id, workspace, status: targetStatus });
+    await copad.call("todo.set_status", { id, workspace, status: targetStatus });
     // load() reconciles action-button visibility (Start only on Todo
     // column) without waiting for the watcher's 2s poll cycle.
     load();
@@ -718,11 +718,11 @@ async function onStart(t) {
   try {
     if (wasNotInProgress) {
       if (card) moveCardOptimistic(card, "in_progress");
-      await nestty.call("todo.set_status", {
+      await copad.call("todo.set_status", {
         id: t.id, workspace: t.workspace, status: "in_progress",
       });
     }
-    await nestty.call("todo.start", { id: t.id, workspace: t.workspace });
+    await copad.call("todo.start", { id: t.id, workspace: t.workspace });
     if (wasNotInProgress) load();
   } catch (err) {
     alert(`start failed: ${err.message}`);
@@ -740,7 +740,7 @@ async function onLoop(button, t) {
   const original = button.textContent;
   button.disabled = true;
   try {
-    const { prompt } = await nestty.call("todo.render_loop_prompt", {
+    const { prompt } = await copad.call("todo.render_loop_prompt", {
       id: t.id, workspace: t.workspace,
     });
     if (await copyToClipboard(prompt)) {
@@ -800,7 +800,7 @@ newInput.addEventListener("keydown", async (e) => {
   if (!title) return;
   newInput.disabled = true;
   try {
-    await nestty.call("todo.create", { title });
+    await copad.call("todo.create", { title });
     newInput.value = "";
     // Same reason as drop/start: don't wait up to 2s for the watcher
     // poll. Reload immediately so the new card is visible before the
@@ -818,10 +818,10 @@ newInput.addEventListener("keydown", async (e) => {
 // error here means a real failure (plugin crashed mid-session, file
 // permissions changed) that the user should see immediately.
 $("#refresh").addEventListener("click", () => load());
-nestty.on("todo.created", () => load());
-nestty.on("todo.changed", () => load());
-nestty.on("todo.completed", () => load());
-nestty.on("todo.deleted", () => load());
+copad.on("todo.created", () => load());
+copad.on("todo.changed", () => load());
+copad.on("todo.completed", () => load());
+copad.on("todo.deleted", () => load());
 
 // --- Edit modal ---
 const modalBackdrop = $("#modal-backdrop");
@@ -864,7 +864,7 @@ function openEditModal(id, workspace) {
   modalBackdrop.hidden = false;
   field("title").focus();
 
-  nestty.call("todo.list", { workspace }).then(({ todos }) => {
+  copad.call("todo.list", { workspace }).then(({ todos }) => {
     // Stale-response guard: compare BOTH id AND workspace. The user
     // could have closed-then-reopened on a different todo before the
     // first list returned, and IDs aren't globally unique.
@@ -945,7 +945,7 @@ modalForm.addEventListener("submit", async (e) => {
   };
   modalErr.hidden = true;
   try {
-    await nestty.call("todo.update", params);
+    await copad.call("todo.update", params);
     closeModal();
     load();
   } catch (err) {
@@ -964,7 +964,7 @@ $("#confirm-delete").addEventListener("click", async () => {
   if (!modalContext) return;
   modalErr.hidden = true;
   try {
-    await nestty.call("todo.delete", {
+    await copad.call("todo.delete", {
       id: modalContext.id, workspace: modalContext.workspace,
     });
     closeModal();

@@ -1,13 +1,13 @@
 [package]
-name = "nestty-plugin-discord"
+name = "copad-plugin-discord"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "First-party Discord service plugin for nestty — connects via Gateway WebSocket, emits discord.message / discord.mention / discord.dm events."
+description = "First-party Discord service plugin for copad — connects via Gateway WebSocket, emits discord.message / discord.mention / discord.dm events."
 repository.workspace = true
 
 [[bin]]
-name = "nestty-plugin-discord"
+name = "copad-plugin-discord"
 path = "src/main.rs"
 
 [dependencies]

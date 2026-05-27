@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=copad
+Comment=Custom Terminal Emulator
+Exec=copad
+Icon=copad
+Type=Application
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;console;
+StartupNotify=true
+StartupWMClass=com.marshall.copad

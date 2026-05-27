@@ -1,4 +1,4 @@
-# Core Library (nestty-core)
+# Core Library (copad-core)
 
 Shared Rust library used by all platform targets.
 
@@ -6,10 +6,10 @@ Shared Rust library used by all platform targets.
 
 ### config.rs
 
-TOML config at `~/.config/nestty/config.toml`.
+TOML config at `~/.config/copad/config.toml`.
 
 ```rust
-NesttyConfig {
+CopadConfig {
     terminal: TerminalConfig { shell, font_family, font_size },
     background: BackgroundConfig { directory, interval, tint, opacity },
     socket: SocketConfig { path },
@@ -19,16 +19,16 @@ NesttyConfig {
 
 Key methods:
 
-- `NesttyConfig::load()` — reads config file, returns defaults if missing
-- `NesttyConfig::write_default()` — creates default config file
-- `NesttyConfig::config_path()` — returns `~/.config/nestty/config.toml`
+- `CopadConfig::load()` — reads config file, returns defaults if missing
+- `CopadConfig::write_default()` — creates default config file
+- `CopadConfig::config_path()` — returns `~/.config/copad/config.toml`
 
 Defaults:
 
 - shell: `$SHELL` or `/bin/sh`
 - font: JetBrainsMono Nerd Font Mono, size 14
 - tint: 0.9, opacity: 0.95
-- socket: `/tmp/nestty.sock`
+- socket: `/tmp/copad.sock`
 - theme: `catppuccin-mocha`
 
 ### background.rs
@@ -38,7 +38,7 @@ Background image cache manager.
 ```rust
 BackgroundManager {
     directory: Option<PathBuf>,
-    cache_file: PathBuf,        // ~/.cache/nestty/wallpapers.txt
+    cache_file: PathBuf,        // ~/.cache/copad/wallpapers.txt
     current: Option<PathBuf>,
     cached_images: Vec<PathBuf>,
 }
@@ -61,13 +61,13 @@ Response { id: String, ok: bool, result: Option<Value>, error: Option<ResponseEr
 ResponseError { code: String, message: String }
 ```
 
-Used by nestty-cli for socket communication.
+Used by copad-cli for socket communication.
 
 ### error.rs
 
 ```rust
-enum NesttyError { Io, Config, Protocol }
-type Result<T> = std::result::Result<T, NesttyError>;
+enum CopadError { Io, Config, Protocol }
+type Result<T> = std::result::Result<T, CopadError>;
 ```
 
 ### trigger.rs
@@ -120,11 +120,11 @@ on_timeout = "abort"   # or "fire_with_default"
 When the trigger fires its action, the engine registers a **preflight** entry. On `<action>.completed` (Phase 14.1 fan-out) the preflight promotes to **pending**; on `<action>.failed` it drops. While pending, every dispatched event is checked against `await.event_kind` + interpolated `payload_match`. On match, the engine publishes a synthesized `<trigger_name>.awaited` event whose payload is the original event's payload PLUS the matched event's payload nested under `await:`. Downstream triggers reference `<trigger_name>.awaited` to continue the chain.
 
 Important constraints:
-- **Subscriptions** (nestty-linux's `TriggerSubscriptions::reconcile`) must subscribe to `await.event_kind`, `<action>.completed`, and `<action>.failed` for await-bearing triggers — otherwise the engine never sees those events. Done automatically in nestty-linux.
-- **Pump ordering** (nestty-linux's `drain_into`) drains receivers into a Vec then stable-sorts so `.completed` / `.failed` events run BEFORE `await.event_kind` events queued in the same tick. Without this, an awaited reply in the same tick as the completion that should promote it could be dropped.
+- **Subscriptions** (copad-linux's `TriggerSubscriptions::reconcile`) must subscribe to `await.event_kind`, `<action>.completed`, and `<action>.failed` for await-bearing triggers — otherwise the engine never sees those events. Done automatically in copad-linux.
+- **Pump ordering** (copad-linux's `drain_into`) drains receivers into a Vec then stable-sorts so `.completed` / `.failed` events run BEFORE `await.event_kind` events queued in the same tick. Without this, an awaited reply in the same tick as the completion that should promote it could be dropped.
 - **FIFO scope is per action name only** — neither per-trigger nor per-invocation. Two triggers using the same action share a queue; even repeated firings of one trigger may mis-correlate completions to preflights if completions arrive out of dispatch order. Closing fully needs per-invocation correlation tokens on `<X>.completed`/`.failed` (slice-2 follow-up).
 - **Volatile state**: both `preflight_awaits` and `pending_awaits` clear on `set_triggers()` and on process restart. The clears use separate locks from the trigger-list swap, and `dispatch` clones the trigger snapshot before registering preflights, so in-flight dispatches that captured the OLD snapshot can register old-generation preflights AFTER the clears — old `<trigger_name>.awaited` events may still fire for events in flight at swap time. Hot-reload is best-effort cleanup, not a hard isolation boundary. Acceptable for typical minute-scale awaits with user-authored config.
-- **Legacy match-arm actions** that don't fire `<action>.completed` (nestty-internal socket actions outside `ActionRegistry`) leave preflights stranded; they expire via `sweep_pending_awaits` and either drop silently (Abort) or emit the awaited event with `await: null` (FireWithDefault).
+- **Legacy match-arm actions** that don't fire `<action>.completed` (copad-internal socket actions outside `ActionRegistry`) leave preflights stranded; they expire via `sweep_pending_awaits` and either drop silently (Abort) or emit the awaited event with `await: null` (FireWithDefault).
 
 **Error handling:** registry-action failures (sync `Err` returned by the sink) are logged via `log::warn!` inside `dispatch` and never propagate. Fallthrough-action failures (sink returns `Ok` synchronously but the legacy command later fails) are surfaced ASYNCHRONOUSLY — see the `LiveTriggerSink` reply-consumer thread. One bad trigger cannot poison the dispatcher or block other triggers.
 
@@ -132,7 +132,7 @@ Important constraints:
 
 **`covering_patterns(patterns)`:** helper used by the platform layer to compute the minimal cover of trigger `event_kind` patterns before subscribing to the bus. `*` covers all; `foo.*` covers `foo.X`, `foo.X.Y`, and `foo.X.*`. Without this, declaring overlapping kinds would cause the same event to land in multiple subscriptions and trigger every matching action once per delivery.
 
-**Reach via `TriggerSink` trait:** `TriggerEngine` invokes through an `Arc<dyn TriggerSink>` (default impl on `ActionRegistry`). Platforms can plug in a wider sink — nestty-linux uses `LiveTriggerSink` which tries the registry first and falls through to `socket::dispatch` for legacy match-arm commands, so triggers can fire any command handled by `socket::dispatch` (`tab.*`, `terminal.exec`, `webview.*`, `plugin.*`, …) without per-command migration. Exception: `event.subscribe` is special-cased earlier in `socket::start_server` (it owns the connection for the lifetime of the stream) and is intentionally not reachable from triggers — its semantics don't fit a fire-once trigger action. **Async error path for fallthrough:** the sink hands `socket::dispatch` a clone of a shared reply channel and a dedicated consumer thread `eprintln!`s any `ok=false` response (typos, unknown methods, runtime errors) to stderr — format: `[nestty] trigger fallthrough id=... failed: <code>: <msg>`. Per-event `fired` count over-counts on fallthrough — it counts queueing as success — but misconfigured trigger actions are still visible on stderr. Registry actions retain full SYNC error semantics; migration of a hot action into the registry recovers the synchronous `fired` accounting too.
+**Reach via `TriggerSink` trait:** `TriggerEngine` invokes through an `Arc<dyn TriggerSink>` (default impl on `ActionRegistry`). Platforms can plug in a wider sink — copad-linux uses `LiveTriggerSink` which tries the registry first and falls through to `socket::dispatch` for legacy match-arm commands, so triggers can fire any command handled by `socket::dispatch` (`tab.*`, `terminal.exec`, `webview.*`, `plugin.*`, …) without per-command migration. Exception: `event.subscribe` is special-cased earlier in `socket::start_server` (it owns the connection for the lifetime of the stream) and is intentionally not reachable from triggers — its semantics don't fit a fire-once trigger action. **Async error path for fallthrough:** the sink hands `socket::dispatch` a clone of a shared reply channel and a dedicated consumer thread `eprintln!`s any `ok=false` response (typos, unknown methods, runtime errors) to stderr — format: `[copad] trigger fallthrough id=... failed: <code>: <msg>`. Per-event `fired` count over-counts on fallthrough — it counts queueing as success — but misconfigured trigger actions are still visible on stderr. Registry actions retain full SYNC error semantics; migration of a hot action into the registry recovers the synchronous `fired` accounting too.
 
 ### context.rs
 
@@ -161,7 +161,7 @@ glib::timeout_add_local(50ms, move || {
 
 **Consumed event kinds:** `panel.focused` (set active panel), `panel.exited` (clear that panel's state, and active if it was), `terminal.cwd_changed` (record cwd in per-panel map). All other kinds are ignored — `apply_event` is safe to call with the firehose subscription `"*"`.
 
-**Why not `tab.closed`?** Its cross-platform payload contract is `{index}` only (see [architecture.md](./architecture.md) event-stream table). nestty-linux currently emits a superset that includes `panel_id`, but acting on that would couple the core primitive to Linux-incidental behavior and silently no-op on macOS. Cleanup relies on `panel.exited`, which both platforms emit consistently with `panel_id` on shell process exit. (If a tab is closed without the shell exiting, the per-panel cwd entry lingers — bounded by UUID space, GC'd on process restart.)
+**Why not `tab.closed`?** Its cross-platform payload contract is `{index}` only (see [architecture.md](./architecture.md) event-stream table). copad-linux currently emits a superset that includes `panel_id`, but acting on that would couple the core primitive to Linux-incidental behavior and silently no-op on macOS. Cleanup relies on `panel.exited`, which both platforms emit consistently with `panel_id` on shell process exit. (If a tab is closed without the shell exiting, the per-panel cwd entry lingers — bounded by UUID space, GC'd on process restart.)
 
 **Per-panel cwd cache:** focus switching reflects cached cwd of the newly-focused panel immediately, without waiting for that panel to re-emit `terminal.cwd_changed`.
 
@@ -180,7 +180,7 @@ ActionRegistry::names() -> Vec<String>   // sorted
 ActionRegistry::len() / is_empty()
 ```
 
-**Errors:** returns `nestty_core::protocol::ResponseError` so socket dispatch can wrap it directly in a `Response::error(...)`. Error helpers:
+**Errors:** returns `copad_core::protocol::ResponseError` so socket dispatch can wrap it directly in a `Response::error(...)`. Error helpers:
 
 - `action_registry::invalid_params(msg)` — `code: "invalid_params"`
 - `action_registry::internal_error(msg)` — `code: "internal_error"`
@@ -188,7 +188,7 @@ ActionRegistry::len() / is_empty()
 
 **Thread safety:** backed by `RwLock<HashMap>`. Multiple threads can invoke concurrently; registration takes a short write lock. Handlers must be `Fn(Value) -> ActionResult + Send + Sync + 'static` — state capture via `Arc<Mutex<T>>` or `Arc<AtomicX>`.
 
-**Not wired yet:** this is a pure primitive. `nestty-linux/socket.rs`'s `dispatch()` still uses its hard-coded match. Migration is incremental — new commands register through the registry; legacy commands move over one at a time.
+**Not wired yet:** this is a pure primitive. `copad-linux/socket.rs`'s `dispatch()` still uses its hard-coded match. Migration is incremental — new commands register through the registry; legacy commands move over one at a time.
 
 ### event_bus.rs
 

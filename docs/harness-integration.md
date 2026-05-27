@@ -2,12 +2,12 @@
 
 ## Vision
 
-nestty becomes the user's **personal automation hub**: a headless daemon that
+copad becomes the user's **personal automation hub**: a headless daemon that
 runs under `systemd --user` (Linux) or `launchd` (macOS), hosts the trigger
 engine + plugin supervisor + action registry + event bus, and relays events
 from every workflow source the user already runs — Slack, Discord, Calendar,
 Jira, Claude Code hooks, Codex broker, ai-browser, life-assistant, and any
-shell-driven `nestctl event publish` call. The GUI process (`nestty`) becomes
+shell-driven `coctl event publish` call. The GUI process (`copad`) becomes
 an optional viewer/shell on top of that daemon, no longer the host.
 
 The trigger engine is the single hub. The GUI is one of its clients.
@@ -17,8 +17,8 @@ The trigger engine is the single hub. The GUI is one of its clients.
 ### Why now
 
 The current host code (TriggerEngine / ActionRegistry / EventBus /
-ServiceSupervisor / socket server) lives entirely inside the `nestty-linux`
-GUI process. Bootstrap is at `nestty-linux/src/window.rs` lines 125–450
+ServiceSupervisor / socket server) lives entirely inside the `copad-linux`
+GUI process. Bootstrap is at `copad-linux/src/window.rs` lines 125–450
 (~330 LOC). The supervisor + socket + trigger fan-out total ~4150 LOC next to
 GTK code.
 
@@ -29,10 +29,10 @@ Consequences today:
 - Over SSH, hooks can't reach the local bus (socket is GUI-process-local).
 - macOS GUI is a stub, so the entire automation surface is unusable on Mac
   despite the Rust core being portable.
-- Multi-display means running multiple nestty windows; each spawns its own
+- Multi-display means running multiple copad windows; each spawns its own
   supervisor + socket today.
 
-`nestty-ffi` already exposes `TriggerEngine + ActionRegistry + EventBus` to
+`copad-ffi` already exposes `TriggerEngine + ActionRegistry + EventBus` to
 macOS Swift via C-ABI (407 LOC). The "core decoupled from shell" idea exists.
 The Linux side hasn't claimed it yet.
 
@@ -44,15 +44,15 @@ The Linux side hasn't claimed it yet.
 as host code (as an earlier draft did) was wrong. The actual split is finer:
 
 ```
-nestty-core/  (already shared)
+copad-core/  (already shared)
   action_registry  event_bus  trigger  condition  context
   plugin protocol  config  theme  error  fs_atomic
 
-nestty-linux/src/  (mixed)
+copad-linux/src/  (mixed)
   service_supervisor.rs   (1778 LOC, host)            ← move whole
   trigger_sink.rs         ( 344 LOC, host)            ← move whole
   socket.rs               (2042 LOC, MIXED)           ← split:
-    ├─ transport (accept loop, framing, NESTTY_SOCKET) → move
+    ├─ transport (accept loop, framing, COPAD_SOCKET) → move
     ├─ daemon-owned action dispatch (event.*, plugin.*,
     │   agent.*, theme.*, todo.* CLI shortcuts, ...)  → move
     └─ GUI-owned action dispatch (tab.*, split.*,
@@ -66,9 +66,9 @@ nestty-linux/src/  (mixed)
   terminal.rs tabs.rs split.rs background.rs
   search.rs statusbar.rs                                    ← stay GUI
 
-nestty-cli/   (already shared, no change)
-nestty-ffi/   (C-ABI to Swift, 407 LOC, role re-scoped — see Out of scope)
-nestty-macos/ (Swift, separate pivot — see Out of scope)
+copad-cli/   (already shared, no change)
+copad-ffi/   (C-ABI to Swift, 407 LOC, role re-scoped — see Out of scope)
+copad-macos/ (Swift, separate pivot — see Out of scope)
 plugins/*     (already shared, no change)
 ```
 
@@ -78,7 +78,7 @@ plugins/*     (already shared, no change)
        systemd --user (Linux) / launchd LaunchAgent (macOS)
                   │ supervises
                   ▼
-            nesttyd  ◄────────────── nestctl (CLI client)
+            copadd  ◄────────────── coctl (CLI client)
             ├─ TriggerEngine                 ← always-on
             ├─ ActionRegistry (daemon-owned actions)
             ├─ ServiceSupervisor (plugins)
@@ -91,7 +91,7 @@ plugins/*     (already shared, no change)
                   │ daemon proxies GUI-owned actions to it,
                   │ events stream the other way
                   ▼
-            nestty GUI (GTK4 on Linux / AppKit on macOS)
+            copad GUI (GTK4 on Linux / AppKit on macOS)
               VTE/terminal · tabs · splits · panels · search
               background · statusbar
               + handlers for daemon-proxied GUI commands
@@ -101,19 +101,19 @@ plugins/*     (already shared, no change)
 
 | Crate | Status | Role |
 |---|---|---|
-| `nestty-core` | extend | + `Notifier` trait, + `PlatformPaths`, + event `origin` tagging, + `GuiClient` registration types |
-| `nestty-daemon` | **new** | binary `nesttyd`. Owns supervisor, socket transport, daemon action dispatch, trigger fan-out, GUI registry, Notifier impls behind `cfg(target_os)`. ~3000 LOC (relocated supervisor + trigger_sink + half of socket.rs). |
-| `nestty-cli` | no change | client only; socket protocol unchanged from CLI viewpoint |
-| `nestty-linux` | shrink | GTK shell + GUI-owned action handlers, now invoked via daemon proxy rather than direct socket dispatch. ~3500 LOC remaining. |
-| `nestty-ffi` | re-scoped | macOS Swift talks to local `nesttyd` over socket once macOS shell pivots. Until then, FFI in-process embed is retained for macOS-only standalone builds — see Out of scope. |
-| `nestty-macos` | unchanged for this plan | Linux daemon pivot does not pull macOS shell along. Separate phase. |
-| `plugins/*` | no change | spawned by `nesttyd`'s supervisor; stdio protocol unchanged |
+| `copad-core` | extend | + `Notifier` trait, + `PlatformPaths`, + event `origin` tagging, + `GuiClient` registration types |
+| `copad-daemon` | **new** | binary `copadd`. Owns supervisor, socket transport, daemon action dispatch, trigger fan-out, GUI registry, Notifier impls behind `cfg(target_os)`. ~3000 LOC (relocated supervisor + trigger_sink + half of socket.rs). |
+| `copad-cli` | no change | client only; socket protocol unchanged from CLI viewpoint |
+| `copad-linux` | shrink | GTK shell + GUI-owned action handlers, now invoked via daemon proxy rather than direct socket dispatch. ~3500 LOC remaining. |
+| `copad-ffi` | re-scoped | macOS Swift talks to local `copadd` over socket once macOS shell pivots. Until then, FFI in-process embed is retained for macOS-only standalone builds — see Out of scope. |
+| `copad-macos` | unchanged for this plan | Linux daemon pivot does not pull macOS shell along. Separate phase. |
+| `plugins/*` | no change | spawned by `copadd`'s supervisor; stdio protocol unchanged |
 
 ### Platform abstraction
 
-Three platform points, all behind `cfg` gates inside `nestty-daemon`:
+Three platform points, all behind `cfg` gates inside `copad-daemon`:
 
-**1. `Notifier` trait** in `nestty-core::notifier`:
+**1. `Notifier` trait** in `copad-core::notifier`:
 
 ```rust
 pub trait Notifier: Send + Sync {
@@ -127,17 +127,17 @@ pub enum Level { Info, Warn, Error }
 
 Registered as action `notify.show {title, body, level?}` — any trigger or plugin can fire it.
 
-**2. `PlatformPaths`** (`nestty-core::paths`, `cfg` functions, not a trait):
+**2. `PlatformPaths`** (`copad-core::paths`, `cfg` functions, not a trait):
 
-- Linux: `${XDG_RUNTIME_DIR:-/tmp}/nestty/` (socket + pids), `~/.local/state/nestty/` (state).
-- macOS: `~/Library/Caches/nestty/` (socket), `~/Library/Application Support/nestty/` (state).
+- Linux: `${XDG_RUNTIME_DIR:-/tmp}/copad/` (socket + pids), `~/.local/state/copad/` (state).
+- macOS: `~/Library/Caches/copad/` (socket), `~/Library/Application Support/copad/` (state).
 
-Socket moves from `/tmp/nestty-{PID}.sock` to `${runtime_dir}/socket`. Daemon owns a stable path; PID discovery retired. **Migration audit list below** — this change has more consumers than nestctl.
+Socket moves from `/tmp/copad-{PID}.sock` to `${runtime_dir}/socket`. Daemon owns a stable path; PID discovery retired. **Migration audit list below** — this change has more consumers than coctl.
 
 **3. Service installation** — install scripts, not runtime code:
 
-- Linux: drop `nestty-daemon.service` into `~/.config/systemd/user/`, `systemctl --user enable --now`. `Restart=on-failure`, `After=default.target`.
-- macOS: drop `com.marshall.nestty.daemon.plist` into `~/Library/LaunchAgents/`, `launchctl bootstrap gui/<uid>`. `RunAtLoad=true`, `KeepAlive=true`.
+- Linux: drop `copad-daemon.service` into `~/.config/systemd/user/`, `systemctl --user enable --now`. `Restart=on-failure`, `After=default.target`.
+- macOS: drop `com.marshall.copad.daemon.plist` into `~/Library/LaunchAgents/`, `launchctl bootstrap gui/<uid>`. `RunAtLoad=true`, `KeepAlive=true`.
 
 `scripts/install-dev.sh` and `scripts/install-macos.sh` get a `--with-daemon` flag (default on).
 
@@ -190,8 +190,8 @@ Minimum semantics:
    - GUI-owned actions (`tab.*`, `split.*`, etc.) return `no_gui` immediately.
    - Daemon-owned actions (`event.*`, `plugin.*`, `todo.*`, etc.) work as
      normal.
-   - `nestctl` surfaces `no_gui` with a one-line hint: "no nestty window
-     attached; run `nestty &` first".
+   - `coctl` surfaces `no_gui` with a one-line hint: "no copad window
+     attached; run `copad &` first".
 
 6. **Event subscription scoping.** Two paths, deliberately separate:
    - **Generic clients** (CLI, plugins) keep using `event.subscribe { patterns }`
@@ -203,7 +203,7 @@ Minimum semantics:
      not bus operations).
 
    Heartbeat is delivered over `Invoke`, not via the event stream —
-   non-GUI subscribers (`nestctl event subscribe`, plugin `subscribes`)
+   non-GUI subscribers (`coctl event subscribe`, plugin `subscribes`)
    stay byte-compatible with today's output.
 
 This protocol is the **first design deliverable**, not the last. Code work on
@@ -223,7 +223,7 @@ Pixel/PTY-bound code only:
 - **GUI command handlers**: the half of current `socket.rs` that
   manipulates `TabManager` / `BackgroundLayer` / `StatusBar` /
   `ApplicationWindow` / WebKit panel. After the pivot, these handlers
-  receive requests from `nesttyd` over the bidirectional protocol instead
+  receive requests from `copadd` over the bidirectional protocol instead
   of dispatching directly inside the same process.
 
 The GUI is *both* a UI process *and* an RPC handler for the daemon. The pivot
@@ -238,36 +238,36 @@ Step 3 in the earlier draft was not atomic. Resliced:
    handling, `no_gui` contract. Land as `docs/gui-daemon-protocol.md`. No
    code yet. ~half day.
 
-2. **Daemon binary scaffolding.** New `nestty-daemon` crate + `nesttyd` bin.
+2. **Daemon binary scaffolding.** New `copad-daemon` crate + `copadd` bin.
    Sliced into three commits to keep each diff reviewable per the user's
    small-unit save convention:
    - **2a (scaffolding):** crate + binary entry; `PlatformPaths` in
-     `nestty-core`; transport (UnixListener bind, accept loop, framing);
+     `copad-core`; transport (UnixListener bind, accept loop, framing);
      minimal dispatch handling `system.ping`; socket-permission hardening
      (parent dir 0700, socket 0600); stale-socket cleanup; sigterm-safe
      shutdown via stale-detect on next start (no async-signal handler).
-     `nestctl` discovery aware of the new well-known path but still prefers
+     `coctl` discovery aware of the new well-known path but still prefers
      legacy GUI socket during migration. ~half day.
    - **2b (supervisor import):** import `service_supervisor` +
      `trigger_sink` (audit confirmed both are GTK-free, depend only on
-     `nestty-core`). `nesttyd` activates plugins on start and pushes bus
+     `copad-core`). `copadd` activates plugins on start and pushes bus
      events. Plugin manifest discovery uses the same path as today. ~half
      day.
    - **2c (pdeathsig / orphan reaping):** dedicated long-lived spawner
-     thread (so the fork-thread never exits while nesttyd is alive) OR
+     thread (so the fork-thread never exits while copadd is alive) OR
      `pidfd_open` + epoll path. Re-introduces crash-safe child reaping
      that Phase 9.5 rolled back. ~half day.
    ~1.5 days total.
 
 3. **Relocate clean modules.** Move `service_supervisor.rs` and
-   `trigger_sink.rs` from `nestty-linux/src/` to `nestty-daemon/src/`. Update
+   `trigger_sink.rs` from `copad-linux/src/` to `copad-daemon/src/`. Update
    imports. Two-binary build: daemon + GUI share module code via the new
    crate. No behavior change. ~half day.
 
 4. **Split `socket.rs`.** Extract transport + daemon-owned dispatch into
-   `nestty-daemon::socket`. The GUI-owned handlers stay in `nestty-linux`,
-   regrouped as `nestty-linux::gui_handlers`. Add a thin "GUI client" mode in
-   `nestty-linux` that connects to `nesttyd` and registers via the new
+   `copad-daemon::socket`. The GUI-owned handlers stay in `copad-linux`,
+   regrouped as `copad-linux::gui_handlers`. Add a thin "GUI client" mode in
+   `copad-linux` that connects to `copadd` and registers via the new
    protocol — but, for now, daemon still does *everything* in-process; GUI
    handlers are wired both via in-process dispatch AND via the new protocol
    path under a feature flag. Validates the protocol on real GUI commands
@@ -281,7 +281,7 @@ Step 3 in the earlier draft was not atomic. Resliced:
 
 6. **Install scripts + socket path consumers.** Ship systemd unit / launchd
    plist. Audit and update every place that injects or discovers
-   `/tmp/nestty-{PID}.sock` — see audit list below. ~1 day.
+   `/tmp/copad-{PID}.sock` — see audit list below. ~1 day.
 
 7. **Switch default to daemon-attached; keep `--standalone` as permanent
    build feature.** The `--standalone` mode (daemon-in-process) ships behind
@@ -295,19 +295,19 @@ green at every commit boundary.
 
 #### Socket path consumer audit (step 6)
 
-Codex flagged this as wider than just nestctl discovery. Inventory the
+Codex flagged this as wider than just coctl discovery. Inventory the
 following before deleting the legacy path:
 
-- `nestty-cli/src/main.rs` — `NESTTY_SOCKET` env discovery + `/tmp/nestty-*.sock` glob
-- Plugin manifests + plugin runtimes that read `NESTTY_SOCKET` from env
+- `copad-cli/src/main.rs` — `COPAD_SOCKET` env discovery + `/tmp/copad-*.sock` glob
+- Plugin manifests + plugin runtimes that read `COPAD_SOCKET` from env
 - macOS Swift `SocketServer.swift` (separate path; coordinate with macOS pivot)
-- Keybinding scripts / desktop entry that pass `NESTTY_SOCKET`
-- terminal agent commands (`nestctl agent ...`) that spawn helpers with the env var
+- Keybinding scripts / desktop entry that pass `COPAD_SOCKET`
+- terminal agent commands (`coctl agent ...`) that spawn helpers with the env var
 - statusbar plugin clients
 - Documentation: `CLAUDE.md`, `docs/cli.md`, install scripts' help text
 
-Symptom of an outdated reference: hard-coded `/tmp/nestty-*.sock` somewhere.
-`rg -n 'nestty-.*\.sock|NESTTY_SOCKET'` catches them.
+Symptom of an outdated reference: hard-coded `/tmp/copad-*.sock` somewhere.
+`rg -n 'copad-.*\.sock|COPAD_SOCKET'` catches them.
 
 ### Trade-offs
 
@@ -350,13 +350,13 @@ plugin stdio protocol, not the socket.
 
 **Goal.** Surface every Claude Code hook fire on the bus so triggers can react.
 
-Prerequisite: **`nestctl event publish`** subcommand. Non-blocking,
+Prerequisite: **`coctl event publish`** subcommand. Non-blocking,
 silent-fail on missing socket. Tags every emitted event with
 `origin: external` (see Trust boundary below).
 
 **Actions**: `claude.session_state`, `claude.list_dirty`, `claude.last_handoff`, `claude.list_sessions`.
 
-**Events** (one new line per hook, `command -v nestctl && nestctl event publish ... &`):
+**Events** (one new line per hook, `command -v coctl && coctl event publish ... &`):
 - `claude.tool_used` — PostToolUse `track-edit.sh`
 - `claude.commit_blocked` — `pre-commit-gate.sh` non-zero exit
 - `claude.review_approved` — `codex-review.sh` on `VERDICT: APPROVED`
@@ -378,20 +378,20 @@ tailscale serve --bg --https=443 http://localhost:7575
 
 This makes the dashboard reachable at `https://<machine>.<tailnet>.ts.net/` from any device on the tailnet, with Tailscale terminating TLS + injecting the identity headers. To unwind: `tailscale serve --bg --https=443 off`. Verify status with `tailscale serve status`.
 
-**Slice 3.1 — "tmx web edition" (shipped 2026-05-23, see decisions.md #43).** Slice 3.0's chat-style snapshot UI proved unusable in practice — no live state, no real interactive control. Slice 3.1 pivots to tmux as the primary data model (the user's actual work mostly runs inside tmux anyway). New endpoints: `GET /api/tmux/panes` (single `list-panes -a` + per-pane `capture-pane`, 2 s cache), `POST /api/tmux/send` (`load-buffer` + `paste-buffer -p -d` for multiline-safe injection), `WS /ws/tmux/overview` (5 s full-snapshot push), `WS /ws/tmux/attach/:pane_id` (bidirectional xterm.js via portable-pty + `tmux attach-session`). SPA gets two modes (overview + attach) + mobile keyboard toolbar (`Esc Tab Ctrl(sticky) / | ↑↓←→ ^C ^D ^Z`). Zero changes to nestty/daemon; tmux's multi-client model handles the shared view between nestty's GUI and the mobile attach. Slice 3.0's `nestty-panels` section stays as a snapshot-only fallback for work happening outside tmux.
+**Slice 3.1 — "tmx web edition" (shipped 2026-05-23, see decisions.md #43).** Slice 3.0's chat-style snapshot UI proved unusable in practice — no live state, no real interactive control. Slice 3.1 pivots to tmux as the primary data model (the user's actual work mostly runs inside tmux anyway). New endpoints: `GET /api/tmux/panes` (single `list-panes -a` + per-pane `capture-pane`, 2 s cache), `POST /api/tmux/send` (`load-buffer` + `paste-buffer -p -d` for multiline-safe injection), `WS /ws/tmux/overview` (5 s full-snapshot push), `WS /ws/tmux/attach/:pane_id` (bidirectional xterm.js via portable-pty + `tmux attach-session`). SPA gets two modes (overview + attach) + mobile keyboard toolbar (`Esc Tab Ctrl(sticky) / | ↑↓←→ ^C ^D ^Z`). Zero changes to copad/daemon; tmux's multi-client model handles the shared view between copad's GUI and the mobile attach. Slice 3.0's `copad-panels` section stays as a snapshot-only fallback for work happening outside tmux.
 
-**Slice 3.0 — `plugins/web-bridge/` (shipped 2026-05-23, see decisions.md #42).** First-party plugin that brokers nesttyd's socket surface over HTTP+WebSocket so a phone or laptop on the user's Tailscale (or via SSH tunnel) can drive the local harness. Architecture is the (δ) variant: web-bridge is a service plugin running the supervisor's stdio RPC handshake minimally AND in the same process spawning an axum HTTP+WS listener AND opening raw daemon-socket connections so requests go through `dispatch()` → `GuiRegistry`. Slice 3.0 ships a web-native chat-style UI (Path A) — pane status snapshot + recent-output viewer + live event feed + textarea command input + presence toggle. xterm.js full-PTY + mobile keyboard toolbar (Path B) is layered on top in Slice 3.1+. The only nestty-daemon change beyond the plugin itself is `ServiceSupervisor` injecting `NESTTY_SOCKET` into every service-plugin child env — a one-spot edit that every future listener-style plugin (ntfy bridge, prometheus exporter, …) inherits.
+**Slice 3.0 — `plugins/web-bridge/` (shipped 2026-05-23, see decisions.md #42).** First-party plugin that brokers copadd's socket surface over HTTP+WebSocket so a phone or laptop on the user's Tailscale (or via SSH tunnel) can drive the local harness. Architecture is the (δ) variant: web-bridge is a service plugin running the supervisor's stdio RPC handshake minimally AND in the same process spawning an axum HTTP+WS listener AND opening raw daemon-socket connections so requests go through `dispatch()` → `GuiRegistry`. Slice 3.0 ships a web-native chat-style UI (Path A) — pane status snapshot + recent-output viewer + live event feed + textarea command input + presence toggle. xterm.js full-PTY + mobile keyboard toolbar (Path B) is layered on top in Slice 3.1+. The only copad-daemon change beyond the plugin itself is `ServiceSupervisor` injecting `COPAD_SOCKET` into every service-plugin child env — a one-spot edit that every future listener-style plugin (ntfy bridge, prometheus exporter, …) inherits.
 
 **Slice 1B — presence-gated routing (shipped 2026-05-23, see decisions.md #41).** The toasts above fire locally regardless of whether the user is at the keyboard, which means they're invisible the moment they walk away. Slice 1B adds:
 
-- `Context.presence` (`Active | Away`) — daemon-state, manual toggle via `nestctl presence away|active|status`.
+- `Context.presence` (`Active | Away`) — daemon-state, manual toggle via `coctl presence away|active|status`.
 - `context.presence` as a third trigger condition root (alongside `context.active_panel` / `context.active_cwd`). Resolves to the lowercase string `"active"` / `"away"`.
 - Reuse of the existing `plugins/discord/` plugin's `discord.send_message` — no new sink plugin. Each presence-gated trigger is a **second `[[triggers]]` block** for the same `event_kind` with `condition = 'context.presence == "away"'`. Local toast trigger stays unconditional.
 - `examples/triggers/claude-hooks.toml` ships the full pattern with placeholder channel ids + setup notes.
 
 Rationale for not building the `notify-webhook` abstract sink plugin yet: Rule of Three. Build the abstract surface when the second integration (ntfy/Slack/PagerDuty) shows what actually differs from Discord. Today the `discord.send_message` action already handles bot auth, ratelimits, and failure shapes — duplicating that path through a webhook indirection for the single Discord case would be premature abstraction.
 
-**Slice 1B+ — presence detector recipes (`examples/presence/`).** What flips `presence` is **policy that varies per user** (compositor, lockscreen choice, work patterns), so nestty itself stays policy-free. `examples/presence/` ships four starter recipes — `hypridle-listener.conf` (Hyprland), `swayidle.sh` (any wlroots), `loginctl-poll.sh` (DE-agnostic systemd), `darwin-pmset.sh` (macOS) — with a README that explains threshold-vs-latency trade-offs and how to wire each one to systemd-user / Hyprland exec-once / LaunchAgent. Users edit-to-taste; promotion to a first-party `plugins/presence-<backend>/` is reserved for backends that stabilise into something the user has run for months and would recommend to others.
+**Slice 1B+ — presence detector recipes (`examples/presence/`).** What flips `presence` is **policy that varies per user** (compositor, lockscreen choice, work patterns), so copad itself stays policy-free. `examples/presence/` ships four starter recipes — `hypridle-listener.conf` (Hyprland), `swayidle.sh` (any wlroots), `loginctl-poll.sh` (DE-agnostic systemd), `darwin-pmset.sh` (macOS) — with a README that explains threshold-vs-latency trade-offs and how to wire each one to systemd-user / Hyprland exec-once / LaunchAgent. Users edit-to-taste; promotion to a first-party `plugins/presence-<backend>/` is reserved for backends that stabilise into something the user has run for months and would recommend to others.
 
 State lives in existing harness files; no duplicate cache. Slice 1A + 1B effort: ~2 days total. Remaining `claude.*` data-surfacing actions (`claude.session_state` / `claude.list_dirty` / `claude.last_handoff` / `claude.list_sessions`) deferred to a later slice.
 
@@ -424,8 +424,8 @@ Depends on Option A for the second example. Effort: M (~2 days).
 
 `/catchup` writes `~/docs/{daily,weekly,topics}`. `/handoff` writes `~/.claude/handoffs/latest.md`. KB plugin manages the same tree.
 
-- `/catchup` skill → `nestctl call kb.ensure` instead of direct `Write`.
-- `/handoff` skill → optionally inline `nestctl call todo.list` (in_progress) + `nestctl call event.history --limit 5`.
+- `/catchup` skill → `coctl call kb.ensure` instead of direct `Write`.
+- `/handoff` skill → optionally inline `coctl call todo.list` (in_progress) + `coctl call event.history --limit 5`.
 - Both fall back to direct `Write` if socket connect fails.
 
 Effort: S (~1 day). Includes adding `event.history` (ring buffer, ~half day).
@@ -433,7 +433,7 @@ Effort: S (~1 day). Includes adding `event.history` (ring buffer, ~half day).
 ### H. life-assistant bridge
 
 **Goal.** Mirror life-assistant's scheduler output and plugin activity onto
-the nestty bus.
+the copad bus.
 
 **Context.** `~/dev/life-assistant` is substantial on its own — own plugin
 runtime (20+ first-party plugins), `robfig/cron` scheduler, dashboard with
@@ -443,14 +443,14 @@ goals/pipelines/triggers/workflows, AI-triggerable post-execution analysis via
 **Bridge path (decided: push)**:
 
 life-assistant scheduler gets a ~30 LOC patch: after every plugin `Execute`,
-call `nestctl event publish lifeassistant.job_completed --json '{...}'` (or
+call `coctl event publish lifeassistant.job_completed --json '{...}'` (or
 the structured equivalent). Same hook point that already routes to Discord.
-Non-blocking; on `nestctl` failure, life-assistant continues with Discord
+Non-blocking; on `coctl` failure, life-assistant continues with Discord
 delivery as today. Trade-off: cross-repo coupling, but cleanest event
 semantics. Alternatives (Discord-filter, REST poll, log tail) listed in commit
 notes for future revisit.
 
-**`lifeassistant` plugin** (nestty side):
+**`lifeassistant` plugin** (copad side):
 
 - Actions: `lifeassistant.list_jobs`, `lifeassistant.run_job`, `lifeassistant.job_status`, `lifeassistant.list_users`.
 - Events received (external origin, from the bridge):
@@ -464,9 +464,9 @@ notes for future revisit.
 Effort: M (~2 days). Plugin = REST adapter + event receiver. Plus the
 ~30 LOC life-assistant patch.
 
-### I. Cron triggers — nestty-native scheduler primitive
+### I. Cron triggers — copad-native scheduler primitive
 
-**Goal.** Time-driven triggers for nestty-internal automation that doesn't
+**Goal.** Time-driven triggers for copad-internal automation that doesn't
 belong in life-assistant (e.g., "every 30min refresh ai-browser session
 cookie", "every hour if any todo is `blocked` notify").
 
@@ -515,7 +515,7 @@ Effort: S (~half day per data source).
 - **`tmux-powertools` deeper integration** — wait for concrete pain point.
 - **`workflow-audit` panel** — defer until audit-run cadence justifies.
 
-## Trust boundary — `nestctl event publish` auth
+## Trust boundary — `coctl event publish` auth
 
 Codex flagged: adding socket-driven event publish lets any process with socket
 access synthesize events. If a trigger binds `system.spawn` to that event,
@@ -529,7 +529,7 @@ the remote account.
 1. **Event bus carries `origin` per event.**
    - `internal` — plugin stdio publishes, daemon-internal code (Phase 14
      chained `<action>.completed`, cron `time.*`, action-result events).
-   - `external` — socket clients via `nestctl event publish`. Includes hook
+   - `external` — socket clients via `coctl event publish`. Includes hook
      fires, life-assistant bridge, manual CLI invocations, anything reaching
      the bus through the socket.
 2. **TriggerEngine fan-out filters by origin.** A trigger fires on an event
@@ -602,15 +602,15 @@ params = { prompt_file = "${state_dir}/last-review.md" }
 - `TriggerEngine::dispatch` gates BEFORE evaluating user-supplied
   `condition`: a misconfigured condition that always returns true must
   not subvert the two opt-ins.
-- Privileged-action list lives in `nestty_core::trigger::is_privileged_action`
+- Privileged-action list lives in `copad_core::trigger::is_privileged_action`
   — a static `matches!(action, "system.spawn")` for now. Registry-marked
   privileged actions (via `ActionRegistry::register_privileged`) are a
   follow-up; the canonical dangerous action (`system.spawn`) is intercepted
   outside the registry today and only needs the static check.
 - Migration: existing triggers without `[security]` parse cleanly as
   `SecurityBlock::default()` (both flags false). No breakage.
-- `nestctl event publish --quiet` exits 0 on transport failures so hook
-  scripts don't break when nesttyd is down. Schema errors still exit 1
+- `coctl event publish --quiet` exits 0 on transport failures so hook
+  scripts don't break when copadd is down. Schema errors still exit 1
   even under `--quiet` — a malformed publish call is a caller bug, not a
   transport failure.
 
@@ -646,7 +646,7 @@ round 3-4) and deliberately scoped out of the first slice:
   downstream triggers without `accept_external` can chain on it.
   Mitigation if exploited: rewrite the completion stamper to inherit
   origin from the causal chain (same fix shape as `.awaited`).
-- **macOS FFI origin plumbing.** `nestty-ffi` and the Swift `BusEvent`
+- **macOS FFI origin plumbing.** `copad-ffi` and the Swift `BusEvent`
   don't carry origin. Out of scope while macOS shell stays a stub.
 - **Registry-marked privileged actions.** `ActionRegistry::register_privileged`
   is not wired yet. The static `is_privileged_action` list is the only
@@ -665,7 +665,7 @@ well-known socket:
 
 ```sshconfig
 Host my-remote
-    RemoteForward ${XDG_RUNTIME_DIR}/nestty/socket ${XDG_RUNTIME_DIR}/nestty/socket
+    RemoteForward ${XDG_RUNTIME_DIR}/copad/socket ${XDG_RUNTIME_DIR}/copad/socket
 ```
 
 Hooks on the remote then hit a local socket forwarding to the workstation
@@ -677,22 +677,22 @@ want to fire on SSH-originated hook events must declare
 `accept_external = true`. No special case for SSH.
 
 Fallback path preserved: hooks silently skip publish when socket connect
-fails. Machines without the forward keep working, just without nestty bus
+fails. Machines without the forward keep working, just without copad bus
 delivery.
 
 ## CLI completeness
 
-Every action must be reachable from `nestctl` without GUI. Audit checklist:
+Every action must be reachable from `coctl` without GUI. Audit checklist:
 
 | Surface | Today | After pivot |
 |---|---|---|
-| Plugin actions (`<plugin>.<verb>`) | `nestctl plugin run` works | Same |
-| Tab / split / window mgmt | `nestctl tab/split` (GUI required) | Same — daemon proxies to primary GUI, returns `no_gui` when none |
-| Event subscribe | `nestctl event subscribe` works | Same |
+| Plugin actions (`<plugin>.<verb>`) | `coctl plugin run` works | Same |
+| Tab / split / window mgmt | `coctl tab/split` (GUI required) | Same — daemon proxies to primary GUI, returns `no_gui` when none |
+| Event subscribe | `coctl event subscribe` works | Same |
 | Event publish | **missing** | **Add** (Option A prerequisite) — emits `external` origin |
 | Event history | **missing** | **Add** (Option D) — ring buffer, ~half day |
 | Notify | **missing** | **Add** as `notify.show` action |
-| Service / plugin lifecycle | `nestctl plugin list/start/stop` | Same |
+| Service / plugin lifecycle | `coctl plugin list/start/stop` | Same |
 | Trigger reload / debug | partial | Audit + complete |
 
 Nothing in the daemon should be GUI-reachable but not CLI-reachable.
@@ -725,15 +725,15 @@ Codex flagged these as more urgent under daemon-first, not less:
 - **Absorbing life-assistant.** Owns its own world. Bridge (Option H).
 - **TCP / network socket on the daemon.** SSH `RemoteForward` covers remote
   access. TCP means auth tokens and a new attack surface.
-- **Multi-user daemon.** Single-UID. Each user runs own `nesttyd`.
-- **Replacing Discord/Slack clients in the GUI.** nestty mirrors events;
+- **Multi-user daemon.** Single-UID. Each user runs own `copadd`.
+- **Replacing Discord/Slack clients in the GUI.** copad mirrors events;
   reading/replying stays in those clients (or via plugin actions).
 - **macOS shell pivot to daemon socket-client.** macOS currently has its own
-  Swift `SocketServer.swift` plus Rust trigger engine via `nestty-ffi`
-  (in-process embed). Pivoting macOS to talk to `nesttyd` over the same
+  Swift `SocketServer.swift` plus Rust trigger engine via `copad-ffi`
+  (in-process embed). Pivoting macOS to talk to `copadd` over the same
   socket protocol is a separate phase — needs its own design (XPC vs Unix
   socket from a sandboxed AppKit app, launchd integration, retiring or
-  re-scoping `nestty-ffi`). For this plan, macOS keeps the in-process FFI
+  re-scoping `copad-ffi`). For this plan, macOS keeps the in-process FFI
   embed; Linux daemon ships first.
 
 ## Suggested sequencing
@@ -745,7 +745,7 @@ Codex flagged these as more urgent under daemon-first, not less:
 5. **Split socket.rs + dual dispatch under flag** (step 4) — ~2 days.
 6. **Switch dispatch to GUI client mode** (step 5) — ~1 day + soak day.
 7. **Install scripts + socket path audit** (step 6) — ~1 day.
-8. **Cross-cutting: `Notifier` + `notify.show` + `nestctl event publish` (with origin tagging) + `event.history` + privileged-action audit** — ~1.5 days bundled.
+8. **Cross-cutting: `Notifier` + `notify.show` + `coctl event publish` (with origin tagging) + `event.history` + privileged-action audit** — ~1.5 days bundled.
 9. **Trust boundary — `[security]` block in trigger TOML** — ~half day. Land before A so hooks have the opt-in mechanism available.
 10. **Option A** (`claude` plugin) — ~1–2 days.
 11. **Option I** (cron triggers) — ~1 day.
@@ -755,7 +755,7 @@ Codex flagged these as more urgent under daemon-first, not less:
 15. **Option E** (`codex` plugin) — ~2 days.
 16. **Option D** (skill ↔ KB sync) — ~1 day.
 
-Steps 1–12 (~12 working days) deliver: daemon-first nestty with Claude hooks
+Steps 1–12 (~12 working days) deliver: daemon-first copad with Claude hooks
 + life-assistant + time triggers on the bus, secured by the trust boundary,
 with the monitor panel showing all data streams. That's the "personal
 automation hub" working end-to-end. Everything after composes on that

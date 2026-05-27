@@ -1,0 +1,8 @@
+// SwiftPM picks this up automatically when a target named `CCopadFFI` lives
+// at Sources/CCopadFFI/. The Swift side does `import CCopadFFI` and gets every
+// symbol declared in copad_ffi.h. The actual implementation comes from
+// libcopad_ffi.a, which the Copad executable target links via -L / -l flags.
+module CCopadFFI {
+    header "copad_ffi.h"
+    export *
+}

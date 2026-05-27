@@ -6,7 +6,7 @@
 #   - No dropped / garbled / mis-ordered lines.
 #   - Renderer keeps up (no visible "snapshot lag" where text appears
 #     in chunks after a freeze).
-#   - On Activity Monitor, Nestty CPU stays below ~80% sustained.
+#   - On Activity Monitor, Copad CPU stays below ~80% sustained.
 #
 # Usage: ./scripts/stress/throughput.sh
 

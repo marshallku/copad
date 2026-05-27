@@ -24,7 +24,7 @@
 # `message_url` is `https://discord.com/channels/{guild_id|@me}/{channel_id}/{message_id}`
 # pre-built so triggers can embed the link in a captured Todo body
 # (the interpolation DSL has no string-concat). Designed for the
-# claude-fetches-from-link workflow: nestty captures the link, claude
+# claude-fetches-from-link workflow: copad captures the link, claude
 # in a downstream session resolves the body.
 #
 # Raw payload shape:
@@ -33,7 +33,7 @@
 #   object (embeds, attachments, components, mentions array, all of it).
 #
 # discord.send_message action:
-#   nestctl call discord.send_message --params \
+#   coctl call discord.send_message --params \
 #     '{"channel_id":"123456789","content":"hello"}'
 #   Returns {message_id, channel_id} on success. Failure codes
 #   (top-level error.code, structurally matchable by trigger
@@ -109,7 +109,7 @@ event_kind = "discord.mention"
 # params = { channel_id = "{event.channel_id}", content = "{event.await.completion}" }
 # [triggers.when]
 # event_kind = "llm.complete.completed"
-# # Note: this second trigger is required because nestty's trigger model
+# # Note: this second trigger is required because copad's trigger model
 # # is action-then-await-then-end. The await result lives on the
 # # follow-up `llm.complete.completed` event which the second trigger
 # # consumes via payload_match (channel_id forwarded as a correlation
@@ -139,7 +139,7 @@ event_kind = "discord.mention"
 # ====================================================================
 # 6. Emoji-react → Todo capture  ★ ACTIVE BY DEFAULT ★
 # ====================================================================
-# React with 📝 on a Discord message → nestty fetches the body and
+# React with 📝 on a Discord message → copad fetches the body and
 # creates a Todo with the message URL + content. Uses Phase 14.2
 # `await` so the get_message reply is correlated to THIS specific
 # reaction (without correlation, every successful get_message

@@ -54,7 +54,7 @@ impl KbHit {
 
 impl Kb {
     pub fn from_env() -> Self {
-        let raw_root = std::env::var("NESTTY_KB_ROOT")
+        let raw_root = std::env::var("COPAD_KB_ROOT")
             .ok()
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
@@ -67,7 +67,7 @@ impl Kb {
         // surface on first use.
         let _ = std::fs::create_dir_all(&raw_root);
         // Force absolute. The protocol contract is "path is absolute
-        // for FS backends" — a relative `NESTTY_KB_ROOT` like `docs`
+        // for FS backends" — a relative `COPAD_KB_ROOT` like `docs`
         // would otherwise produce relative paths in every response.
         // First try canonicalize (resolves symlinks too, which is also
         // what `root_canonical` needs for the symlink-escape check);
@@ -862,10 +862,10 @@ fn atomic_create_with_content(path: &Path, content: &[u8]) -> Result<bool, KbErr
         }
     }
 
-    // Atomic create-or-fail rename. Routed through `nestty_core::fs_atomic`
+    // Atomic create-or-fail rename. Routed through `copad_core::fs_atomic`
     // so the platform-specific syscall (Linux `renameat2(RENAME_NOREPLACE)`,
     // macOS `renamex_np(RENAME_EXCL)`) lives in one place.
-    match nestty_core::fs_atomic::rename_no_replace(&temp_path, path) {
+    match copad_core::fs_atomic::rename_no_replace(&temp_path, path) {
         Ok(()) => Ok(true),
         Err(err) => {
             // Clean up our orphaned temp file regardless of which branch

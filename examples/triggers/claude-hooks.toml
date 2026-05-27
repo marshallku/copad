@@ -1,9 +1,9 @@
 # Claude Code harness hook → desktop toast + presence-gated Discord
 # triggers.
 #
-# Wires `nestctl event publish claude.<event>` calls made from your
+# Wires `coctl event publish claude.<event>` calls made from your
 # `~/.claude/scripts/*.sh` hooks to a `notify.show` toast (always) and
-# `discord.send_message` (only when `nestctl presence away` is set, so
+# `discord.send_message` (only when `coctl presence away` is set, so
 # you don't get Discord-spammed while sitting at the keyboard).
 # Demonstrates the documented Option A flow from
 # `docs/harness-integration.md`.
@@ -11,7 +11,7 @@
 # How to use:
 #
 # 1. Copy the `[[triggers]]` blocks below into your
-#    `~/.config/nestty/config.toml`. The `[triggers.security]`
+#    `~/.config/copad/config.toml`. The `[triggers.security]`
 #    table is REQUIRED — without `accept_external = true` these
 #    triggers ignore socket-published events by default (see
 #    decisions.md #37 trust boundary).
@@ -24,19 +24,19 @@
 #    the channel → Copy Channel ID.
 #
 # 3. Make sure the discord plugin is authed
-#    (`nestctl call discord.auth_status` → `authenticated: true`) and
+#    (`coctl call discord.auth_status` → `authenticated: true`) and
 #    the bot is a member of the server holding that channel. Setup
 #    guide: `plugins/discord/plugin.toml`.
 #
 # 4. Patch your hook scripts to publish events. Examples below;
-#    none of these need any change to nestty itself, just one line
+#    none of these need any change to copad itself, just one line
 #    appended per hook. `--quiet` makes the publish silent when
-#    nesttyd isn't running, so hooks never break the host command.
+#    copadd isn't running, so hooks never break the host command.
 #
 #    `~/.claude/scripts/pre-commit-gate.sh` — on commit refusal:
 #
 #        if [ "$BLOCKED" = "1" ]; then
-#            command -v nestctl >/dev/null && nestctl event publish \
+#            command -v coctl >/dev/null && coctl event publish \
 #                claude.commit_blocked --quiet \
 #                "{\"reason\": \"$REASON\", \"repo\": \"$REPO\"}" &
 #            exit 1
@@ -45,23 +45,23 @@
 #    `~/.claude/scripts/codex-review.sh` — on APPROVED verdict:
 #
 #        if [ "$VERDICT" = "APPROVED" ]; then
-#            command -v nestctl >/dev/null && nestctl event publish \
+#            command -v coctl >/dev/null && coctl event publish \
 #                claude.review_approved --quiet \
 #                "{\"session\": \"$SESSION_ID\"}" &
 #        fi
 #
-# 5. Restart nesttyd (or wait for the 2s config-watcher to pick up
+# 5. Restart copadd (or wait for the 2s config-watcher to pick up
 #    your edited config.toml — daemon reloads triggers in-place).
 #
 # 6. Verify (local toast):
-#       nestctl event publish claude.commit_blocked --quiet \
+#       coctl event publish claude.commit_blocked --quiet \
 #         '{"reason": "test", "repo": "demo"}'
 #    A toast should pop. Now toggle presence and re-fire:
-#       nestctl presence away
-#       nestctl event publish claude.commit_blocked --quiet \
+#       coctl presence away
+#       coctl event publish claude.commit_blocked --quiet \
 #         '{"reason": "test", "repo": "demo"}'
 #    The toast AND a Discord message should both arrive. Reset:
-#       nestctl presence active
+#       coctl presence active
 
 
 # Hook event:   pre-commit-gate.sh on commit refusal
@@ -78,7 +78,7 @@ accept_external = true
 
 
 # Same event, second trigger: only fires when you've toggled
-# `nestctl presence away`. Keeps your phone quiet while you're at
+# `coctl presence away`. Keeps your phone quiet while you're at
 # the keyboard, pings Discord when you've stepped out.
 [[triggers]]
 name = "claude-commit-blocked-discord"

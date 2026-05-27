@@ -8,8 +8,8 @@ TIMESTAMP=$(date -Iseconds)
 cat <<EOF
 {
     "message": "Hello, ${NAME}!",
-    "plugin_dir": "${NESTTY_PLUGIN_DIR}",
-    "socket": "${NESTTY_SOCKET}",
+    "plugin_dir": "${COPAD_PLUGIN_DIR}",
+    "socket": "${COPAD_SOCKET}",
     "timestamp": "${TIMESTAMP}"
 }
 EOF

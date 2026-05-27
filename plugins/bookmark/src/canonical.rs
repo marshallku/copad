@@ -19,7 +19,7 @@
 //! The id surfaced to callers is the first 8 hex chars of
 //! `sha1(canonical_url)`. 8 chars = 4 bytes = ~1 in 4B collision
 //! probability for a personal KB this is fine, and it's prefix-
-//! resolvable like every other nestctl id.
+//! resolvable like every other coctl id.
 
 use sha1::{Digest, Sha1};
 use url::Url;

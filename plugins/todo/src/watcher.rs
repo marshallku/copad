@@ -15,7 +15,7 @@
 //! 2. Snapshot the store: `{(workspace, id) → (mtime, status)}`.
 //!    The first tick is treated as the baseline — we don't emit
 //!    `todo.created` for everything that already exists at startup
-//!    (that would spam triggers on every nestty restart).
+//!    (that would spam triggers on every copad restart).
 //! 3. Each subsequent tick re-scans and diffs:
 //!    - new key → `todo.created`
 //!    - same key, mtime changed → `todo.changed` (+ `todo.completed`

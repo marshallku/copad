@@ -1,11 +1,11 @@
-//! First-party Slack service plugin for nestty.
+//! First-party Slack service plugin for copad.
 //!
 //! Two run modes (selected by `argv[1]`):
 //! - **`auth`** — validates the env tokens against Slack's
 //!   `auth.test` endpoint and persists the validated TokenSet
 //!   (with team/user IDs) to the configured store. Exits 0 on
 //!   success.
-//! - **(no args)** — RPC mode. Speaks the nestty service-plugin
+//! - **(no args)** — RPC mode. Speaks the copad service-plugin
 //!   protocol over stdio, runs Socket Mode WebSocket in a background
 //!   thread, and publishes `slack.mention` / `slack.dm` events when
 //!   real human messages arrive.
@@ -13,7 +13,7 @@
 //! If RPC mode starts with no stored credentials AND the env tokens
 //! are missing, the supervisor handshake still completes — the
 //! Socket Mode loop just stays paused. The user can run
-//! `nestty-plugin-slack auth` while nestty is running and the loop
+//! `copad-plugin-slack auth` while copad is running and the loop
 //! picks up the new credentials on its next reconnect attempt.
 //!
 //! See `docs/service-plugins.md` for the protocol contract. Slack
@@ -23,7 +23,7 @@
 
 #[cfg(not(unix))]
 compile_error!(
-    "nestty-plugin-slack is currently Unix-only. The keyring crate's mock fallback \
+    "copad-plugin-slack is currently Unix-only. The keyring crate's mock fallback \
      would silently lose tokens on platforms without a native credential-store \
      feature; gate exists to make that failure compile-time instead of runtime."
 );
@@ -52,7 +52,7 @@ fn main() {
         Some("auth") => run_auth(),
         Some(other) => {
             eprintln!("[slack] unknown subcommand: {other}");
-            eprintln!("usage: nestty-plugin-slack [auth]");
+            eprintln!("usage: copad-plugin-slack [auth]");
             std::process::exit(2);
         }
         None => run_rpc(),
@@ -68,11 +68,11 @@ fn run_auth() {
         }
     };
     if config.bot_token.is_empty() {
-        eprintln!("[slack] auth requires NESTTY_SLACK_BOT_TOKEN (xoxb-...)");
+        eprintln!("[slack] auth requires COPAD_SLACK_BOT_TOKEN (xoxb-...)");
         std::process::exit(1);
     }
     if config.app_token.is_empty() {
-        eprintln!("[slack] auth requires NESTTY_SLACK_APP_TOKEN (xapp-...)");
+        eprintln!("[slack] auth requires COPAD_SLACK_APP_TOKEN (xapp-...)");
         std::process::exit(1);
     }
     let store = store::open_store(&config);
@@ -184,7 +184,7 @@ fn run_rpc() {
     // `initialized` notification before connecting so events can't
     // race the handshake. The loop itself is responsible for
     // resolving credentials (env then store) on every iteration —
-    // running `nestty-plugin-slack auth` while nestty is already up
+    // running `copad-plugin-slack auth` while copad is already up
     // populates the store and the loop picks it up on the next
     // recheck (no plugin process restart required).
     {
@@ -397,7 +397,7 @@ fn handle_get_message(
     }
     let creds = socket_mode::current_credentials(config, &**store).ok_or((
         "not_authenticated".to_string(),
-        "no Slack credentials available — run `nestty-plugin-slack auth` or set env tokens"
+        "no Slack credentials available — run `copad-plugin-slack auth` or set env tokens"
             .to_string(),
     ))?;
     let channel = params.get("channel").and_then(Value::as_str).ok_or((
@@ -487,7 +487,7 @@ fn handle_post_message(
     // only via store, gets the right token here either way.
     let creds = socket_mode::current_credentials(config, &**store).ok_or((
         "not_authenticated".to_string(),
-        "no Slack credentials available — run `nestty-plugin-slack auth` or set env tokens"
+        "no Slack credentials available — run `copad-plugin-slack auth` or set env tokens"
             .to_string(),
     ))?;
     let channel = params.get("channel").and_then(Value::as_str).ok_or((
@@ -509,7 +509,7 @@ fn handle_post_message(
         // common ones are documented at api.slack.com/methods/chat.postMessage:
         // `missing_scope`, `not_in_channel`, `channel_not_found`,
         // `is_archived`, `msg_too_long`, `rate_limited`. Caller
-        // (trigger / nestctl) can branch on these without
+        // (trigger / coctl) can branch on these without
         // re-parsing message strings.
         Err(err) => Err(("io_error".to_string(), err)),
     }

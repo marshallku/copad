@@ -8,7 +8,7 @@
 //! created: 2026-04-27T12:00:00Z
 //! due: 2026-05-01
 //! priority: normal
-//! workspace: nestty
+//! workspace: copad
 //! linked_jira: PROJ-456
 //! linked_kb:
 //!   - meetings/abc.md
@@ -420,7 +420,7 @@ fn derive_title_and_body(body_str: &str, id: &str) -> (String, String) {
     (id.to_string(), body_str.to_string())
 }
 
-/// Module-local rather than shared with `nestty-plugin-kb`: todo needs
+/// Module-local rather than shared with `copad-plugin-kb`: todo needs
 /// block-form arrays (`linked_kb`/`linked_slack`) that the kb parser
 /// doesn't support.
 fn split_frontmatter(content: &str) -> (Option<Map<String, Value>>, &str) {
@@ -581,17 +581,17 @@ mod tests {
             status: in_progress\n\
             created: 2026-04-27T10:00:00Z\n\
             priority: high\n\
-            workspace: nestty\n\
+            workspace: copad\n\
             due: 2026-05-01\n\
-            linked_jira: NESTTY-1\n\
+            linked_jira: COPAD-1\n\
             linked_kb:\n  - meetings/abc.md\n  - notes/x.md\n\
             tags: [feature, api]\n\
             ---\n\n# Real title\nbody here\n";
-        let t = parse(body, "T-42", "nestty");
+        let t = parse(body, "T-42", "copad");
         assert_eq!(t.status, Status::InProgress);
         assert_eq!(t.priority, Priority::High);
         assert_eq!(t.due.as_deref(), Some("2026-05-01"));
-        assert_eq!(t.linked_jira.as_deref(), Some("NESTTY-1"));
+        assert_eq!(t.linked_jira.as_deref(), Some("COPAD-1"));
         assert_eq!(
             t.linked_kb,
             vec!["meetings/abc.md".to_string(), "notes/x.md".to_string()]

@@ -1,16 +1,16 @@
 [package]
-name = "nestty-plugin-kb"
+name = "copad-plugin-kb"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "First-party KB service plugin for nestty — grep + filename search over ~/docs."
+description = "First-party KB service plugin for copad — grep + filename search over ~/docs."
 repository.workspace = true
 
 [[bin]]
-name = "nestty-plugin-kb"
+name = "copad-plugin-kb"
 path = "src/main.rs"
 
 [dependencies]
 serde_json = "1"
 libc = "0.2"
-nestty-core = { path = "../../nestty-core" }
+copad-core = { path = "../../copad-core" }

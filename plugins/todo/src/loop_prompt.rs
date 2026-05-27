@@ -56,9 +56,9 @@ mod tests {
 
     #[test]
     fn render_substitutes_all_three_markers() {
-        let p = render("doc trim", "nestty", "T-2026-001");
+        let p = render("doc trim", "copad", "T-2026-001");
         assert!(p.contains("LOOP NAME: doc trim"));
-        assert!(p.contains("WORKSPACE: nestty"));
+        assert!(p.contains("WORKSPACE: copad"));
         assert!(p.contains("TODO ID: T-2026-001"));
         // No raw markers left.
         assert!(!p.contains("{TITLE}"));
@@ -71,19 +71,19 @@ mod tests {
         let p = render("x", "y", "z");
         assert!(p.contains("ScheduleWakeup"));
         assert!(p.contains("ACTIVE_SESSION"));
-        assert!(p.contains("nestctl todo update z"));
+        assert!(p.contains("coctl todo update z"));
     }
 
     #[test]
     fn render_does_not_re_substitute_marker_text_inside_title() {
         // Title containing literal `{ID}` text should survive verbatim —
         // chained `replace()` would corrupt it on the second pass.
-        let p = render("trim docs {ID}", "nestty", "T-2026-001");
+        let p = render("trim docs {ID}", "copad", "T-2026-001");
         assert!(p.contains("LOOP NAME: trim docs {ID}"));
         assert!(!p.contains("LOOP NAME: trim docs T-2026-001"));
         // Real template markers still substituted.
         assert!(p.contains("TODO ID: T-2026-001"));
-        assert!(p.contains("WORKSPACE: nestty"));
+        assert!(p.contains("WORKSPACE: copad"));
     }
 
     #[test]

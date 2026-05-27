@@ -1,4 +1,4 @@
-//! First-party Todo service plugin for nestty.
+//! First-party Todo service plugin for copad.
 //!
 //! Markdown-checkbox files at `~/docs/todos/<workspace>/<id>.md`
 //! with YAML-ish frontmatter as the source of truth — vim and git
@@ -12,19 +12,19 @@
 //! cheaper than the build-graph entanglement.
 //!
 //! Activation `onStartup` (rather than `onAction:todo.*`) so the
-//! file-watcher is alive whenever nestty is running. Otherwise an
+//! file-watcher is alive whenever copad is running. Otherwise an
 //! external `vim` edit only surfaces as `todo.changed` after the
 //! first user-initiated action, which would silently break
 //! triggers like `todo.completed → slack.post_message`.
 //!
 //! Unix-only (Linux + macOS) — `store.rs` needs `O_NOFOLLOW` plus a
 //! kernel atomic-create-or-fail primitive, both of which we get via
-//! `nestty_core::fs_atomic`.
+//! `copad_core::fs_atomic`.
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!(
-    "nestty-plugin-todo supports Linux and macOS. Other Unixes need a \
-     backend-specific atomic-create primitive — extend nestty_core::fs_atomic."
+    "copad-plugin-todo supports Linux and macOS. Other Unixes need a \
+     backend-specific atomic-create primitive — extend copad_core::fs_atomic."
 );
 
 mod config;
@@ -604,7 +604,7 @@ fn action_delete(
 ///
 /// The rendered protocol addresses the todo by id+workspace directly,
 /// so the `loop` tag is NOT required for this specific path to work.
-/// We auto-add it anyway for two reasons: (1) `nestctl todo list --tag
+/// We auto-add it anyway for two reasons: (1) `coctl todo list --tag
 /// loop` becomes a useful filter for finding active/historical agent
 /// loops, and (2) the parallel manual-fill template at
 /// `~/.claude/loop-template.md` uses `(workspace, tag=loop, title)` for

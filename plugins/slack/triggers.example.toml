@@ -25,14 +25,14 @@
 #   files, attachments, edit-history, all of it).
 #
 # slack.post_message action:
-#   nestctl call slack.post_message --params \
+#   coctl call slack.post_message --params \
 #     '{"channel":"C123","text":"hello","thread_ts":"1700000000.000100"}'
 #   Returns {ts, channel} on success; surfaces Slack error codes
 #   (missing_scope / not_in_channel / channel_not_found / etc.)
 #   verbatim as `io_error`.
 #
 # slack.get_message action:
-#   nestctl call slack.get_message --params \
+#   coctl call slack.get_message --params \
 #     '{"channel":"C123","ts":"1700000000.000100"}'
 #   Returns the full Slack message object on success. Failure codes
 #   surface STRUCTURALLY at the action's top-level error code so
@@ -122,7 +122,7 @@ event_kind = "slack.mention"
 # ====================================================================
 # 5. Emoji-react → Todo capture  ★ ACTIVE BY DEFAULT ★
 # ====================================================================
-# React with :memo: on a Slack message → nestty fetches the body and
+# React with :memo: on a Slack message → copad fetches the body and
 # creates a Todo with the permalink + content. Uses Phase 14.2 `await`
 # so the get_message reply is correlated to THIS specific reaction
 # (without correlation, every successful get_message anywhere would

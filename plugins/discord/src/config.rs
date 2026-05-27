@@ -1,15 +1,15 @@
 //! Env-based configuration for the Discord plugin.
 //!
-//! - `NESTTY_DISCORD_BOT_TOKEN` — bot token from
+//! - `COPAD_DISCORD_BOT_TOKEN` — bot token from
 //!   <https://discord.com/developers/applications> → Bot tab → "Reset
 //!   Token". Required for `auth` subcommand; optional for the long-
 //!   running RPC mode (we read from the keyring there). Discord bot
 //!   tokens don't have a documented prefix; we accept anything
 //!   non-empty and let the `users/@me` validation catch typos.
-//! - `NESTTY_DISCORD_WORKSPACE` — keyring-entry namespace. Default
-//!   `"default"`. Same role as `NESTTY_SLACK_WORKSPACE`: lets one
+//! - `COPAD_DISCORD_WORKSPACE` — keyring-entry namespace. Default
+//!   `"default"`. Same role as `COPAD_SLACK_WORKSPACE`: lets one
 //!   account host multiple bots whose keyring entries don't collide.
-//! - `NESTTY_DISCORD_REQUIRE_SECURE_STORE` — `1` / `true` refuses to
+//! - `COPAD_DISCORD_REQUIRE_SECURE_STORE` — `1` / `true` refuses to
 //!   fall back to plaintext when the OS keyring is unavailable. Same
 //!   posture as the Slack plugin's flag.
 //!
@@ -48,17 +48,17 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Self {
         let mut errors: Vec<String> = Vec::new();
-        let workspace_label = std::env::var("NESTTY_DISCORD_WORKSPACE")
+        let workspace_label = std::env::var("COPAD_DISCORD_WORKSPACE")
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "default".to_string());
         if let Err(e) = validate_workspace_label(&workspace_label) {
-            errors.push(format!("NESTTY_DISCORD_WORKSPACE: {e}"));
+            errors.push(format!("COPAD_DISCORD_WORKSPACE: {e}"));
         }
-        let bot_token_env = std::env::var("NESTTY_DISCORD_BOT_TOKEN")
+        let bot_token_env = std::env::var("COPAD_DISCORD_BOT_TOKEN")
             .ok()
             .filter(|s| !s.is_empty());
-        let require_secure_store = std::env::var("NESTTY_DISCORD_REQUIRE_SECURE_STORE")
+        let require_secure_store = std::env::var("COPAD_DISCORD_REQUIRE_SECURE_STORE")
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes"))
             .unwrap_or(false);
@@ -92,7 +92,7 @@ fn default_plaintext_path(workspace_label: &str) -> PathBuf {
                 .map(|h| PathBuf::from(h).join(".config"))
         })
         .unwrap_or_else(|| PathBuf::from("."));
-    base.join("nestty")
+    base.join("copad")
         .join(format!("discord-token-{workspace_label}.json"))
 }
 

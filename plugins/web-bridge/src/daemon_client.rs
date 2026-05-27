@@ -1,4 +1,4 @@
-//! Raw daemon-socket client. Mirrors `nestty-cli/src/client.rs` but
+//! Raw daemon-socket client. Mirrors `copad-cli/src/client.rs` but
 //! over `tokio::net::UnixStream` so it composes with the axum runtime.
 //!
 //! Two access patterns are exposed:
@@ -16,14 +16,14 @@
 //!    socket dies. Used by `/ws/events` to fan one daemon
 //!    subscription out to multiple WebSocket clients.
 //!
-//! Requests use the canonical `nestty_core::protocol::{Request,
+//! Requests use the canonical `copad_core::protocol::{Request,
 //! Response}` shape so a daemon protocol change shows up as a
 //! compile error in this plugin too — no parallel structs.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use nestty_core::protocol::{Request, Response};
+use copad_core::protocol::{Request, Response};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -109,7 +109,7 @@ impl DaemonClient {
     /// the receiver is closed or the socket dies.
     ///
     /// Implemented over `std::os::unix::net::UnixStream` inside
-    /// `tokio::task::spawn_blocking`, mirroring `nestty-cli/src/client.rs`
+    /// `tokio::task::spawn_blocking`, mirroring `copad-cli/src/client.rs`
     /// (which is the validated working path against this same daemon
     /// socket protocol). An earlier tokio `UnixStream + into_split`
     /// version connected and wrote successfully but never observed

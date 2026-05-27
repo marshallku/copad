@@ -716,6 +716,222 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
+name = "copad-cli"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "clap",
+ "copad-core",
+ "flate2",
+ "reqwest",
+ "semver",
+ "serde",
+ "serde_json",
+ "tar",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
+name = "copad-core"
+version = "0.1.0"
+dependencies = [
+ "crossbeam-channel",
+ "dirs 6.0.0",
+ "libc",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "copad-daemon"
+version = "0.1.0"
+dependencies = [
+ "copad-core",
+ "env_logger",
+ "libc",
+ "log",
+ "serde",
+ "serde_json",
+ "uuid",
+ "wait-timeout",
+]
+
+[[package]]
+name = "copad-ffi"
+version = "0.1.0"
+dependencies = [
+ "copad-core",
+ "serde_json",
+]
+
+[[package]]
+name = "copad-linux"
+version = "0.1.0"
+dependencies = [
+ "copad-core",
+ "copad-daemon",
+ "dirs 6.0.0",
+ "env_logger",
+ "gtk4",
+ "javascriptcore6",
+ "libc",
+ "log",
+ "serde",
+ "serde_json",
+ "shellexpand",
+ "tempfile",
+ "uuid",
+ "vte4",
+ "webkit6",
+]
+
+[[package]]
+name = "copad-plugin-bookmark"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "copad-core",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha1",
+ "tempfile",
+ "url",
+]
+
+[[package]]
+name = "copad-plugin-calendar"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "keyring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ureq",
+ "url",
+]
+
+[[package]]
+name = "copad-plugin-discord"
+version = "0.1.0"
+dependencies = [
+ "keyring",
+ "serde",
+ "serde_json",
+ "tungstenite",
+ "ureq",
+]
+
+[[package]]
+name = "copad-plugin-echo"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
+name = "copad-plugin-git"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "copad-plugin-jira"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "keyring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ureq",
+]
+
+[[package]]
+name = "copad-plugin-kb"
+version = "0.1.0"
+dependencies = [
+ "copad-core",
+ "libc",
+ "serde_json",
+]
+
+[[package]]
+name = "copad-plugin-llm"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "keyring",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ureq",
+]
+
+[[package]]
+name = "copad-plugin-slack"
+version = "0.1.0"
+dependencies = [
+ "keyring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tungstenite",
+ "ureq",
+ "url",
+]
+
+[[package]]
+name = "copad-plugin-todo"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "copad-core",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "copad-plugin-web-bridge"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "copad-core",
+ "dirs 5.0.1",
+ "futures-util",
+ "portable-pty",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower-http 0.5.2",
+ "uuid",
+ "web-push",
+]
+
+[[package]]
+name = "copad-term"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "libc",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2451,222 +2667,6 @@ dependencies = [
  "ctutils",
  "hybrid-array",
  "num-traits",
-]
-
-[[package]]
-name = "nestty-cli"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "clap",
- "flate2",
- "nestty-core",
- "reqwest",
- "semver",
- "serde",
- "serde_json",
- "tar",
- "tempfile",
- "uuid",
-]
-
-[[package]]
-name = "nestty-core"
-version = "0.1.0"
-dependencies = [
- "crossbeam-channel",
- "dirs 6.0.0",
- "libc",
- "log",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "toml 0.8.23",
-]
-
-[[package]]
-name = "nestty-daemon"
-version = "0.1.0"
-dependencies = [
- "env_logger",
- "libc",
- "log",
- "nestty-core",
- "serde",
- "serde_json",
- "uuid",
- "wait-timeout",
-]
-
-[[package]]
-name = "nestty-ffi"
-version = "0.1.0"
-dependencies = [
- "nestty-core",
- "serde_json",
-]
-
-[[package]]
-name = "nestty-linux"
-version = "0.1.0"
-dependencies = [
- "dirs 6.0.0",
- "env_logger",
- "gtk4",
- "javascriptcore6",
- "libc",
- "log",
- "nestty-core",
- "nestty-daemon",
- "serde",
- "serde_json",
- "shellexpand",
- "tempfile",
- "uuid",
- "vte4",
- "webkit6",
-]
-
-[[package]]
-name = "nestty-plugin-bookmark"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "libc",
- "nestty-core",
- "serde",
- "serde_json",
- "sha1",
- "tempfile",
- "url",
-]
-
-[[package]]
-name = "nestty-plugin-calendar"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "keyring",
- "serde",
- "serde_json",
- "tempfile",
- "ureq",
- "url",
-]
-
-[[package]]
-name = "nestty-plugin-discord"
-version = "0.1.0"
-dependencies = [
- "keyring",
- "serde",
- "serde_json",
- "tungstenite",
- "ureq",
-]
-
-[[package]]
-name = "nestty-plugin-echo"
-version = "0.1.0"
-dependencies = [
- "serde_json",
-]
-
-[[package]]
-name = "nestty-plugin-git"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
- "tempfile",
- "toml 0.8.23",
-]
-
-[[package]]
-name = "nestty-plugin-jira"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "keyring",
- "serde",
- "serde_json",
- "tempfile",
- "ureq",
-]
-
-[[package]]
-name = "nestty-plugin-kb"
-version = "0.1.0"
-dependencies = [
- "libc",
- "nestty-core",
- "serde_json",
-]
-
-[[package]]
-name = "nestty-plugin-llm"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "keyring",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "ureq",
-]
-
-[[package]]
-name = "nestty-plugin-slack"
-version = "0.1.0"
-dependencies = [
- "keyring",
- "serde",
- "serde_json",
- "tempfile",
- "tungstenite",
- "ureq",
- "url",
-]
-
-[[package]]
-name = "nestty-plugin-todo"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "libc",
- "nestty-core",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
-name = "nestty-plugin-web-bridge"
-version = "0.1.0"
-dependencies = [
- "axum",
- "dirs 5.0.1",
- "futures-util",
- "nestty-core",
- "portable-pty",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tower-http 0.5.2",
- "uuid",
- "web-push",
-]
-
-[[package]]
-name = "nestty-term"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "libc",
 ]
 
 [[package]]

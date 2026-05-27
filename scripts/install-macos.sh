@@ -1,36 +1,36 @@
 #!/usr/bin/env bash
-# scripts/install-macos.sh — Build + install nestty-macos as a real .app
-# and install nestctl via `cargo install --path nestty-cli`.
+# scripts/install-macos.sh — Build + install copad-macos as a real .app
+# and install coctl via `cargo install --path copad-cli`.
 #
 # Companion to scripts/install-dev.sh (which is Linux-only — it does
-# `cargo build --workspace`, and the workspace contains nestty-linux which
+# `cargo build --workspace`, and the workspace contains copad-linux which
 # does not build on macOS without GTK4).
 #
 # Why this script exists:
-#   - The macOS GUI app builds via SwiftPM in nestty-macos/, not cargo.
-#     Up to now, nestty-macos/run.sh was the only path, and it builds an
+#   - The macOS GUI app builds via SwiftPM in copad-macos/, not cargo.
+#     Up to now, copad-macos/run.sh was the only path, and it builds an
 #     ephemeral debug bundle under .build/debug/ and `open -n`s it. There
-#     was no way to install nestty as a real /Applications app.
-#   - `cargo install nestty-cli` (crates.io) fails — the package is not
+#     was no way to install copad as a real /Applications app.
+#   - `cargo install copad-cli` (crates.io) fails — the package is not
 #     published. `cargo install --path .` from the repo root also fails
 #     because the root manifest is a workspace, not a package. The
-#     correct invocation is `cargo install --path nestty-cli`, which this
+#     correct invocation is `cargo install --path copad-cli`, which this
 #     script wraps so the user does not need to memorize it.
 #
 # Usage:
 #   ./scripts/install-macos.sh              # ~/Applications + ~/.cargo/bin (no sudo)
 #   ./scripts/install-macos.sh --system     # /Applications + ~/.cargo/bin (sudo for /Applications)
-#   ./scripts/install-macos.sh --no-build   # skip swift build (use existing .build/release/Nestty)
-#   ./scripts/install-macos.sh --no-nestctl # skip cargo install of nestctl
-#   ./scripts/install-macos.sh --no-nesttyd # skip cargo install of nesttyd (daemon)
+#   ./scripts/install-macos.sh --no-build   # skip swift build (use existing .build/release/Copad)
+#   ./scripts/install-macos.sh --no-coctl # skip cargo install of coctl
+#   ./scripts/install-macos.sh --no-copadd # skip cargo install of copadd (daemon)
 #   ./scripts/install-macos.sh --no-plugins # skip building/installing plugin binaries
 #   ./scripts/install-macos.sh --launch     # open the installed app afterwards
 #
 # Notes:
-#   - nestctl + nesttyd always go to ~/.cargo/bin (cargo install's default).
+#   - coctl + copadd always go to ~/.cargo/bin (cargo install's default).
 #     If you want them in /usr/local/bin, run `sudo install -m755 \\
-#     ~/.cargo/bin/{nestctl,nesttyd} /usr/local/bin/` after this script.
-#   - This script kills any running Nestty instance so the binary can be
+#     ~/.cargo/bin/{coctl,copadd} /usr/local/bin/` after this script.
+#   - This script kills any running Copad instance so the binary can be
 #     replaced. macOS holds an exclusive lock on a running .app's exec.
 #   - First launch may show Gatekeeper warning if the .app is unsigned;
 #     right-click → Open once, or `xattr -d com.apple.quarantine` (only
@@ -45,11 +45,11 @@ if [[ "$(uname)" != "Darwin" ]]; then
 fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_NAME="Nestty.app"
+APP_NAME="Copad.app"
 DO_BUILD=true
 SYSTEM_INSTALL=false
-DO_NESTCTL=true
-DO_NESTTYD=true
+DO_COCTL=true
+DO_COPADD=true
 DO_PLUGINS=true
 DO_DAEMON=true
 DO_LAUNCH=false
@@ -63,7 +63,7 @@ DO_LAUNCH=false
 #   `calendar.event_imminent`). RPC actions still work without Google
 #   OAuth creds thanks to `Config::minimal()` fallback.
 # - kb / todo / bookmark formerly required Linux's `renameat2(RENAME_NOREPLACE)`;
-#   the shared `nestty_core::fs_atomic` primitive now selects between
+#   the shared `copad_core::fs_atomic` primitive now selects between
 #   `renameat2` (Linux) and `renamex_np(RENAME_EXCL)` (Darwin), so all
 #   three install and run on macOS.
 # - slack / discord install fine; full functionality needs user-supplied
@@ -76,8 +76,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --system)      SYSTEM_INSTALL=true ; shift ;;
         --no-build)    DO_BUILD=false ; shift ;;
-        --no-nestctl)  DO_NESTCTL=false ; shift ;;
-        --no-nesttyd)  DO_NESTTYD=false ; shift ;;
+        --no-coctl)  DO_COCTL=false ; shift ;;
+        --no-copadd)  DO_COPADD=false ; shift ;;
         --no-plugins)  DO_PLUGINS=false ; shift ;;
         --no-daemon)   DO_DAEMON=false ; shift ;;
         --with-daemon) DO_DAEMON=true ; shift ;;
@@ -102,27 +102,27 @@ else
 fi
 
 # 1. Build the macOS app via SwiftPM (release config).
-#    The Nestty executable links libnestty_ffi.a from the Rust staticlib crate;
+#    The Copad executable links libcopad_ffi.a from the Rust staticlib crate;
 #    SwiftPM cannot run cargo as a prebuild step from Package.swift, so we
 #    invoke cargo here first. swift build's linker phase then picks up the
-#    archive at $REPO_ROOT/target/release/libnestty_ffi.a via the
+#    archive at $REPO_ROOT/target/release/libcopad_ffi.a via the
 #    -L../target/release flag baked into Package.swift.
 if $DO_BUILD; then
-    echo "==> cargo build --release -p nestty-ffi -p nestty-term (Rust staticlibs for Swift FFI)"
-    (cd "$REPO_ROOT" && cargo build --release -p nestty-ffi -p nestty-term)
+    echo "==> cargo build --release -p copad-ffi -p copad-term (Rust staticlibs for Swift FFI)"
+    (cd "$REPO_ROOT" && cargo build --release -p copad-ffi -p copad-term)
 
-    echo "==> swift build -c release (nestty-macos)"
-    (cd "$REPO_ROOT/nestty-macos" && swift build -c release)
+    echo "==> swift build -c release (copad-macos)"
+    (cd "$REPO_ROOT/copad-macos" && swift build -c release)
 fi
 
-BUILT_BIN="$REPO_ROOT/nestty-macos/.build/release/Nestty"
+BUILT_BIN="$REPO_ROOT/copad-macos/.build/release/Copad"
 if [[ ! -x "$BUILT_BIN" ]]; then
-    echo "error: $BUILT_BIN not found — drop --no-build, or run swift build -c release in nestty-macos/" >&2
+    echo "error: $BUILT_BIN not found — drop --no-build, or run swift build -c release in copad-macos/" >&2
     exit 1
 fi
 
 # 2. Stop any running instance so we can replace the bundle's executable.
-pkill -x Nestty 2>/dev/null || true
+pkill -x Copad 2>/dev/null || true
 sleep 0.3
 
 # 3. Stage the bundle in a tmp dir so the install is atomic — the user
@@ -134,21 +134,21 @@ CONTENTS="$STAGING/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 mkdir -p "$MACOS" "$RESOURCES"
-cp "$BUILT_BIN" "$MACOS/Nestty"
+cp "$BUILT_BIN" "$MACOS/Copad"
 
 # Bundle icon. CFBundleIconFile expects the basename ("AppIcon") and
 # Finder/Dock/Launchpad pull pixels from Resources/AppIcon.icns. The
-# .icns is checked in (generated from assets/icons/nestty.png — see
+# .icns is checked in (generated from assets/icons/copad.png — see
 # scripts/build-icons.sh) so swift build alone is enough to produce a
 # fully-iconed bundle.
-ICNS_SRC="$REPO_ROOT/nestty-macos/Resources/AppIcon.icns"
+ICNS_SRC="$REPO_ROOT/copad-macos/Resources/AppIcon.icns"
 if [[ -f "$ICNS_SRC" ]]; then
     cp "$ICNS_SRC" "$RESOURCES/AppIcon.icns"
 else
     echo "warn: $ICNS_SRC missing — bundle will fall back to the generic app icon" >&2
 fi
 
-# Info.plist — kept in sync with nestty-macos/run.sh by hand. Two copies is
+# Info.plist — kept in sync with copad-macos/run.sh by hand. Two copies is
 # acceptable (Rule of Three); a third would mean extracting to a template.
 cat > "$CONTENTS/Info.plist" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -156,15 +156,15 @@ cat > "$CONTENTS/Info.plist" <<'EOF'
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key>
-    <string>Nestty</string>
+    <string>Copad</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.marshall.nestty</string>
+    <string>com.marshall.copad</string>
     <key>CFBundleName</key>
-    <string>nestty</string>
+    <string>copad</string>
     <key>CFBundleDisplayName</key>
-    <string>nestty</string>
+    <string>copad</string>
     <key>CFBundleVersion</key>
     <string>0.1.0</string>
     <key>CFBundleShortVersionString</key>
@@ -195,35 +195,35 @@ mkdir -p "$APP_DEST" 2>/dev/null || $SUDO_APP mkdir -p "$APP_DEST"
 $SUDO_APP rm -rf "$APP_DEST/$APP_NAME"
 $SUDO_APP mv "$STAGING" "$APP_DEST/$APP_NAME"
 
-# 6. Install nestctl + nesttyd via cargo install (writes to ~/.cargo/bin).
-#    Same rationale as nestctl: `cargo install <name>` fails (not on
+# 6. Install coctl + copadd via cargo install (writes to ~/.cargo/bin).
+#    Same rationale as coctl: `cargo install <name>` fails (not on
 #    crates.io) and `cargo install --path .` fails (workspace virtual
 #    manifest), so we always pass `--path <crate-dir>`.
 #
-#    nesttyd is the background daemon (status bar, triggers, plugin
+#    copadd is the background daemon (status bar, triggers, plugin
 #    runtime). The Swift app auto-spawns it on launch when missing, so
-#    a fresh install without nesttyd in PATH would warn-and-skip the
+#    a fresh install without copadd in PATH would warn-and-skip the
 #    status bar / plugin features.
-if $DO_NESTCTL; then
-    echo "==> cargo install --path nestty-cli (nestctl → ~/.cargo/bin)"
-    cargo install --path "$REPO_ROOT/nestty-cli"
+if $DO_COCTL; then
+    echo "==> cargo install --path copad-cli (coctl → ~/.cargo/bin)"
+    cargo install --path "$REPO_ROOT/copad-cli"
 fi
-if $DO_NESTTYD; then
-    echo "==> cargo install --path nestty-daemon (nesttyd → ~/.cargo/bin)"
-    cargo install --path "$REPO_ROOT/nestty-daemon"
+if $DO_COPADD; then
+    echo "==> cargo install --path copad-daemon (copadd → ~/.cargo/bin)"
+    cargo install --path "$REPO_ROOT/copad-daemon"
 fi
 
 # 7. Build + install macOS-buildable plugins. PluginSupervisor (PR 3) reads
-#    ~/Library/Application Support/nestty/plugins/<name>/ at startup; we
+#    ~/Library/Application Support/copad/plugins/<name>/ at startup; we
 #    cargo-build the binary and copy the manifest. Manifest's
 #    `services.exec` is resolved against the plugin dir first, so we drop
 #    the binary alongside plugin.toml so the supervisor finds it without
 #    a $PATH dance.
-PLUGIN_DEST="$HOME/Library/Application Support/nestty/plugins"
+PLUGIN_DEST="$HOME/Library/Application Support/copad/plugins"
 if $DO_PLUGINS; then
     mkdir -p "$PLUGIN_DEST"
     for name in "${MACOS_PLUGINS[@]}"; do
-        crate="nestty-plugin-$name"
+        crate="copad-plugin-$name"
         src_manifest="$REPO_ROOT/plugins/$name/plugin.toml"
         if [[ ! -f "$src_manifest" ]]; then
             echo "skip plugin $name: $src_manifest missing"
@@ -253,7 +253,7 @@ if $DO_PLUGINS; then
     done
 fi
 
-# 8. Install the LaunchAgent plist so nesttyd auto-starts at login
+# 8. Install the LaunchAgent plist so copadd auto-starts at login
 #    (and `KeepAlive=true` restarts it on crash). The plist template
 #    in dist/launchd/ uses HOME_PLACEHOLDER tokens because launchd
 #    does not expand `~` — we rewrite them with the user's actual
@@ -261,9 +261,9 @@ fi
 #    replacement for `launchctl load`; we `bootout` first to make
 #    this idempotent across re-runs.
 if $DO_DAEMON; then
-    if command -v launchctl >/dev/null 2>&1 && $DO_NESTTYD; then
-        PLIST_SRC="$REPO_ROOT/dist/launchd/com.marshall.nestty.daemon.plist"
-        PLIST_DST="$HOME/Library/LaunchAgents/com.marshall.nestty.daemon.plist"
+    if command -v launchctl >/dev/null 2>&1 && $DO_COPADD; then
+        PLIST_SRC="$REPO_ROOT/dist/launchd/com.marshall.copad.daemon.plist"
+        PLIST_DST="$HOME/Library/LaunchAgents/com.marshall.copad.daemon.plist"
         if [[ ! -f "$PLIST_SRC" ]]; then
             echo "warn: $PLIST_SRC missing — skipping LaunchAgent install" >&2
         else
@@ -292,30 +292,30 @@ if $DO_DAEMON; then
             PLIST_TEXT=${PLIST_TEXT//HOME_PLACEHOLDER/$HOME_ESC}
             printf '%s\n' "$PLIST_TEXT" > "$PLIST_DST"
             chmod 644 "$PLIST_DST"
-            launchctl bootout "gui/$UID/com.marshall.nestty.daemon" 2>/dev/null || true
+            launchctl bootout "gui/$UID/com.marshall.copad.daemon" 2>/dev/null || true
             launchctl bootstrap "gui/$UID" "$PLIST_DST"
-            echo "    launchctl list | grep nestty       # to inspect"
-            echo "    tail ~/Library/Logs/nestty-daemon.{out,err}.log  # logs"
+            echo "    launchctl list | grep copad       # to inspect"
+            echo "    tail ~/Library/Logs/copad-daemon.{out,err}.log  # logs"
         fi
     else
         if ! command -v launchctl >/dev/null 2>&1; then
             echo "warn: launchctl not on PATH; skipping LaunchAgent install."
-        elif ! $DO_NESTTYD; then
-            echo "note: skipping LaunchAgent install because --no-nesttyd was passed."
+        elif ! $DO_COPADD; then
+            echo "note: skipping LaunchAgent install because --no-copadd was passed."
         fi
     fi
 fi
 
 # Shell hooks for live-cwd reporting. macOS alacritty backend can't
 # capture OSC 7 (no vte handler) and proc_pidinfo is EPERM under
-# hardened runtime; the in-shell hook calls `nestctl call
+# hardened runtime; the in-shell hook calls `coctl call
 # panel.report_cwd` on every chpwd instead. Files land under
-# ~/.config/nestty/shell-hooks/; users source one from their rc file.
-SHELL_HOOK_SRC="$REPO_ROOT/nestty-macos/shell-hooks"
-SHELL_HOOK_DEST="$HOME/.config/nestty/shell-hooks"
+# ~/.config/copad/shell-hooks/; users source one from their rc file.
+SHELL_HOOK_SRC="$REPO_ROOT/copad-macos/shell-hooks"
+SHELL_HOOK_DEST="$HOME/.config/copad/shell-hooks"
 if [[ -d "$SHELL_HOOK_SRC" ]]; then
     mkdir -p "$SHELL_HOOK_DEST"
-    for f in "$SHELL_HOOK_SRC"/nestty-cwd.*; do
+    for f in "$SHELL_HOOK_SRC"/copad-cwd.*; do
         [[ -f "$f" ]] || continue
         cp -f "$f" "$SHELL_HOOK_DEST/$(basename "$f")"
     done
@@ -330,11 +330,11 @@ cat <<EOF
 Installed:
   $APP_DEST/$APP_NAME
 EOF
-if $DO_NESTCTL; then
-    echo "  $HOME/.cargo/bin/nestctl"
+if $DO_COCTL; then
+    echo "  $HOME/.cargo/bin/coctl"
 fi
-if $DO_NESTTYD; then
-    echo "  $HOME/.cargo/bin/nesttyd"
+if $DO_COPADD; then
+    echo "  $HOME/.cargo/bin/copadd"
 fi
 if $DO_PLUGINS; then
     echo "  $PLUGIN_DEST/{$(IFS=,; echo "${MACOS_PLUGINS[*]}")}"
@@ -342,23 +342,23 @@ fi
 cat <<'EOF'
 
 Next:
-  - Launch the GUI: `open -a Nestty` (or Spotlight / Launchpad).
+  - Launch the GUI: `open -a Copad` (or Spotlight / Launchpad).
   - CLI helpers on the app binary itself:
-      Nestty.app/Contents/MacOS/Nestty --version
-      Nestty.app/Contents/MacOS/Nestty --config-path
-      Nestty.app/Contents/MacOS/Nestty --init-config   # writes ~/.config/nestty/config.toml if missing
-    (Many users alias `nestty` to that binary so `nestty --config-path` works.)
-  - Verify a plugin is alive: `nestctl call echo.ping --params '{"hi":"there"}'`
-  - Tail recent daemon events:    `nestctl recent`
+      Copad.app/Contents/MacOS/Copad --version
+      Copad.app/Contents/MacOS/Copad --config-path
+      Copad.app/Contents/MacOS/Copad --init-config   # writes ~/.config/copad/config.toml if missing
+    (Many users alias `copad` to that binary so `copad --config-path` works.)
+  - Verify a plugin is alive: `coctl call echo.ping --params '{"hi":"there"}'`
+  - Tail recent daemon events:    `coctl recent`
   - Live-cwd tracking (so session restore lands at your current dir,
     not the spawn-time one). macOS hardened runtime blocks the
     proc_pidinfo path Linux/VTE gets for free; the workaround is a
-    shell hook installed under ~/.config/nestty/shell-hooks/. Add ONE
+    shell hook installed under ~/.config/copad/shell-hooks/. Add ONE
     of these lines to your shell rc file:
-        zsh   ~/.zshrc       source ~/.config/nestty/shell-hooks/nestty-cwd.zsh
-        bash  ~/.bashrc      source ~/.config/nestty/shell-hooks/nestty-cwd.bash
+        zsh   ~/.zshrc       source ~/.config/copad/shell-hooks/copad-cwd.zsh
+        bash  ~/.bashrc      source ~/.config/copad/shell-hooks/copad-cwd.bash
         fish  ~/.config/fish/config.fish
-                             source ~/.config/nestty/shell-hooks/nestty-cwd.fish
-    No-op when the shell isn't running inside a nestty PTY, so it's
+                             source ~/.config/copad/shell-hooks/copad-cwd.fish
+    No-op when the shell isn't running inside a copad PTY, so it's
     safe to source unconditionally.
 EOF

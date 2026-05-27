@@ -6,16 +6,16 @@
 # nanoseconds since the last keyboard/mouse event. We poll it.
 #
 # Run as a LaunchAgent. Drop a plist at
-# ~/Library/LaunchAgents/com.you.nestty-presence.plist with:
+# ~/Library/LaunchAgents/com.you.copad-presence.plist with:
 #
 #   <key>ProgramArguments</key>
 #   <array>
-#     <string>/Users/you/.local/bin/nestty-presence-darwin</string>
+#     <string>/Users/you/.local/bin/copad-presence-darwin</string>
 #   </array>
 #   <key>RunAtLoad</key><true/>
 #   <key>KeepAlive</key><true/>
 #
-# Then `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.you.nestty-presence.plist`.
+# Then `launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.you.copad-presence.plist`.
 #
 # Threshold knob: TIMEOUT_SECS. Polls every POLL_SECS.
 
@@ -23,7 +23,7 @@ set -euo pipefail
 
 TIMEOUT_SECS="${TIMEOUT_SECS:-300}"
 POLL_SECS="${POLL_SECS:-15}"
-NESTCTL="${NESTCTL:-nestctl}"
+COCTL="${COCTL:-coctl}"
 
 last=""
 while :; do
@@ -41,7 +41,7 @@ while :; do
     target="active"
   fi
   if [ "$target" != "$last" ]; then
-    "$NESTCTL" presence "$target" >/dev/null || true
+    "$COCTL" presence "$target" >/dev/null || true
     last="$target"
   fi
   sleep "$POLL_SECS"

@@ -2,18 +2,18 @@
 //!
 //! Loop:
 //! 1. Wait until the supervisor has sent `initialized` (so events
-//!    don't leak before nestty has finished the handshake).
+//!    don't leak before copad has finished the handshake).
 //! 2. Run an immediate first `tick()` (no leading sleep), then sleep
 //!    `poll_interval` between subsequent ticks.
 //! 3. If credentials are not present, skip silently (the user might
-//!    run `nestty-plugin-calendar auth` while nestty is already running).
+//!    run `copad-plugin-calendar auth` while copad is already running).
 //! 4. Fetch events for the next `lookahead_hours`.
 //! 5. For each (event, lead_minutes) pair, fire if
 //!    `firing_time <= now < event.start` (where `firing_time =
 //!    event.start - lead_minutes`) AND we have not already fired this
 //!    `(event_id, lead)` pair. The dedupe set ensures exactly-once
 //!    publishing across ticks, while the bare "is now in the firing
-//!    band?" check is what gives us startup-catchup: if nestty restarts
+//!    band?" check is what gives us startup-catchup: if copad restarts
 //!    20 seconds after the canonical firing time but before
 //!    `event.start`, the first tick still publishes. The earlier
 //!    `[now + lead, now + lead + poll_interval)` framing missed
@@ -88,8 +88,8 @@ impl Poller {
         // First tick runs IMMEDIATELY (not after a poll_interval
         // sleep). Without this, any event whose firing window
         // (start - lead - poll_interval, start - lead] overlaps with
-        // the time between nestty startup and the first scheduled tick
-        // is permanently missed. Example: nestty starts at 09:50:30,
+        // the time between copad startup and the first scheduled tick
+        // is permanently missed. Example: copad starts at 09:50:30,
         // lead=10m, event at 10:00, poll=60s → naive sleep-first
         // would not check until 09:51:30, well past the firing
         // window 09:49:00-09:50:00. With immediate-first, 09:50:30
@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     fn fires_after_restart_inside_firing_window() {
-        // Reproduces codex round-5 C1: nestty restarts at 09:50:30, an
+        // Reproduces codex round-5 C1: copad restarts at 09:50:30, an
         // event is at 10:00:00 with lead=10. Canonical firing time
         // was 09:50:00, so we are 30 seconds past it but still well
         // before event start. Must fire.

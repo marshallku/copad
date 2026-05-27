@@ -1,7 +1,7 @@
 # Example triggers driven by the Google Calendar plugin.
 #
-# Drop relevant pieces of this file into your nestty config (or include
-# a `[[triggers]]` block in `~/.config/nestty/config.toml`) once the
+# Drop relevant pieces of this file into your copad config (or include
+# a `[[triggers]]` block in `~/.config/copad/config.toml`) once the
 # calendar plugin is authenticated.
 #
 # The plugin emits ONE event kind: `calendar.event_imminent` — payload
@@ -95,10 +95,10 @@ lead_minutes = 10
 # lead_minutes = 60
 
 # ---------------------------------------------------------------------
-# 4. Open the calendar UI on demand — trigger via nestctl, not a
+# 4. Open the calendar UI on demand — trigger via coctl, not a
 #    calendar event. Run:
 #
-#      nestctl call webview.open --params '{"url":"https://calendar.google.com","mode":"tab"}'
+#      coctl call webview.open --params '{"url":"https://calendar.google.com","mode":"tab"}'
 #
 #    Or bind it to a shortcut by wrapping in a [[triggers]] entry that
 #    listens for whatever event your shortcut publishes (e.g.

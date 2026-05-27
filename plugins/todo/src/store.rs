@@ -1,7 +1,7 @@
 //! Filesystem operations on `~/docs/todos/<workspace>/<id>.md`.
 //!
 //! Atomicity contract:
-//! - `create` uses temp + `nestty_core::fs_atomic::rename_no_replace`
+//! - `create` uses temp + `copad_core::fs_atomic::rename_no_replace`
 //!   (Linux `renameat2(RENAME_NOREPLACE)` / macOS
 //!   `renamex_np(RENAME_EXCL)`) so concurrent creators never see torn
 //!   files; exactly one wins on id collision (loser gets `id_exists`).
@@ -13,7 +13,7 @@
 //!   needs an mtime check that's racey on its own. Future: file lock.
 //! - `delete` is `unlink`; idempotent (NotFound is OK).
 //!
-//! Trust-boundary defense (mirrors `nestty-plugin-kb`):
+//! Trust-boundary defense (mirrors `copad-plugin-kb`):
 //! - Workspace label is validated against the same charset before
 //!   it's joined into the path.
 //! - Id is validated to reject path separators, `..`, leading dot,
@@ -489,7 +489,7 @@ fn atomic_create(target: &Path, content: &[u8]) -> Result<(), Err> {
         f.sync_data()
             .map_err(|e| Err::Io(format!("fsync temp {}: {e}", tmp.display())))?;
     }
-    match nestty_core::fs_atomic::rename_no_replace(&tmp, target) {
+    match copad_core::fs_atomic::rename_no_replace(&tmp, target) {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = fs::remove_file(&tmp);

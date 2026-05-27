@@ -6,8 +6,8 @@ description = "Polls Google Calendar and emits calendar.event_imminent events at
 
 [[services]]
 name = "main"
-exec = "nestty-plugin-calendar"
-# onStartup: the polling daemon must be alive whenever nestty is running
+exec = "copad-plugin-calendar"
+# onStartup: the polling daemon must be alive whenever copad is running
 # so it can publish lead-time events on schedule. Lazy activation
 # (onAction:calendar.*) would only spawn on the first explicit
 # query — too late for "10 minutes before meeting" use cases.
@@ -19,9 +19,9 @@ provides = [
     "calendar.auth_status",
 ]
 subscribes = []
-# Required env (set by user): NESTTY_CALENDAR_CLIENT_ID, NESTTY_CALENDAR_CLIENT_SECRET
-# Optional env: NESTTY_CALENDAR_ACCOUNT (default "default"),
-#               NESTTY_CALENDAR_LEAD_MINUTES (default "10"),
-#               NESTTY_CALENDAR_POLL_SECS (default 60),
-#               NESTTY_CALENDAR_LOOKAHEAD_HOURS (default 24),
-#               NESTTY_CALENDAR_REQUIRE_SECURE_STORE (default false)
+# Required env (set by user): COPAD_CALENDAR_CLIENT_ID, COPAD_CALENDAR_CLIENT_SECRET
+# Optional env: COPAD_CALENDAR_ACCOUNT (default "default"),
+#               COPAD_CALENDAR_LEAD_MINUTES (default "10"),
+#               COPAD_CALENDAR_POLL_SECS (default 60),
+#               COPAD_CALENDAR_LOOKAHEAD_HOURS (default 24),
+#               COPAD_CALENDAR_REQUIRE_SECURE_STORE (default false)

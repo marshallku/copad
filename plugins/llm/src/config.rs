@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Override per call via the `model` param or globally via
-/// `NESTTY_LLM_DEFAULT_MODEL`.
+/// `COPAD_LLM_DEFAULT_MODEL`.
 const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
 /// Capped under the supervisor's 120s `DEFAULT_ACTION_TIMEOUT`; the 10s
@@ -47,14 +47,14 @@ pub struct Config {
 impl Config {
     /// Never errors — env failures accumulate into `fatal_error` while
     /// each setting substitutes a safe default. The account label is
-    /// validated BEFORE deriving paths so a bad `NESTTY_LLM_ACCOUNT`
+    /// validated BEFORE deriving paths so a bad `COPAD_LLM_ACCOUNT`
     /// can't silently redirect `llm.usage` to another account's log.
     pub fn from_env() -> Self {
         let mut errors: Vec<String> = Vec::new();
 
         // Account label first — it determines paths.
         let raw_account =
-            std::env::var("NESTTY_LLM_ACCOUNT").unwrap_or_else(|_| "default".to_string());
+            std::env::var("COPAD_LLM_ACCOUNT").unwrap_or_else(|_| "default".to_string());
         let (account_label, account_resolved) = match validate_account_label(&raw_account) {
             Ok(_) => (raw_account, true),
             Err(e) => {
@@ -72,15 +72,15 @@ impl Config {
             api_key.clear();
         }
 
-        // Reject `NESTTY_LLM_DEFAULT_MODEL=""` — using the empty
+        // Reject `COPAD_LLM_DEFAULT_MODEL=""` — using the empty
         // string as a model id would only surface as a remote API
         // error per call. Accumulate the error locally and fall
         // back to the build-time default so `auth` / completions
         // can still run when the user removes the bad env var.
-        let default_model = match std::env::var("NESTTY_LLM_DEFAULT_MODEL") {
+        let default_model = match std::env::var("COPAD_LLM_DEFAULT_MODEL") {
             Ok(s) if s.is_empty() => {
                 errors.push(
-                    "NESTTY_LLM_DEFAULT_MODEL: empty string is not a valid model id".to_string(),
+                    "COPAD_LLM_DEFAULT_MODEL: empty string is not a valid model id".to_string(),
                 );
                 DEFAULT_MODEL.to_string()
             }
@@ -89,23 +89,23 @@ impl Config {
         };
 
         let default_max_tokens =
-            parse_nonzero_int_with_default("NESTTY_LLM_DEFAULT_MAX_TOKENS", 4096u32, &mut errors);
+            parse_nonzero_int_with_default("COPAD_LLM_DEFAULT_MAX_TOKENS", 4096u32, &mut errors);
         let mut http_timeout_secs: u64 = parse_nonzero_int_with_default(
-            "NESTTY_LLM_HTTP_TIMEOUT_SECS",
+            "COPAD_LLM_HTTP_TIMEOUT_SECS",
             MAX_HTTP_TIMEOUT_SECS,
             &mut errors,
         );
         if http_timeout_secs > MAX_HTTP_TIMEOUT_SECS {
             errors.push(format!(
-                "NESTTY_LLM_HTTP_TIMEOUT_SECS={http_timeout_secs} exceeds supervisor cap \
+                "COPAD_LLM_HTTP_TIMEOUT_SECS={http_timeout_secs} exceeds supervisor cap \
                  ({MAX_HTTP_TIMEOUT_SECS}s; supervisor action_timeout is 120s with 10s \
                  margin for spawn/init/transit). Bump DEFAULT_ACTION_TIMEOUT in \
-                 nestty-linux/src/service_supervisor.rs first if you genuinely need longer."
+                 copad-linux/src/service_supervisor.rs first if you genuinely need longer."
             ));
             http_timeout_secs = MAX_HTTP_TIMEOUT_SECS;
         }
         let require_secure_store =
-            parse_bool_with_default("NESTTY_LLM_REQUIRE_SECURE_STORE", false, &mut errors);
+            parse_bool_with_default("COPAD_LLM_REQUIRE_SECURE_STORE", false, &mut errors);
 
         Self {
             api_key,
@@ -128,18 +128,18 @@ impl Config {
 
 pub fn validate_account_label(s: &str) -> Result<(), String> {
     if s.is_empty() {
-        return Err("NESTTY_LLM_ACCOUNT: cannot be empty".to_string());
+        return Err("COPAD_LLM_ACCOUNT: cannot be empty".to_string());
     }
     if s == "." || s == ".." {
         return Err(format!(
-            "NESTTY_LLM_ACCOUNT: {s:?} is reserved (use a normal label)"
+            "COPAD_LLM_ACCOUNT: {s:?} is reserved (use a normal label)"
         ));
     }
     for c in s.chars() {
         let ok = c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '@');
         if !ok {
             return Err(format!(
-                "NESTTY_LLM_ACCOUNT: invalid character {c:?} \
+                "COPAD_LLM_ACCOUNT: invalid character {c:?} \
                  (allowed: ASCII alphanumeric and _ - . @)"
             ));
         }
@@ -184,7 +184,7 @@ fn parse_bool_with_default(var: &str, default: bool, errors: &mut Vec<String>) -
 fn default_plaintext_path(account: &str) -> PathBuf {
     config_home()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("nestty")
+        .join("copad")
         .join(format!("llm-token-{account}.json"))
 }
 
@@ -193,7 +193,7 @@ fn default_plaintext_path(account: &str) -> PathBuf {
 fn default_usage_log_path(account: &str) -> PathBuf {
     data_home()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("nestty")
+        .join("copad")
         .join(format!("llm-usage-{account}.jsonl"))
 }
 

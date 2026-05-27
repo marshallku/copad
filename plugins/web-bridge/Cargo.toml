@@ -1,17 +1,17 @@
 [package]
-name = "nestty-plugin-web-bridge"
+name = "copad-plugin-web-bridge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "First-party nestty plugin — HTTP+WebSocket broker over nesttyd's socket surface so a remote phone/laptop can drive the local harness (Slice 3.0 of the remote-harness effort)."
+description = "First-party copad plugin — HTTP+WebSocket broker over copadd's socket surface so a remote phone/laptop can drive the local harness (Slice 3.0 of the remote-harness effort)."
 repository.workspace = true
 
 [[bin]]
-name = "nestty-plugin-web-bridge"
+name = "copad-plugin-web-bridge"
 path = "src/main.rs"
 
 [dependencies]
-nestty-core = { path = "../../nestty-core" }
+copad-core = { path = "../../copad-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }

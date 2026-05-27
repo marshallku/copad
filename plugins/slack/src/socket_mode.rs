@@ -36,7 +36,7 @@ use crate::store::TokenStore;
 const CONNECTIONS_OPEN_URL: &str = "https://slack.com/api/apps.connections.open";
 
 /// Recheck cadence when no credentials are available. Lets a fresh
-/// `nestty-plugin-slack auth` invocation be picked up without a
+/// `copad-plugin-slack auth` invocation be picked up without a
 /// supervisor restart.
 const NO_CREDS_RECHECK: Duration = Duration::from_secs(30);
 
@@ -101,13 +101,13 @@ pub fn run_loop<F>(
 {
     // Refuse to run if env validation surfaced a malformed value.
     // Without this guard, falling back to the `default`-workspace
-    // store would silently mask a user typo (bad NESTTY_SLACK_WORKSPACE,
+    // store would silently mask a user typo (bad COPAD_SLACK_WORKSPACE,
     // bad token prefix). The plugin keeps the supervisor handshake
     // alive so `slack.auth_status` can report the error.
     if let Some(err) = &config.fatal_error {
         eprintln!(
             "[slack] socket mode loop NOT starting: {err}\n\
-             [slack] check `nestctl call slack.auth_status` for details"
+             [slack] check `coctl call slack.auth_status` for details"
         );
         return;
     }
@@ -123,8 +123,8 @@ pub fn run_loop<F>(
             // user is genuinely deciding when to run `auth`.
             if last_no_creds_log.elapsed() >= NO_CREDS_RECHECK {
                 eprintln!(
-                    "[slack] no credentials yet — waiting (run `nestty-plugin-slack auth` \
-                     or set NESTTY_SLACK_BOT_TOKEN / NESTTY_SLACK_APP_TOKEN)"
+                    "[slack] no credentials yet — waiting (run `copad-plugin-slack auth` \
+                     or set COPAD_SLACK_BOT_TOKEN / COPAD_SLACK_APP_TOKEN)"
                 );
                 last_no_creds_log = std::time::Instant::now();
             }
@@ -310,7 +310,7 @@ where
         "slash_commands" | "interactive" => {
             // Out of scope for v1 — would need to ACK these for
             // Slack to consider them handled, but we don't emit any
-            // nestty event for them. ACK with empty payload so Slack
+            // copad event for them. ACK with empty payload so Slack
             // doesn't accumulate retries.
             if let Some(envelope_id) = frame.get("envelope_id").and_then(Value::as_str) {
                 let ack = json!({"envelope_id": envelope_id});

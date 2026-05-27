@@ -1,13 +1,13 @@
 [package]
-name = "nestty-plugin-git"
+name = "copad-plugin-git"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "First-party git workspace + worktree plugin for nestty. Lightweight: no external API, just argv-vector shell-outs to `git`."
+description = "First-party git workspace + worktree plugin for copad. Lightweight: no external API, just argv-vector shell-outs to `git`."
 repository.workspace = true
 
 [[bin]]
-name = "nestty-plugin-git"
+name = "copad-plugin-git"
 path = "src/main.rs"
 
 [dependencies]

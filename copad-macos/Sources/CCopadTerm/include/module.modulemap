@@ -1,0 +1,8 @@
+// SwiftPM picks this up automatically when a target named `CCopadTerm` lives
+// at Sources/CCopadTerm/. Swift side `import CCopadTerm` exposes every
+// symbol declared in copad_term.h; implementation comes from
+// libcopad_term.a linked via the Package.swift unsafeFlags.
+module CCopadTerm {
+    header "copad_term.h"
+    export *
+}

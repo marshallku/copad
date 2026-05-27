@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Install first-party plugins into ~/.config/nestty/plugins/ with
+# Install first-party plugins into ~/.config/copad/plugins/ with
 # binaries symlinked from a build directory. Solves the common
-# "service X is not running" startup error caused by nestty being
+# "service X is not running" startup error caused by copad being
 # launched from a desktop entry whose PATH doesn't include the
 # built binaries.
 #
@@ -15,10 +15,10 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PLUGINS_SRC_DIR="$REPO_ROOT/plugins"
 TARGET_DIR="$REPO_ROOT/target/release"
-PLUGIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/nestty/plugins"
+PLUGIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/copad/plugins"
 
 if [ ! -d "$PLUGINS_SRC_DIR" ]; then
-    echo "error: $PLUGINS_SRC_DIR not found — run from a nestty checkout" >&2
+    echo "error: $PLUGINS_SRC_DIR not found — run from a copad checkout" >&2
     exit 1
 fi
 
@@ -28,11 +28,11 @@ fi
 # them whenever the common preamble drifts. We only create empty
 # stubs when missing; existing user content is never touched.
 #
-# Path derivation MUST match `nestty-plugin-todo::prompt::docs_root_for`
-# at runtime: `parent(NESTTY_TODO_ROOT)`. Default is `~/docs/todos` →
+# Path derivation MUST match `copad-plugin-todo::prompt::docs_root_for`
+# at runtime: `parent(COPAD_TODO_ROOT)`. Default is `~/docs/todos` →
 # stubs at `~/docs/claude/`. Anything else here would create stubs
 # the plugin never reads.
-TODO_ROOT="${NESTTY_TODO_ROOT:-$HOME/docs/todos}"
+TODO_ROOT="${COPAD_TODO_ROOT:-$HOME/docs/todos}"
 DOCS_ROOT="$(dirname -- "$TODO_ROOT")"
 ensure_claude_stub() {
     local path="$1"
@@ -47,7 +47,7 @@ ensure_claude_stub "$DOCS_ROOT/claude/global.md" "# Global preamble for claude s
 
 Common context applied to every Todo's claude.start prompt. Edit
 freely — the Todo plugin re-reads this file at start time, so
-changes apply on the next click without restarting nestty.
+changes apply on the next click without restarting copad.
 
 (stub created by scripts/install-plugins.sh — replace with your
 own coding rules, language conventions, project-wide reminders.)"
@@ -72,7 +72,7 @@ for name in "$@"; do
     # them all so the plugin's WebView panel can find its assets.
     # Exclude Cargo.toml — it lives alongside plugin.toml in the
     # source tree (one dir per plugin) but is build-time only and
-    # has no runtime use in ~/.config/nestty/plugins/<name>/.
+    # has no runtime use in ~/.config/copad/plugins/<name>/.
     find "$src" -maxdepth 1 -type f ! -name 'Cargo.toml' -exec cp -f {} "$dst/" \;
 
     # Symlink the binary if it's a [[services]] plugin. Bare-
@@ -93,4 +93,4 @@ for name in "$@"; do
 done
 
 echo
-echo "Restart nestty so discover_plugins() picks up the changes."
+echo "Restart copad so discover_plugins() picks up the changes."

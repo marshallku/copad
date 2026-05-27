@@ -1,13 +1,13 @@
 [package]
-name = "nestty-plugin-calendar"
+name = "copad-plugin-calendar"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "First-party Google Calendar service plugin for nestty — emits calendar.event_imminent and provides read-only calendar.* actions."
+description = "First-party Google Calendar service plugin for copad — emits calendar.event_imminent and provides read-only calendar.* actions."
 repository.workspace = true
 
 [[bin]]
-name = "nestty-plugin-calendar"
+name = "copad-plugin-calendar"
 path = "src/main.rs"
 
 [dependencies]

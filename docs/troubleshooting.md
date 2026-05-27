@@ -22,11 +22,11 @@ The method is gated behind a feature flag.
 ### Cargo binary name collision
 
 ```
-warning: output filename collision at target/debug/nestty
+warning: output filename collision at target/debug/copad
 ```
 
-nestty-linux and nestty-cli both output `nestty`.
-**Fix:** CLI binary renamed to `nestctl` in nestty-cli/Cargo.toml.
+copad-linux and copad-cli both output `copad`.
+**Fix:** CLI binary renamed to `coctl` in copad-cli/Cargo.toml.
 
 ## Runtime Issues
 
@@ -58,7 +58,7 @@ Failed to create GBM buffer of size 841x1352: Invalid argument
 
 Multiple possible causes:
 
-1. **Config `directory` is commented out**: Check `~/.config/nestty/config.toml`. The `directory` field must be uncommented. A `#` before the key comments it out.
+1. **Config `directory` is commented out**: Check `~/.config/copad/config.toml`. The `directory` field must be uncommented. A `#` before the key comments it out.
 
 2. **Surface is opaque**: the window-level `BackgroundLayer` paints behind everything, so any opaque widget above it hides the image. Required transparent surfaces: VTE (`set_clear_background(false)` + `RGBA(0,0,0,0)`), WebKit (`webview.set_background_color(RGBA(0,0,0,0))`), notebook header / statusbar / `html, body` in plugin CSS — all transparent. If you add a new chrome widget and the image disappears under it, that widget needs the same treatment.
 
@@ -66,16 +66,16 @@ Multiple possible causes:
 
 4. **Tint too opaque**: Tint at 0.9 makes images nearly invisible (90% opaque dark overlay). Lower to 0.85 or less.
 
-5. **GTK single-instance**: If an old nestty is running, new launches activate the old instance and exit immediately (exit code 0, no output). Kill all instances first: `killall nestty`.
+5. **GTK single-instance**: If an old copad is running, new launches activate the old instance and exit immediately (exit code 0, no output). Kill all instances first: `killall copad`.
 
 ### App exits immediately with no error
 
-**Cause:** GTK single-instance behavior. Another nestty instance already owns the GTK app ID `com.marshall.nestty`.
-**Fix:** `killall nestty` then relaunch.
+**Cause:** GTK single-instance behavior. Another copad instance already owns the GTK app ID `com.marshall.copad`.
+**Fix:** `killall copad` then relaunch.
 
 ### log:: messages not visible
 
-**Cause (resolved Step 5a):** `nestty-linux` used to skip `env_logger::init()`, so `log::info!` / `log::warn!` were silent. We now initialize `env_logger` with `default_filter_or("warn")` in `main()`. Set `RUST_LOG=info` to surface gui_client register/reconnect, or `RUST_LOG=debug` for the full reconnect cadence. GTK does not capture stderr on console launches, so the diagnostics appear when running `nestty` from a terminal. Desktop-entry launches may still hide stderr depending on the session — use `journalctl --user -f` if needed.
+**Cause (resolved Step 5a):** `copad-linux` used to skip `env_logger::init()`, so `log::info!` / `log::warn!` were silent. We now initialize `env_logger` with `default_filter_or("warn")` in `main()`. Set `RUST_LOG=info` to surface gui_client register/reconnect, or `RUST_LOG=debug` for the full reconnect cadence. GTK does not capture stderr on console launches, so the diagnostics appear when running `copad` from a terminal. Desktop-entry launches may still hide stderr depending on the session — use `journalctl --user -f` if needed.
 
 ### Terminal shows only one line (collapsed height)
 
@@ -102,13 +102,13 @@ WebProcess CRASHED
 
 **Symptom:** Plugin panel (or any `webkit6::WebView`) renders fine on first show. User switches to a different Hyprland workspace, then comes back. Panel is stuck on the last frame — appears alive (backend healthy, WebProcess alive, IPC responsive) but doesn't repaint. Right-click → "Inspect Element" revives instantly. Focusing another window and coming back also revives it.
 
-**Status: known upstream limitation in WebKitGTK 6.0 ↔ Hyprland interaction. Not fixable in nestty-side code.**
+**Status: known upstream limitation in WebKitGTK 6.0 ↔ Hyprland interaction. Not fixable in copad-side code.**
 
-**Reproduction outside nestty:** Spawn the official WebKitGTK reference browser:
+**Reproduction outside copad:** Spawn the official WebKitGTK reference browser:
 ```
 /usr/lib/webkitgtk-6.0/MiniBrowser https://www.google.com
 ```
-on Hyprland and switch workspaces. Same freeze. This is zero nestty code, so the bug is upstream.
+on Hyprland and switch workspaces. Same freeze. This is zero copad code, so the bug is upstream.
 
 **What was ruled out empirically (rounds 1–5, all reverted):**
 - Round 1 — `webview.connect_map(|wv| wv.evaluate_javascript("0"))`: signal never fires; Hyprland uses scene-graph hide without `wl_surface.unmap`.
@@ -122,22 +122,22 @@ on Hyprland and switch workspaces. Same freeze. This is zero nestty code, so the
 
 **Why no application-level fix worked:** The freeze is in WebKit's compositor frame-production path after the wl_surface gets the SUSPENDED bit and then has it cleared. The bit DOES toggle on Hyprland (verified via `connect_state_notify` logs), but WebKit's render scheduler doesn't resume pushing frames on bit-clear unless an actual input event (pointer, dev-tools attach via JS pump from inspector init) drives it. There is no public WebKitGTK 6.0 API to tell the WebProcess "visibility changed, resume rendering."
 
-**User-facing workaround:** Click anywhere in the panel after coming back from a workspace, OR focus another window then refocus nestty, OR right-click → Inspect Element. All three paths cause WebKit's compositor to resume.
+**User-facing workaround:** Click anywhere in the panel after coming back from a workspace, OR focus another window then refocus copad, OR right-click → Inspect Element. All three paths cause WebKit's compositor to resume.
 
 **Automated cure on Hyprland — `window.restored` + `system.spawn` trigger (Phase WR-1/WR-2):**
 
-If you're on Hyprland specifically, two separate `hyprctl dispatch resizewindowpixel` calls (a 1px nudge) empirically unfreeze the panel — the underlying mechanism by which this works where `--batch` doesn't is not fully characterized; the behavior reproduces reliably across cycles. On the dual-monitor setup we tested, only same-monitor workspace cycles trigger the freeze; cross-monitor switches did not. nestty exposes the building blocks:
+If you're on Hyprland specifically, two separate `hyprctl dispatch resizewindowpixel` calls (a 1px nudge) empirically unfreeze the panel — the underlying mechanism by which this works where `--batch` doesn't is not fully characterized; the behavior reproduces reliably across cycles. On the dual-monitor setup we tested, only same-monitor workspace cycles trigger the freeze; cross-monitor switches did not. copad exposes the building blocks:
 
-- `window.restored` event fires when the toplevel's `GDK_TOPLEVEL_STATE_SUSPENDED` bit clears — i.e. you're returning to the workspace nestty lives on.
-- `system.spawn` is a trigger-only action (NOT reachable from `nestctl call`, by design) that exec's an argv vector fire-and-forget.
+- `window.restored` event fires when the toplevel's `GDK_TOPLEVEL_STATE_SUSPENDED` bit clears — i.e. you're returning to the workspace copad lives on.
+- `system.spawn` is a trigger-only action (NOT reachable from `coctl call`, by design) that exec's an argv vector fire-and-forget.
 
-Drop this into `~/.config/nestty/config.toml`:
+Drop this into `~/.config/copad/config.toml`:
 
 ```toml
 [[triggers]]
 name = "hyprland-webkit-cure"
 action = "system.spawn"
-params = { argv = ["sh", "-c", "hyprctl dispatch resizewindowpixel '1 0,class:com.marshall.nestty' && hyprctl dispatch -- resizewindowpixel '-1 0,class:com.marshall.nestty'"] }
+params = { argv = ["sh", "-c", "hyprctl dispatch resizewindowpixel '1 0,class:com.marshall.copad' && hyprctl dispatch -- resizewindowpixel '-1 0,class:com.marshall.copad'"] }
 
 [triggers.when]
 event_kind = "window.restored"
@@ -151,16 +151,16 @@ allow_privileged = true
 
 **Two empirical decisions baked into that snippet** (observed behaviors on Hyprland 0.54.3 — the underlying mechanism for the second one is not fully characterized, but the behavior reproduced reliably across dozens of cycles):
 
-- `resizewindowpixel` with `class:com.marshall.nestty` selector, NOT `resizeactive`. The trigger fires on workspace return regardless of which window has focus on that workspace — the user often returns with focus on whatever they were last using on that workspace, not nestty. `resizeactive` would resize that other window and the freeze stays put. `resizewindowpixel,class:` is focus-agnostic.
+- `resizewindowpixel` with `class:com.marshall.copad` selector, NOT `resizeactive`. The trigger fires on workspace return regardless of which window has focus on that workspace — the user often returns with focus on whatever they were last using on that workspace, not copad. `resizeactive` would resize that other window and the freeze stays put. `resizewindowpixel,class:` is focus-agnostic.
 - Two separate `hyprctl dispatch` calls chained with `&&`, NOT `hyprctl --batch "...; ..."`. `--batch` consistently fails to cure; two separate IPC calls consistently do.
 
-The second `hyprctl` invocation uses `hyprctl dispatch -- resizewindowpixel '-1 0,class:com.marshall.nestty'` because `-1 0,...` begins with `-` and hyprctl's CLI parser would otherwise treat `-1` as a flag — the `--` is what forces end-of-options.
+The second `hyprctl` invocation uses `hyprctl dispatch -- resizewindowpixel '-1 0,class:com.marshall.copad'` because `-1 0,...` begins with `-` and hyprctl's CLI parser would otherwise treat `-1` as a flag — the `--` is what forces end-of-options.
 
 **Why `sh -c` here is safe — and when it would NOT be:** `system.spawn` doesn't auto-wrap argv in a shell, so by default `{event.*}` and `{context.*}` interpolations land as literal argv elements where shell metacharacters can't be re-parsed. That default safety is what protects the bare-argv form. Once the user EXPLICITLY chooses `["sh", "-c", "<string>"]`, every interpolated value spliced into that string IS shell-evaluated, so the bare-argv guarantee no longer applies — every interpolation source must be audited individually. The snippet above is safe only because it satisfies BOTH (a) the trigger doesn't interpolate any `{event.X}` or `{context.X}` value into the shell string (every argv element is a literal) AND (b) `window.restored` itself emits an empty `{}` payload, so even a typo'd `{event.X}` would resolve to a literal token rather than attacker-controlled data. Do NOT copy this `sh -c` pattern to triggers that interpolate ANY field (event payload OR context fields like `{context.active_cwd}`) into the shell string — a trigger on e.g. `slack.mention` carrying a user-controlled `text` field, or even one referencing a directory path the user happens to have, would let a Slack message or a malicious dir name run arbitrary code. Use the bare argv form (`argv = ["program", "arg1", ...]`) whenever the trigger interpolates anything.
 
 A ready-to-copy snippet lives at [`examples/triggers/hyprland-webkit-fix.toml`](../examples/triggers/hyprland-webkit-fix.toml).
 
-This is a workaround that papers over the upstream bug — if you're not on Hyprland, the trigger no-ops (other compositors don't toggle SUSPENDED on workspace switch the same way), and there's no nestty-side state to roll back when WebKit/Hyprland publish a real fix.
+This is a workaround that papers over the upstream bug — if you're not on Hyprland, the trigger no-ops (other compositors don't toggle SUSPENDED on workspace switch the same way), and there's no copad-side state to roll back when WebKit/Hyprland publish a real fix.
 
 **Possible future paths (not pursued):**
 - File upstream issue at `bugs.webkit.org` and `github.com/hyprwm/Hyprland` with the MiniBrowser reproducer.
@@ -173,9 +173,9 @@ The diagnostic signal hooks (`load_changed` / `load_failed` / `web_process_termi
 
 ---
 
-### `notify.show` toast silently fails under systemd-managed nesttyd (Wayland)
+### `notify.show` toast silently fails under systemd-managed copadd (Wayland)
 
-**Symptom:** `nestctl event publish claude.review_approved` returns
+**Symptom:** `coctl event publish claude.review_approved` returns
 `{"queued": true}`, daemon log shows the trigger firing
 `notify.show`, but no toast appears. Journal contains:
 
@@ -215,11 +215,11 @@ prerequisites".
 
 ### Harness Discord trigger fires but no message lands in the channel
 
-**Symptom:** `nestctl recent --kind discord.send_message.completed`
+**Symptom:** `coctl recent --kind discord.send_message.completed`
 shows the completion event, but the Discord channel stays empty.
 
 **Cause:** Most common is wrong channel id. The id is a literal in
-user config (`~/.config/nestty/config.toml`) — trigger interpolation
+user config (`~/.config/copad/config.toml`) — trigger interpolation
 does NOT do `${ENV_VAR}` expansion. The id must be a Discord
 **channel id**, not a server id, message id, or application id. In
 the Discord client: Settings → Advanced → Developer Mode ON, then
@@ -231,8 +231,8 @@ overridden by channel-level role/permission grants).
 **Diagnose:**
 
 ```
-nestctl recent --kind discord.send_message.failed   # if .failed exists, error_code is the API response
-nestctl call discord.send_message --params '{"channel_id":"<your-id>","content":"manual probe"}'
+coctl recent --kind discord.send_message.failed   # if .failed exists, error_code is the API response
+coctl call discord.send_message --params '{"channel_id":"<your-id>","content":"manual probe"}'
 ```
 
 If the manual probe also lands a `.failed` with `403` / `50001`,
@@ -243,7 +243,7 @@ minimum). If `404` / `10003`, the channel id is wrong.
 ### web-bridge plugin exits immediately with "refusing to start"
 
 **Symptom:** journal `[plugin:web-bridge::main:stderr]` shows
-`NESTTY_WEB_BRIDGE_TOKEN is not set` or `is too short`, then the
+`COPAD_WEB_BRIDGE_TOKEN is not set` or `is too short`, then the
 supervisor logs `service web-bridge::main exited`.
 
 **Cause:** web-bridge fail-closes if the token env is missing or
@@ -258,32 +258,32 @@ the user-instance env, restart:
 
 ```
 TOKEN=$(openssl rand -hex 32)
-systemctl --user set-environment NESTTY_WEB_BRIDGE_TOKEN="$TOKEN"
-systemctl --user restart nestty-daemon
+systemctl --user set-environment COPAD_WEB_BRIDGE_TOKEN="$TOKEN"
+systemctl --user restart copad-daemon
 ```
 
 `set-environment` is memory-only — values evaporate at reboot or
 session restart and the plugin will fail to start again.
 
 **Fix (persistent, recommended):** drop the secrets into a systemd
-unit drop-in keyed to `nestty-daemon.service`. The drop-in is read
+unit drop-in keyed to `copad-daemon.service`. The drop-in is read
 on every `daemon-reload` + restart, survives reboots, and stays
 unit-scoped so other services don't accidentally inherit the
 secrets via `import-environment`:
 
 ```
-mkdir -p ~/.config/systemd/user/nestty-daemon.service.d
-cat > ~/.config/systemd/user/nestty-daemon.service.d/web-bridge-env.conf <<EOF
+mkdir -p ~/.config/systemd/user/copad-daemon.service.d
+cat > ~/.config/systemd/user/copad-daemon.service.d/web-bridge-env.conf <<EOF
 [Service]
-Environment=NESTTY_WEB_BRIDGE_TOKEN=$(openssl rand -hex 32)
+Environment=COPAD_WEB_BRIDGE_TOKEN=$(openssl rand -hex 32)
 # Generated by scripts/gen-vapid-keys.sh — paste the two key lines:
-Environment=NESTTY_WEB_BRIDGE_VAPID_PRIVATE=<paste private>
-Environment=NESTTY_WEB_BRIDGE_VAPID_PUBLIC=<paste public>
-Environment=NESTTY_WEB_BRIDGE_VAPID_SUBJECT=mailto:nestty@localhost
+Environment=COPAD_WEB_BRIDGE_VAPID_PRIVATE=<paste private>
+Environment=COPAD_WEB_BRIDGE_VAPID_PUBLIC=<paste public>
+Environment=COPAD_WEB_BRIDGE_VAPID_SUBJECT=mailto:copad@localhost
 EOF
-chmod 600 ~/.config/systemd/user/nestty-daemon.service.d/web-bridge-env.conf
+chmod 600 ~/.config/systemd/user/copad-daemon.service.d/web-bridge-env.conf
 systemctl --user daemon-reload
-systemctl --user restart nestty-daemon
+systemctl --user restart copad-daemon
 ```
 
 Rotation: edit the file in place + `daemon-reload + restart`.
@@ -291,8 +291,8 @@ Phone-side: a fresh token clears every browser's stored bearer; a
 fresh VAPID key pair invalidates every existing push subscription
 (re-subscribe from the dashboard).
 
-Why a drop-in and not `~/.config/nestty/outputs.env`: the installed
-`nestty-daemon.service` doesn't declare `EnvironmentFile=`, so a
+Why a drop-in and not `~/.config/copad/outputs.env`: the installed
+`copad-daemon.service` doesn't declare `EnvironmentFile=`, so a
 file at that path is never read. `Environment=` lines inside a
 `.service.d/*.conf` drop-in ARE read on every start, with the file
 permissions enforced (0600 keeps the token unreadable to other
@@ -305,14 +305,14 @@ section shows "no tmux panes" placeholder, but `tmux ls` on the shell
 lists active sessions.
 
 **Cause one (most common):** `tmux` is not on the daemon process's
-PATH. nestty-daemon is started by `systemctl --user`, which has a
+PATH. copad-daemon is started by `systemctl --user`, which has a
 narrower PATH than your interactive shell. If `which tmux` from your
 shell returns `~/.local/bin/tmux` or another non-system path, the
 daemon's child plugins won't find it.
 
 **Fix:** verify with `systemctl --user show-environment | grep PATH`.
 Add the missing dir via `systemctl --user set-environment
-PATH=$PATH:$HOME/.local/bin && systemctl --user restart nestty-daemon`.
+PATH=$PATH:$HOME/.local/bin && systemctl --user restart copad-daemon`.
 For persistence, drop the right `Environment=PATH=…` line into the
 user unit (or rely on `systemctl --user import-environment PATH` from
 your shell rc).
@@ -336,7 +336,7 @@ DOM nodes points to the JS failing.
 **Cause two:** the `tmux attach-session` child failed (the target
 session was killed between `list-panes` and `attach`, or `tmux` not
 on PATH — see the previous entry). The plugin logs the error to
-stderr; check `journalctl --user -u nestty-daemon --since '2 min ago'
+stderr; check `journalctl --user -u copad-daemon --since '2 min ago'
 | grep web-bridge`. The fix is to refresh the overview (the WS push
 will drop the dead pane on the next tick).
 
@@ -345,52 +345,52 @@ Click "← overview" to disconnect; the next attach spawns a fresh
 PTY. If this recurs, daemon log will show `attach session ended`
 followed by the underlying portable-pty error.
 
-### web-bridge dashboard shows "nestty GUI is not running" banner
+### web-bridge dashboard shows "copad GUI is not running" banner
 
 **Symptom:** the dashboard loads, presence toggle works, recent events
 feed updates — but the pane list is empty and the input textarea is
-disabled with a banner reading "nestty GUI is not running — only
+disabled with a banner reading "copad GUI is not running — only
 presence + events work".
 
 **Cause:** `terminal.read` / `terminal.feed` / `tab.list` /
 `session.list` are GUI-owned methods routed by the daemon through
-`GuiRegistry`. With no GUI registered (no `nestty` process attached
-to `nesttyd`), those methods return `no_gui`. The plugin maps
+`GuiRegistry`. With no GUI registered (no `copad` process attached
+to `copadd`), those methods return `no_gui`. The plugin maps
 `no_gui` to HTTP 503 and the UI banner. Presence + event endpoints
 are daemon-owned, so those still work.
 
-**Fix:** start the nestty GUI on the host so `nesttyd` has a
+**Fix:** start the copad GUI on the host so `copadd` has a
 registered client:
 
-- Locally: launch nestty as usual (desktop entry / shell).
+- Locally: launch copad as usual (desktop entry / shell).
 - Cold-boot via SSH-only: the user's Hyprland config adds
-  `exec-once = /home/marshall/.local/bin/nestty` so after autologin
+  `exec-once = /home/marshall/.local/bin/copad` so after autologin
   the GUI is attached automatically. Without autologin + greetd, a
   fresh boot reached only via SSH has no graphical session at all —
-  nestty cannot start without a Wayland/X display, and `no_gui` is
+  copad cannot start without a Wayland/X display, and `no_gui` is
   the correct failure mode. See decisions.md #42 and harness-integration.md
   for the case-(3) discussion.
 
 ### web-bridge sees zero events on `/ws/events`
 
 **Symptom:** the dashboard's "recent events" feed stays empty, but
-`nestctl event subscribe` from a shell receives `presence.changed`
+`coctl event subscribe` from a shell receives `presence.changed`
 fine.
 
 **Cause (one known instance):** the original `daemon_client::subscribe`
 used `tokio::net::UnixStream + into_split`. Connect + write succeeded,
 but the read side never produced any line — not even the daemon's
 `{"status":"subscribed"}` ack. The same socket protocol works with
-`std::os::unix::net::UnixStream` (which `nestctl client.rs` uses).
+`std::os::unix::net::UnixStream` (which `coctl client.rs` uses).
 Current code runs the subscribe loop inside `tokio::task::spawn_blocking`
 with the sync UnixStream and works correctly; if you swap it back to
 tokio async be ready to chase this. RPC (one-shot request/response)
 on tokio async UnixStream works fine — the bug is specific to the
 long-lived subscribe path.
 
-### `nestctl presence away` set but Discord still silent
+### `coctl presence away` set but Discord still silent
 
-**Symptom:** `nestctl presence status` correctly prints `away`, the
+**Symptom:** `coctl presence status` correctly prints `away`, the
 local `notify.show` toast fires, but no `discord.send_message.*`
 event appears.
 
@@ -402,7 +402,7 @@ unconditionally, the second runs `discord.send_message` with
 block (the pre-slice-1B copy) means presence has nothing to gate.
 Re-copy the discord blocks from the current example file, replace
 `REPLACE_WITH_YOUR_CHANNEL_ID` with your channel id, and either
-restart `nesttyd` or wait ~2s for the config watcher to pick up
+restart `copadd` or wait ~2s for the config watcher to pick up
 the change.
 
 ---
@@ -413,7 +413,7 @@ the change.
 
 **Cause:** SwiftTerm's `LocalProcess.childProcessRead` detects PTY EOF and calls `childStopped()`, which cancels the internal `childMonitor` DispatchSource before it can fire. The `processTerminated` call in the EOF handler is commented out in SwiftTerm source.
 
-**Fix:** Install a separate `DispatchSource.makeProcessSource` after `startProcess()` returns (in `NesttyTerminalView.installExitMonitor()`). This source is not affected by `childStopped()` and fires independently when the process exits.
+**Fix:** Install a separate `DispatchSource.makeProcessSource` after `startProcess()` returns (in `CopadTerminalView.installExitMonitor()`). This source is not affected by `childStopped()` and fires independently when the process exits.
 
 ```swift
 func installExitMonitor() {
@@ -454,7 +454,7 @@ func installExitMonitor() {
 
 **Cause:** SwiftTerm's `LocalProcessTerminalView.clipboardCopy(source:content:)` is declared `public` (not `open`) and unconditionally writes the OSC 52 payload to `NSPasteboard.general`. Because the method is `public`, subclasses outside the SwiftTerm module cannot override it. Pre-fix, any program in a pane could silently overwrite the user's clipboard.
 
-**Fix:** `NesttyTerminalView` installs a custom `NesttyTerminalDelegate` proxy into SwiftTerm's `terminalDelegate` slot. The proxy forwards `sizeChanged` / `setTerminalTitle` / `hostCurrentDirectoryUpdate` / `send` / `scrolled` / `rangeChanged` to the host's public methods (so PTY winsize, title updates, OSC 7, key input, etc. continue to work) and applies an `OSC52Policy` gate on `clipboardCopy`. `requestOpenLink` / `bell` / `iTermContent` are left to the protocol-extension defaults — overriding them would change behavior with no benefit.
+**Fix:** `CopadTerminalView` installs a custom `CopadTerminalDelegate` proxy into SwiftTerm's `terminalDelegate` slot. The proxy forwards `sizeChanged` / `setTerminalTitle` / `hostCurrentDirectoryUpdate` / `send` / `scrolled` / `rangeChanged` to the host's public methods (so PTY winsize, title updates, OSC 7, key input, etc. continue to work) and applies an `OSC52Policy` gate on `clipboardCopy`. `requestOpenLink` / `bell` / `iTermContent` are left to the protocol-extension defaults — overriding them would change behavior with no benefit.
 
 The policy is read from `[security] osc52` in config (`"deny"` default, `"allow"` opts back into legacy behavior). Hot-reload propagates through `applyConfig` → `paneManager.applyOSC52Policy` so live panes pick up the change without restart.
 
@@ -479,7 +479,7 @@ font_family = "JetBrainsMono Nerd Font Mono"
 
 **Cause:** `Config.swift` only parsed `path` and `tint` from the `[background]` section. The `opacity` field was silently ignored, and the `applyBackground` signature only accepted `path` and `tint`. Hot-reload therefore never changed the image layer's alpha.
 
-**Fix:** Added `backgroundOpacity: Double` to `NesttyConfig`, parse `("background", "opacity")` in `Config.parse`, and propagated an `opacity` parameter through the full call chain: `NesttyPanel.applyBackground(path:tint:opacity:)` → `TerminalViewController` (sets `backgroundView?.alphaValue`) → `WebViewController` (no-op) → `PaneManager` → `TabViewController` (stores `currentBackgroundOpacity`) → `AppDelegate` initial apply and `background.set` socket command.
+**Fix:** Added `backgroundOpacity: Double` to `CopadConfig`, parse `("background", "opacity")` in `Config.parse`, and propagated an `opacity` parameter through the full call chain: `CopadPanel.applyBackground(path:tint:opacity:)` → `TerminalViewController` (sets `backgroundView?.alphaValue`) → `WebViewController` (no-op) → `PaneManager` → `TabViewController` (stores `currentBackgroundOpacity`) → `AppDelegate` initial apply and `background.set` socket command.
 
 Also added `("background", "image")` as an alias for `("background", "path")` to match the documented config key.
 
@@ -501,8 +501,8 @@ Back/forward enabled state and URL field text sync via KVO on `WKWebView.canGoBa
 
 **Cause:** `swift build` emits an ad-hoc, linker-signed binary (`codesign -dv` shows `adhoc,linker-signed`, `TeamIdentifier=not set`, `Internal requirements=none`). Every rebuild produces a fresh cdhash, and TCC keys its grants on the binary's *designated requirement* — which collapses to cdhash when there's no real signature. macOS therefore sees each build as a different app and re-prompts for every previously-granted permission.
 
-**Fix:** `scripts/codesign-dev.sh` creates a self-signed `Nestty Dev` code-signing cert in the user's login keychain (once, via `openssl req` + `security import`) and re-signs the bundle with that identity on every build. Both `scripts/install-macos.sh` and `nestty-macos/run.sh` call it automatically.
+**Fix:** `scripts/codesign-dev.sh` creates a self-signed `Copad Dev` code-signing cert in the user's login keychain (once, via `openssl req` + `security import`) and re-signs the bundle with that identity on every build. Both `scripts/install-macos.sh` and `copad-macos/run.sh` call it automatically.
 
-After the first rebuild the Keychain Access dialog asks once for permission to use the new key — click **Always Allow**. From then on TCC binds grants to the cert identity, so permissions persist across rebuilds. To start over (wipe the cert), delete the `Nestty Dev` entry under *login* in Keychain Access; the next build regenerates it.
+After the first rebuild the Keychain Access dialog asks once for permission to use the new key — click **Always Allow**. From then on TCC binds grants to the cert identity, so permissions persist across rebuilds. To start over (wipe the cert), delete the `Copad Dev` entry under *login* in Keychain Access; the next build regenerates it.
 
 The cert is self-signed and not trusted by Gatekeeper — that's intentional. TCC doesn't require trust, only signature validity. Apple Developer ID would be overkill for local dev.

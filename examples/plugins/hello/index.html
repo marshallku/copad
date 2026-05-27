@@ -13,18 +13,18 @@
         }
 
         h1 {
-            color: var(--nestty-accent);
+            color: var(--copad-accent);
             margin-bottom: 8px;
         }
 
         .subtitle {
-            color: var(--nestty-subtext0);
+            color: var(--copad-subtext0);
             margin-bottom: 32px;
         }
 
         .card {
-            background: var(--nestty-surface0);
-            border: 1px solid var(--nestty-overlay0);
+            background: var(--copad-surface0);
+            border: 1px solid var(--copad-overlay0);
             border-radius: 8px;
             padding: 20px;
             margin-bottom: 16px;
@@ -33,7 +33,7 @@
         .card h2 {
             margin: 0 0 12px 0;
             font-size: 14px;
-            color: var(--nestty-subtext1);
+            color: var(--copad-subtext1);
             text-transform: uppercase;
             letter-spacing: 0.5px;
         }
@@ -45,7 +45,7 @@
         }
 
         .info-label {
-            color: var(--nestty-subtext0);
+            color: var(--copad-subtext0);
             font-size: 13px;
         }
 
@@ -55,8 +55,8 @@
         }
 
         button {
-            background: var(--nestty-accent);
-            color: var(--nestty-bg);
+            background: var(--copad-accent);
+            color: var(--copad-bg);
             border: none;
             border-radius: 6px;
             padding: 10px 20px;
@@ -71,13 +71,13 @@
         button:active { opacity: 0.7; }
 
         button.secondary {
-            background: var(--nestty-surface2);
-            color: var(--nestty-text);
+            background: var(--copad-surface2);
+            color: var(--copad-text);
         }
 
         .event-log {
-            background: var(--nestty-surface0);
-            border: 1px solid var(--nestty-overlay0);
+            background: var(--copad-surface0);
+            border: 1px solid var(--copad-overlay0);
             border-radius: 8px;
             padding: 12px 16px;
             max-height: 200px;
@@ -88,11 +88,11 @@
         }
 
         .event-log .event-type {
-            color: var(--nestty-accent);
+            color: var(--copad-accent);
         }
 
         .event-log .event-time {
-            color: var(--nestty-subtext0);
+            color: var(--copad-subtext0);
         }
 
         #screen-output {
@@ -102,8 +102,8 @@
             line-height: 1.4;
             max-height: 300px;
             overflow: auto;
-            background: var(--nestty-bg);
-            border: 1px solid var(--nestty-overlay0);
+            background: var(--copad-bg);
+            border: 1px solid var(--copad-overlay0);
             border-radius: 6px;
             padding: 12px;
         }
@@ -113,17 +113,17 @@
             width: 8px;
             height: 8px;
             border-radius: 50%;
-            background: var(--nestty-accent);
+            background: var(--copad-accent);
             margin-right: 6px;
         }
 
-        .error { color: var(--nestty-red); }
+        .error { color: var(--copad-red); }
     </style>
 </head>
 <body>
     <div class="container">
         <h1>Hello Plugin</h1>
-        <p class="subtitle">Example plugin for nestty</p>
+        <p class="subtitle">Example plugin for copad</p>
 
         <!-- Panel Info -->
         <div class="card">
@@ -175,14 +175,14 @@
 
     <script>
         // Display panel info
-        document.getElementById("plugin-name").textContent = nestty.panel.plugin;
-        document.getElementById("panel-name").textContent = nestty.panel.name;
-        document.getElementById("panel-id").textContent = nestty.panel.id;
+        document.getElementById("plugin-name").textContent = copad.panel.plugin;
+        document.getElementById("panel-name").textContent = copad.panel.name;
+        document.getElementById("panel-id").textContent = copad.panel.id;
 
         // Fetch and display terminal state
         async function refreshState() {
             try {
-                const state = await nestty.call("terminal.state");
+                const state = await copad.call("terminal.state");
                 document.getElementById("term-state").innerHTML = `
                     <span class="info-label">CWD</span>
                     <span class="info-value">${state.cwd || "N/A"}</span>
@@ -203,7 +203,7 @@
         // Read terminal screen
         async function readScreen() {
             try {
-                const result = await nestty.call("terminal.read");
+                const result = await copad.call("terminal.read");
                 document.getElementById("screen-output").textContent = result.text;
                 document.getElementById("screen-card").style.display = "";
             } catch (e) {
@@ -215,7 +215,7 @@
         // Run the greet command
         async function runGreet() {
             try {
-                const result = await nestty.call("plugin.hello.greet", { name: "nestty user" });
+                const result = await copad.call("plugin.hello.greet", { name: "copad user" });
                 document.getElementById("cmd-output").textContent = JSON.stringify(result, null, 2);
                 document.getElementById("cmd-card").style.display = "";
             } catch (e) {
@@ -228,7 +228,7 @@
         const eventsDiv = document.getElementById("events");
         let eventCount = 0;
 
-        nestty.on("*", (type, data) => {
+        copad.on("*", (type, data) => {
             if (eventCount === 0) eventsDiv.innerHTML = "";
             eventCount++;
 

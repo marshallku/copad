@@ -1,12 +1,12 @@
 [workspace]
 resolver = "2"
 members = [
-    "nestty-core",
-    "nestty-daemon",
-    "nestty-linux",
-    "nestty-cli",
-    "nestty-ffi",
-    "nestty-term",
+    "copad-core",
+    "copad-daemon",
+    "copad-linux",
+    "copad-cli",
+    "copad-ffi",
+    "copad-term",
     "plugins/echo",
     "plugins/kb",
     "plugins/calendar",
@@ -25,4 +25,4 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 description = "Cross-platform custom terminal emulator"
-repository = "https://github.com/marshallku/nestty"
+repository = "https://github.com/marshallku/copad"

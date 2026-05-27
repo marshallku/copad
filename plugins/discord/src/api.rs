@@ -102,7 +102,7 @@ pub fn post_message(
         "{DISCORD_API_BASE}/channels/{channel_id}/messages"
     ))
     .set("Authorization", &format!("Bot {bot_token}"))
-    .set("User-Agent", "nestty-plugin-discord (nestty, 0.1)")
+    .set("User-Agent", "copad-plugin-discord (copad, 0.1)")
     .timeout(HTTP_TIMEOUT)
     .send_json(body)
     .map_err(classify_response_error)?;
@@ -133,7 +133,7 @@ pub fn get_message(bot_token: &str, channel_id: &str, message_id: &str) -> Resul
         "{DISCORD_API_BASE}/channels/{channel_id}/messages/{message_id}"
     ))
     .set("Authorization", &format!("Bot {bot_token}"))
-    .set("User-Agent", "nestty-plugin-discord (nestty, 0.1)")
+    .set("User-Agent", "copad-plugin-discord (copad, 0.1)")
     .timeout(HTTP_TIMEOUT)
     .call()
     .map_err(classify_response_error)?;

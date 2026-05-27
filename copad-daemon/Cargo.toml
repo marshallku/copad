@@ -1,0 +1,25 @@
+[package]
+name = "copad-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless host daemon for copad: trigger engine, action registry, event bus, plugin supervisor, socket server. GUI shells (copad-linux, copad-macos) and CLI (coctl) connect via Unix socket."
+repository.workspace = true
+
+[[bin]]
+name = "copadd"
+path = "src/main.rs"
+
+[lib]
+name = "copad_daemon"
+path = "src/lib.rs"
+
+[dependencies]
+copad-core = { path = "../copad-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+libc = "0.2"
+uuid = { version = "1", features = ["v4"] }
+wait-timeout = "0.2"

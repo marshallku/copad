@@ -2,11 +2,11 @@
 name = "kb"
 title = "Knowledge Base"
 version = "0.1.0"
-description = "Filesystem KB plugin: grep + filename search over ~/docs (override with NESTTY_KB_ROOT)."
+description = "Filesystem KB plugin: grep + filename search over ~/docs (override with COPAD_KB_ROOT)."
 
 [[services]]
 name = "main"
-exec = "nestty-plugin-kb"
+exec = "copad-plugin-kb"
 activation = "onAction:kb.*"
 restart = "on-crash"
 provides = ["kb.search", "kb.read", "kb.append", "kb.ensure"]

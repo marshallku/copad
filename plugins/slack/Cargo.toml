@@ -1,13 +1,13 @@
 [package]
-name = "nestty-plugin-slack"
+name = "copad-plugin-slack"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "First-party Slack service plugin for nestty — connects via Socket Mode WebSocket, emits slack.mention / slack.dm events."
+description = "First-party Slack service plugin for copad — connects via Socket Mode WebSocket, emits slack.mention / slack.dm events."
 repository.workspace = true
 
 [[bin]]
-name = "nestty-plugin-slack"
+name = "copad-plugin-slack"
 path = "src/main.rs"
 
 [dependencies]

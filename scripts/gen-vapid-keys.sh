@@ -24,12 +24,12 @@ PUB=$(openssl ec -in "$TMP/private.pem" -pubout -outform DER 2>/dev/null \
     | base64 | tr '+/' '-_' | tr -d '=\n')
 
 cat <<EOF
-# VAPID key pair for nestty plugins/web-bridge.
-# Add to whatever env source your nesttyd systemd unit reads (e.g.
-# ~/.config/environment.d/nestty.conf, your .zprofile, or a per-unit
-# drop-in via systemctl --user edit nestty-daemon).
-NESTTY_WEB_BRIDGE_VAPID_PRIVATE=$PRIV
-NESTTY_WEB_BRIDGE_VAPID_PUBLIC=$PUB
+# VAPID key pair for copad plugins/web-bridge.
+# Add to whatever env source your copadd systemd unit reads (e.g.
+# ~/.config/environment.d/copad.conf, your .zprofile, or a per-unit
+# drop-in via systemctl --user edit copad-daemon).
+COPAD_WEB_BRIDGE_VAPID_PRIVATE=$PRIV
+COPAD_WEB_BRIDGE_VAPID_PUBLIC=$PUB
 # Optional — used as the JWT 'sub' claim. mailto: or https URL.
-# NESTTY_WEB_BRIDGE_VAPID_SUBJECT=mailto:you@example.com
+# COPAD_WEB_BRIDGE_VAPID_SUBJECT=mailto:you@example.com
 EOF

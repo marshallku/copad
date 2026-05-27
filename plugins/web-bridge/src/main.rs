@@ -1,14 +1,14 @@
-//! First-party nestty plugin: HTTP+WebSocket broker over nesttyd's
+//! First-party copad plugin: HTTP+WebSocket broker over copadd's
 //! socket surface. Slice 3.0 of the remote-harness effort.
 //!
-//! Lifecycle: this binary IS a nestty service plugin. The supervisor
+//! Lifecycle: this binary IS a copad service plugin. The supervisor
 //! spawns it with stdio piped and expects an `initialize` reply, the
 //! same handshake `plugins/discord/src/main.rs` runs. Once that
 //! handshake completes, the stdio side stays idle and the real work
 //! happens in a tokio runtime that owns an axum HTTP+WS listener.
 //!
-//! Daemon access: the supervisor injects `NESTTY_SOCKET` into the
-//! child env (see `nestty-daemon/src/service_supervisor.rs` —
+//! Daemon access: the supervisor injects `COPAD_SOCKET` into the
+//! child env (see `copad-daemon/src/service_supervisor.rs` —
 //! `start_service_inner` sets it alongside the plugin metadata env
 //! vars). The plugin opens raw daemon-socket connections (NOT the
 //! service-plugin RPC channel) so requests flow through the daemon's
@@ -19,7 +19,7 @@
 //! Auth: Bearer token in `Authorization` header, OR
 //! `Sec-WebSocket-Protocol: bearer.<token>` for WS upgrades. The
 //! middleware never accepts a query-string token. The token comes
-//! from `NESTTY_WEB_BRIDGE_TOKEN` env and must be ≥32 chars; if
+//! from `COPAD_WEB_BRIDGE_TOKEN` env and must be ≥32 chars; if
 //! missing/short the plugin exits before binding.
 
 mod agents;
@@ -50,7 +50,7 @@ fn main() -> ExitCode {
     //    until after `initialize`, the plugin appears healthy in the
     //    supervisor's eyes but the HTTP listener is dead — much harder
     //    to diagnose.
-    let token = match validate_token_env(std::env::var("NESTTY_WEB_BRIDGE_TOKEN").ok().as_deref()) {
+    let token = match validate_token_env(std::env::var("COPAD_WEB_BRIDGE_TOKEN").ok().as_deref()) {
         Ok(t) => t,
         Err(msg) => {
             eprintln!("[web-bridge] {msg}");
@@ -59,17 +59,17 @@ fn main() -> ExitCode {
     };
 
     let bind_addr =
-        std::env::var("NESTTY_WEB_BRIDGE_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
+        std::env::var("COPAD_WEB_BRIDGE_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
 
-    let socket_path = match std::env::var("NESTTY_SOCKET") {
+    let socket_path = match std::env::var("COPAD_SOCKET") {
         Ok(p) if !p.is_empty() => p,
         _ => {
             eprintln!(
-                "[web-bridge] NESTTY_SOCKET env is not set. The supervisor should \
+                "[web-bridge] COPAD_SOCKET env is not set. The supervisor should \
                  inject this; without it the bridge cannot reach the daemon. \
-                 Falling back to /tmp/nestty.sock for debugging."
+                 Falling back to /tmp/copad.sock for debugging."
             );
-            "/tmp/nestty.sock".to_string()
+            "/tmp/copad.sock".to_string()
         }
     };
 
@@ -188,11 +188,11 @@ fn validate_token_env(raw: Option<&str>) -> Result<String, String> {
     match raw {
         Some(t) if t.len() >= TOKEN_MIN_LEN => Ok(t.to_string()),
         Some(short) => Err(format!(
-            "NESTTY_WEB_BRIDGE_TOKEN is too short ({} chars; need ≥{TOKEN_MIN_LEN}). Refusing to start.",
+            "COPAD_WEB_BRIDGE_TOKEN is too short ({} chars; need ≥{TOKEN_MIN_LEN}). Refusing to start.",
             short.len()
         )),
         None => Err(format!(
-            "NESTTY_WEB_BRIDGE_TOKEN is not set. \
+            "COPAD_WEB_BRIDGE_TOKEN is not set. \
              See plugins/web-bridge/plugin.toml for setup. \
              Token must be ≥{TOKEN_MIN_LEN} chars. Refusing to start."
         )),
@@ -286,7 +286,7 @@ async fn run_server(
     let push_config = push::PushConfig::from_env();
     if push_config.is_none() {
         eprintln!(
-            "[web-bridge] NESTTY_WEB_BRIDGE_VAPID_PRIVATE/PUBLIC not set — push notifications disabled"
+            "[web-bridge] COPAD_WEB_BRIDGE_VAPID_PRIVATE/PUBLIC not set — push notifications disabled"
         );
     }
     let allow_tailscale_header = bind_is_loopback(bind);
@@ -490,7 +490,7 @@ async fn push_loop(state: AppState) {
                     format!("/#attention/{}", urlenc(&entry.tmux_target))
                 };
                 let title = if entry.title.is_empty() {
-                    "nestty".to_string()
+                    "copad".to_string()
                 } else {
                     entry.title.clone()
                 };
@@ -499,7 +499,7 @@ async fn push_loop(state: AppState) {
                 } else {
                     entry.body.clone()
                 };
-                let tag = format!("nestty-{}", entry.kind);
+                let tag = format!("copad-{}", entry.kind);
                 let payload = push::PushPayload {
                     title: &title,
                     body: &body,
@@ -726,9 +726,9 @@ async fn handle_push_test(
     let mut pruned_ids: Vec<String> = Vec::new();
     for sub in subs_snapshot.into_iter() {
         let payload = push::PushPayload {
-            title: "nestty",
+            title: "copad",
             body: "test push from web-bridge",
-            tag: "nestty-test",
+            tag: "copad-test",
             kind: "test",
             url: "/",
         };
@@ -831,7 +831,7 @@ async fn handle_pane_recent(
         .lines
         .unwrap_or(DEFAULT_RECENT_LINES)
         .clamp(1, MAX_RECENT_LINES);
-    // daemon expects `id` (resolve_terminal at nestty-linux/src/socket.rs:1225);
+    // daemon expects `id` (resolve_terminal at copad-linux/src/socket.rs:1225);
     // sending `panel_id` silently falls through to the active terminal.
     let raw = state
         .daemon
@@ -982,7 +982,7 @@ async fn handle_pane_input(
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::Json(body): axum::Json<InputBody>,
 ) -> Result<axum::Json<Value>, AppError> {
-    // daemon expects `id` (resolve_terminal at nestty-linux/src/socket.rs:1225);
+    // daemon expects `id` (resolve_terminal at copad-linux/src/socket.rs:1225);
     // sending `panel_id` silently routes to the active terminal — a
     // remote command would land on the wrong pane.
     let v = state

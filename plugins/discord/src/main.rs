@@ -1,10 +1,10 @@
-//! First-party Discord service plugin for nestty.
+//! First-party Discord service plugin for copad.
 //!
 //! Two run modes (selected by `argv[1]`):
 //! - **`auth`** — validates the env bot token via `GET /users/@me`
 //!   and persists a TokenSet (with bot user_id + global_name) to the
 //!   configured store.
-//! - **(no args)** — RPC mode. Speaks the nestty service-plugin
+//! - **(no args)** — RPC mode. Speaks the copad service-plugin
 //!   protocol over stdio, runs the Gateway WebSocket in a background
 //!   thread, and publishes `discord.message` / `discord.dm` /
 //!   `discord.mention` / `discord.raw` events when MESSAGE_CREATE
@@ -12,16 +12,16 @@
 //!
 //! If RPC mode starts without stored credentials AND the env token is
 //! missing, the supervisor handshake still completes — the gateway
-//! loop just stays paused. Running `nestty-plugin-discord auth` while
-//! nestty is running is enough; the loop picks up the new credentials
+//! loop just stays paused. Running `copad-plugin-discord auth` while
+//! copad is running is enough; the loop picks up the new credentials
 //! on its next reconnect attempt.
 //!
-//! Caveat — env precedence: `NESTTY_DISCORD_BOT_TOKEN`, when set, wins
+//! Caveat — env precedence: `COPAD_DISCORD_BOT_TOKEN`, when set, wins
 //! over the stored token (matches Slack's posture, useful for
 //! testing). That means the auth-while-running recovery path only
 //! works if the env var is UNSET in the supervisor's environment.
-//! Once env is set at nestty startup, a fresh `auth` run updates the
-//! store but the gateway keeps using the env token until nestty
+//! Once env is set at copad startup, a fresh `auth` run updates the
+//! store but the gateway keeps using the env token until copad
 //! restarts. `discord.auth_status.credentials_source` reports the
 //! live source so the user can see which one is live.
 //!
@@ -58,7 +58,7 @@ fn main() {
         Some("auth") => run_auth(),
         None => run_rpc(),
         Some(other) => {
-            eprintln!("usage: nestty-plugin-discord [auth]");
+            eprintln!("usage: copad-plugin-discord [auth]");
             eprintln!("unknown subcommand: {other:?}");
             std::process::exit(2);
         }
@@ -75,7 +75,7 @@ fn run_auth() {
         Some(t) => t.clone(),
         None => {
             eprintln!(
-                "[discord] auth requires NESTTY_DISCORD_BOT_TOKEN env. \
+                "[discord] auth requires COPAD_DISCORD_BOT_TOKEN env. \
                  Get a token from <https://discord.com/developers/applications>"
             );
             std::process::exit(2);
@@ -116,7 +116,7 @@ fn run_auth() {
 fn get_users_me(bot_token: &str) -> Result<Value, String> {
     let resp = ureq::get(&format!("{DISCORD_API_BASE}/users/@me"))
         .set("Authorization", &format!("Bot {bot_token}"))
-        .set("User-Agent", "nestty-plugin-discord (nestty, 0.1)")
+        .set("User-Agent", "copad-plugin-discord (copad, 0.1)")
         .call()
         .map_err(|e| format!("http: {e}"))?;
     let status = resp.status();
@@ -154,7 +154,7 @@ fn run_rpc() {
     // Gateway loop runs in a background thread, gated on the
     // supervisor's `initialized` notification so events can't race
     // the handshake. The loop polls credentials inside `run_loop` —
-    // running `nestty-plugin-discord auth` while the plugin is up
+    // running `copad-plugin-discord auth` while the plugin is up
     // populates the store and the loop picks it up on its next
     // recheck (no plugin process restart required).
     {
@@ -284,7 +284,7 @@ fn handle_action(
             // Same shape as Slack's slack.auth_status — reports BOTH
             // configured (env validation OK) and authenticated (creds
             // resolvable for the gateway loop) so a future
-            // `nestctl context --full` can render both messengers
+            // `coctl context --full` can render both messengers
             // uniformly. credentials_source mirrors what the loop
             // would actually use; reporting "store" while the loop
             // reads from "env" would be a confusing lie.
@@ -341,7 +341,7 @@ fn handle_send_message(
     }
     let creds = gateway::current_credentials(config, &**store).ok_or((
         "not_authenticated".to_string(),
-        "no Discord credentials available — run `nestty-plugin-discord auth` or set NESTTY_DISCORD_BOT_TOKEN"
+        "no Discord credentials available — run `copad-plugin-discord auth` or set COPAD_DISCORD_BOT_TOKEN"
             .to_string(),
     ))?;
     let channel_id = require_snowflake(params, "channel_id")?;
@@ -390,7 +390,7 @@ fn handle_get_message(
     }
     let creds = gateway::current_credentials(config, &**store).ok_or((
         "not_authenticated".to_string(),
-        "no Discord credentials available — run `nestty-plugin-discord auth` or set NESTTY_DISCORD_BOT_TOKEN"
+        "no Discord credentials available — run `copad-plugin-discord auth` or set COPAD_DISCORD_BOT_TOKEN"
             .to_string(),
     ))?;
     let channel_id = require_snowflake(params, "channel_id")?;

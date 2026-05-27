@@ -10,9 +10,9 @@
 //! The filesystem is the source of truth. There is no on-disk index;
 //! `list` walks the tree on every call. (Personal scale, todos plugin
 //! does the same.) If perf becomes a problem we'll add an in-memory
-//! cache invalidated by a watcher — same infra as nestty-plugin-todo.
+//! cache invalidated by a watcher — same infra as copad-plugin-todo.
 //!
-//! Path-safety contract (mirrors nestty-plugin-kb / nestty-plugin-todo):
+//! Path-safety contract (mirrors copad-plugin-kb / copad-plugin-todo):
 //! - Root is canonicalized at construction.
 //! - Every resolved path is re-canonicalized and checked to start
 //!   with `root_canonical` before being surfaced — defeats a symlink
@@ -139,7 +139,7 @@ impl Store {
             let path = entry.path();
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            // Skip hidden entries (.git, .nestty-cache, .DS_Store).
+            // Skip hidden entries (.git, .copad-cache, .DS_Store).
             if name_str.starts_with('.') {
                 continue;
             }
@@ -371,7 +371,7 @@ fn id_from_filename(path: &Path) -> Option<String> {
     }
 }
 
-/// Same-directory temp + `nestty_core::fs_atomic::rename_no_replace`
+/// Same-directory temp + `copad_core::fs_atomic::rename_no_replace`
 /// (matching todo/kb). POSIX `rename(2)` alone replaces atomically —
 /// the kernel's "fail if destination exists" flag is what keeps the
 /// no-replace contract honest against the race between the caller's
@@ -398,7 +398,7 @@ fn atomic_write_new(final_path: &Path, contents: &[u8]) -> io::Result<()> {
         f.write_all(contents)?;
         f.sync_all()?;
     }
-    match nestty_core::fs_atomic::rename_no_replace(&tmp_path, final_path) {
+    match copad_core::fs_atomic::rename_no_replace(&tmp_path, final_path) {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = fs::remove_file(&tmp_path);

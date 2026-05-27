@@ -29,7 +29,7 @@ pub struct Bookmark {
 
 impl Bookmark {
     pub fn from_env() -> Result<Self, String> {
-        let raw_root = std::env::var("NESTTY_BOOKMARK_ROOT")
+        let raw_root = std::env::var("COPAD_BOOKMARK_ROOT")
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| {

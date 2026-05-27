@@ -6,10 +6,10 @@ description = "Markdown-checkbox todo plugin: ~/docs/todos/<workspace>/<id>.md a
 
 [[services]]
 name = "main"
-# onStartup so the file-watcher is alive whenever nestty runs — a vim
+# onStartup so the file-watcher is alive whenever copad runs — a vim
 # edit must surface as todo.changed without needing an explicit
 # action call to wake the plugin first.
-exec = "nestty-plugin-todo"
+exec = "copad-plugin-todo"
 activation = "onStartup"
 restart = "on-crash"
 provides = [
@@ -23,13 +23,13 @@ provides = [
 ]
 subscribes = []
 # Optional env:
-#   NESTTY_TODO_ROOT (default ~/docs/todos)
-#   NESTTY_TODO_DEFAULT_WORKSPACE (default "default")
-#   NESTTY_TODO_POLL_SECS (default 2, range 1..=60)
+#   COPAD_TODO_ROOT (default ~/docs/todos)
+#   COPAD_TODO_DEFAULT_WORKSPACE (default "default")
+#   COPAD_TODO_POLL_SECS (default 2, range 1..=60)
 
-# Panel name "main" so `nestctl plugin open todo` works without
+# Panel name "main" so `coctl plugin open todo` works without
 # having to pass `--params '{"panel":"list"}'` — the dispatch path
-# at nestty-linux/src/socket.rs::handle_plugin_open defaults to
+# at copad-linux/src/socket.rs::handle_plugin_open defaults to
 # panel="main" when none is supplied.
 [[panels]]
 name = "main"

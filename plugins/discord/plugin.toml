@@ -6,10 +6,10 @@ description = "Discord Gateway plugin: emits discord.message / discord.mention /
 
 [[services]]
 name = "main"
-exec = "nestty-plugin-discord"
-# onStartup so the Gateway WebSocket lives whenever nestty is running.
+exec = "copad-plugin-discord"
+# onStartup so the Gateway WebSocket lives whenever copad is running.
 # Lazy `onAction:discord.*` activation would lose mention/DM/reaction
-# events between nestty starts. Same posture as the Slack plugin.
+# events between copad starts. Same posture as the Slack plugin.
 activation = "onStartup"
 restart = "on-crash"
 provides = [
@@ -18,10 +18,10 @@ provides = [
     "discord.get_message",
 ]
 subscribes = []
-# Required env: NESTTY_DISCORD_BOT_TOKEN (only for the one-time `auth`
+# Required env: COPAD_DISCORD_BOT_TOKEN (only for the one-time `auth`
 #   subcommand; the runtime reads from the keyring).
-# Optional env: NESTTY_DISCORD_WORKSPACE (default "default" — keyring
-#   namespace), NESTTY_DISCORD_REQUIRE_SECURE_STORE (default false —
+# Optional env: COPAD_DISCORD_WORKSPACE (default "default" — keyring
+#   namespace), COPAD_DISCORD_REQUIRE_SECURE_STORE (default false —
 #   refuse plaintext fallback).
 #
 # One-time setup:
@@ -34,12 +34,12 @@ subscribes = []
 #      want (Read Messages, Send Messages typical) → copy URL → invite
 #      the bot to your server.
 #   4. From a shell:
-#        NESTTY_DISCORD_BOT_TOKEN=<token> nestty-plugin-discord auth
+#        COPAD_DISCORD_BOT_TOKEN=<token> copad-plugin-discord auth
 #      → validates against /users/@me, persists to OS keyring.
-#   5. Restart nestty — the supervisor spawns the plugin which reads
+#   5. Restart copad — the supervisor spawns the plugin which reads
 #      tokens from the keyring (not env).
 
-# Panel name "main" so `nestctl plugin open discord` works without
+# Panel name "main" so `coctl plugin open discord` works without
 # having to pass `--params '{"panel":"..."}'` — the dispatch path
 # defaults to panel="main" when none is supplied.
 [[panels]]

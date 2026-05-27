@@ -2,11 +2,11 @@
 name = "bookmark"
 title = "Bookmarks"
 version = "0.1.0"
-description = "URL → KB note. Captures bookmarks under ~/docs/bookmarks/YYYY-MM/<urlhash8>-<slug>.md (override root with NESTTY_BOOKMARK_ROOT). Filesystem is the source of truth — vim/git-edit safe."
+description = "URL → KB note. Captures bookmarks under ~/docs/bookmarks/YYYY-MM/<urlhash8>-<slug>.md (override root with COPAD_BOOKMARK_ROOT). Filesystem is the source of truth — vim/git-edit safe."
 
 [[services]]
 name = "main"
-exec = "nestty-plugin-bookmark"
+exec = "copad-plugin-bookmark"
 # onAction (not onStartup) for BM-1 — no watcher / no events yet.
 # BM-2 may flip this to onStartup once a background fetch worker
 # wants to drain queued URLs without an explicit action call.
@@ -20,8 +20,8 @@ provides = [
 ]
 subscribes = []
 # Optional env:
-#   NESTTY_BOOKMARK_ROOT (default ~/docs/bookmarks)
+#   COPAD_BOOKMARK_ROOT (default ~/docs/bookmarks)
 
 # No [[panels]] yet — BM-4 will add panel.html. Until then,
-# `nestctl plugin open bookmark` would fail; use `nestctl bookmark`
-# subcommands or `nestctl call bookmark.<action>` instead.
+# `coctl plugin open bookmark` would fail; use `coctl bookmark`
+# subcommands or `coctl call bookmark.<action>` instead.

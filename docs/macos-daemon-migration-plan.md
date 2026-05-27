@@ -2,29 +2,29 @@
 
 ## Context
 
-Linux는 monolithic GUI에서 daemon-client 아키텍처로 이전 완료 (`83c5122` "Make daemon-client mode the default"). `nestty-daemon` crate / `nesttyd` binary가 trigger engine, plugin supervisor, action registry, context service, event bus를 host. `nestty-linux` GUI는 그 client.
+Linux는 monolithic GUI에서 daemon-client 아키텍처로 이전 완료 (`83c5122` "Make daemon-client mode the default"). `copad-daemon` crate / `copadd` binary가 trigger engine, plugin supervisor, action registry, context service, event bus를 host. `copad-linux` GUI는 그 client.
 
-macOS app (`nestty-macos`, Swift/AppKit + SwiftTerm)은 여전히 monolithic — 모든 것이 in-process. 이 plan은 그 architectural debt를 닫는다.
+macOS app (`copad-macos`, Swift/AppKit + SwiftTerm)은 여전히 monolithic — 모든 것이 in-process. 이 plan은 그 architectural debt를 닫는다.
 
 ## Source-of-truth observations (codex-verified)
 
-- `nestty-core/src/paths.rs:20` — macOS runtime dir 이미 `~/Library/Caches/nestty`; `daemon_socket_path()` reusable.
-- `nestty-core/src/event_bus.rs:29` — `bridge_id`는 `serde(skip)` local-only field (wire에 안 실림).
-- `nestty-daemon/src/main.rs:516` — daemon plugin 자식에 `NESTTY_SOCKET=<daemon socket>` 이미 설정.
-- `nestty-daemon/src/main.rs:103-137` — daemon이 ContextService, ServiceSupervisor, `context.snapshot` already-owned.
-- `nestty-daemon/src/socket.rs:177` — socket perms (0600) + dir prep 코드 reuse.
-- `nestty-daemon/src/gui_registry.rs:24` — GUI env whitelist는 PATH 일부러 제외 (trust boundary).
-- `nestty-daemon/src/gui_registry.rs:405` — daemon→GUI wire events에 bridge_id 없음.
-- `nestty-linux/src/gui_client.rs:23` — forwarder allowlist (terminal.output 등 제외).
-- `nestty-linux/src/gui_client.rs:219, 230, 285, 323` — forwarder ordering, drop guard, bridge_id model.
-- `nestty-macos/Sources/Nestty/AppDelegate.swift:58` — `pluginSupervisor.discoverAndStart()` 무조건 실행. PR2에서 conditional.
-- `nestty-macos/Sources/Nestty/Keybindings.swift:166` — `action:` keybindings은 local `ActionRegistry.tryDispatch` 호출.
-- `nestty-macos/Sources/Nestty/PluginPanelController.swift:145, 180` — local registry + `{"event": ...}` shape 사용.
-- `nestty-macos/Sources/Nestty/EventBus.swift:45-52` — 현재 socket event shape `{"event": ...}` (daemon은 `{"type": ...}`); subscriber는 JSON 문자열만 받음.
+- `copad-core/src/paths.rs:20` — macOS runtime dir 이미 `~/Library/Caches/copad`; `daemon_socket_path()` reusable.
+- `copad-core/src/event_bus.rs:29` — `bridge_id`는 `serde(skip)` local-only field (wire에 안 실림).
+- `copad-daemon/src/main.rs:516` — daemon plugin 자식에 `COPAD_SOCKET=<daemon socket>` 이미 설정.
+- `copad-daemon/src/main.rs:103-137` — daemon이 ContextService, ServiceSupervisor, `context.snapshot` already-owned.
+- `copad-daemon/src/socket.rs:177` — socket perms (0600) + dir prep 코드 reuse.
+- `copad-daemon/src/gui_registry.rs:24` — GUI env whitelist는 PATH 일부러 제외 (trust boundary).
+- `copad-daemon/src/gui_registry.rs:405` — daemon→GUI wire events에 bridge_id 없음.
+- `copad-linux/src/gui_client.rs:23` — forwarder allowlist (terminal.output 등 제외).
+- `copad-linux/src/gui_client.rs:219, 230, 285, 323` — forwarder ordering, drop guard, bridge_id model.
+- `copad-macos/Sources/Copad/AppDelegate.swift:58` — `pluginSupervisor.discoverAndStart()` 무조건 실행. PR2에서 conditional.
+- `copad-macos/Sources/Copad/Keybindings.swift:166` — `action:` keybindings은 local `ActionRegistry.tryDispatch` 호출.
+- `copad-macos/Sources/Copad/PluginPanelController.swift:145, 180` — local registry + `{"event": ...}` shape 사용.
+- `copad-macos/Sources/Copad/EventBus.swift:45-52` — 현재 socket event shape `{"event": ...}` (daemon은 `{"type": ...}`); subscriber는 JSON 문자열만 받음.
 
 ## Goal
 
-macOS Nestty.app은 nestty-linux의 `gui_client.rs`와 동일한 daemon client. `nesttyd`가 trigger engine, plugin supervisor, action registry, context service의 owner. Nestty.app은 GUI 책임만 (terminal panes, web panels, plugin panels, status bar, menus, keybindings).
+macOS Copad.app은 copad-linux의 `gui_client.rs`와 동일한 daemon client. `copadd`가 trigger engine, plugin supervisor, action registry, context service의 owner. Copad.app은 GUI 책임만 (terminal panes, web panels, plugin panels, status bar, menus, keybindings).
 
 ## Fallback contract (사용자 결정)
 
@@ -35,33 +35,33 @@ macOS Nestty.app은 nestty-linux의 `gui_client.rs`와 동일한 daemon client. 
 
 ### PR 1 — Daemon Darwin smoke + docs (TINY)
 
-**Goal:** `nesttyd`가 Darwin에서 동작 + 매뉴얼 시작 docs.
+**Goal:** `copadd`가 Darwin에서 동작 + 매뉴얼 시작 docs.
 
-- `cargo build --release -p nestty-daemon`이 Darwin에서 통과
-- Smoke: `nesttyd &` → `nestctl call system.ping`이 ok 응답
-- `docs/macos-app.md`에 "Manual nesttyd start" 섹션 추가, `~/Library/Caches/nestty/socket` 명시
-- Tests: `cargo test -p nestty-daemon`이 macOS에서 통과
+- `cargo build --release -p copad-daemon`이 Darwin에서 통과
+- Smoke: `copadd &` → `coctl call system.ping`이 ok 응답
+- `docs/macos-app.md`에 "Manual copadd start" 섹션 추가, `~/Library/Caches/copad/socket` 명시
+- Tests: `cargo test -p copad-daemon`이 macOS에서 통과
 
 **Risk:** 매우 낮음. 코드 변경 minimal — 빌드/테스트 통과 + docs.
 
-**Deliverable:** `nesttyd` 가 macOS에서 standalone process로 동작. Nestty.app은 아직 모놀리식.
+**Deliverable:** `copadd` 가 macOS에서 standalone process로 동작. Copad.app은 아직 모놀리식.
 
 ---
 
 ### PR 2 — DaemonClient connect/register + plugin gate + daemon-forward fallback
 
-**Goal:** Nestty.app이 daemon client가 되고, plugin ownership 단일화. 동시에 unmatched method를 daemon으로 forward해서 keybindings/panels/triggers 끊김 방지.
+**Goal:** Copad.app이 daemon client가 되고, plugin ownership 단일화. 동시에 unmatched method를 daemon으로 forward해서 keybindings/panels/triggers 끊김 방지.
 
 #### 2.1 DaemonClient.swift (new)
-- `nestty-linux/src/gui_client.rs` 패턴 mirror
-- 경로: `~/Library/Caches/nestty/socket`
+- `copad-linux/src/gui_client.rs` 패턴 mirror
+- 경로: `~/Library/Caches/copad/socket`
 - Capped backoff reconnect (100ms → 5s)
 - `gui.register` 송신 (capabilities: `tab`, `split`, `webview`, `background`, `statusbar`, `terminal`, `agent.ui`, `plugin.open`, `search`, `session`)
 - Ack 파싱 (기존 daemon ack 필드만): `{client_id, primary, daemon_version, protocol_version, host_triggers}` — `plugins_owned` 필드 추가 X (codex round 2 C3)
 
 #### 2.2 Auto-spawn-on-connect with single-flight lock
-- 첫 connect 실패 → `~/Library/Caches/nestty/.spawn.lock`에 `flock(LOCK_EX | LOCK_NB)`
-- Lock 잡히면: live socket probe (1초 timeout) → 여전히 실패면 detached `nesttyd` fork
+- 첫 connect 실패 → `~/Library/Caches/copad/.spawn.lock`에 `flock(LOCK_EX | LOCK_NB)`
+- Lock 잡히면: live socket probe (1초 timeout) → 여전히 실패면 detached `copadd` fork
 - Lock 못 잡으면: 다른 프로세스 spawning 중 → 짧은 sleep + retry connect
 - pidfile은 diagnostic metadata only
 
@@ -81,8 +81,8 @@ macOS Nestty.app은 nestty-linux의 `gui_client.rs`와 동일한 daemon client. 
 - 각 action을 `ActionRegistry.register`로 stub 등록 → daemon connected이면 forward, 아니면 `daemon_unavailable`
 - Unknown method는 `unknown_method` 그대로 (사용자 오타 vs daemon 장애 구분)
 
-#### 2.6 NESTTY_SOCKET routing (codex round 2 C4)
-- Daemon-owned 자식: `NESTTY_SOCKET=<daemon socket>` (이미 main.rs:516, 변경 X)
+#### 2.6 COPAD_SOCKET routing (codex round 2 C4)
+- Daemon-owned 자식: `COPAD_SOCKET=<daemon socket>` (이미 main.rs:516, 변경 X)
 - GUI-owned 자식 (`spawn:` keybindings, statusbar `_module.run` until PR 5): per-GUI socket (현재 동작 유지)
 - 새 변수 추가 X
 
@@ -94,11 +94,11 @@ macOS Nestty.app은 nestty-linux의 `gui_client.rs`와 동일한 daemon client. 
   - Daemon-forward fallback round-trip
   - Stub registration: known plugin actions이 ActionRegistry에 등록됨
 - E2E:
-  - Daemon up → Nestty.app launch → only daemon-side echo plugin process
-  - Daemon down → `nestctl call echo.ping` returns `daemon_unavailable`
+  - Daemon up → Copad.app launch → only daemon-side echo plugin process
+  - Daemon down → `coctl call echo.ping` returns `daemon_unavailable`
   - Daemon spawned mid-session via auto-spawn → reconnect ack → plugin actions available
 
-**Deliverable:** Nestty.app daemon client. Plugin ownership 충돌 없음. Local callers (keybindings/panels/triggers) 끊김 없음.
+**Deliverable:** Copad.app daemon client. Plugin ownership 충돌 없음. Local callers (keybindings/panels/triggers) 끊김 없음.
 
 ---
 
@@ -117,7 +117,7 @@ macOS Nestty.app은 nestty-linux의 `gui_client.rs`와 동일한 daemon client. 
 - Invoke worker pool with generation gating (`eb2e58d`); on reconnect bump generation → drop in-flight stale invokes
 - Watchdog timeout
 
-**Tests:** unit per guardrail; e2e — `nestctl call tab.new` round-trip; stress 1000 rapid invokes.
+**Tests:** unit per guardrail; e2e — `coctl call tab.new` round-trip; stress 1000 rapid invokes.
 
 ---
 
@@ -128,7 +128,7 @@ macOS Nestty.app은 nestty-linux의 `gui_client.rs`와 동일한 daemon client. 
 #### 4a.1 EventBus 구조화 (codex round 3 C2 — 핵심 prereq)
 - 현재 `EventChannel`은 JSON 문자열만 전달 → typed `Event { kind: String, source: String, data: [String: Any], bridge_id: String? }` payload로 refactor
 - Subscriber API가 typed event 받도록 변경 (또는 기존 JSON 채널 + 새 structured 채널 parallel — Swift는 후자가 깔끔)
-- Existing subscribers (SocketServer, NesttyEngine, ContextService) 모두 typed 채널로 마이그레이션
+- Existing subscribers (SocketServer, CopadEngine, ContextService) 모두 typed 채널로 마이그레이션
 
 #### 4a.2 bridge_id (Linux 일치, round 2 C2)
 - Wire JSON에 `bridge_id` 절대 안 실림 (`serde(skip)` 패턴)
@@ -138,13 +138,13 @@ macOS Nestty.app은 nestty-linux의 `gui_client.rs`와 동일한 daemon client. 
 
 #### 4a.3 Wire shape compat (codex round 3 I2)
 - DaemonClient는 daemon shape `{"type":...}` 인식
-- Legacy SocketServer (nestctl 직접 연결)는 `{"event":...}` 그대로 (back-compat)
+- Legacy SocketServer (coctl 직접 연결)는 `{"event":...}` 그대로 (back-compat)
 - **PluginPanelController.swift:145**가 `event` key를 parse 중 — dual parser 추가 (둘 다 받게) 또는 명시적 migration window 노트
 - 향후 daemon-shape으로 fully align은 별도 PR
 
 #### 4a.4 Forwarder OFF, engine ON (이번 PR 한정)
 - GUI → daemon outbound forwarder 코드 추가 X (PR4b)
-- `NesttyEngine.disable()` 호출 안 함 — local engine이 native events fire
+- `CopadEngine.disable()` 호출 안 함 — local engine이 native events fire
 
 #### Tests
 - Unit:
@@ -183,10 +183,10 @@ macOS Nestty.app은 nestty-linux의 `gui_client.rs`와 동일한 daemon client. 
 - **Order critical:**
   1. PR4a inbound republish 살아있음 ✓
   2. PR4b outbound forwarder 시작
-  3. **그 다음** register ack의 `host_triggers=true` 처리해서 `nesttyEngine.disable()`
-- `NesttyEngine.disable()`: callbacks clear, trigger list empty, dispatch_event no-op
+  3. **그 다음** register ack의 `host_triggers=true` 처리해서 `copadEngine.disable()`
+- `CopadEngine.disable()`: callbacks clear, trigger list empty, dispatch_event no-op
 - **Drop guard** (즉시, codex round 3 I3 — graceful drain X):
-  - DaemonClient disconnect 시 즉시 `nesttyEngine.enable()` — local engine 회복
+  - DaemonClient disconnect 시 즉시 `copadEngine.enable()` — local engine 회복
   - Reconnect 성공 + `host_triggers=true` → 다시 disable
   - Race: forwarder thread는 writer 실패로 자연스럽게 종료, drain timeout 안 줌
 
@@ -196,7 +196,7 @@ macOS Nestty.app은 nestty-linux의 `gui_client.rs`와 동일한 daemon client. 
   - Forwarder skip on bridge_id
   - Drop guard (disconnect 즉시 engine.enable)
   - Engine disable/enable 멱등
-- E2E (daemon with `NESTTYD_HOST_TRIGGERS=1`):
+- E2E (daemon with `COPADD_HOST_TRIGGERS=1`):
   - Trigger fire via daemon, no local double-fire
   - Kill daemon → local GUI-only triggers 회복, plugin actions은 unavailable
   - Reconnect → cut-over 재적용
@@ -220,7 +220,7 @@ macOS Nestty.app은 nestty-linux의 `gui_client.rs`와 동일한 daemon client. 
 - 단, `PluginManifestStore.discover()`는 panel/statusbar manifest 발견을 위해 keep (codex round 3 I5 — duplicate-name winner rule이 panels/statusbar에도 적용)
 
 #### 5.3 GUI env curation in `gui.register` (`0fa2e65` + `734e403` mirror, codex round 3 C3 — 정확한 whitelist)
-- macOS Nestty.app이 `gui.register` 시 curated env 첨부
+- macOS Copad.app이 `gui.register` 시 curated env 첨부
 - **Daemon `gui_registry.rs:24` whitelist 정확히 mirror — PATH 제외, secrets-adjacent 제외**
 - Daemon이 system.spawn 자식에게 forward
 
@@ -240,7 +240,7 @@ macOS Nestty.app은 nestty-linux의 `gui_client.rs`와 동일한 daemon client. 
 #### Tests
 - E2E full plugin set: kb.search/git.list_workspaces/slack.message — daemon-side, results identical to monolithic
 - Status bar modules daemon-side
-- nestctl이 GUI socket으로 plugin 명령 → daemon-forward → 정상 응답
+- coctl이 GUI socket으로 plugin 명령 → daemon-forward → 정상 응답
 - GUI env curation: spawned child의 env에 PATH가 macOS GUI의 PATH로 leak 안 됨
 
 **Deliverable:** 아키텍처 전환 완료. 단일 source of truth.
@@ -267,7 +267,7 @@ macOS Nestty.app은 nestty-linux의 `gui_client.rs`와 동일한 daemon client. 
 
 **Goal:** macOS UX polish.
 
-- `~/Library/LaunchAgents/com.marshall.nesttyd.plist` 생성
+- `~/Library/LaunchAgents/com.marshall.copadd.plist` 생성
 - `scripts/install-macos.sh --launchd` opt-in flag (`launchctl load`)
 - Auto-spawn-on-connect (PR2)는 fallback 유지
 
@@ -277,7 +277,7 @@ macOS Nestty.app은 nestty-linux의 `gui_client.rs`와 동일한 daemon client. 
 
 - **Backwards compatibility**: PR 1 ~ 4a는 daemon 없이도 정상 동작 (graceful degrade). PR 4b가 cut-over 게이트.
 - **Trigger semantics parity**: bridge_id local-only model (Linux 일치)이 echo 방지에 critical.
-- **Socket path**: `~/Library/Caches/nestty/socket` (paths.rs already done). Perms 0600 (`bbd7c9c`).
+- **Socket path**: `~/Library/Caches/copad/socket` (paths.rs already done). Perms 0600 (`bbd7c9c`).
 
 ## Risks / unknowns (status update)
 
@@ -292,8 +292,8 @@ macOS Nestty.app은 nestty-linux의 `gui_client.rs`와 동일한 daemon client. 
 ## Out of scope
 
 - Cursor visibility issue with background image (별도 WIP, post-migration queue).
-- Universal binary support for nesttyd (arm64-only).
-- Code-signing for nesttyd binary distribution.
+- Universal binary support for copadd (arm64-only).
+- Code-signing for copadd binary distribution.
 - macOS launchd full integration (PR7 옵션, post-MVP).
 
 ## Plan rationale

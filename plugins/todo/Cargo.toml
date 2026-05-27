@@ -1,13 +1,13 @@
 [package]
-name = "nestty-plugin-todo"
+name = "copad-plugin-todo"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "First-party Todo service plugin for nestty — markdown checkbox files at ~/docs/todos/<workspace>/<id>.md, file-as-source-of-truth, vim/git-edit compatible."
+description = "First-party Todo service plugin for copad — markdown checkbox files at ~/docs/todos/<workspace>/<id>.md, file-as-source-of-truth, vim/git-edit compatible."
 repository.workspace = true
 
 [[bin]]
-name = "nestty-plugin-todo"
+name = "copad-plugin-todo"
 path = "src/main.rs"
 
 [dependencies]
@@ -19,7 +19,7 @@ chrono = { version = "0.4", default-features = false, features = [
     "serde",
     "std",
 ] }
-nestty-core = { path = "../../nestty-core" }
+copad-core = { path = "../../copad-core" }
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,12 +1,12 @@
 # Knowledge Base Action Protocol
 
 > Status: protocol contract. Implementations live in service plugins (e.g.
-> `nestty-plugin-kb` Phase 9.3). `nestty-core` ships the contract only — no KB
+> `copad-plugin-kb` Phase 9.3). `copad-core` ships the contract only — no KB
 > code in core. This doc is what every KB-backed integration (triggers,
 > meeting prep, derived markdown ingestion, future LLM context-building)
 > reads against.
 
-The KB protocol gives nestty a stable, backend-agnostic vocabulary for "find,
+The KB protocol gives copad a stable, backend-agnostic vocabulary for "find,
 read, write, ensure" over the user's notes. The first implementation is
 grep + filename search over `~/docs` ([service-plugins.md](./service-plugins.md)
 Phase 9.3). Future implementations may swap in SQLite FTS5 (Phase 13),
@@ -108,7 +108,7 @@ in user-facing search.
 
 ## Actions
 
-All actions follow the standard service-plugin RPC shape: nestty sends
+All actions follow the standard service-plugin RPC shape: copad sends
 `action.invoke` with `{name, params}`, the plugin replies on the same
 request id with `{ok, result}` or `{ok=false, error}`.
 
@@ -390,4 +390,4 @@ that can be added with default-omit goes in without a version bump.
 
 - [service-plugins.md](./service-plugins.md) — D6 (KB protocol in core, impl in plugin), D9 (defer indexing upgrades)
 - [workflow-runtime.md](./workflow-runtime.md) — Context Service consumes KB hits as part of `workflow.context`
-- [roadmap.md](./roadmap.md) — Phase 9.3 (first-party `nestty-plugin-kb`), Phase 13 (FTS/embedding upgrade)
+- [roadmap.md](./roadmap.md) — Phase 9.3 (first-party `copad-plugin-kb`), Phase 13 (FTS/embedding upgrade)

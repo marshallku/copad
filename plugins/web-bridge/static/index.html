@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
-  <title>nestty</title>
+  <title>copad</title>
   <link rel="manifest" href="/manifest.webmanifest">
   <link rel="icon" href="/icon.svg" type="image/svg+xml">
   <meta name="theme-color" content="#1e1e2e">
@@ -127,7 +127,7 @@
   <script>
   (() => {
     const root = document.getElementById("root");
-    let token = sessionStorage.getItem("nestty.token") || "";
+    let token = sessionStorage.getItem("copad.token") || "";
     // Auth mode is decided by /api/whoami on boot. tailscale-mode
     // skips the token setup page entirely + omits the Authorization
     // header from /api/* calls + the bearer.<token> subprotocol from
@@ -152,7 +152,7 @@
           // dropping the user back to a setup page that doesn't
           // apply to them.
           if (authMode === "bearer") {
-            token = ""; sessionStorage.removeItem("nestty.token");
+            token = ""; sessionStorage.removeItem("copad.token");
             render();
           }
           throw new Error("unauthorized");
@@ -172,7 +172,7 @@
       tmuxPanes: [],
       attention: [],
       codexJobs: [],
-      nesttyPanels: [],
+      copadPanels: [],
       events: [],
       noGui: false,
       activePane: null,         // pane_id while in attach mode
@@ -259,9 +259,9 @@
 
     function renderSetup() {
       root.innerHTML = `
-        <header><h1>nestty <span class="dim">— remote bridge</span></h1></header>
+        <header><h1>copad <span class="dim">— remote bridge</span></h1></header>
         <div class="setup">
-          <p>Paste the bearer token from <code>$NESTTY_WEB_BRIDGE_TOKEN</code>. Stored in sessionStorage; cleared on tab close.</p>
+          <p>Paste the bearer token from <code>$COPAD_WEB_BRIDGE_TOKEN</code>. Stored in sessionStorage; cleared on tab close.</p>
           <input id="tok" type="password" placeholder="bearer token (≥32 chars)" autocomplete="off">
           <button id="connect">connect</button>
         </div>
@@ -272,7 +272,7 @@
       const go = () => {
         const t = inp.value.trim();
         if (t.length < 32) { inp.style.borderColor = "var(--accent-err)"; return; }
-        token = t; sessionStorage.setItem("nestty.token", t);
+        token = t; sessionStorage.setItem("copad.token", t);
         // honor `#pane/<id>` deep-links that arrived through the
         // pre-auth login flow — without this, a phone shortcut to a
         // specific pane drops you on overview after the first login.
@@ -351,10 +351,10 @@
               <div class="card-preview">${escapeHtml(stripAnsi((p.last_lines || []).join("\n")).trim() || "(empty)")}</div>
             </div>`;
           }).join("")}</div>`;
-      const nesttyBlock = state.nesttyPanels.length === 0
-        ? `<div class="empty">no nestty panels${state.noGui ? " — nestty GUI not running" : ""}</div>`
-        : `<div class="cards">${state.nesttyPanels.map(p => `
-            <div class="card" data-nestty-pane="${escapeHtml(p.id)}">
+      const copadBlock = state.copadPanels.length === 0
+        ? `<div class="empty">no copad panels${state.noGui ? " — copad GUI not running" : ""}</div>`
+        : `<div class="cards">${state.copadPanels.map(p => `
+            <div class="card" data-copad-pane="${escapeHtml(p.id)}">
               <div class="card-head">
                 <div class="card-name">${escapeHtml(p.title || p.id)}</div>
                 <div class="card-meta">${escapeHtml(p.type || "?")}</div>
@@ -372,12 +372,12 @@
         : "";
       root.innerHTML = `
         <header>
-          <h1>nestty <span class="dim">— remote bridge</span></h1>
+          <h1>copad <span class="dim">— remote bridge</span></h1>
           ${authChip}
           ${pushChip}
           <button class="chip ${state.presence === "away" ? "warn" : "ok"}" id="presence-toggle">${state.presence || "…"}</button>
         </header>
-        ${state.noGui ? `<div class="banner" style="margin: 0.5rem 0.6rem;">nestty GUI not running — only tmux + presence + events work</div>` : ""}
+        ${state.noGui ? `<div class="banner" style="margin: 0.5rem 0.6rem;">copad GUI not running — only tmux + presence + events work</div>` : ""}
         <main class="overview">
           ${state.push.status === "on" ? `
             <div class="push-settings">
@@ -425,8 +425,8 @@
           `}
           <div class="section-title">tmux panes <span style="text-transform:none; color:var(--fg-dim);">${state.tmuxPanes.length}</span></div>
           ${tmuxBlock}
-          <div class="section-title">nestty panels <span style="text-transform:none; color:var(--fg-dim);">${state.nesttyPanels.length}</span></div>
-          ${nesttyBlock}
+          <div class="section-title">copad panels <span style="text-transform:none; color:var(--fg-dim);">${state.copadPanels.length}</span></div>
+          ${copadBlock}
           <div class="section-title">recent events</div>
           <div class="events-strip">${
             state.events.length === 0
@@ -702,7 +702,7 @@
           // Load kinds preference from local storage (sticky across
           // reloads). Server is source of truth on next mutate.
           try {
-            const k = JSON.parse(localStorage.getItem("nestty.push.kinds") || "null");
+            const k = JSON.parse(localStorage.getItem("copad.push.kinds") || "null");
             if (Array.isArray(k)) state.push.kinds = k;
           } catch {}
         } else {
@@ -747,7 +747,7 @@
         state.push.status = "on";
         state.push.subId = r.id;
         state.push.error = "";
-        localStorage.setItem("nestty.push.kinds", JSON.stringify(state.push.kinds));
+        localStorage.setItem("copad.push.kinds", JSON.stringify(state.push.kinds));
         render();
       } catch (e) {
         state.push.error = "subscribe failed: " + String(e && e.message || e);
@@ -784,7 +784,7 @@
       const cur = new Set(state.push.kinds);
       if (on) cur.add(kind); else cur.delete(kind);
       state.push.kinds = Array.from(cur);
-      localStorage.setItem("nestty.push.kinds", JSON.stringify(state.push.kinds));
+      localStorage.setItem("copad.push.kinds", JSON.stringify(state.push.kinds));
       // Re-subscribe with new kinds (server dedupes by sha256(endpoint)
       // id, so this is idempotent rather than creating a second row).
       if (state.push.status !== "on") return;
@@ -819,10 +819,10 @@
         state.presence = "?";
       }
       try {
-        state.nesttyPanels = await api("/api/panes");
+        state.copadPanels = await api("/api/panes");
       } catch (e) {
         if (e && e.code === "no_gui") state.noGui = true;
-        state.nesttyPanels = [];
+        state.copadPanels = [];
       }
       await initPush();
       render();

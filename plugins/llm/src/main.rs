@@ -1,4 +1,4 @@
-//! First-party LLM service plugin for nestty (Anthropic provider).
+//! First-party LLM service plugin for copad (Anthropic provider).
 //!
 //! Two run modes:
 //! - **`auth`** — reads `ANTHROPIC_API_KEY` from env, validates it
@@ -9,13 +9,13 @@
 //!
 //! Activation is `onAction:llm.*` (lazy) — there's no inbound stream
 //! to keep alive (no Socket Mode equivalent), so the plugin only
-//! spawns when a trigger or `nestctl call` invokes one of the
+//! spawns when a trigger or `coctl call` invokes one of the
 //! actions. Cold-start cost is dominated by the first HTTP call
 //! anyway.
 
 #[cfg(not(unix))]
 compile_error!(
-    "nestty-plugin-llm is currently Unix-only. The keyring crate's mock fallback \
+    "copad-plugin-llm is currently Unix-only. The keyring crate's mock fallback \
      would silently lose tokens on platforms without a native credential-store \
      feature; gate exists to make that failure compile-time instead of runtime."
 );
@@ -45,7 +45,7 @@ fn main() {
         Some("auth") => run_auth(),
         Some(other) => {
             eprintln!("[llm] unknown subcommand: {other}");
-            eprintln!("usage: nestty-plugin-llm [auth]");
+            eprintln!("usage: copad-plugin-llm [auth]");
             std::process::exit(2);
         }
         None => run_rpc(),
@@ -72,7 +72,7 @@ fn run_auth() {
     if let Err(e) = anthropic::validate_key(&config.api_key, &config.default_model) {
         eprintln!(
             "[llm] validation failed: {e}\n\
-             [llm] confirm ANTHROPIC_API_KEY is correct and NESTTY_LLM_DEFAULT_MODEL \
+             [llm] confirm ANTHROPIC_API_KEY is correct and COPAD_LLM_DEFAULT_MODEL \
              is a valid model id"
         );
         std::process::exit(1);
@@ -217,7 +217,7 @@ fn handle_action(
         // call, no credentials required. Stays available even
         // after a key typo so users can still inspect prior
         // usage. BUT we refuse when account_resolved is false:
-        // a bad NESTTY_LLM_ACCOUNT silently falls back to the
+        // a bad COPAD_LLM_ACCOUNT silently falls back to the
         // "default" account's path, and reading some other
         // account's log under the assumption it's the one the
         // user asked for is a wrong-data bug.
@@ -226,7 +226,7 @@ fn handle_action(
                 return Err((
                     "invalid_params".to_string(),
                     format!(
-                        "NESTTY_LLM_ACCOUNT is invalid; refusing to read llm-usage-default.jsonl as a stand-in. Fix: {}",
+                        "COPAD_LLM_ACCOUNT is invalid; refusing to read llm-usage-default.jsonl as a stand-in. Fix: {}",
                         config.fatal_error.clone().unwrap_or_default()
                     ),
                 ));
@@ -319,7 +319,7 @@ fn handle_complete(
 ) -> Result<Value, (String, String)> {
     let api_key = resolve_api_key(config, &**store).ok_or((
         "not_authenticated".to_string(),
-        "no Anthropic API key — set ANTHROPIC_API_KEY or run `nestty-plugin-llm auth`".to_string(),
+        "no Anthropic API key — set ANTHROPIC_API_KEY or run `copad-plugin-llm auth`".to_string(),
     ))?;
     let prompt = params.get("prompt").and_then(Value::as_str).ok_or((
         "invalid_params".to_string(),
@@ -615,7 +615,7 @@ mod tests {
     fn usage_refuses_when_account_unresolved() {
         let mut c = cfg_base();
         c.account_resolved = false;
-        c.fatal_error = Some("NESTTY_LLM_ACCOUNT: invalid character ...".into());
+        c.fatal_error = Some("COPAD_LLM_ACCOUNT: invalid character ...".into());
         let err = handle_action(
             "llm.usage",
             &json!({}),
@@ -625,7 +625,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.0, "invalid_params");
         assert!(
-            err.1.contains("NESTTY_LLM_ACCOUNT is invalid"),
+            err.1.contains("COPAD_LLM_ACCOUNT is invalid"),
             "got {}",
             err.1
         );

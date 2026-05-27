@@ -129,7 +129,7 @@ where
     if let Some(err) = &config.fatal_error {
         eprintln!(
             "[discord] gateway loop NOT starting: {err}\n\
-             [discord] check `nestctl call discord.auth_status` for details"
+             [discord] check `coctl call discord.auth_status` for details"
         );
         return;
     }
@@ -143,8 +143,8 @@ where
         let Some(creds) = creds else {
             if last_no_creds_log.elapsed() >= NO_CREDS_RECHECK {
                 eprintln!(
-                    "[discord] no credentials yet — waiting (run `nestty-plugin-discord auth` \
-                     or set NESTTY_DISCORD_BOT_TOKEN)"
+                    "[discord] no credentials yet — waiting (run `copad-plugin-discord auth` \
+                     or set COPAD_DISCORD_BOT_TOKEN)"
                 );
                 last_no_creds_log = Instant::now();
             }
@@ -255,8 +255,8 @@ where
                 "intents": GATEWAY_INTENTS,
                 "properties": {
                     "os": std::env::consts::OS,
-                    "browser": "nestty-plugin-discord",
-                    "device": "nestty-plugin-discord",
+                    "browser": "copad-plugin-discord",
+                    "device": "copad-plugin-discord",
                 }
             }
         });
@@ -549,7 +549,7 @@ fn ensure_query(url: &str) -> String {
 fn bootstrap_url(token: &str) -> Result<String, String> {
     let resp = ureq::get(&format!("{DISCORD_API_BASE}/gateway/bot"))
         .set("Authorization", &format!("Bot {token}"))
-        .set("User-Agent", "nestty-plugin-discord (nestty, 0.1)")
+        .set("User-Agent", "copad-plugin-discord (copad, 0.1)")
         .timeout(HTTP_TIMEOUT)
         .call()
         .map_err(|e| format!("/gateway/bot: {e}"))?;
@@ -624,7 +624,7 @@ mod tests {
         StubStore(Some(TokenSet {
             bot_token: token.into(),
             user_id: Some("BOT_STORE".into()),
-            username: Some("nestty".into()),
+            username: Some("copad".into()),
         }))
     }
 

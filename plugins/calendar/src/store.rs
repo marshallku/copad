@@ -3,7 +3,7 @@
 //! - `KeyringStore` — OS-native secret store (Linux Secret Service /
 //!   macOS Keychain). Preferred. Failures during open are not fatal —
 //!   we fall through to plaintext unless `require_secure_store=true`.
-//! - `PlaintextStore` — JSON at `$XDG_CONFIG_HOME/nestty/calendar-token-<account>.json`,
+//! - `PlaintextStore` — JSON at `$XDG_CONFIG_HOME/copad/calendar-token-<account>.json`,
 //!   mode 0600. Used only when keyring is unavailable AND
 //!   `require_secure_store=false`. Emits a stderr warning on every
 //!   open so the user notices.
@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 
-const KEYRING_SERVICE: &str = "nestty-calendar";
+const KEYRING_SERVICE: &str = "copad-calendar";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenSet {
@@ -52,7 +52,7 @@ pub fn open_store(config: &Config) -> Box<dyn TokenStore> {
                 // This preserves a useful error path for actions
                 // without aborting init.
                 eprintln!(
-                    "[calendar] secure keyring unavailable AND NESTTY_CALENDAR_REQUIRE_SECURE_STORE=1: {e}"
+                    "[calendar] secure keyring unavailable AND COPAD_CALENDAR_REQUIRE_SECURE_STORE=1: {e}"
                 );
                 Box::new(BrokenStore { reason: e })
             } else {

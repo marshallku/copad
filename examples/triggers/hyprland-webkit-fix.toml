@@ -2,40 +2,40 @@
 # docs/troubleshooting.md "Plugin/webview panel frozen on last frame
 # after Hyprland workspace switch" for the full upstream-bug write-up.
 #
-# Drop this `[[triggers]]` block into your ~/.config/nestty/config.toml.
+# Drop this `[[triggers]]` block into your ~/.config/copad/config.toml.
 #
 # What it does
 # ------------
 # Hyprland's WebKitGTK 6.0 ↔ wayland interaction leaves WebView
 # panels stuck on their last frame after a same-monitor workspace
 # cycle (verified upstream — reproduces with the official
-# MiniBrowser, zero nestty code involved). On the dual-monitor
+# MiniBrowser, zero copad code involved). On the dual-monitor
 # setup we tested, cross-monitor workspace switches did NOT trigger
 # the freeze; behavior on other multi-monitor configurations isn't
 # characterized. Empirical mitigation: a 1px window resize
 # round-trip via two separate `hyprctl dispatch resizewindowpixel`
-# calls (targeting nestty by `class:` so it works regardless of
+# calls (targeting copad by `class:` so it works regardless of
 # which window has focus on the returning workspace) unfreezes
 # rendering. The precise mechanism by which two separate dispatches
 # cure where `--batch` does not is not fully characterized — the
 # behavior is reproducible, the explanation is conjecture.
 #
-# nestty Phase WR-1 publishes `window.restored` whenever the toplevel's
+# copad Phase WR-1 publishes `window.restored` whenever the toplevel's
 # `GDK_TOPLEVEL_STATE_SUSPENDED` bit clears (compositor told us we're
-# visible/active again). nestty Phase WR-2 added `system.spawn` —
+# visible/active again). copad Phase WR-2 added `system.spawn` —
 # trigger-only argv exec, intercepted at `LiveTriggerSink` and NOT
-# registered in `ActionRegistry` so `nestctl call system.spawn` from
-# any process holding NESTTY_SOCKET still gets `unknown_method`. Same
+# registered in `ActionRegistry` so `coctl call system.spawn` from
+# any process holding COPAD_SOCKET still gets `unknown_method`. Same
 # trust posture as `[keybindings]` `spawn:`: the user-supplied
 # `[[triggers]]` config is the trust boundary.
 #
 # Why a user-config trigger and not a hardcoded fix
 # -------------------------------------------------
-# - Compositor-agnostic: nestty doesn't ship Hyprland-specific code.
+# - Compositor-agnostic: copad doesn't ship Hyprland-specific code.
 #   Other Wayland compositors don't toggle SUSPENDED on workspace
 #   switch the same way, so this trigger is a no-op for them.
 # - Reversible: when WebKit/Hyprland publishes a real fix, you delete
-#   this snippet from your config — no nestty release needed.
+#   this snippet from your config — no copad release needed.
 #
 # Why this specific snippet is safe to use `sh -c`
 # ------------------------------------------------
@@ -80,13 +80,13 @@ allow_privileged = true
 # Two cure shape decisions, both empirical (observed reliably,
 # mechanism for #2 not fully characterized):
 #
-# 1. `resizewindowpixel` with `class:com.marshall.nestty` selector
+# 1. `resizewindowpixel` with `class:com.marshall.copad` selector
 #    (NOT `resizeactive`). The trigger fires on workspace return
 #    regardless of which window has focus on that workspace — at
 #    fire time the active window is often whatever the user was
-#    last using on this workspace, not nestty. `resizeactive`
+#    last using on this workspace, not copad. `resizeactive`
 #    would resize that other window instead, and the freeze stays
-#    on the unrelated nestty panel. `resizewindowpixel,class:` is
+#    on the unrelated copad panel. `resizewindowpixel,class:` is
 #    focus-agnostic.
 #
 # 2. Two SEPARATE `hyprctl dispatch` calls chained with `&&` (NOT
@@ -116,27 +116,27 @@ allow_privileged = true
 argv = [
     "sh",
     "-c",
-    "hyprctl dispatch resizewindowpixel '1 0,class:com.marshall.nestty' && hyprctl dispatch -- resizewindowpixel '-1 0,class:com.marshall.nestty'",
+    "hyprctl dispatch resizewindowpixel '1 0,class:com.marshall.copad' && hyprctl dispatch -- resizewindowpixel '-1 0,class:com.marshall.copad'",
 ]
 
 # How to verify
 # -------------
 # 1. Install: `./scripts/install-dev.sh --restart` (or your usual
 #    install path).
-# 2. Open a plugin panel (e.g. `nestctl plugin open todo`).
-# 3. Switch to another Hyprland workspace, then back to nestty's.
+# 2. Open a plugin panel (e.g. `coctl plugin open todo`).
+# 3. Switch to another Hyprland workspace, then back to copad's.
 # 4. Without this trigger: panel is frozen on its last frame; click
 #    inside it to revive.
 # 5. With this trigger: panel repaints automatically. Stderr from
-#    nestty shows `[nestty] window.restored: SUSPENDED bit cleared`
-#    followed by `[nestty] trigger system.spawn pid=... argv=[...]`.
+#    copad shows `[copad] window.restored: SUSPENDED bit cleared`
+#    followed by `[copad] trigger system.spawn pid=... argv=[...]`.
 #
-# If hyprctl isn't on PATH at nestty's launch env (e.g. nestty
+# If hyprctl isn't on PATH at copad's launch env (e.g. copad
 # launched from a desktop entry that strips PATH), substitute the
 # absolute path inside the same `sh -c` form (keep the `&&` chain
 # and the `class:` selector — see decision notes above):
 #
 #   argv = [
 #       "sh", "-c",
-#       "/usr/bin/hyprctl dispatch resizewindowpixel '1 0,class:com.marshall.nestty' && /usr/bin/hyprctl dispatch -- resizewindowpixel '-1 0,class:com.marshall.nestty'",
+#       "/usr/bin/hyprctl dispatch resizewindowpixel '1 0,class:com.marshall.copad' && /usr/bin/hyprctl dispatch -- resizewindowpixel '-1 0,class:com.marshall.copad'",
 #   ]

@@ -5,7 +5,7 @@
 //! "users supply their own client_id" wart that calendar carries).
 //! Each user generates their own API token at
 //! id.atlassian.com/manage-profile/security/api-tokens and pastes
-//! it via env, then `nestty-plugin-jira auth` validates and persists.
+//! it via env, then `copad-plugin-jira auth` validates and persists.
 
 use std::time::Duration;
 
@@ -37,7 +37,7 @@ pub struct Config {
 }
 
 impl Config {
-    /// Credential env vars (`NESTTY_JIRA_BASE_URL`/`_EMAIL`/`_API_TOKEN`)
+    /// Credential env vars (`COPAD_JIRA_BASE_URL`/`_EMAIL`/`_API_TOKEN`)
     /// are OPTIONAL — RPC mode falls back to the keyring-stored TokenSet,
     /// so a one-time `auth` subcommand is enough. Env wins when set
     /// (useful for testing against a different site). A malformed value
@@ -46,31 +46,31 @@ impl Config {
     pub fn from_env() -> Result<Self, String> {
         // Trim before checking presence so a whitespace-only value (typo'd
         // shell rc) is treated as "not set" rather than shadowing the store.
-        let base_url_raw = std::env::var("NESTTY_JIRA_BASE_URL").unwrap_or_default();
+        let base_url_raw = std::env::var("COPAD_JIRA_BASE_URL").unwrap_or_default();
         let base_url = base_url_raw.trim().trim_end_matches('/').to_string();
         if !base_url.is_empty() {
             validate_base_url(&base_url)?;
         }
 
-        let email = std::env::var("NESTTY_JIRA_EMAIL")
+        let email = std::env::var("COPAD_JIRA_EMAIL")
             .unwrap_or_default()
             .trim()
             .to_string();
-        let api_token = std::env::var("NESTTY_JIRA_API_TOKEN")
+        let api_token = std::env::var("COPAD_JIRA_API_TOKEN")
             .unwrap_or_default()
             .trim()
             .to_string();
 
         let workspace_label =
-            std::env::var("NESTTY_JIRA_WORKSPACE").unwrap_or_else(|_| "default".to_string());
+            std::env::var("COPAD_JIRA_WORKSPACE").unwrap_or_else(|_| "default".to_string());
         validate_workspace_label(&workspace_label)?;
 
-        let require_secure_store = parse_bool("NESTTY_JIRA_REQUIRE_SECURE_STORE", false)?;
+        let require_secure_store = parse_bool("COPAD_JIRA_REQUIRE_SECURE_STORE", false)?;
 
-        let poll_secs: u64 = parse_bounded_int("NESTTY_JIRA_POLL_SECS", 300, 60, 3600)?;
-        let lookback_hours: u32 = parse_bounded_int("NESTTY_JIRA_LOOKBACK_HOURS", 24, 1, 720)?;
-        let projects = parse_projects(&std::env::var("NESTTY_JIRA_PROJECTS").unwrap_or_default())?;
-        let fetch_comments = parse_bool("NESTTY_JIRA_FETCH_COMMENTS", true)?;
+        let poll_secs: u64 = parse_bounded_int("COPAD_JIRA_POLL_SECS", 300, 60, 3600)?;
+        let lookback_hours: u32 = parse_bounded_int("COPAD_JIRA_LOOKBACK_HOURS", 24, 1, 720)?;
+        let projects = parse_projects(&std::env::var("COPAD_JIRA_PROJECTS").unwrap_or_default())?;
+        let fetch_comments = parse_bool("COPAD_JIRA_FETCH_COMMENTS", true)?;
 
         let plaintext_path = default_plaintext_path(&workspace_label);
 
@@ -121,23 +121,23 @@ impl Config {
 /// base_urls (hand-edited keyring entries must not bypass env-time check).
 pub fn validate_base_url(s: &str) -> Result<(), String> {
     if s.is_empty() {
-        return Err("NESTTY_JIRA_BASE_URL: cannot be empty".to_string());
+        return Err("COPAD_JIRA_BASE_URL: cannot be empty".to_string());
     }
     if !s.starts_with("https://") {
         return Err(format!(
-            "NESTTY_JIRA_BASE_URL: must start with https:// (got {s:?})"
+            "COPAD_JIRA_BASE_URL: must start with https:// (got {s:?})"
         ));
     }
     let after_scheme = &s["https://".len()..];
     if after_scheme.is_empty() || after_scheme.starts_with('/') {
-        return Err(format!("NESTTY_JIRA_BASE_URL: missing host (got {s:?})"));
+        return Err(format!("COPAD_JIRA_BASE_URL: missing host (got {s:?})"));
     }
     // Reject embedded whitespace / control chars — they would either
     // get URL-encoded into garbage or break the request line.
     for c in s.chars() {
         if c.is_control() || c == ' ' || c == '\t' {
             return Err(format!(
-                "NESTTY_JIRA_BASE_URL: invalid character {c:?} in URL"
+                "COPAD_JIRA_BASE_URL: invalid character {c:?} in URL"
             ));
         }
     }
@@ -155,7 +155,7 @@ pub fn validate_base_url(s: &str) -> Result<(), String> {
             let path = &after_scheme[i..];
             if path != "/" {
                 return Err(format!(
-                    "NESTTY_JIRA_BASE_URL: must be the bare site root (no path); \
+                    "COPAD_JIRA_BASE_URL: must be the bare site root (no path); \
                      drop everything after the host. Got {s:?}"
                 ));
             }
@@ -168,7 +168,7 @@ pub fn validate_base_url(s: &str) -> Result<(), String> {
     // try to parse around them.
     if host.contains('@') || host.contains(':') {
         return Err(format!(
-            "NESTTY_JIRA_BASE_URL: host must not contain userinfo or port (got {host:?})"
+            "COPAD_JIRA_BASE_URL: host must not contain userinfo or port (got {host:?})"
         ));
     }
     // Atlassian Cloud workspaces are always `<subdomain>.atlassian.net`.
@@ -178,14 +178,14 @@ pub fn validate_base_url(s: &str) -> Result<(), String> {
     let lower = host.to_ascii_lowercase();
     if !lower.ends_with(".atlassian.net") {
         return Err(format!(
-            "NESTTY_JIRA_BASE_URL: host must be <workspace>.atlassian.net for Atlassian Cloud (got {host:?}); \
+            "COPAD_JIRA_BASE_URL: host must be <workspace>.atlassian.net for Atlassian Cloud (got {host:?}); \
              self-hosted Jira Server is not supported in this plugin"
         ));
     }
     let subdomain_len = lower.len() - ".atlassian.net".len();
     if subdomain_len == 0 {
         return Err(format!(
-            "NESTTY_JIRA_BASE_URL: missing workspace subdomain (got {host:?})"
+            "COPAD_JIRA_BASE_URL: missing workspace subdomain (got {host:?})"
         ));
     }
     let subdomain = &lower[..subdomain_len];
@@ -196,7 +196,7 @@ pub fn validate_base_url(s: &str) -> Result<(), String> {
         let ok = c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '.');
         if !ok {
             return Err(format!(
-                "NESTTY_JIRA_BASE_URL: subdomain {subdomain:?} contains invalid character {c:?}"
+                "COPAD_JIRA_BASE_URL: subdomain {subdomain:?} contains invalid character {c:?}"
             ));
         }
     }
@@ -207,18 +207,18 @@ pub fn validate_base_url(s: &str) -> Result<(), String> {
 /// and the plaintext file path. Same charset as calendar/slack/discord.
 fn validate_workspace_label(s: &str) -> Result<(), String> {
     if s.is_empty() {
-        return Err("NESTTY_JIRA_WORKSPACE: cannot be empty".to_string());
+        return Err("COPAD_JIRA_WORKSPACE: cannot be empty".to_string());
     }
     if s == "." || s == ".." {
         return Err(format!(
-            "NESTTY_JIRA_WORKSPACE: {s:?} is reserved (use a normal label)"
+            "COPAD_JIRA_WORKSPACE: {s:?} is reserved (use a normal label)"
         ));
     }
     for c in s.chars() {
         let ok = c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '@');
         if !ok {
             return Err(format!(
-                "NESTTY_JIRA_WORKSPACE: invalid character {c:?} \
+                "COPAD_JIRA_WORKSPACE: invalid character {c:?} \
                  (allowed: ASCII alphanumeric and _ - . @)"
             ));
         }
@@ -288,18 +288,18 @@ fn parse_projects(raw: &str) -> Result<Option<Vec<String>>, String> {
 
 fn validate_project_key(s: &str) -> Result<(), String> {
     if s.is_empty() {
-        return Err("NESTTY_JIRA_PROJECTS: empty project key".to_string());
+        return Err("COPAD_JIRA_PROJECTS: empty project key".to_string());
     }
     let bytes = s.as_bytes();
     if !bytes[0].is_ascii_uppercase() {
         return Err(format!(
-            "NESTTY_JIRA_PROJECTS: project key {s:?} must start with an uppercase ASCII letter"
+            "COPAD_JIRA_PROJECTS: project key {s:?} must start with an uppercase ASCII letter"
         ));
     }
     for &b in bytes {
         if !(b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_') {
             return Err(format!(
-                "NESTTY_JIRA_PROJECTS: project key {s:?} contains invalid character (allowed: A-Z, 0-9, _)"
+                "COPAD_JIRA_PROJECTS: project key {s:?} contains invalid character (allowed: A-Z, 0-9, _)"
             ));
         }
     }
@@ -308,7 +308,7 @@ fn validate_project_key(s: &str) -> Result<(), String> {
 
 fn default_plaintext_path(workspace: &str) -> std::path::PathBuf {
     let base = dirs_config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    base.join("nestty")
+    base.join("copad")
         .join(format!("jira-token-{workspace}.json"))
 }
 
@@ -331,7 +331,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    // Tests that mutate `NESTTY_JIRA_*` env vars must serialize against
+    // Tests that mutate `COPAD_JIRA_*` env vars must serialize against
     // each other — cargo runs tests in parallel by default, so the
     // earlier "single-threaded" SAFETY comments were aspirational, not
     // enforced. Poisoned guard is recovered so a panic in one test
@@ -481,11 +481,11 @@ mod tests {
     fn config_strips_trailing_slash_from_base_url() {
         let _g = env_lock();
         unsafe {
-            std::env::set_var("NESTTY_JIRA_BASE_URL", "https://x.atlassian.net/");
-            std::env::set_var("NESTTY_JIRA_EMAIL", "a@b.com");
-            std::env::set_var("NESTTY_JIRA_API_TOKEN", "tok");
-            std::env::remove_var("NESTTY_JIRA_WORKSPACE");
-            std::env::remove_var("NESTTY_JIRA_REQUIRE_SECURE_STORE");
+            std::env::set_var("COPAD_JIRA_BASE_URL", "https://x.atlassian.net/");
+            std::env::set_var("COPAD_JIRA_EMAIL", "a@b.com");
+            std::env::set_var("COPAD_JIRA_API_TOKEN", "tok");
+            std::env::remove_var("COPAD_JIRA_WORKSPACE");
+            std::env::remove_var("COPAD_JIRA_REQUIRE_SECURE_STORE");
         }
         let c = Config::from_env().unwrap();
         assert_eq!(c.base_url, "https://x.atlassian.net");
@@ -499,11 +499,11 @@ mod tests {
         // requires the env (checked separately in main::run_auth).
         let _g = env_lock();
         unsafe {
-            std::env::remove_var("NESTTY_JIRA_BASE_URL");
-            std::env::remove_var("NESTTY_JIRA_EMAIL");
-            std::env::remove_var("NESTTY_JIRA_API_TOKEN");
-            std::env::remove_var("NESTTY_JIRA_WORKSPACE");
-            std::env::remove_var("NESTTY_JIRA_REQUIRE_SECURE_STORE");
+            std::env::remove_var("COPAD_JIRA_BASE_URL");
+            std::env::remove_var("COPAD_JIRA_EMAIL");
+            std::env::remove_var("COPAD_JIRA_API_TOKEN");
+            std::env::remove_var("COPAD_JIRA_WORKSPACE");
+            std::env::remove_var("COPAD_JIRA_REQUIRE_SECURE_STORE");
         }
         let c = Config::from_env().unwrap();
         assert!(c.base_url.is_empty());
@@ -522,11 +522,11 @@ mod tests {
         // to store.
         let _g = env_lock();
         unsafe {
-            std::env::set_var("NESTTY_JIRA_BASE_URL", "   ");
-            std::env::set_var("NESTTY_JIRA_EMAIL", "  \t  ");
-            std::env::set_var("NESTTY_JIRA_API_TOKEN", " \n ");
-            std::env::remove_var("NESTTY_JIRA_WORKSPACE");
-            std::env::remove_var("NESTTY_JIRA_REQUIRE_SECURE_STORE");
+            std::env::set_var("COPAD_JIRA_BASE_URL", "   ");
+            std::env::set_var("COPAD_JIRA_EMAIL", "  \t  ");
+            std::env::set_var("COPAD_JIRA_API_TOKEN", " \n ");
+            std::env::remove_var("COPAD_JIRA_WORKSPACE");
+            std::env::remove_var("COPAD_JIRA_REQUIRE_SECURE_STORE");
         }
         let c = Config::from_env().unwrap();
         assert!(c.base_url.is_empty(), "got {:?}", c.base_url);
@@ -605,11 +605,11 @@ mod tests {
         // stored URL.
         let _g = env_lock();
         unsafe {
-            std::env::set_var("NESTTY_JIRA_BASE_URL", "ftp://x.atlassian.net");
-            std::env::remove_var("NESTTY_JIRA_EMAIL");
-            std::env::remove_var("NESTTY_JIRA_API_TOKEN");
-            std::env::remove_var("NESTTY_JIRA_WORKSPACE");
-            std::env::remove_var("NESTTY_JIRA_REQUIRE_SECURE_STORE");
+            std::env::set_var("COPAD_JIRA_BASE_URL", "ftp://x.atlassian.net");
+            std::env::remove_var("COPAD_JIRA_EMAIL");
+            std::env::remove_var("COPAD_JIRA_API_TOKEN");
+            std::env::remove_var("COPAD_JIRA_WORKSPACE");
+            std::env::remove_var("COPAD_JIRA_REQUIRE_SECURE_STORE");
         }
         let err = Config::from_env().unwrap_err();
         assert!(err.contains("https://"), "got {err}");

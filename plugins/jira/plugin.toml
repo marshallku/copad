@@ -6,8 +6,8 @@ description = "Polls Jira Cloud for assigned-to-me / watched tickets, emits jira
 
 [[services]]
 name = "main"
-exec = "nestty-plugin-jira"
-# onStartup: the polling daemon must be alive whenever nestty is
+exec = "copad-plugin-jira"
+# onStartup: the polling daemon must be alive whenever copad is
 # running so it can publish ticket-assigned events on schedule.
 # Lazy activation (onAction:jira.*) would only spawn on the first
 # explicit query — too late for "ticket got assigned to me, create
@@ -26,27 +26,27 @@ subscribes = []
 # Setup (one-time):
 #   1. Generate an API token at https://id.atlassian.com/manage-profile/security/api-tokens
 #   2. Set env vars in your shell rc:
-#        export NESTTY_JIRA_BASE_URL=https://yourcompany.atlassian.net
-#        export NESTTY_JIRA_EMAIL=you@example.com
-#        export NESTTY_JIRA_API_TOKEN=<token-from-step-1>
-#   3. Run `nestty-plugin-jira auth` once to validate + persist to keyring
-#   4. Restart nestty (the supervisor only loads service handles at startup)
+#        export COPAD_JIRA_BASE_URL=https://yourcompany.atlassian.net
+#        export COPAD_JIRA_EMAIL=you@example.com
+#        export COPAD_JIRA_API_TOKEN=<token-from-step-1>
+#   3. Run `copad-plugin-jira auth` once to validate + persist to keyring
+#   4. Restart copad (the supervisor only loads service handles at startup)
 #
 # After step 4, env vars become OPTIONAL — the plugin reads from the
 # keyring on subsequent startups. You can drop the env exports from
 # your shell rc once auth has succeeded.
 #
 # Required env (for `auth`; optional for RPC mode once creds are stored):
-#   NESTTY_JIRA_BASE_URL    — https://<workspace>.atlassian.net (no trailing slash)
-#   NESTTY_JIRA_EMAIL       — your Atlassian account email
-#   NESTTY_JIRA_API_TOKEN   — generated at id.atlassian.com
+#   COPAD_JIRA_BASE_URL    — https://<workspace>.atlassian.net (no trailing slash)
+#   COPAD_JIRA_EMAIL       — your Atlassian account email
+#   COPAD_JIRA_API_TOKEN   — generated at id.atlassian.com
 #
 # Optional env (RPC mode):
-#   NESTTY_JIRA_WORKSPACE              (default "default")  — keyring/plaintext namespace
-#   NESTTY_JIRA_REQUIRE_SECURE_STORE   (default false)      — refuse plaintext fallback
-#   NESTTY_JIRA_POLL_SECS              (default 300)        — polling cadence (60..=3600)
-#   NESTTY_JIRA_LOOKBACK_HOURS         (default 24)         — JQL `updated > -<n>h` window (1..=720)
-#   NESTTY_JIRA_PROJECTS               (none)               — comma-separated key allowlist (e.g. PROJ,APP)
-#   NESTTY_JIRA_FETCH_COMMENTS         (default true)       — set false to suppress jira.comment_added/mention events entirely (no API cost change since comments arrive inline in the search response)
+#   COPAD_JIRA_WORKSPACE              (default "default")  — keyring/plaintext namespace
+#   COPAD_JIRA_REQUIRE_SECURE_STORE   (default false)      — refuse plaintext fallback
+#   COPAD_JIRA_POLL_SECS              (default 300)        — polling cadence (60..=3600)
+#   COPAD_JIRA_LOOKBACK_HOURS         (default 24)         — JQL `updated > -<n>h` window (1..=720)
+#   COPAD_JIRA_PROJECTS               (none)               — comma-separated key allowlist (e.g. PROJ,APP)
+#   COPAD_JIRA_FETCH_COMMENTS         (default true)       — set false to suppress jira.comment_added/mention events entirely (no API cost change since comments arrive inline in the search response)
 #
 # See triggers.example.toml for ready-to-copy [[triggers]] entries.

@@ -1,23 +1,23 @@
 #!/bin/bash
-# End-user install script: downloads nestty + nestctl from the
+# End-user install script: downloads copad + coctl from the
 # latest GitHub Release tag and lays them out at ~/.local/bin (or
 # /usr/local/bin with --system).
 #
 # For LOCAL DEVELOPMENT iteration on the working tree, use
 # scripts/install-dev.sh instead — that one builds from source
-# AND warns (loudly, in stderr) when ~/.local/bin/nestty and
-# /usr/local/bin/nestty differ, so a stale system binary silently
+# AND warns (loudly, in stderr) when ~/.local/bin/copad and
+# /usr/local/bin/copad differ, so a stale system binary silently
 # shadowing a working-tree fix at least becomes visible. (It
 # can't auto-resolve the drift; remediation is one of the
 # documented sudo rm or overwrite options the warning prints.)
 #
-# Plugin binaries (nestty-plugin-*) are NOT in the release tarball
+# Plugin binaries (copad-plugin-*) are NOT in the release tarball
 # yet; if you want plugins, install them separately via
 # scripts/install-plugins.sh after running install-dev.sh, OR
 # build from source.
 set -euo pipefail
 
-REPO="marshallku/nestty"
+REPO="marshallku/copad"
 INSTALL_DIR="${HOME}/.local/bin"
 DESKTOP_DIR="${HOME}/.local/share/applications"
 ICON_BASE="${HOME}/.local/share/icons/hicolor"
@@ -28,7 +28,7 @@ ICON_SIZES=(16 22 24 32 48 64 128 256 512)
 usage() {
     echo "Usage: $0 [OPTIONS]"
     echo ""
-    echo "Install nestty from GitHub Releases."
+    echo "Install copad from GitHub Releases."
     echo ""
     echo "Options:"
     echo "  --version VERSION    Install a specific version (e.g., v0.1.0)"
@@ -75,7 +75,7 @@ check_deps() {
     pkg-config --exists gstreamer-1.0 2>/dev/null || missing+=("gst-plugins-good gst-plugins-bad")
     if [[ ${#missing[@]} -gt 0 ]]; then
         echo "Warning: missing system dependencies: ${missing[*]}"
-        echo "nestty requires these libraries to run. Install them via your package manager."
+        echo "copad requires these libraries to run. Install them via your package manager."
     fi
 }
 
@@ -95,28 +95,28 @@ if [[ -z "${VERSION}" ]]; then
     exit 1
 fi
 
-echo "Installing nestty ${VERSION}..."
+echo "Installing copad ${VERSION}..."
 
-ASSET_NAME="nestty-${VERSION}-x86_64-linux.tar.gz"
+ASSET_NAME="copad-${VERSION}-x86_64-linux.tar.gz"
 DOWNLOAD_URL="https://github.com/${REPO}/releases/download/${VERSION}/${ASSET_NAME}"
 
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "${TMPDIR}"' EXIT
 
 echo "Downloading ${ASSET_NAME}..."
-curl -fsSL -o "${TMPDIR}/nestty.tar.gz" "${DOWNLOAD_URL}"
+curl -fsSL -o "${TMPDIR}/copad.tar.gz" "${DOWNLOAD_URL}"
 
 echo "Extracting..."
-tar -xzf "${TMPDIR}/nestty.tar.gz" -C "${TMPDIR}"
+tar -xzf "${TMPDIR}/copad.tar.gz" -C "${TMPDIR}"
 
-# Pre-0.2 release tarballs shipped a "nestty.desktop"; v0.2+ ship
-# "com.marshall.nestty.desktop" so the basename matches the app_id
+# Pre-0.2 release tarballs shipped a "copad.desktop"; v0.2+ ship
+# "com.marshall.copad.desktop" so the basename matches the app_id
 # and Wayland compositors associate windows with the launcher. Detect
 # whichever the tarball carries so this installer is forward- and
 # backward-compatible.
 DESKTOP_SRC=""
 DESKTOP_DEST_NAME=""
-for candidate in "com.marshall.nestty.desktop" "nestty.desktop"; do
+for candidate in "com.marshall.copad.desktop" "copad.desktop"; do
     if [[ -f "${TMPDIR}/${candidate}" ]]; then
         DESKTOP_SRC="${TMPDIR}/${candidate}"
         DESKTOP_DEST_NAME="$candidate"
@@ -126,37 +126,37 @@ done
 
 if ${SYSTEM_INSTALL}; then
     echo "Installing to ${INSTALL_DIR} (requires sudo)..."
-    sudo install -Dm755 "${TMPDIR}/nestty" "${INSTALL_DIR}/nestty"
-    sudo install -Dm755 "${TMPDIR}/nestctl" "${INSTALL_DIR}/nestctl"
+    sudo install -Dm755 "${TMPDIR}/copad" "${INSTALL_DIR}/copad"
+    sudo install -Dm755 "${TMPDIR}/coctl" "${INSTALL_DIR}/coctl"
     if [[ -n "$DESKTOP_SRC" ]]; then
         sudo install -Dm644 "$DESKTOP_SRC" "${DESKTOP_DIR}/${DESKTOP_DEST_NAME}"
         # Drop the pre-rename copy if both are about to coexist.
-        if [[ "$DESKTOP_DEST_NAME" = "com.marshall.nestty.desktop" ]]; then
-            sudo rm -f "${DESKTOP_DIR}/nestty.desktop"
+        if [[ "$DESKTOP_DEST_NAME" = "com.marshall.copad.desktop" ]]; then
+            sudo rm -f "${DESKTOP_DIR}/copad.desktop"
         fi
     fi
     for size in "${ICON_SIZES[@]}"; do
-        src="${TMPDIR}/icons/hicolor/${size}x${size}/apps/nestty.png"
+        src="${TMPDIR}/icons/hicolor/${size}x${size}/apps/copad.png"
         [[ -f "$src" ]] || continue
-        sudo install -Dm644 "$src" "${ICON_BASE}/${size}x${size}/apps/nestty.png"
+        sudo install -Dm644 "$src" "${ICON_BASE}/${size}x${size}/apps/copad.png"
     done
     if command -v gtk-update-icon-cache >/dev/null 2>&1; then
         sudo gtk-update-icon-cache -q -t "${ICON_BASE}" || true
     fi
 else
     mkdir -p "${INSTALL_DIR}" "${DESKTOP_DIR}"
-    install -m755 "${TMPDIR}/nestty" "${INSTALL_DIR}/nestty"
-    install -m755 "${TMPDIR}/nestctl" "${INSTALL_DIR}/nestctl"
+    install -m755 "${TMPDIR}/copad" "${INSTALL_DIR}/copad"
+    install -m755 "${TMPDIR}/coctl" "${INSTALL_DIR}/coctl"
     if [[ -n "$DESKTOP_SRC" ]]; then
         install -Dm644 "$DESKTOP_SRC" "${DESKTOP_DIR}/${DESKTOP_DEST_NAME}"
-        if [[ "$DESKTOP_DEST_NAME" = "com.marshall.nestty.desktop" ]]; then
-            rm -f "${DESKTOP_DIR}/nestty.desktop"
+        if [[ "$DESKTOP_DEST_NAME" = "com.marshall.copad.desktop" ]]; then
+            rm -f "${DESKTOP_DIR}/copad.desktop"
         fi
     fi
     for size in "${ICON_SIZES[@]}"; do
-        src="${TMPDIR}/icons/hicolor/${size}x${size}/apps/nestty.png"
+        src="${TMPDIR}/icons/hicolor/${size}x${size}/apps/copad.png"
         [[ -f "$src" ]] || continue
-        install -Dm644 "$src" "${ICON_BASE}/${size}x${size}/apps/nestty.png"
+        install -Dm644 "$src" "${ICON_BASE}/${size}x${size}/apps/copad.png"
     done
     if command -v gtk-update-icon-cache >/dev/null 2>&1; then
         gtk-update-icon-cache -q -t "${ICON_BASE}" || true
@@ -173,6 +173,6 @@ if ! echo "${PATH}" | tr ':' '\n' | grep -qx "${INSTALL_DIR}"; then
 fi
 
 echo ""
-echo "nestty ${VERSION} installed successfully!"
-echo "  nestty    -> ${INSTALL_DIR}/nestty"
-echo "  nestctl -> ${INSTALL_DIR}/nestctl"
+echo "copad ${VERSION} installed successfully!"
+echo "  copad    -> ${INSTALL_DIR}/copad"
+echo "  coctl -> ${INSTALL_DIR}/coctl"

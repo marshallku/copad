@@ -1,4 +1,4 @@
-# nestty
+# copad
 
 Cross-platform custom terminal emulator with shared Rust core and platform-native UIs.
 
@@ -15,11 +15,11 @@ Cross-platform custom terminal emulator with shared Rust core and platform-nativ
 
 ## Project Structure
 
-- `nestty-core/` — Shared Rust library (config, background, plugin, protocol, theme, error)
-- `nestty-linux/` — GTK4 + VTE4 native terminal app (binary: `nestty`)
-- `nestty-cli/` — CLI control tool (binary: `nestctl`)
-- `nestty-macos/` — Swift/AppKit app (stub)
-- `plugins/<name>/` — First-party plugins. Each dir holds the Rust crate (`Cargo.toml` + `src/`) and its runtime manifest/assets (`plugin.toml`, `panel.html`, `triggers.example.toml`) together. Crate name remains `nestty-plugin-<name>` (binary name unchanged).
+- `copad-core/` — Shared Rust library (config, background, plugin, protocol, theme, error)
+- `copad-linux/` — GTK4 + VTE4 native terminal app (binary: `copad`)
+- `copad-cli/` — CLI control tool (binary: `coctl`)
+- `copad-macos/` — Swift/AppKit app (stub)
+- `plugins/<name>/` — First-party plugins. Each dir holds the Rust crate (`Cargo.toml` + `src/`) and its runtime manifest/assets (`plugin.toml`, `panel.html`, `triggers.example.toml`) together. Crate name remains `copad-plugin-<name>` (binary name unchanged).
 - `examples/plugins/hello/` — Tutorial plugin demonstrating a panel + a bash command (no Rust crate)
 - `docs/` — Project documentation (architecture, decisions, troubleshooting, roadmap)
 
@@ -30,10 +30,10 @@ Cross-platform custom terminal emulator with shared Rust core and platform-nativ
 cargo build
 
 # Run terminal
-cargo run -p nestty-linux
+cargo run -p copad-linux
 
 # Run CLI
-cargo run -p nestty-cli -- <command>
+cargo run -p copad-cli -- <command>
 ```
 
 ## Local development install
@@ -42,20 +42,20 @@ cargo run -p nestty-cli -- <command>
 
 ```bash
 # Linux
-./scripts/install-dev.sh           # cargo build --release + install ~/.local/bin/{nestty,nestctl} + plugins (no sudo)
+./scripts/install-dev.sh           # cargo build --release + install ~/.local/bin/{copad,coctl} + plugins (no sudo)
 ./scripts/install-dev.sh --system  # /usr/local/bin instead of ~/.local/bin (requires sudo)
-./scripts/install-dev.sh --restart # also pkill -x nestty afterwards
+./scripts/install-dev.sh --restart # also pkill -x copad afterwards
 
 # macOS
-./scripts/install-macos.sh             # swift build -c release + ~/Applications/Nestty.app + ~/.cargo/bin/nestctl (no sudo)
-./scripts/install-macos.sh --system    # /Applications/Nestty.app instead (sudo for /Applications)
+./scripts/install-macos.sh             # swift build -c release + ~/Applications/Copad.app + ~/.cargo/bin/coctl (no sudo)
+./scripts/install-macos.sh --system    # /Applications/Copad.app instead (sudo for /Applications)
 ./scripts/install-macos.sh --launch    # open the installed .app afterwards
 ```
 
 Why these exist:
 
-- **Linux**: `install-dev.sh` defaults to user install at `~/.local/bin/nestty` (no sudo) — matches `install.sh`'s end-user default and avoids sudo prompts during dev iteration. Use `--system` explicitly when you want the system-wide copy at `/usr/local/bin`. If both `~/.local/bin/nestty` and `/usr/local/bin/nestty` exist and differ, PATH lookup typically picks `/usr/local/bin` first, so a stale system copy can silently shadow your fresh user-local build (and a desktop-entry-launched nestty will use the system copy too). The script warns loudly in that case and lists the four resolutions.
-- **macOS**: `cargo install nestty-cli` fails (not on crates.io) and `cargo install --path .` fails from the repo root (workspace virtual manifest). The `nestty` GUI app is SwiftPM, not cargo. Before this script, `nestty-macos/run.sh` was the only path and it only built an ephemeral debug bundle under `.build/debug/`. The script wraps `swift build -c release` + bundle layout + `cargo install --path nestty-cli` so the user gets a real `/Applications`-style install.
+- **Linux**: `install-dev.sh` defaults to user install at `~/.local/bin/copad` (no sudo) — matches `install.sh`'s end-user default and avoids sudo prompts during dev iteration. Use `--system` explicitly when you want the system-wide copy at `/usr/local/bin`. If both `~/.local/bin/copad` and `/usr/local/bin/copad` exist and differ, PATH lookup typically picks `/usr/local/bin` first, so a stale system copy can silently shadow your fresh user-local build (and a desktop-entry-launched copad will use the system copy too). The script warns loudly in that case and lists the four resolutions.
+- **macOS**: `cargo install copad-cli` fails (not on crates.io) and `cargo install --path .` fails from the repo root (workspace virtual manifest). The `copad` GUI app is SwiftPM, not cargo. Before this script, `copad-macos/run.sh` was the only path and it only built an ephemeral debug bundle under `.build/debug/`. The script wraps `swift build -c release` + bundle layout + `cargo install --path copad-cli` so the user gets a real `/Applications`-style install.
 
 ## Install first-party plugins
 
@@ -66,7 +66,7 @@ Why these exist:
 ./scripts/install-plugins.sh todo git  # just these two
 ```
 
-Plugins live in `plugins/<name>/` — each directory holds the Rust crate (`Cargo.toml` + `src/`) **and** its runtime manifest/assets (`plugin.toml`, `panel.html`, `triggers.example.toml`, …) side-by-side. nestty's runtime discovers them from `~/.config/nestty/plugins/<name>/` at startup. The install script copies the manifest + assets (everything except `Cargo.toml`) and symlinks the built binary into the plugin dir. `<plugin_dir>/<exec>` takes precedence over `PATH`, which matters because nestty is often launched from a desktop entry whose env doesn't include `~/.local/bin`. After installing, **restart nestty** — `discover_plugins()` only runs at startup. Symptom of an outdated install: `service X is not running and X.action cannot trigger its activation (OnStartup)` from the supervisor.
+Plugins live in `plugins/<name>/` — each directory holds the Rust crate (`Cargo.toml` + `src/`) **and** its runtime manifest/assets (`plugin.toml`, `panel.html`, `triggers.example.toml`, …) side-by-side. copad's runtime discovers them from `~/.config/copad/plugins/<name>/` at startup. The install script copies the manifest + assets (everything except `Cargo.toml`) and symlinks the built binary into the plugin dir. `<plugin_dir>/<exec>` takes precedence over `PATH`, which matters because copad is often launched from a desktop entry whose env doesn't include `~/.local/bin`. After installing, **restart copad** — `discover_plugins()` only runs at startup. Symptom of an outdated install: `service X is not running and X.action cannot trigger its activation (OnStartup)` from the supervisor.
 
 `examples/plugins/hello/` is a tutorial example (a panel + a bash command, no Rust crate); it stays under `examples/` to mark it as illustrative rather than first-party.
 
@@ -86,9 +86,9 @@ git config core.hooksPath .githooks
 - Rust edition 2024, Cargo workspace with `resolver = "2"`
 - GTK4 with `gnome_46` feature flag
 - VTE handles PTY on Linux (no custom PTY management)
-- Unix socket (`/tmp/nestty-{PID}.sock`) for IPC
-- Config: `~/.config/nestty/config.toml` (TOML)
-- Cache: `~/.cache/terminal-wallpapers.txt` (Linux) / `~/Library/Caches/nestty/wallpapers.txt` (macOS, falls back to Linux path)
+- Unix socket (`/tmp/copad-{PID}.sock`) for IPC
+- Config: `~/.config/copad/config.toml` (TOML)
+- Cache: `~/.cache/terminal-wallpapers.txt` (Linux) / `~/Library/Caches/copad/wallpapers.txt` (macOS, falls back to Linux path)
 - Theme: Catppuccin Mocha (hardcoded)
 - Dark theme forced via GTK settings
 
@@ -96,4 +96,4 @@ git config core.hooksPath .githooks
 
 - **Background images**: Must call `terminal.set_clear_background(false)` for VTE transparency
 - **GTK thread safety**: D-Bus → mpsc channel → glib::timeout_add_local polling
-- **Binary names**: `nestty` (app) and `nestctl` (CLI) — do not rename to collide
+- **Binary names**: `copad` (app) and `coctl` (CLI) — do not rename to collide

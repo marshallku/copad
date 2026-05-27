@@ -1,11 +1,11 @@
-//! First-party Jira (Atlassian Cloud) service plugin for nestty.
+//! First-party Jira (Atlassian Cloud) service plugin for copad.
 //!
 //! Two run modes (selected by `argv[1]`):
 //! - **`auth`** — validates the env-supplied API token via
 //!   `/rest/api/3/myself` and persists `{email, api_token, base_url,
 //!   account_id, display_name}` to the configured store. Exits 0 on
 //!   success.
-//! - **(no args)** — RPC mode. Speaks the nestty service-plugin
+//! - **(no args)** — RPC mode. Speaks the copad service-plugin
 //!   protocol over stdio. Slice 16.1 only handles `jira.auth_status`;
 //!   slice 16.2 will add the polling loop + 5 read/write actions.
 //!
@@ -17,11 +17,11 @@
 //! See `docs/service-plugins.md` for the protocol contract. Atlassian
 //! Cloud-only (no Server / Data Center). API token + Basic auth — no
 //! OAuth round-trip needed for personal use, matching the env+keyring
-//! posture every other nestty plugin uses today.
+//! posture every other copad plugin uses today.
 
 #[cfg(not(unix))]
 compile_error!(
-    "nestty-plugin-jira is currently Unix-only. The keyring crate's mock fallback \
+    "copad-plugin-jira is currently Unix-only. The keyring crate's mock fallback \
      would silently lose tokens on platforms without a native credential-store \
      feature; gate exists to make that failure compile-time instead of runtime."
 );
@@ -51,7 +51,7 @@ fn main() {
         Some("auth") => run_auth(),
         Some(other) => {
             eprintln!("[jira] unknown subcommand: {other}");
-            eprintln!("usage: nestty-plugin-jira [auth]");
+            eprintln!("usage: copad-plugin-jira [auth]");
             std::process::exit(2);
         }
         None => run_rpc(),
@@ -71,17 +71,17 @@ fn run_auth() {
     // but `auth` is what populates the store in the first place.
     if config.base_url.is_empty() {
         eprintln!(
-            "[jira] auth requires NESTTY_JIRA_BASE_URL (e.g. https://yourcompany.atlassian.net)"
+            "[jira] auth requires COPAD_JIRA_BASE_URL (e.g. https://yourcompany.atlassian.net)"
         );
         std::process::exit(1);
     }
     if config.email.is_empty() {
-        eprintln!("[jira] auth requires NESTTY_JIRA_EMAIL");
+        eprintln!("[jira] auth requires COPAD_JIRA_EMAIL");
         std::process::exit(1);
     }
     if config.api_token.is_empty() {
         eprintln!(
-            "[jira] auth requires NESTTY_JIRA_API_TOKEN (generate at id.atlassian.com/manage-profile/security/api-tokens)"
+            "[jira] auth requires COPAD_JIRA_API_TOKEN (generate at id.atlassian.com/manage-profile/security/api-tokens)"
         );
         std::process::exit(1);
     }
@@ -98,7 +98,7 @@ fn run_auth() {
         Err(e) => {
             eprintln!("[jira] /myself failed: {e}");
             eprintln!(
-                "[jira] verify NESTTY_JIRA_BASE_URL, NESTTY_JIRA_EMAIL, NESTTY_JIRA_API_TOKEN \
+                "[jira] verify COPAD_JIRA_BASE_URL, COPAD_JIRA_EMAIL, COPAD_JIRA_API_TOKEN \
                  — generate a token at id.atlassian.com/manage-profile/security/api-tokens"
             );
             std::process::exit(1);
@@ -116,7 +116,7 @@ fn run_auth() {
         // empty string which we already short-circuited. But warn
         // loudly so the user knows what they got.
         eprintln!(
-            "[jira] WARNING: NESTTY_JIRA_EMAIL ({:?}) does not match the account's \
+            "[jira] WARNING: COPAD_JIRA_EMAIL ({:?}) does not match the account's \
              emailAddress ({:?}). Auth succeeded with the API token, but you may have \
              pasted credentials from a different Atlassian account than you intended.",
             config.email, user.email_address
@@ -181,8 +181,8 @@ fn run_rpc() {
 
     // Polling daemon runs in a background thread. It waits for the
     // `initialized` notification before starting ticks and resolves
-    // credentials on every tick (so running `nestty-plugin-jira auth`
-    // while nestty is already up populates the store and the next
+    // credentials on every tick (so running `copad-plugin-jira auth`
+    // while copad is already up populates the store and the next
     // tick picks it up — no plugin restart needed).
     {
         let cfg_for_poller = Arc::new(config.clone());
@@ -326,7 +326,7 @@ fn handle_action(
     }
     let resolved = current_credentials(config, &**store).ok_or((
         "not_authenticated".to_string(),
-        "no Jira credentials available — run `nestty-plugin-jira auth` or set env credentials"
+        "no Jira credentials available — run `copad-plugin-jira auth` or set env credentials"
             .to_string(),
     ))?;
     let creds = jira::Creds {
@@ -355,7 +355,7 @@ fn handle_action(
 /// can't escape as ad-hoc codes (`json`/`project`/`transition`) and
 /// break the trigger-matchable contract. Unknown collapses to `io_error`.
 fn map_jira_error(err: String) -> (String, String) {
-    /// Public error-code surface — triggers and `nestctl` clients
+    /// Public error-code surface — triggers and `coctl` clients
     /// pattern-match on these. Adding a new code is a contract change.
     const KNOWN_CODES: &[&str] = &[
         "unauthorized",
@@ -405,7 +405,7 @@ fn handle_list_my_tickets(creds: jira::Creds, params: &Value) -> Result<Value, (
 
     // Paginate up to MAX_PAGES so a chatty workspace doesn't truncate
     // silently. Action surface returns the union of pages with an
-    // explicit `truncated` flag so callers (triggers, nestctl, future
+    // explicit `truncated` flag so callers (triggers, coctl, future
     // panel UIs) can detect partial results and surface a user-visible
     // warning rather than silently acting on an arbitrary prefix of
     // the result set. The new `/search/jql` endpoint dropped `total`
@@ -444,7 +444,7 @@ fn handle_get_ticket(creds: jira::Creds, params: &Value) -> Result<Value, (Strin
     let key = required_string(params, "key")?;
     jira::validate_issue_key(&key).map_err(|e| ("invalid_params".to_string(), e))?;
     // Returns the verbatim Jira response (per the docs contract:
-    // "returns full ticket json"). Triggers / nestctl callers who
+    // "returns full ticket json"). Triggers / coctl callers who
     // want the trigger envelope shape can use list_my_tickets which
     // returns the envelope form. This split lets `get_ticket`
     // surface fields like custom field values, `changelog`, full
@@ -594,7 +594,7 @@ pub fn current_credentials(config: &Config, store: &dyn TokenStore) -> Option<Re
     if t.email.is_empty() || t.api_token.is_empty() || t.base_url.is_empty() {
         eprintln!(
             "[jira] stored credentials are incomplete (email/api_token/base_url empty); \
-             treating as not_authenticated. Re-run `nestty-plugin-jira auth` to repair."
+             treating as not_authenticated. Re-run `copad-plugin-jira auth` to repair."
         );
         return None;
     }
@@ -610,7 +610,7 @@ pub fn current_credentials(config: &Config, store: &dyn TokenStore) -> Option<Re
         eprintln!(
             "[jira] stored base_url failed Atlassian Cloud host check ({e}); \
              treating as not_authenticated to avoid sending the API token to an unintended host. \
-             Re-run `nestty-plugin-jira auth` to repair."
+             Re-run `copad-plugin-jira auth` to repair."
         );
         return None;
     }

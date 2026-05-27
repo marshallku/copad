@@ -1,17 +1,17 @@
-# Linux App (nestty-linux)
+# Linux App (copad-linux)
 
 ## Entry Point (`main.rs`)
 
 CLI flags handled before GTK launch:
 
-- `--init-config` — writes default config to `~/.config/nestty/config.toml`
+- `--init-config` — writes default config to `~/.config/copad/config.toml`
 - `--config-path` — prints config file path
 
 ## Application (`app.rs`)
 
-- GTK Application ID: `com.marshall.nestty`
+- GTK Application ID: `com.marshall.copad`
 - Forces dark theme on startup via `set_gtk_application_prefer_dark_theme(true)`
-- Loads config with `NesttyConfig::load()`, falls back to defaults
+- Loads config with `CopadConfig::load()`, falls back to defaults
 
 ## Window (`window.rs`)
 
@@ -120,11 +120,11 @@ All built-in shortcuts use `Ctrl+Shift` — Ctrl-only keys pass through to termi
 
 ### Session Persistence
 
-On window close, the current tab/split layout and each terminal's cwd are saved to `~/.local/state/nestty/session.json` (XDG state dir). On next launch, that layout is auto-restored — same tabs, same split structure, each shell respawned in its last directory. Closing the last terminal tab clears the file so the next launch starts fresh. WebView and plugin panels are elided from v1 (terminal-only). Paned split positions reset to 50/50.
+On window close, the current tab/split layout and each terminal's cwd are saved to `~/.local/state/copad/session.json` (XDG state dir). On next launch, that layout is auto-restored — same tabs, same split structure, each shell respawned in its last directory. Closing the last terminal tab clears the file so the next launch starts fresh. WebView and plugin panels are elided from v1 (terminal-only). Paned split positions reset to 50/50.
 
 ### Custom Keybindings
 
-Custom keybindings can be configured in `[keybindings]` section of `config.toml`. They are checked before built-in shortcuts, so they can override defaults. Spawned commands receive `NESTTY_SOCKET` environment variable. See [config.md](./config.md#keybindings) for details.
+Custom keybindings can be configured in `[keybindings]` section of `config.toml`. They are checked before built-in shortcuts, so they can override defaults. Spawned commands receive `COPAD_SOCKET` environment variable. See [config.md](./config.md#keybindings) for details.
 
 ## Search (`search.rs`)
 
@@ -146,14 +146,14 @@ Binary tree of `SplitNode` (Leaf = terminal, Branch = `gtk4::Paned` with two chi
 
 ```bash
 # Build + install
-./nestty-linux/install.sh
+./copad-linux/install.sh
 
 # Or manually
-cargo build --release -p nestty-linux
-sudo install -Dm755 target/release/nestty /usr/local/bin/nestty
-sudo install -Dm644 nestty-linux/com.marshall.nestty.desktop \
-    /usr/share/applications/com.marshall.nestty.desktop
+cargo build --release -p copad-linux
+sudo install -Dm755 target/release/copad /usr/local/bin/copad
+sudo install -Dm644 copad-linux/com.marshall.copad.desktop \
+    /usr/share/applications/com.marshall.copad.desktop
 
 # Set as default terminal (GNOME)
-gsettings set org.gnome.desktop.default-applications.terminal exec nestty
+gsettings set org.gnome.desktop.default-applications.terminal exec copad
 ```

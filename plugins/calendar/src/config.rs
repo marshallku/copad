@@ -1,8 +1,8 @@
 //! Plugin runtime configuration sourced from environment variables.
 //!
 //! The plugin avoids hard-coding any Google OAuth client_id / secret
-//! because nestty is OSS and embedding shared credentials would let anyone
-//! impersonate "nestty" in OAuth consent screens. Users supply their own
+//! because copad is OSS and embedding shared credentials would let anyone
+//! impersonate "copad" in OAuth consent screens. Users supply their own
 //! Google Cloud project credentials.
 
 use std::time::Duration;
@@ -21,22 +21,22 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self, String> {
-        let client_id = std::env::var("NESTTY_CALENDAR_CLIENT_ID")
-            .map_err(|_| "NESTTY_CALENDAR_CLIENT_ID is required".to_string())?;
-        let client_secret = std::env::var("NESTTY_CALENDAR_CLIENT_SECRET")
-            .map_err(|_| "NESTTY_CALENDAR_CLIENT_SECRET is required".to_string())?;
+        let client_id = std::env::var("COPAD_CALENDAR_CLIENT_ID")
+            .map_err(|_| "COPAD_CALENDAR_CLIENT_ID is required".to_string())?;
+        let client_secret = std::env::var("COPAD_CALENDAR_CLIENT_SECRET")
+            .map_err(|_| "COPAD_CALENDAR_CLIENT_SECRET is required".to_string())?;
 
         let account_label =
-            std::env::var("NESTTY_CALENDAR_ACCOUNT").unwrap_or_else(|_| "default".to_string());
+            std::env::var("COPAD_CALENDAR_ACCOUNT").unwrap_or_else(|_| "default".to_string());
         validate_account_label(&account_label)?;
 
         let lead_minutes = parse_lead_minutes(
-            &std::env::var("NESTTY_CALENDAR_LEAD_MINUTES").unwrap_or_else(|_| "10".to_string()),
+            &std::env::var("COPAD_CALENDAR_LEAD_MINUTES").unwrap_or_else(|_| "10".to_string()),
         )?;
 
-        let poll_secs: u64 = parse_nonzero_int("NESTTY_CALENDAR_POLL_SECS", 60)?;
-        let lookahead_hours: u32 = parse_nonzero_int("NESTTY_CALENDAR_LOOKAHEAD_HOURS", 24)?;
-        let require_secure_store = parse_bool("NESTTY_CALENDAR_REQUIRE_SECURE_STORE", false)?;
+        let poll_secs: u64 = parse_nonzero_int("COPAD_CALENDAR_POLL_SECS", 60)?;
+        let lookahead_hours: u32 = parse_nonzero_int("COPAD_CALENDAR_LOOKAHEAD_HOURS", 24)?;
+        let require_secure_store = parse_bool("COPAD_CALENDAR_REQUIRE_SECURE_STORE", false)?;
 
         let plaintext_path = default_plaintext_path(&account_label);
 
@@ -77,18 +77,18 @@ impl Config {
 /// plaintext file path (`calendar-token-<account>.json`).
 fn validate_account_label(s: &str) -> Result<(), String> {
     if s.is_empty() {
-        return Err("NESTTY_CALENDAR_ACCOUNT: cannot be empty".to_string());
+        return Err("COPAD_CALENDAR_ACCOUNT: cannot be empty".to_string());
     }
     if s == "." || s == ".." {
         return Err(format!(
-            "NESTTY_CALENDAR_ACCOUNT: {s:?} is reserved (use a normal label)"
+            "COPAD_CALENDAR_ACCOUNT: {s:?} is reserved (use a normal label)"
         ));
     }
     for c in s.chars() {
         let ok = c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '@');
         if !ok {
             return Err(format!(
-                "NESTTY_CALENDAR_ACCOUNT: invalid character {c:?} \
+                "COPAD_CALENDAR_ACCOUNT: invalid character {c:?} \
                  (allowed: ASCII alphanumeric and _ - . @)"
             ));
         }
@@ -105,16 +105,14 @@ fn parse_lead_minutes(raw: &str) -> Result<Vec<u32>, String> {
         }
         let n: u32 = trimmed
             .parse()
-            .map_err(|_| format!("NESTTY_CALENDAR_LEAD_MINUTES: invalid integer {trimmed:?}"))?;
+            .map_err(|_| format!("COPAD_CALENDAR_LEAD_MINUTES: invalid integer {trimmed:?}"))?;
         if n == 0 {
-            return Err(
-                "NESTTY_CALENDAR_LEAD_MINUTES: 0 is not a meaningful lead time".to_string(),
-            );
+            return Err("COPAD_CALENDAR_LEAD_MINUTES: 0 is not a meaningful lead time".to_string());
         }
         out.push(n);
     }
     if out.is_empty() {
-        return Err("NESTTY_CALENDAR_LEAD_MINUTES: at least one value required".to_string());
+        return Err("COPAD_CALENDAR_LEAD_MINUTES: at least one value required".to_string());
     }
     out.sort_unstable();
     out.dedup();
@@ -152,7 +150,7 @@ fn parse_bool(var: &str, default: bool) -> Result<bool, String> {
 
 fn default_plaintext_path(account: &str) -> std::path::PathBuf {
     let base = dirs_config_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-    base.join("nestty")
+    base.join("copad")
         .join(format!("calendar-token-{account}.json"))
 }
 

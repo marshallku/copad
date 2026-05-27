@@ -1,8 +1,0 @@
-// SwiftPM picks this up automatically when a target named `CNesttyTerm` lives
-// at Sources/CNesttyTerm/. Swift side `import CNesttyTerm` exposes every
-// symbol declared in nestty_term.h; implementation comes from
-// libnestty_term.a linked via the Package.swift unsafeFlags.
-module CNesttyTerm {
-    header "nestty_term.h"
-    export *
-}

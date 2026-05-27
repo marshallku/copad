@@ -10,26 +10,26 @@
 # Drop on PATH, run as a systemd --user service:
 #
 #   [Unit]
-#   Description=nestty presence — loginctl IdleHint poller
+#   Description=copad presence — loginctl IdleHint poller
 #   After=graphical-session.target
 #   PartOf=graphical-session.target
 #
 #   [Service]
 #   Type=simple
-#   ExecStart=%h/.local/bin/nestty-presence-loginctl
+#   ExecStart=%h/.local/bin/copad-presence-loginctl
 #   Restart=on-failure
 #
 #   [Install]
 #   WantedBy=graphical-session.target
 #
-# Then `systemctl --user enable --now nestty-presence-loginctl`.
+# Then `systemctl --user enable --now copad-presence-loginctl`.
 #
 # Threshold knob: POLL_SECS. Tune for jitter vs latency.
 
 set -euo pipefail
 
 POLL_SECS="${POLL_SECS:-30}"
-NESTCTL="${NESTCTL:-nestctl}"
+COCTL="${COCTL:-coctl}"
 
 session_id="${XDG_SESSION_ID:-}"
 if [ -z "$session_id" ]; then
@@ -40,7 +40,7 @@ if [ -z "$session_id" ]; then
     | awk -v user="$USER" '$3 == user && $4 == "seat0" {print $1; exit}')"
 fi
 if [ -z "$session_id" ]; then
-  echo "nestty-presence-loginctl: cannot resolve a graphical session" >&2
+  echo "copad-presence-loginctl: cannot resolve a graphical session" >&2
   exit 1
 fi
 
@@ -53,7 +53,7 @@ while :; do
     *)   target="" ;;
   esac
   if [ -n "$target" ] && [ "$target" != "$last" ]; then
-    "$NESTCTL" presence "$target" >/dev/null || true
+    "$COCTL" presence "$target" >/dev/null || true
     last="$target"
   fi
   sleep "$POLL_SECS"

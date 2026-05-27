@@ -1,13 +1,13 @@
 [package]
-name = "nestty-plugin-llm"
+name = "copad-plugin-llm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "First-party LLM service plugin for nestty — calls Anthropic Messages API via llm.complete, tracks token usage."
+description = "First-party LLM service plugin for copad — calls Anthropic Messages API via llm.complete, tracks token usage."
 repository.workspace = true
 
 [[bin]]
-name = "nestty-plugin-llm"
+name = "copad-plugin-llm"
 path = "src/main.rs"
 
 [dependencies]

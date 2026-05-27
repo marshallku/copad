@@ -8,7 +8,7 @@
 //! the WS handler in `main.rs`.
 //!
 //! `send_text` uses the same load-buffer/paste-buffer pattern as
-//! `nestty-linux::socket::handle_claude_start` (socket.rs:1710). Going
+//! `copad-linux::socket::handle_claude_start` (socket.rs:1710). Going
 //! through a buffer makes multiline + ANSI / quoting safe;
 //! `send-keys -l` requires per-character escaping that's easy to get
 //! wrong. `paste-buffer -p` enables bracketed paste so the receiving
@@ -114,10 +114,10 @@ pub fn capture_pane(pane_id: &str, last_n: u32) -> Result<String, String> {
 }
 
 /// Safe arbitrary-text send via `load-buffer` (stdin) + `paste-buffer`.
-/// Mirrors `nestty-linux::socket::handle_claude_start` (socket.rs:1710)
+/// Mirrors `copad-linux::socket::handle_claude_start` (socket.rs:1710)
 /// — multiline / quoted / special-char input round-trips intact.
 pub fn send_text(target: &str, text: &str) -> Result<(), String> {
-    let buf_name = format!("nestty-web-{}", uuid::Uuid::new_v4());
+    let buf_name = format!("copad-web-{}", uuid::Uuid::new_v4());
     let mut load = Command::new("tmux")
         .args(["load-buffer", "-b", &buf_name, "-"])
         .stdin(Stdio::piped())
@@ -157,7 +157,7 @@ mod tests {
 
     #[test]
     fn parse_list_panes_two_panes() {
-        let sample = "main\t@0\t0\twork\t%0\t1\t/home/marshall/dev/nestty\t12345\n\
+        let sample = "main\t@0\t0\twork\t%0\t1\t/home/marshall/dev/copad\t12345\n\
                      main\t@1\t1\tlogs\t%1\t0\t/var/log\t12346\n";
         let panes = parse_list_panes(sample);
         assert_eq!(panes.len(), 2);
@@ -167,7 +167,7 @@ mod tests {
         assert_eq!(panes[0].window_name, "work");
         assert_eq!(panes[0].pane_id, "%0");
         assert!(panes[0].pane_active);
-        assert_eq!(panes[0].cwd, "/home/marshall/dev/nestty");
+        assert_eq!(panes[0].cwd, "/home/marshall/dev/copad");
         assert_eq!(panes[0].pane_pid, Some(12345));
         assert_eq!(panes[1].pane_id, "%1");
         assert!(!panes[1].pane_active);

@@ -2,12 +2,12 @@
 
 ## Overview
 
-nestty plugins extend the terminal with custom panels (HTML/JS UIs) and commands (shell scripts). Plugins live in `~/.config/nestty/plugins/` and are discovered automatically at startup.
+copad plugins extend the terminal with custom panels (HTML/JS UIs) and commands (shell scripts). Plugins live in `~/.config/copad/plugins/` and are discovered automatically at startup.
 
 ## Plugin Structure
 
 ```
-~/.config/nestty/plugins/my-plugin/
+~/.config/copad/plugins/my-plugin/
 ├── plugin.toml          # Manifest (required)
 ├── index.html           # Panel UI
 ├── styles.css           # Panel styles
@@ -65,101 +65,101 @@ file = "settings.html"
 icon = "preferences-system-symbolic"
 ```
 
-Open a specific panel: `nestctl plugin open my-plugin --panel settings`
+Open a specific panel: `coctl plugin open my-plugin --panel settings`
 
 ## JS Bridge API
 
-Every plugin panel gets a `window.nestty` object injected automatically.
+Every plugin panel gets a `window.copad` object injected automatically.
 
-### `nestty.panel`
+### `copad.panel`
 
 Info about the current panel:
 
 ```javascript
-nestty.panel.id       // UUID of this panel instance
-nestty.panel.name     // Panel name from manifest (e.g., "main")
-nestty.panel.plugin   // Plugin name (e.g., "my-plugin")
+copad.panel.id       // UUID of this panel instance
+copad.panel.name     // Panel name from manifest (e.g., "main")
+copad.panel.plugin   // Plugin name (e.g., "my-plugin")
 ```
 
-### `nestty.call(method, params?)`
+### `copad.call(method, params?)`
 
-Call any nestty socket API method. Returns a Promise.
+Call any copad socket API method. Returns a Promise.
 
 ```javascript
 // Get terminal state
-const state = await nestty.call("terminal.state");
+const state = await copad.call("terminal.state");
 console.log(state.cwd, state.cols, state.rows);
 
 // Read terminal screen
-const screen = await nestty.call("terminal.read");
+const screen = await copad.call("terminal.read");
 console.log(screen.text);
 
 // Execute a command in the terminal
-await nestty.call("terminal.exec", { command: "ls -la" });
+await copad.call("terminal.exec", { command: "ls -la" });
 
 // List all panels
-const panels = await nestty.call("session.list");
+const panels = await copad.call("session.list");
 
 // Open a webview
-const { panel_id } = await nestty.call("webview.open", { url: "https://example.com" });
+const { panel_id } = await copad.call("webview.open", { url: "https://example.com" });
 
 // Create a new terminal tab
-await nestty.call("tab.new");
+await copad.call("tab.new");
 
 // List themes
-const { themes, current } = await nestty.call("theme.list");
+const { themes, current } = await copad.call("theme.list");
 
 // Run a plugin command
-const result = await nestty.call("plugin.my-plugin.greet", { name: "world" });
+const result = await copad.call("plugin.my-plugin.greet", { name: "world" });
 ```
 
 All [socket API methods](./architecture.md#socket-server-ipc) are available.
 
-### `nestty.on(type, callback)` / `nestty.off(type, callback)`
+### `copad.on(type, callback)` / `copad.off(type, callback)`
 
-Listen for nestty events:
+Listen for copad events:
 
 ```javascript
 // Listen for focus changes
-nestty.on("panel.focused", (data) => {
+copad.on("panel.focused", (data) => {
     console.log("Panel focused:", data.panel_id);
 });
 
 // Listen for terminal output
-nestty.on("terminal.output", (data) => {
+copad.on("terminal.output", (data) => {
     console.log("Output:", data.text);
 });
 
 // Wildcard: listen for all events
-nestty.on("*", (type, data) => {
+copad.on("*", (type, data) => {
     console.log(`Event: ${type}`, data);
 });
 
 // Remove a listener
 const handler = (data) => { ... };
-nestty.on("panel.focused", handler);
-nestty.off("panel.focused", handler);
+copad.on("panel.focused", handler);
+copad.off("panel.focused", handler);
 ```
 
 All [event types](./architecture.md#event-stream) are available.
 
 ## Theme CSS Variables
 
-Plugin panels automatically receive CSS variables matching the active nestty theme:
+Plugin panels automatically receive CSS variables matching the active copad theme:
 
 ```css
 :root {
-    --nestty-bg: #1e1e2e;
-    --nestty-fg: #cdd6f4;
-    --nestty-surface0: #313244;
-    --nestty-surface1: #45475a;
-    --nestty-surface2: #585b70;
-    --nestty-overlay0: #6c7086;
-    --nestty-text: #cdd6f4;
-    --nestty-subtext0: #a6adc8;
-    --nestty-subtext1: #bac2de;
-    --nestty-accent: #89b4fa;
-    --nestty-red: #f38ba8;
+    --copad-bg: #1e1e2e;
+    --copad-fg: #cdd6f4;
+    --copad-surface0: #313244;
+    --copad-surface1: #45475a;
+    --copad-surface2: #585b70;
+    --copad-overlay0: #6c7086;
+    --copad-text: #cdd6f4;
+    --copad-subtext0: #a6adc8;
+    --copad-subtext1: #bac2de;
+    --copad-accent: #89b4fa;
+    --copad-red: #f38ba8;
 }
 ```
 
@@ -167,16 +167,16 @@ Use these in your CSS to match the terminal theme:
 
 ```css
 .card {
-    background: var(--nestty-surface0);
-    border: 1px solid var(--nestty-overlay0);
-    color: var(--nestty-text);
+    background: var(--copad-surface0);
+    border: 1px solid var(--copad-overlay0);
+    color: var(--copad-text);
     border-radius: 8px;
     padding: 16px;
 }
 
 button {
-    background: var(--nestty-accent);
-    color: var(--nestty-bg);
+    background: var(--copad-accent);
+    color: var(--copad-bg);
     border: none;
     border-radius: 4px;
     padding: 8px 16px;
@@ -198,8 +198,8 @@ Commands are shell scripts that run when called via `plugin.<name>.<command>`.
 
 | Variable | Value |
 |----------|-------|
-| `NESTTY_SOCKET` | Path to nestty's Unix socket |
-| `NESTTY_PLUGIN_DIR` | Absolute path to the plugin directory |
+| `COPAD_SOCKET` | Path to copad's Unix socket |
+| `COPAD_PLUGIN_DIR` | Absolute path to the plugin directory |
 
 ### Input/Output
 
@@ -224,38 +224,38 @@ echo "{\"message\": \"Hello, $NAME!\"}"
 
 From CLI:
 ```bash
-nestctl plugin run my-plugin.greet --params '{"name": "nestty"}'
+coctl plugin run my-plugin.greet --params '{"name": "copad"}'
 ```
 
 From a plugin panel's JS:
 ```javascript
-const result = await nestty.call("plugin.my-plugin.greet", { name: "nestty" });
-console.log(result.message); // "Hello, nestty!"
+const result = await copad.call("plugin.my-plugin.greet", { name: "copad" });
+console.log(result.message); // "Hello, copad!"
 ```
 
-### Calling nestty from Command Scripts
+### Calling copad from Command Scripts
 
-Commands can call back into nestty via the socket:
+Commands can call back into copad via the socket:
 
 ```bash
 #!/bin/bash
-# Use nestctl with the injected socket path
-export NESTTY_SOCKET="$NESTTY_SOCKET"
-nestctl terminal exec "echo 'hello from plugin'"
+# Use coctl with the injected socket path
+export COPAD_SOCKET="$COPAD_SOCKET"
+coctl terminal exec "echo 'hello from plugin'"
 ```
 
 ## CLI
 
 ```bash
 # List installed plugins
-nestctl plugin list
+coctl plugin list
 
 # Open a plugin panel (default panel: "main")
-nestctl plugin open my-plugin
-nestctl plugin open my-plugin --panel settings
+coctl plugin open my-plugin
+coctl plugin open my-plugin --panel settings
 
 # Run a plugin command
-nestctl plugin run my-plugin.greet --params '{"name": "world"}'
+coctl plugin run my-plugin.greet --params '{"name": "world"}'
 ```
 
 ## GTK Icon Names
@@ -312,19 +312,19 @@ Module `exec` stdout supports two formats:
 Place a `style.css` in the plugin directory. It's injected into the bar alongside theme CSS variables.
 
 ```css
-/* ~/.config/nestty/plugins/my-plugin/style.css */
+/* ~/.config/copad/plugins/my-plugin/style.css */
 .clock {
     font-family: monospace;
-    color: var(--nestty-subtext0);
+    color: var(--copad-subtext0);
 }
 
 .claude-usage {
-    color: var(--nestty-accent);
+    color: var(--copad-accent);
     font-weight: bold;
 }
 ```
 
-Available CSS variables: `--nestty-bg`, `--nestty-fg`, `--nestty-surface0/1/2`, `--nestty-overlay0`, `--nestty-text`, `--nestty-subtext0/1`, `--nestty-accent`, `--nestty-red`.
+Available CSS variables: `--copad-bg`, `--copad-fg`, `--copad-surface0/1/2`, `--copad-overlay0`, `--copad-text`, `--copad-subtext0/1`, `--copad-accent`, `--copad-red`.
 
 ### Environment Variables
 
@@ -332,10 +332,10 @@ Module scripts receive:
 
 | Variable | Value |
 |----------|-------|
-| `NESTTY_SOCKET` | Path to nestty's Unix socket |
-| `NESTTY_PLUGIN_DIR` | Absolute path to the plugin directory |
+| `COPAD_SOCKET` | Path to copad's Unix socket |
+| `COPAD_PLUGIN_DIR` | Absolute path to the plugin directory |
 
-Scripts can use `nestctl` for nestty integration (CWD, tab info, etc.).
+Scripts can use `coctl` for copad integration (CWD, tab info, etc.).
 
 ### Config
 
@@ -349,9 +349,9 @@ height = 28             # Height in pixels (default: 28)
 ### CLI
 
 ```bash
-nestctl statusbar show
-nestctl statusbar hide
-nestctl statusbar toggle
+coctl statusbar show
+coctl statusbar hide
+coctl statusbar toggle
 ```
 
 ### Socket API
@@ -370,6 +370,6 @@ The status bar is a single WebView that renders CSS-styled module containers. Ru
 
 - Plugin panels have `allow_file_access_from_file_urls` enabled, so you can load local CSS/JS/images with relative paths in your HTML
 - DevTools are enabled — right-click and inspect to debug your plugin panel
-- Use `nestty.on("*", console.log)` during development to see all events
-- Plugin discovery happens at startup — restart nestty after adding a new plugin
+- Use `copad.on("*", console.log)` during development to see all events
+- Plugin discovery happens at startup — restart copad after adding a new plugin
 - Commands run in a thread, so they won't block the UI even if slow

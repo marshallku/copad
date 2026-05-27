@@ -24,7 +24,7 @@
 //! 5. **linked_kb** — full markdown content of each path under the
 //!    docs_root, prefixed with `## Reference: <path>`.
 //!
-//! `<docs_root>` is `<NESTTY_TODO_ROOT>/..` — sibling-of-todos. For the
+//! `<docs_root>` is `<COPAD_TODO_ROOT>/..` — sibling-of-todos. For the
 //! default `~/docs/todos` setup that's `~/docs`, which the KB plugin
 //! also calls home. Layer files are read at *assembly time*, not at
 //! Todo-create time, so the user can keep evolving global.md /
@@ -72,7 +72,7 @@ pub fn assemble(todo: &Todo, docs_root: Option<&Path>) -> String {
             match resolve_within(root, path) {
                 Some(abs) => {
                     // Symlink-ancestor check matches the KB plugin's
-                    // posture (`nestty-plugin-kb::kb::check_no_symlink_ancestors`):
+                    // posture (`copad-plugin-kb::kb::check_no_symlink_ancestors`):
                     // the lexical containment in `resolve_within` only
                     // catches `..` / absolute paths in the FRONTMATTER
                     // — it can't see filesystem-level escapes where
@@ -204,7 +204,7 @@ mod tests {
             id: "T-1".into(),
             status: Status::Open,
             created: "2026-04-28T00:00:00Z".into(),
-            workspace: "nestty".into(),
+            workspace: "copad".into(),
             title: "Ship Phase 18.2".into(),
             body: "wire claude.start prompt seeding".into(),
             priority: Priority::Normal,
@@ -250,11 +250,7 @@ mod tests {
         let docs = dir.path();
         fs::create_dir_all(docs.join("claude/workspaces")).unwrap();
         fs::write(docs.join("claude/global.md"), "GLOBAL_RULES\n").unwrap();
-        fs::write(
-            docs.join("claude/workspaces/nestty.md"),
-            "WORKSPACE_RULES\n",
-        )
-        .unwrap();
+        fs::write(docs.join("claude/workspaces/copad.md"), "WORKSPACE_RULES\n").unwrap();
         fs::create_dir_all(docs.join("notes")).unwrap();
         fs::write(docs.join("notes/spec.md"), "SPEC_DETAILS\n").unwrap();
 

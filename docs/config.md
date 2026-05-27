@@ -1,17 +1,17 @@
 # Configuration
 
-Path: `~/.config/nestty/config.toml`
+Path: `~/.config/copad/config.toml`
 
 ## Generate Default Config
 
 ```bash
-nestty --init-config
+copad --init-config
 ```
 
 ## Print Config Path
 
 ```bash
-nestty --config-path
+copad --config-path
 ```
 
 ## Full Example
@@ -34,7 +34,7 @@ position = "left"   # top, bottom, left, right
 # width = 200       # tab bar width in pixels (vertical tabs)
 
 [socket]
-path = "/tmp/nestty.sock"
+path = "/tmp/copad.sock"
 
 [theme]
 name = "catppuccin-mocha"
@@ -71,7 +71,7 @@ name = "catppuccin-mocha"
 
 | Key    | Default          | Description      |
 | ------ | ---------------- | ---------------- |
-| `path` | `/tmp/nestty.sock` | Unix socket path |
+| `path` | `/tmp/copad.sock` | Unix socket path |
 
 ### [theme]
 
@@ -95,7 +95,7 @@ Map key combinations to shell commands. Commands prefixed with `spawn:` run in t
 
 **Key format:** `modifier+modifier+key` — modifiers: `ctrl`, `shift`, `alt`. Key names follow GDK naming (e.g. `a`, `b`, `bracketright`, `f1`).
 
-**Environment:** Spawned commands inherit `NESTTY_SOCKET` so scripts can communicate back to the running nestty instance via socket.
+**Environment:** Spawned commands inherit `COPAD_SOCKET` so scripts can communicate back to the running copad instance via socket.
 
 **Note:** Custom bindings override built-in shortcuts. For example, binding `ctrl+shift+b` replaces the default tab bar toggle.
 
@@ -112,7 +112,7 @@ osc52 = "deny"   # or "allow"
 | ------- | ------- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `osc52` | `deny`  | `deny` / `allow`  | Whether to honor OSC 52 clipboard writes from the PTY. `deny` drops the payload and logs one line to stderr; `allow` writes to `NSPasteboard.general`. |
 
-**Why `deny` by default:** SwiftTerm's `LocalProcessTerminalView.clipboardCopy` writes to the macOS pasteboard unconditionally and is `public` (not `open`), so we cannot override it. nestty installs a delegate proxy that consults this policy before any pasteboard access. VTE on Linux already defaults to deny; this aligns the macOS default with that.
+**Why `deny` by default:** SwiftTerm's `LocalProcessTerminalView.clipboardCopy` writes to the macOS pasteboard unconditionally and is `public` (not `open`), so we cannot override it. copad installs a delegate proxy that consults this policy before any pasteboard access. VTE on Linux already defaults to deny; this aligns the macOS default with that.
 
 Hot-reloads (no restart needed for live panes).
 

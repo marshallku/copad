@@ -1,4 +1,4 @@
-//! First-party Google Calendar service plugin for nestty.
+//! First-party Google Calendar service plugin for copad.
 //!
 //! Two run modes (selected by `argv[1]`):
 //! - **`auth`** — interactive OAuth 2.0 device-code flow. Prints a
@@ -6,15 +6,15 @@
 //!   endpoint until the user approves, then writes the resulting
 //!   `TokenSet` to the configured store (keyring with plaintext
 //!   fallback). Exits 0 on success.
-//! - **(no args)** — RPC mode. Speaks the nestty service-plugin protocol
+//! - **(no args)** — RPC mode. Speaks the copad service-plugin protocol
 //!   over stdio, provides `calendar.list_events` / `calendar.event_details`,
 //!   and runs a background poller that publishes `calendar.event_imminent`
-//!   events at the lead times configured via `NESTTY_CALENDAR_LEAD_MINUTES`.
+//!   events at the lead times configured via `COPAD_CALENDAR_LEAD_MINUTES`.
 //!
 //! If RPC mode starts with no stored token the plugin still completes
 //! `initialize` (so `provides` resolution works) but actions return
 //! `not_authenticated` and the poller stays idle until tokens appear.
-//! This lets the user run `nestty-plugin-calendar auth` while nestty is
+//! This lets the user run `copad-plugin-calendar auth` while copad is
 //! already running — the poller picks up the new token on its next tick.
 //!
 //! See the protocol contract in `docs/service-plugins.md`. Per-event
@@ -25,13 +25,13 @@
 //! Unix-only. `keyring`'s mock fallback on platforms with no native
 //! credential-store feature would let `auth` succeed without
 //! actually persisting tokens — a silent failure mode we refuse to
-//! ship. Linux + macOS is nestty's full support matrix; if/when a
+//! ship. Linux + macOS is copad's full support matrix; if/when a
 //! Windows port lands, add `windows-native` to the keyring features
 //! and relax this gate.
 
 #[cfg(not(unix))]
 compile_error!(
-    "nestty-plugin-calendar is currently Unix-only. The keyring crate's mock fallback \
+    "copad-plugin-calendar is currently Unix-only. The keyring crate's mock fallback \
      would silently lose tokens on platforms without a native credential-store \
      feature; gate exists to make that failure compile-time instead of runtime."
 );
@@ -63,7 +63,7 @@ fn main() {
         Some("auth") => run_auth(),
         Some(other) => {
             eprintln!("[calendar] unknown subcommand: {other}");
-            eprintln!("usage: nestty-plugin-calendar [auth]");
+            eprintln!("usage: copad-plugin-calendar [auth]");
             std::process::exit(2);
         }
         None => run_rpc(),
@@ -87,7 +87,7 @@ fn run_auth() {
                 eprintln!("[calendar] failed to save tokens: {e}");
                 std::process::exit(1);
             }
-            eprintln!("[calendar] auth ok — tokens stored, you can now start nestty");
+            eprintln!("[calendar] auth ok — tokens stored, you can now start copad");
         }
         Err(e) => {
             eprintln!("[calendar] auth failed: {e}");
@@ -102,7 +102,7 @@ fn run_rpc() {
         Err(e) => {
             // Don't fail init — the plugin can still echo errors back
             // for actions, and the user might fix the env vars while
-            // nestty is running. Log loudly so the cause is obvious.
+            // copad is running. Log loudly so the cause is obvious.
             eprintln!("[calendar] config error (actions will fail): {e}");
             // Use a minimal config so we can at least serve initialize.
             // Subsequent actions will return not_authenticated.
@@ -257,7 +257,7 @@ fn handle_action(
     if config.is_minimal() {
         return Err((
             "not_authenticated".to_string(),
-            "NESTTY_CALENDAR_CLIENT_ID / NESTTY_CALENDAR_CLIENT_SECRET not set".to_string(),
+            "COPAD_CALENDAR_CLIENT_ID / COPAD_CALENDAR_CLIENT_SECRET not set".to_string(),
         ));
     }
     match name {

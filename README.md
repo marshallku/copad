@@ -1,8 +1,8 @@
-# nestty
+# copad
 
 <img width="3440" height="1440" alt="image" src="https://github.com/user-attachments/assets/a1392646-1255-40ed-9722-ea8523a5c342" />
 
-A cross-platform terminal emulator built around a shared Rust core and platform-native UIs. nestty fuses the terminal with a workflow runtime — Event Bus, Action Registry, Context Service, Trigger Engine — and a plugin system, so calendars, notes, Slack, todos, and Claude Code spawns can compose with the editor as one orchestratable surface.
+A cross-platform terminal emulator built around a shared Rust core and platform-native UIs. copad fuses the terminal with a workflow runtime — Event Bus, Action Registry, Context Service, Trigger Engine — and a plugin system, so calendars, notes, Slack, todos, and Claude Code spawns can compose with the editor as one orchestratable surface.
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
@@ -21,13 +21,13 @@ A cross-platform terminal emulator built around a shared Rust core and platform-
 
 - **Terminal panel** — VTE4 on Linux, SwiftTerm on macOS; PTY handled internally on both platforms
 - **WebView panel** — WebKitGTK 6.0 (Linux) / WKWebView (macOS) as a first-class panel; URL toolbar, DevTools toggle, side-by-side with terminals
-- **Plugin panels** — HTML/JS panels loaded from `~/.config/nestty/plugins/` with an injected `nestty` JS bridge for socket calls and event subscriptions
+- **Plugin panels** — HTML/JS panels loaded from `~/.config/copad/plugins/` with an injected `copad` JS bridge for socket calls and event subscriptions
 - **Status bar** — Waybar-style 3-zone bar (left/center/right) populated by plugin modules
 
 ### Control API
 
-- **`nestctl` CLI** — full programmatic control over tabs, splits, panels, terminals, webviews, plugins, and the event stream
-- **Unix socket** at `/tmp/nestty-{PID}.sock` (auto-discovered via `NESTTY_SOCKET`), newline-delimited JSON
+- **`coctl` CLI** — full programmatic control over tabs, splits, panels, terminals, webviews, plugins, and the event stream
+- **Unix socket** at `/tmp/copad-{PID}.sock` (auto-discovered via `COPAD_SOCKET`), newline-delimited JSON
 - **Event stream** — `event.subscribe` for live `terminal.output`, `panel.focused`, `tab.created`, `webview.navigated`, plus all bus events
 - **Terminal agent API** — `terminal.read` / `state` / `exec` / `feed` / `history` / `context` for AI agents
 - **Approval workflow** — `agent.approve` shows a modal and returns the user's choice
@@ -42,7 +42,7 @@ A cross-platform terminal emulator built around a shared Rust core and platform-
 
 ### First-party Plugins
 
-`plugins/<name>/` — install with `./scripts/install-plugins.sh`. Each plugin directory holds the Rust crate (`Cargo.toml` + `src/`) and its runtime manifest/assets (`plugin.toml`, `panel.html`, `triggers.example.toml`) together. All plugins implement the service-plugin protocol (newline-JSON over stdio, supervised by nestty).
+`plugins/<name>/` — install with `./scripts/install-plugins.sh`. Each plugin directory holds the Rust crate (`Cargo.toml` + `src/`) and its runtime manifest/assets (`plugin.toml`, `panel.html`, `triggers.example.toml`) together. All plugins implement the service-plugin protocol (newline-JSON over stdio, supervised by copad).
 
 | Plugin     | Purpose                                                                     |
 | ---------- | --------------------------------------------------------------------------- |
@@ -77,7 +77,7 @@ Install GTK4, libvte-2.91-gtk4, and webkitgtk-6.0 from your distribution's packa
 
 ### macOS
 
-Xcode Command Line Tools (Swift 6, macOS 14+) and Rust (for `nestctl` and the FFI staticlib).
+Xcode Command Line Tools (Swift 6, macOS 14+) and Rust (for `coctl` and the FFI staticlib).
 
 ```bash
 xcode-select --install
@@ -91,23 +91,23 @@ xcode-select --install
 cargo build
 
 # Run the terminal (Linux)
-cargo run -p nestty-linux
+cargo run -p copad-linux
 
 # Generate a default config file
-cargo run -p nestty-linux -- --init-config
+cargo run -p copad-linux -- --init-config
 
 # Control the running terminal via CLI
-cargo run -p nestty-cli -- <command>
+cargo run -p copad-cli -- <command>
 ```
 
-For macOS dev iteration: `cd nestty-macos && ./run.sh` (debug bundle, opened in place).
+For macOS dev iteration: `cd copad-macos && ./run.sh` (debug bundle, opened in place).
 
 ## Install
 
 ### Linux — GitHub Releases (recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/marshallku/nestty/master/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/marshallku/copad/master/install.sh | bash
 ```
 
 Options: `--version vX.Y.Z` to pin a release, `--system` to install to `/usr/local/bin` (requires sudo).
@@ -117,7 +117,7 @@ Options: `--version vX.Y.Z` to pin a release, `--system` to install to `/usr/loc
 ```bash
 ./scripts/install-dev.sh           # build + install everything to ~/.local/bin (no sudo)
 ./scripts/install-dev.sh --system  # /usr/local/bin instead of ~/.local/bin (requires sudo)
-./scripts/install-dev.sh --restart # also pkill -x nestty afterwards
+./scripts/install-dev.sh --restart # also pkill -x copad afterwards
 ```
 
 Builds a release binary, installs the desktop entry, and lays down all first-party plugins via `install-plugins.sh`.
@@ -127,10 +127,10 @@ Builds a release binary, installs the desktop entry, and lays down all first-par
 ```bash
 ./scripts/install-macos.sh             # ~/Applications + ~/.cargo/bin (no sudo)
 ./scripts/install-macos.sh --system    # /Applications + ~/.cargo/bin (sudo for /Applications)
-./scripts/install-macos.sh --launch    # open Nestty.app after installing
+./scripts/install-macos.sh --launch    # open Copad.app after installing
 ```
 
-Builds `libnestty_ffi.a` (Rust staticlib) → links into the SwiftPM release build → stages and atomically installs `Nestty.app` → installs `nestctl` via `cargo install --path nestty-cli`.
+Builds `libcopad_ffi.a` (Rust staticlib) → links into the SwiftPM release build → stages and atomically installs `Copad.app` → installs `coctl` via `cargo install --path copad-cli`.
 
 ### Plugins only
 
@@ -139,18 +139,18 @@ Builds `libnestty_ffi.a` (Rust staticlib) → links into the SwiftPM release bui
 ./scripts/install-plugins.sh todo git  # install just these
 ```
 
-Restart nestty after installing/updating plugins — `discover_plugins()` only runs at startup.
+Restart copad after installing/updating plugins — `discover_plugins()` only runs at startup.
 
 ### Update
 
 ```bash
-nestctl update check    # check for new versions
-nestctl update apply    # download and install latest (Linux only — macOS users re-run install-macos.sh)
+coctl update check    # check for new versions
+coctl update apply    # download and install latest (Linux only — macOS users re-run install-macos.sh)
 ```
 
 ## Configuration
 
-Config file: `~/.config/nestty/config.toml` (entirely optional — all fields have defaults).
+Config file: `~/.config/copad/config.toml` (entirely optional — all fields have defaults).
 
 ```toml
 [terminal]
@@ -170,7 +170,7 @@ collapsed = true    # start with tab bar collapsed (icon-only)
 width = 200         # tab bar width for vertical positions
 
 [socket]
-path = "/tmp/nestty.sock"
+path = "/tmp/copad.sock"
 
 [theme]
 name = "catppuccin-mocha"
@@ -188,17 +188,17 @@ See [`docs/config.md`](./docs/config.md) for the full reference, and [`docs/work
 ## Project Structure
 
 ```
-nestty/
-├── nestty-core/                # Shared Rust library (config, protocol, event bus,
+copad/
+├── copad-core/                # Shared Rust library (config, protocol, event bus,
 │                                 # action registry, context, triggers, themes, fs_atomic)
-├── nestty-ffi/                 # Rust staticlib for Swift FFI (macOS bridge)
-├── nestty-linux/               # GTK4 + VTE4 native terminal app (binary: nestty)
-├── nestty-macos/               # Swift/AppKit + SwiftTerm app (Nestty.app)
-├── nestty-cli/                 # CLI control tool (binary: nestctl)
+├── copad-ffi/                 # Rust staticlib for Swift FFI (macOS bridge)
+├── copad-linux/               # GTK4 + VTE4 native terminal app (binary: copad)
+├── copad-macos/               # Swift/AppKit + SwiftTerm app (Copad.app)
+├── copad-cli/                 # CLI control tool (binary: coctl)
 ├── plugins/<name>/             # First-party service plugins. Each subdir holds the
 │                                 # Rust crate (Cargo.toml + src/) and its manifest/assets
 │                                 # (plugin.toml, panel.html, triggers.example.toml) together.
-│                                 # Crate names remain `nestty-plugin-<name>`.
+│                                 # Crate names remain `copad-plugin-<name>`.
 ├── examples/plugins/hello/     # Tutorial plugin: panel + bash command (no Rust crate)
 ├── scripts/                    # install-dev.sh, install-macos.sh, install-plugins.sh
 └── docs/                       # Project documentation — start at docs/INDEX.md
@@ -212,7 +212,7 @@ Start at [`docs/INDEX.md`](./docs/INDEX.md). Highlights:
 - [`workflow-runtime.md`](./docs/workflow-runtime.md) — Event Bus, Action Registry, Context Service, triggers
 - [`plugins.md`](./docs/plugins.md) — plugin manifest, JS bridge API, service-plugin RPC
 - [`service-plugins.md`](./docs/service-plugins.md) — long-running supervised subprocess design
-- [`cli.md`](./docs/cli.md) — `nestctl` reference
+- [`cli.md`](./docs/cli.md) — `coctl` reference
 - [`linux-app.md`](./docs/linux-app.md) / [`macos-app.md`](./docs/macos-app.md) — platform internals
 - [`troubleshooting.md`](./docs/troubleshooting.md) — known issues + fixes
 - [`roadmap.md`](./docs/roadmap.md) — implementation phases

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# scripts/codesign-dev.sh — Sign a Nestty.app bundle with a stable,
+# scripts/codesign-dev.sh — Sign a Copad.app bundle with a stable,
 # self-signed code-signing identity so macOS TCC remembers granted
 # permissions across rebuilds.
 #
@@ -12,16 +12,16 @@
 #   identity), and rebuilds with the same cert keep those grants.
 #
 # What it does:
-#   1. Ensures a "Nestty Dev" self-signed code-signing cert exists in the
+#   1. Ensures a "Copad Dev" self-signed code-signing cert exists in the
 #      login keychain. Creates one via `openssl` + `security import` on
 #      first run.
 #   2. codesigns the given .app bundle with that identity.
 #
 # Usage:
-#   ./scripts/codesign-dev.sh <path-to-Nestty.app>
+#   ./scripts/codesign-dev.sh <path-to-Copad.app>
 #
 # Idempotent — safe to call on every build. The first build prompts the
-# Keychain Access dialog once ("codesign wants to use key Nestty Dev");
+# Keychain Access dialog once ("codesign wants to use key Copad Dev");
 # click "Always Allow" and subsequent builds run unattended.
 #
 # Why a self-signed cert (not Apple Developer ID):
@@ -40,12 +40,12 @@ if [[ "$(uname)" != "Darwin" ]]; then
 fi
 
 if [[ $# -ne 1 ]]; then
-    echo "usage: $0 <path-to-Nestty.app>" >&2
+    echo "usage: $0 <path-to-Copad.app>" >&2
     exit 2
 fi
 
 APP_PATH="$1"
-IDENTITY="Nestty Dev"
+IDENTITY="Copad Dev"
 KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
 
 if [[ ! -d "$APP_PATH" ]]; then
@@ -93,7 +93,7 @@ create_identity() {
     #    so an empty `pass:` import also fails with "MAC verification
     #    failed". The password is throwaway — the .p12 lives only in
     #    tempdir, gets imported, then deleted.
-    local p12pass="nestty-dev-transient"
+    local p12pass="copad-dev-transient"
     openssl pkcs12 -export -legacy \
         -inkey "$tmpdir/key.pem" \
         -in "$tmpdir/cert.pem" \
@@ -127,7 +127,7 @@ create_identity() {
 
 sign_app() {
     # `--force` overwrites any prior signature (e.g. swift's ad-hoc one).
-    # `--deep` walks nested bundles. nestty-macos currently has no nested
+    # `--deep` walks nested bundles. copad-macos currently has no nested
     # frameworks, but plugin .dylibs could appear later — cheap insurance.
     # `--timestamp=none` skips the network round-trip to Apple's
     # timestamp server; this is a dev cert, no notarisation, no need.

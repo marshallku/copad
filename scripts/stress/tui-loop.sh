@@ -75,19 +75,19 @@ if command -v tmux >/dev/null 2>&1 && [ -z "${TMUX:-}" ]; then
     echo "=== tmux 3-way split (${DURATION}s) ==="
     sleep 1
     if [ -n "$TIMEOUT_BIN" ]; then
-        "$TIMEOUT_BIN" "${DURATION}s" tmux new-session -A -s nestty-stress \
+        "$TIMEOUT_BIN" "${DURATION}s" tmux new-session -A -s copad-stress \
             "tail -F /var/log/system.log 2>/dev/null || cat" \
             \; split-window -h "command -v htop >/dev/null && htop || top" \
             \; split-window -v "yes 'tmux right-bottom pane'" \
             || true
     else
-        tmux new-session -A -s nestty-stress \
+        tmux new-session -A -s copad-stress \
             "tail -F /var/log/system.log 2>/dev/null || cat" \
             \; split-window -h "command -v htop >/dev/null && htop || top" \
             \; split-window -v "yes 'tmux right-bottom pane'" \
             || true
     fi
-    tmux kill-session -t nestty-stress 2>/dev/null || true
+    tmux kill-session -t copad-stress 2>/dev/null || true
 fi
 
 echo "TUI rotation complete."

@@ -1,13 +1,13 @@
 [package]
-name = "nestty-plugin-echo"
+name = "copad-plugin-echo"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Mock service plugin for nestty — verifies the protocol shape end-to-end."
+description = "Mock service plugin for copad — verifies the protocol shape end-to-end."
 repository.workspace = true
 
 [[bin]]
-name = "nestty-plugin-echo"
+name = "copad-plugin-echo"
 path = "src/main.rs"
 
 [dependencies]

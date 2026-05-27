@@ -1,4 +1,4 @@
-// nestty web-bridge service worker.
+// copad web-bridge service worker.
 // Owns two things: (1) PWA install lifecycle, (2) push events.
 // Deliberately no offline caching — the SPA is small + cache complexity
 // outweighs the rare offline benefit. If we later want offline-attach
@@ -20,9 +20,9 @@ self.addEventListener("activate", (e) => {
 self.addEventListener("push", (e) => {
   let data = {};
   try { data = e.data ? e.data.json() : {}; } catch { data = { body: (e.data && e.data.text()) || "" }; }
-  const title = data.title || "nestty";
+  const title = data.title || "copad";
   const body = data.body || "";
-  const tag = data.tag || ("nestty-" + Date.now());
+  const tag = data.tag || ("copad-" + Date.now());
   const url = data.url || "/";
   const opts = {
     body,

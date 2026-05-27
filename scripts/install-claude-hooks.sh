@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# install-claude-hooks.sh — wire Claude Code hook scripts to the nestty bus.
+# install-claude-hooks.sh — wire Claude Code hook scripts to the copad bus.
 #
 # Sentinel-based, idempotent. Users mark the patch point in their own
 # hook scripts with:
 #
-#     # NESTTY_HOOK_PUBLISH: <kind> [<json-payload>]
+#     # COPAD_HOOK_PUBLISH: <kind> [<json-payload>]
 #
 # and this script inserts a bus-publish line right after, bracketed by:
 #
-#     # NESTTY_HOOK_PUBLISH_END
+#     # COPAD_HOOK_PUBLISH_END
 #
 # so re-runs are no-ops and `--uninstall` is a clean removal. The patch
 # point stays under the user's control (you put the sentinel where the
 # event semantically fires); the patcher just writes the mechanical
-# `nestctl event publish ...` line.
+# `coctl event publish ...` line.
 #
 # Usage:
 #   install-claude-hooks.sh                # install across default dirs
@@ -31,15 +31,15 @@ set -euo pipefail
 SCRIPT_NAME="${0##*/}"
 
 # Sentinel grammar:
-#   # NESTTY_HOOK_PUBLISH: <kind> [<json-payload>]
+#   # COPAD_HOOK_PUBLISH: <kind> [<json-payload>]
 #
 # `<kind>` is the bus event kind (e.g. `claude.commit_blocked`).
 # `<json-payload>` is optional; when omitted, `{}` is used. When
-# present, it's a literal JSON string passed verbatim to `nestctl event
+# present, it's a literal JSON string passed verbatim to `coctl event
 # publish`; shell-style `${VAR}` expansions inside it are expanded by
 # the hook script at run-time (we DO NOT escape `${`).
-SENTINEL_START='# NESTTY_HOOK_PUBLISH:'
-SENTINEL_END='# NESTTY_HOOK_PUBLISH_END'
+SENTINEL_START='# COPAD_HOOK_PUBLISH:'
+SENTINEL_END='# COPAD_HOOK_PUBLISH_END'
 
 DEFAULT_HOOKS_DIRS=("$HOME/.claude/hooks" "$HOME/.claude/scripts")
 
@@ -72,7 +72,7 @@ process_file() {
     fi
 
     local tmp
-    tmp=$(mktemp "${file}.nestty-patch.XXXXXX")
+    tmp=$(mktemp "${file}.copad-patch.XXXXXX")
     # AWK state machine: buffer the sentinel line on hit, defer
     # emission until we know whether an END marker follows (within
     # `LOOKAHEAD` lines of body). Any lines between sentinel and END
@@ -133,7 +133,7 @@ process_file() {
                 # `\` and `\"` → `"`, so the emitted text round-
                 # trips to the literal user payload. Codex C1
                 # round 5: without the `\` escape, `\\tmp` in JSON
-                # arrived at nestctl as `\tmp`.
+                # arrived at coctl as `\tmp`.
                 escaped_payload = payload
                 gsub(/\\/, "\\\\\\\\", escaped_payload)
                 gsub(/"/, "\\\"", escaped_payload)
@@ -141,7 +141,7 @@ process_file() {
             # Print BOTH the publish line and the END marker with
             # matching indent so callers do not need to echo
             # end_marker themselves with the right whitespace.
-            printf "%scommand -v nestctl >/dev/null && nestctl event publish %s --quiet \"%s\" &\n", indent, kind, escaped_payload
+            printf "%scommand -v coctl >/dev/null && coctl event publish %s --quiet \"%s\" &\n", indent, kind, escaped_payload
             printf "%s%s\n", indent, end_marker
         }
         function flush_pending(    i) {
@@ -322,12 +322,12 @@ run_self_test() {
     cat > "$tmp/test1.sh" <<'EOF'
 #!/bin/sh
 echo "before"
-# NESTTY_HOOK_PUBLISH: claude.commit_blocked {"reason":"$R"}
+# COPAD_HOOK_PUBLISH: claude.commit_blocked {"reason":"$R"}
 echo "after"
 EOF
     process_file install "$tmp/test1.sh"
-    if grep -qF 'nestctl event publish claude.commit_blocked --quiet' "$tmp/test1.sh" \
-        && grep -qF 'NESTTY_HOOK_PUBLISH_END' "$tmp/test1.sh"; then
+    if grep -qF 'coctl event publish claude.commit_blocked --quiet' "$tmp/test1.sh" \
+        && grep -qF 'COPAD_HOOK_PUBLISH_END' "$tmp/test1.sh"; then
         _selftest_pass "install adds publish line + END"
     else
         _selftest_fail "test1" "missing publish/end after install: $(cat "$tmp/test1.sh")"
@@ -346,7 +346,7 @@ EOF
     # (or leaves the sentinel for re-install).
     process_file uninstall "$tmp/test1.sh"
     if grep -qF "$SENTINEL_START" "$tmp/test1.sh" \
-        && ! grep -qF 'nestctl event publish claude.commit_blocked' "$tmp/test1.sh" \
+        && ! grep -qF 'coctl event publish claude.commit_blocked' "$tmp/test1.sh" \
         && ! grep -qF "$SENTINEL_END" "$tmp/test1.sh"; then
         _selftest_pass "uninstall removes publish + END, keeps sentinel"
     else
@@ -356,10 +356,10 @@ EOF
     # Test 4: empty payload defaults to {}.
     cat > "$tmp/test4.sh" <<'EOF'
 #!/bin/sh
-# NESTTY_HOOK_PUBLISH: claude.simple_event
+# COPAD_HOOK_PUBLISH: claude.simple_event
 EOF
     process_file install "$tmp/test4.sh"
-    if grep -qF 'nestctl event publish claude.simple_event --quiet "{}"' "$tmp/test4.sh"; then
+    if grep -qF 'coctl event publish claude.simple_event --quiet "{}"' "$tmp/test4.sh"; then
         _selftest_pass "empty payload defaults to {}"
     else
         _selftest_fail "test4" "payload default wrong: $(cat "$tmp/test4.sh")"
@@ -384,27 +384,27 @@ EOF
     cat > "$tmp/test6.sh" <<'EOF'
 #!/bin/sh
 if cond1; then
-# NESTTY_HOOK_PUBLISH: claude.commit_blocked {"reason":"cond1"}
+# COPAD_HOOK_PUBLISH: claude.commit_blocked {"reason":"cond1"}
 echo "denied 1"
 fi
 if cond2; then
-# NESTTY_HOOK_PUBLISH: claude.commit_blocked {"reason":"cond2"}
+# COPAD_HOOK_PUBLISH: claude.commit_blocked {"reason":"cond2"}
 echo "denied 2"
 fi
 EOF
     process_file install "$tmp/test6.sh"
-    # Count actual publish lines (grep on the `nestctl event publish` prefix
+    # Count actual publish lines (grep on the `coctl event publish` prefix
     # avoids the false-positive of matching the user's sentinel-comment
     # `reason` token too).
     local publish_count
-    publish_count=$(grep -cF 'nestctl event publish' "$tmp/test6.sh" || true)
+    publish_count=$(grep -cF 'coctl event publish' "$tmp/test6.sh" || true)
     local end_count
     end_count=$(grep -cF "$SENTINEL_END" "$tmp/test6.sh" || true)
     # Verify each publish carries the right reason.
     local cond1_pub
-    cond1_pub=$(grep -cE 'nestctl event publish.*reason.*cond1' "$tmp/test6.sh" || true)
+    cond1_pub=$(grep -cE 'coctl event publish.*reason.*cond1' "$tmp/test6.sh" || true)
     local cond2_pub
-    cond2_pub=$(grep -cE 'nestctl event publish.*reason.*cond2' "$tmp/test6.sh" || true)
+    cond2_pub=$(grep -cE 'coctl event publish.*reason.*cond2' "$tmp/test6.sh" || true)
     if [[ "$publish_count" -eq 2 && "$end_count" -eq 2 && "$cond1_pub" -eq 1 && "$cond2_pub" -eq 1 ]]; then
         _selftest_pass "multiple sentinels patched independently"
     else
@@ -414,7 +414,7 @@ EOF
     # Test 7: dry-run never writes.
     cat > "$tmp/test7.sh" <<'EOF'
 #!/bin/sh
-# NESTTY_HOOK_PUBLISH: claude.dryrun
+# COPAD_HOOK_PUBLISH: claude.dryrun
 EOF
     cp "$tmp/test7.sh" "$tmp/test7.before"
     process_file dry-run "$tmp/test7.sh" > /dev/null
@@ -430,31 +430,31 @@ EOF
     cat > "$tmp/test9.sh" <<'EOF'
 #!/bin/sh
 R=hello
-# NESTTY_HOOK_PUBLISH: claude.commit_blocked {"reason":"$R"}
+# COPAD_HOOK_PUBLISH: claude.commit_blocked {"reason":"$R"}
 EOF
     process_file install "$tmp/test9.sh"
     # The emitted line should contain `\"reason\":\"$R\"` (escaped),
     # NOT a literal `"reason":"$R"` which would shell-parse into
     # broken JSON tokens.
-    if grep -qE 'nestctl event publish claude.commit_blocked --quiet "\{\\"reason\\":\\"\$R\\"\}"' "$tmp/test9.sh"; then
+    if grep -qE 'coctl event publish claude.commit_blocked --quiet "\{\\"reason\\":\\"\$R\\"\}"' "$tmp/test9.sh"; then
         _selftest_pass "double-quote payload is escaped for bash"
     else
-        _selftest_fail "test9" "payload not escaped: $(grep nestctl "$tmp/test9.sh")"
+        _selftest_fail "test9" "payload not escaped: $(grep coctl "$tmp/test9.sh")"
     fi
-    # Execute the patched script with `nestctl` shimmed to a function
+    # Execute the patched script with `coctl` shimmed to a function
     # that echoes the payload it receives — proves the bash-level
-    # quoting is correct end-to-end. `command -v nestctl` succeeds
+    # quoting is correct end-to-end. `command -v coctl` succeeds
     # because the function is in scope; the function then prints the
     # 4th argv (`<kind> --quiet "<payload>"` → payload at $3).
     local payload_observed
     payload_observed=$(
-        nestctl() {
+        coctl() {
             # $1=event, $2=publish, $3=<kind>, $4=--quiet, $5=<payload>
             printf '%s\n' "$5"
         }
-        export -f nestctl 2>/dev/null || true
+        export -f coctl 2>/dev/null || true
         R=hello bash <<EOS
-nestctl() { printf '%s\n' "\$5"; }
+coctl() { printf '%s\n' "\$5"; }
 $(cat "$tmp/test9.sh")
 EOS
     )
@@ -472,10 +472,10 @@ EOS
     cat > "$tmp/test11.sh" <<'EOF'
 #!/bin/sh
 R='unsafe "value'
-# NESTTY_HOOK_PUBLISH: claude.commit_blocked $(printf '{"reason":"%s"}' "$R")
+# COPAD_HOOK_PUBLISH: claude.commit_blocked $(printf '{"reason":"%s"}' "$R")
 EOF
     process_file install "$tmp/test11.sh"
-    # Run with nestctl shimmed; expect the printf substitution to
+    # Run with coctl shimmed; expect the printf substitution to
     # have produced a literal JSON payload string (printf is not a
     # JSON-escaping tool, so this test just verifies the `$(...)`
     # round-trips, not that printf produces valid JSON — that's the
@@ -483,7 +483,7 @@ EOF
     local payload_observed
     payload_observed=$(
         R='unsafe "value' bash <<EOS
-nestctl() { printf '%s\n' "\$5"; }
+coctl() { printf '%s\n' "\$5"; }
 $(cat "$tmp/test11.sh")
 EOS
     )
@@ -501,13 +501,13 @@ EOS
     # action handler.
     cat > "$tmp/test13.sh" <<'EOF'
 #!/bin/sh
-# NESTTY_HOOK_PUBLISH: claude.path_event {"path":"C:\\tmp\\file"}
+# COPAD_HOOK_PUBLISH: claude.path_event {"path":"C:\\tmp\\file"}
 EOF
     process_file install "$tmp/test13.sh"
     local payload_observed
     payload_observed=$(
         bash <<EOS
-nestctl() { printf '%s\n' "\$5"; }
+coctl() { printf '%s\n' "\$5"; }
 $(cat "$tmp/test13.sh")
 EOS
     )
@@ -529,17 +529,17 @@ EOS
     mkdir -p "$tmp/real-hooks" "$tmp/link-hooks"
     cat > "$tmp/real-hooks/hook.sh" <<'EOF'
 #!/bin/sh
-# NESTTY_HOOK_PUBLISH: claude.symlink_test
+# COPAD_HOOK_PUBLISH: claude.symlink_test
 EOF
     ln -s "$tmp/real-hooks/hook.sh" "$tmp/link-hooks/hook.sh"
     process_file install "$tmp/link-hooks/hook.sh"
     # The symlink itself must still exist and still point at the
     # real file (not be replaced with a regular file).
     if [[ -L "$tmp/link-hooks/hook.sh" ]] \
-        && grep -qF 'nestctl event publish claude.symlink_test' "$tmp/real-hooks/hook.sh"; then
+        && grep -qF 'coctl event publish claude.symlink_test' "$tmp/real-hooks/hook.sh"; then
         _selftest_pass "file-level symlink survives, target updated"
     else
-        _selftest_fail "test14" "symlink replaced or target unmodified: link=$(stat -c '%F' "$tmp/link-hooks/hook.sh" 2>/dev/null) real-content=$(grep -c nestctl "$tmp/real-hooks/hook.sh")"
+        _selftest_fail "test14" "symlink replaced or target unmodified: link=$(stat -c '%F' "$tmp/link-hooks/hook.sh" 2>/dev/null) real-content=$(grep -c coctl "$tmp/real-hooks/hook.sh")"
     fi
 
     # Test 15 (codex C1 round 10 regression): RELATIVE symlink with
@@ -550,17 +550,17 @@ EOF
     mkdir -p "$tmp/relreal" "$tmp/rellink"
     cat > "$tmp/relreal/hook.sh" <<'EOF'
 #!/bin/sh
-# NESTTY_HOOK_PUBLISH: claude.relative_symlink
+# COPAD_HOOK_PUBLISH: claude.relative_symlink
 EOF
     # Symlink with relative target.
     (cd "$tmp/rellink" && ln -s ../relreal/hook.sh hook.sh)
     # Run from a cwd that does NOT resolve the relative path.
     (cd / && process_file install "$tmp/rellink/hook.sh")
     if [[ -L "$tmp/rellink/hook.sh" ]] \
-        && grep -qF 'nestctl event publish claude.relative_symlink' "$tmp/relreal/hook.sh"; then
+        && grep -qF 'coctl event publish claude.relative_symlink' "$tmp/relreal/hook.sh"; then
         _selftest_pass "relative symlink canonicalized to absolute target"
     else
-        _selftest_fail "test15" "relative symlink mishandled (link=$(stat -c '%F' "$tmp/rellink/hook.sh" 2>/dev/null) real-content=$(grep -c nestctl "$tmp/relreal/hook.sh"))"
+        _selftest_fail "test15" "relative symlink mishandled (link=$(stat -c '%F' "$tmp/rellink/hook.sh" 2>/dev/null) real-content=$(grep -c coctl "$tmp/relreal/hook.sh"))"
     fi
 
     # Test 16 (codex C2 round 10 regression): mode is read from the
@@ -569,7 +569,7 @@ EOF
     # file would chmod the underlying target world-writable.
     cat > "$tmp/relreal/mode.sh" <<'EOF'
 #!/bin/sh
-# NESTTY_HOOK_PUBLISH: claude.mode_via_symlink
+# COPAD_HOOK_PUBLISH: claude.mode_via_symlink
 EOF
     chmod 0640 "$tmp/relreal/mode.sh"
     (cd "$tmp/rellink" && ln -sf ../relreal/mode.sh mode.sh)
@@ -585,13 +585,13 @@ EOF
     # Test 12 (codex C1 round 4 regression): sentinel inside an
     # indented case branch (the documented placement in
     # docs/harness-hooks.md § codex-review.sh). The parser must use
-    # the index of `# NESTTY_HOOK_PUBLISH:` within the line, not the
+    # the index of `# COPAD_HOOK_PUBLISH:` within the line, not the
     # column-1 assumption that broke this.
     cat > "$tmp/test12.sh" <<'EOF'
 #!/bin/sh
 case "$VERDICT" in
     "APPROVED")
-        # NESTTY_HOOK_PUBLISH: claude.review_approved {"session":"$SESSION"}
+        # COPAD_HOOK_PUBLISH: claude.review_approved {"session":"$SESSION"}
         exit 0
         ;;
 esac
@@ -599,10 +599,10 @@ EOF
     process_file install "$tmp/test12.sh"
     # The emitted publish must carry `claude.review_approved` as the
     # kind — NOT something derived from the slice misalignment.
-    if grep -qE 'nestctl event publish claude.review_approved --quiet' "$tmp/test12.sh"; then
+    if grep -qE 'coctl event publish claude.review_approved --quiet' "$tmp/test12.sh"; then
         _selftest_pass "indented sentinel parses correctly"
     else
-        _selftest_fail "test12" "indented sentinel slice misaligned: $(grep nestctl "$tmp/test12.sh" || echo NONE)"
+        _selftest_fail "test12" "indented sentinel slice misaligned: $(grep coctl "$tmp/test12.sh" || echo NONE)"
     fi
 
     # Test 10 (codex C1 round 2 regression): patched file keeps its
@@ -612,7 +612,7 @@ EOF
     # via `stat` with both flag styles and reapply before the mv.
     cat > "$tmp/test10.sh" <<'EOF'
 #!/bin/sh
-# NESTTY_HOOK_PUBLISH: claude.mode_test
+# COPAD_HOOK_PUBLISH: claude.mode_test
 EOF
     chmod 0755 "$tmp/test10.sh"
     process_file install "$tmp/test10.sh"
@@ -626,10 +626,10 @@ EOF
     cat > "$tmp/test8.sh" <<'EOF'
 #!/bin/sh
 echo "before"
-# NESTTY_HOOK_PUBLISH: claude.eof
+# COPAD_HOOK_PUBLISH: claude.eof
 EOF
     process_file install "$tmp/test8.sh"
-    if grep -qF 'nestctl event publish claude.eof' "$tmp/test8.sh" \
+    if grep -qF 'coctl event publish claude.eof' "$tmp/test8.sh" \
         && grep -qF "$SENTINEL_END" "$tmp/test8.sh"; then
         _selftest_pass "sentinel at EOF gets paired"
     else
@@ -675,8 +675,8 @@ if [[ ${#HOOKS_DIRS[@]} -eq 0 ]]; then
     HOOKS_DIRS=("${DEFAULT_HOOKS_DIRS[@]}")
 fi
 
-if [[ "$MODE" == "install" ]] && ! command -v nestctl >/dev/null 2>&1; then
-    log "warning: nestctl not on PATH — patches will be inert until you install nestty"
+if [[ "$MODE" == "install" ]] && ! command -v coctl >/dev/null 2>&1; then
+    log "warning: coctl not on PATH — patches will be inert until you install copad"
 fi
 
 for dir in "${HOOKS_DIRS[@]}"; do

@@ -2,17 +2,17 @@
 
 ## Overview
 
-nestty is a cross-platform custom terminal emulator built with a shared Rust core and platform-native UIs. Originally planned with Tauri v2 + React, but pivoted to native UIs due to Tauri IPC input latency (see [decisions.md](./decisions.md)).
+copad is a cross-platform custom terminal emulator built with a shared Rust core and platform-native UIs. Originally planned with Tauri v2 + React, but pivoted to native UIs due to Tauri IPC input latency (see [decisions.md](./decisions.md)).
 
 ## Crate Layout
 
 ```
-nestty/
+copad/
 ├── Cargo.toml              # Workspace root (resolver = "2", edition = "2024")
 ├── plugins/                  # First-party plugins. Each subdir holds the Rust crate
 │   │                            # (`Cargo.toml` + `src/`) AND its runtime manifest /
 │   │                            # assets (`plugin.toml`, `panel.html`, `triggers.example.toml`)
-│   │                            # side-by-side. Crate names remain `nestty-plugin-<name>`.
+│   │                            # side-by-side. Crate names remain `copad-plugin-<name>`.
 │   ├── echo/                 # Mock service plugin (verifies protocol shape)
 │   │   └── src/main.rs            # newline-JSON over stdio: echo.ping + system.heartbeat
 │   ├── kb/                   # First-party KB plugin (grep + filename over ~/docs)
@@ -39,7 +39,7 @@ nestty/
 │   │   └── src/                    # main.rs (RPC loop + actions), config.rs (env),
 │   │                                # todo.rs (Todo struct + frontmatter parse/render +
 │   │                                # surgical update_status_in_text), store.rs (atomic
-│   │                                # create via nestty_core::fs_atomic::rename_no_replace —
+│   │                                # create via copad_core::fs_atomic::rename_no_replace —
 │   │                                # Linux renameat2(RENAME_NOREPLACE) / macOS
 │   │                                # renamex_np(RENAME_EXCL); list_all, set_status,
 │   │                                # delete; mirrors KB security posture), watcher.rs
@@ -49,34 +49,34 @@ nestty/
 │   │   │                            # (lightweight: argv-vector shell-outs to `git`, no
 │   │   │                            # external API, no keyring; cross-platform Linux+macOS)
 │   │   └── src/                    # main.rs (RPC + actions + worktree_add.completed event),
-│   │                                # config.rs (~/.config/nestty/workspaces.toml loader with
+│   │                                # config.rs (~/.config/copad/workspaces.toml loader with
 │   │                                # canonicalization), git.rs (current_branch, list_worktrees
 │   │                                # porcelain v2 parser, worktree_add/remove, status v2 parser,
 │   │                                # validate_branch_name)
 │   └── web-bridge/           # First-party HTTP+WS broker plugin (Slice 3.0 remote-harness).
 │       │                            # Service-plugin model (stdio RPC minimal) + own axum
 │       │                            # tokio listener + raw daemon-socket client (RPC + subscribe)
-│       │                            # via NESTTY_SOCKET (supervisor-injected). Bearer-token
+│       │                            # via COPAD_SOCKET (supervisor-injected). Bearer-token
 │       │                            # auth (Authorization header / Sec-WebSocket-Protocol).
 │       │                            # Localhost bind by default — external access (Tailscale /
 │       │                            # SSH tunnel / cloudflared) is the user's perimeter.
 │       │── src/main.rs        # stdio handshake + token validation + tokio runtime spawn +
 │       │                            # all axum routes (REST + WS overview + WS attach)
 │       │── src/daemon_client.rs   # rpc() async UnixStream; subscribe() sync UnixStream via
-│       │                            # spawn_blocking (matches nestctl wire model)
+│       │                            # spawn_blocking (matches coctl wire model)
 │       │── src/tmux.rs        # Slice 3.1 — list_panes, capture_pane, send_text (load-buffer +
 │       │                            # paste-buffer), find_pane lookup. Single-shellout list-panes -a
 │       │                            # avoids N+1; capture_pane keeps ANSI via -e.
 │       │── plugin.toml        # onStartup, provides=[], env docs
 │       └── static/index.html  # mobile-first vanilla SPA — two modes (overview cards + xterm
 │                                    # attach via CDN xterm.js@5.5.0); include_str!'d into binary
-# claude.start: nestty-internal socket action (lives in nestty-linux/src/socket.rs).
+# claude.start: copad-internal socket action (lives in copad-linux/src/socket.rs).
 # Spawns a tab whose terminal cwd is the worktree, feeds
 # `tmux new-session -A -s <name> 'claude [--resume <id>]'` into it.
 # Returns {panel_id, tab, tmux_session, workspace_path}.
 # Slice 1 ships without `prompt` seeding (interactive REPL stdin is
 # tricky); pass `prompt` and you'll get not_implemented.
-├── nestty-core/            # Shared Rust library — canonical wire formats and validation
+├── copad-core/            # Shared Rust library — canonical wire formats and validation
 │   │                            # for everything that crosses the Linux/macOS boundary.
 │   └── src/
 │       ├── lib.rs              # Module declarations
@@ -103,17 +103,17 @@ nestty/
 │       ├── theme.rs            # 10 built-in Catppuccin/Solarized/etc. palettes
 │       ├── thread_pool.rs      # Bounded worker pool for blocking action handlers
 │       └── trigger.rs          # TriggerEngine + TriggerSink trait + condition matching
-├── nestty-ffi/             # C-ABI bridge from nestty-core to platform UIs that can't
-│   │                            # link Rust directly (currently nestty-macos). One staticlib
-│   │                            # `libnestty_ffi.a` linked into Nestty.app; hand-mirrored C
-│   │                            # header at nestty-macos/Sources/CNesttyFFI/include/nestty_ffi.h.
+├── copad-ffi/             # C-ABI bridge from copad-core to platform UIs that can't
+│   │                            # link Rust directly (currently copad-macos). One staticlib
+│   │                            # `libcopad_ffi.a` linked into Copad.app; hand-mirrored C
+│   │                            # header at copad-macos/Sources/CCopadFFI/include/copad_ffi.h.
 │   │                            # Ownership convention: owned strings cross as `*mut c_char`
-│   │                            # (caller frees with `nestty_ffi_free_string`), bool-ish
+│   │                            # (caller frees with `copad_ffi_free_string`), bool-ish
 │   │                            # returns use 1/0/-1, diagnostics via thread-local
-│   │                            # `nestty_ffi_last_error`. See decisions.md #44.
+│   │                            # `copad_ffi_last_error`. See decisions.md #44.
 │   └── src/lib.rs              # Exported surfaces: engine (TriggerEngine + ActionRegistry +
 │                               #   EventBus), theme, session, background, plugin validation.
-├── nestty-linux/           # GTK4 + VTE4 native terminal
+├── copad-linux/           # GTK4 + VTE4 native terminal
 │   ├── src/
 │   │   ├── main.rs          # Entry point, CLI flags (--init-config, --config-path)
 │   │   ├── app.rs           # GtkApplication setup, dark theme
@@ -129,26 +129,26 @@ nestty/
 │   │   ├── service_supervisor.rs  # Service plugin host: spawn/restart, init handshake, RPC
 │   │   ├── statusbar.rs     # Waybar-style status bar (WebView + plugin modules)
 │   │   └── socket.rs        # Unix socket server + command dispatcher
-│   ├── com.marshall.nestty.desktop  # Desktop entry — basename matches app_id (Wayland window↔launcher mapping)
-│   ├── icons/hicolor/<size>/apps/nestty.png  # Pre-built theme icons (16,22,24,32,48,64,128,256,512)
+│   ├── com.marshall.copad.desktop  # Desktop entry — basename matches app_id (Wayland window↔launcher mapping)
+│   ├── icons/hicolor/<size>/apps/copad.png  # Pre-built theme icons (16,22,24,32,48,64,128,256,512)
 │   └── install.sh           # Build + install script
-├── nestty-cli/             # CLI control tool (binary: nestctl)
+├── copad-cli/             # CLI control tool (binary: coctl)
 │   └── src/
 │       ├── main.rs          # Entry point, output formatting
 │       ├── commands.rs      # clap subcommands (session, background, tab, split, event, webview)
 │       └── client.rs        # Unix socket client
-└── nestty-macos/           # Swift/AppKit native terminal (Phases 1–3 complete)
+└── copad-macos/           # Swift/AppKit native terminal (Phases 1–3 complete)
     ├── Package.swift        # Swift Package Manager config (Swift 6, macOS 14+, SwiftTerm dep)
-    └── Sources/Nestty/
-        ├── NesttyApp.swift            # @main entry point
+    └── Sources/Copad/
+        ├── CopadApp.swift            # @main entry point
         ├── AppDelegate.swift        # NSApplicationDelegate, menu bar, socket command routing
         ├── TabViewController.swift  # Tab list manager, PaneManager array
         ├── TabBarView.swift         # Custom tab bar + add-panel popover
         ├── PaneManager.swift        # Split-pane tree for a single tab
-        ├── SplitNode.swift          # N-ary split tree (any NesttyPanel leaves)
-        ├── NesttyPanel.swift          # Common protocol for terminal + webview panels
+        ├── SplitNode.swift          # N-ary split tree (any CopadPanel leaves)
+        ├── CopadPanel.swift          # Common protocol for terminal + webview panels
         ├── TerminalViewController.swift  # SwiftTerm wrapper, shell, delegates
-        ├── WebViewController.swift  # WKWebView wrapper, NesttyPanel impl
+        ├── WebViewController.swift  # WKWebView wrapper, CopadPanel impl
         ├── EventBus.swift           # Event broadcast hub + per-subscriber channel
         ├── SocketServer.swift       # POSIX Unix socket server (async completion handler)
         ├── Config.swift             # TOML config parser (macOS-extension fields:
@@ -157,17 +157,17 @@ nestty/
         │                                  # Reload semantics match Linux: parse failure preserves
         │                                  # the previous live config.
         ├── Session.swift            # Tab/split snapshot wire model. Persistence (load/save/
-        │                                  # clear) delegates to `nestty_ffi_session_*`; in-memory
+        │                                  # clear) delegates to `copad_ffi_session_*`; in-memory
         │                                  # Codable types stay Swift-side because PaneManager
         │                                  # builds and consumes them.
         ├── BackgroundRotator.swift  # Path resolution stays here; reader/entropy/mode-toggle
-        │                                  # routes through `nestty_ffi_background_*`.
+        │                                  # routes through `copad_ffi_background_*`.
         ├── PluginManifest.swift     # Discovery + dir retention + duplicate-name winner pick
         │                                  # stay Swift-side; TOML parse + schema validation
-        │                                  # delegate to `nestty_ffi_plugin_validate_toml`.
-        └── Theme.swift              # Thin FFI wrapper around `nestty_core::theme::Theme`
-                                          # (fetched via `nestty_ffi_theme_get/_list`). Hex-string
-                                          # `Wire: Decodable` → existing RGBColor/NesttyTheme model.
+        │                                  # delegate to `copad_ffi_plugin_validate_toml`.
+        └── Theme.swift              # Thin FFI wrapper around `copad_core::theme::Theme`
+                                          # (fetched via `copad_ffi_theme_get/_list`). Hex-string
+                                          # `Wire: Decodable` → existing RGBColor/CopadTheme model.
 ```
 
 ## Tech Stack
@@ -178,43 +178,43 @@ nestty/
 | Linux terminal  | GTK4 + VTE4 (VTE handles PTY internally, zero IPC overhead)                                                                            |
 | macOS terminal  | Swift/AppKit + SwiftTerm (LocalProcessTerminalView)                                                                                    |
 | CLI tool        | clap (Rust)                                                                                                                            |
-| Config          | TOML (`~/.config/nestty/config.toml`)                                                                                                  |
+| Config          | TOML (`~/.config/copad/config.toml`)                                                                                                  |
 | IPC             | Unix domain socket, cmux V2 newline-delimited JSON                                                                                     |
-| Background mgmt | File cache at `~/.cache/terminal-wallpapers.txt` (Linux) or `~/Library/Caches/nestty/wallpapers.txt` (macOS, falls back to Linux path) |
+| Background mgmt | File cache at `~/.cache/terminal-wallpapers.txt` (Linux) or `~/Library/Caches/copad/wallpapers.txt` (macOS, falls back to Linux path) |
 | Theme           | Catppuccin Mocha (hardcoded palette)                                                                                                   |
 
 ## Key Dependencies
 
-### nestty-core
+### copad-core
 
 - `serde 1` + `serde_json 1` + `toml 0.8` - Serialization
 - `dirs 6` - XDG directories
 - `thiserror 2` - Error types
 
-### nestty-linux
+### copad-linux
 
 - `gtk4 0.9` (features: `gnome_46`) - UI framework
 - `vte4 0.8` - Terminal widget (libvte-2.91-gtk4)
 - `webkit6 0.4` - WebView panel (WebKitGTK 6.0)
 - `env_logger 0.11` - Logging
 
-### nestty-cli
+### copad-cli
 
 - `clap 4` (features: `derive`) - Argument parsing
 - `uuid 1` - Request IDs
 
 ## Socket Server (IPC)
 
-nestty runs a Unix domain socket server for programmatic control alongside D-Bus.
+copad runs a Unix domain socket server for programmatic control alongside D-Bus.
 
-**Path**: `/tmp/nestty-{PID}.sock` (per-process, discovered via `NESTTY_SOCKET` env var)
+**Path**: `/tmp/copad-{PID}.sock` (per-process, discovered via `COPAD_SOCKET` env var)
 
-**Protocol**: Newline-delimited JSON (`Request` → `Response`, defined in `nestty-core/protocol.rs`)
+**Protocol**: Newline-delimited JSON (`Request` → `Response`, defined in `copad-core/protocol.rs`)
 
 **Architecture**:
 
 ```
-nestctl ──Unix socket──► socket server (per-client thread)
+coctl ──Unix socket──► socket server (per-client thread)
                                 │
                           mpsc::channel
                                 │
@@ -255,7 +255,7 @@ Clients can subscribe to real-time events via `event.subscribe`. The socket stay
 | `webview.navigated` | `{panel_id, url}` | WebView URI changes |
 | `tab.renamed` | `{panel_id, title}` | Tab renamed |
 
-**Usage**: `nestctl event subscribe` — prints events as JSON lines to stdout.
+**Usage**: `coctl event subscribe` — prints events as JSON lines to stdout.
 
 ## Query API
 
@@ -283,12 +283,12 @@ All commands default to the active terminal panel when `id` is omitted.
 **CLI usage**:
 
 ```bash
-nestctl terminal state
-nestctl terminal read --start-row 0 --end-row 5
-nestctl terminal exec "ls -la"
-nestctl terminal feed $'\x03'  # Send Ctrl+C
-nestctl terminal history --lines 200
-nestctl terminal context --history-lines 100
+coctl terminal state
+coctl terminal read --start-row 0 --end-row 5
+coctl terminal exec "ls -la"
+coctl terminal feed $'\x03'  # Send Ctrl+C
+coctl terminal history --lines 200
+coctl terminal context --history-lines 100
 ```
 
 ## Approval Workflow
@@ -304,18 +304,18 @@ Shows a modal GTK dialog and blocks until the user responds. The `actions` param
 **CLI usage**:
 
 ```bash
-nestctl agent approve "Delete 15 files from /tmp?"
-nestctl agent approve "Deploy to production?" --title "Deploy" --actions "Deploy,Cancel"
+coctl agent approve "Delete 15 files from /tmp?"
+coctl agent approve "Deploy to production?" --title "Deploy" --actions "Deploy,Cancel"
 ```
 
 ## Panel System
 
-nestty supports multiple panel types via the `PanelVariant` enum:
+copad supports multiple panel types via the `PanelVariant` enum:
 
 - **Terminal** (`TerminalPanel`): VTE4 terminal with shell, background images, search
 - **WebView** (`WebViewPanel`): WebKitGTK 6.0 browser panel with JS execution, URL toolbar (back/forward/reload/URL entry/DevTools toggle)
 
-- **Plugin** (`PluginPanel`): WebView-based custom panel loaded from plugin HTML with injected `nestty` JS bridge
+- **Plugin** (`PluginPanel`): WebView-based custom panel loaded from plugin HTML with injected `copad` JS bridge
 
 The `Panel` trait provides a common interface (`widget()`, `title()`, `panel_type()`, `grab_focus()`, `id()`). `PanelVariant` delegates to the inner type and provides `as_terminal()` / `as_webview()` / `as_plugin()` accessors.
 
@@ -355,9 +355,9 @@ The tab bar has two modes: **collapsed** (icon-only, default) and **expanded** (
 
 ## Plugin System
 
-Plugins extend nestty with custom panels (HTML/JS UIs) and commands (shell scripts).
+Plugins extend copad with custom panels (HTML/JS UIs) and commands (shell scripts).
 
-**Plugin directory**: `~/.config/nestty/plugins/<plugin-name>/`
+**Plugin directory**: `~/.config/copad/plugins/<plugin-name>/`
 
 **Manifest** (`plugin.toml`):
 
@@ -380,24 +380,24 @@ exec = "bash scripts/do-thing.sh"
 description = "Does a thing"
 ```
 
-**Architecture**: Plugin panels are WebViews (`PluginPanel`) loading local HTML files with an injected `nestty` JS bridge. The bridge uses WebKitGTK's `register_script_message_handler_with_reply` so `nestty.call()` returns a Promise that resolves with the dispatch result. Events are forwarded to the webview via `evaluate_javascript`.
+**Architecture**: Plugin panels are WebViews (`PluginPanel`) loading local HTML files with an injected `copad` JS bridge. The bridge uses WebKitGTK's `register_script_message_handler_with_reply` so `copad.call()` returns a Promise that resolves with the dispatch result. Events are forwarded to the webview via `evaluate_javascript`.
 
 **JS Bridge API** (injected into plugin webviews):
 
 ```javascript
-window.nestty = {
+window.copad = {
     panel: { id, name, plugin },
-    async call(method, params = {}) { ... },  // Call any nestty socket method
+    async call(method, params = {}) { ... },  // Call any copad socket method
     on(type, callback) { ... },               // Listen for events
     off(type, callback) { ... },
 };
 ```
 
-**Theme CSS variables** are injected via `UserStyleSheet`: `--nestty-bg`, `--nestty-fg`, `--nestty-surface0/1/2`, `--nestty-overlay0`, `--nestty-text`, `--nestty-subtext0/1`, `--nestty-accent`, `--nestty-red`.
+**Theme CSS variables** are injected via `UserStyleSheet`: `--copad-bg`, `--copad-fg`, `--copad-surface0/1/2`, `--copad-overlay0`, `--copad-text`, `--copad-subtext0/1`, `--copad-accent`, `--copad-red`.
 
-**Plugin modules** are small HTML widgets rendered in the status bar. Plugins declare `[[modules]]` in their manifest with `name`, `file`, `position` (left/center/right), and `order`. All modules are aggregated into a single WebView bar with its own `nestty` JS bridge.
+**Plugin modules** are small HTML widgets rendered in the status bar. Plugins declare `[[modules]]` in their manifest with `name`, `file`, `position` (left/center/right), and `order`. All modules are aggregated into a single WebView bar with its own `copad` JS bridge.
 
-**Plugin commands** run shell scripts in a thread with `NESTTY_SOCKET` and `NESTTY_PLUGIN_DIR` env vars. Params are piped as JSON to stdin, stdout is parsed as JSON for the response.
+**Plugin commands** run shell scripts in a thread with `COPAD_SOCKET` and `COPAD_PLUGIN_DIR` env vars. Params are piped as JSON to stdin, stdout is parsed as JSON for the response.
 
 ### Service plugins (long-running supervised subprocess)
 
@@ -406,34 +406,34 @@ window.nestty = {
 ```toml
 [[services]]
 name = "main"
-exec = "nestty-plugin-echo"          # PATH or relative to plugin dir
+exec = "copad-plugin-echo"          # PATH or relative to plugin dir
 activation = "onStartup"           # | "onAction:kb.*" | "onEvent:slack.*"
 restart = "on-crash"               # | "always" | "never"
 provides = ["echo.ping"]           # actions this service handles
 subscribes = []                    # bus event-kind globs forwarded as event.dispatch
 ```
 
-**Lifecycle.** Supervisor in `nestty-linux::service_supervisor` walks every enabled plugin's manifest in lexical `[plugin].name` order BEFORE spawning anything, builds the global action-ownership table, resolves `provides` conflicts (lexical-name winner takes the action; loser keeps its other registrations). Activation rules drive spawn timing: `onStartup` eager-spawns at boot; `onAction:` activates on first matching action call (request buffered up to 64 deep during `Starting`); `onEvent:` activates on first matching bus event.
+**Lifecycle.** Supervisor in `copad-linux::service_supervisor` walks every enabled plugin's manifest in lexical `[plugin].name` order BEFORE spawning anything, builds the global action-ownership table, resolves `provides` conflicts (lexical-name winner takes the action; loser keeps its other registrations). Activation rules drive spawn timing: `onStartup` eager-spawns at boot; `onAction:` activates on first matching action call (request buffered up to 64 deep during `Starting`); `onEvent:` activates on first matching bus event.
 
-**Init handshake.** nestty sends `initialize` with `{nestty_version, protocol_version}` (5s default timeout). Service replies with `{service_version, provides, subscribes}`. Asymmetric validation: every runtime entry must appear in the manifest (superset → drop with warn, subset → degraded mode OK). The negotiated runtime `provides` set is recorded BEFORE the state flips to `Running`, and `invoke_remote` gates dispatch against it — manifest-approved actions the runtime didn't claim return `service_degraded`, never reaching the running service. On init timeout, the supervisor SIGKILLs the recorded PID (best-effort) instead of relying on stdin EOF cooperation. Then nestty sends `initialized` notification, drains buffered invocations, and spawns one bus forwarder per accepted `subscribes` glob.
+**Init handshake.** copad sends `initialize` with `{copad_version, protocol_version}` (5s default timeout). Service replies with `{service_version, provides, subscribes}`. Asymmetric validation: every runtime entry must appear in the manifest (superset → drop with warn, subset → degraded mode OK). The negotiated runtime `provides` set is recorded BEFORE the state flips to `Running`, and `invoke_remote` gates dispatch against it — manifest-approved actions the runtime didn't claim return `service_degraded`, never reaching the running service. On init timeout, the supervisor SIGKILLs the recorded PID (best-effort) instead of relying on stdin EOF cooperation. Then copad sends `initialized` notification, drains buffered invocations, and spawns one bus forwarder per accepted `subscribes` glob.
 
 **Bidirectional RPC** over newline-JSON, both directions:
 
 | Direction        | Method           | Notes                                                                                           |
 | ---------------- | ---------------- | ----------------------------------------------------------------------------------------------- |
-| nestty → service | `initialize`     | first message, awaits reply                                                                     |
-| nestty → service | `initialized`    | notification (no id), ack of init                                                               |
-| nestty → service | `action.invoke`  | service is the registered handler                                                               |
-| nestty → service | `event.dispatch` | matches a `subscribes` pattern                                                                  |
-| service → nestty | `event.publish`  | publishes to bus; nestty fills source/timestamp                                                 |
-| service → nestty | `action.invoke`  | call ANOTHER service's action; runs on a worker thread to keep the reader free for nested calls |
-| service → nestty | `log`            | stderr-style logging routed via nestty                                                          |
+| copad → service | `initialize`     | first message, awaits reply                                                                     |
+| copad → service | `initialized`    | notification (no id), ack of init                                                               |
+| copad → service | `action.invoke`  | service is the registered handler                                                               |
+| copad → service | `event.dispatch` | matches a `subscribes` pattern                                                                  |
+| service → copad | `event.publish`  | publishes to bus; copad fills source/timestamp                                                 |
+| service → copad | `action.invoke`  | call ANOTHER service's action; runs on a worker thread to keep the reader free for nested calls |
+| service → copad | `log`            | stderr-style logging routed via copad                                                          |
 
 **Restart.** Exponential backoff on crash: 1s → 2s → 4s … capped at 60s. Reset to 1s on successful init. Policies: `on-crash` (default), `always`, `never`.
 
 **Threading per running service.** Writer thread (drains outgoing channel into child stdin), reader thread (parses child stdout, dispatches frames), stderr-tail thread (logs), wait thread (observes exit, triggers restart). Plus one forwarder thread per accepted `subscribes` pattern bridging the bus into the outgoing channel.
 
-**E2E verification** uses `nestty-plugin-echo` (workspace member): registers `echo.ping`, publishes `system.heartbeat` every `NESTTY_ECHO_HEARTBEAT_SECS` seconds (default 30). `nestctl call echo.ping --params '{...}'` round-trips params through socket → registry → service. `nestctl event subscribe` shows the heartbeat. `pkill -KILL nestty-plugin-echo` triggers supervisor restart, after which the next `echo.ping` works again.
+**E2E verification** uses `copad-plugin-echo` (workspace member): registers `echo.ping`, publishes `system.heartbeat` every `COPAD_ECHO_HEARTBEAT_SECS` seconds (default 30). `coctl call echo.ping --params '{...}'` round-trips params through socket → registry → service. `coctl event subscribe` shows the heartbeat. `pkill -KILL copad-plugin-echo` triggers supervisor restart, after which the next `echo.ping` works again.
 
 | Command               | Params                               | Behavior                                    |
 | --------------------- | ------------------------------------ | ------------------------------------------- |
@@ -444,19 +444,19 @@ subscribes = []                    # bus event-kind globs forwarded as event.dis
 **CLI usage**:
 
 ```bash
-nestctl plugin list
-nestctl plugin open my-plugin
-nestctl plugin open my-plugin --panel settings
-nestctl plugin run my-plugin.do-thing --params '{"key": "value"}'
+coctl plugin list
+coctl plugin open my-plugin
+coctl plugin open my-plugin --panel settings
+coctl plugin run my-plugin.do-thing --params '{"key": "value"}'
 ```
 
 ## App Icon
 
-Single master at `assets/icons/nestty.png` (1024x1024, palette PNG). `scripts/build-icons.sh` regenerates the per-platform artifacts from it:
+Single master at `assets/icons/copad.png` (1024x1024, palette PNG). `scripts/build-icons.sh` regenerates the per-platform artifacts from it:
 
-- `nestty-linux/icons/hicolor/<size>x<size>/apps/nestty.png` — sizes 16/22/24/32/48/64/128/256/512. Installed under `share/icons/hicolor/...` by `install-dev.sh` and the end-user `install.sh`. The desktop entry's `Icon=nestty` plus `gtk4::Window::set_default_icon_name("nestty")` in `app.rs` make the WM/launcher pick them up.
-- The desktop entry is named `com.marshall.nestty.desktop` (matches the GTK `application_id`) and carries `StartupWMClass=com.marshall.nestty`. Wayland compositors (Hyprland/GNOME Shell/KWin) match windows to launcher entries by `app_id ↔ desktop filename`; X11 falls back to `WM_CLASS ↔ StartupWMClass`. Without one of these, the WM shows a generic icon on the running window even when the launcher has the branded one.
-- `nestty-macos/Resources/AppIcon.icns` — multi-resolution `.icns` carrying PNG-encoded entries for icp4..icp6, ic07..ic14 (16, 32, 64, 128, 256, 512, 1024 plus retina @2x variants). Copied into `Contents/Resources/AppIcon.icns` by `scripts/install-macos.sh` and `nestty-macos/run.sh`; `Info.plist`'s `CFBundleIconFile=AppIcon` ties it in.
+- `copad-linux/icons/hicolor/<size>x<size>/apps/copad.png` — sizes 16/22/24/32/48/64/128/256/512. Installed under `share/icons/hicolor/...` by `install-dev.sh` and the end-user `install.sh`. The desktop entry's `Icon=copad` plus `gtk4::Window::set_default_icon_name("copad")` in `app.rs` make the WM/launcher pick them up.
+- The desktop entry is named `com.marshall.copad.desktop` (matches the GTK `application_id`) and carries `StartupWMClass=com.marshall.copad`. Wayland compositors (Hyprland/GNOME Shell/KWin) match windows to launcher entries by `app_id ↔ desktop filename`; X11 falls back to `WM_CLASS ↔ StartupWMClass`. Without one of these, the WM shows a generic icon on the running window even when the launcher has the branded one.
+- `copad-macos/Resources/AppIcon.icns` — multi-resolution `.icns` carrying PNG-encoded entries for icp4..icp6, ic07..ic14 (16, 32, 64, 128, 256, 512, 1024 plus retina @2x variants). Copied into `Contents/Resources/AppIcon.icns` by `scripts/install-macos.sh` and `copad-macos/run.sh`; `Info.plist`'s `CFBundleIconFile=AppIcon` ties it in.
 
 Both bundles are checked in so a fresh clone builds with icons even on hosts without ImageMagick. Run the build script and commit the regenerated files whenever the master changes.
 

@@ -2,7 +2,7 @@
 //!
 //! Mirrors the calendar/slack token-store pattern: keyring preferred
 //! (Linux Secret Service / macOS Keychain), plaintext 0600 fallback
-//! at `$XDG_CONFIG_HOME/nestty/llm-token-<account>.json`. The
+//! at `$XDG_CONFIG_HOME/copad/llm-token-<account>.json`. The
 //! `TokenSet` carries the API key plus optional identity (whether
 //! the key has been validated against the API and what account it
 //! belongs to — Anthropic's `messages` doesn't reveal the account
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 
-const KEYRING_SERVICE: &str = "nestty-llm";
+const KEYRING_SERVICE: &str = "copad-llm";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenSet {
@@ -40,7 +40,7 @@ pub fn open_store(config: &Config) -> Box<dyn TokenStore> {
         Err(e) => {
             if config.require_secure_store {
                 eprintln!(
-                    "[llm] secure keyring unavailable AND NESTTY_LLM_REQUIRE_SECURE_STORE=1: {e}"
+                    "[llm] secure keyring unavailable AND COPAD_LLM_REQUIRE_SECURE_STORE=1: {e}"
                 );
                 Box::new(BrokenStore { reason: e })
             } else {

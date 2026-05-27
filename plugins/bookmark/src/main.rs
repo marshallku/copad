@@ -1,4 +1,4 @@
-//! First-party bookmark service plugin for nestty.
+//! First-party bookmark service plugin for copad.
 //!
 //! Captures URLs into `~/docs/bookmarks/YYYY-MM/<urlhash8>-<slug>.md`,
 //! one file per bookmark, frontmatter-headed Markdown. Filesystem is
@@ -20,14 +20,14 @@
 //! - BM-5: harness `/bookmark` slash skill + offline inbox drain.
 //!
 //! Unix-only (Linux + macOS); path-safety primitives mirror
-//! `nestty-plugin-kb` (canonicalize root + re-validate every resolved
+//! `copad-plugin-kb` (canonicalize root + re-validate every resolved
 //! path). The atomic-create-or-fail rename routes through
-//! `nestty_core::fs_atomic` so the per-OS syscall lives in one place.
+//! `copad_core::fs_atomic` so the per-OS syscall lives in one place.
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!(
-    "nestty-plugin-bookmark supports Linux and macOS. Other Unixes need a \
-     backend-specific atomic-create primitive — extend nestty_core::fs_atomic."
+    "copad-plugin-bookmark supports Linux and macOS. Other Unixes need a \
+     backend-specific atomic-create primitive — extend copad_core::fs_atomic."
 );
 
 mod bookmark;

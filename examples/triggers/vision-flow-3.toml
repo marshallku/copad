@@ -1,14 +1,14 @@
 # Vision Flow 3 — the killer demo: clicking "start" on a Todo
-# pops a nestty tab with claude-code running inside a tmux session
+# pops a copad tab with claude-code running inside a tmux session
 # in a fresh git worktree, with a layered prompt pre-seeded into
 # claude. Implemented as a chain of three triggers via Phase 14.1's
 # auto-published `<action>.completed` events.
 #
 # Drop this whole file's `[[triggers]]` blocks into your
-# ~/.config/nestty/config.toml.
+# ~/.config/copad/config.toml.
 #
 # Prereqs (already shipped):
-# - Phase 15.1+: nestty-plugin-todo registered. `todo.start` action
+# - Phase 15.1+: copad-plugin-todo registered. `todo.start` action
 #   emits `todo.start_requested` with both `prompt` (raw per-Todo
 #   frontmatter field, may be null) AND `assembled_prompt` (the
 #   LAYERED string built at start time from `~/docs/claude/global.md`
@@ -17,12 +17,12 @@
 #   id, workspace, title, body, status, priority, due, linked_jira,
 #   linked_slack, linked_kb, tags. The trigger chain below feeds
 #   `assembled_prompt` forward — that's the agent-facing string.
-# - Phase 17.1: nestty-plugin-git registered. `git.worktree_add`
+# - Phase 17.1: copad-plugin-git registered. `git.worktree_add`
 #   creates the branch+dir; Phase 14.1 auto-emits
 #   `git.worktree_add.completed {workspace, path, branch, base, prompt?}`.
 #   `prompt` only appears when the upstream trigger forwards it via
 #   the optional `prompt` passthrough param (used below).
-# - Phase 18.1+18.2: claude.start spawns a nestty tab with
+# - Phase 18.1+18.2: claude.start spawns a copad tab with
 #   cwd=workspace_path, runs `tmux new-session -A -s <name> claude`,
 #   and (when `prompt` supplied) pastes the prompt into claude's
 #   REPL once it becomes interactive — guarded by claude-specific
@@ -60,7 +60,7 @@
 #
 # What you get end-to-end today:
 #   click Start in Todo panel
-#     → nestty-plugin-todo emits todo.start_requested with both raw
+#     → copad-plugin-todo emits todo.start_requested with both raw
 #       `prompt` and layered `assembled_prompt` fields
 #     → trigger-1 or trigger-2 fires git.worktree_add (sanitize_jira
 #       branch from linked_jira, or todo-<id>); the layered string
@@ -70,12 +70,12 @@
 #       `prompt` — the passthrough field, NOT to be confused with
 #       todo.start_requested's `prompt`)
 #     → trigger-3 fires claude.start with workspace_path + prompt
-#     → new nestty tab, fresh worktree, tmux session, claude REPL
+#     → new copad tab, fresh worktree, tmux session, claude REPL
 #       opens with the layered prompt already pasted + submitted.
 #
 # Convention: the Todo plugin's `workspace` label and the git
 # plugin's workspace `name` are assumed to coincide (e.g.
-# todo.workspace = "nestty" maps to a `[[workspace]] name = "nestty"`
+# todo.workspace = "copad" maps to a `[[workspace]] name = "copad"`
 # entry in workspaces.toml). If you want them to differ, hardcode
 # `workspace = "<git-name>"` instead of `{event.workspace}`.
 
@@ -138,7 +138,7 @@ event_kind = "git.worktree_add.completed"
 # alongside (not after) trigger 3. Uncomment if you want it.
 #
 # Note: hooking on `claude.start.completed` would be more natural
-# but doesn't work today — `claude.start` is a nestty-internal
+# but doesn't work today — `claude.start` is a copad-internal
 # socket action that lives in the legacy match arm of
 # `socket::dispatch`, not the ActionRegistry, so Phase 14.1
 # fan-out doesn't apply. Migrating claude.start into the registry
@@ -158,7 +158,7 @@ event_kind = "git.worktree_add.completed"
 # Jira key, then wait up to 5 min for a reply. On reply, fire a
 # synthesized event so a downstream trigger can use the answer as the
 # branch name. Copy this block + uncomment if you want this flow.
-# Requires `nestty-plugin-slack` registered with `slack.post_message`
+# Requires `copad-plugin-slack` registered with `slack.post_message`
 # action and `slack.dm` event (Phase 11.2).
 # ---------------------------------------------------------------------
 # [[triggers]]

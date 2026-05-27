@@ -289,12 +289,12 @@ mod tests {
     const SAMPLE: &str = r#"{
         "agents": [
             {
-                "id": "pane:nestty:0.0",
-                "pane": {"session":"nestty","window":0,"pane":0,"pane_pid":99},
+                "id": "pane:copad:0.0",
+                "pane": {"session":"copad","window":0,"pane":0,"pane_pid":99},
                 "kind": "claude",
                 "status": "working",
-                "cwd": "/home/me/dev/nestty",
-                "repo_name": "nestty",
+                "cwd": "/home/me/dev/copad",
+                "repo_name": "copad",
                 "flags": {"has_intent": true, "blocked": false, "reviewed_fresh": true},
                 "extra": "pid 12345"
             },
@@ -310,8 +310,8 @@ mod tests {
             }
         ],
         "attention": [
-            {"ts": 1700000000, "kind": "stop", "source": "claude", "title": "Claude · nestty", "body": "Turn finished",
-             "session_id": "sid-1", "tmux_target": "nestty:0", "tmux_session": "nestty"}
+            {"ts": 1700000000, "kind": "stop", "source": "claude", "title": "Claude · copad", "body": "Turn finished",
+             "session_id": "sid-1", "tmux_target": "copad:0", "tmux_session": "copad"}
         ],
         "global_blocked": 2,
         "captured_at_ms": 1700000000000,
@@ -327,16 +327,16 @@ mod tests {
         assert_eq!(s.captured_at_ms, 1700000000000);
 
         let claude = &s.agents[0];
-        assert_eq!(claude.id, "pane:nestty:0.0");
+        assert_eq!(claude.id, "pane:copad:0.0");
         assert_eq!(claude.kind, "claude");
         assert_eq!(claude.status, "working");
-        assert_eq!(claude.cwd, "/home/me/dev/nestty");
-        assert_eq!(claude.repo_name, "nestty");
+        assert_eq!(claude.cwd, "/home/me/dev/copad");
+        assert_eq!(claude.repo_name, "copad");
         assert_eq!(claude.extra, "pid 12345");
         assert!(claude.flags.has_intent);
         assert!(!claude.flags.blocked);
         assert!(claude.flags.reviewed_fresh);
-        assert_eq!(claude.pane.session, "nestty");
+        assert_eq!(claude.pane.session, "copad");
         assert_eq!(claude.pane.window, 0);
         assert_eq!(claude.pane.pane, 0);
         assert_eq!(claude.pane.pane_pid, Some(99));
@@ -345,11 +345,11 @@ mod tests {
         assert_eq!(att.ts, 1700000000);
         assert_eq!(att.kind, "stop");
         assert_eq!(att.source, "claude");
-        assert_eq!(att.title, "Claude · nestty");
+        assert_eq!(att.title, "Claude · copad");
         assert_eq!(att.body, "Turn finished");
         assert_eq!(att.session_id, "sid-1");
-        assert_eq!(att.tmux_target, "nestty:0");
-        assert_eq!(att.tmux_session, "nestty");
+        assert_eq!(att.tmux_target, "copad:0");
+        assert_eq!(att.tmux_session, "copad");
     }
 
     #[test]
@@ -398,7 +398,7 @@ mod tests {
         use std::fs;
         use tempfile::tempdir;
         let tmp = tempdir().unwrap();
-        let ws = tmp.path().join("nestty-abcd");
+        let ws = tmp.path().join("copad-abcd");
         fs::create_dir_all(&ws).unwrap();
         let state = r#"{
             "jobs": [

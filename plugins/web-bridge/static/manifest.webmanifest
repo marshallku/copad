@@ -1,7 +1,7 @@
 {
-  "name": "nestty bridge",
-  "short_name": "nestty",
-  "description": "Remote dashboard for the local nestty harness — tmux overview, attach, push notifications.",
+  "name": "copad bridge",
+  "short_name": "copad",
+  "description": "Remote dashboard for the local copad harness — tmux overview, attach, push notifications.",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

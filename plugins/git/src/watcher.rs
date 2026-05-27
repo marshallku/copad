@@ -209,7 +209,7 @@ pub fn to_frame(event: &WatchEvent, workspace: &str) -> Value {
 }
 
 fn poll_interval() -> Duration {
-    let raw = std::env::var("NESTTY_GIT_POLL_MS")
+    let raw = std::env::var("COPAD_GIT_POLL_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_POLL_MS);
@@ -374,11 +374,11 @@ mod tests {
             &WatchEvent::BranchCreated {
                 name: "feat-x".into(),
             },
-            "nestty",
+            "copad",
         );
         assert_eq!(f["method"], "event.publish");
         assert_eq!(f["params"]["kind"], "git.branch_created");
-        assert_eq!(f["params"]["payload"]["workspace"], "nestty");
+        assert_eq!(f["params"]["payload"]["workspace"], "copad");
         assert_eq!(f["params"]["payload"]["name"], "feat-x");
     }
 

@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
 # End-to-end verification of the daemon ↔ GUI socket link.
 #
-# Runs nesttyd against an isolated socket path, then exercises:
+# Runs copadd against an isolated socket path, then exercises:
 #   1. register handshake
 #   2. heartbeat survival
 #   3. daemon restart → GUI re-register
 #   4. frozen GUI → heartbeat-miss unregister
 #
-# A small Python mock client (stdlib only) stands in for nestty-linux so the
-# script doesn't need GTK / a display. Real nestty GUI verification is a
+# A small Python mock client (stdlib only) stands in for copad-linux so the
+# script doesn't need GTK / a display. Real copad GUI verification is a
 # manual step listed at the bottom.
 
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DAEMON="$REPO/target/debug/nesttyd"
-NESTCTL="$REPO/target/debug/nestctl"
+DAEMON="$REPO/target/debug/copadd"
+COCTL="$REPO/target/debug/coctl"
 
-[[ -x "$DAEMON" ]] || { echo "build first: cargo build -p nestty-daemon"; exit 2; }
-[[ -x "$NESTCTL" ]] || { echo "build first: cargo build -p nestty-cli"; exit 2; }
+[[ -x "$DAEMON" ]] || { echo "build first: cargo build -p copad-daemon"; exit 2; }
+[[ -x "$COCTL" ]] || { echo "build first: cargo build -p copad-cli"; exit 2; }
 
-WORK="$(mktemp -d -t nestty-e2e.XXXXXX)"
+WORK="$(mktemp -d -t copad-e2e.XXXXXX)"
 # Step 12's marker path is interpolated into both a TOML string and
 # a `/bin/sh -c` command. Use a STRICT allowlist (alphanumerics +
 # `._/-`) so no shell metacharacter (`;`, `&`, backtick, `>`, `|`,
@@ -33,18 +33,18 @@ if ! printf '%s' "$WORK" | LC_ALL=C grep -Eq '^[A-Za-z0-9._/-]+$'; then
 fi
 DAEMON_LOG="$WORK/daemon.log"
 GUI_LOG="$WORK/gui.log"
-SOCKET="$WORK/nesttyd.sock"
+SOCKET="$WORK/copadd.sock"
 
-export NESTTY_SOCKET="$SOCKET"
+export COPAD_SOCKET="$SOCKET"
 export RUST_LOG="${RUST_LOG:-info}"
 # Tiny pool + test-only action so step 6 can force saturation.
-export NESTTYD_POOL_WORKERS=2
-export NESTTYD_POOL_QUEUE=2
-export NESTTYD_E2E_TEST_ACTIONS=1
+export COPADD_POOL_WORKERS=2
+export COPADD_POOL_QUEUE=2
+export COPADD_E2E_TEST_ACTIONS=1
 # Isolate plugin discovery: daemon is the sole plugin host since Step
 # 5b, so without this it would spawn every plugin from the user's real
-# ~/.config/nestty/plugins/ during the test.
-mkdir -p "$WORK/xdg-config/nestty/plugins"
+# ~/.config/copad/plugins/ during the test.
+mkdir -p "$WORK/xdg-config/copad/plugins"
 export XDG_CONFIG_HOME="$WORK/xdg-config"
 
 # Stub plugin for Step 8 (plugin.<name>.<cmd> + _module.run dispatch).
@@ -52,7 +52,7 @@ export XDG_CONFIG_HOME="$WORK/xdg-config"
 # non-existent binary. `hello` command emits JSON so the dispatcher's
 # "parse stdout as JSON" path is exercised; `clock` module emits a
 # fixed string so the test can assert exact stdout.
-STUB_DIR="$WORK/xdg-config/nestty/plugins/e2e-stub"
+STUB_DIR="$WORK/xdg-config/copad/plugins/e2e-stub"
 mkdir -p "$STUB_DIR"
 cat > "$STUB_DIR/plugin.toml" <<'TOML'
 [plugin]
@@ -127,7 +127,7 @@ start_daemon() {
     DAEMON_PID=$!
     # Count-based wait so restart doesn't false-positive on the prior
     # daemon's "listening on" line in the accumulated log.
-    wait_for_count 'nesttyd listening on' "$DAEMON_LOG" "$DAEMON_STARTS" 5 \
+    wait_for_count 'copadd listening on' "$DAEMON_LOG" "$DAEMON_STARTS" 5 \
         || fail "daemon did not start (pid=$DAEMON_PID, attempt #$DAEMON_STARTS)"
     [[ -S "$SOCKET" ]] || fail "socket not created at $SOCKET"
 }
@@ -209,7 +209,7 @@ PY
     GUI_PID=$!
 }
 
-step 1 "start nesttyd"
+step 1 "start copadd"
 start_daemon
 pass "daemon listening on $SOCKET"
 
@@ -264,9 +264,9 @@ req = {"id": str(uuid.uuid4()), "method": "__test.slow_blocking", "params": {"ms
 f.write((json.dumps(req) + "\n").encode())
 f.readline()  # ignore response
 PY
-wait_for 'event: type=__test\.slow_blocking\.completed source=nestty\.action' "$GUI_LOG" 5 \
-    || fail "event bridge: completion event missing or source field stripped (need source=nestty.action so chained triggers fire)"
-pass "event bridge delivered __test.slow_blocking.completed with source=nestty.action"
+wait_for 'event: type=__test\.slow_blocking\.completed source=copad\.action' "$GUI_LOG" 5 \
+    || fail "event bridge: completion event missing or source field stripped (need source=copad.action so chained triggers fire)"
+pass "event bridge delivered __test.slow_blocking.completed with source=copad.action"
 
 step 6 "frozen GUI → heartbeat-miss unregister"
 kill -STOP "$GUI_PID"
@@ -441,7 +441,7 @@ gf.write((json.dumps(pub) + "\n").encode())
 #   - ZERO Events of type=e2e.bridge_test (echo gate verified)
 # Then trigger positive control:
 #   - daemon-native __test.slow_blocking from a SEPARATE connection
-#     produces __test.slow_blocking.completed with source=nestty.action
+#     produces __test.slow_blocking.completed with source=copad.action
 #     and bridge_id=None → forwarder DOES deliver
 collected = []
 stop = threading.Event()
@@ -500,7 +500,7 @@ print(json.dumps({
     ],
     "saw_positive_control": any(
         m.get("type") == "__test.slow_blocking.completed"
-        and m.get("source") == "nestty.action"
+        and m.get("source") == "copad.action"
         for m in collected
     ),
 }))
@@ -529,7 +529,7 @@ ctrl_seen=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['saw_posi
 pass "positive control: __test.slow_blocking.completed delivered (forwarder alive)"
 
 step 10 "host_triggers=true cut-over → daemon dispatches trigger from bridged event"
-# Tear down the running daemon and restart it with NESTTYD_HOST_TRIGGERS=1
+# Tear down the running daemon and restart it with COPADD_HOST_TRIGGERS=1
 # plus a config.toml containing a `[[trigger]]` that listens on a
 # synthetic kind and fires `system.log`. A registered mock GUI then
 # pushes the matching event via `_bus.publish`; the daemon's
@@ -539,8 +539,8 @@ kill -TERM "$DAEMON_PID" 2>/dev/null || true
 wait "$DAEMON_PID" 2>/dev/null || true
 DAEMON_PID=""
 
-mkdir -p "$XDG_CONFIG_HOME/nestty"
-cat > "$XDG_CONFIG_HOME/nestty/config.toml" <<'TOML'
+mkdir -p "$XDG_CONFIG_HOME/copad"
+cat > "$XDG_CONFIG_HOME/copad/config.toml" <<'TOML'
 [[triggers]]
 name = "e2e-cutover"
 action = "system.log"
@@ -553,11 +553,11 @@ TOML
 # isolate the new run's stderr from prior step output.
 DAEMON_LOG_OFFSET=$(wc -c < "$DAEMON_LOG")
 
-NESTTYD_HOST_TRIGGERS=1 "$DAEMON" >>"$DAEMON_LOG" 2>&1 &
+COPADD_HOST_TRIGGERS=1 "$DAEMON" >>"$DAEMON_LOG" 2>&1 &
 DAEMON_PID=$!
 DAEMON_STARTS=$(( DAEMON_STARTS + 1 ))
-wait_for_count 'nesttyd listening on' "$DAEMON_LOG" "$DAEMON_STARTS" 5 \
-    || fail "daemon did not restart with NESTTYD_HOST_TRIGGERS=1"
+wait_for_count 'copadd listening on' "$DAEMON_LOG" "$DAEMON_STARTS" 5 \
+    || fail "daemon did not restart with COPADD_HOST_TRIGGERS=1"
 wait_for 'trigger engine: 1 configured' "$DAEMON_LOG" 5 \
     || fail "daemon did not load the cut-over trigger config"
 wait_for 'dispatch=ON' "$DAEMON_LOG" 2 \
@@ -614,8 +614,8 @@ print(json.dumps({
 PY
 C_SUMMARY=$(tail -n1 "$CUTOVER_LOG")
 ht_ack=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['host_triggers_advertised'])" "$C_SUMMARY")
-[[ "$ht_ack" == "True" ]] || fail "register ack with NESTTYD_HOST_TRIGGERS=1 didn't return host_triggers=true (got $ht_ack)"
-pass "register ack advertises host_triggers=true under NESTTYD_HOST_TRIGGERS=1"
+[[ "$ht_ack" == "True" ]] || fail "register ack with COPADD_HOST_TRIGGERS=1 didn't return host_triggers=true (got $ht_ack)"
+pass "register ack advertises host_triggers=true under COPADD_HOST_TRIGGERS=1"
 
 pub_ok=$(python3 -c "import sys,json; print(json.loads(sys.argv[1])['publish_ok'])" "$C_SUMMARY")
 [[ "$pub_ok" == "True" ]] || fail "_bus.publish: expected ok=true, got $pub_ok"
@@ -635,13 +635,13 @@ done
 (( fired == 1 )) || fail "daemon's TriggerEngine did not dispatch the bridged event (system.log line absent)"
 pass "daemon dispatched bridged e2e.cutover → system.log fired"
 
-step 11 "nestctl event publish fires daemon trigger end-to-end"
+step 11 "coctl event publish fires daemon trigger end-to-end"
 # Rewrite the trigger config so the new e2e.publish kind matches a
 # fresh `system.log` action. The daemon's 2s mtime watcher picks up
-# the change without restart. Then nestctl event publish from a
+# the change without restart. Then coctl event publish from a
 # separate shell process fires the trigger; daemon dispatches the
 # trigger and emits the configured system.log to stderr.
-cat > "$XDG_CONFIG_HOME/nestty/config.toml" <<'TOML'
+cat > "$XDG_CONFIG_HOME/copad/config.toml" <<'TOML'
 [[triggers]]
 name = "e2e-publish"
 action = "system.log"
@@ -656,11 +656,11 @@ wait_for_count 'trigger config reloaded' "$DAEMON_LOG" 1 8 \
     || fail "daemon's config watcher did not pick up the new trigger config"
 
 PUBLISH_LOG_OFFSET=$(wc -c < "$DAEMON_LOG")
-PUBLISH_OUT=$("$NESTCTL" event publish e2e.publish '{"hello": "world"}' 2>&1)
-echo "[nestctl publish output] $PUBLISH_OUT"
+PUBLISH_OUT=$("$COCTL" event publish e2e.publish '{"hello": "world"}' 2>&1)
+echo "[coctl publish output] $PUBLISH_OUT"
 echo "$PUBLISH_OUT" | grep -q 'queued' \
-    || fail "nestctl event publish did not return queued: got $PUBLISH_OUT"
-pass "nestctl event publish returned queued"
+    || fail "coctl event publish did not return queued: got $PUBLISH_OUT"
+pass "coctl event publish returned queued"
 
 # Verify the daemon dispatched the trigger via the watcher-reloaded
 # config. Offset-based grep so prior steps' system.log lines don't
@@ -674,8 +674,8 @@ while (( SECONDS < fire_deadline )); do
     fi
     sleep 0.2
 done
-(( fired == 1 )) || fail "daemon did not dispatch the nestctl-published trigger (system.log line absent)"
-pass "daemon dispatched nestctl-published e2e.publish → system.log fired"
+(( fired == 1 )) || fail "daemon did not dispatch the coctl-published trigger (system.log line absent)"
+pass "daemon dispatched coctl-published e2e.publish → system.log fired"
 
 step 12 "system.spawn inherits primary GUI's curated env"
 # Register a mock GUI with custom HYPRLAND_INSTANCE_SIGNATURE, fire
@@ -685,7 +685,7 @@ step 12 "system.spawn inherits primary GUI's curated env"
 # GUI capture → daemon whitelist → primary_gui_env → Command::envs.
 ENV_MARKER="$WORK/spawn-env-marker"
 ENV_RELOAD_COUNT_BEFORE=$(grep -cE 'trigger config reloaded' "$DAEMON_LOG" 2>/dev/null) || ENV_RELOAD_COUNT_BEFORE=0
-cat > "$XDG_CONFIG_HOME/nestty/config.toml" <<TOML
+cat > "$XDG_CONFIG_HOME/copad/config.toml" <<TOML
 [[triggers]]
 name = "e2e-envspawn"
 action = "system.spawn"
@@ -984,9 +984,9 @@ echo "=== AUTO E2E COMPLETE ==="
 echo
 echo "Manual visual check (independent of this run — the trap already shut things down):"
 echo "  1. start daemon in one terminal:  $DAEMON"
-echo "  2. start GUI in another:           cargo run -p nestty-linux"
+echo "  2. start GUI in another:           cargo run -p copad-linux"
 echo "     (daemon-client mode is on by default since Step 5a; no env var needed."
-echo "      Both default to the same socket path — do not set NESTTY_SOCKET unless"
+echo "      Both default to the same socket path — do not set COPAD_SOCKET unless"
 echo "      you start the daemon with the same override.)"
 echo "  3. confirm: tabs/panels render normally, no extra startup latency, panel commands work"
 echo "  4. kill the daemon; confirm GUI logs reconnect_loop and reattaches when daemon restarts"

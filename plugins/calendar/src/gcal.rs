@@ -10,7 +10,7 @@
 //! the `oauth` module, persist the new `TokenSet` through the
 //! `TokenStore`, and retry the request once. A second 401 is fatal
 //! (we don't loop indefinitely if the refresh_token itself was
-//! revoked — caller must re-run `nestty-plugin-calendar auth`).
+//! revoked — caller must re-run `copad-plugin-calendar auth`).
 
 use std::sync::Arc;
 
@@ -33,7 +33,7 @@ pub struct Client {
 impl Client {
     pub fn new(config: Config, store: Arc<dyn TokenStore>) -> Result<Self, String> {
         let tokens = store.load().ok_or_else(|| {
-            "no stored credentials — run `nestty-plugin-calendar auth`".to_string()
+            "no stored credentials — run `copad-plugin-calendar auth`".to_string()
         })?;
         Ok(Self {
             config,
@@ -83,7 +83,7 @@ impl Client {
             if page + 1 == MAX_PAGES {
                 eprintln!(
                     "[calendar] list_events truncated after {MAX_PAGES} pages; \
-                     consider narrowing NESTTY_CALENDAR_LOOKAHEAD_HOURS"
+                     consider narrowing COPAD_CALENDAR_LOOKAHEAD_HOURS"
                 );
             }
         }

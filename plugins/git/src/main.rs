@@ -1,10 +1,10 @@
-//! First-party git workspace + worktree plugin for nestty.
+//! First-party git workspace + worktree plugin for copad.
 //!
 //! Lightweight: every action is an argv-vector shell-out to `git`,
 //! never a shell string, so caller-supplied data (branch names, base
 //! refs, paths) cannot inject extra arguments. Configuration of
-//! "what is a workspace" lives in `~/.config/nestty/workspaces.toml`
-//! (override via `NESTTY_GIT_WORKSPACES_FILE`).
+//! "what is a workspace" lives in `~/.config/copad/workspaces.toml`
+//! (override via `COPAD_GIT_WORKSPACES_FILE`).
 //!
 //! Actions (Phase 17 slice 1):
 //! - `git.list_workspaces`
@@ -24,7 +24,7 @@
 //! (Phase 17 slice 2) emits `git.worktree_created` /
 //! `git.worktree_removed` / `git.branch_created` /
 //! `git.branch_deleted` / `git.checkout` and must be alive whenever
-//! nestty runs. Tunable via `NESTTY_GIT_POLL_MS` (default 2000 ms).
+//! copad runs. Tunable via `COPAD_GIT_POLL_MS` (default 2000 ms).
 //!
 //! Cross-platform: `git` is the only binary dependency. Works on
 //! Linux + macOS without OS-specific gates. (No keyring, no
@@ -886,7 +886,7 @@ default_base = "main"
         // the ActionRegistry on the platform side, not by this
         // action handler. The plugin just returns Ok(payload) and
         // the registry stamps `git.worktree_add.completed` onto
-        // the bus from there. Verified in nestty-core action_registry
+        // the bus from there. Verified in copad-core action_registry
         // tests; not exercised here because the plugin under test
         // doesn't own a registry-backed bus.
         let added_path = r["path"].as_str().unwrap().to_string();

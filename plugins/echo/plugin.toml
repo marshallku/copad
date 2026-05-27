@@ -6,7 +6,7 @@ description = "Mock service plugin used to verify the protocol shape end-to-end.
 
 [[services]]
 name = "main"
-exec = "nestty-plugin-echo"
+exec = "copad-plugin-echo"
 activation = "onStartup"
 restart = "on-crash"
 provides = ["echo.ping"]

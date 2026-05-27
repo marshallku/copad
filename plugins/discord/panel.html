@@ -42,8 +42,8 @@
   --discord-msg:   #6c7086;   /* muted — plain-message rail (firehose) */
 
   /* Type rails — modifier-driven */
-  --rail-default: var(--nestty-overlay0);
-  --rail-mention: var(--nestty-accent);
+  --rail-default: var(--copad-overlay0);
+  --rail-mention: var(--copad-accent);
   --rail-dm:      var(--discord-info);
   --rail-rxn:     var(--discord-rxn);
   --rail-msg:     var(--discord-msg);
@@ -74,7 +74,7 @@ body {
   font-feature-settings: "tnum", "ss02", "calt";
   font-size: var(--fs-body);
   line-height: 1.45;
-  color: var(--nestty-text);
+  color: var(--copad-text);
   background: transparent;
 }
 
@@ -93,39 +93,39 @@ body {
   gap: var(--s-3);
   height: 36px;
   padding-inline: var(--s-4);
-  background: color-mix(in oklab, var(--nestty-surface0) 60%, transparent);
-  border-bottom: 1px solid var(--nestty-overlay0);
+  background: color-mix(in oklab, var(--copad-surface0) 60%, transparent);
+  border-bottom: 1px solid var(--copad-overlay0);
   flex-shrink: 0;
 }
 .discord-header__dot {
   width: 8px; height: 8px; border-radius: 50%;
-  background: var(--nestty-overlay0);
+  background: var(--copad-overlay0);
   flex-shrink: 0;
 }
 .discord-header__dot--ok   { background: var(--discord-ok);   animation: signalPulse 2.4s ease-out infinite; }
 .discord-header__dot--warn { background: var(--discord-warn); }
-.discord-header__dot--err  { background: var(--nestty-red);     }
+.discord-header__dot--err  { background: var(--copad-red);     }
 .discord-header__workspace {
   font-size: var(--fs-head);
   font-weight: 500;
-  color: var(--nestty-text);
+  color: var(--copad-text);
   letter-spacing: -0.005em;
 }
 .discord-header__meta {
   display: flex; gap: var(--s-3);
   font-size: var(--fs-meta);
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-style: italic;
 }
 .discord-header__meta strong {
   font-weight: 400; font-style: normal;
-  color: var(--nestty-subtext1);
+  color: var(--copad-subtext1);
 }
 .discord-header__spacer { flex: 1; }
 .discord-header__refresh {
   background: transparent;
-  border: 1px solid var(--nestty-surface2);
-  color: var(--nestty-subtext1);
+  border: 1px solid var(--copad-surface2);
+  color: var(--copad-subtext1);
   font: inherit;
   font-size: var(--fs-meta);
   padding: 4px 10px;
@@ -135,8 +135,8 @@ body {
   transition: background var(--t-fast), color var(--t-fast);
 }
 .discord-header__refresh:hover {
-  background: var(--nestty-surface1);
-  color: var(--nestty-text);
+  background: var(--copad-surface1);
+  color: var(--copad-text);
 }
 .discord-header__refresh:active { transform: scale(0.97); }
 .discord-header__refresh:disabled { opacity: 0.4; cursor: progress; }
@@ -148,7 +148,7 @@ body {
   align-items: center;
   height: 32px;
   padding-inline: var(--s-4);
-  border-bottom: 1px solid var(--nestty-overlay0);
+  border-bottom: 1px solid var(--copad-overlay0);
   flex-shrink: 0;
   overflow-x: auto;
 }
@@ -156,7 +156,7 @@ body {
 .discord-filter__chip {
   background: transparent;
   border: 0;
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font: inherit;
   font-size: var(--fs-meta);
   letter-spacing: 0.04em;
@@ -168,18 +168,18 @@ body {
   white-space: nowrap;
 }
 .discord-filter__chip:hover {
-  background: color-mix(in oklab, var(--nestty-surface0) 40%, transparent);
+  background: color-mix(in oklab, var(--copad-surface0) 40%, transparent);
 }
 .discord-filter__chip--active {
-  color: var(--nestty-accent);
+  color: var(--copad-accent);
 }
 .discord-filter__count {
   margin-left: 4px;
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-variant-numeric: tabular-nums;
 }
 .discord-filter__chip--active .discord-filter__count {
-  color: color-mix(in oklab, var(--nestty-accent) 70%, var(--nestty-subtext1));
+  color: color-mix(in oklab, var(--copad-accent) 70%, var(--copad-subtext1));
 }
 
 /* §6 FEED --------------------------------------------------------------- */
@@ -195,14 +195,14 @@ body {
 .discord-feed::-webkit-scrollbar { width: 8px; }
 .discord-feed::-webkit-scrollbar-track { background: transparent; }
 .discord-feed::-webkit-scrollbar-thumb {
-  background: var(--nestty-surface1);
+  background: var(--copad-surface1);
   border-radius: 4px;
 }
-.discord-feed::-webkit-scrollbar-thumb:hover { background: var(--nestty-surface2); }
+.discord-feed::-webkit-scrollbar-thumb:hover { background: var(--copad-surface2); }
 
 .discord-feed__empty {
   margin: var(--s-7) auto;
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-style: italic;
   font-size: var(--fs-body);
   text-align: center;
@@ -210,12 +210,12 @@ body {
 .discord-feed__empty::before {
   content: "··· ";
   letter-spacing: 0.2em;
-  color: var(--nestty-overlay0);
+  color: var(--copad-overlay0);
 }
 .discord-feed__empty::after {
   content: " ···";
   letter-spacing: 0.2em;
-  color: var(--nestty-overlay0);
+  color: var(--copad-overlay0);
 }
 
 /* §7 CARD --------------------------------------------------------------- */
@@ -229,7 +229,7 @@ body {
   align-items: start;
   gap: 0 var(--s-3);
   padding: var(--s-2) var(--s-3) var(--s-2) var(--s-2);
-  background: color-mix(in oklab, var(--nestty-surface0) 60%, transparent);
+  background: color-mix(in oklab, var(--copad-surface0) 60%, transparent);
   border-left: var(--rail-w) solid var(--rail-color);
   border-left-color: color-mix(in oklab, var(--rail-color) 40%, transparent);
   border-radius: 0 4px 4px 0;
@@ -238,17 +238,17 @@ body {
               transform var(--t-fast), padding var(--t-med);
 }
 .discord-card:hover {
-  background: color-mix(in oklab, var(--nestty-surface1) 85%, transparent);
+  background: color-mix(in oklab, var(--copad-surface1) 85%, transparent);
   border-left-color: var(--rail-color);
   transform: translateY(-1px);
 }
 .discord-card:active { transform: translateY(0) scale(0.997); }
 .discord-card:focus-visible {
-  outline: 1px solid var(--nestty-accent);
+  outline: 1px solid var(--copad-accent);
   outline-offset: 2px;
 }
 .discord-card--expanded {
-  background: var(--nestty-surface1);
+  background: var(--copad-surface1);
   border-left-color: var(--rail-color);
   padding-block: var(--s-3) var(--s-4);
   cursor: default;
@@ -267,12 +267,12 @@ body {
   font-size: var(--fs-meta);
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  color: color-mix(in oklab, var(--rail-color) 80%, var(--nestty-text));
+  color: color-mix(in oklab, var(--rail-color) 80%, var(--copad-text));
   font-weight: 600;
 }
 .discord-card__ts {
   font-size: var(--fs-meta);
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-variant-numeric: tabular-nums;
   font-style: italic;
   white-space: nowrap;
@@ -293,15 +293,15 @@ body {
   font-size: var(--fs-id);
 }
 .discord-card__channel {
-  color: var(--nestty-text);
+  color: var(--copad-text);
   font-weight: 600;
 }
 .discord-card__user {
-  color: var(--nestty-subtext1);
+  color: var(--copad-subtext1);
   font-weight: 400;
 }
 .discord-card__rel {
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-style: italic;
   font-size: var(--fs-meta);
   margin-left: auto;
@@ -309,7 +309,7 @@ body {
   white-space: nowrap;
 }
 .discord-card__preview {
-  color: var(--nestty-subtext1);
+  color: var(--copad-subtext1);
   font-size: var(--fs-body);
   white-space: nowrap;
   overflow: hidden;
@@ -319,7 +319,7 @@ body {
 .discord-card--expanded .discord-card__preview {
   white-space: pre-wrap;
   overflow: visible;
-  color: var(--nestty-text);
+  color: var(--copad-text);
   word-break: break-word;
 }
 
@@ -341,7 +341,7 @@ body {
 .discord-card__action {
   background: transparent;
   border: 0;
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font: inherit;
   font-size: var(--fs-meta);
   letter-spacing: 0.04em;
@@ -352,8 +352,8 @@ body {
   text-decoration: none;
 }
 .discord-card__action:hover {
-  background: var(--nestty-surface2);
-  color: var(--nestty-text);
+  background: var(--copad-surface2);
+  color: var(--copad-text);
 }
 
 .discord-card__expand {
@@ -382,7 +382,7 @@ body {
 .discord-card--message { --rail-color: var(--rail-msg); }
 .discord-card--message .discord-card__channel {
   /* Plain-message channel id is less load-bearing than mention/DM */
-  color: var(--nestty-subtext1);
+  color: var(--copad-subtext1);
 }
 
 /* §7.4 CARD-RXN ---------------------------------------------------------- */
@@ -395,13 +395,13 @@ body {
 }
 .discord-card--rxn .discord-card__preview::before {
   content: "↳ on: ";
-  color: var(--nestty-overlay0);
+  color: var(--copad-overlay0);
 }
 .discord-card__rxn-body {
   font-size: var(--fs-body);
-  color: var(--nestty-subtext1);
-  background: color-mix(in oklab, var(--nestty-surface0) 80%, transparent);
-  border-left: 2px solid var(--nestty-overlay0);
+  color: var(--copad-subtext1);
+  background: color-mix(in oklab, var(--copad-surface0) 80%, transparent);
+  border-left: 2px solid var(--copad-overlay0);
   padding: var(--s-2) var(--s-3);
   white-space: pre-wrap;
   word-break: break-word;
@@ -412,8 +412,8 @@ body {
 .discord-composer {
   display: flex;
   flex-direction: column;
-  background: color-mix(in oklab, var(--nestty-surface2) 92%, transparent);
-  border-top: 1px solid var(--nestty-overlay0);
+  background: color-mix(in oklab, var(--copad-surface2) 92%, transparent);
+  border-top: 1px solid var(--copad-overlay0);
   padding: var(--s-2) var(--s-4);
   flex-shrink: 0;
   transition: padding var(--t-fast);
@@ -426,14 +426,14 @@ body {
 }
 .discord-composer__row::before {
   content: "›";
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-size: var(--fs-id);
   flex-shrink: 0;
 }
 .discord-composer__channel {
-  background: var(--nestty-surface0);
-  border: 1px solid var(--nestty-surface2);
-  color: var(--nestty-text);
+  background: var(--copad-surface0);
+  border: 1px solid var(--copad-surface2);
+  color: var(--copad-text);
   font: inherit;
   font-size: var(--fs-body);
   padding: 4px 8px;
@@ -444,9 +444,9 @@ body {
   font-variant-numeric: tabular-nums;
 }
 .discord-composer__channel:focus {
-  outline: 1px solid var(--nestty-accent);
+  outline: 1px solid var(--copad-accent);
   outline-offset: 1px;
-  border-color: var(--nestty-accent);
+  border-color: var(--copad-accent);
 }
 .discord-composer__channel:read-only {
   opacity: 0.7;
@@ -455,14 +455,14 @@ body {
 .discord-composer__divider {
   width: 1px;
   height: 16px;
-  background: var(--nestty-overlay0);
+  background: var(--copad-overlay0);
   flex-shrink: 0;
 }
 .discord-composer__textarea {
   flex: 1;
-  background: var(--nestty-surface0);
-  border: 1px solid var(--nestty-surface2);
-  color: var(--nestty-text);
+  background: var(--copad-surface0);
+  border: 1px solid var(--copad-surface2);
+  color: var(--copad-text);
   font: inherit;
   font-size: var(--fs-body);
   padding: 4px 8px;
@@ -474,19 +474,19 @@ body {
   transition: height var(--t-fast), border-color var(--t-fast);
 }
 .discord-composer__textarea::placeholder {
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-style: italic;
 }
 .discord-composer__textarea:focus {
-  outline: 1px solid var(--nestty-accent);
+  outline: 1px solid var(--copad-accent);
   outline-offset: 1px;
-  border-color: var(--nestty-accent);
+  border-color: var(--copad-accent);
   height: 96px;
 }
 .discord-composer__send {
   background: transparent;
-  border: 1px solid var(--nestty-surface2);
-  color: var(--nestty-subtext1);
+  border: 1px solid var(--copad-surface2);
+  color: var(--copad-subtext1);
   font: inherit;
   font-size: var(--fs-meta);
   padding: 0 10px;
@@ -497,9 +497,9 @@ body {
   flex-shrink: 0;
 }
 .discord-composer__send:hover {
-  background: var(--nestty-accent);
-  color: var(--nestty-bg);
-  border-color: var(--nestty-accent);
+  background: var(--copad-accent);
+  color: var(--copad-bg);
+  border-color: var(--copad-accent);
 }
 .discord-composer__send:disabled {
   opacity: 0.4;
@@ -507,22 +507,22 @@ body {
 }
 .discord-composer__hint {
   font-size: var(--fs-meta);
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-style: italic;
   padding-top: 4px;
   padding-left: 18px;
   display: none;
   font-variant-numeric: tabular-nums;
 }
-.discord-composer__hint--over { color: var(--nestty-red); font-style: normal; }
+.discord-composer__hint--over { color: var(--copad-red); font-style: normal; }
 .discord-composer__textarea:focus ~ .discord-composer__hint,
 .discord-composer__textarea:not(:placeholder-shown) ~ .discord-composer__hint {
   display: block;
 }
 
 .discord-card__expand .discord-composer {
-  background: color-mix(in oklab, var(--nestty-surface0) 80%, transparent);
-  border: 1px solid var(--nestty-overlay0);
+  background: color-mix(in oklab, var(--copad-surface0) 80%, transparent);
+  border: 1px solid var(--copad-overlay0);
   border-radius: 4px;
   padding: var(--s-2);
 }
@@ -540,9 +540,9 @@ body {
   pointer-events: none;
 }
 .discord-toast__item {
-  background: color-mix(in oklab, var(--nestty-surface2) 95%, transparent);
-  color: var(--nestty-text);
-  border-left: 4px solid var(--nestty-red);
+  background: color-mix(in oklab, var(--copad-surface2) 95%, transparent);
+  color: var(--copad-text);
+  border-left: 4px solid var(--copad-red);
   border-radius: 3px;
   padding: var(--s-2) var(--s-3);
   font-size: var(--fs-body);
@@ -554,7 +554,7 @@ body {
 .discord-toast__code {
   display: block;
   font-size: var(--fs-meta);
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   letter-spacing: 0.04em;
   text-transform: uppercase;
   margin-bottom: 2px;
@@ -575,22 +575,22 @@ body {
 }
 .discord-setup__title {
   font-size: var(--fs-head);
-  color: var(--nestty-text);
+  color: var(--copad-text);
   font-weight: 500;
   letter-spacing: -0.005em;
   margin: 0;
 }
 .discord-setup__body {
-  color: var(--nestty-subtext1);
+  color: var(--copad-subtext1);
   font-size: var(--fs-body);
   line-height: 1.6;
 }
 .discord-setup__error {
-  border-left: 3px solid var(--nestty-red);
-  background: color-mix(in oklab, var(--nestty-red) 8%, transparent);
+  border-left: 3px solid var(--copad-red);
+  background: color-mix(in oklab, var(--copad-red) 8%, transparent);
   padding: var(--s-3) var(--s-4);
   border-radius: 0 3px 3px 0;
-  color: var(--nestty-text);
+  color: var(--copad-text);
   font-size: var(--fs-body);
   white-space: pre-wrap;
   word-break: break-word;
@@ -598,7 +598,7 @@ body {
 .discord-setup__error strong {
   display: block;
   font-weight: 600;
-  color: var(--nestty-red);
+  color: var(--copad-red);
   margin-bottom: 4px;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -617,7 +617,7 @@ body {
   counter-increment: step;
   padding-left: var(--s-7);
   position: relative;
-  color: var(--nestty-subtext1);
+  color: var(--copad-subtext1);
 }
 .discord-setup__steps li::before {
   content: counter(step);
@@ -626,19 +626,19 @@ body {
   top: 0;
   width: 24px;
   height: 24px;
-  border: 1px solid var(--nestty-overlay0);
+  border: 1px solid var(--copad-overlay0);
   border-radius: 50%;
   display: grid;
   place-items: center;
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
   font-size: var(--fs-meta);
 }
 .discord-setup__cmd {
   display: block;
   margin-top: var(--s-2);
-  background: var(--nestty-surface0);
-  color: var(--nestty-text);
-  border: 1px solid var(--nestty-surface2);
+  background: var(--copad-surface0);
+  color: var(--copad-text);
+  border: 1px solid var(--copad-surface2);
   border-radius: 3px;
   padding: var(--s-2) var(--s-3);
   font-size: var(--fs-body);
@@ -648,7 +648,7 @@ body {
 }
 .discord-setup__cmd::before {
   content: "$ ";
-  color: var(--nestty-subtext0);
+  color: var(--copad-subtext0);
 }
 
 /* §11 MOTION ------------------------------------------------------------ */
@@ -738,7 +738,7 @@ body {
 
 /* ========================================================================
    discord/panel.html — JS
-   - Bridge: window.nestty.call / .on
+   - Bridge: window.copad.call / .on
    - Snowflake → ms via DISCORD_EPOCH; no ts field on payloads.
    - localStorage keys: discord-filter, discord-expanded, discord-composer-draft
    ======================================================================== */
@@ -817,7 +817,7 @@ function clockOf(ms) {
 async function refreshAuth() {
   dom.refresh.disabled = true;
   try {
-    state.auth = await nestty.call('discord.auth_status', {});
+    state.auth = await copad.call('discord.auth_status', {});
     state.authError = null;
   } catch (err) {
     // Distinguish "the call itself failed" from "the call returned
@@ -896,7 +896,7 @@ function renderTransportError() {
       The <code>discord.auth_status</code> call failed before the plugin
       could respond. The supervisor probably hasn't started the discord
       service, or the IPC connection broke. Try refresh after a moment;
-      if it persists, check nestty's stderr (e.g. <code>journalctl --user -u nestty</code>
+      if it persists, check copad's stderr (e.g. <code>journalctl --user -u copad</code>
       or the launching terminal's output) for service-supervisor messages.
     </p>
     <section class="discord-setup__error">
@@ -914,8 +914,8 @@ function renderSetup() {
       <strong>fatal_error</strong>${esc(fatal)}
     </section>` : '';
   const status = a.configured
-    ? `Discord plugin is configured but no credentials are signed in (<code>credentials_source = ${esc(a.credentials_source || 'none')}</code>). Run the auth command below and restart nestty.`
-    : `Discord plugin is not configured. Required env vars are missing or invalid; run the auth command below and restart nestty.`;
+    ? `Discord plugin is configured but no credentials are signed in (<code>credentials_source = ${esc(a.credentials_source || 'none')}</code>). Run the auth command below and restart copad.`
+    : `Discord plugin is not configured. Required env vars are missing or invalid; run the auth command below and restart copad.`;
   dom.main.className = 'discord-setup';
   dom.main.innerHTML = `
     <h1 class="discord-setup__title">discord plugin · setup</h1>
@@ -926,9 +926,9 @@ function renderSetup() {
       <li>Enable the <strong>MESSAGE CONTENT</strong> privileged intent (required to read message bodies for keyword matching).</li>
       <li>Use OAuth2 → URL Generator → <code>bot</code> scope + the permissions you want (Read Messages, Send Messages typical) → invite the bot to your server.</li>
       <li>Persist the credentials and verify against Discord:
-        <code class="discord-setup__cmd">NESTTY_DISCORD_BOT_TOKEN=&lt;token&gt; nestty-plugin-discord auth</code>
+        <code class="discord-setup__cmd">COPAD_DISCORD_BOT_TOKEN=&lt;token&gt; copad-plugin-discord auth</code>
       </li>
-      <li>Restart nestty. The Gateway WebSocket reconnects automatically.</li>
+      <li>Restart copad. The Gateway WebSocket reconnects automatically.</li>
     </ol>
   `;
 }
@@ -1108,7 +1108,7 @@ async function fetchReactionBody(channelId, messageId) {
   if (state.bodies.has(key)) return;
   state.bodies.set(key, undefined);
   try {
-    const msg = await nestty.call('discord.get_message', {
+    const msg = await copad.call('discord.get_message', {
       channel_id: channelId,
       message_id: messageId,
     });
@@ -1154,7 +1154,7 @@ async function sendMessage(channelId, content, sourceEv) {
     return false;
   }
   try {
-    await nestty.call('discord.send_message', { channel_id: channelId, content });
+    await copad.call('discord.send_message', { channel_id: channelId, content });
     if (sourceEv) {
       sourceEv.sentAt = new Date().toLocaleTimeString([], { hour12: false });
       scheduleRender();
@@ -1305,10 +1305,10 @@ async function init() {
   bindFeed();
   bindComposer();
 
-  nestty.on('discord.message',  ev => ingestEvent('message',  ev));
-  nestty.on('discord.mention',  ev => ingestEvent('mention',  ev));
-  nestty.on('discord.dm',       ev => ingestEvent('dm',       ev));
-  nestty.on('discord.reaction', ev => ingestEvent('reaction', ev));
+  copad.on('discord.message',  ev => ingestEvent('message',  ev));
+  copad.on('discord.mention',  ev => ingestEvent('mention',  ev));
+  copad.on('discord.dm',       ev => ingestEvent('dm',       ev));
+  copad.on('discord.reaction', ev => ingestEvent('reaction', ev));
 
   await refreshAuth();
   setInterval(refreshRelTimes, 30 * 1000);

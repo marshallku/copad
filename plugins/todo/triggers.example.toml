@@ -1,6 +1,6 @@
 # Example triggers for the Todo plugin.
 #
-# Drop relevant pieces into `~/.config/nestty/config.toml` once the
+# Drop relevant pieces into `~/.config/copad/config.toml` once the
 # plugin is enabled. The todo plugin emits four event kinds:
 #   - todo.created          full Todo payload
 #   - todo.changed          full Todo payload (mtime delta detected)

@@ -5,9 +5,9 @@
 //!
 //! Keyring is preferred (Linux Secret Service / macOS Keychain).
 //! On failure, falls back to plaintext at
-//! `$XDG_CONFIG_HOME/nestty/discord-token-<workspace>.json` (mode 0600,
+//! `$XDG_CONFIG_HOME/copad/discord-token-<workspace>.json` (mode 0600,
 //! atomic-replace via per-call temp + rename) with a stderr warning
-//! on every open. `NESTTY_DISCORD_REQUIRE_SECURE_STORE=1` forbids the
+//! on every open. `COPAD_DISCORD_REQUIRE_SECURE_STORE=1` forbids the
 //! plaintext fallback entirely.
 
 use std::fs;
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 
-const KEYRING_SERVICE: &str = "nestty-discord";
+const KEYRING_SERVICE: &str = "copad-discord";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenSet {
@@ -45,7 +45,7 @@ pub fn open_store(config: &Config) -> Box<dyn TokenStore> {
         Err(e) => {
             if config.require_secure_store {
                 eprintln!(
-                    "[discord] secure keyring unavailable AND NESTTY_DISCORD_REQUIRE_SECURE_STORE=1: {e}"
+                    "[discord] secure keyring unavailable AND COPAD_DISCORD_REQUIRE_SECURE_STORE=1: {e}"
                 );
                 Box::new(BrokenStore { reason: e })
             } else {
@@ -89,7 +89,7 @@ impl TokenStore for KeyringStore {
                     // from the never-ran-`auth` case.
                     eprintln!(
                         "[discord] keyring credential is corrupted (failed to deserialize): {e}. \
-                         Re-run `nestty-plugin-discord auth` to overwrite."
+                         Re-run `copad-plugin-discord auth` to overwrite."
                     );
                     None
                 }
@@ -149,7 +149,7 @@ impl TokenStore for PlaintextStore {
             Err(e) => {
                 eprintln!(
                     "[discord] plaintext credential at {} is corrupted: {e}. \
-                     Re-run `nestty-plugin-discord auth` to overwrite.",
+                     Re-run `copad-plugin-discord auth` to overwrite.",
                     self.path.display()
                 );
                 None

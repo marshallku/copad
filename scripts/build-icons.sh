@@ -2,12 +2,12 @@
 # Regenerate platform icons from a single master PNG.
 #
 # Inputs:
-#   assets/icons/nestty.png  — square master, 1024x1024 (or larger)
+#   assets/icons/copad.png  — square master, 1024x1024 (or larger)
 #
 # Outputs (checked in so a fresh checkout builds with icons without
 # having ImageMagick / Python on the build host):
-#   nestty-linux/icons/hicolor/<size>x<size>/apps/nestty.png   for size ∈ {16,22,24,32,48,64,128,256,512}
-#   nestty-macos/Resources/AppIcon.icns                        — multi-res .icns (PNG-encoded entries)
+#   copad-linux/icons/hicolor/<size>x<size>/apps/copad.png   for size ∈ {16,22,24,32,48,64,128,256,512}
+#   copad-macos/Resources/AppIcon.icns                        — multi-res .icns (PNG-encoded entries)
 #
 # Run this whenever the master PNG changes, then commit the regenerated
 # files. Optimization choice: -type Palette -colors 256 squashes the
@@ -21,7 +21,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SRC="$REPO_ROOT/assets/icons/nestty.png"
+SRC="$REPO_ROOT/assets/icons/copad.png"
 
 if [[ ! -f "$SRC" ]]; then
     echo "error: master icon not found at $SRC" >&2
@@ -47,13 +47,13 @@ PNG_OPTS=(
 
 echo "==> Linux hicolor PNGs"
 for size in 16 22 24 32 48 64 128 256 512; do
-    out="$REPO_ROOT/nestty-linux/icons/hicolor/${size}x${size}/apps/nestty.png"
+    out="$REPO_ROOT/copad-linux/icons/hicolor/${size}x${size}/apps/copad.png"
     mkdir -p "$(dirname "$out")"
     magick "$SRC" -resize "${size}x${size}" "${PNG_OPTS[@]}" "$out"
 done
 
 echo "==> macOS iconset (staging)"
-ICONSET="$(mktemp -d)/nestty.iconset"
+ICONSET="$(mktemp -d)/copad.iconset"
 mkdir -p "$ICONSET"
 gen() {
     local size="$1"; shift
@@ -71,7 +71,7 @@ gen 512  icon_256x256@2x.png icon_512x512.png
 gen 1024 icon_512x512@2x.png
 
 echo "==> macOS AppIcon.icns"
-ICNS_OUT="$REPO_ROOT/nestty-macos/Resources/AppIcon.icns"
+ICNS_OUT="$REPO_ROOT/copad-macos/Resources/AppIcon.icns"
 mkdir -p "$(dirname "$ICNS_OUT")"
 ICONSET="$ICONSET" ICNS_OUT="$ICNS_OUT" python3 - <<'PY'
 import os, struct, pathlib
@@ -111,4 +111,4 @@ pathlib.Path(os.environ["ICNS_OUT"]).write_bytes(icns)
 print(f"  wrote {os.environ['ICNS_OUT']} ({len(icns)} bytes, {len(TYPES)} entries)")
 PY
 
-echo "Done. Commit the regenerated files under nestty-linux/icons/ and nestty-macos/Resources/."
+echo "Done. Commit the regenerated files under copad-linux/icons/ and copad-macos/Resources/."

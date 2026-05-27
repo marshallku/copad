@@ -1,6 +1,6 @@
 # Presence detector recipes
 
-`nestctl presence away|active` is a thin pipe. Whether you are "away" is policy that depends on your environment (Wayland compositor, screensaver daemon, lockscreen behaviour, work patterns), so nestty itself ships zero idle-detection logic. The recipes here are starting points — pick one, edit it to taste, drop it into your dotfiles / systemd-user / Hyprland exec-once / LaunchAgent.
+`coctl presence away|active` is a thin pipe. Whether you are "away" is policy that depends on your environment (Wayland compositor, screensaver daemon, lockscreen behaviour, work patterns), so copad itself ships zero idle-detection logic. The recipes here are starting points — pick one, edit it to taste, drop it into your dotfiles / systemd-user / Hyprland exec-once / LaunchAgent.
 
 ## Picking a recipe
 
@@ -28,16 +28,16 @@ Verify the detector actually fires:
 
 ```
 # in one terminal, watch the presence stream
-nestctl event subscribe | grep -E 'presence|claude\.'
+coctl event subscribe | grep -E 'presence|claude\.'
 
 # in another, wait out the idle threshold, then check
-nestctl presence status   # should print `away`
+coctl presence status   # should print `away`
 ```
 
-If you don't see a `presence.changed` event around your timeout, the detector is not reaching the daemon — usually a `PATH` problem (the detector running outside your shell env doesn't have `nestctl` on PATH; either use the absolute path `~/.local/bin/nestctl` in the recipe or add `PATH=$HOME/.local/bin:$PATH` to the unit/service that runs the detector).
+If you don't see a `presence.changed` event around your timeout, the detector is not reaching the daemon — usually a `PATH` problem (the detector running outside your shell env doesn't have `coctl` on PATH; either use the absolute path `~/.local/bin/coctl` in the recipe or add `PATH=$HOME/.local/bin:$PATH` to the unit/service that runs the detector).
 
 ## Adding your own backend
 
-If you write a backend for an environment not covered here (KDE / X11 / GNOME / mobile geo-fence / motion sensor / whatever), the contract is just "call `nestctl presence away` when you decide the user is gone, `nestctl presence active` when they come back." No need to coordinate with nestty.
+If you write a backend for an environment not covered here (KDE / X11 / GNOME / mobile geo-fence / motion sensor / whatever), the contract is just "call `coctl presence away` when you decide the user is gone, `coctl presence active` when they come back." No need to coordinate with copad.
 
 When a backend stabilises into something you have used for months and would recommend to others, that's the right moment to consider promoting it to a first-party plugin (`plugins/presence-<backend>/`). Until then, keep it in your dotfiles where you can iterate freely.

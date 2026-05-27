@@ -6,7 +6,7 @@
 
 ## Goal
 
-Replace SwiftTerm (the terminal-emulation core inside `nestty-macos`) with `alacritty_terminal` (Rust crate) wrapped behind a thin C FFI, and implement a first-party AppKit/CoreText renderer on top. CoreText for v1; Metal for v2 only if scrollback perf demands it.
+Replace SwiftTerm (the terminal-emulation core inside `copad-macos`) with `alacritty_terminal` (Rust crate) wrapped behind a thin C FFI, and implement a first-party AppKit/CoreText renderer on top. CoreText for v1; Metal for v2 only if scrollback perf demands it.
 
 Success criteria:
 
@@ -28,11 +28,11 @@ Why vertical slices over horizontal layers:
 
 ## Architectural decisions
 
-### D1. New Rust crate `nestty-term` (not extending `nestty-ffi`)
+### D1. New Rust crate `copad-term` (not extending `copad-ffi`)
 
-Existing `nestty-ffi` exists to expose `nestty-core`'s TriggerEngine + ActionRegistry over a C ABI. Terminal emulation is a separate large surface (PTY, grid, scrollback, parsing) that does not belong mixed into the same crate.
+Existing `copad-ffi` exists to expose `copad-core`'s TriggerEngine + ActionRegistry over a C ABI. Terminal emulation is a separate large surface (PTY, grid, scrollback, parsing) that does not belong mixed into the same crate.
 
-`nestty-term/` will be a new workspace member containing:
+`copad-term/` will be a new workspace member containing:
 
 - `Cargo.toml` with `alacritty_terminal` dependency, `crate-type = ["staticlib"]`
 - `src/lib.rs` — C-ABI entry points
@@ -40,7 +40,7 @@ Existing `nestty-ffi` exists to expose `nestty-core`'s TriggerEngine + ActionReg
 - `src/snapshot.rs` — immutable grid snapshot for FFI consumers
 - `src/input.rs` — keystroke → escape-sequence mapping
 
-Swift side adds a new `CNesttyTerm` clang-module target in `Package.swift` (parallel to existing `CNesttyFFI`), with its own header + dummy.c + linker flag.
+Swift side adds a new `CCopadTerm` clang-module target in `Package.swift` (parallel to existing `CCopadFFI`), with its own header + dummy.c + linker flag.
 
 ### D2. Threading model
 
@@ -54,8 +54,8 @@ Swift side adds a new `CNesttyTerm` clang-module target in `Package.swift` (para
 Codex round 2 flagged per-cell POD as under-modeled for real-world terminal rendering (combining marks, ZWJ emoji, wide cells, ligatures, hyperlink IDs, underline color/style all need expression). The boundary is row+run oriented, with row-contiguous UTF-8 to avoid per-run pointer lifetime issues.
 
 ```c
-typedef void* nestty_term_t;
-typedef void* nestty_snapshot_t;
+typedef void* copad_term_t;
+typedef void* copad_snapshot_t;
 
 typedef struct {
     uint16_t start_col;      // inclusive
@@ -69,33 +69,33 @@ typedef struct {
     uint8_t  reserved;
     uint32_t underline_color_rgba; // 0 = use fg
     uint32_t hyperlink_id;   // 0 = none, opaque key into a separate hyperlink table
-} nestty_run_t;
+} copad_run_t;
 
-nestty_term_t nestty_term_create(uint16_t cols, uint16_t rows,
+copad_term_t copad_term_create(uint16_t cols, uint16_t rows,
                                   const char* shell, const char* cwd);
-void nestty_term_destroy(nestty_term_t);
+void copad_term_destroy(copad_term_t);
 
-void nestty_term_input(nestty_term_t, const uint8_t* bytes, size_t len);
-void nestty_term_resize(nestty_term_t, uint16_t cols, uint16_t rows);
+void copad_term_input(copad_term_t, const uint8_t* bytes, size_t len);
+void copad_term_resize(copad_term_t, uint16_t cols, uint16_t rows);
 
-nestty_snapshot_t nestty_term_snapshot(nestty_term_t);
-void nestty_snapshot_destroy(nestty_snapshot_t);
+copad_snapshot_t copad_term_snapshot(copad_term_t);
+void copad_snapshot_destroy(copad_snapshot_t);
 
-uint16_t nestty_snapshot_rows(nestty_snapshot_t);
-uint16_t nestty_snapshot_cols(nestty_snapshot_t);
+uint16_t copad_snapshot_rows(copad_snapshot_t);
+uint16_t copad_snapshot_cols(copad_snapshot_t);
 
 // Row-contiguous accessor pair: caller passes row index, gets back
 // a borrowed pointer to that row's run array AND a borrowed pointer
 // to the row's utf8 buffer. Both are valid until the snapshot is
 // destroyed. Swift draws from borrowed memory during the frame, then
-// calls nestty_snapshot_destroy. No per-cell allocations.
-size_t nestty_snapshot_row_runs(nestty_snapshot_t, uint16_t row, const nestty_run_t** runs);
-const uint8_t* nestty_snapshot_row_utf8(nestty_snapshot_t, uint16_t row, size_t* len);
+// calls copad_snapshot_destroy. No per-cell allocations.
+size_t copad_snapshot_row_runs(copad_snapshot_t, uint16_t row, const copad_run_t** runs);
+const uint8_t* copad_snapshot_row_utf8(copad_snapshot_t, uint16_t row, size_t* len);
 
-void nestty_snapshot_cursor(nestty_snapshot_t, nestty_cursor_t* out);
+void copad_snapshot_cursor(copad_snapshot_t, copad_cursor_t* out);
 ```
 
-The snapshot owns all buffers (`Vec<u8>` per row + `Vec<nestty_run_t>` per row). Swift borrows them during the frame; `nestty_snapshot_destroy` releases. Combining marks and ZWJ emoji land inside `utf8` as actual byte sequences; ligature decisions happen in Swift via CoreText. Wide cells span columns within a single run (`start_col=N, end_col=N+2`).
+The snapshot owns all buffers (`Vec<u8>` per row + `Vec<copad_run_t>` per row). Swift borrows them during the frame; `copad_snapshot_destroy` releases. Combining marks and ZWJ emoji land inside `utf8` as actual byte sequences; ligature decisions happen in Swift via CoreText. Wide cells span columns within a single run (`start_col=N, end_col=N+2`).
 
 The full surface grows over phases — selection getters in Phase 4, IME helpers in Phase 6, hyperlink table lookups in Phase 7.
 
@@ -108,7 +108,7 @@ Config gains a new section:
 backend = "swiftterm"  # or "alacritty"
 ```
 
-At pane construction time in `TabViewController`, branch on the config value and instantiate either `TerminalViewController` (current SwiftTerm-based) or `AlacrittyTerminalViewController` (new). Both conform to `NesttyPanel` so the rest of the app — `PaneManager`, `SplitNode`, socket commands, daemon Invokes — sees no difference.
+At pane construction time in `TabViewController`, branch on the config value and instantiate either `TerminalViewController` (current SwiftTerm-based) or `AlacrittyTerminalViewController` (new). Both conform to `CopadPanel` so the rest of the app — `PaneManager`, `SplitNode`, socket commands, daemon Invokes — sees no difference.
 
 This means each phase ends with a runnable comparison: same shell, same config, two windows side-by-side, swap with a config edit + restart.
 
@@ -130,8 +130,8 @@ Phase ordering reflects codex round 2 critique C4 (the user's original blocker �
 
 **Scope:** one throwaway macOS binary that proves the three things that would invalidate the entire plan if broken:
 
-1. **Dual staticlib linking** — link both existing `nestty_ffi` AND new `nestty_term` staticlibs into the same Swift binary. Call one symbol from each. No duplicate-symbol errors. Archive + sign + run on a clean machine.
-2. **Snapshot ABI lifetime** — Rust creates a snapshot containing one row of runs (red cell + reverse-video cell + wide CJK cell + a combining-mark or ZWJ-emoji sample). Swift gets borrowed pointers via `nestty_snapshot_row_runs` + `nestty_snapshot_row_utf8`, draws from them during a frame, then calls `nestty_snapshot_destroy`. Run with leaks instrument — no leaks, no dangling pointers, no crashes.
+1. **Dual staticlib linking** — link both existing `copad_ffi` AND new `copad_term` staticlibs into the same Swift binary. Call one symbol from each. No duplicate-symbol errors. Archive + sign + run on a clean machine.
+2. **Snapshot ABI lifetime** — Rust creates a snapshot containing one row of runs (red cell + reverse-video cell + wide CJK cell + a combining-mark or ZWJ-emoji sample). Swift gets borrowed pointers via `copad_snapshot_row_runs` + `copad_snapshot_row_utf8`, draws from them during a frame, then calls `copad_snapshot_destroy`. Run with leaks instrument — no leaks, no dangling pointers, no crashes.
 3. **Cursor + reverse-video over image bg** — Swift draws the one row over an `NSImageView`, with a cursor block as a separate overlay path. Reverse-video cell materializes `bg=default → theme.background` correctly. Cursor visible against arbitrary image content.
 
 Intentionally ugly throwaway code in a `spikes/` subfolder. Not Production.
@@ -142,9 +142,9 @@ Intentionally ugly throwaway code in a `spikes/` subfolder. Not Production.
 
 **Estimated:** 1 week.
 
-### Phase 1 — `nestty-term` crate scaffold + FFI handle/snapshot wiring
+### Phase 1 — `copad-term` crate scaffold + FFI handle/snapshot wiring
 
-**Scope:** create `nestty-term/` workspace member with full FFI surface from §D3 stubbed out (handle creation, no PTY yet — fixture snapshots returned). Add `CNesttyTerm` Swift target in `Package.swift`. Wire `install-macos.sh` to build both staticlibs.
+**Scope:** create `copad-term/` workspace member with full FFI surface from §D3 stubbed out (handle creation, no PTY yet — fixture snapshots returned). Add `CCopadTerm` Swift target in `Package.swift`. Wire `install-macos.sh` to build both staticlibs.
 
 **Acceptance:** `swift build` produces a binary; Swift host can create a handle, request a snapshot containing a hardcoded fixture row, walk runs + utf8, destroy snapshot, destroy handle, no leaks.
 
@@ -154,7 +154,7 @@ Intentionally ugly throwaway code in a `spikes/` subfolder. Not Production.
 
 ### Phase 2 — PTY + grid via test harness
 
-**Scope:** wire `alacritty_terminal::Term` + PTY spawn behind FFI. Snapshots are now real, sourced from Term's grid. No Swift rendering — verification is purely via a test harness that calls `nestty_term_input("ls\n")` and reads back grid cells containing "ls".
+**Scope:** wire `alacritty_terminal::Term` + PTY spawn behind FFI. Snapshots are now real, sourced from Term's grid. No Swift rendering — verification is purely via a test harness that calls `copad_term_input("ls\n")` and reads back grid cells containing "ls".
 
 **Acceptance:** spawn shell, type `printf 'hello'`, snapshot row 0 cols 0-4 contains 'h','e','l','l','o'. Resize: change cols/rows, snapshot reflects new dims after a re-prompt.
 
@@ -174,7 +174,7 @@ Intentionally ugly throwaway code in a `spikes/` subfolder. Not Production.
 - Cursor rendering (block/bar/underline + DECSCUSR + `\e[?25l/h`). Cursor draws as opaque theme.accent over the cell's already-materialized bg, so cursor is visible against any image regardless of `transparent_default_bg` setting.
 - Background image layer hierarchy ported from existing `TerminalViewController`.
 
-**Acceptance:** with `renderer.backend = "alacritty"`, open Nestty, set image bg, run Claude Code — cursor block clearly visible. `printf '\e[7mreverse\e[0m\n'` shows visible reverse-video text against image bg. Toggle `transparent_default_bg` — visible difference in whether image shows through blank cells. Damage tracking land here too (`alacritty_terminal::Term::damage` driving partial repaints; CADisplayLink at 60 Hz, no draw when no damage).
+**Acceptance:** with `renderer.backend = "alacritty"`, open Copad, set image bg, run Claude Code — cursor block clearly visible. `printf '\e[7mreverse\e[0m\n'` shows visible reverse-video text against image bg. Toggle `transparent_default_bg` — visible difference in whether image shows through blank cells. Damage tracking land here too (`alacritty_terminal::Term::damage` driving partial repaints; CADisplayLink at 60 Hz, no draw when no damage).
 
 **Risk:** CoreText shaping cost per row × full-screen redraw may be too slow at first. Mitigation: profile after first prompt renders; gate optimization on real numbers. Metal escape hatch is Phase 9.
 
@@ -208,7 +208,7 @@ Edge cases to cover explicitly:
 - Composition cancel (Esc) — preedit clears, no PTY bytes sent
 - Dead keys (Option+E then E = é) — handled via insertText with replacement range
 - Focus change mid-composition (Cmd+Tab away then back) — commit on focus loss
-- Pane switch mid-composition (Cmd+Shift+] in nestty) — commit before pane swap
+- Pane switch mid-composition (Cmd+Shift+] in copad) — commit before pane swap
 - Resize during composition — preedit cell position updates with new geometry
 - Multi-pane simultaneous composition (only the focused pane has IME state)
 - Synchronized output (`\e[?2026h`) during composition — preedit overlays the rendered snapshot regardless of sync state
@@ -223,7 +223,7 @@ Why it comes BEFORE automation/socket parity: codex round 2 — IME shape constr
 
 ### Phase 7 — Automation / socket API parity
 
-**Scope:** make the new renderer honor the full nestty automation surface that `TerminalViewController` currently exposes:
+**Scope:** make the new renderer honor the full copad automation surface that `TerminalViewController` currently exposes:
 
 - `terminal.state` — cols, rows, cursor row/col, title
 - `terminal.read` — visible screen text (concat of row utf8)
@@ -240,9 +240,9 @@ Why it comes BEFORE automation/socket parity: codex round 2 — IME shape constr
 - Theme hot-reload (`applyTheme`)
 - Pane focus tracking (`activePanel` / `activeTerminal` accessors)
 
-Each automation API needs an integration test using `nestctl call` against a running Nestty with `renderer.backend = "alacritty"`. The existing test inventory for SwiftTerm path is the parity baseline.
+Each automation API needs an integration test using `coctl call` against a running Copad with `renderer.backend = "alacritty"`. The existing test inventory for SwiftTerm path is the parity baseline.
 
-**Acceptance:** every `nestctl call terminal.*` command that works on SwiftTerm path produces identical output shape on alacritty path. Daemon Invokes route to the right pane regardless of backend.
+**Acceptance:** every `coctl call terminal.*` command that works on SwiftTerm path produces identical output shape on alacritty path. Daemon Invokes route to the right pane regardless of backend.
 
 **Estimated:** 3 weeks. Larger than it looks because of integration-test surface.
 
@@ -264,7 +264,7 @@ Each automation API needs an integration test using `nestctl call` against a run
 
 ### Phase 10 — Default swap + SwiftTerm removal
 
-**Scope:** flip the default `[renderer] backend` to "alacritty". Keep SwiftTerm path as a fallback for one release cycle (in case of regression reports). Next release: delete `TerminalViewController` (SwiftTerm-based), `NesttyTerminalView`, `Package.swift` SwiftTerm dependency, and the renderer config flag (no longer a choice).
+**Scope:** flip the default `[renderer] backend` to "alacritty". Keep SwiftTerm path as a fallback for one release cycle (in case of regression reports). Next release: delete `TerminalViewController` (SwiftTerm-based), `CopadTerminalView`, `Package.swift` SwiftTerm dependency, and the renderer config flag (no longer a choice).
 
 **Acceptance:** one release cycle of bug reports settled, no regression escalations. Codebase shrinks by ~1500 lines of SwiftTerm wrapping.
 
@@ -280,12 +280,12 @@ Each automation API needs an integration test using `nestctl call` against a run
 | R4 | FFI overhead per row × full-screen redraw amplifies latency | Row-contiguous utf8 + run array (§D3); Swift borrows during frame, no per-cell allocations. Batch reads only if profiling shows need. |
 | R5 | Swift main thread can starve Rust PTY thread if rendering is heavy | Render off-main only if profiling proves the need; CADisplayLink-based throttling for now. |
 | R6 | Migration takes longer than 6 months and Linux churn requires touching renderer code | Daemon-first architecture isolates renderer from Linux churn. Re-evaluate at month 4 if behind schedule. |
-| R7 | Dual staticlib linking surfaces a Rust std symbol collision or build-flag conflict | Phase 0 spike's #1 task is to prove this. Mitigation paths if it fails: (a) merge `nestty-term` into `nestty-ffi` instead of separate crate, (b) build one staticlib as a Rust dynamic library, (c) cdylib instead. |
+| R7 | Dual staticlib linking surfaces a Rust std symbol collision or build-flag conflict | Phase 0 spike's #1 task is to prove this. Mitigation paths if it fails: (a) merge `copad-term` into `copad-ffi` instead of separate crate, (b) build one staticlib as a Rust dynamic library, (c) cdylib instead. |
 | R8 | Phase 3 (6 weeks) underestimates the combined slice; original-blocker proof slips, user loses trust | Half-way through Phase 3, demo the cursor-over-image fix even if other Phase 3 items aren't done. If the slice is genuinely 8+ weeks, peel scrollback (Phase 5) earlier to ship the cursor fix sooner. |
 
 ## Out of scope (explicitly deferred)
 
-- Sixel / Kitty graphics protocol (defer to v2; complex spec, low user demand for nestty's audience)
+- Sixel / Kitty graphics protocol (defer to v2; complex spec, low user demand for copad's audience)
 - GPU rendering (Phase 8, gated on measurement)
 - Multi-window terminals (single tab = single PTY)
 - Remote terminal protocols (mosh, ssh-mux)

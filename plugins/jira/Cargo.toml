@@ -1,13 +1,13 @@
 [package]
-name = "nestty-plugin-jira"
+name = "copad-plugin-jira"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "First-party Jira (Atlassian Cloud) service plugin for nestty — polls assigned/watched tickets and emits jira.ticket_assigned/status_changed/comment_added/mention; provides jira.list_my_tickets/get_ticket/create_ticket/transition/add_comment actions plus jira.auth_status."
+description = "First-party Jira (Atlassian Cloud) service plugin for copad — polls assigned/watched tickets and emits jira.ticket_assigned/status_changed/comment_added/mention; provides jira.list_my_tickets/get_ticket/create_ticket/transition/add_comment actions plus jira.auth_status."
 repository.workspace = true
 
 [[bin]]
-name = "nestty-plugin-jira"
+name = "copad-plugin-jira"
 path = "src/main.rs"
 
 [dependencies]

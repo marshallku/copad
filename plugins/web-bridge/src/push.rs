@@ -1,10 +1,10 @@
 //! Web Push (RFC 8030) subscription storage + send pipeline for the
 //! PWA notification path.
 //!
-//! VAPID key pair comes from env (`NESTTY_WEB_BRIDGE_VAPID_PRIVATE` /
-//! `NESTTY_WEB_BRIDGE_VAPID_PUBLIC`, URL-safe base64 without padding —
+//! VAPID key pair comes from env (`COPAD_WEB_BRIDGE_VAPID_PRIVATE` /
+//! `COPAD_WEB_BRIDGE_VAPID_PUBLIC`, URL-safe base64 without padding —
 //! the form that `web-push --gen-vapid` and the SPA both consume).
-//! Subscriptions persist to `~/.config/nestty/web-bridge-push.jsonl`
+//! Subscriptions persist to `~/.config/copad/web-bridge-push.jsonl`
 //! (one JSON record per line), reloaded from disk on each mutation
 //! since the list stays small. Push send uses the isahc client baked
 //! into `web-push 0.11`.
@@ -41,15 +41,15 @@ impl PushConfig {
     /// keys aren't both set — caller treats push as disabled and
     /// returns 501 from the subscribe endpoint.
     pub fn from_env() -> Option<Self> {
-        let priv_k = std::env::var("NESTTY_WEB_BRIDGE_VAPID_PRIVATE").ok()?;
-        let pub_k = std::env::var("NESTTY_WEB_BRIDGE_VAPID_PUBLIC").ok()?;
+        let priv_k = std::env::var("COPAD_WEB_BRIDGE_VAPID_PRIVATE").ok()?;
+        let pub_k = std::env::var("COPAD_WEB_BRIDGE_VAPID_PUBLIC").ok()?;
         if priv_k.is_empty() || pub_k.is_empty() {
             return None;
         }
-        let subject = std::env::var("NESTTY_WEB_BRIDGE_VAPID_SUBJECT")
+        let subject = std::env::var("COPAD_WEB_BRIDGE_VAPID_SUBJECT")
             .ok()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "mailto:nestty@localhost".to_string());
+            .unwrap_or_else(|| "mailto:copad@localhost".to_string());
         Some(PushConfig {
             vapid_private_b64: priv_k,
             vapid_public_b64: pub_k,
@@ -102,7 +102,7 @@ pub fn subscriptions_path() -> Option<PathBuf> {
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
         .or_else(|| dirs::home_dir().map(|h| h.join(".config")))?;
-    Some(config.join("nestty/web-bridge-push.jsonl"))
+    Some(config.join("copad/web-bridge-push.jsonl"))
 }
 
 pub fn load_subscriptions() -> Vec<Subscription> {
@@ -252,8 +252,8 @@ mod tests {
         // this as a smoke test for the None-path. The Some path is
         // covered via runtime e2e since it requires real keys.)
         unsafe {
-            std::env::remove_var("NESTTY_WEB_BRIDGE_VAPID_PRIVATE");
-            std::env::remove_var("NESTTY_WEB_BRIDGE_VAPID_PUBLIC");
+            std::env::remove_var("COPAD_WEB_BRIDGE_VAPID_PRIVATE");
+            std::env::remove_var("COPAD_WEB_BRIDGE_VAPID_PUBLIC");
         }
         assert!(PushConfig::from_env().is_none());
     }

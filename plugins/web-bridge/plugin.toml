@@ -2,12 +2,12 @@
 name = "web-bridge"
 title = "Web Bridge"
 version = "0.1.0"
-description = "HTTP+WebSocket broker over nesttyd's socket surface. Lets a phone/laptop on your Tailscale (or via SSH tunnel) drive the local nestty harness — flip presence, fire commands, read recent pane output, stream events. Slice 3.0 ships a web-native chat-style UI; Slice 3.1+ adds full-PTY xterm.js + mobile keyboard toolbar."
+description = "HTTP+WebSocket broker over copadd's socket surface. Lets a phone/laptop on your Tailscale (or via SSH tunnel) drive the local copad harness — flip presence, fire commands, read recent pane output, stream events. Slice 3.0 ships a web-native chat-style UI; Slice 3.1+ adds full-PTY xterm.js + mobile keyboard toolbar."
 
 [[services]]
 name = "main"
-exec = "nestty-plugin-web-bridge"
-# onStartup so the listener lives whenever nesttyd is up — a Discord
+exec = "copad-plugin-web-bridge"
+# onStartup so the listener lives whenever copadd is up — a Discord
 # alert routing the user to the dashboard URL can land any time
 # without requiring a lazy first action call.
 activation = "onStartup"
@@ -15,12 +15,12 @@ restart = "on-crash"
 provides = []
 subscribes = []
 # Required env:
-#   NESTTY_WEB_BRIDGE_TOKEN — Bearer token, ≥32 chars. Inject via the
-#     daemon's systemd EnvironmentFile (`~/.config/nestty/outputs.env`
-#     is the recommended path, shared with NESTTY_DISCORD_BOT_TOKEN
+#   COPAD_WEB_BRIDGE_TOKEN — Bearer token, ≥32 chars. Inject via the
+#     daemon's systemd EnvironmentFile (`~/.config/copad/outputs.env`
+#     is the recommended path, shared with COPAD_DISCORD_BOT_TOKEN
 #     etc.). Without it the plugin exits before binding (fail-closed).
 # Optional env:
-#   NESTTY_WEB_BRIDGE_BIND — listen address (default `127.0.0.1:7575`).
+#   COPAD_WEB_BRIDGE_BIND — listen address (default `127.0.0.1:7575`).
 #     Keep localhost-only and tunnel from your phone via Tailscale or
 #     `ssh -L 7575:localhost:7575 host`; or bind your Tailscale IP if
 #     you trust the tailnet identity layer.
@@ -34,7 +34,7 @@ subscribes = []
 #     access logs.
 #
 # Daemon-socket client:
-#   The plugin opens two raw connections to nesttyd via NESTTY_SOCKET
+#   The plugin opens two raw connections to copadd via COPAD_SOCKET
 #   (injected by the supervisor). One long-lived for `event.subscribe`,
 #   one (pooled) for RPC. Requests flow through the normal daemon
 #   `dispatch()` path including `GuiRegistry` routing, so GUI-owned

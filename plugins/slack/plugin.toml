@@ -6,11 +6,11 @@ description = "Slack Socket Mode plugin: emits slack.mention / slack.dm / slack.
 
 [[services]]
 name = "main"
-exec = "nestty-plugin-slack"
+exec = "copad-plugin-slack"
 # onStartup: Socket Mode requires a long-lived WebSocket connection
-# that needs to be alive whenever nestty is, so events flow inbound at
+# that needs to be alive whenever copad is, so events flow inbound at
 # arrival time. Lazy (onAction) activation works for slack.post_message
-# alone but would lose mention/DM/reaction events between nestty starts
+# alone but would lose mention/DM/reaction events between copad starts
 # and the first action call — which defeats the point.
 activation = "onStartup"
 restart = "on-crash"
@@ -20,9 +20,9 @@ provides = [
     "slack.get_message",
 ]
 subscribes = []
-# Required env: NESTTY_SLACK_BOT_TOKEN (xoxb-...), NESTTY_SLACK_APP_TOKEN (xapp-...)
-# Optional env: NESTTY_SLACK_WORKSPACE (default "default" — keyring entry namespace),
-#               NESTTY_SLACK_REQUIRE_SECURE_STORE (default false — refuse plaintext fallback)
+# Required env: COPAD_SLACK_BOT_TOKEN (xoxb-...), COPAD_SLACK_APP_TOKEN (xapp-...)
+# Optional env: COPAD_SLACK_WORKSPACE (default "default" — keyring entry namespace),
+#               COPAD_SLACK_REQUIRE_SECURE_STORE (default false — refuse plaintext fallback)
 #
 # One-time setup:
 #   1. Create a Slack App at https://api.slack.com/apps
@@ -40,9 +40,9 @@ subscribes = []
 #                              im:history / mpim:history for the
 #                              respective conversation kinds)
 #   5. Install to your workspace; copy the Bot User OAuth Token (xoxb-...)
-#   6. Run `NESTTY_SLACK_BOT_TOKEN=xoxb-... NESTTY_SLACK_APP_TOKEN=xapp-... nestty-plugin-slack auth`
+#   6. Run `COPAD_SLACK_BOT_TOKEN=xoxb-... COPAD_SLACK_APP_TOKEN=xapp-... copad-plugin-slack auth`
 
-# Panel name "main" so `nestctl plugin open slack` works without
+# Panel name "main" so `coctl plugin open slack` works without
 # having to pass `--params '{"panel":"..."}'` — the dispatch path
 # defaults to panel="main" when none is supplied.
 [[panels]]

@@ -10,10 +10,10 @@ and Migration step 1.
 ## Why this is its own doc
 
 The pivot moves the trigger engine / supervisor / event bus out of the GUI
-process and into `nesttyd`. GUI-owned commands (`tab.*`, `split.*`,
+process and into `copadd`. GUI-owned commands (`tab.*`, `split.*`,
 `terminal.*`, `webview.*`, `background.*`, `statusbar.*`, `plugin.open`,
 `agent.approve` UI prompts) still need to mutate GUI state — but the
-*caller* (a trigger, a `nestctl` invocation, a plugin's action chain) now
+*caller* (a trigger, a `coctl` invocation, a plugin's action chain) now
 lives in the daemon.
 
 Current socket is one-way: clients send `Request`, server replies with
@@ -22,35 +22,35 @@ needs **bidirectional request/response** because the daemon must now invoke
 methods *on the GUI*. Today's protocol has no such concept.
 
 This doc specifies the minimum additive changes to support that without
-breaking `nestctl` or any plugin.
+breaking `coctl` or any plugin.
 
 ## Baseline (what stays unchanged)
 
 The current **wire format** is preserved verbatim. Plugins (which read
-`NESTTY_SOCKET` from env set by the supervisor) and any third-party tool
-that reads `NESTTY_SOCKET` continue to work without recompilation.
+`COPAD_SOCKET` from env set by the supervisor) and any third-party tool
+that reads `COPAD_SOCKET` continue to work without recompilation.
 
-**Socket path changes**, so anything that hardcodes `/tmp/nestty-*.sock` or
-uses the current `nestctl` discovery glob will not find the daemon socket
+**Socket path changes**, so anything that hardcodes `/tmp/copad-*.sock` or
+uses the current `coctl` discovery glob will not find the daemon socket
 until rebuilt or env-injected. The full consumer list is in
 [harness-integration.md § Socket path consumer audit](./harness-integration.md).
-`nestctl` itself is rebuilt as part of the workspace, so the audit's job is
+`coctl` itself is rebuilt as part of the workspace, so the audit's job is
 external scripts and per-machine config.
 
 ### Transport
 
-- Unix socket at well-known path (see `nestty_core::paths::socket_path`):
-  - Linux: `${XDG_RUNTIME_DIR}/nestty/socket` when set, else
-    `/tmp/nestty-{uid}/socket` (uid-namespaced so multi-user `/tmp` doesn't
+- Unix socket at well-known path (see `copad_core::paths::socket_path`):
+  - Linux: `${XDG_RUNTIME_DIR}/copad/socket` when set, else
+    `/tmp/copad-{uid}/socket` (uid-namespaced so multi-user `/tmp` doesn't
     race on first-binder).
-  - macOS: `~/Library/Caches/nestty/socket`.
+  - macOS: `~/Library/Caches/copad/socket`.
 - Newline-delimited JSON. One JSON object per line.
-- The daemon honors `NESTTY_SOCKET` (override path) and accepts an optional
-  `--legacy-socket /tmp/nestty.sock` flag for a transitional second listener
+- The daemon honors `COPAD_SOCKET` (override path) and accepts an optional
+  `--legacy-socket /tmp/copad.sock` flag for a transitional second listener
   during the audit-and-update window. The flag is meant to be temporary and
   removed before final release.
 
-### Message types (from `nestty-core/src/protocol.rs`)
+### Message types (from `copad-core/src/protocol.rs`)
 
 ```rust
 struct Request  { id: String, method: String, params: Value }
@@ -122,7 +122,7 @@ No `gui.register` needed. The daemon treats unregistered connections as
 methods, which the daemon proxies to the primary GUI (returns `no_gui` if
 none).
 
-### GUI client (nestty / Nestty.app)
+### GUI client (copad / Copad.app)
 
 ```
 gui connect
@@ -282,7 +282,7 @@ two-way switch — it never sees Invoke because it never registers as a GUI.
 (Alternative considered: reuse `Request` for `Invoke` with the daemon as the
 sender. Rejected because plugins and clients also send `Request`, and a
 single discriminator field (`invoke` vs `method`) makes intent crisp on
-inspection — important for debugging `nestctl event subscribe` output.)
+inspection — important for debugging `coctl event subscribe` output.)
 
 ### Correlation and timeouts
 
@@ -329,7 +329,7 @@ daemon-owned and stay handled inline post-migration.
 | `session` | `session.list`, `session.info` (per-window tab sessions) |
 
 `claude.start` is GUI-owned because the current implementation
-(`nestty-linux/src/socket.rs:1394` onward) takes `TabManager` +
+(`copad-linux/src/socket.rs:1394` onward) takes `TabManager` +
 `ApplicationWindow` and calls `add_tab_with_cwd_and_initial_input` —
 it returns `panel_id` and `tab` references, so its response contract is
 GUI-bound. Listed under `tab` capability.
@@ -360,14 +360,14 @@ When the daemon receives a CLI `Request`:
      capability, issue an `Invoke` on that connection, await the `Response`,
      forward `result` / `error` to the original CLI client (preserving
      `error.code`).
-   - Otherwise: reply with `error.code = "no_gui"`, message = "no nestty
-     window attached for capability `<cap>`; start nestty or pass
+   - Otherwise: reply with `error.code = "no_gui"`, message = "no copad
+     window attached for capability `<cap>`; start copad or pass
      `--target_client_id` to an alternate GUI".
 3. **Unknown method?** → `error.code = "unknown_method"`.
 
 ### Explicit targeting
 
-CLI may pass `--target_client_id <id>` (new `nestctl` flag) to address a
+CLI may pass `--target_client_id <id>` (new `coctl` flag) to address a
 specific GUI by id. The flag value is placed in the `Request.target_client_id`
 top-level optional field (not inside `params`, so method-specific param
 schemas never collide):
@@ -413,7 +413,7 @@ Bus-record schema (Rust, not wire):
 
 - `internal` — plugin stdio publishes; daemon-internal code (chained
   `<action>.completed`, cron `time.*`, action-result events).
-- `external` — events arriving via `nestctl event publish`, including
+- `external` — events arriving via `coctl event publish`, including
   hook fires, life-assistant bridge, manual CLI invocations.
 
 `TriggerEngine` consults the bus-record `origin` against each trigger's
@@ -462,7 +462,7 @@ subscription path they used.
 
 Heartbeat is point-to-point on registered GUI connections only. It uses the
 `Invoke` shape (daemon → GUI), keeping it strictly off the event bus so
-non-GUI subscribers — `nestctl event subscribe`, plugin `subscribes` —
+non-GUI subscribers — `coctl event subscribe`, plugin `subscribes` —
 never see ping traffic and stay byte-compatible with today's wire output.
 
 ```jsonc
@@ -481,7 +481,7 @@ pending invokes with `gui_disconnected`, transfers primary if applicable.
 keeps the wire vocabulary at four shapes (Request / Response / Event /
 Invoke) and lets the GUI's existing Invoke handler dispatch it as a
 no-op method. Round-trip latency is also measurable from the same
-correlation map used for real methods, which is useful for `nestctl plugin
+correlation map used for real methods, which is useful for `coctl plugin
 diagnose gui` style introspection.
 
 ## Error vocabulary additions
@@ -517,20 +517,20 @@ Backward-compatible additions (new capabilities, new methods, new event
 types) don't bump `protocol_version`. Breaking changes (removing a field,
 changing a discriminator) do.
 
-## What `nestctl` doesn't see
+## What `coctl` doesn't see
 
-`nestctl` connects as a generic client. It does not register. It does not
+`coctl` connects as a generic client. It does not register. It does not
 participate in Invoke. Concretely:
 
-- `nestctl tab new` → daemon proxies to primary GUI → reply forwarded back.
+- `coctl tab new` → daemon proxies to primary GUI → reply forwarded back.
   Looks identical to today from the CLI's view.
-- `nestctl event subscribe` → daemon streams Events. Wire shape is the
+- `coctl event subscribe` → daemon streams Events. Wire shape is the
   same `{ type, data, source? }` it always was — origin lives on the
   server-side bus record, not on the wire. Existing parsers that read
   only `type` + `data` keep working unchanged.
-- `nestctl event publish foo.x '{"k":"v"}'` (positional JSON payload, optional)
+- `coctl event publish foo.x '{"k":"v"}'` (positional JSON payload, optional)
   → daemon stamps the event `External` on the bus record. `--quiet`
-  exits 0 on transport failures so hook scripts don't break when nesttyd
+  exits 0 on transport failures so hook scripts don't break when copadd
   is down.
 
 CLI clients never need to know `client_id` or `gui.register` unless they
@@ -542,12 +542,12 @@ explicitly want to address a specific GUI (`--target_client_id`).
 no env-var gate. It opens a daemon-attached connection at startup and
 reconnects (1→30s backoff) whenever the daemon goes away. The
 in-process `socket::dispatch` path is still wired for the legacy
-nestctl-via-per-instance-socket flow; daemon→GUI Invokes route through
+coctl-via-per-instance-socket flow; daemon→GUI Invokes route through
 the daemon path. Daemon-absent is benign: the reconnect loop polls
 quietly while the GUI runs entirely through its in-process supervisor.
 
 **Step 5b (next, separate phase):** the in-process plugin supervisor
-inside nestty-linux is removed and the daemon becomes the sole plugin
+inside copad-linux is removed and the daemon becomes the sole plugin
 host. After this point the GUI cannot run plugins without a daemon
 attached. The standalone build feature in § Resolved decisions #3
 covers single-user no-systemd setups and CI by re-embedding the daemon
@@ -572,7 +572,7 @@ Listed here as the canonical answer to consult during implementation.
 2. **Heartbeat shape — `_ping` over `Invoke`, not Event.** Keeps the
    non-GUI subscriber stream byte-identical to today's. See § Heartbeat.
 
-3. **Standalone fallback — permanent build feature.** `nestty --standalone`
+3. **Standalone fallback — permanent build feature.** `copad --standalone`
    (daemon-in-process) ships as a build-flag-gated permanent mode for
    single-user no-systemd setups, CI, and first-use bootstrapping. It is
    not deleted at the end of migration. The migration just switches the
@@ -620,19 +620,19 @@ next codex round before step 4.
 
 Code touch points when implementation lands:
 
-- `nestty-core/src/protocol.rs` — add `Invoke` struct, extend Event with
+- `copad-core/src/protocol.rs` — add `Invoke` struct, extend Event with
   origin handling helpers.
-- `nestty-daemon/src/socket.rs` (relocated transport) — pending-Invoke map,
+- `copad-daemon/src/socket.rs` (relocated transport) — pending-Invoke map,
   GUI registry, capability routing.
-- `nestty-daemon/src/gui_registry.rs` (new) — `GuiClient` records, primary
+- `copad-daemon/src/gui_registry.rs` (new) — `GuiClient` records, primary
   selection, capability lookup.
-- `nestty-linux/src/gui_client.rs` (new) — outbound connection,
+- `copad-linux/src/gui_client.rs` (new) — outbound connection,
   `gui.register` on connect, Invoke handler dispatching to existing
   `gui_handlers` module.
-- `nestty-linux/src/gui_handlers.rs` (new — split from `socket.rs`) — the
+- `copad-linux/src/gui_handlers.rs` (new — split from `socket.rs`) — the
   GUI-owned half of current dispatch, function-call shaped (not socket
   shaped).
-- `nestty-cli/src/main.rs` — optional `--target_client_id` flag, `event
+- `copad-cli/src/main.rs` — optional `--target_client_id` flag, `event
   publish` subcommand.
 
 Tests required at each step are listed in the parent doc's sequencing.

@@ -1,7 +1,7 @@
 # Example triggers driven by the Jira plugin.
 #
-# Drop relevant pieces of this file into your nestty config (or include
-# a `[[triggers]]` block in `~/.config/nestty/config.toml`) once the
+# Drop relevant pieces of this file into your copad config (or include
+# a `[[triggers]]` block in `~/.config/copad/config.toml`) once the
 # Jira plugin is authenticated.
 #
 # The plugin emits four event kinds:
@@ -85,7 +85,7 @@ event_kind = "jira.mention"
 
 # ---------------------------------------------------------------------
 # 4. (Sketch) Per-project condition narrowing
-#    The polling JQL already supports `NESTTY_JIRA_PROJECTS=APP,PROJ`
+#    The polling JQL already supports `COPAD_JIRA_PROJECTS=APP,PROJ`
 #    for env-side narrowing, but a trigger-side condition lets one
 #    plugin instance drive multiple destinations per project.
 # ---------------------------------------------------------------------

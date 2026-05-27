@@ -9,9 +9,9 @@
 //!
 //! Keyring is preferred (Linux Secret Service / macOS Keychain).
 //! On failure, falls back to plaintext at
-//! `$XDG_CONFIG_HOME/nestty/slack-tokens-<workspace>.json` (mode 0600,
+//! `$XDG_CONFIG_HOME/copad/slack-tokens-<workspace>.json` (mode 0600,
 //! atomic-replace via per-call temp + rename) with a stderr warning
-//! on every open. `NESTTY_SLACK_REQUIRE_SECURE_STORE=1` forbids the
+//! on every open. `COPAD_SLACK_REQUIRE_SECURE_STORE=1` forbids the
 //! plaintext fallback entirely — token operations error instead of
 //! writing plaintext, while RPC init still succeeds (analogous to
 //! calendar plugin's degraded mode).
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 
-const KEYRING_SERVICE: &str = "nestty-slack";
+const KEYRING_SERVICE: &str = "copad-slack";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenSet {
@@ -50,7 +50,7 @@ pub fn open_store(config: &Config) -> Box<dyn TokenStore> {
         Err(e) => {
             if config.require_secure_store {
                 eprintln!(
-                    "[slack] secure keyring unavailable AND NESTTY_SLACK_REQUIRE_SECURE_STORE=1: {e}"
+                    "[slack] secure keyring unavailable AND COPAD_SLACK_REQUIRE_SECURE_STORE=1: {e}"
                 );
                 Box::new(BrokenStore { reason: e })
             } else {
