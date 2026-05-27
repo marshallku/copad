@@ -225,18 +225,32 @@ impl EventListener for NesttyListener {
                 // `nestty_term_take_clipboard_request`.
                 *self.pending_clipboard.lock().unwrap() = Some(text);
             }
-            // TEMPORARILY DISABLED — A3 (PtyWrite forward) + OSC4
-            // (ColorRequest reply) wired the alacritty Event arms to
-            // write back through `Msg::Input`, but real-world prompts
-            // (zsh + powerlevel10k / oh-my-zsh) trip a double-echo +
-            // `'network': unknown terminal type` regression on the
-            // user's box. Disabling the arms while we isolate; falls
-            // through to the catch-all drop. nvim DSR warning + OSC
-            // color answers regress for now, accepted trade-off until
-            // the root cause is found.
-            #[allow(unreachable_patterns)]
-            Event::PtyWrite(_) | Event::ColorRequest(_, _) => {
-                // intentional silent drop while diagnosing
+            Event::PtyWrite(reply) => {
+                // alacritty_terminal already formatted the reply
+                // (`\e[<row>;<col>R` for DSR 6n, `\e[?6c` for DA 0c,
+                // etc.) — we just forward the bytes back to the child.
+                // Without this hop nvim logs `"Did not detect DSR
+                // response from terminal"` on startup and falls back
+                // to slower paths.
+                self.send_to_pty(reply.into_bytes());
+            }
+            Event::ColorRequest(index, format_reply) => {
+                // OSC 4 / 10 / 11 / 12 — apps query "what color does
+                // index N actually render as?" so they can pick
+                // contrast (e.g. nvim's `&background=dark`). alacritty
+                // hands us the formatter; we resolve the index against
+                // the host-supplied palette and feed the result back
+                // via the same Msg::Input path PtyWrite uses.
+                //
+                // No reply on miss: better than answering with a stale
+                // alacritty default that doesn't match what we actually
+                // draw on screen. Apps treat no-reply as "use my
+                // built-in default".
+                let rgb = self.palette.lock().unwrap().get(&index).copied();
+                if let Some(rgb) = rgb {
+                    let reply = format_reply(rgb);
+                    self.send_to_pty(reply.into_bytes());
+                }
             }
             _ => {
                 // Title / Bell / MouseCursorDirty / TextAreaSizeRequest /
