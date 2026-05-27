@@ -5,11 +5,17 @@
 
 if test -n "$NESTTY_PANEL_ID"; and test -n "$NESTTY_SOCKET"; and command -q nestctl
     function __nestty_json_escape
-        # Backslash MUST be replaced first or the next pass will
-        # double-escape it. Newline → literal `\n`.
+        # Backslash MUST be replaced first or later passes double-
+        # escape it. Covers the JSON-mandated controls (`\b \f \n
+        # \r \t`) that occur in real paths; rarer 0x01-0x1f bytes
+        # would need `\uXXXX` form and aren't handled.
         set -l s (string replace --all '\\' '\\\\' -- $argv[1])
         set s (string replace --all '"' '\\"' -- $s)
-        string replace --all \n '\\n' -- $s
+        set s (string replace --all \b '\\b' -- $s)
+        set s (string replace --all \f '\\f' -- $s)
+        set s (string replace --all \n '\\n' -- $s)
+        set s (string replace --all \r '\\r' -- $s)
+        string replace --all \t '\\t' -- $s
     end
     function __nestty_report_cwd --on-variable PWD
         set -l pid_esc (__nestty_json_escape "$NESTTY_PANEL_ID")

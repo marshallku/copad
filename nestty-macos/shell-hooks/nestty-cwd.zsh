@@ -15,13 +15,20 @@
 
 if [[ -n "$NESTTY_PANEL_ID" && -n "$NESTTY_SOCKET" ]] && command -v nestctl >/dev/null 2>&1; then
     # JSON-escape a single string value: backslash first (otherwise
-    # the later `"` replacement would double-escape), then `"`, then
-    # newline. Tab / control bytes are out of scope (cwd is a
-    # filesystem path; embedded newlines are the realistic concern).
+    # later replacements would double-escape), then `"`, then the
+    # control bytes that are technically legal in POSIX filenames
+    # (`\b \f \n \r \t`). Other control bytes (0x01-0x1f) are
+    # extremely rare in real paths and would need `\uXXXX` form —
+    # punt on them: nestctl rejects the request with a JSON parse
+    # error and the hook stays a no-op for that one cd.
     _nestty_json_escape() {
         local s=${1//\\/\\\\}
         s=${s//\"/\\\"}
-        printf '%s' "${s//$'\n'/\\n}"
+        s=${s//$'\b'/\\b}
+        s=${s//$'\f'/\\f}
+        s=${s//$'\n'/\\n}
+        s=${s//$'\r'/\\r}
+        printf '%s' "${s//$'\t'/\\t}"
     }
     _nestty_report_cwd() {
         # Background + redirect so a slow socket can't stall the prompt.

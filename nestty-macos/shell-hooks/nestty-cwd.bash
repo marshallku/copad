@@ -8,7 +8,11 @@ if [[ -n "$NESTTY_PANEL_ID" && -n "$NESTTY_SOCKET" ]] && command -v nestctl >/de
     _nestty_json_escape() {
         local s=${1//\\/\\\\}
         s=${s//\"/\\\"}
-        printf '%s' "${s//$'\n'/\\n}"
+        s=${s//$'\b'/\\b}
+        s=${s//$'\f'/\\f}
+        s=${s//$'\n'/\\n}
+        s=${s//$'\r'/\\r}
+        printf '%s' "${s//$'\t'/\\t}"
     }
     _nestty_report_cwd() {
         if [[ "$PWD" != "$_NESTTY_LAST_REPORTED_CWD" ]]; then

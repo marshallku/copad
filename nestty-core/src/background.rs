@@ -27,11 +27,11 @@ pub struct BackgroundPaths {
 pub fn pick_random(paths: &BackgroundPaths) -> Option<String> {
     let contents = read_list(&paths.primary_list)
         .or_else(|| paths.fallback_list.as_deref().and_then(read_list))?;
-    let lines: Vec<&str> = contents
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
+    // Preserve verbatim line content (matches Linux's prior
+    // `socket.rs::select_random_image` semantics — paths can legally
+    // contain leading/trailing spaces). Only skip empty-after-LF
+    // entries; `lines()` already drops the trailing newline.
+    let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
     if lines.is_empty() {
         return None;
     }
@@ -105,8 +105,13 @@ mod tests {
     }
 
     #[test]
-    fn pick_random_skips_blank_lines() {
-        let p = tmpfile("blanks", "\n   \n/only.png\n   \n");
+    fn pick_random_skips_empty_lines() {
+        // Empty-after-LF entries drop, but whitespace-only lines pass
+        // through verbatim — paths with leading/trailing spaces are
+        // valid POSIX filenames, and Linux's prior
+        // `socket.rs::select_random_image` preserves them. Single
+        // non-empty entry → that's what we get.
+        let p = tmpfile("blanks", "\n\n/only.png\n\n");
         let paths = BackgroundPaths {
             primary_list: p.clone(),
             fallback_list: None,
