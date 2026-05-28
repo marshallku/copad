@@ -47,6 +47,15 @@ final class TabViewController: NSViewController {
         activePaneManager?.activeTerminal()
     }
 
+    /// Backend-agnostic terminal accessor — returns either backend's
+    /// controller (or nil for webview / plugin pane). Use this for
+    /// socket `terminal.*` dispatch; reserve `activeTerminal` for the
+    /// SwiftTerm-only call sites (URL click handler, custom-title
+    /// setter, etc.).
+    var activeTerminalPanel: (any TerminalCapable)? {
+        activePaneManager?.activeTerminalPanel()
+    }
+
     var activeWebView: WebViewController? {
         activePaneManager?.activeWebView()
     }
@@ -67,6 +76,21 @@ final class TabViewController: NSViewController {
         for manager in paneManagers {
             if let p = manager.allPanels().first(where: { $0.panelID == id }) {
                 return p
+            }
+        }
+        return nil
+    }
+
+    /// First terminal panel across all tabs in DFS order — matches
+    /// Linux's `TabManager::find_first_terminal`. Used by
+    /// `resolveTerminalPanel` as the last-resort fallback when the
+    /// caller passed no id and the active pane isn't a terminal.
+    func firstTerminalPanel() -> (any TerminalCapable)? {
+        for manager in paneManagers {
+            for panel in manager.allPanels() {
+                if let term = panel as? TerminalCapable {
+                    return term
+                }
             }
         }
         return nil
@@ -500,20 +524,36 @@ final class TabViewController: NSViewController {
 
     // MARK: - Socket Commands
 
+    //
+    // These dispatch through `activeTerminalPanel` so both backends
+    // (SwiftTerm + alacritty) are handled identically. AppDelegate's
+    // `resolveTerminalPanel` is the preferred path for any caller that
+    // needs id-based panel lookup or Linux-style error reporting; these
+    // are thin convenience wrappers for the "active terminal, no
+    // id-resolution, no error reporting" case.
+
     func execCommand(_ command: String) {
-        activeTerminal?.execCommand(command)
+        activeTerminalPanel?.execCommand(command)
     }
 
     func feedText(_ text: String) {
-        activeTerminal?.feedText(text)
+        activeTerminalPanel?.feedText(text)
     }
 
     func terminalState() -> [String: Any] {
-        activeTerminal?.terminalState() ?? [:]
+        activeTerminalPanel?.terminalState() ?? [:]
     }
 
     func readScreen() -> [String: Any] {
-        activeTerminal?.readScreen() ?? [:]
+        activeTerminalPanel?.readScreen() ?? [:]
+    }
+
+    func history(lines: Int = 100) -> [String: Any] {
+        activeTerminalPanel?.history(lines: lines) ?? [:]
+    }
+
+    func context(historyLines: Int = 50) -> [String: Any] {
+        activeTerminalPanel?.context(historyLines: historyLines) ?? [:]
     }
 
     func tabList() -> [[String: Any]] {
@@ -550,7 +590,7 @@ final class TabViewController: NSViewController {
     func sessionInfo(index: Int) -> [String: Any]? {
         guard paneManagers.indices.contains(index) else { return nil }
         let m = paneManagers[index]
-        let state = m.activeTerminal()?.terminalState() ?? [:]
+        let state = m.activeTerminalPanel()?.terminalState() ?? [:]
         return [
             "index": index,
             "title": m.activePane.currentTitle,

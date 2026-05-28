@@ -26,7 +26,7 @@ import Foundation
 /// - Damage tracking + selection + IME + ligatures + automation
 ///   parity (Phases 3.6, 4, 5, 6, 7)
 @MainActor
-final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zoomable {
+final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zoomable, TerminalCapable {
     let panelID: String = UUID().uuidString
     private(set) var currentTitle: String = "Terminal (alacritty)"
 
@@ -256,6 +256,94 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
             let (cols, rows) = render.computeGrid()
             termHandle?.resize(cols: cols, rows: rows)
         }
+    }
+
+    // MARK: - TerminalCapable (socket commands)
+
+    /// Raw text → PTY. Matches SwiftTerm `feedText` semantics. UTF-8
+    /// encoded; bytes are kernel-buffered so even pre-`startIfNeeded`
+    /// feeds reach the child once it's up.
+    func feedText(_ text: String) {
+        termHandle?.input(Array(text.utf8))
+    }
+
+    /// Convenience: feed + trailing newline. SwiftTerm uses `"\n"` here
+    /// (LF only); we match so scripts that rely on the bare LF (no CR)
+    /// behave identically across backends.
+    func execCommand(_ command: String) {
+        feedText(command + "\n")
+    }
+
+    /// `terminal.state` — grid metrics + cursor + window title.
+    /// Reads via snapshot (cheap; alacritty snapshot is a Rust-side
+    /// copy of the current grid). Cursor is reported as
+    /// `[row, col]` to match SwiftTerm's shape.
+    func terminalState() -> [String: Any] {
+        guard let snap = termHandle?.snapshot() else { return [:] }
+        let cursor = snap.cursor
+        return [
+            "cols": Int(snap.cols),
+            "rows": Int(snap.rows),
+            "cursor": [Int(cursor.row), Int(cursor.col)],
+            "title": view.window?.title ?? "copad",
+        ]
+    }
+
+    /// `terminal.read` — visible viewport rendered as plain text.
+    /// One line per grid row, joined by '\n'. Decoder copies bytes
+    /// out of the borrowed `rowUtf8` buffer before the snapshot is
+    /// dropped, so the returned string outlives the FFI lifetime.
+    func readScreen() -> [String: Any] {
+        guard let snap = termHandle?.snapshot() else { return [:] }
+        var lines: [String] = []
+        lines.reserveCapacity(Int(snap.rows))
+        for r in 0 ..< snap.rows {
+            let buf = snap.rowUtf8(r)
+            lines.append(buf.isEmpty ? "" : String(decoding: buf, as: UTF8.self))
+        }
+        let cursor = snap.cursor
+        return [
+            "text": lines.joined(separator: "\n"),
+            "cursor": [Int(cursor.row), Int(cursor.col)],
+            "rows": Int(snap.rows),
+            "cols": Int(snap.cols),
+        ]
+    }
+
+    /// `terminal.history` — viewport-only for v1.
+    ///
+    /// The `copad-term` FFI exposes the current snapshot only; alacritty
+    /// scrollback is not yet bridged. SwiftTerm walks negative-row
+    /// indices via `Terminal.getLine(row:)`; the alacritty equivalent
+    /// would need a new `copad_term_history(handle, lines)` FFI walking
+    /// `Term::grid()` history rows — tracked as a follow-up slice.
+    /// Until then we return the same visible-area text as
+    /// `readScreen`, with the requested line count echoed back for
+    /// caller diagnostics. Shape stays identical to SwiftTerm's
+    /// `terminal.history` so coctl callers don't need to fork on
+    /// backend.
+    func history(lines: Int = 100) -> [String: Any] {
+        guard let snap = termHandle?.snapshot() else { return [:] }
+        var rows: [String] = []
+        rows.reserveCapacity(Int(snap.rows))
+        for r in 0 ..< snap.rows {
+            let buf = snap.rowUtf8(r)
+            rows.append(buf.isEmpty ? "" : String(decoding: buf, as: UTF8.self))
+        }
+        return [
+            "text": rows.joined(separator: "\n"),
+            "lines_requested": lines,
+            "rows": Int(snap.rows),
+            "cols": Int(snap.cols),
+        ]
+    }
+
+    func context(historyLines: Int = 50) -> [String: Any] {
+        [
+            "state": terminalState(),
+            "screen": readScreen(),
+            "history": history(lines: historyLines),
+        ]
     }
 
     // MARK: - Zoom (Cmd+= / Cmd+- / Cmd+0)

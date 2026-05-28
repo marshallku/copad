@@ -168,7 +168,7 @@ private final class CopadTerminalDelegate: NSObject, @preconcurrency TerminalVie
 // MARK: - TerminalViewController
 
 @MainActor
-class TerminalViewController: NSViewController, CopadPanel, Zoomable {
+class TerminalViewController: NSViewController, CopadPanel, Zoomable, TerminalCapable {
     let panelID: String = UUID().uuidString
 
     private let config: CopadConfig

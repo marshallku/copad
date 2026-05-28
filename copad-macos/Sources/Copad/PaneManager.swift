@@ -271,6 +271,16 @@ final class PaneManager {
         activePane as? TerminalViewController
     }
 
+    /// Backend-agnostic accessor used by socket `terminal.*` dispatch.
+    /// Returns whichever terminal controller (SwiftTerm or alacritty) is
+    /// focused, or nil if the active pane is non-terminal (webview /
+    /// plugin). Distinct from `activeTerminal` which is intentionally
+    /// SwiftTerm-typed for the few call sites that need SwiftTerm-only
+    /// hooks.
+    func activeTerminalPanel() -> (any TerminalCapable)? {
+        activePane as? TerminalCapable
+    }
+
     func activeWebView() -> WebViewController? {
         activePane as? WebViewController
     }

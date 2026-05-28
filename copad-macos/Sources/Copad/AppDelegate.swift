@@ -870,6 +870,42 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         socketServer.start()
     }
 
+    /// Linux-parity terminal panel resolver. Mirrors
+    /// `resolve_terminal` in copad-linux/src/socket.rs:1213.
+    ///
+    /// Priority:
+    ///   1. If `params["id"]` is given → look up that exact panel; emit
+    ///      `not_found` if no panel matches, `wrong_panel_type` if the
+    ///      panel exists but isn't a terminal (e.g. webview / plugin).
+    ///   2. Otherwise, prefer the active pane if it's a terminal.
+    ///   3. Otherwise, fall back to the first terminal anywhere across
+    ///      tabs (`firstTerminalPanel`).
+    ///   4. If none of the above produces a terminal → `no_terminal`.
+    ///
+    /// Error codes intentionally match Linux verbatim so coctl / agent
+    /// error handling can be backend-agnostic.
+    private func resolveTerminalPanel(
+        params: [String: Any],
+        vc: TabViewController,
+    ) -> Result<any TerminalCapable, RPCError> {
+        if let id = params["id"] as? String {
+            guard let panel = vc.panel(id: id) else {
+                return .failure(RPCError(code: "not_found", message: "Panel not found: \(id)"))
+            }
+            guard let term = panel as? TerminalCapable else {
+                return .failure(RPCError(code: "wrong_panel_type", message: "Panel is not a terminal"))
+            }
+            return .success(term)
+        }
+        if let active = vc.activeTerminalPanel {
+            return .success(active)
+        }
+        if let first = vc.firstTerminalPanel() {
+            return .success(first)
+        }
+        return .failure(RPCError(code: "no_terminal", message: "No terminal panel found"))
+    }
+
     /// `allowFallback: false` makes the default arm return local
     /// `unknown_method` instead of forwarding to daemon — required for
     /// daemon-originated Invokes so they don't recurse back through the
@@ -895,27 +931,47 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         case "terminal.exec":
             guard let command = params["command"] as? String else { completion(nil); return }
-            vc.execCommand(command)
-            completion(["ok": true])
+            switch resolveTerminalPanel(params: params, vc: vc) {
+            case let .failure(err): completion(err)
+            case let .success(panel):
+                panel.execCommand(command)
+                completion(["ok": true])
+            }
 
         case "terminal.feed":
             guard let text = params["text"] as? String else { completion(nil); return }
-            vc.feedText(text)
-            completion(["ok": true])
+            switch resolveTerminalPanel(params: params, vc: vc) {
+            case let .failure(err): completion(err)
+            case let .success(panel):
+                panel.feedText(text)
+                completion(["ok": true])
+            }
 
         case "terminal.state":
-            completion(vc.terminalState())
+            switch resolveTerminalPanel(params: params, vc: vc) {
+            case let .failure(err): completion(err)
+            case let .success(panel): completion(panel.terminalState())
+            }
 
         case "terminal.read":
-            completion(vc.readScreen())
+            switch resolveTerminalPanel(params: params, vc: vc) {
+            case let .failure(err): completion(err)
+            case let .success(panel): completion(panel.readScreen())
+            }
 
         case "terminal.history":
             let lines = params["lines"] as? Int ?? 100
-            completion(vc.activeTerminal?.history(lines: lines))
+            switch resolveTerminalPanel(params: params, vc: vc) {
+            case let .failure(err): completion(err)
+            case let .success(panel): completion(panel.history(lines: lines))
+            }
 
         case "terminal.context":
             let historyLines = params["history_lines"] as? Int ?? 50
-            completion(vc.activeTerminal?.context(historyLines: historyLines))
+            switch resolveTerminalPanel(params: params, vc: vc) {
+            case let .failure(err): completion(err)
+            case let .success(panel): completion(panel.context(historyLines: historyLines))
+            }
 
         case "tab.new":
             vc.newTab()

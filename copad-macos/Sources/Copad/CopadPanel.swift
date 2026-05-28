@@ -54,3 +54,20 @@ protocol Zoomable {
     func zoomOut()
     func zoomReset()
 }
+
+/// Backend-agnostic surface for the `terminal.*` socket methods.
+/// Both `TerminalViewController` (SwiftTerm) and
+/// `AlacrittyTerminalViewController` conform; WebView / plugin
+/// panels do not, so `panel as? TerminalCapable == nil` is the
+/// compile-time signal AppDelegate uses to emit `wrong_panel_type`
+/// — matching Linux's `as_terminal()` check in
+/// copad-linux/src/socket.rs::resolve_terminal.
+@MainActor
+protocol TerminalCapable: CopadPanel {
+    func feedText(_ text: String)
+    func execCommand(_ command: String)
+    func terminalState() -> [String: Any]
+    func readScreen() -> [String: Any]
+    func history(lines: Int) -> [String: Any]
+    func context(historyLines: Int) -> [String: Any]
+}
