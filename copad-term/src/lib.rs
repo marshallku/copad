@@ -368,6 +368,21 @@ pub unsafe extern "C" fn copad_term_create(
     // emulator we ship alongside (alacritty / iterm2 / Terminal.app)
     // exports by default.
     tty_opts.env.insert("TERM".into(), "xterm-256color".into());
+    // Guarantee a UTF-8 locale for the child shell. When Copad.app is
+    // launched from Finder / Spotlight (vs `cargo run` from a parent
+    // terminal), launchd's env has no LANG / LC_*. Without these the
+    // shell starts in C (POSIX) locale: powerline10k falls back to
+    // ASCII separators, claude-code prints ASCII placeholders for its
+    // Unicode banner, and zsh mangles multi-byte input/output. Skip
+    // the injection when the parent already specifies any UTF-8
+    // hint — that's explicit user intent (set via shell rc that did
+    // run, or `launchctl setenv`).
+    if std::env::var_os("LANG").is_none()
+        && std::env::var_os("LC_ALL").is_none()
+        && std::env::var_os("LC_CTYPE").is_none()
+    {
+        tty_opts.env.insert("LANG".into(), "en_US.UTF-8".into());
+    }
     if !shell.is_null() {
         // SAFETY: caller contract — non-null pointer is a NUL-terminated C string.
         if let Ok(s) = unsafe { CStr::from_ptr(shell) }.to_str() {
