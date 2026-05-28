@@ -475,6 +475,20 @@ VTE on Linux already disables OSC 52 by default, so this fix is macOS-only.
 font_family = "JetBrainsMono Nerd Font Mono"
 ```
 
+### macOS: Powerline glyphs, Claude Code banner, and Nerd Font icons render as `_` (esp. inside tmux)
+
+**Cause:** Copad.app launched from Finder / Spotlight / Dock inherits launchd's empty env (`launchctl getenv LANG` returns nothing). `/etc/zprofile` does set `LANG=C.UTF-8` for **login** shells, but tmux pane shells and other non-login children skip it — and tmux's per-client UTF-8 detection at `attach` time uses the launching shell's locale, not its own pane shell's. Without a UTF-8 locale at that probe point, tmux client comes up with `utf8=0` and the outer terminal (whichever app is attached) renders Unicode glyphs as `_` placeholders, even though the byte stream itself is valid UTF-8.
+
+Ghostty avoids this by injecting `LANG` into every PTY child it spawns. Copad did not — so the symptom appeared inside Copad but was absent in Ghostty for the same tmux session.
+
+Korean text often still rendered because once a UTF-8 byte sequence makes it through, AppKit / CoreText can still draw it via cascading font fallback. The failure mode bites Nerd Font icons / powerline triangles / the Claude Code `✻` because those need *both* the byte to arrive intact AND a font fallback hop — and the byte-pass already failed at the tmux layer.
+
+**Fix:** `copad-term::copad_term_create` injects `LANG=C.UTF-8` into the PTY child env when none of `LANG` / `LC_ALL` / `LC_CTYPE` is already set in the parent (Copad.app) process. Same default Ghostty uses. Explicit user locale set via `launchctl setenv` or a wrapper script wins (the conditional only fires when nothing is present).
+
+Verified by the user: adding `export LANG=C.UTF-8` to `.zshrc` made the rendering work; this fix moves the same injection into the PTY spawn so users don't need the rc-file workaround.
+
+Same pattern was already present in `plugins/web-bridge/src/main.rs:1162` for tmux attach — the main PTY spawn was the only place still missing it.
+
 ### macOS: Background `opacity` config change not reflected at runtime
 
 **Cause:** `Config.swift` only parsed `path` and `tint` from the `[background]` section. The `opacity` field was silently ignored, and the `applyBackground` signature only accepted `path` and `tint`. Hot-reload therefore never changed the image layer's alpha.

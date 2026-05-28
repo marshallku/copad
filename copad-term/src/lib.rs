@@ -368,6 +368,25 @@ pub unsafe extern "C" fn copad_term_create(
     // emulator we ship alongside (alacritty / iterm2 / Terminal.app)
     // exports by default.
     tty_opts.env.insert("TERM".into(), "xterm-256color".into());
+    // Match Ghostty: inject a default UTF-8 locale into the PTY child
+    // when none was inherited. Copad.app launched from Finder /
+    // Spotlight / Dock comes up with launchd's environment, which has
+    // no LANG / LC_*. /etc/zprofile sets LANG=C.UTF-8 but only for
+    // login shells — tmux pane shells and other non-login children
+    // can therefore land in plain `C`, and tmux's per-client UTF-8
+    // probe at attach time inherits whatever the launching shell had.
+    // Ghostty injects LANG by default so its users never see this;
+    // without the same injection here, Unicode glyphs (powerline,
+    // Nerd Font icons, the Claude Code banner) get rendered as `_`
+    // placeholders in non-login children. Skip when the parent already
+    // specifies any locale so explicit user choice (launchctl setenv,
+    // wrapper script) is preserved.
+    if std::env::var_os("LANG").is_none()
+        && std::env::var_os("LC_ALL").is_none()
+        && std::env::var_os("LC_CTYPE").is_none()
+    {
+        tty_opts.env.insert("LANG".into(), "C.UTF-8".into());
+    }
     if !shell.is_null() {
         // SAFETY: caller contract — non-null pointer is a NUL-terminated C string.
         if let Ok(s) = unsafe { CStr::from_ptr(shell) }.to_str() {
