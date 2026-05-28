@@ -475,20 +475,6 @@ VTE on Linux already disables OSC 52 by default, so this fix is macOS-only.
 font_family = "JetBrainsMono Nerd Font Mono"
 ```
 
-### macOS: Powerline glyphs, Claude Code banner, and Korean render as `_` / placeholders
-
-**Cause:** Copad.app launched from Finder / Spotlight inherits launchd's env, which on macOS has no `LANG` / `LC_*` (verify with `launchctl getenv LANG` — empty). `copad-term` only injected `TERM=xterm-256color` for the PTY child; without a UTF-8 locale the shell starts in `C` (POSIX) locale and:
-
-- powerline10k swaps powerline triangles / Nerd Font icons for ASCII fallback (`▶` → `>`, separators → `_`)
-- Node programs like `claude-code` print ASCII placeholders for their Unicode banner
-- zsh mangles Korean and other multi-byte input/output
-
-Note this is **not** a font fallback bug — `resolveRunFont` + `CTFontCreateForString` correctly resolve CJK / PUA / claude logo glyphs. The byte stream from the shell no longer contains those Unicode chars to render.
-
-**Fix:** `copad-term::copad_term_create` now injects `LANG=en_US.UTF-8` into the PTY child env when none of `LANG` / `LC_ALL` / `LC_CTYPE` is set in the parent (Copad.app) process. Explicit user locale (e.g. set via `launchctl setenv` or shell rc that ran before the PTY spawn) is preserved.
-
-Same pattern was already present in `plugins/web-bridge/src/main.rs` for tmux attach — the main PTY spawn was missed.
-
 ### macOS: Background `opacity` config change not reflected at runtime
 
 **Cause:** `Config.swift` only parsed `path` and `tint` from the `[background]` section. The `opacity` field was silently ignored, and the `applyBackground` signature only accepted `path` and `tint`. Hot-reload therefore never changed the image layer's alpha.
