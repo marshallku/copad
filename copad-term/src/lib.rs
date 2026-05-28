@@ -1469,6 +1469,76 @@ pub unsafe extern "C" fn copad_term_selection_string(handle: *mut CopadHandle) -
     }))
 }
 
+/// Render the last `lines` rows of scrollback as plain text — `\n`
+/// between rows, no trailing newline. Mirrors SwiftTerm's
+/// `Terminal.getLine(row: -N..0)` walk so coctl `terminal.history`
+/// returns the same shape across both backends.
+///
+/// When the user has scrolled into history (`display_offset > 0`), the
+/// result is still the N rows immediately above the *original*
+/// viewport top — NOT shifted to follow the scroll. Callers that want
+/// "the scrollback you can see right now" should use `terminal.read`.
+///
+/// Returns a non-NULL but length-0 `CopadString` when `lines == 0` or
+/// when no scrollback exists, so the Swift wrapper can return an empty
+/// `String` instead of `nil` and the JSON shape stays stable.
+/// Caller must free via `copad_string_destroy` exactly once.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `copad_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_history(
+    handle: *mut CopadHandle,
+    lines: usize,
+) -> *mut CopadString {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return ptr::null_mut();
+    };
+    let term = h.term.lock();
+    let cols = term.columns();
+    let text = read_history_text(term.grid(), cols, lines);
+    Box::into_raw(Box::new(CopadString {
+        data: text.into_bytes().into_boxed_slice(),
+    }))
+}
+
+/// Walk `lines` rows of scrollback above the viewport top and join
+/// cell `c` chars into a plain-text string, oldest row first.
+/// Extracted from the FFI so unit tests can drive a synthetic Term
+/// without spinning up a real PTY EventLoop — same pattern
+/// `walk_row` / `selection_range_for_ffi` use.
+///
+/// Clamps `lines` to `grid.history_size()`; never panics on
+/// out-of-range scrollback indices. NUL cells render as `' '`
+/// (matches SwiftTerm's getLine extraction and the existing
+/// snapshot row-decode behavior).
+fn read_history_text(
+    grid: &alacritty_terminal::grid::Grid<alacritty_terminal::term::cell::Cell>,
+    cols: usize,
+    lines: usize,
+) -> String {
+    let take = lines.min(grid.history_size());
+    if take == 0 || cols == 0 {
+        return String::new();
+    }
+    // Capacity hint: one char per cell + one '\n' per row except the last.
+    let mut out = String::with_capacity(take * cols + take.saturating_sub(1));
+    for i in (1..=take).rev() {
+        let line = Line(-(i as i32));
+        for col in 0..cols {
+            let cell = &grid[Point::new(line, Column(col))];
+            let ch = cell.c;
+            out.push(if ch == '\0' { ' ' } else { ch });
+        }
+        if i > 1 {
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Borrowed pointer to the string's bytes (NOT NUL-terminated).
 /// `*out_len` receives the byte length. Both are valid until
 /// `copad_string_destroy`.
@@ -1855,5 +1925,117 @@ mod color_encoding_tests {
             color_to_rgba(AnsiColor::Named(NamedColor::Red)),
             TAG_INDEXED | 1,
         );
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::vte::ansi::Handler;
+
+    /// Build a Term wide enough for 4 columns and a 4-row viewport, with
+    /// a generous scrollback buffer. Caller drives content via
+    /// `<Term as Handler>::input` + `linefeed` / `carriage_return`.
+    fn fixture_term() -> Term<VoidListener> {
+        let size = TermSize::new(4, 4);
+        // Bump scrollback so push_lines tests can exercise it without
+        // tripping the default cap.
+        let cfg = Config {
+            scrolling_history: 32,
+            ..Default::default()
+        };
+        Term::new(cfg, &size, VoidListener)
+    }
+
+    /// Push N rows, each labeled "rXX" left-aligned in the 4-col cells.
+    /// Drives the parser via Handler::input + linefeed + carriage_return
+    /// so the grid + scrollback wire up exactly as they would for live
+    /// PTY bytes.
+    fn push_lines<T: alacritty_terminal::event::EventListener>(term: &mut Term<T>, n: usize) {
+        for i in 1..=n {
+            // 4-col label: "r" + two-digit index + space. For N > 99 the
+            // labels still fit because alacritty wraps at col 4 (we
+            // explicitly avoid that case in tests).
+            let label = format!("r{i:02} ");
+            for ch in label.chars().take(4) {
+                Handler::input(term, ch);
+            }
+            Handler::linefeed(term);
+            Handler::carriage_return(term);
+        }
+    }
+
+    #[test]
+    fn empty_history_returns_empty_string() {
+        let term = fixture_term();
+        let text = read_history_text(term.grid(), term.columns(), 10);
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn zero_lines_returns_empty_string() {
+        let mut term = fixture_term();
+        push_lines(&mut term, 10);
+        let text = read_history_text(term.grid(), term.columns(), 0);
+        assert_eq!(text, "");
+    }
+
+    #[test]
+    fn clamps_to_history_size_without_panic() {
+        let mut term = fixture_term();
+        // Push 6 rows into a 4-row viewport. Linefeed after the last input
+        // leaves the cursor on the empty bottom row, so the live viewport
+        // holds rows {r04, r05, r06, ""} and scrollback ends up with
+        // {r01, r02, r03} = 3 rows.
+        push_lines(&mut term, 6);
+        let history_size = term.grid().history_size();
+        assert_eq!(history_size, 3, "expected 3 scrollback rows from 6 pushes in a 4-row viewport");
+        let text = read_history_text(term.grid(), term.columns(), 100);
+        // 3 rows joined by 2 newlines, no trailing newline.
+        assert_eq!(text.matches('\n').count(), 2);
+        let row_count = text.split('\n').count();
+        assert_eq!(row_count, 3);
+    }
+
+    #[test]
+    fn returns_oldest_first_and_excludes_viewport() {
+        let mut term = fixture_term();
+        // 10 pushes into a 4-row viewport. Cursor ends on the empty
+        // bottom row, viewport holds {r08, r09, r10, ""} and scrollback
+        // contains r01..r07. Last 3 scrollback rows = r05, r06, r07.
+        push_lines(&mut term, 10);
+        let text = read_history_text(term.grid(), term.columns(), 3);
+        let lines: Vec<&str> = text.split('\n').collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].starts_with("r05"), "first line was {:?}", lines[0]);
+        assert!(lines[1].starts_with("r06"), "second line was {:?}", lines[1]);
+        assert!(lines[2].starts_with("r07"), "third line was {:?}", lines[2]);
+        // Viewport content must not bleed in.
+        assert!(!text.contains("r08"));
+        assert!(!text.contains("r10"));
+    }
+
+    #[test]
+    fn nul_cells_render_as_space() {
+        let mut term = fixture_term();
+        // Single-char row leaves cols 1..3 as NUL cells in scrollback.
+        Handler::input(&mut term, 'X');
+        Handler::linefeed(&mut term);
+        Handler::carriage_return(&mut term);
+        // Push more rows so "X" gets pushed into scrollback.
+        push_lines(&mut term, 5);
+        let text = read_history_text(term.grid(), term.columns(), 6);
+        // The very first scrollback row (oldest) is the bare "X" row.
+        let lines: Vec<&str> = text.split('\n').collect();
+        assert_eq!(lines[0], "X   ", "expected NUL → space padding, got {:?}", lines[0]);
+    }
+
+    #[test]
+    fn no_trailing_newline() {
+        let mut term = fixture_term();
+        push_lines(&mut term, 10);
+        let text = read_history_text(term.grid(), term.columns(), 4);
+        assert!(!text.ends_with('\n'), "history must not end with newline");
     }
 }

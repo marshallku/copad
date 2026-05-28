@@ -173,6 +173,27 @@ enum CopadTermFFI {
             return String(bytes: buf, encoding: .utf8)
         }
 
+        /// Last `lines` rows of scrollback as plain text — `\n` between
+        /// rows, no trailing newline. NUL cells render as space.
+        ///
+        /// Returns `""` when no scrollback exists or `lines == 0` (the
+        /// FFI emits a non-NULL empty CopadString for these cases, so
+        /// the JSON shape from `terminal.history` stays stable). Returns
+        /// `nil` only when the handle is gone (`ptr == nil`) or the FFI
+        /// returned NULL (defensive — shouldn't happen for a live
+        /// handle).
+        func history(lines: Int) -> String? {
+            guard let ptr else { return nil }
+            let count = lines < 0 ? 0 : lines
+            guard let sPtr = copad_term_history(ptr, count) else { return nil }
+            defer { copad_string_destroy(sPtr) }
+            var len = 0
+            guard let bytes = copad_string_bytes(sPtr, &len) else { return "" }
+            if len == 0 { return "" }
+            let buf = UnsafeBufferPointer(start: bytes, count: len)
+            return String(bytes: buf, encoding: .utf8) ?? ""
+        }
+
         /// True if any of alacritty's mouse-reporting modes is on
         /// (vim's `set mouse=a`, less, htop, etc.). Renderer uses this
         /// to leave mouse drag alone unless the user holds Shift.

@@ -160,6 +160,16 @@ void copad_term_selection_all(CopadHandle* handle);
 // nothing selected. Caller frees with copad_string_destroy exactly
 // once.
 CopadString* copad_term_selection_string(CopadHandle* handle);
+
+// Last N rows of scrollback above the viewport top, rendered as plain
+// text — '\n' between rows, no trailing newline. NUL cells render as
+// space. When N exceeds the populated scrollback, returns however
+// many rows exist (clamped, no panic). When N==0 or no scrollback
+// exists, returns a non-NULL but length-0 CopadString. Returns NULL
+// only when the handle pointer is NULL. Caller frees with
+// copad_string_destroy exactly once.
+CopadString* copad_term_history(CopadHandle* handle, size_t lines);
+
 const uint8_t* copad_string_bytes(const CopadString* s, size_t* out_len);
 void copad_string_destroy(CopadString* s);
 

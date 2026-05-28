@@ -310,28 +310,19 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         ]
     }
 
-    /// `terminal.history` — viewport-only for v1.
+    /// `terminal.history` — last `lines` rows of scrollback above the
+    /// viewport top. Routes through `copad_term_history` so output
+    /// matches SwiftTerm's `Terminal.getLine(row: -N..0)` walk. NUL
+    /// cells render as space; `\n` between rows; no trailing newline.
     ///
-    /// The `copad-term` FFI exposes the current snapshot only; alacritty
-    /// scrollback is not yet bridged. SwiftTerm walks negative-row
-    /// indices via `Terminal.getLine(row:)`; the alacritty equivalent
-    /// would need a new `copad_term_history(handle, lines)` FFI walking
-    /// `Term::grid()` history rows — tracked as a follow-up slice.
-    /// Until then we return the same visible-area text as
-    /// `readScreen`, with the requested line count echoed back for
-    /// caller diagnostics. Shape stays identical to SwiftTerm's
-    /// `terminal.history` so coctl callers don't need to fork on
-    /// backend.
+    /// `rows` / `cols` reflect viewport metrics (not the history
+    /// dimensions) so the shape matches SwiftTerm and callers can
+    /// pair the text with a follow-up `terminal.state`.
     func history(lines: Int = 100) -> [String: Any] {
-        guard let snap = termHandle?.snapshot() else { return [:] }
-        var rows: [String] = []
-        rows.reserveCapacity(Int(snap.rows))
-        for r in 0 ..< snap.rows {
-            let buf = snap.rowUtf8(r)
-            rows.append(buf.isEmpty ? "" : String(decoding: buf, as: UTF8.self))
-        }
+        guard let handle = termHandle, let snap = handle.snapshot() else { return [:] }
+        let text = handle.history(lines: lines) ?? ""
         return [
-            "text": rows.joined(separator: "\n"),
+            "text": text,
             "lines_requested": lines,
             "rows": Int(snap.rows),
             "cols": Int(snap.cols),
