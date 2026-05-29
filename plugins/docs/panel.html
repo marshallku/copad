@@ -1,0 +1,741 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Knowledge Base</title>
+<style>
+  :root {
+    --bg: #1e1e2e;
+    --bg-alt: #181825;
+    --bg-card: #313244;
+    --fg: #cdd6f4;
+    --fg-dim: #a6adc8;
+    --fg-mute: #6c7086;
+    --accent: #cba6f7;
+    --green: #a6e3a1;
+    --yellow: #f9e2af;
+    --red: #f38ba8;
+    --blue: #89b4fa;
+    --border: #45475a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px;
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
+      Roboto, "Helvetica Neue", Arial, sans-serif;
+    background: var(--bg); color: var(--fg);
+  }
+  h2 { margin: 0 0 8px; font-size: 14px; color: var(--accent);
+       text-transform: uppercase; letter-spacing: .04em; }
+  h3 { margin: 8px 0 4px; font-size: 12px; color: var(--fg-dim);
+       text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+  section { margin-bottom: 24px; }
+  section:last-child { margin-bottom: 0; }
+  .empty { color: var(--fg-mute); font-style: italic; padding: 8px 0; }
+  .row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 4px 0;
+  }
+  .chip {
+    display: inline-block; padding: 2px 8px; border-radius: 12px;
+    background: var(--bg-card); color: var(--fg-dim);
+    font-size: 11px; margin: 2px 4px 2px 0;
+    cursor: pointer;
+  }
+  .chip:hover { background: var(--accent); color: var(--bg); }
+  .chip.active { background: var(--accent); color: var(--bg); }
+  .link {
+    color: var(--blue); cursor: pointer; word-break: break-all;
+  }
+  .link:hover { text-decoration: underline; }
+  .card {
+    background: var(--bg-card); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px 12px; margin-bottom: 8px;
+  }
+  .scope-pill {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 4px 10px; border-radius: 14px;
+    background: var(--bg-card); border: 1px solid var(--border);
+    color: var(--fg-dim); cursor: pointer;
+    font-size: 11px;
+  }
+  .scope-pill.active {
+    background: var(--accent); color: var(--bg); border-color: var(--accent);
+  }
+  .tag-group { margin-bottom: 6px; }
+  .tag-group-head { color: var(--yellow); font-size: 11px;
+                    text-transform: uppercase; letter-spacing: .04em; }
+  .item-row { display: flex; gap: 8px; padding: 3px 0;
+              border-bottom: 1px dotted var(--border); align-items: center; }
+  .item-row:last-child { border: 0; }
+  .item-summary { color: var(--fg-mute); font-size: 11px;
+                  white-space: nowrap; overflow: hidden;
+                  text-overflow: ellipsis; max-width: 280px; }
+  .count { color: var(--fg-mute); font-size: 11px; margin-left: 6px; }
+  .folder-name { color: var(--fg); font-weight: 600; }
+  .folder { margin-bottom: 6px; }
+  .folder-entries { padding-left: 12px; }
+  .head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    margin-bottom: 12px;
+  }
+  .title { color: var(--accent); font-weight: 600; font-size: 13px; }
+</style>
+</head>
+<body>
+  <div class="head">
+    <div class="title" id="panelTitle">Knowledge Base</div>
+    <div id="scopePill" class="scope-pill" style="display:none">
+      <span id="scopePillLabel">Project: —</span>
+    </div>
+  </div>
+
+  <section id="activeNoteSection">
+    <h2>Active note</h2>
+    <div id="activeNote" class="empty">
+      Open a file under your KB root in nvim to see context here.
+    </div>
+  </section>
+
+  <section id="backlinksSection">
+    <h2>Backlinks</h2>
+    <div id="backlinks" class="empty">—</div>
+  </section>
+
+  <section id="relatedSection">
+    <h2>Related notes</h2>
+    <div id="related" class="empty">—</div>
+  </section>
+
+  <section id="tagsSection">
+    <h2>Tags</h2>
+    <div id="tags" class="empty">—</div>
+  </section>
+
+  <section id="foldersSection">
+    <h2>Folders</h2>
+    <div id="folders" class="empty">—</div>
+  </section>
+
+  <section id="recentSection">
+    <h2>Recent edits</h2>
+    <div id="recent" class="empty">—</div>
+  </section>
+
+<script>
+"use strict";
+
+// Conservative HTML escape — we never inject untrusted text via
+// innerHTML; this is here for the rare title/snippet fields that
+// flow through textContent already, but kept as a defense for any
+// future innerHTML use.
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({
+  "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;",
+})[c]);
+
+// POSIX-shell single-quote escape: `'foo'\''bar'` is the canonical form
+// that survives `$()` / backticks / parameter expansion. The kb root +
+// any file path the panel passes to `terminal.exec` MUST go through
+// this — otherwise `$(rm -rf ~)` in a filename would execute. Codex
+// review flagged this as C4 in the plan pressure-test.
+const shq = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+
+const $ = (id) => document.getElementById(id);
+
+let state = {
+  activePanelId: null,
+  paneContext: null,
+  activeDoc: null,
+  backlinks: null,       // {bySource: Map, byTarget: Map}
+  tags: null,            // {byPath: Map<path, [tag, ...]>, byTag: Map<tag, [path, ...]>}
+  projectScope: true,    // toggleable pill
+};
+
+// ---------- terminal.exec routing ----------
+
+async function openInNvim(relPath) {
+  if (!relPath) return;
+  const kbRoot = await getKbRoot();
+  const full = kbRoot.replace(/\/$/, "") + "/" + relPath.replace(/^\/+/, "");
+  const cmd = "nvim " + shq(full);
+  // Resolve target panel. Active pane may itself be the docs panel
+  // (we'd then need a new terminal tab). Heuristic: if pane_context
+  // points to a shell (pane_cmd contains a shell name), use that;
+  // otherwise spawn a new terminal tab.
+  const targetPaneId = await resolveTerminalTargetId();
+  if (targetPaneId) {
+    // socket dispatcher accepts `id`, not `panel_id` — codex C3.
+    await copad.call("terminal.exec", { id: targetPaneId, command: cmd });
+    return;
+  }
+  // Fallback: new tab + exec. Wait one tick so the shell prompts.
+  const tab = await copad.call("tab.new", {});
+  const newPanelId = tab && (tab.panel_id || (tab.panels && tab.panels[0]));
+  if (newPanelId) {
+    setTimeout(() => {
+      copad.call("terminal.exec", { id: newPanelId, command: cmd })
+        .catch(() => {});
+    }, 150);
+  }
+}
+
+let cachedKbRoot = null;
+async function getKbRoot() {
+  if (cachedKbRoot) return cachedKbRoot;
+  // We don't have a dedicated "get root" action. Pull a small sample
+  // entry through kb.list and read the path of an entry to recover the
+  // root prefix. If the KB is empty, fall back to ~/docs.
+  try {
+    const r = await copad.call("kb.list", { limit: 1 });
+    if (r && r.entries && r.entries.length > 0) {
+      // We don't get an absolute path from kb.list — only the id. But
+      // kb.read DOES return path. Use that.
+      const id = r.entries[0].id;
+      const read = await copad.call("kb.read", { id });
+      if (read && read.path) {
+        const idx = read.path.lastIndexOf("/" + id);
+        if (idx >= 0) {
+          cachedKbRoot = read.path.slice(0, idx);
+          return cachedKbRoot;
+        }
+      }
+    }
+  } catch (_) {}
+  // Fallback: $HOME/docs (the daemon-side kb plugin defaults to this).
+  cachedKbRoot = "~/docs";
+  return cachedKbRoot;
+}
+
+async function resolveTerminalTargetId() {
+  // Prefer the focused pane if it's a terminal.
+  try {
+    const snap = await copad.call("session.list", {});
+    if (!snap || !Array.isArray(snap.tabs)) return null;
+    const focused = snap.focused_panel_id || snap.active_panel_id;
+    for (const t of snap.tabs) {
+      const panels = t.panels || [];
+      for (const p of panels) {
+        if (p.id === focused && (p.kind === "terminal" || p.type === "terminal")) {
+          return p.id;
+        }
+      }
+    }
+    // Fallback: first terminal we find.
+    for (const t of snap.tabs) {
+      const panels = t.panels || [];
+      for (const p of panels) {
+        if (p.kind === "terminal" || p.type === "terminal") return p.id;
+      }
+    }
+  } catch (_) {}
+  return null;
+}
+
+// ---------- data loads ----------
+
+async function loadBacklinks() {
+  // The `.backlinks/index.tsv` lives under the KB root. kb.read accepts
+  // dotfolder ids (`.backlinks/index.tsv` is not a `.` segment — only
+  // bare `.` is rejected).
+  try {
+    const r = await copad.call("kb.read", { id: ".backlinks/index.tsv" });
+    return parseBacklinksTsv(r && r.content ? r.content : "");
+  } catch (_) {
+    return { bySource: new Map(), byTarget: new Map() };
+  }
+}
+
+function parseBacklinksTsv(text) {
+  // Format: <target_path>\t<source_path>[\t<link_text>]
+  const bySource = new Map();
+  const byTarget = new Map();
+  const lines = text.split("\n");
+  for (const line of lines) {
+    if (!line) continue;
+    const cols = line.split("\t");
+    if (cols.length < 2) continue;
+    const target = cols[0];
+    const source = cols[1];
+    if (!byTarget.has(target)) byTarget.set(target, []);
+    byTarget.get(target).push(source);
+    if (!bySource.has(source)) bySource.set(source, []);
+    bySource.get(source).push(target);
+  }
+  return { bySource, byTarget };
+}
+
+async function loadTags() {
+  try {
+    const r = await copad.call("kb.read", { id: ".tags/index.tsv" });
+    return parseTagsTsv(r && r.content ? r.content : "");
+  } catch (_) {
+    return { byPath: new Map(), byTag: new Map() };
+  }
+}
+
+function parseTagsTsv(text) {
+  const byPath = new Map();
+  const byTag = new Map();
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    const cols = line.split("\t");
+    if (cols.length < 2) continue;
+    const tag = cols[0];
+    const path = cols[1];
+    if (!byTag.has(tag)) byTag.set(tag, []);
+    byTag.get(tag).push(path);
+    if (!byPath.has(path)) byPath.set(path, []);
+    byPath.get(path).push(tag);
+  }
+  return { byPath, byTag };
+}
+
+// ---------- rendering ----------
+
+function projectSlug(remote) {
+  // owner/repo → repo (use just the bare name as the loose match —
+  // strict match uses the full owner/repo via frontmatter `repo:`).
+  if (!remote) return null;
+  const parts = remote.split("/");
+  return parts[parts.length - 1] || null;
+}
+
+function shouldKeepForProject(path, frontmatterRepo, tags) {
+  if (!state.projectScope) return true;
+  const remote = state.paneContext && state.paneContext.git_remote;
+  if (!remote) return true;
+  if (frontmatterRepo && frontmatterRepo === remote) return true;
+  if (tags && tags.includes("repo/" + remote)) return true;
+  const slug = projectSlug(remote);
+  if (slug && path && path.indexOf(slug) >= 0) return true;
+  return false;
+}
+
+function renderActiveNote() {
+  const el = $("activeNote");
+  if (!state.activeDoc || !state.activeDoc.path) {
+    el.className = "empty";
+    el.textContent = "Open a file under your KB root in nvim to see context here.";
+    return;
+  }
+  el.className = "card";
+  el.innerHTML = "";
+  const title = document.createElement("div");
+  title.style.fontWeight = "600";
+  title.textContent = state.activeDoc.path;
+  el.appendChild(title);
+  // Lazy: pull frontmatter via kb.read.
+  copad.call("kb.read", { id: state.activeDoc.path })
+    .then((r) => {
+      if (!r) return;
+      const fm = r.frontmatter || {};
+      if (fm.summary) {
+        const sum = document.createElement("div");
+        sum.style.color = "var(--fg-dim)";
+        sum.style.marginTop = "4px";
+        sum.textContent = String(fm.summary);
+        el.appendChild(sum);
+      }
+      if (fm.tags && Array.isArray(fm.tags)) {
+        const tagWrap = document.createElement("div");
+        tagWrap.style.marginTop = "6px";
+        for (const t of fm.tags) {
+          const c = document.createElement("span");
+          c.className = "chip";
+          c.textContent = "#" + String(t);
+          tagWrap.appendChild(c);
+        }
+        el.appendChild(tagWrap);
+      }
+    })
+    .catch(() => {});
+}
+
+function renderBacklinks() {
+  const el = $("backlinks");
+  el.innerHTML = "";
+  if (!state.activeDoc || !state.activeDoc.path || !state.backlinks) {
+    el.className = "empty";
+    el.textContent = "—";
+    return;
+  }
+  const sources = state.backlinks.byTarget.get(state.activeDoc.path) || [];
+  if (sources.length === 0) {
+    el.className = "empty";
+    el.textContent = "No inbound links.";
+    return;
+  }
+  el.className = "";
+  for (const src of sources) {
+    if (!shouldKeepForProject(src, null, state.tags ? state.tags.byPath.get(src) : null)) {
+      continue;
+    }
+    const row = document.createElement("div");
+    row.className = "item-row";
+    const link = document.createElement("span");
+    link.className = "link";
+    link.textContent = src;
+    link.addEventListener("click", () => openInNvim(src));
+    row.appendChild(link);
+    el.appendChild(row);
+  }
+  if (!el.firstChild) {
+    el.className = "empty";
+    el.textContent = "No inbound links (after project filter).";
+  }
+}
+
+function computeRelated() {
+  // dn related algorithm fragments: bidirectional×6 + same_folder×1 +
+  // shared_tag×2 (idf approximation). same_repo×3 + cited_by_sources×2
+  // would need each candidate's frontmatter — done lazily per-candidate
+  // to bound kb.read calls (codex I2).
+  if (!state.activeDoc || !state.backlinks || !state.tags) return [];
+  const active = state.activeDoc.path;
+  const score = new Map();
+  // bidirectional: candidates that both link to AND from active.
+  const out = state.backlinks.bySource.get(active) || [];
+  const inbound = state.backlinks.byTarget.get(active) || [];
+  const inboundSet = new Set(inbound);
+  for (const o of out) {
+    if (inboundSet.has(o)) {
+      score.set(o, (score.get(o) || 0) + 6);
+    } else {
+      score.set(o, (score.get(o) || 0) + 2);
+    }
+  }
+  for (const i of inbound) {
+    if (!score.has(i)) score.set(i, 2);
+  }
+  // Shared tag (idf approximated by 1/freq).
+  const activeTags = state.tags.byPath.get(active) || [];
+  for (const tag of activeTags) {
+    const peers = state.tags.byTag.get(tag) || [];
+    const idf = 2 / Math.max(1, peers.length);
+    for (const p of peers) {
+      if (p === active) continue;
+      score.set(p, (score.get(p) || 0) + idf);
+    }
+  }
+  // Same folder.
+  const activeFolder = active.includes("/") ? active.slice(0, active.lastIndexOf("/")) : "";
+  if (activeFolder) {
+    for (const path of state.tags.byPath.keys()) {
+      if (path === active) continue;
+      if (path.startsWith(activeFolder + "/") || path.startsWith(activeFolder + "_")) {
+        score.set(path, (score.get(path) || 0) + 1);
+      }
+    }
+  }
+  // Sort desc, top 10.
+  return Array.from(score.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10);
+}
+
+function renderRelated() {
+  const el = $("related");
+  el.innerHTML = "";
+  const related = computeRelated();
+  if (related.length === 0) {
+    el.className = "empty";
+    el.textContent = state.activeDoc ? "No related notes found." : "—";
+    return;
+  }
+  el.className = "";
+  for (const [path, sc] of related) {
+    if (!shouldKeepForProject(path, null, state.tags ? state.tags.byPath.get(path) : null)) {
+      continue;
+    }
+    const row = document.createElement("div");
+    row.className = "item-row";
+    const link = document.createElement("span");
+    link.className = "link";
+    link.textContent = path;
+    link.addEventListener("click", () => openInNvim(path));
+    row.appendChild(link);
+    const sct = document.createElement("span");
+    sct.className = "count";
+    sct.textContent = sc.toFixed(1);
+    row.appendChild(sct);
+    el.appendChild(row);
+  }
+  if (!el.firstChild) {
+    el.className = "empty";
+    el.textContent = "No related notes (after project filter).";
+  }
+}
+
+function renderTags() {
+  const el = $("tags");
+  el.innerHTML = "";
+  if (!state.tags || state.tags.byTag.size === 0) {
+    el.className = "empty";
+    el.textContent = "—";
+    return;
+  }
+  el.className = "";
+  // Group by 3-axis prefix.
+  const axes = { stack: [], domain: [], activity: [], other: [] };
+  for (const [tag, paths] of state.tags.byTag.entries()) {
+    const slash = tag.indexOf("/");
+    if (slash < 0) {
+      axes.other.push([tag, paths.length]);
+      continue;
+    }
+    const prefix = tag.slice(0, slash);
+    if (axes[prefix]) {
+      axes[prefix].push([tag, paths.length]);
+    } else {
+      axes.other.push([tag, paths.length]);
+    }
+  }
+  for (const axis of ["stack", "domain", "activity", "other"]) {
+    if (axes[axis].length === 0) continue;
+    const group = document.createElement("div");
+    group.className = "tag-group";
+    const head = document.createElement("div");
+    head.className = "tag-group-head";
+    head.textContent = axis;
+    group.appendChild(head);
+    const wrap = document.createElement("div");
+    axes[axis].sort((a, b) => b[1] - a[1]);
+    for (const [tag, count] of axes[axis]) {
+      const chip = document.createElement("span");
+      chip.className = "chip";
+      chip.textContent = tag + " (" + count + ")";
+      chip.addEventListener("click", () => {
+        showTagPeers(tag);
+      });
+      wrap.appendChild(chip);
+    }
+    group.appendChild(wrap);
+    el.appendChild(group);
+  }
+}
+
+function showTagPeers(tag) {
+  // Inline list of files carrying this tag — click to open.
+  const el = $("tags");
+  const existing = el.querySelector(".tag-peers");
+  if (existing) existing.remove();
+  const peers = state.tags.byTag.get(tag) || [];
+  const card = document.createElement("div");
+  card.className = "card tag-peers";
+  const head = document.createElement("div");
+  head.style.fontWeight = "600";
+  head.textContent = tag + " (" + peers.length + ")";
+  card.appendChild(head);
+  for (const p of peers.slice(0, 30)) {
+    const row = document.createElement("div");
+    row.className = "item-row";
+    const link = document.createElement("span");
+    link.className = "link";
+    link.textContent = p;
+    link.addEventListener("click", () => openInNvim(p));
+    row.appendChild(link);
+    card.appendChild(row);
+  }
+  el.appendChild(card);
+}
+
+async function renderFolders() {
+  const el = $("folders");
+  el.innerHTML = "Loading…";
+  try {
+    const r = await copad.call("kb.list", {
+      recursive: false,
+      include_mtime: false,
+      limit: 100,
+    });
+    el.innerHTML = "";
+    const entries = (r && r.entries) || [];
+    const dirs = entries.filter((e) => e.kind === "dir");
+    if (dirs.length === 0) {
+      el.className = "empty";
+      el.textContent = "No folders found.";
+      return;
+    }
+    el.className = "";
+    for (const d of dirs) {
+      const folder = document.createElement("div");
+      folder.className = "folder";
+      const head = document.createElement("div");
+      head.className = "folder-name";
+      head.style.cursor = "pointer";
+      head.textContent = d.id + " ▸";
+      folder.appendChild(head);
+      const entries = document.createElement("div");
+      entries.className = "folder-entries";
+      entries.style.display = "none";
+      folder.appendChild(entries);
+      let loaded = false;
+      head.addEventListener("click", async () => {
+        const open = entries.style.display !== "none";
+        entries.style.display = open ? "none" : "block";
+        head.textContent = d.id + (open ? " ▸" : " ▾");
+        if (!loaded && !open) {
+          loaded = true;
+          try {
+            const sub = await copad.call("kb.list", {
+              folder: d.id,
+              recursive: false,
+              limit: 50,
+            });
+            const subEntries = (sub && sub.entries) || [];
+            for (const e of subEntries) {
+              const row = document.createElement("div");
+              row.className = "item-row";
+              const link = document.createElement("span");
+              link.className = "link";
+              link.textContent = (e.kind === "dir" ? "📁 " : "") + e.id;
+              if (e.kind === "file") {
+                link.addEventListener("click", () => openInNvim(e.id));
+              }
+              row.appendChild(link);
+              entries.appendChild(row);
+            }
+            if (!subEntries.length) {
+              const ed = document.createElement("div");
+              ed.className = "empty";
+              ed.textContent = "(empty)";
+              entries.appendChild(ed);
+            }
+          } catch (_) {
+            entries.textContent = "(error)";
+          }
+        }
+      });
+      el.appendChild(folder);
+    }
+  } catch (e) {
+    el.className = "empty";
+    el.textContent = "Failed to load folders.";
+  }
+}
+
+async function renderRecent() {
+  const el = $("recent");
+  el.innerHTML = "Loading…";
+  try {
+    const r = await copad.call("kb.list", {
+      recursive: true,
+      sort: "mtime",
+      include_mtime: true,
+      include_frontmatter: true,
+      limit: 20,
+    });
+    el.innerHTML = "";
+    const entries = ((r && r.entries) || [])
+      .filter((e) => e.kind === "file");
+    if (entries.length === 0) {
+      el.className = "empty";
+      el.textContent = "No files.";
+      return;
+    }
+    el.className = "";
+    for (const e of entries) {
+      const fm = e.frontmatter || {};
+      const tags = Array.isArray(fm.tags) ? fm.tags : [];
+      const repoStr = typeof fm.repo === "string" ? fm.repo : null;
+      if (!shouldKeepForProject(e.id, repoStr, tags)) continue;
+      const row = document.createElement("div");
+      row.className = "item-row";
+      const link = document.createElement("span");
+      link.className = "link";
+      link.textContent = e.id;
+      link.addEventListener("click", () => openInNvim(e.id));
+      row.appendChild(link);
+      if (fm.summary) {
+        const sum = document.createElement("span");
+        sum.className = "item-summary";
+        sum.textContent = String(fm.summary);
+        row.appendChild(sum);
+      }
+      el.appendChild(row);
+    }
+    if (!el.firstChild) {
+      el.className = "empty";
+      el.textContent = "No recent edits (after project filter).";
+    }
+  } catch (_) {
+    el.className = "empty";
+    el.textContent = "Failed to load recent edits.";
+  }
+}
+
+function renderScopePill() {
+  const pill = $("scopePill");
+  const label = $("scopePillLabel");
+  const remote = state.paneContext && state.paneContext.git_remote;
+  if (!remote) {
+    pill.style.display = "none";
+    return;
+  }
+  pill.style.display = "inline-flex";
+  pill.classList.toggle("active", state.projectScope);
+  label.textContent = (state.projectScope ? "Project: " : "All notes — ") + remote;
+  pill.onclick = () => {
+    state.projectScope = !state.projectScope;
+    renderAll();
+  };
+}
+
+function renderAll() {
+  renderScopePill();
+  renderActiveNote();
+  renderBacklinks();
+  renderRelated();
+  renderTags();
+  renderRecent();
+}
+
+// ---------- bootstrap ----------
+
+async function init() {
+  // Wait until copad.call is available — the host injects it as part of
+  // the panel runtime.
+  if (typeof copad === "undefined" || !copad.call) {
+    setTimeout(init, 50);
+    return;
+  }
+
+  // Pull initial pane_context + active_doc from snapshot if exposed.
+  try {
+    const snap = await copad.call("context.snapshot", {});
+    if (snap && typeof snap === "object") {
+      if (snap.active_panel) state.activePanelId = snap.active_panel;
+      if (snap.pane_context) state.paneContext = snap.pane_context;
+      if (snap.active_doc) state.activeDoc = snap.active_doc;
+    }
+  } catch (_) {}
+
+  // Cold-load the indices.
+  state.backlinks = await loadBacklinks();
+  state.tags = await loadTags();
+  await renderFolders();
+  await renderRecent();
+  renderAll();
+
+  // Subscribe to live signals.
+  if (copad.on) {
+    copad.on("pane.context_changed", (payload) => {
+      if (!payload || typeof payload !== "object") return;
+      state.paneContext = payload;
+      renderAll();
+    });
+    copad.on("doc.opened", async (payload) => {
+      if (!payload || typeof payload !== "object" || !payload.path) return;
+      state.activeDoc = payload;
+      // Refresh indices in case dn rebuilt while we were idle.
+      state.backlinks = await loadBacklinks();
+      state.tags = await loadTags();
+      renderAll();
+    });
+  }
+}
+
+init();
+</script>
+</body>
+</html>

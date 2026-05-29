@@ -830,6 +830,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "copad-plugin-docs"
+version = "0.2.0"
+dependencies = [
+ "copad-core",
+]
+
+[[package]]
 name = "copad-plugin-echo"
 version = "0.2.0"
 dependencies = [

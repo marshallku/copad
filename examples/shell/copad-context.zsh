@@ -105,4 +105,71 @@ if [[ -n "$COPAD_PANEL_ID" && -n "$COPAD_SOCKET" ]] && [[ -n "$(__copad_ctx_coct
     # change. Append once via unique-array.
     typeset -gaU precmd_functions
     precmd_functions+=(__copad_context_publish)
+
+    # Phase 22.3 — active-doc signal. precmd fires AFTER foreground
+    # nvim exits, so a pgrep-on-precmd approach would never see the
+    # editor that's actually open. preexec fires BEFORE the command
+    # runs, so when the user types `nvim ~/docs/foo.md` the hook sees
+    # the cmd line and can publish a `doc.opened` event with the
+    # path-relative-to-KB-root for the panel to consume.
+    #
+    # Misses (acceptable for v1):
+    # - `nvim` with no path arg (fzf-driven file picker, `:e`)
+    # - editing via `dn add-todo` style writers (not nvim)
+    # - foreground `nvim` swap to another file via `:e` mid-session
+    __copad_doc_publish() {
+        # `preexec` arg 1 is the literal command line.
+        local cmd="$1"
+        # Cheap guard before we fork.
+        [[ "$cmd" == nvim* ]] || return 0
+        setopt local_options no_monitor
+        (
+            local kb_root="${COPAD_KB_ROOT:-${COPAD_DOCS_ROOT:-$HOME/docs}}"
+            # Canonicalize so relative-arg lookups (`nvim foo.md` from
+            # inside ~/docs) still match the kb_root prefix.
+            local cwd_abs="$PWD"
+            # Extract first arg under kb_root. zsh word-split with =().
+            local -a words
+            words=(${(z)cmd})
+            local active=""
+            local w
+            for w in "${words[@]:1}"; do
+                # Strip surrounding quotes if any.
+                w=${(Q)w}
+                [[ -z "$w" ]] && continue
+                [[ "$w" == -* ]] && continue
+                # Resolve relative paths against PWD.
+                local cand
+                if [[ "$w" == /* ]]; then
+                    cand="$w"
+                else
+                    cand="$cwd_abs/$w"
+                fi
+                # Normalize without requiring the file to exist
+                # (`nvim` on a new file is a real workflow).
+                # Drop `./` and double-slashes; leave the rest.
+                cand="${cand//\/.\//\/}"
+                while [[ "$cand" == *//* ]]; do
+                    cand=${cand//\/\//\/}
+                done
+                if [[ "$cand" == "$kb_root"/* ]]; then
+                    active="${cand#$kb_root/}"
+                    break
+                fi
+            done
+            [[ -z "$active" ]] && return 0
+            local panel_esc path_esc ts_ms payload
+            panel_esc=$(_copad_ctx_json_escape "$COPAD_PANEL_ID")
+            path_esc=$(_copad_ctx_json_escape "$active")
+            ts_ms=$(( EPOCHSECONDS * 1000 ))
+            payload=$(printf '{"panel_id":"%s","path":"%s","timestamp_ms":%d,"v":1}' \
+                "$panel_esc" "$path_esc" "$ts_ms")
+            "$__COPAD_CTX_COCTL" event publish doc.opened "$payload" --quiet \
+                >/dev/null 2>&1
+        ) &!
+        return 0
+    }
+
+    typeset -gaU preexec_functions
+    preexec_functions+=(__copad_doc_publish)
 fi

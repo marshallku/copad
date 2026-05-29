@@ -1,0 +1,14 @@
+[package]
+name = "copad-plugin-docs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phase 22.3 — KB Panel for copad. Read-only browse surface over ~/docs (backlinks, tag tree, related notes, per-folder browser, recent edits). Panel-only at v1 — all data access goes through the existing kb.* action surface. The binary exists as a scaffold for future per-plugin services (e.g., a long-running frontmatter index cache once dn graph deltas surface as events)."
+repository.workspace = true
+
+[[bin]]
+name = "copad-plugin-docs"
+path = "src/main.rs"
+
+[dependencies]
+copad-core = { path = "../../copad-core" }

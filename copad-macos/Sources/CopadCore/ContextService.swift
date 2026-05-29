@@ -115,11 +115,38 @@ public enum Presence: String, Sendable {
     case away
 }
 
+/// Phase 22.3 — Swift mirror of `copad_core::context::ActiveDoc`. Published
+/// from the shell's preexec hook when `nvim <path>` is invoked. `path` is
+/// relative to the KB root so it can be passed directly to `kb.read`.
+public struct ActiveDoc: Equatable, Sendable {
+    public let panelID: String
+    public let path: String
+    public let timestampMs: Int64
+    public let version: UInt32
+
+    public init?(payload: [String: Any]) {
+        panelID = (payload["panel_id"] as? String) ?? ""
+        path = (payload["path"] as? String) ?? ""
+        timestampMs = (payload["timestamp_ms"] as? NSNumber)?.int64Value ?? 0
+        version = (payload["v"] as? NSNumber)?.uint32Value ?? 0
+    }
+
+    public var asDictionary: [String: Any] {
+        [
+            "panel_id": panelID,
+            "path": path,
+            "timestamp_ms": timestampMs,
+            "v": version,
+        ]
+    }
+}
+
 public final class ContextService: @unchecked Sendable {
     private let lock = NSLock()
     private var activePanel: String?
     private var panelCwds: [String: String] = [:]
     private var paneContexts: [String: PaneContext] = [:]
+    private var activeDocs: [String: ActiveDoc] = [:]
     private var presence: Presence = .active
 
     public init() {}
@@ -138,6 +165,7 @@ public final class ContextService: @unchecked Sendable {
             lock.withLock {
                 panelCwds.removeValue(forKey: id)
                 paneContexts.removeValue(forKey: id)
+                activeDocs.removeValue(forKey: id)
                 if activePanel == id {
                     activePanel = nil
                 }
@@ -150,9 +178,27 @@ public final class ContextService: @unchecked Sendable {
         case "pane.context_changed":
             guard let ctx = PaneContext(payload: data), !ctx.panelID.isEmpty else { return }
             lock.withLock { paneContexts[ctx.panelID] = ctx }
+        case "doc.opened":
+            guard let doc = ActiveDoc(payload: data),
+                  !doc.panelID.isEmpty, !doc.path.isEmpty
+            else { return }
+            lock.withLock { activeDocs[doc.panelID] = doc }
         default:
             return
         }
+    }
+
+    public func activeDoc(panelID: String) -> ActiveDoc? {
+        lock.lock()
+        defer { lock.unlock() }
+        return activeDocs[panelID]
+    }
+
+    public func currentActiveDoc() -> ActiveDoc? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let panel = activePanel else { return nil }
+        return activeDocs[panel]
     }
 
     /// Cached pane_context for a specific panel id, if any.
@@ -218,6 +264,9 @@ public final class ContextService: @unchecked Sendable {
             }
             if let ctx = paneContexts[panel] {
                 out["pane_context"] = ctx.asDictionary
+            }
+            if let doc = activeDocs[panel] {
+                out["active_doc"] = doc.asDictionary
             }
         }
         return out

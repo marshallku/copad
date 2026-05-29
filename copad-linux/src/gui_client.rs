@@ -25,6 +25,7 @@ const PROTOCOL_VERSION: u32 = copad_core::protocol::PROTOCOL_VERSION;
 /// is excluded because it fires per-keystroke and would saturate the
 /// wire without any trigger-facing value.
 const GUI_TO_DAEMON_FORWARD_KINDS: &[&str] = &[
+    "doc.opened",
     "pane.context_changed",
     "panel.exited",
     "panel.focused",

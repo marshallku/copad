@@ -1,6 +1,13 @@
 # KB Panel — Phase 22.3
 
-> Status: design. Phase 22.3 implements the surface sketched here. Orthogonal to the project-orchestration track ([22.2 / 22.4–22.7](./project-orchestration.md)) — depends only on Phase 22.1 (`pane_context.git_remote`) and existing `copad-plugin-kb` actions + the user's `dn`-maintained indices.
+> Status: shipped. Phase 22.3 lives at `plugins/docs/` (panel.html + Cargo scaffold) + `copad-core::context::ActiveDoc` + `kb.list` action. Orthogonal to the project-orchestration track ([22.2 / 22.4–22.7](./project-orchestration.md)) — depends only on Phase 22.1 (`pane_context.git_remote`) and the new `kb.list` extension to `copad-plugin-kb` plus the user's `dn`-maintained indices.
+
+> Codex-plan deviations from the original design (all required to ship; rationale captured here so future readers see the gap between v1 design and v1 reality):
+> - **§ 4 active-doc detection switched precmd → preexec** — `precmd` fires *after* foreground nvim exits, so the original `pgrep` design would have detected the editor only when it was no longer running. `preexec` sees the literal command line before execution and parses `nvim <arg>` directly.
+> - **§ 7 "no kb protocol change" relaxed** — `kb.search` rejects empty queries (so it can't enumerate a folder) and exposes no mtime (so it can't power recent-edits). A new `kb.list` action was the smallest extension that powers both. See [kb-protocol.md § kb.list](./kb-protocol.md).
+> - **shell-quoting `terminal.exec` paths** — the design's `JSON.stringify(path)` doesn't survive `$()`/backticks. The panel now passes paths through a POSIX single-quote escape before concatenating into the nvim command.
+> - **`terminal.exec id field` corrected** — design said `panel_id`; the socket dispatcher accepts `id`.
+> - **macOS parity not skippable** — `ContextService` lives in `copad-core` (Linux) AND `CopadCore.framework` (Swift mirror); the `ActiveDoc` data path needs both to keep `context.snapshot` shape symmetric.
 
 ## 1. Goal
 

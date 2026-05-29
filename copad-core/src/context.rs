@@ -48,6 +48,24 @@ pub struct PaneContext {
     pub v: u32,
 }
 
+/// Phase 22.3 — active nvim document signal published from the shell's
+/// preexec hook (when `nvim <path>` is invoked) via
+/// `coctl event publish doc.opened '<json>'`. `path` is relative to the
+/// KB root (`COPAD_KB_ROOT` / `COPAD_DOCS_ROOT` / `~/docs`), so it can be
+/// passed directly to `kb.read { id }`. Same Origin::External trust note
+/// as PaneContext.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveDoc {
+    #[serde(default)]
+    pub panel_id: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub timestamp_ms: i64,
+    #[serde(default)]
+    pub v: u32,
+}
+
 /// "What the user is currently doing" — v1 carries only the two fields
 /// with confirmed event-stream sources. See `docs/workflow-runtime.md`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -58,12 +76,15 @@ pub struct Context {
     pub presence: Presence,
     #[serde(default)]
     pub pane_context: Option<PaneContext>,
+    #[serde(default)]
+    pub active_doc: Option<ActiveDoc>,
 }
 
 struct Inner {
     active_panel: Option<String>,
     cwd_by_panel: HashMap<String, PathBuf>,
     pane_context_by_panel: HashMap<String, PaneContext>,
+    active_doc_by_panel: HashMap<String, ActiveDoc>,
     presence: Presence,
 }
 
@@ -79,6 +100,7 @@ impl ContextService {
                 active_panel: None,
                 cwd_by_panel: HashMap::new(),
                 pane_context_by_panel: HashMap::new(),
+                active_doc_by_panel: HashMap::new(),
                 presence: Presence::default(),
             }),
         }
@@ -94,11 +116,16 @@ impl ContextService {
             .active_panel
             .as_ref()
             .and_then(|p| inner.pane_context_by_panel.get(p).cloned());
+        let active_doc = inner
+            .active_panel
+            .as_ref()
+            .and_then(|p| inner.active_doc_by_panel.get(p).cloned());
         Context {
             active_panel: inner.active_panel.clone(),
             active_cwd,
             presence: inner.presence,
             pane_context,
+            active_doc,
         }
     }
 
@@ -129,6 +156,23 @@ impl ContextService {
             .active_panel
             .as_ref()
             .and_then(|p| inner.pane_context_by_panel.get(p).cloned())
+    }
+
+    pub fn doc_for_panel(&self, panel_id: &str) -> Option<ActiveDoc> {
+        self.inner
+            .read()
+            .unwrap()
+            .active_doc_by_panel
+            .get(panel_id)
+            .cloned()
+    }
+
+    pub fn active_doc(&self) -> Option<ActiveDoc> {
+        let inner = self.inner.read().unwrap();
+        inner
+            .active_panel
+            .as_ref()
+            .and_then(|p| inner.active_doc_by_panel.get(p).cloned())
     }
 
     pub fn presence(&self) -> Presence {
@@ -162,6 +206,7 @@ impl ContextService {
                     let mut inner = self.inner.write().unwrap();
                     inner.cwd_by_panel.remove(&panel_id);
                     inner.pane_context_by_panel.remove(&panel_id);
+                    inner.active_doc_by_panel.remove(&panel_id);
                     if inner.active_panel.as_deref() == Some(panel_id.as_str()) {
                         inner.active_panel = None;
                     }
@@ -199,6 +244,22 @@ impl ContextService {
                     }
                 }
             }
+            "doc.opened" => match serde_json::from_value::<ActiveDoc>(event.payload.clone()) {
+                Ok(doc) if !doc.panel_id.is_empty() && !doc.path.is_empty() => {
+                    let panel_id = doc.panel_id.clone();
+                    self.inner
+                        .write()
+                        .unwrap()
+                        .active_doc_by_panel
+                        .insert(panel_id, doc);
+                }
+                Ok(_) => {
+                    log::debug!("context: dropped doc.opened with empty panel_id or path");
+                }
+                Err(e) => {
+                    log::debug!("context: dropped doc.opened (deserialize failed): {e}");
+                }
+            },
             _ => {}
         }
     }
@@ -536,6 +597,71 @@ mod tests {
         let stored = ctx.pane_context("p1").unwrap();
         assert_eq!(stored.cwd, "/x");
         assert_eq!(stored.git_remote, "owner/repo");
+    }
+
+    fn sample_active_doc(panel_id: &str, path: &str) -> ActiveDoc {
+        ActiveDoc {
+            panel_id: panel_id.into(),
+            path: path.into(),
+            timestamp_ms: 1_748_500_000_000,
+            v: 1,
+        }
+    }
+
+    #[test]
+    fn doc_opened_records_payload_per_panel() {
+        let ctx = ContextService::new();
+        let doc = sample_active_doc("p1", "topics/copad.md");
+        ctx.apply_event(&evt("doc.opened", serde_json::to_value(&doc).unwrap()));
+        assert_eq!(ctx.doc_for_panel("p1").unwrap(), doc);
+        assert!(ctx.doc_for_panel("p2").is_none());
+    }
+
+    #[test]
+    fn doc_opened_replaces_on_second_event() {
+        let ctx = ContextService::new();
+        let mut doc = sample_active_doc("p1", "topics/copad.md");
+        ctx.apply_event(&evt("doc.opened", serde_json::to_value(&doc).unwrap()));
+        doc.path = "topics/copad-revised.md".into();
+        doc.timestamp_ms += 1_000;
+        ctx.apply_event(&evt("doc.opened", serde_json::to_value(&doc).unwrap()));
+        let stored = ctx.doc_for_panel("p1").unwrap();
+        assert_eq!(stored.path, "topics/copad-revised.md");
+    }
+
+    #[test]
+    fn active_doc_resolves_via_active_panel() {
+        let ctx = ContextService::new();
+        let doc = sample_active_doc("p1", "topics/copad.md");
+        ctx.apply_event(&evt("doc.opened", serde_json::to_value(&doc).unwrap()));
+        assert!(ctx.active_doc().is_none());
+        ctx.apply_event(&evt("panel.focused", json!({"panel_id": "p1"})));
+        assert_eq!(ctx.active_doc().unwrap(), doc);
+        assert_eq!(ctx.snapshot().active_doc.unwrap(), doc);
+    }
+
+    #[test]
+    fn panel_exited_drops_active_doc_entry() {
+        let ctx = ContextService::new();
+        ctx.apply_event(&evt(
+            "doc.opened",
+            serde_json::to_value(sample_active_doc("p1", "topics/copad.md")).unwrap(),
+        ));
+        ctx.apply_event(&evt("panel.focused", json!({"panel_id": "p1"})));
+        ctx.apply_event(&evt("panel.exited", json!({"panel_id": "p1"})));
+        assert!(ctx.doc_for_panel("p1").is_none());
+        assert!(ctx.active_doc().is_none());
+    }
+
+    #[test]
+    fn doc_opened_empty_panel_id_or_path_dropped() {
+        let ctx = ContextService::new();
+        let mut doc = sample_active_doc("", "topics/copad.md");
+        ctx.apply_event(&evt("doc.opened", serde_json::to_value(&doc).unwrap()));
+        assert!(ctx.doc_for_panel("").is_none());
+        doc = sample_active_doc("p1", "");
+        ctx.apply_event(&evt("doc.opened", serde_json::to_value(&doc).unwrap()));
+        assert!(ctx.doc_for_panel("p1").is_none());
     }
 
     #[test]

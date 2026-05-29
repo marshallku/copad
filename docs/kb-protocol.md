@@ -351,6 +351,65 @@ INSUFFICIENT.
 **Errors:** `invalid_params` (missing `id`, wrong type), `invalid_id`,
 `forbidden`, `io_error`.
 
+### `kb.list`
+
+Browse-shaped listing of KB entries under an optional folder. Returns
+**ids only** (and optional metadata) — not full content. Powers
+folder-browser and recent-edits surfaces in panels (e.g. the Phase 22.3
+KB Panel) without forcing every caller to grep for an empty-query
+pattern that `kb.search` rejects.
+
+**Request:**
+```json
+{
+  "folder": "topics",
+  "recursive": false,
+  "sort": "mtime",
+  "limit": 50,
+  "offset": 0,
+  "include_mtime": true,
+  "include_frontmatter": true
+}
+```
+
+| Field                 | Type    | Required | Notes                                                                 |
+| --------------------- | ------- | -------- | --------------------------------------------------------------------- |
+| `folder`              | string  | no       | Scope under the KB root. Same validation as `kb.search.folder` (no traversal, no symlink ancestors). Omit/null = whole root. |
+| `recursive`           | bool    | no       | Default false. When false, returns immediate children only. When true, walks the subtree depth-first. |
+| `sort`                | string  | no       | `"name"` (default) or `"mtime"` (descending). Unknown values → `invalid_params`. |
+| `limit`               | number  | no       | Default 50, max 500.                                                  |
+| `offset`              | number  | no       | Page through results.                                                 |
+| `include_mtime`       | bool    | no       | Default false. When true, file/dir entries include `mtime_ms`.        |
+| `include_frontmatter` | bool    | no       | Default false. When true, file entries include a minimal frontmatter subset (`title`, `summary`, `tags`, `repo`, `created_at`, `updated_at`, `canonical_url`, `supersedes`). Parser reads up to 8 KiB per file. |
+
+**Response:**
+```json
+{
+  "entries": [
+    {"id": "topics/foo.md", "kind": "file", "mtime_ms": 1730000000000},
+    {"id": "topics/subfolder", "kind": "dir"}
+  ],
+  "total": 2
+}
+```
+
+| Field             | Type   | Always present | Notes                                                                 |
+| ----------------- | ------ | -------------- | --------------------------------------------------------------------- |
+| `entries`         | array  | yes            | Page of entries after `offset/limit`.                                 |
+| `entries[].id`    | string | yes            | Same stable handle as `kb.search.hits[].id` / `kb.read.id`.           |
+| `entries[].kind`  | string | yes            | `"file"` or `"dir"`. Symlinks are skipped entirely (trust boundary).  |
+| `entries[].mtime_ms`     | number | when `include_mtime=true` OR `sort="mtime"` | Last-modified millis since epoch. |
+| `entries[].frontmatter`  | object | when `include_frontmatter=true` (files only) | Subset of immutable frontmatter fields. |
+| `total`           | number | yes            | Total entry count BEFORE `offset/limit`.                              |
+
+**Trust boundary:** symlinks are skipped (no escape via symlink-to-anywhere).
+The `.raw/` folder is excluded by default (same rule as `kb.search`).
+Dotfiles/dotdirs are excluded by default — pass the dotfolder explicitly
+as `folder` to list its contents (e.g. `folder: ".backlinks"`).
+
+**Errors:** `invalid_params` (wrong type for `folder`/`sort`/`limit`),
+`forbidden` (folder traversal), `io_error`.
+
 ## Error codes (shared)
 
 KB plugins SHOULD use these codes; they keep callers' error handling

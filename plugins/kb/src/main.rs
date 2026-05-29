@@ -104,7 +104,7 @@ fn handle_frame(kb: &Kb, frame: &Value, tx: &Sender<String>) {
                 id,
                 json!({
                     "service_version": env!("CARGO_PKG_VERSION"),
-                    "provides": ["kb.search", "kb.read", "kb.append", "kb.ensure"],
+                    "provides": ["kb.search", "kb.read", "kb.append", "kb.ensure", "kb.list"],
                     "subscribes": [],
                 }),
             );

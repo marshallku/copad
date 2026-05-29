@@ -9,5 +9,5 @@ name = "main"
 exec = "copad-plugin-kb"
 activation = "onAction:kb.*"
 restart = "on-crash"
-provides = ["kb.search", "kb.read", "kb.append", "kb.ensure"]
+provides = ["kb.search", "kb.read", "kb.append", "kb.ensure", "kb.list"]
 subscribes = []

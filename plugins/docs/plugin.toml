@@ -1,0 +1,14 @@
+[plugin]
+name = "docs"
+title = "Knowledge Base"
+version = "0.1.0"
+description = "Phase 22.3 — read+navigate surface over ~/docs. Backlinks / tag tree / related notes / per-folder browser / recent edits. Editing stays in nvim (every open routes through terminal.exec). All data access via existing kb.* actions; no new RPC surface."
+
+# Panel-only plugin. Data access routes through the kb plugin's
+# kb.search/read/list actions — no [[services]] block here means the
+# install script's panel-only path takes care of copying panel.html
+# without trying to symlink a non-service binary.
+[[panels]]
+name = "main"
+title = "Knowledge Base"
+file = "panel.html"

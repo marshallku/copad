@@ -425,6 +425,7 @@ impl CopadWindow {
             ctx_exited: event_bus.subscribe("panel.exited"),
             ctx_cwd: event_bus.subscribe("terminal.cwd_changed"),
             ctx_pane_context: event_bus.subscribe("pane.context_changed"),
+            ctx_doc_opened: event_bus.subscribe("doc.opened"),
             trigger_subs: TriggerSubscriptions::new(),
         }));
         pump_state
@@ -883,6 +884,7 @@ pub struct PumpState {
     ctx_exited: EventReceiver,
     ctx_cwd: EventReceiver,
     ctx_pane_context: EventReceiver,
+    ctx_doc_opened: EventReceiver,
     trigger_subs: TriggerSubscriptions,
 }
 
@@ -899,6 +901,9 @@ impl PumpState {
             ctx.apply_event(&event);
         }
         while let Some(event) = self.ctx_pane_context.try_recv() {
+            ctx.apply_event(&event);
+        }
+        while let Some(event) = self.ctx_doc_opened.try_recv() {
             ctx.apply_event(&event);
         }
     }
@@ -1062,6 +1067,7 @@ mod tests {
             ctx_exited: bus.subscribe("panel.exited"),
             ctx_cwd: bus.subscribe("terminal.cwd_changed"),
             ctx_pane_context: bus.subscribe("pane.context_changed"),
+            ctx_doc_opened: bus.subscribe("doc.opened"),
             trigger_subs: TriggerSubscriptions::new(),
         };
         pump.reconcile_triggers(&bus, &cached);
@@ -1084,6 +1090,7 @@ mod tests {
             ctx_exited: bus.subscribe("panel.exited"),
             ctx_cwd: bus.subscribe("terminal.cwd_changed"),
             ctx_pane_context: bus.subscribe("pane.context_changed"),
+            ctx_doc_opened: bus.subscribe("doc.opened"),
             trigger_subs: TriggerSubscriptions::new(),
         };
         // Start in cut-over (daemon-authoritative) state.
