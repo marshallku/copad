@@ -1138,24 +1138,36 @@ impl TabManager {
         let hbox = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
         let vertical = self.is_vertical_tabs();
         let (icon_name, default_title) = match &**panel {
-            PanelVariant::Terminal(_) => ("utilities-terminal-symbolic".to_string(), "Terminal"),
-            PanelVariant::WebView(_) => ("web-browser-symbolic".to_string(), "WebView"),
+            PanelVariant::Terminal(_) => (
+                "utilities-terminal-symbolic".to_string(),
+                "Terminal".to_string(),
+            ),
+            PanelVariant::WebView(_) => ("web-browser-symbolic".to_string(), "WebView".to_string()),
             PanelVariant::Plugin(pp) => {
                 // `resolve_by_name` honors the same duplicate-winner rule
                 // as daemon dispatch and `plugin.open`, so the tab icon
-                // matches the manifest those paths actually run.
-                let icon_name = copad_core::plugin::resolve_by_name(&self.plugins, &pp.plugin_name)
-                    .and_then(|p| p.manifest.panels.iter().find(|pd| pd.name == pp.panel_name))
+                // and label match the manifest those paths actually run.
+                // Title fallback chain: panel-specific title → plugin's
+                // top-level title → plugin name (so even a malformed
+                // manifest produces something readable, not just "Plugin").
+                let resolved = copad_core::plugin::resolve_by_name(&self.plugins, &pp.plugin_name);
+                let panel_def = resolved
+                    .and_then(|p| p.manifest.panels.iter().find(|pd| pd.name == pp.panel_name));
+                let icon_name = panel_def
                     .and_then(|pd| pd.icon.clone())
                     .unwrap_or_else(|| "application-x-addon-symbolic".to_string());
-                (icon_name, "Plugin")
+                let title = panel_def
+                    .map(|pd| pd.title.clone())
+                    .or_else(|| resolved.map(|p| p.manifest.plugin.title.clone()))
+                    .unwrap_or_else(|| pp.plugin_name.clone());
+                (icon_name, title)
             }
         };
 
         let icon = gtk4::Image::from_icon_name(&icon_name);
         icon.add_css_class("copad-tab-icon");
 
-        let label = gtk4::Label::new(Some(default_title));
+        let label = gtk4::Label::new(Some(&default_title));
         label.add_css_class("copad-tab-label");
         label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         if vertical {
