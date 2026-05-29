@@ -1496,18 +1496,20 @@ fn handle_claude_start(
     // timestamp suffix passes `validate_tmux_session_name` /
     // `sanitize_session_name` because it's ASCII digits only.
     //
-    // **Microsecond precision** (not seconds — codex-review C5): two
-    // `fresh_session` dispatches against the same workspace within the
-    // same second would otherwise produce identical session names and
-    // `-A` attach onto each other, violating the fresh contract for
-    // side-effecting workflows. u128 micros gives ~1µs collision window
-    // — well under any realistic re-dispatch cadence.
+    // **Microsecond precision + atomic counter** (codex 22.2 retro-review C1):
+    // micros alone leave a 1µs window where two concurrent dispatches in
+    // the same workspace produce identical session names → `tmux
+    // new-session -A` attaches the second to the first, breaking the
+    // fresh contract. Combining wall-clock micros with a process-local
+    // atomic counter closes the window — same uniqueness pattern used
+    // for goal/mission/approval ids in the 22.4-22.7 audit.
     let session_name = if fresh_session {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros())
             .unwrap_or(0);
-        format!("{session_name}-{ts}")
+        let seq = next_fresh_session_seq();
+        format!("{session_name}-{ts}-{seq}")
     } else {
         session_name
     };
@@ -1775,12 +1777,17 @@ fn handle_workflow_run(
         );
     }
 
+    // Codex 22.2 retro-review C1: micros alone collide under same-
+    // microsecond concurrent dispatches; the seq closes the window so
+    // workflow.started / workflow.timed_out events can be correlated
+    // unambiguously even under load.
     let run_id = format!(
-        "wfr-{}",
+        "wfr-{}-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_micros())
-            .unwrap_or(0)
+            .unwrap_or(0),
+        next_fresh_session_seq()
     );
 
     // Construct synthetic Request for handle_claude_start. Reusing the
@@ -1871,6 +1878,15 @@ fn handle_workflow_run(
 /// Last 1-2 path components joined by `-`, lowercased + sanitized.
 /// Two components, not one, so `<root>/feature/foo` doesn't collapse
 /// to `foo` and collide with siblings sharing a leaf name.
+/// Process-local atomic counter for breaking ties on `fresh_session`
+/// uniqueness and `wfr-<…>` run id generation when two calls land in
+/// the same wall microsecond. Codex 22.2 retro-review C1.
+fn next_fresh_session_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 fn derive_session_name(path: &std::path::Path) -> String {
     let mut parts: Vec<String> = Vec::new();
     for comp in path.components().rev() {

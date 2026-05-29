@@ -127,8 +127,21 @@ fn infer_git_remote(path: &Path) -> Option<String> {
 /// `git@github.com:owner/repo.git` / `https://github.com/owner/repo.git` /
 /// `https://github.com/owner/repo` → `owner/repo`. Mirrors the regex in
 /// `examples/shell/copad-context.zsh`.
+///
+/// **Codex 22.2 retro-review I1**: trim trailing slashes AND `.git`
+/// suffix repeatedly so URLs like `owner/repo.git/` (trailing slash
+/// after the suffix) and `owner/repo/` (trailing slash, no suffix)
+/// both normalize correctly.
 fn canonicalize_remote_url(url: &str) -> Option<String> {
-    let trimmed = url.strip_suffix(".git").unwrap_or(url);
+    let mut trimmed = url;
+    loop {
+        let stripped = trimmed.trim_end_matches('/');
+        let after_git = stripped.strip_suffix(".git").unwrap_or(stripped);
+        if after_git == trimmed {
+            break;
+        }
+        trimmed = after_git;
+    }
     let after_sep = trimmed.rsplit(['/', ':']).take(2).collect::<Vec<_>>();
     if after_sep.len() != 2 {
         return None;
@@ -288,6 +301,26 @@ mod tests {
         let reg = ProjectRegistry::from_projects(vec![p("copad", "/home/me/dev/copad")]);
         let ctx = Context::default();
         assert!(reg.resolve_active(&ctx).is_none());
+    }
+
+    #[test]
+    fn canonicalize_remote_url_handles_trailing_slash_with_git_suffix_round1_i1() {
+        // Codex 22.2 retro-review I1: previously `https://github.com/
+        // owner/repo.git/` failed because `.git` was stripped before
+        // trailing-slash normalization. Fix: loop until neither
+        // operation changes the string.
+        assert_eq!(
+            canonicalize_remote_url("https://github.com/owner/repo.git/"),
+            Some("owner/repo".into()),
+        );
+        assert_eq!(
+            canonicalize_remote_url("https://github.com/owner/repo/"),
+            Some("owner/repo".into()),
+        );
+        assert_eq!(
+            canonicalize_remote_url("git@github.com:owner/repo/"),
+            Some("owner/repo".into()),
+        );
     }
 
     #[test]
