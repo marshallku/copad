@@ -162,6 +162,8 @@ fn main() -> ExitCode {
     let _runledger_thread =
         register_runledger_actions(&actions, &event_bus, runledger_stop.clone());
     let _ = runledger_stop;
+    // Phase 22.7 — pipeline registry + Brain dispatcher routing helper.
+    register_pipeline_actions(&actions);
 
     // GuiRegistry is built before the trigger sink so both share the
     // same registry instance — the sink's fallthrough worker resolves
@@ -1356,6 +1358,84 @@ fn register_runledger_actions(
             }
         })
         .expect("spawn copad-runledger thread")
+}
+
+/// Phase 22.7 — Pipeline registry (Team / Role / Stage) + Brain
+/// dispatcher route helper. v1 ships CRUD over teams/roles + a
+/// `brain.route_model` helper that exposes which backend
+/// (`claude.start` vs `codex.start`) handles a given model name.
+/// Full pipeline execution (multi-stage parallel dispatch with output
+/// materialization) is deferred — see roadmap.md § 22.7.
+fn register_pipeline_actions(actions: &Arc<ActionRegistry>) {
+    use copad_core::pipeline::PipelineRegistry;
+
+    let xdg_config = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|h| PathBuf::from(h).join(".config"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".config"));
+    let user_root = xdg_config.join("copad/pipeline");
+    let registry = Arc::new(PipelineRegistry::new(&user_root, None));
+
+    let r1 = registry.clone();
+    actions.register_silent("pipeline.teams", move |_| {
+        Ok(json!({ "teams": r1.list_teams() }))
+    });
+
+    let r2 = registry.clone();
+    actions.register_silent("pipeline.roles", move |_| {
+        Ok(json!({ "roles": r2.list_roles() }))
+    });
+
+    let r3 = registry.clone();
+    actions.register_silent("pipeline.team", move |params| {
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid_params("'name' required (non-empty string)"))?;
+        match r3.team(name) {
+            Some(t) => {
+                serde_json::to_value(&t).map_err(|e| internal_error(format!("serialize team: {e}")))
+            }
+            None => Err(copad_core::protocol::ResponseError {
+                code: "not_found".into(),
+                message: format!("team not found: {name}"),
+            }),
+        }
+    });
+
+    let r4 = registry.clone();
+    actions.register_silent("pipeline.role", move |params| {
+        let name = params
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid_params("'name' required (non-empty string)"))?;
+        match r4.role(name) {
+            Some(r) => {
+                serde_json::to_value(&r).map_err(|e| internal_error(format!("serialize: {e}")))
+            }
+            None => Err(copad_core::protocol::ResponseError {
+                code: "not_found".into(),
+                message: format!("role not found: {name}"),
+            }),
+        }
+    });
+
+    actions.register_silent("brain.route_model", move |params| {
+        let model = params
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid_params("'model' required (non-empty string)"))?;
+        let (action, resolved) = PipelineRegistry::route_model(model);
+        Ok(json!({ "action": action, "model": resolved }))
+    });
 }
 
 fn require_id_param(

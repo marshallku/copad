@@ -12,6 +12,7 @@ pub mod goal;
 pub mod mission;
 pub mod notifier;
 pub mod paths;
+pub mod pipeline;
 pub mod plugin;
 pub mod project;
 pub mod protocol;

@@ -1,0 +1,20 @@
+name: planner
+description: "Reads the mission objective + codebase, drafts a concrete plan with file paths and step bullets."
+model: claude-opus-4-7
+prompt_template: |
+  You are the planner.
+
+  ## Mission objective
+  {objective}
+
+  ## Project workspace
+  {workspace_path}
+
+  ## Your task
+  Draft an implementation plan: which files to touch, which functions to add/modify, what tests to write. Keep the plan tight — 5-10 bullets total. Call out any risks the implementer should know about.
+
+  Respond in markdown. Do NOT write any code yet.
+tools:
+  - read_file
+  - grep
+  - glob

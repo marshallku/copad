@@ -144,6 +144,10 @@ pub enum Command {
     #[command(subcommand)]
     Runledger(RunledgerCommand),
 
+    /// Pipeline + Brain dispatcher (`pipeline.*` + `brain.route_model`). Phase 22.7.
+    #[command(subcommand)]
+    Pipeline(PipelineCommand),
+
     /// Recent bus events ("what happened?" — wraps `event.history`).
     Recent(RecentArgs),
 
@@ -637,6 +641,21 @@ pub enum RunledgerCommand {
     },
 }
 
+#[derive(Subcommand)]
+pub enum PipelineCommand {
+    /// List available teams (project override → user config → builtins)
+    Teams,
+    /// List available roles
+    Roles,
+    /// Show one team's full spec
+    Team { name: String },
+    /// Show one role's full spec
+    Role { name: String },
+    /// Route a model name to its dispatcher backend (`claude.start` vs
+    /// `codex.start`). Helper for callers building dispatch params.
+    RouteModel { model: String },
+}
+
 fn parse_kv(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -982,6 +1001,14 @@ impl Cli {
                 RunledgerCommand::Query { .. } => "events.replay",
             }
             .to_string(),
+            Command::Pipeline(cmd) => match cmd {
+                PipelineCommand::Teams => "pipeline.teams",
+                PipelineCommand::Roles => "pipeline.roles",
+                PipelineCommand::Team { .. } => "pipeline.team",
+                PipelineCommand::Role { .. } => "pipeline.role",
+                PipelineCommand::RouteModel { .. } => "brain.route_model",
+            }
+            .to_string(),
             Command::Statusbar(cmd) => match cmd {
                 StatusBarCommand::Show => "statusbar.show",
                 StatusBarCommand::Hide => "statusbar.hide",
@@ -1241,6 +1268,12 @@ impl Cli {
                     }
                     serde_json::Value::Object(o)
                 }
+            },
+            Command::Pipeline(cmd) => match cmd {
+                PipelineCommand::Teams | PipelineCommand::Roles => json!({}),
+                PipelineCommand::Team { name } => json!({ "name": name }),
+                PipelineCommand::Role { name } => json!({ "name": name }),
+                PipelineCommand::RouteModel { model } => json!({ "model": model }),
             },
             Command::Runledger(cmd) => match cmd {
                 RunledgerCommand::Query {
