@@ -148,6 +148,7 @@ final class DaemonClient: @unchecked Sendable {
     /// `tab.opened` is a macOS-publish artifact mapped to Linux `tab.created`
     /// at forward time so daemon-side triggers see the canonical name.
     private static let forwardKinds: Set<String> = [
+        "pane.context_changed",
         "panel.exited", "panel.focused", "panel.title_changed",
         "tab.closed", "tab.created", "tab.opened", "tab.renamed",
         "terminal.cwd_changed", "terminal.shell_precmd", "terminal.shell_preexec",

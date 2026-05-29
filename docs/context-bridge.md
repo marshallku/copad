@@ -1,6 +1,6 @@
 # Context Bridge — Phase 22.1 (local, coctl-based)
 
-> Status: shipped (Linux). macOS port owned by the user. Original SSH-flavored OSC design preserved in [§ Out of scope but designed for revival](#out-of-scope-but-designed-for-revival).
+> Status: shipped (Linux + macOS). Original SSH-flavored OSC design preserved in [§ Out of scope but designed for revival](#out-of-scope-but-designed-for-revival).
 
 ## Purpose
 
@@ -61,11 +61,15 @@ Bytes-through-PTY only buys anything when copad and the shell aren't already in 
 
 ## macOS parity
 
-The macOS shell-spawn already injects both `$COPAD_SOCKET` and `$COPAD_PANEL_ID` (`copad-macos/Sources/Copad/TerminalViewController.swift:527-528`) and ships `copad-macos/shell-hooks/copad-cwd.zsh` as a precedent for backgrounded coctl-from-precmd. The Linux script's structure is mirror-able, with one platform-specific gotcha:
+The macOS shell-spawn already injects both `$COPAD_SOCKET` and `$COPAD_PANEL_ID` — both backends do it: SwiftTerm legacy via `copad-macos/Sources/Copad/TerminalViewController.swift:527-528`, alacritty via `copad_term_create` in `copad-term/src/lib.rs:346-358` (called from `AlacrittyTerminalViewController`). The shell hook is the same script Linux uses — `examples/shell/copad-context.zsh` is shipped to `~/.config/copad/shell-hooks/copad-context.zsh` by `scripts/install-macos.sh`, no platform fork. One gotcha to keep in mind if the script is ever rewritten:
 
-**Timestamp**: zsh's `$EPOCHSECONDS` (from `zmodload zsh/datetime`) works on both platforms (zsh ≥ 5.0 ships on modern macOS). `$EPOCHREALTIME` is a float and would fail `i64` deserialization. `date +%s%N` is GNU-only — don't use it. If the macOS port targets older zsh, fall back to `python3 -c 'import time;print(int(time.time()*1000))'`.
+**Timestamp**: zsh's `$EPOCHSECONDS` (from `zmodload zsh/datetime`) works on both platforms (zsh ≥ 5.0 ships on modern macOS). `$EPOCHREALTIME` is a float and would fail `i64` deserialization. `date +%s%N` is GNU-only — don't use it. If a future macOS port targets older zsh, fall back to `python3 -c 'import time;print(int(time.time()*1000))'`.
 
-Otherwise the macOS port is one-for-one — same payload shape, same `coctl` call, same detached background subshell pattern.
+Swift-side wiring (mirror of Linux's `copad-linux/src/window.rs` + `gui_client.rs` Phase 22.1 changes):
+
+- `copad-macos/Sources/CopadCore/ContextService.swift` — Swift mirror of `copad_core::context::ContextService`. `apply(eventKind: "pane.context_changed", data:)` parses the payload via the `PaneContext` struct (same struct shape as `copad_core::context::PaneContext` with `#[serde(default)]` semantics) and stores it keyed by `panel_id`. `snapshot()` derives `pane_context` from the active panel only, matching Rust's `Context::pane_context` derivation. `panel.exited` cleans up both cwd and pane_context entries. Empty `panel_id` and non-dict payloads are silently dropped, same as Linux.
+- `copad-macos/Sources/Copad/DaemonClient.swift` — `"pane.context_changed"` added to `forwardKinds` so any GUI-side emitter (plugin, future trigger) is forwarded to the daemon. The normal path is coctl publishing directly to the daemon socket (no GUI traversal), but the allowlist is the contract for *any* GUI-side emitter — keeps Linux/macOS forward-list symmetric.
+- `copad-macos/Tests/CopadCoreTests/ContextServiceTests.swift` — XCTest cases mirroring `copad-core/src/context.rs` `pane_context_*` tests. Pure-logic test surface; runs under `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test` (Command Line Tools alone do not ship XCTest).
 
 ## Per-shell init
 

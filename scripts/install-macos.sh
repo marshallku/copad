@@ -321,6 +321,18 @@ if [[ -d "$SHELL_HOOK_SRC" ]]; then
     done
 fi
 
+# Phase 22.1 context bridge (zsh). Single source of truth at
+# examples/shell/copad-context.zsh — same script Linux uses. macOS
+# zsh ≥ 5.0 ships `zmodload zsh/datetime` natively, so no platform
+# fork is needed. Sourcing is opt-in: the dossier panel (Phase 22.2)
+# is the eventual consumer, and the script is a no-op outside copad
+# PTY children regardless.
+CONTEXT_HOOK_SRC="$REPO_ROOT/examples/shell/copad-context.zsh"
+if [[ -f "$CONTEXT_HOOK_SRC" ]]; then
+    mkdir -p "$SHELL_HOOK_DEST"
+    cp -f "$CONTEXT_HOOK_SRC" "$SHELL_HOOK_DEST/copad-context.zsh"
+fi
+
 if $DO_LAUNCH; then
     open "$APP_DEST/$APP_NAME"
 fi
@@ -361,4 +373,9 @@ Next:
                              source ~/.config/copad/shell-hooks/copad-cwd.fish
     No-op when the shell isn't running inside a copad PTY, so it's
     safe to source unconditionally.
+  - Optional: Phase 22.1 context bridge (publishes pane.context_changed
+    every prompt redraw with host / cwd / git_remote / branch / tmux —
+    eventual input for the dossier panel). zsh-only in v1:
+        zsh   ~/.zshrc       source ~/.config/copad/shell-hooks/copad-context.zsh
+    Same no-op-outside-copad guarantee.
 EOF

@@ -50,6 +50,19 @@ let package = Package(
             path: "Sources/CCopadTerm",
             publicHeadersPath: "include",
         ),
+        // Pure-Swift library holding the executable-independent mirror
+        // types (Swift counterparts of `copad-core` Rust structs:
+        // ContextService, PaneContext). Extracted from the executable
+        // target so the test bundle below can be built without
+        // recompiling the GUI layer — that layer has pre-existing
+        // strict-concurrency issues under Xcode's Swift 6 (warnings
+        // under CLT's compiler, errors under Xcode's), and isolating
+        // these types here keeps unit-test iteration unblocked. New
+        // pure-logic types should land here, not in the executable.
+        .target(
+            name: "CopadCore",
+            path: "Sources/CopadCore",
+        ),
         .executableTarget(
             name: "Copad",
             dependencies: [
@@ -57,13 +70,34 @@ let package = Package(
                 .product(name: "TOMLKit", package: "TOMLKit"),
                 "CCopadFFI",
                 "CCopadTerm",
+                "CopadCore",
             ],
             path: "Sources/Copad",
+            // Pin Swift 5 language mode for the GUI layer. Under CLT's
+            // 6.2.4 compiler the Sendable errors here are warnings, but
+            // Xcode 16's 6.3.2 escalates them to hard errors during
+            // `swift test`. Pinning swift 5 keeps the test bundle
+            // buildable without scope-creeping into a strict-concurrency
+            // refactor of AppDelegate / TerminalViewController. The
+            // pure-logic mirror lives in CopadCore which stays on the
+            // package-default Swift 6 mode.
+            swiftSettings: [.swiftLanguageMode(.v5)],
             linkerSettings: [
                 .unsafeFlags(["-L../target/release"]),
                 .linkedLibrary("copad_ffi"),
                 .linkedLibrary("copad_term"),
             ],
+        ),
+        // Swift-side unit tests. Depends on `CopadCore` (not the
+        // executable) so the build does not pull in the GUI layer.
+        // `@testable import CopadCore` exposes internal helpers when
+        // we add tests for non-public APIs later. Run with
+        // `DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer swift test`
+        // — Command Line Tools alone do not ship XCTest.
+        .testTarget(
+            name: "CopadCoreTests",
+            dependencies: ["CopadCore"],
+            path: "Tests/CopadCoreTests",
         ),
     ],
 )

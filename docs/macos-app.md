@@ -29,8 +29,12 @@ Swift/AppKit app using [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) f
 
 ```
 copad-macos/
-├── Package.swift                      # SwiftTerm 의존성 선언
+├── Package.swift                      # SwiftTerm 의존성 선언 + 타깃 분리 (Copad / CopadCore / CopadCoreTests)
 ├── run.sh                             # .app 번들 생성 후 실행
+├── Sources/CopadCore/                 # 순수-Swift 라이브러리 (실행파일과 분리)
+│   └── ContextService.swift          # copad_core::context 미러 (PaneContext + ContextService)
+├── Tests/CopadCoreTests/              # XCTest — Xcode 툴체인 필요 (CLT는 XCTest 미동봉)
+│   └── ContextServiceTests.swift     # pane_context 페어리티 테스트
 └── Sources/Copad/
     ├── CopadApp.swift                  # @main 진입점
     ├── AppDelegate.swift              # NSWindow 생성, 메뉴바, 소켓 커맨드 라우팅
@@ -46,6 +50,8 @@ copad-macos/
     ├── Config.swift                   # config.toml 파서
     └── Theme.swift                    # 10개 내장 테마 (RGBColor, CopadTheme)
 ```
+
+`CopadCore`는 Rust `copad_core` 미러를 위한 순수-Swift 라이브러리 타깃. GUI 레이어가 Xcode의 stricter Swift 6 concurrency check에서 막혀서 `swift test`로 빌드가 실패하는 문제를 우회하기 위해 실행파일 타깃과 분리했음. 새로 추가하는 순수-로직 미러(EventBus 형 코어 모델 등)는 여기에 두는 것이 권장. 실행파일 `Copad`는 `swiftLanguageMode(.v5)`로 핀되어 CLT (6.2.4) / Xcode (6.3.2) 두 컴파일러 모두에서 빌드됨.
 
 ---
 
