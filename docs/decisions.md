@@ -1064,3 +1064,66 @@ The README now documents this — Tahoe users are pointed at `scripts/install-ma
 - **Brain dispatcher generalization is design-load on 22.7.** `claude.start` (Phase 18.1) becomes the canonical spawner; `model` param routes to claude/codex variants; pipeline runner drives multi-stage dispatch. If the generalization proves leaky, 22.7 absorbs the rework cost — flagged as the highest-risk slice.
 
 **See:** [docs/roadmap.md § Phase 22](./roadmap.md#phase-22-context-aware-workstation-hub) (slice checklist), [docs/project-orchestration.md](./project-orchestration.md) (substrate + data-model design), [docs/kb-panel.md](./kb-panel.md) (the parallel 22.3 track), [#47](#47-life-assistant-absorption-stance--selective-native-reimplementation-not-embedding-phase-223) (the superseded stance).
+
+## 49. Agent session dispatch via a standalone `csd` CLI — subscription-seat driver, consumed by copad
+
+**Relation to [#48](#48-copad-native-port-of-project-orchestration-spine).** #48 ported the orchestration spine (goal / mission / agent / approval / pipeline) into `copad-core`, but every autonomous-dispatch piece was deferred at every slice ("no autonomous `claude.start` from the tick thread" in 22.4, "no wake-firing" in 22.5, "execution orchestration deferred" in 22.7). The spine is a brain with **no body** — it can store goals and missions but nothing actually drives an agent turn and reads the result back. #49 decides what that body is and where it lives. It does **not** supersede #48; it fills #48's deferred dispatch hole.
+
+**Problem — the billing boundary (researched against primary sources, 2026-05-30).** The user is a heavy interactive Claude (Max) user and wants `claude -p` ergonomics (scriptable, multi-turn, structured) with subscription-seat economics. That combination is not available:
+
+- **Interactive `claude` REPL** (subscription login, no `ANTHROPIC_API_KEY`) → **flat-rate subscription**, unchanged.
+- **`claude -p` / Agent SDK / `claude setup-token`+SDK** → as of **2026-06-15**, a **separate monthly "Agent SDK credit"** (Pro $20 / Max-5x $100 / Max-20x $200), then **full API rates** on overage.
+- **No officially-supported programmatic interface bills as flat-rate.** Sources: support.claude.com/articles/15036540, code.claude.com/docs/en/authentication.
+
+For a heavy user the metered path is economically dead: interactive use already saturates the subscription, and programmatic work draws a small separate credit then bills API on top. So flat-rate is the only viable substrate for high-volume autonomous work — and flat-rate means the **interactive REPL**.
+
+**The forced tradeoff.** You cannot get both flat-rate billing and clean structured interaction:
+
+| | flat-rate (subscription) | clean structured events |
+| --- | --- | --- |
+| path | interactive `claude` REPL only | `claude -p --output-format stream-json` only |
+| cost | ~0 marginal (already paid) | Agent SDK credit → API rates |
+| plan-approval / questions / tool-permissions | TUI gate — detect + inject keystrokes | structured events, programmatic response |
+| robustness | brittle (TUI-dependent), gray-area | supported |
+
+The user's stated worry (handling plan-mode approval + mid-task questions) is cleanly solved only on the metered side; on the flat-rate side it must be driven through the TUI.
+
+**Empirical validation (PoC, claude v2.1.157, 2026-05-30).** Driving an interactive `claude` in a detached `tmux` session was tested end-to-end and **both interactions work**:
+
+- **Subscription billing confirmed** — the TUI footer shows the Max rate-limit windows (`5h.. 7d..`); the `$` line is notional, not a charge.
+- **Clarifying-question detection** — reliable from the session JSONL (`~/.claude/projects/<slug>/<id>.jsonl`): last `assistant` event with `stop_reason=end_turn`, text ending in `?`, no later `user` event.
+- **Plan-ready detection** — the JSONL **lags** here (the approval gate is a TUI interrupt; `ExitPlanMode` is loaded lazily via ToolSearch and not committed until approved). Reliable signals are the **plan file** (`~/.claude/plans/plan-*.md`) plus **capture-pane** markers ("Here is Claude's plan" / "Would you like to proceed?").
+- **Approval + execution** — sending the menu keystroke approved the plan and the work executed and completed.
+- **Input injection** — `tmux send-keys -l` works (`paste-buffer` did not); keystrokes sent before the TUI is ready are dropped, so send→verify-echo→retry is required.
+
+Net: a **hybrid detector** is needed — JSONL (questions, responses, normal turns) + capture-pane (TUI-interrupt gates) + filesystem (plan files, work products). More brittle than `-p` stream-json, but tractable, and the only flat-rate path.
+
+**Decision.**
+
+- Build the session-driving capability as a **standalone CLI named `csd`** (claude/codex session driver) in its **own repo `~/dev/csd`** (Rust, lib+bin), **not** inside `copad-core` and **not** inside `coctl`. It owns: spawning an interactive agent in detached `tmux` (subscription seat), input injection with readiness/retry, and the hybrid state detector emitting JSON. Backend-agnostic by design — `claude` first, `codex` later — mirroring life-assistant's already-swappable backend.
+- **copad consumes `csd`** via shell-out + JSON, exactly the [#43](#43-pluginsweb-bridge-slice-31--tmux-as-data-model--xtermjs-attach-harness-integration-slice-31) tmx pattern (`tmx agents --json`): the projects panel / `web-bridge` reads `csd ps --json` for visibility, and the autonomous loop (in `copadd`, when built) shells out to `csd` to dispatch goal / mission turns. `csd` becomes a **pluggable dispatch backend** alongside the existing GUI `claude.start` (interactive, user-visible tab) and a possible future metered `-p` backend.
+- **`csd` implementation details are out of scope for copad docs** — they live in the `csd` repo. copad docs record only the boundary, the consumption contract, and the non-goals.
+
+**What was researched (so it is not re-derived).**
+
+- Billing split (primary sources, above).
+- The flat-rate-vs-structured tradeoff (above).
+- The end-to-end PoC (above) — flat-rate interactive driving is proven viable.
+- copad headless capability — `copadd` runs independently of the GUI (own ActionRegistry / EventBus / socket); `claude.start` is GUI-bound only for *tab spawning*; daemon-side dispatch is feasible (~hundreds of LOC reusing the headless `tmux` primitives already in `plugins/web-bridge/src/tmux.rs`).
+- life-assistant's Brain dispatcher as the proven reference pattern (`-p --output-format json --resume/--session-id --permission-mode --max-turns`, deterministic session UUIDs, per-project worktree locks, `BLOCKED` detection) — already abstracted to allow a codex backend.
+
+**What copad will NOT do (non-goals).**
+
+- **Not** reimplement session-driving inside `copad-core` or `coctl`. `csd` is standalone; the daemon / `coctl` shell out to it. (A thin `coctl` passthrough is optional sugar, not where the logic lives.)
+- **Not** make the metered `-p` / stream-json path the default autonomous substrate. It stays available as a backend option for clean structured interaction when per-token cost is acceptable, but the heavy-use autonomous path is subscription-seat `tmux` driving.
+- **Not** couple the 24/7 life-assistant server to copad. `csd` being standalone means the server can consume it directly; neither depends on the other.
+- **Not** reinvent `~/.claude` readers or agent dashboards in copad — `tmx` owns observation, `csd` owns driving, copad **visualizes** both via JSON shell-out.
+- **Not** treat the projects-panel `workflow.run` launcher as the product value — it is a dispatch primitive, not a `tmx`-competing launcher. The value is autonomous-body + visibility.
+
+**Open risks (carry forward).**
+
+- **Gray-area loophole.** Driving the interactive REPL programmatically to obtain flat-rate billing is undocumented and uncontemplated by the billing model. Anthropic could reclassify it as programmatic (metered) or disallow automated interactive driving. Mitigation: keep `csd`'s dispatch backend swappable so a forced move to `-p` is a config flip, not a rewrite.
+- **Shared rate limits.** An autonomous fleet draws from the **same** interactive subscription limits as the user's own (heavy) interactive use — they compete for capacity. Mitigation under consideration: a dedicated second subscription seat for the fleet.
+- **Release-dependent TUI markers.** capture-pane gate markers (plan approval, permission prompts) shift between `claude` releases and must be re-verified per version; the JSONL lags live state by a tool-call.
+
+**See:** [#48](#48-copad-native-port-of-project-orchestration-spine) (the spine this is the body for), [docs/project-orchestration.md](./project-orchestration.md) (dispatch section), [docs/roadmap.md § Phase 22.4 / 22.7](./roadmap.md#phase-22-context-aware-workstation-hub) (the deferred-dispatch notes this fills), [#43](#43-pluginsweb-bridge-slice-31--tmux-as-data-model--xtermjs-attach-harness-integration-slice-31) (the tmx shell-out + JSON consumption pattern `csd` reuses).

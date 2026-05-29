@@ -330,6 +330,8 @@ Pipeline runner (also 22.7) sits on top: for a workflow with `default_team`, the
 
 Stage outputs are written to files under the mission/run workspace; subsequent stages reference them via `{stage_outputs.architect}` placeholders in role prompt templates. Parallel stages fan out via existing async dispatch; sequential stages chain on completion events.
 
+> **Dispatch body — the deferred autonomous loop ([decision #49](./decisions.md#49-agent-session-dispatch-via-a-standalone-csd-cli--subscription-seat-driver-consumed-by-copad)).** The spine above (and 22.4/22.5/22.6) stores goals/missions but never autonomously *runs* an agent turn — every slice deferred dispatch. That body is a **standalone `csd` CLI** (claude/codex session driver, `~/dev/csd`), **not** copad-core code: it spawns an interactive agent in detached `tmux` (subscription-seat billing — the only flat-rate path for a heavy user; `claude -p` is metered from 2026-06-15) and exposes a hybrid state detector (JSONL + capture-pane + plan file) as JSON. copad **consumes** `csd` (the `tmx agents --json` pattern): the panel reads `csd ps --json` for visibility; the daemon-side loop shells out to `csd` to dispatch turns. `csd` is one pluggable backend alongside the GUI `claude.start` (interactive tab) and a possible metered `-p` backend. The PoC (claude v2.1.157) verified both clarifying-question detection and plan-mode approval→execute over `tmux`. Implementation details live in the `csd` repo, not here. See #49 for the billing research, the flat-rate-vs-structured tradeoff, and the explicit non-goals.
+
 ## 6. Wake conditions ↔ TriggerEngine mapping
 
 life-assistant's mission `wake_conditions` map to copad TriggerEngine entries with one-to-one semantics:
