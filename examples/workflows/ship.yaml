@@ -1,0 +1,15 @@
+# /ship — tests → cross-review gate → commit → push → gh PR create
+#
+# Mirrors life-assistant's `ship` spec (Timeout=20m, FreshSession=true).
+# Side-effecting end-to-end flow; no form fields — the active branch +
+# commits drive everything. Fresh session forced so a partial-progress
+# attach can't accidentally pick up stale context.
+id: ship
+name: /ship
+description: |
+  Run /ship — tests, codex cross-review gate, commit, push, gh PR create.
+  20m timeout, fresh session each dispatch (no retry on partial progress).
+require_project: true
+timeout_secs: 1800
+fresh_session: true
+prompt: "/ship"

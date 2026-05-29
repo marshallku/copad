@@ -1,0 +1,12 @@
+# /catchup — walk ~/.claude + ~/.codex transcripts since the last
+# /catchup and organize findings into ~/docs (daily / weekly / topics)
+#
+# Project-agnostic. Date range read from ~/docs/.last-catchup;
+# no input needed.
+id: catchup
+name: /catchup
+description: |
+  Walk ~/.claude + ~/.codex conversation logs since the last catchup
+  date (stored at ~/docs/.last-catchup) and organize work / decisions /
+  learnings into ~/docs (daily, weekly, topics).
+prompt: "/catchup"

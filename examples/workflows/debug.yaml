@@ -1,0 +1,19 @@
+# /debug — 5-phase structured debugging (3-strike + scope lock)
+#
+# `symptom` is required — keeps users from invoking debug without a
+# concrete failure description (which always ends in flailing).
+id: debug
+name: /debug
+description: |
+  Run /debug — 5-phase structured debugging (SSoT recall → collect →
+  pattern-match → hypothesize → fix → validate). 3-strike rule +
+  scope lock prevent unbounded exploration.
+require_project: true
+form_fields:
+  - name: symptom
+    label: Symptom
+    type: textarea
+    required: true
+    placeholder: "What's broken? Logs, stack traces, repro steps welcome."
+    max_length: 2000
+prompt: "/debug {symptom}"

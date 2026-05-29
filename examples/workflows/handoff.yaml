@@ -1,0 +1,12 @@
+# /handoff — session context capture for the next Claude session
+#
+# Project-agnostic. The skill walks the current session's transcript +
+# git state and writes a narrative handoff to ~/.claude/handoffs/.
+# The Stop hook (auto-handoff.sh) also writes one automatically; this
+# is the on-demand higher-quality version.
+id: handoff
+name: /handoff
+description: |
+  Manually produce a handoff note for the next session. Complementary
+  to the Stop hook's auto-handoff (which is shorter and structural).
+prompt: "/handoff"

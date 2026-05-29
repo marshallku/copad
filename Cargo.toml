@@ -17,6 +17,7 @@ members = [
     "plugins/discord",
     "plugins/bookmark",
     "plugins/jira",
+    "plugins/projects",
     "plugins/web-bridge",
 ]
 

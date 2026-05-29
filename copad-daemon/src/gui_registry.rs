@@ -83,6 +83,12 @@ pub fn method_capability(method: &str) -> Option<&'static str> {
         "agent.approve" => Some("agent.ui"),
         "plugin.open" => Some("plugin.open"),
         "session.list" | "session.info" => Some("session"),
+        // Phase 22.2 — project + workflow surfaces live GUI-side because
+        // workflow.run dispatches `claude.start` in-process (needs TabManager
+        // + GTK window). project.* + workflow.list/get are also GUI-routed
+        // for proximity to the registries that hold the data.
+        m if m.starts_with("project.") => Some("project"),
+        m if m.starts_with("workflow.") => Some("workflow"),
         _ => None,
     }
 }

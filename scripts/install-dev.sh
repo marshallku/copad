@@ -152,6 +152,28 @@ if $DO_PLUGINS; then
     bash "$REPO_ROOT/scripts/install-plugins.sh"
 fi
 
+# Phase 22.2 — seed workflow YAMLs. Skip-if-exists so user edits are
+# preserved across re-installs. New examples (added in later commits)
+# land on the next install; existing ones are never overwritten.
+WORKFLOWS_SRC="$REPO_ROOT/examples/workflows"
+WORKFLOWS_DST="$HOME/.config/copad/workflows"
+if [ -d "$WORKFLOWS_SRC" ]; then
+    mkdir -p "$WORKFLOWS_DST"
+    seeded=0
+    skipped=0
+    for f in "$WORKFLOWS_SRC"/*.yaml; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f")
+        if [ -f "$WORKFLOWS_DST/$name" ]; then
+            skipped=$((skipped + 1))
+        else
+            cp "$f" "$WORKFLOWS_DST/$name"
+            seeded=$((seeded + 1))
+        fi
+    done
+    echo "==> seeded $seeded workflow yaml(s) to $WORKFLOWS_DST (skipped $skipped existing)"
+fi
+
 if $DO_DAEMON; then
     # `systemd --user` unit install. Without this, copadd never starts
     # automatically — every reboot or new SSH session leaves the user

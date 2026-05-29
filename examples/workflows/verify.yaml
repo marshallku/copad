@@ -1,0 +1,19 @@
+# /verify — browser screenshot + vision analysis on a URL
+#
+# Project-agnostic (require_project: false). URL field carries both
+# pattern (^https?://) and max_length (500) — load-bearing per
+# codex-plan C6: invalid URLs were getting through in the bridge plan.
+id: verify
+name: /verify
+description: |
+  Run /verify on a URL — browser screenshot + vision analysis.
+  Project-agnostic. Browser must be running with the control extension.
+form_fields:
+  - name: url
+    label: URL
+    type: text
+    required: true
+    placeholder: "https://example.com"
+    pattern: "^https?://.+"
+    max_length: 500
+prompt: "/verify {url}"

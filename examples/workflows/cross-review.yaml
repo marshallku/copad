@@ -1,0 +1,18 @@
+# /cross-review — Codex VERDICT loop on uncommitted diff, max 3 rounds
+#
+# Intent brief is optional. Empty value falls through to
+# uncommitted-mode auto-derive; non-empty appends to the slash command.
+id: cross-review
+name: /cross-review
+description: |
+  Run /cross-review on the current uncommitted diff. Codex VERDICT loop,
+  max 3 rounds. Fix-First triage — mechanical fixes inline, judgment
+  calls surface to the user.
+require_project: true
+form_fields:
+  - name: intent_brief
+    label: Intent brief (optional)
+    type: textarea
+    placeholder: "Short context for codex — what the changes are for."
+    max_length: 2000
+prompt: "/cross-review {intent_brief}"

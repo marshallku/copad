@@ -241,6 +241,11 @@ pub struct CopadConfig {
     /// Declarative event → action automation. See `docs/workflow-runtime.md`.
     #[serde(default)]
     pub triggers: Vec<Trigger>,
+
+    /// Project entries — see `docs/project-orchestration.md` § Project entity
+    /// + git_remote resolution. Phase 22.2+.
+    #[serde(default)]
+    pub projects: Vec<crate::project::Project>,
 }
 
 impl CopadConfig {
@@ -382,6 +387,53 @@ event_kind = "x.fired"
         let cfg = CopadConfig::load_from(&path).expect("load");
         assert_eq!(cfg.triggers.len(), 1);
         assert_eq!(cfg.triggers[0].name, "t1");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn load_from_parses_projects_section() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[[projects]]
+name = "copad"
+path = "/home/me/dev/copad"
+git_remote = "marshallku/copad"
+aliases = ["copad-app"]
+
+[[projects]]
+name = "monorepo"
+path = "/home/me/dev/mono"
+subpath = "apps/web"
+"#,
+        )
+        .expect("write");
+        let cfg = CopadConfig::load_from(&path).expect("load");
+        assert_eq!(cfg.projects.len(), 2);
+        assert_eq!(cfg.projects[0].name, "copad");
+        assert_eq!(
+            cfg.projects[0].git_remote.as_deref(),
+            Some("marshallku/copad")
+        );
+        assert_eq!(cfg.projects[0].aliases, vec!["copad-app".to_string()]);
+        assert_eq!(
+            cfg.projects[1].subpath,
+            Some(std::path::PathBuf::from("apps/web"))
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn load_from_missing_projects_section_is_empty() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[terminal]\n").expect("write");
+        let cfg = CopadConfig::load_from(&path).expect("load");
+        assert!(cfg.projects.is_empty());
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir(&dir).ok();
     }

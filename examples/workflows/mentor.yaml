@@ -1,0 +1,23 @@
+# /mentor — consult a mentor persona on a question
+#
+# `name` chooses the persona; `question` is free-text. Both required —
+# empty name routes to auto-pick but defeats the explicit-persona UX.
+id: mentor
+name: /mentor
+description: |
+  Consult a mentor persona (tech/career/investment domains) on a
+  specific question. Persona thinking-frame applied; not a generic
+  answer. `/mentor list` to see available personas first.
+form_fields:
+  - name: name
+    label: Persona
+    type: text
+    required: true
+    placeholder: "e.g. linus, charlie-munger, naval"
+    max_length: 100
+  - name: question
+    label: Question
+    type: textarea
+    required: true
+    max_length: 2000
+prompt: "/mentor {name} {question}"

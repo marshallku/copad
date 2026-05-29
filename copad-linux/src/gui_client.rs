@@ -32,6 +32,14 @@ const GUI_TO_DAEMON_FORWARD_KINDS: &[&str] = &[
     "tab.closed",
     "tab.created",
     "tab.renamed",
+    // Phase 22.2 — workflow lifecycle. `workflow.started` /
+    // `workflow.timed_out` originate on the GUI bus (workflow.run lives
+    // GUI-side) but `coctl recent --kind workflow.*` queries the daemon
+    // ring buffer; without forwarding here, the interim/final e2e gate
+    // ("verify via coctl recent") would only see workflow events from a
+    // restart of the daemon-process bus, not from the GUI-spawned tab.
+    "workflow.started",
+    "workflow.timed_out",
     "terminal.cwd_changed",
     "terminal.shell_precmd",
     "terminal.shell_preexec",
@@ -67,6 +75,10 @@ const CAPABILITIES: &[&str] = &[
     "plugin.open",
     "session",
     "search",
+    // Phase 22.2 — project + workflow routes (see
+    // `copad-daemon::gui_registry::method_capability`).
+    "project",
+    "workflow",
 ];
 
 /// Curated env keys the GUI exports to the daemon via `gui.register`'s

@@ -99,6 +99,62 @@ Map key combinations to shell commands. Commands prefixed with `spawn:` run in t
 
 **Note:** Custom bindings override built-in shortcuts. For example, binding `ctrl+shift+b` replaces the default tab bar toggle.
 
+### [[projects]] (Phase 22.2)
+
+Project entries — one `[[projects]]` block per project. Drives `coctl project list` / `project.resolve` and scopes `copad-plugin-projects` panel rendering. See [project-orchestration.md](./project-orchestration.md) for the full design.
+
+```toml
+[[projects]]
+name = "copad"
+path = "/home/marshall/dev/copad"
+git_remote = "marshallku/copad"     # optional — inferred at startup via `git remote get-url origin` if absent
+aliases = ["copad-app"]              # optional — alternate names for `project.resolve --name`
+
+[[projects]]
+name = "monorepo"
+path = "/home/marshall/dev/mono"
+subpath = "apps/web"                 # optional — workflow tabs open at <path>/<subpath>
+description = "Frontend monorepo"    # optional — surfaced in the projects panel header
+```
+
+| Key          | Type           | Required | Description                                                                    |
+| ------------ | -------------- | -------- | ------------------------------------------------------------------------------ |
+| `name`       | string         | yes      | Canonical project id (must be unique)                                          |
+| `path`       | string (path)  | yes      | Filesystem root — workflow tabs open here unless `subpath` is set              |
+| `subpath`    | string (path)  | no       | Working subdir inside `path` (monorepo packages)                               |
+| `description`| string         | no       | Free-text shown in the projects panel header                                   |
+| `aliases`    | array<string>  | no       | Alternate names accepted by `project.resolve --name`                           |
+| `git_remote` | string         | no       | Canonical `owner/repo` — inferred via `git remote get-url origin` if omitted    |
+
+### Workflow specs — `~/.config/copad/workflows/*.yaml` (Phase 22.2)
+
+Each YAML file in `~/.config/copad/workflows/` defines one workflow that surfaces in the projects panel + `coctl workflow list`. Schema:
+
+```yaml
+id: ship
+name: /ship
+description: Run /ship — tests, codex review gate, commit, push, PR.
+require_project: true            # if true, panel/coctl must resolve a project before run
+timeout_secs: 1200               # optional — emits workflow.timed_out (no kill in v1)
+fresh_session: true              # mirrors life-assistant's ship contract
+form_fields:                     # optional — rendered as form in the panel
+  - name: branch
+    label: Git branch
+    type: text                   # text | textarea | select
+    required: true
+    placeholder: "feat/x"
+    max_length: 200              # optional length cap
+    pattern: "^[a-z][a-z0-9/_-]*$"  # optional regex validator
+prompt: |
+  /ship for branch {branch} in project {project}
+```
+
+Available placeholders in `prompt`: `{field_name}` (each form_fields entry), `{project}` (project name), `{project.path}`, `{project.subpath}`, `{workspace_path}` (resolved final path passed to `claude.start`). Unknown placeholders error.
+
+`default_team` and `default_model` are accepted and stored but ignored at v1 dispatch — Phase 22.7's pipeline router + Brain dispatcher generalization activates them.
+
+`install-dev.sh` seeds 7 starter specs (`ship` / `cross-review` / `debug` / `verify` / `handoff` / `mentor` / `catchup`) on first install via skip-if-exists copy from `examples/workflows/`. User edits are preserved across re-installs.
+
 ### [security] (macOS only, for now)
 
 Trust-boundary policies for behaviors driven by PTY output.

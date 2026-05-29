@@ -501,6 +501,11 @@ pub fn dispatch(
             cmd.reply_with_completion(event_bus, resp);
         }
 
+        "workflow.run" => {
+            let resp = handle_workflow_run(req, mgr, window, event_bus);
+            cmd.reply_with_completion(event_bus, resp);
+        }
+
         "theme.list" => {
             let themes: Vec<&str> = copad_core::theme::Theme::list().to_vec();
             let current = mgr.current_theme_name();
@@ -1443,6 +1448,24 @@ fn handle_claude_start(
         );
     }
 
+    // `fresh_session` (Phase 22.2): mirror of life-assistant's `ship`
+    // contract — side-effecting flows force a brand-new tmux session
+    // so they never accidentally attach onto a stale one. v1 implements
+    // by suffixing the derived/explicit session_name with the current
+    // unix seconds, which guarantees uniqueness in practice (1-sec
+    // granularity is finer than any realistic re-dispatch cadence).
+    let fresh_session = match req.params.get("fresh_session") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::Null) | None => false,
+        Some(other) => {
+            return Response::error(
+                req.id.clone(),
+                "invalid_params",
+                &format!("'fresh_session' must be a bool, got {other}"),
+            );
+        }
+    };
+
     // session_name: explicit or derived. tmux forbids `:` and `.`
     // in session names; we restrict further to ASCII alphanumeric
     // + `-_` so the value stays safe to embed in shell commands
@@ -1466,6 +1489,27 @@ fn handle_claude_start(
                 &format!("'session_name' must be a string, got {other}"),
             );
         }
+    };
+
+    // Apply fresh_session uniquification AFTER session_name resolution
+    // so explicit + derived paths share the same suffix logic. The unix
+    // timestamp suffix passes `validate_tmux_session_name` /
+    // `sanitize_session_name` because it's ASCII digits only.
+    //
+    // **Microsecond precision** (not seconds — codex-review C5): two
+    // `fresh_session` dispatches against the same workspace within the
+    // same second would otherwise produce identical session names and
+    // `-A` attach onto each other, violating the fresh contract for
+    // side-effecting workflows. u128 micros gives ~1µs collision window
+    // — well under any realistic re-dispatch cadence.
+    let session_name = if fresh_session {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros())
+            .unwrap_or(0);
+        format!("{session_name}-{ts}")
+    } else {
+        session_name
     };
 
     // resume_session: optional claude session id. Validated
@@ -1519,6 +1563,14 @@ fn handle_claude_start(
              resume restores existing context; prompt seeds a new conversation",
         );
     }
+    if fresh_session && resume_session.is_some() {
+        return Response::error(
+            req.id.clone(),
+            "invalid_params",
+            "'fresh_session' and 'resume_session' are mutually exclusive — \
+             fresh forces a new session; resume requires an existing one",
+        );
+    }
 
     let claude_cmd = match &resume_session {
         Some(id) => format!("claude --resume {}", shell_single_quote(id)),
@@ -1568,6 +1620,238 @@ fn handle_claude_start(
             "tab": tab_index,
             "tmux_session": session_name,
             "workspace_path": canon.display().to_string(),
+        }),
+    )
+}
+
+/// `workflow.run` — Phase 22.2 dispatcher. Resolves the spec, validates
+/// form values, substitutes the prompt template, then reuses
+/// `handle_claude_start` in-process by constructing a synthetic `Request`
+/// with the resolved params. Emits `workflow.started` on the bus regardless
+/// of caller; `workflow.timed_out` is registered as a one-shot timer when
+/// `timeout_secs` is set (event only — does not kill the subprocess in v1;
+/// hard kill lands in 22.6).
+fn handle_workflow_run(
+    req: &Request,
+    mgr: &Rc<TabManager>,
+    window: &ApplicationWindow,
+    event_bus: &EventBus,
+) -> Response {
+    let id = match req.params.get("id").and_then(|v| v.as_str()) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => {
+            return Response::error(
+                req.id.clone(),
+                "invalid_params",
+                "workflow.run requires non-empty `id` string",
+            );
+        }
+    };
+
+    let workflow_registry = mgr.workflow_registry();
+    let spec = match workflow_registry.get(&id) {
+        Some(s) => s.clone(),
+        None => {
+            return Response::error(
+                req.id.clone(),
+                "not_found",
+                &format!("workflow id '{id}' not found"),
+            );
+        }
+    };
+
+    // Form values: accept object map or null/missing (= empty).
+    let values: std::collections::HashMap<String, String> = match req.params.get("values") {
+        None | Some(serde_json::Value::Null) => std::collections::HashMap::new(),
+        Some(serde_json::Value::Object(map)) => {
+            let mut out = std::collections::HashMap::new();
+            for (k, v) in map {
+                let s = match v {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Null => String::new(),
+                    other => other.to_string(),
+                };
+                out.insert(k.clone(), s);
+            }
+            out
+        }
+        Some(other) => {
+            return Response::error(
+                req.id.clone(),
+                "invalid_params",
+                &format!("'values' must be an object, got {other}"),
+            );
+        }
+    };
+
+    if let Err(e) = copad_core::workflow::validate_values(&spec, &values) {
+        return Response::error(req.id.clone(), "invalid_params", &e.to_string());
+    }
+
+    // Project resolution: explicit param → active context fallback → None.
+    let explicit_project = req.params.get("project").and_then(|v| v.as_str());
+    let registry = mgr.project_registry().lock().unwrap();
+    let resolved_project: Option<copad_core::project::Project> =
+        if let Some(name) = explicit_project {
+            match registry.resolve_by_name(name) {
+                Some(p) => Some(p.clone()),
+                None => {
+                    return Response::error(
+                        req.id.clone(),
+                        "not_found",
+                        &format!("project '{name}' not found"),
+                    );
+                }
+            }
+        } else {
+            registry.resolve_active(&mgr.context().snapshot()).cloned()
+        };
+    drop(registry);
+
+    if spec.require_project && resolved_project.is_none() {
+        return Response::error(
+            req.id.clone(),
+            "project_required",
+            &format!(
+                "workflow '{id}' requires a project — pass `project: \"<name>\"` or focus a \
+                 pane whose pane_context.git_remote or active_cwd matches a configured project"
+            ),
+        );
+    }
+
+    let workspace_path: std::path::PathBuf = match &resolved_project {
+        Some(p) => p.workspace_path(),
+        None => match mgr.context().snapshot().active_cwd {
+            Some(c) => c,
+            None => {
+                return Response::error(
+                    req.id.clone(),
+                    "no_workspace",
+                    "workflow.run could not resolve a workspace_path — no project and no \
+                     active_cwd in context",
+                );
+            }
+        },
+    };
+
+    let prompt = match copad_core::workflow::substitute(
+        &spec.prompt,
+        &values,
+        resolved_project.as_ref(),
+        &workspace_path,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            return Response::error(
+                req.id.clone(),
+                "template_error",
+                &format!("workflow '{id}' prompt: {e}"),
+            );
+        }
+    };
+
+    if spec.default_team.is_some() {
+        log::info!(
+            "workflow.run: spec '{id}' has default_team set but pipeline router not yet \
+             shipped (Phase 22.7) — dispatching via claude.start without team routing"
+        );
+    }
+    if spec.default_model.is_some() {
+        log::info!(
+            "workflow.run: spec '{id}' has default_model set but Brain dispatcher \
+             generalization not yet shipped (Phase 22.7) — dispatching to claude regardless"
+        );
+    }
+
+    let run_id = format!(
+        "wfr-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros())
+            .unwrap_or(0)
+    );
+
+    // Construct synthetic Request for handle_claude_start. Reusing the
+    // existing handler in-process is cheaper than duplicating the
+    // workspace_path / session_name / paste-buffer pipeline.
+    let claude_params = json!({
+        "workspace_path": workspace_path.display().to_string(),
+        "prompt": prompt,
+        "fresh_session": spec.fresh_session,
+    });
+    let claude_req = Request {
+        id: req.id.clone(),
+        method: "claude.start".to_string(),
+        params: claude_params,
+        target_client_id: req.target_client_id.clone(),
+    };
+    let claude_resp = handle_claude_start(&claude_req, mgr, window);
+    if !claude_resp.ok {
+        // Propagate the error verbatim — caller sees the same shape they'd
+        // have seen had they called claude.start directly, with workflow.run's
+        // request id.
+        return claude_resp;
+    }
+
+    let claude_result = claude_resp
+        .result
+        .clone()
+        .unwrap_or(serde_json::Value::Null);
+    let panel_id = claude_result
+        .get("panel_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let tab = claude_result
+        .get("tab")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    let project_name = resolved_project.as_ref().map(|p| p.name.clone());
+    event_bus.publish(BusEvent::new(
+        "workflow.started".to_string(),
+        BUS_SOURCE_COPAD_LINUX,
+        json!({
+            "run_id": run_id,
+            "workflow_id": spec.id,
+            "project": project_name,
+            "workspace_path": workspace_path.display().to_string(),
+            "panel_id": panel_id,
+            "tab": tab,
+            "started_at_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0),
+        }),
+    ));
+
+    if let Some(secs) = spec.timeout_secs {
+        let bus_clone = event_bus.clone();
+        let run_id_clone = run_id.clone();
+        let workflow_id = spec.id.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            // v1: emit-only signal. Does NOT kill the claude subprocess
+            // — hard kill lands in 22.6 with runledger + tab-exit watcher.
+            bus_clone.publish(BusEvent::new(
+                "workflow.timed_out".to_string(),
+                BUS_SOURCE_COPAD_LINUX,
+                json!({
+                    "run_id": run_id_clone,
+                    "workflow_id": workflow_id,
+                    "timeout_secs": secs,
+                }),
+            ));
+        });
+    }
+
+    Response::success(
+        req.id.clone(),
+        json!({
+            "run_id": run_id,
+            "panel_id": panel_id,
+            "tab": tab,
+            "workspace_path": workspace_path.display().to_string(),
         }),
     )
 }

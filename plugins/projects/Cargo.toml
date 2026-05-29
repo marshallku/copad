@@ -1,0 +1,14 @@
+[package]
+name = "copad-plugin-projects"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Phase 22.2 — Projects panel for copad. Panel-only at v1 (all project.*/workflow.* actions registered GUI-side in copad-linux). The binary exists as a scaffold so future per-plugin services (e.g., on-disk run cache for the recent-runs slot post-22.6 runledger ship) have a place to land without restructuring the crate."
+repository.workspace = true
+
+[[bin]]
+name = "copad-plugin-projects"
+path = "src/main.rs"
+
+[dependencies]
+copad-core = { path = "../../copad-core" }

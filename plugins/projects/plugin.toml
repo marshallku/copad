@@ -1,0 +1,14 @@
+[plugin]
+name = "projects"
+title = "Projects"
+version = "0.1.0"
+description = "Phase 22.2 — per-project panel. Renders the active pane's project, available workflows (form-driven submit), and recent workflow runs. All actions are GUI-side (registered in copad-linux/src/window.rs + socket.rs) — the plugin is panel-only, no Rust service binary."
+
+# Panel-only plugin. The project / workflow actions live in copad-core
+# and are registered GUI-side, so we don't need a service block — the
+# install script's panel-only path takes care of copying panel.html
+# without symlinking a binary.
+[[panels]]
+name = "main"
+title = "Projects"
+file = "panel.html"

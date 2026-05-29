@@ -238,7 +238,7 @@ Two roots: config (read-mostly, user-editable) and state (write-heavy, daemon-ma
         ├── api-dev.yaml
         └── ...
 
-~/.local/share/copad/                  # state (daemon-managed, machine-local)
+~/.local/state/copad/                  # state (daemon-managed, machine-local)
 ├── goals/<goal-id>/                   # 22.4
 │   ├── state.json
 │   └── roadmap.md
@@ -341,7 +341,7 @@ life-assistant's mission `wake_conditions` map to copad TriggerEngine entries wi
 
 The wake handler is a single action (`mission.wake_handler`) registered by `copad-core::mission`. It receives `{mission_id}`, loads the manifest, selects an orchestrator agent, builds the prompt from objective + assigned_agents + recent timeline events + memory summary, and dispatches `claude.start` (model routed per agent's `autonomy.default_model`). The turn JSON response (next_action, detail, target_agent?) writes to `timeline.md` and may emit `mission.state_changed`.
 
-Approval expiry is also TriggerEngine-driven: `register_cron("*/30 * * * * *", "approval.expire_sweep")` — handler scans `~/.local/share/copad/approvals/`, transitions pending+expired entries, emits `approval.expired`.
+Approval expiry is also TriggerEngine-driven: `register_cron("*/30 * * * * *", "approval.expire_sweep")` — handler scans `~/.local/state/copad/approvals/`, transitions pending+expired entries, emits `approval.expired`.
 
 Goal ticks use the same primitive: `register_cron("*/1 * * * *", "goal.tick_next_runnable")` — handler picks `next_runnable()` and dispatches one claude turn.
 
@@ -349,7 +349,7 @@ Goal ticks use the same primitive: `register_cron("*/1 * * * *", "goal.tick_next
 
 EventBus today is in-memory only (ring buffer for `coctl recent`). 22.6 adds durable persistence:
 
-- New write-through subscriber registered at daemon startup: subscribes to `Pattern::All`, appends each event as one JSON line to `~/.local/share/copad/runledger/<YYYY-MM>.jsonl`.
+- New write-through subscriber registered at daemon startup: subscribes to `Pattern::All`, appends each event as one JSON line to `~/.local/state/copad/runledger/<YYYY-MM>.jsonl`.
 - Each line: `{ event_id, ts, kind, origin, payload }`. event_id is ULID (sortable). origin from existing `Origin` field.
 - Monthly rotation: handler opens current month's file on first event, switches on month boundary.
 - Read API: `events.replay` streams matching events from one or more monthly files.
@@ -409,7 +409,7 @@ Cron dependency: if Phase 21 Step 11 cron-triggers isn't shipped, 22.4 includes 
 ### 22.5 Agent + Mission
 
 Functional gates:
-- 5 seed agent profiles ship via `include_str!`; copying one to `~/.local/share/copad/agents/<id>/` overrides at startup.
+- 5 seed agent profiles ship via `include_str!`; copying one to `~/.local/state/copad/agents/<id>/` overrides at startup.
 - `mission.submit` creates manifest + registers wake_conditions with TriggerEngine.
 - Wake handler dispatches `claude.start` with full context (objective + assigned_agents + recent memory) and persists turn output to `timeline.md`.
 - `mission.pause` deregisters wake triggers; `mission.resume` re-registers.

@@ -256,6 +256,150 @@ impl CopadWindow {
             });
         }
 
+        // Phase 22.2 — project + workflow registries. Built once at startup
+        // from config + ~/.config/copad/workflows/*.yaml; reload requires
+        // restart (matches existing config-reload semantics for triggers).
+        // See docs/project-orchestration.md.
+        let project_registry = Arc::new(Mutex::new({
+            let mut r =
+                copad_core::project::ProjectRegistry::from_projects(config.projects.clone());
+            r.refresh_git_remotes();
+            r
+        }));
+        let workflows_dir = CopadConfig::config_path()
+            .parent()
+            .map(|p| p.join("workflows"))
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/copad-workflows"));
+        let workflow_registry = Arc::new(copad_core::workflow::WorkflowRegistry::load_from_dir(
+            &workflows_dir,
+        ));
+        {
+            let reg = project_registry.clone();
+            actions.register_silent("project.list", move |_| {
+                let projects = reg.lock().unwrap().list().to_vec();
+                Ok(json!({ "projects": projects }))
+            });
+        }
+        {
+            let reg = project_registry.clone();
+            let ctx = context.clone();
+            actions.register_silent("project.resolve", move |params| {
+                let by_git_remote = params.get("git_remote").and_then(|v| v.as_str());
+                let by_name = params.get("name").and_then(|v| v.as_str());
+                let by_cwd = params.get("cwd").and_then(|v| v.as_str()).map(std::path::PathBuf::from);
+                let active = params
+                    .get("active")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let registry = reg.lock().unwrap();
+                let resolved: Option<copad_core::project::Project> = if let Some(g) = by_git_remote {
+                    registry.resolve_by_git_remote(g).cloned()
+                } else if let Some(n) = by_name {
+                    registry.resolve_by_name(n).cloned()
+                } else if let Some(c) = by_cwd {
+                    registry.resolve_by_cwd(&c).cloned()
+                } else if active {
+                    registry.resolve_active(&ctx.snapshot()).cloned()
+                } else {
+                    return Err(invalid_params(
+                        "project.resolve requires one of `git_remote`, `name`, `cwd`, or `active: true`",
+                    ));
+                };
+                Ok(json!({ "project": resolved }))
+            });
+        }
+        {
+            // `project.last_commit { name }` — shells `git log -1` against
+            // the resolved project's path and returns `{short_hash, subject,
+            // when_relative}`. Panel calls this per active-pane change rather
+            // than baking last_commit into `project.list`, so the per-project
+            // git shellout cost (~10ms) doesn't multiply with N projects.
+            let reg = project_registry.clone();
+            actions.register_blocking_silent("project.last_commit", move |params| {
+                let name = params
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| invalid_params("project.last_commit requires `name` string"))?;
+                let path = {
+                    let registry = reg.lock().unwrap();
+                    match registry.resolve_by_name(name) {
+                        Some(p) => p.path.clone(),
+                        None => {
+                            return Err(copad_core::protocol::ResponseError {
+                                code: "not_found".into(),
+                                message: format!("project '{name}' not found"),
+                            });
+                        }
+                    }
+                };
+                let output = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&path)
+                    .arg("log")
+                    .arg("-1")
+                    .arg("--format=%h%x09%s%x09%cr")
+                    .output()
+                    .map_err(|e| internal_error(format!("git: {e}")))?;
+                if !output.status.success() {
+                    return Ok(json!({ "last_commit": null }));
+                }
+                let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                let mut parts = line.splitn(3, '\t');
+                let short_hash = parts.next().unwrap_or("").to_string();
+                let subject = parts.next().unwrap_or("").to_string();
+                let when_relative = parts.next().unwrap_or("").to_string();
+                if short_hash.is_empty() {
+                    return Ok(json!({ "last_commit": null }));
+                }
+                Ok(json!({
+                    "last_commit": {
+                        "short_hash": short_hash,
+                        "subject": subject,
+                        "when_relative": when_relative,
+                    }
+                }))
+            });
+        }
+        {
+            let reg = workflow_registry.clone();
+            actions.register_silent("workflow.list", move |_| {
+                // Minimal listing — clients call workflow.get for full spec
+                // (prompt + form_fields). Keeps the per-tick re-render cheap.
+                let workflows: Vec<serde_json::Value> = reg
+                    .list()
+                    .into_iter()
+                    .map(|s| {
+                        json!({
+                            "id": s.id,
+                            "name": s.name,
+                            "description": s.description,
+                            "require_project": s.require_project,
+                            "default_team": s.default_team,
+                            "default_model": s.default_model,
+                            "has_form_fields": !s.form_fields.is_empty(),
+                        })
+                    })
+                    .collect();
+                Ok(json!({ "workflows": workflows }))
+            });
+        }
+        {
+            let reg = workflow_registry.clone();
+            actions.register_silent("workflow.get", move |params| {
+                let id = params
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| invalid_params("workflow.get requires `id` string"))?;
+                match reg.get(id) {
+                    Some(spec) => Ok(serde_json::to_value(spec).unwrap_or(serde_json::Value::Null)),
+                    None => Err(copad_core::protocol::ResponseError {
+                        code: "not_found".into(),
+                        message: format!("workflow id '{id}' not found"),
+                    }),
+                }
+            });
+        }
+
         // Dispatch channel: TabManager owns the original sender (used by
         // plugin JS bridges). Trigger sink gets a clone so trigger-fired
         // legacy actions (anything not in the registry yet) can fall through
@@ -341,6 +485,9 @@ impl CopadWindow {
             plugins.clone(),
             dispatch_tx,
             actions.clone(),
+            project_registry.clone(),
+            workflow_registry.clone(),
+            context.clone(),
         );
 
         // Try restoring from the previous session, else seed a single

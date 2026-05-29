@@ -112,6 +112,14 @@ pub enum Command {
     #[command(subcommand)]
     Calendar(CalendarCommand),
 
+    /// Project shortcuts (`project.*` actions — `list` / `resolve`)
+    #[command(subcommand)]
+    Project(ProjectCommand),
+
+    /// Workflow shortcuts (`workflow.*` actions — `list` / `get` / `run`)
+    #[command(subcommand)]
+    Workflow(WorkflowCommand),
+
     /// Recent bus events ("what happened?" — wraps `event.history`).
     Recent(RecentArgs),
 
@@ -298,6 +306,71 @@ pub enum TerminalCommand {
         #[arg(long, default_value_t = 50)]
         history_lines: i64,
     },
+}
+
+#[derive(Subcommand)]
+pub enum ProjectCommand {
+    /// List configured projects
+    List,
+    /// Resolve a project by name/alias, cwd, git_remote, or active context
+    Resolve {
+        /// Match by canonical name or alias
+        #[arg(long)]
+        name: Option<String>,
+        /// Match by walking up cwd ancestors
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Match by canonical "owner/repo" git remote
+        #[arg(long)]
+        git_remote: Option<String>,
+        /// Resolve active project (pane_context → active_cwd fallback);
+        /// mutually exclusive with the explicit flags above.
+        #[arg(long)]
+        active: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum WorkflowCommand {
+    /// List available workflows
+    List,
+    /// Show full WorkflowSpec for one id (includes prompt + form_fields)
+    Get {
+        /// Workflow id (e.g. `ship`)
+        id: String,
+    },
+    /// Run a workflow (opens a new tab with claude.start dispatched against
+    /// the resolved project + substituted prompt template).
+    Run {
+        /// Workflow id (e.g. `ship`)
+        #[arg(long)]
+        id: String,
+        /// Explicit project name/alias (overrides active-pane resolution)
+        #[arg(long)]
+        project: Option<String>,
+        /// JSON object of form values (takes precedence over --value
+        /// repeated flags when both are provided)
+        #[arg(long)]
+        values: Option<String>,
+        /// Repeatable `name=value` form field. Multiple uses build a JSON
+        /// object. Ignored if `--values` is also given.
+        #[arg(long = "value", value_parser = parse_kv)]
+        kv: Vec<(String, String)>,
+    },
+}
+
+fn parse_kv(s: &str) -> Result<(String, String), String> {
+    s.split_once('=')
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .ok_or_else(|| format!("expected `name=value`, got `{s}`"))
+}
+
+fn kv_to_object(kv: &[(String, String)]) -> serde_json::Value {
+    let mut map = serde_json::Map::new();
+    for (k, v) in kv {
+        map.insert(k.clone(), serde_json::Value::String(v.clone()));
+    }
+    serde_json::Value::Object(map)
 }
 
 #[derive(Subcommand)]
@@ -577,6 +650,17 @@ impl Cli {
                 PluginCommand::Open { .. } => "plugin.open".to_string(),
                 PluginCommand::Run { command, .. } => format!("plugin.{command}"),
             },
+            Command::Project(cmd) => match cmd {
+                ProjectCommand::List => "project.list",
+                ProjectCommand::Resolve { .. } => "project.resolve",
+            }
+            .to_string(),
+            Command::Workflow(cmd) => match cmd {
+                WorkflowCommand::List => "workflow.list",
+                WorkflowCommand::Get { .. } => "workflow.get",
+                WorkflowCommand::Run { .. } => "workflow.run",
+            }
+            .to_string(),
             Command::Statusbar(cmd) => match cmd {
                 StatusBarCommand::Show => "statusbar.show",
                 StatusBarCommand::Hide => "statusbar.hide",
@@ -738,6 +822,70 @@ impl Cli {
             Command::Call { params, .. } => {
                 serde_json::from_str(params).unwrap_or_else(|_| json!({}))
             }
+            Command::Project(cmd) => match cmd {
+                ProjectCommand::List => json!({}),
+                ProjectCommand::Resolve {
+                    name,
+                    cwd,
+                    git_remote,
+                    active,
+                } => {
+                    let mut obj = serde_json::Map::new();
+                    if let Some(n) = name {
+                        obj.insert("name".into(), json!(n));
+                    }
+                    if let Some(c) = cwd {
+                        obj.insert("cwd".into(), json!(c));
+                    }
+                    if let Some(g) = git_remote {
+                        obj.insert("git_remote".into(), json!(g));
+                    }
+                    if *active {
+                        obj.insert("active".into(), json!(true));
+                    }
+                    serde_json::Value::Object(obj)
+                }
+            },
+            Command::Workflow(cmd) => match cmd {
+                WorkflowCommand::List => json!({}),
+                WorkflowCommand::Get { id } => json!({ "id": id }),
+                WorkflowCommand::Run {
+                    id,
+                    project,
+                    values,
+                    kv,
+                } => {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("id".into(), json!(id));
+                    if let Some(p) = project {
+                        obj.insert("project".into(), json!(p));
+                    }
+                    // `--values <json>` precedence; falls back to building
+                    // the object from repeated `--value name=val` flags
+                    // (per codex-plan Q8). Both omitted → empty object.
+                    let values_obj: serde_json::Value = if let Some(s) = values {
+                        match serde_json::from_str::<serde_json::Value>(s) {
+                            Ok(v) if v.is_object() => v,
+                            Ok(_) => {
+                                eprintln!(
+                                    "warn: --values must be a JSON object; falling back to --value kv pairs"
+                                );
+                                kv_to_object(kv)
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "warn: --values JSON parse error ({e}); falling back to --value kv pairs"
+                                );
+                                kv_to_object(kv)
+                            }
+                        }
+                    } else {
+                        kv_to_object(kv)
+                    };
+                    obj.insert("values".into(), values_obj);
+                    serde_json::Value::Object(obj)
+                }
+            },
             Command::Webview(cmd) => match cmd {
                 WebviewCommand::Open { url, mode } => json!({ "url": url, "mode": mode }),
                 WebviewCommand::Navigate { id, url } => json!({ "id": id, "url": url }),

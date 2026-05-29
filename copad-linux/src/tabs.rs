@@ -41,9 +41,16 @@ pub struct TabManager {
     /// In-process action registry; used by the Ctrl+Shift+P command
     /// palette to enumerate registered actions.
     actions: std::sync::Arc<copad_core::action_registry::ActionRegistry>,
+    /// Phase 22.2 — project + workflow runtime state.
+    /// `workflow.run` (in `socket::dispatch`) reaches both via the
+    /// `project_registry()`/`workflow_registry()`/`context()` getters.
+    project_registry: std::sync::Arc<std::sync::Mutex<copad_core::project::ProjectRegistry>>,
+    workflow_registry: std::sync::Arc<copad_core::workflow::WorkflowRegistry>,
+    context: std::sync::Arc<copad_core::context::ContextService>,
 }
 
 impl TabManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: &CopadConfig,
         window: &gtk4::ApplicationWindow,
@@ -51,6 +58,9 @@ impl TabManager {
         plugins: Vec<LoadedPlugin>,
         dispatch_tx: std::sync::mpsc::Sender<SocketCommand>,
         actions: std::sync::Arc<copad_core::action_registry::ActionRegistry>,
+        project_registry: std::sync::Arc<std::sync::Mutex<copad_core::project::ProjectRegistry>>,
+        workflow_registry: std::sync::Arc<copad_core::workflow::WorkflowRegistry>,
+        context: std::sync::Arc<copad_core::context::ContextService>,
     ) -> Rc<Self> {
         let notebook = gtk4::Notebook::new();
         notebook.set_scrollable(true);
@@ -90,6 +100,9 @@ impl TabManager {
             plugins: Rc::new(plugins),
             dispatch_tx,
             actions,
+            project_registry,
+            workflow_registry,
+            context,
         });
 
         // Apply initial collapsed state
@@ -294,6 +307,20 @@ impl TabManager {
 
     pub fn plugins(&self) -> &[LoadedPlugin] {
         &self.plugins
+    }
+
+    pub fn project_registry(
+        &self,
+    ) -> &std::sync::Arc<std::sync::Mutex<copad_core::project::ProjectRegistry>> {
+        &self.project_registry
+    }
+
+    pub fn workflow_registry(&self) -> &std::sync::Arc<copad_core::workflow::WorkflowRegistry> {
+        &self.workflow_registry
+    }
+
+    pub fn context(&self) -> &std::sync::Arc<copad_core::context::ContextService> {
+        &self.context
     }
 
     pub fn split_focused(

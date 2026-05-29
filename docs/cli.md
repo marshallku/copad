@@ -129,6 +129,45 @@ Ergonomic wrapper over the `bookmark.*` action surface. Captures URLs into `~/do
 
 **Out of scope for BM-1** (queued for later phases): async fetch + readability extraction (BM-2), keyword-based linking writing `linked_kb` frontmatter (BM-3), HTML panel (BM-4), harness `/bookmark` slash skill + offline `bookmark drain` for inbox (BM-5), embeddings-based similarity (BM-6, on demand only).
 
+### Project (Phase 22.2)
+
+| Command                                                             | Description                                                                |
+| ------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `coctl project list`                                                  | List all configured projects (from `[[projects]]` in `config.toml`)        |
+| `coctl project resolve --name <name-or-alias>`                       | Match by canonical name or alias                                            |
+| `coctl project resolve --git-remote <owner/repo>`                     | Match against the `git_remote` field (exact)                                |
+| `coctl project resolve --cwd <path>`                                  | Walk up `cwd` ancestors; longest-prefix match wins                          |
+| `coctl project resolve --active`                                      | Resolve active project: `pane_context.git_remote` → `active_cwd` fallback   |
+
+All resolve modes return `{ "project": <Project> | null }`. The `--active` mode honors the focused pane's `pane_context` (from Phase 22.1's shell hook), then walks `active_cwd` if `pane_context` is empty.
+
+### Workflow (Phase 22.2)
+
+| Command                                                                              | Description                                                                                                            |
+| ------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------- |
+| `coctl workflow list`                                                                 | List available workflows (id + name + description + require_project)                                                   |
+| `coctl workflow get <id>`                                                              | Full `WorkflowSpec` for one id — includes `prompt`, `form_fields`, `timeout_secs`, `fresh_session`                      |
+| `coctl workflow run <id> [--project <name>] [--values <json>] [--value name=val ...]` | Dispatch a workflow — opens a new copad tab with `claude.start` substituted prompt against the resolved project        |
+
+`workflow run` value-passing:
+
+- `--values '{"k":"v"}'` — JSON object form; takes precedence
+- `--value name=val` — repeated flag form (clap multi-occurrence), built into a JSON object when `--values` is absent
+
+Project resolution for `workflow run`:
+
+1. `--project <name>` (explicit) → `project.resolve_by_name`
+2. otherwise → `project.resolve_active` (`pane_context.git_remote` → `active_cwd` fallback)
+3. if `require_project: true` and neither resolves → `project_required` error
+4. if `require_project: false` and no project resolves → workspace falls back to `context.active_cwd`; errors with `no_workspace` if that's also empty
+
+Return shape: `{ "run_id": "wfr-<ulid>", "panel_id": "<uuid>", "tab": <int>, "workspace_path": "<path>" }`. The dispatched `claude.start` opens the new tab and begins the substituted prompt.
+
+Events emitted:
+
+- `workflow.started` — fires immediately after `claude.start` returns ok
+- `workflow.timed_out` — fires after `timeout_secs` if the spec has one set (v1: emit-only signal, does NOT kill the subprocess — hard kill lands in Phase 22.6 with runledger)
+
 ### Theme
 
 - `coctl theme list` — list available themes and current theme
