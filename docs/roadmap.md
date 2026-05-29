@@ -875,18 +875,26 @@ Phase 22.5 v1 decisions:
 
 **Phase 22.6 — Approval gate + Runledger persistence**
 
-Approvals gate privileged actions; runledger persists the event stream for replay/audit. Maps `internal/approval/` + `internal/runledger/` (life-assistant). Design at [project-orchestration.md § Approval + Runledger](./project-orchestration.md).
+Approvals gate privileged actions; runledger persists the event stream for replay/audit. Storage under `~/.local/state/copad/{approvals,runledger}/`. Design at [project-orchestration.md § Approval + Runledger](./project-orchestration.md).
 
-- [ ] **`copad-core::approval`**: `Approval { id, mission_id?, agent_id?, action, params_preview, rationale, state, created_at, expires_at, decided_at?, decided_by? }`. State: `pending / granted / denied / expired`. Persistence: `~/.local/share/copad/approvals/<id>.yaml`.
-- [ ] **Expiry sweep**: TriggerEngine cron trigger (every 30s) sweeps `pending && now > expires_at`, transitions to `expired`, emits `approval.expired`.
-- [ ] **Action-level gate integration**: `ActionRegistry::register_privileged_with_approval(name)` variant. When invoked: if no `[security] allow_privileged = true` AND no fresh approval for this `(action, params_hash)` tuple, dispatcher creates a `pending` approval, emits `approval.requested`, and returns `ApprovalPending` error. Caller (e.g., mission wake handler) re-tries after `approval.granted` event.
-- [ ] **Actions**: `approval.list {state?, mission?}` / `approval.get {id}` / `approval.grant {id, by, note?}` / `approval.deny {id, by, reason?}`.
-- [ ] **Events**: `approval.requested {id, action, params_preview, rationale, expires_at}` / `approval.granted {id, by}` / `approval.denied {id, by, reason}` / `approval.expired {id}`.
-- [ ] **Panel integration**: `copad-plugin-projects` Slot 6 — pending approvals (project-filtered). Grant/deny inline; uses `copad.action("approval.grant", …)`.
-- [ ] **Runledger persistence**: monthly JSONL at `~/.local/share/copad/runledger/<YYYY-MM>.jsonl`. EventBus gains a write-through subscriber that persists each event with id+ts+kind+origin+payload. Append-only; monthly rotation on first event of new month. Existing ring buffer (in-memory, last N) untouched — runledger is the durable layer.
-- [ ] **Replay API**: `events.replay {since: ts, kinds?, limit?}` / `coctl runledger query --since 1h --kind mission.*`. Stream-friendly (chunked response).
-- [ ] **Trigger trust integration**: pre-existing `[security] accept_external` + Origin tagging carries through unchanged. Approval requests stamped with origin of the invoking action.
-- [ ] **Docs**: per-slice acceptance section in [project-orchestration.md](./project-orchestration.md).
+- [x] **`copad-core::approval`**: `Approval { id, action, params_preview, rationale, state, created_at_ms, expires_at_ms, mission_id?, agent_id?, project?, decided_at_ms?, decided_by?, decision_note? }`. State: `pending / granted / denied / expired`. Persistence: `~/.local/state/copad/approvals/<id>.yaml` (atomic temp→rename). 6 unit tests covering request/grant/deny/sweep_expired/list_for + grant-after-deny no-op.
+- [x] **Expiry sweep**: temporary 30s sweeper thread (`copad-approval-sweep`) — same pattern as the 22.4 goal tick. Transitions `pending && now >= expires_at` to `expired`, emits `approval.expired` per transition. Ripped out when cron triggers ship.
+- [ ] **Action-level gate integration** (deferred to 22.7): `ActionRegistry::register_privileged_with_approval(name)` variant. v1 ships CRUD only; auto-gating belongs with the Brain dispatcher's per-role action whitelist.
+- [x] **Actions**: `approval.request {action, params_preview?, rationale?, mission_id?, agent_id?, project?, ttl_secs?}` / `approval.list {state?, project?}` / `approval.get {id}` / `approval.grant {id, by?, note?}` / `approval.deny {id, by?, reason?}`.
+- [x] **Events**: `approval.requested {id, action, params_preview, rationale, expires_at_ms}` / `approval.granted {id, by}` / `approval.denied {id, by, reason}` / `approval.expired {id}`.
+- [x] **Panel integration**: `copad-plugin-projects` gained an "Approvals" section showing pending entries (project-filtered) with action name + rationale + params_preview JSON block + inline Grant/Deny buttons. 5-second poll loop.
+- [x] **Runledger persistence**: `copad-core::runledger::Runledger` writes monthly JSONL at `~/.local/state/copad/runledger/<YYYY-MM>.jsonl`. EventBus gains a write-through subscriber (`copad-runledger` thread) that drains a `*`-pattern subscription. One line per event with `id, kind, source, origin, ts_ms, payload`. `flush()` per write — audit logs survive SIGKILL. Existing ring buffer (in-memory, last N) untouched — runledger is the durable layer.
+- [x] **Replay API**: `events.replay {since_ms?, kinds?, limit?}` action returns `{entries, total}`. `kinds` accepts `prefix.*` glob (covers `mission.*` / `goal.tick.*`). Reads all monthly JSONLs, filters, sorts newest-first, caps at `limit`. `coctl runledger query --kinds 'mission.*' --limit 50` exposes the action surface to the shell.
+- [x] **Trigger trust integration**: events stamped with their bus origin pass through unchanged; the ledger records the `origin` field verbatim. No new trust boundary.
+- [x] **`coctl` subcommands**: `coctl approval request / list / get / grant / deny` + `coctl runledger query`.
+- [x] **Docs**: this slice's acceptance lives here.
+
+Phase 22.6 v1 decisions:
+
+- **No `register_privileged_with_approval` ActionRegistry hook yet**. The auto-gating that turns "any dispatch of action X automatically materializes an Approval and blocks until grant" requires touching the dispatch hot path. Scope-wise it belongs with the 22.7 Brain dispatcher's per-role action whitelist — both gates need the same params_hash key and approval-state-cache. Today the caller (mission wake handler, agent invocation) explicitly calls `approval.request` then polls until granted.
+- **30s sweeper thread, not cron**. Same temporary-pattern as the 22.4 goal tick — Phase 21 Step 11 cron triggers aren't shipped. Removed by the same migration when cron lands.
+- **`events.replay` not chunked**. v1 returns the full result set in one response. Streaming chunked responses need the existing socket protocol to grow a "partial result" frame; deferred until any consumer actually asks for a many-day replay.
+- **macOS port deferred** (per phase doc).
 
 **Phase 22.7 — Pipeline (team/role) + Brain dispatcher**
 

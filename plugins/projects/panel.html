@@ -128,6 +128,14 @@
   <div id="missions-body" class="empty">No active missions.</div>
 </section>
 
+<section id="approvals-section">
+  <h2>
+    Approvals
+    <span class="meta" title="Phase 22.6 — pending action gates. 30s expiry sweeper runs daemon-side.">(per-project)</span>
+  </h2>
+  <div id="approvals-body" class="empty">No pending approvals.</div>
+</section>
+
 <script>
 (function () {
   const api = window.copad;
@@ -408,6 +416,85 @@
     await loadRuns();
     await loadGoals();
     await loadMissions();
+    await loadApprovals();
+  }
+
+  // Phase 22.6 — Approvals slot. Filtered to pending state by default.
+  // Grant/deny inline; daemon's 30s sweeper takes care of expiry.
+  async function loadApprovals() {
+    const el = document.getElementById("approvals-body");
+    if (!el) return;
+    const remote = (activeProject && activeProject.git_remote) || lastPaneRemote;
+    try {
+      const params = { state: "pending" };
+      if (remote) params.project = remote;
+      const resp = await api.call("approval.list", params);
+      const approvals = (resp && resp.approvals) || [];
+      if (approvals.length === 0) {
+        el.className = "empty";
+        el.textContent = "No pending approvals.";
+        return;
+      }
+      el.className = "";
+      el.innerHTML = "";
+      for (const a of approvals) {
+        const card = document.createElement("div");
+        card.className = "card";
+        const head = document.createElement("div");
+        head.style.fontWeight = "600";
+        head.textContent = a.action;
+        card.appendChild(head);
+        if (a.rationale) {
+          const rt = document.createElement("div");
+          rt.style.color = "var(--fg-mute, #6c7086)";
+          rt.style.fontSize = "11px";
+          rt.style.marginTop = "4px";
+          rt.textContent = a.rationale;
+          card.appendChild(rt);
+        }
+        if (a.params_preview && typeof a.params_preview === "object") {
+          const pp = document.createElement("pre");
+          pp.style.fontSize = "10px";
+          pp.style.background = "rgba(0,0,0,0.2)";
+          pp.style.padding = "4px";
+          pp.style.borderRadius = "3px";
+          pp.style.marginTop = "4px";
+          pp.textContent = JSON.stringify(a.params_preview, null, 2);
+          card.appendChild(pp);
+        }
+        const ctrls = document.createElement("div");
+        ctrls.style.marginTop = "8px";
+        ctrls.style.display = "flex";
+        ctrls.style.gap = "6px";
+        const grant = document.createElement("button");
+        grant.textContent = "Grant";
+        grant.addEventListener("click", async () => {
+          try {
+            await api.call("approval.grant", { id: a.id });
+            await loadApprovals();
+          } catch (_) {
+            grant.textContent = "Error";
+          }
+        });
+        const deny = document.createElement("button");
+        deny.textContent = "Deny";
+        deny.addEventListener("click", async () => {
+          try {
+            await api.call("approval.deny", { id: a.id });
+            await loadApprovals();
+          } catch (_) {
+            deny.textContent = "Error";
+          }
+        });
+        ctrls.appendChild(grant);
+        ctrls.appendChild(deny);
+        card.appendChild(ctrls);
+        el.appendChild(card);
+      }
+    } catch (e) {
+      el.className = "empty";
+      el.textContent = "Could not load approvals.";
+    }
   }
 
   // Phase 22.5 — Missions slot. Filtered by active project's git_remote.
@@ -623,6 +710,9 @@
   // Missions: same 10s cadence — wake-condition auto-firing isn't shipped,
   // but the UI still needs to reflect manual state changes (pause/resume).
   setInterval(loadMissions, 10000);
+  // Approvals expire in 5 min by default; 5s poll keeps the UI honest
+  // about the expiry sweep without burning bandwidth.
+  setInterval(loadApprovals, 5000);
 
   refresh().catch((e) => console.warn("initial load failed", e));
 })();

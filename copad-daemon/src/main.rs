@@ -148,6 +148,20 @@ fn main() -> ExitCode {
     // (CRUD-only at v1; wake-condition auto-firing lands in 22.7).
     let _agent_registry = register_agent_actions(&actions);
     let _mission_registry = register_mission_actions(&actions, &event_bus);
+    // Phase 22.6 — approval registry + 30s expiry sweeper.
+    let (approval_registry, approval_sweep_stop) = register_approval_actions(&actions, &event_bus);
+    let _approval_sweep_thread = spawn_approval_sweeper(
+        approval_registry.clone(),
+        event_bus.clone(),
+        approval_sweep_stop.clone(),
+    );
+    let _ = approval_registry;
+    let _ = approval_sweep_stop;
+    // Phase 22.6 — runledger write-through subscriber + events.replay action.
+    let runledger_stop = Arc::new(AtomicBool::new(false));
+    let _runledger_thread =
+        register_runledger_actions(&actions, &event_bus, runledger_stop.clone());
+    let _ = runledger_stop;
 
     // GuiRegistry is built before the trigger sink so both share the
     // same registry instance — the sink's fallthrough worker resolves
@@ -1107,6 +1121,241 @@ fn register_mission_actions(
     });
 
     registry
+}
+
+/// Phase 22.6 — Approval gate. CRUD + grant/deny actions.
+fn register_approval_actions(
+    actions: &Arc<ActionRegistry>,
+    bus: &Arc<copad_core::event_bus::EventBus>,
+) -> (Arc<copad_core::approval::ApprovalRegistry>, Arc<AtomicBool>) {
+    use copad_core::approval::{ApprovalRegistry, ApprovalState};
+    use copad_core::event_bus::Event as BusEvent;
+
+    let root = copad_core::paths::state_dir().join("approvals");
+    let registry = Arc::new(ApprovalRegistry::new(root));
+
+    let r1 = registry.clone();
+    let bus1 = bus.clone();
+    actions.register_blocking("approval.request", move |params| {
+        let action = params
+            .get("action")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid_params("'action' required (non-empty string)"))?
+            .to_string();
+        let params_preview = params
+            .get("params_preview")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let rationale = params
+            .get("rationale")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let mission_id = params
+            .get("mission_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let project = params
+            .get("project")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let ttl_secs = params
+            .get("ttl_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(300);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let appr = r1
+            .request(
+                &action,
+                params_preview,
+                &rationale,
+                mission_id.as_deref(),
+                agent_id.as_deref(),
+                project.as_deref(),
+                ttl_secs,
+                now_ms,
+            )
+            .map_err(internal_error)?;
+        bus1.publish(BusEvent::new(
+            "approval.requested",
+            "copad-daemon",
+            json!({
+                "id": appr.id,
+                "action": appr.action,
+                "params_preview": appr.params_preview,
+                "rationale": appr.rationale,
+                "expires_at_ms": appr.expires_at_ms,
+            }),
+        ));
+        serde_json::to_value(&appr).map_err(|e| internal_error(format!("serialize: {e}")))
+    });
+
+    let r2 = registry.clone();
+    actions.register_silent("approval.list", move |params| {
+        let state: Option<ApprovalState> = match params.get("state") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => serde_json::from_value(v.clone())
+                .map_err(|_| invalid_params("'state' must be pending/granted/denied/expired"))?,
+        };
+        let project = params
+            .get("project")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        Ok(json!({ "approvals": r2.list_for(state, project.as_deref()) }))
+    });
+
+    let r3 = registry.clone();
+    actions.register_silent("approval.get", move |params| {
+        let id = require_id_param(&params, "approval.get")?;
+        match r3.get(&id) {
+            Some(a) => {
+                serde_json::to_value(&a).map_err(|e| internal_error(format!("serialize: {e}")))
+            }
+            None => Err(copad_core::protocol::ResponseError {
+                code: "not_found".into(),
+                message: format!("approval not found: {id}"),
+            }),
+        }
+    });
+
+    let r4 = registry.clone();
+    let bus4 = bus.clone();
+    actions.register_blocking("approval.grant", move |params| {
+        let id = require_id_param(&params, "approval.grant")?;
+        let by = params.get("by").and_then(|v| v.as_str()).unwrap_or("user");
+        let note = params.get("note").and_then(|v| v.as_str());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let appr = r4.grant(&id, by, note, now_ms).map_err(internal_error)?;
+        bus4.publish(BusEvent::new(
+            "approval.granted",
+            "copad-daemon",
+            json!({"id": appr.id, "by": appr.decided_by}),
+        ));
+        serde_json::to_value(&appr).map_err(|e| internal_error(format!("serialize: {e}")))
+    });
+
+    let r5 = registry.clone();
+    let bus5 = bus.clone();
+    actions.register_blocking("approval.deny", move |params| {
+        let id = require_id_param(&params, "approval.deny")?;
+        let by = params.get("by").and_then(|v| v.as_str()).unwrap_or("user");
+        let reason = params.get("reason").and_then(|v| v.as_str());
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let appr = r5.deny(&id, by, reason, now_ms).map_err(internal_error)?;
+        bus5.publish(BusEvent::new(
+            "approval.denied",
+            "copad-daemon",
+            json!({"id": appr.id, "by": appr.decided_by, "reason": appr.decision_note}),
+        ));
+        serde_json::to_value(&appr).map_err(|e| internal_error(format!("serialize: {e}")))
+    });
+
+    let stop = Arc::new(AtomicBool::new(false));
+    (registry, stop)
+}
+
+/// 30s sweeper thread for approval TTL expiry. Same pattern as the
+/// goal tick scheduler — gets ripped out once cron triggers ship.
+fn spawn_approval_sweeper(
+    registry: Arc<copad_core::approval::ApprovalRegistry>,
+    bus: Arc<copad_core::event_bus::EventBus>,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    use copad_core::event_bus::Event as BusEvent;
+    thread::Builder::new()
+        .name("copad-approval-sweep".into())
+        .spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                for _ in 0..30 {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                for appr in registry.sweep_expired(now_ms) {
+                    bus.publish(BusEvent::new(
+                        "approval.expired",
+                        "copad-daemon",
+                        json!({"id": appr.id}),
+                    ));
+                }
+            }
+        })
+        .expect("spawn copad-approval-sweep thread")
+}
+
+/// Phase 22.6 — Runledger subscriber + replay action. Spawns a thread
+/// that drains a bus subscription into the monthly JSONL ledger.
+fn register_runledger_actions(
+    actions: &Arc<ActionRegistry>,
+    bus: &Arc<copad_core::event_bus::EventBus>,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    use copad_core::event_bus::RecvOutcome;
+    use copad_core::runledger::Runledger;
+
+    let root = copad_core::paths::state_dir().join("runledger");
+    let runledger = Arc::new(Runledger::new(root));
+
+    let r1 = runledger.clone();
+    actions.register_silent("events.replay", move |params| {
+        let since_ms = params.get("since_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+        let kinds: Option<Vec<String>> = match params.get("kinds") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::Array(arr)) => Some(
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect(),
+            ),
+            Some(_) => return Err(invalid_params("'kinds' must be an array of strings")),
+        };
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize);
+        let entries = r1
+            .replay(since_ms, kinds.as_deref(), limit)
+            .map_err(internal_error)?;
+        let total = entries.len();
+        Ok(json!({ "entries": entries, "total": total }))
+    });
+
+    let r2 = runledger.clone();
+    let rx = bus.subscribe_unbounded("*");
+    thread::Builder::new()
+        .name("copad-runledger".into())
+        .spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                match rx.recv_timeout(Duration::from_secs(1)) {
+                    RecvOutcome::Event(e) => {
+                        if let Err(err) = r2.append(&e) {
+                            log::warn!("runledger append failed: {err}");
+                        }
+                    }
+                    RecvOutcome::Timeout => {}
+                    RecvOutcome::Disconnected => return,
+                }
+            }
+        })
+        .expect("spawn copad-runledger thread")
 }
 
 fn require_id_param(

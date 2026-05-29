@@ -1,5 +1,6 @@
 pub mod action_registry;
 pub mod agent;
+pub mod approval;
 pub mod background;
 pub mod condition;
 pub mod config;
@@ -14,6 +15,7 @@ pub mod paths;
 pub mod plugin;
 pub mod project;
 pub mod protocol;
+pub mod runledger;
 pub mod session;
 pub mod theme;
 pub mod thread_pool;

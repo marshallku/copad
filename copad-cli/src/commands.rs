@@ -136,6 +136,14 @@ pub enum Command {
     #[command(subcommand)]
     Mission(MissionCommand),
 
+    /// Approval gate (`approval.*` actions). Phase 22.6.
+    #[command(subcommand)]
+    Approval(ApprovalCommand),
+
+    /// Runledger replay (`events.replay`). Phase 22.6.
+    #[command(subcommand)]
+    Runledger(RunledgerCommand),
+
     /// Recent bus events ("what happened?" — wraps `event.history`).
     Recent(RecentArgs),
 
@@ -560,6 +568,75 @@ pub enum MissionCommand {
     },
 }
 
+#[derive(Subcommand)]
+pub enum ApprovalCommand {
+    /// Request a new approval (pending state, TTL counts down)
+    Request {
+        #[arg(long)]
+        action: String,
+        /// Why this needs approval (free-form)
+        #[arg(long, default_value = "")]
+        rationale: String,
+        /// JSON object with the action's params for the operator to inspect
+        #[arg(long)]
+        params_preview: Option<String>,
+        /// TTL in seconds (default 300)
+        #[arg(long, default_value_t = 300)]
+        ttl_secs: u64,
+        /// Originating mission id
+        #[arg(long)]
+        mission_id: Option<String>,
+        /// Originating agent id
+        #[arg(long)]
+        agent_id: Option<String>,
+        /// Project owner/repo
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// List approvals (optionally filtered)
+    List {
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    Get {
+        id: String,
+    },
+    /// Grant a pending approval
+    Grant {
+        id: String,
+        #[arg(long, default_value = "user")]
+        by: String,
+        #[arg(long)]
+        note: Option<String>,
+    },
+    /// Deny a pending approval
+    Deny {
+        id: String,
+        #[arg(long, default_value = "user")]
+        by: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RunledgerCommand {
+    /// Replay events from the durable ledger
+    Query {
+        /// Lower bound timestamp (epoch millis) — default 0 (everything)
+        #[arg(long, default_value_t = 0)]
+        since_ms: i64,
+        /// Comma-separated kind globs (e.g. `mission.*,goal.tick.*`)
+        #[arg(long)]
+        kinds: Option<String>,
+        /// Max entries
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+}
+
 fn parse_kv(s: &str) -> Result<(String, String), String> {
     s.split_once('=')
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -893,6 +970,18 @@ impl Cli {
                 MissionCommand::TurnCompleted { .. } => "mission.turn_completed",
             }
             .to_string(),
+            Command::Approval(cmd) => match cmd {
+                ApprovalCommand::Request { .. } => "approval.request",
+                ApprovalCommand::List { .. } => "approval.list",
+                ApprovalCommand::Get { .. } => "approval.get",
+                ApprovalCommand::Grant { .. } => "approval.grant",
+                ApprovalCommand::Deny { .. } => "approval.deny",
+            }
+            .to_string(),
+            Command::Runledger(cmd) => match cmd {
+                RunledgerCommand::Query { .. } => "events.replay",
+            }
+            .to_string(),
             Command::Statusbar(cmd) => match cmd {
                 StatusBarCommand::Show => "statusbar.show",
                 StatusBarCommand::Hide => "statusbar.hide",
@@ -1092,6 +1181,87 @@ impl Cli {
                 AgentRegistryCommand::AppendMemory { id, kind, body } => json!({
                     "id": id, "kind": kind, "body": body,
                 }),
+            },
+            Command::Approval(cmd) => match cmd {
+                ApprovalCommand::Request {
+                    action,
+                    rationale,
+                    params_preview,
+                    ttl_secs,
+                    mission_id,
+                    agent_id,
+                    project,
+                } => {
+                    let mut o = serde_json::Map::new();
+                    o.insert("action".into(), json!(action));
+                    o.insert("rationale".into(), json!(rationale));
+                    o.insert("ttl_secs".into(), json!(ttl_secs));
+                    if let Some(s) = params_preview
+                        && let Ok(v) = serde_json::from_str::<serde_json::Value>(s)
+                    {
+                        o.insert("params_preview".into(), v);
+                    }
+                    if let Some(s) = mission_id {
+                        o.insert("mission_id".into(), json!(s));
+                    }
+                    if let Some(s) = agent_id {
+                        o.insert("agent_id".into(), json!(s));
+                    }
+                    if let Some(s) = project {
+                        o.insert("project".into(), json!(s));
+                    }
+                    serde_json::Value::Object(o)
+                }
+                ApprovalCommand::List { state, project } => {
+                    let mut o = serde_json::Map::new();
+                    if let Some(s) = state {
+                        o.insert("state".into(), json!(s));
+                    }
+                    if let Some(p) = project {
+                        o.insert("project".into(), json!(p));
+                    }
+                    serde_json::Value::Object(o)
+                }
+                ApprovalCommand::Get { id } => json!({ "id": id }),
+                ApprovalCommand::Grant { id, by, note } => {
+                    let mut o = serde_json::Map::new();
+                    o.insert("id".into(), json!(id));
+                    o.insert("by".into(), json!(by));
+                    if let Some(n) = note {
+                        o.insert("note".into(), json!(n));
+                    }
+                    serde_json::Value::Object(o)
+                }
+                ApprovalCommand::Deny { id, by, reason } => {
+                    let mut o = serde_json::Map::new();
+                    o.insert("id".into(), json!(id));
+                    o.insert("by".into(), json!(by));
+                    if let Some(r) = reason {
+                        o.insert("reason".into(), json!(r));
+                    }
+                    serde_json::Value::Object(o)
+                }
+            },
+            Command::Runledger(cmd) => match cmd {
+                RunledgerCommand::Query {
+                    since_ms,
+                    kinds,
+                    limit,
+                } => {
+                    let mut o = serde_json::Map::new();
+                    o.insert("since_ms".into(), json!(since_ms));
+                    if let Some(k) = kinds {
+                        let arr: Vec<serde_json::Value> = k
+                            .split(',')
+                            .map(|s| serde_json::Value::String(s.trim().to_string()))
+                            .collect();
+                        o.insert("kinds".into(), serde_json::Value::Array(arr));
+                    }
+                    if let Some(l) = limit {
+                        o.insert("limit".into(), json!(l));
+                    }
+                    serde_json::Value::Object(o)
+                }
             },
             Command::Mission(cmd) => match cmd {
                 MissionCommand::Submit {
