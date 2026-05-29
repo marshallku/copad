@@ -133,6 +133,17 @@ fn main() -> ExitCode {
     if env_flag_enabled(ENV_E2E_ACTIONS) {
         register_e2e_actions(&actions);
     }
+    // Phase 22.4 — goal registry + tick scheduler. Registry is shared
+    // between action handlers (CRUD) and the scheduler thread (read +
+    // publish tick.started).
+    let (goal_registry, goal_tick_stop) = register_goal_actions(&actions, &event_bus);
+    let _goal_tick_thread = spawn_goal_tick_thread(
+        goal_registry.clone(),
+        event_bus.clone(),
+        goal_tick_stop.clone(),
+    );
+    let _ = goal_registry;
+    let _ = goal_tick_stop;
 
     // GuiRegistry is built before the trigger sink so both share the
     // same registry instance — the sink's fallthrough worker resolves
@@ -586,6 +597,321 @@ fn env_usize(var: &str) -> Option<usize> {
 
 /// Test-only actions enabled via `COPADD_E2E_TEST_ACTIONS=1`. Keep these
 /// gated so they never appear in normal daemon runs.
+/// Phase 22.4 — Goal driver actions + tick scheduler.
+///
+/// Registers `goal.create / list / get / pause / resume / answer /
+/// cancel` against the daemon's GoalRegistry. Spawns a background
+/// thread that ticks every 60s: picks the next runnable goal,
+/// publishes `goal.tick.started {goal_id, prompt}` so the GUI can
+/// dispatch `claude.start`, and waits for `goal.tick.completed
+/// {goal_id, raw_output}` to apply the parsed result.
+///
+/// Storage: `<state_dir>/goals/<id>/state.json` + `roadmap.md`.
+fn register_goal_actions(
+    actions: &Arc<ActionRegistry>,
+    bus: &Arc<copad_core::event_bus::EventBus>,
+) -> (Arc<copad_core::goal::GoalRegistry>, Arc<AtomicBool>) {
+    use copad_core::event_bus::Event as BusEvent;
+    use copad_core::goal::{GoalRegistry, GoalStatus, parse_tick_output};
+
+    let goals_root = copad_core::paths::state_dir().join("goals");
+    let goals = Arc::new(GoalRegistry::new(goals_root));
+
+    let goals_for_create = goals.clone();
+    let bus_for_create = bus.clone();
+    actions.register_blocking("goal.create", move |params| {
+        let title = params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid_params("goal.create requires non-empty 'title' string"))?
+            .to_string();
+        let project = params
+            .get("project")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid_params("goal.create requires non-empty 'project' string"))?
+            .to_string();
+        let project_path = params
+            .get("project_path")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid_params("goal.create requires non-empty 'project_path' string"))?
+            .to_string();
+        let roadmap_template = params
+            .get("roadmap")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        let goal = goals_for_create
+            .create(
+                &title,
+                &project,
+                &project_path,
+                roadmap_template.as_deref(),
+                now_ms,
+            )
+            .map_err(internal_error)?;
+        bus_for_create.publish(BusEvent::new(
+            "goal.created",
+            "copad-daemon",
+            json!({"id": goal.id, "title": goal.title, "project": goal.project}),
+        ));
+        serde_json::to_value(&goal).map_err(|e| internal_error(format!("serialize goal: {e}")))
+    });
+
+    let goals_for_list = goals.clone();
+    actions.register_silent("goal.list", move |params| {
+        let project = params
+            .get("project")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let status: Option<GoalStatus> = match params.get("status") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => serde_json::from_value(v.clone()).map_err(|_| {
+                invalid_params("'status' must be one of running/paused/blocked/done/cancelled")
+            })?,
+        };
+        let goals = goals_for_list.list_for(project.as_deref(), status);
+        Ok(json!({ "goals": goals }))
+    });
+
+    let goals_for_get = goals.clone();
+    actions.register_silent("goal.get", move |params| {
+        let id = require_id_param(&params, "goal.get")?;
+        match goals_for_get.get(&id) {
+            Some(g) => {
+                serde_json::to_value(&g).map_err(|e| internal_error(format!("serialize goal: {e}")))
+            }
+            None => Err(copad_core::protocol::ResponseError {
+                code: "not_found".into(),
+                message: format!("goal not found: {id}"),
+            }),
+        }
+    });
+
+    let goals_for_pause = goals.clone();
+    let bus_for_pause = bus.clone();
+    actions.register_blocking("goal.pause", move |params| {
+        let id = require_id_param(&params, "goal.pause")?;
+        let goal = goals_for_pause.pause(&id).map_err(internal_error)?;
+        bus_for_pause.publish(BusEvent::new(
+            "goal.paused",
+            "copad-daemon",
+            json!({"goal_id": goal.id}),
+        ));
+        serde_json::to_value(&goal).map_err(|e| internal_error(format!("serialize goal: {e}")))
+    });
+
+    let goals_for_resume = goals.clone();
+    let bus_for_resume = bus.clone();
+    actions.register_blocking("goal.resume", move |params| {
+        let id = require_id_param(&params, "goal.resume")?;
+        let goal = goals_for_resume.resume(&id).map_err(internal_error)?;
+        bus_for_resume.publish(BusEvent::new(
+            "goal.resumed",
+            "copad-daemon",
+            json!({"goal_id": goal.id}),
+        ));
+        serde_json::to_value(&goal).map_err(|e| internal_error(format!("serialize goal: {e}")))
+    });
+
+    let goals_for_answer = goals.clone();
+    let bus_for_answer = bus.clone();
+    actions.register_blocking("goal.answer", move |params| {
+        let id = require_id_param(&params, "goal.answer")?;
+        let answer = params
+            .get("answer")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid_params("goal.answer requires non-empty 'answer' string"))?
+            .to_string();
+        let goal = goals_for_answer
+            .answer(&id, &answer)
+            .map_err(internal_error)?;
+        bus_for_answer.publish(BusEvent::new(
+            "goal.unblocked",
+            "copad-daemon",
+            json!({"goal_id": goal.id}),
+        ));
+        serde_json::to_value(&goal).map_err(|e| internal_error(format!("serialize goal: {e}")))
+    });
+
+    let goals_for_cancel = goals.clone();
+    let bus_for_cancel = bus.clone();
+    actions.register_blocking("goal.cancel", move |params| {
+        let id = require_id_param(&params, "goal.cancel")?;
+        let goal = goals_for_cancel.cancel(&id).map_err(internal_error)?;
+        bus_for_cancel.publish(BusEvent::new(
+            "goal.cancelled",
+            "copad-daemon",
+            json!({"goal_id": goal.id}),
+        ));
+        serde_json::to_value(&goal).map_err(|e| internal_error(format!("serialize goal: {e}")))
+    });
+
+    // Daemon-side bridge for the tick result loop: GUI publishes
+    // `goal.tick.completed {goal_id, raw_output, panel_id?}` after the
+    // claude tab exits; we parse + apply + emit the state-change event.
+    let goals_for_tick_apply = goals.clone();
+    let bus_for_tick_apply = bus.clone();
+    actions.register_blocking("goal.tick.apply", move |params| {
+        let id = require_id_param(&params, "goal.tick.apply")?;
+        let raw_output = params
+            .get("raw_output")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let result = parse_tick_output(raw_output);
+        let outcome_str = result.outcome.as_str().to_string();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        let goal = goals_for_tick_apply
+            .apply_tick_result(&id, result, now_ms)
+            .map_err(internal_error)?;
+        bus_for_tick_apply.publish(BusEvent::new(
+            "goal.tick.completed",
+            "copad-daemon",
+            json!({
+                "goal_id": goal.id,
+                "outcome": outcome_str,
+                "status": goal.status.as_str(),
+            }),
+        ));
+        if goal.status == GoalStatus::Blocked && goal.blocked_question.is_some() {
+            bus_for_tick_apply.publish(BusEvent::new(
+                "goal.blocked",
+                "copad-daemon",
+                json!({"goal_id": goal.id, "question": goal.blocked_question}),
+            ));
+        }
+        if goal.status == GoalStatus::Done {
+            bus_for_tick_apply.publish(BusEvent::new(
+                "goal.done",
+                "copad-daemon",
+                json!({"goal_id": goal.id}),
+            ));
+        }
+        serde_json::to_value(&goal).map_err(|e| internal_error(format!("serialize goal: {e}")))
+    });
+
+    let goals_for_tick_mark = goals.clone();
+    actions.register_blocking_silent("goal.tick.mark_in_flight", move |params| {
+        let id = require_id_param(&params, "goal.tick.mark_in_flight")?;
+        let panel_id = params
+            .get("panel_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid_params("'panel_id' required"))?
+            .to_string();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        let goal = goals_for_tick_mark
+            .mark_in_flight(&id, &panel_id, now_ms)
+            .map_err(internal_error)?;
+        serde_json::to_value(&goal).map_err(|e| internal_error(format!("serialize goal: {e}")))
+    });
+
+    let tick_stop = Arc::new(AtomicBool::new(false));
+    (goals, tick_stop)
+}
+
+fn require_id_param(
+    params: &serde_json::Value,
+    method: &str,
+) -> Result<String, copad_core::protocol::ResponseError> {
+    params
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .ok_or_else(|| invalid_params(format!("{method} requires non-empty 'id' string")))
+}
+
+/// 60-second tick scheduler — picks `next_runnable()` from the
+/// GoalRegistry, builds the prompt (roadmap.md + last 5 history
+/// entries + JSON instruction), and publishes `goal.tick.started
+/// {goal_id, prompt, workspace_path}`. The GUI subscribes and
+/// dispatches `claude.start`; daemon's `goal.tick.apply` handler
+/// closes the loop when the GUI publishes `goal.tick.completed`.
+fn spawn_goal_tick_thread(
+    goals: Arc<copad_core::goal::GoalRegistry>,
+    bus: Arc<copad_core::event_bus::EventBus>,
+    stop: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    use copad_core::event_bus::Event as BusEvent;
+
+    const TICK_INTERVAL: Duration = Duration::from_secs(60);
+    thread::Builder::new()
+        .name("copad-goal-tick".into())
+        .spawn(move || {
+            while !stop.load(Ordering::SeqCst) {
+                // Sleep first so the first tick lands at +60s (gives the
+                // GUI time to register on cold boot).
+                let sleep_chunks = 60u64;
+                for _ in 0..sleep_chunks {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_secs(1));
+                }
+                let _ = TICK_INTERVAL;
+                let Some(goal) = goals.next_runnable() else {
+                    continue;
+                };
+                let roadmap = goals.read_roadmap(&goal.id).unwrap_or_default();
+                let history_tail: String = goal
+                    .history
+                    .iter()
+                    .rev()
+                    .take(5)
+                    .rev()
+                    .map(|h| format!("- {}: {}", h.outcome, h.detail))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let prompt = format!(
+                    "You are working on goal `{title}` for project `{project}`.\n\n\
+                     ## Current roadmap (`roadmap.md`)\n\n{roadmap}\n\n\
+                     ## Recent ticks\n{history}\n\n\
+                     ## Your task\n\
+                     Take one concrete step toward the goal. When done, RESPOND \
+                     WITH a fenced JSON block as the LAST thing you write:\n\n\
+                     ```json\n\
+                     {{\"next_action\": \"<one of: record_progress, ask_player, \
+                     invoke_specialist, self_schedule, complete>\", \
+                     \"detail\": \"<short description>\"}}\n\
+                     ```\n",
+                    title = goal.title,
+                    project = goal.project,
+                    roadmap = roadmap,
+                    history = if history_tail.is_empty() {
+                        "(none yet)".to_string()
+                    } else {
+                        history_tail
+                    },
+                );
+                bus.publish(BusEvent::new(
+                    "goal.tick.started",
+                    "copad-daemon",
+                    json!({
+                        "goal_id": goal.id,
+                        "title": goal.title,
+                        "project": goal.project,
+                        "workspace_path": goal.project_path,
+                        "prompt": prompt,
+                    }),
+                ));
+            }
+        })
+        .expect("spawn copad-goal-tick thread")
+}
+
 fn register_e2e_actions(actions: &Arc<ActionRegistry>) {
     log::warn!("e2e test actions enabled (COPADD_E2E_TEST_ACTIONS=1)");
     actions.register_blocking("__test.slow_blocking", |params| {

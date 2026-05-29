@@ -6,6 +6,7 @@ pub mod context;
 pub mod error;
 pub mod event_bus;
 pub mod fs_atomic;
+pub mod goal;
 pub mod notifier;
 pub mod paths;
 pub mod plugin;

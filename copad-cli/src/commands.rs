@@ -120,6 +120,11 @@ pub enum Command {
     #[command(subcommand)]
     Workflow(WorkflowCommand),
 
+    /// Goal driver shortcuts (`goal.*` actions — create / list / get /
+    /// pause / resume / answer / cancel / tick-apply). Phase 22.4.
+    #[command(subcommand)]
+    Goal(GoalCommand),
+
     /// Recent bus events ("what happened?" — wraps `event.history`).
     Recent(RecentArgs),
 
@@ -356,6 +361,78 @@ pub enum WorkflowCommand {
         /// object. Ignored if `--values` is also given.
         #[arg(long = "value", value_parser = parse_kv)]
         kv: Vec<(String, String)>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum GoalCommand {
+    /// Create a goal. Allocates an id, writes `state.json` + `roadmap.md`
+    /// under `~/.local/state/copad/goals/<id>/`. Goal starts in `running`
+    /// status; the daemon's 1-minute tick scheduler picks it up next cycle.
+    Create {
+        /// Human-readable title
+        #[arg(long)]
+        title: String,
+        /// Project owner/repo (or name from `[[projects]]`)
+        #[arg(long)]
+        project: String,
+        /// Absolute project path on disk (used as `workspace_path` for
+        /// every tick's claude.start dispatch)
+        #[arg(long)]
+        project_path: String,
+        /// Optional initial roadmap body. If omitted, a stub roadmap.md is
+        /// created with the title + project metadata.
+        #[arg(long)]
+        roadmap: Option<String>,
+    },
+    /// List goals (optionally filtered)
+    List {
+        /// Filter by project owner/repo
+        #[arg(long)]
+        project: Option<String>,
+        /// Filter by status (`running`/`paused`/`blocked`/`done`/`cancelled`)
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Show full Goal record by id
+    Get {
+        /// Goal id (e.g. `goal-1748504000000000`)
+        id: String,
+    },
+    /// Pause an active goal (scheduler skips paused goals)
+    Pause {
+        /// Goal id
+        id: String,
+    },
+    /// Resume a paused goal
+    Resume {
+        /// Goal id
+        id: String,
+    },
+    /// Provide an answer to a blocked goal's question; transitions back to running
+    Answer {
+        /// Goal id
+        id: String,
+        /// The answer to send (free-form text)
+        answer: String,
+    },
+    /// Cancel a goal (terminal state — won't tick again)
+    Cancel {
+        /// Goal id
+        id: String,
+    },
+    /// Apply a parsed tick result to a goal. Used by the result loop —
+    /// invoked after claude returns. `raw_output` is the full claude
+    /// stdout; the driver extracts the fenced JSON block, parses
+    /// `next_action`, and updates state.
+    TickApply {
+        /// Goal id
+        #[arg(long)]
+        id: String,
+        /// Raw claude output text (read from terminal.history of the
+        /// tick's spawned tab, or piped in via shell)
+        #[arg(long)]
+        raw_output: String,
     },
 }
 
@@ -661,6 +738,17 @@ impl Cli {
                 WorkflowCommand::Run { .. } => "workflow.run",
             }
             .to_string(),
+            Command::Goal(cmd) => match cmd {
+                GoalCommand::Create { .. } => "goal.create",
+                GoalCommand::List { .. } => "goal.list",
+                GoalCommand::Get { .. } => "goal.get",
+                GoalCommand::Pause { .. } => "goal.pause",
+                GoalCommand::Resume { .. } => "goal.resume",
+                GoalCommand::Answer { .. } => "goal.answer",
+                GoalCommand::Cancel { .. } => "goal.cancel",
+                GoalCommand::TickApply { .. } => "goal.tick.apply",
+            }
+            .to_string(),
             Command::Statusbar(cmd) => match cmd {
                 StatusBarCommand::Show => "statusbar.show",
                 StatusBarCommand::Hide => "statusbar.hide",
@@ -844,6 +932,41 @@ impl Cli {
                         obj.insert("active".into(), json!(true));
                     }
                     serde_json::Value::Object(obj)
+                }
+            },
+            Command::Goal(cmd) => match cmd {
+                GoalCommand::Create {
+                    title,
+                    project,
+                    project_path,
+                    roadmap,
+                } => {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("title".into(), json!(title));
+                    obj.insert("project".into(), json!(project));
+                    obj.insert("project_path".into(), json!(project_path));
+                    if let Some(r) = roadmap {
+                        obj.insert("roadmap".into(), json!(r));
+                    }
+                    serde_json::Value::Object(obj)
+                }
+                GoalCommand::List { project, status } => {
+                    let mut obj = serde_json::Map::new();
+                    if let Some(p) = project {
+                        obj.insert("project".into(), json!(p));
+                    }
+                    if let Some(s) = status {
+                        obj.insert("status".into(), json!(s));
+                    }
+                    serde_json::Value::Object(obj)
+                }
+                GoalCommand::Get { id } => json!({ "id": id }),
+                GoalCommand::Pause { id } => json!({ "id": id }),
+                GoalCommand::Resume { id } => json!({ "id": id }),
+                GoalCommand::Answer { id, answer } => json!({ "id": id, "answer": answer }),
+                GoalCommand::Cancel { id } => json!({ "id": id }),
+                GoalCommand::TickApply { id, raw_output } => {
+                    json!({ "id": id, "raw_output": raw_output })
                 }
             },
             Command::Workflow(cmd) => match cmd {

@@ -112,6 +112,14 @@
   <div id="runs-body" class="empty">No runs yet.</div>
 </section>
 
+<section id="goals-section">
+  <h2>
+    Goals
+    <span class="meta" title="Phase 22.4 — daemon ticks every 60s; each tick spawns claude with the goal's roadmap.md">(per-project)</span>
+  </h2>
+  <div id="goals-body" class="empty">No active goals.</div>
+</section>
+
 <script>
 (function () {
   const api = window.copad;
@@ -390,6 +398,108 @@
     renderProject();
     renderWorkflows();
     await loadRuns();
+    await loadGoals();
+  }
+
+  // Phase 22.4 — Goals slot. Filtered by active project's git_remote.
+  // Status badges + pause/resume/cancel/answer buttons. Daemon ticks
+  // every 60s; tick result loop is async (goal.tick.apply called when
+  // claude returns), so panel just rerenders on event signals.
+  async function loadGoals() {
+    const el = document.getElementById("goals-body");
+    if (!el) return;
+    const remote = (activeProject && activeProject.git_remote) || lastPaneRemote;
+    try {
+      const params = {};
+      if (remote) params.project = remote;
+      const resp = await api.call("goal.list", params);
+      const goals = (resp && resp.goals) || [];
+      const active = goals.filter((g) => g.status !== "done" && g.status !== "cancelled");
+      if (active.length === 0) {
+        el.className = "empty";
+        el.textContent = remote ? `No active goals for ${remote}.` : "No active goals.";
+        return;
+      }
+      el.className = "";
+      el.innerHTML = "";
+      for (const g of active) {
+        const card = document.createElement("div");
+        card.className = "card";
+        const head = document.createElement("div");
+        head.style.display = "flex";
+        head.style.justifyContent = "space-between";
+        head.style.alignItems = "baseline";
+        const title = document.createElement("div");
+        title.style.fontWeight = "600";
+        title.textContent = g.title;
+        const status = document.createElement("span");
+        status.className = "chip";
+        status.textContent = g.status;
+        head.appendChild(title);
+        head.appendChild(status);
+        card.appendChild(head);
+        if (g.last_tick_result) {
+          const lt = document.createElement("div");
+          lt.style.color = "var(--fg-mute, #6c7086)";
+          lt.style.fontSize = "11px";
+          lt.style.marginTop = "4px";
+          lt.textContent = "last tick: " + String(g.last_tick_result).slice(0, 200);
+          card.appendChild(lt);
+        }
+        if (g.status === "blocked" && g.blocked_question) {
+          const q = document.createElement("div");
+          q.style.marginTop = "6px";
+          q.style.color = "var(--yellow, #f9e2af)";
+          q.textContent = g.blocked_question;
+          card.appendChild(q);
+          const inp = document.createElement("input");
+          inp.type = "text";
+          inp.placeholder = "Answer…";
+          inp.style.width = "100%";
+          inp.style.marginTop = "4px";
+          const ans = document.createElement("button");
+          ans.textContent = "Send answer";
+          ans.style.marginTop = "4px";
+          ans.addEventListener("click", async () => {
+            const text = inp.value.trim();
+            if (!text) return;
+            try {
+              await api.call("goal.answer", { id: g.id, answer: text });
+              await loadGoals();
+            } catch (e) {
+              ans.textContent = "Error";
+            }
+          });
+          card.appendChild(inp);
+          card.appendChild(ans);
+        }
+        const ctrls = document.createElement("div");
+        ctrls.style.marginTop = "8px";
+        ctrls.style.display = "flex";
+        ctrls.style.gap = "6px";
+        const mkBtn = (label, method) => {
+          const b = document.createElement("button");
+          b.textContent = label;
+          b.addEventListener("click", async () => {
+            try {
+              await api.call(method, { id: g.id });
+              await loadGoals();
+            } catch (e) {
+              b.textContent = "Error";
+            }
+          });
+          return b;
+        };
+        if (g.status === "running") ctrls.appendChild(mkBtn("Pause", "goal.pause"));
+        if (g.status === "paused") ctrls.appendChild(mkBtn("Resume", "goal.resume"));
+        ctrls.appendChild(mkBtn("Cancel", "goal.cancel"));
+        card.appendChild(ctrls);
+        el.appendChild(card);
+      }
+    } catch (e) {
+      el.className = "empty";
+      el.textContent = "Could not load goals.";
+    }
   }
 
   // copad-linux/src/plugin_panel.rs::_handleEvent invokes the handler
@@ -411,6 +521,9 @@
   // Periodic refresh of recent runs (covers events fired between
   // pane.context_changed beats — e.g. workflow.timed_out)
   setInterval(loadRuns, 5000);
+  // Goals tick every 60s daemon-side; UI refresh at 10s gives the user
+  // near-immediate feedback for tick.completed / blocked transitions.
+  setInterval(loadGoals, 10000);
 
   refresh().catch((e) => console.warn("initial load failed", e));
 })();
