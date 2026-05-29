@@ -1990,7 +1990,10 @@ mod history_tests {
         // {r01, r02, r03} = 3 rows.
         push_lines(&mut term, 6);
         let history_size = term.grid().history_size();
-        assert_eq!(history_size, 3, "expected 3 scrollback rows from 6 pushes in a 4-row viewport");
+        assert_eq!(
+            history_size, 3,
+            "expected 3 scrollback rows from 6 pushes in a 4-row viewport"
+        );
         let text = read_history_text(term.grid(), term.columns(), 100);
         // 3 rows joined by 2 newlines, no trailing newline.
         assert_eq!(text.matches('\n').count(), 2);
@@ -2009,7 +2012,11 @@ mod history_tests {
         let lines: Vec<&str> = text.split('\n').collect();
         assert_eq!(lines.len(), 3);
         assert!(lines[0].starts_with("r05"), "first line was {:?}", lines[0]);
-        assert!(lines[1].starts_with("r06"), "second line was {:?}", lines[1]);
+        assert!(
+            lines[1].starts_with("r06"),
+            "second line was {:?}",
+            lines[1]
+        );
         assert!(lines[2].starts_with("r07"), "third line was {:?}", lines[2]);
         // Viewport content must not bleed in.
         assert!(!text.contains("r08"));
@@ -2028,7 +2035,11 @@ mod history_tests {
         let text = read_history_text(term.grid(), term.columns(), 6);
         // The very first scrollback row (oldest) is the bare "X" row.
         let lines: Vec<&str> = text.split('\n').collect();
-        assert_eq!(lines[0], "X   ", "expected NUL → space padding, got {:?}", lines[0]);
+        assert_eq!(
+            lines[0], "X   ",
+            "expected NUL → space padding, got {:?}",
+            lines[0]
+        );
     }
 
     #[test]

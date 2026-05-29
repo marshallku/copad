@@ -67,6 +67,7 @@ enum Session {
 }
 
 // MARK: - Wire model
+
 //
 // PaneManager / TabViewController construct + consume these types in-
 // process. The FFI surface only ever crosses serialized JSON, so the
