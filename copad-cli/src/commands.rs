@@ -125,6 +125,17 @@ pub enum Command {
     #[command(subcommand)]
     Goal(GoalCommand),
 
+    /// Agent registry shortcuts (`agent.*` actions — list / get /
+    /// show-memory / append-memory). Phase 22.5.
+    #[command(subcommand)]
+    AgentRegistry(AgentRegistryCommand),
+
+    /// Mission substrate shortcuts (`mission.*` actions — submit / list /
+    /// get / pause / resume / abort / redirect-objective /
+    /// assign-agent / turn-started / turn-completed). Phase 22.5.
+    #[command(subcommand)]
+    Mission(MissionCommand),
+
     /// Recent bus events ("what happened?" — wraps `event.history`).
     Recent(RecentArgs),
 
@@ -433,6 +444,119 @@ pub enum GoalCommand {
         /// tick's spawned tab, or piped in via shell)
         #[arg(long)]
         raw_output: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AgentRegistryCommand {
+    /// List builtin + user-overridden agent profiles
+    List,
+    /// Show full Agent record (profile.md + autonomy + memory tail)
+    Get {
+        /// Agent id (e.g. `architect`)
+        id: String,
+    },
+    /// Show the agent's memory journal (newest first)
+    ShowMemory {
+        /// Agent id
+        id: String,
+        /// Max entries to return (default 50)
+        #[arg(long)]
+        limit: Option<u64>,
+    },
+    /// Append a memory entry to the agent's journal
+    AppendMemory {
+        /// Agent id
+        #[arg(long)]
+        id: String,
+        /// Entry kind (e.g. `fact`, `decision`, `lesson`)
+        #[arg(long)]
+        kind: String,
+        /// Entry body
+        #[arg(long)]
+        body: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MissionCommand {
+    /// Submit a new mission (state = pending until a turn starts)
+    Submit {
+        /// Human-readable title
+        #[arg(long)]
+        title: String,
+        /// What the mission should accomplish
+        #[arg(long)]
+        objective: String,
+        /// Project owner/repo
+        #[arg(long)]
+        project: Option<String>,
+        /// Urgency 0–9
+        #[arg(long, default_value_t = 0)]
+        urgency: u8,
+        /// Optional cadence hint (free-form)
+        #[arg(long)]
+        cadence: Option<String>,
+        /// JSON object: `{"max_turns": N, "cost_cap_cents": M}`
+        #[arg(long)]
+        budget: Option<String>,
+        /// JSON array of `{"agent_id": "…", "role": "…"}` assignments
+        #[arg(long)]
+        assigned_agents: Option<String>,
+        /// JSON array of wake conditions (Time/Event/Webhook variants)
+        #[arg(long)]
+        wake_conditions: Option<String>,
+    },
+    /// List missions (optionally filtered)
+    List {
+        #[arg(long)]
+        project: Option<String>,
+        /// `pending`/`active`/`paused`/`done`/`aborted`
+        #[arg(long)]
+        state: Option<String>,
+    },
+    /// Show full Mission record
+    Get {
+        id: String,
+    },
+    Pause {
+        id: String,
+    },
+    Resume {
+        id: String,
+    },
+    /// Abort a mission (terminal)
+    Abort {
+        id: String,
+    },
+    /// Replace the objective without aborting
+    RedirectObjective {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        new_objective: String,
+    },
+    /// Append an agent assignment
+    AssignAgent {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        agent_id: String,
+        #[arg(long, default_value = "")]
+        role: String,
+    },
+    /// Mark a turn as started (state → active, turn_count++)
+    TurnStarted {
+        id: String,
+    },
+    /// Mark a turn as completed; `decision = "complete"` marks the mission done
+    TurnCompleted {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        decision: String,
+        #[arg(long, default_value = "")]
+        detail: String,
     },
 }
 
@@ -749,6 +873,26 @@ impl Cli {
                 GoalCommand::TickApply { .. } => "goal.tick.apply",
             }
             .to_string(),
+            Command::AgentRegistry(cmd) => match cmd {
+                AgentRegistryCommand::List => "agent.list",
+                AgentRegistryCommand::Get { .. } => "agent.get",
+                AgentRegistryCommand::ShowMemory { .. } => "agent.show_memory",
+                AgentRegistryCommand::AppendMemory { .. } => "agent.append_memory",
+            }
+            .to_string(),
+            Command::Mission(cmd) => match cmd {
+                MissionCommand::Submit { .. } => "mission.submit",
+                MissionCommand::List { .. } => "mission.list",
+                MissionCommand::Get { .. } => "mission.get",
+                MissionCommand::Pause { .. } => "mission.pause",
+                MissionCommand::Resume { .. } => "mission.resume",
+                MissionCommand::Abort { .. } => "mission.abort",
+                MissionCommand::RedirectObjective { .. } => "mission.redirect_objective",
+                MissionCommand::AssignAgent { .. } => "mission.assign_agent",
+                MissionCommand::TurnStarted { .. } => "mission.turn_started",
+                MissionCommand::TurnCompleted { .. } => "mission.turn_completed",
+            }
+            .to_string(),
             Command::Statusbar(cmd) => match cmd {
                 StatusBarCommand::Show => "statusbar.show",
                 StatusBarCommand::Hide => "statusbar.hide",
@@ -933,6 +1077,86 @@ impl Cli {
                     }
                     serde_json::Value::Object(obj)
                 }
+            },
+            Command::AgentRegistry(cmd) => match cmd {
+                AgentRegistryCommand::List => json!({}),
+                AgentRegistryCommand::Get { id } => json!({ "id": id }),
+                AgentRegistryCommand::ShowMemory { id, limit } => {
+                    let mut o = serde_json::Map::new();
+                    o.insert("id".into(), json!(id));
+                    if let Some(l) = limit {
+                        o.insert("limit".into(), json!(l));
+                    }
+                    serde_json::Value::Object(o)
+                }
+                AgentRegistryCommand::AppendMemory { id, kind, body } => json!({
+                    "id": id, "kind": kind, "body": body,
+                }),
+            },
+            Command::Mission(cmd) => match cmd {
+                MissionCommand::Submit {
+                    title,
+                    objective,
+                    project,
+                    urgency,
+                    cadence,
+                    budget,
+                    assigned_agents,
+                    wake_conditions,
+                } => {
+                    let mut o = serde_json::Map::new();
+                    o.insert("title".into(), json!(title));
+                    o.insert("objective".into(), json!(objective));
+                    if let Some(p) = project {
+                        o.insert("project".into(), json!(p));
+                    }
+                    o.insert("urgency".into(), json!(urgency));
+                    if let Some(c) = cadence {
+                        o.insert("cadence".into(), json!(c));
+                    }
+                    if let Some(s) = budget
+                        && let Ok(v) = serde_json::from_str::<serde_json::Value>(s)
+                    {
+                        o.insert("budget".into(), v);
+                    }
+                    if let Some(s) = assigned_agents
+                        && let Ok(v) = serde_json::from_str::<serde_json::Value>(s)
+                    {
+                        o.insert("assigned_agents".into(), v);
+                    }
+                    if let Some(s) = wake_conditions
+                        && let Ok(v) = serde_json::from_str::<serde_json::Value>(s)
+                    {
+                        o.insert("wake_conditions".into(), v);
+                    }
+                    serde_json::Value::Object(o)
+                }
+                MissionCommand::List { project, state } => {
+                    let mut o = serde_json::Map::new();
+                    if let Some(p) = project {
+                        o.insert("project".into(), json!(p));
+                    }
+                    if let Some(s) = state {
+                        o.insert("state".into(), json!(s));
+                    }
+                    serde_json::Value::Object(o)
+                }
+                MissionCommand::Get { id } => json!({ "id": id }),
+                MissionCommand::Pause { id } => json!({ "id": id }),
+                MissionCommand::Resume { id } => json!({ "id": id }),
+                MissionCommand::Abort { id } => json!({ "id": id }),
+                MissionCommand::RedirectObjective { id, new_objective } => json!({
+                    "id": id, "new_objective": new_objective,
+                }),
+                MissionCommand::AssignAgent { id, agent_id, role } => json!({
+                    "id": id, "agent_id": agent_id, "role": role,
+                }),
+                MissionCommand::TurnStarted { id } => json!({ "id": id }),
+                MissionCommand::TurnCompleted {
+                    id,
+                    decision,
+                    detail,
+                } => json!({"id": id, "decision": decision, "detail": detail}),
             },
             Command::Goal(cmd) => match cmd {
                 GoalCommand::Create {

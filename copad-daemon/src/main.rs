@@ -144,6 +144,10 @@ fn main() -> ExitCode {
     );
     let _ = goal_registry;
     let _ = goal_tick_stop;
+    // Phase 22.5 — agent + mission registries. Both are daemon-owned
+    // (CRUD-only at v1; wake-condition auto-firing lands in 22.7).
+    let _agent_registry = register_agent_actions(&actions);
+    let _mission_registry = register_mission_actions(&actions, &event_bus);
 
     // GuiRegistry is built before the trigger sink so both share the
     // same registry instance — the sink's fallthrough worker resolves
@@ -820,6 +824,289 @@ fn register_goal_actions(
 
     let tick_stop = Arc::new(AtomicBool::new(false));
     (goals, tick_stop)
+}
+
+/// Phase 22.5 — Agent actions (CRUD + memory append). Read-mostly:
+/// builtin profiles ship embedded; user overrides land at
+/// `~/.local/state/copad/agents/<id>/`.
+fn register_agent_actions(actions: &Arc<ActionRegistry>) -> Arc<copad_core::agent::AgentRegistry> {
+    use copad_core::agent::AgentRegistry;
+
+    let root = copad_core::paths::state_dir().join("agents");
+    let registry = Arc::new(AgentRegistry::new(root));
+
+    let r1 = registry.clone();
+    actions.register_silent("agent.list", move |_| Ok(json!({ "agents": r1.list() })));
+
+    let r2 = registry.clone();
+    actions.register_silent("agent.get", move |params| {
+        let id = require_id_param(&params, "agent.get")?;
+        match r2.get(&id) {
+            Some(a) => serde_json::to_value(&a)
+                .map_err(|e| internal_error(format!("serialize agent: {e}"))),
+            None => Err(copad_core::protocol::ResponseError {
+                code: "not_found".into(),
+                message: format!("agent not found: {id}"),
+            }),
+        }
+    });
+
+    let r3 = registry.clone();
+    actions.register_silent("agent.show_memory", move |params| {
+        let id = require_id_param(&params, "agent.show_memory")?;
+        let limit = params.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+        let agent = r3
+            .get(&id)
+            .ok_or_else(|| copad_core::protocol::ResponseError {
+                code: "not_found".into(),
+                message: format!("agent not found: {id}"),
+            })?;
+        let total = agent.memory.len();
+        let tail: Vec<_> = agent.memory.into_iter().rev().take(limit).collect();
+        Ok(json!({ "entries": tail, "total": total }))
+    });
+
+    let r4 = registry.clone();
+    actions.register_blocking("agent.append_memory", move |params| {
+        let id = require_id_param(&params, "agent.append_memory")?;
+        let kind = params
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid_params("'kind' required (non-empty string)"))?
+            .to_string();
+        let body = params
+            .get("body")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| invalid_params("'body' required (string)"))?
+            .to_string();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        let entry = r4
+            .append_memory(&id, &kind, &body, now_ms)
+            .map_err(internal_error)?;
+        serde_json::to_value(&entry).map_err(|e| internal_error(format!("serialize entry: {e}")))
+    });
+
+    registry
+}
+
+/// Phase 22.5 — Mission actions (CRUD + state transitions). Wake-
+/// condition auto-firing arrives with 22.7 + Brain dispatcher.
+fn register_mission_actions(
+    actions: &Arc<ActionRegistry>,
+    bus: &Arc<copad_core::event_bus::EventBus>,
+) -> Arc<copad_core::mission::MissionRegistry> {
+    use copad_core::event_bus::Event as BusEvent;
+    use copad_core::mission::{
+        AgentAssignment, MissionBudget, MissionRegistry, MissionState, WakeCondition,
+    };
+
+    let root = copad_core::paths::state_dir().join("missions");
+    let registry = Arc::new(MissionRegistry::new(root));
+
+    let r1 = registry.clone();
+    let bus1 = bus.clone();
+    actions.register_blocking("mission.submit", move |params| {
+        let title = params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid_params("'title' required (non-empty string)"))?
+            .to_string();
+        let objective = params
+            .get("objective")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid_params("'objective' required (non-empty string)"))?
+            .to_string();
+        let project = params
+            .get("project")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let urgency = params.get("urgency").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+        let cadence = params
+            .get("cadence")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let assigned_agents: Vec<AgentAssignment> = match params.get("assigned_agents") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(v) => serde_json::from_value(v.clone())
+                .map_err(|e| invalid_params(format!("'assigned_agents' must be an array: {e}")))?,
+        };
+        let budget: MissionBudget = match params.get("budget") {
+            None | Some(serde_json::Value::Null) => MissionBudget::default(),
+            Some(v) => serde_json::from_value(v.clone())
+                .map_err(|e| invalid_params(format!("'budget' invalid: {e}")))?,
+        };
+        let wake_conditions: Vec<WakeCondition> = match params.get("wake_conditions") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(v) => serde_json::from_value(v.clone())
+                .map_err(|e| invalid_params(format!("'wake_conditions' invalid: {e}")))?,
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        let mission = r1
+            .submit(
+                &title,
+                &objective,
+                project.as_deref(),
+                assigned_agents,
+                budget,
+                wake_conditions,
+                cadence.as_deref(),
+                urgency,
+                now_ms,
+            )
+            .map_err(internal_error)?;
+        bus1.publish(BusEvent::new(
+            "mission.created",
+            "copad-daemon",
+            json!({"id": mission.id, "title": mission.title, "project": mission.project}),
+        ));
+        serde_json::to_value(&mission)
+            .map_err(|e| internal_error(format!("serialize mission: {e}")))
+    });
+
+    let r2 = registry.clone();
+    actions.register_silent("mission.list", move |params| {
+        let project = params
+            .get("project")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let state: Option<MissionState> = match params.get("state") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => serde_json::from_value(v.clone()).map_err(|_| {
+                invalid_params("'state' must be one of pending/active/paused/done/aborted")
+            })?,
+        };
+        Ok(json!({ "missions": r2.list_for(project.as_deref(), state) }))
+    });
+
+    let r3 = registry.clone();
+    actions.register_silent("mission.get", move |params| {
+        let id = require_id_param(&params, "mission.get")?;
+        match r3.get(&id) {
+            Some(m) => serde_json::to_value(&m)
+                .map_err(|e| internal_error(format!("serialize mission: {e}"))),
+            None => Err(copad_core::protocol::ResponseError {
+                code: "not_found".into(),
+                message: format!("mission not found: {id}"),
+            }),
+        }
+    });
+
+    // Macro-pattern transitions: pause/resume/abort + redirect/assign + turn_started/turn_completed.
+    let r4 = registry.clone();
+    let bus4 = bus.clone();
+    actions.register_blocking("mission.pause", move |params| {
+        let id = require_id_param(&params, "mission.pause")?;
+        let m = r4.pause(&id).map_err(internal_error)?;
+        bus4.publish(BusEvent::new(
+            "mission.paused",
+            "copad-daemon",
+            json!({"mission_id": m.id}),
+        ));
+        serde_json::to_value(&m).map_err(|e| internal_error(format!("serialize mission: {e}")))
+    });
+
+    let r5 = registry.clone();
+    let bus5 = bus.clone();
+    actions.register_blocking("mission.resume", move |params| {
+        let id = require_id_param(&params, "mission.resume")?;
+        let m = r5.resume(&id).map_err(internal_error)?;
+        bus5.publish(BusEvent::new(
+            "mission.resumed",
+            "copad-daemon",
+            json!({"mission_id": m.id}),
+        ));
+        serde_json::to_value(&m).map_err(|e| internal_error(format!("serialize mission: {e}")))
+    });
+
+    let r6 = registry.clone();
+    let bus6 = bus.clone();
+    actions.register_blocking("mission.abort", move |params| {
+        let id = require_id_param(&params, "mission.abort")?;
+        let m = r6.abort(&id).map_err(internal_error)?;
+        bus6.publish(BusEvent::new(
+            "mission.aborted",
+            "copad-daemon",
+            json!({"mission_id": m.id}),
+        ));
+        serde_json::to_value(&m).map_err(|e| internal_error(format!("serialize mission: {e}")))
+    });
+
+    let r7 = registry.clone();
+    actions.register_blocking("mission.redirect_objective", move |params| {
+        let id = require_id_param(&params, "mission.redirect_objective")?;
+        let new_objective = params
+            .get("new_objective")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid_params("'new_objective' required (non-empty string)"))?;
+        let m = r7
+            .redirect_objective(&id, new_objective)
+            .map_err(internal_error)?;
+        serde_json::to_value(&m).map_err(|e| internal_error(format!("serialize mission: {e}")))
+    });
+
+    let r8 = registry.clone();
+    actions.register_blocking("mission.assign_agent", move |params| {
+        let id = require_id_param(&params, "mission.assign_agent")?;
+        let agent_id = params
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| invalid_params("'agent_id' required (non-empty string)"))?;
+        let role = params.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        let m = r8
+            .assign_agent(&id, agent_id, role)
+            .map_err(internal_error)?;
+        serde_json::to_value(&m).map_err(|e| internal_error(format!("serialize mission: {e}")))
+    });
+
+    let r9 = registry.clone();
+    let bus9 = bus.clone();
+    actions.register_blocking("mission.turn_started", move |params| {
+        let id = require_id_param(&params, "mission.turn_started")?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        let m = r9.turn_started(&id, now_ms).map_err(internal_error)?;
+        bus9.publish(BusEvent::new(
+            "mission.turn_started",
+            "copad-daemon",
+            json!({"mission_id": m.id, "turn_count": m.turn_count}),
+        ));
+        serde_json::to_value(&m).map_err(|e| internal_error(format!("serialize mission: {e}")))
+    });
+
+    let r10 = registry.clone();
+    let bus10 = bus.clone();
+    actions.register_blocking("mission.turn_completed", move |params| {
+        let id = require_id_param(&params, "mission.turn_completed")?;
+        let decision = params
+            .get("decision")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let detail = params.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+        let m = r10
+            .turn_completed(&id, decision, detail)
+            .map_err(internal_error)?;
+        bus10.publish(BusEvent::new(
+            "mission.turn_completed",
+            "copad-daemon",
+            json!({"mission_id": m.id, "decision": decision, "state": m.state.as_str()}),
+        ));
+        serde_json::to_value(&m).map_err(|e| internal_error(format!("serialize mission: {e}")))
+    });
+
+    registry
 }
 
 fn require_id_param(

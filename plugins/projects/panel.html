@@ -120,6 +120,14 @@
   <div id="goals-body" class="empty">No active goals.</div>
 </section>
 
+<section id="missions-section">
+  <h2>
+    Missions
+    <span class="meta" title="Phase 22.5 — multi-agent orchestrated tasks. Wake-condition auto-firing lands in 22.7">(per-project)</span>
+  </h2>
+  <div id="missions-body" class="empty">No active missions.</div>
+</section>
+
 <script>
 (function () {
   const api = window.copad;
@@ -399,6 +407,94 @@
     renderWorkflows();
     await loadRuns();
     await loadGoals();
+    await loadMissions();
+  }
+
+  // Phase 22.5 — Missions slot. Filtered by active project's git_remote.
+  // Agent chips + state badge + pause/resume/abort buttons.
+  async function loadMissions() {
+    const el = document.getElementById("missions-body");
+    if (!el) return;
+    const remote = (activeProject && activeProject.git_remote) || lastPaneRemote;
+    try {
+      const params = {};
+      if (remote) params.project = remote;
+      const resp = await api.call("mission.list", params);
+      const missions = (resp && resp.missions) || [];
+      const active = missions.filter((m) => m.state !== "done" && m.state !== "aborted");
+      if (active.length === 0) {
+        el.className = "empty";
+        el.textContent = remote ? `No active missions for ${remote}.` : "No active missions.";
+        return;
+      }
+      el.className = "";
+      el.innerHTML = "";
+      for (const m of active) {
+        const card = document.createElement("div");
+        card.className = "card";
+        const head = document.createElement("div");
+        head.style.display = "flex";
+        head.style.justifyContent = "space-between";
+        head.style.alignItems = "baseline";
+        const title = document.createElement("div");
+        title.style.fontWeight = "600";
+        title.textContent = m.title;
+        const state = document.createElement("span");
+        state.className = "chip";
+        state.textContent = m.state;
+        head.appendChild(title);
+        head.appendChild(state);
+        card.appendChild(head);
+        if (m.objective) {
+          const ob = document.createElement("div");
+          ob.style.color = "var(--fg-mute, #6c7086)";
+          ob.style.fontSize = "11px";
+          ob.style.marginTop = "4px";
+          ob.textContent = m.objective;
+          card.appendChild(ob);
+        }
+        if (m.assigned_agents && m.assigned_agents.length > 0) {
+          const ag = document.createElement("div");
+          ag.style.marginTop = "4px";
+          for (const a of m.assigned_agents) {
+            const c = document.createElement("span");
+            c.className = "chip";
+            c.textContent = a.agent_id + (a.role ? " (" + a.role + ")" : "");
+            ag.appendChild(c);
+          }
+          card.appendChild(ag);
+        }
+        const ctrls = document.createElement("div");
+        ctrls.style.marginTop = "8px";
+        ctrls.style.display = "flex";
+        ctrls.style.gap = "6px";
+        const mkBtn = (label, method) => {
+          const b = document.createElement("button");
+          b.textContent = label;
+          b.addEventListener("click", async () => {
+            try {
+              await api.call(method, { id: m.id });
+              await loadMissions();
+            } catch (e) {
+              b.textContent = "Error";
+            }
+          });
+          return b;
+        };
+        if (m.state === "active" || m.state === "pending") {
+          ctrls.appendChild(mkBtn("Pause", "mission.pause"));
+        }
+        if (m.state === "paused") {
+          ctrls.appendChild(mkBtn("Resume", "mission.resume"));
+        }
+        ctrls.appendChild(mkBtn("Abort", "mission.abort"));
+        card.appendChild(ctrls);
+        el.appendChild(card);
+      }
+    } catch (e) {
+      el.className = "empty";
+      el.textContent = "Could not load missions.";
+    }
   }
 
   // Phase 22.4 — Goals slot. Filtered by active project's git_remote.
@@ -524,6 +620,9 @@
   // Goals tick every 60s daemon-side; UI refresh at 10s gives the user
   // near-immediate feedback for tick.completed / blocked transitions.
   setInterval(loadGoals, 10000);
+  // Missions: same 10s cadence — wake-condition auto-firing isn't shipped,
+  // but the UI still needs to reflect manual state changes (pause/resume).
+  setInterval(loadMissions, 10000);
 
   refresh().catch((e) => console.warn("initial load failed", e));
 })();
