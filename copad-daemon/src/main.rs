@@ -664,7 +664,7 @@ fn register_goal_actions(
             .map(String::from);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as i64)
+            .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let goal = goals_for_create
             .create(
@@ -715,33 +715,42 @@ fn register_goal_actions(
 
     let goals_for_pause = goals.clone();
     let bus_for_pause = bus.clone();
-    actions.register_blocking("goal.pause", move |params| {
+    actions.register_blocking_silent("goal.pause", move |params| {
         let id = require_id_param(&params, "goal.pause")?;
-        let goal = goals_for_pause.pause(&id).map_err(internal_error)?;
-        bus_for_pause.publish(BusEvent::new(
-            "goal.paused",
-            "copad-daemon",
-            json!({"goal_id": goal.id}),
-        ));
-        serde_json::to_value(&goal).map_err(|e| internal_error(format!("serialize goal: {e}")))
+        let (goal, advanced) = goals_for_pause.pause(&id).map_err(internal_error)?;
+        if advanced {
+            bus_for_pause.publish(BusEvent::new(
+                "goal.paused",
+                "copad-daemon",
+                json!({"goal_id": goal.id}),
+            ));
+        }
+        Ok(json!({ "goal": goal, "advanced": advanced }))
     });
 
     let goals_for_resume = goals.clone();
     let bus_for_resume = bus.clone();
-    actions.register_blocking("goal.resume", move |params| {
+    actions.register_blocking_silent("goal.resume", move |params| {
         let id = require_id_param(&params, "goal.resume")?;
-        let goal = goals_for_resume.resume(&id).map_err(internal_error)?;
-        bus_for_resume.publish(BusEvent::new(
-            "goal.resumed",
-            "copad-daemon",
-            json!({"goal_id": goal.id}),
-        ));
-        serde_json::to_value(&goal).map_err(|e| internal_error(format!("serialize goal: {e}")))
+        let (goal, advanced) = goals_for_resume.resume(&id).map_err(internal_error)?;
+        if advanced {
+            bus_for_resume.publish(BusEvent::new(
+                "goal.resumed",
+                "copad-daemon",
+                json!({"goal_id": goal.id}),
+            ));
+        }
+        Ok(json!({ "goal": goal, "advanced": advanced }))
     });
 
     let goals_for_answer = goals.clone();
     let bus_for_answer = bus.clone();
-    actions.register_blocking("goal.answer", move |params| {
+    // `register_blocking_silent`: lifecycle actions already publish a
+    // domain event (`goal.unblocked` etc.) — we don't also want the
+    // ActionRegistry's `*.completed` fan-out to leak refused calls to
+    // external listeners (codex round-4 C2). Same change applied to
+    // every mutating lifecycle action below.
+    actions.register_blocking_silent("goal.answer", move |params| {
         let id = require_id_param(&params, "goal.answer")?;
         let answer = params
             .get("answer")
@@ -749,28 +758,33 @@ fn register_goal_actions(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| invalid_params("goal.answer requires non-empty 'answer' string"))?
             .to_string();
-        let goal = goals_for_answer
+        let (goal, advanced) = goals_for_answer
             .answer(&id, &answer)
             .map_err(internal_error)?;
-        bus_for_answer.publish(BusEvent::new(
-            "goal.unblocked",
-            "copad-daemon",
-            json!({"goal_id": goal.id}),
-        ));
-        serde_json::to_value(&goal).map_err(|e| internal_error(format!("serialize goal: {e}")))
+        // Suppress domain event when the registry no-oped (codex round-4 C1).
+        if advanced {
+            bus_for_answer.publish(BusEvent::new(
+                "goal.unblocked",
+                "copad-daemon",
+                json!({"goal_id": goal.id}),
+            ));
+        }
+        Ok(json!({ "goal": goal, "advanced": advanced }))
     });
 
     let goals_for_cancel = goals.clone();
     let bus_for_cancel = bus.clone();
-    actions.register_blocking("goal.cancel", move |params| {
+    actions.register_blocking_silent("goal.cancel", move |params| {
         let id = require_id_param(&params, "goal.cancel")?;
-        let goal = goals_for_cancel.cancel(&id).map_err(internal_error)?;
-        bus_for_cancel.publish(BusEvent::new(
-            "goal.cancelled",
-            "copad-daemon",
-            json!({"goal_id": goal.id}),
-        ));
-        serde_json::to_value(&goal).map_err(|e| internal_error(format!("serialize goal: {e}")))
+        let (goal, advanced) = goals_for_cancel.cancel(&id).map_err(internal_error)?;
+        if advanced {
+            bus_for_cancel.publish(BusEvent::new(
+                "goal.cancelled",
+                "copad-daemon",
+                json!({"goal_id": goal.id}),
+            ));
+        }
+        Ok(json!({ "goal": goal, "advanced": advanced }))
     });
 
     // Daemon-side bridge for the tick result loop: GUI publishes
@@ -784,15 +798,36 @@ fn register_goal_actions(
             .get("raw_output")
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        // Codex round-2 C1: the marker the daemon emitted in
+        // `goal.tick.started` must come back here so a stale duplicate
+        // apply from an earlier tick can't clear a newer reservation.
+        // Omitting the marker is the "force apply" path (manual
+        // operator override via `coctl goal tick-apply` with no
+        // --in-flight-marker arg).
+        let expected_marker = params
+            .get("in_flight_marker")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let result = parse_tick_output(raw_output);
         let outcome_str = result.outcome.as_str().to_string();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as i64)
+            .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let goal = goals_for_tick_apply
-            .apply_tick_result(&id, result, now_ms)
+        let (goal, applied) = goals_for_tick_apply
+            .apply_tick_result(&id, result, now_ms, expected_marker.as_deref())
             .map_err(internal_error)?;
+        // Codex round-3 I1: surface `applied` in the response so callers
+        // can distinguish "stale marker dropped" from "apply succeeded
+        // but state didn't change visibly." When false: still ack with
+        // the unchanged goal, no bus event, no state-change side-effect.
+        if !applied {
+            return Ok(json!({
+                "goal": goal,
+                "applied": false,
+                "reason": "in_flight_marker_mismatch",
+            }));
+        }
         bus_for_tick_apply.publish(BusEvent::new(
             "goal.tick.completed",
             "copad-daemon",
@@ -816,7 +851,7 @@ fn register_goal_actions(
                 json!({"goal_id": goal.id}),
             ));
         }
-        serde_json::to_value(&goal).map_err(|e| internal_error(format!("serialize goal: {e}")))
+        Ok(json!({ "goal": goal, "applied": true }))
     });
 
     let goals_for_tick_mark = goals.clone();
@@ -830,7 +865,7 @@ fn register_goal_actions(
             .to_string();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as i64)
+            .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let goal = goals_for_tick_mark
             .mark_in_flight(&id, &panel_id, now_ms)
@@ -898,7 +933,7 @@ fn register_agent_actions(actions: &Arc<ActionRegistry>) -> Arc<copad_core::agen
             .to_string();
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as i64)
+            .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let entry = r4
             .append_memory(&id, &kind, &body, now_ms)
@@ -964,7 +999,7 @@ fn register_mission_actions(
         };
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as i64)
+            .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let mission = r1
             .submit(
@@ -1019,59 +1054,65 @@ fn register_mission_actions(
     // Macro-pattern transitions: pause/resume/abort + redirect/assign + turn_started/turn_completed.
     let r4 = registry.clone();
     let bus4 = bus.clone();
-    actions.register_blocking("mission.pause", move |params| {
+    actions.register_blocking_silent("mission.pause", move |params| {
         let id = require_id_param(&params, "mission.pause")?;
-        let m = r4.pause(&id).map_err(internal_error)?;
-        bus4.publish(BusEvent::new(
-            "mission.paused",
-            "copad-daemon",
-            json!({"mission_id": m.id}),
-        ));
-        serde_json::to_value(&m).map_err(|e| internal_error(format!("serialize mission: {e}")))
+        let (m, advanced) = r4.pause(&id).map_err(internal_error)?;
+        if advanced {
+            bus4.publish(BusEvent::new(
+                "mission.paused",
+                "copad-daemon",
+                json!({"mission_id": m.id}),
+            ));
+        }
+        Ok(json!({ "mission": m, "advanced": advanced }))
     });
 
     let r5 = registry.clone();
     let bus5 = bus.clone();
-    actions.register_blocking("mission.resume", move |params| {
+    actions.register_blocking_silent("mission.resume", move |params| {
         let id = require_id_param(&params, "mission.resume")?;
-        let m = r5.resume(&id).map_err(internal_error)?;
-        bus5.publish(BusEvent::new(
-            "mission.resumed",
-            "copad-daemon",
-            json!({"mission_id": m.id}),
-        ));
-        serde_json::to_value(&m).map_err(|e| internal_error(format!("serialize mission: {e}")))
+        let (m, advanced) = r5.resume(&id).map_err(internal_error)?;
+        if advanced {
+            bus5.publish(BusEvent::new(
+                "mission.resumed",
+                "copad-daemon",
+                json!({"mission_id": m.id}),
+            ));
+        }
+        Ok(json!({ "mission": m, "advanced": advanced }))
     });
 
     let r6 = registry.clone();
     let bus6 = bus.clone();
-    actions.register_blocking("mission.abort", move |params| {
+    actions.register_blocking_silent("mission.abort", move |params| {
         let id = require_id_param(&params, "mission.abort")?;
-        let m = r6.abort(&id).map_err(internal_error)?;
-        bus6.publish(BusEvent::new(
-            "mission.aborted",
-            "copad-daemon",
-            json!({"mission_id": m.id}),
-        ));
-        serde_json::to_value(&m).map_err(|e| internal_error(format!("serialize mission: {e}")))
+        let (m, advanced) = r6.abort(&id).map_err(internal_error)?;
+        if advanced {
+            bus6.publish(BusEvent::new(
+                "mission.aborted",
+                "copad-daemon",
+                json!({"mission_id": m.id}),
+            ));
+        }
+        Ok(json!({ "mission": m, "advanced": advanced }))
     });
 
     let r7 = registry.clone();
-    actions.register_blocking("mission.redirect_objective", move |params| {
+    actions.register_blocking_silent("mission.redirect_objective", move |params| {
         let id = require_id_param(&params, "mission.redirect_objective")?;
         let new_objective = params
             .get("new_objective")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .ok_or_else(|| invalid_params("'new_objective' required (non-empty string)"))?;
-        let m = r7
+        let (m, advanced) = r7
             .redirect_objective(&id, new_objective)
             .map_err(internal_error)?;
-        serde_json::to_value(&m).map_err(|e| internal_error(format!("serialize mission: {e}")))
+        Ok(json!({ "mission": m, "advanced": advanced }))
     });
 
     let r8 = registry.clone();
-    actions.register_blocking("mission.assign_agent", move |params| {
+    actions.register_blocking_silent("mission.assign_agent", move |params| {
         let id = require_id_param(&params, "mission.assign_agent")?;
         let agent_id = params
             .get("agent_id")
@@ -1087,39 +1128,46 @@ fn register_mission_actions(
 
     let r9 = registry.clone();
     let bus9 = bus.clone();
-    actions.register_blocking("mission.turn_started", move |params| {
+    actions.register_blocking_silent("mission.turn_started", move |params| {
         let id = require_id_param(&params, "mission.turn_started")?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_micros() as i64)
+            .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let m = r9.turn_started(&id, now_ms).map_err(internal_error)?;
-        bus9.publish(BusEvent::new(
-            "mission.turn_started",
-            "copad-daemon",
-            json!({"mission_id": m.id, "turn_count": m.turn_count}),
-        ));
-        serde_json::to_value(&m).map_err(|e| internal_error(format!("serialize mission: {e}")))
+        let (m, advanced) = r9.turn_started(&id, now_ms).map_err(internal_error)?;
+        // Codex round-3 C1: don't emit the bus event when the registry
+        // refused to advance (paused / terminal mission).
+        if advanced {
+            bus9.publish(BusEvent::new(
+                "mission.turn_started",
+                "copad-daemon",
+                json!({"mission_id": m.id, "turn_count": m.turn_count}),
+            ));
+        }
+        // Codex round-4 I1: surface advanced so the caller can detect refusal.
+        Ok(json!({ "mission": m, "advanced": advanced }))
     });
 
     let r10 = registry.clone();
     let bus10 = bus.clone();
-    actions.register_blocking("mission.turn_completed", move |params| {
+    actions.register_blocking_silent("mission.turn_completed", move |params| {
         let id = require_id_param(&params, "mission.turn_completed")?;
         let decision = params
             .get("decision")
             .and_then(|v| v.as_str())
             .unwrap_or("");
         let detail = params.get("detail").and_then(|v| v.as_str()).unwrap_or("");
-        let m = r10
+        let (m, advanced) = r10
             .turn_completed(&id, decision, detail)
             .map_err(internal_error)?;
-        bus10.publish(BusEvent::new(
-            "mission.turn_completed",
-            "copad-daemon",
-            json!({"mission_id": m.id, "decision": decision, "state": m.state.as_str()}),
-        ));
-        serde_json::to_value(&m).map_err(|e| internal_error(format!("serialize mission: {e}")))
+        if advanced {
+            bus10.publish(BusEvent::new(
+                "mission.turn_completed",
+                "copad-daemon",
+                json!({"mission_id": m.id, "decision": decision, "state": m.state.as_str()}),
+            ));
+        }
+        Ok(json!({ "mission": m, "advanced": advanced }))
     });
 
     registry
@@ -1230,7 +1278,7 @@ fn register_approval_actions(
 
     let r4 = registry.clone();
     let bus4 = bus.clone();
-    actions.register_blocking("approval.grant", move |params| {
+    actions.register_blocking_silent("approval.grant", move |params| {
         let id = require_id_param(&params, "approval.grant")?;
         let by = params.get("by").and_then(|v| v.as_str()).unwrap_or("user");
         let note = params.get("note").and_then(|v| v.as_str());
@@ -1238,18 +1286,24 @@ fn register_approval_actions(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let appr = r4.grant(&id, by, note, now_ms).map_err(internal_error)?;
-        bus4.publish(BusEvent::new(
-            "approval.granted",
-            "copad-daemon",
-            json!({"id": appr.id, "by": appr.decided_by}),
-        ));
-        serde_json::to_value(&appr).map_err(|e| internal_error(format!("serialize: {e}")))
+        let (appr, transitioned) = r4.grant(&id, by, note, now_ms).map_err(internal_error)?;
+        // Only emit the bus event when the registry actually moved the
+        // state — calling grant on a terminal approval is a no-op and
+        // a phantom `approval.granted` would falsely unblock waiters
+        // (codex C1).
+        if transitioned {
+            bus4.publish(BusEvent::new(
+                "approval.granted",
+                "copad-daemon",
+                json!({"id": appr.id, "by": appr.decided_by}),
+            ));
+        }
+        Ok(json!({ "approval": appr, "transitioned": transitioned }))
     });
 
     let r5 = registry.clone();
     let bus5 = bus.clone();
-    actions.register_blocking("approval.deny", move |params| {
+    actions.register_blocking_silent("approval.deny", move |params| {
         let id = require_id_param(&params, "approval.deny")?;
         let by = params.get("by").and_then(|v| v.as_str()).unwrap_or("user");
         let reason = params.get("reason").and_then(|v| v.as_str());
@@ -1257,13 +1311,15 @@ fn register_approval_actions(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let appr = r5.deny(&id, by, reason, now_ms).map_err(internal_error)?;
-        bus5.publish(BusEvent::new(
-            "approval.denied",
-            "copad-daemon",
-            json!({"id": appr.id, "by": appr.decided_by, "reason": appr.decision_note}),
-        ));
-        serde_json::to_value(&appr).map_err(|e| internal_error(format!("serialize: {e}")))
+        let (appr, transitioned) = r5.deny(&id, by, reason, now_ms).map_err(internal_error)?;
+        if transitioned {
+            bus5.publish(BusEvent::new(
+                "approval.denied",
+                "copad-daemon",
+                json!({"id": appr.id, "by": appr.decided_by, "reason": appr.decision_note}),
+            ));
+        }
+        Ok(json!({ "approval": appr, "transitioned": transitioned }))
     });
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -1333,10 +1389,9 @@ fn register_runledger_actions(
             .get("limit")
             .and_then(|v| v.as_u64())
             .map(|n| n as usize);
-        let entries = r1
+        let (entries, total) = r1
             .replay(since_ms, kinds.as_deref(), limit)
             .map_err(internal_error)?;
-        let total = entries.len();
         Ok(json!({ "entries": entries, "total": total }))
     });
 
@@ -1512,6 +1567,23 @@ fn spawn_goal_tick_thread(
                         history_tail
                     },
                 );
+                // Reserve the goal BEFORE publishing the tick event
+                // (codex C5). Without this, `next_runnable()` would
+                // re-pick the same goal every 60 seconds while an
+                // outstanding tick was still in flight, duplicating
+                // work. We use a synthetic `tick-<unix_ms>` panel id
+                // because the daemon doesn't know the GUI panel id yet
+                // — the GUI claims the slot on `goal.tick.completed`
+                // by passing the real panel id forward.
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let synthetic_panel = format!("tick-{now_ms}");
+                if let Err(e) = goals.mark_in_flight(&goal.id, &synthetic_panel, now_ms) {
+                    log::warn!("goal tick mark_in_flight {}: {e}", goal.id);
+                    continue;
+                }
                 bus.publish(BusEvent::new(
                     "goal.tick.started",
                     "copad-daemon",
@@ -1521,6 +1593,7 @@ fn spawn_goal_tick_thread(
                         "project": goal.project,
                         "workspace_path": goal.project_path,
                         "prompt": prompt,
+                        "in_flight_marker": synthetic_panel,
                     }),
                 ));
             }

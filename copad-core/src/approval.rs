@@ -24,6 +24,12 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+fn next_approval_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ApprovalState {
@@ -142,7 +148,7 @@ impl ApprovalRegistry {
         ttl_secs: u64,
         now_ms: i64,
     ) -> Result<Approval, String> {
-        let id = format!("approval-{}", now_ms);
+        let id = format!("approval-{}-{}", now_ms, next_approval_seq());
         let appr = Approval {
             id: id.clone(),
             action: action.to_string(),
@@ -167,32 +173,44 @@ impl ApprovalRegistry {
     where
         F: FnOnce(&mut Approval),
     {
+        // Lock held through `persist` (codex C4): dropping the lock
+        // before fs IO opened a window where an older snapshot could
+        // overwrite a newer one on disk under concurrent updates.
+        // fs::rename is fast enough that holding the lock through it
+        // is acceptable for single-user workstation use.
         let mut guard = self.inner.lock().unwrap();
         let appr = guard
             .get_mut(id)
             .ok_or_else(|| format!("approval not found: {id}"))?;
         mutator(appr);
         let snapshot = appr.clone();
-        drop(guard);
         self.persist(&snapshot)?;
         Ok(snapshot)
     }
 
+    /// Returns `(approval, transitioned)`. `transitioned=false` when the
+    /// approval was already in a terminal state — the caller (daemon)
+    /// uses this to suppress the `approval.granted` bus event so a
+    /// post-deny grant call doesn't falsely tell a waiter to proceed
+    /// (codex C1). Same shape for `deny` / `sweep_expired`.
     pub fn grant(
         &self,
         id: &str,
         by: &str,
         note: Option<&str>,
         now_ms: i64,
-    ) -> Result<Approval, String> {
-        self.update(id, |a| {
+    ) -> Result<(Approval, bool), String> {
+        let mut did_transition = false;
+        let appr = self.update(id, |a| {
             if a.state == ApprovalState::Pending {
                 a.state = ApprovalState::Granted;
                 a.decided_at_ms = Some(now_ms);
                 a.decided_by = Some(by.to_string());
                 a.decision_note = note.map(String::from);
+                did_transition = true;
             }
-        })
+        })?;
+        Ok((appr, did_transition))
     }
 
     pub fn deny(
@@ -201,20 +219,25 @@ impl ApprovalRegistry {
         by: &str,
         reason: Option<&str>,
         now_ms: i64,
-    ) -> Result<Approval, String> {
-        self.update(id, |a| {
+    ) -> Result<(Approval, bool), String> {
+        let mut did_transition = false;
+        let appr = self.update(id, |a| {
             if a.state == ApprovalState::Pending {
                 a.state = ApprovalState::Denied;
                 a.decided_at_ms = Some(now_ms);
                 a.decided_by = Some(by.to_string());
                 a.decision_note = reason.map(String::from);
+                did_transition = true;
             }
-        })
+        })?;
+        Ok((appr, did_transition))
     }
 
-    /// Sweep expired pending approvals. Returns the list that just
-    /// transitioned. Caller (the daemon's sweeper thread) publishes
-    /// `approval.expired` per returned entry.
+    /// Sweep expired pending approvals. Returns only entries that
+    /// **actually transitioned this call** (codex C2 fix) — concurrent
+    /// grant/deny between the filter pass and the per-id update means
+    /// the mutator no-ops, in which case we MUST NOT republish an
+    /// `approval.expired` event.
     pub fn sweep_expired(&self, now_ms: i64) -> Vec<Approval> {
         let mut transitioned = Vec::new();
         let ids: Vec<String> = self
@@ -226,14 +249,17 @@ impl ApprovalRegistry {
             .map(|a| a.id.clone())
             .collect();
         for id in ids {
+            let mut did_transition = false;
             if let Ok(a) = self.update(&id, |a| {
                 if a.state == ApprovalState::Pending {
                     a.state = ApprovalState::Expired;
                     a.decided_at_ms = Some(now_ms);
                     a.decided_by = Some("system".into());
                     a.decision_note = Some("expired".into());
+                    did_transition = true;
                 }
-            }) {
+            }) && did_transition
+            {
                 transitioned.push(a);
             }
         }
@@ -305,7 +331,8 @@ mod tests {
         let a = r
             .request("x", serde_json::Value::Null, "", None, None, None, 60, 1)
             .unwrap();
-        let g = r.grant(&a.id, "user", Some("ok"), 100).unwrap();
+        let (g, transitioned) = r.grant(&a.id, "user", Some("ok"), 100).unwrap();
+        assert!(transitioned);
         assert_eq!(g.state, ApprovalState::Granted);
         assert_eq!(g.decided_by.as_deref(), Some("user"));
         assert_eq!(g.decided_at_ms, Some(100));
@@ -318,7 +345,8 @@ mod tests {
         let a = r
             .request("x", serde_json::Value::Null, "", None, None, None, 60, 1)
             .unwrap();
-        let d = r.deny(&a.id, "user", Some("no thanks"), 100).unwrap();
+        let (d, transitioned) = r.deny(&a.id, "user", Some("no thanks"), 100).unwrap();
+        assert!(transitioned);
         assert_eq!(d.state, ApprovalState::Denied);
         assert_eq!(d.decision_note.as_deref(), Some("no thanks"));
         let _ = fs::remove_dir_all(&r.root);
@@ -348,9 +376,13 @@ mod tests {
             .request("x", serde_json::Value::Null, "", None, None, None, 60, 1)
             .unwrap();
         let _ = r.deny(&a.id, "u", None, 50).unwrap();
-        let g = r.grant(&a.id, "u", None, 100).unwrap();
-        // State stayed Denied.
+        let (g, transitioned) = r.grant(&a.id, "u", None, 100).unwrap();
+        // State stayed Denied AND we report no transition (codex C1 fix).
         assert_eq!(g.state, ApprovalState::Denied);
+        assert!(
+            !transitioned,
+            "grant on terminal state must not report transition"
+        );
         let _ = fs::remove_dir_all(&r.root);
     }
 
@@ -382,6 +414,10 @@ mod tests {
             )
             .unwrap();
         r.grant(&a1.id, "u", None, 10).unwrap();
+        // Adding a codex C2 sanity check inline: a second grant on the
+        // already-granted record must NOT report transition.
+        let (_, trans) = r.grant(&a1.id, "u", None, 11).unwrap();
+        assert!(!trans);
         let pending = r.list_for(Some(ApprovalState::Pending), None);
         assert_eq!(pending.len(), 1);
         let p1_only = r.list_for(None, Some("p1"));

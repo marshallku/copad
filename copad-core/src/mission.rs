@@ -16,6 +16,14 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+/// Process-local sequence for mission id uniqueness inside one wall
+/// millisecond.
+fn next_mission_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MissionState {
@@ -179,7 +187,9 @@ impl MissionRegistry {
         urgency: u8,
         now_ms: i64,
     ) -> Result<Mission, String> {
-        let id = format!("mission-{}", now_ms);
+        // Sequence ensures uniqueness inside one wall millisecond
+        // (codex I1: `now_ms` is real millis now).
+        let id = format!("mission-{}-{}", now_ms, next_mission_seq());
         let mission = Mission {
             id: id.clone(),
             title: title.to_string(),
@@ -206,90 +216,164 @@ impl MissionRegistry {
     where
         F: FnOnce(&mut Mission),
     {
+        // Lock held through `persist` — codex C4 closes the window where
+        // an older snapshot could overwrite a newer one on disk.
         let mut guard = self.inner.lock().unwrap();
         let mission = guard
             .get_mut(id)
             .ok_or_else(|| format!("mission not found: {id}"))?;
         mutator(mission);
         let snapshot = mission.clone();
-        drop(guard);
         self.persist(&snapshot)?;
         Ok(snapshot)
     }
 
-    pub fn pause(&self, id: &str) -> Result<Mission, String> {
-        self.update(id, |m| {
-            if !m.state.is_terminal() {
-                m.paused = true;
-                if m.state == MissionState::Active {
-                    m.state = MissionState::Paused;
-                }
+    /// Returns `(mission, advanced)`. Pause/resume become no-ops on
+    /// terminal missions (codex round-5 C1) — daemon handler suppresses
+    /// the bus event on no-op.
+    pub fn pause(&self, id: &str) -> Result<(Mission, bool), String> {
+        let mut advanced = false;
+        let m = self.update(id, |m| {
+            if m.state.is_terminal() || m.paused {
+                return;
             }
-        })
+            m.paused = true;
+            if m.state == MissionState::Active || m.state == MissionState::Pending {
+                m.state = MissionState::Paused;
+            }
+            advanced = true;
+        })?;
+        Ok((m, advanced))
     }
 
-    pub fn resume(&self, id: &str) -> Result<Mission, String> {
-        self.update(id, |m| {
+    pub fn resume(&self, id: &str) -> Result<(Mission, bool), String> {
+        let mut advanced = false;
+        let m = self.update(id, |m| {
             if m.state == MissionState::Paused {
                 m.paused = false;
-                m.state = MissionState::Active;
+                m.state = if m.last_turn_at_ms > 0 {
+                    MissionState::Active
+                } else {
+                    MissionState::Pending
+                };
+                advanced = true;
             }
-        })
+        })?;
+        Ok((m, advanced))
     }
 
-    pub fn redirect_objective(&self, id: &str, new_objective: &str) -> Result<Mission, String> {
-        let _ = self.append_timeline(id, "redirected", new_objective);
-        self.update(id, |m| {
+    /// Codex round-6 C1: append the timeline entry only when the
+    /// mutation actually applied — terminal missions shouldn't see
+    /// their `timeline.md` mutated.
+    pub fn redirect_objective(
+        &self,
+        id: &str,
+        new_objective: &str,
+    ) -> Result<(Mission, bool), String> {
+        let mut advanced = false;
+        let m = self.update(id, |m| {
             if !m.state.is_terminal() {
                 m.objective = new_objective.to_string();
+                advanced = true;
             }
-        })
+        })?;
+        if advanced {
+            let _ = self.append_timeline(id, "redirected", new_objective);
+        }
+        Ok((m, advanced))
     }
 
+    /// Codex round-3 C3: refuses to mutate terminal missions. The prior
+    /// implementation appended assignments to aborted/done missions
+    /// because it didn't gate on `is_terminal()`.
     pub fn assign_agent(&self, id: &str, agent_id: &str, role: &str) -> Result<Mission, String> {
-        let _ = self.append_timeline(id, "agent_assigned", &format!("{agent_id} as {role}"));
-        self.update(id, |m| {
+        let mut advanced = false;
+        let after = self.update(id, |m| {
+            if m.state.is_terminal() {
+                return;
+            }
+            advanced = true;
             m.assigned_agents.push(AgentAssignment {
                 agent_id: agent_id.to_string(),
                 role: role.to_string(),
             });
-        })
+        })?;
+        if advanced {
+            let _ = self.append_timeline(id, "agent_assigned", &format!("{agent_id} as {role}"));
+        }
+        Ok(after)
     }
 
-    pub fn abort(&self, id: &str) -> Result<Mission, String> {
-        let _ = self.append_timeline(id, "aborted", "");
-        self.update(id, |m| {
+    /// Returns `(mission, advanced)`. Codex round-5 C1: prior version
+    /// appended the timeline entry BEFORE checking terminal state, then
+    /// only mutated when not-terminal — so a completed mission's
+    /// timeline got an "aborted" line and the daemon still emitted
+    /// `mission.aborted` even though state stayed Done.
+    pub fn abort(&self, id: &str) -> Result<(Mission, bool), String> {
+        let mut advanced = false;
+        let m = self.update(id, |m| {
             if !m.state.is_terminal() {
                 m.state = MissionState::Aborted;
+                advanced = true;
             }
-        })
+        })?;
+        if advanced {
+            let _ = self.append_timeline(id, "aborted", "");
+        }
+        Ok((m, advanced))
     }
 
-    /// Mark a turn started — driver records the timing for budget tracking
-    /// + emits `mission.turn_started`. Returns the updated mission.
-    pub fn turn_started(&self, id: &str, now_ms: i64) -> Result<Mission, String> {
-        let _ = self.append_timeline(id, "turn_started", "");
-        self.update(id, |m| {
+    /// Mark a turn started. **Codex round-2 C2**: refuses to advance a
+    /// paused or terminal mission — the prior implementation bumped
+    /// `last_turn_at_ms` + `turn_count` regardless, which then poisoned
+    /// the `resume` heuristic (`last_turn_at_ms > 0 → Active`) so a
+    /// paused-pending mission resumed as Active instead of Pending.
+    /// Returns `(mission, advanced)`. `advanced=false` when paused /
+    /// terminal — daemon handler uses this to suppress the
+    /// `mission.turn_started` event so external listeners don't act on
+    /// refused turns (codex round-3 C1).
+    pub fn turn_started(&self, id: &str, now_ms: i64) -> Result<(Mission, bool), String> {
+        let mut advanced = false;
+        let after = self.update(id, |m| {
+            if m.paused || m.state.is_terminal() || m.state == MissionState::Paused {
+                return;
+            }
             if m.state == MissionState::Pending {
                 m.state = MissionState::Active;
             }
             m.last_turn_at_ms = now_ms;
             m.turn_count = m.turn_count.saturating_add(1);
-        })
+            advanced = true;
+        })?;
+        if advanced {
+            let _ = self.append_timeline(id, "turn_started", "");
+        }
+        Ok((after, advanced))
     }
 
+    /// Returns `(mission, advanced)`. Same paused-blind protection as
+    /// `turn_started` (codex round-3 C2): a paused or terminal mission
+    /// can't be completed/advanced by `turn_completed`.
     pub fn turn_completed(
         &self,
         id: &str,
         decision: &str,
         detail: &str,
-    ) -> Result<Mission, String> {
-        let _ = self.append_timeline(id, "turn_completed", &format!("{decision}: {detail}"));
-        self.update(id, |m| {
-            if decision == "complete" && !m.state.is_terminal() {
+    ) -> Result<(Mission, bool), String> {
+        let mut advanced = false;
+        let after = self.update(id, |m| {
+            if m.paused || m.state.is_terminal() || m.state == MissionState::Paused {
+                return;
+            }
+            advanced = true;
+            if decision == "complete" {
                 m.state = MissionState::Done;
             }
-        })
+        })?;
+        if advanced {
+            let _ = self.append_timeline(id, "turn_completed", &format!("{decision}: {detail}"));
+        }
+        Ok((after, advanced))
     }
 
     fn persist(&self, mission: &Mission) -> Result<(), String> {
@@ -393,7 +477,7 @@ mod tests {
                 1,
             )
             .unwrap();
-        let m2 = r.turn_started(&m.id, 100).unwrap();
+        let (m2, _) = r.turn_started(&m.id, 100).unwrap();
         assert_eq!(m2.state, MissionState::Active);
         assert_eq!(m2.turn_count, 1);
         let _ = fs::remove_dir_all(&r.root);
@@ -416,12 +500,123 @@ mod tests {
             )
             .unwrap();
         r.turn_started(&m.id, 10).unwrap();
-        let p = r.pause(&m.id).unwrap();
+        let (p, _) = r.pause(&m.id).unwrap();
         assert_eq!(p.state, MissionState::Paused);
         assert!(p.paused);
-        let r2 = r.resume(&m.id).unwrap();
+        let (r2, _) = r.resume(&m.id).unwrap();
         assert_eq!(r2.state, MissionState::Active);
         assert!(!r2.paused);
+        let _ = fs::remove_dir_all(&r.root);
+    }
+
+    #[test]
+    fn pause_pending_mission_then_resume_returns_to_pending() {
+        // Codex C3: pausing a pending mission previously left state=Pending
+        // with paused=true, and resume only handled state=Paused → stranded.
+        // Fix: pause transitions Pending → Paused; resume reads last_turn
+        // to return to Pending (no turn yet) or Active (turn already ran).
+        let r = mk();
+        let m = r
+            .submit(
+                "t",
+                "o",
+                None,
+                vec![],
+                MissionBudget::default(),
+                vec![],
+                None,
+                1,
+                1,
+            )
+            .unwrap();
+        assert_eq!(m.state, MissionState::Pending);
+        let (p, _) = r.pause(&m.id).unwrap();
+        assert_eq!(p.state, MissionState::Paused);
+        assert!(p.paused);
+        let (r2, _) = r.resume(&m.id).unwrap();
+        // Never ticked → resume returns to Pending, not Active.
+        assert_eq!(r2.state, MissionState::Pending);
+        assert!(!r2.paused);
+        let _ = fs::remove_dir_all(&r.root);
+    }
+
+    #[test]
+    fn turn_completed_refuses_paused_mission_round3_c2() {
+        let r = mk();
+        let m = r
+            .submit(
+                "t",
+                "o",
+                None,
+                vec![],
+                MissionBudget::default(),
+                vec![],
+                None,
+                1,
+                1,
+            )
+            .unwrap();
+        r.turn_started(&m.id, 10).unwrap();
+        r.pause(&m.id).unwrap();
+        let (after, advanced) = r.turn_completed(&m.id, "complete", "x").unwrap();
+        assert!(!advanced);
+        assert_eq!(after.state, MissionState::Paused);
+        let _ = fs::remove_dir_all(&r.root);
+    }
+
+    #[test]
+    fn assign_agent_refuses_terminal_mission_round3_c3() {
+        let r = mk();
+        let m = r
+            .submit(
+                "t",
+                "o",
+                None,
+                vec![],
+                MissionBudget::default(),
+                vec![],
+                None,
+                1,
+                1,
+            )
+            .unwrap();
+        r.abort(&m.id).unwrap();
+        let m2 = r.assign_agent(&m.id, "architect", "lead").unwrap();
+        assert_eq!(m2.state, MissionState::Aborted);
+        assert_eq!(m2.assigned_agents.len(), 0);
+        let _ = fs::remove_dir_all(&r.root);
+    }
+
+    #[test]
+    fn turn_started_refuses_to_advance_paused_mission() {
+        // Codex round-2 C2: prior turn_started bumped last_turn_at_ms +
+        // turn_count regardless of paused, which poisoned the resume
+        // heuristic (last_turn_at_ms > 0 → Active).
+        let r = mk();
+        let m = r
+            .submit(
+                "t",
+                "o",
+                None,
+                vec![],
+                MissionBudget::default(),
+                vec![],
+                None,
+                1,
+                1,
+            )
+            .unwrap();
+        let (p, _) = r.pause(&m.id).unwrap();
+        assert_eq!(p.state, MissionState::Paused);
+        let (after_attempt, _) = r.turn_started(&m.id, 100).unwrap();
+        // Nothing changed.
+        assert_eq!(after_attempt.last_turn_at_ms, 0);
+        assert_eq!(after_attempt.turn_count, 0);
+        assert_eq!(after_attempt.state, MissionState::Paused);
+        // Resume → Pending (not Active) because no valid turn ever
+        // happened.
+        let (resumed, _) = r.resume(&m.id).unwrap();
+        assert_eq!(resumed.state, MissionState::Pending);
         let _ = fs::remove_dir_all(&r.root);
     }
 
@@ -441,11 +636,12 @@ mod tests {
                 1,
             )
             .unwrap();
-        let a = r.abort(&m.id).unwrap();
+        let (a, _) = r.abort(&m.id).unwrap();
         assert_eq!(a.state, MissionState::Aborted);
         // Abort again is a no-op (state stays terminal, no error).
-        let a2 = r.abort(&m.id).unwrap();
+        let (a2, advanced) = r.abort(&m.id).unwrap();
         assert_eq!(a2.state, MissionState::Aborted);
+        assert!(!advanced, "abort on terminal must be no-op");
         let _ = fs::remove_dir_all(&r.root);
     }
 
@@ -488,7 +684,7 @@ mod tests {
                 1,
             )
             .unwrap();
-        let m2 = r.redirect_objective(&m.id, "new objective").unwrap();
+        let (m2, _) = r.redirect_objective(&m.id, "new objective").unwrap();
         assert_eq!(m2.objective, "new objective");
         let _ = fs::remove_dir_all(&r.root);
     }
@@ -510,7 +706,7 @@ mod tests {
             )
             .unwrap();
         r.turn_started(&m.id, 10).unwrap();
-        let m2 = r.turn_completed(&m.id, "complete", "shipped").unwrap();
+        let (m2, _) = r.turn_completed(&m.id, "complete", "shipped").unwrap();
         assert_eq!(m2.state, MissionState::Done);
         let _ = fs::remove_dir_all(&r.root);
     }

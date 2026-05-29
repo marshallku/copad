@@ -1734,9 +1734,21 @@ fn handle_workflow_run(
         },
     };
 
+    // Codex round-8 C1: merge unfilled optional fields as either their
+    // `default` or "" before substitute, so `cross-review` with no
+    // `intent_brief` doesn't fail as `template_error: unknown
+    // placeholder 'intent_brief'`. Required fields are already
+    // validated above.
+    let mut effective_values = values.clone();
+    for field in &spec.form_fields {
+        if !effective_values.contains_key(&field.name) {
+            let default = field.default.clone().unwrap_or_default();
+            effective_values.insert(field.name.clone(), default);
+        }
+    }
     let prompt = match copad_core::workflow::substitute(
         &spec.prompt,
-        &values,
+        &effective_values,
         resolved_project.as_ref(),
         &workspace_path,
     ) {

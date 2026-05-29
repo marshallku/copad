@@ -100,16 +100,21 @@ impl Runledger {
     /// files newer than or equal to the month of `since_ms` —
     /// month boundaries don't bite for v1 because users mostly
     /// query "last hour" / "last day."
+    /// Returns `(entries, total_matched)`. `total_matched` is the count
+    /// **before** `limit` truncation — callers paginating need this to
+    /// know whether more matches exist. Codex round-2 I1: the action
+    /// handler was previously reporting `entries.len()` AFTER truncate,
+    /// which made `total` equal to the page size.
     pub fn replay(
         &self,
         since_ms: i64,
         kinds: Option<&[String]>,
         limit: Option<usize>,
-    ) -> Result<Vec<LedgerEntry>, String> {
+    ) -> Result<(Vec<LedgerEntry>, usize), String> {
         let mut entries: Vec<LedgerEntry> = Vec::new();
         let entries_iter = match fs::read_dir(&self.root) {
             Ok(e) => e,
-            Err(_) => return Ok(entries),
+            Err(_) => return Ok((entries, 0)),
         };
         let mut months: Vec<PathBuf> = entries_iter
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -142,10 +147,11 @@ impl Runledger {
         }
         // Newest first.
         entries.sort_by_key(|e| std::cmp::Reverse(e.ts_ms));
+        let total_matched = entries.len();
         if let Some(n) = limit {
             entries.truncate(n);
         }
-        Ok(entries)
+        Ok((entries, total_matched))
     }
 
     fn path_for(&self, month: &str) -> PathBuf {
@@ -232,7 +238,7 @@ mod tests {
             .unwrap();
         r.append(&mk_event("test.evt", serde_json::json!({"x": 2})))
             .unwrap();
-        let entries = r.replay(0, None, None).unwrap();
+        let (entries, _) = r.replay(0, None, None).unwrap();
         assert_eq!(entries.len(), 2);
         let _ = fs::remove_dir_all(&r.root);
     }
@@ -248,7 +254,7 @@ mod tests {
         // Don't fall behind the wall clock — `event_ts_ms` uses the max
         // of payload + wall clock so the durable record matches the
         // bus's view; we just assert there's at least one entry.
-        let entries = r.replay(0, None, None).unwrap();
+        let (entries, _) = r.replay(0, None, None).unwrap();
         assert!(!entries.is_empty());
         let _ = fs::remove_dir_all(&r.root);
     }
@@ -262,7 +268,7 @@ mod tests {
             .unwrap();
         r.append(&mk_event("mission.aborted", serde_json::json!({})))
             .unwrap();
-        let mission_only = r.replay(0, Some(&["mission.*".to_string()]), None).unwrap();
+        let (mission_only, _) = r.replay(0, Some(&["mission.*".to_string()]), None).unwrap();
         assert_eq!(mission_only.len(), 2);
         assert!(mission_only.iter().all(|e| e.kind.starts_with("mission.")));
         let _ = fs::remove_dir_all(&r.root);
@@ -275,7 +281,7 @@ mod tests {
             r.append(&mk_event("e", serde_json::json!({ "i": i })))
                 .unwrap();
         }
-        let three = r.replay(0, None, Some(3)).unwrap();
+        let (three, _) = r.replay(0, None, Some(3)).unwrap();
         assert_eq!(three.len(), 3);
         let _ = fs::remove_dir_all(&r.root);
     }

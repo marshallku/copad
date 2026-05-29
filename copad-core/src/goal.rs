@@ -273,6 +273,10 @@ impl GoalRegistry {
             .cloned()
     }
 
+    /// `now_ms` is real milliseconds (codex I1) — it's persisted into
+    /// `created_at_ms` verbatim. The id is uniquified separately by a
+    /// process-local sequence so two goals created in the same wall
+    /// millisecond still get distinct ids.
     pub fn create(
         &self,
         title: &str,
@@ -281,7 +285,8 @@ impl GoalRegistry {
         roadmap_template: Option<&str>,
         now_ms: i64,
     ) -> Result<Goal, String> {
-        let id = format!("goal-{}", now_ms);
+        let seq = next_goal_seq();
+        let id = format!("goal-{}-{}", now_ms, seq);
         let goal = Goal {
             id: id.clone(),
             title: title.to_string(),
@@ -317,15 +322,16 @@ impl GoalRegistry {
     where
         F: FnOnce(&mut Goal),
     {
+        // Lock held through `persist` (codex C4): dropping it before fs
+        // IO let an older snapshot overwrite a newer one on disk under
+        // concurrent ticks + user mutations. Re-restoring lock-during-IO
+        // serializes persistence to match in-memory mutation order.
         let mut guard = self.inner.lock().unwrap();
         let goal = guard
             .get_mut(id)
             .ok_or_else(|| format!("goal not found: {id}"))?;
         mutator(goal);
         let snapshot = goal.clone();
-        // Persistence requires fs IO — drop lock first to avoid blocking
-        // other readers if the FS is slow. Lock is re-acquired below.
-        drop(guard);
         self.persist(&snapshot)?;
         Ok(snapshot)
     }
@@ -337,20 +343,41 @@ impl GoalRegistry {
         })
     }
 
+    /// `expected_marker` (codex round-2 C1): when `Some`, the apply
+    /// only proceeds if `g.in_flight_panel_id == expected_marker`. A
+    /// stale duplicate `goal.tick.apply` from an earlier tick can't
+    /// clear a newer in-flight reservation. When `None`, validation is
+    /// skipped — the caller has explicitly opted into "force apply" (e.g.
+    /// manual operator override via `coctl goal tick-apply` with no
+    /// marker passed).
     pub fn apply_tick_result(
         &self,
         id: &str,
         result: TickResult,
         now_ms: i64,
-    ) -> Result<Goal, String> {
-        self.update(id, |g| {
-            // If the goal was cancelled/paused/done while the tick was
-            // running, discard the result entirely (still clear in-flight
-            // marker so the panel doesn't show stuck status).
+        expected_marker: Option<&str>,
+    ) -> Result<(Goal, bool), String> {
+        let mut applied = false;
+        let goal = self.update(id, |g| {
+            // Codex round-2 C1: validate that the marker matches before
+            // touching anything. Mismatch → drop the apply on the floor,
+            // leaving the newer tick's reservation untouched.
+            if let Some(expected) = expected_marker
+                && g.in_flight_panel_id.as_deref() != Some(expected)
+            {
+                return;
+            }
+            // Codex round-7 C1: clear in-flight marker first (so the
+            // panel doesn't show stuck status) but DON'T flip
+            // `applied=true` until we know we'll actually mutate
+            // history/status. The prior version returned `applied=true`
+            // for cancelled/paused goals → daemon emitted a phantom
+            // `goal.tick.completed`.
             g.in_flight_panel_id = None;
             if g.status != GoalStatus::Running {
                 return;
             }
+            applied = true;
             let outcome_str = result.outcome.as_str().to_string();
             let detail = result.detail.clone();
             g.history.push(TickRecord {
@@ -383,41 +410,64 @@ impl GoalRegistry {
                     }
                 }
             }
-        })
+        })?;
+        Ok((goal, applied))
     }
 
-    pub fn pause(&self, id: &str) -> Result<Goal, String> {
-        self.update(id, |g| {
+    /// Returns `(goal, advanced)` — `advanced=false` when the call was a
+    /// no-op (codex round-5 C1). Daemon handlers suppress the
+    /// `goal.paused` / `goal.resumed` bus events on no-op so external
+    /// listeners can't be falsely driven from a done/cancelled goal.
+    pub fn pause(&self, id: &str) -> Result<(Goal, bool), String> {
+        let mut advanced = false;
+        let goal = self.update(id, |g| {
             if g.status == GoalStatus::Running || g.status == GoalStatus::Blocked {
                 g.status = GoalStatus::Paused;
+                advanced = true;
             }
-        })
+        })?;
+        Ok((goal, advanced))
     }
 
-    pub fn resume(&self, id: &str) -> Result<Goal, String> {
-        self.update(id, |g| {
+    pub fn resume(&self, id: &str) -> Result<(Goal, bool), String> {
+        let mut advanced = false;
+        let goal = self.update(id, |g| {
             if g.status == GoalStatus::Paused {
                 g.status = GoalStatus::Running;
+                advanced = true;
             }
-        })
+        })?;
+        Ok((goal, advanced))
     }
 
-    pub fn answer(&self, id: &str, answer: &str) -> Result<Goal, String> {
-        self.update(id, |g| {
+    /// Returns `(goal, advanced)` — `advanced=false` when the goal was
+    /// not Blocked at call time (codex round-4 C1). Daemon handler
+    /// suppresses the `goal.unblocked` event on no-op.
+    pub fn answer(&self, id: &str, answer: &str) -> Result<(Goal, bool), String> {
+        let mut advanced = false;
+        let goal = self.update(id, |g| {
             if g.status == GoalStatus::Blocked {
                 g.blocked_answer = Some(answer.to_string());
                 g.status = GoalStatus::Running;
                 g.no_progress_count = 0;
+                advanced = true;
             }
-        })
+        })?;
+        Ok((goal, advanced))
     }
 
-    pub fn cancel(&self, id: &str) -> Result<Goal, String> {
-        self.update(id, |g| {
+    /// Returns `(goal, advanced)` — `advanced=false` when the goal was
+    /// already terminal. Daemon handler suppresses the
+    /// `goal.cancelled` event on no-op (codex round-4 C1).
+    pub fn cancel(&self, id: &str) -> Result<(Goal, bool), String> {
+        let mut advanced = false;
+        let goal = self.update(id, |g| {
             if !g.status.is_terminal() {
                 g.status = GoalStatus::Cancelled;
+                advanced = true;
             }
-        })
+        })?;
+        Ok((goal, advanced))
     }
 
     pub fn roadmap_path(&self, id: &str) -> PathBuf {
@@ -442,6 +492,15 @@ impl GoalRegistry {
             .map_err(|e| format!("rename {}: {e}", state_path.display()))?;
         Ok(())
     }
+}
+
+/// Process-local sequence for goal id uniqueness inside the same wall
+/// millisecond. Cross-process collisions are not a concern — copadd is
+/// the single writer.
+fn next_goal_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 fn default_roadmap(goal: &Goal) -> String {
@@ -544,7 +603,7 @@ mod tests {
             outcome: TickOutcome::RecordProgress,
             detail: "did X".into(),
         };
-        let updated = r.apply_tick_result(&g.id, result, 10).unwrap();
+        let (updated, _) = r.apply_tick_result(&g.id, result, 10, None).unwrap();
         assert_eq!(updated.no_progress_count, 0);
         assert_eq!(updated.history.len(), 1);
         assert!(updated.in_flight_panel_id.is_none());
@@ -560,7 +619,7 @@ mod tests {
             outcome: TickOutcome::AskPlayer,
             detail: "What region?".into(),
         };
-        let updated = r.apply_tick_result(&g.id, result, 10).unwrap();
+        let (updated, _) = r.apply_tick_result(&g.id, result, 10, None).unwrap();
         assert_eq!(updated.status, GoalStatus::Blocked);
         assert_eq!(updated.blocked_question.as_deref(), Some("What region?"));
         let _ = fs::remove_dir_all(&r.root);
@@ -574,7 +633,7 @@ mod tests {
             outcome: TickOutcome::Complete,
             detail: "shipped".into(),
         };
-        let updated = r.apply_tick_result(&g.id, result, 10).unwrap();
+        let (updated, _) = r.apply_tick_result(&g.id, result, 10, None).unwrap();
         assert_eq!(updated.status, GoalStatus::Done);
         let _ = fs::remove_dir_all(&r.root);
     }
@@ -588,13 +647,35 @@ mod tests {
                 outcome: TickOutcome::Error,
                 detail: format!("err {i}"),
             };
-            let updated = r.apply_tick_result(&g.id, result, i).unwrap();
+            let (updated, _) = r.apply_tick_result(&g.id, result, i, None).unwrap();
             if i < 3 {
                 assert_eq!(updated.status, GoalStatus::Running);
             } else {
                 assert_eq!(updated.status, GoalStatus::Blocked);
             }
         }
+        let _ = fs::remove_dir_all(&r.root);
+    }
+
+    #[test]
+    fn cancelled_goal_apply_reports_not_applied_round7_c1() {
+        // Codex round-7 C1: a cancelled-mid-tick goal that later
+        // receives goal.tick.apply must report applied=false so the
+        // daemon doesn't emit a phantom goal.tick.completed.
+        let r = mk();
+        let g = r.create("a", "p", "/tmp", None, 1).unwrap();
+        r.mark_in_flight(&g.id, "panel-x", 5).unwrap();
+        r.cancel(&g.id).unwrap();
+        let result = TickResult {
+            outcome: TickOutcome::RecordProgress,
+            detail: "discarded".into(),
+        };
+        let (updated, applied) = r
+            .apply_tick_result(&g.id, result, 10, Some("panel-x"))
+            .unwrap();
+        assert!(!applied, "must not report applied for cancelled goal");
+        assert_eq!(updated.status, GoalStatus::Cancelled);
+        assert!(updated.history.is_empty());
         let _ = fs::remove_dir_all(&r.root);
     }
 
@@ -608,7 +689,7 @@ mod tests {
             outcome: TickOutcome::RecordProgress,
             detail: "this should be discarded".into(),
         };
-        let updated = r.apply_tick_result(&g.id, result, 10).unwrap();
+        let (updated, _) = r.apply_tick_result(&g.id, result, 10, None).unwrap();
         assert_eq!(updated.status, GoalStatus::Cancelled);
         assert!(updated.history.is_empty(), "no history append after cancel");
         let _ = fs::remove_dir_all(&r.root);
@@ -627,9 +708,10 @@ mod tests {
                     detail: "?".into(),
                 },
                 10,
+                None,
             )
             .unwrap();
-        let updated = r.answer(&g.id, "yes").unwrap();
+        let (updated, _) = r.answer(&g.id, "yes").unwrap();
         assert_eq!(updated.status, GoalStatus::Running);
         assert_eq!(updated.blocked_answer.as_deref(), Some("yes"));
         assert_eq!(updated.no_progress_count, 0);
@@ -640,9 +722,9 @@ mod tests {
     fn pause_resume_round_trip() {
         let r = mk();
         let g = r.create("a", "p", "/tmp", None, 1).unwrap();
-        let p = r.pause(&g.id).unwrap();
+        let (p, _) = r.pause(&g.id).unwrap();
         assert_eq!(p.status, GoalStatus::Paused);
-        let r2 = r.resume(&g.id).unwrap();
+        let (r2, _) = r.resume(&g.id).unwrap();
         assert_eq!(r2.status, GoalStatus::Running);
         let _ = fs::remove_dir_all(&r.root);
     }

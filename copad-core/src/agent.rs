@@ -139,6 +139,12 @@ impl AgentRegistry {
 
     /// Append a memory entry to the agent's `memory.jsonl` AND the in-memory
     /// list. Single-syscall write via `O_APPEND`.
+    ///
+    /// **Codex round-9 C1**: validates the id is path-safe AND refers to
+    /// a known agent BEFORE any filesystem write. The prior version
+    /// joined caller-supplied `id` directly into `self.root` and called
+    /// `create_dir_all` — `id: "../outside"` would create directories
+    /// outside the agents root and write `memory.jsonl` there.
     pub fn append_memory(
         &self,
         id: &str,
@@ -146,6 +152,11 @@ impl AgentRegistry {
         body: &str,
         now_ms: i64,
     ) -> Result<MemoryEntry, String> {
+        Self::validate_id(id)?;
+        // Verify agent exists in registry (covers builtins + disk-overrides).
+        if !self.inner.lock().unwrap().contains_key(id) {
+            return Err(format!("agent not found: {id}"));
+        }
         let entry = MemoryEntry {
             timestamp_ms: now_ms,
             kind: kind.to_string(),
@@ -167,6 +178,20 @@ impl AgentRegistry {
             a.memory.push(entry.clone());
         }
         Ok(entry)
+    }
+
+    /// Path-safe id check: non-empty, no `/`, no `..`, no NUL, no leading `.`.
+    fn validate_id(id: &str) -> Result<(), String> {
+        if id.is_empty() {
+            return Err("agent id cannot be empty".into());
+        }
+        if id.contains('/') || id.contains('\\') || id.contains('\0') {
+            return Err(format!("agent id '{id}' contains path separator or nul"));
+        }
+        if id == "." || id == ".." || id.starts_with('.') {
+            return Err(format!("agent id '{id}' cannot start with '.'"));
+        }
+        Ok(())
     }
 }
 
@@ -248,6 +273,29 @@ mod tests {
         assert_eq!(a.profile_md, "OVERRIDE BODY");
         assert_eq!(a.autonomy.model.as_deref(), Some("opus"));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn append_memory_rejects_traversal_round9_c1() {
+        let r = AgentRegistry::new(unique_root("traversal"));
+        // Even though "../foo" might look like a path, it must be rejected
+        // before any fs IO.
+        let err = r.append_memory("../outside", "fact", "x", 1).unwrap_err();
+        assert!(err.contains("path separator") || err.contains("not found"));
+        // NUL byte rejection
+        let err = r.append_memory("a\0b", "f", "x", 1).unwrap_err();
+        assert!(err.contains("nul") || err.contains("not found"));
+        let _ = fs::remove_dir_all(&r.root);
+    }
+
+    #[test]
+    fn append_memory_rejects_unknown_agent_round9_c1() {
+        let r = AgentRegistry::new(unique_root("unknown"));
+        let err = r
+            .append_memory("not-a-real-agent", "f", "x", 1)
+            .unwrap_err();
+        assert!(err.contains("agent not found"));
+        let _ = fs::remove_dir_all(&r.root);
     }
 
     #[test]
