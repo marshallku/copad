@@ -325,7 +325,11 @@
     const values = {};
     inputs.forEach((i) => { values[i.name] = i.value; });
     const params = { id: spec.id, values };
-    if (spec.require_project && activeProject) {
+    // Pass the active project whenever one is resolved — not only for
+    // require_project workflows. Project-agnostic workflows (e.g. /catchup)
+    // then run from the project's dir; with no active project the server
+    // falls back to $HOME rather than failing with no_workspace.
+    if (activeProject) {
       params.project = activeProject.name;
     }
     btn.disabled = true;

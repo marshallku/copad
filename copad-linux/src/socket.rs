@@ -1,8 +1,8 @@
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::mpsc;
+use std::sync::Arc;
 
 use gtk4::ApplicationWindow;
 use serde_json::json;
@@ -21,7 +21,7 @@ const WALLPAPER_CACHE: &str = ".cache/terminal-wallpapers.txt";
 const BG_MODE_FILE: &str = ".cache/copad-bg-mode";
 const BUS_SOURCE_COPAD_LINUX: &str = "copad-linux";
 
-pub use copad_daemon::socket::{EventBus, SocketCommand, new_event_bus};
+pub use copad_daemon::socket::{new_event_bus, EventBus, SocketCommand};
 
 pub fn broadcast(bus: &EventBus, event: &Event) {
     bus.publish(BusEvent::new(
@@ -1188,6 +1188,20 @@ fn home_dir() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
+/// Resolve the cwd a `workflow.run` spawns its tab in: a resolved project's
+/// workspace path wins, else the active pane's cwd, else `$HOME`. The final
+/// fallback lets project-agnostic workflows (e.g. `/catchup`) launch from the
+/// panel — whose own pane carries no cwd — instead of failing.
+fn resolve_workflow_workspace(
+    project: Option<&copad_core::project::Project>,
+    active_cwd: Option<PathBuf>,
+) -> PathBuf {
+    match project {
+        Some(p) => p.workspace_path(),
+        None => active_cwd.unwrap_or_else(home_dir),
+    }
+}
+
 fn bg_paths() -> copad_core::background::BackgroundPaths {
     let home = home_dir();
     copad_core::background::BackgroundPaths {
@@ -1721,20 +1735,14 @@ fn handle_workflow_run(
         );
     }
 
-    let workspace_path: std::path::PathBuf = match &resolved_project {
-        Some(p) => p.workspace_path(),
-        None => match mgr.context().snapshot().active_cwd {
-            Some(c) => c,
-            None => {
-                return Response::error(
-                    req.id.clone(),
-                    "no_workspace",
-                    "workflow.run could not resolve a workspace_path — no project and no \
-                     active_cwd in context",
-                );
-            }
-        },
-    };
+    // A resolved project wins; otherwise the active pane's cwd; otherwise
+    // $HOME so project-agnostic workflows (require_project is false here —
+    // required ones already errored above) still get a usable directory
+    // instead of failing with no_workspace.
+    let workspace_path = resolve_workflow_workspace(
+        resolved_project.as_ref(),
+        mgr.context().snapshot().active_cwd,
+    );
 
     // Codex round-8 C1: merge unfilled optional fields as either their
     // `default` or "" before substitute, so `cross-review` with no
@@ -2248,6 +2256,40 @@ mod tests {
     fn derive_session_name_sanitizes_uppercase_and_dots() {
         let p = std::path::Path::new("/x/Feature.Branch/PROJ-456");
         assert_eq!(derive_session_name(p), "feature-branch-proj-456");
+    }
+
+    #[test]
+    fn resolve_workflow_workspace_prefers_project_then_cwd_then_home() {
+        use copad_core::project::Project;
+        let proj = Project {
+            name: "copad".into(),
+            path: PathBuf::from("/home/u/dev/copad"),
+            subpath: None,
+            description: None,
+            aliases: vec![],
+            git_remote: None,
+        };
+        // Project wins even when an active cwd is present.
+        assert_eq!(
+            resolve_workflow_workspace(Some(&proj), Some(PathBuf::from("/elsewhere"))),
+            PathBuf::from("/home/u/dev/copad")
+        );
+        // A project's subpath is honored.
+        let sub = Project {
+            subpath: Some(PathBuf::from("crates/inner")),
+            ..proj.clone()
+        };
+        assert_eq!(
+            resolve_workflow_workspace(Some(&sub), None),
+            PathBuf::from("/home/u/dev/copad/crates/inner")
+        );
+        // No project: active cwd is used.
+        assert_eq!(
+            resolve_workflow_workspace(None, Some(PathBuf::from("/work/here"))),
+            PathBuf::from("/work/here")
+        );
+        // No project and no cwd: $HOME fallback (the project-agnostic path).
+        assert_eq!(resolve_workflow_workspace(None, None), home_dir());
     }
 
     #[test]
