@@ -24,7 +24,9 @@
 | [roadmap.md](./roadmap.md)                 | Implementation phases, pending work         | Planning next steps                       |
 | [harness-integration.md](./harness-integration.md) | Daemon-first pivot + integrations with the user's external harness/tools (~/dotfiles/claude, ~/dev/browser, codex-plugin-cc, life-assistant) | Picking next harness-coupled work |
 | [gui-daemon-protocol.md](./gui-daemon-protocol.md) | GUI ↔ daemon wire protocol spec (Invoke, gui.register, capabilities, origin tagging) | Implementing daemon-first migration step 1+ |
-| [context-bridge.md](./context-bridge.md) | Shell-precmd → `coctl event publish` design piping the active local pane's host/cwd/git/branch/tmux into the bus (Phase 22.1); also archives the SSH OSC design in a revival section | Implementing the bridge on other shells/platforms; designing dossier-panel consumers; reasoning about origin-tagged trust |
+| [context-bridge.md](./context-bridge.md) | Shell-precmd → `coctl event publish` design piping the active local pane's host/cwd/git/branch/tmux into the bus (Phase 22.1 ✅ shipped — Linux `bd31403`, macOS `c14ae96`); also archives the SSH OSC design in a revival section | Implementing the bridge on other shells/platforms; designing project / KB panel consumers; reasoning about origin-tagged trust |
+| [project-orchestration.md](./project-orchestration.md) | Substrate map + data model + filesystem layout + action surface + brain-dispatcher generalization for Phases 22.2 / 22.4 / 22.5 / 22.6 / 22.7 (mission / goal / agent / approval / workflow / pipeline ported into `copad-core` with no life-assistant runtime dependency — decision [#48](./decisions.md)) | Planning or implementing any Phase 22.2+ slice; reasoning about what stays on the life-assistant Go server |
+| [kb-panel.md](./kb-panel.md) | Phase 22.3 KB Panel — read+navigate UI for `~/docs` over `dn`'s incremental indices (`.backlinks/`, `.tags/`) + existing `copad-plugin-kb` actions; editing stays in nvim. Orthogonal to the project-orchestration track | Implementing the docs panel; deciding which Obsidian-like features to surface or defer |
 
 ## Quick Reference
 
