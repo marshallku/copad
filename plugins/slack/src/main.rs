@@ -86,36 +86,11 @@ fn run_auth() {
             std::process::exit(1);
         }
     };
-    // Validate the app-level token via auth.test as well — Slack's
-    // auth.test accepts app-level tokens — so we can confirm the
-    // tokens come from the SAME workspace. Without this, a user
-    // accidentally pasting a bot token from one workspace and an
-    // app token from another would pass independent validation but
-    // connect to a different workspace than auth_status reports.
-    eprintln!("[slack] validating app token via auth.test...");
-    let (app_team_id, _app_user_id) = match socket_mode::auth_test(&config.app_token) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!(
-                "[slack] auth.test (app) failed: {e}\n\
-                 [slack] verify the App-Level Token (xapp-...) is correct and Socket Mode \
-                 is enabled in your Slack App settings"
-            );
-            std::process::exit(1);
-        }
-    };
-    if bot_team_id != app_team_id {
-        eprintln!(
-            "[slack] token mismatch — bot belongs to team {bot_team_id} but app belongs to {app_team_id}.\n\
-             [slack] both tokens must come from the SAME Slack App in the SAME workspace."
-        );
-        std::process::exit(1);
-    }
-    // Validate the App-Level Token also has the runtime scope by
-    // exercising the same endpoint Socket Mode uses —
-    // `apps.connections.open`. Without this, an app token that
-    // passes auth.test but lacks `connections:write` would silently
-    // break the WebSocket path at first connect.
+    // `auth.test` on xapp tokens returns `{ok, app_id, app_name}` with
+    // no team_id/user_id, so the cross-workspace match against the bot
+    // can't actually be enforced here. `apps.connections.open` below
+    // is the only meaningful xapp validation Slack supports for our
+    // use case (token alive + has `connections:write` scope).
     eprintln!("[slack] validating app token via apps.connections.open...");
     if let Err(e) = socket_mode::validate_app_token(&config.app_token) {
         eprintln!(
