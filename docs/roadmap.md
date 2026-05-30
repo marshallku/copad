@@ -789,7 +789,9 @@ User-explicit gap. The terminal core is mature and the plugin substrate is rich,
 2. **Project orchestration spine ported into copad-core** (22.2 / 22.4 / 22.5 / 22.6 / 22.7) — mission/goal/agent/approval/workflow/pipeline reimplemented natively, no life-assistant runtime dependency. Decision: [#48](./decisions.md#48-copad-native-port-of-project-orchestration-spine). Design: [project-orchestration.md](./project-orchestration.md).
 3. **Knowledge base panel** (22.3) — read+navigate UI over `~/docs` driven by `dn`'s incremental indices + existing `kb.*` actions. Design: [kb-panel.md](./kb-panel.md).
 
-Sub-slices are sized for 1–2 week ship windows. 22.2 and 22.3 can run in parallel (orthogonal). 22.4 → 22.7 are sequenced because each depends on the previous slice's data model. Phase 23 — life-assistant module deprecation + one-shot data migration — opens after Phase 22 dogfoods stably.
+Sub-slices are sized for 1–2 week ship windows. 22.2 and 22.3 can run in parallel (orthogonal). 22.4 → 22.7 are sequenced because each depends on the previous slice's data model. Phase 23 — life-assistant module deprecation + one-shot data migration — opens after the orchestration **body** (Phase 24) dogfoods stably.
+
+**Status reframe (2026-05-31).** 22.4–22.7 shipped the spine as data model + CRUD actions + panel sections + CLI, but every autonomous-dispatch piece was deferred at every slice (no tick-thread dispatch in 22.4, no wake-firing in 22.5, no gate hook in 22.6, no pipeline execution in 22.7). The spine is **substrate without a body** — it stores goals/missions but nothing autonomously *runs* an agent turn and reads the result back. That body is externalized to the standalone `csd` CLI ([decision #49](./decisions.md#49-agent-session-dispatch-via-a-standalone-csd-cli--subscription-seat-driver-consumed-by-copad)) and integrated in **Phase 24**. So read 22.4–22.7 as *"substrate complete; autonomous dispatch deferred to Phase 24 / `csd`"* — not as a working autonomous driver.
 
 **Phase 22.1 — Local context bridge (foundational signal)** ✅
 
@@ -918,12 +920,33 @@ Phase 22.7 v1 decisions:
 - **No panel team picker** in this slice. The workflow form already exposes `default_team` as a free-form field; a structured dropdown is the natural follow-up alongside the orchestrator landing.
 - **macOS port deferred** (per phase doc — pipeline registry is data-only and works on macOS via the daemon, but the GUI panel + future orchestrator surfaces are Linux-only today).
 
-### Phase 23: life-assistant trim + data migration (opens after Phase 22 dogfoods stably)
+### Phase 23: life-assistant trim + data migration (opens after Phase 24 dogfoods stably)
 
-- [ ] **Dogfood window** — Phase 22.7 ships, user runs project orchestration through copad for ~2 weeks. Bugs collected; deltas in the Go server are minimal during this window.
+- [ ] **Dogfood window** — Phase 24 ships (the autonomous body), user runs project orchestration through copad for ~2 weeks. The gate is Phase 24, not 22.7: a CRUD-only spine has nothing to dogfood. Bugs collected; deltas in the Go server are minimal during this window.
+- [ ] **Shared dispatch backend** — life-assistant's already-swappable Brain backend gains a `csd` option, so the Go server and copad drive interactive (subscription-seat) sessions through the same tool instead of each owning a `claude -p` path. Lets the server keep orchestrating its daily-ops agents on the flat rate post-2026-06-15 without a copad dependency.
 - [ ] **One-shot data migration script** (`scripts/migrate-from-life-assistant.sh`) — walks `~/bots/<user>/{missions,goals,agents,approvals}/` and translates to copad layout under `~/.local/share/copad/`. Workflow specs migrate from `~/dev/life-assistant/internal/dashboard/workflows/` to `~/.config/copad/workflows/`. Idempotent (re-runnable; skips already-migrated entries by `id`).
 - [ ] **life-assistant module deprecation** — remove `internal/{mission,goal,agent,approval,pipeline,brain}` from the Go server. Dashboard SPA loses mission/goal/approval/workflow pages. Server scope reduces to daily-life ops (Discord/Toss/Yahoo/KMA/news/Google) + cron infrastructure backing those.
 - [ ] **Decision entry** documenting the trimmed life-assistant scope post-migration.
+
+### Phase 24: csd integration + autonomous loop (the body for the 22.4–22.7 spine)
+
+The spine (22.4–22.7) is a brain with no body; Phase 24 gives it one by **consuming the standalone `csd` CLI** (claude/codex session driver, `~/dev/csd`) rather than building dispatch into `copad-core`. `csd` spawns an interactive agent in detached `tmux` on the **flat-rate subscription seat** (the only viable substrate for a heavy user post-2026-06-15 `claude -p` metering) and exposes `spawn` / `send` / `state` / `approve` / `ps` / `kill` as JSON. **`csd` v1 shipped 2026-05-31** (crate `claude-session-driver`, binary `csd`) — the spawn/send/detect/approve layers are built and e2e-verified, so this phase is unblocked. copad consumes it via shell-out + JSON, the same pattern as `tmx agents --json`. Strategic rationale + billing research + non-goals: [decision #49](./decisions.md#49-agent-session-dispatch-via-a-standalone-csd-cli--subscription-seat-driver-consumed-by-copad). `csd` implementation lives in its own repo (docs at `~/dev/csd/docs`).
+
+This phase also promotes copad's two latent server-ish components to first-class, because autonomous orchestration needs a **single always-on host**: `copadd` (the daemon) becomes the 24/7 orchestration server, and `web-bridge` (already an HTTP/WS server, decision #43) becomes its remote face. The cut is deliberate — **only the orchestration dimension is server-shaped** (one host, no split-brain across machines); the rest of copad (terminal, KB, context) stays per-machine self-sufficient per [#48](./decisions.md#48-copad-native-port-of-project-orchestration-spine). This is not a life-assistant rebuild: it is an integrated Rust daemon on the high-perf always-on workstation where the agents actually run, not a separate low-power server app.
+
+- [ ] **24.1 — copadd as 24/7 orchestration host + dispatch glue.** Run `copadd` as a systemd user service (not GUI-spawned). The deferred dispatch from 22.4/22.5/22.7 lands here as thin glue: goal-tick / mission-turn → `csd spawn` / `csd send` → poll `csd state` → map the result to `goal.tick.apply` / `mission.turn_completed`. No native claude-CLI invocation in copad — `csd` owns it.
+- [ ] **24.2 — interaction routing (the 22.6 approval-gate, made real).** When `csd state` reports a gate — `awaiting_answer` (clarifying question), `plan_ready`, or `blocked{gate: trust|permission}` — surface it (panel + notification) and route the reply back: a free-text answer to a question via `csd send`, a menu gate (plan / permission / trust) via `csd approve --option N`. This is what lets agents run unattended yet stop-and-ask safely. (`csd` spawn flags `--auto-accept` / `--bypass-permissions` / `--yolo` tune how much gates even fire.)
+- [ ] **24.3 — visibility.** The projects panel consumes `csd ps --json` (turns in flight) alongside `tmx agents --json` (all sessions). copad visualizes; `csd` drives; `tmx` observes — no reimplementation.
+- [ ] **24.4 — wake conditions → dispatch.** The `WakeCondition` schema persisted in 22.5 gets registered with the TriggerEngine; a firing wake condition feeds the 24.1 dispatch glue. (Depends on Phase 21 Step 11 cron triggers for the time-based variant.)
+- [ ] **24.5 — projects panel reframe.** From orchestration-control + `workflow.run` launcher to: (a) per-project visibility dashboard (goal/mission progress + live `csd`/`tmx` state) and (b) the human-in-the-loop surface for 24.2. `workflow.run` is demoted to a dispatch primitive, not a `tmx`-competing launcher — launching is `tmx`'s job.
+- [ ] **24.6 — web-bridge orchestration surface (remote face).** Extend `web-bridge` from tmux-pane attach to the orchestration cockpit: read goal/mission/`csd` state and answer/approve from a phone or another machine. So a 2am block-and-ask is answerable without sitting at the workstation.
+- [ ] **macOS port deferred** (per the Phase 22 pattern — the daemon glue is shared, the panel/web surfaces are Linux-first).
+
+Phase 24 v1 decisions (rationale for future readers):
+
+- **Consume `csd`, don't embed.** Dispatch logic lives in the standalone tool so the life-assistant server can share it (Phase 23) and so a forced billing-model change (interactive → metered) is a `csd` backend flip, not a copad rewrite. Mirrors the `tmx` boundary (copad observes via `tmx agents --json`, never reimplements).
+- **Single orchestration host, by nature.** Two copad instances can't independently drive the same agents without split-brain, so the autonomous loop is pinned to one always-on `copadd`. Other machines reach it via `web-bridge`; their local terminal/KB/context stay independent.
+- **Open risks carried from #49.** The flat-rate-via-interactive path is a gray-area loophole (could be reclassified/metered or disallowed); the fleet shares the user's own interactive rate limits; `csd`'s capture-pane gate markers are claude-release-dependent. Keep the `csd` backend swappable and re-verify markers per claude version.
 
 ## Pending Cleanup
 
