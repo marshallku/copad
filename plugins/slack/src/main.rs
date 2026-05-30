@@ -124,6 +124,32 @@ fn run_auth() {
         );
         std::process::exit(1);
     }
+    // Same-workspace check: a user token from a different team would let
+    // `as_user: true` posts target unintended workspaces.
+    let user_token = if config.user_token.is_empty() {
+        String::new()
+    } else {
+        eprintln!("[slack] validating user token via auth.test...");
+        let (user_team_id, _) = match socket_mode::auth_test(&config.user_token) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!(
+                    "[slack] auth.test (user) failed: {e}\n\
+                     [slack] verify the User OAuth Token (xoxp-...) is correct \
+                     and the user scopes are granted (OAuth & Permissions → User Token Scopes)"
+                );
+                std::process::exit(1);
+            }
+        };
+        if user_team_id != bot_team_id {
+            eprintln!(
+                "[slack] token mismatch — user token belongs to team {user_team_id} but bot belongs to {bot_team_id}.\n\
+                 [slack] the user token must come from the SAME workspace as the bot."
+            );
+            std::process::exit(1);
+        }
+        config.user_token.clone()
+    };
     let team_id = bot_team_id;
     let user_id = bot_user_id;
     let tokens = TokenSet {
@@ -131,13 +157,19 @@ fn run_auth() {
         app_token: config.app_token.clone(),
         team_id: Some(team_id.clone()),
         user_id: Some(user_id.clone()),
+        user_token: user_token.clone(),
     };
     if let Err(e) = store.save(&tokens) {
         eprintln!("[slack] failed to save tokens: {e}");
         std::process::exit(1);
     }
+    let user_token_note = if user_token.is_empty() {
+        "bot-only"
+    } else {
+        "bot+user"
+    };
     eprintln!(
-        "[slack] auth ok — team={team_id} user={user_id} stored ({})",
+        "[slack] auth ok — team={team_id} user={user_id} mode={user_token_note} stored ({})",
         store.kind()
     );
 }
@@ -334,6 +366,7 @@ fn handle_action(
                 "fatal_error": err,
                 "store_kind": store.kind(),
                 "workspace": config.workspace_label.clone(),
+                "has_user_token": false,
                 "team_id": Value::Null,
                 "user_id": Value::Null,
             }));
@@ -357,6 +390,7 @@ fn handle_action(
         // could be from a different workspace). Surface them only
         // when consistent with the live source.
         let report_identity = credentials_source == "store";
+        let has_user_token = resolved.as_ref().is_some_and(|c| c.user_token.is_some());
         return Ok(json!({
             "configured": true,
             "authenticated": authenticated,
@@ -364,6 +398,7 @@ fn handle_action(
             "fatal_error": Value::Null,
             "store_kind": store.kind(),
             "workspace": config.workspace_label.clone(),
+            "has_user_token": has_user_token,
             "team_id": if report_identity {
                 stored.as_ref().and_then(|t| t.team_id.clone())
             } else { None },
@@ -408,6 +443,11 @@ fn handle_get_message(
         "invalid_params".to_string(),
         "missing 'ts' (string)".to_string(),
     ))?;
+    let as_user = params
+        .get("as_user")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let token = select_action_token(&creds, as_user)?;
     // Slack channel ids start with C/D/G/U and are uppercase
     // alphanumeric. ts looks like "1700000000.000100" — digits and
     // exactly one dot. Validate to close the same trust-boundary
@@ -426,7 +466,7 @@ fn handle_get_message(
             format!("'ts' must be a Slack timestamp (digits.digits); got {ts:?}"),
         ));
     }
-    match socket_mode::get_message(&creds.bot_token, channel, ts) {
+    match socket_mode::get_message(token, channel, ts) {
         Ok(value) => Ok(value),
         // Slack errors come through in two shapes:
         //   - bare error code (`channel_not_found`, `not_in_channel`,
@@ -450,6 +490,24 @@ fn handle_get_message(
                 Err(("io_error".to_string(), err))
             }
         }
+    }
+}
+
+/// `as_user: true` hard-fails when no user token is configured —
+/// silent fallback to the bot would post under the wrong identity.
+fn select_action_token(
+    creds: &socket_mode::ResolvedCredentials,
+    as_user: bool,
+) -> Result<&str, (String, String)> {
+    if as_user {
+        creds.user_token.as_deref().ok_or((
+            "user_token_unavailable".to_string(),
+            "no Slack User OAuth Token configured — set COPAD_SLACK_USER_TOKEN \
+             or include it when running `copad-plugin-slack auth`"
+                .to_string(),
+        ))
+    } else {
+        Ok(&creds.bot_token)
     }
 }
 
@@ -499,8 +557,13 @@ fn handle_post_message(
         "missing 'text' (string)".to_string(),
     ))?;
     let thread_ts = params.get("thread_ts").and_then(Value::as_str);
+    let as_user = params
+        .get("as_user")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let token = select_action_token(&creds, as_user)?;
 
-    match socket_mode::post_message(&creds.bot_token, channel, text, thread_ts) {
+    match socket_mode::post_message(token, channel, text, thread_ts) {
         Ok((ts, posted_channel)) => Ok(json!({
             "ts": ts,
             "channel": posted_channel,

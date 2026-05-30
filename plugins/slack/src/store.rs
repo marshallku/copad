@@ -33,6 +33,10 @@ pub struct TokenSet {
     pub app_token: String,
     pub team_id: Option<String>,
     pub user_id: Option<String>,
+    /// `#[serde(default)]` load-bearing: keyring entries written before
+    /// this field existed must still deserialize.
+    #[serde(default)]
+    pub user_token: String,
 }
 
 pub trait TokenStore: Send + Sync {
@@ -250,6 +254,7 @@ mod tests {
             app_token: "xapp-app".into(),
             team_id: Some("T012345".into()),
             user_id: Some("U012345".into()),
+            user_token: String::new(),
         }
     }
 
@@ -303,5 +308,30 @@ mod tests {
         assert!(s.load().is_none());
         let err = s.save(&sample()).unwrap_err();
         assert!(err.contains("no D-Bus"), "got {err}");
+    }
+
+    #[test]
+    fn token_set_deserializes_without_user_token_field() {
+        let legacy = r#"{
+            "bot_token": "xoxb-legacy",
+            "app_token": "xapp-legacy",
+            "team_id": "T999",
+            "user_id": "U999"
+        }"#;
+        let parsed: TokenSet = serde_json::from_str(legacy).expect("legacy JSON must load");
+        assert_eq!(parsed.bot_token, "xoxb-legacy");
+        assert_eq!(parsed.app_token, "xapp-legacy");
+        assert_eq!(parsed.team_id.as_deref(), Some("T999"));
+        assert_eq!(parsed.user_id.as_deref(), Some("U999"));
+        assert_eq!(parsed.user_token, "");
+    }
+
+    #[test]
+    fn token_set_round_trips_user_token() {
+        let mut t = sample();
+        t.user_token = "xoxp-mine".into();
+        let json = serde_json::to_string(&t).unwrap();
+        let parsed: TokenSet = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.user_token, "xoxp-mine");
     }
 }

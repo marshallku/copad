@@ -18,6 +18,8 @@ use std::time::Duration;
 pub struct Config {
     pub bot_token: String,
     pub app_token: String,
+    /// Optional User OAuth Token (`xoxp-...`). Empty = bot-only mode.
+    pub user_token: String,
     pub workspace_label: String,
     pub require_secure_store: bool,
     pub plaintext_path: PathBuf,
@@ -54,6 +56,13 @@ impl Config {
                     .to_string(),
             );
         }
+        let user_token = std::env::var("COPAD_SLACK_USER_TOKEN").unwrap_or_default();
+        if !user_token.is_empty() && !user_token.starts_with("xoxp-") {
+            return Err(
+                "COPAD_SLACK_USER_TOKEN, when set, must be a User OAuth Token (xoxp-...)"
+                    .to_string(),
+            );
+        }
         let workspace_label =
             std::env::var("COPAD_SLACK_WORKSPACE").unwrap_or_else(|_| "default".to_string());
         validate_workspace_label(&workspace_label)?;
@@ -63,6 +72,7 @@ impl Config {
         Ok(Self {
             bot_token,
             app_token,
+            user_token,
             workspace_label,
             require_secure_store,
             plaintext_path,
@@ -80,6 +90,7 @@ impl Config {
         Self {
             bot_token: String::new(),
             app_token: String::new(),
+            user_token: String::new(),
             workspace_label: "default".to_string(),
             require_secure_store: false,
             plaintext_path: default_plaintext_path("default"),

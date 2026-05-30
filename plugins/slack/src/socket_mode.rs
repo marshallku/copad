@@ -43,6 +43,9 @@ const NO_CREDS_RECHECK: Duration = Duration::from_secs(30);
 pub struct ResolvedCredentials {
     pub bot_token: String,
     pub app_token: String,
+    /// `None` when no user token is configured. Cross-source resolution
+    /// is gated by `bot_token` match — see `current_credentials`.
+    pub user_token: Option<String>,
     /// Captured at `auth` time and persisted; `None` when creds come from
     /// env. Used by the events layer to filter the bot's own
     /// `reaction_added` events out of `slack.reaction` so a starter-emoji
@@ -64,13 +67,30 @@ pub fn current_credentials(config: &Config, store: &dyn TokenStore) -> Option<Re
         // avoids attributing the wrong identity to env-overridden
         // credentials. When the env token differs (cross-workspace
         // testing), bot_user_id stays None and the filter no-ops.
-        let stored_bot_user_id = store
-            .load()
+        let stored = store.load();
+        let stored_matches_env_bot = stored
+            .as_ref()
+            .is_some_and(|t| t.bot_token == config.bot_token);
+        let stored_bot_user_id = stored
+            .as_ref()
             .filter(|t| t.bot_token == config.bot_token)
-            .and_then(|t| t.user_id);
+            .and_then(|t| t.user_id.clone());
+        // Lifting stored user_token across a bot_token mismatch would
+        // let `as_user: true` posts cross workspaces — guarded.
+        let user_token = if !config.user_token.is_empty() {
+            Some(config.user_token.clone())
+        } else if stored_matches_env_bot {
+            stored
+                .as_ref()
+                .map(|t| t.user_token.clone())
+                .filter(|s| !s.is_empty())
+        } else {
+            None
+        };
         return Some(ResolvedCredentials {
             bot_token: config.bot_token.clone(),
             app_token: config.app_token.clone(),
+            user_token,
             bot_user_id: stored_bot_user_id,
             source: "env",
         });
@@ -79,9 +99,17 @@ pub fn current_credentials(config: &Config, store: &dyn TokenStore) -> Option<Re
     if stored.bot_token.is_empty() || stored.app_token.is_empty() {
         return None;
     }
+    let user_token = if !config.user_token.is_empty() {
+        Some(config.user_token.clone())
+    } else if !stored.user_token.is_empty() {
+        Some(stored.user_token.clone())
+    } else {
+        None
+    };
     Some(ResolvedCredentials {
         bot_token: stored.bot_token,
         app_token: stored.app_token,
+        user_token,
         bot_user_id: stored.user_id,
         source: "store",
     })
@@ -572,9 +600,14 @@ mod tests {
     }
 
     fn cfg(bot: &str, app: &str) -> Config {
+        cfg_with_user(bot, app, "")
+    }
+
+    fn cfg_with_user(bot: &str, app: &str, user: &str) -> Config {
         Config {
             bot_token: bot.to_string(),
             app_token: app.to_string(),
+            user_token: user.to_string(),
             workspace_label: "test".into(),
             require_secure_store: false,
             plaintext_path: std::path::PathBuf::from("/tmp/unused"),
@@ -585,11 +618,16 @@ mod tests {
     }
 
     fn stored_pair(bot: &str, app: &str) -> StubStore {
+        stored_with_user(bot, app, "")
+    }
+
+    fn stored_with_user(bot: &str, app: &str, user: &str) -> StubStore {
         StubStore(Some(TokenSet {
             bot_token: bot.into(),
             app_token: app.into(),
             team_id: Some("T_STORE".into()),
             user_id: Some("U_STORE".into()),
+            user_token: user.to_string(),
         }))
     }
 
@@ -644,5 +682,70 @@ mod tests {
         // simultaneously) but the runtime defends anyway.
         let store = stored_pair("xoxb-store", "");
         assert!(current_credentials(&cfg("", ""), &store).is_none());
+    }
+
+    #[test]
+    fn user_token_absent_when_neither_env_nor_store_has_one() {
+        let store = stored_pair("xoxb-store", "xapp-store");
+        let r = current_credentials(&cfg("xoxb-env", "xapp-env"), &store).unwrap();
+        assert!(r.user_token.is_none());
+    }
+
+    #[test]
+    fn user_token_from_env_with_env_bot_app() {
+        let store = stored_pair("xoxb-store", "xapp-store");
+        let cfg = cfg_with_user("xoxb-env", "xapp-env", "xoxp-env");
+        let r = current_credentials(&cfg, &store).unwrap();
+        assert_eq!(r.user_token.as_deref(), Some("xoxp-env"));
+        assert_eq!(r.source, "env");
+    }
+
+    #[test]
+    fn user_token_from_env_overrides_store_user_token() {
+        let store = stored_with_user("xoxb-store", "xapp-store", "xoxp-store");
+        let cfg = cfg_with_user("xoxb-env", "xapp-env", "xoxp-env");
+        let r = current_credentials(&cfg, &store).unwrap();
+        assert_eq!(r.user_token.as_deref(), Some("xoxp-env"));
+    }
+
+    #[test]
+    fn user_token_from_store_when_env_user_token_absent_and_bot_matches() {
+        let store = stored_with_user("xoxb-shared", "xapp-store", "xoxp-store");
+        let cfg = cfg_with_user("xoxb-shared", "xapp-env", "");
+        let r = current_credentials(&cfg, &store).unwrap();
+        assert_eq!(r.user_token.as_deref(), Some("xoxp-store"));
+        assert_eq!(r.source, "env");
+    }
+
+    #[test]
+    fn user_token_not_lifted_from_store_when_env_bot_differs() {
+        let store = stored_with_user("xoxb-workspaceA", "xapp-A", "xoxp-A");
+        let cfg = cfg_with_user("xoxb-workspaceB", "xapp-B", "");
+        let r = current_credentials(&cfg, &store).unwrap();
+        assert!(r.user_token.is_none());
+    }
+
+    #[test]
+    fn user_token_from_store_on_all_store_path() {
+        let store = stored_with_user("xoxb-store", "xapp-store", "xoxp-store");
+        let r = current_credentials(&cfg("", ""), &store).unwrap();
+        assert_eq!(r.user_token.as_deref(), Some("xoxp-store"));
+        assert_eq!(r.source, "store");
+    }
+
+    #[test]
+    fn user_token_env_only_works_on_all_store_bot_app_path() {
+        let store = stored_pair("xoxb-store", "xapp-store");
+        let cfg = cfg_with_user("", "", "xoxp-env");
+        let r = current_credentials(&cfg, &store).unwrap();
+        assert_eq!(r.user_token.as_deref(), Some("xoxp-env"));
+        assert_eq!(r.source, "store");
+    }
+
+    #[test]
+    fn empty_stored_user_token_does_not_surface() {
+        let store = stored_with_user("xoxb-store", "xapp-store", "");
+        let r = current_credentials(&cfg("", ""), &store).unwrap();
+        assert!(r.user_token.is_none());
     }
 }
