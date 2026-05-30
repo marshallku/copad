@@ -1127,3 +1127,29 @@ Net: a **hybrid detector** is needed — JSONL (questions, responses, normal tur
 - **Release-dependent TUI markers.** capture-pane gate markers (plan approval, permission prompts) shift between `claude` releases and must be re-verified per version; the JSONL lags live state by a tool-call.
 
 **See:** [#48](#48-copad-native-port-of-project-orchestration-spine) (the spine this is the body for), [docs/project-orchestration.md](./project-orchestration.md) (dispatch section), [docs/roadmap.md § Phase 22.4 / 22.7](./roadmap.md#phase-22-context-aware-workstation-hub) (the deferred-dispatch notes this fills), [#43](#43-pluginsweb-bridge-slice-31--tmux-as-data-model--xtermjs-attach-harness-integration-slice-31) (the tmx shell-out + JSON consumption pattern `csd` reuses).
+
+## 50. Projects panel retired — `web-bridge` is the single orchestration cockpit
+
+**Retires the `copad-plugin-projects` panel surface built across Phase 22.2–22.7 (under [#48](#48-copad-native-port-of-project-orchestration-spine)).** Only the GTK panel UI is removed; the `copad-core` orchestration data model (goal / mission / agent / approval / pipeline / runledger) stays — it is the state the cockpit reads and the daemon loop drives.
+
+**Problem.** Dogfooding showed the projects panel has no standalone value in its built form:
+
+- **workflows** section — a launcher slower than `tmx` (click → expand → fill form → Run, vs `tmx`'s keyboard selector).
+- **runs** section — volatile (`workflow.started` events, cleared on restart) and duplicates `tmx agents`.
+- **goals / missions / approvals** sections — empty CRUD lists, because nothing drives the spine (autonomous dispatch was deferred at every slice; the body lands as `csd` in Phase 24, [#49](#49-agent-session-dispatch-via-a-standalone-csd-cli--subscription-seat-driver-consumed-by-copad)).
+
+All of the panel's value is downstream of the body, and even with the body it would be a *rebuild* (visibility + human-in-the-loop), not the current control-panel form. So the form built in 22.2–22.7 is effectively dead weight.
+
+**Decision.** Retire the GTK projects panel. The single orchestration **cockpit** is `web-bridge` (already an HTTP/WS server, [#43](#43-pluginsweb-bridge-slice-31--tmux-as-data-model--xtermjs-attach-harness-integration-slice-31)): it renders goal / mission / `csd` state and routes answer/approve, reachable from the workstation browser **and** a phone.
+
+- **One cockpit, not two.** A GTK panel and a web SPA would be two UIs over the same state. `web-bridge` already exists and works remotely; a GTK panel adds a second surface to maintain for no capability the web surface lacks.
+- **The orchestration need is "answer from anywhere."** Autonomous agents block-and-ask while the user is away; a phone-reachable surface is the requirement — inherently web, not GTK.
+- **`tmx` launches + observes, `csd` drives, the cockpit only visualizes + routes replies.** A heavy GTK panel was the wrong shape for that thin role.
+
+**Removed vs kept.**
+- **Removed:** `plugins/projects/` (project-header / workflows / runs / goals / missions / approvals). Action `workflow.run` stays as a callable dispatch primitive, not a launcher UI.
+- **Kept:** the `copad-core` spine (state store + daemon-driven body); the **KB panel** (22.3) — in-app-useful, unaffected.
+
+**Trade-off accepted.** Cockpit interaction requires a browser (local or phone) rather than an in-app GTK pane. Acceptable: the user is `tmux`-heavy and found the in-app panel dead weight, and the browser surface is the one that also solves remote/away access.
+
+**See:** [#49](#49-agent-session-dispatch-via-a-standalone-csd-cli--subscription-seat-driver-consumed-by-copad) (the dispatch body the cockpit visualizes), [#43](#43-pluginsweb-bridge-slice-31--tmux-as-data-model--xtermjs-attach-harness-integration-slice-31) (the `web-bridge` server this becomes the cockpit on), [#48](#48-copad-native-port-of-project-orchestration-spine) (the spine whose panel surface this retires), [docs/roadmap.md § Phase 24.5 / 24.6](./roadmap.md#phase-24-csd-integration--autonomous-loop-the-body-for-the-224227-spine).
