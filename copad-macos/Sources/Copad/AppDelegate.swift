@@ -242,6 +242,21 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         self.window = window
         tabVC = vc
         vc.eventBus = eventBus
+        // "+" popover's plugin-row dispatch — same outcome as the
+        // `plugin.open` RPC. Errors stderr-log here (popover is
+        // fire-and-forget; surfacing an alert needs UX design we
+        // haven't tackled yet).
+        vc.onOpenPlugin = { [weak self] name, panelName, mode in
+            guard let self, let tab = tabVC else { return }
+            let modeStr: String = switch mode {
+            case .tab: "tab"
+            case .splitH: "split_h"
+            case .splitV: "split_v"
+            }
+            if case let .failure(err) = openPluginPanel(name: name, panelName: panelName, mode: modeStr, vc: tab) {
+                FileHandle.standardError.write(Data("[copad] plugin.open via popover failed: \(err.code) \(err.message)\n".utf8))
+            }
+        }
 
         // Tier 4.2 — status bar modules. Loaded AFTER tabVC is built (it
         // owns the StatusBarView) but BEFORE socket starts so the modules'
@@ -907,6 +922,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return .failure(RPCError(code: "no_terminal", message: "No terminal panel found"))
     }
 
+    /// Open a plugin-provided panel. Shared by the `plugin.open` RPC and
+    /// the `+` popover's plugin-panel rows so both surfaces reach the
+    /// same outcome with one source of truth.
+    ///
+    /// `mode` matches the RPC contract: "tab" (default) / "split_h" /
+    /// "split_v". An unknown value falls through to "tab" — same forgiving
+    /// shape as the inline implementation it replaces.
+    private func openPluginPanel(
+        name: String,
+        panelName: String,
+        mode: String,
+        vc: TabViewController,
+    ) -> Result<String, RPCError> {
+        let manifests = PluginManifestStore.discover()
+        guard let manifest = manifests.first(where: { $0.manifest.plugin.name == name }) else {
+            return .failure(RPCError(code: "not_found", message: "plugin '\(name)' not installed"))
+        }
+        guard let panelDef = manifest.manifest.panels.first(where: { $0.name == panelName }) else {
+            let available = manifest.manifest.panels.map(\.name).joined(separator: ", ")
+            return .failure(RPCError(
+                code: "not_found",
+                message: "panel '\(panelName)' not in \(name) manifest (available: [\(available)])",
+            ))
+        }
+        let panelController = PluginPanelController(
+            plugin: manifest,
+            panelDef: panelDef,
+            registry: actionRegistry,
+            eventBus: eventBus,
+        )
+        let panelID: String? = switch mode {
+        case "split_h":
+            vc.splitActivePaneWithPluginPanel(panelController, orientation: .horizontal)
+        case "split_v":
+            vc.splitActivePaneWithPluginPanel(panelController, orientation: .vertical)
+        default: // "tab"
+            vc.newPluginPanelTab(panelController)
+        }
+        guard let panelID else {
+            return .failure(RPCError(code: "internal_error", message: "no active tab to split into"))
+        }
+        return .success(panelID)
+    }
+
     /// `allowFallback: false` makes the default arm return local
     /// `unknown_method` instead of forwarding to daemon — required for
     /// daemon-originated Invokes so they don't recurse back through the
@@ -1330,37 +1389,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             let panelName = (params["panel"] as? String) ?? "main"
             let mode = (params["mode"] as? String) ?? "tab"
-            let manifests = PluginManifestStore.discover()
-            guard let manifest = manifests.first(where: { $0.manifest.plugin.name == name }) else {
-                completion(RPCError(code: "not_found", message: "plugin '\(name)' not installed"))
-                return
-            }
-            guard let panelDef = manifest.manifest.panels.first(where: { $0.name == panelName }) else {
-                let available = manifest.manifest.panels.map(\.name).joined(separator: ", ")
-                completion(RPCError(
-                    code: "not_found",
-                    message: "panel '\(panelName)' not in \(name) manifest (available: [\(available)])",
-                ))
-                return
-            }
-            let panelController = PluginPanelController(
-                plugin: manifest,
-                panelDef: panelDef,
-                registry: actionRegistry,
-                eventBus: eventBus,
-            )
-            let panelID: String? = switch mode {
-            case "split_h":
-                vc.splitActivePaneWithPluginPanel(panelController, orientation: .horizontal)
-            case "split_v":
-                vc.splitActivePaneWithPluginPanel(panelController, orientation: .vertical)
-            default: // "tab"
-                vc.newPluginPanelTab(panelController)
-            }
-            if let panelID {
+            switch openPluginPanel(name: name, panelName: panelName, mode: mode, vc: vc) {
+            case let .success(panelID):
                 completion(["status": "ok", "panel_id": panelID])
-            } else {
-                completion(RPCError(code: "internal_error", message: "no active tab to split into"))
+            case let .failure(error):
+                completion(error)
             }
 
         // Tier 4.2 — status bar visibility toggles. Match Linux's

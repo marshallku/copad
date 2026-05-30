@@ -35,6 +35,15 @@ final class TabViewController: NSViewController {
         didSet { paneManagers.forEach { $0.eventBus = eventBus } }
     }
 
+    /// Invoked when the "+" popover's plugin-panel row is clicked. Kept
+    /// as a callback (set by AppDelegate at launch) so TabViewController
+    /// stays free of `ActionRegistry` / `EventBus` dependencies for
+    /// plugin construction — AppDelegate owns those and runs the same
+    /// path the `plugin.open` RPC takes. Closure is called on the main
+    /// actor (the popover dispatch lives there). Mode mirrors the RPC's
+    /// `mode` param ("tab" / "split_h" / "split_v").
+    var onOpenPlugin: ((_ name: String, _ panelName: String, _ mode: AddPanelMode) -> Void)?
+
     var isTabBarCollapsed: Bool {
         isBarCollapsed
     }
@@ -155,13 +164,25 @@ final class TabViewController: NSViewController {
         }
         tabBar.onNewPanel = { [weak self] type, mode in
             guard let self else { return }
-            switch (type, mode) {
-            case (.terminal, .tab): newTab()
-            case (.terminal, .splitH): splitActivePane(orientation: .horizontal)
-            case (.terminal, .splitV): splitActivePane(orientation: .vertical)
-            case (.webview, .tab): newWebViewTab()
-            case (.webview, .splitH): splitActivePaneWithWebView(orientation: .horizontal)
-            case (.webview, .splitV): splitActivePaneWithWebView(orientation: .vertical)
+            switch type {
+            case .terminal:
+                switch mode {
+                case .tab: newTab()
+                case .splitH: splitActivePane(orientation: .horizontal)
+                case .splitV: splitActivePane(orientation: .vertical)
+                }
+            case .webview:
+                switch mode {
+                case .tab: newWebViewTab()
+                case .splitH: splitActivePaneWithWebView(orientation: .horizontal)
+                case .splitV: splitActivePaneWithWebView(orientation: .vertical)
+                }
+            case let .plugin(name, panelName, _, _):
+                // Construction (PluginPanelController) and registry/eventBus
+                // wiring live in AppDelegate where `openPluginPanel` mirrors
+                // the `plugin.open` RPC handler. Errors are logged inside
+                // that helper — popover dispatch stays fire-and-forget.
+                onOpenPlugin?(name, panelName, mode)
             }
         }
         root.addSubview(tabBar)

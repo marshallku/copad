@@ -5,6 +5,12 @@ import AppKit
 enum AddPanelType {
     case terminal
     case webview
+    /// Open a plugin-provided panel (e.g. Slack, Discord, Todos). Selected
+    /// via the dynamic rows in `AddPanelPopoverController` built from
+    /// `PluginManifestStore.discover()`. `panelName` is the `[[panels]]`
+    /// entry's `name` (default "main"); routed through
+    /// `AppDelegate.openPluginPanel` which mirrors the `plugin.open` RPC.
+    case plugin(name: String, panelName: String, label: String, icon: String?)
 }
 
 enum AddPanelMode {
@@ -337,11 +343,52 @@ private final class AddPanelPopoverController: NSViewController {
         divider.boxType = .separator
         stack.addArrangedSubview(divider)
 
-        // Panel rows
+        // Panel rows — builtin first.
         stack.addArrangedSubview(makeRow(type: .terminal, icon: "terminal", label: "Terminal"))
         stack.addArrangedSubview(makeRow(type: .webview, icon: "globe", label: "Browser"))
 
+        // Plugin-provided panels. Discovery walks
+        // `~/Library/Application Support/copad/plugins/` (mirror of the
+        // path `copadd` reads + the `plugin.open` RPC handler at
+        // `AppDelegate.swift`'s `case "plugin.open"`). Only manifests
+        // that declare `[[panels]]` show up — service-only plugins
+        // (echo, calendar, git, etc.) stay out. Discovery is sorted
+        // by plugin name so row order is stable across launches.
+        let pluginRows = pluginPanelRows()
+        if !pluginRows.isEmpty {
+            let pluginDivider = NSBox()
+            pluginDivider.boxType = .separator
+            stack.addArrangedSubview(pluginDivider)
+            for row in pluginRows {
+                stack.addArrangedSubview(row)
+            }
+        }
+
         view = container
+    }
+
+    /// One row per discovered plugin panel. Multi-panel plugins emit
+    /// a row per panel so the dispatch target (`panel.name`) is
+    /// click-resolvable. Default SF Symbol `puzzlepiece.extension` is
+    /// used when the manifest didn't set `[[panels]].icon` — every
+    /// shipping plugin today is in that bucket.
+    private func pluginPanelRows() -> [NSView] {
+        var rows: [NSView] = []
+        for loaded in PluginManifestStore.discover() {
+            let pluginName = loaded.manifest.plugin.name
+            for panelDef in loaded.manifest.panels {
+                let icon = panelDef.icon ?? "puzzlepiece.extension"
+                let label = panelDef.title
+                let type: AddPanelType = .plugin(
+                    name: pluginName,
+                    panelName: panelDef.name,
+                    label: label,
+                    icon: icon,
+                )
+                rows.append(makeRow(type: type, icon: icon, label: label))
+            }
+        }
+        return rows
     }
 
     /// Column header: blank | Tab | Split→ | Split↓
