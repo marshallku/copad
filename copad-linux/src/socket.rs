@@ -1,8 +1,8 @@
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 
 use gtk4::ApplicationWindow;
 use serde_json::json;
@@ -21,7 +21,7 @@ const WALLPAPER_CACHE: &str = ".cache/terminal-wallpapers.txt";
 const BG_MODE_FILE: &str = ".cache/copad-bg-mode";
 const BUS_SOURCE_COPAD_LINUX: &str = "copad-linux";
 
-pub use copad_daemon::socket::{new_event_bus, EventBus, SocketCommand};
+pub use copad_daemon::socket::{EventBus, SocketCommand, new_event_bus};
 
 pub fn broadcast(bus: &EventBus, event: &Event) {
     bus.publish(BusEvent::new(
