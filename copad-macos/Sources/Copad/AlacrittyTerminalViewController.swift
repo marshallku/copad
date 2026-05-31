@@ -152,6 +152,7 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
             transparentDefaultBg: config.transparentDefaultBg,
             osc52Policy: config.osc52,
             optionAsAlt: config.optionAsAlt,
+            forceMetaKeys: config.forceMetaKeys,
         )
         render.frame = container.bounds
         render.autoresizingMask = [.width, .height]
@@ -530,6 +531,14 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// and Alt-bindings never see the keystroke.
     private let optionAsAlt: Bool
 
+    /// Set of macOS virtual keyCodes that should send `ESC + <byte>` on
+    /// Option, even though they're control characters that
+    /// `optionAsAlt`'s printable-only filter normally drops. Built from
+    /// `config.forceMetaKeys`. Fires independently of `optionAsAlt` so
+    /// users who keep Option=diacritics globally can still get
+    /// newline-in-prompt for Claude Code / Python REPL / ipython.
+    private let forceMetaKeyCodes: Set<UInt16>
+
     /// Cursor-blink state. Honored only when the TUI/shell actually
     /// asks for it via DECSCUSR (`cursor.blink == 1` on the snapshot).
     /// When idle with blink on, the display-link callback forces a
@@ -571,7 +580,14 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// a new cascade list.
     private var fallbackCache: [UInt32: NSFont] = [:]
 
-    init(theme: CopadTheme, font: NSFont, transparentDefaultBg: Bool, osc52Policy: OSC52Policy, optionAsAlt: Bool) {
+    init(
+        theme: CopadTheme,
+        font: NSFont,
+        transparentDefaultBg: Bool,
+        osc52Policy: OSC52Policy,
+        optionAsAlt: Bool,
+        forceMetaKeys: [String],
+    ) {
         self.theme = theme
         self.font = font
         boldFont = Self.deriveTrait(font, mask: .boldFontMask)
@@ -581,6 +597,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         self.transparentDefaultBg = transparentDefaultBg
         self.osc52Policy = osc52Policy
         self.optionAsAlt = optionAsAlt
+        forceMetaKeyCodes = Self.parseForceMetaKeyCodes(forceMetaKeys)
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = theme.background.nsColor.cgColor
@@ -1884,6 +1901,21 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             sendInput(bytes)
             return
         }
+        // Force-Meta keys: Option + Return / Escape (whichever subset
+        // the user opted into via `force_meta_keys`) send `ESC + <byte>`
+        // regardless of `optionAsAlt`. These are control-char keys that
+        // the optionAsAlt printable filter below intentionally drops,
+        // so they need their own explicit branch. Default config
+        // includes Return so Claude Code / Python REPL / ipython get
+        // newline-in-prompt out of the box.
+        if mods.subtracting(.shift) == .option,
+           forceMetaKeyCodes.contains(event.keyCode),
+           let bytes = forceMetaBytes(forKeyCode: event.keyCode)
+        {
+            scrollToBottomOnInput()
+            sendInput(bytes)
+            return
+        }
         // Option-as-Alt: route Option+key as `ESC + base_char` so tmux /
         // zsh / readline see the Meta prefix instead of the macOS
         // dead-key composition that turns Option+1 into `¡` via the IME.
@@ -1938,6 +1970,44 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         static let pageDown: UInt16 = 121
         static let delete: UInt16 = 51
         static let forwardDelete: UInt16 = 117
+        static let returnKey: UInt16 = 36
+        static let escape: UInt16 = 53
+    }
+
+    /// Translate a `force_meta_keys` keyCode to the `ESC + <byte>` PTY
+    /// sequence. Only keys present in `forceMetaKeyCodes` reach this —
+    /// the keyDown caller filters first, so an unmapped keyCode here is
+    /// a programming error (caller and parser must stay in sync). Add
+    /// a case here when extending `parseForceMetaKeyCodes`.
+    private func forceMetaBytes(forKeyCode kc: UInt16) -> [UInt8]? {
+        switch kc {
+        case KeyCode.returnKey: [0x1B, 0x0D] // ESC + CR
+        case KeyCode.escape: [0x1B, 0x1B] // ESC + ESC
+        default: nil
+        }
+    }
+
+    /// Map user-facing `force_meta_keys` names to macOS virtual key
+    /// codes. Case-insensitive; recognized aliases follow common
+    /// keyboard nomenclature. Unknown entries emit one stderr line
+    /// each and are dropped — invalid config never crashes the app.
+    /// Returns a Set so the hot `keyDown` path does O(1) contains
+    /// checks instead of walking `[String]` on every keystroke.
+    private static func parseForceMetaKeyCodes(_ names: [String]) -> Set<UInt16> {
+        var codes: Set<UInt16> = []
+        for name in names {
+            switch name.lowercased() {
+            case "return", "enter":
+                codes.insert(KeyCode.returnKey)
+            case "escape", "esc":
+                codes.insert(KeyCode.escape)
+            default:
+                let msg = "[copad] [terminal] force_meta_keys: unknown key '\(name)' " +
+                    "(supported: Return, Escape)\n"
+                FileHandle.standardError.write(Data(msg.utf8))
+            }
+        }
+        return codes
     }
 
     /// Intercept Cmd / Shift-modified scroll keys before they reach

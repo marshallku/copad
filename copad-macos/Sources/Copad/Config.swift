@@ -81,6 +81,18 @@ struct CopadConfig {
     /// this is a dev terminal — users who need Option for diacritics
     /// can set `option_as_alt = false`.
     let optionAsAlt: Bool
+    /// macOS-only: control-character keys that should bypass the
+    /// `optionAsAlt` printable-only filter and send `ESC + <byte>` when
+    /// pressed with Option (independent of `option_as_alt`). Default
+    /// `["Return"]` so Opt+Return delivers `ESC + CR` — the sequence
+    /// Claude Code, Python REPL, ipython, etc. accept as newline-in-
+    /// prompt. Recognized names (case-insensitive): `Return`/`Enter`,
+    /// `Escape`/`Esc`. Unknown names are ignored with a stderr warning.
+    /// Arrows / Delete are intentionally NOT supported — they rely on
+    /// Cocoa's `moveWordLeft:` / `deleteWordBackward:` key bindings
+    /// translating Opt+← / Opt+⌫ to readline byte sequences, and a
+    /// force-Meta override would steal those keystrokes.
+    let forceMetaKeys: [String]
     let themeName: String
     let backgroundPath: String?
     let backgroundTint: Double
@@ -178,6 +190,7 @@ struct CopadConfig {
             fontFamily: raw.terminal?.fontFamily ?? defaults.fontFamily,
             fontSize: raw.terminal?.fontSize ?? defaults.fontSize,
             optionAsAlt: raw.terminal?.optionAsAlt ?? defaults.optionAsAlt,
+            forceMetaKeys: raw.terminal?.forceMetaKeys ?? defaults.forceMetaKeys,
             themeName: raw.theme?.name ?? defaults.themeName,
             backgroundPath: bgPath,
             backgroundTint: clamp01(raw.background?.tint ?? defaults.backgroundTint),
@@ -217,6 +230,7 @@ struct CopadConfig {
             fontFamily: "JetBrains Mono",
             fontSize: 14,
             optionAsAlt: true,
+            forceMetaKeys: ["Return"],
             themeName: "catppuccin-mocha",
             backgroundPath: nil,
             backgroundTint: 0.6,
@@ -358,12 +372,14 @@ private struct TerminalSection: Decodable {
     var fontFamily: String?
     var fontSize: Int?
     var optionAsAlt: Bool?
+    var forceMetaKeys: [String]?
 
     enum CodingKeys: String, CodingKey {
         case shell
         case fontFamily = "font_family"
         case fontSize = "font_size"
         case optionAsAlt = "option_as_alt"
+        case forceMetaKeys = "force_meta_keys"
     }
 }
 

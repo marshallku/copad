@@ -658,6 +658,8 @@ var commandHandler: ((_ method: String, _ params: [String: Any], _ completion: @
 shell = "/bin/zsh"
 font_family = "JetBrains Mono"
 font_size = 13
+option_as_alt = true               # Option+printable → ESC + char (tmux/zsh Meta)
+force_meta_keys = ["Return"]       # control-char keys that get ESC prefix too
 
 [theme]
 name = "catppuccin-mocha"
@@ -670,6 +672,12 @@ opacity = 0.95
 [security]
 osc52 = "deny"                    # or "allow"
 ```
+
+**`option_as_alt` vs. `force_meta_keys`**: `option_as_alt = true`(default)는 Option+printable 키(예: Option+1, Option+a)를 `ESC + base_char`로 PTY에 보내서 tmux/zsh/readline Meta 바인딩이 동작하게 합니다. `option_as_alt`는 의도적으로 control-character 키(Return, Escape 등)를 제외합니다 — Cocoa의 `moveWordLeft:` / `deleteWordBackward:` 키 바인딩이 Option+←/Option+⌫을 readline 바이트로 변환하는 path를 보존해야 하기 때문.
+
+`force_meta_keys`(default `["Return"]`)는 그 필터를 명시적으로 우회할 키 화이트리스트입니다 — Opt+Return이 `ESC + CR`을 보내서 Claude Code / Python REPL / ipython 등의 newline-in-prompt가 동작합니다. 두 옵션은 직교: `option_as_alt = false`(악센트 입력자)여도 `force_meta_keys = ["Return"]`만 켜면 Claude Code newline은 살아 있습니다.
+
+지원 키 (case-insensitive): `Return`/`Enter`, `Escape`/`Esc`. 알 수 없는 이름은 stderr 경고 후 무시. Arrows/Delete는 지원하지 않습니다 (Cocoa 바인딩 경로 보존 필요). 끄려면 `force_meta_keys = []`.
 
 Linux 쪽 schema의 `[tabs]`, `[statusbar]`, `[keybindings]`, `[[triggers]]`는 macOS가 아직 안 읽지만 TOMLKit이 unknown key를 silently 무시하므로 Linux 사용자가 같은 config 파일을 그대로 쓸 수 있음. malformed TOML은 stderr에 `[copad] config.toml parse failed: …`를 찍고 defaults로 fallback (crash 안 함).
 
