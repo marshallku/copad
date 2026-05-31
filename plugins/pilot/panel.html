@@ -4,11 +4,24 @@
 <meta charset="utf-8" />
 <title>Pilot</title>
 <style>
+  /* Consume the theme CSS copad injects into every panel (--copad-*),
+     so the panel tracks the active color theme instead of a hardcoded
+     palette. `color-scheme: dark` makes native <select>/<input> controls
+     render dark instead of the light system default. */
   :root {
-    --bg: #1e1e2e; --bg-alt: #181825; --bg-card: #313244;
-    --fg: #cdd6f4; --fg-dim: #a6adc8; --fg-mute: #6c7086;
-    --accent: #cba6f7; --green: #a6e3a1; --yellow: #f9e2af;
-    --red: #f38ba8; --blue: #89b4fa; --border: #45475a;
+    color-scheme: dark;
+    --bg: var(--copad-bg, #1e1e2e);
+    --bg-alt: var(--copad-surface0, #181825);
+    --bg-card: var(--copad-surface1, #313244);
+    --fg: var(--copad-fg, #cdd6f4);
+    --fg-dim: var(--copad-subtext1, #a6adc8);
+    --fg-mute: var(--copad-subtext0, #6c7086);
+    --accent: var(--copad-accent, #cba6f7);
+    --red: var(--copad-red, #f38ba8);
+    --border: var(--copad-surface2, #45475a);
+    /* Semantic status colors (no theme var for these) — saturated so
+       they stay legible on any dark theme. */
+    --green: #a6e3a1; --yellow: #f9e2af; --blue: #89b4fa;
   }
   * { box-sizing: border-box; }
   body {
@@ -52,6 +65,8 @@
     background: var(--bg-alt); color: var(--fg); border: 1px solid var(--border);
     border-radius: 6px; padding: 5px 8px; font: inherit; font-size: 12px; flex: 1; min-width: 0;
   }
+  option { background: var(--bg-alt); color: var(--fg); }
+  input::placeholder, textarea::placeholder { color: var(--fg-mute); }
   textarea { width: 100%; min-height: 3.2em; resize: vertical; }
   .add { background: var(--bg-card); border: 1px solid var(--border);
          border-radius: 8px; padding: 10px; margin-top: 14px; display: flex; flex-direction: column; gap: 7px; }
@@ -70,7 +85,7 @@
       <select id="cwd-select" title="project cwd"><option value="">— pick a project —</option></select>
     </div>
     <div class="row">
-      <input id="cwd" placeholder="or type a cwd (absolute path)" />
+      <input id="cwd" placeholder="cwd — custom absolute path (or filled from the project above)" />
     </div>
     <textarea id="instruction" placeholder="goal instruction (what should the agent do, then stop)"></textarea>
     <div class="row">
@@ -97,8 +112,12 @@
       const r = await copad.call("project.list", {});
       projects = (r && r.projects) || [];
       const sel = $("cwd-select");
-      sel.innerHTML = '<option value="">— pick a project —</option>' +
+      sel.innerHTML = '<option value="">— pick a project (or type a custom path below) —</option>' +
         projects.map((p) => `<option value="${esc(p.subpath ? p.path + "/" + p.subpath : p.path)}">${esc(p.name)} · ${esc(p.path)}</option>`).join("");
+      // Picking a project fills the editable cwd field, which the user can
+      // then override with any custom absolute path (the field is the
+      // source of truth at submit).
+      sel.onchange = () => { if (sel.value) $("cwd").value = sel.value; };
     } catch (e) { /* projects optional */ }
   }
 
