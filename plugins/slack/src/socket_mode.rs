@@ -587,6 +587,78 @@ pub fn conversations_info(token: &str, channel: &str) -> Result<Option<String>, 
     Ok(if name.is_empty() { None } else { Some(name) })
 }
 
+/// Single page of `conversations.list`. Caller paginates by passing
+/// the returned cursor. `types` is comma-separated and validated by
+/// the caller against the Slack-documented allowlist
+/// (public_channel/private_channel/mpim/im); we don't re-validate here
+/// because the caller owns the API contract. Up to ~1000/page Slack
+/// limit (we cap at 1000 to be safe).
+pub fn conversations_list(
+    bot_token: &str,
+    cursor: Option<&str>,
+    types: &str,
+    limit: u32,
+) -> Result<(Vec<Value>, Option<String>), String> {
+    let limit_clamped = limit.clamp(1, 1000).to_string();
+    // url::Url::parse_with_params handles the percent-encoding so
+    // attacker-controlled cursor values can't break out of the
+    // query string. cursor is an opaque Slack-issued token but we
+    // still encode it as data, not trust it as URL syntax.
+    let mut params: Vec<(&str, &str)> = vec![
+        ("types", types),
+        ("limit", &limit_clamped),
+        ("exclude_archived", "false"),
+    ];
+    if let Some(c) = cursor
+        && !c.is_empty()
+    {
+        params.push(("cursor", c));
+    }
+    let url = url::Url::parse_with_params("https://slack.com/api/conversations.list", &params)
+        .map_err(|e| format!("conversations.list url build: {e}"))?;
+    let resp = match ureq::get(url.as_str())
+        .set("Authorization", &format!("Bearer {bot_token}"))
+        .timeout(Duration::from_secs(20))
+        .call()
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(429, r)) => {
+            let retry = r
+                .header("Retry-After")
+                .map(str::to_string)
+                .unwrap_or_default();
+            return Err(format!(
+                "rate_limited (Retry-After: {})",
+                if retry.is_empty() { "unknown" } else { &retry }
+            ));
+        }
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            return Err(format!("conversations.list HTTP {code}: {body}"));
+        }
+        Err(e) => return Err(format!("conversations.list: {e}")),
+    };
+    let body: Value = resp
+        .into_json()
+        .map_err(|e| format!("conversations.list response parse: {e}"))?;
+    if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let err = body.get("error").and_then(Value::as_str).unwrap_or("?");
+        return Err(err.to_string());
+    }
+    let channels = body
+        .get("channels")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let next_cursor = body
+        .get("response_metadata")
+        .and_then(|m| m.get("next_cursor"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Ok((channels, next_cursor))
+}
+
 /// `auth.test` probe; returns `(team_id, user_id)`.
 pub fn auth_test(bot_token: &str) -> Result<(String, String), String> {
     let resp = ureq::post("https://slack.com/api/auth.test")
@@ -655,6 +727,7 @@ mod tests {
             use_keychain: false,
             plaintext_path: std::path::PathBuf::from("/tmp/unused"),
             channel_path: std::path::PathBuf::from("/tmp/unused-channels"),
+            collect_dir: std::path::PathBuf::from("/tmp/unused-collect"),
             reconnect_initial: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(60),
             fatal_error: None,

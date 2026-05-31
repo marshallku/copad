@@ -34,6 +34,10 @@ pub struct Config {
     pub use_keychain: bool,
     pub plaintext_path: PathBuf,
     pub channel_path: PathBuf,
+    /// Per-workspace root for collect-profile JSONL. Each registered
+    /// `collect` channel gets `<root>/<channel_id>.jsonl`. Lives under
+    /// XDG_DATA_HOME (not config) because messages are data, not config.
+    pub collect_dir: PathBuf,
     /// Initial reconnect delay; exponential backoff up to `reconnect_max`.
     pub reconnect_initial: Duration,
     pub reconnect_max: Duration,
@@ -86,6 +90,7 @@ impl Config {
         let use_keychain = parse_bool("COPAD_SLACK_USE_KEYCHAIN", use_keychain_default)?;
         let plaintext_path = default_plaintext_path(&workspace_label);
         let channel_path = default_channel_path(&workspace_label);
+        let collect_dir = default_collect_dir(&workspace_label);
 
         Ok(Self {
             bot_token,
@@ -96,6 +101,7 @@ impl Config {
             use_keychain,
             plaintext_path,
             channel_path,
+            collect_dir,
             reconnect_initial: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(60),
             fatal_error: None,
@@ -116,6 +122,7 @@ impl Config {
             use_keychain: false,
             plaintext_path: default_plaintext_path("default"),
             channel_path: default_channel_path("default"),
+            collect_dir: default_collect_dir("default"),
             reconnect_initial: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(60),
             fatal_error: Some(error),
@@ -173,6 +180,27 @@ fn default_channel_path(workspace: &str) -> PathBuf {
     let base = config_home().unwrap_or_else(|| PathBuf::from("."));
     base.join("copad")
         .join(format!("slack-channels-{workspace}.json"))
+}
+
+/// `~/.local/share/copad/slack-knowledge/<workspace>/`. Lives under
+/// XDG_DATA_HOME (not config) because captured messages are data.
+fn default_collect_dir(workspace: &str) -> PathBuf {
+    let base = data_home().unwrap_or_else(|| PathBuf::from("."));
+    base.join("copad").join("slack-knowledge").join(workspace)
+}
+
+fn data_home() -> Option<PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
+        && !xdg.is_empty()
+    {
+        return Some(PathBuf::from(xdg));
+    }
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        return Some(PathBuf::from(home).join(".local").join("share"));
+    }
+    None
 }
 
 fn config_home() -> Option<PathBuf> {

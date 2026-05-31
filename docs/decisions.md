@@ -1266,3 +1266,42 @@ The plaintext store writes `~/.config/copad/slack-tokens-default.json` at mode `
 - The default cross-platform behaviour now diverges (Linux uses keyring, macOS uses plaintext). Documented in the field doc and in [troubleshooting.md § slack plugin hangs at initialize](./troubleshooting.md).
 
 **See:** `plugins/slack/src/store.rs` (`open_store` flag check, `save_macos_open_acl`, 2s probe timeout), `plugins/slack/src/config.rs` (`use_keychain` field), [docs/troubleshooting.md § slack plugin hangs at initialize](./troubleshooting.md).
+
+## 55. Slack bot-rpc — correlation via thread/user/regex; recent message buffer closes the postMessage race
+
+**Problem.** The naïve "post a message, wait for the next channel message" pattern fails three ways at once:
+
+1. **Self-echo** — Slack delivers the bot's own `chat.postMessage` back over Socket Mode. Without a guard, the bot completes its own wait the moment the post lands.
+2. **Race** — Slack can deliver the responding bot's reply on the Socket Mode WebSocket *before* the HTTP `chat.postMessage` call returns with our `request_ts`. The wait registration would then miss the response entirely.
+3. **Zero-correlation matches** — in a busy channel, "any later message" is too lax. Random chatter can complete a wait that was looking for a Jira-style reply.
+
+**Decision.** `plugins/slack/src/bot_rpc.rs` enforces a three-axis correlation contract on each match:
+
+- `event.user != wait.bot_user_id` — strict. `bot_user_id` is REQUIRED at invoke time (resolved from stored credentials, falling back to a fresh `auth.test` call cached by bot_token).
+- One of three correlation signals must be present, enforced by `validate_bot_rpc`:
+  - `wait_in_thread == true` (the default for new entries via panel UI) — the response's `event.thread_ts` must equal `request_ts`. Matches the Jira-bot-style pattern where bots reply in-thread.
+  - `wait_user_filter` non-empty — `event.user == filter`.
+  - `wait_mode == Regex` with a non-empty pattern — `Regex::captures` must succeed. Named groups land in the `slack.bot_rpc.completed` payload's `captures` object.
+
+The `RecentMessageBuffer` is a per-channel bounded FIFO (256 entries / 30s window). Every incoming `SlackEvent::Raw` message is pushed into the buffer *before* `match_event` scans pending waits. When `slack.bot_rpc.invoke` registers a fresh wait via `BotRpcRegistry::add`, the buffer is replayed through the same `match_event` path — so a response that arrived between `chat.postMessage` send and HTTP response receive still completes the wait. Same code path on both real-time and replayed match, so a successful match always removes the wait exactly once.
+
+Timestamp ordering: `parse_slack_ts` splits Slack's `<sec>.<frac>` format, pads fractional to 9 nanosecond digits, and compares as `(u64, u64)` tuples. Variable-width fractions (`"5.1"` vs `"5.05"`) sort correctly.
+
+`wait_in_thread` defaults to `false` in serde (preserves existing saved rows from decision #54's slice), but the panel form pre-checks the checkbox for new entries so users get the safer default. The validator rejects bot-rpc configs with no correlation signal whatsoever (first-reply + no thread + no user filter).
+
+A background sweeper thread ticks every 250ms, removes deadlined waits, and publishes `slack.bot_rpc.timeout` notifications for each. `wait_timeout_ms == 0` rejected on upsert — explicit, never ambiguous.
+
+**Why not check-on-receive timeout, or per-wait timer threads.**
+
+- Per-wait timer thread is the cleanest expression of "wait until deadline" but spawns one thread per active invoke. A 250ms sweeper keeps thread count constant, and 250ms granularity is well below the user-perceptible window for a Slack response.
+- Check-on-receive can't fire timeouts when no messages arrive — which is the most common case for an expired wait.
+
+**Why JSONL with per-channel directory for collect.**
+
+User chose `~/.local/share/copad/slack-knowledge/<workspace>/<channel_id>.jsonl` over SQLite because (1) grep/jq compose with existing shell workflows, (2) per-channel files let `tail -f` follow one channel without filtering, (3) channel migration (`mv`/`rm`) is trivial. SQLite + FTS5 stays as a future option if knowledge-base search becomes load-bearing. JSONL append is mode 0600 and gated by `is_valid_channel_id` (defense in depth against Slack-event-payload-controlled channel ids hitting the filesystem).
+
+**Why `slack.bot_rpc.completed` notification, not auto-action.**
+
+Trigger-DSL composability. Plugins shouldn't hardcode "after match, call plugin X RPC Y" — that's the trigger layer's job. `[[triggers]]\nwhen = "slack.bot_rpc.completed"\nwhen.captures.key = "(.+)"\naction = "kb.append"` is the user-controlled wiring.
+
+**See:** `plugins/slack/src/bot_rpc.rs` (registry, recent buffer, sweeper), `plugins/slack/src/collect.rs` (JSONL append), `plugins/slack/src/channels.rs::validate_bot_rpc` (correlation guard, zero-timeout reject), `plugins/slack/src/main.rs::handle_bot_rpc_invoke` (auth.test fallback, legacy validation, replay dispatch), `plugins/slack/panel.html` (CHANNELS tab — wait_in_thread checkbox, Discover modal).

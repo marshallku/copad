@@ -54,6 +54,12 @@ pub struct BotRpcConfig {
     pub wait_user_filter: String,
     #[serde(default)]
     pub wait_timeout_ms: u64,
+    /// When true, response must be posted in the request's thread
+    /// (`event.thread_ts == request_ts`). Default `false` so existing
+    /// saved rows keep their original "channel-wide" semantics; new
+    /// rows opt in via the panel form (checkbox pre-checked).
+    #[serde(default)]
+    pub wait_in_thread: bool,
 }
 
 /// Placeholder for the future `collect` profile config (destination,
@@ -144,6 +150,12 @@ fn validate_bot_rpc(cfg: &BotRpcConfig) -> Result<(), String> {
             "'bot_rpc.default_template' exceeds {MAX_TEMPLATE_LEN} chars"
         ));
     }
+    // Codex round-2 PB4: zero is ambiguous (forever vs default) — the
+    // panel form pre-existing builds let users enter 0; this makes the
+    // contract explicit so invoke never has to guess.
+    if cfg.wait_timeout_ms == 0 {
+        return Err("'bot_rpc.wait_timeout_ms' must be > 0 (suggested 30000)".to_string());
+    }
     if cfg.wait_timeout_ms > MAX_TIMEOUT_MS {
         return Err(format!(
             "'bot_rpc.wait_timeout_ms' exceeds {MAX_TIMEOUT_MS} (1 hour)"
@@ -164,6 +176,20 @@ fn validate_bot_rpc(cfg: &BotRpcConfig) -> Result<(), String> {
             "'bot_rpc.wait_user_filter' must be a Slack user id (Uxxx); got {:?}",
             cfg.wait_user_filter
         ));
+    }
+    // Codex round-2 PB3: prevent zero-correlation channels. If the
+    // response isn't expected in the request's thread AND the user
+    // gives no filter AND the wait_mode is first-reply (no regex
+    // signal), ANY channel chatter would complete the wait.
+    if !cfg.wait_in_thread
+        && cfg.wait_user_filter.is_empty()
+        && matches!(cfg.wait_mode, WaitMode::FirstReply)
+    {
+        return Err(
+            "bot-rpc without 'wait_in_thread' must set 'wait_user_filter' or use \
+             wait_mode=regex (otherwise any channel message completes the wait)"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -341,6 +367,7 @@ mod tests {
                 wait_regex: r"^(?<key>[A-Z]+-\d+)".into(),
                 wait_user_filter: "U0BOT00001".into(),
                 wait_timeout_ms: 30_000,
+                wait_in_thread: false,
             }),
             collect: None,
             added_at: 0,
@@ -409,6 +436,41 @@ mod tests {
         let mut e = sample_bot_rpc("C01");
         e.bot_rpc.as_mut().unwrap().wait_timeout_ms = MAX_TIMEOUT_MS + 1;
         assert!(validate_entry(&e).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_timeout() {
+        let mut e = sample_bot_rpc("C01");
+        e.bot_rpc.as_mut().unwrap().wait_timeout_ms = 0;
+        let err = validate_entry(&e).unwrap_err();
+        assert!(err.contains("must be > 0"), "got {err}");
+    }
+
+    #[test]
+    fn validate_rejects_zero_correlation_first_reply() {
+        // first-reply + no thread + no user filter = any channel
+        // chatter would complete the wait. Codex round-2 PB3 fix.
+        let mut e = sample_bot_rpc("C01");
+        let cfg = e.bot_rpc.as_mut().unwrap();
+        cfg.wait_mode = WaitMode::FirstReply;
+        cfg.wait_regex = String::new();
+        cfg.wait_user_filter = String::new();
+        cfg.wait_in_thread = false;
+        let err = validate_entry(&e).unwrap_err();
+        assert!(err.contains("wait_in_thread"), "got {err}");
+    }
+
+    #[test]
+    fn validate_accepts_first_reply_when_in_thread() {
+        // wait_in_thread provides the correlation signal — empty
+        // user filter and first-reply is fine.
+        let mut e = sample_bot_rpc("C01");
+        let cfg = e.bot_rpc.as_mut().unwrap();
+        cfg.wait_mode = WaitMode::FirstReply;
+        cfg.wait_regex = String::new();
+        cfg.wait_user_filter = String::new();
+        cfg.wait_in_thread = true;
+        validate_entry(&e).expect("in-thread first-reply is OK");
     }
 
     #[test]

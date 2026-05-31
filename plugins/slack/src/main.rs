@@ -28,7 +28,9 @@ compile_error!(
      feature; gate exists to make that failure compile-time instead of runtime."
 );
 
+mod bot_rpc;
 mod channels;
+mod collect;
 mod config;
 mod events;
 mod socket_mode;
@@ -42,8 +44,11 @@ use std::thread;
 
 use serde_json::{Value, json};
 
+use bot_rpc::{BotRpcRegistry, IncomingMessage, PendingWait, compile_regex, is_matchable_subtype};
 use channels::{BotRpcConfig, ChannelEntry, ChannelProfile, ChannelStore, WaitMode};
+use collect::{CollectLine, CollectStore};
 use config::Config;
+use events::SlackEvent;
 use store::{TokenSet, TokenStore};
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -161,6 +166,10 @@ fn run_rpc() {
     };
     let store: Arc<dyn TokenStore> = Arc::from(store::open_store(&config));
     let channel_store = Arc::new(ChannelStore::new(config.channel_path.clone()));
+    let collect_store = Arc::new(CollectStore::new(config.collect_dir.clone()));
+    let bot_rpc_registry = Arc::new(BotRpcRegistry::new());
+    let bot_user_id_cache: Arc<std::sync::Mutex<Option<(String, String)>>> =
+        Arc::new(std::sync::Mutex::new(None));
     eprintln!(
         "[slack] token store: {} (env tokens: {})",
         store.kind(),
@@ -171,6 +180,7 @@ fn run_rpc() {
         }
     );
     eprintln!("[slack] channel store: {}", config.channel_path.display());
+    eprintln!("[slack] collect dir:   {}", config.collect_dir.display());
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -204,6 +214,9 @@ fn run_rpc() {
         let event_tx = tx.clone();
         let cfg = config.clone();
         let store_for_loop = store.clone();
+        let collect_for_loop = collect_store.clone();
+        let channels_for_loop = channel_store.clone();
+        let registry_for_loop = bot_rpc_registry.clone();
         thread::spawn(move || {
             while !init_flag.load(Ordering::SeqCst) {
                 if stop.load(Ordering::SeqCst) {
@@ -212,6 +225,17 @@ fn run_rpc() {
                 thread::sleep(std::time::Duration::from_millis(100));
             }
             socket_mode::run_loop(&cfg, store_for_loop, &stop, |event| {
+                // Route to collect/bot_rpc BEFORE the firehose publish so
+                // a slow listener can't delay disk writes / response
+                // matching. Both are best-effort: errors log but never
+                // suppress the outgoing event.publish frame.
+                route_for_collect_and_bot_rpc(
+                    &event,
+                    &channels_for_loop,
+                    &collect_for_loop,
+                    &registry_for_loop,
+                    &event_tx,
+                );
                 let frame = json!({
                     "method": "event.publish",
                     "params": {
@@ -221,6 +245,16 @@ fn run_rpc() {
                 });
                 let _ = event_tx.send(frame.to_string());
             });
+        });
+    }
+
+    // Sweeper publishes slack.bot_rpc.timeout for each deadlined wait.
+    {
+        let registry = bot_rpc_registry.clone();
+        let stop = stop_signal.clone();
+        let sweeper_tx = tx.clone();
+        bot_rpc::start_sweeper(registry, stop, move |expired| {
+            bot_rpc::dispatch_timeout(&sweeper_tx, &expired);
         });
     }
 
@@ -248,10 +282,113 @@ fn run_rpc() {
             &config,
             &store,
             &channel_store,
+            &bot_rpc_registry,
+            &bot_user_id_cache,
         );
     }
 }
 
+/// Routes a `SlackEvent::Raw` message to (a) JSONL append for
+/// collect-profile channels and (b) bot_rpc registry's
+/// `ingest_message` for any pending wait correlations. Both paths
+/// filter on the matcher subtype contract so edits / joins / etc.
+/// don't sneak in.
+fn route_for_collect_and_bot_rpc(
+    event: &SlackEvent,
+    channels: &Arc<ChannelStore>,
+    collect_store: &Arc<CollectStore>,
+    registry: &Arc<BotRpcRegistry>,
+    tx: &Sender<String>,
+) {
+    let SlackEvent::Raw(raw) = event else {
+        return;
+    };
+    if raw.event_type != "message" {
+        return;
+    }
+    let inner = &raw.event_json;
+    let subtype = inner.get("subtype").and_then(Value::as_str);
+    if !is_matchable_subtype(subtype) {
+        return;
+    }
+    // Author extraction: prefer `user`, accept `bot_message` shape
+    // where Slack puts `user` alongside `bot_id`. Bots without `user`
+    // (rare; legacy webhooks) are dropped — see `wait_user_filter`
+    // contract in bot_rpc.rs.
+    let Some(user) = inner.get("user").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(channel) = raw.channel.clone() else {
+        return;
+    };
+    let Some(ts) = raw.ts.clone() else {
+        return;
+    };
+    let text = inner
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let thread_ts = inner
+        .get("thread_ts")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    // Bot-RPC ingest first — registry's recent buffer must be primed
+    // before the collect append (cheap, in-memory). If a match fires
+    // here, publish completed.
+    let msg = IncomingMessage {
+        channel: channel.clone(),
+        ts: ts.clone(),
+        user: user.to_string(),
+        text: text.clone(),
+        thread_ts: thread_ts.clone(),
+        event_id: raw.event_id.clone(),
+        team_id: raw.team_id.clone(),
+        received_at_ms: collect::now_ms(),
+    };
+    if let Some(matched) = registry.ingest_message(msg) {
+        bot_rpc::dispatch_completed(tx, &matched);
+    }
+
+    // Collect: routing reads the channel entry on every message.
+    // Cheap (small JSON file) and avoids cache invalidation when
+    // the user upserts a channel mid-stream.
+    //
+    // Stricter filter than the bot-rpc matcher: knowledge-base capture
+    // wants normal human messages only. `bot_message` subtype is
+    // allowed for bot-rpc (Jira replies) but explicitly excluded here
+    // per the intent's AC — "bot 메시지 또는 subtype 있는 message
+    // (edit/delete/join 등)가 와도 jsonl에 기록되지 않음".
+    if subtype.is_some() {
+        return;
+    }
+    if inner.get("bot_id").is_some() {
+        return;
+    }
+    let file = channels.load();
+    let matches_collect = file
+        .channels
+        .iter()
+        .any(|c| c.id == channel && matches!(c.profile, ChannelProfile::Collect));
+    if matches_collect {
+        let line = CollectLine {
+            channel: channel.clone(),
+            ts,
+            user: user.to_string(),
+            text,
+            thread_ts,
+            team_id: raw.team_id.clone(),
+            event_id: raw.event_id.clone(),
+            captured_at_ms: collect::now_ms(),
+        };
+        if let Err(e) = collect_store.append(&line) {
+            eprintln!("[slack] collect append failed: {e}");
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_frame(
     frame: &Value,
     tx: &Sender<String>,
@@ -260,6 +397,8 @@ fn handle_frame(
     config: &Config,
     store: &Arc<dyn TokenStore>,
     channel_store: &Arc<ChannelStore>,
+    bot_rpc_registry: &Arc<BotRpcRegistry>,
+    bot_user_id_cache: &Arc<std::sync::Mutex<Option<(String, String)>>>,
 ) {
     let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
     let id = frame.get("id").and_then(Value::as_str).unwrap_or("");
@@ -289,6 +428,8 @@ fn handle_frame(
                         "slack.channels.list",
                         "slack.channels.upsert",
                         "slack.channels.remove",
+                        "slack.channels.discover",
+                        "slack.bot_rpc.invoke",
                     ],
                     "subscribes": [],
                 }),
@@ -304,7 +445,16 @@ fn handle_frame(
                 .unwrap_or("")
                 .to_string();
             let action_params = params.get("params").cloned().unwrap_or(Value::Null);
-            let result = handle_action(&name, &action_params, config, store, channel_store);
+            let result = handle_action(
+                &name,
+                &action_params,
+                config,
+                store,
+                channel_store,
+                bot_rpc_registry,
+                bot_user_id_cache,
+                tx,
+            );
             match result {
                 Ok(v) => send_response(tx, id, v),
                 Err((code, msg)) => send_error(tx, id, &code, &msg),
@@ -329,12 +479,16 @@ fn handle_frame(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_action(
     name: &str,
     params: &Value,
     config: &Config,
     store: &Arc<dyn TokenStore>,
     channel_store: &Arc<ChannelStore>,
+    bot_rpc_registry: &Arc<BotRpcRegistry>,
+    bot_user_id_cache: &Arc<std::sync::Mutex<Option<(String, String)>>>,
+    tx: &Sender<String>,
 ) -> Result<Value, (String, String)> {
     if name == "slack.auth_status" {
         // Round-5 fix: when env validation produced a fatal_error,
@@ -407,10 +561,246 @@ fn handle_action(
     if name == "slack.channels.remove" {
         return handle_channels_remove(params, channel_store);
     }
+    if name == "slack.channels.discover" {
+        return handle_channels_discover(params, config, store);
+    }
+    if name == "slack.bot_rpc.invoke" {
+        return handle_bot_rpc_invoke(
+            params,
+            config,
+            store,
+            channel_store,
+            bot_rpc_registry,
+            bot_user_id_cache,
+            tx,
+        );
+    }
     Err((
         "action_not_found".to_string(),
         format!("slack plugin does not handle {name}"),
     ))
+}
+
+/// `slack.channels.discover {cursor?, types?, limit?}` — single page
+/// of `conversations.list`. Caller paginates by passing back the
+/// `next_cursor` in subsequent calls. `types` defaults to
+/// `public_channel,private_channel` (DMs/MPIMs rarely have meaningful
+/// names; user can override).
+fn handle_channels_discover(
+    params: &Value,
+    config: &Config,
+    store: &Arc<dyn TokenStore>,
+) -> Result<Value, (String, String)> {
+    if config.fatal_error.is_some() {
+        return Err((
+            "not_authenticated".to_string(),
+            "slack plugin is in fatal-config state — see slack.auth_status".to_string(),
+        ));
+    }
+    let creds = socket_mode::current_credentials(config, &**store).ok_or((
+        "not_authenticated".to_string(),
+        "no Slack credentials available — run `copad-plugin-slack auth` or set env tokens"
+            .to_string(),
+    ))?;
+    let cursor = params.get("cursor").and_then(Value::as_str);
+    // Hard-cap at 200 per intent AC ("첫 페이지 최대 200"). Caller can
+    // pass `limit` for *smaller* pages (e.g. 50) to keep modal scroll
+    // sane, but cannot widen — that would invite Tier-2 rate-limit
+    // pressure under user-driven pagination.
+    let limit_raw = params.get("limit").and_then(Value::as_u64).unwrap_or(200);
+    let limit = limit_raw.min(200) as u32;
+    let types_raw = params
+        .get("types")
+        .and_then(Value::as_str)
+        .unwrap_or("public_channel,private_channel");
+    // Allowlist: Slack documents exactly these four. Reject unknown
+    // segments before sending — the API would 200-with-ok=false but a
+    // pre-check is cleaner than parsing back the error.
+    for t in types_raw.split(',').map(str::trim) {
+        if !matches!(t, "public_channel" | "private_channel" | "mpim" | "im") {
+            return Err((
+                "invalid_params".to_string(),
+                format!("'types' contains unknown segment {t:?}"),
+            ));
+        }
+    }
+    let (channels, next_cursor) =
+        socket_mode::conversations_list(&creds.bot_token, cursor, types_raw, limit)
+            .map_err(map_slack_error)?;
+    let summarized: Vec<Value> = channels
+        .iter()
+        .map(|c| {
+            json!({
+                "id": c.get("id").and_then(Value::as_str).unwrap_or(""),
+                "name": c.get("name").and_then(Value::as_str).unwrap_or(""),
+                "is_private": c.get("is_private").and_then(Value::as_bool).unwrap_or(false),
+                "is_member": c.get("is_member").and_then(Value::as_bool).unwrap_or(false),
+                "is_archived": c.get("is_archived").and_then(Value::as_bool).unwrap_or(false),
+            })
+        })
+        .collect();
+    Ok(json!({
+        "channels": summarized,
+        "next_cursor": next_cursor,
+    }))
+}
+
+/// Map a Slack-shaped error string to (code, message) the same way
+/// `handle_get_message` does — Slack-shaped codes (lowercase + underscore)
+/// promote to top-level so triggers can branch.
+fn map_slack_error(err: String) -> (String, String) {
+    let bare = err
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("");
+    if !bare.is_empty() && bare.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
+        (bare.to_string(), err)
+    } else {
+        ("io_error".to_string(), err)
+    }
+}
+
+/// `slack.bot_rpc.invoke {channel, text?}` — posts the configured
+/// template (or `text` override) to the channel and registers a
+/// pending wait for the response. Returns `{request_ts}` so the
+/// caller can correlate the upcoming `slack.bot_rpc.completed` /
+/// `slack.bot_rpc.timeout` notifications.
+#[allow(clippy::too_many_arguments)]
+fn handle_bot_rpc_invoke(
+    params: &Value,
+    config: &Config,
+    store: &Arc<dyn TokenStore>,
+    channel_store: &Arc<ChannelStore>,
+    bot_rpc_registry: &Arc<BotRpcRegistry>,
+    bot_user_id_cache: &Arc<std::sync::Mutex<Option<(String, String)>>>,
+    tx: &Sender<String>,
+) -> Result<Value, (String, String)> {
+    if config.fatal_error.is_some() {
+        return Err((
+            "not_authenticated".to_string(),
+            "slack plugin is in fatal-config state — see slack.auth_status".to_string(),
+        ));
+    }
+    let channel_id = params.get("channel").and_then(Value::as_str).ok_or((
+        "invalid_params".to_string(),
+        "missing 'channel' (string)".to_string(),
+    ))?;
+    if !channels::is_valid_channel_id(channel_id) {
+        return Err((
+            "invalid_params".to_string(),
+            format!("'channel' must be a Slack id; got {channel_id:?}"),
+        ));
+    }
+    let creds = socket_mode::current_credentials(config, &**store).ok_or((
+        "not_authenticated".to_string(),
+        "no Slack credentials available — run `copad-plugin-slack auth` or set env tokens"
+            .to_string(),
+    ))?;
+    let file = channel_store.load();
+    let entry = file
+        .channels
+        .iter()
+        .find(|c| c.id == channel_id)
+        .cloned()
+        .ok_or((
+            "precondition_failed".to_string(),
+            format!("channel {channel_id} not registered — upsert it first"),
+        ))?;
+    if !matches!(entry.profile, ChannelProfile::BotRpc) {
+        return Err((
+            "precondition_failed".to_string(),
+            format!(
+                "channel {channel_id} has profile {:?}, not bot-rpc",
+                entry.profile
+            ),
+        ));
+    }
+    // Re-validate the loaded entry against current rules — legacy rows
+    // written before the zero-correlation / zero-timeout gates were
+    // added would otherwise sneak past `compile_regex` alone and
+    // complete on unrelated channel chatter.
+    channels::validate_entry(&entry).map_err(|e| {
+        (
+            "precondition_failed".to_string(),
+            format!("legacy row failed validation — re-upsert to fix: {e}"),
+        )
+    })?;
+    let cfg = entry.bot_rpc.ok_or((
+        "precondition_failed".to_string(),
+        format!("channel {channel_id} is bot-rpc but has no bot_rpc config"),
+    ))?;
+    let compiled_regex = compile_regex(&cfg).map_err(|e| ("invalid_params".to_string(), e))?;
+    let text = params
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cfg.default_template.clone());
+    if text.is_empty() {
+        return Err((
+            "invalid_params".to_string(),
+            "no 'text' override and channel has empty default_template".to_string(),
+        ));
+    }
+    // bot_user_id is REQUIRED — without it the self-echo guard in the
+    // matcher can't function. Prefer the resolved credentials' value,
+    // fall back to live auth.test (cached by bot_token) so env-only
+    // setups still work.
+    let bot_user_id = resolve_bot_user_id(&creds, bot_user_id_cache)?;
+    let (request_ts, posted_channel) =
+        socket_mode::post_message(&creds.bot_token, channel_id, &text, None)
+            .map_err(map_slack_error)?;
+    let deadline_ms = collect::now_ms().saturating_add(cfg.wait_timeout_ms);
+    let wait = PendingWait {
+        request_ts: request_ts.clone(),
+        channel: posted_channel.clone(),
+        config: cfg,
+        deadline_ms,
+        bot_user_id,
+        compiled_regex,
+    };
+    // add() also replays the recent message buffer — a response that
+    // arrived between postMessage send and HTTP response receive will
+    // already have been ingested via the Socket Mode loop, so we
+    // catch it here without any race.
+    if let Some(matched) = bot_rpc_registry.add(wait) {
+        bot_rpc::dispatch_completed(tx, &matched);
+    }
+    Ok(json!({
+        "request_ts": request_ts,
+        "channel": posted_channel,
+    }))
+}
+
+/// Resolves the bot's own Slack user id, caching against the
+/// originating bot token. Required by `bot_rpc.invoke` so the matcher's
+/// self-echo guard has a real value to compare against.
+fn resolve_bot_user_id(
+    creds: &socket_mode::ResolvedCredentials,
+    cache: &Arc<std::sync::Mutex<Option<(String, String)>>>,
+) -> Result<String, (String, String)> {
+    if let Some(uid) = creds.bot_user_id.clone() {
+        return Ok(uid);
+    }
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_token, cached_uid)) = guard.as_ref()
+            && cached_token == &creds.bot_token
+        {
+            return Ok(cached_uid.clone());
+        }
+    }
+    let (_, user_id) = socket_mode::auth_test(&creds.bot_token).map_err(|e| {
+        (
+            "bot_user_unresolved".to_string(),
+            format!("auth.test for bot user id: {e}"),
+        )
+    })?;
+    {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some((creds.bot_token.clone(), user_id.clone()));
+    }
+    Ok(user_id)
 }
 
 fn handle_channels_list(channel_store: &Arc<ChannelStore>) -> Result<Value, (String, String)> {
@@ -557,12 +947,17 @@ fn parse_bot_rpc(v: &Value) -> Result<BotRpcConfig, (String, String)> {
         .get("wait_timeout_ms")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let wait_in_thread = v
+        .get("wait_in_thread")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     Ok(BotRpcConfig {
         default_template,
         wait_mode,
         wait_regex,
         wait_user_filter,
         wait_timeout_ms,
+        wait_in_thread,
     })
 }
 

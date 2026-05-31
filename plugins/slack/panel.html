@@ -506,6 +506,77 @@ body {
 }
 .chan-add__submit:disabled { opacity: 0.4; cursor: not-allowed; }
 
+.chan-discover {
+  padding: var(--s-3) var(--s-4);
+  border-bottom: 1px solid var(--copad-surface1);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  max-height: 40vh;
+  overflow-y: auto;
+  background: var(--copad-base);
+}
+.chan-discover__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  font-size: var(--fs-meta);
+  color: var(--copad-subtext1);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.chan-discover__count { color: var(--copad-overlay1); }
+.chan-discover__empty {
+  color: var(--copad-subtext0);
+  font-style: italic;
+  padding: var(--s-3) 0;
+  text-align: center;
+}
+.chan-disc-row {
+  display: grid;
+  grid-template-columns: minmax(110px, max-content) 1fr auto;
+  align-items: center;
+  gap: var(--s-3);
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: var(--fs-body);
+}
+.chan-disc-row:hover,
+.chan-disc-row:focus-visible {
+  border-color: var(--copad-surface1);
+  background: var(--copad-mantle);
+}
+.chan-disc-row__id { color: var(--copad-text); font-weight: 600; }
+.chan-disc-row__name { color: var(--copad-subtext1); }
+.chan-disc-row__name::before { content: "#"; color: var(--copad-overlay0); }
+.chan-disc-row__flags {
+  display: flex;
+  gap: var(--s-2);
+  font-size: var(--fs-meta);
+  color: var(--copad-overlay1);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.chan-disc-row__flag--reg { color: var(--copad-green); }
+.chan-disc-row__flag--archived { color: var(--copad-peach); }
+.chan-discover__more {
+  align-self: center;
+  margin-top: var(--s-2);
+  background: transparent;
+  border: 1px solid var(--copad-surface1);
+  color: var(--copad-subtext1);
+  font-family: inherit;
+  font-size: var(--fs-meta);
+  text-transform: uppercase;
+  padding: var(--s-2) var(--s-4);
+  cursor: pointer;
+  border-radius: 3px;
+}
+.chan-discover__more:hover { border-color: var(--copad-accent); color: var(--copad-text); }
+.chan-discover__more:disabled { opacity: 0.4; cursor: not-allowed; }
+
 .chan-list {
   flex: 1;
   min-height: 0;
@@ -1091,7 +1162,13 @@ body {
       <option value="bot-rpc">bot-rpc</option>
     </select>
     <button class="chan-add__submit" id="chan-add-submit" type="submit">ADD</button>
+    <button class="chan-add__submit" id="chan-discover-toggle" type="button"
+            title="browse workspace channels">DISCOVER</button>
   </form>
+
+  <!-- Discover section: workspace channel browser. Sibling of #main so
+       renderChannelsList() never wipes it. -->
+  <section class="chan-discover" id="chan-discover" hidden></section>
 
   <main id="main" class="slack-feed" aria-live="polite"></main>
 
@@ -1153,6 +1230,12 @@ const state = {
   channelsLoaded: false,
   chanExpanded: new Set(safeJSON(localStorage.getItem(LS.chanExp)) || []),
   chanDrafts: new Map(),
+  // DISCOVER (sub-section of channels tab)
+  discoverOpen: false,
+  discoverRows: [],
+  discoverCursor: null,
+  discoverLoading: false,
+  discoverError: null,
 };
 
 function safeJSON(s) { try { return JSON.parse(s); } catch { return null; } }
@@ -1175,6 +1258,8 @@ const dom = {
   chanAddId:      $('chan-add-id'),
   chanAddProfile: $('chan-add-profile'),
   chanAddSubmit:  $('chan-add-submit'),
+  chanDiscoverToggle: $('chan-discover-toggle'),
+  chanDiscover:   $('chan-discover'),
   main:      $('main'),
   composer:  $('composer'),
   composerChannel: $('composer-channel'),
@@ -1274,6 +1359,7 @@ function renderBody() {
     dom.tabs.hidden = true;
     dom.filter.hidden = true;
     dom.chanAdd.hidden = true;
+    dom.chanDiscover.hidden = true;
     dom.composer.hidden = true;
     renderTransportError();
     return;
@@ -1284,6 +1370,7 @@ function renderBody() {
     dom.tabs.hidden = true;
     dom.filter.hidden = true;
     dom.chanAdd.hidden = true;
+    dom.chanDiscover.hidden = true;
     dom.composer.hidden = true;
     renderSetup();
     return;
@@ -1295,9 +1382,11 @@ function renderBody() {
     dom.chanAdd.hidden = false;
     dom.composer.hidden = true;
     renderChannelsList();
+    renderDiscover();
   } else {
     dom.filter.hidden = false;
     dom.chanAdd.hidden = true;
+    dom.chanDiscover.hidden = true;
     dom.composer.hidden = false;
     renderFeed();
   }
@@ -1516,6 +1605,7 @@ function renderChanEditForm(ch) {
     wait_regex: '',
     wait_user_filter: '',
     wait_timeout_ms: 30000,
+    wait_in_thread: true,
   };
   return `
     <form class="chan-form" data-profile="${esc(ch.profile)}" data-edit-id="${esc(ch.id)}">
@@ -1567,13 +1657,23 @@ function renderChanEditForm(ch) {
                  placeholder="U0BOT123 (empty = any)" spellcheck="false" />
         </div>
         <div class="chan-form__field">
-          <label class="chan-form__label" for="edit-timeout-${esc(ch.id)}">timeout (ms)</label>
-          <input class="chan-form__input" id="edit-timeout-${esc(ch.id)}"
-                 name="wait_timeout_ms" type="number" min="0" max="3600000"
-                 value="${esc(String(cfg.wait_timeout_ms ?? 30000))}" />
+          <label class="chan-form__label" for="edit-inthread-${esc(ch.id)}">in-thread only</label>
+          <input class="chan-form__input" id="edit-inthread-${esc(ch.id)}"
+                 name="wait_in_thread" type="checkbox"
+                 ${cfg.wait_in_thread ? 'checked' : ''} />
         </div>
         <div class="chan-form__hint">
-          0 = wait forever. max 3,600,000 (1 hour).
+          when checked, only replies posted in the request's thread complete the wait.
+          uncheck for bots that reply in the main channel (then set 'from user' or use regex).
+        </div>
+        <div class="chan-form__field">
+          <label class="chan-form__label" for="edit-timeout-${esc(ch.id)}">timeout (ms)</label>
+          <input class="chan-form__input" id="edit-timeout-${esc(ch.id)}"
+                 name="wait_timeout_ms" type="number" min="1000" max="3600000"
+                 value="${esc(String(cfg.wait_timeout_ms || 30000))}" />
+        </div>
+        <div class="chan-form__hint">
+          how long to wait for a response. 1,000–3,600,000 ms (1 second to 1 hour).
         </div>
       </fieldset>
 
@@ -1597,7 +1697,9 @@ function readChanDraft(form) {
       wait_mode: fd.get('wait_mode') || 'first-reply',
       wait_regex: (fd.get('wait_regex') || '').toString(),
       wait_user_filter: (fd.get('wait_user_filter') || '').toString().trim(),
-      wait_timeout_ms: Math.max(0, parseInt(fd.get('wait_timeout_ms'), 10) || 0),
+      // FormData omits unchecked checkboxes — presence = true.
+      wait_in_thread: fd.has('wait_in_thread'),
+      wait_timeout_ms: Math.max(1000, parseInt(fd.get('wait_timeout_ms'), 10) || 30000),
     },
   };
 }
@@ -1787,13 +1889,16 @@ function bindChannels() {
     const params = { id, profile };
     if (profile === 'bot-rpc') {
       // Minimal default config so server validation passes — user
-      // refines after expand.
+      // refines after expand. wait_in_thread=true is the default
+      // correlation gate so a fresh bot-rpc channel can't match
+      // arbitrary channel chatter.
       params.bot_rpc = {
         default_template: '',
         wait_mode: 'first-reply',
         wait_regex: '',
         wait_user_filter: '',
         wait_timeout_ms: 30000,
+        wait_in_thread: true,
       };
     }
     try {
@@ -1893,6 +1998,101 @@ function bindChannels() {
   });
 }
 
+/* §10 DISCOVER — workspace channel browser ----------------------------- */
+function renderDiscover() {
+  if (!state.discoverOpen) {
+    dom.chanDiscover.hidden = true;
+    dom.chanDiscover.innerHTML = '';
+    return;
+  }
+  dom.chanDiscover.hidden = false;
+  const registered = new Set(state.channels.map(c => c.id));
+  const rows = state.discoverRows.map(c => {
+    const isReg = registered.has(c.id);
+    const flags = [];
+    if (isReg) flags.push('<span class="chan-disc-row__flags chan-disc-row__flag--reg">REGISTERED</span>');
+    if (c.is_private) flags.push('<span class="chan-disc-row__flags">PRIVATE</span>');
+    if (c.is_archived) flags.push('<span class="chan-disc-row__flags chan-disc-row__flag--archived">ARCHIVED</span>');
+    if (c.is_member) flags.push('<span class="chan-disc-row__flags">MEMBER</span>');
+    return `
+      <div class="chan-disc-row" data-disc-id="${esc(c.id)}" data-disc-name="${esc(c.name)}" tabindex="0">
+        <span class="chan-disc-row__id">${esc(c.id)}</span>
+        <span class="chan-disc-row__name">${esc(c.name || '(no name)')}</span>
+        <span class="chan-disc-row__flags-wrap">${flags.join(' ')}</span>
+      </div>`;
+  }).join('');
+  const more = state.discoverCursor
+    ? `<button class="chan-discover__more" data-act="discover-more" type="button"
+              ${state.discoverLoading ? 'disabled' : ''}>
+         ${state.discoverLoading ? 'LOADING…' : 'LOAD MORE'}
+       </button>`
+    : '';
+  const empty = state.discoverRows.length === 0 && !state.discoverLoading && !state.discoverError
+    ? '<div class="chan-discover__empty">no channels visible to this bot</div>'
+    : '';
+  const err = state.discoverError
+    ? `<div class="chan-discover__empty">error: ${esc(state.discoverError)}</div>`
+    : '';
+  dom.chanDiscover.innerHTML = `
+    <div class="chan-discover__head">
+      <span>discover</span>
+      <span class="chan-discover__count">${state.discoverRows.length} loaded</span>
+    </div>
+    ${err}
+    ${empty}
+    ${rows}
+    ${more}
+  `;
+}
+
+async function loadDiscoverPage(reset) {
+  if (state.discoverLoading) return;
+  state.discoverLoading = true;
+  state.discoverError = null;
+  if (reset) {
+    state.discoverRows = [];
+    state.discoverCursor = null;
+  }
+  renderDiscover();
+  try {
+    const params = {};
+    if (state.discoverCursor) params.cursor = state.discoverCursor;
+    const res = await copad.call('slack.channels.discover', params);
+    state.discoverRows = state.discoverRows.concat(res.channels || []);
+    state.discoverCursor = res.next_cursor || null;
+  } catch (err) {
+    state.discoverError = `${err.code || 'discover_failed'}: ${err.message || String(err)}`;
+  } finally {
+    state.discoverLoading = false;
+    renderDiscover();
+  }
+}
+
+function bindDiscover() {
+  dom.chanDiscoverToggle.addEventListener('click', () => {
+    state.discoverOpen = !state.discoverOpen;
+    if (state.discoverOpen && state.discoverRows.length === 0) {
+      loadDiscoverPage(true);
+    } else {
+      renderDiscover();
+    }
+  });
+  dom.chanDiscover.addEventListener('click', (e) => {
+    const more = e.target.closest('[data-act="discover-more"]');
+    if (more) {
+      loadDiscoverPage(false);
+      return;
+    }
+    const row = e.target.closest('.chan-disc-row');
+    if (!row) return;
+    // Prefill the Add form — user picks profile + clicks ADD to register.
+    // Auto-upsert would surprise on a misclick.
+    dom.chanAddId.value = row.dataset.discId;
+    dom.chanAddId.focus();
+    dom.chanAddId.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  });
+}
+
 function bindComposer() {
   dom.composerText.value = localStorage.getItem(LS.draft) || '';
   dom.composerText.addEventListener('input', () => {
@@ -1949,6 +2149,7 @@ async function init() {
   bindFilter();
   bindFeed();
   bindChannels();
+  bindDiscover();
   bindComposer();
 
   copad.on('slack.mention',  ev => ingestEvent('mention',  ev));

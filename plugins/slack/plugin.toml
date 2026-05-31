@@ -21,6 +21,8 @@ provides = [
     "slack.channels.list",
     "slack.channels.upsert",
     "slack.channels.remove",
+    "slack.channels.discover",
+    "slack.bot_rpc.invoke",
 ]
 subscribes = []
 # Required env: COPAD_SLACK_BOT_TOKEN (xoxb-...), COPAD_SLACK_APP_TOKEN (xapp-...)
@@ -42,6 +44,9 @@ subscribes = []
 #                              public channels (use groups:history /
 #                              im:history / mpim:history for the
 #                              respective conversation kinds)
+#        channels:read       ← required for slack.channels.discover
+#                              (public channels listing). Add groups:read
+#                              if you want private channels in discover.
 #   5. Install to your workspace; copy the Bot User OAuth Token (xoxb-...)
 #   6. Run `COPAD_SLACK_BOT_TOKEN=xoxb-... COPAD_SLACK_APP_TOKEN=xapp-... copad-plugin-slack auth`
 
