@@ -113,7 +113,7 @@ copad.action("terminal.exec", {
 });
 ```
 
-Active pane runs the command. If the active pane is a non-terminal panel (kb panel itself, projects panel), the call escalates to:
+Active pane runs the command. If the active pane is a non-terminal panel (e.g. the kb panel itself), the call escalates to:
 
 ```js
 copad.action("tabs.new", { ... }).then(({ tab_id, panel_id }) =>

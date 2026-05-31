@@ -101,7 +101,7 @@ Map key combinations to shell commands. Commands prefixed with `spawn:` run in t
 
 ### [[projects]] (Phase 22.2)
 
-Project entries — one `[[projects]]` block per project. Drives `coctl project list` / `project.resolve` and scopes `copad-plugin-projects` panel rendering. See [project-orchestration.md](./project-orchestration.md) for the full design.
+Project entries — one `[[projects]]` block per project. Drives `coctl project list` / `project.resolve` and `workflow.run` workspace resolution. (The `copad-plugin-projects` GTK panel that originally rendered these was retired in Phase 24.5 — see [decision #50](./decisions.md#50-projects-panel-retired--web-bridge-is-the-single-orchestration-cockpit); the orchestration cockpit moves to `web-bridge`.)
 
 ```toml
 [[projects]]
@@ -114,7 +114,7 @@ aliases = ["copad-app"]              # optional — alternate names for `project
 name = "monorepo"
 path = "/home/marshall/dev/mono"
 subpath = "apps/web"                 # optional — workflow tabs open at <path>/<subpath>
-description = "Frontend monorepo"    # optional — surfaced in the projects panel header
+description = "Frontend monorepo"    # optional — human-readable label
 ```
 
 | Key          | Type           | Required | Description                                                                    |
@@ -122,22 +122,22 @@ description = "Frontend monorepo"    # optional — surfaced in the projects pan
 | `name`       | string         | yes      | Canonical project id (must be unique)                                          |
 | `path`       | string (path)  | yes      | Filesystem root — workflow tabs open here unless `subpath` is set              |
 | `subpath`    | string (path)  | no       | Working subdir inside `path` (monorepo packages)                               |
-| `description`| string         | no       | Free-text shown in the projects panel header                                   |
+| `description`| string         | no       | Free-text human-readable label                                                 |
 | `aliases`    | array<string>  | no       | Alternate names accepted by `project.resolve --name`                           |
 | `git_remote` | string         | no       | Canonical `owner/repo` — inferred via `git remote get-url origin` if omitted    |
 
 ### Workflow specs — `~/.config/copad/workflows/*.yaml` (Phase 22.2)
 
-Each YAML file in `~/.config/copad/workflows/` defines one workflow that surfaces in the projects panel + `coctl workflow list`. Schema:
+Each YAML file in `~/.config/copad/workflows/` defines one workflow that `coctl workflow list` exposes and `workflow.run` can dispatch (the retired projects panel originally rendered these; the cockpit moves to `web-bridge`). Schema:
 
 ```yaml
 id: ship
 name: /ship
 description: Run /ship — tests, codex review gate, commit, push, PR.
-require_project: true            # if true, panel/coctl must resolve a project before run
+require_project: true            # if true, the caller (coctl / workflow.run) must resolve a project before run
 timeout_secs: 1200               # optional — emits workflow.timed_out (no kill in v1)
 fresh_session: true              # mirrors life-assistant's ship contract
-form_fields:                     # optional — rendered as form in the panel
+form_fields:                     # optional — field schema for callers that render a form (e.g. the web-bridge cockpit)
   - name: branch
     label: Git branch
     type: text                   # text | textarea | select
