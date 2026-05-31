@@ -1,0 +1,13 @@
+[plugin]
+name = "pilot"
+title = "Pilot — Autonomous Goal Queue"
+version = "0.1.0"
+description = "Owns a persistent goal queue and drives one interactive agent session at a time via csd."
+
+[[services]]
+name = "main"
+exec = "copad-plugin-pilot"
+activation = "onStartup"
+restart = "on-crash"
+provides = ["pilot.add", "pilot.list", "pilot.cancel", "pilot.answer", "pilot.approve"]
+subscribes = []

@@ -888,6 +888,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "copad-plugin-pilot"
+version = "0.2.0"
+dependencies = [
+ "dirs 5.0.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "copad-plugin-projects"
 version = "0.2.0"
 dependencies = [
