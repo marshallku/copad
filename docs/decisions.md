@@ -1153,3 +1153,37 @@ All of the panel's value is downstream of the body, and even with the body it wo
 **Trade-off accepted.** Cockpit interaction requires a browser (local or phone) rather than an in-app GTK pane. Acceptable: the user is `tmux`-heavy and found the in-app panel dead weight, and the browser surface is the one that also solves remote/away access.
 
 **See:** [#49](#49-agent-session-dispatch-via-a-standalone-csd-cli--subscription-seat-driver-consumed-by-copad) (the dispatch body the cockpit visualizes), [#43](#43-pluginsweb-bridge-slice-31--tmux-as-data-model--xtermjs-attach-harness-integration-slice-31) (the `web-bridge` server this becomes the cockpit on), [#48](#48-copad-native-port-of-project-orchestration-spine) (the spine whose panel surface this retires), [docs/roadmap.md § Phase 24.5 / 24.6](./roadmap.md#phase-24-csd-integration--autonomous-loop-the-body-for-the-224227-spine).
+
+## 51. Orchestration = lean goal-queue plugin over `csd`; goal-tick state-machine + mission removed
+
+**Completes the trio with [#49](#49-agent-session-dispatch-via-a-standalone-csd-cli--subscription-seat-driver-consumed-by-copad) (the `csd` dispatch body) and [#50](#50-projects-panel-retired--web-bridge-is-the-single-orchestration-cockpit) (the `web-bridge` cockpit).** #51 decides the orchestration *model* between them — and it is much smaller than the Phase 22.4–22.7 spine [#48](#48-copad-native-port-of-project-orchestration-spine) built.
+
+**Problem.** Two facts collapsed the spine's scope:
+
+1. **The goal/mission distinction is dead weight in copad.** It was inherited from life-assistant, where `mission` = multi-agent **persona** orchestration (sarah-cfo, tom-cto, …) with `wake_conditions` + `budget` + assigned `agents`. Those personas were deliberately *not* ported (#48/#50). copad's actual use is single-track coding work — so `mission` (and the `agent` registry + `pipeline` team model it depended on) has **no consumer**.
+2. **The goal-tick state-machine is a `claude -p` artifact.** `copad-core::goal`'s 60s re-tick, `no_progress_count`, `in_flight_panel_id`, and `TickRecord` history exist because `-p` is stateless per call — each tick re-spawns a fresh turn from `roadmap.md`. But the chosen dispatch body is `csd`, a **persistent interactive session** (#49): the session stays alive, you just `csd send` the next thing. Persistent sessions obviate re-ticking, so the tick machinery is solving a problem that no longer exists.
+
+What the workstation actually needs (user-stated): a **sequential goal queue** — instruct a goal in natural language, run it in a cwd via `csd`, and when the session returns idle, advance to the next goal — plus human-in-the-loop on gates. No tick machine, no multi-agent container.
+
+**Decision.** Orchestration is a **new copad service plugin** (`copad-plugin-<name>`, OnStartup, supervised by `copadd`) owning a thin **persistent goal queue**. There is one source of truth — the plugin's queue — so the `copad-core` spine modules are removed.
+
+- **Goal** = `{id, cwd, instruction, status, phase, csd_session, gate?}`. No tick loop, no agents, no roadmap-as-driver. (A `roadmap.md` can still be *referenced* by an instruction; it is not the engine.)
+- **Dispatcher** runs in a **background thread** in the plugin (not in an action handler — service-plugin action calls are bounded by the supervisor's ~120s timeout). Registered actions (`.add/.list/.answer/.approve/.cancel`) are quick RPCs that enqueue/signal.
+- **Per-goal session identity** (session name = goal id) — never "find a session by cwd" (multiple sessions per cwd, idle-session context contamination).
+- **Nonce completion sentinel** — the instruction asks the agent to emit `DONE:<goal_id>:<nonce>` / `BLOCKED:<…>`; accepted only in the latest assistant turn *after* the recorded send point. `csd idle_done` alone ≠ goal complete.
+- **Crash idempotency** — a persisted `phase` cursor written *before and after* each `csd send`, so a restart never re-sends.
+- **`csd` invoked via `Command` arg vector** (never a shell string — instruction/cwd are user-controlled); CLI failures (missing sidecar, dead session, tmux error, hang) handled via exit-code/stderr/timeout, separate from `csd state`.
+- **Gates** (`awaiting_answer` / `plan_ready` / `blocked`) → pause the queue, persist gate context (session, gate type, question/plan/options) in a **queryable** list/read action (events alone are ephemeral; a browser opened later must render the current gate), surface in the `web-bridge` cockpit (#50). `.answer`/`.approve` re-check current `csd state`, reject stale, resume polling.
+- **True 24/7** needs `loginctl enable-linger` (copadd-spawned plugins otherwise stop at logout); the plugin inherits the daemon env, so `csd`/`tmux`/`claude`/PATH/auth must be resolved explicitly (the `web-bridge`→`tmx` PATH-fallback precedent).
+
+**Removed (single-SoT cleanup, Phase 24).**
+- **`copad-core::goal` + `copad-core::mission`** modules, their daemon actions (`goal.*`, `mission.*`), and `coctl goal` / `coctl mission` subcommands. The 60s goal-tick thread in `copadd` goes with them.
+- **Candidates flagged (not auto-deleted by this decision):** `copad-core::agent`, `::approval`, `::pipeline` (22.5–22.7) lose their consumer under the lean model — `approval` is superseded by `csd` gates + queue gate-state, `agent`/`pipeline` by single-track goals. Remove in the same Phase 24 cleanup unless a concrete use surfaces; confirm before deleting.
+
+**Kept.** `copad-core::runledger` (durable event log / audit) — still useful. `copad-core::project` + `pane_context` resolution — still used for cwd/project scoping. KB panel (22.3) — independent.
+
+**Trade-offs accepted.**
+- **Throwing away built code.** 22.4 (goal) + 22.5 (mission) shipped and were codex-audited; deleting them is sunk cost. Honest cause: #48 over-ported the spine wholesale ("upfront, because of internal coupling") before a real consumer existed — the Rule-of-Three gate it waived would have caught this. The lean plugin is ~a fraction of the code and matches actual use.
+- **No multi-agent orchestration.** If a genuine multi-agent need appears later, it returns as its own plugin/feature earned by use — not pre-built.
+
+**See:** [#49](#49-agent-session-dispatch-via-a-standalone-csd-cli--subscription-seat-driver-consumed-by-copad) (csd dispatch body), [#50](#50-projects-panel-retired--web-bridge-is-the-single-orchestration-cockpit) (web-bridge cockpit), [#48](#48-copad-native-port-of-project-orchestration-spine) (the over-ported spine this trims), [docs/roadmap.md § Phase 24](./roadmap.md#phase-24-csd-integration--autonomous-loop-the-body-for-the-224227-spine).
