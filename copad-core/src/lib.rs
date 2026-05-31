@@ -1,6 +1,4 @@
 pub mod action_registry;
-pub mod agent;
-pub mod approval;
 pub mod background;
 pub mod condition;
 pub mod config;
@@ -8,11 +6,8 @@ pub mod context;
 pub mod error;
 pub mod event_bus;
 pub mod fs_atomic;
-pub mod goal;
-pub mod mission;
 pub mod notifier;
 pub mod paths;
-pub mod pipeline;
 pub mod plugin;
 pub mod project;
 pub mod protocol;

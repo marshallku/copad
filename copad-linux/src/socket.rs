@@ -1774,14 +1774,14 @@ fn handle_workflow_run(
 
     if spec.default_team.is_some() {
         log::info!(
-            "workflow.run: spec '{id}' has default_team set but pipeline router not yet \
-             shipped (Phase 22.7) — dispatching via claude.start without team routing"
+            "workflow.run: spec '{id}' has default_team set but it is inert — the pipeline \
+             router was removed in Phase 24.7 (decision #51); dispatching via claude.start"
         );
     }
     if spec.default_model.is_some() {
         log::info!(
-            "workflow.run: spec '{id}' has default_model set but Brain dispatcher \
-             generalization not yet shipped (Phase 22.7) — dispatching to claude regardless"
+            "workflow.run: spec '{id}' has default_model set but it is inert — the Brain \
+             dispatcher was removed in Phase 24.7 (decision #51); dispatching to claude"
         );
     }
 

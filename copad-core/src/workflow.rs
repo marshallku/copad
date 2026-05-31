@@ -7,8 +7,10 @@ use std::path::{Path, PathBuf};
 /// A pre-defined workflow that the user can dispatch via the projects panel
 /// or `coctl workflow run`. v1: dispatcher resolves the spec, substitutes
 /// `prompt` with form values + project context, then calls `claude.start`.
-/// `default_team` / `default_model` are stored but ignored at dispatch
-/// until Phase 22.7's pipeline router + Brain dispatcher ship.
+/// `default_team` / `default_model` are inert spec passthrough — the
+/// pipeline router + Brain dispatcher that would have consumed them were
+/// removed in Phase 24.7 (decision #51); the fields stay for schema
+/// compatibility with existing workflow YAMLs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowSpec {
     pub id: String,
