@@ -169,7 +169,7 @@ fn handle_action(
     tx: &Sender<String>,
 ) -> Result<Value, (String, String)> {
     match name {
-        "pilot.add" => action_add(params, store),
+        "pilot.add" => action_add(params, store, tx),
         "pilot.list" => action_list(store),
         "pilot.status" => action_status(store, csd),
         "pilot.cancel" => action_cancel(params, store, csd, tx),
@@ -182,7 +182,11 @@ fn handle_action(
     }
 }
 
-fn action_add(params: &Value, store: &Arc<Mutex<Store>>) -> Result<Value, (String, String)> {
+fn action_add(
+    params: &Value,
+    store: &Arc<Mutex<Store>>,
+    tx: &Sender<String>,
+) -> Result<Value, (String, String)> {
     let cwd = required_string(params, "cwd")?;
     let instruction = required_string(params, "instruction")?;
     let posture = optional_string(params, "posture")?.unwrap_or_else(|| "trust".to_string());
@@ -209,6 +213,16 @@ fn action_add(params: &Value, store: &Arc<Mutex<Store>>) -> Result<Value, (Strin
                 format!("goal not enqueued — could not persist the queue: {e}"),
             )
         })?;
+    // Observable enqueue (Phase 24.4): lets the cockpit and chained
+    // triggers react to a goal being added — including goals added BY a
+    // trigger (`event_kind → pilot.add`), which is how event-driven
+    // enqueue works (the TriggerEngine interpolates `{event.*}` into the
+    // params; pilot just exposes the action). See triggers.example.toml.
+    publish_event(
+        tx,
+        "pilot.goal_added",
+        json!({ "id": goal.id, "cwd": goal.cwd, "instruction": goal.instruction }),
+    );
     Ok(goal.to_json())
 }
 
@@ -324,11 +338,7 @@ fn action_cancel(
         },
         None => json!("no_session"),
     };
-    let frame = json!({
-        "method": "event.publish",
-        "params": { "kind": "pilot.goal_cancelled", "payload": { "id": id } },
-    });
-    let _ = tx.send(frame.to_string());
+    publish_event(tx, "pilot.goal_cancelled", json!({ "id": id }));
     Ok(json!({ "id": id, "status": "cancelled", "session_kill": session_kill }))
 }
 
@@ -548,6 +558,14 @@ fn send_error(tx: &Sender<String>, id: &str, code: &str, message: &str) {
     let _ = tx.send(frame.to_string());
 }
 
+fn publish_event(tx: &Sender<String>, kind: &str, payload: Value) {
+    let frame = json!({
+        "method": "event.publish",
+        "params": { "kind": kind, "payload": payload },
+    });
+    let _ = tx.send(frame.to_string());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,12 +577,18 @@ mod tests {
         (dir, store)
     }
 
+    // rx dropped immediately — publish_event sends are best-effort.
+    fn null_tx() -> Sender<String> {
+        channel::<String>().0
+    }
+
     #[test]
     fn add_requires_existing_cwd() {
         let (dir, store) = fixture();
         let err = action_add(
             &json!({ "cwd": "/no/such/dir/xyz", "instruction": "do it" }),
             &store,
+            &null_tx(),
         )
         .unwrap_err();
         assert_eq!(err.0, "invalid_params");
@@ -573,6 +597,7 @@ mod tests {
         let ok = action_add(
             &json!({ "cwd": dir.path().to_str().unwrap(), "instruction": "do it" }),
             &store,
+            &null_tx(),
         )
         .unwrap();
         assert_eq!(ok["status"], "queued");
@@ -585,6 +610,7 @@ mod tests {
         let err = action_add(
             &json!({ "cwd": dir.path().to_str().unwrap(), "instruction": "x", "posture": "wild" }),
             &store,
+            &null_tx(),
         )
         .unwrap_err();
         assert_eq!(err.0, "invalid_params");
@@ -596,10 +622,31 @@ mod tests {
         action_add(
             &json!({ "cwd": dir.path().to_str().unwrap(), "instruction": "a" }),
             &store,
+            &null_tx(),
         )
         .unwrap();
         let listed = action_list(&store).unwrap();
         assert_eq!(listed["goals"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn add_publishes_goal_added_event() {
+        // Phase 24.4: an enqueue (incl. a trigger-driven `event_kind →
+        // pilot.add`) is observable on the bus so the cockpit / chained
+        // triggers can react.
+        let (dir, store) = fixture();
+        let (tx, rx) = channel::<String>();
+        let ok = action_add(
+            &json!({ "cwd": dir.path().to_str().unwrap(), "instruction": "triage CI" }),
+            &store,
+            &tx,
+        )
+        .unwrap();
+        let frame: Value = serde_json::from_str(&rx.recv().unwrap()).unwrap();
+        assert_eq!(frame["method"], "event.publish");
+        assert_eq!(frame["params"]["kind"], "pilot.goal_added");
+        assert_eq!(frame["params"]["payload"]["id"], ok["id"]);
+        assert_eq!(frame["params"]["payload"]["instruction"], "triage CI");
     }
 
     #[test]
@@ -609,11 +656,13 @@ mod tests {
         let a = action_add(
             &json!({ "cwd": dir.path().to_str().unwrap(), "instruction": "a" }),
             &store,
+            &null_tx(),
         )
         .unwrap();
         action_add(
             &json!({ "cwd": dir.path().to_str().unwrap(), "instruction": "b" }),
             &store,
+            &null_tx(),
         )
         .unwrap();
         // First goal done; the second (Queued, no session → no csd shell-out) is active.
@@ -637,6 +686,7 @@ mod tests {
         let added = action_add(
             &json!({ "cwd": dir.path().to_str().unwrap(), "instruction": "a" }),
             &store,
+            &null_tx(),
         )
         .unwrap();
         let id = added["id"].as_str().unwrap().to_string();
@@ -673,6 +723,7 @@ mod tests {
         let added = action_add(
             &json!({ "cwd": dir.path().to_str().unwrap(), "instruction": "a" }),
             &store,
+            &null_tx(),
         )
         .unwrap();
         let id = added["id"].as_str().unwrap();
@@ -687,6 +738,7 @@ mod tests {
         let added = action_add(
             &json!({ "cwd": dir.path().to_str().unwrap(), "instruction": "a" }),
             &store,
+            &null_tx(),
         )
         .unwrap();
         let id = added["id"].as_str().unwrap().to_string();

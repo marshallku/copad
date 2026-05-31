@@ -1985,6 +1985,65 @@ mod tests {
         );
     }
 
+    /// Phase 24.4: pin `plugins/pilot/triggers.example.toml` so the shipped
+    /// event→goal reference stays valid, and prove a `ci.failed` event
+    /// interpolates into a correct `pilot.add` call end-to-end.
+    #[test]
+    fn pilot_enqueue_example_toml_parses_and_interpolates() {
+        use crate::event_bus::Event;
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("plugins/pilot/triggers.example.toml");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        #[derive(serde::Deserialize)]
+        struct File {
+            #[serde(default)]
+            triggers: Vec<Trigger>,
+        }
+        let parsed: File =
+            toml::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+
+        assert_eq!(parsed.triggers.len(), 3);
+        assert!(parsed.triggers.iter().all(|t| t.action == "pilot.add"));
+
+        // All three compile under the engine (no condition::parse drops).
+        let engine = TriggerEngine::new(Arc::new(ActionRegistry::new()));
+        engine.set_triggers(parsed.triggers.clone());
+        assert_eq!(engine.count(), 3);
+
+        // The CI-failure trigger interpolates event payload into pilot.add params.
+        let ci = parsed
+            .triggers
+            .iter()
+            .find(|t| t.name == "ci-failure-to-pilot-goal")
+            .expect("ci-failure-to-pilot-goal present");
+        // ci.failed is socket-injected (External) — without this opt-in the
+        // TriggerEngine would silently skip it, so pin it here.
+        assert!(
+            ci.security.accept_external,
+            "external-event triggers must set accept_external = true"
+        );
+        let event = Event::new(
+            "ci.failed",
+            "test",
+            serde_json::json!({
+                "repo_path": "/tmp/fakerepo",
+                "branch": "feat/x",
+                "run_url": "https://ci/123",
+            }),
+        );
+        let params = ci.interpolate(&event, None);
+        assert_eq!(params["cwd"], "/tmp/fakerepo");
+        assert_eq!(params["posture"], "auto-accept");
+        let instruction = params["instruction"].as_str().unwrap();
+        assert!(instruction.contains("feat/x"), "got {instruction}");
+        assert!(instruction.contains("https://ci/123"), "got {instruction}");
+    }
+
     /// `git.worktree_add.failed` must NOT fire claude.start.
     #[test]
     fn worktree_add_chain_halts_on_failure() {

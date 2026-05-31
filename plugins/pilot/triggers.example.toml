@@ -1,0 +1,81 @@
+# Example triggers that enqueue autonomous goals via the pilot plugin
+# (Phase 24.4 — event-triggered enqueue).
+#
+# pilot exposes one enqueue action:
+#
+#   pilot.add { cwd, instruction, posture? }
+#     cwd         — existing directory the agent runs in (validated)
+#     instruction — the natural-language goal (the dispatcher appends a
+#                   per-goal completion sentinel before sending it to csd)
+#     posture     — trust (default) | auto-accept | bypass | yolo | default
+#                   (how much csd auto-clears gates; see csd's README)
+#
+# The wiring is the copad TriggerEngine, NOT plugin-internal subscription:
+# a `[[triggers]]` block matches a bus event and calls `pilot.add`, with
+# `{event.<field>}` / `{context.<field>}` tokens interpolated into the
+# params before dispatch. So ANY event a plugin (or `coctl event
+# publish`, or a webhook bridge) puts on the bus can spawn a goal.
+#
+# A successful enqueue publishes `pilot.goal_added {id, cwd, instruction}`;
+# the dispatcher then drives goals one at a time and publishes
+# `pilot.goal_started` / `pilot.goal_blocked` / `pilot.goal_completed` /
+# `pilot.goal_stalled` / `pilot.goal_failed` as it goes. Copy the blocks
+# you want into `~/.config/copad/triggers.toml` and edit the paths.
+
+# SECURITY NOTE: events injected over the socket — `coctl event publish`,
+# SSH-forwarded harness hooks, or a webhook bridge — are tagged
+# `Origin::External`, and the TriggerEngine SKIPS external events for any
+# trigger that doesn't set `[triggers.security] accept_external = true`.
+# Events emitted by a first-party plugin (e.g. the jira plugin) are
+# `Internal` and fire without that opt-in. Since `pilot.add` spawns an
+# autonomous agent, only opt a trigger into external events when you trust
+# the injector.
+
+# ---------------------------------------------------------------------
+# 1. A newly-assigned Jira ticket → a triage goal in the repo.
+#    Requires the jira plugin (emits `jira.ticket_assigned` with
+#    { key, summary, url, ... }). That's an INTERNAL plugin event, so no
+#    accept_external opt-in is needed. `cwd` is a fixed project path — edit it.
+# ---------------------------------------------------------------------
+[[triggers]]
+name = "jira-assigned-to-pilot-goal"
+action = "pilot.add"
+params = { cwd = "/home/you/dev/yourrepo", instruction = "Triage Jira {event.key}: {event.summary}. Read the ticket at {event.url}, reproduce, then propose a fix and stop for plan approval.", posture = "auto-accept" }
+[triggers.when]
+event_kind = "jira.ticket_assigned"
+
+# ---------------------------------------------------------------------
+# 2. A CI failure → a fix goal. `ci.failed` is NOT a built-in event —
+#    publish it from a CI webhook bridge or with:
+#      coctl event publish ci.failed \
+#        '{"repo_path":"/home/you/dev/x","branch":"main","run_url":"https://..."}'
+#    so the payload carries the fields this trigger interpolates.
+# ---------------------------------------------------------------------
+[[triggers]]
+name = "ci-failure-to-pilot-goal"
+action = "pilot.add"
+params = { cwd = "{event.repo_path}", instruction = "CI failed on branch {event.branch} (run {event.run_url}). Investigate the failure, fix it, and verify the build passes locally.", posture = "auto-accept" }
+[triggers.when]
+event_kind = "ci.failed"
+[triggers.security]
+accept_external = true     # required: ci.failed is injected over the socket (External origin)
+
+# ---------------------------------------------------------------------
+# 3. Narrowing by payload — only enqueue for one repo. Any key OTHER than
+#    `event_kind` under `[triggers.when]` is a payload-match constraint
+#    (the table is `#[serde(flatten)]`), checked against the event payload
+#    before the action fires, so unrelated `ci.failed` events are ignored.
+# ---------------------------------------------------------------------
+[[triggers]]
+name = "ci-failure-main-repo-only"
+action = "pilot.add"
+params = { cwd = "/home/you/dev/yourrepo", instruction = "CI failed on {event.branch}. Fix it." }
+[triggers.when]
+event_kind = "ci.failed"
+repo = "yourrepo"          # payload_match: only fire when event payload `repo` == "yourrepo"
+[triggers.security]
+accept_external = true     # required: ci.failed is injected over the socket (External origin)
+
+# Time-based enqueue (e.g. a nightly research goal) lands once the cron
+# trigger source (roadmap Phase 21 Step 11) ships — it will publish a
+# scheduled event that a block like #2 can match.
