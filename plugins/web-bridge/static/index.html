@@ -90,6 +90,27 @@
     .event-row[data-kind^="claude.commit_blocked"] .event-kind { color: var(--accent-err); }
     .event-row[data-kind^="claude.review_approved"] .event-kind { color: var(--accent-ok); }
     .banner { background: var(--accent-warn); color: var(--bg-3); padding: 0.4rem 0.85rem; font-size: 0.78rem; border-radius: 0.5rem; text-align: center; }
+    /* Phase 24.6 pilot cockpit */
+    .pilot-strip { display: flex; flex-direction: column; gap: 0.35rem; }
+    .pilot-goal { background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.55rem; padding: 0.45rem 0.55rem; }
+    .pilot-goal.active { border-color: var(--accent); }
+    .pilot-goal-head { display: flex; align-items: center; gap: 0.45rem; }
+    .pilot-goal-head .pill { font-size: 0.65rem; padding: 0.12rem 0.4rem; border-radius: 0.35rem; border: 1px solid var(--border); color: var(--fg-dim); white-space: nowrap; }
+    .pilot-goal-head .pill.busy { color: var(--accent-warn); border-color: var(--accent-warn); }
+    .pilot-goal-head .pill.ok { color: var(--accent-ok); border-color: var(--accent-ok); }
+    .pilot-goal-head .pill.err { color: var(--accent-err); border-color: var(--accent-err); }
+    .pilot-goal-id { font-size: 0.7rem; color: var(--fg-dim); font-family: monospace; }
+    .pilot-goal-instr { flex: 1; font-size: 0.78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pilot-gate { margin-top: 0.4rem; padding: 0.4rem; background: var(--bg-3); border-radius: 0.45rem; display: flex; flex-direction: column; gap: 0.35rem; }
+    .pilot-gate .pill { align-self: flex-start; font-size: 0.65rem; padding: 0.12rem 0.4rem; border-radius: 0.35rem; border: 1px solid var(--accent-warn); color: var(--accent-warn); }
+    .pilot-gate-prompt { font-size: 0.76rem; white-space: pre-wrap; word-break: break-word; max-height: 8em; overflow-y: auto; }
+    .pilot-gate-controls { display: flex; gap: 0.35rem; }
+    .pilot-gate-controls input, .pilot-add input, .pilot-add textarea, .pilot-add select { flex: 1; background: var(--bg-3); color: var(--fg); border: 1px solid var(--border); border-radius: 0.4rem; padding: 0.35rem 0.45rem; font: inherit; font-size: 0.78rem; }
+    .pilot-add { display: flex; flex-direction: column; gap: 0.35rem; margin-top: 0.4rem; }
+    .pilot-add textarea { min-height: 3em; resize: vertical; }
+    .pilot-add-row { display: flex; gap: 0.35rem; }
+    .pilot-sidecar-err { font-size: 0.68rem; color: var(--fg-dim); padding: 0.1rem 0.2rem; }
+    .chip.ok { color: var(--accent-ok); border-color: var(--accent-ok); }
 
     /* ==== attach mode ==== */
     main.attach { display: flex; flex-direction: column; height: calc(100vh - 50px); }
@@ -175,6 +196,9 @@
       copadPanels: [],
       events: [],
       noGui: false,
+      pilot: null,              // /api/pilot/status result: {pilot:{goals,active,gate,counts}, csd, tmx, errors}
+      pilotError: "",           // set when pilot.status RPC fails (plugin not running)
+      pilotAdd: false,          // add-goal form expanded?
       activePane: null,         // pane_id while in attach mode
       ws: { events: null, overview: null, attach: null },
       term: null,               // xterm.js Terminal instance
@@ -398,6 +422,7 @@
                 <span class="age">${escapeHtml(a.tmux_session || "")} ${escapeHtml(humanAgeFromEpochSec(a.ts))}</span>
               </div>`).join("")}</div>
           `}
+          ${renderPilot()}
           ${state.codexJobs.length === 0 ? "" : `
             <div class="section-title">codex jobs <span style="text-transform:none; color:var(--fg-dim);">${state.codexJobs.length}</span></div>
             <div class="cards">${state.codexJobs.map(j => {
@@ -455,6 +480,7 @@
           if (pid) enterAttach(pid);
         });
       });
+      wirePilot();
     }
 
     // Resolve a "session:window_idx" tmux_target (or bare session name)
@@ -534,6 +560,135 @@
         refocus();
       });
       openTerminal();
+    }
+
+    // --- Phase 24.6 pilot orchestration cockpit ---
+
+    function shortId(id) { return (id || "").replace(/^g-/, "").slice(0, 8); }
+
+    // Build the pilot strip for the overview. Renders the goal queue with
+    // per-goal status pills, the active goal's gate (with answer/approve
+    // controls), a cancel affordance, and an add-goal form.
+    function renderPilot() {
+      const wrap = state.pilot && state.pilot.pilot ? state.pilot.pilot : null;
+      const goals = wrap && Array.isArray(wrap.goals) ? wrap.goals : [];
+      const counts = (wrap && wrap.counts) || {};
+      const countStr = Object.keys(counts).length
+        ? Object.entries(counts).map(([k, v]) => `${escapeHtml(k)} ${v}`).join(" · ")
+        : "";
+      const addForm = `
+        <div class="pilot-add">
+          ${state.pilotAdd ? `
+            <input id="pilot-cwd" placeholder="cwd (existing dir)" value="${escapeHtml(state.lastCwd || "")}">
+            <textarea id="pilot-instruction" placeholder="goal instruction"></textarea>
+            <div class="pilot-add-row">
+              <select id="pilot-posture">
+                <option value="trust">trust</option>
+                <option value="auto-accept">auto-accept</option>
+                <option value="bypass">bypass</option>
+                <option value="yolo">yolo</option>
+                <option value="default">default</option>
+              </select>
+              <button class="chip" id="pilot-add-submit">enqueue</button>
+              <button class="chip" id="pilot-add-cancel">cancel</button>
+            </div>
+          ` : `<button class="chip" id="pilot-add-open">+ add goal</button>`}
+        </div>`;
+      if (state.pilotError) {
+        return `<div class="section-title">pilot</div>
+          <div class="banner" style="margin:0 0 0.4rem;">pilot: ${escapeHtml(state.pilotError)}</div>${addForm}`;
+      }
+      const rows = goals.length === 0
+        ? `<div class="empty" style="border:none; padding:0.6rem;">no goals queued</div>`
+        : goals.map(g => {
+          const live = g.live && g.live.status ? ` · ${escapeHtml(g.live.status)}` : "";
+          const isActive = wrap.active === g.id;
+          const terminal = ["done", "stalled", "failed", "cancelled"].includes(g.status);
+          let gateBlock = "";
+          if (g.status === "awaiting_gate" && g.gate) {
+            const gk = g.gate.kind;
+            const prompt = g.gate.prompt || (gk === "plan" ? "Plan ready for approval" : "Gate open");
+            const controls = gk === "answer"
+              ? `<input class="pilot-answer-input" data-id="${escapeHtml(g.id)}" placeholder="your answer">
+                 <button class="chip pilot-answer" data-id="${escapeHtml(g.id)}">send</button>`
+              : `<button class="chip ok pilot-approve" data-id="${escapeHtml(g.id)}">approve</button>`;
+            gateBlock = `<div class="pilot-gate">
+              <span class="pill warn">${escapeHtml(gk)}</span>
+              <div class="pilot-gate-prompt">${escapeHtml(prompt)}</div>
+              <div class="pilot-gate-controls">${controls}</div>
+            </div>`;
+          }
+          const statusClass = g.status === "running" ? "busy"
+            : g.status === "done" ? "ok"
+            : (g.status === "failed" || g.status === "stalled") ? "err" : "";
+          return `<div class="pilot-goal${isActive ? " active" : ""}">
+            <div class="pilot-goal-head">
+              <span class="pill ${statusClass}">${escapeHtml(g.status)}${live}</span>
+              <span class="pilot-goal-id">${escapeHtml(shortId(g.id))}</span>
+              <span class="pilot-goal-instr">${escapeHtml(g.instruction || "")}</span>
+              ${terminal ? "" : `<button class="chip pilot-cancel" data-id="${escapeHtml(g.id)}">cancel</button>`}
+            </div>
+            ${gateBlock}
+          </div>`;
+        }).join("");
+      const sidecarErr = state.pilot && state.pilot.errors && Object.keys(state.pilot.errors).length
+        ? `<div class="pilot-sidecar-err">${Object.entries(state.pilot.errors).map(([k, v]) => `${escapeHtml(k)}: ${escapeHtml(String(v))}`).join(" / ")}</div>`
+        : "";
+      return `
+        <div class="section-title">pilot ${countStr ? `<span style="text-transform:none; color:var(--fg-dim);">${countStr}</span>` : ""}</div>
+        <div class="pilot-strip">${rows}</div>
+        ${sidecarErr}
+        ${addForm}`;
+    }
+
+    async function loadPilot() {
+      try {
+        state.pilot = await api("/api/pilot/status");
+        state.pilotError = "";
+      } catch (e) {
+        // pilot plugin not running / no daemon → show a banner, keep polling.
+        state.pilot = null;
+        state.pilotError = (e && e.message) || "unavailable";
+      }
+      if (state.mode === "overview") render();
+    }
+
+    function wirePilot() {
+      const open = document.getElementById("pilot-add-open");
+      if (open) open.addEventListener("click", () => { state.pilotAdd = true; render(); });
+      const cancelAdd = document.getElementById("pilot-add-cancel");
+      if (cancelAdd) cancelAdd.addEventListener("click", () => { state.pilotAdd = false; render(); });
+      const submit = document.getElementById("pilot-add-submit");
+      if (submit) submit.addEventListener("click", async () => {
+        const cwd = document.getElementById("pilot-cwd").value.trim();
+        const instruction = document.getElementById("pilot-instruction").value.trim();
+        const posture = document.getElementById("pilot-posture").value;
+        if (!cwd || !instruction) return;
+        state.lastCwd = cwd;
+        try {
+          await api("/api/pilot/goals", { method: "POST", body: JSON.stringify({ cwd, instruction, posture }) });
+          state.pilotAdd = false;
+          await loadPilot();
+        } catch (e) { alert("add failed: " + (e.message || e)); }
+      });
+      document.querySelectorAll(".pilot-answer").forEach(el => el.addEventListener("click", async () => {
+        const id = el.dataset.id;
+        const input = document.querySelector(`.pilot-answer-input[data-id="${CSS.escape(id)}"]`);
+        const text = input ? input.value.trim() : "";
+        if (!text) return;
+        try { await api(`/api/pilot/goals/${encodeURIComponent(id)}/answer`, { method: "POST", body: JSON.stringify({ text }) }); await loadPilot(); }
+        catch (e) { alert("answer failed: " + (e.message || e)); }
+      }));
+      document.querySelectorAll(".pilot-approve").forEach(el => el.addEventListener("click", async () => {
+        const id = el.dataset.id;
+        try { await api(`/api/pilot/goals/${encodeURIComponent(id)}/approve`, { method: "POST", body: JSON.stringify({}) }); await loadPilot(); }
+        catch (e) { alert("approve failed: " + (e.message || e)); }
+      }));
+      document.querySelectorAll(".pilot-cancel").forEach(el => el.addEventListener("click", async () => {
+        const id = el.dataset.id;
+        try { await api(`/api/pilot/goals/${encodeURIComponent(id)}/cancel`, { method: "POST" }); await loadPilot(); }
+        catch (e) { alert("cancel failed: " + (e.message || e)); }
+      }));
     }
 
     function render() {
@@ -676,6 +831,9 @@
             const cur = ev.data?.current || ev.payload?.current;
             if (cur) state.presence = cur;
           }
+          // A pilot.* bus event means the queue changed — refresh the
+          // cockpit immediately (loadPilot re-renders on completion).
+          if ((ev.type || ev.kind || "").startsWith("pilot.")) loadPilot();
           if (state.mode === "overview") render();
         } catch {}
       };
@@ -828,6 +986,13 @@
       render();
       openEventStream();
       openOverviewStream();
+      // Pilot cockpit: initial load + a slow poll as a backstop (pilot.*
+      // bus events on the event stream drive the responsive refresh; this
+      // catches state the events miss and the first paint).
+      loadPilot();
+      if (!state.pilotPoll) {
+        state.pilotPoll = setInterval(() => { if (state.mode === "overview") loadPilot(); }, 8000);
+      }
     }
 
     async function togglePresence() {

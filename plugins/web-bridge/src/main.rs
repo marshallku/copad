@@ -23,6 +23,7 @@
 //! missing/short the plugin exits before binding.
 
 mod agents;
+mod cockpit;
 mod daemon_client;
 mod push;
 mod tmux;
@@ -325,6 +326,12 @@ async fn run_server(
         .route("/api/events", get(handle_events_history))
         .route("/api/tmux/panes", get(handle_tmux_panes))
         .route("/api/tmux/send", post(handle_tmux_send))
+        // Phase 24.6 — orchestration cockpit (pilot goal queue + csd + tmx).
+        .route("/api/pilot/status", get(handle_pilot_status))
+        .route("/api/pilot/goals", post(handle_pilot_add))
+        .route("/api/pilot/goals/:id/answer", post(handle_pilot_answer))
+        .route("/api/pilot/goals/:id/approve", post(handle_pilot_approve))
+        .route("/api/pilot/goals/:id/cancel", post(handle_pilot_cancel))
         .route("/ws/tmux/overview", get(handle_ws_tmux_overview))
         .route("/ws/tmux/attach/:pane_id", get(handle_ws_tmux_attach))
         .route("/ws/events", get(handle_ws_events))
@@ -901,6 +908,95 @@ async fn handle_tmux_send(
         .map_err(|e| AppError::custom("internal", &format!("tmux send task: {e}")))?
         .map_err(|msg| AppError::custom("tmux_error", &msg))?;
     Ok(axum::Json(json!({ "ok": true })))
+}
+
+// --- Phase 24.6: orchestration cockpit (pilot goal queue) ---
+
+/// `GET /api/pilot/status` — the goal queue (pilot.status, via daemon RPC)
+/// aggregated with the live `csd ps` driven sessions and the `tmx agents`
+/// observation snapshot. The two side-cars are best-effort (see
+/// `cockpit::aggregate`); a `no_gui`-style daemon error on pilot.status
+/// itself still surfaces as a 5xx so the UI shows "pilot not running".
+async fn handle_pilot_status(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Result<axum::Json<Value>, AppError> {
+    let pilot = state.daemon.rpc("pilot.status", json!({})).await?;
+    let csd = tokio::task::spawn_blocking(cockpit::read_csd_ps)
+        .await
+        .map_err(|e| AppError::custom("internal", &format!("csd ps task: {e}")))?;
+    let tmx = tokio::task::spawn_blocking(|| {
+        agents::read_snapshot().and_then(|s| serde_json::to_value(s).map_err(|e| e.to_string()))
+    })
+    .await
+    .map_err(|e| AppError::custom("internal", &format!("tmx agents task: {e}")))?;
+    Ok(axum::Json(cockpit::aggregate(pilot, csd, tmx)))
+}
+
+#[derive(Deserialize)]
+struct PilotAddBody {
+    cwd: String,
+    instruction: String,
+    posture: Option<String>,
+}
+
+/// `POST /api/pilot/goals` — enqueue a goal from the cockpit.
+async fn handle_pilot_add(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::Json(body): axum::Json<PilotAddBody>,
+) -> Result<axum::Json<Value>, AppError> {
+    let mut params = json!({ "cwd": body.cwd, "instruction": body.instruction });
+    if let Some(posture) = body.posture {
+        params["posture"] = json!(posture);
+    }
+    Ok(axum::Json(state.daemon.rpc("pilot.add", params).await?))
+}
+
+#[derive(Deserialize)]
+struct PilotAnswerBody {
+    text: String,
+}
+
+/// `POST /api/pilot/goals/:id/answer` — answer a clarifying-question gate.
+async fn handle_pilot_answer(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<PilotAnswerBody>,
+) -> Result<axum::Json<Value>, AppError> {
+    let v = state
+        .daemon
+        .rpc("pilot.answer", json!({ "id": id, "text": body.text }))
+        .await?;
+    Ok(axum::Json(v))
+}
+
+#[derive(Deserialize)]
+struct PilotApproveBody {
+    option: Option<u32>,
+}
+
+/// `POST /api/pilot/goals/:id/approve` — approve a plan / permission / trust gate.
+async fn handle_pilot_approve(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<PilotApproveBody>,
+) -> Result<axum::Json<Value>, AppError> {
+    let mut params = json!({ "id": id });
+    if let Some(option) = body.option {
+        params["option"] = json!(option);
+    }
+    Ok(axum::Json(state.daemon.rpc("pilot.approve", params).await?))
+}
+
+/// `POST /api/pilot/goals/:id/cancel` — cancel a goal and kill its session.
+async fn handle_pilot_cancel(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<axum::Json<Value>, AppError> {
+    let v = state
+        .daemon
+        .rpc("pilot.cancel", json!({ "id": id }))
+        .await?;
+    Ok(axum::Json(v))
 }
 
 /// Sync helper used inside `spawn_blocking`. Builds the overview JSON
