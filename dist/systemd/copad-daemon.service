@@ -25,6 +25,18 @@ RestartSec=10
 # Pump copadd info-level logs into the journal. Set RUST_LOG=debug
 # in `systemctl --user edit copad-daemon` to override per-deployment.
 Environment=RUST_LOG=info
+# Deterministic PATH for the daemon and everything it spawns. The
+# `systemd --user` instance otherwise inherits whatever the login
+# session happened to export, which is not guaranteed to include
+# `~/.local/bin` / `~/.cargo/bin`. The pilot plugin (Phase 24) shells
+# out to `csd`, which in turn spawns `claude` + `tmux`, so all three
+# must resolve from copadd's env, not just an interactive shell's.
+# `%h` expands to the user's home (systemd specifier).
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+# Explicit csd binary for the pilot goal-queue plugin. Redundant with
+# PATH above, but pins the location so a PATH change can't silently
+# break dispatch. Override per-deployment via `systemctl --user edit`.
+Environment=COPAD_PILOT_CSD_BIN=%h/.cargo/bin/csd
 # Limit runaway memory + thread pool damage. copadd's own thread
 # pool is bounded; this is a defense in depth against plugin
 # fork-bombs landing through the supervisor.
