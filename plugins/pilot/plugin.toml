@@ -9,5 +9,5 @@ name = "main"
 exec = "copad-plugin-pilot"
 activation = "onStartup"
 restart = "on-crash"
-provides = ["pilot.add", "pilot.list", "pilot.cancel", "pilot.answer", "pilot.approve"]
+provides = ["pilot.add", "pilot.list", "pilot.status", "pilot.cancel", "pilot.answer", "pilot.approve"]
 subscribes = []

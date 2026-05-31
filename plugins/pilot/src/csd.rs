@@ -95,6 +95,11 @@ impl CsdState {
 pub struct Csd {
     bin: String,
     timeout: Duration,
+    /// Shorter cap for `csd state` reads (always fast: jsonl + capture-pane)
+    /// vs the long `timeout` for `spawn`/`send` (which type into the TUI with
+    /// retries). Keeps a hung `state` from stalling the dispatcher poll — or
+    /// the single reader thread during a `pilot.status` cockpit read.
+    status_timeout: Duration,
 }
 
 impl Csd {
@@ -104,13 +109,22 @@ impl Csd {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(60);
+        let status_timeout = std::env::var("COPAD_PILOT_STATUS_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5);
         Self {
             bin,
             timeout: Duration::from_secs(timeout),
+            status_timeout: Duration::from_secs(status_timeout),
         }
     }
 
     fn run(&self, args: &[String]) -> Result<Value, CsdError> {
+        self.run_with_timeout(args, self.timeout)
+    }
+
+    fn run_with_timeout(&self, args: &[String], timeout: Duration) -> Result<Value, CsdError> {
         let mut child = Command::new(&self.bin)
             .args(args)
             .stdin(Stdio::null())
@@ -145,7 +159,7 @@ impl Csd {
             s
         });
 
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + timeout;
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -169,7 +183,7 @@ impl Csd {
                         return Err(CsdError::new(format!(
                             "csd {} timed out after {:?}",
                             args.first().cloned().unwrap_or_default(),
-                            self.timeout
+                            timeout
                         )));
                     }
                     std::thread::sleep(Duration::from_millis(100));
@@ -211,9 +225,15 @@ impl Csd {
         Ok(())
     }
 
+    /// Raw `csd state` JSON — what the cockpit wants (question / plan /
+    /// tools detail beyond the persisted [`CsdState`] enum). Uses the short
+    /// `status_timeout` so a cockpit read can't stall the reader thread.
+    pub fn state_json(&self, name: &str) -> Result<Value, CsdError> {
+        self.run_with_timeout(&["state".into(), name.into()], self.status_timeout)
+    }
+
     pub fn state(&self, name: &str) -> Result<CsdState, CsdError> {
-        let v = self.run(&["state".into(), name.into()])?;
-        Ok(CsdState::from_json(&v))
+        Ok(CsdState::from_json(&self.state_json(name)?))
     }
 
     pub fn approve(&self, name: &str, option: u32) -> Result<(), CsdError> {
@@ -347,6 +367,7 @@ mod tests {
         let csd = Csd {
             bin: "definitely-not-a-real-binary-xyz".into(),
             timeout: Duration::from_secs(5),
+            status_timeout: Duration::from_secs(5),
         };
         let err = csd.state("whatever").unwrap_err();
         assert!(err.message.contains("cannot run"), "got {}", err.message);

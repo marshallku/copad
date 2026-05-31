@@ -122,6 +122,7 @@ fn handle_frame(
                     "provides": [
                         "pilot.add",
                         "pilot.list",
+                        "pilot.status",
                         "pilot.cancel",
                         "pilot.answer",
                         "pilot.approve",
@@ -170,6 +171,7 @@ fn handle_action(
     match name {
         "pilot.add" => action_add(params, store),
         "pilot.list" => action_list(store),
+        "pilot.status" => action_status(store, csd),
         "pilot.cancel" => action_cancel(params, store, csd, tx),
         "pilot.answer" => action_answer(params, store, csd),
         "pilot.approve" => action_approve(params, store, csd),
@@ -219,6 +221,65 @@ fn action_list(store: &Arc<Mutex<Store>>) -> Result<Value, (String, String)> {
         .map(|g| g.to_json())
         .collect();
     Ok(json!({ "goals": goals }))
+}
+
+/// Cockpit read (Phase 24.3). The full queue + status counts + the active
+/// goal and its current gate, plus a best-effort LIVE `csd state` for the
+/// one active goal (sub-poll freshness + working/tools detail the persisted
+/// status doesn't carry). Events are ephemeral, so a browser opened later
+/// renders the live gate from this read. Cross-session observation
+/// (`csd ps --json` + `tmx agents --json`) is aggregated by `web-bridge`
+/// (Phase 24.6), not reimplemented here.
+fn action_status(store: &Arc<Mutex<Store>>, csd: &Csd) -> Result<Value, (String, String)> {
+    let goals = store.lock().unwrap().snapshot();
+
+    // The dispatcher drives exactly one goal at a time: the first
+    // non-terminal goal in insertion order.
+    let active = goals.iter().find(|g| !g.status.is_terminal()).cloned();
+    let active_id = active.as_ref().map(|g| g.id.clone());
+
+    // One live `csd state` query, for the active goal only (bounded cost).
+    let live = active
+        .as_ref()
+        .and_then(|g| g.csd_session.as_deref())
+        .and_then(|session| csd.state_json(session).ok());
+
+    let gate = active
+        .as_ref()
+        .filter(|g| g.status == Status::AwaitingGate)
+        .and_then(|g| g.gate.as_ref())
+        .map(|gate| serde_json::to_value(gate).unwrap_or(Value::Null))
+        .unwrap_or(Value::Null);
+
+    let mut counts = serde_json::Map::new();
+    for g in &goals {
+        let key = serde_json::to_value(g.status)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_else(|| "unknown".into());
+        let n = counts.get(&key).and_then(Value::as_u64).unwrap_or(0);
+        counts.insert(key, json!(n + 1));
+    }
+
+    let goal_jsons: Vec<Value> = goals
+        .iter()
+        .map(|g| {
+            let mut v = g.to_json();
+            if active_id.as_deref() == Some(g.id.as_str())
+                && let Some(obj) = v.as_object_mut()
+            {
+                obj.insert("live".into(), live.clone().unwrap_or(Value::Null));
+            }
+            v
+        })
+        .collect();
+
+    Ok(json!({
+        "goals": goal_jsons,
+        "active": active_id,
+        "gate": gate,
+        "counts": Value::Object(counts),
+    }))
 }
 
 fn action_cancel(
@@ -539,6 +600,61 @@ mod tests {
         .unwrap();
         let listed = action_list(&store).unwrap();
         assert_eq!(listed["goals"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn status_reports_counts_and_active() {
+        let (dir, store) = fixture();
+        let csd = Csd::from_env();
+        let a = action_add(
+            &json!({ "cwd": dir.path().to_str().unwrap(), "instruction": "a" }),
+            &store,
+        )
+        .unwrap();
+        action_add(
+            &json!({ "cwd": dir.path().to_str().unwrap(), "instruction": "b" }),
+            &store,
+        )
+        .unwrap();
+        // First goal done; the second (Queued, no session → no csd shell-out) is active.
+        store
+            .lock()
+            .unwrap()
+            .update_if(a["id"].as_str().unwrap(), &[], |g| g.status = Status::Done);
+        let st = action_status(&store, &csd).unwrap();
+        assert_eq!(st["goals"].as_array().unwrap().len(), 2);
+        assert_eq!(st["counts"]["done"], 1);
+        assert_eq!(st["counts"]["queued"], 1);
+        assert!(st["active"].is_string());
+        assert_ne!(st["active"].as_str().unwrap(), a["id"].as_str().unwrap());
+        assert_eq!(st["gate"], Value::Null);
+    }
+
+    #[test]
+    fn status_surfaces_the_active_gate() {
+        let (dir, store) = fixture();
+        let csd = Csd::from_env();
+        let added = action_add(
+            &json!({ "cwd": dir.path().to_str().unwrap(), "instruction": "a" }),
+            &store,
+        )
+        .unwrap();
+        let id = added["id"].as_str().unwrap().to_string();
+        // AwaitingGate but no session → action_status skips the live query.
+        store.lock().unwrap().update_if(&id, &[], |g| {
+            g.status = Status::AwaitingGate;
+            g.gate = Some(queue::Gate {
+                kind: "answer".into(),
+                prompt: Some("which file?".into()),
+                options: None,
+                plan_file: None,
+            });
+        });
+        let st = action_status(&store, &csd).unwrap();
+        assert_eq!(st["active"].as_str().unwrap(), id);
+        assert_eq!(st["gate"]["kind"], "answer");
+        assert_eq!(st["gate"]["prompt"], "which file?");
+        assert_eq!(st["counts"]["awaiting_gate"], 1);
     }
 
     #[test]
