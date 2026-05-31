@@ -11,3 +11,13 @@ activation = "onStartup"
 restart = "on-crash"
 provides = ["pilot.add", "pilot.list", "pilot.status", "pilot.cancel", "pilot.answer", "pilot.approve"]
 subscribes = []
+
+# In-copad cockpit (Phase 24.6 follow-up): the same pilot.* actions the
+# web-bridge cockpit drives, rendered as a GTK WebView panel via the
+# copad.call() bridge — so the queue is reachable without a browser.
+# `coctl plugin open pilot` (or the panel launcher).
+[[panels]]
+name = "main"
+title = "Pilot"
+file = "panel.html"
+icon = "applications-engineering-symbolic"

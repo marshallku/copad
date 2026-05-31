@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Pilot</title>
+<style>
+  :root {
+    --bg: #1e1e2e; --bg-alt: #181825; --bg-card: #313244;
+    --fg: #cdd6f4; --fg-dim: #a6adc8; --fg-mute: #6c7086;
+    --accent: #cba6f7; --green: #a6e3a1; --yellow: #f9e2af;
+    --red: #f38ba8; --blue: #89b4fa; --border: #45475a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 14px;
+    font: 13px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--fg);
+  }
+  h2 { margin: 0 0 10px; font-size: 13px; color: var(--accent);
+       text-transform: uppercase; letter-spacing: .05em;
+       display: flex; align-items: center; gap: 8px; }
+  h2 .counts { font-size: 11px; color: var(--fg-mute); text-transform: none; letter-spacing: 0; }
+  .empty { color: var(--fg-mute); font-style: italic; padding: 10px 0; }
+  .err-banner { background: #45293a; color: var(--red); padding: 6px 10px;
+                border-radius: 6px; font-size: 12px; margin-bottom: 10px; }
+  .goal { background: var(--bg-card); border: 1px solid var(--border);
+          border-radius: 8px; padding: 9px 11px; margin-bottom: 8px; }
+  .goal.active { border-color: var(--accent); }
+  .goal-head { display: flex; align-items: center; gap: 8px; }
+  .pill { font-size: 11px; padding: 1px 7px; border-radius: 5px;
+          border: 1px solid var(--border); color: var(--fg-dim); white-space: nowrap; }
+  .pill.running { color: var(--yellow); border-color: var(--yellow); }
+  .pill.done { color: var(--green); border-color: var(--green); }
+  .pill.failed, .pill.stalled { color: var(--red); border-color: var(--red); }
+  .pill.awaiting_gate { color: var(--blue); border-color: var(--blue); }
+  .goal-id { font-family: ui-monospace, monospace; font-size: 11px; color: var(--fg-mute); }
+  .goal-instr { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .goal-cwd { font-size: 11px; color: var(--fg-mute); margin-top: 2px;
+              overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .gate { margin-top: 8px; padding: 8px; background: var(--bg-alt); border-radius: 6px; }
+  .gate-prompt { font-size: 12px; white-space: pre-wrap; word-break: break-word;
+                 max-height: 9em; overflow-y: auto; margin: 4px 0; }
+  .row { display: flex; gap: 6px; align-items: center; }
+  button {
+    background: var(--bg-alt); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer;
+  }
+  button:hover { border-color: var(--accent); }
+  button.approve { color: var(--green); border-color: var(--green); }
+  button.go { color: var(--accent); border-color: var(--accent); }
+  input, textarea, select {
+    background: var(--bg-alt); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 8px; font: inherit; font-size: 12px; flex: 1; min-width: 0;
+  }
+  textarea { width: 100%; min-height: 3.2em; resize: vertical; }
+  .add { background: var(--bg-card); border: 1px solid var(--border);
+         border-radius: 8px; padding: 10px; margin-top: 14px; display: flex; flex-direction: column; gap: 7px; }
+  .add .row { gap: 6px; }
+  .mute { color: var(--fg-mute); font-size: 11px; }
+  section { margin-bottom: 8px; }
+</style>
+</head>
+<body>
+  <h2>Pilot <span class="counts" id="counts"></span></h2>
+  <div id="err"></div>
+  <section id="queue"><div class="empty">loading…</div></section>
+
+  <div class="add">
+    <div class="row">
+      <select id="cwd-select" title="project cwd"><option value="">— pick a project —</option></select>
+    </div>
+    <div class="row">
+      <input id="cwd" placeholder="or type a cwd (absolute path)" />
+    </div>
+    <textarea id="instruction" placeholder="goal instruction (what should the agent do, then stop)"></textarea>
+    <div class="row">
+      <select id="posture" title="csd permission posture">
+        <option value="trust">trust</option>
+        <option value="auto-accept">auto-accept</option>
+        <option value="bypass">bypass</option>
+        <option value="yolo">yolo</option>
+        <option value="default">default</option>
+      </select>
+      <button class="go" id="enqueue">enqueue goal</button>
+    </div>
+    <div class="mute">each goal runs in its own isolated tmux session (driven by csd → claude)</div>
+  </div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const shortId = (id) => String(id || "").replace(/^g-/, "").slice(0, 8);
+  let projects = [];
+
+  async function loadProjects() {
+    try {
+      const r = await copad.call("project.list", {});
+      projects = (r && r.projects) || [];
+      const sel = $("cwd-select");
+      sel.innerHTML = '<option value="">— pick a project —</option>' +
+        projects.map((p) => `<option value="${esc(p.subpath ? p.path + "/" + p.subpath : p.path)}">${esc(p.name)} · ${esc(p.path)}</option>`).join("");
+    } catch (e) { /* projects optional */ }
+  }
+
+  function render(status) {
+    const goals = (status && status.goals) || [];
+    const counts = (status && status.counts) || {};
+    $("counts").textContent = Object.entries(counts).map(([k, v]) => `${k} ${v}`).join(" · ");
+    const queue = $("queue");
+    if (goals.length === 0) { queue.innerHTML = '<div class="empty">no goals queued</div>'; return; }
+    queue.innerHTML = goals.map((g) => {
+      const live = g.live && g.live.status ? ` · ${esc(g.live.status)}` : "";
+      const terminal = ["done", "stalled", "failed", "cancelled"].includes(g.status);
+      let gate = "";
+      if (g.status === "awaiting_gate" && g.gate) {
+        const gk = g.gate.kind;
+        const prompt = g.gate.prompt || (gk === "plan" ? "Plan ready for approval" : "Gate open");
+        const controls = gk === "answer"
+          ? `<input class="answer-input" data-id="${esc(g.id)}" placeholder="your answer" />
+             <button class="go answer-btn" data-id="${esc(g.id)}">send</button>`
+          : `<button class="approve approve-btn" data-id="${esc(g.id)}">approve</button>`;
+        gate = `<div class="gate"><span class="pill awaiting_gate">${esc(gk)}</span>
+          <div class="gate-prompt">${esc(prompt)}</div><div class="row">${controls}</div></div>`;
+      }
+      return `<div class="goal${status.active === g.id ? " active" : ""}">
+        <div class="goal-head">
+          <span class="pill ${esc(g.status)}">${esc(g.status)}${live}</span>
+          <span class="goal-id">${esc(shortId(g.id))}</span>
+          <span class="goal-instr">${esc(g.instruction)}</span>
+          ${terminal ? "" : `<button class="cancel-btn" data-id="${esc(g.id)}">cancel</button>`}
+        </div>
+        <div class="goal-cwd">${esc(g.cwd)}</div>
+        ${gate}
+      </div>`;
+    }).join("");
+
+    queue.querySelectorAll(".answer-btn").forEach((b) => b.onclick = () => answer(b.dataset.id));
+    queue.querySelectorAll(".approve-btn").forEach((b) => b.onclick = () => act("pilot.approve", { id: b.dataset.id }));
+    queue.querySelectorAll(".cancel-btn").forEach((b) => b.onclick = () => act("pilot.cancel", { id: b.dataset.id }));
+  }
+
+  async function load() {
+    try {
+      const status = await copad.call("pilot.status", {});
+      $("err").innerHTML = "";
+      render(status);
+    } catch (e) {
+      $("err").innerHTML = `<div class="err-banner">pilot: ${esc((e && e.message) || e)} (is the pilot plugin running?)</div>`;
+    }
+  }
+
+  async function act(method, params) {
+    try { await copad.call(method, params); await load(); }
+    catch (e) { $("err").innerHTML = `<div class="err-banner">${esc(method)}: ${esc((e && e.message) || e)}</div>`; }
+  }
+
+  function answer(id) {
+    const input = document.querySelector(`.answer-input[data-id="${CSS.escape(id)}"]`);
+    const text = input ? input.value.trim() : "";
+    if (!text) return;
+    act("pilot.answer", { id, text });
+  }
+
+  $("enqueue").onclick = async () => {
+    const cwd = ($("cwd").value.trim()) || $("cwd-select").value;
+    const instruction = $("instruction").value.trim();
+    const posture = $("posture").value;
+    if (!cwd || !instruction) { $("err").innerHTML = '<div class="err-banner">cwd and instruction are required</div>'; return; }
+    await act("pilot.add", { cwd, instruction, posture });
+    $("instruction").value = "";
+  };
+
+  // Refresh on any pilot.* bus event, plus a slow poll backstop.
+  if (window.copad && copad.on) copad.on("pilot.goal_added", load);
+  ["pilot.goal_started", "pilot.goal_blocked", "pilot.goal_completed", "pilot.goal_stalled", "pilot.goal_failed", "pilot.goal_cancelled"]
+    .forEach((k) => { try { copad.on(k, load); } catch (e) {} });
+  setInterval(load, 5000);
+
+  loadProjects();
+  load();
+</script>
+</body>
+</html>

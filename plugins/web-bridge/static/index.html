@@ -576,9 +576,15 @@
       const countStr = Object.keys(counts).length
         ? Object.entries(counts).map(([k, v]) => `${escapeHtml(k)} ${v}`).join(" · ")
         : "";
+      const projects = (state.pilot && Array.isArray(state.pilot.projects)) ? state.pilot.projects : [];
+      const projectOpts = `<option value="">— pick a project —</option>` + projects.map(p => {
+        const path = p.subpath ? `${p.path}/${p.subpath}` : p.path;
+        return `<option value="${escapeHtml(path)}">${escapeHtml(p.name)} · ${escapeHtml(p.path)}</option>`;
+      }).join("");
       const addForm = `
         <div class="pilot-add">
           ${state.pilotAdd ? `
+            ${projects.length ? `<select id="pilot-cwd-select">${projectOpts}</select>` : ""}
             <input id="pilot-cwd" placeholder="cwd (existing dir)" value="${escapeHtml(state.lastCwd || "")}">
             <textarea id="pilot-instruction" placeholder="goal instruction"></textarea>
             <div class="pilot-add-row">
@@ -659,8 +665,12 @@
       const cancelAdd = document.getElementById("pilot-add-cancel");
       if (cancelAdd) cancelAdd.addEventListener("click", () => { state.pilotAdd = false; render(); });
       const submit = document.getElementById("pilot-add-submit");
+      const cwdSelect = document.getElementById("pilot-cwd-select");
+      if (cwdSelect) cwdSelect.addEventListener("change", () => {
+        if (cwdSelect.value) document.getElementById("pilot-cwd").value = cwdSelect.value;
+      });
       if (submit) submit.addEventListener("click", async () => {
-        const cwd = document.getElementById("pilot-cwd").value.trim();
+        const cwd = document.getElementById("pilot-cwd").value.trim() || (cwdSelect ? cwdSelect.value : "");
         const instruction = document.getElementById("pilot-instruction").value.trim();
         const posture = document.getElementById("pilot-posture").value;
         if (!cwd || !instruction) return;

@@ -929,7 +929,18 @@ async fn handle_pilot_status(
     })
     .await
     .map_err(|e| AppError::custom("internal", &format!("tmx agents task: {e}")))?;
-    Ok(axum::Json(cockpit::aggregate(pilot, csd, tmx)))
+    let mut out = cockpit::aggregate(pilot, csd, tmx);
+    // Configured projects power the cockpit's cwd picker (so a goal can be
+    // targeted at a project without hand-typing the path). Best-effort.
+    let projects = state
+        .daemon
+        .rpc("project.list", json!({}))
+        .await
+        .ok()
+        .and_then(|v| v.get("projects").cloned())
+        .unwrap_or_else(|| Value::Array(vec![]));
+    out["projects"] = projects;
+    Ok(axum::Json(out))
 }
 
 #[derive(Deserialize)]

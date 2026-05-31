@@ -1187,3 +1187,15 @@ What the workstation actually needs (user-stated): a **sequential goal queue** �
 - **No multi-agent orchestration.** If a genuine multi-agent need appears later, it returns as its own plugin/feature earned by use — not pre-built.
 
 **See:** [#49](#49-agent-session-dispatch-via-a-standalone-csd-cli--subscription-seat-driver-consumed-by-copad) (csd dispatch body), [#50](#50-projects-panel-retired--web-bridge-is-the-single-orchestration-cockpit) (web-bridge cockpit), [#48](#48-copad-native-port-of-project-orchestration-spine) (the over-ported spine this trims), [docs/roadmap.md § Phase 24](./roadmap.md#phase-24-csd-integration--autonomous-loop-the-body-for-the-224227-spine).
+
+## 52. Pilot cockpit also lives as an in-copad plugin panel (amends #50)
+
+**Decision.** Add a GTK WebView **plugin panel to the `pilot` plugin** (`[[panels]]` + `panel.html`) that renders the same orchestration cockpit — the goal queue, per-goal gate answer/approve, cancel, and a project-dropdown add-goal form — driving the **same `pilot.*` daemon actions** via the `copad.call()` bridge. This **amends [#50](#50-projects-panel-retired--web-bridge-is-the-single-orchestration-cockpit)**, which said `web-bridge` was the *only* cockpit surface with "no GTK equivalent."
+
+**Why the reversal is not a regression to the retired projects panel.**
+
+- #50 retired `copad-plugin-projects` because it was **CRUD over a body-less spine** (goals/missions/approvals with nothing driving them) and a slow launcher duplicating `tmx`. That problem is gone: the spine was deleted (#51) and the body exists (the pilot dispatcher drives real `csd`→claude sessions).
+- The new panel is a **thin view over live daemon actions**, not a parallel state model. The orchestration logic stays single-sourced in the pilot plugin; `web-bridge` (HTTP, over `fetch`) and this panel (GTK, over `copad.call`) are two renderers of the identical `pilot.*` surface. No duplicated logic, no second source of truth.
+- The user's actual need: drive goals from inside the terminal they already live in, without opening a browser + pasting a bearer token. `web-bridge` stays the **remote / phone** surface (Tailscale / SSH); the panel is the **local desk** surface.
+
+**Boundary unchanged.** `csd` drives, `tmx` observes, the pilot plugin owns the queue; both cockpits only read/command the same actions. The project-dropdown cwd picker (`project.list`) addresses the "had to hand-type cwd" friction on both surfaces. Per-goal session **isolation is preserved** (#51 / codex C2) — neither surface reuses an existing tmux session; targeting is by `cwd` only.
