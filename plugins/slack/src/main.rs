@@ -28,6 +28,7 @@ compile_error!(
      feature; gate exists to make that failure compile-time instead of runtime."
 );
 
+mod channels;
 mod config;
 mod events;
 mod socket_mode;
@@ -41,6 +42,7 @@ use std::thread;
 
 use serde_json::{Value, json};
 
+use channels::{BotRpcConfig, ChannelEntry, ChannelProfile, ChannelStore, WaitMode};
 use config::Config;
 use store::{TokenSet, TokenStore};
 
@@ -158,6 +160,7 @@ fn run_rpc() {
         }
     };
     let store: Arc<dyn TokenStore> = Arc::from(store::open_store(&config));
+    let channel_store = Arc::new(ChannelStore::new(config.channel_path.clone()));
     eprintln!(
         "[slack] token store: {} (env tokens: {})",
         store.kind(),
@@ -167,6 +170,7 @@ fn run_rpc() {
             "present — will override store"
         }
     );
+    eprintln!("[slack] channel store: {}", config.channel_path.display());
 
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -243,6 +247,7 @@ fn run_rpc() {
             &stop_signal,
             &config,
             &store,
+            &channel_store,
         );
     }
 }
@@ -254,6 +259,7 @@ fn handle_frame(
     stop_signal: &AtomicBool,
     config: &Config,
     store: &Arc<dyn TokenStore>,
+    channel_store: &Arc<ChannelStore>,
 ) {
     let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
     let id = frame.get("id").and_then(Value::as_str).unwrap_or("");
@@ -280,6 +286,9 @@ fn handle_frame(
                         "slack.auth_status",
                         "slack.post_message",
                         "slack.get_message",
+                        "slack.channels.list",
+                        "slack.channels.upsert",
+                        "slack.channels.remove",
                     ],
                     "subscribes": [],
                 }),
@@ -295,7 +304,7 @@ fn handle_frame(
                 .unwrap_or("")
                 .to_string();
             let action_params = params.get("params").cloned().unwrap_or(Value::Null);
-            let result = handle_action(&name, &action_params, config, store);
+            let result = handle_action(&name, &action_params, config, store, channel_store);
             match result {
                 Ok(v) => send_response(tx, id, v),
                 Err((code, msg)) => send_error(tx, id, &code, &msg),
@@ -325,6 +334,7 @@ fn handle_action(
     params: &Value,
     config: &Config,
     store: &Arc<dyn TokenStore>,
+    channel_store: &Arc<ChannelStore>,
 ) -> Result<Value, (String, String)> {
     if name == "slack.auth_status" {
         // Round-5 fix: when env validation produced a fatal_error,
@@ -388,10 +398,186 @@ fn handle_action(
     if name == "slack.get_message" {
         return handle_get_message(params, config, store);
     }
+    if name == "slack.channels.list" {
+        return handle_channels_list(channel_store);
+    }
+    if name == "slack.channels.upsert" {
+        return handle_channels_upsert(params, config, store, channel_store);
+    }
+    if name == "slack.channels.remove" {
+        return handle_channels_remove(params, channel_store);
+    }
     Err((
         "action_not_found".to_string(),
         format!("slack plugin does not handle {name}"),
     ))
+}
+
+fn handle_channels_list(channel_store: &Arc<ChannelStore>) -> Result<Value, (String, String)> {
+    let file = channel_store.load();
+    Ok(json!({
+        "channels": file.channels,
+        "version": file.version,
+    }))
+}
+
+/// `slack.channels.upsert` — insert or replace by `id`. For C/G prefix
+/// channels, this calls `conversations.info` to enrich `name` (overrides
+/// user-provided name on success; falls back to user input on API failure
+/// so a missing-scope error doesn't block the user from registering a
+/// channel they care about).
+fn handle_channels_upsert(
+    params: &Value,
+    config: &Config,
+    store: &Arc<dyn TokenStore>,
+    channel_store: &Arc<ChannelStore>,
+) -> Result<Value, (String, String)> {
+    let id = params
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or((
+            "invalid_params".to_string(),
+            "missing 'id' (string)".to_string(),
+        ))?
+        .to_string();
+    // Validate the channel id BEFORE any outbound Slack call (the C/G
+    // `conversations.info` enrichment below). An unvalidated caller-
+    // controlled value would otherwise reach slack.com in the query
+    // string before `invalid_params` is returned — the ChannelStore
+    // re-validates on persist, but only the early check keeps malformed
+    // input out of the network.
+    if !channels::is_valid_channel_id(&id) {
+        return Err((
+            "invalid_params".to_string(),
+            format!(
+                "'id' must match [CDGU][A-Z0-9]+ (Slack channel id); got {:?}",
+                id
+            ),
+        ));
+    }
+    let user_name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let profile_str = params
+        .get("profile")
+        .and_then(Value::as_str)
+        .ok_or((
+            "invalid_params".to_string(),
+            "missing 'profile' (\"read\" | \"collect\" | \"bot-rpc\")".to_string(),
+        ))?
+        .to_string();
+    let profile: ChannelProfile = serde_json::from_value(Value::String(profile_str.clone()))
+        .map_err(|_| {
+            (
+                "invalid_params".to_string(),
+                format!(
+                    "'profile' must be one of read|collect|bot-rpc; got {:?}",
+                    profile_str
+                ),
+            )
+        })?;
+    let bot_rpc: Option<BotRpcConfig> = match params.get("bot_rpc") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(parse_bot_rpc(v)?),
+    };
+
+    // Auto-fetch name for public/private channels. Best effort: if the API
+    // fails (no scope, transient error), fall back to user-provided name.
+    // We deliberately do NOT abort upsert on lookup failure — the registry
+    // entry is local-only metadata, and a missing-scope error shouldn't
+    // block the user from saving a channel they care about.
+    let resolved_name = if channels::channel_supports_name(&id) {
+        let creds = socket_mode::current_credentials(config, &**store);
+        match creds.as_ref() {
+            Some(c) => match socket_mode::conversations_info(&c.bot_token, &id) {
+                Ok(Some(api_name)) => api_name,
+                Ok(None) => user_name.clone(),
+                Err(e) => {
+                    eprintln!(
+                        "[slack] conversations.info {id} failed: {e} — \
+                         falling back to user-provided name"
+                    );
+                    user_name.clone()
+                }
+            },
+            None => user_name.clone(),
+        }
+    } else {
+        user_name.clone()
+    };
+
+    let entry = ChannelEntry {
+        id,
+        name: resolved_name,
+        profile,
+        bot_rpc,
+        collect: None,
+        added_at: 0,
+        updated_at: 0,
+    };
+    let saved = channel_store
+        .upsert(entry)
+        .map_err(|e| ("invalid_params".to_string(), e))?;
+    Ok(json!({ "channel": saved }))
+}
+
+fn parse_bot_rpc(v: &Value) -> Result<BotRpcConfig, (String, String)> {
+    let default_template = v
+        .get("default_template")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let wait_mode_str = v.get("wait_mode").and_then(Value::as_str).ok_or((
+        "invalid_params".to_string(),
+        "'bot_rpc.wait_mode' required (\"first-reply\" | \"regex\")".to_string(),
+    ))?;
+    let wait_mode: WaitMode = serde_json::from_value(Value::String(wait_mode_str.to_string()))
+        .map_err(|_| {
+            (
+                "invalid_params".to_string(),
+                format!(
+                    "'bot_rpc.wait_mode' must be first-reply|regex; got {:?}",
+                    wait_mode_str
+                ),
+            )
+        })?;
+    let wait_regex = v
+        .get("wait_regex")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let wait_user_filter = v
+        .get("wait_user_filter")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let wait_timeout_ms = v
+        .get("wait_timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    Ok(BotRpcConfig {
+        default_template,
+        wait_mode,
+        wait_regex,
+        wait_user_filter,
+        wait_timeout_ms,
+    })
+}
+
+fn handle_channels_remove(
+    params: &Value,
+    channel_store: &Arc<ChannelStore>,
+) -> Result<Value, (String, String)> {
+    let id = params.get("id").and_then(Value::as_str).ok_or((
+        "invalid_params".to_string(),
+        "missing 'id' (string)".to_string(),
+    ))?;
+    let removed = channel_store
+        .remove(id)
+        .map_err(|e| ("io_error".to_string(), e))?;
+    Ok(json!({ "removed": removed }))
 }
 
 fn handle_get_message(

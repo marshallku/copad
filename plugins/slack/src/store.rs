@@ -49,6 +49,22 @@ pub trait TokenStore: Send + Sync {
 }
 
 pub fn open_store(config: &Config) -> Box<dyn TokenStore> {
+    if !config.use_keychain {
+        // Default on macOS — see `Config::use_keychain` doc. Skipping
+        // the probe entirely (vs relying on the 2s timeout in
+        // `KeyringStore::open`) keeps startup snappy on the typical
+        // path and avoids the leaked probe thread.
+        if config.require_secure_store {
+            eprintln!(
+                "[slack] secure keyring disabled (COPAD_SLACK_USE_KEYCHAIN=0) but \
+                 COPAD_SLACK_REQUIRE_SECURE_STORE=1 — no usable store"
+            );
+            return Box::new(BrokenStore {
+                reason: "keychain disabled and plaintext forbidden".to_string(),
+            });
+        }
+        return Box::new(PlaintextStore::new(config.plaintext_path.clone()));
+    }
     match KeyringStore::open(&config.workspace_label) {
         Ok(s) => Box::new(s),
         Err(e) => {
@@ -72,6 +88,7 @@ pub fn open_store(config: &Config) -> Box<dyn TokenStore> {
 
 pub struct KeyringStore {
     entry: keyring::Entry,
+    workspace: String,
 }
 
 impl KeyringStore {
@@ -80,11 +97,42 @@ impl KeyringStore {
             .map_err(|e| format!("keyring entry: {e}"))?;
         // Probe the secret-service backend so a real failure (D-Bus
         // unavailable, locked keyring) surfaces here rather than at
-        // first save.
-        match entry.get_password() {
-            Ok(_) => Ok(Self { entry }),
-            Err(keyring::Error::NoEntry) => Ok(Self { entry }),
-            Err(e) => Err(format!("keyring probe: {e}")),
+        // first save. Probe runs in a thread with a 2s deadline —
+        // macOS Keychain blocks indefinitely waiting for a UI prompt
+        // when the binary's signature doesn't match the entry's ACL,
+        // which happens every time we rebuild the binary. A background
+        // plugin process has no UI to surface that prompt, so a
+        // probe-time hang would prevent the plugin from ever
+        // initialising. On timeout, surface as a probe failure so
+        // `open_store` falls back to plaintext.
+        let probe_entry = keyring::Entry::new(KEYRING_SERVICE, workspace)
+            .map_err(|e| format!("keyring entry (probe): {e}"))?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = match probe_entry.get_password() {
+                Ok(_) => Ok(()),
+                Err(keyring::Error::NoEntry) => Ok(()),
+                Err(e) => Err(format!("keyring probe: {e}")),
+            };
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(2)) {
+            Ok(Ok(())) => Ok(Self {
+                entry,
+                workspace: workspace.to_string(),
+            }),
+            Ok(Err(e)) => Err(e),
+            // The probe thread is leaked (it stays blocked on the
+            // Keychain prompt). Plugin lifetime is short, and the leak
+            // is bounded to one thread per plugin process, so this is
+            // acceptable for the rebuild-during-dev case this guard
+            // exists for.
+            Err(_) => Err(
+                "keyring probe timed out — likely waiting for a Keychain ACL prompt that \
+                 cannot be surfaced from a background plugin process (run the binary from a \
+                 foreground terminal once to grant access, or rely on plaintext fallback)"
+                    .to_string(),
+            ),
         }
     }
 }
@@ -116,9 +164,16 @@ impl TokenStore for KeyringStore {
 
     fn save(&self, tokens: &TokenSet) -> Result<(), String> {
         let s = serde_json::to_string(tokens).map_err(|e| format!("serialize: {e}"))?;
-        self.entry
-            .set_password(&s)
-            .map_err(|e| format!("keyring write: {e}"))
+        #[cfg(target_os = "macos")]
+        {
+            save_macos_open_acl(&self.workspace, &s)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.entry
+                .set_password(&s)
+                .map_err(|e| format!("keyring write: {e}"))
+        }
     }
 
     fn clear(&self) -> Result<(), String> {
@@ -132,6 +187,58 @@ impl TokenStore for KeyringStore {
     fn kind(&self) -> &'static str {
         "keyring"
     }
+}
+
+/// macOS-specific write that sets the Keychain ACL to "Allow all
+/// applications" (`-A` flag). The default ACL is bound to the writing
+/// binary's code-signing identity (cdhash), so a rebuild produces a
+/// new cdhash and the next read prompts the user. A background plugin
+/// process can't surface that prompt — it hangs until the supervisor
+/// kills it. Setting an open ACL avoids the prompt entirely.
+///
+/// Security trade-off: within the same user account, any process can
+/// now read the entry without warning. Cross-user / cross-machine
+/// boundaries are unchanged (the Keychain is still unlocked only when
+/// the user logs in). For a single-user dev laptop running their own
+/// Slack bot tokens, this is acceptable; for shared systems it's
+/// roughly equivalent to the plaintext fallback we already use under
+/// `COPAD_SLACK_REQUIRE_SECURE_STORE=0`.
+///
+/// `ps`-visibility: the password appears in the `security` argv for the
+/// brief duration of the command. Acceptable for the `auth` subcommand
+/// (runs once per token rotation), not great for high-frequency saves —
+/// we don't have any.
+#[cfg(target_os = "macos")]
+fn save_macos_open_acl(workspace: &str, json: &str) -> Result<(), String> {
+    // Delete first — `add-generic-password` won't overwrite an existing
+    // entry's ACL, only its data. We need a fresh entry to pick up `-A`.
+    let _ = std::process::Command::new("/usr/bin/security")
+        .args([
+            "delete-generic-password",
+            "-s",
+            KEYRING_SERVICE,
+            "-a",
+            workspace,
+        ])
+        .output();
+    let output = std::process::Command::new("/usr/bin/security")
+        .args([
+            "add-generic-password",
+            "-A",
+            "-s",
+            KEYRING_SERVICE,
+            "-a",
+            workspace,
+            "-w",
+            json,
+        ])
+        .output()
+        .map_err(|e| format!("security invoke: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("security add-generic-password: {stderr}"));
+    }
+    Ok(())
 }
 
 // -- Plaintext fallback --

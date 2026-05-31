@@ -520,3 +520,37 @@ Back/forward enabled state and URL field text sync via KVO on `WKWebView.canGoBa
 After the first rebuild the Keychain Access dialog asks once for permission to use the new key — click **Always Allow**. From then on TCC binds grants to the cert identity, so permissions persist across rebuilds. To start over (wipe the cert), delete the `Copad Dev` entry under *login* in Keychain Access; the next build regenerates it.
 
 The cert is self-signed and not trusted by Gatekeeper — that's intentional. TCC doesn't require trust, only signature validity. Apple Developer ID would be overkill for local dev.
+
+### macOS: slack plugin hangs at `initialize`, copadd kills it after 5s
+
+**Symptom.** copadd log shows `service slack::main failed to start: did not reply to initialize within 5s` repeatedly. Plugin stderr only emits up to `[slack] token store: keyring …` then nothing — the process is alive but blocked.
+
+**Cause.** macOS Keychain ACLs are bound to the writing binary's code-signing identity (cdhash). Every dev rebuild produces a new cdhash, so the next `get_password` triggers a "Allow this app to access?" prompt. A copadd-spawned plugin runs in a background context with no UI to surface that prompt — the call blocks forever, copadd hits its init deadline and SIGKILLs. The `security` CLI doesn't see this because it's Apple-signed and routed through a different code path that bypasses the prompt.
+
+`-A` ("allow all applications") via `security add-generic-password -A` widens the ACL but does **not** fix this case — on modern macOS the partition list (a newer constraint layered on top of ACL) still blocks unsigned/ad-hoc-signed binaries, and the partition list can only be edited with the keychain password (`-k`), which we can't supply programmatically from a background process.
+
+**Fix.** `plugins/slack/src/config.rs` defaults `Config::use_keychain` to `false` on macOS. `open_store` then skips the keyring probe entirely and goes straight to `PlaintextStore` at `~/.config/copad/slack-tokens-default.json` (mode 0600). Same single-user-laptop protection envelope as the previous fallback path, but instant — no 2s probe wait and no `failed to start` cycle. Opt back in with `COPAD_SLACK_USE_KEYCHAIN=1` if the binary is on a stable build *and* the user has manually arranged the ACL.
+
+The `KeyringStore::open` 2-second probe timeout stays as a safety net for the opt-in path: any future hang surfaces as a clear timeout message and falls back to plaintext, rather than the 5-second init-deadline silent SIGKILL.
+
+### macOS: slack reaction/mention events don't reach the panel even though Socket Mode is "connected"
+
+**Symptom.** Plugin logs `[slack] socket mode connected` and the panel's FEED tab stays empty no matter how many reactions or mentions are sent. `apps.connections.open` and `auth.test` both return `ok: true`.
+
+**Cause.** Slack's Socket Mode is just the *transport* — what event types actually arrive over the WebSocket is controlled by the Slack App's **Event Subscriptions** page. If "Enable Events" is OFF, or `Subscribe to bot events` is empty, Slack accepts the WebSocket connect but sends zero frames (not even `hello` in some configurations).
+
+**Trap.** The Event Subscriptions UI requires a `Request URL` for the legacy HTTP webhook flow. Even when Socket Mode is ON (per the Socket Mode page), the UI may still show `Request URL` as required and refuse to enable Save Changes. Toggling "Enable Events" without being able to Save means refreshing the page reverts the toggle, leaving the user stuck in a loop.
+
+**Fix.** Edit the **App Manifest** directly (Settings → App Manifest in api.slack.com/apps) — bypasses the UI's stuck Request-URL check. Add:
+
+```yaml
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.im
+      - reaction_added
+  socket_mode_enabled: true
+```
+
+Save the manifest, then reinstall the app from the **Install App** sidebar entry so the new scopes/events take effect. Frames should start flowing on the next plugin reconnect.

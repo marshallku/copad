@@ -902,6 +902,7 @@ name = "copad-plugin-slack"
 version = "0.2.0"
 dependencies = [
  "keyring",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

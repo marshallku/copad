@@ -22,7 +22,18 @@ pub struct Config {
     pub user_token: String,
     pub workspace_label: String,
     pub require_secure_store: bool,
+    /// On macOS, defaults to `false` because Keychain ACLs are bound to
+    /// the writing binary's code-signing identity (cdhash). Every dev
+    /// rebuild changes cdhash and a background plugin process can't
+    /// surface the resulting "Allow this app?" prompt — the probe just
+    /// hangs. Plaintext is the reliable default. Power users on stable
+    /// builds can set `COPAD_SLACK_USE_KEYCHAIN=1` to opt back in (and
+    /// pair it with `security add-generic-password -A` if they want a
+    /// permissive ACL). Defaults to `true` on Linux where the secret
+    /// service / GNOME-Keyring model handles this gracefully.
+    pub use_keychain: bool,
     pub plaintext_path: PathBuf,
+    pub channel_path: PathBuf,
     /// Initial reconnect delay; exponential backoff up to `reconnect_max`.
     pub reconnect_initial: Duration,
     pub reconnect_max: Duration,
@@ -67,7 +78,14 @@ impl Config {
             std::env::var("COPAD_SLACK_WORKSPACE").unwrap_or_else(|_| "default".to_string());
         validate_workspace_label(&workspace_label)?;
         let require_secure_store = parse_bool("COPAD_SLACK_REQUIRE_SECURE_STORE", false)?;
+        // Platform-specific default — see field doc.
+        #[cfg(target_os = "macos")]
+        let use_keychain_default = false;
+        #[cfg(not(target_os = "macos"))]
+        let use_keychain_default = true;
+        let use_keychain = parse_bool("COPAD_SLACK_USE_KEYCHAIN", use_keychain_default)?;
         let plaintext_path = default_plaintext_path(&workspace_label);
+        let channel_path = default_channel_path(&workspace_label);
 
         Ok(Self {
             bot_token,
@@ -75,7 +93,9 @@ impl Config {
             user_token,
             workspace_label,
             require_secure_store,
+            use_keychain,
             plaintext_path,
+            channel_path,
             reconnect_initial: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(60),
             fatal_error: None,
@@ -93,7 +113,9 @@ impl Config {
             user_token: String::new(),
             workspace_label: "default".to_string(),
             require_secure_store: false,
+            use_keychain: false,
             plaintext_path: default_plaintext_path("default"),
+            channel_path: default_channel_path("default"),
             reconnect_initial: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(60),
             fatal_error: Some(error),
@@ -145,6 +167,12 @@ fn default_plaintext_path(workspace: &str) -> PathBuf {
     let base = config_home().unwrap_or_else(|| PathBuf::from("."));
     base.join("copad")
         .join(format!("slack-tokens-{workspace}.json"))
+}
+
+fn default_channel_path(workspace: &str) -> PathBuf {
+    let base = config_home().unwrap_or_else(|| PathBuf::from("."));
+    base.join("copad")
+        .join(format!("slack-channels-{workspace}.json"))
 }
 
 fn config_home() -> Option<PathBuf> {

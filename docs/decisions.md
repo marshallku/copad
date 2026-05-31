@@ -1241,3 +1241,28 @@ What the workstation actually needs (user-stated): a **sequential goal queue** �
 **Verification.** e2e: copad에서 Claude Code 띄우고 Opt+Return으로 prompt 안 줄바꿈 확인. `force_meta_keys = []`로 끄면 그냥 submit. 케이스 무관 + 알 수 없는 이름 stderr 경고 + Opt+←/Opt+⌫ readline 동작 보존.
 
 **See:** `copad-macos/Sources/Copad/Config.swift` (스키마), `copad-macos/Sources/Copad/AlacrittyTerminalViewController.swift` (`keyDown` 분기 + `parseForceMetaKeyCodes`), [docs/macos-app.md § Config.swift](./macos-app.md#configswift).
+
+## 54. Slack plugin defaults to plaintext token store on macOS
+
+**Problem.** The keyring crate's `get_password` blocks indefinitely on macOS Tahoe whenever the calling binary's cdhash isn't on the keychain entry's ACL — i.e. **every dev rebuild**. A `copadd`-spawned plugin runs in a background context with no UI to surface the resulting "Allow this app?" prompt, so the call never returns. copadd's 5-second init deadline then SIGKILLs the plugin with `service slack::main did not reply to initialize within 5s`. The Apple-signed `security` CLI doesn't trip this because it routes through a different keychain access path; user-built ad-hoc-signed binaries do.
+
+We tried widening the ACL with `security add-generic-password -A` ("allow all applications"). On modern macOS the **partition list** sits on top of the ACL as a second gate, and the partition list only accepts edits when the user supplies the keychain unlock password (`-k`). A background process can't supply that, so partition-list-driven prompts still hang.
+
+**Decision.** `plugins/slack/src/config.rs` sets `Config::use_keychain = false` by default on `cfg(target_os = "macos")`. `open_store` checks the flag before touching the keyring crate at all and goes straight to `PlaintextStore`. Linux keeps `true` because the secret-service / GNOME-Keyring backend doesn't have this prompt-on-rebuild model.
+
+The plaintext store writes `~/.config/copad/slack-tokens-default.json` at mode `0600` — same envelope as the previous fallback path that already kicked in when the probe timeout fired. Within a single-user laptop running the user's own Slack bot tokens, this is the same protection level keychain would have provided (login keychain is unlocked automatically post-login).
+
+**Opt-back-in.** `COPAD_SLACK_USE_KEYCHAIN=1` flips the flag for users on stable builds (no rebuild churn) who've manually arranged the ACL + partition list. `KeyringStore::save` on macOS still routes through `save_macos_open_acl` (delete + `add-generic-password -A`) for those users. The `KeyringStore::open` 2-second probe timeout stays as a safety net.
+
+**Why not just keep the 2s-timeout-fallback path.**
+
+- Burns 2s on every plugin startup on the default path — adds up across rebuilds.
+- Leaks one blocked probe thread per process (acceptable as a fallback, not as a steady-state default).
+- The fallback message in the log (`secure keyring unavailable …`) misleads users into thinking the keychain *could* work if they figured out the prompt — but on background-spawned plugins it categorically can't.
+
+**Trade-offs accepted.**
+
+- macOS users lose keychain idle-lock / TouchID gating for slack tokens. The bot tokens are revocable per-app from the Slack admin UI, so the blast radius of plaintext exposure is bounded to the workspace's Slack app and immediately mitigatable.
+- The default cross-platform behaviour now diverges (Linux uses keyring, macOS uses plaintext). Documented in the field doc and in [troubleshooting.md § slack plugin hangs at initialize](./troubleshooting.md).
+
+**See:** `plugins/slack/src/store.rs` (`open_store` flag check, `save_macos_open_acl`, 2s probe timeout), `plugins/slack/src/config.rs` (`use_keychain` field), [docs/troubleshooting.md § slack plugin hangs at initialize](./troubleshooting.md).

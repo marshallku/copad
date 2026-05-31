@@ -18,6 +18,9 @@ provides = [
     "slack.auth_status",
     "slack.post_message",
     "slack.get_message",
+    "slack.channels.list",
+    "slack.channels.upsert",
+    "slack.channels.remove",
 ]
 subscribes = []
 # Required env: COPAD_SLACK_BOT_TOKEN (xoxb-...), COPAD_SLACK_APP_TOKEN (xapp-...)

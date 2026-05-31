@@ -5,58 +5,63 @@
 <title>Slack</title>
 <style>
 /* ========================================================================
-   slack/panel.html — "Signal Log" aesthetic
-   Information-dense row-based event log; monospace throughout; type-rail
-   color is the primary visual differentiator. No card boxes; the row IS
-   the affordance. See the matching brief in conversation history.
+   slack/panel.html — single panel with two internal views
+   Top-level tab strip switches between FEED (Signal Log: mention/DM/reaction
+   event feed) and CHANNELS (per-channel profile registry). Monospace
+   throughout, Catppuccin Mocha tokens, type-rail color is the primary
+   visual differentiator.
    ----------------------------------------------------------------------
-   §1  TOKENS         design tokens, status colors, motion timings
-   §2  RESET          box-sizing, color-scheme, body baseline
-   §3  LAYOUT         shell: header / filter / feed / composer
-   §4  HEADER         workspace + status pill + refresh
-   §5  FILTER         chip row, active state
-   §6  FEED           list, empty state, scroll
-   §7  CARD           shared row chrome — rail / collapsed / expanded
-   §7.1 CARD-MENTION   mention rail
-   §7.2 CARD-DM        DM rail
-   §7.3 CARD-RXN       reaction rail + reacted-on body slot
-   §8  COMPOSER       sticky standalone + inline reply (same DOM)
-   §9  TOAST          error overlay
-   §10 SETUP          fatal/setup view
-   §11 MOTION         keyframes, prefers-reduced-motion override
-   §12 UTIL           .visually-hidden, .truncate, .copy-btn
+   §1   TOKENS         design tokens, status colors, motion timings
+   §2   RESET          box-sizing, color-scheme, body baseline
+   §3   LAYOUT         shell: header / tabs / body / composer
+   §4   HEADER         workspace + status pill + refresh
+   §5   TABS           internal view switcher (feed | channels)
+   §6   FILTER         feed sub-filter (chip row, active state)
+   §7   FEED           event-card list, empty state
+   §8   CARD           shared card chrome — rail / collapsed / expanded
+   §8.1 CARD-MENTION   mention rail
+   §8.2 CARD-DM        DM rail
+   §8.3 CARD-RXN       reaction rail + reacted-on body slot
+   §9   CHANNELS       channel-registry view (add bar + row list + edit form)
+   §9.1 CHAN-ROW       channel row chrome — rail per profile
+   §9.2 CHAN-FORM      inline edit form (name / profile / bot-rpc)
+   §9.3 CHAN-BOTRPC    bot-rpc sub-form (template / wait / regex / timeout)
+   §10  COMPOSER       sticky standalone + inline reply (feed only)
+   §11  TOAST          error / success overlay
+   §12  SETUP          fatal/setup view (replaces feed+channels when un-auth)
+   §13  MOTION         keyframes, prefers-reduced-motion override
+   §14  UTIL           visually-hidden, truncate, copy-btn
    ======================================================================== */
 
 /* §1 TOKENS ------------------------------------------------------------- */
 :root {
-  /* Status palette — Catppuccin Mocha defaults; host doesn't expose these
-     as CSS vars, so the panel hardcodes them. Edit here to retheme. */
-  --slack-ok:    #a6e3a1;   /* connected: green */
-  --slack-warn:  #f9e2af;   /* configured-not-signed-in: yellow */
-  --slack-info:  #89b4fa;   /* DM rail: blue */
-  --slack-rxn:   #94e2d5;   /* reaction rail: teal */
+  --slack-ok:    #a6e3a1;
+  --slack-warn:  #f9e2af;
+  --slack-info:  #89b4fa;
+  --slack-rxn:   #94e2d5;
 
-  /* Type rails — modifier-driven, defaults to grey overlay */
+  /* Type rails — modifier-driven; defaults to overlay grey */
   --rail-default: var(--copad-overlay0);
   --rail-mention: var(--copad-accent);
   --rail-dm:      var(--slack-info);
   --rail-rxn:     var(--slack-rxn);
 
-  /* Motion */
+  /* Channel-profile rails */
+  --rail-read:    var(--copad-overlay0);
+  --rail-collect: var(--slack-ok);
+  --rail-bot:     var(--slack-info);
+
   --t-fast: 80ms cubic-bezier(.2, 0, .1, 1);
   --t-med:  180ms cubic-bezier(.2, 0, .1, 1);
   --t-slow: 320ms cubic-bezier(.2, 0, .1, 1);
 
-  /* Spacing scale — 4px base, restricted to {4,8,12,16,20,32} */
   --s-1: 4px; --s-2: 8px; --s-3: 12px; --s-4: 16px; --s-5: 20px; --s-7: 32px;
 
-  /* Type scale */
-  --fs-meta: 11px;     /* uppercase badge / header label */
+  --fs-meta: 11px;
   --fs-body: 12px;
   --fs-id:   13px;
   --fs-head: 15px;
 
-  /* Component-level */
   --row-h-collapsed: 30px;
   --rail-w:          4px;
 }
@@ -74,7 +79,6 @@ body {
   font-size: var(--fs-body);
   line-height: 1.45;
   color: var(--copad-text);
-  /* Body MUST stay transparent — host paints window-level wallpaper. */
   background: transparent;
 }
 
@@ -102,9 +106,9 @@ body {
   background: var(--copad-overlay0);
   flex-shrink: 0;
 }
-.slack-header__dot--ok   { background: var(--slack-ok);   animation: signalPulse 2.4s ease-out infinite; }
+.slack-header__dot--ok   { background: var(--slack-ok); animation: signalPulse 2.4s ease-out infinite; }
 .slack-header__dot--warn { background: var(--slack-warn); }
-.slack-header__dot--err  { background: var(--copad-red);   }
+.slack-header__dot--err  { background: var(--copad-red); }
 .slack-header__workspace {
   font-size: var(--fs-head);
   font-weight: 500;
@@ -141,7 +145,45 @@ body {
 .slack-header__refresh:active { transform: scale(0.97); }
 .slack-header__refresh:disabled { opacity: 0.4; cursor: progress; }
 
-/* §5 FILTER ------------------------------------------------------------- */
+/* §5 TABS --------------------------------------------------------------- */
+.slack-tabs {
+  display: flex;
+  align-items: stretch;
+  height: 28px;
+  padding-inline: var(--s-4);
+  border-bottom: 1px solid var(--copad-overlay0);
+  flex-shrink: 0;
+  background: color-mix(in oklab, var(--copad-surface0) 30%, transparent);
+}
+.slack-tabs__tab {
+  background: transparent;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--copad-subtext0);
+  font: inherit;
+  font-size: var(--fs-meta);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  padding: 0 var(--s-3);
+  cursor: pointer;
+  transition: color var(--t-fast), border-color var(--t-fast);
+  margin-bottom: -1px;
+}
+.slack-tabs__tab:hover { color: var(--copad-text); }
+.slack-tabs__tab--active {
+  color: var(--copad-accent);
+  border-bottom-color: var(--copad-accent);
+}
+.slack-tabs__count {
+  margin-left: 4px;
+  color: var(--copad-subtext0);
+  font-variant-numeric: tabular-nums;
+}
+.slack-tabs__tab--active .slack-tabs__count {
+  color: color-mix(in oklab, var(--copad-accent) 70%, var(--copad-subtext1));
+}
+
+/* §6 FILTER ------------------------------------------------------------- */
 .slack-filter {
   display: flex;
   gap: var(--s-1);
@@ -167,9 +209,7 @@ body {
 .slack-filter__chip:hover {
   background: color-mix(in oklab, var(--copad-surface0) 40%, transparent);
 }
-.slack-filter__chip--active {
-  color: var(--copad-accent);
-}
+.slack-filter__chip--active { color: var(--copad-accent); }
 .slack-filter__count {
   margin-left: 4px;
   color: var(--copad-subtext0);
@@ -179,7 +219,7 @@ body {
   color: color-mix(in oklab, var(--copad-accent) 70%, var(--copad-subtext1));
 }
 
-/* §6 FEED --------------------------------------------------------------- */
+/* §7 FEED --------------------------------------------------------------- */
 .slack-feed {
   flex: 1;
   min-height: 0;
@@ -215,7 +255,7 @@ body {
   color: var(--copad-overlay0);
 }
 
-/* §7 CARD --------------------------------------------------------------- */
+/* §8 CARD --------------------------------------------------------------- */
 .slack-card {
   --rail-color: var(--rail-default);
   display: grid;
@@ -289,14 +329,8 @@ body {
   flex-wrap: wrap;
   font-size: var(--fs-id);
 }
-.slack-card__channel {
-  color: var(--copad-text);
-  font-weight: 600;
-}
-.slack-card__user {
-  color: var(--copad-subtext1);
-  font-weight: 400;
-}
+.slack-card__channel { color: var(--copad-text); font-weight: 600; }
+.slack-card__user    { color: var(--copad-subtext1); font-weight: 400; }
 .slack-card__rel {
   color: var(--copad-subtext0);
   font-style: italic;
@@ -352,7 +386,6 @@ body {
   color: var(--copad-text);
 }
 
-/* Expand-only zone — reply composer, fetched body, reacted-on body */
 .slack-card__expand {
   grid-area: expand;
   margin-top: var(--s-3);
@@ -369,16 +402,15 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* §7.1 CARD-MENTION ------------------------------------------------------ */
+/* §8.1 CARD-MENTION ----------------------------------------------------- */
 .slack-card--mention { --rail-color: var(--rail-mention); }
 
-/* §7.2 CARD-DM ----------------------------------------------------------- */
+/* §8.2 CARD-DM ---------------------------------------------------------- */
 .slack-card--dm { --rail-color: var(--rail-dm); }
 
-/* §7.3 CARD-RXN ---------------------------------------------------------- */
+/* §8.3 CARD-RXN --------------------------------------------------------- */
 .slack-card--rxn { --rail-color: var(--rail-rxn); }
 .slack-card--rxn .slack-card__badge {
-  /* Reaction badge: emoji name in shortcode form. */
   font-size: 13px;
   letter-spacing: 0;
   text-transform: none;
@@ -403,7 +435,338 @@ body {
   font-style: italic;
 }
 
-/* §8 COMPOSER ----------------------------------------------------------- */
+/* §9 CHANNELS ----------------------------------------------------------- */
+.chan-add {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-4);
+  background: color-mix(in oklab, var(--copad-surface0) 40%, transparent);
+  border-bottom: 1px solid var(--copad-overlay0);
+  flex-shrink: 0;
+}
+.chan-add::before {
+  content: "+";
+  color: var(--copad-subtext0);
+  font-size: var(--fs-head);
+  flex-shrink: 0;
+}
+.chan-add__input {
+  flex: 1;
+  background: var(--copad-surface0);
+  border: 1px solid var(--copad-surface2);
+  color: var(--copad-text);
+  font: inherit;
+  font-size: var(--fs-body);
+  padding: 4px 8px;
+  height: 24px;
+  border-radius: 3px;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+.chan-add__input:focus {
+  outline: 1px solid var(--copad-accent);
+  outline-offset: 1px;
+  border-color: var(--copad-accent);
+}
+.chan-add__select {
+  background: var(--copad-surface0);
+  border: 1px solid var(--copad-surface2);
+  color: var(--copad-text);
+  font: inherit;
+  font-size: var(--fs-body);
+  padding: 4px 8px;
+  height: 24px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.chan-add__select:focus {
+  outline: 1px solid var(--copad-accent);
+  outline-offset: 1px;
+  border-color: var(--copad-accent);
+}
+.chan-add__submit {
+  background: transparent;
+  border: 1px solid var(--copad-surface2);
+  color: var(--copad-subtext1);
+  font: inherit;
+  font-size: var(--fs-meta);
+  padding: 0 10px;
+  height: 24px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+  flex-shrink: 0;
+  letter-spacing: 0.04em;
+}
+.chan-add__submit:hover {
+  background: var(--copad-accent);
+  color: var(--copad-bg);
+  border-color: var(--copad-accent);
+}
+.chan-add__submit:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.chan-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--s-4) var(--s-4) var(--s-7);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+}
+.chan-list::-webkit-scrollbar { width: 8px; }
+.chan-list::-webkit-scrollbar-track { background: transparent; }
+.chan-list::-webkit-scrollbar-thumb {
+  background: var(--copad-surface1);
+  border-radius: 4px;
+}
+.chan-list__empty {
+  margin: var(--s-7) auto;
+  color: var(--copad-subtext0);
+  font-style: italic;
+  font-size: var(--fs-body);
+  text-align: center;
+}
+.chan-list__empty::before {
+  content: "··· ";
+  letter-spacing: 0.2em;
+  color: var(--copad-overlay0);
+}
+.chan-list__empty::after {
+  content: " ···";
+  letter-spacing: 0.2em;
+  color: var(--copad-overlay0);
+}
+
+/* §9.1 CHAN-ROW --------------------------------------------------------- */
+.chan-row {
+  --rail-color: var(--rail-read);
+  display: grid;
+  grid-template-columns: 56px 1fr auto;
+  grid-template-areas:
+    "rail body actions"
+    "rail expand expand";
+  align-items: start;
+  gap: 0 var(--s-3);
+  padding: var(--s-2) var(--s-3) var(--s-2) var(--s-2);
+  background: color-mix(in oklab, var(--copad-surface0) 60%, transparent);
+  border-left: var(--rail-w) solid var(--rail-color);
+  border-left-color: color-mix(in oklab, var(--rail-color) 40%, transparent);
+  border-radius: 0 4px 4px 0;
+  cursor: pointer;
+  transition: background var(--t-fast), border-color var(--t-fast);
+}
+.chan-row:hover {
+  background: color-mix(in oklab, var(--copad-surface1) 85%, transparent);
+  border-left-color: var(--rail-color);
+}
+.chan-row:focus-visible {
+  outline: 1px solid var(--copad-accent);
+  outline-offset: 2px;
+}
+.chan-row--expanded {
+  background: var(--copad-surface1);
+  border-left-color: var(--rail-color);
+  padding-block: var(--s-3) var(--s-4);
+  cursor: default;
+}
+.chan-row--read    { --rail-color: var(--rail-read); }
+.chan-row--collect { --rail-color: var(--rail-collect); }
+.chan-row--bot-rpc { --rail-color: var(--rail-bot); }
+
+.chan-row__rail {
+  grid-area: rail;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding-top: 2px;
+}
+.chan-row__badge {
+  font-size: var(--fs-meta);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: color-mix(in oklab, var(--rail-color) 80%, var(--copad-text));
+  font-weight: 600;
+}
+.chan-row__body {
+  grid-area: body;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.chan-row__head {
+  display: flex;
+  gap: var(--s-2);
+  align-items: baseline;
+  flex-wrap: wrap;
+  font-size: var(--fs-id);
+}
+.chan-row__id   { color: var(--copad-text); font-weight: 600; }
+.chan-row__name { color: var(--copad-subtext1); font-weight: 400; }
+.chan-row__name::before {
+  content: "#";
+  color: var(--copad-overlay0);
+  margin-right: 1px;
+}
+.chan-row__sub {
+  color: var(--copad-subtext0);
+  font-size: var(--fs-meta);
+  font-style: italic;
+}
+.chan-row__actions {
+  grid-area: actions;
+  display: flex;
+  gap: var(--s-1);
+  align-self: center;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--t-med);
+}
+.chan-row:hover .chan-row__actions,
+.chan-row:focus-within .chan-row__actions,
+.chan-row--expanded .chan-row__actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+.chan-row__action {
+  background: transparent;
+  border: 0;
+  color: var(--copad-subtext0);
+  font: inherit;
+  font-size: var(--fs-meta);
+  letter-spacing: 0.04em;
+  padding: 4px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.chan-row__action:hover {
+  background: var(--copad-surface2);
+  color: var(--copad-text);
+}
+.chan-row__action--danger:hover {
+  background: var(--copad-red);
+  color: var(--copad-bg);
+}
+
+.chan-row__expand {
+  grid-area: expand;
+  margin-top: var(--s-3);
+  display: none;
+  flex-direction: column;
+  gap: var(--s-3);
+}
+.chan-row--expanded .chan-row__expand { display: flex; }
+
+/* §9.2 CHAN-FORM -------------------------------------------------------- */
+.chan-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+}
+.chan-form__field {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  font-size: var(--fs-body);
+}
+.chan-form__label {
+  width: 110px;
+  flex-shrink: 0;
+  color: var(--copad-subtext0);
+  font-size: var(--fs-meta);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+.chan-form__input,
+.chan-form__select,
+.chan-form__textarea {
+  flex: 1;
+  background: var(--copad-surface0);
+  border: 1px solid var(--copad-surface2);
+  color: var(--copad-text);
+  font: inherit;
+  font-size: var(--fs-body);
+  padding: 4px 8px;
+  border-radius: 3px;
+}
+.chan-form__input,
+.chan-form__select { height: 24px; }
+.chan-form__textarea {
+  resize: vertical;
+  min-height: 48px;
+  line-height: 1.45;
+}
+.chan-form__input:focus,
+.chan-form__select:focus,
+.chan-form__textarea:focus {
+  outline: 1px solid var(--copad-accent);
+  outline-offset: 1px;
+  border-color: var(--copad-accent);
+}
+.chan-form__hint {
+  font-size: var(--fs-meta);
+  color: var(--copad-subtext0);
+  font-style: italic;
+  padding-left: 118px;
+  margin-top: -4px;
+}
+.chan-form__row-actions {
+  display: flex;
+  gap: var(--s-2);
+  justify-content: flex-end;
+  padding-top: var(--s-2);
+  border-top: 1px solid var(--copad-overlay0);
+}
+.chan-form__btn {
+  background: transparent;
+  border: 1px solid var(--copad-surface2);
+  color: var(--copad-subtext1);
+  font: inherit;
+  font-size: var(--fs-meta);
+  padding: 4px 14px;
+  height: 26px;
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background var(--t-fast), color var(--t-fast);
+  letter-spacing: 0.04em;
+}
+.chan-form__btn:hover {
+  background: var(--copad-surface2);
+  color: var(--copad-text);
+}
+.chan-form__btn--primary {
+  border-color: var(--copad-accent);
+  color: var(--copad-accent);
+}
+.chan-form__btn--primary:hover {
+  background: var(--copad-accent);
+  color: var(--copad-bg);
+}
+
+/* §9.3 CHAN-BOTRPC ------------------------------------------------------ */
+.chan-botrpc {
+  display: none;
+  flex-direction: column;
+  gap: var(--s-3);
+  padding: var(--s-3);
+  background: color-mix(in oklab, var(--copad-surface0) 80%, transparent);
+  border-left: 2px solid var(--rail-bot);
+  border-radius: 0 3px 3px 0;
+}
+.chan-form[data-profile="bot-rpc"] .chan-botrpc { display: flex; }
+.chan-botrpc__head {
+  font-size: var(--fs-meta);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--rail-bot);
+  font-weight: 600;
+}
+
+/* §10 COMPOSER ---------------------------------------------------------- */
 .slack-composer {
   display: flex;
   flex-direction: column;
@@ -512,7 +875,6 @@ body {
   display: block;
 }
 
-/* Inline reply variant — same DOM shape, different scope */
 .slack-card__expand .slack-composer {
   background: color-mix(in oklab, var(--copad-surface0) 80%, transparent);
   border: 1px solid var(--copad-overlay0);
@@ -521,7 +883,7 @@ body {
 }
 .slack-card__expand .slack-composer__channel { width: 100px; }
 
-/* §9 TOAST -------------------------------------------------------------- */
+/* §11 TOAST ------------------------------------------------------------- */
 .slack-toast {
   position: fixed;
   top: 12px;
@@ -544,6 +906,7 @@ body {
   cursor: pointer;
   animation: toastIn var(--t-med) ease-out;
 }
+.slack-toast__item--ok { border-left-color: var(--slack-ok); }
 .slack-toast__code {
   display: block;
   font-size: var(--fs-meta);
@@ -552,11 +915,9 @@ body {
   text-transform: uppercase;
   margin-bottom: 2px;
 }
-.slack-toast__msg {
-  word-break: break-word;
-}
+.slack-toast__msg { word-break: break-word; }
 
-/* §10 SETUP ------------------------------------------------------------- */
+/* §12 SETUP ------------------------------------------------------------- */
 .slack-setup {
   flex: 1;
   min-height: 0;
@@ -646,7 +1007,7 @@ body {
   color: var(--copad-subtext0);
 }
 
-/* §11 MOTION ------------------------------------------------------------ */
+/* §13 MOTION ------------------------------------------------------------ */
 @keyframes signalPulse {
   0%   { box-shadow: 0 0 0 0    color-mix(in oklab, var(--slack-ok) 60%, transparent); }
   70%  { box-shadow: 0 0 0 6px  color-mix(in oklab, var(--slack-ok)  0%, transparent); }
@@ -665,7 +1026,7 @@ body {
   .slack-card:hover { transform: none; }
 }
 
-/* §12 UTIL -------------------------------------------------------------- */
+/* §14 UTIL -------------------------------------------------------------- */
 .visually-hidden {
   position: absolute !important;
   width: 1px; height: 1px;
@@ -686,7 +1047,6 @@ body {
 <body>
 <div class="slack-shell">
 
-  <!-- §4 HEADER -->
   <header class="slack-header" id="header" aria-label="Slack auth status">
     <div class="slack-header__dot" id="status-dot"></div>
     <div class="slack-header__workspace" id="workspace-label">…</div>
@@ -695,7 +1055,16 @@ body {
     <button class="slack-header__refresh" id="refresh-btn" type="button">refresh</button>
   </header>
 
-  <!-- §5 FILTER (only mounted in feed view) -->
+  <nav class="slack-tabs" id="tabs" role="tablist" hidden>
+    <button class="slack-tabs__tab" data-tab="feed" type="button" role="tab">
+      FEED<span class="slack-tabs__count" id="tab-count-feed"> 0</span>
+    </button>
+    <button class="slack-tabs__tab" data-tab="channels" type="button" role="tab">
+      CHANNELS<span class="slack-tabs__count" id="tab-count-channels"> 0</span>
+    </button>
+  </nav>
+
+  <!-- Feed sub-filter (visible only when tab=feed) -->
   <nav class="slack-filter" id="filter" role="tablist" hidden>
     <button class="slack-filter__chip" data-filter="all" type="button" role="tab">
       ALL<span class="slack-filter__count" data-count="all"> 0</span>
@@ -711,10 +1080,21 @@ body {
     </button>
   </nav>
 
-  <!-- §6 FEED or §10 SETUP — toggled by JS -->
+  <!-- Channel add row (visible only when tab=channels) -->
+  <form class="chan-add" id="chan-add" hidden>
+    <input class="chan-add__input" id="chan-add-id" type="text"
+           placeholder="C01ABC… (channel id)" spellcheck="false"
+           autocomplete="off" required />
+    <select class="chan-add__select" id="chan-add-profile" aria-label="profile">
+      <option value="read">read</option>
+      <option value="collect">collect</option>
+      <option value="bot-rpc">bot-rpc</option>
+    </select>
+    <button class="chan-add__submit" id="chan-add-submit" type="submit">ADD</button>
+  </form>
+
   <main id="main" class="slack-feed" aria-live="polite"></main>
 
-  <!-- §8 COMPOSER (standalone) — only mounted in feed view -->
   <footer class="slack-composer" id="composer" hidden>
     <div class="slack-composer__row">
       <input class="slack-composer__channel" id="composer-channel"
@@ -731,7 +1111,6 @@ body {
 
 </div>
 
-<!-- §9 TOAST region — outside shell, fixed-positioned -->
 <div class="slack-toast" id="toast" role="status" aria-live="polite"></div>
 
 <script>
@@ -739,38 +1118,46 @@ body {
 
 /* ========================================================================
    slack/panel.html — JS
-   - Bridge: window.copad.call / .on (host-injected)
-   - Single-pass full-feed render (200 cap → ~5ms cost). Throttled by RAF.
-   - localStorage keys:
-     * slack-filter           "all"|"mention"|"dm"|"reaction"
-     * slack-expanded         JSON Set<eventId>
-     * slack-composer-draft   string
-   - Events arriving before init() finishes are queued. The bridge starts
-     pumping as soon as `copad.on(...)` is registered, but the auth-status
-     call may not have returned yet — buffer until UI ready.
+   Two internal views: FEED (event log) and CHANNELS (registry). The tab
+   strip toggles visibility — both are mounted, only one is rendered into.
+   ----------------------------------------------------------------------
+   localStorage keys:
+     * slack-tab               "feed"|"channels"  (active view)
+     * slack-filter            feed sub-filter
+     * slack-expanded          feed cards expanded
+     * slack-channels-expanded channel rows expanded
+     * slack-composer-draft    composer text
    ======================================================================== */
 
 const LS = {
-  filter:   'slack-filter',
-  expanded: 'slack-expanded',
-  draft:    'slack-composer-draft',
+  tab:       'slack-tab',
+  filter:    'slack-filter',
+  expanded:  'slack-expanded',
+  chanExp:   'slack-channels-expanded',
+  draft:     'slack-composer-draft',
 };
 
 const state = {
   auth: null,
+  authError: null,
+  activeTab: localStorage.getItem(LS.tab) || 'feed',
+  // FEED
   filter: localStorage.getItem(LS.filter) || 'all',
-  authError: null,  // populated when auth_status REJECTS (transport)
-  events: [],   // { id, kind, payload, sentAt? } — newest first
+  events: [],
   expanded: new Set(safeJSON(localStorage.getItem(LS.expanded)) || []),
-  bodies: new Map(),  // key=`${channel}:${ts}`, value=string|null|Promise
+  bodies: new Map(),
   ready: false,
-  pending: [],  // events received before ready
+  pending: [],
+  // CHANNELS
+  channels: [],
+  channelsLoaded: false,
+  chanExpanded: new Set(safeJSON(localStorage.getItem(LS.chanExp)) || []),
+  chanDrafts: new Map(),
 };
 
 function safeJSON(s) { try { return JSON.parse(s); } catch { return null; } }
-function persistExpanded() {
-  localStorage.setItem(LS.expanded, JSON.stringify([...state.expanded]));
-}
+function persistExpanded()  { localStorage.setItem(LS.expanded, JSON.stringify([...state.expanded])); }
+function persistChanExp()   { localStorage.setItem(LS.chanExp,  JSON.stringify([...state.chanExpanded])); }
 
 /* DOM refs ------------------------------------------------------------- */
 const $ = (id) => document.getElementById(id);
@@ -780,7 +1167,14 @@ const dom = {
   workspace: $('workspace-label'),
   meta:      $('header-meta'),
   refresh:   $('refresh-btn'),
+  tabs:      $('tabs'),
+  tabCountFeed:     $('tab-count-feed'),
+  tabCountChannels: $('tab-count-channels'),
   filter:    $('filter'),
+  chanAdd:        $('chan-add'),
+  chanAddId:      $('chan-add-id'),
+  chanAddProfile: $('chan-add-profile'),
+  chanAddSubmit:  $('chan-add-submit'),
   main:      $('main'),
   composer:  $('composer'),
   composerChannel: $('composer-channel'),
@@ -789,11 +1183,9 @@ const dom = {
   toast:     $('toast'),
 };
 
-/* HTML escape ---------------------------------------------------------- */
 const ESC_MAP = { '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;', "'": '&#39;' };
 function esc(s) { return String(s ?? '').replace(/[<>&"']/g, c => ESC_MAP[c]); }
 
-/* Time ----------------------------------------------------------------- */
 function relTime(tsStr) {
   const sec = Date.now() / 1000 - parseFloat(tsStr);
   if (!isFinite(sec) || sec < 0) return '—';
@@ -807,28 +1199,43 @@ function tsClock(tsStr) {
   if (isNaN(d.getTime())) return '——:——';
   return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
 }
+// `unixMs` is the server's millisecond timestamp from ChannelStore.upsert.
+// Negative ages clamp to "just now" via the < 60 branch so minor clock
+// skew between writer and reader doesn't render as "—".
+function relTimeMs(unixMs) {
+  if (!unixMs) return '—';
+  const sec = (Date.now() - unixMs) / 1000;
+  if (!isFinite(sec)) return '—';
+  if (sec < 60)    return 'just now';
+  if (sec < 3600)  return `${Math.floor(sec / 60)}m ago`;
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h ago`;
+  return `${Math.floor(sec / 86400)}d ago`;
+}
 
-/* Auth refresh --------------------------------------------------------- */
-async function refreshAuth() {
+/* Auth + channels refresh --------------------------------------------- */
+async function refreshAll() {
   dom.refresh.disabled = true;
   try {
     state.auth = await copad.call('slack.auth_status', {});
     state.authError = null;
   } catch (err) {
-    // Distinguish "the call itself failed" from "the call returned
-    // configured=false". The former usually means service_unavailable
-    // (supervisor + slack plugin not running) — collapsing it into a
-    // setup-style error would mislead the user into re-running auth
-    // when the actual problem is the supervisor. Carry the error
-    // code through to renderSetup so it can route accordingly.
     state.auth = null;
     state.authError = {
       code: err.code || 'auth_status_failed',
       message: err.message || String(err),
     };
-  } finally {
-    dom.refresh.disabled = false;
   }
+  if (state.auth && state.auth.authenticated) {
+    try {
+      const res = await copad.call('slack.channels.list', {});
+      state.channels = Array.isArray(res?.channels) ? res.channels : [];
+      state.channelsLoaded = true;
+    } catch (err) {
+      state.channels = [];
+      toast(err.code || 'channels_list_failed', err.message || String(err));
+    }
+  }
+  dom.refresh.disabled = false;
   renderHeader();
   renderBody();
   flushPending();
@@ -845,9 +1252,9 @@ function renderHeader() {
   }
   dom.workspace.textContent = a.workspace || '…';
   let dotClass = '';
-  if (a.authenticated)        dotClass = 'slack-header__dot--ok';
-  else if (a.configured)      dotClass = 'slack-header__dot--warn';
-  else                        dotClass = 'slack-header__dot--err';
+  if (a.authenticated)      dotClass = 'slack-header__dot--ok';
+  else if (a.configured)    dotClass = 'slack-header__dot--warn';
+  else                      dotClass = 'slack-header__dot--err';
   dom.dot.className = `slack-header__dot ${dotClass}`;
   dom.dot.title = a.authenticated
     ? 'connected'
@@ -864,25 +1271,47 @@ function renderHeader() {
 
 function renderBody() {
   if (state.authError) {
+    dom.tabs.hidden = true;
     dom.filter.hidden = true;
+    dom.chanAdd.hidden = true;
     dom.composer.hidden = true;
     renderTransportError();
     return;
   }
   const a = state.auth || {};
   const ok = a.configured && a.authenticated;
-  if (ok) {
-    dom.filter.hidden = false;
-    dom.composer.hidden = false;
-    renderFeed();
-  } else {
+  if (!ok) {
+    dom.tabs.hidden = true;
     dom.filter.hidden = true;
+    dom.chanAdd.hidden = true;
     dom.composer.hidden = true;
     renderSetup();
+    return;
+  }
+  dom.tabs.hidden = false;
+  renderTabsCounts();
+  if (state.activeTab === 'channels') {
+    dom.filter.hidden = true;
+    dom.chanAdd.hidden = false;
+    dom.composer.hidden = true;
+    renderChannelsList();
+  } else {
+    dom.filter.hidden = false;
+    dom.chanAdd.hidden = true;
+    dom.composer.hidden = false;
+    renderFeed();
   }
 }
 
-/* §10 SETUP render — transport-error variant -------------------------- */
+function renderTabsCounts() {
+  dom.tabCountFeed.textContent = ` ${state.events.length}`;
+  dom.tabCountChannels.textContent = ` ${state.channels.length}`;
+  dom.tabs.querySelectorAll('.slack-tabs__tab').forEach(b => {
+    b.classList.toggle('slack-tabs__tab--active', b.dataset.tab === state.activeTab);
+  });
+}
+
+/* §12 SETUP render ----------------------------------------------------- */
 function renderTransportError() {
   const e = state.authError;
   dom.main.className = 'slack-setup';
@@ -901,7 +1330,6 @@ function renderTransportError() {
   `;
 }
 
-/* §10 SETUP render ----------------------------------------------------- */
 function renderSetup() {
   const a = state.auth || {};
   const fatal = a.fatal_error;
@@ -930,7 +1358,7 @@ function renderSetup() {
   `;
 }
 
-/* §6 FEED render ------------------------------------------------------- */
+/* §7 FEED render ------------------------------------------------------- */
 function renderFeed() {
   dom.main.className = 'slack-feed';
   const filtered = state.events.filter(matchesFilter);
@@ -974,14 +1402,13 @@ function renderCard(ev) {
   } else if (ev.kind === 'dm') {
     badge = 'DM';
     preview = esc((p.text || '').trim() || '(no text)');
-  } else { /* reaction */
+  } else {
     badge = `:${esc(p.reaction || '?')}:`;
     preview = `ts ${esc(p.ts || '?')}`;
   }
   const sentFooter = ev.sentAt
     ? `<div class="slack-card__sent">✓ sent ${esc(ev.sentAt)}</div>` : '';
 
-  // Reaction body slot: lazy-fetched
   let rxnBody = '';
   if (ev.kind === 'reaction' && expanded) {
     const key = `${p.channel}:${p.ts}`;
@@ -990,8 +1417,6 @@ function renderCard(ev) {
                     data-rxn-body="${esc(key)}">${cached === undefined ? 'fetching…' : esc(cached || '(empty)')}</div>`;
   }
 
-  // Reply composer (mounted only when expanded; not for reaction since
-  // reply context for reactions is ambiguous — keep one composer-per-thread)
   const replyChannel = p.channel || '';
   const replyThread  = p.thread_ts || p.ts || '';
   const replyComposer = expanded && (ev.kind === 'mention' || ev.kind === 'dm') ? `
@@ -1008,14 +1433,6 @@ function renderCard(ev) {
       <div class="slack-composer__hint">thread_ts ${esc(replyThread)} · ⌘+enter / esc</div>
     </form>` : '';
 
-  // The "open" link is only rendered when the payload carries a
-  // permalink. As of slack/events.rs, only `slack.reaction` payloads
-  // include a (best-effort) permalink fetched at event time via
-  // `chat.getPermalink`. Mention/DM payloads do not — the workspace
-  // subdomain is unknown locally, so we cannot build a URL ourselves.
-  // The user sees `copy ts` on every card; `open` only on reactions
-  // and on mentions/DMs after a future plugin-side enhancement that
-  // back-fills permalink there too.
   return `
     <article class="${cls}" data-event-id="${esc(ev.id)}" tabindex="0">
       <div class="slack-card__rail">
@@ -1042,10 +1459,151 @@ function renderCard(ev) {
     </article>`;
 }
 
+/* §9 CHANNELS render --------------------------------------------------- */
+function renderChannelsList() {
+  dom.main.className = 'chan-list';
+  if (state.channels.length === 0) {
+    dom.main.innerHTML = `<div class="chan-list__empty">no channels yet · add one above</div>`;
+    return;
+  }
+  // bot-rpc first (interactive), then collect, then read. Within group,
+  // alphabetical by id — stable ordering helps user re-locate rows.
+  const order = { 'bot-rpc': 0, 'collect': 1, 'read': 2 };
+  const sorted = [...state.channels].sort((a, b) => {
+    const diff = (order[a.profile] ?? 9) - (order[b.profile] ?? 9);
+    return diff !== 0 ? diff : a.id.localeCompare(b.id);
+  });
+  dom.main.innerHTML = sorted.map(renderChanRow).join('');
+}
+
+function profileBadge(profile) {
+  if (profile === 'read')    return 'READ';
+  if (profile === 'collect') return 'COL';
+  if (profile === 'bot-rpc') return 'BOT';
+  return '?';
+}
+
+function renderChanRow(ch) {
+  const expanded = state.chanExpanded.has(ch.id);
+  const draft = state.chanDrafts.get(ch.id) || ch;
+  const cls = `chan-row chan-row--${ch.profile}${expanded ? ' chan-row--expanded' : ''}`;
+  const displayName = ch.name || (ch.id.startsWith('D') ? '(direct message)' : '(no name)');
+  const sub = `${ch.profile} · updated ${esc(relTimeMs(ch.updated_at))}`;
+  return `
+    <article class="${cls}" data-channel-id="${esc(ch.id)}" tabindex="0">
+      <div class="chan-row__rail">
+        <span class="chan-row__badge">${profileBadge(ch.profile)}</span>
+      </div>
+      <div class="chan-row__body">
+        <div class="chan-row__head">
+          <span class="chan-row__id">${esc(ch.id)}</span>
+          <span class="chan-row__name">${esc(displayName)}</span>
+        </div>
+        <div class="chan-row__sub">${sub}</div>
+      </div>
+      <div class="chan-row__actions">
+        <button class="chan-row__action" data-act="copy-id" type="button">copy id</button>
+        <button class="chan-row__action chan-row__action--danger" data-act="delete" type="button">delete</button>
+      </div>
+      <div class="chan-row__expand">${expanded ? renderChanEditForm(draft) : ''}</div>
+    </article>`;
+}
+
+function renderChanEditForm(ch) {
+  const cfg = ch.bot_rpc || {
+    default_template: '',
+    wait_mode: 'first-reply',
+    wait_regex: '',
+    wait_user_filter: '',
+    wait_timeout_ms: 30000,
+  };
+  return `
+    <form class="chan-form" data-profile="${esc(ch.profile)}" data-edit-id="${esc(ch.id)}">
+      <div class="chan-form__field">
+        <label class="chan-form__label" for="edit-name-${esc(ch.id)}">name</label>
+        <input class="chan-form__input" id="edit-name-${esc(ch.id)}"
+               name="name" value="${esc(ch.name || '')}" maxlength="80"
+               placeholder="${ch.id.startsWith('D') ? 'DM with @bob' : '(auto from Slack)'}"
+               spellcheck="false" autocomplete="off" />
+      </div>
+      <div class="chan-form__field">
+        <label class="chan-form__label" for="edit-profile-${esc(ch.id)}">profile</label>
+        <select class="chan-form__select" id="edit-profile-${esc(ch.id)}" name="profile">
+          <option value="read"    ${ch.profile === 'read'    ? 'selected' : ''}>read — observe only</option>
+          <option value="collect" ${ch.profile === 'collect' ? 'selected' : ''}>collect — capture to knowledge base</option>
+          <option value="bot-rpc" ${ch.profile === 'bot-rpc' ? 'selected' : ''}>bot-rpc — send + wait for response</option>
+        </select>
+      </div>
+
+      <fieldset class="chan-botrpc">
+        <div class="chan-botrpc__head">bot-rpc settings</div>
+        <div class="chan-form__field">
+          <label class="chan-form__label" for="edit-template-${esc(ch.id)}">template</label>
+          <textarea class="chan-form__textarea" id="edit-template-${esc(ch.id)}"
+                    name="default_template" maxlength="4000"
+                    placeholder="default message (leave empty to type each time)"
+                    spellcheck="false">${esc(cfg.default_template || '')}</textarea>
+        </div>
+        <div class="chan-form__field">
+          <label class="chan-form__label" for="edit-waitmode-${esc(ch.id)}">wait for</label>
+          <select class="chan-form__select" id="edit-waitmode-${esc(ch.id)}" name="wait_mode">
+            <option value="first-reply" ${cfg.wait_mode === 'first-reply' ? 'selected' : ''}>first reply (any)</option>
+            <option value="regex"       ${cfg.wait_mode === 'regex'       ? 'selected' : ''}>regex match</option>
+          </select>
+        </div>
+        <div class="chan-form__field">
+          <label class="chan-form__label" for="edit-regex-${esc(ch.id)}">regex</label>
+          <input class="chan-form__input" id="edit-regex-${esc(ch.id)}"
+                 name="wait_regex" value="${esc(cfg.wait_regex || '')}"
+                 placeholder="^(?&lt;key&gt;[A-Z]+-\\d+)" spellcheck="false" />
+        </div>
+        <div class="chan-form__hint">
+          required when wait mode is regex. matches must be valid Rust regex.
+        </div>
+        <div class="chan-form__field">
+          <label class="chan-form__label" for="edit-userfilter-${esc(ch.id)}">from user</label>
+          <input class="chan-form__input" id="edit-userfilter-${esc(ch.id)}"
+                 name="wait_user_filter" value="${esc(cfg.wait_user_filter || '')}"
+                 placeholder="U0BOT123 (empty = any)" spellcheck="false" />
+        </div>
+        <div class="chan-form__field">
+          <label class="chan-form__label" for="edit-timeout-${esc(ch.id)}">timeout (ms)</label>
+          <input class="chan-form__input" id="edit-timeout-${esc(ch.id)}"
+                 name="wait_timeout_ms" type="number" min="0" max="3600000"
+                 value="${esc(String(cfg.wait_timeout_ms ?? 30000))}" />
+        </div>
+        <div class="chan-form__hint">
+          0 = wait forever. max 3,600,000 (1 hour).
+        </div>
+      </fieldset>
+
+      <div class="chan-form__row-actions">
+        <button class="chan-form__btn" type="button" data-act="cancel">CANCEL</button>
+        <button class="chan-form__btn chan-form__btn--primary" type="submit">SAVE</button>
+      </div>
+    </form>`;
+}
+
+function readChanDraft(form) {
+  const id = form.dataset.editId;
+  const fd = new FormData(form);
+  const profile = fd.get('profile') || 'read';
+  return {
+    id,
+    name: (fd.get('name') || '').toString().trim(),
+    profile,
+    bot_rpc: {
+      default_template: (fd.get('default_template') || '').toString(),
+      wait_mode: fd.get('wait_mode') || 'first-reply',
+      wait_regex: (fd.get('wait_regex') || '').toString(),
+      wait_user_filter: (fd.get('wait_user_filter') || '').toString().trim(),
+      wait_timeout_ms: Math.max(0, parseInt(fd.get('wait_timeout_ms'), 10) || 0),
+    },
+  };
+}
+
 /* Event ingest --------------------------------------------------------- */
 function makeEventId(kind, payload) {
-  // Slack guarantees uniqueness via event_id when present; fall back to
-  // (channel, ts, kind) which is also unique for messages and reactions.
   if (payload.event_id) return `${kind}:${payload.event_id}`;
   return `${kind}:${payload.channel || '?'}:${payload.ts || Date.now()}`;
 }
@@ -1056,8 +1614,6 @@ function ingestEvent(kind, payload) {
     return;
   }
   const id = makeEventId(kind, payload);
-  // Dedup — Slack occasionally redelivers; the bridge re-sends won't
-  // happen but defending against accidental double-binds is cheap.
   if (state.events.some(e => e.id === id)) return;
   state.events.unshift({ id, kind, payload });
   if (state.events.length > 200) state.events.length = 200;
@@ -1076,7 +1632,7 @@ function scheduleRender() {
   if (renderRAF) return;
   renderRAF = requestAnimationFrame(() => {
     renderRAF = 0;
-    if (state.auth?.authenticated) renderFeed();
+    if (state.auth?.authenticated) renderBody();
   });
 }
 
@@ -1084,7 +1640,7 @@ function scheduleRender() {
 async function fetchReactionBody(channel, ts) {
   const key = `${channel}:${ts}`;
   if (state.bodies.has(key)) return;
-  state.bodies.set(key, undefined);  // placeholder = "in flight"
+  state.bodies.set(key, undefined);
   try {
     const msg = await copad.call('slack.get_message', { channel, ts });
     const body = (msg && (msg.text || msg.messages?.[0]?.text)) || '(no text)';
@@ -1097,18 +1653,18 @@ async function fetchReactionBody(channel, ts) {
 }
 
 /* Toast ---------------------------------------------------------------- */
-function toast(code, msg, ttl = 4000) {
+function toast(code, msg, opts = {}) {
   const el = document.createElement('div');
-  el.className = 'slack-toast__item';
+  el.className = `slack-toast__item${opts.ok ? ' slack-toast__item--ok' : ''}`;
   el.innerHTML = `
     <span class="slack-toast__code">${esc(code)}</span>
     <span class="slack-toast__msg">${esc(msg)}</span>`;
   el.addEventListener('click', () => el.remove());
   dom.toast.appendChild(el);
-  setTimeout(() => el.remove(), ttl);
+  setTimeout(() => el.remove(), opts.ttl || 4000);
 }
 
-/* Send ----------------------------------------------------------------- */
+/* Send (feed view) ----------------------------------------------------- */
 async function sendMessage(channel, text, threadTs, sourceEv) {
   if (!channel || !text.trim()) return;
   try {
@@ -1128,7 +1684,17 @@ async function sendMessage(channel, text, threadTs, sourceEv) {
   }
 }
 
-/* Wire UP -------------------------------------------------------------- */
+/* Wire up -------------------------------------------------------------- */
+function bindTabs() {
+  dom.tabs.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-tab]');
+    if (!btn) return;
+    state.activeTab = btn.dataset.tab;
+    localStorage.setItem(LS.tab, state.activeTab);
+    renderBody();
+  });
+}
+
 function bindFilter() {
   dom.filter.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-filter]');
@@ -1141,7 +1707,7 @@ function bindFilter() {
 
 function bindFeed() {
   dom.main.addEventListener('click', (e) => {
-    // Action buttons short-circuit the card-toggle handler.
+    if (state.activeTab !== 'feed') return;
     const action = e.target.closest('[data-act]');
     if (action) {
       e.stopPropagation();
@@ -1166,7 +1732,6 @@ function bindFeed() {
       if (ev?.kind === 'reaction') {
         fetchReactionBody(ev.payload.channel, ev.payload.ts);
       }
-      // Focus the reply textarea if the new expansion has one
       requestAnimationFrame(() => {
         const ta = dom.main.querySelector(
           `[data-event-id="${cssEscape(id)}"] .slack-composer__textarea`);
@@ -1175,8 +1740,8 @@ function bindFeed() {
     }
   });
 
-  // Reply form submit
   dom.main.addEventListener('submit', async (e) => {
+    if (state.activeTab !== 'feed') return;
     const form = e.target.closest('form[data-reply]');
     if (!form) return;
     e.preventDefault();
@@ -1192,14 +1757,13 @@ function bindFeed() {
     if (ok) ta.value = '';
   });
 
-  // Cmd/Ctrl+Enter inside reply textarea triggers submit
   dom.main.addEventListener('keydown', (e) => {
+    if (state.activeTab !== 'feed') return;
     if (e.target.matches('form[data-reply] textarea')) {
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
         e.preventDefault();
         e.target.closest('form').requestSubmit();
       } else if (e.key === 'Escape') {
-        // Collapse the card
         const card = e.target.closest('.slack-card');
         if (card) {
           state.expanded.delete(card.dataset.eventId);
@@ -1211,13 +1775,129 @@ function bindFeed() {
   });
 }
 
+function bindChannels() {
+  dom.chanAdd.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const id = dom.chanAddId.value.trim().toUpperCase();
+    const profile = dom.chanAddProfile.value;
+    if (!id) {
+      toast('invalid_params', 'channel id required');
+      return;
+    }
+    const params = { id, profile };
+    if (profile === 'bot-rpc') {
+      // Minimal default config so server validation passes — user
+      // refines after expand.
+      params.bot_rpc = {
+        default_template: '',
+        wait_mode: 'first-reply',
+        wait_regex: '',
+        wait_user_filter: '',
+        wait_timeout_ms: 30000,
+      };
+    }
+    try {
+      const res = await copad.call('slack.channels.upsert', params);
+      const saved = res.channel;
+      state.channels = [saved, ...state.channels.filter(c => c.id !== saved.id)];
+      state.chanExpanded.add(saved.id);
+      persistChanExp();
+      dom.chanAddId.value = '';
+      renderTabsCounts();
+      renderChannelsList();
+      toast('added', `${saved.id} (${saved.profile})`, { ok: true });
+    } catch (err) {
+      toast(err.code || 'upsert_failed', err.message || String(err));
+    }
+  });
+
+  dom.main.addEventListener('click', async (e) => {
+    if (state.activeTab !== 'channels') return;
+    const action = e.target.closest('[data-act]');
+    const row = e.target.closest('.chan-row');
+    if (!row) return;
+    const id = row.dataset.channelId;
+
+    if (action) {
+      e.stopPropagation();
+      const act = action.dataset.act;
+      if (act === 'copy-id') {
+        navigator.clipboard.writeText(id).catch(() => {});
+        return;
+      }
+      if (act === 'delete') {
+        if (!confirm(`remove channel ${id}?`)) return;
+        try {
+          await copad.call('slack.channels.remove', { id });
+          state.channels = state.channels.filter(c => c.id !== id);
+          state.chanExpanded.delete(id);
+          state.chanDrafts.delete(id);
+          persistChanExp();
+          renderTabsCounts();
+          renderChannelsList();
+        } catch (err) {
+          toast(err.code || 'remove_failed', err.message || String(err));
+        }
+        return;
+      }
+      if (act === 'cancel') {
+        state.chanExpanded.delete(id);
+        state.chanDrafts.delete(id);
+        persistChanExp();
+        renderChannelsList();
+        return;
+      }
+    }
+
+    if (e.target.closest('form, input, select, textarea, button, label')) return;
+    if (state.chanExpanded.has(id)) state.chanExpanded.delete(id);
+    else state.chanExpanded.add(id);
+    persistChanExp();
+    renderChannelsList();
+  });
+
+  dom.main.addEventListener('change', (e) => {
+    if (state.activeTab !== 'channels') return;
+    const sel = e.target;
+    if (sel.name !== 'profile' && sel.name !== 'wait_mode') return;
+    const form = sel.closest('form[data-edit-id]');
+    if (!form) return;
+    if (sel.name === 'profile') {
+      form.dataset.profile = sel.value;
+      // Persist in-progress draft so toggling profile preserves input.
+      state.chanDrafts.set(form.dataset.editId, readChanDraft(form));
+    }
+  });
+
+  dom.main.addEventListener('submit', async (e) => {
+    if (state.activeTab !== 'channels') return;
+    const form = e.target.closest('form[data-edit-id]');
+    if (!form) return;
+    e.preventDefault();
+    const draft = readChanDraft(form);
+    const params = { id: draft.id, name: draft.name, profile: draft.profile };
+    if (draft.profile === 'bot-rpc') params.bot_rpc = draft.bot_rpc;
+    try {
+      const res = await copad.call('slack.channels.upsert', params);
+      const saved = res.channel;
+      state.channels = state.channels.map(c => (c.id === saved.id ? saved : c));
+      state.chanDrafts.delete(saved.id);
+      state.chanExpanded.delete(saved.id);
+      persistChanExp();
+      renderTabsCounts();
+      renderChannelsList();
+      toast('saved', saved.id, { ok: true });
+    } catch (err) {
+      toast(err.code || 'save_failed', err.message || String(err));
+    }
+  });
+}
+
 function bindComposer() {
-  // Restore draft
   dom.composerText.value = localStorage.getItem(LS.draft) || '';
   dom.composerText.addEventListener('input', () => {
     localStorage.setItem(LS.draft, dom.composerText.value);
   });
-  // Cmd/Ctrl+Enter triggers send
   dom.composerText.addEventListener('keydown', (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
       e.preventDefault();
@@ -1243,17 +1923,16 @@ function bindComposer() {
 }
 
 function bindHeader() {
-  dom.refresh.addEventListener('click', refreshAuth);
+  dom.refresh.addEventListener('click', refreshAll);
 }
 
-/* CSS escape for selectors -------------------------------------------- */
 function cssEscape(s) {
   if (window.CSS?.escape) return CSS.escape(s);
   return String(s).replace(/[^\w-]/g, '\\$&');
 }
 
-/* Periodic relTime refresh — tick every 30s without rebuilding cards */
 function refreshRelTimes() {
+  if (state.activeTab !== 'feed') return;
   for (const card of dom.main.querySelectorAll('.slack-card')) {
     const id = card.dataset.eventId;
     const ev = state.events.find(x => x.id === id);
@@ -1266,18 +1945,17 @@ function refreshRelTimes() {
 /* Init ----------------------------------------------------------------- */
 async function init() {
   bindHeader();
+  bindTabs();
   bindFilter();
   bindFeed();
+  bindChannels();
   bindComposer();
 
-  // Buffer events that arrive before auth_status returns. The bridge
-  // pump starts immediately on `copad.on`, but the panel isn't visually
-  // ready until refreshAuth() resolves.
   copad.on('slack.mention',  ev => ingestEvent('mention',  ev));
   copad.on('slack.dm',       ev => ingestEvent('dm',       ev));
   copad.on('slack.reaction', ev => ingestEvent('reaction', ev));
 
-  await refreshAuth();
+  await refreshAll();
   setInterval(refreshRelTimes, 30 * 1000);
 }
 

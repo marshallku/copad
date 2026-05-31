@@ -545,6 +545,48 @@ pub fn get_message(bot_token: &str, channel: &str, ts: &str) -> Result<Value, St
     Ok(msg)
 }
 
+/// `conversations.info` lookup. Returns `Some(name)` for public/private
+/// channels, `None` for DMs (`is_im: true`) and other shapes that don't
+/// carry a name. Slack `error` codes surface verbatim so callers can
+/// distinguish `channel_not_found` / `missing_scope` from transport.
+pub fn conversations_info(token: &str, channel: &str) -> Result<Option<String>, String> {
+    let resp = match ureq::get(&format!(
+        "https://slack.com/api/conversations.info?channel={channel}"
+    ))
+    .set("Authorization", &format!("Bearer {token}"))
+    .timeout(Duration::from_secs(15))
+    .call()
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            return Err(format!("conversations.info HTTP {code}: {body}"));
+        }
+        Err(e) => return Err(format!("conversations.info: {e}")),
+    };
+    let body: Value = resp
+        .into_json()
+        .map_err(|e| format!("conversations.info response parse: {e}"))?;
+    if !body.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        let err = body.get("error").and_then(Value::as_str).unwrap_or("?");
+        return Err(err.to_string());
+    }
+    let ch = body.get("channel").and_then(Value::as_object);
+    let is_im = ch
+        .and_then(|c| c.get("is_im"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if is_im {
+        return Ok(None);
+    }
+    let name = ch
+        .and_then(|c| c.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Ok(if name.is_empty() { None } else { Some(name) })
+}
+
 /// `auth.test` probe; returns `(team_id, user_id)`.
 pub fn auth_test(bot_token: &str) -> Result<(String, String), String> {
     let resp = ureq::post("https://slack.com/api/auth.test")
@@ -610,7 +652,9 @@ mod tests {
             user_token: user.to_string(),
             workspace_label: "test".into(),
             require_secure_store: false,
+            use_keychain: false,
             plaintext_path: std::path::PathBuf::from("/tmp/unused"),
+            channel_path: std::path::PathBuf::from("/tmp/unused-channels"),
             reconnect_initial: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(60),
             fatal_error: None,
