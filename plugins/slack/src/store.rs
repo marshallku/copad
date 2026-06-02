@@ -88,6 +88,9 @@ pub fn open_store(config: &Config) -> Box<dyn TokenStore> {
 
 pub struct KeyringStore {
     entry: keyring::Entry,
+    // Only read by the macOS `save_macos_open_acl` path; on other platforms
+    // `save` writes through `entry` directly, leaving this field unread.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     workspace: String,
 }
 
