@@ -348,6 +348,15 @@ class TerminalViewController: NSViewController, CopadPanel, Zoomable, TerminalCa
     /// no lock needed.
     private var backgroundLoadToken: UInt64 = 0
 
+    /// Last-configured image opacity + tint (the values passed to
+    /// `applyBackground` / `setTint`). Tracked so a runtime
+    /// `[window] opacity` change can re-scale the overlay alphas
+    /// without the caller having to re-issue applyBackground —
+    /// otherwise an opaque image hides the desktop even with
+    /// `[window] opacity < 1.0`.
+    private var currentImageOpacity: Double = 1.0
+    private var currentImageTint: Double = 0.0
+
     /// Async wallpaper decode. Same shape as `AlacrittyTerminalViewController`:
     /// offload `NSImage(contentsOfFile:)` to a global queue so a slow
     /// Gatekeeper scan doesn't pin the main thread, and gate the
@@ -362,15 +371,23 @@ class TerminalViewController: NSViewController, CopadPanel, Zoomable, TerminalCa
                 guard let self else { return }
                 guard token == backgroundLoadToken else { return }
                 guard let image else { return }
+                currentImageOpacity = opacity
+                currentImageTint = tint
                 backgroundView?.image = image
                 // Use alphaValue (not isHidden) to control opacity so applyTheme always
                 // sees the background as "active" (isHidden == false) and keeps
                 // nativeBackgroundColor = .clear. Hiding via isHidden corrupts SwiftTerm's
                 // internal cell buffer: applyTheme fills it with the solid theme color,
                 // and setting nativeBackgroundColor back to .clear does not clear cells.
-                backgroundView?.alphaValue = CGFloat(opacity)
+                //
+                // `windowOpacity` scales image + tint alpha so a single
+                // `[window] opacity` knob produces visible desktop
+                // transparency even with a background image set. No-op
+                // when windowOpacity = 1.0.
+                backgroundView?.alphaValue = CGFloat(opacity * windowOpacity)
                 backgroundView?.isHidden = false
-                tintView?.layer?.backgroundColor = NSColor.black.withAlphaComponent(CGFloat(tint)).cgColor
+                tintView?.layer?.backgroundColor = NSColor.black
+                    .withAlphaComponent(CGFloat(tint * windowOpacity)).cgColor
                 tintView?.isHidden = opacity == 0
                 // Make terminal layer non-opaque so the image layers composite through.
                 // nativeBackgroundColor = .clear tells SwiftTerm not to fill the bg rect.
@@ -426,15 +443,22 @@ class TerminalViewController: NSViewController, CopadPanel, Zoomable, TerminalCa
     }
 
     /// Config hot-reload: `[window] opacity`. Mirrors
-    /// `AlacrittyTerminalViewController.applyWindowOpacity`. No-op when
-    /// an image is active — the image path already runs the same
-    /// `.clear + transparent layer` setup and the window-level alpha
-    /// composes on top regardless of the cached value.
+    /// `AlacrittyTerminalViewController.applyWindowOpacity`. Re-scales
+    /// image + tint overlay alphas (no-op when their views are hidden)
+    /// and, when no image is active, updates the terminal layer alpha
+    /// directly. When an image is active the layer + nativeBackgroundColor
+    /// are owned by the image path; we only update the alpha of the
+    /// image + tint overlays so the desktop bleeds through.
     func applyWindowOpacity(_ opacity: Double) {
         windowOpacity = opacity
-        // If a background image is active, leave it alone — the image
-        // path owns nativeBackgroundColor / layer.bg until the user
-        // clears the image.
+        // Always re-scale image + tint alpha. These are no-ops when
+        // backgroundView / tintView are hidden, so safe to call
+        // unconditionally; necessary when an image IS active so the
+        // single `[window] opacity` knob still makes the desktop visible.
+        backgroundView?.alphaValue = CGFloat(currentImageOpacity * opacity)
+        tintView?.layer?.backgroundColor = NSColor.black
+            .withAlphaComponent(CGFloat(currentImageTint * opacity)).cgColor
+        // Image-active path owns the terminal layer state — leave it.
         guard backgroundView?.image == nil, let tv = terminalView else { return }
         if opacity < 1.0 {
             applyWindowOpacityToTerminal(tv)
@@ -449,7 +473,9 @@ class TerminalViewController: NSViewController, CopadPanel, Zoomable, TerminalCa
     }
 
     func setTint(_ alpha: Double) {
-        tintView?.layer?.backgroundColor = NSColor.black.withAlphaComponent(CGFloat(alpha)).cgColor
+        currentImageTint = alpha
+        tintView?.layer?.backgroundColor = NSColor.black
+            .withAlphaComponent(CGFloat(alpha * windowOpacity)).cgColor
     }
 
     // MARK: - Hot-reload

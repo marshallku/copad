@@ -103,6 +103,7 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         configFontSize = base
         currentFontSize = base
         currentFontFamily = config.fontFamily
+        windowOpacity = config.windowOpacity
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -232,8 +233,18 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
     /// and the per-cell skip gate. The window-level isOpaque /
     /// NSVisualEffectView swap is handled by `AppDelegate.
     /// applyWindowTransparency` — this is the cell-renderer half.
+    ///
+    /// Also re-scales the image + tint overlay alphas using the cached
+    /// configured values. Without this, an opaque background image
+    /// would hide the desktop even when `window.opacity < 1.0`. The
+    /// alphaValue / tint-bg writes are no-ops when the views are
+    /// hidden (no image set), so this is safe to call unconditionally.
     func applyWindowOpacity(_ opacity: Double) {
+        windowOpacity = opacity
         renderView?.setWindowOpacity(opacity)
+        backgroundView?.alphaValue = CGFloat(currentImageOpacity * opacity)
+        tintView?.layer?.backgroundColor = NSColor.black
+            .withAlphaComponent(CGFloat(currentImageTint * opacity)).cgColor
     }
 
     /// Config hot-reload: swap the theme on a running pane. Mirrors
@@ -383,6 +394,25 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
     /// visual state with a stale image. Lives on the main actor; no lock.
     private var backgroundLoadToken: UInt64 = 0
 
+    /// Last-configured image opacity + tint (the values passed to
+    /// `applyBackground` / `setTint`). Tracked here so a runtime
+    /// `[window] opacity` change can re-scale the overlay alpha without
+    /// the caller having to re-issue applyBackground. Without this, an
+    /// opaque background image hides the desktop even when window
+    /// opacity is < 1.0, defeating the whole transparency feature for
+    /// users running with both an image AND window opacity set.
+    private var currentImageOpacity: Double = 1.0
+    private var currentImageTint: Double = 0.0
+
+    /// Mirror of the render view's `windowOpacity` so the controller's
+    /// `applyBackground` / `setTint` (which write to backgroundView /
+    /// tintView, not the render view) can scale by the current
+    /// `[window] opacity` value. Initialized from `config.windowOpacity`
+    /// at construction; updated by `applyWindowOpacity` hot-reload.
+    /// The render view keeps its own copy because the draw loop
+    /// reads it on every frame.
+    private var windowOpacity: Double = 1.0
+
     /// Wire an image background + tint overlay. The render view's layer
     /// goes transparent so the image layer underneath composites
     /// through. `transparent_default_bg` config decides whether default
@@ -409,10 +439,21 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
                 // state authoritative.
                 guard token == backgroundLoadToken else { return }
                 guard let image else { return }
+                currentImageOpacity = opacity
+                currentImageTint = tint
                 backgroundView?.image = image
-                backgroundView?.alphaValue = CGFloat(opacity)
+                // Window opacity scales the image + tint alpha so a
+                // single `[window] opacity` knob still produces visible
+                // desktop transparency even with a background image set.
+                // At windowOpacity = 1.0 this is a no-op (preserves the
+                // pre-feature behavior); at windowOpacity < 1.0 the
+                // image dims proportionally so the desktop bleeds
+                // through the same compositing chain as the no-image
+                // path.
+                backgroundView?.alphaValue = CGFloat(opacity * windowOpacity)
                 backgroundView?.isHidden = false
-                tintView?.layer?.backgroundColor = NSColor.black.withAlphaComponent(CGFloat(tint)).cgColor
+                tintView?.layer?.backgroundColor = NSColor.black
+                    .withAlphaComponent(CGFloat(tint * windowOpacity)).cgColor
                 tintView?.isHidden = opacity == 0
                 renderView?.setImageBackgroundActive(true)
                 renderView?.needsDisplay = true
@@ -430,7 +471,9 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
     }
 
     func setTint(_ alpha: Double) {
-        tintView?.layer?.backgroundColor = NSColor.black.withAlphaComponent(CGFloat(alpha)).cgColor
+        currentImageTint = alpha
+        tintView?.layer?.backgroundColor = NSColor.black
+            .withAlphaComponent(CGFloat(alpha * windowOpacity)).cgColor
     }
 
     // MARK: - Font
