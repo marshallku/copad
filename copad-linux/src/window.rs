@@ -114,7 +114,6 @@ impl CopadWindow {
         // because terminals are permanently transparent now.
         let window_css = gtk4::CssProvider::new();
         let theme = copad_core::theme::Theme::by_name(&config.theme.name).unwrap_or_default();
-        update_window_bg_css(&window_css, &theme);
         gtk4::style_context_add_provider_for_display(
             &gtk4::gdk::Display::default().unwrap(),
             &window_css,
@@ -523,7 +522,7 @@ impl CopadWindow {
         // Overlay so every tab/panel above it (notebook, statusbar,
         // terminals, plugin webviews) renders on top of the same image
         // — no more "background only on the first terminal" surprise.
-        let background = BackgroundLayer::new(config);
+        let background = BackgroundLayer::new(config, window_css, &theme.background);
 
         // Layout: vertical box with notebook + statusbar
         let layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -558,7 +557,6 @@ impl CopadWindow {
             &tab_manager,
             &statusbar,
             &background,
-            &window_css,
             &plugins,
             &triggers,
             &event_bus,
@@ -750,19 +748,11 @@ impl CopadWindow {
     }
 }
 
-fn update_window_bg_css(provider: &gtk4::CssProvider, theme: &copad_core::theme::Theme) {
-    provider.load_from_string(&format!(
-        "window {{ background-color: {}; }}",
-        theme.background
-    ));
-}
-
 #[allow(clippy::too_many_arguments)]
 fn watch_config(
     tab_manager: &Rc<TabManager>,
     statusbar: &Rc<StatusBar>,
     background: &Rc<BackgroundLayer>,
-    window_css: &gtk4::CssProvider,
     plugins: &[copad_core::plugin::LoadedPlugin],
     triggers: &Arc<TriggerEngine>,
     event_bus: &Arc<CoreEventBus>,
@@ -785,7 +775,6 @@ fn watch_config(
     let mgr = tab_manager.clone();
     let sb = statusbar.clone();
     let bg = background.clone();
-    let win_css = window_css.clone();
     let pl = plugins.to_vec();
     let trg = triggers.clone();
     let bus = event_bus.clone();
@@ -811,10 +800,11 @@ fn watch_config(
 
         eprintln!("[copad] config reloaded");
         let theme = copad_core::theme::Theme::by_name(&config.theme.name).unwrap_or_default();
-        update_window_bg_css(&win_css, &theme);
         mgr.update_config(&config);
         sb.reload(&config, &pl);
-        bg.apply_config(&config);
+        // apply_config owns the window backdrop refresh (alpha tracks the new
+        // opacity, theme color, and image state in one place).
+        bg.apply_config(&config, &theme.background);
 
         // Always refresh the cache from disk — even when daemon is
         // authoritative — so a later disconnect restores the freshest

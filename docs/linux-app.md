@@ -31,19 +31,21 @@ This pattern is required because GTK widgets are not `Send+Sync` and can only be
 
 ## Background (`background.rs`)
 
-`BackgroundLayer` owns the window-level image + tint. Lives once per window and is shared via `Rc`. Mounted as the base child of the root `gtk4::Overlay` in `window.rs`.
+`BackgroundLayer` owns the window-level image + tint **and the window's `background-color` CSS**. Lives once per window and is shared via `Rc`. Mounted as the base child of the root `gtk4::Overlay` in `window.rs`.
 
 ```rust
 pub struct BackgroundLayer {
     pub bg_picture: gtk4::Picture,   // GtkPicture, content-fit: cover, can_target=false
     pub tint_overlay: gtk4::Box,     // CSS rgba, can_target=false
-    // … private state cells
+    // … private state cells: image/tint/window opacity, theme bg, window_css provider
 }
 ```
 
-API: `set_image(path)`, `clear_image()`, `set_tint(opacity)`, `apply_config(cfg)`.
+API: `new(config, window_css, theme_bg)`, `set_image(path)`, `clear_image()`, `set_tint(opacity)`, `apply_config(config, theme_bg)`.
 
 `can_target=false` on both layers so clicks pass through to the panels above them. The socket `background.*` commands operate on this single layer (no longer on the active terminal panel), and `apply_config` is invoked once from `watch_config` on hot reload.
+
+The layer also owns the window's `background-color` provider: `[window] opacity` drives its alpha (`rgba(theme_bg, opacity)`), or `0` when an image is active (the image owns the transparency then — see decision #57). `set_image`/`clear_image`/`apply_config` each call a private `refresh_window_backdrop()`, so every image-state change — config reload AND socket commands — keeps the backdrop in sync. The image + tint alphas are also scaled by `window.opacity` so one knob fades the image background too.
 
 ## Terminal (`terminal.rs`)
 

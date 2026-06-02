@@ -72,11 +72,13 @@ Window-level transparency for the terminal itself (Ghostty model). Distinct from
 | Key       | Default | Description                                                                          |
 | --------- | ------- | ------------------------------------------------------------------------------------ |
 | `opacity` | `1.0`   | Window + terminal default-bg cell opacity (0.0 = fully transparent, 1.0 = opaque)    |
-| `blur`    | `false` | macOS only: blur the desktop behind the window (NSVisualEffectView). No-op on Linux. |
+| `blur`    | `false` | macOS only: blur the desktop behind the window (NSVisualEffectView). On Linux, blur is the compositor's job (e.g. Hyprland `decoration:blur`), so this key is a no-op. |
 
 On macOS, `opacity < 1.0` sets `NSWindow.isOpaque = false`; default-bg cells render with `theme.background.alpha = opacity` so the desktop / blurred surface behind shows through. ANSI-colored cells, reverse-video cells, and text glyphs stay fully opaque. Tab bar and status bar pick up the same alpha so chrome stays cohesive.
 
-On Linux, the `[window]` schema parses but is not wired to the GTK4 window yet — follow-up. Linux users today get terminal-cell transparency only through the background-image path.
+On Linux, `opacity` drives the GTK4 window's `background-color` alpha (`rgba(theme.background, opacity)`). VTE already paints with a transparent default background, so text glyphs stay opaque while the gaps reveal the desktop. When a background image is set, the window backdrop goes fully transparent and the image + tint alphas are scaled by `opacity` instead — so a single knob fades both, and an opaque image never hides the desktop. Tab pills and status-bar borders keep their theme color by design (matches macOS, where pills stay opaque). `blur` is a no-op: on Wayland, blur belongs to the compositor — enable `decoration:blur` in Hyprland and it blurs behind the translucent window automatically.
+
+> If you previously dimmed copad with a Hyprland `windowrule = opacity …, class:copad`, remove it once you set `[window] opacity` — otherwise the compositor alpha stacks on top of the app alpha and dims the text too (the app-level knob keeps glyphs opaque; the windowrule does not).
 
 ### [tabs]
 

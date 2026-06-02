@@ -325,6 +325,30 @@ pub fn parse_color(hex: &str) -> gdk::RGBA {
     gdk::RGBA::new(r, g, b, 1.0)
 }
 
+/// Clamp an opacity into [0, 1]. Non-finite input (NaN / ±inf, reachable
+/// from a malformed TOML float) collapses to fully opaque rather than
+/// poisoning a CSS string or widget alpha — `f64::clamp` would otherwise
+/// propagate NaN through.
+pub fn norm_opacity(o: f64) -> f64 {
+    if o.is_finite() {
+        o.clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
+}
+
+/// CSS `rgba(...)` literal for a `#rrggbb` color at the given alpha.
+pub fn rgba_css(hex: &str, alpha: f64) -> String {
+    let c = parse_color(hex);
+    format!(
+        "rgba({},{},{},{})",
+        (c.red() * 255.0) as u8,
+        (c.green() * 255.0) as u8,
+        (c.blue() * 255.0) as u8,
+        norm_opacity(alpha),
+    )
+}
+
 #[cfg(test)]
 mod osc7_tests {
     use super::normalize_osc7_uri;
@@ -366,5 +390,29 @@ mod osc7_tests {
             "/home/me/My Project"
         );
         assert_eq!(normalize_osc7_uri("file:///tmp/a%2Bb"), "/tmp/a+b");
+    }
+}
+
+#[cfg(test)]
+mod color_tests {
+    use super::{norm_opacity, rgba_css};
+
+    #[test]
+    fn norm_opacity_clamps_and_guards_non_finite() {
+        assert_eq!(norm_opacity(0.85), 0.85);
+        assert_eq!(norm_opacity(-0.5), 0.0);
+        assert_eq!(norm_opacity(1.5), 1.0);
+        assert_eq!(norm_opacity(f64::NAN), 1.0);
+        assert_eq!(norm_opacity(f64::INFINITY), 1.0);
+        assert_eq!(norm_opacity(f64::NEG_INFINITY), 1.0);
+    }
+
+    #[test]
+    fn rgba_css_renders_channels_and_alpha() {
+        assert_eq!(rgba_css("#1e1e2e", 0.85), "rgba(30,30,46,0.85)");
+        assert_eq!(rgba_css("1e1e2e", 1.0), "rgba(30,30,46,1)");
+        assert_eq!(rgba_css("#000000", 0.0), "rgba(0,0,0,0)");
+        // Out-of-range alpha is normalized before formatting.
+        assert_eq!(rgba_css("#ffffff", 2.0), "rgba(255,255,255,1)");
     }
 }
