@@ -7,7 +7,10 @@ final class TabViewController: NSViewController {
     /// Mutable so config hot-reload affects panes spawned AFTER the reload (theme/font/security).
     /// Existing panes are updated separately via `applyConfig` fan-out.
     private var config: CopadConfig
-    private var theme: CopadTheme
+    /// `private(set)` so AppDelegate's plugin-panel construction path can
+    /// pass the active theme into PluginPanelController without piping it
+    /// through every call site.
+    private(set) var theme: CopadTheme
 
     private var tabBar: TabBarView!
     private var contentArea: NSView!

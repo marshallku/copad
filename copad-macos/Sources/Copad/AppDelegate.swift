@@ -230,6 +230,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.center()
         window.isRestorable = false
         window.backgroundColor = theme.background.nsColor
+        // Let theme.background show through the titlebar instead of OS
+        // default chrome (black in dark mode, white in light). Force
+        // appearance based on background luminance so traffic-light
+        // buttons stay readable on dark themes like Catppuccin Mocha.
+        window.titlebarAppearsTransparent = true
+        window.appearance = NSAppearance(named: isDark(theme.background) ? .darkAqua : .aqua)
 
         let vc = TabViewController(config: config, theme: theme)
         window.contentViewController = vc
@@ -248,7 +254,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // haven't tackled yet).
         vc.onOpenPlugin = { [weak self] name, panelName, mode in
             guard let self, let tab = tabVC else { return }
-            let modeStr: String = switch mode {
+            let modeStr = switch mode {
             case .tab: "tab"
             case .splitH: "split_h"
             case .splitV: "split_v"
@@ -324,6 +330,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_: NSApplication) -> Bool {
         true
+    }
+
+    /// Rec. 601 luminance over [0,1]; threshold 0.5 picks darkAqua for any
+    /// reasonably dark background. Used to align titlebar chrome (traffic
+    /// lights) with whatever theme.background the user is running.
+    private func isDark(_ c: RGBColor) -> Bool {
+        let lum = 0.299 * Double(c.r) + 0.587 * Double(c.g) + 0.114 * Double(c.b)
+        return lum < 128
     }
 
     // MARK: - Menu Bar
@@ -951,6 +965,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             panelDef: panelDef,
             registry: actionRegistry,
             eventBus: eventBus,
+            theme: vc.theme,
         )
         let panelID: String? = switch mode {
         case "split_h":

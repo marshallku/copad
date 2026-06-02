@@ -195,6 +195,12 @@
   .modal-backdrop.open { display: flex; }
   .modal {
     width: min(720px, 100%);
+    /* Cap modal height so it scrolls internally on short windows instead
+       of running off-screen — the textareas (body 160px, prompt 200px)
+       blow past viewport quickly. The backdrop itself also scrolls
+       (`overflow-y: auto` above) as a fallback. */
+    max-height: 88vh;
+    overflow-y: auto;
     background: var(--copad-bg);
     border: 1px solid var(--copad-surface2);
     border-radius: 6px;

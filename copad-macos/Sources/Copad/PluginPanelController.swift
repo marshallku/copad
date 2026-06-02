@@ -39,6 +39,7 @@ final class PluginPanelController: NSViewController, CopadPanel {
     private let pluginName: String
     private let panelName: String
     private let panelFileURL: URL
+    private let theme: CopadTheme
     private weak var registry: ActionRegistry?
     private weak var eventBus: EventBus?
 
@@ -54,6 +55,7 @@ final class PluginPanelController: NSViewController, CopadPanel {
         panelDef: PluginPanelDef,
         registry: ActionRegistry,
         eventBus: EventBus,
+        theme: CopadTheme,
     ) {
         pluginName = plugin.manifest.plugin.name
         panelName = panelDef.name
@@ -61,6 +63,7 @@ final class PluginPanelController: NSViewController, CopadPanel {
         panelFileURL = plugin.dir.appendingPathComponent(panelDef.file)
         self.registry = registry
         self.eventBus = eventBus
+        self.theme = theme
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -97,6 +100,20 @@ final class PluginPanelController: NSViewController, CopadPanel {
             forMainFrameOnly: false,
         )
         config.userContentController.addUserScript(userScript)
+
+        // Inject theme CSS (--copad-* variables + base font) at document
+        // start. Without this, panel.html's `var(--copad-bg)` and friends
+        // resolve to nothing — modal/columns render transparent and the
+        // browser default font (Times on WKWebView) is used. Mirrors
+        // copad-linux's `build_theme_css` + UserStyleSheet path.
+        let themeCSS = Self.buildThemeCSS(theme: theme)
+        let themeJS = Self.buildStyleInjectionJS(css: themeCSS)
+        let themeScript = WKUserScript(
+            source: themeJS,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false,
+        )
+        config.userContentController.addUserScript(themeScript)
 
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.translatesAutoresizingMaskIntoConstraints = false
@@ -189,6 +206,52 @@ final class PluginPanelController: NSViewController, CopadPanel {
     }
 
     // MARK: - Static helpers
+
+    private static func buildThemeCSS(theme: CopadTheme) -> String {
+        let bg = hex(theme.background)
+        let text = hex(theme.text)
+        return """
+        :root {
+            --copad-bg: \(bg);
+            --copad-fg: \(text);
+            --copad-surface0: \(hex(theme.surface0));
+            --copad-surface1: \(hex(theme.surface1));
+            --copad-surface2: \(hex(theme.surface2));
+            --copad-overlay0: \(hex(theme.overlay0));
+            --copad-text: \(text);
+            --copad-subtext0: \(hex(theme.subtext0));
+            --copad-subtext1: \(hex(theme.subtext1));
+            --copad-accent: \(hex(theme.accent));
+            --copad-red: \(hex(theme.red));
+        }
+        html, body {
+            background-color: transparent;
+            color: \(text);
+            font-family: system-ui, -apple-system, sans-serif;
+            margin: 0;
+            padding: 0;
+        }
+        """
+    }
+
+    private static func buildStyleInjectionJS(css: String) -> String {
+        // Inject a <style> element at documentStart. document.head may not
+        // exist yet, so fall back to documentElement (always present once
+        // <html> is created, which is before user scripts fire).
+        let cssJSON = jsonString(css) ?? "\"\""
+        return """
+        (() => {
+            const style = document.createElement('style');
+            style.setAttribute('data-copad-theme', '1');
+            style.textContent = \(cssJSON);
+            (document.head || document.documentElement).appendChild(style);
+        })()
+        """
+    }
+
+    private nonisolated static func hex(_ c: RGBColor) -> String {
+        String(format: "#%02x%02x%02x", c.r, c.g, c.b)
+    }
 
     private static func buildBridgeJS(pluginName: String, panelName: String, panelID: String) -> String {
         let id = jsonString(panelID) ?? "\"\""
