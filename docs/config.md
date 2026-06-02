@@ -25,8 +25,12 @@ font_size = 14
 [background]
 # image = "/path/to/wallpaper.jpg"  # Single image (takes priority)
 directory = "/mnt/disk2/Wallpapers/"  # Directory for random picks
-tint = 0.85         # Tint overlay opacity (0.0 = no tint, 1.0 = fully opaque)
-opacity = 0.95      # Terminal opacity
+tint = 0.85         # Tint overlay opacity on the IMAGE (0.0 = no tint, 1.0 = fully opaque)
+opacity = 0.95      # Background-image opacity (only takes effect when an image is set)
+
+[window]
+# opacity = 0.85   # 0.0 = fully transparent, 1.0 = fully opaque (default)
+# blur = true      # macOS only: blur the desktop behind the window (Ghostty-style)
 
 [tabs]
 position = "left"   # top, bottom, left, right
@@ -52,12 +56,27 @@ name = "catppuccin-mocha"
 
 ### [background]
 
-| Key         | Default      | Description                                              |
-| ----------- | ------------ | -------------------------------------------------------- |
-| `image`     | — (optional) | Single image file path (takes priority over directory)   |
-| `directory` | — (optional) | Path to wallpaper directory (random pick)                |
-| `tint`      | `0.9`        | Tint overlay opacity (0.0=transparent, 1.0=fully opaque) |
-| `opacity`   | `0.95`       | Terminal opacity                                         |
+`tint` + `opacity` only take effect when a background image is set. For window-level transparency (no image), use `[window]` below.
+
+| Key         | Default      | Description                                                |
+| ----------- | ------------ | ---------------------------------------------------------- |
+| `image`     | — (optional) | Single image file path (takes priority over directory)     |
+| `directory` | — (optional) | Path to wallpaper directory (random pick)                  |
+| `tint`      | `0.9`        | Tint overlay opacity on the image (0.0=transparent, 1.0=opaque) |
+| `opacity`   | `0.95`       | Background-image opacity                                   |
+
+### [window]
+
+Window-level transparency for the terminal itself (Ghostty model). Distinct from `[background]`, which only affects an optional background-image layer.
+
+| Key       | Default | Description                                                                          |
+| --------- | ------- | ------------------------------------------------------------------------------------ |
+| `opacity` | `1.0`   | Window + terminal default-bg cell opacity (0.0 = fully transparent, 1.0 = opaque)    |
+| `blur`    | `false` | macOS only: blur the desktop behind the window (NSVisualEffectView). No-op on Linux. |
+
+On macOS, `opacity < 1.0` sets `NSWindow.isOpaque = false`; default-bg cells render with `theme.background.alpha = opacity` so the desktop / blurred surface behind shows through. ANSI-colored cells, reverse-video cells, and text glyphs stay fully opaque. Tab bar and status bar pick up the same alpha so chrome stays cohesive.
+
+On Linux, the `[window]` schema parses but is not wired to the GTK4 window yet — follow-up. Linux users today get terminal-cell transparency only through the background-image path.
 
 ### [tabs]
 

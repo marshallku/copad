@@ -146,9 +146,15 @@ final class TabViewController: NSViewController {
     override func loadView() {
         let root = NSView()
         root.wantsLayer = true
-        root.layer?.backgroundColor = theme.background.nsColor.cgColor
+        // When `[window] opacity < 1.0`, leave the root view's layer bg
+        // clear so the non-opaque window's backgroundColor + blur view
+        // (installed under contentView by AppDelegate) show through.
+        // An opaque root would cover both, defeating the entire
+        // window-transparency feature. Hot-reload handled in
+        // `applyConfig`.
+        root.layer?.backgroundColor = Self.rootBg(theme: theme, opacity: config.windowOpacity)
 
-        tabBar = TabBarView(theme: theme)
+        tabBar = TabBarView(theme: theme, windowOpacity: config.windowOpacity)
         tabBar.translatesAutoresizingMaskIntoConstraints = false
         tabBar.onSelectTab = { [weak self] i in self?.switchTab(to: i) }
         tabBar.onCloseTab = { [weak self] i in self?.closeTabByButton(at: i) }
@@ -203,7 +209,7 @@ final class TabViewController: NSViewController {
         // which isn't worth the layout complexity until somebody asks.
         var statusBarBottom: NSLayoutYAxisAnchor = root.bottomAnchor
         if config.statusBar.enabled {
-            let bar = StatusBarView(theme: theme)
+            let bar = StatusBarView(theme: theme, windowOpacity: config.windowOpacity)
             statusBar = bar
             root.addSubview(bar)
             NSLayoutConstraint.activate([
@@ -508,6 +514,17 @@ final class TabViewController: NSViewController {
         config = newConfig
         self.theme = theme
 
+        // Root view bg follows window opacity — opaque blocks both the
+        // semi-transparent window backgroundColor and the blur view
+        // installed beneath it. Same conditional as initial loadView.
+        view.layer?.backgroundColor = Self.rootBg(theme: theme, opacity: newConfig.windowOpacity)
+
+        // Chrome: rebuild bg colors for new theme + window opacity.
+        // Pills stay opaque (read inside their own draw paths); only the
+        // outer bar bgs pick up the alpha.
+        tabBar?.applyWindowOpacity(newConfig.windowOpacity, theme: theme)
+        statusBar?.applyWindowOpacity(newConfig.windowOpacity, theme: theme)
+
         // Fan out to existing pane trees (theme/font/security; current zoom preserved).
         for paneManager in paneManagers {
             paneManager.applyConfig(newConfig, theme: theme)
@@ -623,5 +640,12 @@ final class TabViewController: NSViewController {
             "cols": state["cols"] ?? 0,
             "rows": state["rows"] ?? 0,
         ]
+    }
+
+    /// Pick the root view layer bg. `.clear` when opacity < 1.0 so the
+    /// non-opaque window's backgroundColor and any blur view installed
+    /// by AppDelegate show through; otherwise opaque theme.background.
+    private static func rootBg(theme: CopadTheme, opacity: Double) -> CGColor {
+        opacity < 1.0 ? NSColor.clear.cgColor : theme.background.nsColor.cgColor
     }
 }

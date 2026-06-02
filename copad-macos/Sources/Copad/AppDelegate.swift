@@ -229,7 +229,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.title = "copad"
         window.center()
         window.isRestorable = false
-        window.backgroundColor = theme.background.nsColor
         // Let theme.background show through the titlebar instead of OS
         // default chrome (black in dark mode, white in light). Force
         // appearance based on background luminance so traffic-light
@@ -239,6 +238,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         let vc = TabViewController(config: config, theme: theme)
         window.contentViewController = vc
+        applyWindowTransparency(window, config: config, theme: theme)
         window.setContentSize(NSSize(width: 1200, height: 800))
         window.center()
 
@@ -338,6 +338,70 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private func isDark(_ c: RGBColor) -> Bool {
         let lum = 0.299 * Double(c.r) + 0.587 * Double(c.g) + 0.114 * Double(c.b)
         return lum < 128
+    }
+
+    /// Apply `[window] opacity` + `[window] blur` to the main window
+    /// (Ghostty model). Idempotent: safe to call on initial launch and
+    /// on hot-reload. When opacity = 1.0, removes any installed blur
+    /// view and restores opaque chrome.
+    ///
+    /// Layout: `NSVisualEffectView` becomes the contentView's bottom-most
+    /// sibling so it sits behind the TabViewController's root view. The
+    /// TabViewController's root is the existing contentView — we wrap
+    /// it in a container so the blur can layer beneath without
+    /// disturbing AutoLayout of any subview that assumes the controller's
+    /// view is the top-level container.
+    private func applyWindowTransparency(_ window: NSWindow, config: CopadConfig, theme: CopadTheme) {
+        let opacity = CGFloat(config.windowOpacity)
+        let wantsTransparent = opacity < 1.0
+        let bg = theme.background.nsColor.withAlphaComponent(opacity)
+
+        window.isOpaque = !wantsTransparent
+        window.hasShadow = true
+        // backgroundColor alpha < 1 only takes effect when isOpaque = false.
+        // Setting it unconditionally keeps the chrome color consistent on
+        // the opacity = 1.0 path too.
+        window.backgroundColor = bg
+
+        installOrRemoveBlurView(window: window, enabled: wantsTransparent && config.windowBlur)
+    }
+
+    /// Place an `NSVisualEffectView` as the bottom-most subview of the
+    /// window's contentView, sized to fill. Removes it when `enabled =
+    /// false`. Tagged with a unique identifier so we don't double-install
+    /// or accidentally remove an unrelated view.
+    private func installOrRemoveBlurView(window: NSWindow, enabled: Bool) {
+        guard let content = window.contentView else { return }
+        let blurTag = "copad.blurView"
+
+        let existing = content.subviews.first {
+            ($0 as? NSVisualEffectView)?.identifier?.rawValue == blurTag
+        } as? NSVisualEffectView
+
+        if !enabled {
+            existing?.removeFromSuperview()
+            return
+        }
+
+        let blur = existing ?? {
+            let v = NSVisualEffectView()
+            v.identifier = NSUserInterfaceItemIdentifier(blurTag)
+            // `.hudWindow` reads as dark, dense vibrancy — pairs well
+            // with Catppuccin Mocha / dark themes. `.behindWindow`
+            // blends the desktop behind the window (Ghostty pattern);
+            // `.withinWindow` would only blur sibling windows of the
+            // same app, which is not what we want.
+            v.material = .hudWindow
+            v.blendingMode = .behindWindow
+            v.state = .active
+            v.autoresizingMask = [.width, .height]
+            return v
+        }()
+
+        blur.frame = content.bounds
+        if blur.superview !== content {
+            content.addSubview(blur, positioned: .below, relativeTo: content.subviews.first)
+        }
     }
 
     // MARK: - Menu Bar
@@ -750,6 +814,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let newTheme = CopadTheme.byName(newConfig.themeName) ?? .default
         tabVC?.applyConfig(newConfig, theme: newTheme)
+        if let window {
+            applyWindowTransparency(window, config: newConfig, theme: newTheme)
+        }
         // Skip local trigger reload while daemon owns triggers. Daemon
         // runs its own config watcher and would race our setTriggers.
         // Local engine retains its previous trigger set, ready for cut-over

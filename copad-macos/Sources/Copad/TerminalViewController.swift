@@ -174,6 +174,13 @@ class TerminalViewController: NSViewController, CopadPanel, Zoomable, TerminalCa
     private let config: CopadConfig
     /// Mutable so applyTheme() can update it; clearBackground() uses the live value.
     private var theme: CopadTheme
+
+    /// `[window] opacity`. When < 1.0 and no image is active, the
+    /// terminal renders with `nativeBackgroundColor = .clear` + layer
+    /// bg = `theme.bg.withAlpha(opacity)` so the non-opaque window /
+    /// NSVisualEffectView behind shows through. SwiftTerm has no
+    /// native alpha mode — this is the same trick the image path uses.
+    private var windowOpacity: Double
     /// `private(set)` so PaneManager's URL click monitor (Tier 1.5 plain-text
     /// extension) can reach the SwiftTerm `Terminal` for buffer reads. Setter
     /// stays private because TerminalViewController owns the view's lifecycle.
@@ -232,6 +239,7 @@ class TerminalViewController: NSViewController, CopadPanel, Zoomable, TerminalCa
     init(config: CopadConfig, theme: CopadTheme, cwd: String? = nil, initialInput: String? = nil) {
         self.config = config
         self.theme = theme
+        windowOpacity = config.windowOpacity
         let baseFontSize = CGFloat(config.fontSize)
         configFontSize = baseFontSize
         currentFontSize = baseFontSize
@@ -294,6 +302,14 @@ class TerminalViewController: NSViewController, CopadPanel, Zoomable, TerminalCa
         // Apply background from config if set
         if let path = config.backgroundPath {
             applyBackground(path: path, tint: config.backgroundTint, opacity: config.backgroundOpacity)
+        } else if windowOpacity < 1.0 {
+            // No image, but window-level transparency requested. Reuse
+            // the same `nativeBackgroundColor = .clear` trick the image
+            // path uses; the layer bg carries the alpha-tinted theme
+            // color so the non-opaque window's blur / desktop shows
+            // through. Distinct from `applyBackground` because there is
+            // no image / tint overlay involved.
+            applyWindowOpacityToTerminal(tv)
         }
     }
 
@@ -380,16 +396,56 @@ class TerminalViewController: NSViewController, CopadPanel, Zoomable, TerminalCa
         backgroundView?.image = nil
         backgroundView?.isHidden = true
         tintView?.isHidden = true
-        terminalView?.layer?.isOpaque = false // keep layer-backed, just restore color
-        terminalView?.layer?.backgroundColor = theme.background.nsColor.cgColor
-        terminalView?.nativeBackgroundColor = theme.background.nsColor
         if let tv = terminalView {
+            if windowOpacity < 1.0 {
+                // Window opacity still wants transparency — keep the
+                // `.clear` nativeBackgroundColor and alpha layer bg
+                // (Ghostty mode persists even after image clear).
+                applyWindowOpacityToTerminal(tv)
+            } else {
+                tv.layer?.isOpaque = false // keep layer-backed, just restore color
+                tv.layer?.backgroundColor = theme.background.nsColor.cgColor
+                tv.nativeBackgroundColor = theme.background.nsColor
+            }
             applyCaretColors(tv: tv, theme: theme)
+            // Restore the program's last requested cursor style — clamp drops
+            // out once nativeBackgroundColor is no longer .clear.
+            tv.applyClampedCursorStyle()
+            tv.needsDisplay = true
         }
-        // Restore the program's last requested cursor style — clamp drops
-        // out once nativeBackgroundColor is no longer .clear.
-        terminalView?.applyClampedCursorStyle()
-        terminalView?.needsDisplay = true
+    }
+
+    /// Configure terminal layer + SwiftTerm bg for window-opacity mode.
+    /// Reused by initial loadView + clearBackground (when opacity < 1.0)
+    /// + applyWindowOpacity hot-reload + applyTheme.
+    private func applyWindowOpacityToTerminal(_ tv: LocalProcessTerminalView) {
+        tv.layer?.isOpaque = false
+        tv.layer?.backgroundColor = theme.background.nsColor
+            .withAlphaComponent(CGFloat(windowOpacity)).cgColor
+        tv.nativeBackgroundColor = .clear
+    }
+
+    /// Config hot-reload: `[window] opacity`. Mirrors
+    /// `AlacrittyTerminalViewController.applyWindowOpacity`. No-op when
+    /// an image is active — the image path already runs the same
+    /// `.clear + transparent layer` setup and the window-level alpha
+    /// composes on top regardless of the cached value.
+    func applyWindowOpacity(_ opacity: Double) {
+        windowOpacity = opacity
+        // If a background image is active, leave it alone — the image
+        // path owns nativeBackgroundColor / layer.bg until the user
+        // clears the image.
+        guard backgroundView?.image == nil, let tv = terminalView else { return }
+        if opacity < 1.0 {
+            applyWindowOpacityToTerminal(tv)
+        } else {
+            tv.layer?.isOpaque = false
+            tv.layer?.backgroundColor = theme.background.nsColor.cgColor
+            tv.nativeBackgroundColor = theme.background.nsColor
+        }
+        applyCaretColors(tv: tv, theme: theme)
+        tv.applyClampedCursorStyle()
+        tv.needsDisplay = true
     }
 
     func setTint(_ alpha: Double) {
@@ -407,8 +463,21 @@ class TerminalViewController: NSViewController, CopadPanel, Zoomable, TerminalCa
         // backgroundView.isHidden is always false when a background image is configured
         // (opacity=0 uses alphaValue=0, not isHidden, to avoid corrupting SwiftTerm's
         // cell buffer). Check image != nil to detect "background configured".
-        let bgColor: NSColor = (backgroundView?.image != nil) ? .clear : newTheme.background.nsColor
+        //
+        // Three-way choice:
+        //   - image active → .clear (image path owns the bg)
+        //   - window.opacity < 1.0 → .clear (alpha layer bg owns the bg)
+        //   - else → opaque theme color
+        let imageActive = backgroundView?.image != nil
+        let wantsTransparent = imageActive || windowOpacity < 1.0
+        let bgColor: NSColor = wantsTransparent ? .clear : newTheme.background.nsColor
         tv.nativeBackgroundColor = bgColor
+        // When window-opacity owns the bg, refresh the layer alpha
+        // against the new theme color too.
+        if !imageActive, windowOpacity < 1.0 {
+            tv.layer?.backgroundColor = newTheme.background.nsColor
+                .withAlphaComponent(CGFloat(windowOpacity)).cgColor
+        }
         tv.nativeForegroundColor = newTheme.foreground.nsColor
         applyCaretColors(tv: tv, theme: newTheme)
         let ansiColors = newTheme.palette.map { c in

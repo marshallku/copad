@@ -30,6 +30,14 @@ fn default_opacity() -> f64 {
     0.95
 }
 
+fn default_window_opacity() -> f64 {
+    1.0
+}
+
+fn default_window_blur() -> bool {
+    false
+}
+
 fn default_tab_position() -> String {
     "top".to_string()
 }
@@ -86,6 +94,37 @@ impl Default for BackgroundConfig {
             tint: default_tint(),
             tint_color: default_tint_color(),
             opacity: default_opacity(),
+        }
+    }
+}
+
+/// `[window]` — window-level transparency / blur. Distinct from
+/// `[background]` (which only affects the optional background-image
+/// layer); these knobs control the window itself so the desktop /
+/// blurred surface behind it shows through the terminal (Ghostty
+/// model). `blur` is macOS-only (NSVisualEffectView); Linux ignores it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowConfig {
+    /// 0.0 = fully transparent, 1.0 = fully opaque. Clamped at read
+    /// time (`load_from`-side callers should normalize; the field
+    /// here trusts the parse).
+    #[serde(default = "default_window_opacity")]
+    pub opacity: f64,
+
+    /// macOS-only. When true and `opacity < 1.0`, the window installs
+    /// an `NSVisualEffectView` behind the content view so the desktop
+    /// behind is blurred (Ghostty `background-blur-radius` equivalent).
+    /// No-op on Linux today; the key is accepted for cross-platform
+    /// config parity so the same config.toml works on both.
+    #[serde(default = "default_window_blur")]
+    pub blur: bool,
+}
+
+impl Default for WindowConfig {
+    fn default() -> Self {
+        Self {
+            opacity: default_window_opacity(),
+            blur: default_window_blur(),
         }
     }
 }
@@ -227,6 +266,9 @@ pub struct CopadConfig {
     pub background: BackgroundConfig,
 
     #[serde(default)]
+    pub window: WindowConfig,
+
+    #[serde(default)]
     pub tabs: TabsConfig,
 
     #[serde(default)]
@@ -308,6 +350,10 @@ font_size = 14
 # tint_color = "#1e1e2e"
 # opacity = 0.95
 
+[window]
+# opacity = 0.85   # 0.0 = fully transparent, 1.0 = fully opaque (default)
+# blur = false     # macOS only: blur the desktop behind the window (Ghostty-style)
+
 [tabs]
 # position = "top"  # top, bottom, left, right
 # width = 120       # vertical tab width in pixels (left/right)
@@ -365,6 +411,37 @@ mod tests {
         let path = dir.join("does-not-exist.toml");
         let cfg = CopadConfig::load_from(&path).expect("load");
         assert!(cfg.triggers.is_empty());
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn window_config_defaults_when_section_absent() {
+        // Default-constructed `CopadConfig` (no config file present) must
+        // give `opacity = 1.0` so the macOS / Linux window stays opaque
+        // for users who never opt in. Regression guard: a future
+        // refactor that changes the `Default` derive must keep this.
+        let cfg = CopadConfig::default();
+        assert_eq!(cfg.window.opacity, 1.0);
+        assert!(!cfg.window.blur);
+    }
+
+    #[test]
+    fn load_from_parses_window_section() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[window]
+opacity = 0.85
+blur = true
+"#,
+        )
+        .expect("write");
+        let cfg = CopadConfig::load_from(&path).expect("load");
+        assert!((cfg.window.opacity - 0.85).abs() < 1e-9);
+        assert!(cfg.window.blur);
+        std::fs::remove_file(&path).ok();
         std::fs::remove_dir(&dir).ok();
     }
 

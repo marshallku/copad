@@ -150,6 +150,7 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
             theme: theme,
             font: resolveFont(family: config.fontFamily, size: CGFloat(config.fontSize)),
             transparentDefaultBg: config.transparentDefaultBg,
+            windowOpacity: config.windowOpacity,
             osc52Policy: config.osc52,
             optionAsAlt: config.optionAsAlt,
             forceMetaKeys: config.forceMetaKeys,
@@ -225,6 +226,14 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
     /// `[security] osc52` setting without needing to be recreated.
     func applyOSC52Policy(_ policy: OSC52Policy) {
         renderView?.setOSC52Policy(policy)
+    }
+
+    /// Config hot-reload: `[window] opacity`. Refreshes the layer bg
+    /// and the per-cell skip gate. The window-level isOpaque /
+    /// NSVisualEffectView swap is handled by `AppDelegate.
+    /// applyWindowTransparency` — this is the cell-renderer half.
+    func applyWindowOpacity(_ opacity: Double) {
+        renderView?.setWindowOpacity(opacity)
     }
 
     /// Config hot-reload: swap the theme on a running pane. Mirrors
@@ -514,6 +523,24 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     private let transparentDefaultBg: Bool
     private var imageBackgroundActive = false
 
+    /// `[window] opacity` — when < 1.0, the window is non-opaque and
+    /// the renderer skips default-bg cells (same path as
+    /// `transparentDefaultBg && imageBackgroundActive`) so the
+    /// alpha-tinted layer bg / blurred desktop bleeds through. ANSI bg
+    /// + reverse-video cells still paint opaque (Ghostty / Zed pattern).
+    /// `var` for hot-reload via `setWindowOpacity`.
+    private var windowOpacity: Double
+
+    /// Single gate for "skip default-bg cell fills". Either
+    /// `[window] opacity < 1.0` (Ghostty) or
+    /// `transparentDefaultBg && imageBackgroundActive` (wallpaper
+    /// passthrough). Used by the bounds fill, per-cell skip, and the
+    /// cursor-outline heuristic — read it everywhere instead of
+    /// duplicating the OR.
+    private var isTransparentBgActive: Bool {
+        windowOpacity < 1.0 || (transparentDefaultBg && imageBackgroundActive)
+    }
+
     /// OSC 52 policy from config. `.deny` (default) drops the request
     /// with a stderr warning; `.allow` writes to NSPasteboard.general.
     /// `var` so config hot-reload can flip it without re-creating the
@@ -584,6 +611,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         theme: CopadTheme,
         font: NSFont,
         transparentDefaultBg: Bool,
+        windowOpacity: Double,
         osc52Policy: OSC52Policy,
         optionAsAlt: Bool,
         forceMetaKeys: [String],
@@ -595,12 +623,13 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         boldItalicFont = Self.deriveTrait(font, mask: [.boldFontMask, .italicFontMask])
         paletteCache = Self.buildPalette(theme: theme)
         self.transparentDefaultBg = transparentDefaultBg
+        self.windowOpacity = windowOpacity
         self.osc52Policy = osc52Policy
         self.optionAsAlt = optionAsAlt
         forceMetaKeyCodes = Self.parseForceMetaKeyCodes(forceMetaKeys)
         super.init(frame: .zero)
         wantsLayer = true
-        layer?.backgroundColor = theme.background.nsColor.cgColor
+        layer?.backgroundColor = Self.layerBg(theme: theme, opacity: windowOpacity, imageActive: false)
         recomputeCellMetrics()
         // CADisplayLink can't be created until the view has a window
         // (the link binds to the display showing the view). Hooked up
@@ -617,9 +646,43 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         theme = newTheme
         paletteCache = Self.buildPalette(theme: newTheme)
         if !imageBackgroundActive {
-            layer?.backgroundColor = newTheme.background.nsColor.cgColor
+            layer?.backgroundColor = Self.layerBg(
+                theme: newTheme,
+                opacity: windowOpacity,
+                imageActive: false,
+            )
         }
         needsDisplay = true
+    }
+
+    /// Hot-reload entry for `[window] opacity`. Updates the cached
+    /// alpha and refreshes the layer bg (when no image is active —
+    /// the image path uses `.clear` and is driven by
+    /// `setImageBackgroundActive`).
+    func setWindowOpacity(_ newOpacity: Double) {
+        windowOpacity = newOpacity
+        if !imageBackgroundActive {
+            layer?.backgroundColor = Self.layerBg(
+                theme: theme,
+                opacity: newOpacity,
+                imageActive: false,
+            )
+        }
+        needsDisplay = true
+    }
+
+    /// Resolve the layer background CGColor for the current state.
+    /// Three cases:
+    /// - image active → `.clear` (image view + tint paint the bg)
+    /// - opacity = 1.0 → theme.background opaque
+    /// - opacity < 1.0 → theme.background with alpha = opacity, so the
+    ///   non-opaque window's blurred / desktop layer behind shows through
+    private static func layerBg(theme: CopadTheme, opacity: Double, imageActive: Bool) -> CGColor {
+        if imageActive { return NSColor.clear.cgColor }
+        let nsColor = theme.background.nsColor
+        return opacity < 1.0
+            ? nsColor.withAlphaComponent(CGFloat(opacity)).cgColor
+            : nsColor.cgColor
     }
 
     /// Hot-reload: swap the font (regular face) and rebuild the bold /
@@ -648,9 +711,11 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// re-cover it inside `draw(_:)`.
     func setImageBackgroundActive(_ active: Bool) {
         imageBackgroundActive = active
-        layer?.backgroundColor = active
-            ? NSColor.clear.cgColor
-            : theme.background.nsColor.cgColor
+        layer?.backgroundColor = Self.layerBg(
+            theme: theme,
+            opacity: windowOpacity,
+            imageActive: active,
+        )
         needsDisplay = true
     }
 
@@ -903,13 +968,18 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
               let ctx = NSGraphicsContext.current?.cgContext
         else { return }
 
-        // Fill the bounds with theme background unless the user opted
-        // into transparent default cells AND a background image is
-        // active. In that case the image layer underneath shows through
-        // blank cells; cells with explicit ANSI bg or reverse-video
-        // still materialize opaque in `drawRow` (Zed pattern), so
-        // reverse-video stays legible against the image.
-        if !(transparentDefaultBg && imageBackgroundActive) {
+        // Fill the bounds with theme background unless we're in a
+        // transparent-default-bg mode. Two modes activate it:
+        //   (a) `transparentDefaultBg && imageBackgroundActive` — image
+        //       layer underneath shows through blank cells; or
+        //   (b) `windowOpacity < 1.0` — Ghostty model: layer bg is
+        //       `theme.background.alpha=opacity`, blurred desktop /
+        //       wallpaper underneath bleeds through. Skipping the
+        //       opaque bounds fill is what lets that alpha take effect.
+        // Cells with explicit ANSI bg or reverse-video still materialize
+        // opaque in `drawRow` (Zed pattern) under both modes, so
+        // colored content stays legible.
+        if !isTransparentBgActive {
             ctx.setFillColor(theme.background.nsColor.cgColor)
             ctx.fill(bounds)
         }
@@ -1113,7 +1183,11 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         let cell = CGRect(x: x, y: y, width: cellWidth, height: cellHeight)
         let isKey = window?.isKeyWindow ?? false
         let color = theme.accent.nsColor.cgColor
-        let needsOutline = imageBackgroundActive
+        // Cursor outline is for legibility against an unknown backdrop.
+        // Both image mode and window-opacity mode put unpredictable
+        // pixels behind the accent fill (wallpaper or blurred desktop),
+        // so the dark frame around the accent helps in either.
+        let needsOutline = isTransparentBgActive
         let outlineColor = theme.background.nsColor.cgColor
 
         switch cursor.style {
@@ -1260,7 +1334,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         let flagDim: UInt16 = 1 << 4
         let flagStrike: UInt16 = 1 << 5
 
-        let transparentMode = transparentDefaultBg && imageBackgroundActive
+        let transparentMode = isTransparentBgActive
 
         for i in 0 ..< runs.count {
             let run = runs[i]

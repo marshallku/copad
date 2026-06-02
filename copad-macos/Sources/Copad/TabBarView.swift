@@ -513,14 +513,19 @@ final class TabBarView: NSView {
     private let scrollView = NSScrollView()
     private let addButton = NSButton()
     private var tabButtons: [TabButton] = []
-    private let theme: CopadTheme
+    private var theme: CopadTheme
     private var popover: NSPopover?
+    /// `[window] opacity` — only applied to the *bar* bg, not the tab
+    /// pills. Pills stay opaque so the active tab and hover state read
+    /// clearly against any backdrop.
+    private var windowOpacity: Double
 
     /// Width constraints for tab buttons (swapped on collapse/expand)
     private var tabWidthConstraints: [NSLayoutConstraint] = []
 
-    init(theme: CopadTheme) {
+    init(theme: CopadTheme, windowOpacity: Double = 1.0) {
         self.theme = theme
+        self.windowOpacity = windowOpacity
         super.init(frame: .zero)
         setupView()
     }
@@ -532,7 +537,7 @@ final class TabBarView: NSView {
 
     private func setupView() {
         wantsLayer = true
-        layer?.backgroundColor = theme.surface0.nsColor.cgColor
+        layer?.backgroundColor = Self.barBg(theme: theme, opacity: windowOpacity)
 
         // Bottom border
         let border = NSView()
@@ -690,5 +695,20 @@ final class TabBarView: NSView {
         popover = pop
 
         pop.show(relativeTo: addButton.bounds, of: addButton, preferredEdge: .maxY)
+    }
+
+    /// Hot-reload: `[window] opacity` and/or theme change. Recolors
+    /// the bar bg with the alpha-tinted surface; tab pills stay
+    /// opaque (per the pill's own draw path).
+    func applyWindowOpacity(_ opacity: Double, theme: CopadTheme) {
+        self.theme = theme
+        windowOpacity = opacity
+        layer?.backgroundColor = Self.barBg(theme: theme, opacity: opacity)
+    }
+
+    private static func barBg(theme: CopadTheme, opacity: Double) -> CGColor {
+        opacity < 1.0
+            ? theme.surface0.nsColor.withAlphaComponent(CGFloat(opacity)).cgColor
+            : theme.surface0.nsColor.cgColor
     }
 }

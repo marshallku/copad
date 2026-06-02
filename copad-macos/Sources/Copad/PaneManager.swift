@@ -396,6 +396,7 @@ final class PaneManager {
             term.applyTheme(newTheme)
             term.applyFont(family: newConfig.fontFamily, baseSize: CGFloat(newConfig.fontSize))
             term.applyOSC52Policy(newConfig.osc52)
+            term.applyWindowOpacity(newConfig.windowOpacity)
         }
         // Fan out theme/font/security to alacritty panes too. Phase 10
         // flips the default backend, so an existing user editing their
@@ -405,6 +406,7 @@ final class PaneManager {
                 alac.applyTheme(newTheme)
                 alac.applyFont(family: newConfig.fontFamily, baseSize: CGFloat(newConfig.fontSize))
                 alac.applyOSC52Policy(newConfig.osc52)
+                alac.applyWindowOpacity(newConfig.windowOpacity)
             }
         }
     }

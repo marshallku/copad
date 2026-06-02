@@ -38,14 +38,18 @@ final class StatusBarView: NSView {
     /// across animation states.
     private(set) var isShown: Bool = true
 
-    private let theme: CopadTheme
+    private var theme: CopadTheme
+    /// `[window] opacity` mirrored here so the bar bg blends with the
+    /// transparent window. Updated via `applyWindowOpacity` on hot-reload.
+    private var windowOpacity: Double
 
-    init(theme: CopadTheme) {
+    init(theme: CopadTheme, windowOpacity: Double = 1.0) {
         self.theme = theme
+        self.windowOpacity = windowOpacity
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
-        layer?.backgroundColor = theme.surface0.nsColor.cgColor
+        layer?.backgroundColor = Self.barBg(theme: theme, opacity: windowOpacity)
         // 1px top edge so the bar visibly separates from the content above
         // even when the surface0/background contrast is low (Catppuccin
         // Mocha they're nearly the same shade).
@@ -152,5 +156,20 @@ final class StatusBarView: NSView {
         case "center": centerStack
         default: rightStack
         }
+    }
+
+    /// Hot-reload: `[window] opacity` and/or theme change. Recolors
+    /// the bar bg with the alpha-tinted surface so the bar still reads
+    /// as chrome but lets the desktop / blur bleed through.
+    func applyWindowOpacity(_ opacity: Double, theme: CopadTheme) {
+        self.theme = theme
+        windowOpacity = opacity
+        layer?.backgroundColor = Self.barBg(theme: theme, opacity: opacity)
+    }
+
+    private static func barBg(theme: CopadTheme, opacity: Double) -> CGColor {
+        opacity < 1.0
+            ? theme.surface0.nsColor.withAlphaComponent(CGFloat(opacity)).cgColor
+            : theme.surface0.nsColor.cgColor
     }
 }

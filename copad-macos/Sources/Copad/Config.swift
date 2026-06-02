@@ -115,6 +115,16 @@ struct CopadConfig {
     /// cells still materialize opaquely (Zed pattern). No-op on the
     /// SwiftTerm backend.
     let transparentDefaultBg: Bool
+    /// `[window] opacity` (0.0 = fully transparent, 1.0 = fully opaque,
+    /// default 1.0). Controls the window itself + terminal default-bg
+    /// cells (Ghostty model). Distinct from `backgroundOpacity` which
+    /// only affects the optional background-image layer.
+    let windowOpacity: Double
+    /// `[window] blur = true`. macOS-only — when `windowOpacity < 1.0`
+    /// the AppDelegate installs an `NSVisualEffectView` behind the
+    /// content view so the desktop is blurred (Ghostty
+    /// `background-blur-radius`). No effect when opacity = 1.0.
+    let windowBlur: Bool
     /// Tier 1.4 — `[tabs] position` (top/bottom). left/right deferred.
     let tabsPosition: TabsPosition
     /// Tier 4.2 — `[statusbar]` config (enabled/position/height). Modules
@@ -205,6 +215,8 @@ struct CopadConfig {
             // know to set `[renderer] transparent_default_bg = true`.
             transparentDefaultBg: raw.renderer?.transparentDefaultBg
                 ?? (bgPath != nil ? true : defaults.transparentDefaultBg),
+            windowOpacity: clamp01(raw.window?.opacity ?? defaults.windowOpacity),
+            windowBlur: raw.window?.blur ?? defaults.windowBlur,
             tabsPosition: raw.tabs?.position.map(TabsPosition.parse) ?? defaults.tabsPosition,
             statusBar: StatusBarConfig(
                 enabled: raw.statusbar?.enabled ?? defaults.statusBar.enabled,
@@ -238,6 +250,8 @@ struct CopadConfig {
             osc52: .deny,
             rendererBackend: .alacritty,
             transparentDefaultBg: false,
+            windowOpacity: 1.0,
+            windowBlur: false,
             tabsPosition: .top,
             statusBar: .defaults,
             keybindings: [:],
@@ -342,8 +356,14 @@ private struct RawConfig: Decodable {
     var background: BackgroundSection?
     var security: SecuritySection?
     var renderer: RendererSection?
+    var window: WindowSection?
     var tabs: TabsSection?
     var statusbar: StatusBarSection?
+}
+
+private struct WindowSection: Decodable {
+    var opacity: Double?
+    var blur: Bool?
 }
 
 private struct RendererSection: Decodable {
