@@ -112,6 +112,23 @@ pub struct CopadSelectionRange {
     pub _reserved: u16,
 }
 
+/// Current in-terminal search match in viewport coordinates. Shape
+/// mirrors `CopadSelectionRange` (minus `is_block`, which doesn't
+/// apply to substring/regex matches). `present == 0` means no
+/// active match — either the search was cleared or the most recent
+/// `search_next` returned no hit. Multi-row matches (rare — happens
+/// when the pattern crosses an autowrap) carry both endpoints.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CopadSearchRange {
+    pub start_row: u16,
+    pub start_col: u16,
+    pub end_row: u16,
+    pub end_col: u16,
+    pub present: u8,
+    pub _reserved: [u8; 3],
+}
+
 /// Opaque heap-allocated UTF-8 byte buffer. Returned by FFI methods
 /// that hand the caller a copy of terminal content (selection,
 /// scrollback). Free with `copad_string_destroy` exactly once.
@@ -314,6 +331,28 @@ pub struct CopadHandle {
     /// range, so without remembering the previous we'd leave stale
     /// surface2 overlay painted on cells that are no longer selected.
     last_selection_range: Mutex<CopadSelectionRange>,
+    /// In-terminal find state. `pattern`/`case_sensitive` cache the
+    /// last compiled regex so back-to-back next/prev calls reuse the
+    /// `RegexSearch` (build is non-trivial — alacritty constructs four
+    /// lazy DFAs internally). `current_match` is the alacritty grid
+    /// range of the most recent hit; `None` until the first
+    /// `search_next` succeeds. All three are owned by the same Mutex
+    /// so the snapshot path can read them atomically.
+    search_state: Mutex<SearchState>,
+}
+
+/// Per-handle search bookkeeping. `regex` is the compiled
+/// `RegexSearch` matching `pattern` under the `case_sensitive`
+/// flag; we rebuild only when the user-facing query changes.
+#[derive(Default)]
+struct SearchState {
+    regex: Option<alacritty_terminal::term::search::RegexSearch>,
+    pattern: String,
+    case_sensitive: bool,
+    /// Most recent hit in alacritty grid coordinates (NOT viewport).
+    /// Viewport mapping happens at snapshot time so a scroll into
+    /// history correctly hides / repositions the highlight.
+    current_match: Option<std::ops::RangeInclusive<Point>>,
 }
 
 pub struct CopadSnapshot {
@@ -321,6 +360,10 @@ pub struct CopadSnapshot {
     rows: Vec<Row>,
     cursor: CopadCursor,
     selection: CopadSelectionRange,
+    /// Current in-terminal find match, projected into viewport
+    /// coordinates the same way `selection` is. `present == 0` when
+    /// no find is active or the active match scrolled out of view.
+    search_match: CopadSearchRange,
     /// OSC 8 hyperlink URIs visible in this snapshot. The per-run
     /// `hyperlink_id` is 1-based index into this vec (0 = no link).
     /// Deduped by alacritty's `Hyperlink::id` so a hyperlink spanning
@@ -464,6 +507,7 @@ pub unsafe extern "C" fn copad_term_create(
         last_redraw_state_hash: AtomicU64::new(0),
         last_display_offset: AtomicI32::new(0),
         last_selection_range: Mutex::new(CopadSelectionRange::default()),
+        search_state: Mutex::new(SearchState::default()),
     }))
 }
 
@@ -1155,13 +1199,80 @@ pub unsafe extern "C" fn copad_term_snapshot(handle: *mut CopadHandle) -> *mut C
 
     drop(term);
 
+    // Project the active find match into viewport coordinates. Locked
+    // strictly AFTER the term lock is released so the global lock
+    // order matches `copad_term_search_next` (search_state THEN term).
+    // Without that ordering the two paths could AB-BA deadlock when
+    // the renderer and find run concurrently. Stale match (rows
+    // scrolled out of view) collapses to `present == 0`.
+    let search_match = search_match_for_ffi(&h.search_state, display_offset, rows_count, cols);
+
     Box::into_raw(Box::new(CopadSnapshot {
         cols,
         rows: snapshot_rows,
         cursor,
         selection,
+        search_match,
         hyperlinks,
     }))
+}
+
+/// Project the current find match (stored in alacritty grid coords)
+/// into the viewport-coord range the renderer paints from. Returns
+/// the empty range when there's no active match or when the match
+/// sits entirely outside the visible viewport — same shape contract
+/// as `selection_range_for_ffi`.
+fn search_match_for_ffi(
+    state: &Mutex<SearchState>,
+    display_offset: i32,
+    rows_count: u16,
+    cols: u16,
+) -> CopadSearchRange {
+    let guard = match state.lock() {
+        Ok(g) => g,
+        Err(_) => return CopadSearchRange::default(),
+    };
+    let Some(range) = guard.current_match.as_ref() else {
+        return CopadSearchRange::default();
+    };
+    let start_view = range.start().line.0 + display_offset;
+    let end_view = range.end().line.0 + display_offset;
+    let last_row = rows_count.saturating_sub(1) as i32;
+    if end_view < 0 || start_view > last_row {
+        return CopadSearchRange::default();
+    }
+    // Clip rows to the visible range. When an endpoint is off-screen
+    // the visible boundary row is logically a "middle row" of the
+    // match — wrap-spanning matches paint the FULL row width on every
+    // row except the original first/last. So if start clipped from a
+    // negative line, the new first visible row should start at col 0
+    // (its actual match content begins at the row's left edge from
+    // the prior wrap, not at the off-screen start column). Same on
+    // the end side: if end clipped from past last_row, the new last
+    // visible row should extend through the last column.
+    let (start_row_clamped, start_col_clamped) = if start_view < 0 {
+        (0u16, 0u16)
+    } else {
+        (start_view as u16, range.start().column.0 as u16)
+    };
+    let (end_row_clamped, end_col_clamped) = if end_view > last_row {
+        // Match extends past the bottom of the viewport — the new
+        // last visible row is logically a "middle row" of the
+        // original wrap, so it paints from col 0 through the
+        // viewport's rightmost column. `cols - 1` is that index
+        // (clamped to 0 for the degenerate cols == 0 case).
+        (last_row as u16, cols.saturating_sub(1))
+    } else {
+        (end_view as u16, range.end().column.0 as u16)
+    };
+    CopadSearchRange {
+        start_row: start_row_clamped,
+        start_col: start_col_clamped,
+        end_row: end_row_clamped,
+        end_col: end_col_clamped,
+        present: 1,
+        _reserved: [0; 3],
+    }
 }
 
 
@@ -1519,6 +1630,330 @@ pub unsafe extern "C" fn copad_snapshot_selection(
         return;
     };
     unsafe { *out = s.selection };
+}
+
+/// Copy out the current find match in viewport coordinates. The
+/// renderer reads this every frame so it can paint the highlight
+/// underneath glyphs. `present == 0` means no active match — caller
+/// should skip the highlight pass.
+///
+/// # Safety
+///
+/// `out` must point to writable storage for one `CopadSearchRange`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_snapshot_search_match(
+    snap: *const CopadSnapshot,
+    out: *mut CopadSearchRange,
+) {
+    if out.is_null() {
+        return;
+    }
+    let Some(s) = (unsafe { snap.as_ref() }) else {
+        return;
+    };
+    unsafe { *out = s.search_match };
+}
+
+// ---------- In-terminal find ----------
+
+/// Backslash-escape regex metacharacters so the FFI's substring
+/// contract is honored. Mirrors the set the `regex` crate's
+/// `regex::escape` function escapes (we don't pull in `regex` just
+/// for this — alacritty uses `regex-automata` and we don't want to
+/// bring another regex crate transitively).
+fn escape_regex_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(
+            c,
+            '\\' | '.'
+                | '+'
+                | '*'
+                | '?'
+                | '('
+                | ')'
+                | '|'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '^'
+                | '$'
+                | '#'
+                | '&'
+                | '-'
+                | '~'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Find the next/previous match of `pattern` in the terminal grid +
+/// scrollback. Pattern is treated as a fixed string (special regex
+/// chars are escaped by the caller — copad doesn't expose regex to
+/// the find bar in v1).
+///
+/// `case_sensitive == false` wraps the pattern in `(?i:...)` so
+/// alacritty's regex_automata engine matches without case. `forward`
+/// chooses `regex_search_right` (next) vs `regex_search_left` (prev).
+/// Search starts after the current match's end (forward) / before
+/// its start (backward); with no current match it starts at the
+/// term cursor — that's where the user is logically looking. Wraps
+/// around the grid boundaries (`(start, end)` covers the full
+/// scrollback + live region).
+///
+/// On a hit, updates the cached match + viewport-scrolls so the row
+/// containing the match start is on-screen; returns `true`. On miss,
+/// clears the cached match and returns `false`.
+///
+/// Cache reuse: if `(pattern, case_sensitive)` matches the last call,
+/// the compiled `RegexSearch` is reused — alacritty builds four
+/// lazy DFAs internally, so rebuilding on every keystroke would be
+/// wasteful.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `copad_term_create` and not yet destroyed. `pattern` must point
+/// to a valid NUL-terminated UTF-8 string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_search_next(
+    handle: *mut CopadHandle,
+    pattern: *const c_char,
+    case_sensitive: bool,
+    forward: bool,
+) -> bool {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return false;
+    };
+    if pattern.is_null() {
+        return false;
+    }
+    // SAFETY: caller contract — pattern is a NUL-terminated UTF-8 string.
+    let raw_pattern = match unsafe { CStr::from_ptr(pattern) }.to_str() {
+        Ok(s) if !s.is_empty() => s,
+        _ => {
+            // Empty / invalid pattern → clear and return.
+            if let Ok(mut state) = h.search_state.lock() {
+                state.current_match = None;
+            }
+            return false;
+        }
+    };
+
+    let mut state = match h.search_state.lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+
+    // Substring semantics: escape regex metacharacters in the user's
+    // input so `.` `*` `(` `[` etc. match literally. Without this a
+    // user typing `foo.bar` would unexpectedly match `fooXbar`.
+    let escaped = escape_regex_literal(raw_pattern);
+
+    // Force case bias explicitly. Alacritty's RegexSearch::new applies
+    // SMART-CASE by default (case-insensitive iff the pattern has no
+    // uppercase), so `case_sensitive=true` on a lowercase query like
+    // "foo" would still match "FOO" without the `(?-i:...)` override.
+    // Wrap with the corresponding inline flag group so the user's
+    // toggle is load-bearing in both directions.
+    let cache_key_pattern = if case_sensitive {
+        format!("(?-i:{escaped})")
+    } else {
+        format!("(?i:{escaped})")
+    };
+    let cache_hit = state.regex.is_some()
+        && state.pattern == cache_key_pattern
+        && state.case_sensitive == case_sensitive;
+    if !cache_hit {
+        match alacritty_terminal::term::search::RegexSearch::new(&cache_key_pattern) {
+            Ok(r) => {
+                state.regex = Some(r);
+                state.pattern = cache_key_pattern;
+                state.case_sensitive = case_sensitive;
+                // Query changed — the previously-cached match is from
+                // a different pattern and using it as the search
+                // origin would skip a valid hit at the same location
+                // (e.g. extending "abc" → "abcd" would step past
+                // the old "abc" match and miss the "abcd" that
+                // overlaps it). Reset so the next search starts at
+                // the term cursor instead.
+                state.current_match = None;
+            }
+            Err(_) => {
+                // Invalid pattern (extremely rare for substring searches
+                // after our `(?i:...)`/`(?-i:...)` wrap — would mean
+                // unbalanced parentheses in user input). Bail without
+                // changing current_match so the previous highlight stays.
+                return false;
+            }
+        }
+    }
+
+    let mut term = h.term.lock();
+    let cols = term.columns();
+    let total_lines = term.total_lines();
+    let topmost_line = term.topmost_line();
+    let bottommost_line = term.bottommost_line();
+
+    // Pick the search origin. With a cached match we step past its
+    // boundary in the chosen direction; without one we start at the
+    // term cursor so the first call after the user types "foo" finds
+    // the nearest "foo" to where they were looking.
+    let cursor_point = term.grid().cursor.point;
+    let start_point = match (forward, state.current_match.as_ref()) {
+        (true, Some(m)) => {
+            // Step one cell past the match's end. If that overshoots
+            // the bottom-right corner of the grid, wrap to the top.
+            let mut p = *m.end();
+            if p.column.0 + 1 >= cols {
+                p.column = Column(0);
+                p.line = if p.line == bottommost_line {
+                    topmost_line
+                } else {
+                    Line(p.line.0 + 1)
+                };
+            } else {
+                p.column = Column(p.column.0 + 1);
+            }
+            p
+        }
+        (false, Some(m)) => {
+            let mut p = *m.start();
+            if p.column.0 == 0 {
+                p.column = Column(cols.saturating_sub(1));
+                p.line = if p.line == topmost_line {
+                    bottommost_line
+                } else {
+                    Line(p.line.0 - 1)
+                };
+            } else {
+                p.column = Column(p.column.0 - 1);
+            }
+            p
+        }
+        (_, None) => cursor_point,
+    };
+
+    // Search bounds: full grid (live + scrollback), each direction.
+    // `regex_search_*` take `&mut RegexSearch` — alacritty's lazy DFAs
+    // mutate internal cache state as they evaluate. Take the regex
+    // out of the Option for the duration of the search so we hold a
+    // single `&mut`, then put it back.
+    let mut regex = state
+        .regex
+        .take()
+        .expect("regex set above when cache_hit was false");
+
+    let found = if forward {
+        // Forward search wraps: try from start_point to bottom; if
+        // nothing, retry from top to start_point. alacritty doesn't
+        // wrap natively, so we do two calls.
+        let bottom_right =
+            Point { line: bottommost_line, column: Column(cols.saturating_sub(1)) };
+        let first = term.regex_search_right(&mut regex, start_point, bottom_right);
+        first.or_else(|| {
+            let top_left = Point { line: topmost_line, column: Column(0) };
+            // Wrap-around guard: don't return the same match twice in a
+            // row if the only match in the grid is at start_point.
+            let mut prev_end = start_point;
+            if prev_end.column.0 == 0 {
+                prev_end.column = Column(cols.saturating_sub(1));
+                prev_end.line = if prev_end.line == topmost_line {
+                    bottommost_line
+                } else {
+                    Line(prev_end.line.0 - 1)
+                };
+            } else {
+                prev_end.column = Column(prev_end.column.0 - 1);
+            }
+            term.regex_search_right(&mut regex, top_left, prev_end)
+        })
+    } else {
+        let top_left = Point { line: topmost_line, column: Column(0) };
+        let first = term.regex_search_left(&mut regex, start_point, top_left);
+        first.or_else(|| {
+            let bottom_right =
+                Point { line: bottommost_line, column: Column(cols.saturating_sub(1)) };
+            let mut prev_start = start_point;
+            if prev_start.column.0 + 1 >= cols {
+                prev_start.column = Column(0);
+                prev_start.line = if prev_start.line == bottommost_line {
+                    topmost_line
+                } else {
+                    Line(prev_start.line.0 + 1)
+                };
+            } else {
+                prev_start.column = Column(prev_start.column.0 + 1);
+            }
+            term.regex_search_left(&mut regex, prev_start, bottom_right)
+        })
+    };
+    // Hand the (now-mutated) regex back to the cache.
+    state.regex = Some(regex);
+    // total_lines is read but unused below if the closure-based
+    // logic above changes — keep the binding to avoid an unused-let
+    // warning that would block clippy.
+    let _ = total_lines;
+
+    state.current_match = found.clone();
+
+    // Scroll viewport so the match row is visible. alacritty's
+    // display_offset counts rows above the live region (0 = live
+    // bottom). For a match on line `L` (where negative L = scrollback,
+    // 0..screen_lines = live), the offset needed to bring L onto the
+    // bottom row is `(screen_lines-1) - L` clamped to [0,
+    // total_lines-screen_lines].
+    if let Some(ref m) = found {
+        let screen_lines = term.screen_lines() as i32;
+        let match_line = m.start().line.0;
+        let needed_offset = if match_line < 0 {
+            // Match in scrollback — show it at the top of the viewport.
+            (-match_line) as usize
+        } else if match_line >= screen_lines {
+            // Shouldn't happen (live region max is screen_lines-1),
+            // but be defensive.
+            0
+        } else {
+            0 // Match already in live viewport.
+        };
+        let max_offset = term.history_size();
+        let final_offset = needed_offset.min(max_offset);
+        let current_offset = term.grid().display_offset();
+        if current_offset != final_offset {
+            // alacritty exposes scroll via Term::scroll_display(Scroll).
+            // ::Top jumps to start of scrollback, ::Bottom to live,
+            // ::Lines(N) scrolls N lines (positive = into history).
+            let delta = final_offset as i32 - current_offset as i32;
+            if delta != 0 {
+                term.scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
+            }
+        }
+    }
+
+    found.is_some()
+}
+
+/// Drop the cached regex + current match. The renderer's highlight
+/// vanishes on the next frame.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `copad_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_search_clear(handle: *mut CopadHandle) {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return;
+    };
+    if let Ok(mut state) = h.search_state.lock() {
+        state.regex = None;
+        state.pattern.clear();
+        state.current_match = None;
+    }
 }
 
 // ---------- Selection control ----------
@@ -2477,5 +2912,105 @@ mod damage_rows_tests {
         // Either Full directly from alacritty (initial-state path),
         // or via cap overflow. Both are correct.
         assert!(matches!(outcome, DamageRowsOutcome::Full));
+    }
+}
+
+#[cfg(test)]
+mod search_match_projection_tests {
+    use super::*;
+    use alacritty_terminal::index::{Column, Line, Point};
+    use std::sync::Mutex;
+
+    fn make_state(start: (i32, usize), end: (i32, usize)) -> Mutex<SearchState> {
+        let state = SearchState {
+            current_match: Some(
+                Point { line: Line(start.0), column: Column(start.1) }
+                    ..=Point { line: Line(end.0), column: Column(end.1) },
+            ),
+            ..Default::default()
+        };
+        Mutex::new(state)
+    }
+
+    #[test]
+    fn empty_match_returns_absent() {
+        let state = Mutex::new(SearchState::default());
+        let out = search_match_for_ffi(&state, 0, 24, 80);
+        assert_eq!(out.present, 0);
+    }
+
+    #[test]
+    fn match_in_live_viewport_projects_with_zero_offset() {
+        // Match on grid line 5, cols 2..=7. No scroll → display_offset=0.
+        let state = make_state((5, 2), (5, 7));
+        let out = search_match_for_ffi(&state, 0, 24, 80);
+        assert_eq!(out.present, 1);
+        assert_eq!(out.start_row, 5);
+        assert_eq!(out.end_row, 5);
+        assert_eq!(out.start_col, 2);
+        assert_eq!(out.end_col, 7);
+    }
+
+    #[test]
+    fn match_in_scrollback_with_user_scroll_appears_at_top() {
+        // Match on grid line -3 (3 rows into scrollback). User scrolled
+        // back 5 rows (display_offset = 5). Viewport row should be
+        // -3 + 5 = 2.
+        let state = make_state((-3, 0), (-3, 3));
+        let out = search_match_for_ffi(&state, 5, 24, 80);
+        assert_eq!(out.present, 1);
+        assert_eq!(out.start_row, 2);
+        assert_eq!(out.end_row, 2);
+    }
+
+    #[test]
+    fn match_above_viewport_collapses_to_absent() {
+        // Match on line -10, user only scrolled 3 → viewport row = -7.
+        // Off-screen, present=0.
+        let state = make_state((-10, 0), (-10, 3));
+        let out = search_match_for_ffi(&state, 3, 24, 80);
+        assert_eq!(out.present, 0);
+    }
+
+    #[test]
+    fn match_below_viewport_collapses_to_absent() {
+        // Match on line 30, rows_count=24 → viewport row 30, out of range.
+        let state = make_state((30, 0), (30, 3));
+        let out = search_match_for_ffi(&state, 0, 24, 80);
+        assert_eq!(out.present, 0);
+    }
+
+    #[test]
+    fn multi_row_match_clips_endpoints_to_viewport() {
+        // Match spans line -2..=1 (4 rows). Viewport (24 rows × 80 cols,
+        // no scroll): start clamps to row 0 (was -2), end stays at row 1.
+        // The original start row (-2) is off-screen, so the new first
+        // VISIBLE row is logically a "middle row" of the wrap — start_col
+        // becomes 0 (paints from the left edge through the continuation
+        // wrap), NOT the original off-screen start column (10).
+        let state = make_state((-2, 10), (1, 5));
+        let out = search_match_for_ffi(&state, 0, 24, 80);
+        assert_eq!(out.present, 1);
+        assert_eq!(out.start_row, 0);
+        assert_eq!(out.end_row, 1);
+        assert_eq!(out.start_col, 0, "clipped start row should begin at col 0");
+        // End row IS the original end (row 1, in-viewport), so its
+        // end_col carries through unchanged.
+        assert_eq!(out.end_col, 5);
+    }
+
+    #[test]
+    fn multi_row_match_clipped_at_bottom_extends_to_viewport_right() {
+        // Match spans line 22..=30 (10 rows). Viewport (24 rows × 80
+        // cols): start stays at row 22 with its real start col, end
+        // clips to row 23 with end_col extended through col 79 (the
+        // viewport's rightmost column).
+        let state = make_state((22, 4), (30, 5));
+        let out = search_match_for_ffi(&state, 0, 24, 80);
+        assert_eq!(out.present, 1);
+        assert_eq!(out.start_row, 22);
+        assert_eq!(out.start_col, 4);
+        assert_eq!(out.end_row, 23);
+        assert_eq!(out.end_col, 79, "clipped end row should extend through last col");
     }
 }

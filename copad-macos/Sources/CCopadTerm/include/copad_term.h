@@ -148,6 +148,41 @@ int32_t copad_term_take_damage_rows(CopadHandle* handle,
                                      uint16_t* out_buf,
                                      uint16_t cap);
 
+// --- In-terminal find ---
+
+// Current find match in viewport coordinates. Same shape as
+// CopadSelectionRange minus is_block (find can't be block-shaped).
+typedef struct {
+    uint16_t start_row;
+    uint16_t start_col;
+    uint16_t end_row;
+    uint16_t end_col;
+    uint8_t present; // 0 = no active match (cleared or off-screen)
+    uint8_t _reserved[3];
+} CopadSearchRange;
+
+// Find next/prev match of `pattern` in grid + scrollback. Pattern is
+// treated as a fixed string: the FFI escapes regex metacharacters
+// internally, so callers can pass raw user input from a find-bar
+// text field without any pre-processing. `case_sensitive` controls
+// the case-fold bias explicitly (overrides alacritty's smart-case
+// default). Wraps around grid boundaries. Returns true if a match
+// was found (and the viewport was scrolled to make it visible).
+bool copad_term_search_next(CopadHandle* handle,
+                             const char* pattern,
+                             bool case_sensitive,
+                             bool forward);
+
+// Drop the cached regex + current match — the renderer's highlight
+// vanishes on the next frame.
+void copad_term_search_clear(CopadHandle* handle);
+
+// Project the snapshot's cached match into the caller's storage.
+// `present == 0` when no active match or the match scrolled out of
+// view. Callable any number of times per snapshot.
+void copad_snapshot_search_match(const CopadSnapshot* snap,
+                                  CopadSearchRange* out);
+
 // --- Snapshot ---
 
 CopadSnapshot* copad_term_snapshot(CopadHandle* handle);

@@ -77,6 +77,7 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
     private var backgroundView: NSImageView?
     private var tintView: NSView?
     private var shellStarted = false
+    private var findBar: FindBar?
 
     /// Active font size for Cmd+= / Cmd+- / Cmd+0 zoom. Mirror of
     /// `TerminalViewController.currentFontSize`. Decoupled from
@@ -169,6 +170,21 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         render.eventBus = eventBus
         renderView = render
 
+        // Find bar — hidden by default. Anchored at the bottom of the
+        // pane with manual frame math (auto-resize on container
+        // resize). Toggled by Cmd+F via AppDelegate; the bar handles
+        // its own next/prev/close shortcuts when first responder.
+        let bar = FindBar(theme: theme) { [weak self] action in
+            self?.handleFindAction(action)
+        }
+        bar.isHidden = true
+        container.addSubview(bar)
+        findBar = bar
+        // Lay out against the local `container` — `self.view` isn't
+        // assigned until the next line, and reading `view` here would
+        // re-enter `loadView`.
+        layoutFindBar(in: container)
+
         view = container
 
         // Apply background from config if set. Runs before viewDidAppear,
@@ -254,6 +270,119 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         theme = newTheme
         renderView?.setTheme(newTheme)
         termHandle?.applyPaletteFromTheme(newTheme)
+        findBar?.applyTheme(newTheme)
+    }
+
+    // MARK: - Find
+
+    /// Show / hide the find bar. Cmd+F handler routes here via
+    /// `AppDelegate.performFindPanelAction`. Toggle behavior matches
+    /// the Linux SearchBar: first invocation shows + focuses, second
+    /// invocation hides + clears search state.
+    func toggleFindBar() {
+        guard let bar = findBar else { return }
+        if bar.isHidden {
+            bar.isHidden = false
+            layoutFindBar()
+            bar.focusSearchField()
+            // Re-apply the existing query if user re-opens the bar
+            // (keeps the highlight on what they were last finding).
+            performFindIfPattern(forward: true)
+        } else {
+            closeFindBar()
+        }
+    }
+
+    /// Esc / close-button path. Hides the bar, clears the Rust search
+    /// state, and returns focus to the render view so the user can
+    /// keep typing into the shell.
+    func closeFindBar() {
+        findBar?.isHidden = true
+        if let h = termHandle {
+            h.searchClear()
+            renderView?.refreshSnapshotForSearchChange(h)
+        }
+        if let render = renderView {
+            view.window?.makeFirstResponder(render)
+        }
+    }
+
+    /// Cmd+G / Cmd+Shift+G — only acts when the bar is visible.
+    /// Otherwise the menu's keyEquivalent silently no-ops, which
+    /// matches iTerm2 / Terminal.app behavior.
+    func findNext() {
+        performFindAction(forward: true)
+    }
+
+    func findPrevious() {
+        performFindAction(forward: false)
+    }
+
+    private func performFindAction(forward: Bool) {
+        guard let bar = findBar, !bar.isHidden else { return }
+        let pattern = bar.currentPattern
+        guard !pattern.isEmpty, let h = termHandle else { return }
+        _ = h.searchNext(pattern: pattern, caseSensitive: bar.caseSensitive, forward: forward)
+        // searchNext mutates Rust-side state only — no grid damage —
+        // so the per-tick damage gate won't refresh the snapshot for
+        // us. Force a refresh so the next `draw(_:)` sees the new
+        // `search_match` from the snapshot.
+        renderView?.refreshSnapshotForSearchChange(h)
+    }
+
+    private func performFindIfPattern(forward: Bool) {
+        guard let bar = findBar else { return }
+        let pattern = bar.currentPattern
+        guard let h = termHandle else { return }
+        if pattern.isEmpty {
+            // User deleted the query — drop the cached match so the
+            // highlight vanishes on the next frame instead of pinning
+            // on the last hit.
+            h.searchClear()
+            renderView?.refreshSnapshotForSearchChange(h)
+            return
+        }
+        _ = h.searchNext(pattern: pattern, caseSensitive: bar.caseSensitive, forward: forward)
+        renderView?.refreshSnapshotForSearchChange(h)
+    }
+
+    private func handleFindAction(_ action: FindBar.Action) {
+        switch action {
+        case .queryChanged:
+            performFindIfPattern(forward: true)
+        case .next:
+            performFindAction(forward: true)
+        case .prev:
+            performFindAction(forward: false)
+        case .caseToggle:
+            performFindIfPattern(forward: true)
+        case .close:
+            closeFindBar()
+        }
+    }
+
+    /// Apply the bar's frame inside the given parent view. Call
+    /// `layoutFindBar(in: container)` during `loadView` (before
+    /// `self.view` is assigned) and the no-arg `layoutFindBar()`
+    /// from any post-load reflow path (theme apply, resize) where
+    /// `self.view` is safe to read.
+    private func layoutFindBar(in parent: NSView) {
+        guard let bar = findBar else { return }
+        let height: CGFloat = 32
+        let margin: CGFloat = 8
+        let w = parent.bounds.width - margin * 2
+        // Container is unflipped AppKit coords (y=0 is bottom). Pin
+        // the bar near the bottom of the pane, full-width minus
+        // margins. `.maxYMargin` lets the space ABOVE the bar grow
+        // when the parent grows, keeping the bar anchored at bottom.
+        bar.frame = NSRect(x: margin, y: margin, width: max(0, w), height: height)
+        bar.autoresizingMask = [.width, .maxYMargin]
+    }
+
+    private func layoutFindBar() {
+        // Safe entry point for post-load callers — `self.view` is
+        // assigned and stable here.
+        layoutFindBar(in: view)
     }
 
     /// Config hot-reload: swap the font family/size on a running pane.
@@ -820,6 +949,17 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         needsDisplay = true
     }
 
+    /// Refresh `snapshotCache` immediately, bypassing the per-tick
+    /// damage gate. Required after a find operation: the search
+    /// match lives inside the snapshot, and `searchNext` doesn't
+    /// generate any grid damage (it mutates Rust-side search state
+    /// only), so without this the next `draw(_:)` would paint the
+    /// stale highlight from the previous frame's snapshot.
+    func refreshSnapshotForSearchChange(_ handle: CopadTermFFI.Handle) {
+        snapshotCache = handle.snapshot()
+        needsDisplay = true
+    }
+
     /// Apply font traits via NSFontManager, falling back to the regular
     /// face if the family doesn't ship the requested variant (common
     /// for monospace fonts that lack an italic — synthesized italics
@@ -1294,10 +1434,57 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         // marking the range.
         paintSelection(snap.selection, ctx: ctx)
 
+        // In-terminal find match highlight. Painted in theme.accent at
+        // moderate alpha so it's visually distinct from the selection
+        // overlay (surface2) — the user can tell at a glance which
+        // band is the search hit vs which is their drag selection.
+        paintSearchMatch(snap.searchMatch, ctx: ctx)
+
         // IME preedit overlay (Korean / Japanese / Chinese composition).
         // Paints OVER everything else at the cursor cell — what the
         // user is composing, before any of it touches the PTY.
         paintMarkedText(snap.cursor, ctx: ctx)
+    }
+
+    /// Paint the current find match. Single-row matches are a single
+    /// rect (start_col..=end_col on the match row); multi-row matches
+    /// (rare — pattern crossed an autowrap) paint each affected row:
+    /// start row from start_col to last column, full middle rows,
+    /// end row from column 0 to end_col. Theme.accent at ~0.45 alpha.
+    private func paintSearchMatch(_ match: CopadSearchRange, ctx: CGContext) {
+        guard match.present == 1, cellWidth > 0, cellHeight > 0 else { return }
+        let color = theme.accent.nsColor.withAlphaComponent(0.45).cgColor
+        ctx.setFillColor(color)
+
+        let startRow = Int(match.start_row)
+        let endRow = Int(match.end_row)
+        let startCol = Int(match.start_col)
+        let endCol = Int(match.end_col)
+        let cols = max(1, Int(bounds.width / cellWidth))
+        let lastCol = cols - 1
+
+        for row in startRow ... endRow {
+            let firstCol: Int
+            let finalCol: Int
+            if startRow == endRow {
+                firstCol = startCol
+                finalCol = endCol
+            } else if row == startRow {
+                firstCol = startCol
+                finalCol = lastCol
+            } else if row == endRow {
+                firstCol = 0
+                finalCol = endCol
+            } else {
+                firstCol = 0
+                finalCol = lastCol
+            }
+            guard firstCol <= finalCol else { continue }
+            let x = CGFloat(firstCol) * cellWidth
+            let w = CGFloat(finalCol - firstCol + 1) * cellWidth
+            let y = CGFloat(row) * cellHeight
+            ctx.fill(CGRect(x: x, y: y, width: w, height: cellHeight))
+        }
     }
 
     /// Paint the in-progress IME composition at the cursor cell.
@@ -2767,5 +2954,162 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// the IME from probing further.
     func characterIndex(for _: NSPoint) -> Int {
         NSNotFound
+    }
+}
+
+/// In-terminal find UI. Mirrors `copad-linux/src/search.rs`'s
+/// SearchBar shape — text field + prev/next/case-toggle/close —
+/// laid out at the bottom of the pane and toggled by Cmd+F. Owns no
+/// search logic itself; reports user actions back to the controller
+/// via an `Action` callback, which drives the Rust FFI + redraws.
+private final class FindBar: NSView, NSTextFieldDelegate {
+    enum Action {
+        case queryChanged
+        case next
+        case prev
+        case caseToggle
+        case close
+    }
+
+    private let textField: NSTextField
+    private let prevButton: NSButton
+    private let nextButton: NSButton
+    private let caseButton: NSButton
+    private let closeButton: NSButton
+    private let onAction: (Action) -> Void
+
+    var currentPattern: String {
+        textField.stringValue
+    }
+
+    var caseSensitive: Bool {
+        caseButton.state == .on
+    }
+
+    init(theme: CopadTheme, onAction: @escaping (Action) -> Void) {
+        self.onAction = onAction
+        textField = NSTextField(frame: .zero)
+        prevButton = NSButton(title: "↑", target: nil, action: nil)
+        nextButton = NSButton(title: "↓", target: nil, action: nil)
+        caseButton = NSButton(title: "Aa", target: nil, action: nil)
+        closeButton = NSButton(title: "✕", target: nil, action: nil)
+        super.init(frame: .zero)
+        wantsLayer = true
+        layer?.cornerRadius = 6
+        applyTheme(theme)
+
+        textField.placeholderString = "Search…"
+        textField.bezelStyle = .roundedBezel
+        textField.delegate = self
+        textField.target = self
+        textField.action = #selector(textFieldEnter(_:))
+        textField.refusesFirstResponder = false
+
+        for btn in [prevButton, nextButton, caseButton, closeButton] {
+            btn.bezelStyle = .accessoryBar
+            btn.isBordered = false
+            btn.font = NSFont.systemFont(ofSize: 12)
+            btn.target = self
+        }
+        caseButton.setButtonType(.toggle)
+        caseButton.toolTip = "Case sensitive"
+        prevButton.toolTip = "Previous match (Shift+Enter)"
+        nextButton.toolTip = "Next match (Enter)"
+        closeButton.toolTip = "Close (Esc)"
+        prevButton.action = #selector(prevTapped)
+        nextButton.action = #selector(nextTapped)
+        caseButton.action = #selector(caseTapped)
+        closeButton.action = #selector(closeTapped)
+
+        let stack = NSStackView(views: [textField, prevButton, nextButton, caseButton, closeButton])
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 6
+        stack.edgeInsets = NSEdgeInsets(top: 4, left: 8, bottom: 4, right: 8)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.topAnchor.constraint(equalTo: topAnchor),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+            textField.widthAnchor.constraint(greaterThanOrEqualToConstant: 180),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder _: NSCoder) {
+        fatalError()
+    }
+
+    func applyTheme(_ theme: CopadTheme) {
+        // Slightly lighter than the terminal background so the bar
+        // visually separates from the text grid behind it.
+        layer?.backgroundColor = theme.surface2.nsColor
+            .withAlphaComponent(0.92).cgColor
+    }
+
+    func focusSearchField() {
+        window?.makeFirstResponder(textField)
+        // Select-all so a fresh Cmd+F over an existing query lets the
+        // user type to replace immediately.
+        textField.currentEditor()?.selectAll(nil)
+    }
+
+    @objc private func textFieldEnter(_: Any?) {
+        onAction(.next)
+    }
+
+    @objc private func prevTapped() {
+        onAction(.prev)
+    }
+
+    @objc private func nextTapped() {
+        onAction(.next)
+    }
+
+    @objc private func caseTapped() {
+        onAction(.caseToggle)
+    }
+
+    @objc private func closeTapped() {
+        onAction(.close)
+    }
+
+    func controlTextDidChange(_: Notification) {
+        onAction(.queryChanged)
+    }
+
+    /// Keyboard handling on the bar itself — Esc closes, Shift+Enter
+    /// goes to prev match (Enter alone is wired via the text field's
+    /// action selector above for next match).
+    override func keyDown(with event: NSEvent) {
+        // Escape (keyCode 53)
+        if event.keyCode == 53 {
+            onAction(.close)
+            return
+        }
+        if event.keyCode == 36, event.modifierFlags.contains(.shift) { // Shift+Enter
+            onAction(.prev)
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    /// Re-route Esc from the embedded text field's field editor.
+    /// Without this the field editor swallows Esc as "cancel editing"
+    /// and the bar wouldn't close.
+    func control(_: NSControl, textView _: NSTextView, doCommandBy selector: Selector) -> Bool {
+        if selector == #selector(NSStandardKeyBindingResponding.cancelOperation(_:)) {
+            onAction(.close)
+            return true
+        }
+        if selector == #selector(NSStandardKeyBindingResponding.insertBacktab(_:)) {
+            // Shift+Tab → prev match (alternative to Shift+Enter for
+            // keyboards where Shift+Enter triggers something else).
+            onAction(.prev)
+            return true
+        }
+        return false
     }
 }

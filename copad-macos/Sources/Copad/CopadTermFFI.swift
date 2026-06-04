@@ -209,6 +209,27 @@ enum CopadTermFFI {
             copad_term_selection_all(ptr)
         }
 
+        // MARK: - Find
+
+        /// Find the next (or previous, with `forward = false`) match
+        /// of `pattern` across the live grid + scrollback. Returns
+        /// true if a match was found and the viewport was scrolled to
+        /// reveal it. Caches the compiled regex internally — repeated
+        /// calls with the same `(pattern, caseSensitive)` reuse the
+        /// DFAs.
+        @discardableResult
+        func searchNext(pattern: String, caseSensitive: Bool, forward: Bool = true) -> Bool {
+            guard let ptr, !pattern.isEmpty else { return false }
+            return pattern.withCString { cstr in
+                copad_term_search_next(ptr, cstr, caseSensitive, forward)
+            }
+        }
+
+        func searchClear() {
+            guard let ptr else { return }
+            copad_term_search_clear(ptr)
+        }
+
         /// Returns the current selection as a Swift string (or nil if
         /// nothing selected). Lifetime of the underlying Rust buffer
         /// is bounded by this call — we copy the bytes into a Swift
@@ -410,6 +431,20 @@ enum CopadTermFFI {
             guard let ptr else { return empty }
             var out = empty
             copad_snapshot_selection(ptr, &out)
+            return out
+        }
+
+        /// Current in-terminal find match in viewport coordinates.
+        /// `present == 0` when no search is active or the match
+        /// scrolled out of view; renderer paints nothing in that case.
+        var searchMatch: CopadSearchRange {
+            let empty = CopadSearchRange(
+                start_row: 0, start_col: 0, end_row: 0, end_col: 0,
+                present: 0, _reserved: (0, 0, 0),
+            )
+            guard let ptr else { return empty }
+            var out = empty
+            copad_snapshot_search_match(ptr, &out)
             return out
         }
 

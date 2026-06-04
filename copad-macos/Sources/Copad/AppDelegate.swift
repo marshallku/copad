@@ -571,8 +571,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Find
 
+    /// Cmd+F / Cmd+G / Cmd+Shift+G dispatch. All three Find-menu
+    /// items route here; the `tag` carries an `NSFindPanelAction`
+    /// raw value telling us which one was hit (showFindPanel / next /
+    /// previous). Backend-aware: alacritty uses its own bottom-of-
+    /// pane bar (`AlacrittyTerminalViewController`); SwiftTerm
+    /// forwards through its built-in NSResponder find chain. Other
+    /// panel types (webview, plugin) silently no-op.
     @objc func performFindPanelAction(_ sender: NSMenuItem) {
-        tabVC?.activeTerminal?.view.perform(#selector(performFindPanelAction(_:)), with: sender)
+        guard let panel = tabVC?.activePaneManager?.activePane else { return }
+        let action = NSFindPanelAction(rawValue: UInt(sender.tag))
+        if let alacritty = panel as? AlacrittyTerminalViewController {
+            switch action {
+            case .next: alacritty.findNext()
+            case .previous: alacritty.findPrevious()
+            default: alacritty.toggleFindBar()
+            }
+            return
+        }
+        if let swiftTerm = panel as? TerminalViewController {
+            swiftTerm.view.perform(#selector(performFindPanelAction(_:)), with: sender)
+        }
     }
 
     // MARK: - Zoom Actions
