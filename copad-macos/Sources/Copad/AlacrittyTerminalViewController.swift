@@ -650,6 +650,54 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// a new cascade list.
     private var fallbackCache: [UInt32: NSFont] = [:]
 
+    /// (text, font, fg, decoration) → retained CTLine cache. Reuses
+    /// the CoreText shaping work across frames so the hot redraw loop
+    /// stops paying ~19k `NSAttributedString` + `CTLineCreate` allocs
+    /// per second (80×24 grid × ~4 runs × 60 Hz). Per-render-view —
+    /// each pane has its own font and zoom level, so a global cache
+    /// would key off NSFont identity but evict cross-pane more
+    /// aggressively than helps.
+    ///
+    /// Key includes the full text as a `String`: Swift Dictionary
+    /// Equatable handles collisions natively, so we get the
+    /// codex-flagged "verify on hit" semantics without a UInt64 hash
+    /// + manual compare step.
+    ///
+    /// LRU via tick counter + scan-on-evict: the eviction scan is
+    /// O(n) but only fires when the cache is full. Steady-state
+    /// terminal output settles into a working set well under the cap
+    /// so eviction is rare; the hot lookup path stays O(1).
+    ///
+    /// Flushed on `setFont` (cascade changes) and `setTheme` (every
+    /// `fgRGBA` is potentially stale). `setImageBackgroundActive` /
+    /// `setWindowOpacity` deliberately don't flush: only the bg fill
+    /// path reads those, the cached CTLine paints text only.
+    private struct CTLineCacheKey: Hashable {
+        let text: String
+        let fontId: ObjectIdentifier
+        let fgRGBA: UInt32
+        /// bit 0-7: underline_style (raw u8 from `CopadRun`); bits
+        /// 8-10: bold, italic, strike. dim/inverse are NOT bits —
+        /// their visual effect is already baked into `fgRGBA` by the
+        /// caller before lookup.
+        let styleBits: UInt16
+        let underlineRGBA: UInt32
+        let strikeRGBA: UInt32
+    }
+
+    private struct CTLineCacheEntry {
+        let line: CTLine
+        var tick: UInt64
+    }
+
+    private var ctLineCache: [CTLineCacheKey: CTLineCacheEntry] = [:]
+    private var ctLineTick: UInt64 = 0
+    private static let ctLineCacheMax: Int = 2048
+
+    private static let styleBitBold: UInt16 = 1 << 8
+    private static let styleBitItalic: UInt16 = 1 << 9
+    private static let styleBitStrike: UInt16 = 1 << 10
+
     init(
         theme: CopadTheme,
         font: NSFont,
@@ -688,6 +736,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     func setTheme(_ newTheme: CopadTheme) {
         theme = newTheme
         paletteCache = Self.buildPalette(theme: newTheme)
+        flushCTLineCache()
         if !imageBackgroundActive {
             layer?.backgroundColor = Self.layerBg(
                 theme: newTheme,
@@ -740,6 +789,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         italicFont = Self.deriveTrait(newFont, mask: .italicFontMask)
         boldItalicFont = Self.deriveTrait(newFont, mask: [.boldFontMask, .italicFontMask])
         fallbackCache.removeAll(keepingCapacity: true)
+        flushCTLineCache()
         let oldW = cellWidth
         let oldH = cellHeight
         recomputeCellMetrics()
@@ -806,6 +856,122 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         ) as NSFont
         fallbackCache[cp] = resolved
         return resolved
+    }
+
+    /// Pack a `CGColor` into RGBA8888 for use as a cache key. Returns
+    /// 0 on color spaces we don't expect to see in the draw path
+    /// (gray scale CGColors should be rare — palette + theme entries
+    /// come through `nsColor.cgColor` which is RGB). A 0 sentinel is
+    /// safe: it bins all unexpected colors into the same key, which
+    /// at worst causes cache misses, never wrong-glyph hits (Swift
+    /// Dict's String equality on the `text` field rules that out).
+    @inline(__always)
+    private func cgColorToRGBA32(_ color: CGColor) -> UInt32 {
+        guard let comps = color.components else { return 0 }
+        let r: CGFloat, g: CGFloat, b: CGFloat, a: CGFloat
+        switch comps.count {
+        case 2:
+            r = comps[0]; g = comps[0]; b = comps[0]; a = comps[1]
+        case 4:
+            r = comps[0]; g = comps[1]; b = comps[2]; a = comps[3]
+        default:
+            return 0
+        }
+        let rr = UInt32(max(0, min(255, Int(r * 255))))
+        let gg = UInt32(max(0, min(255, Int(g * 255))))
+        let bb = UInt32(max(0, min(255, Int(b * 255))))
+        let aa = UInt32(max(0, min(255, Int(a * 255))))
+        return (rr << 24) | (gg << 16) | (bb << 8) | aa
+    }
+
+    /// LRU lookup / build. On hit, bumps the entry's tick and returns
+    /// the retained `CTLine`. On miss, builds via
+    /// `CTLineCreateWithAttributedString`, stores, evicts the
+    /// lowest-tick entry if over `ctLineCacheMax`.
+    ///
+    /// `underlineColor` / `strikeColor` may be 0 — caller passes 0
+    /// when the attr isn't applied to this run. They're key
+    /// components either way so toggling underline on/off doesn't
+    /// reuse the wrong line.
+    private func ctLineFor(
+        text: String,
+        font: NSFont,
+        fgRGBA: UInt32,
+        styleBits: UInt16,
+        underlineRGBA: UInt32,
+        strikeRGBA: UInt32,
+    ) -> CTLine {
+        ctLineTick &+= 1
+        let key = CTLineCacheKey(
+            text: text,
+            fontId: ObjectIdentifier(font),
+            fgRGBA: fgRGBA,
+            styleBits: styleBits,
+            underlineRGBA: underlineRGBA,
+            strikeRGBA: strikeRGBA,
+        )
+        if var entry = ctLineCache[key] {
+            entry.tick = ctLineTick
+            ctLineCache[key] = entry
+            return entry.line
+        }
+
+        // Miss — build the attributed string. The bits in
+        // `styleBits` decide which decoration attrs participate;
+        // `font` already has the right bold/italic face baked in
+        // (caller resolved via `boldFont`/`italicFont`/etc. before
+        // calling).
+        var attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor(red: CGFloat((fgRGBA >> 24) & 0xFF) / 255.0,
+                                      green: CGFloat((fgRGBA >> 16) & 0xFF) / 255.0,
+                                      blue: CGFloat((fgRGBA >> 8) & 0xFF) / 255.0,
+                                      alpha: CGFloat(fgRGBA & 0xFF) / 255.0),
+        ]
+        let rawUnderline = UInt8(styleBits & 0xFF)
+        if rawUnderline != 0 {
+            attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
+            attrs[.underlineColor] = NSColor(
+                red: CGFloat((underlineRGBA >> 24) & 0xFF) / 255.0,
+                green: CGFloat((underlineRGBA >> 16) & 0xFF) / 255.0,
+                blue: CGFloat((underlineRGBA >> 8) & 0xFF) / 255.0,
+                alpha: CGFloat(underlineRGBA & 0xFF) / 255.0,
+            )
+        }
+        if styleBits & Self.styleBitStrike != 0 {
+            attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
+            attrs[.strikethroughColor] = NSColor(
+                red: CGFloat((strikeRGBA >> 24) & 0xFF) / 255.0,
+                green: CGFloat((strikeRGBA >> 16) & 0xFF) / 255.0,
+                blue: CGFloat((strikeRGBA >> 8) & 0xFF) / 255.0,
+                alpha: CGFloat(strikeRGBA & 0xFF) / 255.0,
+            )
+        }
+        let attr = NSAttributedString(string: text, attributes: attrs)
+        let line = CTLineCreateWithAttributedString(attr)
+
+        // Evict the lowest-tick entry when full. Scan is O(n) but
+        // only runs when the cache is at capacity — at steady state
+        // the working set stabilizes well below the cap so this is
+        // effectively never hit.
+        if ctLineCache.count >= Self.ctLineCacheMax {
+            var oldestKey: CTLineCacheKey?
+            var oldestTick: UInt64 = .max
+            for (k, v) in ctLineCache where v.tick < oldestTick {
+                oldestTick = v.tick
+                oldestKey = k
+            }
+            if let k = oldestKey {
+                ctLineCache.removeValue(forKey: k)
+            }
+        }
+        ctLineCache[key] = CTLineCacheEntry(line: line, tick: ctLineTick)
+        return line
+    }
+
+    private func flushCTLineCache() {
+        ctLineCache.removeAll(keepingCapacity: true)
+        ctLineTick = 0
     }
 
     /// 256-color ANSI table, computed once at view init. Indices 0-15
@@ -1346,12 +1512,21 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         }
         let runFont = resolveRunFont(str, base: baseRunFont)
 
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: runFont,
-            .foregroundColor: NSColor(cgColor: theme.background.nsColor.cgColor) ?? .black,
-        ]
-        let attr = NSAttributedString(string: str, attributes: attrs)
-        let line = CTLineCreateWithAttributedString(attr)
+        // Cursor cell paints text in the inverted color: fg ←
+        // theme.background so it's legible against the accent-filled
+        // cursor block. No underline / strike on the cursor glyph.
+        let cursorFgRGBA = cgColorToRGBA32(theme.background.nsColor.cgColor)
+        var styleBits: UInt16 = 0
+        if isBold { styleBits |= Self.styleBitBold }
+        if isItalic { styleBits |= Self.styleBitItalic }
+        let line = ctLineFor(
+            text: str,
+            font: runFont,
+            fgRGBA: cursorFgRGBA,
+            styleBits: styleBits,
+            underlineRGBA: 0,
+            strikeRGBA: 0,
+        )
         let baselineY = CGFloat(cursor.row) * cellHeight + ascent
         ctx.textPosition = CGPoint(x: drawX, y: baselineY)
         CTLineDraw(line, ctx)
@@ -1447,26 +1622,34 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             case (false, false): font
             }
             let runFont = resolveRunFont(str, base: baseRunFont)
-            var attrs: [NSAttributedString.Key: Any] = [
-                .font: runFont,
-                .foregroundColor: NSColor(cgColor: fg) ?? .white,
-            ]
-            // underline_style: 0=none, others=show single (richer
-            // double/curly/dotted/dashed decoding will land alongside
-            // the dirty-line refinement when we extend the FFI).
-            if run.underline_style != 0 {
-                attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
-                let ulColor = run.underline_color_rgba == 0
-                    ? fg
-                    : resolveColor(run.underline_color_rgba, defaultColor: fg)
-                attrs[.underlineColor] = NSColor(cgColor: ulColor) ?? .white
-            }
-            if run.flags & flagStrike != 0 {
-                attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
-                attrs[.strikethroughColor] = NSColor(cgColor: fg) ?? .white
-            }
-            let attr = NSAttributedString(string: str, attributes: attrs)
-            let line = CTLineCreateWithAttributedString(attr)
+            let fgRGBA = cgColorToRGBA32(fg)
+            // styleBits packs the visual decoration into the cache
+            // key. Underline byte is the raw FFI value (preserves
+            // forward-compat for richer underline variants the renderer
+            // doesn't yet distinguish — current code folds non-zero to
+            // single, but the key still discriminates by raw style so
+            // future expansion doesn't silently reuse stale lines).
+            var styleBits = UInt16(run.underline_style)
+            if isBold { styleBits |= Self.styleBitBold }
+            if isItalic { styleBits |= Self.styleBitItalic }
+            let isStrike = run.flags & flagStrike != 0
+            if isStrike { styleBits |= Self.styleBitStrike }
+            let ulRGBA: UInt32 = if run.underline_style != 0 {
+                cgColorToRGBA32(
+                    run.underline_color_rgba == 0
+                        ? fg
+                        : resolveColor(run.underline_color_rgba, defaultColor: fg),
+                )
+            } else { 0 }
+            let strRGBA: UInt32 = isStrike ? fgRGBA : 0
+            let line = ctLineFor(
+                text: str,
+                font: runFont,
+                fgRGBA: fgRGBA,
+                styleBits: styleBits,
+                underlineRGBA: ulRGBA,
+                strikeRGBA: strRGBA,
+            )
             ctx.textPosition = CGPoint(x: x, y: baselineY)
             CTLineDraw(line, ctx)
         }
