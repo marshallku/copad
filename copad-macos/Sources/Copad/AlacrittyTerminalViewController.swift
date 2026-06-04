@@ -1112,23 +1112,65 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         if cellHeight <= 0 { cellHeight = 16 }
     }
 
-    /// Display-link callback. Runs on the main runloop at vsync. Gated
-    /// on `takeDamage` so an idle terminal pays only the FFI bool
-    /// query (sub-microsecond) instead of a full snapshot + redraw.
+    /// Display-link callback. Runs on the main runloop at vsync.
+    /// Drains alacritty's per-row damage via `takeDamageRows` so the
+    /// view's invalidation is scoped to the rows that actually
+    /// changed — cursor blink no longer triggers an 80×24 redraw.
     /// When a TUI-driven blinking cursor is active, an additional
-    /// 2 Hz tick forces a redraw to advance the blink phase. Also
-    /// drains the OSC 52 clipboard-request queue so paste requests
-    /// from inside the terminal flow through the policy gate.
+    /// 2 Hz tick forces a single-cell repaint to advance the blink
+    /// phase. Also drains the OSC 52 clipboard-request queue so
+    /// paste requests from inside the terminal flow through the
+    /// policy gate.
     @objc private func displayLinkFired(_: CADisplayLink) {
         guard let handle = termHandle else { return }
         drainClipboardRequests(handle)
-        let damaged = handle.takeDamage()
+        let damage = handle.takeDamageRows()
         let blinkPhaseChanged = advanceBlinkPhase()
-        guard damaged || blinkPhaseChanged else { return }
-        if damaged {
+
+        // Even a no-op damage drain must capture a fresh snapshot when
+        // we're going to repaint (blink toggle still needs the latest
+        // cursor row). `takeDamageRows` already advanced the FFI's
+        // internal prev-state — recovering the snapshot here is the
+        // only side-effect we still owe.
+        switch damage {
+        case .full:
             snapshotCache = handle.snapshot()
+            needsDisplay = true
+        case let .rows(rows):
+            guard !rows.isEmpty || blinkPhaseChanged else { return }
+            snapshotCache = handle.snapshot()
+            // Always include the cursor row when the blink phase
+            // flipped this tick. Without this, a blink tick that
+            // happens to coincide with unrelated row damage would
+            // skip the cursor cell — the user-visible "blink
+            // stopped" symptom codex C1 flagged.
+            var dirty = rows
+            if blinkPhaseChanged, let cursor = snapshotCache?.cursor,
+               !dirty.contains(cursor.row)
+            {
+                dirty.append(cursor.row)
+            }
+            invalidateRows(dirty)
         }
-        needsDisplay = true
+    }
+
+    /// Convert a list of dirty viewport row indices into AppKit
+    /// `setNeedsDisplay(_:)` calls. AppKit unions the resulting dirty
+    /// rectangles automatically before the next `draw(_:)`, so
+    /// per-row calls compose into a single (possibly tight) repaint
+    /// region without explicit rect-merging on our side. Layer-backed
+    /// views preserve pixels outside the union from the backing
+    /// store — that's what makes the per-row invalidation a win.
+    private func invalidateRows(_ rows: [UInt16]) {
+        guard cellHeight > 0 else {
+            needsDisplay = true
+            return
+        }
+        let viewWidth = bounds.width
+        for row in rows {
+            let y = CGFloat(row) * cellHeight
+            setNeedsDisplay(CGRect(x: 0, y: y, width: viewWidth, height: cellHeight))
+        }
     }
 
     /// Apply the user's OSC 52 policy to any pending clipboard write
@@ -1172,13 +1214,18 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         return false
     }
 
-    override func draw(_: NSRect) {
+    override func draw(_ dirtyRect: NSRect) {
         guard let snap = snapshotCache,
               let ctx = NSGraphicsContext.current?.cgContext
         else { return }
 
         // Fill the bounds with theme background unless we're in a
-        // transparent-default-bg mode. Two modes activate it:
+        // transparent-default-bg mode. AppKit clips this context to
+        // `dirtyRect`, so `ctx.fill(bounds)` here only actually paints
+        // the dirty area — non-dirty rows keep their backing-store
+        // pixels intact (the win of layer-backed partial repaint).
+        //
+        // Two modes activate transparent bg:
         //   (a) `transparentDefaultBg && imageBackgroundActive` — image
         //       layer underneath shows through blank cells; or
         //   (b) `windowOpacity < 1.0` — Ghostty model: layer bg is
@@ -1203,8 +1250,22 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         ctx.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
         defer { ctx.restoreGState() }
 
+        // Per-row dirty intersect: skip rows whose y-band doesn't
+        // overlap the AppKit-supplied dirty rect. `cellHeight > 0`
+        // guarded so the very first paint (pre-layout) still draws
+        // every row.
         let snapRows = snap.rows
+        let useDirtyClip = cellHeight > 0
         for row in 0 ..< snapRows {
+            if useDirtyClip {
+                let rowRect = CGRect(
+                    x: 0,
+                    y: CGFloat(row) * cellHeight,
+                    width: bounds.width,
+                    height: cellHeight,
+                )
+                if !rowRect.intersects(dirtyRect) { continue }
+            }
             let runs = snap.rowRuns(row)
             let utf8 = snap.rowUtf8(row)
             guard runs.count > 0, utf8.count > 0 else { continue }

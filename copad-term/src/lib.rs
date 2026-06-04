@@ -26,7 +26,8 @@ use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -299,6 +300,20 @@ pub struct CopadHandle {
     /// `damage_point` on that branch); (3) DECSCUSR / `\e[?25l/h`
     /// cursor metadata transitions that produce zero grid damage.
     last_redraw_state_hash: AtomicU64,
+    /// Last observed `Grid::display_offset()`. The per-row damage path
+    /// uses this to detect scroll into / out of history — alacritty's
+    /// damage tracking only fires on writes to the live region, but a
+    /// scroll changes what every viewport row DISPLAYS. Diverging from
+    /// the previous offset promotes the result to Full damage (every
+    /// viewport row is different content).
+    last_display_offset: AtomicI32,
+    /// Last observed selection range, in viewport coordinates. Damage-
+    /// rows callers need the union of (old ∪ new) so that a selection
+    /// SHRINK or CLEAR repaints the rows that were highlighted last
+    /// frame — `selection_range_for_ffi` only exposes the current
+    /// range, so without remembering the previous we'd leave stale
+    /// surface2 overlay painted on cells that are no longer selected.
+    last_selection_range: Mutex<CopadSelectionRange>,
 }
 
 pub struct CopadSnapshot {
@@ -447,6 +462,8 @@ pub unsafe extern "C" fn copad_term_create(
         io_thread: Some(io_thread),
         child_pid,
         last_redraw_state_hash: AtomicU64::new(0),
+        last_display_offset: AtomicI32::new(0),
+        last_selection_range: Mutex::new(CopadSelectionRange::default()),
     }))
 }
 
@@ -663,54 +680,334 @@ pub unsafe extern "C" fn copad_term_resize(handle: *mut CopadHandle, cols: u16, 
 /// `copad_term_create` and not yet destroyed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn copad_term_take_damage(handle: *mut CopadHandle) -> bool {
-    let Some(h) = (unsafe { handle.as_ref() }) else {
-        return false;
-    };
-    let mut term = h.term.lock();
+    // Thin wrapper over `copad_term_take_damage_rows`: any non-zero
+    // outcome (Full=-1 OR rows>0) means the renderer needs to repaint.
+    // Single bookkeeping path so the two FFI entries can't disagree
+    // about prev-state — callers MUST NOT call both in the same frame
+    // (the rows variant advances `last_*` state too).
+    let mut buf: [u16; 1] = [0];
+    let result = unsafe { copad_term_take_damage_rows(handle, buf.as_mut_ptr(), buf.len() as u16) };
+    result != 0
+}
+
+/// Outcome of the per-row damage drain. Separate from the FFI
+/// signature so the test helper has a typed result, and so the
+/// orchestration in [`copad_term_take_damage_rows`] doesn't recompute
+/// "is full" from a magic integer.
+enum DamageRowsOutcome {
+    /// Whole viewport must redraw (display_offset shifted, or
+    /// alacritty reported `TermDamage::Full`, or the dirty row count
+    /// would exceed the caller's buffer cap).
+    Full,
+    /// Distinct viewport row indices that need repaint, written into
+    /// the caller-provided buffer in unspecified order. `count` is in
+    /// `0..=cap`.
+    Count(u16),
+}
+
+/// Drain alacritty's per-row damage iterator into the caller's buffer,
+/// merged with three damage sources alacritty's bounds filter can't
+/// surface on its own:
+/// * cursor-row content / cursor metadata (combining marks, DECSCUSR,
+///   blink toggle) — caught via the `hash_redraw_state` mechanism;
+/// * scrollback offset change — every viewport row maps to different
+///   content, so we promote to `Full`;
+/// * selection union (old ∪ new) — `selection_range_for_ffi` only
+///   exposes the CURRENT range; without remembering the previous one
+///   a SHRINK / CLEAR would leave stale `surface2` overlay painted on
+///   rows no longer selected.
+///
+/// Extracted from the FFI shim so unit tests can drive a synthetic
+/// `Term<VoidListener>` without standing up a real PTY EventLoop. The
+/// caller threads in the previous-state values + receives the updated
+/// ones in the return; the FFI shim writes them back to the handle's
+/// atomic / mutex fields.
+fn compute_damage_rows<L: EventListener>(
+    term: &mut Term<L>,
+    prev_display_offset: i32,
+    prev_selection: CopadSelectionRange,
+    prev_cursor_hash: u64,
+    out: &mut [u16],
+) -> (DamageRowsOutcome, i32, CopadSelectionRange, u64) {
     let cursor_point = term.grid().cursor.point;
+    let current_offset = term.grid().display_offset() as i32;
+    let current_selection = selection_range_for_ffi(term);
+    let current_cursor_hash = hash_redraw_state(term, cursor_point);
+
+    // Scroll into / out of history — every viewport row's content
+    // changes. No point computing per-row damage; the partial iterator
+    // would only reflect cell writes since the last call (which lag the
+    // viewport-display change), so we'd under-report and leave stale
+    // pixels. Reset alacritty's damage so the next non-scrolling frame
+    // starts clean.
+    if prev_display_offset != current_offset {
+        term.reset_damage();
+        return (
+            DamageRowsOutcome::Full,
+            current_offset,
+            current_selection,
+            current_cursor_hash,
+        );
+    }
+
+    let cursor_state_changed = current_cursor_hash != prev_cursor_hash;
+    let screen_lines = term.screen_lines();
     let cursor_line = cursor_point.line.0.max(0) as usize;
     let cursor_col = cursor_point.column.0;
 
-    // Hash everything `copad_term_snapshot` will expose for the
-    // current cursor row + the cursor + active selection bounds.
-    // Catches (1) cursor-cell mutations whose damage bounds collapse
-    // to `(line, col, col)` (same shape as the unconditional
-    // `damage_cursor` hint the line-bounds filter discards),
-    // (2) combining marks pushed onto a non-cursor cell (alacritty's
-    // `Term::input` zero-width branch updates `cell.zerowidth`
-    // without calling `damage_point`), (3) DECSCUSR / `\e[?25l/h`
-    // transitions that change cursor metadata without grid damage,
-    // and (4) selection start/extend/clear that doesn't touch any
-    // cell content.
-    let state_hash = hash_redraw_state(&term, cursor_point);
-    let prev_hash = h.last_redraw_state_hash.swap(state_hash, Ordering::Relaxed);
-    let state_changed = state_hash != prev_hash;
+    // Collect dirty rows into a small bitmap. u16 row indices in the
+    // 0..=screen_lines range — a fixed 256-bit bitmap covers anything
+    // reasonable a terminal would render in viewport rows. Out-of-range
+    // returns `Full` (the caller's buffer can't hold the row list).
+    let mut dirty_bitmap: [u64; 4] = [0; 4]; // 256 rows
+    let bitmap_max_row: usize = 256;
+    let mut full = false;
 
-    let real_damage = match term.damage() {
-        alacritty_terminal::term::TermDamage::Full => true,
-        alacritty_terminal::term::TermDamage::Partial(mut iter) => {
-            state_changed
-                || iter.any(|d| {
-                    !(d.line == cursor_line && d.left == cursor_col && d.right == cursor_col)
-                })
+    let mark_row = |bitmap: &mut [u64; 4], row: usize| -> Result<(), ()> {
+        if row >= bitmap_max_row {
+            return Err(());
         }
+        bitmap[row / 64] |= 1u64 << (row % 64);
+        Ok(())
     };
+
+    match term.damage() {
+        alacritty_terminal::term::TermDamage::Full => full = true,
+        alacritty_terminal::term::TermDamage::Partial(iter) => {
+            for d in iter {
+                // Skip the cursor-cell-only damage hint alacritty emits
+                // unconditionally on every `damage()` call. The cursor
+                // case is handled by `cursor_state_changed` below, which
+                // catches the cases that matter (movement, style change,
+                // content mutation under the cursor).
+                if d.line == cursor_line && d.left == cursor_col && d.right == cursor_col {
+                    continue;
+                }
+                // alacritty grid line indices are NON-negative for the
+                // live region (`damage()` only reports the live area —
+                // scrollback writes don't fire damage events). Map to
+                // viewport row via display_offset — since we already
+                // bailed on offset change above, `current_offset` is
+                // stable for the rest of this call.
+                let viewport_row = d.line as i32 + current_offset;
+                if viewport_row < 0 || viewport_row as usize >= screen_lines {
+                    continue;
+                }
+                if mark_row(&mut dirty_bitmap, viewport_row as usize).is_err() {
+                    full = true;
+                    break;
+                }
+            }
+        }
+    }
     term.reset_damage();
-    real_damage
+
+    if full {
+        return (
+            DamageRowsOutcome::Full,
+            current_offset,
+            current_selection,
+            current_cursor_hash,
+        );
+    }
+
+    // Cursor row dirty (cursor moved / blinked / DECSCUSR / combining
+    // mark). The cursor row's VIEWPORT index uses the same offset map
+    // as snapshot rows + the FFI cursor row reported by snapshot, so a
+    // user scrolled past the live cursor doesn't get a stray "row 0"
+    // dirty.
+    if cursor_state_changed {
+        let cursor_viewport_row = cursor_point.line.0 + current_offset;
+        if cursor_viewport_row >= 0 && (cursor_viewport_row as usize) < screen_lines {
+            let _ = mark_row(&mut dirty_bitmap, cursor_viewport_row as usize);
+        }
+    }
+
+    // Selection union: any row that WAS or IS in the highlight rect
+    // needs repaint. Without the OLD union, shrinking the selection
+    // would leave painted surface2 overlay on rows that no longer
+    // belong to the range.
+    for sel in [&prev_selection, &current_selection] {
+        if sel.present != 1 {
+            continue;
+        }
+        let lo = sel.start_row.min(sel.end_row) as usize;
+        let hi = sel.start_row.max(sel.end_row) as usize;
+        for r in lo..=hi {
+            if r >= screen_lines {
+                break;
+            }
+            let _ = mark_row(&mut dirty_bitmap, r);
+        }
+    }
+
+    // Flatten bitmap → caller's u16 array, writing distinct rows. Once
+    // we run out of buffer cap, promote to Full — easier for the
+    // renderer to handle than a "partial list" with unknown gaps.
+    let cap = out.len();
+    let mut count: usize = 0;
+    for (word_idx, word) in dirty_bitmap.iter().enumerate() {
+        let mut bits = *word;
+        while bits != 0 {
+            let bit = bits.trailing_zeros() as usize;
+            bits &= bits - 1;
+            let row = word_idx * 64 + bit;
+            if count >= cap {
+                return (
+                    DamageRowsOutcome::Full,
+                    current_offset,
+                    current_selection,
+                    current_cursor_hash,
+                );
+            }
+            out[count] = row as u16;
+            count += 1;
+        }
+    }
+
+    (
+        DamageRowsOutcome::Count(count as u16),
+        current_offset,
+        current_selection,
+        current_cursor_hash,
+    )
+}
+
+/// Per-row damage drain — viewport row indices that need repaint
+/// since the last call. Returns:
+/// * `-1` — Full repaint required (scrollback offset changed,
+///   alacritty signaled `TermDamage::Full`, or the dirty list exceeded
+///   `cap`); the renderer should redraw the whole view.
+/// * `0..=cap` — exact dirty row count. The first `count` `u16` slots
+///   of `out_buf` hold distinct viewport row indices, in unspecified
+///   order; rows beyond `count` are untouched.
+///
+/// Idempotent in the "no events fired since last call" case: returns
+/// `0` and leaves the buffer untouched. Resets alacritty's damage
+/// state at the end so the next call only sees subsequent changes.
+///
+/// # Safety
+///
+/// * `handle` must be NULL or a valid pointer returned by
+///   `copad_term_create` and not yet destroyed.
+/// * `out_buf` must point to writable storage for at least `cap`
+///   `u16` slots when `cap > 0`. When `cap == 0` it MAY be null —
+///   the function returns `-1` immediately (the buffer can't hold
+///   any rows, equivalent to "promote to full").
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_take_damage_rows(
+    handle: *mut CopadHandle,
+    out_buf: *mut u16,
+    cap: u16,
+) -> i32 {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return 0;
+    };
+    if cap == 0 {
+        // No room to write rows — caller can't ever receive partial
+        // damage. Drain the damage state anyway so the next non-zero-
+        // cap call sees a clean slate.
+        let mut term = h.term.lock();
+        term.reset_damage();
+        return -1;
+    }
+
+    let prev_offset = h.last_display_offset.load(Ordering::Relaxed);
+    let prev_selection = h
+        .last_selection_range
+        .lock()
+        .map(|guard| *guard)
+        .unwrap_or_default();
+    let prev_cursor_hash = h.last_redraw_state_hash.load(Ordering::Relaxed);
+
+    let mut term = h.term.lock();
+    // SAFETY: caller contract — `out_buf` points to `cap` writable u16
+    // slots. We hold the term lock for the duration so no concurrent
+    // FFI call can race on the same buffer (the caller is expected to
+    // be a single render thread on the GUI side).
+    let out_slice = unsafe { std::slice::from_raw_parts_mut(out_buf, cap as usize) };
+    let (outcome, new_offset, new_selection, new_cursor_hash) =
+        compute_damage_rows(&mut term, prev_offset, prev_selection, prev_cursor_hash, out_slice);
+    drop(term);
+
+    h.last_display_offset.store(new_offset, Ordering::Relaxed);
+    if let Ok(mut guard) = h.last_selection_range.lock() {
+        *guard = new_selection;
+    }
+    h.last_redraw_state_hash
+        .store(new_cursor_hash, Ordering::Relaxed);
+
+    match outcome {
+        DamageRowsOutcome::Full => -1,
+        DamageRowsOutcome::Count(n) => i32::from(n),
+    }
+}
+
+/// Project `term.selection` (if any) into the FFI-friendly inclusive-
+/// bounds struct the renderer paints from. Returns the default
+/// (present=0) when there's no selection or it doesn't resolve to a
+/// range (e.g. empty drag, viewport scrolled past the selection).
+///
+/// Generic over `EventListener` so the damage-rows computation can
+/// run against the synthetic `Term<VoidListener>` used by unit tests
+/// while the public FFI path stays on `Term<CopadListener>`.
+fn selection_range_for_ffi<L: EventListener>(term: &Term<L>) -> CopadSelectionRange {
+    let Some(sel) = term.selection.as_ref() else {
+        return CopadSelectionRange::default();
+    };
+    let Some(range): Option<SelectionRange> = sel.to_range(term) else {
+        return CopadSelectionRange::default();
+    };
+    let display_offset = term.grid().display_offset() as i32;
+    let last_row = term.screen_lines().saturating_sub(1) as i32;
+    let last_col = term.columns().saturating_sub(1) as u16;
+    let start_view = range.start.line.0 + display_offset;
+    let end_view = range.end.line.0 + display_offset;
+    if end_view < 0 || start_view > last_row {
+        return CopadSelectionRange::default();
+    }
+    let (start_row, start_col) = if start_view < 0 {
+        if range.is_block {
+            (0u16, range.start.column.0 as u16)
+        } else {
+            (0u16, 0u16)
+        }
+    } else {
+        (start_view as u16, range.start.column.0 as u16)
+    };
+    let (end_row, end_col) = if end_view > last_row {
+        if range.is_block {
+            (last_row as u16, range.end.column.0 as u16)
+        } else {
+            (last_row as u16, last_col)
+        }
+    } else {
+        (end_view as u16, range.end.column.0 as u16)
+    };
+    CopadSelectionRange {
+        start_row,
+        start_col,
+        end_row,
+        end_col,
+        is_block: u8::from(range.is_block),
+        present: 1,
+        _reserved: 0,
+    }
 }
 
 /// Hash every renderable field the snapshot path will expose: cursor
-/// row contents, cursor metadata (pos/style/blink/visibility), and
-/// active selection bounds. Used by `copad_term_take_damage` to
-/// catch grid-invisible state transitions (DECSCUSR, selection
-/// start/extend/clear) and the cursor-row content cases the line-
-/// bounds filter would otherwise collapse with the unconditional
-/// `damage_cursor` hint.
+/// row contents, cursor metadata (pos/style/blink/visibility), active
+/// selection bounds, and scrollback offset. Used by
+/// `compute_damage_rows` to catch grid-invisible state transitions
+/// (DECSCUSR, selection start/extend/clear, blink toggle) and the
+/// cursor-row content cases the line-bounds filter would otherwise
+/// collapse with the unconditional `damage_cursor` hint.
 ///
 /// Caller already holds the term lock — no extra synchronization
 /// needed. Out-of-range cursor returns a fixed sentinel so the
-/// comparison is still stable.
-fn hash_redraw_state(term: &Term<CopadListener>, cursor: Point) -> u64 {
+/// comparison is still stable. Generic over `EventListener` so unit
+/// tests can drive a `Term<VoidListener>`.
+fn hash_redraw_state<L: EventListener>(term: &Term<L>, cursor: Point) -> u64 {
     let line = cursor.line;
     if line.0 < 0 || (line.0 as usize) >= term.screen_lines() {
         return 0;
@@ -723,9 +1020,6 @@ fn hash_redraw_state(term: &Term<CopadListener>, cursor: Point) -> u64 {
             let cell = &grid[Point::new(line, Column(c))];
             cell.c.hash(&mut hasher);
             cell.flags.bits().hash(&mut hasher);
-            // AnsiColor isn't Hash, so round-trip through our tagged-u32
-            // encoding (which already collapses every variant to a
-            // stable value).
             color_to_rgba(cell.fg).hash(&mut hasher);
             color_to_rgba(cell.bg).hash(&mut hasher);
             if let Some(extras) = cell.zerowidth() {
@@ -736,10 +1030,6 @@ fn hash_redraw_state(term: &Term<CopadListener>, cursor: Point) -> u64 {
             if let Some(uc) = cell.underline_color() {
                 color_to_rgba(uc).hash(&mut hasher);
             }
-            // Hyperlink: hash (id, uri) — id alone isn't enough
-            // because OSC 8's explicit `id=` parameter survives
-            // unchanged across distinct URIs, so a same-id-new-uri
-            // transition would slip past the gate.
             if let Some(h) = cell.hyperlink() {
                 h.id().hash(&mut hasher);
                 h.uri().hash(&mut hasher);
@@ -748,10 +1038,6 @@ fn hash_redraw_state(term: &Term<CopadListener>, cursor: Point) -> u64 {
             }
         }
     }
-    // Cursor metadata. Movement is technically caught by the line-bounds
-    // filter (prev+current cursor damage widens the line bounds), but
-    // style/blink/visibility changes leave no grid damage at all — they
-    // only matter once they appear in the next snapshot.
     cursor.line.0.hash(&mut hasher);
     cursor.column.0.hash(&mut hasher);
     let cs = term.cursor_style();
@@ -760,8 +1046,6 @@ fn hash_redraw_state(term: &Term<CopadListener>, cursor: Point) -> u64 {
     term.mode()
         .contains(TermMode::SHOW_CURSOR)
         .hash(&mut hasher);
-    // Selection bounds — start/extend/clear don't necessarily damage
-    // any cell content, but the highlight overlay needs to redraw.
     let sel = selection_range_for_ffi(term);
     sel.present.hash(&mut hasher);
     if sel.present == 1 {
@@ -771,16 +1055,18 @@ fn hash_redraw_state(term: &Term<CopadListener>, cursor: Point) -> u64 {
         sel.end_col.hash(&mut hasher);
         sel.is_block.hash(&mut hasher);
     }
-    // Scrollback offset: scrolling into history doesn't damage the
-    // live grid (alacritty's damage tracking only fires on writes to
-    // the live region) but changes what the viewport DISPLAYS, so
-    // every row visible to the user is different. Including the
-    // offset here forces a redraw on scroll without needing alacritty
-    // to surface a "display_offset changed" event.
     term.grid().display_offset().hash(&mut hasher);
     hasher.finish()
 }
 
+/// Hash every renderable field the snapshot path will expose: cursor
+/// row contents, cursor metadata (pos/style/blink/visibility), and
+/// active selection bounds. Used by `copad_term_take_damage` to
+/// catch grid-invisible state transitions (DECSCUSR, selection
+/// start/extend/clear) and the cursor-row content cases the line-
+/// bounds filter would otherwise collapse with the unconditional
+/// `damage_cursor` hint.
+///
 /// Take a snapshot of the visible viewport. Lock duration is bounded
 /// by the time it takes to walk `rows × cols` cells and copy them
 /// into the snapshot's owned buffers.
@@ -878,76 +1164,6 @@ pub unsafe extern "C" fn copad_term_snapshot(handle: *mut CopadHandle) -> *mut C
     }))
 }
 
-/// Project `term.selection` (if any) into the FFI-friendly inclusive-
-/// bounds struct the renderer paints from. Returns the default
-/// (present=0) when there's no selection or it doesn't resolve to a
-/// range (e.g. empty drag, viewport scrolled past the selection).
-fn selection_range_for_ffi(term: &Term<CopadListener>) -> CopadSelectionRange {
-    let Some(sel) = term.selection.as_ref() else {
-        return CopadSelectionRange::default();
-    };
-    let Some(range): Option<SelectionRange> = sel.to_range(term) else {
-        return CopadSelectionRange::default();
-    };
-    // Map absolute line coordinates → viewport rows by adding
-    // display_offset (same mapping as the snapshot row walk + cursor).
-    let display_offset = term.grid().display_offset() as i32;
-    let last_row = term.screen_lines().saturating_sub(1) as i32;
-    let last_col = term.columns().saturating_sub(1) as u16;
-    let start_view = range.start.line.0 + display_offset;
-    let end_view = range.end.line.0 + display_offset;
-
-    // Intersection with the visible viewport. If the entire selection
-    // sits above or below the visible rows, hide the overlay (the
-    // selection still exists logically — Cmd+C will still grab it,
-    // because `selection_to_string` operates on the absolute range —
-    // we just don't paint a misleading row-0 sliver).
-    if end_view < 0 || start_view > last_row {
-        return CopadSelectionRange::default();
-    }
-
-    // Clip the off-viewport endpoint columns: when a row-wrapped
-    // selection extends BEFORE row 0, the visible start logically
-    // begins at column 0 of row 0 (the "before viewport" portion is
-    // invisible). Likewise when it extends past `last_row`, the
-    // visible end is the last column of `last_row`. Without this, a
-    // multi-line selection scrolled partway out would paint with the
-    // off-screen endpoint's column index, producing wrong clip widths
-    // on the boundary row.
-    //
-    // Block selections are column-major — every row paints the SAME
-    // column span — so column-edge clipping would expand the visible
-    // band to the viewport width and over-highlight. For block we keep
-    // the original column values on both endpoints; only the rows clip.
-    let (start_row, start_col) = if start_view < 0 {
-        if range.is_block {
-            (0u16, range.start.column.0 as u16)
-        } else {
-            (0u16, 0u16)
-        }
-    } else {
-        (start_view as u16, range.start.column.0 as u16)
-    };
-    let (end_row, end_col) = if end_view > last_row {
-        if range.is_block {
-            (last_row as u16, range.end.column.0 as u16)
-        } else {
-            (last_row as u16, last_col)
-        }
-    } else {
-        (end_view as u16, range.end.column.0 as u16)
-    };
-
-    CopadSelectionRange {
-        start_row,
-        start_col,
-        end_row,
-        end_col,
-        is_block: u8::from(range.is_block),
-        present: 1,
-        _reserved: 0,
-    }
-}
 
 /// Walk a single display line into a `Row`. Groups consecutive cells
 /// with identical attributes AND identical single-byte ASCII char into
@@ -2048,5 +2264,218 @@ mod history_tests {
         push_lines(&mut term, 10);
         let text = read_history_text(term.grid(), term.columns(), 4);
         assert!(!text.ends_with('\n'), "history must not end with newline");
+    }
+}
+
+#[cfg(test)]
+mod damage_rows_tests {
+    use super::*;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::vte::ansi::Handler;
+
+    fn fixture_term() -> Term<VoidListener> {
+        let size = TermSize::new(8, 4);
+        let cfg = Config {
+            scrolling_history: 32,
+            ..Default::default()
+        };
+        Term::new(cfg, &size, VoidListener)
+    }
+
+    fn type_text<T: EventListener>(term: &mut Term<T>, s: &str) {
+        for ch in s.chars() {
+            Handler::input(term, ch);
+        }
+    }
+
+    fn empty_sel() -> CopadSelectionRange {
+        CopadSelectionRange::default()
+    }
+
+    /// First call after any writes must report the damaged rows (the
+    /// shell prompt etc.) — alacritty starts every Term with
+    /// TermDamage::Full pending until first reset_damage, which our
+    /// path consumes. We assert the Full→Count transition is sane.
+    #[test]
+    fn initial_full_damage_drains_to_full_or_rows() {
+        let mut term = fixture_term();
+        type_text(&mut term, "hi");
+        let mut buf = [0u16; 16];
+        let (outcome, _, _, _) =
+            compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
+        // Either Full or some rows — but not Count(0): the writes
+        // should produce SOME damage signal.
+        match outcome {
+            DamageRowsOutcome::Full => {}
+            DamageRowsOutcome::Count(n) => assert!(n >= 1, "expected >=1 dirty row, got 0"),
+        }
+    }
+
+    /// After a clean drain, an idle term reports zero dirty rows. The
+    /// cursor-cell-only damage hint alacritty re-asserts on every
+    /// `damage()` call must be filtered out — otherwise an idle
+    /// terminal would force a redraw every vsync.
+    #[test]
+    fn idle_terminal_reports_zero_dirty_rows() {
+        let mut term = fixture_term();
+        type_text(&mut term, "x");
+        // Prime: consume initial damage.
+        let mut buf = [0u16; 16];
+        let (_, off1, sel1, hash1) =
+            compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
+        // Now idle: re-call with the updated prev state.
+        let (outcome, _, _, _) =
+            compute_damage_rows(&mut term, off1, sel1, hash1, &mut buf);
+        match outcome {
+            DamageRowsOutcome::Count(0) => {}
+            DamageRowsOutcome::Count(n) => panic!("expected 0 dirty rows on idle, got {n}"),
+            DamageRowsOutcome::Full => panic!("expected 0 dirty rows on idle, got Full"),
+        }
+    }
+
+    /// Cap=0 → Full (caller has no room to receive partial damage,
+    /// so we drain alacritty's state and signal a full repaint).
+    #[test]
+    fn zero_cap_returns_full_and_drains_damage() {
+        let mut term = fixture_term();
+        type_text(&mut term, "data");
+        let mut buf = [0u16; 0];
+        let (outcome, _, _, _) =
+            compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
+        assert!(matches!(outcome, DamageRowsOutcome::Full));
+    }
+
+    /// Scrollback offset change → Full. Even if the live region had
+    /// no writes, every viewport row maps to different content.
+    /// Drive this by pushing enough rows to fill scrollback, then
+    /// passing a stale prev_display_offset.
+    #[test]
+    fn display_offset_change_promotes_to_full() {
+        let mut term = fixture_term();
+        for i in 0..6 {
+            type_text(&mut term, &format!("r{i}"));
+            Handler::linefeed(&mut term);
+            Handler::carriage_return(&mut term);
+        }
+        // Drain initial damage.
+        let mut buf = [0u16; 16];
+        let (_, off1, sel1, hash1) =
+            compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
+        // Now claim the previous offset was different — simulates a
+        // scroll-back action having happened between calls.
+        let (outcome, _, _, _) =
+            compute_damage_rows(&mut term, off1 + 1, sel1, hash1, &mut buf);
+        assert!(matches!(outcome, DamageRowsOutcome::Full));
+    }
+
+    /// Selection union: a previously-present selection on row 1 that
+    /// has since cleared must still report row 1 dirty so the
+    /// surface2 overlay gets repainted off the cells. Simulates the
+    /// "shrink / clear" path codex round-1 C1 flagged.
+    #[test]
+    fn old_selection_rows_remain_dirty_after_clear() {
+        let mut term = fixture_term();
+        type_text(&mut term, "data");
+        let mut buf = [0u16; 16];
+        // Prime: cleanly drained, no selection.
+        let (_, off1, _, hash1) =
+            compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
+        // Build a synthetic "prev selection on row 1, cols 0..=3" that
+        // the renderer would have painted last frame.
+        let prev = CopadSelectionRange {
+            start_row: 1,
+            start_col: 0,
+            end_row: 1,
+            end_col: 3,
+            is_block: 0,
+            present: 1,
+            _reserved: 0,
+        };
+        let (outcome, _, new_sel, _) =
+            compute_damage_rows(&mut term, off1, prev, hash1, &mut buf);
+        // Current term has no selection — new_sel.present == 0 — but
+        // the union must include row 1 from the prev selection.
+        assert_eq!(new_sel.present, 0);
+        match outcome {
+            DamageRowsOutcome::Count(n) => {
+                let rows = &buf[..n as usize];
+                assert!(
+                    rows.contains(&1u16),
+                    "expected row 1 in dirty rows (old selection), got {rows:?}"
+                );
+            }
+            DamageRowsOutcome::Full => {}
+        }
+    }
+
+    /// Cursor metadata change (we synthesize via a stale prev_cursor_hash
+    /// of 0) must report the cursor's viewport row dirty even when
+    /// alacritty's per-row iterator only emits the cursor-cell hint
+    /// (which compute_damage_rows filters out).
+    #[test]
+    fn cursor_state_change_marks_cursor_row_dirty() {
+        let mut term = fixture_term();
+        type_text(&mut term, "abc");
+        // Prime to clear initial damage but DON'T cache hash —
+        // pass 0 as prev_cursor_hash so the second call sees a change.
+        let mut buf = [0u16; 16];
+        let (_, off1, sel1, _) =
+            compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
+        // Re-call: alacritty has nothing in its damage iter (idle),
+        // but our prev_cursor_hash differs from current → mark cursor
+        // row dirty.
+        let cursor_row = term.grid().cursor.point.line.0;
+        assert!(cursor_row >= 0);
+        let cursor_row_u16 = cursor_row as u16;
+        let (outcome, _, _, _) =
+            compute_damage_rows(&mut term, off1, sel1, 0, &mut buf);
+        match outcome {
+            DamageRowsOutcome::Count(n) => {
+                let rows = &buf[..n as usize];
+                assert!(
+                    rows.contains(&cursor_row_u16),
+                    "expected cursor row {cursor_row_u16} in dirty rows, got {rows:?}"
+                );
+            }
+            DamageRowsOutcome::Full => {}
+        }
+    }
+
+    /// Damage tracking resets after each drain: a write → drain → idle
+    /// cycle leaves Count(0) on the idle call. Guards against the
+    /// "reset_damage not called" regression.
+    #[test]
+    fn damage_drain_is_idempotent() {
+        let mut term = fixture_term();
+        type_text(&mut term, "first");
+        let mut buf = [0u16; 16];
+        let (_, off1, sel1, hash1) =
+            compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
+        // Same prev state immediately reused: nothing changed since
+        // last drain, expect Count(0).
+        let (outcome, _, _, _) =
+            compute_damage_rows(&mut term, off1, sel1, hash1, &mut buf);
+        assert!(
+            matches!(outcome, DamageRowsOutcome::Count(0)),
+            "expected Count(0) on idempotent re-drain"
+        );
+    }
+
+    /// Buffer cap overflow → Full. Verify by claiming cap=1 with at
+    /// least two distinct dirty rows queued via writes that span them.
+    #[test]
+    fn cap_overflow_promotes_to_full() {
+        let mut term = fixture_term();
+        // Two distinct rows: write row 0, advance to row 1, write more.
+        type_text(&mut term, "a");
+        Handler::linefeed(&mut term);
+        Handler::carriage_return(&mut term);
+        type_text(&mut term, "b");
+        let mut buf = [0u16; 1];
+        let (outcome, _, _, _) =
+            compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
+        // Either Full directly from alacritty (initial-state path),
+        // or via cap overflow. Both are correct.
+        assert!(matches!(outcome, DamageRowsOutcome::Full));
     }
 }

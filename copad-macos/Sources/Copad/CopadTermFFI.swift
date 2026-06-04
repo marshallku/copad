@@ -120,9 +120,59 @@ enum CopadTermFFI {
         /// True if the terminal grid has any damage since the previous
         /// call (and resets the internal damage state). False means
         /// nothing changed — renderer can skip the snapshot + draw.
+        ///
+        /// Thin wrapper over `takeDamageRows`. Callers should pick ONE
+        /// of the two per frame — calling both per frame would advance
+        /// the FFI's prev-state twice, leaving the second call to
+        /// observe state the first just consumed.
         func takeDamage() -> Bool {
             guard let ptr else { return false }
             return copad_term_take_damage(ptr)
+        }
+
+        /// Outcome of a per-row damage drain. `.full` means redraw the
+        /// whole view (display_offset shifted, alacritty signaled Full,
+        /// or the dirty row count exceeded the buffer cap). `.rows`
+        /// carries distinct viewport row indices in unspecified order;
+        /// empty rows array == nothing changed.
+        enum DamageResult {
+            case rows([UInt16])
+            case full
+        }
+
+        /// Per-row damage. Allocates a small stack-bounded buffer
+        /// (`cap` rows) and copies the dirty row list out. Returns
+        /// `.rows([])` for the idle case, `.full` for the catch-all
+        /// promotion. Resets alacritty's damage state on every call.
+        func takeDamageRows(cap: UInt16 = 256) -> DamageResult {
+            guard let ptr else { return .rows([]) }
+            // `cap == 0` is supported by the Rust side as
+            // "drain-and-promote-to-Full" — caller can't receive any
+            // rows but we still want to consume alacritty's damage
+            // state so the next non-zero call sees a clean slate.
+            // Route through the FFI explicitly with a null buffer
+            // since a 0-element `ContiguousArray` has no baseAddress
+            // and would otherwise skip the FFI altogether.
+            if cap == 0 {
+                _ = copad_term_take_damage_rows(ptr, nil, 0)
+                return .full
+            }
+            // `cap` is a u16 in the FFI; 256 is plenty for any
+            // practical viewport. ContiguousArray to keep the storage
+            // contiguous + avoid Swift Array's COW noise on each call.
+            var buf = ContiguousArray<UInt16>(repeating: 0, count: Int(cap))
+            let result = buf.withUnsafeMutableBufferPointer { bp -> Int32 in
+                guard let base = bp.baseAddress else { return -1 }
+                return copad_term_take_damage_rows(ptr, base, cap)
+            }
+            if result < 0 {
+                return .full
+            }
+            let count = Int(result)
+            if count == 0 {
+                return .rows([])
+            }
+            return .rows(Array(buf.prefix(count)))
         }
 
         // MARK: - Selection

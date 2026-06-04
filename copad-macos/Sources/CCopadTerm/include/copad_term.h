@@ -124,7 +124,29 @@ void copad_term_resize(CopadHandle* handle, uint16_t cols, uint16_t rows);
 // Returns true if the grid has any pending damage since the last call;
 // always resets internal damage state. Intended for CADisplayLink-driven
 // renderers to skip work when nothing changed.
+//
+// Thin wrapper over `copad_term_take_damage_rows` — callers MUST NOT
+// invoke both per frame (the rows variant advances the same internal
+// prev-state, so two calls would observe each other's writes).
 bool copad_term_take_damage(CopadHandle* handle);
+
+// Per-row damage drain — viewport row indices that need repaint since
+// the last call. Returns:
+//   * -1 — Full repaint required (scrollback offset changed, alacritty
+//          signaled TermDamage::Full, OR the dirty list would exceed
+//          `cap`); renderer should redraw the whole view.
+//   * 0..=cap — exact dirty row count. The first `count` slots of
+//          `out_buf` hold distinct viewport row indices, in unspecified
+//          order; rows beyond `count` are untouched.
+// Resets alacritty's damage state every call so the next invocation
+// only sees subsequent changes.
+//
+// `out_buf` must point to writable storage for at least `cap` uint16_t
+// slots when `cap > 0`; with `cap == 0` it MAY be null and the function
+// returns -1 immediately.
+int32_t copad_term_take_damage_rows(CopadHandle* handle,
+                                     uint16_t* out_buf,
+                                     uint16_t cap);
 
 // --- Snapshot ---
 
