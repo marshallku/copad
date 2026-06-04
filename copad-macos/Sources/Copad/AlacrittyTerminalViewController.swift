@@ -722,6 +722,14 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         wantsLayer = true
         layer?.backgroundColor = Self.layerBg(theme: theme, opacity: windowOpacity, imageActive: false)
         recomputeCellMetrics()
+        // Accept the three drop shapes a terminal cares about:
+        //   - .fileURL — Finder, any app exporting a file URL. Single
+        //     or multi-select both arrive as one drop with N URLs.
+        //   - .png/.tiff — raw image bytes (browser drag, screenshot
+        //     buffer, NSImage drag). Materialized to a temp file so the
+        //     paste delivers a path the running CLI can read.
+        //   - .URL — non-file URLs (web links). Pasted as text.
+        registerForDraggedTypes([.fileURL, .png, .tiff, .URL])
         // CADisplayLink can't be created until the view has a window
         // (the link binds to the display showing the view). Hooked up
         // in `viewDidMoveToWindow`.
@@ -2184,6 +2192,143 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             h.input([0x1B, 0x5B, 0x32, 0x30, 0x31, 0x7E]) // ESC [ 2 0 1 ~
         } else {
             h.input(bytes)
+        }
+    }
+
+    // MARK: - Drag-drop
+
+    /// Signal that we'll accept the drag — required for AppKit to
+    /// emit `performDragOperation`. `.copy` matches user intent: we're
+    /// pasting a path / saving an image, not "moving" anything.
+    override func draggingEntered(_: NSDraggingInfo) -> NSDragOperation {
+        .copy
+    }
+
+    /// Materialize the dropped pasteboard into a single shell-quoted
+    /// text payload and route it through the standard paste path
+    /// (`sendPaste` already handles bracketed-paste mode +
+    /// `terminal.output` event publication).
+    ///
+    /// Three drop shapes, in priority order:
+    ///   1. File URLs (Finder, multi-select, any app exporting files):
+    ///      shell-quoted absolute paths joined by spaces.
+    ///   2. Raw image bytes (browser drag, screenshot buffer, NSImage
+    ///      drag): saved as PNG to `~/Library/Caches/copad/drops/`,
+    ///      then the saved path is pasted.
+    ///   3. Web URLs: pasted as bare text.
+    ///
+    /// Returning `false` falls back to AppKit's "drop rejected"
+    /// animation — used when the pasteboard had nothing usable.
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        let pb = sender.draggingPasteboard
+
+        // Priority 1: file URLs. `readObjects` with
+        // `urlReadingFileURLsOnly` filters out web URLs so they fall
+        // through to priority 3 below — that's the right precedence
+        // because Finder always exports `.fileURL` alongside `.URL`
+        // and we want the local path, not the `file://` URL string.
+        if let fileURLs = pb.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true],
+        ) as? [URL], !fileURLs.isEmpty {
+            let quoted = fileURLs.map { Self.shellQuote($0.path) }.joined(separator: " ")
+            sendPaste(quoted)
+            return true
+        }
+
+        // Priority 2: raw image bytes. PNG first since browsers tend
+        // to export it directly; TIFF as fallback because NSImage drag
+        // (from Preview, screenshot buffer at Cmd+Shift+4 +Ctrl) lands
+        // as `.tiff`. Both paths normalize to PNG on disk so callers
+        // don't fork on format.
+        let imageData = pb.data(forType: .png) ?? pb.data(forType: .tiff)
+        if let data = imageData,
+           let path = saveDroppedImage(data, prefersPng: pb.data(forType: .png) != nil)
+        {
+            sendPaste(Self.shellQuote(path))
+            return true
+        }
+
+        // Priority 3: non-file URLs (web links). Pasted as text so the
+        // shell / CLI receiving it can decide what to do (curl,
+        // browser open, Claude Code ingestion, etc.).
+        if let urls = pb.readObjects(forClasses: [NSURL.self], options: nil) as? [URL],
+           let url = urls.first
+        {
+            sendPaste(url.absoluteString)
+            return true
+        }
+
+        return false
+    }
+
+    /// POSIX single-quote escape: every `'` becomes `'\''` and the
+    /// whole string is wrapped in `'...'`. Safe for any shell-
+    /// interpreted character (spaces, `$`, backticks, glob chars).
+    /// Empty string round-trips as `''`.
+    private static func shellQuote(_ s: String) -> String {
+        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// Convert a TIFF/PNG byte blob to PNG and save under
+    /// `~/Library/Caches/copad/drops/<timestamp>-<n>.png`. Returns
+    /// the absolute path on success, `nil` if either the directory
+    /// can't be created or PNG re-encoding fails (rare — only
+    /// happens with malformed image data).
+    ///
+    /// `prefersPng = true` means the input is already PNG and we
+    /// could write the bytes directly. We re-encode anyway so the
+    /// on-disk file always carries the `.png` extension that matches
+    /// its format (avoids `.tiff`-extension confusion if the user
+    /// inspects the cache later).
+    private func saveDroppedImage(_ data: Data, prefersPng: Bool) -> String? {
+        _ = prefersPng // routed through the same encoder either way
+        guard let dir = Self.dropsCacheDir() else { return nil }
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd-HHmmss"
+        let stamp = formatter.string(from: Date())
+        // Add a random 4-hex suffix so back-to-back drops in the same
+        // second don't collide on the same filename.
+        let suffix = String(format: "%04x", UInt32.random(in: 0 ... 0xFFFF))
+        let filename = "\(stamp)-\(suffix).png"
+        let url = dir.appendingPathComponent(filename)
+
+        guard let image = NSImage(data: data),
+              let tiff = image.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:])
+        else {
+            return nil
+        }
+        do {
+            try png.write(to: url, options: .atomic)
+            return url.path
+        } catch {
+            FileHandle.standardError.write(
+                Data("[copad] drag-drop: failed to write \(url.path): \(error)\n".utf8),
+            )
+            return nil
+        }
+    }
+
+    /// `~/Library/Caches/copad/drops/` — created lazily on first
+    /// drop. `nil` only if the FileManager refuses to create the
+    /// directory (read-only home, etc.), which is rare enough we
+    /// just log + give up the drop.
+    private static func dropsCacheDir() -> URL? {
+        let fm = FileManager.default
+        guard let caches = fm.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+            return nil
+        }
+        let dir = caches.appendingPathComponent("copad/drops", isDirectory: true)
+        do {
+            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            return dir
+        } catch {
+            FileHandle.standardError.write(
+                Data("[copad] drag-drop: failed to create \(dir.path): \(error)\n".utf8),
+            )
+            return nil
         }
     }
 
