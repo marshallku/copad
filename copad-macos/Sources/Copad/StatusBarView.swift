@@ -11,12 +11,10 @@ import Foundation
 ///
 /// macOS-specific simplifications vs Linux:
 ///
-/// - No CSS hot-reload. Theme colors applied once at view-build time. If the
-///   user changes themes the bar will pick up new colors on `applyTheme`
-///   (called by AppDelegate's hot-reload path; not yet wired).
-/// - Position support is `bottom` only. Linux supports both — top requires
-///   reshuffling around the tab bar layout we already do in `TabViewController`.
-///   Defer until somebody asks.
+/// - No CSS hot-reload primitive. Theme colors are applied imperatively
+///   via `applyTheme(_:)` from the config-reload path. `applyTheme` updates
+///   the bar bg, the 1px separator, and every module label's text color.
+///   Module-level CSS classes still ignored (see below).
 /// - Module CSS class (`module.class`) ignored. Linux uses GTK CSS to scope
 ///   per-module styling; we don't have a clean macOS equivalent without
 ///   reaching for `NSAttributedString` per module. Module authors that want
@@ -32,6 +30,9 @@ final class StatusBarView: NSView {
     /// (push from plugin instead of poll) can target a specific module.
     /// Not used yet; kept so the API doesn't have to change later.
     private var labels: [String: NSTextField] = [:]
+    /// Retained so `applyTheme` can re-color it. Without this we'd have to
+    /// walk `subviews` and identify the separator by frame/size — fragile.
+    private let separator = NSView()
 
     /// Backing store for `isHidden` so `statusbar.show/hide/toggle` reads
     /// stay consistent with what we set, even if AppKit's accessor races
@@ -53,7 +54,6 @@ final class StatusBarView: NSView {
         // 1px top edge so the bar visibly separates from the content above
         // even when the surface0/background contrast is low (Catppuccin
         // Mocha they're nearly the same shade).
-        let separator = NSView()
         separator.translatesAutoresizingMaskIntoConstraints = false
         separator.wantsLayer = true
         separator.layer?.backgroundColor = theme.overlay0.nsColor.cgColor
@@ -160,11 +160,29 @@ final class StatusBarView: NSView {
 
     /// Hot-reload: `[window] opacity` and/or theme change. Recolors
     /// the bar bg with the alpha-tinted surface so the bar still reads
-    /// as chrome but lets the desktop / blur bleed through.
+    /// as chrome but lets the desktop / blur bleed through. Routes
+    /// through `applyTheme` so the separator and module labels also
+    /// pick up the new colors.
     func applyWindowOpacity(_ opacity: Double, theme: CopadTheme) {
-        self.theme = theme
         windowOpacity = opacity
-        layer?.backgroundColor = Self.barBg(theme: theme, opacity: opacity)
+        applyTheme(theme)
+    }
+
+    /// Hot-reload theme. Refreshes everything color-derived:
+    ///   - bar bg layer (respects current `windowOpacity`)
+    ///   - 1px separator
+    ///   - every module label's text color
+    /// Module label *contents* are owned by `StatusModuleRunner` and
+    /// the next poll/event overwrites whatever's there; only the
+    /// color attribute is sticky from `loadModules`, so that's what
+    /// we need to re-stamp here.
+    func applyTheme(_ newTheme: CopadTheme) {
+        theme = newTheme
+        layer?.backgroundColor = Self.barBg(theme: newTheme, opacity: windowOpacity)
+        separator.layer?.backgroundColor = newTheme.overlay0.nsColor.cgColor
+        for label in labels.values {
+            label.textColor = newTheme.text.nsColor
+        }
     }
 
     private static func barBg(theme: CopadTheme, opacity: Double) -> CGColor {
