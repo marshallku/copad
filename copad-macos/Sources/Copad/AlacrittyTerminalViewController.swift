@@ -178,12 +178,22 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
             self?.handleFindAction(action)
         }
         bar.isHidden = true
+        // Use Auto Layout for the bar's outer placement so the
+        // bottom-anchor is unambiguous regardless of the parent's
+        // `isFlipped` setting. Manual frame + autoresizing was
+        // unreliable: depending on the autoresizing/flip
+        // combination, the bar could end up at the wrong edge.
+        bar.translatesAutoresizingMaskIntoConstraints = false
         container.addSubview(bar)
         findBar = bar
-        // Lay out against the local `container` — `self.view` isn't
-        // assigned until the next line, and reading `view` here would
-        // re-enter `loadView`.
-        layoutFindBar(in: container)
+        let barMargin: CGFloat = 8
+        let barHeight: CGFloat = 32
+        NSLayoutConstraint.activate([
+            bar.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: barMargin),
+            bar.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -barMargin),
+            bar.bottomAnchor.constraint(equalTo: container.bottomAnchor, constant: -barMargin),
+            bar.heightAnchor.constraint(equalToConstant: barHeight),
+        ])
 
         view = container
 
@@ -283,7 +293,6 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         guard let bar = findBar else { return }
         if bar.isHidden {
             bar.isHidden = false
-            layoutFindBar()
             bar.focusSearchField()
             // Re-apply the existing query if user re-opens the bar
             // (keeps the highlight on what they were last finding).
@@ -359,30 +368,6 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         case .close:
             closeFindBar()
         }
-    }
-
-    /// Apply the bar's frame inside the given parent view. Call
-    /// `layoutFindBar(in: container)` during `loadView` (before
-    /// `self.view` is assigned) and the no-arg `layoutFindBar()`
-    /// from any post-load reflow path (theme apply, resize) where
-    /// `self.view` is safe to read.
-    private func layoutFindBar(in parent: NSView) {
-        guard let bar = findBar else { return }
-        let height: CGFloat = 32
-        let margin: CGFloat = 8
-        let w = parent.bounds.width - margin * 2
-        // Container is unflipped AppKit coords (y=0 is bottom). Pin
-        // the bar near the bottom of the pane, full-width minus
-        // margins. `.maxYMargin` lets the space ABOVE the bar grow
-        // when the parent grows, keeping the bar anchored at bottom.
-        bar.frame = NSRect(x: margin, y: margin, width: max(0, w), height: height)
-        bar.autoresizingMask = [.width, .maxYMargin]
-    }
-
-    private func layoutFindBar() {
-        // Safe entry point for post-load callers — `self.view` is
-        // assigned and stable here.
-        layoutFindBar(in: view)
     }
 
     /// Config hot-reload: swap the font family/size on a running pane.
@@ -2982,8 +2967,16 @@ private final class FindBar: NSView, NSTextFieldDelegate {
         textField.stringValue
     }
 
+    /// Authoritative case-sensitive state. Tracked separately from
+    /// `NSButton.state` because the borderless `.accessoryBar` style
+    /// gives no obvious click feedback — `setButtonType(.toggle)`
+    /// toggles `.state` but the button doesn't render any visible
+    /// "pressed" indicator without a border, so users would click
+    /// without knowing whether it landed. `updateCaseButtonAppearance`
+    /// repaints the title in the accent color when active.
+    private var caseSensitiveState: Bool = false
     var caseSensitive: Bool {
-        caseButton.state == .on
+        caseSensitiveState
     }
 
     init(theme: CopadTheme, onAction: @escaping (Action) -> Void) {
@@ -3011,8 +3004,8 @@ private final class FindBar: NSView, NSTextFieldDelegate {
             btn.font = NSFont.systemFont(ofSize: 12)
             btn.target = self
         }
-        caseButton.setButtonType(.toggle)
-        caseButton.toolTip = "Case sensitive"
+        caseButton.toolTip = "Case sensitive (Aa)"
+        updateCaseButtonAppearance()
         prevButton.toolTip = "Previous match (Shift+Enter)"
         nextButton.toolTip = "Next match (Enter)"
         closeButton.toolTip = "Close (Esc)"
@@ -3069,7 +3062,25 @@ private final class FindBar: NSView, NSTextFieldDelegate {
     }
 
     @objc private func caseTapped() {
+        caseSensitiveState.toggle()
+        updateCaseButtonAppearance()
         onAction(.caseToggle)
+    }
+
+    /// Repaint the "Aa" title to make the toggle state obvious. We
+    /// can't use `NSButton.state` for this because borderless buttons
+    /// show no built-in pressed indicator; coloring the glyph in the
+    /// accent color when active is the clearest signal at our 32-pt
+    /// bar height.
+    private func updateCaseButtonAppearance() {
+        let color: NSColor = caseSensitiveState
+            ? .controlAccentColor
+            : .secondaryLabelColor
+        let attrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: color,
+            .font: NSFont.boldSystemFont(ofSize: 12),
+        ]
+        caseButton.attributedTitle = NSAttributedString(string: "Aa", attributes: attrs)
     }
 
     @objc private func closeTapped() {
