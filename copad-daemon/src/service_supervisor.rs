@@ -574,7 +574,8 @@ impl ServiceSupervisor {
         // pdeathsig only fires correctly because every fork happens on
         // the long-lived `copad-spawner` thread (set up in `new`).
         // macOS has no equivalent — `shutdown_all` is the only path
-        // there.
+        // there, plus the orphan-sweep at next launch that uses the
+        // pid file written below.
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::process::CommandExt;
@@ -601,6 +602,26 @@ impl ServiceSupervisor {
                 });
             }
         }
+        // macOS: no PDEATHSIG. Put the child in its own process group
+        // (pgid == child pid) so `shutdown_all` can `killpg` the
+        // entire group, reaching plugin grandchildren too. Combined
+        // with the post-spawn pid-file write + `sweep_orphan_pids`
+        // at startup, SIGKILL of the daemon stops leaking orphan
+        // plugin processes between sessions.
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: `setpgid` is async-signal-safe and only mutates
+            // the calling (post-fork, pre-exec) process's pgid.
+            unsafe {
+                cmd.pre_exec(|| {
+                    if libc::setpgid(0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
         let mut child = cmd.spawn().map_err(|e| ResponseError {
             code: "spawn_failed".into(),
             message: format!(
@@ -613,6 +634,16 @@ impl ServiceSupervisor {
 
         let pid = child.id();
         *handle.child_pid.lock().unwrap() = Some(pid);
+        // macOS-only: write the pid (== pgid post `setpgid(0,0)`) to
+        // a per-service file under the state dir. `sweep_orphan_pids`
+        // at next launch reads these to find and kill plugin process
+        // groups left behind by a SIGKILL'd or panicked daemon. Linux
+        // doesn't need this — PDEATHSIG already covers the parent-died
+        // case. Best-effort: a write failure logs but doesn't abort
+        // the spawn, since the only downside is a one-time orphan on
+        // an out-of-band daemon death.
+        #[cfg(target_os = "macos")]
+        write_pid_file(&handle.plugin_name, &handle.service_name, pid);
 
         let stdin = child
             .stdin
@@ -676,7 +707,10 @@ impl ServiceSupervisor {
                 // doesn't accumulate as an orphaned process across
                 // restart attempts. The wait thread will pick up the
                 // exit and run `handle_exit` cleanly afterwards.
-                kill_child(pid);
+                // macOS: also SIGKILL the whole pgroup + remove pid
+                // file so grandchildren of a misbehaving init don't
+                // survive and the next-launch sweep stays clean.
+                kill_service_group(pid, &handle.plugin_name, &handle.service_name);
                 // `service_unavailable` matches the documented protocol
                 // error code (docs/service-plugins.md "During Starting,
                 // requests for the service are buffered… If the service
@@ -700,14 +734,16 @@ impl ServiceSupervisor {
         };
 
         if !response.ok {
-            kill_child(pid);
+            kill_service_group(pid, &handle.plugin_name, &handle.service_name);
             return Err(response.error.unwrap_or_else(|| ResponseError {
                 code: "init_failed".into(),
                 message: "service rejected initialize".into(),
             }));
         }
+        let plugin_name = handle.plugin_name.clone();
+        let service_name = handle.service_name.clone();
         let result = response.result.ok_or_else(|| {
-            kill_child(pid);
+            kill_service_group(pid, &plugin_name, &service_name);
             ResponseError {
                 code: "init_failed".into(),
                 message: "init response missing result".into(),
@@ -1374,14 +1410,146 @@ impl ServiceSupervisor {
         }
 
         // SIGTERM-handler grace — joining the spawner just fired
-        // pdeathsig SIGTERM on every survivor.
+        // pdeathsig SIGTERM on every Linux survivor. On macOS we
+        // explicitly killpg(SIGTERM) here, then 200ms wait, then
+        // SIGKILL the leader (or whole group on macOS) below.
+        #[cfg(target_os = "macos")]
+        {
+            for handle in &services {
+                if let Some(pid) = *handle.child_pid.lock().unwrap() {
+                    killpg_signal(pid, libc::SIGTERM);
+                }
+            }
+        }
         thread::sleep(Duration::from_millis(200));
 
         for handle in &services {
             if let Some(pid) = *handle.child_pid.lock().unwrap() {
-                kill_child(pid);
+                kill_service_group(pid, &handle.plugin_name, &handle.service_name);
             }
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn pid_files_dir() -> std::path::PathBuf {
+    copad_core::paths::state_dir().join("plugin-pids")
+}
+
+#[cfg(target_os = "macos")]
+fn pid_file_path(plugin: &str, service: &str) -> std::path::PathBuf {
+    // `<plugin>.<service>.pid`. service is typically `main`; the
+    // filename is intentionally flat (no subdirs) to keep the sweep
+    // a single readdir.
+    pid_files_dir().join(format!("{plugin}.{service}.pid"))
+}
+
+#[cfg(target_os = "macos")]
+fn write_pid_file(plugin: &str, service: &str, pid: u32) {
+    let dir = pid_files_dir();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log::warn!("[copad] pid-file dir create failed ({}): {e}", dir.display());
+        return;
+    }
+    let path = pid_file_path(plugin, service);
+    if let Err(e) = std::fs::write(&path, pid.to_string()) {
+        log::warn!("[copad] pid-file write failed ({}): {e}", path.display());
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn remove_pid_file(plugin: &str, service: &str) {
+    let path = pid_file_path(plugin, service);
+    if let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        log::warn!("[copad] pid-file remove failed ({}): {e}", path.display());
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn killpg_signal(pid: u32, sig: libc::c_int) {
+    // SAFETY: `killpg` only requires a pgid and signal; we passed
+    // `setpgid(0, 0)` post-fork so child pid == pgid. Signal goes to
+    // every process in the group including plugin grandchildren.
+    unsafe {
+        libc::killpg(pid as libc::pid_t, sig);
+    }
+}
+
+/// macOS-only: at supervisor startup, walk the pid-files dir and
+/// kill any process group whose pid file references a still-living
+/// pgid. A live orphan here is by definition NOT owned by us (we
+/// haven't started spawning yet), so it must be a leftover from a
+/// SIGKILL'd or panicked prior daemon run — safe to terminate.
+/// Files are removed regardless of whether the pgid was alive.
+#[cfg(target_os = "macos")]
+pub fn sweep_orphan_pids() {
+    sweep_orphan_pids_in(&pid_files_dir());
+}
+
+/// Inner implementation that takes an explicit dir — `sweep_orphan_pids`
+/// is the production caller. Lifted out so tests can isolate via a
+/// per-test temp dir without racing on `env::set_var("HOME", ...)`.
+#[cfg(target_os = "macos")]
+fn sweep_orphan_pids_in(dir: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut swept = 0u32;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("pid") {
+            continue;
+        }
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(pid) = content.trim().parse::<i32>() else {
+            let _ = std::fs::remove_file(&path);
+            continue;
+        };
+        // Defensive: a malformed file containing `0` (or a negative)
+        // would otherwise turn `kill(-pid, 0)` into `kill(0, 0)`,
+        // which targets the DAEMON'S OWN process group, and the
+        // followup `killpg(0, SIGTERM)` would actually signal us.
+        // Treat any non-positive pid as garbage, remove the file,
+        // and move on.
+        if pid <= 0 {
+            log::warn!(
+                "[copad] orphan pid file {} contains non-positive pid {pid}; removing",
+                path.display()
+            );
+            let _ = std::fs::remove_file(&path);
+            continue;
+        }
+        // `kill(-pgid, 0)` returns 0 if the group has any live
+        // member, -1 otherwise. We negate `pid` to address the
+        // pgid since `setpgid(0, 0)` made pid == pgid for the
+        // plugin's leader.
+        let alive = unsafe { libc::kill(-pid, 0) } == 0;
+        if alive {
+            log::warn!(
+                "[copad] orphan plugin pgid {pid} from {} — sending SIGTERM then SIGKILL",
+                path.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("?")
+            );
+            unsafe {
+                libc::killpg(pid, libc::SIGTERM);
+            }
+            // Short grace then force-kill — orphans don't get to
+            // negotiate. 200ms matches `shutdown_all`'s rhythm.
+            std::thread::sleep(Duration::from_millis(200));
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+            swept += 1;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    if swept > 0 {
+        log::info!("[copad] swept {swept} orphan plugin process group(s)");
     }
 }
 
@@ -1435,7 +1603,7 @@ fn spawner_loop(sup: Weak<ServiceSupervisor>, rx: Receiver<SpawnRequest>) {
                 "[copad] service {} spawned during shutdown; killing pid {pid}",
                 handle.fq_name()
             );
-            kill_child(pid);
+            kill_service_group(pid, &handle.plugin_name, &handle.service_name);
         }
     }
 }
@@ -1550,6 +1718,28 @@ fn kill_child(pid: u32) {
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGKILL);
     }
+}
+
+/// Symmetric kill+cleanup for a single plugin service.
+/// - macOS: `killpg(SIGKILL)` to catch grandchildren in the same
+///   pgroup the spawn-time `setpgid(0,0)` established, then the
+///   per-service pid file is removed so the next-launch
+///   `sweep_orphan_pids` doesn't see a stale (dead-pgid) entry that
+///   takes a startup tick to GC anyway.
+/// - Linux: just `kill_child` — PDEATHSIG handles grandchildren
+///   transitively at parent exit, and no pid file was ever written.
+///
+/// Used by every macOS init-failure and shutdown-race path so the
+/// cleanup is consistent. The normal `shutdown_all` flow does the
+/// SIGTERM grace + SIGKILL + remove_pid_file inline (mirrors this
+/// helper but interleaves a 200ms wait between SIGTERM and SIGKILL).
+fn kill_service_group(pid: u32, _plugin: &str, _service: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        killpg_signal(pid, libc::SIGKILL);
+        remove_pid_file(_plugin, _service);
+    }
+    kill_child(pid);
 }
 
 fn resolve_exec(plugin_dir: &Path, exec: &str) -> PathBuf {
@@ -2069,5 +2259,122 @@ mod tests {
             let d = b.next_delay();
             assert!(d <= BACKOFF_CAP);
         }
+    }
+
+    /// macOS-only: dead-pgid + malformed-content + non-.pid branches.
+    /// Live-orphan kill path is covered by
+    /// `sweep_kills_live_orphan_pgid` below.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sweep_removes_pid_file_for_dead_pgid_and_malformed() {
+        // Use a temp HOME so the sweep walks an isolated dir.
+        let tmp = std::env::temp_dir().join(format!(
+            "copad-sweep-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let pids_dir = tmp.join("plugin-pids");
+        std::fs::create_dir_all(&pids_dir).unwrap();
+        // Dead pgid: 999999 — almost certainly not assigned, kill(0)
+        // returns ESRCH, sweep removes file.
+        let dead_path = pids_dir.join("ghost.main.pid");
+        std::fs::write(&dead_path, "999999").unwrap();
+        // Malformed: non-numeric content, sweep removes file silently.
+        let bad_path = pids_dir.join("malformed.main.pid");
+        std::fs::write(&bad_path, "not-a-pid").unwrap();
+        // Non-pid extension: sweep ignores entirely (left behind).
+        let leave_path = pids_dir.join("README.txt");
+        std::fs::write(&leave_path, "doc").unwrap();
+
+        super::sweep_orphan_pids_in(&pids_dir);
+
+        assert!(!dead_path.exists(), "dead-pgid pid file should be removed");
+        assert!(!bad_path.exists(), "malformed pid file should be removed");
+        assert!(leave_path.exists(), "non-.pid file should be ignored");
+
+        // C1 defense: pid file containing 0 or a negative pid must
+        // not turn the sweep into a `killpg(0, SIGTERM)` self-signal.
+        // The file is removed and the daemon process group is left
+        // untouched.
+        let zero_path = pids_dir.join("zero.main.pid");
+        std::fs::write(&zero_path, "0").unwrap();
+        let neg_path = pids_dir.join("neg.main.pid");
+        std::fs::write(&neg_path, "-42").unwrap();
+        super::sweep_orphan_pids_in(&pids_dir);
+        assert!(!zero_path.exists(), "zero-pid file should be removed without signaling");
+        assert!(!neg_path.exists(), "negative-pid file should be removed without signaling");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// macOS-only: spawn a real `sleep` child in its own process
+    /// group, write its pid to a pid file, run sweep, assert the
+    /// child was killed and the file was removed. Covers the
+    /// `kill(-pgid, 0) == 0` branch — the one that actually matters
+    /// for orphan cleanup after a SIGKILL'd daemon.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sweep_kills_live_orphan_pgid() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Command;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "copad-sweep-live-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let pids_dir = tmp.join("plugin-pids");
+        std::fs::create_dir_all(&pids_dir).unwrap();
+
+        // Spawn `sleep 60` in its own pgroup so the sweep's
+        // `kill(-pgid, ...)` targets a real, isolated process.
+        let mut cmd = Command::new("sleep");
+        cmd.arg("60");
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id() as i32;
+
+        // Wait a beat for the pgid to settle.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            unsafe { libc::kill(-pid, 0) },
+            0,
+            "pre-sweep: sleep's pgroup should be alive"
+        );
+
+        let pid_file = pids_dir.join("orphan-test.main.pid");
+        std::fs::write(&pid_file, pid.to_string()).unwrap();
+
+        super::sweep_orphan_pids_in(&pids_dir);
+
+        // 200ms grace (per sweep impl) + small buffer for SIGKILL to
+        // land + the child to be reaped.
+        std::thread::sleep(Duration::from_millis(400));
+        // After sweep + SIGKILL, the pgroup should be dead.
+        let still_alive = unsafe { libc::kill(-pid, 0) } == 0;
+        assert!(!still_alive, "post-sweep: orphan pgroup should be killed");
+        assert!(!pid_file.exists(), "pid file should be removed after sweep");
+
+        // Reap the zombie via Child::wait so the Child handle's
+        // lifetime is clean (satisfies clippy::zombie_processes and
+        // gives us a reaped status to inspect).
+        let _ = child.wait();
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -180,6 +180,15 @@ fn main() -> ExitCode {
         }
     };
 
+    // macOS-only: kill any plugin process groups still alive from a
+    // prior daemon run that exited without `shutdown_all` (panic /
+    // SIGKILL). No-op on Linux, where PDEATHSIG already cleaned them
+    // up at parent death. Runs BEFORE the supervisor spawns its own
+    // plugins so we don't accidentally kill a freshly-spawned child
+    // that recycled an old pid.
+    #[cfg(target_os = "macos")]
+    copad_daemon::service_supervisor::sweep_orphan_pids();
+
     let supervisor_guard: Arc<ServiceSupervisor> =
         activate_supervisor(&actions, &event_bus, &plugins, socket_path.clone());
 
