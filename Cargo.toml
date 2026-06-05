@@ -20,6 +20,7 @@ members = [
     "plugins/docs",
     "plugins/web-bridge",
     "plugins/pilot",
+    "plugins/claude",
 ]
 
 [workspace.package]

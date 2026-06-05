@@ -821,6 +821,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "copad-plugin-claude"
+version = "0.2.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "copad-plugin-discord"
 version = "0.2.0"
 dependencies = [

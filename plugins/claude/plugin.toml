@@ -1,0 +1,21 @@
+[plugin]
+name = "claude"
+title = "Claude Code State Plugin"
+version = "0.1.0"
+description = "Surfaces Claude Code session / handoff / dirty state to triggers and tooling. Read-only — does not modify any ~/.claude files."
+
+[[services]]
+name = "main"
+exec = "copad-plugin-claude"
+# Lazy: state queries are rare (triggers, monitor panel pulls). No
+# point keeping the process alive while idle. Supervisor spawns on
+# first matching action call.
+activation = "onAction:claude.*"
+restart = "on-crash"
+provides = [
+    "claude.session_state",
+    "claude.list_dirty",
+    "claude.last_handoff",
+    "claude.list_sessions",
+]
+subscribes = []
