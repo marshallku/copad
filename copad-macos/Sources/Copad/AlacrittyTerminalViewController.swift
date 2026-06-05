@@ -1926,9 +1926,10 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// `set mouse=a`, `less`, `htop`, tmux with `set -g mouse on`,
     /// …), the click/drag goes to the TUI — Shift held overrides so
     /// the user can still grab text into the host selection.
-    /// Forwarding (`forwardMouseEvent`) covers wheel + press/release +
-    /// drag-with-button-held; bare-cursor MOTION-level forwarding
-    /// (`\e[?1003h`) is not wired yet — rare in practice, deferred.
+    /// Forwarding (`forwardMouseEvent`) covers wheel, press/release,
+    /// drag-with-button-held, and bare-cursor motion at the MOTION
+    /// (`\e[?1003h`) level (see `mouseMoved(with:)` + the tracking-
+    /// area install in `updateTrackingAreas`).
     private func shouldHandleAsSelection(_ event: NSEvent) -> Bool {
         if event.modifierFlags.contains(.shift) { return true }
         return !(termHandle?.mouseModeActive ?? false)
@@ -2042,6 +2043,44 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         case .drag, .motion: true
         case .none, .click: false
         }
+    }
+
+    /// MOTION-level reporting (`\e[?1003h`) — TUI subscribed to ALL
+    /// motion, including bare cursor moves with no button held. AppKit
+    /// doesn't deliver `mouseMoved` to a view by default; we install
+    /// a tracking area + accept the moved-events stream once and gate
+    /// per-event in the handler so the area itself doesn't have to
+    /// thrash as the TUI flips between modes. `inVisibleRect` keeps
+    /// the area in sync with the layer-backed render view's bounds
+    /// across resizes without us having to recompute on viewDidLayout.
+    private var motionTrackingArea: NSTrackingArea?
+
+    /// Required for `mouseMoved` to fire even before the user clicks.
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let area = motionTrackingArea {
+            removeTrackingArea(area)
+        }
+        let area = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil,
+        )
+        addTrackingArea(area)
+        motionTrackingArea = area
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        // Gate at handler time, not tracking-area install time, so
+        // a TUI flipping from `.motion` to `.click` and back doesn't
+        // thrash the area. Bare motion only reports when the TUI
+        // explicitly subscribed via `\e[?1003h`.
+        if termHandle?.mouseReportLevel == .motion {
+            forwardMouseEvent(event: event, button: 3, kind: .motion)
+            return
+        }
+        super.mouseMoved(with: event)
     }
 
     override func mouseDown(with event: NSEvent) {
