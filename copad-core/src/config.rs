@@ -60,6 +60,15 @@ pub struct TerminalConfig {
 
     #[serde(default = "default_font_size")]
     pub font_size: u32,
+
+    /// When the PTY child (typically the user's shell) exits, close
+    /// the owning pane → cascade up to tab + window if it was the
+    /// last pane / tab. `false` keeps the dead-PTY viewport visible
+    /// so the user can read the exit message; they must close the
+    /// pane manually (Cmd+W / Ctrl+Shift+W). Default `true` matches
+    /// the long-standing Linux behavior pre-config.
+    #[serde(default = "default_true")]
+    pub close_on_exit: bool,
 }
 
 impl Default for TerminalConfig {
@@ -68,6 +77,7 @@ impl Default for TerminalConfig {
             shell: default_shell(),
             font_family: default_font_family(),
             font_size: default_font_size(),
+            close_on_exit: true,
         }
     }
 }
@@ -411,6 +421,33 @@ mod tests {
         let path = dir.join("does-not-exist.toml");
         let cfg = CopadConfig::load_from(&path).expect("load");
         assert!(cfg.triggers.is_empty());
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn terminal_close_on_exit_defaults_true() {
+        let cfg = CopadConfig::default();
+        assert!(
+            cfg.terminal.close_on_exit,
+            "default must close pane on shell exit — matches long-standing Linux behavior pre-opt-out"
+        );
+    }
+
+    #[test]
+    fn load_from_parses_terminal_close_on_exit_false() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[terminal]
+close_on_exit = false
+"#,
+        )
+        .expect("write");
+        let cfg = CopadConfig::load_from(&path).expect("load");
+        assert!(!cfg.terminal.close_on_exit);
+        std::fs::remove_file(&path).ok();
         std::fs::remove_dir(&dir).ok();
     }
 

@@ -810,4 +810,4 @@ coctl ──Unix socket──► SocketServer (background thread)
 ## 알려진 주의사항
 
 - **`NSSplitView` subview layout**: NSSplitView의 직접 자식은 `translatesAutoresizingMaskIntoConstraints = true` + `autoresizingMask = [.width, .height]`를 써야 합니다. Auto Layout을 사용하면 NSSplitView와 충돌합니다.
-- **alacritty 자동 pane close 없음**: shell이 exit하면 `panel.exited` 이벤트는 발행되지만 (Phase 10b commit에 추가된 `copad_term_take_child_exit` FFI 경유), 화면에서 pane을 자동으로 닫지는 않음 — 사용자가 Cmd+W로 명시적 close 필요. dead-PTY viewport는 그대로 남음.
+- **`[terminal] close_on_exit`**: shell이 exit (Ctrl+D, `exit`, parent killed)하면 pane을 자동으로 닫고 → 마지막 pane이면 탭 → 마지막 탭이면 윈도우까지 cascading close. 기본 `true` (Linux의 오래된 동작과 동일). `false`로 두면 `panel.exited`만 broadcast하고 dead-PTY viewport를 그대로 두므로 사용자가 exit 메시지를 읽고 Cmd+W로 직접 닫을 수 있음. macOS 경로: `AlacrittyRenderView.drainChildExit` → `onChildExited` 콜백 → `PaneManager.closePanel` → `TabViewController.onLastPaneClosed` → `closeTab(at:)`. Linux는 `tabs.rs::handle_panel_exit`에서 broadcast 후 같은 config 키로 게이트.

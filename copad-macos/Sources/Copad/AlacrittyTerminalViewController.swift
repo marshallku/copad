@@ -47,6 +47,12 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         didSet { renderView?.eventBus = eventBus }
     }
 
+    /// Set by `PaneManager.wirePanel` so the pane closes when its PTY
+    /// child exits (gated on `[terminal] close_on_exit`). Passes
+    /// `self` so PaneManager can locate the leaf in the split tree
+    /// without an identity comparison on `panelID`.
+    var onChildExited: ((any CopadPanel) -> Void)?
+
     /// v1 cwd snapshot for session persistence. Only reflects the
     /// startup cwd passed at construction — the alacritty backend
     /// doesn't surface OSC 7 / cwd_changed yet (alacritty_terminal as
@@ -160,6 +166,10 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         // forwards subsequent assignments.
         render.panelID = panelID
         render.eventBus = eventBus
+        render.onChildExited = { [weak self] in
+            guard let self else { return }
+            onChildExited?(self)
+        }
         renderView = render
 
         // Find bar — hidden by default. Anchored at the bottom of the
@@ -617,6 +627,14 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// forwards subsequent assignments so PaneManager's late wiring
     /// reaches the render view too.
     weak var eventBus: EventBus?
+
+    /// Fires once when the PTY child (shell) exits — the VC sets this
+    /// to forward to `AlacrittyTerminalViewController.onChildExited`,
+    /// which PaneManager wires to a close cascade when
+    /// `[terminal] close_on_exit` is true. `nil` ⇒ silently do
+    /// nothing (test-only render views, panels constructed before
+    /// VC wiring).
+    var onChildExited: (() -> Void)?
 
     /// User opt-in: when true AND an image background is active, default
     /// (sentinel-zero) cells render without a bg fill so the image shows
@@ -1276,13 +1294,16 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
 
     /// Drain alacritty's child-exit latch — when the PTY child
     /// (shell) terminates, broadcast `panel.exited` so copad-core's
-    /// ContextService clears per-panel cwd/active state. Matches the
-    /// cross-platform contract the SwiftTerm path used to honor via
-    /// `processTerminated`. Fires at most once per Term lifetime;
-    /// repeated polls after the first return false.
+    /// ContextService clears per-panel cwd/active state, then invoke
+    /// the optional `onChildExited` hook so the owning VC can close
+    /// the pane (gated on `[terminal] close_on_exit`). Matches Linux's
+    /// `connect_child_exited` → `handle_panel_exit` order. Fires at
+    /// most once per Term lifetime; repeated polls after the first
+    /// return false.
     private func drainChildExit(_ handle: CopadTermFFI.Handle) {
         guard handle.takeChildExit() else { return }
         eventBus?.broadcast(event: "panel.exited", data: ["panel_id": panelID])
+        onChildExited?()
     }
 
     /// Toggle the cursor visibility once per `blinkInterval` whenever

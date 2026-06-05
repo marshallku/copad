@@ -207,7 +207,18 @@ final class PaneManager {
     }
 
     func closeActive() {
-        let closing = activePane
+        closePanel(activePane)
+    }
+
+    /// Close a specific pane (Cmd+W via `closeActive`, or auto-close
+    /// from `[terminal] close_on_exit` when a shell terminates in any
+    /// pane — not necessarily the active one). When the closed pane
+    /// was the last leaf, fires `onLastPaneClosed` so TabViewController
+    /// can drop the tab (and the window if it was the last tab).
+    /// When a non-active pane closes, the active pane keeps focus —
+    /// only an active-pane close transfers focus to a sibling.
+    func closePanel(_ closing: any CopadPanel) {
+        let closingActive = ObjectIdentifier(closing as AnyObject) == ObjectIdentifier(activePane as AnyObject)
         guard let newRoot = root.removing(closing) else {
             closing.view.removeFromSuperview()
             closing.removeFromParent()
@@ -220,9 +231,13 @@ final class PaneManager {
         closing.removeFromParent()
         rebuildViewHierarchy()
 
-        let next = root.allLeaves().first!
-        setActive(next)
-        next.view.window?.makeFirstResponder(next.focusTarget)
+        if closingActive {
+            let next = root.allLeaves().first!
+            setActive(next)
+            next.view.window?.makeFirstResponder(next.focusTarget)
+        } else {
+            activePane.view.window?.makeFirstResponder(activePane.focusTarget)
+        }
     }
 
     func setActive(_ panel: any CopadPanel) {
@@ -471,11 +486,25 @@ final class PaneManager {
 
     // MARK: - Panel Wiring
 
-    /// Phase 10b removed the SwiftTerm-specific `onProcessTerminated`
-    /// hook this used to wire. Alacritty's child-exit notification
-    /// isn't on the FFI surface yet — when an alacritty shell exits,
-    /// the pane stays as a dead-pty placeholder until the user
-    /// closes it explicitly. Tracked as a catchup item in
-    /// `docs/macos-post-renderer-catchup.md`.
-    private func wirePanel(_: any CopadPanel) {}
+    /// Wire lifecycle callbacks on a newly-created panel. Today the
+    /// only hook is alacritty's child-exit close cascade, gated on
+    /// `[terminal] close_on_exit` — when the user's shell exits
+    /// (Ctrl+D, `exit`, killed parent), we close the owning pane;
+    /// PaneManager's `closePanel` cascades up to TabViewController's
+    /// `onLastPaneClosed` if it was the last leaf, mirroring Linux's
+    /// `tab.close_panel` → `notebook.remove_page` chain in
+    /// `copad-linux/src/tabs.rs::handle_panel_exit`. Webview /
+    /// plugin panels are no-ops here (no PTY child).
+    ///
+    /// The gate is checked at fire time (not at wiring time) so a
+    /// hot-reload of `close_on_exit` applies to already-open panes —
+    /// matches Linux's live read of `self.config.borrow().terminal.
+    /// close_on_exit` inside `handle_panel_exit`.
+    private func wirePanel(_ panel: any CopadPanel) {
+        guard let alac = panel as? AlacrittyTerminalViewController else { return }
+        alac.onChildExited = { [weak self] panel in
+            guard let self, config.closeOnExit else { return }
+            closePanel(panel)
+        }
+    }
 }

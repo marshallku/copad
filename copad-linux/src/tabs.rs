@@ -1046,8 +1046,11 @@ impl TabManager {
             tab.root.borrow().collect_panels(&mut panels);
             if let Some(panel) = panels.iter().find(|p| p.widget() == panel_widget) {
                 let panel_id = panel.id().to_string();
-                let result = tab.close_panel(panel);
 
+                // Notify first — consumers (ContextService, trigger
+                // engine) need the event even when the pane stays
+                // visible. Matches the macOS path, which broadcasts
+                // before deciding whether to close.
                 broadcast(
                     bus,
                     &Event::new(
@@ -1058,6 +1061,12 @@ impl TabManager {
                         }),
                     ),
                 );
+
+                if !self.config.borrow().terminal.close_on_exit {
+                    return;
+                }
+
+                let result = tab.close_panel(panel);
 
                 match result {
                     CloseResult::CloseTab => {

@@ -66,6 +66,12 @@ struct CopadConfig {
     /// translating Opt+← / Opt+⌫ to readline byte sequences, and a
     /// force-Meta override would steal those keystrokes.
     let forceMetaKeys: [String]
+    /// `[terminal] close_on_exit` — close the pane when the PTY child
+    /// (shell) exits. Cascades: last pane in tab → close tab; last
+    /// tab in window → close window. `false` keeps the dead viewport
+    /// so the user can read the exit message. Default `true` matches
+    /// Linux's long-standing behavior.
+    let closeOnExit: Bool
     let themeName: String
     let backgroundPath: String?
     let backgroundTint: Double
@@ -166,6 +172,7 @@ struct CopadConfig {
             fontSize: raw.terminal?.fontSize ?? defaults.fontSize,
             optionAsAlt: raw.terminal?.optionAsAlt ?? defaults.optionAsAlt,
             forceMetaKeys: raw.terminal?.forceMetaKeys ?? defaults.forceMetaKeys,
+            closeOnExit: raw.terminal?.closeOnExit ?? defaults.closeOnExit,
             themeName: raw.theme?.name ?? defaults.themeName,
             backgroundPath: bgPath,
             backgroundTint: clamp01(raw.background?.tint ?? defaults.backgroundTint),
@@ -207,6 +214,7 @@ struct CopadConfig {
             fontSize: 14,
             optionAsAlt: true,
             forceMetaKeys: ["Return"],
+            closeOnExit: true,
             themeName: "catppuccin-mocha",
             backgroundPath: nil,
             backgroundTint: 0.6,
@@ -361,6 +369,7 @@ private struct TerminalSection: Decodable {
     var fontSize: Int?
     var optionAsAlt: Bool?
     var forceMetaKeys: [String]?
+    var closeOnExit: Bool?
 
     enum CodingKeys: String, CodingKey {
         case shell
@@ -368,6 +377,7 @@ private struct TerminalSection: Decodable {
         case fontSize = "font_size"
         case optionAsAlt = "option_as_alt"
         case forceMetaKeys = "force_meta_keys"
+        case closeOnExit = "close_on_exit"
     }
 }
 

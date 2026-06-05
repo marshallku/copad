@@ -79,10 +79,16 @@ Cross-platform `panel.exited` event preserved — added
 panes broadcast `panel.exited` on shell termination (was
 SwiftTerm-only via `processTerminated`). copad-core's
 `ContextService` cleanup contract honored across both backends.
-PaneManager's `wirePanel` is now a no-op stub — pane auto-close on
-shell exit is a separate UI concern (the renderer keeps the dead-PTY
-viewport visible until the user closes the tab), tracked as a
-follow-up.
+
+Pane auto-close on shell exit landed in a follow-up commit:
+`PaneManager.wirePanel` now sets `AlacrittyRenderView.onChildExited`
+to a closure that calls `closePanel(self)` when
+`[terminal] close_on_exit = true` (default). The cascade up to tab
+close / window close reuses the existing
+`onLastPaneClosed` → `TabViewController.closeTab(at:)` chain.
+`close_on_exit = false` keeps the dead-PTY viewport visible so
+the user can read the exit message — Linux honors the same key in
+`tabs.rs::handle_panel_exit`.
 
 ---
 
