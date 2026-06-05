@@ -201,25 +201,33 @@ final class TabViewController: NSViewController {
         contentArea.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(contentArea)
 
-        // Tier 4.2 — status bar at the very bottom of the root view, BELOW
-        // the tab bar even when `tabsPosition = bottom`. Linux does the
-        // same: statusbar is the lowest-priority container and the rest
-        // of the layout sits on top of it. macOS only supports
-        // `[statusbar] position = bottom` for now; top would need to flip
-        // the tabBar/contentArea anchors against statusBar's top edge,
-        // which isn't worth the layout complexity until somebody asks.
-        var statusBarBottom: NSLayoutYAxisAnchor = root.bottomAnchor
+        // Tier 4.2 — status bar pinned to either the top or bottom of
+        // the root view, depending on `[statusbar] position`. Tab bar
+        // + content area then anchor against whichever edge of the
+        // status bar faces inward (so they never overlap the bar).
+        // Linux supports the same two values. left/right deferred —
+        // status bar is currently a horizontal NSStackView so vertical
+        // would need a separate layout pass.
+        var topEdge: NSLayoutYAxisAnchor = root.topAnchor
+        var bottomEdge: NSLayoutYAxisAnchor = root.bottomAnchor
+        let statusOnTop = config.statusBar.position.lowercased() == "top"
         if config.statusBar.enabled {
             let bar = StatusBarView(theme: theme, windowOpacity: config.windowOpacity)
             statusBar = bar
             root.addSubview(bar)
-            NSLayoutConstraint.activate([
+            var barConstraints: [NSLayoutConstraint] = [
                 bar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
                 bar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-                bar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
                 bar.heightAnchor.constraint(equalToConstant: CGFloat(config.statusBar.height)),
-            ])
-            statusBarBottom = bar.topAnchor
+            ]
+            if statusOnTop {
+                barConstraints.append(bar.topAnchor.constraint(equalTo: root.topAnchor))
+                topEdge = bar.bottomAnchor
+            } else {
+                barConstraints.append(bar.bottomAnchor.constraint(equalTo: root.bottomAnchor))
+                bottomEdge = bar.topAnchor
+            }
+            NSLayoutConstraint.activate(barConstraints)
         }
 
         // Tier 1.4 — tabs position. The tabBar is always full-width and at
@@ -236,15 +244,15 @@ final class TabViewController: NSViewController {
         switch config.tabsPosition {
         case .top:
             constraints.append(contentsOf: [
-                tabBar.topAnchor.constraint(equalTo: root.topAnchor),
+                tabBar.topAnchor.constraint(equalTo: topEdge),
                 contentArea.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
-                contentArea.bottomAnchor.constraint(equalTo: statusBarBottom),
+                contentArea.bottomAnchor.constraint(equalTo: bottomEdge),
             ])
         case .bottom:
             constraints.append(contentsOf: [
-                contentArea.topAnchor.constraint(equalTo: root.topAnchor),
+                contentArea.topAnchor.constraint(equalTo: topEdge),
                 contentArea.bottomAnchor.constraint(equalTo: tabBar.topAnchor),
-                tabBar.bottomAnchor.constraint(equalTo: statusBarBottom),
+                tabBar.bottomAnchor.constraint(equalTo: bottomEdge),
             ])
         }
         NSLayoutConstraint.activate(constraints)
