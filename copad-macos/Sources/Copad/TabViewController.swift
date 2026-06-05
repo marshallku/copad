@@ -630,36 +630,34 @@ final class TabViewController: NSViewController {
     /// fill the entire pane area regardless of split layout.
     private func ensureBackgroundViews() {
         if backgroundView != nil { return }
+        // Use autoresizing instead of Auto Layout. An NSImageView with
+        // a large image (e.g. 5K wallpaper) reports its intrinsic
+        // content size as the image's pixel dimensions, and even with
+        // explicit edge constraints that intrinsic size propagates
+        // upward through `fittingSize` and pushes the window past the
+        // screen. `translatesAutoresizingMaskIntoConstraints = true`
+        // (the default) + `autoresizingMask = [.width, .height]`
+        // sizes the bg to whatever frame we set + grows it with the
+        // parent — and AutoLayout never gets a say in the window's
+        // fitting size from this subtree.
         let bg = NSImageView(frame: contentArea.bounds)
         bg.imageScaling = .scaleAxesIndependently
         bg.wantsLayer = true
         bg.isHidden = true
-        bg.translatesAutoresizingMaskIntoConstraints = false
+        bg.autoresizingMask = [.width, .height]
         let firstSubview = contentArea.subviews.first
         if let firstSubview {
             contentArea.addSubview(bg, positioned: .below, relativeTo: firstSubview)
         } else {
             contentArea.addSubview(bg)
         }
-        NSLayoutConstraint.activate([
-            bg.topAnchor.constraint(equalTo: contentArea.topAnchor),
-            bg.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
-            bg.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
-            bg.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
-        ])
         backgroundView = bg
 
-        let tint = NSView()
+        let tint = NSView(frame: contentArea.bounds)
         tint.wantsLayer = true
         tint.isHidden = true
-        tint.translatesAutoresizingMaskIntoConstraints = false
+        tint.autoresizingMask = [.width, .height]
         contentArea.addSubview(tint, positioned: .above, relativeTo: bg)
-        NSLayoutConstraint.activate([
-            tint.topAnchor.constraint(equalTo: contentArea.topAnchor),
-            tint.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
-            tint.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
-            tint.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
-        ])
         tintView = tint
     }
 
