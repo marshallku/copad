@@ -1,6 +1,7 @@
 //! Headless host: socket transport, plugin supervisor, action registry.
 //! Wire protocol: see `docs/gui-daemon-protocol.md`.
 
+pub mod cron_scheduler;
 pub mod daemon_trigger_sink;
 pub mod gui_registry;
 pub mod plugin_exec;

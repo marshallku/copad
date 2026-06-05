@@ -40,7 +40,21 @@ impl TriggerSink for ActionRegistry {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Trigger {
     pub name: String,
-    pub when: WhenSpec,
+    /// Event-driven source. Mutually exclusive with `cron`. Exactly
+    /// one of `when` / `cron` must be set; validation in
+    /// `set_triggers` drops triggers that violate the invariant.
+    #[serde(default)]
+    pub when: Option<WhenSpec>,
+    /// Cron-driven source — 6-field schedule (`sec min hr dom mon dow`,
+    /// chrono-Local timezone). Compiled by the daemon's
+    /// `CronScheduler`; core only validates exclusivity here and
+    /// rejects cron-incompatible options. v1 limits: `condition`,
+    /// `await`, and `{event.*}`/`{action_result.*}` interpolation
+    /// tokens in `params` are disallowed for cron triggers (no
+    /// originating event to evaluate against). Documented in
+    /// `docs/workflow-runtime.md`.
+    #[serde(default)]
+    pub cron: Option<String>,
     pub action: String,
     #[serde(default)]
     pub params: Value,
@@ -58,6 +72,15 @@ pub struct Trigger {
     /// § "Trust boundary".
     #[serde(default)]
     pub security: SecurityBlock,
+}
+
+impl Trigger {
+    /// True iff this trigger fires on a cron schedule (vs an event).
+    /// Used by the daemon scheduler to filter; `TriggerEngine::dispatch`
+    /// already skips cron triggers via `matches()` returning false.
+    pub fn is_cron(&self) -> bool {
+        self.cron.is_some()
+    }
 }
 
 /// Two-axis trust opt-in. Default-deny: a freshly authored trigger
@@ -82,6 +105,37 @@ pub struct SecurityBlock {
 /// paths, `kb.write` outside the KB root).
 pub fn is_privileged_action(action: &str) -> bool {
     matches!(action, "system.spawn")
+}
+
+/// Shared invariant check for event-vs-cron source. Both core's
+/// `set_triggers` and the daemon's `CronScheduler::reload` route
+/// through this so a config rejected by one is rejected by the other —
+/// no silent drift between engine-visible triggers and scheduler-visible
+/// triggers. Returns a human-readable reason on rejection so call sites
+/// can log it verbatim. Does NOT parse the cron schedule itself; that's
+/// the daemon scheduler's job (the `cron` crate dep lives there).
+pub fn validate_source_invariants(t: &Trigger) -> Result<(), String> {
+    match (&t.when, &t.cron) {
+        (None, None) => Err("missing both `when` and `cron` — exactly one source required".into()),
+        (Some(_), Some(_)) => Err("both `when` and `cron` set — sources are mutually exclusive".into()),
+        (Some(_), None) => Ok(()),
+        (None, Some(_)) => {
+            if t.condition.is_some() {
+                return Err("cron trigger cannot use `condition` (no event payload to evaluate against in v1)".into());
+            }
+            if t.r#await.is_some() {
+                return Err("cron trigger cannot use `await` (no originating event to correlate with in v1)".into());
+            }
+            let params_str = t.params.to_string();
+            if params_str.contains("{event.") {
+                return Err("cron trigger params reference `{event.X}` — cron has no originating event".into());
+            }
+            if params_str.contains("{action_result.") {
+                return Err("cron trigger params reference `{action_result.X}` — cron has no await chain".into());
+            }
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -118,10 +172,13 @@ pub struct WhenSpec {
 
 impl Trigger {
     pub fn matches(&self, event: &Event) -> bool {
-        if !pattern_matches(&self.when.event_kind, &event.kind) {
+        // Cron triggers have `when = None` and are invisible to bus
+        // dispatch — the daemon's `CronScheduler` invokes them directly.
+        let Some(when) = &self.when else { return false };
+        if !pattern_matches(&when.event_kind, &event.kind) {
             return false;
         }
-        for (key, expected) in &self.when.payload_match {
+        for (key, expected) in &when.payload_match {
             match event.payload.get(key) {
                 Some(actual) if actual == expected => continue,
                 _ => return false,
@@ -227,6 +284,10 @@ impl TriggerEngine {
         let compiled: Vec<CompiledTrigger> = triggers
             .into_iter()
             .filter_map(|t| {
+                if let Err(reason) = validate_source_invariants(&t) {
+                    log::warn!("trigger {:?} dropped: {reason}", t.name);
+                    return None;
+                }
                 let parsed = match &t.condition {
                     None => None,
                     Some(src) => match condition::parse(src) {
@@ -253,6 +314,62 @@ impl TriggerEngine {
 
     pub fn count(&self) -> usize {
         self.triggers.read().unwrap().len()
+    }
+
+    /// Cron-source triggers all satisfy `Trigger::is_cron()`. Used by
+    /// the daemon's `CronScheduler` to enumerate just the cron subset
+    /// after `set_triggers` (which validates + stores both event- and
+    /// cron-source triggers in the same list).
+    pub fn cron_triggers(&self) -> Vec<Trigger> {
+        self.triggers
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|ct| ct.trigger.is_cron())
+            .map(|ct| ct.trigger.clone())
+            .collect()
+    }
+
+    /// Direct action invocation for cron triggers — bypasses
+    /// `Trigger::matches` (cron triggers have `when = None` so they'd
+    /// never match) and skips event-driven trust gates that don't
+    /// apply (cron has no originating event, no `External` origin).
+    /// Still routes through the sink, so the registry's auto-publish
+    /// of `<action>.completed`/`.failed` fires normally — downstream
+    /// triggers chaining on those events work the same way as
+    /// event-driven dispatches.
+    ///
+    /// `allow_privileged` is honored here too: a cron trigger trying
+    /// to invoke `system.spawn` without opting in is rejected with a
+    /// warning, mirroring `dispatch()`.
+    ///
+    /// Returns the sink's `ActionResult` so the scheduler can log
+    /// dispatch failures (mostly diagnostic — sinks usually return
+    /// `Ok({queued: true})` synchronously regardless of action
+    /// success).
+    pub fn dispatch_cron(&self, trigger: &Trigger, context: Option<&Context>) -> ActionResult {
+        if is_privileged_action(&trigger.action) && !trigger.security.allow_privileged {
+            log::warn!(
+                "cron trigger {:?} refused privileged action {:?}: allow_privileged not set",
+                trigger.name,
+                trigger.action
+            );
+            return Err(crate::action_registry::invalid_params(format!(
+                "trigger {:?} refused privileged action {:?}: allow_privileged not set",
+                trigger.name, trigger.action
+            )));
+        }
+        // No originating event → synthesize an empty event for the
+        // interpolation helper. Validation in `set_triggers` already
+        // rejected cron triggers with `{event.*}` / `{action_result.*}`
+        // tokens, so the empty-event substrate is sufficient.
+        let synthetic = Event::new(
+            format!("cron.{}", trigger.name),
+            crate::action_registry::COMPLETION_EVENT_SOURCE,
+            Value::Null,
+        );
+        let params = trigger.interpolate(&synthetic, context);
+        self.sink.dispatch_action(&trigger.action, params)
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -860,14 +977,105 @@ mod tests {
         (reg, engine)
     }
 
+    fn mk_cron_trigger(name: &str, schedule: &str, action: &str) -> Trigger {
+        Trigger {
+            name: name.into(),
+            when: None,
+            cron: Some(schedule.into()),
+            action: action.into(),
+            params: Value::Null,
+            condition: None,
+            r#await: None,
+            security: SecurityBlock::default(),
+        }
+    }
+
+    #[test]
+    fn validate_rejects_missing_both_sources() {
+        let mut t = mk_cron_trigger("t", "* * * * * *", "noop");
+        t.cron = None;
+        assert!(validate_source_invariants(&t).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_both_sources_set() {
+        let mut t = mk_cron_trigger("t", "* * * * * *", "noop");
+        t.when = Some(WhenSpec { event_kind: "x".into(), payload_match: Map::new() });
+        assert!(validate_source_invariants(&t).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_cron_with_condition() {
+        let mut t = mk_cron_trigger("t", "* * * * * *", "noop");
+        t.condition = Some("event.x == 1".into());
+        assert!(validate_source_invariants(&t).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_cron_with_await() {
+        let mut t = mk_cron_trigger("t", "* * * * * *", "noop");
+        t.r#await = Some(AwaitClause {
+            event_kind: "x.reply".into(),
+            payload_match: Map::new(),
+            timeout_seconds: 5,
+            on_timeout: TimeoutPolicy::Abort,
+        });
+        assert!(validate_source_invariants(&t).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_cron_with_event_interpolation_token() {
+        let mut t = mk_cron_trigger("t", "* * * * * *", "noop");
+        t.params = json!({ "msg": "from {event.kind}" });
+        assert!(validate_source_invariants(&t).is_err());
+    }
+
+    #[test]
+    fn validate_rejects_cron_with_action_result_token() {
+        let mut t = mk_cron_trigger("t", "* * * * * *", "noop");
+        t.params = json!({ "data": "{action_result.value}" });
+        assert!(validate_source_invariants(&t).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_cron_with_context_interpolation_token() {
+        let mut t = mk_cron_trigger("t", "* * * * * *", "noop");
+        t.params = json!({ "panel": "{context.active_panel}" });
+        assert!(validate_source_invariants(&t).is_ok());
+    }
+
+    #[test]
+    fn matches_returns_false_for_cron_only_trigger() {
+        let t = mk_cron_trigger("t", "* * * * * *", "noop");
+        assert!(!t.matches(&evt("anything", json!({}))));
+    }
+
+    #[test]
+    fn cron_trigger_dropped_by_set_triggers_when_invalid() {
+        let (_, engine) = mk_engine();
+        let mut bad = mk_cron_trigger("bad", "* * * * * *", "noop");
+        bad.r#await = Some(AwaitClause {
+            event_kind: "x.reply".into(),
+            payload_match: Map::new(),
+            timeout_seconds: 5,
+            on_timeout: TimeoutPolicy::Abort,
+        });
+        let good = mk_cron_trigger("good", "0 * * * * *", "noop");
+        engine.set_triggers(vec![bad, good]);
+        // Only `good` survives validation; `bad` is dropped with a warning.
+        assert_eq!(engine.count(), 1);
+        assert_eq!(engine.names(), vec!["good"]);
+    }
+
     #[test]
     fn matches_exact_kind() {
         let t = Trigger {
             name: "t".into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: "calendar.event_imminent".into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: "noop".into(),
             params: Value::Null,
             condition: None,
@@ -882,10 +1090,11 @@ mod tests {
     fn matches_glob_kind() {
         let t = Trigger {
             name: "t".into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: "calendar.*".into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: "noop".into(),
             params: Value::Null,
             condition: None,
@@ -901,14 +1110,15 @@ mod tests {
     fn payload_match_required() {
         let t = Trigger {
             name: "t".into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: "slack.mention".into(),
                 payload_match: {
                     let mut m = Map::new();
                     m.insert("channel".into(), json!("alerts"));
                     m
                 },
-            },
+            }),
+            cron: None,
             action: "noop".into(),
             params: Value::Null,
             condition: None,
@@ -927,10 +1137,11 @@ mod tests {
     fn interpolates_event_payload_fields() {
         let t = Trigger {
             name: "t".into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: "*".into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: "noop".into(),
             params: json!({
                 "id": "{event.id}",
@@ -959,10 +1170,11 @@ mod tests {
         // `{event.await.text}` and `{event.action_result.thread_ts}` resolve.
         let t = Trigger {
             name: "t".into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: "*".into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: "noop".into(),
             params: json!({
                 "answer": "{event.await.text}",
@@ -995,10 +1207,11 @@ mod tests {
         // rather than silently substituting empty.
         let t = Trigger {
             name: "t".into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: "*".into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: "noop".into(),
             params: json!({"v": "{event.missing.path}"}),
             condition: None,
@@ -1013,10 +1226,11 @@ mod tests {
     fn interpolates_context_fields() {
         let t = Trigger {
             name: "t".into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: "*".into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: "noop".into(),
             params: json!({"cmd": "echo {context.active_cwd} :: {context.active_panel}"}),
             condition: None,
@@ -1036,10 +1250,11 @@ mod tests {
     fn unresolved_tokens_kept_as_literals() {
         let t = Trigger {
             name: "t".into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: "*".into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: "noop".into(),
             params: json!({
                 "a": "{event.missing}",
@@ -1062,10 +1277,11 @@ mod tests {
     fn interpolates_event_top_level_fields() {
         let t = Trigger {
             name: "t".into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: "*".into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: "noop".into(),
             params: json!({
                 "k": "{event.kind}",
@@ -1088,10 +1304,11 @@ mod tests {
     fn payload_key_shadows_event_top_level_field() {
         let t = Trigger {
             name: "t".into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: "*".into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: "noop".into(),
             params: json!({"s": "{event.source}"}),
             condition: None,
@@ -1119,10 +1336,11 @@ mod tests {
     fn interpolation_walks_nested_arrays_and_objects() {
         let t = Trigger {
             name: "t".into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: "*".into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: "noop".into(),
             params: json!({
                 "list": ["{event.a}", "x", {"deep": "{event.b}"}],
@@ -1154,10 +1372,11 @@ mod tests {
         }
         engine.set_triggers(vec![Trigger {
             name: "t".into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: "calendar.event_imminent".into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: "record".into(),
             params: json!({"id": "{event.id}"}),
             condition: None,
@@ -1187,10 +1406,11 @@ mod tests {
         }
         engine.set_triggers(vec![Trigger {
             name: "only_slack".into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: "slack.*".into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: "bump".into(),
             params: Value::Null,
             condition: None,
@@ -1210,10 +1430,11 @@ mod tests {
         reg.register("fail", |_| Err(invalid_params("nope")));
         engine.set_triggers(vec![Trigger {
             name: "t".into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: "any".into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: "fail".into(),
             params: Value::Null,
             condition: None,
@@ -1230,10 +1451,11 @@ mod tests {
         let (_reg, engine) = mk_engine();
         engine.set_triggers(vec![Trigger {
             name: "t".into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: "any".into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: "no_such_action".into(),
             params: Value::Null,
             condition: None,
@@ -1249,10 +1471,11 @@ mod tests {
     fn trig_with_condition(name: &str, condition: Option<&str>) -> Trigger {
         Trigger {
             name: name.into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: "calendar.event_imminent".into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: "fire".into(),
             params: Value::Null,
             condition: condition.map(str::to_string),
@@ -1410,10 +1633,11 @@ mod tests {
         }
         let make = |kind: &str| Trigger {
             name: kind.into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: kind.into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: "bump".into(),
             params: Value::Null,
             condition: None,
@@ -1499,9 +1723,10 @@ mod tests {
         let t: Trigger = toml::from_str(toml_src).unwrap();
         assert_eq!(t.name, "meeting-prep");
         assert_eq!(t.action, "plugin.notion.open_event_doc");
-        assert_eq!(t.when.event_kind, "calendar.event_imminent");
+        let when = t.when.as_ref().expect("event-source trigger has when");
+        assert_eq!(when.event_kind, "calendar.event_imminent");
         // The non-`event_kind` field under `[when]` becomes a payload match.
-        assert_eq!(t.when.payload_match["minutes"], json!(10));
+        assert_eq!(when.payload_match["minutes"], json!(10));
         // `params` interpolates as a normal Value tree.
         assert_eq!(t.params["event_id"], json!("{event.id}"));
         assert_eq!(t.params["lead_minutes"], json!(10));
@@ -1538,10 +1763,11 @@ mod tests {
         engine.set_triggers(vec![
             Trigger {
                 name: "trigger-a".into(),
-                when: WhenSpec {
+                when: Some(WhenSpec {
                     event_kind: "user.kicked_off".into(),
                     payload_match: Map::new(),
-                },
+                }),
+                cron: None,
                 action: "step1".into(),
                 params: json!({ "id": "{event.id}" }),
                 condition: None,
@@ -1550,10 +1776,11 @@ mod tests {
             },
             Trigger {
                 name: "trigger-b".into(),
-                when: WhenSpec {
+                when: Some(WhenSpec {
                     event_kind: "step1.completed".into(),
                     payload_match: Map::new(),
-                },
+                }),
+                cron: None,
                 action: "step2".into(),
                 params: json!({ "marker": "{event.marker}" }),
                 condition: None,
@@ -1613,10 +1840,11 @@ mod tests {
         engine.set_triggers(vec![
             Trigger {
                 name: "kick".into(),
-                when: WhenSpec {
+                when: Some(WhenSpec {
                     event_kind: "go".into(),
                     payload_match: Map::new(),
-                },
+                }),
+                cron: None,
                 action: "flaky".into(),
                 params: Value::Null,
                 condition: None,
@@ -1625,10 +1853,11 @@ mod tests {
             },
             Trigger {
                 name: "on-fail".into(),
-                when: WhenSpec {
+                when: Some(WhenSpec {
                     event_kind: "flaky.failed".into(),
                     payload_match: Map::new(),
-                },
+                }),
+                cron: None,
                 action: "recovery".into(),
                 params: Value::Null,
                 condition: None,
@@ -1731,10 +1960,11 @@ mod tests {
             // Trigger 1: with-jira branch
             Trigger {
                 name: "with-jira".into(),
-                when: WhenSpec {
+                when: Some(WhenSpec {
                     event_kind: "todo.start_requested".into(),
                     payload_match: Map::new(),
-                },
+                }),
+                cron: None,
                 action: "git.worktree_add".into(),
                 params: json!({
                     "workspace": "{event.workspace}",
@@ -1753,10 +1983,11 @@ mod tests {
             },
             Trigger {
                 name: "without-jira".into(),
-                when: WhenSpec {
+                when: Some(WhenSpec {
                     event_kind: "todo.start_requested".into(),
                     payload_match: Map::new(),
-                },
+                }),
+                cron: None,
                 action: "git.worktree_add".into(),
                 params: json!({
                     "workspace": "{event.workspace}",
@@ -1768,10 +1999,11 @@ mod tests {
             },
             Trigger {
                 name: "claude-after-worktree".into(),
-                when: WhenSpec {
+                when: Some(WhenSpec {
                     event_kind: "git.worktree_add.completed".into(),
                     payload_match: Map::new(),
-                },
+                }),
+                cron: None,
                 action: "claude.start".into(),
                 params: json!({"workspace_path": "{event.path}"}),
                 condition: None,
@@ -1871,10 +2103,11 @@ mod tests {
         engine.set_triggers(vec![
             Trigger {
                 name: "with-jira".into(),
-                when: WhenSpec {
+                when: Some(WhenSpec {
                     event_kind: "todo.start_requested".into(),
                     payload_match: Map::new(),
-                },
+                }),
+                cron: None,
                 action: "git.worktree_add".into(),
                 params: json!({
                     "workspace": "{event.workspace}",
@@ -1886,10 +2119,11 @@ mod tests {
             },
             Trigger {
                 name: "without-jira".into(),
-                when: WhenSpec {
+                when: Some(WhenSpec {
                     event_kind: "todo.start_requested".into(),
                     payload_match: Map::new(),
-                },
+                }),
+                cron: None,
                 action: "git.worktree_add".into(),
                 params: json!({
                     "workspace": "{event.workspace}",
@@ -1901,10 +2135,11 @@ mod tests {
             },
             Trigger {
                 name: "claude-after-worktree".into(),
-                when: WhenSpec {
+                when: Some(WhenSpec {
                     event_kind: "git.worktree_add.completed".into(),
                     payload_match: Map::new(),
-                },
+                }),
+                cron: None,
                 action: "claude.start".into(),
                 params: json!({"workspace_path": "{event.path}"}),
                 condition: None,
@@ -2069,10 +2304,11 @@ mod tests {
         engine.set_triggers(vec![
             Trigger {
                 name: "kick".into(),
-                when: WhenSpec {
+                when: Some(WhenSpec {
                     event_kind: "todo.start_requested".into(),
                     payload_match: Map::new(),
-                },
+                }),
+                cron: None,
                 action: "git.worktree_add".into(),
                 params: json!({"workspace": "x", "branch": "y"}),
                 condition: None,
@@ -2081,10 +2317,11 @@ mod tests {
             },
             Trigger {
                 name: "claude-after-worktree".into(),
-                when: WhenSpec {
+                when: Some(WhenSpec {
                     event_kind: "git.worktree_add.completed".into(),
                     payload_match: Map::new(),
-                },
+                }),
+                cron: None,
                 action: "claude.start".into(),
                 params: Value::Null,
                 condition: None,
@@ -2140,10 +2377,11 @@ mod tests {
     fn trig_with_await(name: &str, action: &str, when_kind: &str, aw: AwaitClause) -> Trigger {
         Trigger {
             name: name.into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: when_kind.into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: action.into(),
             params: Value::Null,
             condition: None,
@@ -2906,10 +3144,11 @@ mod tests {
     fn trig_for_action(name: &str, action: &str, kind: &str, security: SecurityBlock) -> Trigger {
         Trigger {
             name: name.into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: kind.into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: action.into(),
             params: Value::Null,
             condition: None,

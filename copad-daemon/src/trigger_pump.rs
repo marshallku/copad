@@ -111,7 +111,12 @@ impl TriggerSubscriptions {
         // promotes" — see docs/workflow-runtime.md "Async correlation".
         let mut raw: Vec<String> = Vec::with_capacity(triggers.len() * 3);
         for t in triggers {
-            raw.push(t.when.event_kind.clone());
+            // Cron-source triggers fire via `CronScheduler`, not the
+            // bus pump — skip subscription for them so we don't allocate
+            // dead receivers. (`Trigger::matches` would no-op anyway,
+            // but keeping the receiver count tight matters at scale.)
+            let Some(when) = &t.when else { continue };
+            raw.push(when.event_kind.clone());
             if let Some(aw) = &t.r#await {
                 raw.push(aw.event_kind.clone());
                 raw.push(format!("{}.completed", t.action));
@@ -168,10 +173,11 @@ mod tests {
     fn mk_trigger(name: &str, kind: &str, action: &str) -> Trigger {
         Trigger {
             name: name.into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: kind.into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: action.into(),
             params: Value::Null,
             condition: None,
@@ -183,10 +189,11 @@ mod tests {
     fn mk_trigger_with_await(name: &str, kind: &str, action: &str, await_kind: &str) -> Trigger {
         Trigger {
             name: name.into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: kind.into(),
                 payload_match: Map::new(),
-            },
+            }),
+            cron: None,
             action: action.into(),
             params: Value::Null,
             condition: None,

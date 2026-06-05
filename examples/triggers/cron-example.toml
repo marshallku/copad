@@ -1,0 +1,38 @@
+# Cron-driven trigger examples. Fire on a schedule instead of a bus
+# event. Daemon-only — requires `COPADD_HOST_TRIGGERS=1` (default).
+#
+# Schedule grammar: 6-field cron, `sec min hr dom mon dow [year]`,
+# evaluated in the user's local timezone. Examples below.
+#
+# v1 limits (see `validate_source_invariants` in copad-core/src/trigger.rs):
+#   - Each trigger sets exactly one of `[when]` or `cron`.
+#   - Cron triggers cannot use `condition` or `[await]` (no originating
+#     event to evaluate against).
+#   - `params` interpolation tokens `{event.X}` and `{action_result.X}`
+#     are rejected at config-load time — cron has no originating event.
+#     `{context.X}` (active panel, active cwd, ...) is allowed.
+#   - Missed runs are skipped (no catchup). If the daemon was down at
+#     a scheduled tick, the slot is dropped silently and the next
+#     future fire is awaited.
+
+# Every minute on the minute: log a heartbeat.
+[[triggers]]
+name = "cron-minute-heartbeat"
+cron = "0 * * * * *"
+action = "system.log"
+params = { message = "cron heartbeat at top of minute" }
+
+# Every 5 seconds: echo the currently-active pane id (proves
+# `{context.*}` interpolation reaches the cron-fired action).
+[[triggers]]
+name = "cron-5s-active-pane"
+cron = "*/5 * * * * *"
+action = "echo.ping"
+params = { panel = "{context.active_panel}", cwd = "{context.active_cwd}" }
+
+# Daily at 09:00 local: open a daily-standup panel.
+[[triggers]]
+name = "cron-daily-standup"
+cron = "0 0 9 * * *"
+action = "plugin.open"
+params = { name = "standup", panel = "main", mode = "tab" }

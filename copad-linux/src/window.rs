@@ -948,7 +948,12 @@ impl TriggerSubscriptions {
         // never promotes" — see docs/workflow-runtime.md "Async correlation".
         let mut raw: Vec<String> = Vec::with_capacity(triggers.len() * 3);
         for t in triggers {
-            raw.push(t.when.event_kind.clone());
+            // Cron-source triggers fire via the daemon's `CronScheduler`,
+            // not the GUI's bus pump — skip subscription so we don't
+            // allocate dead receivers. Mirrors the equivalent skip in
+            // `copad-daemon/src/trigger_pump.rs::reconcile`.
+            let Some(when) = &t.when else { continue };
+            raw.push(when.event_kind.clone());
             if let Some(aw) = &t.r#await {
                 raw.push(aw.event_kind.clone());
                 raw.push(format!("{}.completed", t.action));
@@ -1011,10 +1016,11 @@ mod tests {
     fn mk_trigger(name: &str, kind: &str, action: &str) -> Trigger {
         Trigger {
             name: name.into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: kind.into(),
                 payload_match: serde_json::Map::new(),
-            },
+            }),
+            cron: None,
             action: action.into(),
             params: Value::Null,
             condition: None,

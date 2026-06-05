@@ -19,6 +19,7 @@ use copad_core::plugin::LoadedPlugin;
 use copad_core::protocol::ResponseError;
 use copad_core::thread_pool::ThreadPool;
 use copad_core::trigger::{Trigger, TriggerEngine, TriggerSink};
+use copad_daemon::cron_scheduler::CronScheduler;
 use copad_daemon::daemon_trigger_sink::DaemonTriggerSink;
 use copad_daemon::gui_registry::GuiRegistry;
 use copad_daemon::plugin_exec::{ShellError, spawn_plugin_shell};
@@ -192,6 +193,26 @@ fn main() -> ExitCode {
         )
     });
 
+    // Cron scheduler: daemon-only. When `host_triggers=false` the
+    // GUI owns trigger dispatch and a daemon-side cron firer would
+    // double-fire (or — worse — fire actions the GUI doesn't know
+    // about). Skip the scheduler entirely in that mode and log so
+    // the operator notices their cron triggers won't fire.
+    let (cron_scheduler, cron_thread) = if host_triggers {
+        let sched = Arc::new(CronScheduler::new(engine.clone(), context.clone()));
+        sched.reload(&cached_triggers.lock().unwrap());
+        let handle = sched.spawn();
+        (Some(sched), Some(handle))
+    } else {
+        if cached_triggers.lock().unwrap().iter().any(|t| t.is_cron()) {
+            log::warn!(
+                "cron triggers present but host_triggers=false — \
+                 scheduler disabled (set COPADD_HOST_TRIGGERS=1 to enable)"
+            );
+        }
+        (None, None)
+    };
+
     // Config-file watcher runs unconditionally — daemon's own engine
     // tracks `[[triggers]]` edits even with no GUI attached (headless
     // case). When `host_triggers=false`, the watcher updates engine
@@ -209,6 +230,7 @@ fn main() -> ExitCode {
         event_bus.clone(),
         cached_triggers.clone(),
         initial_mtime,
+        cron_scheduler.clone(),
         watcher_stop.clone(),
     );
 
@@ -226,6 +248,9 @@ fn main() -> ExitCode {
 
     pump_stop.store(true, Ordering::SeqCst);
     watcher_stop.store(true, Ordering::SeqCst);
+    if let Some(sched) = cron_scheduler.as_ref() {
+        sched.shutdown();
+    }
     if let Some(handle) = pump_thread
         && let Err(panic) = handle.join()
     {
@@ -233,6 +258,11 @@ fn main() -> ExitCode {
     }
     if let Err(panic) = watcher_thread.join() {
         log::error!("config watcher thread panicked: {panic:?}");
+    }
+    if let Some(handle) = cron_thread
+        && let Err(panic) = handle.join()
+    {
+        log::error!("cron scheduler thread panicked: {panic:?}");
     }
 
     // Arc::drop does not call shutdown_all; we must invoke it explicitly
@@ -472,6 +502,7 @@ fn spawn_config_watcher(
     event_bus: Arc<copad_core::event_bus::EventBus>,
     cached_triggers: Arc<Mutex<Vec<Trigger>>>,
     initial_mtime: Option<std::time::SystemTime>,
+    cron_scheduler: Option<Arc<CronScheduler>>,
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::Builder::new()
@@ -484,6 +515,7 @@ fn spawn_config_watcher(
                 event_bus,
                 cached_triggers,
                 initial_mtime,
+                cron_scheduler,
                 stop,
                 &CopadConfig::config_path(),
             );
@@ -499,6 +531,7 @@ fn config_watcher_loop(
     event_bus: Arc<copad_core::event_bus::EventBus>,
     cached_triggers: Arc<Mutex<Vec<Trigger>>>,
     initial_mtime: Option<std::time::SystemTime>,
+    cron_scheduler: Option<Arc<CronScheduler>>,
     stop: Arc<AtomicBool>,
     path: &Path,
 ) {
@@ -521,6 +554,7 @@ fn config_watcher_loop(
                 &context,
                 &event_bus,
                 &cached_triggers,
+                cron_scheduler.as_ref(),
                 cfg.triggers,
             ),
             Err(e) => log::warn!(
@@ -541,12 +575,14 @@ fn config_watcher_loop(
 ///   subscriptions don't exist at all — nothing to reconcile and
 ///   nothing to flush. The engine's internal trigger list is the
 ///   only thing that updates.
+#[allow(clippy::too_many_arguments)]
 fn apply_reloaded_triggers(
     engine: &Arc<TriggerEngine>,
     pump_state: Option<&Arc<Mutex<PumpState>>>,
     context: &Arc<ContextService>,
     event_bus: &Arc<copad_core::event_bus::EventBus>,
     cached_triggers: &Arc<Mutex<Vec<Trigger>>>,
+    cron_scheduler: Option<&Arc<CronScheduler>>,
     new_triggers: Vec<Trigger>,
 ) {
     engine.set_triggers(new_triggers.clone());
@@ -554,6 +590,9 @@ fn apply_reloaded_triggers(
         let mut ps = ps.lock().unwrap();
         ps.pump_all(context, engine);
         ps.reconcile_triggers(event_bus, &new_triggers);
+    }
+    if let Some(sched) = cron_scheduler {
+        sched.reload(&new_triggers);
     }
     *cached_triggers.lock().unwrap() = new_triggers;
     log::info!(
@@ -965,10 +1004,11 @@ mod tests {
     fn mk_trigger(name: &str, kind: &str) -> Trigger {
         Trigger {
             name: name.into(),
-            when: WhenSpec {
+            when: Some(WhenSpec {
                 event_kind: kind.into(),
                 payload_match: serde_json::Map::new(),
-            },
+            }),
+            cron: None,
             action: "system.log".into(),
             params: Value::Null,
             condition: None,
@@ -1001,7 +1041,7 @@ mod tests {
             mk_trigger("a", "panel.focused"),
             mk_trigger("b", "terminal.cwd_changed"),
         ];
-        apply_reloaded_triggers(&engine, Some(&pump), &ctx, &bus, &cached, new.clone());
+        apply_reloaded_triggers(&engine, Some(&pump), &ctx, &bus, &cached, None, new.clone());
         assert_eq!(engine.count(), 2);
         assert_eq!(pump.lock().unwrap().trigger_subs_len(), 2);
         assert_eq!(cached.lock().unwrap().len(), 2);
@@ -1020,6 +1060,7 @@ mod tests {
             &ctx,
             &bus,
             &cached,
+            None,
             vec![mk_trigger("a", "panel.focused")],
         );
         assert_eq!(engine.count(), 1);
@@ -1061,6 +1102,7 @@ mod tests {
                 bus_clone,
                 cached_clone,
                 initial_mtime,
+                None,
                 stop_clone,
                 &path_clone,
             );

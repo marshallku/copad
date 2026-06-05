@@ -169,6 +169,29 @@ params = { command = "echo {event.text} >> ~/pings.log" }
 
 Parameter interpolation (`{event.foo}`, `{context.bar}`) handles dynamic action arguments. Conditional firing — "skip if I declined", "skip the weekly 1:1" — is expressed by an optional `condition` clause on each trigger, evaluated AFTER `when` matches. The expression DSL supports `== != < <= > >= && || !` plus parens, references like `event.X.Y` / `context.X`, and string/number/bool/null literals. Conditions are compiled once at config load; a parse failure drops THAT trigger only. See `copad-core/src/condition.rs` for the full grammar and Phase 10.2 in roadmap.md for the rollout history.
 
+### Cron triggers (`cron` schedule)
+
+A trigger may use `cron` instead of `[when]` to fire on a wall-clock schedule. Exactly one source — `[when]` (event-driven) or `cron` (schedule-driven) — must be set per trigger; both or neither is rejected at config load.
+
+```toml
+[[triggers]]
+name = "minute-heartbeat"
+cron = "0 * * * * *"           # 6-field: sec min hr dom mon dow, local timezone
+action = "system.log"
+params = { message = "tick" }
+```
+
+**v1 limits** (`validate_source_invariants` in `copad-core/src/trigger.rs`):
+- Cron triggers cannot use `condition` or `[await]` — there's no originating event to evaluate against. Rejected at config load.
+- `params` interpolation tokens `{event.X}` and `{action_result.X}` are rejected (no event, no await chain). `{context.X}` (active panel / cwd, populated from the ContextService snapshot taken at fire time) is allowed.
+- Missed runs are skipped — there's no catchup state. If the daemon was down or the laptop slept past a scheduled tick, the slot is dropped silently and the next future fire is awaited. `MISSED_RUN_GRACE` (5s in `cron_scheduler.rs`) is the tolerance: a slot whose `next_fire` is in `[now - 5s, now]` is the one the worker explicitly woke for and fires normally; a slot whose `next_fire` is older than `now - 5s` is treated as missed and silently advanced (`log::warn` records the skip).
+
+**Daemon-only**: cron triggers fire from `copad-daemon::cron_scheduler::CronScheduler`. When `COPADD_HOST_TRIGGERS=0` (rollback flag) the daemon doesn't dispatch triggers, so cron is disabled — startup logs a warning if any cron triggers are present in that mode.
+
+**Dispatch path**: scheduler invokes the trigger's action directly via `TriggerEngine::dispatch_cron`, which routes through the same `TriggerSink` event-driven triggers use. The registry's auto-publish of `<action>.completed` / `.failed` fires normally — downstream chained event triggers work the same way as for event-driven dispatches.
+
+**Hot reload**: the config-file watcher's `apply_reloaded_triggers` path calls `scheduler.reload(triggers)` alongside `engine.set_triggers`; the scheduler's condvar-based worker wakes immediately, drops removed schedules, and picks up new ones without waiting for the old soonest-fire horizon.
+
 ### Async correlation (`await` clauses)
 
 A trigger may declare an `await` clause to hold a chain until a follow-up event arrives. The engine uses a two-phase state machine:
