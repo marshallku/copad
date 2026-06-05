@@ -1,7 +1,6 @@
 import AppKit
 import CCopadFFI
 import CopadCore
-import SwiftTerm
 @preconcurrency import WebKit
 
 @MainActor
@@ -29,9 +28,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// the latest snapshot via `self`.
     private var keybindings: [Keybindings.Binding] = []
     private var keybindingMonitor: Any?
-    /// Bridges Cmd/Option + Backspace/Delete to readline control bytes — see
-    /// `installEditKeyMonitor()` for why this can't be done inside SwiftTerm.
-    private var editKeyMonitor: Any?
     /// Cmd+Shift+P palette controller. Held for the sheet's lifetime —
     /// `NSTableView` data source / delegate are unowned references, so a
     /// transient stack-only controller would deallocate the moment `open`
@@ -216,7 +212,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // local monitors). Hot-reload calls `applyKeybindings` to swap.
         applyKeybindings(config.keybindings)
         installKeybindingMonitor()
-        installEditKeyMonitor()
 
         setupMenuBar()
 
@@ -574,23 +569,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Cmd+F / Cmd+G / Cmd+Shift+G dispatch. All three Find-menu
     /// items route here; the `tag` carries an `NSFindPanelAction`
     /// raw value telling us which one was hit (showFindPanel / next /
-    /// previous). Backend-aware: alacritty uses its own bottom-of-
-    /// pane bar (`AlacrittyTerminalViewController`); SwiftTerm
-    /// forwards through its built-in NSResponder find chain. Other
-    /// panel types (webview, plugin) silently no-op.
+    /// previous). Alacritty is the only macOS terminal backend; the
+    /// find bar is its own bottom-of-pane control. Non-terminal panes
+    /// (webview, plugin) silently no-op.
     @objc func performFindPanelAction(_ sender: NSMenuItem) {
         guard let panel = tabVC?.activePaneManager?.activePane else { return }
+        guard let alacritty = panel as? AlacrittyTerminalViewController else { return }
         let action = NSFindPanelAction(rawValue: UInt(sender.tag))
-        if let alacritty = panel as? AlacrittyTerminalViewController {
-            switch action {
-            case .next: alacritty.findNext()
-            case .previous: alacritty.findPrevious()
-            default: alacritty.toggleFindBar()
-            }
-            return
-        }
-        if let swiftTerm = panel as? TerminalViewController {
-            swiftTerm.view.perform(#selector(performFindPanelAction(_:)), with: sender)
+        switch action {
+        case .next: alacritty.findNext()
+        case .previous: alacritty.findPrevious()
+        default: alacritty.toggleFindBar()
         }
     }
 
@@ -936,48 +925,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    /// SwiftTerm's `MacTerminalView.doCommand(by:)` only handles a subset of
-    /// macOS standard text-edit selectors (deleteBackward:, moveUp:, …).
-    /// Cmd+Backspace, Option+Backspace, Cmd+Delete and friends emit selectors
-    /// it routes to the default branch ("Unhandle selector …" print), so they
-    /// silently no-op. `keyDown` and `doCommand` on `MacTerminalView` are
-    /// `public` (not `open`), so we can't override them from this module.
-    /// Intercept the NSEvent before SwiftTerm sees it and send the readline-
-    /// equivalent control bytes directly. Mirrors Terminal.app / iTerm2:
-    ///
-    ///   Cmd+Backspace    → ^U   (kill to start of line)
-    ///   Option+Backspace → ^W   (kill word backward)
-    ///   Cmd+Delete       → ^K   (kill to end of line)
-    ///   Option+Delete    → ESC d (kill word forward)
-    private func installEditKeyMonitor() {
-        editKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
-            guard
-                let chars = event.charactersIgnoringModifiers,
-                let scalar = chars.unicodeScalars.first
-            else { return event }
-            // Backspace key reports U+007F; Forward Delete reports
-            // NSDeleteFunctionKey (0xF728).
-            let backspace: UInt32 = 0x7F
-            let forwardDelete: UInt32 = 0xF728
-
-            // Only act when a SwiftTerm view is the first responder; otherwise
-            // pass the event through (Find bar, etc. need their own keys).
-            guard let view = NSApp.keyWindow?.firstResponder as? LocalProcessTerminalView else {
-                return event
-            }
-
-            switch (mods, scalar.value) {
-            case ([.command], backspace): view.send([0x15])
-            case ([.option], backspace): view.send([0x17])
-            case ([.command], forwardDelete): view.send([0x0B])
-            case ([.option], forwardDelete): view.send([0x1B, 0x64])
-            default: return event
-            }
-            return nil
-        }
-    }
-
     private func startSocketServer() {
         socketServer.eventBus = eventBus
         socketServer.commandHandler = { [weak self] method, params, completion in
@@ -1185,12 +1132,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             completion(vc.sessionInfo(index: index))
 
         case "terminal.shell_precmd":
-            let panelID = params["panel_id"] as? String ?? vc.activeTerminal?.panelID ?? ""
+            let panelID = params["panel_id"] as? String ?? vc.activeTerminalPanel?.panelID ?? ""
             eventBus.broadcast(event: "terminal.shell_precmd", data: ["panel_id": panelID])
             completion(["ok": true])
 
         case "terminal.shell_preexec":
-            let panelID = params["panel_id"] as? String ?? vc.activeTerminal?.panelID ?? ""
+            let panelID = params["panel_id"] as? String ?? vc.activeTerminalPanel?.panelID ?? ""
             eventBus.broadcast(event: "terminal.shell_preexec", data: ["panel_id": panelID])
             completion(["ok": true])
 

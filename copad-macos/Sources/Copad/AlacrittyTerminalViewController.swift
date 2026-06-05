@@ -29,6 +29,12 @@ import Foundation
 final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zoomable, TerminalCapable {
     let panelID: String = UUID().uuidString
     private(set) var currentTitle: String = "Terminal (alacritty)"
+    /// `tab.rename`-set title override. When non-nil, OSC 0/2 updates
+    /// from the running program (shell prompt setting window title)
+    /// are ignored — the user's chosen name wins. Mirrors SwiftTerm
+    /// path's customTitle semantics so the socket contract is the
+    /// same across (historical) backends.
+    private(set) var customTitle: String?
 
     /// Set by `PaneManager.assignEventBus` after the EventBus is created.
     /// Used to publish `terminal.output` on keyboard / paste input —
@@ -74,8 +80,6 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
 
     private var termHandle: CopadTermFFI.Handle?
     private var renderView: AlacrittyRenderView?
-    private var backgroundView: NSImageView?
-    private var tintView: NSView?
     private var shellStarted = false
     private var findBar: FindBar?
 
@@ -113,11 +117,14 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         fatalError("init(coder:) has not been implemented")
     }
 
-    /// Layered view hierarchy mirroring `TerminalViewController`:
+    /// View hierarchy:
     ///   container (plain NSView)
-    ///   ├─ backgroundView (NSImageView, hidden until image set)
-    ///   ├─ tintView (NSView with dark overlay layer)
     ///   └─ renderView (AlacrittyRenderView, transparent layer when image active)
+    ///
+    /// Background image + tint moved to `TabViewController.contentArea`
+    /// in Phase 10b follow-up so splits share one image. Pane's
+    /// `setImageBackgroundActive` flips to true so default-bg cells
+    /// stay transparent and the window-level image shows through.
     ///
     /// Focus contract: external callers that target `panel.view` (the
     /// container) get a silent no-op because the container's default
@@ -132,21 +139,6 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         let frame = NSRect(x: 0, y: 0, width: 1200, height: 800)
         let container = NSView(frame: frame)
         container.wantsLayer = true
-
-        let bg = NSImageView(frame: container.bounds)
-        bg.autoresizingMask = [.width, .height]
-        bg.imageScaling = .scaleAxesIndependently
-        bg.wantsLayer = true
-        bg.isHidden = true
-        container.addSubview(bg)
-        backgroundView = bg
-
-        let tint = NSView(frame: container.bounds)
-        tint.autoresizingMask = [.width, .height]
-        tint.wantsLayer = true
-        tint.isHidden = true
-        container.addSubview(tint)
-        tintView = tint
 
         let render = AlacrittyRenderView(
             theme: theme,
@@ -259,18 +251,11 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
     /// and the per-cell skip gate. The window-level isOpaque /
     /// NSVisualEffectView swap is handled by `AppDelegate.
     /// applyWindowTransparency` — this is the cell-renderer half.
-    ///
-    /// Also re-scales the image + tint overlay alphas using the cached
-    /// configured values. Without this, an opaque background image
-    /// would hide the desktop even when `window.opacity < 1.0`. The
-    /// alphaValue / tint-bg writes are no-ops when the views are
-    /// hidden (no image set), so this is safe to call unconditionally.
+    /// Image + tint alpha scaling now happens at the window level
+    /// (TabViewController owns the bg/tint views).
     func applyWindowOpacity(_ opacity: Double) {
         windowOpacity = opacity
         renderView?.setWindowOpacity(opacity)
-        backgroundView?.alphaValue = CGFloat(currentImageOpacity * opacity)
-        tintView?.layer?.backgroundColor = NSColor.black
-            .withAlphaComponent(CGFloat(currentImageTint * opacity)).cgColor
     }
 
     /// Config hot-reload: swap the theme on a running pane. Mirrors
@@ -395,9 +380,18 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
 
     // MARK: - TerminalCapable (socket commands)
 
-    /// Raw text → PTY. Matches SwiftTerm `feedText` semantics. UTF-8
-    /// encoded; bytes are kernel-buffered so even pre-`startIfNeeded`
-    /// feeds reach the child once it's up.
+    /// `tab.rename` entry. Saves the user-chosen title, marks it as
+    /// the current title, and notifies the tab bar to repaint.
+    /// Subsequent OSC 0/2 from the running program are ignored as
+    /// long as `customTitle` is set.
+    func setCustomTitle(_ title: String) {
+        customTitle = title
+        currentTitle = title
+        NotificationCenter.default.post(name: .terminalTitleChanged, object: self)
+    }
+
+    /// Raw text → PTY. UTF-8 encoded; bytes are kernel-buffered so
+    /// even pre-`startIfNeeded` feeds reach the child once it's up.
     func feedText(_ text: String) {
         termHandle?.input(Array(text.utf8))
     }
@@ -504,27 +498,10 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
 
     /// Monotonic token bumped on every `applyBackground` / `clearBackground`
     /// so an async image decode finishing late (slow Gatekeeper scan,
-    /// quarantine attribute review, etc.) doesn't clobber a newer load's
-    /// visual state with a stale image. Lives on the main actor; no lock.
-    private var backgroundLoadToken: UInt64 = 0
-
-    /// Last-configured image opacity + tint (the values passed to
-    /// `applyBackground` / `setTint`). Tracked here so a runtime
-    /// `[window] opacity` change can re-scale the overlay alpha without
-    /// the caller having to re-issue applyBackground. Without this, an
-    /// opaque background image hides the desktop even when window
-    /// opacity is < 1.0, defeating the whole transparency feature for
-    /// users running with both an image AND window opacity set.
-    private var currentImageOpacity: Double = 1.0
-    private var currentImageTint: Double = 0.0
-
-    /// Mirror of the render view's `windowOpacity` so the controller's
-    /// `applyBackground` / `setTint` (which write to backgroundView /
-    /// tintView, not the render view) can scale by the current
-    /// `[window] opacity` value. Initialized from `config.windowOpacity`
-    /// at construction; updated by `applyWindowOpacity` hot-reload.
-    /// The render view keeps its own copy because the draw loop
-    /// reads it on every frame.
+    /// Mirror of the render view's `windowOpacity` value. Initialized
+    /// from `config.windowOpacity` at construction; updated by
+    /// `applyWindowOpacity` hot-reload. The render view keeps its own
+    /// copy because the draw loop reads it on every frame.
     private var windowOpacity: Double = 1.0
 
     /// Wire an image background + tint overlay. The render view's layer
@@ -537,57 +514,28 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
     /// Wire an image background + tint overlay. `NSImage(contentsOfFile:)`
     /// can stall the main thread for tens to hundreds of ms during the
     /// first Gatekeeper / XProtect scan of a newly-seen wallpaper file;
-    /// we offload the decode to a global queue and bounce the visual
-    /// swap back to main. `backgroundLoadToken` guards against a stale
-    /// decode landing after a newer applyBackground / clearBackground
-    /// took ownership of the visual state.
-    func applyBackground(path: String, tint: Double, opacity: Double) {
-        backgroundLoadToken &+= 1
-        let token = backgroundLoadToken
-        DispatchQueue.global(qos: .userInitiated).async {
-            let image = NSImage(contentsOfFile: path)
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                // Stale: newer applyBackground / clearBackground won
-                // the race; drop this decode to keep the latest visual
-                // state authoritative.
-                guard token == backgroundLoadToken else { return }
-                guard let image else { return }
-                currentImageOpacity = opacity
-                currentImageTint = tint
-                backgroundView?.image = image
-                // Window opacity scales the image + tint alpha so a
-                // single `[window] opacity` knob still produces visible
-                // desktop transparency even with a background image set.
-                // At windowOpacity = 1.0 this is a no-op (preserves the
-                // pre-feature behavior); at windowOpacity < 1.0 the
-                // image dims proportionally so the desktop bleeds
-                // through the same compositing chain as the no-image
-                // path.
-                backgroundView?.alphaValue = CGFloat(opacity * windowOpacity)
-                backgroundView?.isHidden = false
-                tintView?.layer?.backgroundColor = NSColor.black
-                    .withAlphaComponent(CGFloat(tint * windowOpacity)).cgColor
-                tintView?.isHidden = opacity == 0
-                renderView?.setImageBackgroundActive(true)
-                renderView?.needsDisplay = true
-            }
-        }
+    /// Per-pane bg/tint ownership moved to TabViewController.contentArea
+    /// (one image spans the whole window — splits no longer duplicate
+    /// the wallpaper). This method now only updates renderer state so
+    /// the alacritty draw path knows to skip the opaque default-bg
+    /// fill (`isTransparentBgActive` gate). `path` / `tint` / `opacity`
+    /// are consumed at the window level; AlacrittyTerminalViewController
+    /// doesn't need them. Kept in the signature for `CopadPanel`
+    /// protocol conformance.
+    func applyBackground(path _: String, tint _: Double, opacity _: Double) {
+        renderView?.setImageBackgroundActive(true)
+        renderView?.needsDisplay = true
     }
 
     func clearBackground() {
-        backgroundLoadToken &+= 1
-        backgroundView?.image = nil
-        backgroundView?.isHidden = true
-        tintView?.isHidden = true
         renderView?.setImageBackgroundActive(false)
         renderView?.needsDisplay = true
     }
 
-    func setTint(_ alpha: Double) {
-        currentImageTint = alpha
-        tintView?.layer?.backgroundColor = NSColor.black
-            .withAlphaComponent(CGFloat(alpha * windowOpacity)).cgColor
+    func setTint(_: Double) {
+        // No-op on the panel — tint is rendered at the window level
+        // (TabViewController owns the tint overlay). Kept for
+        // CopadPanel protocol conformance.
     }
 
     // MARK: - Font
@@ -1257,6 +1205,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     @objc private func displayLinkFired(_: CADisplayLink) {
         guard let handle = termHandle else { return }
         drainClipboardRequests(handle)
+        drainChildExit(handle)
         let damage = handle.takeDamageRows()
         let blinkPhaseChanged = advanceBlinkPhase()
 
@@ -1323,6 +1272,17 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
                 + "Set `[security] osc52 = \"allow\"` to opt in.\n"
             FileHandle.standardError.write(Data(msg.utf8))
         }
+    }
+
+    /// Drain alacritty's child-exit latch — when the PTY child
+    /// (shell) terminates, broadcast `panel.exited` so copad-core's
+    /// ContextService clears per-panel cwd/active state. Matches the
+    /// cross-platform contract the SwiftTerm path used to honor via
+    /// `processTerminated`. Fires at most once per Term lifetime;
+    /// repeated polls after the first return false.
+    private func drainChildExit(_ handle: CopadTermFFI.Handle) {
+        guard handle.takeChildExit() else { return }
+        eventBus?.broadcast(event: "panel.exited", data: ["panel_id": panelID])
     }
 
     /// Toggle the cursor visibility once per `blinkInterval` whenever

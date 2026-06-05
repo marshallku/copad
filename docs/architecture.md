@@ -137,8 +137,8 @@ copad/
 │       ├── main.rs          # Entry point, output formatting
 │       ├── commands.rs      # clap subcommands (session, background, tab, split, event, webview)
 │       └── client.rs        # Unix socket client
-└── copad-macos/           # Swift/AppKit native terminal (Phases 1–3 complete)
-    ├── Package.swift        # Swift Package Manager config (Swift 6, macOS 14+, SwiftTerm dep)
+└── copad-macos/           # Swift/AppKit native terminal (alacritty backend post-Phase-10b)
+    ├── Package.swift        # Swift Package Manager config (Swift 6, macOS 14+)
     └── Sources/Copad/
         ├── CopadApp.swift            # @main entry point
         ├── AppDelegate.swift        # NSApplicationDelegate, menu bar, socket command routing
@@ -147,7 +147,7 @@ copad/
         ├── PaneManager.swift        # Split-pane tree for a single tab
         ├── SplitNode.swift          # N-ary split tree (any CopadPanel leaves)
         ├── CopadPanel.swift          # Common protocol for terminal + webview panels
-        ├── TerminalViewController.swift  # SwiftTerm wrapper, shell, delegates
+        ├── AlacrittyTerminalViewController.swift  # alacritty_terminal renderer + PTY
         ├── WebViewController.swift  # WKWebView wrapper, CopadPanel impl
         ├── EventBus.swift           # Event broadcast hub + per-subscriber channel
         ├── SocketServer.swift       # POSIX Unix socket server (async completion handler)
@@ -176,7 +176,7 @@ copad/
 | --------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
 | Core library    | Rust (shared across platforms)                                                                                                         |
 | Linux terminal  | GTK4 + VTE4 (VTE handles PTY internally, zero IPC overhead)                                                                            |
-| macOS terminal  | Swift/AppKit + SwiftTerm (LocalProcessTerminalView)                                                                                    |
+| macOS terminal  | Swift/AppKit + `alacritty_terminal` (custom AppKit/CoreText renderer in `copad-term/`)                                                  |
 | CLI tool        | clap (Rust)                                                                                                                            |
 | Config          | TOML (`~/.config/copad/config.toml`)                                                                                                  |
 | IPC             | Unix domain socket, cmux V2 newline-delimited JSON                                                                                     |

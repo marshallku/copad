@@ -86,6 +86,14 @@ final class PaneManager {
     let containerView: NSView
 
     var onLastPaneClosed: (() -> Void)?
+    /// Fires after any new pane is added to this tab (split, webview
+    /// split, plugin split). TabViewController uses it to fan
+    /// runtime-applied state (window-level background, …) onto the
+    /// new pane — the pane was constructed from `self.config`, which
+    /// only carries load-time bg state, so without this hook a split
+    /// after a `background.set` socket call would render the new
+    /// pane opaque and cover the wallpaper.
+    var onPaneAdded: ((any CopadPanel) -> Void)?
     var onActivePaneChanged: (() -> Void)?
 
     /// Propagated from AppDelegate so all panels can emit events.
@@ -94,11 +102,6 @@ final class PaneManager {
     }
 
     private nonisolated(unsafe) var clickMonitor: Any?
-    /// Tier 1.5 (plain-text part) — separate `.leftMouseUp` monitor that
-    /// intercepts cmd+click for URL opening. Distinct from `clickMonitor`
-    /// (which is `.leftMouseDown` for pane focus) so each handler stays
-    /// single-purpose.
-    private nonisolated(unsafe) var urlClickMonitor: Any?
     /// Tracks the fill constraints added to containerView so they can be
     /// deactivated before the next rebuild.
     private var rootConstraints: [NSLayoutConstraint] = []
@@ -129,12 +132,10 @@ final class PaneManager {
         wirePanel(panel)
         rebuildViewHierarchy()
         installClickMonitor()
-        installURLClickMonitor()
     }
 
     deinit {
         if let m = clickMonitor { NSEvent.removeMonitor(m) }
-        if let m = urlClickMonitor { NSEvent.removeMonitor(m) }
     }
 
     // MARK: - Public API
@@ -150,31 +151,27 @@ final class PaneManager {
 
         setActive(newTermVC)
         newTermVC.startIfNeeded()
+        // Notify TabViewController so it can fan runtime state
+        // (window-level background, …) onto the new pane.
+        onPaneAdded?(newTermVC)
         // Target the panel's `focusTarget` (the inner keyboard view)
         // rather than `view` — alacritty panes wrap the render view in
         // a layout container that doesn't accept first-responder, so
-        // targeting `view` silently fails. SwiftTerm panes' container
-        // also doesn't accept; `focusTarget` returns the SwiftTerm
-        // `TerminalView` for both backends.
+        // targeting `view` silently fails.
         newTermVC.view.window?.makeFirstResponder(newTermVC.focusTarget)
     }
 
-    /// Factory: pick the terminal renderer based on `[renderer] backend`.
-    /// `alacritty` is the production default after Phase 10a (the
-    /// alacritty path reached parity through Phases 3–6); `swiftterm`
-    /// stays as an explicit opt-in fallback during dogfooding.
+    /// Factory: construct the terminal renderer. Phase 10b removed
+    /// the SwiftTerm fallback — alacritty is the only macOS backend
+    /// now. Stale `[renderer] backend = "swiftterm"` config keys are
+    /// parsed but ignored (see `RendererSection.backend`).
     static func makeTerminalPanel(
         config: CopadConfig,
         theme: CopadTheme,
         cwd: String? = nil,
         initialInput: String? = nil,
     ) -> any CopadPanel {
-        switch config.rendererBackend {
-        case .swiftterm:
-            TerminalViewController(config: config, theme: theme, cwd: cwd, initialInput: initialInput)
-        case .alacritty:
-            AlacrittyTerminalViewController(config: config, theme: theme, cwd: cwd, initialInput: initialInput)
-        }
+        AlacrittyTerminalViewController(config: config, theme: theme, cwd: cwd, initialInput: initialInput)
     }
 
     func splitActiveWithWebView(url: URL? = nil, orientation: SplitOrientation = .horizontal) {
@@ -188,6 +185,7 @@ final class PaneManager {
 
         setActive(webVC)
         webVC.startIfNeeded()
+        onPaneAdded?(webVC)
         webVC.view.window?.makeFirstResponder(webVC.focusTarget)
     }
 
@@ -204,6 +202,7 @@ final class PaneManager {
 
         setActive(panel)
         panel.startIfNeeded()
+        onPaneAdded?(panel)
         panel.view.window?.makeFirstResponder(panel.focusTarget)
     }
 
@@ -237,7 +236,6 @@ final class PaneManager {
     }
 
     private func assignEventBus(to panel: any CopadPanel) {
-        if let t = panel as? TerminalViewController { t.eventBus = eventBus }
         if let a = panel as? AlacrittyTerminalViewController { a.eventBus = eventBus }
         if let w = panel as? WebViewController { w.eventBus = eventBus }
     }
@@ -263,20 +261,18 @@ final class PaneManager {
         next.view.window?.makeFirstResponder(next.focusTarget)
     }
 
-    func allTerminals() -> [TerminalViewController] {
-        root.allLeaves().compactMap { $0 as? TerminalViewController }
+    /// All terminal panels in DFS leaf order. Returns the
+    /// backend-agnostic `TerminalCapable` interface — alacritty is
+    /// the only conformer today but the protocol keeps call sites
+    /// free of backend identity.
+    func allTerminals() -> [any TerminalCapable] {
+        root.allLeaves().compactMap { $0 as? TerminalCapable }
     }
 
-    func activeTerminal() -> TerminalViewController? {
-        activePane as? TerminalViewController
-    }
-
-    /// Backend-agnostic accessor used by socket `terminal.*` dispatch.
-    /// Returns whichever terminal controller (SwiftTerm or alacritty) is
-    /// focused, or nil if the active pane is non-terminal (webview /
-    /// plugin). Distinct from `activeTerminal` which is intentionally
-    /// SwiftTerm-typed for the few call sites that need SwiftTerm-only
-    /// hooks.
+    /// Active terminal-typed accessor used by socket `terminal.*`
+    /// dispatch. Returns nil if the focused pane is non-terminal
+    /// (webview / plugin), which AppDelegate surfaces as
+    /// `wrong_panel_type`.
     func activeTerminalPanel() -> (any TerminalCapable)? {
         activePane as? TerminalCapable
     }
@@ -286,7 +282,7 @@ final class PaneManager {
     }
 
     func setCustomTitle(_ title: String) {
-        (activePane as? TerminalViewController)?.setCustomTitle(title)
+        (activePane as? TerminalCapable)?.setCustomTitle(title)
     }
 
     // MARK: - Session persistence
@@ -305,7 +301,7 @@ final class PaneManager {
     /// the live title (cwd / process name) on reopen.
     func customTabTitle() -> String? {
         for panel in allPanels() {
-            if let t = panel as? TerminalViewController, let title = t.customTitle {
+            if let t = panel as? TerminalCapable, let title = t.customTitle {
                 return title
             }
         }
@@ -336,12 +332,6 @@ final class PaneManager {
     private static func buildSnap(node: SplitNode) -> Session.SplitSnap? {
         switch node {
         case let .leaf(panel):
-            // Both terminal backends carry a `currentCwd`; alacritty's
-            // is initialCwd-only for v1 (no OSC 7 surface yet — see
-            // macos-post-renderer-catchup.md).
-            if let t = panel as? TerminalViewController {
-                return .terminal(cwd: t.currentCwd)
-            }
             if let a = panel as? AlacrittyTerminalViewController {
                 return .terminal(cwd: a.currentCwd)
             }
@@ -375,6 +365,11 @@ final class PaneManager {
         }
     }
 
+    /// Fan a background-applied notification to every pane's render
+    /// view so default-bg cells flip transparent. Image + tint are
+    /// now drawn at the window level (TabViewController owns the
+    /// NSImageView / tint overlay) — these per-pane calls just
+    /// update renderer state. Kept for new-tab inheritance.
     func applyBackground(path: String, tint: Double, opacity: Double) {
         allPanels().forEach { $0.applyBackground(path: path, tint: tint, opacity: opacity) }
     }
@@ -387,20 +382,21 @@ final class PaneManager {
         allPanels().forEach { $0.setTint(alpha) }
     }
 
-    /// Single hot-reload entry: snapshot the new config/theme so split-spawned panes
-    /// pick them up, then fan out to existing terminals.
+    /// Expose the live `window.opacity` for TabViewController's
+    /// window-level bg / tint alpha calc. Held on the per-pane config
+    /// snapshot; PaneManager.applyConfig keeps it fresh.
+    func configWindowOpacity() -> Double {
+        config.windowOpacity
+    }
+
+    /// Single hot-reload entry: snapshot the new config/theme so
+    /// split-spawned panes pick them up, then fan out to live alacritty
+    /// terminals. Methods called here are alacritty-specific (not on
+    /// the `TerminalCapable` protocol — the protocol covers the
+    /// socket-facing surface, not internal config hooks).
     func applyConfig(_ newConfig: CopadConfig, theme newTheme: CopadTheme) {
         config = newConfig
         theme = newTheme
-        for term in allTerminals() {
-            term.applyTheme(newTheme)
-            term.applyFont(family: newConfig.fontFamily, baseSize: CGFloat(newConfig.fontSize))
-            term.applyOSC52Policy(newConfig.osc52)
-            term.applyWindowOpacity(newConfig.windowOpacity)
-        }
-        // Fan out theme/font/security to alacritty panes too. Phase 10
-        // flips the default backend, so an existing user editing their
-        // config expects the same hot-reload UX on either renderer.
         for pane in root.allLeaves() {
             if let alac = pane as? AlacrittyTerminalViewController {
                 alac.applyTheme(newTheme)
@@ -473,51 +469,13 @@ final class PaneManager {
         }
     }
 
-    /// Tier 1.5 — Cmd+click anywhere in a terminal pane: detect a plain-text
-    /// URL at the click position via `URLClickHelper` and open it. Returning
-    /// `nil` consumes the event so SwiftTerm's own `mouseUp` doesn't also
-    /// see it (which would be harmless — its OSC 8 path looks at a payload
-    /// we don't have on plain text — but consuming keeps the responder
-    /// chain tidy). Returning the event when no URL matches is intentional:
-    /// SwiftTerm still gets to handle OSC 8 hyperlinks via its built-in
-    /// `requestOpenLink` flow.
-    private func installURLClickMonitor() {
-        urlClickMonitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
-            guard let self else { return event }
-            guard event.modifierFlags.contains(.command) else { return event }
-            for panel in root.allLeaves() {
-                guard let termVC = panel as? TerminalViewController,
-                      let terminalView = termVC.terminalView
-                else { continue }
-                let locInTerm = terminalView.convert(event.locationInWindow, from: nil)
-                guard terminalView.bounds.contains(locInTerm) else { continue }
-                if let url = URLClickHelper.findURL(at: event, in: terminalView) {
-                    NSWorkspace.shared.open(url)
-                    return nil
-                }
-            }
-            return event
-        }
-    }
-
     // MARK: - Panel Wiring
 
-    private func wirePanel(_ panel: any CopadPanel) {
-        if let termVC = panel as? TerminalViewController {
-            termVC.onProcessTerminated = { [weak self, weak termVC] in
-                guard let self, let termVC else { return }
-                if ObjectIdentifier(termVC) == ObjectIdentifier(activePane) {
-                    closeActive()
-                } else {
-                    guard let newRoot = root.removing(termVC) else {
-                        onLastPaneClosed?(); return
-                    }
-                    termVC.view.removeFromSuperview()
-                    termVC.removeFromParent()
-                    root = newRoot
-                    rebuildViewHierarchy()
-                }
-            }
-        }
-    }
+    /// Phase 10b removed the SwiftTerm-specific `onProcessTerminated`
+    /// hook this used to wire. Alacritty's child-exit notification
+    /// isn't on the FFI surface yet — when an alacritty shell exits,
+    /// the pane stays as a dead-pty placeholder until the user
+    /// closes it explicitly. Tracked as a catchup item in
+    /// `docs/macos-post-renderer-catchup.md`.
+    private func wirePanel(_: any CopadPanel) {}
 }

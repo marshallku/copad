@@ -19,7 +19,7 @@ A cross-platform terminal emulator built around a shared Rust core and platform-
 
 ### Panels
 
-- **Terminal panel** — VTE4 on Linux, SwiftTerm on macOS; PTY handled internally on both platforms
+- **Terminal panel** — VTE4 on Linux, `alacritty_terminal` + custom AppKit/CoreText renderer on macOS; PTY handled internally on both platforms
 - **WebView panel** — WebKitGTK 6.0 (Linux) / WKWebView (macOS) as a first-class panel; URL toolbar, DevTools toggle, side-by-side with terminals
 - **Plugin panels** — HTML/JS panels loaded from `~/.config/copad/plugins/` with an injected `copad` JS bridge for socket calls and event subscriptions
 - **Status bar** — Waybar-style 3-zone bar (left/center/right) populated by plugin modules
@@ -59,7 +59,7 @@ A cross-platform terminal emulator built around a shared Rust core and platform-
 ### Platforms
 
 - **Linux** — GTK4 + VTE4, full feature set
-- **macOS** — Swift/AppKit + SwiftTerm, near-parity (terminal, tabs, splits, search, themes, webview, plugins, status bar, keybindings, background images, AI agent API). See [`docs/macos-parity-plan.md`](./docs/macos-parity-plan.md).
+- **macOS** — Swift/AppKit + `alacritty_terminal` renderer (custom AppKit/CoreText), near-parity (terminal, tabs, splits, search, themes, webview, plugins, status bar, keybindings, background images, AI agent API). See [`docs/macos-parity-plan.md`](./docs/macos-parity-plan.md).
 
 ## Requirements
 
@@ -244,7 +244,8 @@ copad/
 │                                 # action registry, context, triggers, themes, fs_atomic)
 ├── copad-ffi/                 # Rust staticlib for Swift FFI (macOS bridge)
 ├── copad-linux/               # GTK4 + VTE4 native terminal app (binary: copad)
-├── copad-macos/               # Swift/AppKit + SwiftTerm app (Copad.app)
+├── copad-macos/               # Swift/AppKit + alacritty_terminal app (Copad.app)
+├── copad-term/                # Rust staticlib wrapping alacritty_terminal for the macOS renderer
 ├── copad-cli/                 # CLI control tool (binary: coctl)
 ├── plugins/<name>/             # First-party service plugins. Each subdir holds the
 │                                 # Rust crate (Cargo.toml + src/) and its manifest/assets

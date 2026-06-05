@@ -1,10 +1,24 @@
 # macOS App (copad-macos)
 
+> ⚠️ **Doc currency note (2026-06-05)**: many sections below still
+> describe the original SwiftTerm-backed implementation. Phase 10b
+> (2026-06-05) removed the SwiftTerm path; the current renderer is
+> `alacritty_terminal` + a custom AppKit/CoreText draw layer
+> (`AlacrittyTerminalViewController`). The "Phase 6 / 7" sections at
+> the bottom + [macos-post-renderer-catchup.md](./macos-post-renderer-catchup.md)
+> are authoritative for the current state. Older sections kept as
+> historical record + reference for SwiftTerm-era gotchas that may
+> still inform decisions if a similar pattern arises.
+
 ## Overview
 
-Swift/AppKit app using [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) for terminal rendering and PTY management. SwiftTerm's `LocalProcessTerminalView` handles the PTY internally — the same design choice as VTE on Linux: no custom PTY layer needed.
+Swift/AppKit app. **Current renderer**: `alacritty_terminal` (Rust
+staticlib via `copad-term/`) with a custom AppKit/CoreText draw
+layer. **Historical**: started on [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)
+(commit `e0ddf31` 2026-05-18 flipped default to alacritty; Phase 10b
+2026-06-05 removed SwiftTerm entirely).
 
-**Tech stack:** Swift 6, AppKit, SwiftTerm 1.11+, macOS 14+
+**Tech stack:** Swift 6, AppKit, macOS 14+, `libcopad_term.a` (Rust staticlib wrapping `alacritty_terminal`)
 
 **Build system:** Swift Package Manager (standalone, not in Cargo workspace)
 
@@ -785,19 +799,15 @@ coctl ──Unix socket──► SocketServer (background thread)
 - ~~Plugin system~~ ✅ HTML/JS 패널 (`WKScriptMessageHandlerWithReply` 브리지) + daemon-routed 플러그인 호스트 (Swift `PluginSupervisor`는 macOS daemon-migration PR 5, 커밋 `2913441`에서 삭제됨 — daemon이 supervisor 소유)
 - ~~Status bar~~ ✅ Waybar-style 3-zone + `[[modules]]` (Tier 4.2)
 
-### Phase 6: Renderer migration (SwiftTerm → alacritty_terminal) ✅ Phase 10a 까지
-[macos-renderer-migration-plan.md](./macos-renderer-migration-plan.md) 진행 완료, default backend가 `alacritty`로 flip됨. `[renderer] backend = "swiftterm"` 명시 시 fallback. Phase 10b (SwiftTerm path 완전 제거)는 dogfooding window 후.
+### Phase 6: Renderer migration (SwiftTerm → alacritty_terminal) ✅ Phase 10a + 10b
+[macos-renderer-migration-plan.md](./macos-renderer-migration-plan.md) 완료. Phase 10a (`e0ddf31`)에서 default backend가 `alacritty`로 flip, Phase 10b (2026-06-05)에서 SwiftTerm path 완전 제거. `[renderer] backend = "swiftterm"` 설정은 silent-ignore (stale config 호환).
 
 ### Phase 7: Post-renderer catch-up
-[macos-post-renderer-catchup.md](./macos-post-renderer-catchup.md) — renderer polish + Linux-parity 잔여 + Phase 10b. 현재 active 백로그.
+[macos-post-renderer-catchup.md](./macos-post-renderer-catchup.md) — renderer polish + Linux-parity 잔여. 현재 active 백로그.
 
 ---
 
 ## 알려진 주의사항
 
-- **`fullSizeContentView` 금지**: 콘텐츠가 타이틀바 아래까지 확장되어 SwiftTerm이 행 수를 잘못 계산하고 커서 위치가 어긋납니다.
-- **환경변수 상속 필수**: `startProcess(environment:)`에 배열을 넘기면 부모 환경 완전 교체. `TERM` 없이 쉘 실행 시 오류 발생.
-- **`hostCurrentDirectoryUpdate` 구현 필수**: `LocalProcessTerminalViewDelegate`에 필수 메서드이므로 stub이라도 있어야 컴파일됩니다.
-- **`startShellIfNeeded()` 타이밍**: `layoutSubtreeIfNeeded()` 이후에 호출해야 SwiftTerm이 올바른 cols/rows를 계산합니다.
 - **`NSSplitView` subview layout**: NSSplitView의 직접 자식은 `translatesAutoresizingMaskIntoConstraints = true` + `autoresizingMask = [.width, .height]`를 써야 합니다. Auto Layout을 사용하면 NSSplitView와 충돌합니다.
-- **SwiftTerm `processTerminated` 미호출 버그**: troubleshooting.md 참조.
+- **alacritty 자동 pane close 없음**: shell이 exit하면 `panel.exited` 이벤트는 발행되지만 (Phase 10b commit에 추가된 `copad_term_take_child_exit` FFI 경유), 화면에서 pane을 자동으로 닫지는 않음 — 사용자가 Cmd+W로 명시적 close 필요. dead-PTY viewport는 그대로 남음.

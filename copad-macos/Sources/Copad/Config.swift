@@ -43,33 +43,6 @@ struct StatusBarConfig {
     static let defaults = StatusBarConfig(enabled: true, position: "bottom", height: 28)
 }
 
-/// Selects which terminal-emulation core renders a pane.
-/// `alacritty` is the current default after Phase 3-6 reached feature
-/// parity with the SwiftTerm path on the slice that matters for daily
-/// use (cells/colors/cursor/image bg/transparency/damage gating,
-/// selection + clipboard + OSC 52/8 + URL click, scrollback +
-/// mouse wheel + Cmd nav, IME preedit, font/theme hot-reload).
-/// `swiftterm` is retained as an explicit fallback while the
-/// alacritty path dogfoods — drop it via Phase 10b once we're
-/// confident nothing daily falls back. Read once per pane at
-/// construction time — flipping the config requires a restart
-/// (or a new tab) for the change to apply.
-enum RendererBackend: String {
-    case swiftterm
-    case alacritty
-
-    static func parse(_ raw: String?) -> RendererBackend {
-        switch raw?.lowercased() {
-        case "swiftterm": .swiftterm
-        // Default to alacritty — an unspecified or unknown value
-        // gets the active production backend rather than the legacy
-        // fallback. Users who explicitly want SwiftTerm set
-        // `[renderer] backend = "swiftterm"`.
-        default: .alacritty
-        }
-    }
-}
-
 struct CopadConfig {
     let shell: String
     let fontFamily: String
@@ -100,20 +73,12 @@ struct CopadConfig {
     /// Distinct from `backgroundTint`, which darkens the image via an overlay.
     let backgroundOpacity: Double
     let osc52: OSC52Policy
-    /// `[renderer] backend = "swiftterm" | "alacritty"`. Defaults to
-    /// `alacritty` after Phase 10a; SwiftTerm stays as a one-flag-flip
-    /// fallback during dogfooding. Per-pane: each new tab/split reads
-    /// the live config value at construction time (changing it doesn't
-    /// affect already-open panes — they keep whichever backend they
-    /// were spawned with).
-    let rendererBackend: RendererBackend
     /// `[renderer] transparent_default_bg = true` makes default-bg cells
-    /// transparent on the alacritty backend, so a configured background
-    /// image shows through blank cells. Off by default — cursor
-    /// visibility against image backgrounds wins over aesthetic
-    /// transparency. Cells with explicit ANSI bg colors and reverse-video
-    /// cells still materialize opaquely (Zed pattern). No-op on the
-    /// SwiftTerm backend.
+    /// transparent so a configured background image shows through blank
+    /// cells. Off by default — cursor visibility against image
+    /// backgrounds wins over aesthetic transparency. Cells with explicit
+    /// ANSI bg colors and reverse-video cells still materialize opaquely
+    /// (Zed pattern).
     let transparentDefaultBg: Bool
     /// `[window] opacity` (0.0 = fully transparent, 1.0 = fully opaque,
     /// default 1.0). Controls the window itself + terminal default-bg
@@ -206,7 +171,6 @@ struct CopadConfig {
             backgroundTint: clamp01(raw.background?.tint ?? defaults.backgroundTint),
             backgroundOpacity: clamp01(raw.background?.opacity ?? defaults.backgroundOpacity),
             osc52: raw.security?.osc52 ?? defaults.osc52,
-            rendererBackend: RendererBackend.parse(raw.renderer?.backend),
             // Smart default: a wallpaper config implies the user wants
             // to see the wallpaper, so default to transparent-default-
             // bg unless they explicitly say otherwise. Without this the
@@ -248,7 +212,6 @@ struct CopadConfig {
             backgroundTint: 0.6,
             backgroundOpacity: 1.0,
             osc52: .deny,
-            rendererBackend: .alacritty,
             transparentDefaultBg: false,
             windowOpacity: 1.0,
             windowBlur: false,
@@ -367,6 +330,11 @@ private struct WindowSection: Decodable {
 }
 
 private struct RendererSection: Decodable {
+    /// Stale-config tolerance: Phase 10b removed the SwiftTerm
+    /// backend, but configs that still carry `[renderer] backend =
+    /// "swiftterm"` should parse cleanly. The value is read into this
+    /// field and ignored — `makeTerminalPanel` always constructs an
+    /// alacritty controller now.
     var backend: String?
     var transparentDefaultBg: Bool?
 

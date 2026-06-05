@@ -1,4 +1,15 @@
 import AppKit
+import Foundation
+
+extension Notification.Name {
+    /// Posted by any panel that changes its title — terminal
+    /// (`setCustomTitle`, OSC 0/2 future hook) or webview
+    /// (`didFinishNavigation`). The tab bar observes this to refresh
+    /// the active tab label. Lifts the constant out of the deleted
+    /// `TerminalViewController.swift` so all panel types share one
+    /// notification key.
+    static let terminalTitleChanged = Notification.Name("copad.terminalTitleChanged")
+}
 
 /// Common interface for all panel types (terminal, webview, …).
 /// Both TerminalViewController and WebViewController conform to this.
@@ -12,10 +23,10 @@ protocol CopadPanel: AnyObject {
 
     /// The view that should receive keyboard focus. For panels that
     /// wrap their input-handling view in a layout container, this is
-    /// the inner view (e.g. the SwiftTerm `TerminalView` or the
-    /// alacritty `AlacrittyRenderView`). External callers use this
-    /// instead of `view` when calling `makeFirstResponder`, so the
-    /// container being unfocusable doesn't break activation.
+    /// the inner view (e.g. the alacritty `AlacrittyRenderView`).
+    /// External callers use this instead of `view` when calling
+    /// `makeFirstResponder`, so the container being unfocusable
+    /// doesn't break activation.
     var focusTarget: NSView { get }
 
     /// Title shown in the tab bar.
@@ -56,11 +67,10 @@ protocol Zoomable {
 }
 
 /// Backend-agnostic surface for the `terminal.*` socket methods.
-/// Both `TerminalViewController` (SwiftTerm) and
-/// `AlacrittyTerminalViewController` conform; WebView / plugin
-/// panels do not, so `panel as? TerminalCapable == nil` is the
-/// compile-time signal AppDelegate uses to emit `wrong_panel_type`
-/// — matching Linux's `as_terminal()` check in
+/// `AlacrittyTerminalViewController` is the only conformer today;
+/// WebView / plugin panels do not, so `panel as? TerminalCapable
+/// == nil` is the compile-time signal AppDelegate uses to emit
+/// `wrong_panel_type` — matching Linux's `as_terminal()` check in
 /// copad-linux/src/socket.rs::resolve_terminal.
 @MainActor
 protocol TerminalCapable: CopadPanel {
@@ -70,4 +80,9 @@ protocol TerminalCapable: CopadPanel {
     func readScreen() -> [String: Any]
     func history(lines: Int) -> [String: Any]
     func context(historyLines: Int) -> [String: Any]
+    /// Title override set via `tab.rename`. When non-nil, suppresses
+    /// auto-derived title updates (OSC 0/2 from the running shell).
+    /// `currentTitle` reflects this when set.
+    var customTitle: String? { get }
+    func setCustomTitle(_ title: String)
 }

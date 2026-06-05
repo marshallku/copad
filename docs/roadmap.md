@@ -206,7 +206,7 @@ Goal: full Linux feature parity. Phase 1 MVP complete; porting remaining Linux f
 
 **Phase 6 — Renderer migration (SwiftTerm → alacritty_terminal) ✅**
 
-Replaces SwiftTerm with `alacritty_terminal` + a custom AppKit/CoreText renderer (decision #31). Default backend flipped to alacritty in commit `e0ddf31` (Phase 10a); SwiftTerm retained as `[renderer] backend = "swiftterm"` opt-in fallback until Phase 10b removal. Full slice tracking in [macos-renderer-migration-plan.md](./macos-renderer-migration-plan.md).
+Replaces SwiftTerm with `alacritty_terminal` + a custom AppKit/CoreText renderer (decision #31). Default backend flipped to alacritty in commit `e0ddf31` (Phase 10a, 2026-05-18); SwiftTerm path removed entirely in Phase 10b (2026-06-05) after the dogfooding window + Cycle 4 added in-terminal find as the Cmd+F regression guard. Full slice tracking in [macos-renderer-migration-plan.md](./macos-renderer-migration-plan.md).
 
 - [x] Phase 1–2: `copad-term` scaffold + PTY EventLoop wiring (`9f2e76c`, `3885980`)
 - [x] Phase 3: CoreText render + ANSI palette + cursor + image background + damage-gated CADisplayLink (`d1773b6` → `d504254`)
@@ -216,7 +216,7 @@ Replaces SwiftTerm with `alacritty_terminal` + a custom AppKit/CoreText renderer
 - [x] Phase 10a: theme/font hot-reload prerequisite + default backend flip (`85f1beb`, `e0ddf31`)
 - [x] Post-flip polish: Opt/Cmd line-edit shortcuts (`402ab61`), nvim cursor cursor-on-top + inverse-glyph + scroll-perf run aggregation + needsDisplay dedupe (`6b6ac42`), wheel forwarding to mouse-mode TUIs (`5420ef5`)
 - [x] CLI parity: `copad --version` / `--config-path` / `--init-config` flags + config-path unified to `~/.config/copad/` + `install-macos.sh` copadd install (`4c70817`); copadd LaunchAgent auto-start (`b93bc0b`)
-- [ ] Phase 10b: remove SwiftTerm path entirely (after ~2–4 weeks dogfooding window) — see [macos-post-renderer-catchup.md §C](./macos-post-renderer-catchup.md)
+- [x] Phase 10b: SwiftTerm path removed entirely (2026-06-05). See [macos-post-renderer-catchup.md §C](./macos-post-renderer-catchup.md). Stale `[renderer] backend = "swiftterm"` configs silently fall through to alacritty.
 
 **Phase 7 — Post-renderer catch-up** (active backlog)
 

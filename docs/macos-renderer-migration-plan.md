@@ -101,16 +101,9 @@ The full surface grows over phases — selection getters in Phase 4, IME helpers
 
 ### D4. Feature flag
 
-Config gains a new section:
+**Historical (Phases 1–10a)**: Config gained a `[renderer] backend` switch (`"swiftterm"` vs `"alacritty"`) so each phase ended with a runnable side-by-side comparison: same shell, same config, two windows, swap with a config edit + restart. `PaneManager.makeTerminalPanel` branched on the value and instantiated either `TerminalViewController` (SwiftTerm) or `AlacrittyTerminalViewController`.
 
-```toml
-[renderer]
-backend = "swiftterm"  # or "alacritty"
-```
-
-At pane construction time in `TabViewController`, branch on the config value and instantiate either `TerminalViewController` (current SwiftTerm-based) or `AlacrittyTerminalViewController` (new). Both conform to `CopadPanel` so the rest of the app — `PaneManager`, `SplitNode`, socket commands, daemon Invokes — sees no difference.
-
-This means each phase ends with a runnable comparison: same shell, same config, two windows side-by-side, swap with a config edit + restart.
+**Phase 10b (2026-06-05)** removed the SwiftTerm branch entirely. The `RendererSection.backend` field is parsed but ignored — stale configs still load. Only the alacritty path remains.
 
 ### D5. Renderer technology
 

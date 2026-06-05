@@ -230,6 +230,18 @@ enum CopadTermFFI {
             copad_term_search_clear(ptr)
         }
 
+        // MARK: - Child exit
+
+        /// True iff the PTY child (shell) exited since the last call.
+        /// Latch is cleared on read — a second poll returns false.
+        /// AlacrittyTerminalViewController polls in `displayLinkFired`
+        /// and broadcasts `panel.exited` on the bus so copad-core's
+        /// ContextService can clean per-panel state.
+        func takeChildExit() -> Bool {
+            guard let ptr else { return false }
+            return copad_term_take_child_exit(ptr)
+        }
+
         /// Returns the current selection as a Swift string (or nil if
         /// nothing selected). Lifetime of the underlying Rust buffer
         /// is bounded by this call — we copy the bytes into a Swift

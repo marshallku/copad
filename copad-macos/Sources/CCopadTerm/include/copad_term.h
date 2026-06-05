@@ -148,6 +148,12 @@ int32_t copad_term_take_damage_rows(CopadHandle* handle,
                                      uint16_t* out_buf,
                                      uint16_t cap);
 
+// True iff the PTY child process exited since the last call. Clears
+// the latch on read (a second poll returns false). The renderer
+// should broadcast `panel.exited` when this returns true so
+// copad-core's ContextService cleans up per-panel cwd state.
+bool copad_term_take_child_exit(CopadHandle* handle);
+
 // --- In-terminal find ---
 
 // Current find match in viewport coordinates. Same shape as

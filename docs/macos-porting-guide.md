@@ -4,7 +4,8 @@
 project memory still call it one, but that's stale — the macOS app
 already runs at near-parity with `copad-linux/`. Renderer migration
 (SwiftTerm → `alacritty_terminal`) flipped the default in commit
-`e0ddf31` (Phase 10a). Daemon-first migration (PRs 1–8, see
+`e0ddf31` (Phase 10a) and removed the SwiftTerm path entirely in
+Phase 10b (2026-06-05). Daemon-first migration (PRs 1–8, see
 `docs/macos-daemon-migration-plan.md`) is shipped. 10 first-party plugins
 build + install. Status bar, command palette, session persistence — all
 landed.
@@ -24,12 +25,12 @@ Tree shape: `copad-macos/Package.swift` (SwiftPM, macOS 14+, Swift 6) +
 `copad-macos/run.sh` (dev launcher) + `copad-macos/Sources/` containing
 three SPM targets:
 
-- **`Copad/`** — 31 Swift files, ~7800 LOC. The full app: `CopadApp` /
-  `AppDelegate` / tab+split tree (`TabViewController`, `PaneManager`,
-  `SplitNode`, `CopadPanel`) / two terminal backends
-  (`TerminalViewController` = SwiftTerm fallback,
-  `AlacrittyTerminalViewController` = `copad-term` default) /
-  `WebViewController` / `PluginPanelController` / `SocketServer` /
+- **`Copad/`** — Swift files (~7000 LOC after Phase 10b SwiftTerm
+  removal). The full app: `CopadApp` / `AppDelegate` / tab+split tree
+  (`TabViewController`, `PaneManager`, `SplitNode`, `CopadPanel`) /
+  the alacritty terminal backend (`AlacrittyTerminalViewController`
+  via `copad-term`) / `WebViewController` / `PluginPanelController`
+  / `SocketServer` /
   `DaemonClient` / `ActionRegistry` / `ContextService` / `EventBus` /
   `CommandPalette` / `Session` / `StatusBarView` + `StatusModuleRunner` /
   `BackgroundRotator` / `Keybindings` / `ClaudeStart` / `Config` +
@@ -66,7 +67,7 @@ Linux feature, this is its macOS equivalent and current status.
 
 | Concern | Linux source | macOS source | Status |
 |---|---|---|---|
-| PTY + terminal grid | VTE 0.84 owns PTY (`copad-linux/src/tabs.rs`) | `AlacrittyTerminalViewController` via `libcopad_term.a` (default); SwiftTerm `TerminalViewController` (fallback) | done; SwiftTerm removal pending (Phase 10b) |
+| PTY + terminal grid | VTE 0.84 owns PTY (`copad-linux/src/tabs.rs`) | `AlacrittyTerminalViewController` via `libcopad_term.a` | done (Phase 10b 2026-06-05 removed the SwiftTerm fallback) |
 | Renderer | VTE | Custom AppKit/CoreText draw + `CADisplayLink` damage gate | done (decision #36) |
 | Socket server | `copad-linux/src/socket.rs` (1961 LOC) | `SocketServer.swift` + `AppDelegate.handleCommand` | done |
 | Daemon (`copadd`) | wired (`83c5122`) | `DaemonClient.swift` auto-spawns + connects | done |
@@ -273,10 +274,8 @@ The macOS app is past the original parity plan. Active queue is in
    parsing argv, so a second invocation while one is running errors
    out even for `--version`. Parse `--version`/`--help` first.
 
-**C. Phase 10b — remove SwiftTerm path:** after 2–4 weeks daily-use
-dogfooding on alacritty with no regressions, delete the SwiftTerm path
-entirely. File list in `docs/macos-post-renderer-catchup.md` §C. Biggest
-code-simplification win available; do it when there's confidence.
+**C. ~~Phase 10b — remove SwiftTerm path~~ ✅ done 2026-06-05.** See
+`docs/macos-post-renderer-catchup.md` §C for the changes that shipped.
 
 **D. Cross-platform daemon work** — pure-Rust changes in `copad-daemon`
 or plugins; macOS daemon auto-spawned via LaunchAgent picks them up for
@@ -289,8 +288,7 @@ gate or subprocess-per-test.
 
 **Recommended starting point:** **A1 (DSR)** for a tiny first commit, or
 **B1 (`notify.show` in-process)** for a real cross-platform parity fix
-that exercises FFI + registry + system APIs in one PR. The biggest-risk
-item to start with cold is the SwiftTerm path (C) — leave it last.
+that exercises FFI + registry + system APIs in one PR.
 
 ---
 

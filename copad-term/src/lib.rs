@@ -169,6 +169,14 @@ struct CopadListener {
     /// fall back to their own defaults rather than getting a wrong
     /// answer.
     palette: Arc<std::sync::Mutex<HashMap<usize, Rgb>>>,
+    /// One-shot latch: set when alacritty's EventLoop observes
+    /// `Event::ChildExit` (the PTY child — typically the user's
+    /// shell — terminated). Polled by the FFI's
+    /// `copad_term_take_child_exit` so the renderer can broadcast
+    /// `panel.exited` on the bus. Atomic + clear-on-take: a second
+    /// poll after the first returns false even though the underlying
+    /// signal is permanent.
+    child_exited: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Catppuccin Mocha defaults — same palette
@@ -216,6 +224,7 @@ impl CopadListener {
             pending_clipboard: Arc::new(std::sync::Mutex::new(None)),
             sender: Arc::new(std::sync::Mutex::new(None)),
             palette: Arc::new(std::sync::Mutex::new(palette)),
+            child_exited: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -270,11 +279,20 @@ impl EventListener for CopadListener {
                     self.send_to_pty(reply.into_bytes());
                 }
             }
+            Event::ChildExit(_status) => {
+                // Shell exited. Flip the latched flag so the renderer
+                // can poll-pull this on its next `displayLinkFired`
+                // tick and broadcast `panel.exited` to the bus —
+                // matching the cross-platform cleanup contract
+                // (`copad-core::context` clears per-panel cwd / active
+                // state on this event). Latch (vs. counter) is fine:
+                // ChildExit fires at most once per Term lifetime.
+                self.child_exited.store(true, Ordering::Relaxed);
+            }
             _ => {
                 // Title / Bell / MouseCursorDirty / TextAreaSizeRequest /
-                // CursorBlinkingChange / Wakeup / Exit / ChildExit —
-                // intentionally dropped; the renderer doesn't react to
-                // them today.
+                // CursorBlinkingChange / Wakeup / Exit — intentionally
+                // dropped; the renderer doesn't react to them today.
             }
         }
     }
@@ -2418,6 +2436,27 @@ pub unsafe extern "C" fn copad_term_take_clipboard_request(
     Box::into_raw(Box::new(CopadString {
         data: text.into_bytes().into_boxed_slice(),
     }))
+}
+
+/// True iff the PTY child process (typically the user's shell) has
+/// exited since the last call. Clears the latch on read so a second
+/// poll after the first returns false. The renderer broadcasts
+/// `panel.exited` on the event bus when this returns true; consumers
+/// (copad-core ContextService, daemon subscribers) rely on that
+/// event to clear per-panel cwd / active-doc state.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `copad_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_take_child_exit(handle: *mut CopadHandle) -> bool {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return false;
+    };
+    h.listener
+        .child_exited
+        .swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Number of distinct OSC 8 hyperlink URIs visible in this snapshot.

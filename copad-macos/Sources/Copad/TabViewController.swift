@@ -14,6 +14,18 @@ final class TabViewController: NSViewController {
 
     private var tabBar: TabBarView!
     private var contentArea: NSView!
+    /// Window-level background image (Phase 10b follow-up). One image
+    /// fills the entire `contentArea` so splits share the same
+    /// wallpaper instead of each pane duplicating it. Lazily created
+    /// on first `applyBackground`. z-order: inserted below the
+    /// PaneManager containerView so panes (with transparent
+    /// default-bg cells via `setImageBackgroundActive`) overlay it.
+    private var backgroundView: NSImageView?
+    private var tintView: NSView?
+    /// Monotonic load token guards against a slow `NSImage(contentsOfFile:)`
+    /// decode landing after a newer applyBackground/clearBackground
+    /// took ownership of the visual state.
+    private var backgroundLoadToken: UInt64 = 0
     /// Tier 4.2 — status bar at the bottom of the window. nil when
     /// `[statusbar] enabled = false`. Public so AppDelegate can wire
     /// it up post-launch (load modules from discovered plugin manifests
@@ -55,15 +67,10 @@ final class TabViewController: NSViewController {
         paneManagers.indices.contains(activeIndex) ? paneManagers[activeIndex] : nil
     }
 
-    var activeTerminal: TerminalViewController? {
-        activePaneManager?.activeTerminal()
-    }
-
-    /// Backend-agnostic terminal accessor — returns either backend's
-    /// controller (or nil for webview / plugin pane). Use this for
-    /// socket `terminal.*` dispatch; reserve `activeTerminal` for the
-    /// SwiftTerm-only call sites (URL click handler, custom-title
-    /// setter, etc.).
+    /// Backend-agnostic terminal accessor — returns the active
+    /// alacritty controller via the `TerminalCapable` protocol, or
+    /// nil for webview / plugin panes. Used by socket `terminal.*`
+    /// dispatch.
     var activeTerminalPanel: (any TerminalCapable)? {
         activePaneManager?.activeTerminalPanel()
     }
@@ -72,11 +79,9 @@ final class TabViewController: NSViewController {
         activePaneManager?.activeWebView()
     }
 
-    /// Polymorphic zoom dispatch — covers both terminal backends
-    /// without AppDelegate needing to know which one is in front.
-    /// Returns nil for non-terminal panes (webview, plugin) so the
-    /// View → Zoom menu items become no-ops there, matching what
-    /// the SwiftTerm-only `activeTerminal` path used to do.
+    /// Polymorphic zoom dispatch — works for any pane that conforms
+    /// to `Zoomable`. Returns nil for non-zoomable panes (webview,
+    /// plugin) so the View → Zoom menu items become no-ops there.
     var activeZoomable: (any Zoomable)? {
         activePaneManager?.activePane as? Zoomable
     }
@@ -115,10 +120,6 @@ final class TabViewController: NSViewController {
     @discardableResult
     func applyReportedCwd(panelID: String, cwd: String) -> Bool {
         guard let p = panel(id: panelID) else { return false }
-        if let t = p as? TerminalViewController {
-            t.setReportedCwd(cwd)
-            return true
-        }
         if let a = p as? AlacrittyTerminalViewController {
             a.setReportedCwd(cwd)
             return true
@@ -376,6 +377,17 @@ final class TabViewController: NSViewController {
         manager.onActivePaneChanged = { [weak self] in
             self?.refreshTabBar()
         }
+        manager.onPaneAdded = { [weak self] panel in
+            // Fan window-level state onto the new pane. Right now
+            // that's just background-active gate so default-bg cells
+            // stay transparent and the shared wallpaper shows
+            // through. Future runtime state (per-pane theme, etc.)
+            // would route through here too.
+            guard let self else { return }
+            if currentBackgroundPath != nil {
+                panel.applyBackground(path: "", tint: 0, opacity: 0)
+            }
+        }
 
         NotificationCenter.default.addObserver(
             forName: .terminalTitleChanged,
@@ -530,6 +542,11 @@ final class TabViewController: NSViewController {
             paneManager.applyConfig(newConfig, theme: theme)
         }
 
+        // Re-scale the window-level bg / tint alpha against the new
+        // window.opacity. Pane-level applyWindowOpacity used to do
+        // this per-pane; image is window-owned now.
+        refreshBackgroundForWindowOpacity()
+
         // Background: apply/clear based on new config
         if let path = newConfig.backgroundPath {
             applyBackground(path: path, tint: newConfig.backgroundTint, opacity: newConfig.backgroundOpacity)
@@ -546,32 +563,137 @@ final class TabViewController: NSViewController {
 
     // MARK: - Background
 
+    /// Window-level background. Renders one image across the whole
+    /// `contentArea` (under all splits within the active tab) so
+    /// splits no longer duplicate the wallpaper. Async decode +
+    /// monotonic load token to drop stale loads on a fast
+    /// path-change. Image alpha + tint alpha are scaled by the
+    /// configured `window.opacity` so the desktop bleeds through
+    /// when the user opts into window transparency.
     func applyBackground(path: String, tint: Double, opacity: Double = 1.0) {
         currentBackgroundPath = path
         currentBackgroundTint = tint
         currentBackgroundOpacity = opacity
-        paneManagers.forEach { $0.applyBackground(path: path, tint: tint, opacity: opacity) }
+        ensureBackgroundViews()
+        backgroundLoadToken &+= 1
+        let token = backgroundLoadToken
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let image = NSImage(contentsOfFile: path)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                // Stale: newer applyBackground / clearBackground won
+                // the race; drop this decode.
+                guard token == backgroundLoadToken else { return }
+                guard let image else { return }
+                let windowOpacity = currentWindowOpacity()
+                backgroundView?.image = image
+                backgroundView?.alphaValue = CGFloat(opacity * windowOpacity)
+                backgroundView?.isHidden = false
+                tintView?.layer?.backgroundColor = NSColor.black
+                    .withAlphaComponent(CGFloat(tint * windowOpacity)).cgColor
+                tintView?.isHidden = opacity == 0
+                // Fan to every pane's render view so default-bg cells
+                // stay transparent and the image shows through.
+                fanSetImageBackgroundActive(true)
+            }
+        }
     }
 
     func clearBackground() {
         currentBackgroundPath = nil
-        paneManagers.forEach { $0.clearBackground() }
+        backgroundLoadToken &+= 1
+        backgroundView?.image = nil
+        backgroundView?.isHidden = true
+        tintView?.isHidden = true
+        fanSetImageBackgroundActive(false)
     }
 
     func setTint(_ alpha: Double) {
         currentBackgroundTint = alpha
-        paneManagers.forEach { $0.setTint(alpha) }
+        let windowOpacity = currentWindowOpacity()
+        tintView?.layer?.backgroundColor = NSColor.black
+            .withAlphaComponent(CGFloat(alpha * windowOpacity)).cgColor
+    }
+
+    /// `window.opacity` hot-reload (called from AppDelegate config
+    /// watcher path). Re-scales image + tint alpha so the user-knob
+    /// stays load-bearing on top of an active background image.
+    func refreshBackgroundForWindowOpacity() {
+        let windowOpacity = currentWindowOpacity()
+        backgroundView?.alphaValue = CGFloat(currentBackgroundOpacity * windowOpacity)
+        tintView?.layer?.backgroundColor = NSColor.black
+            .withAlphaComponent(CGFloat(currentBackgroundTint * windowOpacity)).cgColor
+    }
+
+    /// Lazily insert the bg + tint NSImageView/NSView under
+    /// `contentArea`. Both pinned to the contentArea edges so they
+    /// fill the entire pane area regardless of split layout.
+    private func ensureBackgroundViews() {
+        if backgroundView != nil { return }
+        let bg = NSImageView(frame: contentArea.bounds)
+        bg.imageScaling = .scaleAxesIndependently
+        bg.wantsLayer = true
+        bg.isHidden = true
+        bg.translatesAutoresizingMaskIntoConstraints = false
+        let firstSubview = contentArea.subviews.first
+        if let firstSubview {
+            contentArea.addSubview(bg, positioned: .below, relativeTo: firstSubview)
+        } else {
+            contentArea.addSubview(bg)
+        }
+        NSLayoutConstraint.activate([
+            bg.topAnchor.constraint(equalTo: contentArea.topAnchor),
+            bg.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
+            bg.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
+            bg.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
+        ])
+        backgroundView = bg
+
+        let tint = NSView()
+        tint.wantsLayer = true
+        tint.isHidden = true
+        tint.translatesAutoresizingMaskIntoConstraints = false
+        contentArea.addSubview(tint, positioned: .above, relativeTo: bg)
+        NSLayoutConstraint.activate([
+            tint.topAnchor.constraint(equalTo: contentArea.topAnchor),
+            tint.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
+            tint.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
+            tint.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
+        ])
+        tintView = tint
+    }
+
+    /// Walk every pane in every tab and flip its renderer's
+    /// transparent-default-bg gate. Called when the window-level
+    /// background image appears / disappears.
+    private func fanSetImageBackgroundActive(_ active: Bool) {
+        for manager in paneManagers {
+            for panel in manager.allPanels() {
+                if active {
+                    panel.applyBackground(path: "", tint: 0, opacity: 0)
+                } else {
+                    panel.clearBackground()
+                }
+            }
+        }
+    }
+
+    /// Read the current `window.opacity` from the live config. The
+    /// active config lives on each PaneManager (since it gets hot-
+    /// reloaded there) — any pane's value is authoritative because
+    /// they all share it.
+    private func currentWindowOpacity() -> Double {
+        paneManagers.first?.configWindowOpacity() ?? 1.0
     }
 
     // MARK: - Socket Commands
 
     //
-    // These dispatch through `activeTerminalPanel` so both backends
-    // (SwiftTerm + alacritty) are handled identically. AppDelegate's
-    // `resolveTerminalPanel` is the preferred path for any caller that
-    // needs id-based panel lookup or Linux-style error reporting; these
-    // are thin convenience wrappers for the "active terminal, no
-    // id-resolution, no error reporting" case.
+    // These dispatch through `activeTerminalPanel`.
+    // AppDelegate's `resolveTerminalPanel` is the preferred path for
+    // any caller that needs id-based panel lookup or Linux-style error
+    // reporting; these are thin convenience wrappers for the "active
+    // terminal, no id-resolution, no error reporting" case.
 
     func execCommand(_ command: String) {
         activeTerminalPanel?.execCommand(command)

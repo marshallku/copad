@@ -45,19 +45,44 @@ Linux landed these; macOS hasn't ported yet.
 
 ---
 
-## C. Phase 10b — remove SwiftTerm path
+## C. Phase 10b — remove SwiftTerm path ✅
 
-Once the alacritty backend has accumulated enough dogfooding time without
-regressions (target: 2–4 weeks of daily use post-Phase-10a), delete the
-SwiftTerm path entirely:
+Shipped 2026-06-05. Alacritty dogfood window: 2026-05-18 default flip
+(`e0ddf31`) + ~3 weeks of daily use including the same-day Cycle 1–4
+exercise (CTLine cache, damage rect, drag-drop, find UI). No regressions
+surfaced; Cmd+F regression risk was closed by adding the alacritty find
+bar in Cycle 4 BEFORE the SwiftTerm path was removed.
 
-- `copad-macos/Sources/Copad/TerminalViewController.swift`
-- `SwiftTerm` package dependency in `copad-macos/Package.swift`
-- `RendererBackend.swiftterm` enum case in `copad-macos/Sources/Copad/Config.swift` (and the fallback branch in `RendererBackend.parse`)
-- Backend-switching branch in `PaneManager.makeTerminalPanel`
-- The `"swiftterm"` mention in the install-macos.sh footer + any decision docs that point users at the fallback
+Deletions:
+- `copad-macos/Sources/Copad/TerminalViewController.swift` — gone.
+- `SwiftTerm` package dep in `Package.swift` — gone.
+- `RendererBackend` enum in `Config.swift` — gone. `RendererSection.backend`
+  is parsed but ignored so stale `[renderer] backend = "swiftterm"`
+  configs don't fail to load.
+- `PaneManager.makeTerminalPanel`: single-path now (always alacritty).
+- `URLClickHelper.findURL(at:in:)` — gone (SwiftTerm-specific). Static
+  helpers (`urlRegex`, `trimURLTrailingPunctuation`) retained — alacritty
+  renderer uses them.
+- `AppDelegate.installEditKeyMonitor` — gone (SwiftTerm-only Cmd/Option
+  + Backspace/Delete bridge; alacritty handles these natively).
+- `AppDelegate.performFindPanelAction` — single-path now (always
+  alacritty's bar).
+- `TabViewController.activeTerminal` (SwiftTerm-typed getter) — gone;
+  use the protocol-typed `activeTerminalPanel`.
 
-Gate before deleting: `swift build -c release` clean, `cargo test -p copad-term --tests` green, and at least one explicit ping in this doc saying "Phase 10b unblocked".
+New protocol surface:
+- `TerminalCapable.customTitle` + `setCustomTitle` so `tab.rename`
+  still works on the alacritty backend (was SwiftTerm-only).
+
+Cross-platform `panel.exited` event preserved — added
+`copad_term_take_child_exit` FFI in the same commit so alacritty
+panes broadcast `panel.exited` on shell termination (was
+SwiftTerm-only via `processTerminated`). copad-core's
+`ContextService` cleanup contract honored across both backends.
+PaneManager's `wirePanel` is now a no-op stub — pane auto-close on
+shell exit is a separate UI concern (the renderer keeps the dead-PTY
+viewport visible until the user closes the tab), tracked as a
+follow-up.
 
 ---
 

@@ -27,7 +27,6 @@ let package = Package(
         .macOS(.v14),
     ],
     dependencies: [
-        .package(url: "https://github.com/migueldeicaza/SwiftTerm", from: "1.2.0"),
         .package(url: "https://github.com/LebJe/TOMLKit", from: "0.6.0"),
     ],
     targets: [
@@ -66,7 +65,6 @@ let package = Package(
         .executableTarget(
             name: "Copad",
             dependencies: [
-                .product(name: "SwiftTerm", package: "SwiftTerm"),
                 .product(name: "TOMLKit", package: "TOMLKit"),
                 "CCopadFFI",
                 "CCopadTerm",
@@ -78,9 +76,8 @@ let package = Package(
             // Xcode 16's 6.3.2 escalates them to hard errors during
             // `swift test`. Pinning swift 5 keeps the test bundle
             // buildable without scope-creeping into a strict-concurrency
-            // refactor of AppDelegate / TerminalViewController. The
-            // pure-logic mirror lives in CopadCore which stays on the
-            // package-default Swift 6 mode.
+            // refactor of AppDelegate. The pure-logic mirror lives in
+            // CopadCore which stays on the package-default Swift 6 mode.
             swiftSettings: [.swiftLanguageMode(.v5)],
             linkerSettings: [
                 .unsafeFlags(["-L../target/release"]),
