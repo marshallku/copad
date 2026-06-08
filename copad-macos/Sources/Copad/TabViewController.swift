@@ -20,7 +20,16 @@ final class TabViewController: NSViewController {
     /// on first `applyBackground`. z-order: inserted below the
     /// PaneManager containerView so panes (with transparent
     /// default-bg cells via `setImageBackgroundActive`) overlay it.
-    private var backgroundView: NSImageView?
+    /// Layer-backed plain NSView (not `NSImageView`). `NSImageView`'s
+    /// `imageScaling` doesn't include a CSS `cover`-equivalent mode —
+    /// `.scaleAxesIndependently` (stretch) distorts the image,
+    /// `.scaleProportionallyUpOrDown` (CSS `contain`) leaves letterbox
+    /// bars. We want fill-and-crop. CALayer's `contentsGravity =
+    /// .resizeAspectFill` is the exact equivalent of CSS `background-
+    /// size: cover` — image scales up until it fully covers the view
+    /// while preserving aspect ratio, overflow is clipped. Matches
+    /// Linux's `gtk4::Picture::set_content_fit(ContentFit::Cover)`.
+    private var backgroundView: NSView?
     private var tintView: NSView?
     /// Monotonic load token guards against a slow `NSImage(contentsOfFile:)`
     /// decode landing after a newer applyBackground/clearBackground
@@ -593,8 +602,21 @@ final class TabViewController: NSViewController {
                 // the race; drop this decode.
                 guard token == backgroundLoadToken else { return }
                 guard let image else { return }
+                // NSImage → CGImage so the layer can render it under
+                // its `contentsGravity` rule. `forProposedRect: nil`
+                // asks for the image's natural representation; aspect-
+                // fill scaling happens in CoreAnimation, not in the
+                // bitmap, so passing the original-size CGImage is
+                // correct (and cheaper than pre-rasterizing at view
+                // size). Skip the assignment if conversion fails —
+                // we don't want to wipe a previously-good image.
+                guard let cgImage = image.cgImage(
+                    forProposedRect: nil,
+                    context: nil,
+                    hints: nil,
+                ) else { return }
                 let windowOpacity = currentWindowOpacity()
-                backgroundView?.image = image
+                backgroundView?.layer?.contents = cgImage
                 backgroundView?.alphaValue = CGFloat(opacity * windowOpacity)
                 backgroundView?.isHidden = false
                 tintView?.layer?.backgroundColor = NSColor.black
@@ -610,7 +632,7 @@ final class TabViewController: NSViewController {
     func clearBackground() {
         currentBackgroundPath = nil
         backgroundLoadToken &+= 1
-        backgroundView?.image = nil
+        backgroundView?.layer?.contents = nil
         backgroundView?.isHidden = true
         tintView?.isHidden = true
         fanSetImageBackgroundActive(false)
@@ -633,26 +655,30 @@ final class TabViewController: NSViewController {
             .withAlphaComponent(CGFloat(currentBackgroundTint * windowOpacity)).cgColor
     }
 
-    /// Lazily insert the bg + tint NSImageView/NSView under
-    /// `contentArea`. Both pinned to the contentArea edges so they
-    /// fill the entire pane area regardless of split layout.
+    /// Lazily insert the bg + tint views under `contentArea`. Both
+    /// pinned to the contentArea edges so they fill the entire pane
+    /// area regardless of split layout.
     private func ensureBackgroundViews() {
         if backgroundView != nil { return }
-        // Use autoresizing instead of Auto Layout. An NSImageView with
-        // a large image (e.g. 5K wallpaper) reports its intrinsic
-        // content size as the image's pixel dimensions, and even with
-        // explicit edge constraints that intrinsic size propagates
-        // upward through `fittingSize` and pushes the window past the
-        // screen. `translatesAutoresizingMaskIntoConstraints = true`
-        // (the default) + `autoresizingMask = [.width, .height]`
-        // sizes the bg to whatever frame we set + grows it with the
-        // parent — and AutoLayout never gets a say in the window's
-        // fitting size from this subtree.
-        let bg = NSImageView(frame: contentArea.bounds)
-        bg.imageScaling = .scaleAxesIndependently
+        // Use autoresizing (not Auto Layout). NSImageView reported its
+        // intrinsic content size as the image's pixel dimensions even
+        // with explicit edge constraints, and that fittingSize
+        // propagated up to the window. Switching to a plain layer-
+        // backed NSView side-steps the issue entirely — plain NSView
+        // has no intrinsic size. The aspect-fill rendering moves to
+        // the layer (`contentsGravity = .resizeAspectFill`, set
+        // below), matching Linux's `gtk4::Picture` Cover content fit.
+        let bg = NSView(frame: contentArea.bounds)
         bg.wantsLayer = true
         bg.isHidden = true
         bg.autoresizingMask = [.width, .height]
+        if let layer = bg.layer {
+            layer.contentsGravity = .resizeAspectFill
+            // Clip cropped overflow at the view bounds (essential —
+            // without this, the over-sized scaled image draws past
+            // the view into split dividers and the tab bar).
+            layer.masksToBounds = true
+        }
         let firstSubview = contentArea.subviews.first
         if let firstSubview {
             contentArea.addSubview(bg, positioned: .below, relativeTo: firstSubview)
