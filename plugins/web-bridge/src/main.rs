@@ -411,6 +411,8 @@ async fn run_server(
     if state.push_config.is_some() {
         let push_state = state.clone();
         tokio::spawn(async move { push_loop(push_state).await });
+        let pilot_state = state.clone();
+        tokio::spawn(async move { pilot_push_loop(pilot_state).await });
     }
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
@@ -487,50 +489,208 @@ async fn push_loop(state: AppState) {
         }
         let mut pruned_ids: Vec<String> = Vec::new();
         for entry in &new_entries {
-            for sub in &subs_snapshot {
-                if !sub.matches_kind(&entry.kind) {
-                    continue;
-                }
-                let url = if entry.tmux_target.is_empty() {
-                    "/".to_string()
-                } else {
-                    format!("/#attention/{}", urlenc(&entry.tmux_target))
-                };
-                let title = if entry.title.is_empty() {
-                    "copad".to_string()
-                } else {
-                    entry.title.clone()
-                };
-                let body = if entry.body.is_empty() {
-                    entry.kind.clone()
-                } else {
-                    entry.body.clone()
-                };
-                let tag = format!("copad-{}", entry.kind);
-                let payload = push::PushPayload {
-                    title: &title,
-                    body: &body,
-                    tag: &tag,
-                    kind: &entry.kind,
-                    url: &url,
-                };
-                if let Err(e) = push::send_to(&cfg, sub, &payload).await {
-                    if push::is_terminal_error(&e) {
-                        pruned_ids.push(sub.id.clone());
-                    } else {
-                        eprintln!("[web-bridge] push send error (kept): {e:?}");
-                    }
-                }
-            }
+            let url = if entry.tmux_target.is_empty() {
+                "/".to_string()
+            } else {
+                format!("/#attention/{}", urlenc(&entry.tmux_target))
+            };
+            let title = if entry.title.is_empty() {
+                "copad".to_string()
+            } else {
+                entry.title.clone()
+            };
+            let body = if entry.body.is_empty() {
+                entry.kind.clone()
+            } else {
+                entry.body.clone()
+            };
+            let tag = format!("copad-{}", entry.kind);
+            let payload = push::PushPayload {
+                title: &title,
+                body: &body,
+                tag: &tag,
+                kind: &entry.kind,
+                url: &url,
+            };
+            fan_out(
+                &cfg,
+                &subs_snapshot,
+                Some(&entry.kind),
+                &payload,
+                &mut pruned_ids,
+            )
+            .await;
         }
-        if !pruned_ids.is_empty() {
-            let mut subs = state.push_subs.lock().await;
-            subs.retain(|s| !pruned_ids.contains(&s.id));
-            if let Err(e) = push::save_subscriptions(&subs) {
-                eprintln!("[web-bridge] push save_subscriptions failed: {e}");
+        prune_subscriptions(&state, &pruned_ids).await;
+    }
+}
+
+/// Send one payload to every subscription, optionally gated by the
+/// subscriber's kind filter. `filter_kind = None` force-delivers to all
+/// subscriptions regardless of their filter — used for pilot gate
+/// notifications, the highest-signal event copad emits (a blocked
+/// autonomous loop waiting on a human). Terminal endpoints (410 Gone /
+/// 404) are appended to `pruned` for the caller to remove in one pass.
+async fn fan_out(
+    cfg: &push::PushConfig,
+    subs: &[push::Subscription],
+    filter_kind: Option<&str>,
+    payload: &push::PushPayload<'_>,
+    pruned: &mut Vec<String>,
+) {
+    for sub in subs {
+        if let Some(kind) = filter_kind
+            && !sub.matches_kind(kind)
+        {
+            continue;
+        }
+        if let Err(e) = push::send_to(cfg, sub, payload).await {
+            if push::is_terminal_error(&e) {
+                pruned.push(sub.id.clone());
+            } else {
+                eprintln!("[web-bridge] push send error (kept): {e:?}");
             }
         }
     }
+}
+
+/// Drop subscriptions whose endpoints returned a terminal error and
+/// persist the trimmed list. No-op on an empty prune set. `retain`-by-id
+/// is idempotent, so two loops pruning the same id concurrently is safe.
+async fn prune_subscriptions(state: &AppState, pruned_ids: &[String]) {
+    if pruned_ids.is_empty() {
+        return;
+    }
+    let mut subs = state.push_subs.lock().await;
+    subs.retain(|s| !pruned_ids.contains(&s.id));
+    if let Err(e) = push::save_subscriptions(&subs) {
+        eprintln!("[web-bridge] push save_subscriptions failed: {e}");
+    }
+}
+
+/// Poll task: surfaces pilot goals that hit a gate (`awaiting_gate` —
+/// waiting on a human answer/approval) as Web Push, so a goal that
+/// blocks at 2am pings the phone instead of silently stalling the queue.
+///
+/// Polls `pilot.status` rather than subscribing to the `pilot.goal_blocked`
+/// bus event: events are ephemeral, so a consumer that's down when the
+/// gate opens loses it; a poll re-reads the live queue and is self-healing
+/// across a web-bridge restart. No-op when VAPID is unconfigured or the
+/// pilot plugin isn't running (the RPC just errors and we retry).
+async fn pilot_push_loop(state: AppState) {
+    let cfg = match state.push_config.as_ref().as_ref() {
+        Some(c) => c.clone(),
+        None => return,
+    };
+    // No boot pre-seed (unlike push_loop): the pilot queue is sequential,
+    // so at most one gate is open at any time. Re-surfacing that single
+    // open gate after a web-bridge restart is a desired reminder, not the
+    // stale-backlog dump push_loop guards against. The in-memory `seen`
+    // set still prevents re-pushing the same gate on every 5s tick.
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let status = match state.daemon.rpc("pilot.status", json!({})).await {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[web-bridge] pilot_push_loop: pilot.status failed: {e}");
+                continue;
+            }
+        };
+        let pushes = pilot_gate_pushes(&status, &mut seen);
+        if pushes.is_empty() {
+            continue;
+        }
+        let subs_snapshot = state.push_subs.lock().await.clone();
+        if subs_snapshot.is_empty() {
+            continue;
+        }
+        let mut pruned_ids: Vec<String> = Vec::new();
+        for p in &pushes {
+            let payload = push::PushPayload {
+                title: &p.title,
+                body: &p.body,
+                tag: &p.tag,
+                kind: "pilot-blocked",
+                url: &p.url,
+            };
+            fan_out(&cfg, &subs_snapshot, None, &payload, &mut pruned_ids).await;
+        }
+        prune_subscriptions(&state, &pruned_ids).await;
+    }
+}
+
+/// One Web Push to emit for a freshly-blocked pilot goal. Owned (not
+/// borrowed) so `pilot_gate_pushes` stays a pure, unit-testable mapping
+/// from a `pilot.status` value to the notifications it implies.
+struct GatePush {
+    title: String,
+    body: String,
+    tag: String,
+    url: String,
+}
+
+/// Scan a `pilot.status` response for goals at a gate, returning one
+/// `GatePush` per gate not already in `seen`. The dedup fingerprint
+/// covers the goal id plus the *entire* gate object (kind + prompt +
+/// options + plan_file), so a goal that re-blocks with a different
+/// question or option set notifies again, while a still-open gate seen
+/// on the previous tick stays quiet. Marks every gate seen (even with no
+/// subscribers) so dedup state advances regardless of delivery.
+fn pilot_gate_pushes(status: &Value, seen: &mut std::collections::HashSet<u64>) -> Vec<GatePush> {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut out = Vec::new();
+    let Some(goals) = status.get("goals").and_then(|g| g.as_array()) else {
+        return out;
+    };
+    for g in goals {
+        if g.get("status").and_then(|s| s.as_str()) != Some("awaiting_gate") {
+            continue;
+        }
+        let Some(gate) = g.get("gate").filter(|v| !v.is_null()) else {
+            continue;
+        };
+        let id = g.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        let mut h = DefaultHasher::new();
+        id.hash(&mut h);
+        gate.to_string().hash(&mut h);
+        if !seen.insert(h.finish()) {
+            continue;
+        }
+        let gkind = gate.get("kind").and_then(|v| v.as_str()).unwrap_or("gate");
+        let prompt = gate
+            .get("prompt")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(truncate_prompt)
+            .unwrap_or_else(|| match gkind {
+                "plan" => "plan ready for approval".to_string(),
+                "answer" => "a question is waiting".to_string(),
+                _ => "input needed".to_string(),
+            });
+        out.push(GatePush {
+            title: "Pilot needs you".to_string(),
+            body: format!("{gkind} gate · {prompt}"),
+            tag: format!("copad-pilot-{id}"),
+            url: "/".to_string(),
+        });
+    }
+    out
+}
+
+/// Clamp a gate prompt to a notification-sized string on a char boundary
+/// (push bodies render at most a couple of lines on a phone anyway).
+fn truncate_prompt(s: &str) -> String {
+    const MAX: usize = 120;
+    if s.chars().count() <= MAX {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(MAX).collect();
+    out.push('…');
+    out
 }
 
 /// Fingerprint an attention entry across (ts, kind, title, body,
@@ -1674,5 +1834,93 @@ mod tests {
     fn validate_token_env_rejects_missing() {
         let err = validate_token_env(None).expect_err("missing must fail");
         assert!(err.contains("is not set"));
+    }
+
+    fn status_with(goals: Value) -> Value {
+        json!({ "goals": goals })
+    }
+
+    #[test]
+    fn pilot_gate_pushes_emits_one_per_open_gate() {
+        let mut seen = std::collections::HashSet::new();
+        let st = status_with(json!([
+            { "id": "g-abc", "status": "awaiting_gate",
+              "gate": { "kind": "answer", "prompt": "Which DB?" } },
+            { "id": "g-run", "status": "running" },
+            { "id": "g-plan", "status": "awaiting_gate",
+              "gate": { "kind": "plan", "prompt": null } },
+        ]));
+        let pushes = pilot_gate_pushes(&st, &mut seen);
+        assert_eq!(pushes.len(), 2);
+        assert_eq!(pushes[0].tag, "copad-pilot-g-abc");
+        assert_eq!(pushes[0].body, "answer gate · Which DB?");
+        // null prompt → kind-specific fallback copy.
+        assert_eq!(pushes[1].body, "plan gate · plan ready for approval");
+    }
+
+    #[test]
+    fn pilot_gate_pushes_dedups_unchanged_gate_across_ticks() {
+        let mut seen = std::collections::HashSet::new();
+        let st = status_with(json!([
+            { "id": "g-1", "status": "awaiting_gate",
+              "gate": { "kind": "answer", "prompt": "Q1" } },
+        ]));
+        assert_eq!(pilot_gate_pushes(&st, &mut seen).len(), 1);
+        // Same gate on the next poll → no re-push.
+        assert_eq!(pilot_gate_pushes(&st, &mut seen).len(), 0);
+    }
+
+    #[test]
+    fn pilot_gate_pushes_renotifies_on_changed_gate() {
+        let mut seen = std::collections::HashSet::new();
+        let g1 = status_with(json!([
+            { "id": "g-1", "status": "awaiting_gate",
+              "gate": { "kind": "answer", "prompt": "Q1" } },
+        ]));
+        let g2 = status_with(json!([
+            { "id": "g-1", "status": "awaiting_gate",
+              "gate": { "kind": "answer", "prompt": "Q2" } },
+        ]));
+        assert_eq!(pilot_gate_pushes(&g1, &mut seen).len(), 1);
+        // Same goal, different prompt → a new push.
+        assert_eq!(pilot_gate_pushes(&g2, &mut seen).len(), 1);
+    }
+
+    #[test]
+    fn pilot_gate_pushes_renotifies_on_changed_options() {
+        let mut seen = std::collections::HashSet::new();
+        let g1 = status_with(json!([
+            { "id": "g-1", "status": "awaiting_gate",
+              "gate": { "kind": "approve", "prompt": "ok?", "options": ["a", "b"] } },
+        ]));
+        let g2 = status_with(json!([
+            { "id": "g-1", "status": "awaiting_gate",
+              "gate": { "kind": "approve", "prompt": "ok?", "options": ["a", "b", "c"] } },
+        ]));
+        assert_eq!(pilot_gate_pushes(&g1, &mut seen).len(), 1);
+        // Same kind + prompt but different options → still a new push.
+        assert_eq!(pilot_gate_pushes(&g2, &mut seen).len(), 1);
+    }
+
+    #[test]
+    fn pilot_gate_pushes_ignores_non_gated_and_empty() {
+        let mut seen = std::collections::HashSet::new();
+        let none = status_with(json!([
+            { "id": "g-1", "status": "running" },
+            { "id": "g-2", "status": "done" },
+        ]));
+        assert_eq!(pilot_gate_pushes(&none, &mut seen).len(), 0);
+        // Missing/!array goals → no panic, no pushes.
+        assert_eq!(pilot_gate_pushes(&json!({}), &mut seen).len(), 0);
+    }
+
+    #[test]
+    fn truncate_prompt_clamps_on_char_boundary() {
+        let short = "hi";
+        assert_eq!(truncate_prompt(short), "hi");
+        let long: String = "가".repeat(200); // multi-byte chars
+        let got = truncate_prompt(&long);
+        assert_eq!(got.chars().count(), 121); // 120 + ellipsis
+        assert!(got.ends_with('…'));
     }
 }
