@@ -45,7 +45,7 @@ API: `new(config, window_css, theme_bg)`, `set_image(path)`, `clear_image()`, `s
 
 `can_target=false` on both layers so clicks pass through to the panels above them. The socket `background.*` commands operate on this single layer (no longer on the active terminal panel), and `apply_config` is invoked once from `watch_config` on hot reload.
 
-The layer also owns the window's `background-color` provider: `[window] opacity` drives its alpha (`rgba(theme_bg, opacity)`), or `0` when an image is active (the image owns the transparency then — see decision #57). `set_image`/`clear_image`/`apply_config` each call a private `refresh_window_backdrop()`, so every image-state change — config reload AND socket commands — keeps the backdrop in sync. The image + tint alphas are also scaled by `window.opacity` so one knob fades the image background too.
+The layer also owns the window's `background-color` provider: `[window] opacity` drives its alpha (`rgba(theme_bg, opacity)`), painted as the always-present base **behind** the image. The backdrop, the image (`background.opacity`), and the tint (`background.tint`) are three independent layers — none scales the others, so a strong dark base can sit under a faint image (decision #58, reversing #57's macOS-parity coupling). `refresh_window_backdrop()` runs only on a `[window] opacity` / theme-color change (via `apply_config`), not on image add/remove, since the backdrop no longer depends on image state.
 
 ## Terminal (`terminal.rs`)
 

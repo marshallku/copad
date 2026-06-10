@@ -19,17 +19,15 @@ pub struct BackgroundLayer {
     tint_opacity: Cell<f64>,
     tint_color: Cell<gdk::RGBA>,
     image_opacity: Cell<f64>,
-    // `[window] opacity`. The image + tint alphas are scaled by this so a
-    // single window-opacity knob fades the image background too — without
-    // it an opaque image would hide the desktop even at opacity < 1.0
-    // (mirrors the macOS behavior).
+    // `[window] opacity` — alpha of the solid backdrop color only. The image
+    // and tint layers carry their own opacities (`background.opacity` /
+    // `background.tint`), independent of this, so the backdrop can stay a
+    // strong dark base under a faint image.
     window_opacity: Cell<f64>,
     has_image: Cell<bool>,
-    // The window's own `background-color`. This layer owns it because its
-    // alpha depends on `has_image`: with an image active the image owns the
-    // transparency and the backdrop must go fully transparent, else a second
-    // semi-opaque layer stacks behind the image. Owning it here means every
-    // image mutation — config reload AND socket commands — refreshes it.
+    // The window's own `background-color` — the bottom-most layer, an always
+    // present `rgba(theme_bg, window_opacity)` base painted behind the image.
+    // This layer owns it so a theme/opacity change refreshes it in one place.
     window_css: gtk4::CssProvider,
     theme_bg: RefCell<String>,
 }
@@ -43,7 +41,7 @@ impl BackgroundLayer {
         bg_picture.set_hexpand(true);
         bg_picture.set_vexpand(true);
         bg_picture.set_visible(false);
-        bg_picture.set_opacity(config.background.opacity * window_opacity);
+        bg_picture.set_opacity(config.background.opacity);
         // Don't intercept input — clicks must reach the panels above.
         bg_picture.set_can_target(false);
 
@@ -58,7 +56,7 @@ impl BackgroundLayer {
         update_tint_css(
             &tint_css,
             &config.background.tint_color,
-            config.background.tint * window_opacity,
+            config.background.tint,
         );
         gtk4::style_context_add_provider_for_display(
             &gdk::Display::default().unwrap(),
@@ -123,27 +121,20 @@ impl BackgroundLayer {
         }
 
         self.bg_picture.set_visible(true);
-        self.bg_picture
-            .set_opacity(self.image_opacity.get() * self.window_opacity.get());
+        self.bg_picture.set_opacity(self.image_opacity.get());
         self.tint_overlay.set_visible(true);
         self.has_image.set(true);
-        self.refresh_window_backdrop();
     }
 
-    // The window's `background-color`: `rgba(theme_bg, alpha)` where alpha is
-    /// `window_opacity` with no image, or `0` with an image (the image owns
-    /// the transparency then — a second semi-opaque backdrop would stack
-    /// behind it and double-dim the desktop). Re-run on every change to
-    /// `has_image`, `window_opacity`, or the theme color.
+    /// The window's `background-color`: `rgba(theme_bg, window_opacity)`, the
+    /// always-present dark base. Independent of image state — the image is a
+    /// separate layer painted on top with its own `background.opacity`, so the
+    /// base stays put underneath it. Re-run when `window_opacity` or the theme
+    /// color changes.
     fn refresh_window_backdrop(&self) {
-        let alpha = if self.has_image.get() {
-            0.0
-        } else {
-            self.window_opacity.get()
-        };
         self.window_css.load_from_string(&format!(
             "window {{ background-color: {}; }}",
-            rgba_css(&self.theme_bg.borrow(), alpha)
+            rgba_css(&self.theme_bg.borrow(), self.window_opacity.get())
         ));
     }
 
@@ -152,7 +143,6 @@ impl BackgroundLayer {
         self.bg_picture.set_visible(false);
         self.tint_overlay.set_visible(false);
         self.has_image.set(false);
-        self.refresh_window_backdrop();
     }
 
     pub fn set_tint(&self, opacity: f64) {
@@ -166,16 +156,13 @@ impl BackgroundLayer {
                 (c.green() * 255.0) as u8,
                 (c.blue() * 255.0) as u8,
             ),
-            opacity * self.window_opacity.get(),
+            opacity,
         );
     }
 
     pub fn apply_config(&self, config: &CopadConfig, theme_bg: &str) {
-        let window_opacity = norm_opacity(config.window.opacity);
-        self.window_opacity.set(window_opacity);
+        self.window_opacity.set(norm_opacity(config.window.opacity));
         *self.theme_bg.borrow_mut() = theme_bg.to_string();
-        // Refresh up-front so the no-image path and a new theme color land
-        // even when neither set_image nor clear_image runs below.
         self.refresh_window_backdrop();
 
         self.tint_opacity.set(config.background.tint);
@@ -184,13 +171,12 @@ impl BackgroundLayer {
         update_tint_css(
             &self.tint_css,
             &config.background.tint_color,
-            config.background.tint * window_opacity,
+            config.background.tint,
         );
 
         self.image_opacity.set(config.background.opacity);
         if self.has_image.get() {
-            self.bg_picture
-                .set_opacity(config.background.opacity * window_opacity);
+            self.bg_picture.set_opacity(config.background.opacity);
         }
 
         match &config.background.image {

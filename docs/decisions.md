@@ -1339,3 +1339,17 @@ Trigger-DSL composability. Plugins shouldn't hardcode "after match, call plugin 
 **Tab chrome.** Already aligned with macOS pre-change: `notebook`/`stack`/`header`/`tabs` are all `background-color: transparent`, only the tab pill keeps `theme.background`. So pills stay opaque (readable labels, matches macOS) and the rest of the bar fades — no tab CSS change needed.
 
 **See:** `copad-linux/src/terminal.rs::{norm_opacity, rgba_css}`, `copad-linux/src/background.rs::BackgroundLayer::{refresh_window_backdrop, set_image, clear_image, apply_config}`, `copad-linux/src/window.rs` (window_css creation handed to `BackgroundLayer::new`).
+
+## 58. Decouple the Linux backdrop / image / tint opacities (reverses two parts of #57)
+
+**Decision.** On Linux the window backdrop, the background image, and the tint each carry their own alpha and stack independently — `desktop → rgba(window.background, window.opacity) → image[background.opacity] → tint[background.tint] → text`. Specifically, reversing two choices from #57:
+- The backdrop alpha is **always** `window.opacity` — it no longer drops to `0` when an image is active. The dark base is painted behind the image, not removed.
+- The image and tint alphas are **no longer multiplied** by `window.opacity`. `background.opacity` / `background.tint` are used as-is.
+
+**Why (user feedback).** The #57 model — copied from macOS, where the window goes `isOpaque = false`/clear under an image and the image alpha is scaled by `window.opacity` — made the two knobs move together: you could not have *a strong dark base* (high `window.opacity`) *under a faint image* (low `background.opacity`), because raising `window.opacity` also darkened the image, and the base was zeroed out entirely whenever an image was present. The user's actual goal is exactly that layered look: a maintained dark base for readability with a subtle image on top. Independent per-layer opacities deliver it; the macOS-parity coupling actively prevented it.
+
+**Why this is also simpler.** The backdrop alpha no longer depends on `has_image`, so `refresh_window_backdrop()` is only called on a `window.opacity` / theme-color change (not from `set_image`/`clear_image`). That removes the entire class of "a `has_image` mutation forgot to refresh the backdrop" bug that #57 had to guard against on the socket path — the backdrop and the image are now genuinely orthogonal.
+
+**Trade-off.** Linux now diverges from the macOS image-transparency model (#56). An opaque image (`background.opacity = 1.0`) still covers the backdrop on Linux — the fix for "image hides the desktop" is to lower `background.opacity`, the image's own knob, rather than have `window.opacity` fade it. This is the more predictable mapping (one knob, one layer). macOS realignment is left as a follow-up if parity is wanted.
+
+**See:** `copad-linux/src/background.rs::BackgroundLayer::{refresh_window_backdrop, set_image, set_tint, apply_config}`.
