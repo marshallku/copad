@@ -128,6 +128,14 @@ pub struct WindowConfig {
     /// config parity so the same config.toml works on both.
     #[serde(default = "default_window_blur")]
     pub blur: bool,
+
+    /// Solid base color for the window backdrop (`#rrggbb`). `opacity`
+    /// is this color's alpha, so it is the fraction of the color that
+    /// stays "maintained" over the desktop — a dark value keeps text
+    /// readable on a bright wallpaper. Defaults to the theme background
+    /// when unset. Linux-only today (macOS uses the theme background).
+    #[serde(default)]
+    pub background: Option<String>,
 }
 
 impl Default for WindowConfig {
@@ -135,6 +143,7 @@ impl Default for WindowConfig {
         Self {
             opacity: default_window_opacity(),
             blur: default_window_blur(),
+            background: None,
         }
     }
 }
@@ -361,8 +370,11 @@ font_size = 14
 # opacity = 0.95
 
 [window]
-# opacity = 0.85   # 0.0 = fully transparent, 1.0 = fully opaque (default)
-# blur = false     # macOS only: blur the desktop behind the window (Ghostty-style)
+# opacity = 0.85        # 0.0 = fully transparent, 1.0 = fully opaque (default)
+# background = "#000000" # base color blended with the desktop at `opacity`;
+#                        # a dark value keeps text readable on a bright wallpaper
+#                        # (defaults to the theme background when unset)
+# blur = false          # macOS only: blur the desktop behind the window (Ghostty-style)
 
 [tabs]
 # position = "top"  # top, bottom, left, right
@@ -460,6 +472,7 @@ close_on_exit = false
         let cfg = CopadConfig::default();
         assert_eq!(cfg.window.opacity, 1.0);
         assert!(!cfg.window.blur);
+        assert_eq!(cfg.window.background, None);
     }
 
     #[test]
@@ -468,16 +481,18 @@ close_on_exit = false
         let path = dir.join("config.toml");
         std::fs::write(
             &path,
-            r#"
+            r##"
 [window]
 opacity = 0.85
 blur = true
-"#,
+background = "#000000"
+"##,
         )
         .expect("write");
         let cfg = CopadConfig::load_from(&path).expect("load");
         assert!((cfg.window.opacity - 0.85).abs() < 1e-9);
         assert!(cfg.window.blur);
+        assert_eq!(cfg.window.background.as_deref(), Some("#000000"));
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir(&dir).ok();
     }

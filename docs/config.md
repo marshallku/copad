@@ -69,14 +69,17 @@ name = "catppuccin-mocha"
 
 Window-level transparency for the terminal itself (Ghostty model). Distinct from `[background]`, which only affects an optional background-image layer.
 
-| Key       | Default | Description                                                                          |
-| --------- | ------- | ------------------------------------------------------------------------------------ |
-| `opacity` | `1.0`   | Window + terminal default-bg cell opacity (0.0 = fully transparent, 1.0 = opaque)    |
-| `blur`    | `false` | macOS only: blur the desktop behind the window (NSVisualEffectView). On Linux, blur is the compositor's job (e.g. Hyprland `decoration:blur`), so this key is a no-op. |
+| Key          | Default          | Description                                                                          |
+| ------------ | ---------------- | ------------------------------------------------------------------------------------ |
+| `opacity`    | `1.0`            | Window + terminal default-bg cell opacity (0.0 = fully transparent, 1.0 = opaque)    |
+| `background` | theme background | Linux only: solid `#rrggbb` base color blended with the desktop at `opacity`. A dark value keeps text readable on a bright wallpaper. |
+| `blur`       | `false`          | macOS only: blur the desktop behind the window (NSVisualEffectView). On Linux, blur is the compositor's job (e.g. Hyprland `decoration:blur`), so this key is a no-op. |
 
 On macOS, `opacity < 1.0` sets `NSWindow.isOpaque = false`; default-bg cells render with `theme.background.alpha = opacity` so the desktop / blurred surface behind shows through. ANSI-colored cells, reverse-video cells, and text glyphs stay fully opaque. Tab bar and status bar pick up the same alpha so chrome stays cohesive.
 
-On Linux, `opacity` drives the GTK4 window's `background-color` alpha (`rgba(theme.background, opacity)`). VTE already paints with a transparent default background, so text glyphs stay opaque while the gaps reveal the desktop. When a background image is set, the window backdrop goes fully transparent and the image + tint alphas are scaled by `opacity` instead — so a single knob fades both, and an opaque image never hides the desktop. Tab pills and status-bar borders keep their theme color by design (matches macOS, where pills stay opaque). `blur` is a no-op: on Wayland, blur belongs to the compositor — enable `decoration:blur` in Hyprland and it blurs behind the translucent window automatically.
+On Linux, `opacity` drives the GTK4 window's `background-color` alpha (`rgba(background, opacity)`, where `background` defaults to `theme.background`). VTE already paints with a transparent default background, so text glyphs stay opaque while the gaps reveal the desktop. When a background image is set, the window backdrop goes fully transparent and the image + tint alphas are scaled by `opacity` instead — so a single knob fades both, and an opaque image never hides the desktop. Tab pills and status-bar borders keep their theme color by design (matches macOS, where pills stay opaque). `blur` is a no-op: on Wayland, blur belongs to the compositor — enable `decoration:blur` in Hyprland and it blurs behind the translucent window automatically.
+
+`opacity` is the **fraction of `background` that is maintained** over the desktop: every pixel is `background × opacity + desktop × (1 − opacity)`. So a dark `background` at e.g. `opacity = 0.85` keeps a stable dark base under the text regardless of how bright the wallpaper is — the desktop can only bleed through the remaining `1 − opacity`. Lower the opacity for more see-through; raise it (or darken `background`) for more readability.
 
 > If you previously dimmed copad with a Hyprland `windowrule = opacity …, class:copad`, remove it once you set `[window] opacity` — otherwise the compositor alpha stacks on top of the app alpha and dims the text too (the app-level knob keeps glyphs opaque; the windowrule does not).
 

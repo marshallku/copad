@@ -522,7 +522,13 @@ impl CopadWindow {
         // Overlay so every tab/panel above it (notebook, statusbar,
         // terminals, plugin webviews) renders on top of the same image
         // — no more "background only on the first terminal" surprise.
-        let background = BackgroundLayer::new(config, window_css, &theme.background);
+        // `[window] background` overrides the theme color as the backdrop base.
+        let backdrop = config
+            .window
+            .background
+            .as_deref()
+            .unwrap_or(&theme.background);
+        let background = BackgroundLayer::new(config, window_css, backdrop);
 
         // Layout: vertical box with notebook + statusbar
         let layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -803,8 +809,13 @@ fn watch_config(
         mgr.update_config(&config);
         sb.reload(&config, &pl);
         // apply_config owns the window backdrop refresh (alpha tracks the new
-        // opacity, theme color, and image state in one place).
-        bg.apply_config(&config, &theme.background);
+        // opacity, base color, and image state in one place).
+        let backdrop = config
+            .window
+            .background
+            .as_deref()
+            .unwrap_or(&theme.background);
+        bg.apply_config(&config, backdrop);
 
         // Always refresh the cache from disk — even when daemon is
         // authoritative — so a later disconnect restores the freshest
