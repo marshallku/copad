@@ -98,7 +98,7 @@ the user can read the exit message — Linux honors the same key in
 Tracked in [`harness-integration.md`](./harness-integration.md); these are pure-Rust changes on the daemon, so the macOS daemon (auto-spawned via the LaunchAgent shipped in commit `b93bc0b`) picks them up for free.
 
 - [x] **Step 10 Option A slice 2** — `plugins/claude/` first-party plugin shipping `claude.last_handoff` / `claude.list_sessions` / `claude.session_state` / `claude.list_dirty` actions. Read-only over the existing `~/.claude/` harness artifacts (`handoffs/latest.md`, `projects/<encoded-cwd>/<session-id>.jsonl`, `state/dirty-<session-id>.log`). Lazy activation (`activation = "onAction:claude.*"`) — supervisor spawns the process on first matching call. `COPAD_CLAUDE_DIR` env override for tests. 8 unit tests + direct stdio e2e covering all 4 actions. Cross-platform: same plugin binary serves Linux + macOS. `install-macos.sh` MACOS_PLUGINS list extended.
-- [ ] **Step 11 Option I** — cron triggers (`[[triggers]]` cron field, scheduler, missed-run policy).
+- [x] **Step 11 Option I** — cron triggers (`[[triggers]]` cron field, `CronScheduler`, skip-missed-runs policy) — shipped daemon-side (`copad-daemon::cron_scheduler`, examples at `examples/triggers/cron-example.toml`), so macOS gets it for free via the LaunchAgent daemon.
 - [ ] **Steps 12–16** — life-assistant bridge, monitor panel, browser / codex adapters, `/handoff` + `/catchup` ↔ KB.
 
 ---

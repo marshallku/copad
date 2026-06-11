@@ -18,7 +18,7 @@ Cross-platform custom terminal emulator with shared Rust core and platform-nativ
 - `copad-core/` — Shared Rust library (config, background, plugin, protocol, theme, error)
 - `copad-linux/` — GTK4 + VTE4 native terminal app (binary: `copad`)
 - `copad-cli/` — CLI control tool (binary: `coctl`)
-- `copad-macos/` — Swift/AppKit app (stub)
+- `copad-macos/` — Swift/AppKit app (full secondary platform: alacritty_terminal renderer, tabs/splits, webview, plugins, daemon client — see `docs/macos-post-renderer-catchup.md` for the remaining polish backlog)
 - `plugins/<name>/` — First-party plugins. Each dir holds the Rust crate (`Cargo.toml` + `src/`) and its runtime manifest/assets (`plugin.toml`, `panel.html`, `triggers.example.toml`) together. Crate name remains `copad-plugin-<name>` (binary name unchanged).
 - `examples/plugins/hello/` — Tutorial plugin demonstrating a panel + a bash command (no Rust crate)
 - `docs/` — Project documentation (architecture, decisions, troubleshooting, roadmap)
@@ -86,10 +86,10 @@ git config core.hooksPath .githooks
 - Rust edition 2024, Cargo workspace with `resolver = "2"`
 - GTK4 with `gnome_46` feature flag
 - VTE handles PTY on Linux (no custom PTY management)
-- Unix socket (`/tmp/copad-{PID}.sock`) for IPC
+- Unix sockets for IPC: GUI per-instance at `$XDG_RUNTIME_DIR/copad/gui-{PID}.sock`, daemon at its well-known path (`copad_core::paths`); legacy `/tmp/copad-{PID}.sock` recognized for back-compat
 - Config: `~/.config/copad/config.toml` (TOML)
 - Cache: `~/.cache/terminal-wallpapers.txt` (Linux) / `~/Library/Caches/copad/wallpapers.txt` (macOS, falls back to Linux path)
-- Theme: Catppuccin Mocha (hardcoded)
+- Theme: configurable via `[theme] name` — 10 built-ins (catppuccin variants, dracula, nord, tokyo-night, gruvbox-dark, one-dark, solarized-dark), default `catppuccin-mocha`, hot-reloads
 - Dark theme forced via GTK settings
 
 ## Critical Implementation Details
