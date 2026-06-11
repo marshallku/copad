@@ -1182,13 +1182,12 @@ async fn handle_pilot_cancel(
 ///   * Per-pane capture-pane failure → that card's `last_lines: []`.
 fn build_tmux_snapshot() -> Result<Value, AppError> {
     let panes = tmux::list_panes().map_err(|msg| AppError::custom("tmux_error", &msg))?;
-    let mut tmx_snap = agents::read_snapshot().unwrap_or_else(|e| {
+    // codex_jobs ride along in the snapshot since tmx 1.1 (alive-filtered
+    // there) — no local read of `~/.claude/state/codex-companion/`.
+    let tmx_snap = agents::read_snapshot().unwrap_or_else(|e| {
         eprintln!("[web-bridge] tmx snapshot unavailable, degrading: {e}");
         agents::TmxSnapshot::default()
     });
-    // tmx 1.x doesn't surface codex-companion jobs in its snapshot
-    // yet; populate them locally from `~/.claude/state/codex-companion/`.
-    tmx_snap.codex_jobs = agents::read_codex_jobs();
     let rows: Vec<Value> = panes
         .into_iter()
         .map(|p| {

@@ -1,12 +1,14 @@
 //! Shell-out to `tmx agents --json` for the agent + attention +
-//! codex-job snapshot. tmx 1.x is the source of truth; we just parse
+//! codex-job snapshot. tmx ≥ 1.1 is the source of truth; we just parse
 //! its JSON and surface what the dashboard needs.
 //!
 //! Why a shell-out instead of inline:
 //!   * Single source of truth — tmx's Claude/Codex classification,
-//!     process-tree walk, zombie filtering, repo-marker scanning, and
-//!     attention queue parsing all live in one project and evolve
-//!     together. Re-implementing them here would drift.
+//!     process-tree walk, zombie filtering, repo-marker scanning,
+//!     attention queue parsing AND codex-companion job reading all live
+//!     in one project and evolve together. Re-implementing them here
+//!     would drift (the codex reader WAS duplicated here until tmx 1.1
+//!     exposed structured `codex_jobs`).
 //!   * No `~/.claude/sessions/*.json` schema coupling — when Claude
 //!     renames a field, tmx absorbs the breakage and we get an
 //!     unchanged JSON shape.
@@ -14,7 +16,8 @@
 //! On `tmx` not installed / not on PATH: `read_snapshot` returns
 //! `Err`; callers degrade gracefully (panes still render from
 //! `tmux list-panes`, agent enrichment + attention strip simply
-//! show empty).
+//! show empty). A pre-1.1 tmx parses fine — `codex_jobs` defaults
+//! to empty.
 
 use serde::{Deserialize, Serialize};
 use std::process::Command;
@@ -29,17 +32,19 @@ pub struct TmxSnapshot {
     pub global_blocked: u32,
     #[serde(default)]
     pub captured_at_ms: i64,
-    /// Populated by `enrich_codex_jobs` after the shell-out — tmx's
-    /// `agents --json` doesn't include codex-companion jobs yet, so we
-    /// still read them locally and stuff them into the snapshot here.
-    #[serde(default, skip)]
+    /// Structured codex-companion background jobs, emitted by tmx ≥ 1.1
+    /// (alive-filtered there: PID liveness + updatedAt freshness).
+    #[serde(default)]
     pub codex_jobs: Vec<CodexJob>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub id: String,
-    pub pane: AgentPane,
+    /// `None` for non-pane rows — tmx emits codex background jobs into
+    /// `agents[]` with `"pane": null`. A required field here used to
+    /// fail the WHOLE snapshot parse whenever a codex job was live.
+    pub pane: Option<AgentPane>,
     /// `claude` / `codex` / `shell` / `other`. tmx classifies — we
     /// just relay so the SPA can color cards or filter.
     pub kind: String,
@@ -99,137 +104,26 @@ pub struct Attention {
     pub tmux_session: String,
 }
 
-/// codex-companion background job. Surfaced in the overview as its own
-/// card section. tmx's `agents --json` doesn't yet emit these so we
-/// keep the local reader of `~/.claude/state/codex-companion/state/*`.
-#[derive(Debug, Clone, Serialize)]
+/// codex-companion background job, as emitted by tmx ≥ 1.1's
+/// `codex_jobs` (already alive-filtered + newest-first there).
+/// Surfaced in the overview as its own card section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexJob {
     pub id: String,
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
     pub kind_label: String,
+    #[serde(default)]
     pub workspace_root: String,
+    #[serde(default)]
     pub status: String,
+    #[serde(default)]
     pub started_at_ms: Option<i64>,
+    #[serde(default)]
     pub updated_at_ms: Option<i64>,
+    #[serde(default)]
     pub pid: Option<u32>,
-}
-
-impl CodexJob {
-    /// True for any non-terminal status (running / queued / unknown).
-    /// tmx's terminal set: completed | failed | cancelled | canceled.
-    pub fn is_active(&self) -> bool {
-        !matches!(
-            self.status.as_str(),
-            "completed" | "failed" | "cancelled" | "canceled"
-        )
-    }
-}
-
-#[derive(Deserialize)]
-struct CodexStateFile {
-    jobs: Option<Vec<RawCodexJob>>,
-}
-
-#[derive(Deserialize)]
-struct RawCodexJob {
-    id: String,
-    #[serde(default)]
-    title: String,
-    #[serde(rename = "kindLabel", default)]
-    kind_label: String,
-    #[serde(rename = "workspaceRoot", default)]
-    workspace_root: String,
-    #[serde(default)]
-    status: String,
-    #[serde(rename = "startedAt", default)]
-    started_at: String,
-    #[serde(rename = "updatedAt", default)]
-    updated_at: String,
-    #[serde(default)]
-    pid: Option<u32>,
-}
-
-/// Walk `~/.claude/state/codex-companion/state/<workspace>/state.json`,
-/// concat all `jobs` arrays, keep non-terminal only, newest-started
-/// first. Empty Vec on missing dir.
-pub fn read_codex_jobs() -> Vec<CodexJob> {
-    let Some(home) = dirs::home_dir() else {
-        return Vec::new();
-    };
-    read_codex_jobs_in(&home.join(".claude/state/codex-companion/state"))
-}
-
-fn read_codex_jobs_in(dir: &std::path::Path) -> Vec<CodexJob> {
-    let Ok(read) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut jobs: Vec<CodexJob> = Vec::new();
-    for entry in read.flatten() {
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        jobs.extend(read_workspace_codex_jobs(&entry.path()));
-    }
-    jobs.retain(CodexJob::is_active);
-    jobs.sort_by_key(|j| std::cmp::Reverse(j.started_at_ms));
-    jobs
-}
-
-fn read_workspace_codex_jobs(workspace_dir: &std::path::Path) -> Vec<CodexJob> {
-    let state_path = workspace_dir.join("state.json");
-    let Ok(bytes) = std::fs::read(&state_path) else {
-        return Vec::new();
-    };
-    let Ok(file): Result<CodexStateFile, _> = serde_json::from_slice(&bytes) else {
-        return Vec::new();
-    };
-    file.jobs
-        .unwrap_or_default()
-        .into_iter()
-        .map(|j| CodexJob {
-            id: j.id,
-            title: j.title,
-            kind_label: j.kind_label,
-            workspace_root: j.workspace_root,
-            status: j.status,
-            started_at_ms: parse_iso8601_millis(&j.started_at),
-            updated_at_ms: parse_iso8601_millis(&j.updated_at),
-            pid: j.pid,
-        })
-        .collect()
-}
-
-/// Minimal ISO-8601 → epoch-millis parser tuned for codex-companion's
-/// `YYYY-MM-DDTHH:MM:SS.fffZ` output. Mirrors tmx's parser.
-fn parse_iso8601_millis(s: &str) -> Option<i64> {
-    if s.len() < 20 {
-        return None;
-    }
-    let year: i64 = s.get(0..4)?.parse().ok()?;
-    let month: u32 = s.get(5..7)?.parse().ok()?;
-    let day: u32 = s.get(8..10)?.parse().ok()?;
-    let hour: i64 = s.get(11..13)?.parse().ok()?;
-    let min: i64 = s.get(14..16)?.parse().ok()?;
-    let sec: i64 = s.get(17..19)?.parse().ok()?;
-    let mut millis: i64 = 0;
-    if s.get(19..20) == Some(".")
-        && let Some(frac) = s.get(20..23)
-    {
-        millis = frac.parse().ok()?;
-    }
-    let days = days_from_civil(year, month, day) - 719_468;
-    let secs = days * 86_400 + hour * 3600 + min * 60 + sec;
-    Some(secs * 1000 + millis)
-}
-
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = (y - era * 400) as u32;
-    let m_adj = if m > 2 { m - 3 } else { m + 9 };
-    let doy = (153 * m_adj + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe as i64
 }
 
 /// Shell out to `tmx agents --json` and parse the snapshot. Returns
@@ -274,7 +168,9 @@ impl TmxSnapshot {
     /// running in. Returns the first match — there shouldn't ever be
     /// duplicates since `pane_pid` is unique per pane.
     pub fn agent_for_pane_pid(&self, pid: u32) -> Option<&Agent> {
-        self.agents.iter().find(|a| a.pane.pane_pid == Some(pid))
+        self.agents
+            .iter()
+            .find(|a| a.pane.as_ref().is_some_and(|p| p.pane_pid == Some(pid)))
     }
 }
 
@@ -282,10 +178,11 @@ impl TmxSnapshot {
 mod tests {
     use super::*;
 
-    /// Captured from live `tmx agents --json` 2026-05-24. Uses the
-    /// real vocabulary (`working`/`awaiting-decision`/`ready`/`idle`)
-    /// and the real top-level fields (no `codex_jobs` — tmx doesn't
-    /// emit it; we populate that locally via `read_codex_jobs`).
+    /// Captured from live `tmx agents --json` (tmx 1.1, 2026-06-12).
+    /// Uses the real vocabulary and top-level fields, including a codex
+    /// background row in `agents[]` with `"pane": null` (which used to
+    /// fail the whole parse when `Agent.pane` was required) and the
+    /// structured `codex_jobs` array.
     const SAMPLE: &str = r#"{
         "agents": [
             {
@@ -307,6 +204,16 @@ mod tests {
                 "repo_name": "docs",
                 "flags": {"has_intent": false, "blocked": false, "reviewed_fresh": false},
                 "extra": ""
+            },
+            {
+                "id": "codex:task-e2e-1",
+                "pane": null,
+                "kind": "codex",
+                "status": "background",
+                "cwd": "/home/me/dev/copad",
+                "repo_name": "copad",
+                "flags": {"has_intent": false, "blocked": false, "reviewed_fresh": false},
+                "extra": "running • 0s ago"
             }
         ],
         "attention": [
@@ -315,13 +222,18 @@ mod tests {
         ],
         "global_blocked": 2,
         "captured_at_ms": 1700000000000,
-        "panes_error": null
+        "panes_error": null,
+        "codex_jobs": [
+            {"id": "task-e2e-1", "title": "E2E probe", "kind_label": "task",
+             "workspace_root": "/home/me/dev/copad", "status": "running",
+             "started_at_ms": 1781198712000, "updated_at_ms": 1781198712000, "pid": 469373}
+        ]
     }"#;
 
     #[test]
     fn parse_full_snapshot_all_fields() {
         let s = parse_snapshot(SAMPLE.as_bytes()).expect("parses");
-        assert_eq!(s.agents.len(), 2);
+        assert_eq!(s.agents.len(), 3);
         assert_eq!(s.attention.len(), 1);
         assert_eq!(s.global_blocked, 2);
         assert_eq!(s.captured_at_ms, 1700000000000);
@@ -336,10 +248,27 @@ mod tests {
         assert!(claude.flags.has_intent);
         assert!(!claude.flags.blocked);
         assert!(claude.flags.reviewed_fresh);
-        assert_eq!(claude.pane.session, "copad");
-        assert_eq!(claude.pane.window, 0);
-        assert_eq!(claude.pane.pane, 0);
-        assert_eq!(claude.pane.pane_pid, Some(99));
+        let pane = claude.pane.as_ref().unwrap();
+        assert_eq!(pane.session, "copad");
+        assert_eq!(pane.window, 0);
+        assert_eq!(pane.pane, 0);
+        assert_eq!(pane.pane_pid, Some(99));
+
+        // Codex background row: pane is null, must not fail the parse.
+        let codex = &s.agents[2];
+        assert_eq!(codex.kind, "codex");
+        assert!(codex.pane.is_none());
+
+        // Structured codex_jobs from tmx ≥ 1.1.
+        assert_eq!(s.codex_jobs.len(), 1);
+        let job = &s.codex_jobs[0];
+        assert_eq!(job.id, "task-e2e-1");
+        assert_eq!(job.title, "E2E probe");
+        assert_eq!(job.kind_label, "task");
+        assert_eq!(job.workspace_root, "/home/me/dev/copad");
+        assert_eq!(job.status, "running");
+        assert_eq!(job.started_at_ms, Some(1781198712000));
+        assert_eq!(job.pid, Some(469373));
 
         let att = &s.attention[0];
         assert_eq!(att.ts, 1700000000);
@@ -362,69 +291,12 @@ mod tests {
 
     #[test]
     fn parse_handles_missing_optional_top_keys() {
+        // Pre-1.1 tmx output has no codex_jobs key — must still parse.
         let minimal = r#"{"agents":[],"attention":[]}"#;
         let s = parse_snapshot(minimal.as_bytes()).expect("parses");
         assert!(s.agents.is_empty());
-        assert!(s.codex_jobs.is_empty()); // local-populated, default empty
+        assert!(s.codex_jobs.is_empty());
         assert_eq!(s.global_blocked, 0);
-    }
-
-    #[test]
-    fn codex_job_is_active_excludes_terminal() {
-        let base = CodexJob {
-            id: "x".into(),
-            title: String::new(),
-            kind_label: String::new(),
-            workspace_root: String::new(),
-            status: "running".into(),
-            started_at_ms: None,
-            updated_at_ms: None,
-            pid: None,
-        };
-        assert!(base.is_active());
-        for s in ["completed", "failed", "cancelled", "canceled"] {
-            assert!(
-                !CodexJob {
-                    status: s.into(),
-                    ..base.clone()
-                }
-                .is_active()
-            );
-        }
-    }
-
-    #[test]
-    fn read_codex_jobs_in_filters_active_and_sorts() {
-        use std::fs;
-        use tempfile::tempdir;
-        let tmp = tempdir().unwrap();
-        let ws = tmp.path().join("copad-abcd");
-        fs::create_dir_all(&ws).unwrap();
-        let state = r#"{
-            "jobs": [
-                {"id":"old-done","status":"completed","workspaceRoot":"/x","startedAt":"2026-05-18T01:00:00.000Z","updatedAt":"2026-05-18T01:00:01.000Z"},
-                {"id":"new-run","status":"running","workspaceRoot":"/y","startedAt":"2026-05-20T01:00:00.000Z","updatedAt":"2026-05-20T01:01:00.000Z","pid":12345}
-            ]
-        }"#;
-        fs::write(ws.join("state.json"), state).unwrap();
-        let jobs = read_codex_jobs_in(tmp.path());
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].id, "new-run");
-        assert_eq!(jobs[0].pid, Some(12345));
-        assert!(jobs[0].started_at_ms.is_some());
-    }
-
-    #[test]
-    fn read_codex_jobs_in_missing_dir_empty() {
-        assert!(read_codex_jobs_in(std::path::Path::new("/nope/xyz")).is_empty());
-    }
-
-    #[test]
-    fn parse_iso8601_round_trip() {
-        let ms = parse_iso8601_millis("2026-05-19T01:56:52.454Z").unwrap();
-        let days = days_from_civil(2026, 5, 19) - 719_468;
-        let secs = days * 86_400 + 3600 + 56 * 60 + 52;
-        assert_eq!(ms, secs * 1000 + 454);
     }
 
     #[test]
