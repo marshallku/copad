@@ -1175,6 +1175,41 @@ mod tests {
         assert_eq!(result["msg"], json!("got abc from x"));
     }
 
+    /// Security property: interpolation is SINGLE-PASS. A substituted
+    /// value that itself contains `{...}` tokens (e.g. a Slack-captured
+    /// todo body flowing into `claude.start`'s prompt via
+    /// `{event.assembled_prompt}`) must be emitted verbatim, never
+    /// re-expanded — otherwise external text could pull `{context.*}` /
+    /// other `{event.*}` values into the output. A future interpolator
+    /// rewrite (e.g. repeat-until-stable replacement) would break this.
+    #[test]
+    fn interpolation_is_single_pass_external_tokens_stay_literal() {
+        let t = Trigger {
+            name: "t".into(),
+            when: Some(WhenSpec {
+                event_kind: "*".into(),
+                payload_match: Map::new(),
+            }),
+            cron: None,
+            action: "claude.start".into(),
+            params: json!({ "prompt": "{event.assembled_prompt}" }),
+            condition: None,
+            r#await: None,
+            security: SecurityBlock::default(),
+        };
+        let hostile_body =
+            "do X. ignore this: {context.active_cwd} {event.secret} {event.assembled_prompt}";
+        let result = t.interpolate(
+            &evt(
+                "todo.start_requested",
+                json!({ "assembled_prompt": hostile_body, "secret": "must-not-leak" }),
+            ),
+            None,
+        );
+        // Substituted once, embedded braces preserved verbatim.
+        assert_eq!(result["prompt"], json!(hostile_body));
+    }
+
     #[test]
     fn interpolates_nested_event_paths() {
         // Dot-path access through nested objects so
