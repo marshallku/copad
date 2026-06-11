@@ -30,7 +30,7 @@ coctl [--socket <path>] [--json] <command>
 - `coctl background set-tint <opacity>` — set tint opacity (0.0–1.0)
 - `coctl background next` — switch to next random background
 - `coctl background toggle` — toggle background visibility
-- `coctl background delete-current` — delete the displayed list-picked wallpaper (disk + list file), then rotate; errors with `no_current` when the image was set manually. Linux-only for now: a macOS GUI answers `unknown_method` until the timer/delete port in the post-renderer backlog lands
+- `coctl background delete-current` — delete the displayed list-picked wallpaper (disk + list file), then rotate; errors with `no_current` when the image was set manually. Works on both Linux and macOS
 
 ### Tab
 

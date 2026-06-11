@@ -37,6 +37,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Constructed inside `applicationDidFinishLaunching`. Background
     /// reconnect loop is owned by the client.
     private var daemonClient: DaemonClient?
+    /// Native wallpaper rotation (parity with Linux's glib timer in
+    /// `copad-linux/src/background.rs`). `rotationTimer` ticks every
+    /// `liveRotateInterval` seconds; `armRotation` (re)builds it. The live
+    /// interval is tracked separately so manual `set`/`next`/`toggle` can
+    /// restart the countdown without re-reading config.
+    private var rotationTimer: DispatchSourceTimer?
+    private var liveRotateInterval: UInt = 0
 
     func applicationDidFinishLaunching(_: Notification) {
         // PR 1 (Tier 2.1) FFI smoke test. Proves the Rust staticlib linked
@@ -292,6 +299,49 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let path = config.backgroundPath {
             vc.applyBackground(path: path, tint: config.backgroundTint, opacity: config.backgroundOpacity)
         }
+
+        // Native wallpaper rotation: a static `image` is applied above;
+        // the first rotation tick then takes over (matches Linux's
+        // window.rs apply-at-start + arm sequence). No-op at interval 0.
+        liveRotateInterval = config.rotateInterval
+        if liveRotateInterval > 0 {
+            rotateOnce()
+        }
+        armRotation()
+    }
+
+    // MARK: - Background rotation (Linux parity)
+
+    /// (Re)build the rotation timer from `liveRotateInterval`. 0 stops it.
+    /// Also the manual-change hook: `background.set`/`next`/`toggle` call
+    /// this so the countdown restarts after a manual pick (Linux's
+    /// `BackgroundLayer::arm_rotation`).
+    private func armRotation() {
+        rotationTimer?.cancel()
+        rotationTimer = nil
+        guard liveRotateInterval > 0 else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        // `.seconds(Int)` — clamp the UInt into Int range so an absurd
+        // config value can't overflow the conversion.
+        let secs = Int(min(liveRotateInterval, UInt(Int.max)))
+        timer.schedule(deadline: .now() + .seconds(secs), repeating: .seconds(secs))
+        timer.setEventHandler { [weak self] in self?.rotateOnce() }
+        timer.resume()
+        rotationTimer = timer
+    }
+
+    /// One rotation tick: honor the shared mode flag, pick a random list
+    /// image, apply it as a list pick. No-op when deactive or the list is
+    /// missing/empty. Mirrors `BackgroundLayer::rotate_once`.
+    private func rotateOnce() {
+        guard BackgroundRotator.isActive else { return }
+        guard let img = BackgroundRotator.nextRandomImage(), let vc = tabVC else { return }
+        vc.applyBackground(
+            path: img,
+            tint: vc.currentBackgroundTint,
+            opacity: vc.currentBackgroundOpacity,
+            fromList: true,
+        )
     }
 
     func applicationWillTerminate(_: Notification) {
@@ -318,6 +368,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         tabVC?.statusBar?.shutdown()
         socketServer.stop()
         configWatcher?.stop()
+        rotationTimer?.cancel()
+        rotationTimer = nil
         if let token = keybindingMonitor {
             NSEvent.removeMonitor(token)
         }
@@ -825,6 +877,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let window {
             applyWindowTransparency(window, config: newConfig, theme: newTheme)
         }
+        // Re-arm rotation with the (possibly changed) interval — arming at
+        // 0 stops the timer. A rotated wallpaper survives the reload via
+        // TabViewController.applyConfig's list-image guard.
+        liveRotateInterval = newConfig.rotateInterval
+        armRotation()
         // Skip local trigger reload while daemon owns triggers. Daemon
         // runs its own config watcher and would race our setTriggers.
         // Local engine retains its previous trigger set, ready for cut-over
@@ -1169,6 +1226,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let tint = params["tint"] as? Double ?? 0.6
             let opacity = params["opacity"] as? Double ?? 1.0
             vc.applyBackground(path: path, tint: tint, opacity: opacity)
+            // A manual pick restarts the countdown so the timer doesn't
+            // replace it a moment later (Linux handle_bg_set parity).
+            armRotation()
             completion(["ok": true])
 
         case "background.set_tint":
@@ -1201,7 +1261,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 path: img,
                 tint: vc.currentBackgroundTint,
                 opacity: vc.currentBackgroundOpacity,
+                fromList: true,
             )
+            armRotation()
             completion(["status": "ok", "mode": "active", "path": img])
 
         case "background.toggle":
@@ -1212,12 +1274,50 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         path: img,
                         tint: vc.currentBackgroundTint,
                         opacity: vc.currentBackgroundOpacity,
+                        fromList: true,
                     )
                 }
             } else {
                 vc.clearBackground()
             }
+            armRotation()
             completion(["status": "ok", "mode": nowActive ? "active" : "deactive"])
+
+        // Delete the displayed list-picked wallpaper from disk AND the list
+        // file(s), then rotate. Only operates on rotation / `next` / `toggle`
+        // picks — a manually `set` image or `[background] image` is never
+        // deleted (Linux handle_bg_delete_current parity).
+        case "background.delete_current":
+            guard vc.currentBackgroundFromList, let img = vc.currentBackgroundPath else {
+                completion(RPCError(
+                    code: "no_current",
+                    message: "No list-picked background to delete (manual/static images are never deleted)",
+                ))
+                return
+            }
+            do {
+                try FileManager.default.removeItem(atPath: img)
+            } catch let err as NSError where !(err.domain == NSCocoaErrorDomain && err.code == NSFileNoSuchFileError) {
+                completion(RPCError(code: "io_error", message: "delete \(img): \(err.localizedDescription)"))
+                return
+            } catch {
+                // NotFound — already gone, treat as success and continue to
+                // list removal + rotation.
+            }
+            BackgroundRotator.removeFromList(img)
+            if let next = BackgroundRotator.nextRandomImage() {
+                vc.applyBackground(
+                    path: next,
+                    tint: vc.currentBackgroundTint,
+                    opacity: vc.currentBackgroundOpacity,
+                    fromList: true,
+                )
+                armRotation()
+                completion(["status": "ok", "deleted": img, "next": next])
+            } else {
+                vc.clearBackground()
+                completion(["status": "ok", "deleted": img, "next": NSNull()])
+            }
 
         // MARK: WebView commands
 

@@ -153,6 +153,12 @@ int copad_ffi_background_is_active(const char *mode_file);
 /// or -1 on NULL / invalid UTF-8.
 int copad_ffi_background_toggle(const char *mode_file);
 
+/// Remove every line exactly equal to `entry` from the wallpaper list at
+/// `list` (temp-file + rename in core). Returns 1 if removed, 0 if absent
+/// or list missing, -1 on NULL / invalid UTF-8 / IO error (see
+/// `copad_ffi_last_error`). Backs `background.delete_current`.
+int copad_ffi_background_remove_from_list(const char *list, const char *entry);
+
 // ---------------------------------------------------------------------------
 // Session FFI
 //

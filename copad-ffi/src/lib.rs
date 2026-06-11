@@ -711,6 +711,45 @@ pub unsafe extern "C" fn copad_ffi_background_toggle(mode_file: *const c_char) -
     if background::toggle(&path) { 1 } else { 0 }
 }
 
+/// Remove every line exactly equal to `entry` from the wallpaper list at
+/// `list`. Returns 1 if something was removed, 0 if the entry wasn't
+/// present (or the list is missing), -1 on NULL / invalid UTF-8 / IO
+/// error (see `copad_ffi_last_error`). Backs `background.delete_current`
+/// on macOS — the rewrite is temp-file + rename in core so a crash can't
+/// truncate the catalog.
+///
+/// # Safety
+///
+/// Both `list` and `entry` must be NUL-terminated UTF-8 pointers valid
+/// for the duration of the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_ffi_background_remove_from_list(
+    list: *const c_char,
+    entry: *const c_char,
+) -> i32 {
+    let Some(list_path) = (unsafe { cstr_to_pathbuf(list) }) else {
+        set_last_error("copad_ffi_background_remove_from_list: list is NULL or invalid UTF-8");
+        return -1;
+    };
+    let Some(entry_path) = (unsafe { cstr_to_pathbuf(entry) }) else {
+        set_last_error("copad_ffi_background_remove_from_list: entry is NULL or invalid UTF-8");
+        return -1;
+    };
+    match background::remove_from_list(&list_path, &entry_path.to_string_lossy()) {
+        Ok(removed) => {
+            clear_last_error();
+            if removed { 1 } else { 0 }
+        }
+        Err(e) => {
+            set_last_error(format!(
+                "copad_ffi_background_remove_from_list: {}: {e}",
+                list_path.display()
+            ));
+            -1
+        }
+    }
+}
+
 // ============================================================================
 // Session FFI surface
 //

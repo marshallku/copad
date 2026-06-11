@@ -42,6 +42,25 @@ enum BackgroundRotator {
         return rc == 1
     }
 
+    /// Delete `entry` from both the macOS-native and XDG-fallback list
+    /// files (temp-file + rename in core). A rotation pick can come from
+    /// either list, so we drop it from both — idempotent, a missing entry
+    /// is a no-op. Returns true if any list actually changed. Backs
+    /// `background.delete_current`.
+    @discardableResult
+    static func removeFromList(_ entry: String) -> Bool {
+        var removed = false
+        for list in [primaryListURL.path, fallbackListURL.path] {
+            let rc = list.withCString { listPtr in
+                entry.withCString { entryPtr in
+                    copad_ffi_background_remove_from_list(listPtr, entryPtr)
+                }
+            }
+            if rc == 1 { removed = true }
+        }
+        return removed
+    }
+
     /// Pick a random wallpaper path. Returns nil if no list exists or
     /// every line is blank. Caller decides whether to suppress on
     /// deactive mode (`background.next` socket handler chooses no-op).

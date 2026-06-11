@@ -65,17 +65,23 @@ name = "catppuccin-mocha"
 | `tint`            | `0.9`        | Tint overlay opacity on the image (0.0=transparent, 1.0=opaque) |
 | `opacity`         | `0.95`       | Background-image opacity                                   |
 
-**Rotation (Linux).** With `rotate_interval > 0` copad picks a random image from
-`~/.cache/terminal-wallpapers.txt` at startup and every interval — no external daemon needed.
-The shared mode flag (`~/.cache/copad-bg-mode`, flipped by `coctl background toggle`) pauses
-rotation across all instances. A static `image` is applied first and then replaced by the
-first rotation pick, so with rotation enabled it acts as a pre-list fallback. Manual
-`coctl background set`/`next` restarts the countdown. `coctl background delete-current`
-removes the displayed wallpaper from disk and the list, then rotates — it refuses when the
-displayed image was set manually (or via `image`) rather than picked from the list. Each GUI
-instance rotates independently ("current" is per instance; keybinding-spawned `coctl`
-inherits that instance's socket). macOS: `next`/`toggle` work today; the interval timer is
-in the post-renderer catch-up backlog.
+**Rotation.** With `rotate_interval > 0` copad picks a random image from the platform list
+file at startup and every interval — no external daemon needed. The shared mode flag (flipped
+by `coctl background toggle`) pauses rotation across all instances. A static `image` is applied
+first and then replaced by the first rotation pick, so with rotation enabled it acts as a
+pre-list fallback. Manual `coctl background set`/`next` restarts the countdown. `coctl
+background delete-current` removes the displayed wallpaper from disk and the list, then
+rotates — it refuses when the displayed image was set manually (or via `image`) rather than
+picked from the list. Each GUI instance rotates independently ("current" is per instance;
+keybinding-spawned `coctl` inherits that instance's socket).
+
+Platform list-file + mode-flag locations:
+
+- **Linux**: list `~/.cache/terminal-wallpapers.txt`, mode flag `~/.cache/copad-bg-mode`.
+- **macOS**: list `~/Library/Caches/copad/wallpapers.txt` (XDG `~/.cache/terminal-wallpapers.txt`
+  as a cross-platform fallback), mode flag `~/Library/Caches/copad/bg-mode`. Rotation,
+  `next`/`toggle`, and `delete-current` all work natively (the in-process timer is a
+  `DispatchSourceTimer`; `delete-current` drops the entry from both the native and fallback lists).
 
 ### [window]
 

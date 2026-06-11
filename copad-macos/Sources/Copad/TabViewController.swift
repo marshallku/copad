@@ -47,6 +47,11 @@ final class TabViewController: NSViewController {
     private(set) var currentBackgroundPath: String?
     private(set) var currentBackgroundTint: Double = 0.6
     private(set) var currentBackgroundOpacity: Double = 1.0
+    // Whether `currentBackgroundPath` was picked from the wallpaper list
+    // (rotation / `background.next` / `toggle`) rather than set manually or
+    // via `[background] image`. `background.delete_current` only ever
+    // deletes a list-picked image — matches Linux's `current.1` flag.
+    private(set) var currentBackgroundFromList = false
 
     // Tab bar collapsed state.
     // Default: collapsed (icon-only). Auto-expands on 1→2 tab transition
@@ -567,10 +572,13 @@ final class TabViewController: NSViewController {
         // Background: apply/clear based on new config
         if let path = newConfig.backgroundPath {
             applyBackground(path: path, tint: newConfig.backgroundTint, opacity: newConfig.backgroundOpacity)
-        } else if currentBackgroundPath != nil {
+        } else if currentBackgroundPath != nil, !currentBackgroundFromList {
             clearBackground()
         } else {
-            // Tint may have changed even if path stayed the same
+            // No config image, or a rotated wallpaper we must preserve (a
+            // reload that only touched tint/opacity/interval must not wipe
+            // a rotation pick — matches Linux apply_config's showing_list_
+            // image guard). Only the tint knob may have changed.
             setTint(newConfig.backgroundTint)
         }
 
@@ -587,10 +595,11 @@ final class TabViewController: NSViewController {
     /// path-change. Image alpha + tint alpha are scaled by the
     /// configured `window.opacity` so the desktop bleeds through
     /// when the user opts into window transparency.
-    func applyBackground(path: String, tint: Double, opacity: Double = 1.0) {
+    func applyBackground(path: String, tint: Double, opacity: Double = 1.0, fromList: Bool = false) {
         currentBackgroundPath = path
         currentBackgroundTint = tint
         currentBackgroundOpacity = opacity
+        currentBackgroundFromList = fromList
         ensureBackgroundViews()
         backgroundLoadToken &+= 1
         let token = backgroundLoadToken
@@ -631,6 +640,7 @@ final class TabViewController: NSViewController {
 
     func clearBackground() {
         currentBackgroundPath = nil
+        currentBackgroundFromList = false
         backgroundLoadToken &+= 1
         backgroundView?.layer?.contents = nil
         backgroundView?.isHidden = true

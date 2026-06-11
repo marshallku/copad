@@ -283,6 +283,7 @@ enum CommandPalette {
     static let macOSLegacyMethods: [String] = [
         "agent.approve",
         "background.clear",
+        "background.delete_current",
         "background.next",
         "background.set",
         "background.set_tint",

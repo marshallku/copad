@@ -78,6 +78,11 @@ struct CopadConfig {
     /// Opacity of the background image layer itself (0.0 = invisible, 1.0 = fully visible).
     /// Distinct from `backgroundTint`, which darkens the image via an overlay.
     let backgroundOpacity: Double
+    /// `[background] rotate_interval` — seconds between random wallpapers
+    /// from the platform list file. 0 (default) disables the in-process
+    /// rotation timer; `coctl background next` keeps working either way.
+    /// Mirrors `copad_core::config::BackgroundConfig::rotate_interval`.
+    let rotateInterval: UInt
     let osc52: OSC52Policy
     /// `[renderer] transparent_default_bg = true` makes default-bg cells
     /// transparent so a configured background image shows through blank
@@ -177,6 +182,7 @@ struct CopadConfig {
             backgroundPath: bgPath,
             backgroundTint: clamp01(raw.background?.tint ?? defaults.backgroundTint),
             backgroundOpacity: clamp01(raw.background?.opacity ?? defaults.backgroundOpacity),
+            rotateInterval: raw.background?.rotateInterval ?? defaults.rotateInterval,
             osc52: raw.security?.osc52 ?? defaults.osc52,
             // Smart default: a wallpaper config implies the user wants
             // to see the wallpaper, so default to transparent-default-
@@ -219,6 +225,7 @@ struct CopadConfig {
             backgroundPath: nil,
             backgroundTint: 0.6,
             backgroundOpacity: 1.0,
+            rotateInterval: 0,
             osc52: .deny,
             transparentDefaultBg: false,
             windowOpacity: 1.0,
@@ -390,6 +397,15 @@ private struct BackgroundSection: Decodable {
     var image: String?
     var tint: Double?
     var opacity: Double?
+    var rotateInterval: UInt?
+
+    enum CodingKeys: String, CodingKey {
+        case path
+        case image
+        case tint
+        case opacity
+        case rotateInterval = "rotate_interval"
+    }
 }
 
 private struct SecuritySection: Decodable {
