@@ -23,8 +23,8 @@ font_family = "JetBrainsMono Nerd Font Mono"
 font_size = 14
 
 [background]
-# image = "/path/to/wallpaper.jpg"  # Single image (takes priority)
-directory = "/mnt/disk2/Wallpapers/"  # Directory for random picks
+# image = "/path/to/wallpaper.jpg"  # Static image (rotation replaces it at the first tick)
+# rotate_interval = 300  # Seconds between random wallpapers; 0 (default) = no auto-rotation
 tint = 0.85         # Tint overlay opacity on the IMAGE (0.0 = no tint, 1.0 = fully opaque)
 opacity = 0.95      # Background-image opacity (only takes effect when an image is set)
 
@@ -58,12 +58,24 @@ name = "catppuccin-mocha"
 
 `tint` + `opacity` only take effect when a background image is set. For window-level transparency (no image), use `[window]` below.
 
-| Key         | Default      | Description                                                |
-| ----------- | ------------ | ---------------------------------------------------------- |
-| `image`     | — (optional) | Single image file path (takes priority over directory)     |
-| `directory` | — (optional) | Path to wallpaper directory (random pick)                  |
-| `tint`      | `0.9`        | Tint overlay opacity on the image (0.0=transparent, 1.0=opaque) |
-| `opacity`   | `0.95`       | Background-image opacity                                   |
+| Key               | Default      | Description                                                |
+| ----------------- | ------------ | ---------------------------------------------------------- |
+| `image`           | — (optional) | Static image file path, applied at startup                 |
+| `rotate_interval` | `0`          | Seconds between random wallpapers from the platform list file; `0` disables auto-rotation |
+| `tint`            | `0.9`        | Tint overlay opacity on the image (0.0=transparent, 1.0=opaque) |
+| `opacity`         | `0.95`       | Background-image opacity                                   |
+
+**Rotation (Linux).** With `rotate_interval > 0` copad picks a random image from
+`~/.cache/terminal-wallpapers.txt` at startup and every interval — no external daemon needed.
+The shared mode flag (`~/.cache/copad-bg-mode`, flipped by `coctl background toggle`) pauses
+rotation across all instances. A static `image` is applied first and then replaced by the
+first rotation pick, so with rotation enabled it acts as a pre-list fallback. Manual
+`coctl background set`/`next` restarts the countdown. `coctl background delete-current`
+removes the displayed wallpaper from disk and the list, then rotates — it refuses when the
+displayed image was set manually (or via `image`) rather than picked from the list. Each GUI
+instance rotates independently ("current" is per instance; keybinding-spawned `coctl`
+inherits that instance's socket). macOS: `next`/`toggle` work today; the interval timer is
+in the post-renderer catch-up backlog.
 
 ### [window]
 

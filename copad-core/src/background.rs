@@ -69,6 +69,32 @@ fn read_list(path: &Path) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+/// Remove every line exactly equal to `entry` from the list file
+/// (`grep -vxF` parity with the retired rotation script). Temp-file +
+/// rename so a crash can't truncate the user's wallpaper catalog.
+/// Missing list file is fine (`Ok(false)`); returns whether anything
+/// was removed.
+pub fn remove_from_list(list: &Path, entry: &str) -> std::io::Result<bool> {
+    let contents = match std::fs::read_to_string(list) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let kept: Vec<&str> = contents.lines().filter(|l| *l != entry).collect();
+    let removed = kept.len() != contents.lines().count();
+    if !removed {
+        return Ok(false);
+    }
+    let mut body = kept.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    let tmp = list.with_extension("tmp");
+    std::fs::write(&tmp, &body)?;
+    std::fs::rename(&tmp, list)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +150,28 @@ mod tests {
     #[test]
     fn is_active_defaults_true_for_missing_file() {
         assert!(is_active(Path::new("/nonexistent/mode")));
+    }
+
+    #[test]
+    fn remove_from_list_drops_exact_lines_only() {
+        let p = tmpfile("remove", "/a.png\n/sub/a.png\n/b with space.png \n/a.png\n");
+        assert!(remove_from_list(&p, "/a.png").unwrap());
+        let after = std::fs::read_to_string(&p).unwrap();
+        // Exact-line match: both /a.png copies go, the substring match
+        // and the trailing-space variant stay verbatim.
+        assert_eq!(after, "/sub/a.png\n/b with space.png \n");
+        assert!(!remove_from_list(&p, "/not-there.png").unwrap());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), after);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn remove_from_list_tolerates_missing_file_and_empties_cleanly() {
+        assert!(!remove_from_list(Path::new("/nonexistent/list"), "/a.png").unwrap());
+        let p = tmpfile("remove-all", "/only.png\n");
+        assert!(remove_from_list(&p, "/only.png").unwrap());
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "");
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

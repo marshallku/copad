@@ -322,7 +322,7 @@ daemon-owned and stay handled inline post-migration.
 | `split` | `split.horizontal`, `split.vertical` |
 | `terminal` | `terminal.read`, `terminal.state`, `terminal.exec`, `terminal.feed`, `terminal.history`, `terminal.context` |
 | `webview` | all `webview.*` |
-| `background` | `background.set`, `background.clear`, `background.next`, `background.toggle`, `background.set_tint` |
+| `background` | `background.set`, `background.clear`, `background.next`, `background.delete_current`, `background.toggle`, `background.set_tint` |
 | `statusbar` | `statusbar.show`, `statusbar.hide`, `statusbar.toggle` |
 | `agent.ui` | `agent.approve` |
 | `plugin.open` | `plugin.open` (opens panel — UI side) |

@@ -13,12 +13,10 @@ use copad_core::protocol::{Event, Request, Response};
 
 use vte4::prelude::*;
 
-use crate::background::BackgroundLayer;
+use crate::background::{BackgroundLayer, bg_paths};
 use crate::panel::Panel;
 use crate::tabs::TabManager;
 
-const WALLPAPER_CACHE: &str = ".cache/terminal-wallpapers.txt";
-const BG_MODE_FILE: &str = ".cache/copad-bg-mode";
 const BUS_SOURCE_COPAD_LINUX: &str = "copad-linux";
 
 pub use copad_daemon::socket::{EventBus, SocketCommand, new_event_bus};
@@ -256,6 +254,11 @@ pub fn dispatch(
 
         "background.next" => {
             let resp = handle_bg_next(req, background);
+            cmd.reply_with_completion(event_bus, resp);
+        }
+
+        "background.delete_current" => {
+            let resp = handle_bg_delete_current(req, background);
             cmd.reply_with_completion(event_bus, resp);
         }
 
@@ -603,6 +606,9 @@ fn handle_bg_set(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
                 );
             }
             bg.set_image(path);
+            // A manual pick restarts the rotation countdown so the timer
+            // doesn't replace it a moment later.
+            bg.arm_rotation();
             Response::success(req.id.clone(), json!({ "status": "ok" }))
         }
         None => Response::error(req.id.clone(), "invalid_params", "Missing 'path' param"),
@@ -631,7 +637,8 @@ fn handle_bg_next(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
                     &format!("File not found: {img}"),
                 );
             }
-            bg.set_image(path);
+            bg.set_image_from_list(path);
+            bg.arm_rotation();
             Response::success(req.id.clone(), json!({ "status": "ok", "path": img }))
         }
         None => Response::error(req.id.clone(), "no_images", "No images in wallpaper cache"),
@@ -642,13 +649,58 @@ fn handle_bg_toggle(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
     let now_active = toggle_bg_mode();
     if now_active {
         if let Some(img) = select_random_image() {
-            bg.set_image(Path::new(&img));
+            bg.set_image_from_list(Path::new(&img));
         }
     } else {
         bg.clear_image();
     }
+    bg.arm_rotation();
     let mode = if now_active { "active" } else { "deactive" };
     Response::success(req.id.clone(), json!({ "status": "ok", "mode": mode }))
+}
+
+/// Delete the currently displayed wallpaper from disk AND the list file,
+/// then rotate to the next pick. Only operates on list-picked images
+/// (rotation / `background.next` / `toggle`) — a manually `set` file or a
+/// config `[background] image` is never deleted.
+fn handle_bg_delete_current(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
+    let Some(img) = bg.current_list_image() else {
+        return Response::error(
+            req.id.clone(),
+            "no_current",
+            "No list-picked background to delete (manual/static images are never deleted)",
+        );
+    };
+    if let Err(e) = std::fs::remove_file(&img)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        return Response::error(
+            req.id.clone(),
+            "io_error",
+            &format!("delete {}: {e}", img.display()),
+        );
+    }
+    if let Err(e) =
+        copad_core::background::remove_from_list(&bg_paths().primary_list, &img.to_string_lossy())
+    {
+        return Response::error(
+            req.id.clone(),
+            "io_error",
+            &format!("rewrite wallpaper list: {e}"),
+        );
+    }
+    let next = select_random_image();
+    match &next {
+        Some(n) => {
+            bg.set_image_from_list(Path::new(n));
+            bg.arm_rotation();
+        }
+        None => bg.clear_image(),
+    }
+    Response::success(
+        req.id.clone(),
+        json!({ "status": "ok", "deleted": img.to_string_lossy(), "next": next }),
+    )
 }
 
 fn handle_bg_set_tint(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
@@ -1199,15 +1251,6 @@ fn resolve_workflow_workspace(
     match project {
         Some(p) => p.workspace_path(),
         None => active_cwd.unwrap_or_else(home_dir),
-    }
-}
-
-fn bg_paths() -> copad_core::background::BackgroundPaths {
-    let home = home_dir();
-    copad_core::background::BackgroundPaths {
-        primary_list: home.join(WALLPAPER_CACHE),
-        fallback_list: None,
-        mode_file: home.join(BG_MODE_FILE),
     }
 }
 

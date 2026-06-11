@@ -405,6 +405,31 @@ Re-copy the discord blocks from the current example file, replace
 restart `copadd` or wait ~2s for the config watcher to pick up
 the change.
 
+### Migrating off copad-random-bg.sh (native rotation since 2026-06-12)
+
+Native rotation (`[background] rotate_interval`, docs/config.md) replaces
+the external script daemon. Until the dotfiles side is cleaned up, both
+can run at once — benign (each just sets images) but the cadence looks
+erratic. To migrate:
+
+1. `rotate_interval = 300` under `[background]` in config.toml.
+2. Remove the zshrc launch line (`copad-random-bg.sh --daemon ...`) and
+   kill leftovers: `pkill -f copad-random-bg.sh`.
+3. Rebind keys to the native actions:
+   ```toml
+   [keybindings]
+   "ctrl+shift+y" = "spawn:coctl background toggle"
+   "ctrl+shift+bracketright" = "spawn:coctl background next"
+   "ctrl+shift+d" = "spawn:coctl background delete-current"
+   ```
+4. Stale `~/.cache/copad-bg-daemon-*.pid` / `copad-bg-current-*` files
+   can be deleted; `~/.cache/copad-bg-mode` and
+   `~/.cache/terminal-wallpapers.txt` stay (native rotation reads both).
+
+`delete-current` only deletes wallpapers picked from the list (rotation /
+`next` / `toggle`); on a manually `set` image it errors with
+`no_current` instead of deleting an arbitrary file.
+
 ### Pilot goals stall without a gate after a claude upgrade (marker drift)
 
 **Symptom:** pilot goals sit in `running` forever (or hit the re-prompt

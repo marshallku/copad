@@ -191,6 +191,8 @@ pub enum BackgroundCommand {
     Next,
     /// Toggle background visibility
     Toggle,
+    /// Delete the current list-picked wallpaper (disk + list) and rotate
+    DeleteCurrent,
 }
 
 #[derive(Subcommand)]
@@ -608,6 +610,7 @@ impl Cli {
                 BackgroundCommand::SetTint { .. } => "background.set_tint",
                 BackgroundCommand::Next => "background.next",
                 BackgroundCommand::Toggle => "background.toggle",
+                BackgroundCommand::DeleteCurrent => "background.delete_current",
             }
             .to_string(),
             Command::Tab(cmd) => match cmd {
@@ -739,7 +742,9 @@ impl Cli {
                 }
                 BackgroundCommand::Clear => json!({}),
                 BackgroundCommand::SetTint { opacity } => json!({ "opacity": opacity }),
-                BackgroundCommand::Next | BackgroundCommand::Toggle => json!({}),
+                BackgroundCommand::Next
+                | BackgroundCommand::Toggle
+                | BackgroundCommand::DeleteCurrent => json!({}),
             },
             Command::Tab(cmd) => match cmd {
                 TabCommand::Rename { id, title } => json!({ "id": id, "title": title }),

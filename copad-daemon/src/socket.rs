@@ -91,6 +91,7 @@ pub const LEGACY_DISPATCH_METHODS: &[&str] = &[
     "background.set",
     "background.clear",
     "background.next",
+    "background.delete_current",
     "background.toggle",
     "background.set_tint",
     "tab.new",

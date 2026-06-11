@@ -1,13 +1,28 @@
 use std::cell::{Cell, RefCell};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gtk4::gdk;
+use gtk4::glib;
 use gtk4::prelude::*;
 
 use copad_core::config::CopadConfig;
 
 use crate::terminal::{norm_opacity, parse_color, rgba_css};
+
+const WALLPAPER_CACHE: &str = ".cache/terminal-wallpapers.txt";
+const BG_MODE_FILE: &str = ".cache/copad-bg-mode";
+
+/// Linux locations of the wallpaper list + rotation mode flag — shared by
+/// the socket handlers and the native rotation timer.
+pub fn bg_paths() -> copad_core::background::BackgroundPaths {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    copad_core::background::BackgroundPaths {
+        primary_list: home.join(WALLPAPER_CACHE),
+        fallback_list: None,
+        mode_file: home.join(BG_MODE_FILE),
+    }
+}
 
 /// Image + tint mounted as the `gtk4::Overlay` base child in
 /// `CopadWindow`. Statusbar / notebook / panels are layered on top as
@@ -30,6 +45,13 @@ pub struct BackgroundLayer {
     // This layer owns it so a theme/opacity change refreshes it in one place.
     window_css: gtk4::CssProvider,
     theme_bg: RefCell<String>,
+    // Native rotation (replaces the external copad-random-bg.sh daemon).
+    // `current` remembers what's displayed; the bool marks whether it was
+    // picked from the wallpaper list — `background.delete_current` only
+    // ever deletes list-picked images, never a manually `set` file.
+    current: RefCell<Option<(PathBuf, bool)>>,
+    rotate_interval: Cell<u64>,
+    rotation_source: RefCell<Option<glib::SourceId>>,
 }
 
 impl BackgroundLayer {
@@ -75,6 +97,9 @@ impl BackgroundLayer {
             has_image: Cell::new(false),
             window_css,
             theme_bg: RefCell::new(theme_bg.to_string()),
+            current: RefCell::new(None),
+            rotate_interval: Cell::new(config.background.rotate_interval),
+            rotation_source: RefCell::new(None),
         });
 
         layer.refresh_window_backdrop();
@@ -90,6 +115,16 @@ impl BackgroundLayer {
     }
 
     pub fn set_image(&self, path: &Path) {
+        self.apply_image(path, false);
+    }
+
+    /// Like [`set_image`], but marks the image as picked from the wallpaper
+    /// list — the only kind `background.delete_current` will delete.
+    pub fn set_image_from_list(&self, path: &Path) {
+        self.apply_image(path, true);
+    }
+
+    fn apply_image(&self, path: &Path, from_list: bool) {
         eprintln!("[copad] background.set_image: {}", path.display());
 
         if !path.exists() {
@@ -124,6 +159,57 @@ impl BackgroundLayer {
         self.bg_picture.set_opacity(self.image_opacity.get());
         self.tint_overlay.set_visible(true);
         self.has_image.set(true);
+        *self.current.borrow_mut() = Some((path.to_path_buf(), from_list));
+    }
+
+    /// The displayed image's path, only when it came from the wallpaper list.
+    pub fn current_list_image(&self) -> Option<PathBuf> {
+        self.current
+            .borrow()
+            .as_ref()
+            .and_then(|(p, from_list)| from_list.then(|| p.clone()))
+    }
+
+    /// True while the displayed image is a rotation/list pick (used by the
+    /// config hot-reload to keep rotated wallpapers when `[background] image`
+    /// is unset).
+    fn showing_list_image(&self) -> bool {
+        matches!(self.current.borrow().as_ref(), Some((_, true)))
+    }
+
+    /// (Re)start the rotation timer from the configured interval; 0 stops it.
+    /// Also the manual-change hook: `background.set`/`next` call this so the
+    /// countdown restarts after a manual pick (the retired script did the
+    /// same via file mtimes).
+    pub fn arm_rotation(self: &Rc<Self>) {
+        if let Some(id) = self.rotation_source.borrow_mut().take() {
+            id.remove();
+        }
+        let interval = self.rotate_interval.get();
+        if interval == 0 {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let id = glib::timeout_add_seconds_local(interval.min(u32::MAX as u64) as u32, move || {
+            let Some(layer) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            layer.rotate_once();
+            glib::ControlFlow::Continue
+        });
+        *self.rotation_source.borrow_mut() = Some(id);
+    }
+
+    /// One rotation tick: respect the shared mode flag, pick a random list
+    /// image, apply it. No-op when the list is missing/empty.
+    pub fn rotate_once(&self) {
+        let paths = bg_paths();
+        if !copad_core::background::is_active(&paths.mode_file) {
+            return;
+        }
+        if let Some(img) = copad_core::background::pick_random(&paths) {
+            self.set_image_from_list(Path::new(&img));
+        }
     }
 
     /// The window's `background-color`: `rgba(theme_bg, window_opacity)`, the
@@ -143,6 +229,7 @@ impl BackgroundLayer {
         self.bg_picture.set_visible(false);
         self.tint_overlay.set_visible(false);
         self.has_image.set(false);
+        *self.current.borrow_mut() = None;
     }
 
     pub fn set_tint(&self, opacity: f64) {
@@ -179,6 +266,8 @@ impl BackgroundLayer {
             self.bg_picture.set_opacity(config.background.opacity);
         }
 
+        self.rotate_interval.set(config.background.rotate_interval);
+
         match &config.background.image {
             Some(image) => {
                 let path = Path::new(image);
@@ -196,7 +285,9 @@ impl BackgroundLayer {
                 }
             }
             None => {
-                if self.has_image.get() {
+                // A rotated wallpaper isn't config-driven — a reload that
+                // merely touched tint/opacity/interval must not clear it.
+                if self.has_image.get() && !self.showing_list_image() {
                     self.clear_image();
                 }
             }

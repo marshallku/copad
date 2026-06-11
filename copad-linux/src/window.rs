@@ -529,6 +529,13 @@ impl CopadWindow {
             .as_deref()
             .unwrap_or(&theme.background);
         let background = BackgroundLayer::new(config, window_css, backdrop);
+        // Native wallpaper rotation: pick an image right away (the
+        // retired external daemon's apply-at-start behavior), then tick
+        // on the configured interval. No-op at interval 0.
+        if config.background.rotate_interval > 0 {
+            background.rotate_once();
+        }
+        background.arm_rotation();
 
         // Layout: vertical box with notebook + statusbar
         let layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
@@ -816,6 +823,9 @@ fn watch_config(
             .as_deref()
             .unwrap_or(&theme.background);
         bg.apply_config(&config, backdrop);
+        // Re-arm with the (possibly changed) interval — apply_config
+        // stored it; arming at 0 stops the timer.
+        bg.arm_rotation();
 
         // Always refresh the cache from disk — even when daemon is
         // authoritative — so a later disconnect restores the freshest

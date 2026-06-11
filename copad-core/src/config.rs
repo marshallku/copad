@@ -95,6 +95,13 @@ pub struct BackgroundConfig {
 
     #[serde(default = "default_opacity")]
     pub opacity: f64,
+
+    /// Auto-rotation cadence in seconds for random wallpapers from the
+    /// platform list file. 0 (default) disables the timer — manual
+    /// `background.next` keeps working either way. A static `image` is
+    /// applied at startup; the first rotation tick then takes over.
+    #[serde(default)]
+    pub rotate_interval: u64,
 }
 
 impl Default for BackgroundConfig {
@@ -104,6 +111,7 @@ impl Default for BackgroundConfig {
             tint: default_tint(),
             tint_color: default_tint_color(),
             opacity: default_opacity(),
+            rotate_interval: 0,
         }
     }
 }
@@ -368,6 +376,8 @@ font_size = 14
 # tint = 0.85
 # tint_color = "#1e1e2e"
 # opacity = 0.95
+# rotate_interval = 300  # seconds between random wallpapers from the
+#                        # platform list file; 0 (default) = no auto-rotation
 
 [window]
 # opacity = 0.85        # 0.0 = fully transparent, 1.0 = fully opaque (default)
@@ -493,6 +503,26 @@ background = "#000000"
         assert!((cfg.window.opacity - 0.85).abs() < 1e-9);
         assert!(cfg.window.blur);
         assert_eq!(cfg.window.background.as_deref(), Some("#000000"));
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn background_rotate_interval_defaults_zero_and_parses() {
+        assert_eq!(CopadConfig::default().background.rotate_interval, 0);
+
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r##"
+[background]
+rotate_interval = 300
+"##,
+        )
+        .expect("write");
+        let cfg = CopadConfig::load_from(&path).expect("load");
+        assert_eq!(cfg.background.rotate_interval, 300);
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir(&dir).ok();
     }

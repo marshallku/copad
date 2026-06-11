@@ -45,8 +45,9 @@ The Phase 1–21 work concentrates on making each integration *possible*. Phase 
 - [x] VTE transparent background (`set_clear_background(false)`)
 - [x] Tint overlay via CSS (no Cairo)
 - [x] D-Bus interface for dynamic control (SetBackground, ClearBackground, SetTint)
-- [x] Shell script for random rotation daemon (`copad-random-bg.sh`)
+- [x] Shell script for random rotation daemon (`copad-random-bg.sh`) — **retired 2026-06-12**, see below
 - [x] Config hot-reload (file watcher)
+- [x] **Native rotation (2026-06-12)** — `[background] rotate_interval` (seconds, 0 = off) drives an in-process glib timer: random pick from `~/.cache/terminal-wallpapers.txt` at startup + every tick, honoring the shared `~/.cache/copad-bg-mode` flag. New `background.delete_current` action (+ `coctl background delete-current`) deletes the displayed wallpaper from disk + list (temp-file+rename) and rotates; it only operates on list-picked images — a manual `background.set` or config `image` is never deleted. Manual set/next restarts the countdown; config hot-reload re-arms the timer and keeps a rotated wallpaper when `image` is unset. Replaces the external `copad-random-bg.sh` daemon (per-instance PID files, mtime countdowns, stale sweeps) — keybinds become `spawn:coctl background next` etc. macOS interval timer deferred to the post-renderer catch-up backlog (`next`/`toggle` already shared via core FFI).
 
 ### Phase 3: Tabs + Panel System ✅
 
@@ -70,7 +71,7 @@ Single programmable interface for both human CLI and AI agents.
 - [x] cmux V2 JSON protocol types
 - [x] Unix socket client
 - [x] **Socket server** in copad-linux (Unix socket, per-PID path)
-- [x] **Command dispatch**: system.ping, background.set/clear/set_tint/next/toggle, tab.new/close/list, split.horizontal/vertical
+- [x] **Command dispatch**: system.ping, background.set/clear/set_tint/next/toggle/delete_current, tab.new/close/list, split.horizontal/vertical
 - [x] **Env var injection**: COPAD_SOCKET per terminal session
 - [x] **Event stream**: subscribe to terminal output, focus changes, panel lifecycle via `event.subscribe`
 - [x] **Query API**: `session.list`, `session.info` (panel details + cursor/dimensions), `tab.info` (extended tab info)
