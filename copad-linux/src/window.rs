@@ -128,7 +128,13 @@ impl CopadWindow {
 
         // `with_completion_bus` auto-publishes `<name>.completed/.failed`
         // so chained triggers compose without per-plugin emit code.
-        let actions = Arc::new(ActionRegistry::with_completion_bus(event_bus.clone()));
+        // The bounded pool gives GUI-local blocking handlers (notify.show,
+        // project.last_commit) the same backpressure the daemon registry
+        // got in Phase 9.4 — without it they fall back to unbounded
+        // `thread::spawn` per dispatch. Smaller than the daemon's pool:
+        // the GUI hosts a handful of blocking actions, not a plugin fleet.
+        let actions = Arc::new(ActionRegistry::with_completion_bus(event_bus.clone()))
+            .with_pool(copad_core::thread_pool::ThreadPool::new(2, 32));
         // High-frequency built-ins are registered "silent" so their
         // completions don't dwarf real workflow events on the bus.
         // system.ping fires from heartbeat probes; context.snapshot

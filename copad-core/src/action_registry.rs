@@ -235,9 +235,9 @@ impl ActionRegistry {
                     rejected.cancel();
                 }
             } else {
-                // Legacy fallback: unbounded spawn. Kept for callers that
-                // haven't wired a pool (notably copad-linux's in-process
-                // registry — to be migrated in a later phase).
+                // Legacy fallback: unbounded spawn. Production registries
+                // (copadd + copad-linux) all wire a pool now; this path
+                // remains for tests and embedders that don't.
                 std::thread::spawn(move || {
                     let result = handler(params);
                     publish_completion(publish_bus.as_deref(), &action_name, &result);
