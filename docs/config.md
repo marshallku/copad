@@ -67,7 +67,10 @@ name = "catppuccin-mocha"
 
 **Rotation.** With `rotate_interval > 0` copad picks a random image from the platform list
 file at startup and every interval — no external daemon needed. The shared mode flag (flipped
-by `coctl background toggle`) pauses rotation across all instances. A static `image` is applied
+by `coctl background toggle`) pauses rotation across all instances; on Linux every instance
+also watches the flag file (inotify), so a toggle against one instance clears/re-applies the
+wallpaper on all of them immediately — the watcher is armed even at `rotate_interval = 0`,
+matching the retired script's broadcast behavior. A static `image` is applied
 first and then replaced by the first rotation pick, so with rotation enabled it acts as a
 pre-list fallback. Manual `coctl background set`/`next` restarts the countdown. `coctl
 background delete-current` removes the displayed wallpaper from disk and the list, then

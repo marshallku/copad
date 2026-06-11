@@ -647,6 +647,9 @@ fn handle_bg_next(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
 
 fn handle_bg_toggle(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
     let now_active = toggle_bg_mode();
+    // Mark before the watcher's echo of our own write arrives — other
+    // instances react via their own mode-file monitors.
+    bg.note_mode_applied(now_active);
     if now_active {
         if let Some(img) = select_random_image() {
             bg.set_image_from_list(Path::new(&img));

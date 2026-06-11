@@ -52,6 +52,12 @@ pub struct BackgroundLayer {
     current: RefCell<Option<(PathBuf, bool)>>,
     rotate_interval: Cell<u64>,
     rotation_source: RefCell<Option<glib::SourceId>>,
+    // Cross-instance toggle propagation: every instance watches the shared
+    // mode file and applies clear/pick on a flip, so `background.toggle`
+    // against ONE instance reaches all of them (the retired script did
+    // this by broadcasting to every gui-*.sock instead).
+    last_mode_active: Cell<bool>,
+    mode_monitor: RefCell<Option<gtk4::gio::FileMonitor>>,
 }
 
 impl BackgroundLayer {
@@ -100,6 +106,8 @@ impl BackgroundLayer {
             current: RefCell::new(None),
             rotate_interval: Cell::new(config.background.rotate_interval),
             rotation_source: RefCell::new(None),
+            last_mode_active: Cell::new(copad_core::background::is_active(&bg_paths().mode_file)),
+            mode_monitor: RefCell::new(None),
         });
 
         layer.refresh_window_backdrop();
@@ -210,6 +218,51 @@ impl BackgroundLayer {
         if let Some(img) = copad_core::background::pick_random(&paths) {
             self.set_image_from_list(Path::new(&img));
         }
+    }
+
+    /// Record the mode this instance just applied itself, so the file
+    /// monitor's echo of our own `background.toggle` write is a no-op
+    /// instead of a second random pick.
+    pub fn note_mode_applied(&self, active: bool) {
+        self.last_mode_active.set(active);
+    }
+
+    /// Watch the shared mode file so a `background.toggle` against ANY
+    /// instance propagates here: flip→deactive clears the image,
+    /// flip→active picks a fresh one. Armed regardless of
+    /// `rotate_interval` — the retired script broadcast its toggle to
+    /// every instance, and interval-less instances still participated.
+    pub fn arm_mode_watch(self: &Rc<Self>) {
+        let mode_file = bg_paths().mode_file;
+        let gfile = gtk4::gio::File::for_path(&mode_file);
+        let monitor = match gfile.monitor_file(
+            gtk4::gio::FileMonitorFlags::NONE,
+            gtk4::gio::Cancellable::NONE,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[copad] background mode watch unavailable: {e}");
+                return;
+            }
+        };
+        let weak = Rc::downgrade(self);
+        monitor.connect_changed(move |_, _, _, _| {
+            let Some(layer) = weak.upgrade() else { return };
+            let active = copad_core::background::is_active(&bg_paths().mode_file);
+            if active == layer.last_mode_active.get() {
+                return;
+            }
+            layer.last_mode_active.set(active);
+            if active {
+                if let Some(img) = copad_core::background::pick_random(&bg_paths()) {
+                    layer.set_image_from_list(Path::new(&img));
+                }
+            } else {
+                layer.clear_image();
+            }
+            layer.arm_rotation();
+        });
+        *self.mode_monitor.borrow_mut() = Some(monitor);
     }
 
     /// The window's `background-color`: `rgba(theme_bg, window_opacity)`, the

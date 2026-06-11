@@ -536,6 +536,7 @@ impl CopadWindow {
             background.rotate_once();
         }
         background.arm_rotation();
+        background.arm_mode_watch();
 
         // Layout: vertical box with notebook + statusbar
         let layout = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
