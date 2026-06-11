@@ -295,7 +295,11 @@ fn list_sessions(claude_dir: &Path, project_filter: Option<&str>) -> Result<Valu
         b.get("last_modified_ms")
             .and_then(Value::as_u64)
             .unwrap_or(0)
-            .cmp(&a.get("last_modified_ms").and_then(Value::as_u64).unwrap_or(0))
+            .cmp(
+                &a.get("last_modified_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+            )
     });
     Ok(json!({
         "count": sessions.len(),
@@ -398,7 +402,9 @@ fn list_dirty(claude_dir: &Path) -> Result<Value, ActionError> {
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        let Some(session_id) = name.strip_prefix("dirty-").and_then(|s| s.strip_suffix(".log"))
+        let Some(session_id) = name
+            .strip_prefix("dirty-")
+            .and_then(|s| s.strip_suffix(".log"))
         else {
             continue;
         };
@@ -544,7 +550,11 @@ mod tests {
         let dir = tmpdir();
         let proj = dir.join("projects").join("-proj");
         fs::create_dir_all(&proj).unwrap();
-        fs::write(proj.join("sess1.jsonl"), "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n").unwrap();
+        fs::write(
+            proj.join("sess1.jsonl"),
+            "{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n",
+        )
+        .unwrap();
         let out = session_state(&dir, Some("sess1")).unwrap();
         assert_eq!(out["session_id"], "sess1");
         assert_eq!(out["message_count"], 3);
@@ -584,7 +594,11 @@ mod tests {
         assert_eq!(e.code, "invalid_params");
         // Absent / null = None (still treated as unset).
         assert!(optional_string_param(&json!({}), "x").unwrap().is_none());
-        assert!(optional_string_param(&json!({"x": null}), "x").unwrap().is_none());
+        assert!(
+            optional_string_param(&json!({"x": null}), "x")
+                .unwrap()
+                .is_none()
+        );
         // Whole-params null is treated as "no params" — None for any key.
         assert!(optional_string_param(&Value::Null, "x").unwrap().is_none());
         // String passes through.

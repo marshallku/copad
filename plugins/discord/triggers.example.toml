@@ -106,14 +106,15 @@ event_kind = "discord.mention"
 # [[triggers]]
 # name = "discord-dm-llm-reply-post"
 # action = "discord.send_message"
-# params = { channel_id = "{event.channel_id}", content = "{event.await.completion}" }
+# params = { channel_id = "{event.channel_id}", content = "{event.await.text}" }
 # [triggers.when]
-# event_kind = "llm.complete.completed"
-# # Note: this second trigger is required because copad's trigger model
-# # is action-then-await-then-end. The await result lives on the
-# # follow-up `llm.complete.completed` event which the second trigger
-# # consumes via payload_match (channel_id forwarded as a correlation
-# # token through llm.complete params).
+# event_kind = "discord-dm-llm-reply.awaited"
+# # The synthesized `.awaited` event carries the ORIGINAL dm event's
+# # fields at the top level (so `{event.channel_id}` resolves) and the
+# # llm.complete result under `await:` — the reply text is
+# # `{event.await.text}` (llm.complete returns `text`). Consuming the
+# # `.awaited` event (not raw `llm.complete.completed`) is what scopes
+# # this trigger to ITS llm call instead of every llm call on the bus.
 
 # ---------------------------------------------------------------------
 # 4. Channel-scoped subscription

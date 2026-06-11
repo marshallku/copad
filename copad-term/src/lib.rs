@@ -988,8 +988,13 @@ pub unsafe extern "C" fn copad_term_take_damage_rows(
     // FFI call can race on the same buffer (the caller is expected to
     // be a single render thread on the GUI side).
     let out_slice = unsafe { std::slice::from_raw_parts_mut(out_buf, cap as usize) };
-    let (outcome, new_offset, new_selection, new_cursor_hash) =
-        compute_damage_rows(&mut term, prev_offset, prev_selection, prev_cursor_hash, out_slice);
+    let (outcome, new_offset, new_selection, new_cursor_hash) = compute_damage_rows(
+        &mut term,
+        prev_offset,
+        prev_selection,
+        prev_cursor_hash,
+        out_slice,
+    );
     drop(term);
 
     h.last_display_offset.store(new_offset, Ordering::Relaxed);
@@ -1292,7 +1297,6 @@ fn search_match_for_ffi(
         _reserved: [0; 3],
     }
 }
-
 
 /// Walk a single display line into a `Row`. Groups consecutive cells
 /// with identical attributes AND identical single-byte ASCII char into
@@ -1870,11 +1874,16 @@ pub unsafe extern "C" fn copad_term_search_next(
         // Forward search wraps: try from start_point to bottom; if
         // nothing, retry from top to start_point. alacritty doesn't
         // wrap natively, so we do two calls.
-        let bottom_right =
-            Point { line: bottommost_line, column: Column(cols.saturating_sub(1)) };
+        let bottom_right = Point {
+            line: bottommost_line,
+            column: Column(cols.saturating_sub(1)),
+        };
         let first = term.regex_search_right(&mut regex, start_point, bottom_right);
         first.or_else(|| {
-            let top_left = Point { line: topmost_line, column: Column(0) };
+            let top_left = Point {
+                line: topmost_line,
+                column: Column(0),
+            };
             // Wrap-around guard: don't return the same match twice in a
             // row if the only match in the grid is at start_point.
             let mut prev_end = start_point;
@@ -1891,11 +1900,16 @@ pub unsafe extern "C" fn copad_term_search_next(
             term.regex_search_right(&mut regex, top_left, prev_end)
         })
     } else {
-        let top_left = Point { line: topmost_line, column: Column(0) };
+        let top_left = Point {
+            line: topmost_line,
+            column: Column(0),
+        };
         let first = term.regex_search_left(&mut regex, start_point, top_left);
         first.or_else(|| {
-            let bottom_right =
-                Point { line: bottommost_line, column: Column(cols.saturating_sub(1)) };
+            let bottom_right = Point {
+                line: bottommost_line,
+                column: Column(cols.saturating_sub(1)),
+            };
             let mut prev_start = start_point;
             if prev_start.column.0 + 1 >= cols {
                 prev_start.column = Column(0);
@@ -2775,8 +2789,7 @@ mod damage_rows_tests {
         let mut term = fixture_term();
         type_text(&mut term, "hi");
         let mut buf = [0u16; 16];
-        let (outcome, _, _, _) =
-            compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
+        let (outcome, _, _, _) = compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
         // Either Full or some rows — but not Count(0): the writes
         // should produce SOME damage signal.
         match outcome {
@@ -2795,11 +2808,9 @@ mod damage_rows_tests {
         type_text(&mut term, "x");
         // Prime: consume initial damage.
         let mut buf = [0u16; 16];
-        let (_, off1, sel1, hash1) =
-            compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
+        let (_, off1, sel1, hash1) = compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
         // Now idle: re-call with the updated prev state.
-        let (outcome, _, _, _) =
-            compute_damage_rows(&mut term, off1, sel1, hash1, &mut buf);
+        let (outcome, _, _, _) = compute_damage_rows(&mut term, off1, sel1, hash1, &mut buf);
         match outcome {
             DamageRowsOutcome::Count(0) => {}
             DamageRowsOutcome::Count(n) => panic!("expected 0 dirty rows on idle, got {n}"),
@@ -2814,8 +2825,7 @@ mod damage_rows_tests {
         let mut term = fixture_term();
         type_text(&mut term, "data");
         let mut buf = [0u16; 0];
-        let (outcome, _, _, _) =
-            compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
+        let (outcome, _, _, _) = compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
         assert!(matches!(outcome, DamageRowsOutcome::Full));
     }
 
@@ -2833,12 +2843,10 @@ mod damage_rows_tests {
         }
         // Drain initial damage.
         let mut buf = [0u16; 16];
-        let (_, off1, sel1, hash1) =
-            compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
+        let (_, off1, sel1, hash1) = compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
         // Now claim the previous offset was different — simulates a
         // scroll-back action having happened between calls.
-        let (outcome, _, _, _) =
-            compute_damage_rows(&mut term, off1 + 1, sel1, hash1, &mut buf);
+        let (outcome, _, _, _) = compute_damage_rows(&mut term, off1 + 1, sel1, hash1, &mut buf);
         assert!(matches!(outcome, DamageRowsOutcome::Full));
     }
 
@@ -2852,8 +2860,7 @@ mod damage_rows_tests {
         type_text(&mut term, "data");
         let mut buf = [0u16; 16];
         // Prime: cleanly drained, no selection.
-        let (_, off1, _, hash1) =
-            compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
+        let (_, off1, _, hash1) = compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
         // Build a synthetic "prev selection on row 1, cols 0..=3" that
         // the renderer would have painted last frame.
         let prev = CopadSelectionRange {
@@ -2865,8 +2872,7 @@ mod damage_rows_tests {
             present: 1,
             _reserved: 0,
         };
-        let (outcome, _, new_sel, _) =
-            compute_damage_rows(&mut term, off1, prev, hash1, &mut buf);
+        let (outcome, _, new_sel, _) = compute_damage_rows(&mut term, off1, prev, hash1, &mut buf);
         // Current term has no selection — new_sel.present == 0 — but
         // the union must include row 1 from the prev selection.
         assert_eq!(new_sel.present, 0);
@@ -2893,16 +2899,14 @@ mod damage_rows_tests {
         // Prime to clear initial damage but DON'T cache hash —
         // pass 0 as prev_cursor_hash so the second call sees a change.
         let mut buf = [0u16; 16];
-        let (_, off1, sel1, _) =
-            compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
+        let (_, off1, sel1, _) = compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
         // Re-call: alacritty has nothing in its damage iter (idle),
         // but our prev_cursor_hash differs from current → mark cursor
         // row dirty.
         let cursor_row = term.grid().cursor.point.line.0;
         assert!(cursor_row >= 0);
         let cursor_row_u16 = cursor_row as u16;
-        let (outcome, _, _, _) =
-            compute_damage_rows(&mut term, off1, sel1, 0, &mut buf);
+        let (outcome, _, _, _) = compute_damage_rows(&mut term, off1, sel1, 0, &mut buf);
         match outcome {
             DamageRowsOutcome::Count(n) => {
                 let rows = &buf[..n as usize];
@@ -2923,12 +2927,10 @@ mod damage_rows_tests {
         let mut term = fixture_term();
         type_text(&mut term, "first");
         let mut buf = [0u16; 16];
-        let (_, off1, sel1, hash1) =
-            compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
+        let (_, off1, sel1, hash1) = compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
         // Same prev state immediately reused: nothing changed since
         // last drain, expect Count(0).
-        let (outcome, _, _, _) =
-            compute_damage_rows(&mut term, off1, sel1, hash1, &mut buf);
+        let (outcome, _, _, _) = compute_damage_rows(&mut term, off1, sel1, hash1, &mut buf);
         assert!(
             matches!(outcome, DamageRowsOutcome::Count(0)),
             "expected Count(0) on idempotent re-drain"
@@ -2946,8 +2948,7 @@ mod damage_rows_tests {
         Handler::carriage_return(&mut term);
         type_text(&mut term, "b");
         let mut buf = [0u16; 1];
-        let (outcome, _, _, _) =
-            compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
+        let (outcome, _, _, _) = compute_damage_rows(&mut term, 0, empty_sel(), 0, &mut buf);
         // Either Full directly from alacritty (initial-state path),
         // or via cap overflow. Both are correct.
         assert!(matches!(outcome, DamageRowsOutcome::Full));
@@ -2963,8 +2964,13 @@ mod search_match_projection_tests {
     fn make_state(start: (i32, usize), end: (i32, usize)) -> Mutex<SearchState> {
         let state = SearchState {
             current_match: Some(
-                Point { line: Line(start.0), column: Column(start.1) }
-                    ..=Point { line: Line(end.0), column: Column(end.1) },
+                Point {
+                    line: Line(start.0),
+                    column: Column(start.1),
+                }..=Point {
+                    line: Line(end.0),
+                    column: Column(end.1),
+                },
             ),
             ..Default::default()
         };
@@ -3050,6 +3056,9 @@ mod search_match_projection_tests {
         assert_eq!(out.start_row, 22);
         assert_eq!(out.start_col, 4);
         assert_eq!(out.end_row, 23);
-        assert_eq!(out.end_col, 79, "clipped end row should extend through last col");
+        assert_eq!(
+            out.end_col, 79,
+            "clipped end row should extend through last col"
+        );
     }
 }

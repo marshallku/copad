@@ -117,7 +117,9 @@ pub fn is_privileged_action(action: &str) -> bool {
 pub fn validate_source_invariants(t: &Trigger) -> Result<(), String> {
     match (&t.when, &t.cron) {
         (None, None) => Err("missing both `when` and `cron` — exactly one source required".into()),
-        (Some(_), Some(_)) => Err("both `when` and `cron` set — sources are mutually exclusive".into()),
+        (Some(_), Some(_)) => {
+            Err("both `when` and `cron` set — sources are mutually exclusive".into())
+        }
         (Some(_), None) => Ok(()),
         (None, Some(_)) => {
             if t.condition.is_some() {
@@ -128,10 +130,16 @@ pub fn validate_source_invariants(t: &Trigger) -> Result<(), String> {
             }
             let params_str = t.params.to_string();
             if params_str.contains("{event.") {
-                return Err("cron trigger params reference `{event.X}` — cron has no originating event".into());
+                return Err(
+                    "cron trigger params reference `{event.X}` — cron has no originating event"
+                        .into(),
+                );
             }
             if params_str.contains("{action_result.") {
-                return Err("cron trigger params reference `{action_result.X}` — cron has no await chain".into());
+                return Err(
+                    "cron trigger params reference `{action_result.X}` — cron has no await chain"
+                        .into(),
+                );
             }
             Ok(())
         }
@@ -1000,7 +1008,10 @@ mod tests {
     #[test]
     fn validate_rejects_both_sources_set() {
         let mut t = mk_cron_trigger("t", "* * * * * *", "noop");
-        t.when = Some(WhenSpec { event_kind: "x".into(), payload_match: Map::new() });
+        t.when = Some(WhenSpec {
+            event_kind: "x".into(),
+            payload_match: Map::new(),
+        });
         assert!(validate_source_invariants(&t).is_err());
     }
 
@@ -2277,6 +2288,209 @@ mod tests {
         let instruction = params["instruction"].as_str().unwrap();
         assert!(instruction.contains("feat/x"), "got {instruction}");
         assert!(instruction.contains("https://ci/123"), "got {instruction}");
+    }
+
+    fn parse_example_triggers(rel_path: &str) -> Vec<Trigger> {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join(rel_path);
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        #[derive(serde::Deserialize)]
+        struct File {
+            #[serde(default)]
+            triggers: Vec<Trigger>,
+        }
+        let parsed: File =
+            toml::from_str(&raw).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        parsed.triggers
+    }
+
+    /// Phase 14.3: pin `plugins/llm/triggers.example.toml` and drive its
+    /// DM-summarize chain through the engine end-to-end — slack.dm fires
+    /// llm.complete, the `.completed` event promotes AND satisfies the
+    /// await in one dispatch, and the synthesized `.awaited` event lands
+    /// the summary in kb.append's interpolated params.
+    #[test]
+    fn llm_chain_example_drives_engine_end_to_end() {
+        use crate::event_bus::EventBus;
+
+        let triggers = parse_example_triggers("plugins/llm/triggers.example.toml");
+        assert_eq!(
+            triggers.len(),
+            2,
+            "two active triggers (raw variant stays commented)"
+        );
+        let summarize = triggers
+            .iter()
+            .find(|t| t.name == "slack-dm-summarize")
+            .expect("slack-dm-summarize present");
+        let aw = summarize.r#await.as_ref().expect("await clause present");
+        assert_eq!(aw.event_kind, "llm.complete.completed");
+
+        let bus = Arc::new(EventBus::new());
+        let registry = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
+        registry.register("llm.complete", |_| {
+            Ok(
+                json!({"text": "- stub summary", "model": "m", "stop_reason": "end_turn",
+                      "usage": {"input_tokens": 1, "output_tokens": 1}}),
+            )
+        });
+        let kb_calls = Arc::new(Mutex::new(Vec::<Value>::new()));
+        {
+            let calls = kb_calls.clone();
+            registry.register("kb.append", move |p| {
+                calls.lock().unwrap().push(p.clone());
+                Ok(json!({"id": p["id"], "bytes_written": 1, "created": true, "path": null}))
+            });
+        }
+
+        let engine = TriggerEngine::with_publish_bus(registry, bus.clone());
+        engine.set_triggers(triggers);
+        assert_eq!(engine.count(), 2, "both triggers compile");
+
+        let completed_rx = bus.subscribe("llm.complete.completed");
+        let awaited_rx = bus.subscribe("slack-dm-summarize.awaited");
+
+        engine.dispatch(
+            &evt(
+                "slack.dm",
+                json!({"user": "U123", "channel": "D1", "text": "hello there",
+                       "ts": "1700000000.000100", "thread_ts": null,
+                       "team_id": "T1", "event_id": "Ev1"}),
+            ),
+            None,
+        );
+        assert_eq!(engine.preflight_await_count(), 1);
+
+        // Feed the bus events back into the engine — same bridge the
+        // copad-linux pump provides at runtime.
+        let completed = completed_rx
+            .try_recv()
+            .expect("llm.complete.completed on bus");
+        engine.dispatch(&completed, None);
+        let awaited = awaited_rx.try_recv().expect("synthesized .awaited on bus");
+        engine.dispatch(&awaited, None);
+
+        let calls = kb_calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "kb.append fired exactly once");
+        assert_eq!(calls[0]["id"], "threads/derived/slack-dm-U123.md");
+        let content = calls[0]["content"].as_str().unwrap();
+        assert!(
+            content.contains("- stub summary"),
+            "summary interpolated: {content}"
+        );
+        assert!(
+            content.contains("1700000000.000100"),
+            "original ts kept: {content}"
+        );
+    }
+
+    /// Phase 14.3: pin the calendar meeting-prep auto-open chain
+    /// (deferred since Phase 10) — `calendar.event_imminent` ensures the
+    /// note, the await carries kb.ensure's `path` result, and
+    /// webview.open receives the file:// URL.
+    #[test]
+    fn calendar_meeting_prep_chain_example_drives_engine_end_to_end() {
+        use crate::event_bus::EventBus;
+
+        let triggers = parse_example_triggers("plugins/calendar/triggers.example.toml");
+        assert_eq!(
+            triggers.len(),
+            4,
+            "two Phase 10 rules + the 14.3 chain pair"
+        );
+        let prep = triggers
+            .iter()
+            .find(|t| t.name == "meeting-prep-open-note")
+            .expect("meeting-prep-open-note present");
+        assert_eq!(
+            prep.r#await.as_ref().unwrap().event_kind,
+            "kb.ensure.completed"
+        );
+
+        let bus = Arc::new(EventBus::new());
+        let registry = Arc::new(ActionRegistry::with_completion_bus(bus.clone()));
+        registry.register("kb.ensure", |p| {
+            Ok(json!({"id": p["id"], "created": true,
+                      "path": "/home/u/docs/meetings/ev1.md"}))
+        });
+        registry.register("kb.append", |_| {
+            Ok(json!({"id": "x", "bytes_written": 1, "created": false, "path": null}))
+        });
+        let opened = Arc::new(Mutex::new(Vec::<Value>::new()));
+        {
+            let calls = opened.clone();
+            registry.register("webview.open", move |p| {
+                calls.lock().unwrap().push(p.clone());
+                Ok(json!({"opened": true}))
+            });
+        }
+
+        let engine = TriggerEngine::with_publish_bus(registry, bus.clone());
+        engine.set_triggers(triggers);
+        assert_eq!(
+            engine.count(),
+            4,
+            "all four compile (no condition::parse drops)"
+        );
+
+        let completed_rx = bus.subscribe("kb.ensure.completed");
+        let awaited_rx = bus.subscribe("meeting-prep-open-note.awaited");
+
+        // An ordinary recurring meeting: rule 1 (meeting-prep-common,
+        // await-less kb.ensure) fires alongside the chain — the realistic
+        // both-enabled path. The chain's await still resolves correctly:
+        // both completions carry identical params/results, so per-action
+        // FIFO pairing is harmless here (as the example file documents).
+        engine.dispatch(
+            &evt(
+                "calendar.event_imminent",
+                json!({"id": "ev1", "title": "Standup", "start_time": "2026-06-12T09:00:00+09:00",
+                       "location": "", "lead_minutes": 10, "my_response_status": "accepted",
+                       "recurring_id": "rec-standup"}),
+            ),
+            None,
+        );
+        assert_eq!(engine.preflight_await_count(), 1);
+
+        // Two kb.ensure dispatches → two completion events; feed both back
+        // (first promotes + matches, second is a no-op promote).
+        let mut completions = 0;
+        while let Some(completed) = completed_rx.try_recv() {
+            engine.dispatch(&completed, None);
+            completions += 1;
+        }
+        assert_eq!(completions, 2, "rule 1 + the chain both ran kb.ensure");
+        let awaited = awaited_rx.try_recv().expect("synthesized .awaited on bus");
+        engine.dispatch(&awaited, None);
+
+        {
+            let calls = opened.lock().unwrap();
+            assert_eq!(calls.len(), 1, "webview.open fired exactly once");
+            assert_eq!(calls[0]["url"], "file:///home/u/docs/meetings/ev1.md");
+            assert_eq!(calls[0]["mode"], "tab");
+        }
+
+        // The weekly 1:1 must NOT create/open a per-event note — rule 2
+        // owns it (rolling note). Pins the exclusion the chain shares
+        // with rule 1.
+        engine.dispatch(
+            &evt(
+                "calendar.event_imminent",
+                json!({"id": "ev2", "title": "1:1", "start_time": "2026-06-12T10:00:00+09:00",
+                       "location": "", "lead_minutes": 10, "my_response_status": "accepted",
+                       "recurring_id": "REPLACE_WITH_YOUR_WEEKLY_1ON1_RECURRING_ID"}),
+            ),
+            None,
+        );
+        assert_eq!(
+            engine.preflight_await_count(),
+            0,
+            "weekly 1:1 must not arm the open-note chain"
+        );
+        assert_eq!(opened.lock().unwrap().len(), 1, "no second webview.open");
     }
 
     /// `git.worktree_add.failed` must NOT fire claude.start.

@@ -117,3 +117,53 @@ lead_minutes = 10
 # [triggers.when]
 # event_kind = "calendar.event_imminent"
 # lead_minutes = 1
+
+# ---------------------------------------------------------------------
+# 6. Meeting-prep auto-open (Phase 14.3 — deferred since Phase 10).
+#    The chained version of rule 1: ensure the per-event note, then
+#    open THAT note in a webview tab once `kb.ensure` reports its
+#    absolute path. The await scopes the open to this trigger's
+#    kb.ensure call; `{event.await.path}` is kb.ensure's `path`
+#    result field (see docs/kb-protocol.md).
+#
+#    Pairs with rule 1 but is standalone — rule 1 only creates the
+#    note; this pair creates AND opens. Same exclusions as rule 1
+#    (skip declined, skip the weekly 1:1 that rule 2 routes to its
+#    rolling note). If you enable both rule 1 and this chain, the
+#    duplicate kb.ensure is harmless (create-only, exactly-one-creator)
+#    but you probably want just one of the two.
+# ---------------------------------------------------------------------
+[[triggers]]
+name = "meeting-prep-open-note"
+action = "kb.ensure"
+params = { id = "meetings/{event.id}.md", default_template = """\
+---
+title: {event.title}
+date: {event.start_time}
+location: {event.location}
+---
+
+# {event.title}
+
+""" }
+condition = """
+event.my_response_status != "declined" \
+&& event.recurring_id != "REPLACE_WITH_YOUR_WEEKLY_1ON1_RECURRING_ID"
+"""
+
+[triggers.when]
+event_kind = "calendar.event_imminent"
+lead_minutes = 10
+
+[triggers.await]
+event_kind = "kb.ensure.completed"
+timeout_seconds = 15
+on_timeout = "abort"
+
+[[triggers]]
+name = "meeting-prep-open-note-show"
+action = "webview.open"
+params = { url = "file://{event.await.path}", mode = "tab" }
+
+[triggers.when]
+event_kind = "meeting-prep-open-note.awaited"

@@ -13,24 +13,24 @@
 # `llm.usage` output and your current per-model rates.
 
 # ---------------------------------------------------------------------
-# IMPORTANT: limitation of triggers + llm.complete (Phase 12.1)
+# Result handling (Phase 14.2 chains)
 # ---------------------------------------------------------------------
-# Trigger-fired `llm.complete` calls run as blocking actions through
-# the supervisor's worker thread, but the trigger engine has no
-# place for the action's RESULT to land. Successful response text
-# is discarded; only the usage record is appended to the JSONL log.
+# A trigger-fired `llm.complete` publishes `llm.complete.completed`
+# with the result payload when it finishes (registry-level fan-out).
+# To USE the result, give the firing trigger an `[triggers.await]`
+# clause: the engine then synthesizes `<trigger_name>.awaited` whose
+# payload carries the ORIGINAL event's fields at the top level plus
+# the awaited result under `await:` — a second trigger consumes that
+# and reads `{event.await.text}`.
 #
-# That means triggers using `llm.complete` are effectively
-# "fire-and-forget" — useful for cost tracking or
-# downstream-side-effect workflows (writing to KB via a custom
-# action that wraps llm.complete + kb.append), NOT for surfacing a
-# generated response back to the user.
+# Correlation caveat (14.2 slice-1 limit): in-flight awaits on the
+# same action correlate FIFO per action name. Two `llm.complete`
+# calls completing out of dispatch order can mis-pair. Fine for
+# human-rate flows (DMs, reactions); for high-rate order-sensitive
+# chains, give each trigger its own wrapper action.
 #
 # For ad-hoc summarization with visible output, use coctl:
 #   coctl call llm.complete --params '{"prompt":"summarize this thread: ..."}'
-#
-# Phase 12.3 (deferred) addresses the result-handling gap with a
-# chained-trigger / composite-action mechanism.
 # ---------------------------------------------------------------------
 
 # ---------------------------------------------------------------------
@@ -49,15 +49,66 @@
 # ---------------------------------------------------------------------
 
 # ---------------------------------------------------------------------
-# 2. (Commented sketch) Slack DM cost tracking
-#    Fire llm.complete on every slack.dm purely for usage tracking
-#    + side-effect logging. The response is discarded — see
-#    "IMPORTANT" note above. Don't enable unless you actually want
-#    to pay for one Claude call per DM received.
+# 2. Auto-summarize Slack DMs into a derived KB note (Phase 14.3)
+#    The real chain the old "fire-and-forget" limitation note used to
+#    rule out: summarize each DM, append the summary to a per-sender
+#    derived markdown file under the KB.
+#
+#    💸 COST: one LLM call per DM received. This file is NOT loaded
+#    at runtime — copying these two blocks into config.toml is the
+#    opt-in. Narrow with a `condition` (e.g. on `event.user`) if you
+#    only want specific senders summarized.
+# ---------------------------------------------------------------------
+[[triggers]]
+name = "slack-dm-summarize"
+action = "llm.complete"
+params = { system = "You summarize Slack messages into 1-3 terse bullet points. Output only the bullets.", prompt = "{event.text}", max_tokens = 300, source = "trigger:slack-dm-summarize" }
+[triggers.when]
+event_kind = "slack.dm"
+[triggers.await]
+event_kind = "llm.complete.completed"
+timeout_seconds = 120
+on_timeout = "abort"
+
+[[triggers]]
+name = "slack-dm-summarize-save"
+action = "kb.append"
+params = { id = "threads/derived/slack-dm-{event.user}.md", content = """
+
+## {event.ts}
+
+{event.await.text}
+
+""", ensure = true }
+[triggers.when]
+event_kind = "slack-dm-summarize.awaited"
+
+# ---------------------------------------------------------------------
+# 3. (Commented) Raw-archive distillation — the Phase 11.3 / 12.3
+#    derived-markdown shape: distill each archived `slack.raw` message
+#    frame into searchable markdown under threads/. `kb.ensure` (not
+#    append) so a Slack re-delivery of the same event_id is a no-op —
+#    same dedup posture as the slack-archive-raw trigger.
+#
+#    💸 COST: one LLM call per message in every channel the bot can
+#    see — far hotter than the DM chain above. Don't enable wholesale;
+#    narrow the condition to the channels you actually want distilled.
 # ---------------------------------------------------------------------
 # [[triggers]]
-# name = "slack-dm-cost-track"
+# name = "slack-raw-distill"
 # action = "llm.complete"
-# params = { system = "Reply with a single word.", prompt = "{event.text}", model = "claude-sonnet-4-6", max_tokens = 50, source = "trigger:slack-dm-cost-track" }
+# params = { system = "Distill this raw Slack event JSON into 1-3 bullets of searchable prose. Output only the bullets.", prompt = "{event.event_json}", max_tokens = 300, source = "trigger:slack-raw-distill" }
+# condition = """event.event_type == "message" """
 # [triggers.when]
-# event_kind = "slack.dm"
+# event_kind = "slack.raw"
+# [triggers.await]
+# event_kind = "llm.complete.completed"
+# timeout_seconds = 120
+# on_timeout = "abort"
+#
+# [[triggers]]
+# name = "slack-raw-distill-save"
+# action = "kb.ensure"
+# params = { id = "threads/derived/slack/{event.team_id}/{event.event_id}.md", default_template = "{event.await.text}\n" }
+# [triggers.when]
+# event_kind = "slack-raw-distill.awaited"

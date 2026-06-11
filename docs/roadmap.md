@@ -352,9 +352,9 @@ Plugin-first foundation. See [service-plugins.md](./service-plugins.md) for full
 - [ ] `slack.add_reaction` / `slack.update_message` / `slack.delete_message` write actions — convenience surface beyond `chat.postMessage` / `chat.getPermalink`.
 - [ ] Trigger interpolation DSL string ops — needed to transform a Slack ts into the `https://<workspace>.slack.com/archives/<ch>/p<ts-without-dot>` deep link URL inside `params` (only relevant if `chat.getPermalink` becomes load-bearing on the hot path; it's a per-event RTT today).
 
-**11.3 — Derived markdown ingestion ⏳**
+**11.3 — Derived markdown ingestion** — **expressible since 14.3 (2026-06-12)**
 
-- [ ] Depends on Phase 12 LLM plugin. Uses the `.raw/slack/` archive as input, summarizes to `~/docs/threads/<topic>.md` for searchability via `kb.search`.
+- [x] Reference chains shipped in `plugins/llm/triggers.example.toml`: active `slack.dm` summarize → `kb.append` pair, plus the commented `slack.raw` → `llm.complete` → `kb.ensure` distillation variant (per-message LLM cost — enable narrowed). See Phase 14.3 for the pin tests.
 
 ### Phase 12: LLM plugin
 
@@ -377,9 +377,9 @@ Plugin-first foundation. See [service-plugins.md](./service-plugins.md) for full
 - [ ] Streaming completions via SSE — needs a different action-protocol shape (incremental events instead of single response). Most useful for terminal-output progressive rendering.
 - [ ] Per-action timeout override at the `register_blocking` site so `llm.complete` can extend to e.g. 5min for long-context tasks without affecting the rest of the supervisor.
 
-**12.3 — Derived markdown ingestion ⏳**
+**12.3 — Derived markdown ingestion** — **basic form shipped via 14.3 (2026-06-12)**
 
-- [ ] Trigger-driven distillation of the slack `.raw/slack/...` archive into searchable markdown under `~/docs/threads/`. Composes `kb.search` (find related threads) + `kb.read` + `llm.complete` (synthesize) + `kb.ensure` (write derived). Needs the chained-trigger / composite-action mechanism that's been deferred since Phase 9.
+- [x] Per-message distillation chain (`slack.raw` → `llm.complete` → `kb.ensure` under `threads/derived/`) shipped as the commented `slack-raw-distill` pair in `plugins/llm/triggers.example.toml`; the active DM variant is pinned end-to-end in copad-core. The richer compose sketched here (`kb.search` related threads + `kb.read` + synthesize into topic files) stays future work — it needs multi-await chains and topic clustering, and no concrete workflow has demanded it yet.
 
 ### Phase 13: KB indexing upgrade (when grep is slow)
 
@@ -441,11 +441,12 @@ Three sketches were on the table:
 - [ ] **Persistent pending_awaits**. Restart loses any in-flight awaits. Acceptable for typical minute-scale flows; would need a small on-disk journal for hour-scale awaits (e.g. waiting for a slow Slack approval).
 - [ ] `workflow.<name>` action namespace for hand-rolled multi-step Rust handlers when chained TOML gets cumbersome. Built into core or registered by a `copad-plugin-workflow` (TBD).
 
-**14.3 — backfill: re-enable derived workflows that need composition**
+**14.3 — backfill: re-enable derived workflows that need composition** — **shipped (2026-06-12)**
 
-- [ ] Phase 11.3 derived markdown ingestion (`slack.raw` → LLM summarize → `kb.ensure`) now expressible
-- [ ] Phase 12.1 trigger-fired `llm.complete` results land in subsequent triggers
-- [ ] LLM example trigger ("auto-summarize DM to KB") rewritten as a real chain, not a fire-and-forget
+- [x] Phase 11.3 derived markdown ingestion (`slack.raw` → LLM summarize → `kb.ensure`) — reference chain in `plugins/llm/triggers.example.toml` (`slack-raw-distill` pair; commented — one LLM call per visible message, narrow the condition before enabling). Dedup posture matches the raw archive: `kb.ensure` at `threads/derived/slack/<team>/<event_id>.md` so a Slack re-delivery is a no-op.
+- [x] Phase 12.1 trigger-fired `llm.complete` results land in subsequent triggers — the `slack-dm-summarize` → `.awaited` → `kb.append` chain is active in the example file and pinned by `llm_chain_example_drives_engine_end_to_end` (copad-core), which drives the engine end-to-end: `slack.dm` → `llm.complete` → `.completed` promotes AND satisfies the await in one dispatch → synthesized `.awaited` → `kb.append` receives the summary via `{event.await.text}`. The example's stale "fire-and-forget" limitation note (pre-14.2) is replaced by a chain explainer + the per-action FIFO caveat.
+- [x] LLM example trigger ("auto-summarize DM to KB") rewritten as a real chain, not a fire-and-forget — same pair as above. The commented Discord DM auto-reply sketch was also fixed to consume `<trigger>.awaited` + `{event.await.text}` (it referenced raw `llm.complete.completed` and a nonexistent `.completion` field).
+- [x] Phase 10 meeting-prep auto-open (per [service-plugins.md](./service-plugins.md) 14.3 scope) — `meeting-prep-open-note` chain in `plugins/calendar/triggers.example.toml`: `calendar.event_imminent` → `kb.ensure` (await `kb.ensure.completed`) → `webview.open file://{event.await.path}`. Pinned end-to-end by `calendar_meeting_prep_chain_example_drives_engine_end_to_end`.
 
 ### Phase 15: Todo system
 

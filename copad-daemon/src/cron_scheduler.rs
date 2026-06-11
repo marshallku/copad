@@ -118,7 +118,11 @@ impl CronScheduler {
                         Some(c)
                     }
                     Err(e) => {
-                        log::warn!("cron trigger {:?} schedule {:?} parse error: {e}", t.name, raw);
+                        log::warn!(
+                            "cron trigger {:?} schedule {:?} parse error: {e}",
+                            t.name,
+                            raw
+                        );
                         None
                     }
                 }
@@ -210,11 +214,7 @@ fn worker_loop(
         // advance). Cron expressions always produce a future
         // occurrence, so `next_fire` is `Some` after `advance()`
         // unless the schedule has truly exhausted itself.
-        let next_horizon = state
-            .schedules
-            .iter()
-            .filter_map(|c| c.next_fire)
-            .min();
+        let next_horizon = state.schedules.iter().filter_map(|c| c.next_fire).min();
         drop(state);
 
         for name in &skipped_names {
@@ -278,9 +278,7 @@ fn worker_loop(
             }
             continue;
         };
-        let sleep_for = (horizon - now)
-            .to_std()
-            .unwrap_or(Duration::from_secs(0));
+        let sleep_for = (horizon - now).to_std().unwrap_or(Duration::from_secs(0));
         let parked = lock.lock().unwrap();
         if parked.shutdown {
             return;
@@ -324,7 +322,11 @@ mod tests {
         count: Arc<AtomicUsize>,
     }
     impl TriggerSink for CountingSink {
-        fn dispatch_action(&self, _action: &str, _params: Value) -> copad_core::action_registry::ActionResult {
+        fn dispatch_action(
+            &self,
+            _action: &str,
+            _params: Value,
+        ) -> copad_core::action_registry::ActionResult {
             self.count.fetch_add(1, Ordering::SeqCst);
             Ok(Value::Null)
         }
@@ -332,7 +334,9 @@ mod tests {
 
     fn mk_engine_with_counter() -> (Arc<TriggerEngine>, Arc<AtomicUsize>) {
         let count = Arc::new(AtomicUsize::new(0));
-        let sink: Arc<dyn TriggerSink> = Arc::new(CountingSink { count: count.clone() });
+        let sink: Arc<dyn TriggerSink> = Arc::new(CountingSink {
+            count: count.clone(),
+        });
         let bus = Arc::new(EventBus::new());
         let engine = Arc::new(TriggerEngine::with_publish_bus(sink, bus));
         (engine, count)
@@ -387,7 +391,11 @@ mod tests {
         let start = Instant::now();
         sched.shutdown();
         handle.join().unwrap();
-        assert!(start.elapsed() < Duration::from_secs(1), "shutdown took {:?}", start.elapsed());
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "shutdown took {:?}",
+            start.elapsed()
+        );
     }
 
     #[test]
@@ -415,7 +423,11 @@ mod tests {
         }
         sched.shutdown();
         handle.join().unwrap();
-        assert!(count.load(Ordering::SeqCst) >= 1, "expected >=1 fire, got {}", count.load(Ordering::SeqCst));
+        assert!(
+            count.load(Ordering::SeqCst) >= 1,
+            "expected >=1 fire, got {}",
+            count.load(Ordering::SeqCst)
+        );
     }
 
     #[test]
@@ -437,7 +449,10 @@ mod tests {
         sched.shutdown();
         handle.join().unwrap();
         let fired = count.load(Ordering::SeqCst);
-        assert!(fired <= 2, "expected <=2 fires in 1.5s, got {fired} (re-fire regression)");
+        assert!(
+            fired <= 2,
+            "expected <=2 fires in 1.5s, got {fired} (re-fire regression)"
+        );
     }
 
     #[test]
@@ -455,15 +470,18 @@ mod tests {
         // Tamper: set next_fire to 60s ago (well past 5s grace).
         {
             let mut state = sched.inner.0.lock().unwrap();
-            state.schedules[0].next_fire =
-                Some(Local::now() - ChronoDuration::seconds(60));
+            state.schedules[0].next_fire = Some(Local::now() - ChronoDuration::seconds(60));
         }
         let handle = sched.spawn();
         thread::sleep(Duration::from_millis(200));
         sched.shutdown();
         handle.join().unwrap();
         // Slot was past the grace window → skipped, not fired.
-        assert_eq!(count.load(Ordering::SeqCst), 0, "missed slot fired despite grace");
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "missed slot fired despite grace"
+        );
     }
 
     #[test]
@@ -526,6 +544,9 @@ mod tests {
         }
         sched.shutdown();
         handle.join().unwrap();
-        assert!(count.load(Ordering::SeqCst) >= 1, "reload did not wake worker");
+        assert!(
+            count.load(Ordering::SeqCst) >= 1,
+            "reload did not wake worker"
+        );
     }
 }

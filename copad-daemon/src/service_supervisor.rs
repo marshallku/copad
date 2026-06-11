@@ -1448,7 +1448,10 @@ fn pid_file_path(plugin: &str, service: &str) -> std::path::PathBuf {
 fn write_pid_file(plugin: &str, service: &str, pid: u32) {
     let dir = pid_files_dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        log::warn!("[copad] pid-file dir create failed ({}): {e}", dir.display());
+        log::warn!(
+            "[copad] pid-file dir create failed ({}): {e}",
+            dir.display()
+        );
         return;
     }
     let path = pid_file_path(plugin, service);
@@ -1531,9 +1534,7 @@ fn sweep_orphan_pids_in(dir: &std::path::Path) {
         if alive {
             log::warn!(
                 "[copad] orphan plugin pgid {pid} from {} — sending SIGTERM then SIGKILL",
-                path.file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("?")
+                path.file_name().and_then(|s| s.to_str()).unwrap_or("?")
             );
             unsafe {
                 libc::killpg(pid, libc::SIGTERM);
@@ -2305,8 +2306,14 @@ mod tests {
         let neg_path = pids_dir.join("neg.main.pid");
         std::fs::write(&neg_path, "-42").unwrap();
         super::sweep_orphan_pids_in(&pids_dir);
-        assert!(!zero_path.exists(), "zero-pid file should be removed without signaling");
-        assert!(!neg_path.exists(), "negative-pid file should be removed without signaling");
+        assert!(
+            !zero_path.exists(),
+            "zero-pid file should be removed without signaling"
+        );
+        assert!(
+            !neg_path.exists(),
+            "negative-pid file should be removed without signaling"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
