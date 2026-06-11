@@ -38,6 +38,21 @@ impl fmt::Display for CsdError {
 pub struct SpawnInfo {
     pub session_id: Option<String>,
     pub jsonl_path: Option<String>,
+    /// csd's marker version guard (csd ≥ 0.2.0): present when the installed
+    /// claude is not marker-verified, i.e. gate detection may silently miss
+    /// prompts. Absent on older csd — treated as "no warning".
+    pub marker_warning: Option<String>,
+}
+
+impl SpawnInfo {
+    fn from_json(v: &Value) -> Self {
+        let s = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+        Self {
+            session_id: s("session_id"),
+            jsonl_path: s("jsonl_path"),
+            marker_warning: s("marker_warning"),
+        }
+    }
 }
 
 /// One verdict from `csd state` (and the `state` field of `csd ps`).
@@ -204,17 +219,7 @@ impl Csd {
         for flag in posture_flags(posture) {
             args.push(flag.into());
         }
-        let v = self.run(&args)?;
-        Ok(SpawnInfo {
-            session_id: v
-                .get("session_id")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            jsonl_path: v
-                .get("jsonl_path")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        })
+        Ok(SpawnInfo::from_json(&self.run(&args)?))
     }
 
     pub fn send(&self, name: &str, prompt: &str) -> Result<(), CsdError> {
@@ -335,6 +340,23 @@ mod tests {
             }
             other => panic!("expected Blocked, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn spawn_info_parses_marker_warning_and_tolerates_absence() {
+        let with = SpawnInfo::from_json(&json!({
+            "session_id": "0a1b", "jsonl_path": "/tmp/x.jsonl",
+            "marker_warning": "claude 9.9.9 is not marker-verified"
+        }));
+        assert_eq!(with.session_id.as_deref(), Some("0a1b"));
+        assert_eq!(
+            with.marker_warning.as_deref(),
+            Some("claude 9.9.9 is not marker-verified")
+        );
+        // Pre-0.2.0 csd output has no marker_warning field.
+        let without = SpawnInfo::from_json(&json!({"session_id": "0a1b"}));
+        assert_eq!(without.marker_warning, None);
+        assert_eq!(without.jsonl_path, None);
     }
 
     #[test]

@@ -229,6 +229,9 @@ fn start_goal(store: &Arc<Mutex<Store>>, csd: &Csd, tx: &Sender<String>, goal: &
             return;
         }
     };
+    if let Some(warning) = &info.marker_warning {
+        warn_marker_drift(tx, &id, warning);
+    }
 
     // A cancel could have landed during the spawn — if the goal is no
     // longer Spawning, the session is now an orphan; kill it.
@@ -434,6 +437,24 @@ fn continue_prompt(id: &str, nonce: &str) -> String {
         "Continue until the goal is fully done. When finished, write this exact line by itself \
          as the very last line of your reply, then stop:\nDONE:{id}:{nonce}"
     )
+}
+
+/// Surface csd's marker version guard as a `pilot.marker_warning` event,
+/// once per distinct warning text per process — an unattended fleet on a
+/// drifted claude release would otherwise repeat it on every goal.
+fn warn_marker_drift(tx: &Sender<String>, id: &str, warning: &str) {
+    use std::collections::HashSet;
+    use std::sync::OnceLock;
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    if seen.lock().unwrap().insert(warning.to_string()) {
+        eprintln!("[pilot] goal {id}: {warning}");
+        publish(
+            tx,
+            "pilot.marker_warning",
+            json!({ "id": id, "warning": warning }),
+        );
+    }
 }
 
 fn publish(tx: &Sender<String>, kind: &str, payload: Value) {

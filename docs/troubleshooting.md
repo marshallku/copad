@@ -405,6 +405,40 @@ Re-copy the discord blocks from the current example file, replace
 restart `copadd` or wait ~2s for the config watcher to pick up
 the change.
 
+### Pilot goals stall without a gate after a claude upgrade (marker drift)
+
+**Symptom:** pilot goals sit in `running` forever (or hit the re-prompt
+budget and go `stalled`) while the underlying tmux session is visibly
+waiting on a plan-approval / permission / trust prompt that pilot never
+reports as a gate.
+
+**Cause:** `csd`'s gate detection matches capture-pane substrings pinned
+to claude's TUI wording, which can change in any release. When the
+wording shifts, the gate is invisible to `csd state` — the session waits
+on a prompt nobody answers.
+
+**Signal:** since `csd` 0.2.0 every `spawn`/`state`/`ps` JSON carries a
+`marker_warning` field when the installed claude version is not in the
+marker-verified set, and pilot publishes **`pilot.marker_warning
+{id, warning}`** (once per distinct warning per daemon run) the moment a
+goal spawns on a drifted version. Wire it to a toast like the other
+harness events:
+
+```toml
+[[triggers]]
+event_kind = "pilot.marker_warning"
+action = "notify.show"
+[triggers.args]
+title = "pilot: claude marker drift"
+body = "{event.warning}"
+```
+
+**Fix:** re-verify the markers on the new release (`csd` repo:
+`./scripts/e2e.sh` exercises question / plan / permission / trust gates
+live) and extend `verified_versions` in `csd`'s `src/backend.rs` — or,
+after manual verification, silence locally with
+`CSD_VERIFIED_VERSIONS=<version>` in the daemon environment.
+
 ---
 
 ## macOS App Issues
