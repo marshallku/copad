@@ -588,12 +588,12 @@
             <input id="pilot-cwd" placeholder="cwd (existing dir)" value="${escapeHtml(state.lastCwd || "")}">
             <textarea id="pilot-instruction" placeholder="goal instruction"></textarea>
             <div class="pilot-add-row">
-              <select id="pilot-posture">
-                <option value="trust">trust</option>
-                <option value="auto-accept">auto-accept</option>
-                <option value="bypass">bypass</option>
-                <option value="yolo">yolo</option>
-                <option value="default">default</option>
+              <select id="pilot-posture" title="how much the agent may do unattended before a gate pauses the queue">
+                <option value="trust">trust (default — folder trust only)</option>
+                <option value="auto-accept">auto-accept (auto-accept edits)</option>
+                <option value="bypass">bypass (skip permission prompts)</option>
+                <option value="yolo">yolo (no guardrails)</option>
+                <option value="default">default (no flags — gates on everything)</option>
               </select>
               <button class="chip" id="pilot-add-submit">enqueue</button>
               <button class="chip" id="pilot-add-cancel">cancel</button>

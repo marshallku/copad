@@ -89,12 +89,12 @@
     </div>
     <textarea id="instruction" placeholder="goal instruction (what should the agent do, then stop)"></textarea>
     <div class="row">
-      <select id="posture" title="csd permission posture">
-        <option value="trust">trust</option>
-        <option value="auto-accept">auto-accept</option>
-        <option value="bypass">bypass</option>
-        <option value="yolo">yolo</option>
-        <option value="default">default</option>
+      <select id="posture" title="how much the agent may do unattended before a gate pauses the queue">
+        <option value="trust">trust (default — folder trust only)</option>
+        <option value="auto-accept">auto-accept (auto-accept edits)</option>
+        <option value="bypass">bypass (skip permission prompts)</option>
+        <option value="yolo">yolo (no guardrails)</option>
+        <option value="default">default (no flags — gates on everything)</option>
       </select>
       <button class="go" id="enqueue">enqueue goal</button>
     </div>

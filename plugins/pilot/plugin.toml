@@ -4,6 +4,27 @@ title = "Pilot — Autonomous Goal Queue"
 version = "0.1.0"
 description = "Owns a persistent goal queue and drives one interactive agent session at a time via csd."
 
+# Posture — the `pilot.add {posture}` tuning knob. Picks how much the driven
+# agent is allowed to do unattended before pilot pauses the queue on a gate.
+# Maps to `csd spawn` flags (see plugins/pilot/src/csd.rs::posture_flags):
+#
+#   trust        (default) `--trust` — clears only the one-time folder-trust
+#                gate so unattended spawns can start; per-action permission
+#                prompts still surface as `awaiting_gate` (you approve each).
+#                Safest autonomous default.
+#   auto-accept  `--auto-accept --trust` — auto-accepts file edits; other
+#                permission prompts still gate. Good for "let it write code,
+#                ask me before anything risky."
+#   bypass       `--bypass-permissions --trust` — skips permission prompts
+#                entirely. Fewest interruptions; the agent can run commands /
+#                edits without asking. Use only in repos you trust it to drive.
+#   yolo         `--yolo` — no guardrails at all (implies bypass + trust).
+#   default      no flags — claude's normal interactive prompting; pilot gates
+#                on each prompt. Most hand-holding; useful for first runs.
+#
+# A gate (any posture) blocks the WHOLE queue until resolved via pilot.answer /
+# pilot.approve, the cockpit, or the Web Push that fires on `awaiting_gate`.
+
 [[services]]
 name = "main"
 exec = "copad-plugin-pilot"
