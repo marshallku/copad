@@ -8,7 +8,7 @@ Binary name: `coctl`
 coctl [--socket <path>] [--json] <command>
 ```
 
-- `--socket` — override socket path (default: `$COPAD_SOCKET` or `/tmp/copad-{PID}.sock`)
+- `--socket` — override socket path (default: `$COPAD_SOCKET`, else newest `$XDG_RUNTIME_DIR/copad/gui-*.sock` (Linux), else `/tmp/copad-*.sock` (macOS / legacy Linux), else the daemon socket)
 - `--json` — output in JSON format
 
 ## Commands
@@ -17,6 +17,16 @@ coctl [--socket <path>] [--json] <command>
 
 - `coctl ping` — ping running instance
 - `coctl context [--full]` — workflow context. **Default (human mode)** aggregates: active panel + cwd, resolved workspace + git status (branch, ahead/behind, dirty), open + in-progress todos for that workspace, calendar events in the next 2h, slack/discord auth state. Each section degrades to `(unavailable)` independently when its action call fails. **`--json`** (without `--full`) returns the raw `context.snapshot` shape (`{active_panel, active_cwd}`) verbatim, for backward compatibility with scripts already piping it. **`--json --full`** emits the aggregate as a single JSON object — useful for scripting "what's the user's current cross-plugin state?" without N round-trips. Workspace resolution mirrors the `coctl git` cwd-derive (longest-prefix match against `path` or `worktree_root`, both canonicalized); when cwd doesn't match any workspace, workspace-bound sections (git, todos) are simply skipped — the CLI doesn't pretend the user is in a workspace they're not.
+
+### Presence
+
+- `coctl presence away` — mark presence as away; triggers with `condition = 'context.presence == "away"'` (e.g. Discord forwarding of harness events) start firing
+- `coctl presence active` — mark presence as active; external-sink trigger actions stay quiet
+- `coctl presence status` — print the current presence (`active` or `away`)
+
+### Recent
+
+- `coctl recent [--since 2h|30m|1d|<secs>] [--kind <glob>]` — "what happened?" — wraps `event.history`; `--kind` filters by event-kind glob (e.g. `jira.*`, `slack.dm`). Default lookback `1h`
 
 ### Session
 
@@ -45,6 +55,10 @@ coctl [--socket <path>] [--json] <command>
 
 - `coctl split horizontal` — split focused pane horizontally
 - `coctl split vertical` — split focused pane vertically
+
+### Statusbar
+
+- `coctl statusbar show` / `hide` / `toggle` — status bar visibility
 
 ### Event Stream
 

@@ -15,7 +15,7 @@ A cross-platform terminal emulator built around a shared Rust core and platform-
 - **In-terminal search** — `Ctrl+Shift+F` (Linux) / `Cmd+F` (macOS), regex with case/whole-word toggle
 - **10 built-in themes** — Catppuccin (Mocha/Latte/Frappé/Macchiato), Dracula, Nord, Tokyo Night, Gruvbox Dark, One Dark, Solarized Dark; hot-reload on config save
 - **Dynamic font scaling** — `Ctrl+=`/`Ctrl+-`/`Ctrl+0` (Linux) / `Cmd+=`/`Cmd+-`/`Cmd+0` (macOS)
-- **Custom keybindings** — bind any chord to a shell command (`spawn:`) or socket action (`action:`)
+- **Custom keybindings** — bind any chord to a shell command (`spawn:`); the spawned command inherits `COPAD_SOCKET`, so `spawn:coctl …` reaches the binding instance's socket actions
 
 ### Panels
 
@@ -27,7 +27,7 @@ A cross-platform terminal emulator built around a shared Rust core and platform-
 ### Control API
 
 - **`coctl` CLI** — full programmatic control over tabs, splits, panels, terminals, webviews, plugins, and the event stream
-- **Unix socket** at `/tmp/copad-{PID}.sock` (auto-discovered via `COPAD_SOCKET`), newline-delimited JSON
+- **Unix socket** per GUI instance, newline-delimited JSON — `$XDG_RUNTIME_DIR/copad/gui-{PID}.sock` on Linux, `/tmp/copad-{PID}.sock` on macOS (hardened relocation pending); injected as `COPAD_SOCKET`, both forms auto-discovered by `coctl`
 - **Event stream** — `event.subscribe` for live `terminal.output`, `panel.focused`, `tab.created`, `webview.navigated`, plus all bus events
 - **Terminal agent API** — `terminal.read` / `state` / `exec` / `feed` / `history` / `context` for AI agents
 - **Approval workflow** — `agent.approve` shows a modal and returns the user's choice
@@ -38,23 +38,28 @@ A cross-platform terminal emulator built around a shared Rust core and platform-
 - **Event Bus** — pub/sub with glob patterns, bounded delivery, drop-newest overflow
 - **Action Registry** — name → handler map; the same registry serves CLI dispatch, plugin RPC, and triggers
 - **Context Service** — active panel, per-panel cwd cache, snapshots; exposed via `context.snapshot`
-- **Trigger Engine** — declarative triggers in `config.toml` (`when`, `match`, `do`); fires actions on bus events with `{event.*}` / `{context.*}` interpolation; hot-reloads with subscriber reconciliation
+- **Trigger Engine** — declarative `[[triggers]]` in `config.toml` (`when.event_kind` glob + payload match, `condition` DSL, `action` + `params`, optional `await` for chained correlation, or `cron` for schedules); fires actions on bus events with `{event.*}` / `{context.*}` interpolation; hot-reloads with subscriber reconciliation
 
 ### First-party Plugins
 
 `plugins/<name>/` — install with `./scripts/install-plugins.sh`. Each plugin directory holds the Rust crate (`Cargo.toml` + `src/`) and its runtime manifest/assets (`plugin.toml`, `panel.html`, `triggers.example.toml`) together. All plugins implement the service-plugin protocol (newline-JSON over stdio, supervised by copad).
 
-| Plugin     | Purpose                                                                     |
-| ---------- | --------------------------------------------------------------------------- |
-| `kb`       | Grep + filename search and atomic read/append/ensure over `~/docs`          |
-| `calendar` | Google Calendar event polling with lead-time dedupe                         |
-| `slack`    | Slack Socket Mode — mention/DM events + `chat.postMessage`                  |
-| `llm`      | Anthropic Messages API client with JSONL usage log                          |
-| `todo`     | Markdown-checkbox todos in `~/docs/todos/<workspace>/` (vim/git compatible) |
-| `git`      | Worktree create/remove + branch / status queries                            |
-| `discord`  | Discord integration                                                         |
-| `bookmark` | Bookmarks plugin                                                            |
-| `echo`     | Reference / E2E plugin                                                      |
+| Plugin       | Purpose                                                                     |
+| ------------ | --------------------------------------------------------------------------- |
+| `kb`         | Grep + filename search and atomic read/append/ensure over `~/docs`          |
+| `docs`       | KB panel — read + navigate `~/docs` over `dn`'s incremental indices         |
+| `calendar`   | Google Calendar event polling with lead-time dedupe                         |
+| `slack`      | Slack Socket Mode — mention/DM/reaction events + `chat.postMessage`         |
+| `discord`    | Discord gateway — mention/DM/reaction events + `send_message`               |
+| `jira`       | Jira Cloud polling (assigned/comments/transitions) + read/write actions     |
+| `llm`        | Anthropic Messages API client with JSONL usage log                          |
+| `todo`       | Markdown-checkbox todos in `~/docs/todos/<workspace>/` (vim/git compatible) |
+| `git`        | Worktree create/remove + branch / status queries                            |
+| `claude`     | Read-only views over `~/.claude` harness artifacts (handoffs, sessions)     |
+| `pilot`      | Autonomous goal queue — drives detached Claude sessions via `csd`           |
+| `web-bridge` | HTTP+WS cockpit (panes, attention, pilot queue) for browser / phone         |
+| `bookmark`   | Bookmark capture with dedupe store                                          |
+| `echo`       | Reference / E2E plugin                                                      |
 
 ### Platforms
 
@@ -210,25 +215,22 @@ font_family = "JetBrainsMono Nerd Font Mono"
 font_size = 14
 
 [background]
-# image = "/path/to/wallpaper.jpg"   # single image (takes priority over directory)
-directory = "/path/to/wallpapers/"
+# image = "/path/to/wallpaper.jpg"   # static image (rotation replaces it at the first tick)
+# rotate_interval = 300              # seconds between random wallpapers from the platform list; 0 = off
 tint = 0.85       # tint overlay opacity (0.0–1.0)
-opacity = 0.95    # terminal opacity
+opacity = 0.95    # background-image opacity
 
 [tabs]
 position = "left"   # top, bottom, left, right
 collapsed = true    # start with tab bar collapsed (icon-only)
 width = 200         # tab bar width for vertical positions
 
-[socket]
-path = "/tmp/copad.sock"
-
 [theme]
 name = "catppuccin-mocha"
 
 [keybindings]
 "ctrl+shift+g" = "spawn:~/scripts/wallpaper.sh --next"
-"ctrl+shift+m" = "action:background.toggle"
+"ctrl+shift+m" = "spawn:~/.local/bin/coctl background toggle"
 
 [security]   # macOS only, for now
 osc52 = "deny"   # or "allow" — gates OSC 52 clipboard writes from the PTY

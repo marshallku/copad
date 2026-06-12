@@ -37,9 +37,6 @@ position = "left"   # top, bottom, left, right
 # collapsed = true  # start with tab bar collapsed (icon-only)
 # width = 200       # tab bar width in pixels (vertical tabs)
 
-[socket]
-path = "/tmp/copad.sock"
-
 [theme]
 name = "catppuccin-mocha"
 ```
@@ -114,11 +111,13 @@ On Linux, `opacity` drives the GTK4 window's `background-color` alpha (`rgba(bac
 | `collapsed` | `true`  | Start with tab bar in collapsed (icon-only) mode   |
 | `width`     | `200`   | Tab bar width in pixels (vertical tabs only)       |
 
-### [socket]
+### Socket path (not a config key)
 
-| Key    | Default          | Description      |
-| ------ | ---------------- | ---------------- |
-| `path` | `/tmp/copad.sock` | Unix socket path |
+There is no `[socket]` config section — the GUI socket path is derived per instance
+(`$XDG_RUNTIME_DIR/copad/gui-{PID}.sock` on Linux; `/tmp/copad-{PID}.sock` on macOS, whose
+hardened relocation is still pending) and injected into child shells as `COPAD_SOCKET`;
+the daemon uses its well-known path from `copad_core::paths`. Override the target per call
+with `coctl --socket <path>` or the `COPAD_SOCKET` env var.
 
 ### [theme]
 

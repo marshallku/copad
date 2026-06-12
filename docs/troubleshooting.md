@@ -430,6 +430,26 @@ erratic. To migrate:
 `next` / `toggle`); on a manually `set` image it errors with
 `no_current` instead of deleting an arbitrary file.
 
+### Messenger plugin tokens stored in plaintext (no OS keyring)
+
+**Symptom:** copadd stderr shows `[slack] secure keyring unavailable …`
+(or the discord/jira equivalent) and the plugin keeps working — tokens
+fell back to a plaintext store file.
+
+**Cause:** slack / discord / jira persist their tokens via the OS keyring
+when available (Secret Service on Linux, Keychain on macOS) and fall back
+to a plaintext file when it isn't (headless session, no
+`org.freedesktop.secrets` provider).
+
+**Fix / hardening:** install a Secret Service provider (e.g.
+`gnome-keyring`) — or forbid the plaintext fallback with
+`COPAD_SLACK_REQUIRE_SECURE_STORE=1` /
+`COPAD_DISCORD_REQUIRE_SECURE_STORE=1` /
+`COPAD_JIRA_REQUIRE_SECURE_STORE=1` in the daemon environment. The
+plugin still starts (supervisor handshake stays alive) but token
+operations and auth-dependent actions fail with the keyring error
+instead of silently writing tokens to disk.
+
 ### Pilot goals stall without a gate after a claude upgrade (marker drift)
 
 **Symptom:** pilot goals sit in `running` forever (or hit the re-prompt
