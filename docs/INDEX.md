@@ -12,6 +12,7 @@
 | [macos-daemon-migration-plan.md](./macos-daemon-migration-plan.md) | 7-PR plan to migrate macOS from monolithic to daemon-client (codex round 1/2/3 reflected) | After parity-plan Tier 4; this is the next architectural gate |
 | [macos-renderer-migration-plan.md](./macos-renderer-migration-plan.md) | Vertical-slice plan to replace SwiftTerm with alacritty_terminal + custom AppKit/CoreText renderer (decision #31) | After daemon migration; the long-running 3-6 month effort that addresses SwiftTerm's structural limits |
 | [macos-post-renderer-catchup.md](./macos-post-renderer-catchup.md) | Living backlog after Phase 10a/10b — renderer polish + Linux-parity catch-up. SwiftTerm path removed in Phase 10b (2026-06-05). | Picking next macOS work item after the renderer migration plan |
+| [macos-gpu-renderer-plan.md](./macos-gpu-renderer-plan.md) | Metal render path behind `[renderer] gpu` (renderer-migration Phase 9, gate waived). Slice 1 shipped 2026-06-12; slices 2-3 (perf harness, default flip) pending | Working on the Metal painter, glyph atlas, or deciding the gpu default flip |
 | [core-lib.md](./core-lib.md)               | Shared Rust core library modules            | Working on copad-core                      |
 | [cli.md](./cli.md)                         | CLI tool (coctl) and D-Bus interface      | Working on remote control features        |
 | [config.md](./config.md)                   | Configuration format and defaults           | Adding config options                     |

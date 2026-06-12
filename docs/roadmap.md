@@ -237,6 +237,14 @@ Single source of truth for the wire formats and validation that previously had h
 - [x] **2A Config reload policy** — macOS now matches Linux: parse failure preserves the live config (was: reset to defaults)
 - [x] **2B Plugin manifest** — `copad_core::plugin::validate_toml` is the single canonical validator; both Linux discovery and macOS FFI consumer route through it; `Activation`/`RestartPolicy` custom Serialize emits raw strings for cross-language round-trip
 
+**Phase 9 — GPU (Metal) renderer** (slice 1 ✅ 2026-06-12)
+
+The renderer-migration plan's deferred Phase 9, started by explicit user decision (measurement gate waived). Plan + codex pressure-test + slice tracking in [macos-gpu-renderer-plan.md](./macos-gpu-renderer-plan.md).
+
+- [x] **Slice 1** — `[renderer] gpu = true` (default off) flips `AlacrittyRenderView` to a CAMetalLayer + `MetalGridRenderer`: CoreText-shaped glyphs in a 2048² RGBA atlas (shelf-packed, bearings first-class, color-emoji flagged untinted), every visual element as ordered instanced quads in one draw call, runtime-compiled shaders. Pure logic (`CellQuadResolver`, `AtlasShelfPacker`, `GridQuadGeometry`) in CopadCore with 38 unit tests. `requestRepaint()` unifies all invalidation sites; `gpuFrameDirty` latch survives nil drawables. IME preedit via CG overlay child view. E2E on-device: styles/256/truecolor/한글/emoji/box-drawing/vim-TUI/find-highlight/zoom/theme-hot-reload/wallpaper-transparency captures inspected vs CPU painter; `seq 1 200000` wall 0.334s (GPU) vs 0.441s (CPU painter), peak process CPU ~7% vs ~15% while streaming.
+- [ ] **Slice 2** — perf harness (frame times on `yes`/`seq`/vim-scroll), atlas LRU/multi-page, ProMotion/resize polish, preedit-in-Metal evaluation, manual IME + mouse-selection dogfood items from slice 1.
+- [ ] **Slice 3** — default flip after dogfood window; decide CoreText painter's fate (keep as fallback vs 10b-style removal).
+
 ### Phase WR: Hyprland WebKit freeze automatic cure ✅
 
 Lightweight pair of primitives that lets the user wire a cure for the upstream WebKitGTK ↔ Hyprland panel freeze documented in [troubleshooting.md](./troubleshooting.md#pluginwebview-panel-frozen-on-last-frame-after-hyprland-workspace-switch--known-upstream-limitation). Compositor-agnostic (the trigger no-ops on non-Hyprland compositors that don't toggle SUSPENDED on workspace switch); reversible (delete from config when upstream ships a real fix).

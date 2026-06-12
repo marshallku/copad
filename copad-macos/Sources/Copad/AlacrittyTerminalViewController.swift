@@ -1,6 +1,9 @@
 import AppKit
 import CCopadTerm
+import CopadCore
 import Foundation
+import Metal
+import QuartzCore
 
 /// Phase 3.2 — `copad-term` (alacritty_terminal-backed) pane with
 /// CoreText cell rendering. Conforms to `CopadPanel` so PaneManager
@@ -150,6 +153,20 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         let container = NSView(frame: frame)
         container.wantsLayer = true
 
+        // GPU mode resolves BEFORE the view exists: the backing-layer
+        // class is committed at init and never swapped, so a missing
+        // Metal device (VM, headless context) must fall back to the
+        // CoreText painter here, not after the fact.
+        var gpuDevice: MTLDevice?
+        if config.rendererGPU {
+            gpuDevice = MTLCreateSystemDefaultDevice()
+            if gpuDevice == nil {
+                FileHandle.standardError.write(
+                    Data("[copad] [renderer] gpu = true but no Metal device — using CoreText painter\n".utf8),
+                )
+            }
+        }
+
         let render = AlacrittyRenderView(
             theme: theme,
             font: resolveFont(family: config.fontFamily, size: CGFloat(config.fontSize)),
@@ -158,6 +175,7 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
             osc52Policy: config.osc52,
             optionAsAlt: config.optionAsAlt,
             forceMetaKeys: config.forceMetaKeys,
+            gpuDevice: gpuDevice,
         )
         render.frame = container.bounds
         render.autoresizingMask = [.width, .height]
@@ -538,12 +556,10 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
     /// protocol conformance.
     func applyBackground(path _: String, tint _: Double, opacity _: Double) {
         renderView?.setImageBackgroundActive(true)
-        renderView?.needsDisplay = true
     }
 
     func clearBackground() {
         renderView?.setImageBackgroundActive(false)
-        renderView?.needsDisplay = true
     }
 
     func setTint(_: Double) {
@@ -782,6 +798,24 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     private static let styleBitItalic: UInt16 = 1 << 9
     private static let styleBitStrike: UInt16 = 1 << 10
 
+    /// GPU mode (plan D1): non-nil device → `makeBackingLayer` returns
+    /// a CAMetalLayer and `metalRenderer` paints; nil → the CoreText
+    /// `draw(_:)` path. Committed at init; never hot-swapped.
+    private let gpuDevice: MTLDevice?
+    private var metalRenderer: MetalGridRenderer?
+    /// Pending-repaint latch for GPU mode. Set by `requestRepaint()`
+    /// (any invalidation: damage, theme, focus, selection, search,
+    /// …); cleared ONLY after a frame successfully encodes+presents,
+    /// so a nil `nextDrawable` can never drop the one repaint the
+    /// already-drained damage was owed.
+    private var gpuFrameDirty = false
+    /// Theme colors pre-packed for the Metal painter; rebuilt on
+    /// `setTheme` alongside `paletteCache`.
+    private var gpuTheme: MetalGridRenderer.ThemeColors?
+    /// CG-drawn IME composition overlay (plan D2) — only exists in
+    /// GPU mode; the CPU painter draws preedit inside `draw(_:)`.
+    private var imeOverlay: IMEPreeditOverlayView?
+
     init(
         theme: CopadTheme,
         font: NSFont,
@@ -790,6 +824,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         osc52Policy: OSC52Policy,
         optionAsAlt: Bool,
         forceMetaKeys: [String],
+        gpuDevice: MTLDevice? = nil,
     ) {
         self.theme = theme
         self.font = font
@@ -801,11 +836,13 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         self.windowOpacity = windowOpacity
         self.osc52Policy = osc52Policy
         self.optionAsAlt = optionAsAlt
+        self.gpuDevice = gpuDevice
         forceMetaKeyCodes = Self.parseForceMetaKeyCodes(forceMetaKeys)
         super.init(frame: .zero)
         wantsLayer = true
         layer?.backgroundColor = Self.layerBg(theme: theme, opacity: windowOpacity, imageActive: false)
         recomputeCellMetrics()
+        setupGPUPipelineIfRequested()
         // Accept the three drop shapes a terminal cares about:
         //   - .fileURL — Finder, any app exporting a file URL. Single
         //     or multi-select both arrive as one drop with N URLs.
@@ -819,6 +856,103 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         // in `viewDidMoveToWindow`.
     }
 
+    /// CAMetalLayer when GPU mode resolved at construction; AppKit's
+    /// default backing layer otherwise. `isOpaque = false` always —
+    /// the transparent modes (wallpaper passthrough, window opacity)
+    /// need the alpha-0 clear to composite, and in opaque mode the
+    /// frame's clear color is fully opaque anyway.
+    override func makeBackingLayer() -> CALayer {
+        guard let device = gpuDevice else { return super.makeBackingLayer() }
+        let metalLayer = CAMetalLayer()
+        metalLayer.device = device
+        metalLayer.pixelFormat = .bgra8Unorm
+        metalLayer.framebufferOnly = true
+        metalLayer.isOpaque = false
+        return metalLayer
+    }
+
+    /// Build the Metal painter + IME overlay. Failure (shader compile
+    /// / pipeline create — should never happen on a real device) falls
+    /// back to the CoreText painter by swapping a plain CALayer back
+    /// in, so the pane still renders.
+    private func setupGPUPipelineIfRequested() {
+        guard let device = gpuDevice else { return }
+        if let metalLayer = layer as? CAMetalLayer,
+           let renderer = MetalGridRenderer(
+               layer: metalLayer,
+               device: device,
+               fonts: gpuFonts(),
+               metrics: gpuMetrics(),
+           )
+        {
+            metalRenderer = renderer
+            rebuildGPUTheme()
+            let overlay = IMEPreeditOverlayView(theme: theme, font: font)
+            overlay.frame = bounds
+            overlay.autoresizingMask = [.width, .height]
+            overlay.resolveFont = { [weak self] str, base in
+                self?.resolveRunFont(str, base: base) ?? base
+            }
+            overlay.updateFont(font, cellWidth: cellWidth, cellHeight: cellHeight, ascent: ascent)
+            addSubview(overlay)
+            imeOverlay = overlay
+        } else {
+            FileHandle.standardError.write(
+                Data("[copad] Metal renderer init failed — falling back to CoreText painter\n".utf8),
+            )
+            let fallback = CALayer()
+            fallback.backgroundColor = Self.layerBg(
+                theme: theme,
+                opacity: windowOpacity,
+                imageActive: false,
+            )
+            layer = fallback
+        }
+    }
+
+    private func gpuFonts() -> MetalGridRenderer.Fonts {
+        MetalGridRenderer.Fonts(
+            regular: font,
+            bold: boldFont,
+            italic: italicFont,
+            boldItalic: boldItalicFont,
+        )
+    }
+
+    private func gpuMetrics() -> MetalGridRenderer.Metrics {
+        MetalGridRenderer.Metrics(
+            cellWidth: cellWidth,
+            cellHeight: cellHeight,
+            ascent: ascent,
+            scale: window?.backingScaleFactor ?? 2,
+        )
+    }
+
+    private func rebuildGPUTheme() {
+        guard metalRenderer != nil else { return }
+        gpuTheme = MetalGridRenderer.ThemeColors(
+            defaultFg: cgColorToRGBA32(theme.foreground.nsColor.cgColor),
+            defaultBg: cgColorToRGBA32(theme.background.nsColor.cgColor),
+            accent: cgColorToRGBA32(theme.accent.nsColor.cgColor),
+            surface2: cgColorToRGBA32(theme.surface2.nsColor.cgColor),
+            palette: paletteCache.map { cgColorToRGBA32($0) },
+        )
+    }
+
+    /// Single repaint funnel (plan D1 / codex B1). Every invalidation
+    /// — PTY damage, theme/opacity/background flips, focus change,
+    /// selection, search refresh, font swap — routes here so GPU mode
+    /// can't miss a non-damage visual change. CPU mode forwards to
+    /// AppKit as before; GPU mode latches the dirty flag the next
+    /// display-link tick consumes.
+    func requestRepaint() {
+        if metalRenderer != nil {
+            gpuFrameDirty = true
+        } else {
+            needsDisplay = true
+        }
+    }
+
     /// Hot-reload: swap the theme and rebuild the palette cache.
     /// Draw paths read `theme` and `paletteCache` directly each frame,
     /// so the next paint picks up the new colors. Also touches the
@@ -829,6 +963,8 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         theme = newTheme
         paletteCache = Self.buildPalette(theme: newTheme)
         flushCTLineCache()
+        rebuildGPUTheme()
+        imeOverlay?.updateTheme(newTheme)
         if !imageBackgroundActive {
             layer?.backgroundColor = Self.layerBg(
                 theme: newTheme,
@@ -836,7 +972,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
                 imageActive: false,
             )
         }
-        needsDisplay = true
+        requestRepaint()
     }
 
     /// Hot-reload entry for `[window] opacity`. Updates the cached
@@ -852,7 +988,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
                 imageActive: false,
             )
         }
-        needsDisplay = true
+        requestRepaint()
     }
 
     /// Resolve the layer background CGColor for the current state.
@@ -885,7 +1021,9 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         let oldW = cellWidth
         let oldH = cellHeight
         recomputeCellMetrics()
-        needsDisplay = true
+        metalRenderer?.setFonts(gpuFonts(), metrics: gpuMetrics())
+        imeOverlay?.updateFont(newFont, cellWidth: cellWidth, cellHeight: cellHeight, ascent: ascent)
+        requestRepaint()
         return cellWidth != oldW || cellHeight != oldH
     }
 
@@ -901,7 +1039,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             opacity: windowOpacity,
             imageActive: active,
         )
-        needsDisplay = true
+        requestRepaint()
     }
 
     /// Refresh `snapshotCache` immediately, bypassing the per-tick
@@ -912,7 +1050,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// stale highlight from the previous frame's snapshot.
     func refreshSnapshotForSearchChange(_ handle: CopadTermFFI.Handle) {
         snapshotCache = handle.snapshot()
-        needsDisplay = true
+        requestRepaint()
     }
 
     /// Apply font traits via NSFontManager, falling back to the regular
@@ -1167,6 +1305,13 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             link.add(to: .current, forMode: .common)
             vsyncLink = link
         }
+        // First window attach is when the real backingScaleFactor
+        // becomes known — the init-time metrics assumed 2x.
+        if metalRenderer != nil {
+            layer?.contentsScale = win.backingScaleFactor
+            metalRenderer?.setFonts(gpuFonts(), metrics: gpuMetrics())
+            requestRepaint()
+        }
         center.removeObserver(self)
         center.addObserver(self, selector: #selector(windowFocusChanged(_:)),
                            name: NSWindow.didBecomeKeyNotification, object: win)
@@ -1178,8 +1323,8 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         // Cursor draw depends on `window?.isKeyWindow`; force the next
         // paint to pick the new focus state up. The damage gate stays
         // safe (no snapshot churn) — we just invalidate the cached
-        // bitmap so AppKit re-runs `draw(_:)` with the cached snapshot.
-        needsDisplay = true
+        // bitmap so the next paint re-runs with the cached snapshot.
+        requestRepaint()
     }
 
     override var isFlipped: Bool {
@@ -1188,6 +1333,28 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
 
     override var acceptsFirstResponder: Bool {
         true
+    }
+
+    /// Display switch / Retina ↔ non-Retina move: the atlas is
+    /// rasterized at the old scale — re-derive metrics (which flushes
+    /// it) and repaint. CPU mode needs neither (AppKit re-rasterizes
+    /// draw(_:) output itself).
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        guard metalRenderer != nil else { return }
+        layer?.contentsScale = window?.backingScaleFactor ?? 2
+        metalRenderer?.setFonts(gpuFonts(), metrics: gpuMetrics())
+        requestRepaint()
+    }
+
+    /// GPU mode redraws on resize explicitly — there's no AppKit
+    /// draw(_:) pass to pick up the new bounds, and the drawable size
+    /// follows the view size inside `render`.
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        if metalRenderer != nil {
+            requestRepaint()
+        }
     }
 
     func bind(handle: CopadTermFFI.Handle?) {
@@ -1231,6 +1398,24 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         let damage = handle.takeDamageRows()
         let blinkPhaseChanged = advanceBlinkPhase()
 
+        // GPU path: every frame is a full redraw, so per-row dirty
+        // rects collapse into the single `gpuFrameDirty` latch. The
+        // latch may already be set by a non-damage invalidation
+        // (focus, theme, selection) — damage only adds the snapshot
+        // refresh on top.
+        if metalRenderer != nil {
+            let hasDamage: Bool = switch damage {
+            case .full: true
+            case let .rows(rows): !rows.isEmpty
+            }
+            if hasDamage || blinkPhaseChanged {
+                snapshotCache = handle.snapshot()
+                gpuFrameDirty = true
+            }
+            renderGPUFrameIfNeeded()
+            return
+        }
+
         // Even a no-op damage drain must capture a fresh snapshot when
         // we're going to repaint (blink toggle still needs the latest
         // cursor row). `takeDamageRows` already advanced the FFI's
@@ -1258,6 +1443,39 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         }
     }
 
+    /// Encode + present one Metal frame when the dirty latch is set.
+    /// The latch clears only on success: a nil drawable (occluded
+    /// window) leaves it set so the next tick retries — the damage
+    /// that armed it was already consumed by `takeDamageRows` and
+    /// will never fire again (codex B2).
+    private func renderGPUFrameIfNeeded() {
+        guard gpuFrameDirty,
+              let renderer = metalRenderer,
+              let gpuTheme,
+              let snap = snapshotCache
+        else { return }
+        let state = MetalGridRenderer.FrameState(
+            viewSizePoints: bounds.size,
+            transparentMode: isTransparentBgActive,
+            blinkVisible: blinkVisible,
+            isKeyWindow: window?.isKeyWindow ?? false,
+        )
+        if renderer.render(snap: snap, theme: gpuTheme, state: state) {
+            gpuFrameDirty = false
+        }
+        // Keep the preedit overlay anchored to the (possibly moved)
+        // cursor while composing.
+        if markedText != nil {
+            let cursor = snap.cursor
+            imeOverlay?.updateComposition(
+                markedText: markedText,
+                selectedRange: markedSelectedRange,
+                cursorRow: Int(cursor.row),
+                cursorCol: Int(cursor.col),
+            )
+        }
+    }
+
     /// Convert a list of dirty viewport row indices into AppKit
     /// `setNeedsDisplay(_:)` calls. AppKit unions the resulting dirty
     /// rectangles automatically before the next `draw(_:)`, so
@@ -1266,6 +1484,10 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// views preserve pixels outside the union from the backing
     /// store — that's what makes the per-row invalidation a win.
     private func invalidateRows(_ rows: [UInt16]) {
+        guard metalRenderer == nil else {
+            gpuFrameDirty = true
+            return
+        }
         guard cellHeight > 0 else {
             needsDisplay = true
             return
@@ -1333,6 +1555,9 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     }
 
     override func draw(_ dirtyRect: NSRect) {
+        // GPU mode renders via the display link directly into the
+        // CAMetalLayer — AppKit shouldn't call this, but guard anyway.
+        guard metalRenderer == nil else { return }
         guard let snap = snapshotCache,
               let ctx = NSGraphicsContext.current?.cgContext
         else { return }
@@ -2115,7 +2340,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             return
         }
         h.selectionStart(row: row, col: col, side: side, kind: selectionKind(for: event))
-        needsDisplay = true
+        requestRepaint()
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -2236,7 +2461,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             return
         }
         h.selectionUpdate(row: row, col: col, side: side)
-        needsDisplay = true
+        requestRepaint()
     }
 
     // MARK: - Scrolling
@@ -2366,7 +2591,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
 
     @objc override func selectAll(_: Any?) {
         termHandle?.selectionAll()
-        needsDisplay = true
+        requestRepaint()
     }
 
     /// Cmd+V dispatch. Wraps the pasted bytes in bracketed-paste
@@ -2799,7 +3024,8 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         // overlay doesn't linger after the bytes land in the PTY.
         if markedText != nil {
             markedText = nil
-            needsDisplay = true
+            syncIMEOverlay()
+            requestRepaint()
         }
         guard !text.isEmpty else { return }
         scrollToBottomOnInput()
@@ -2890,14 +3116,30 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             let len = max(0, min(selectedRange.length, utf16Count - loc))
             markedSelectedRange = NSRange(location: loc, length: len)
         }
-        needsDisplay = true
+        syncIMEOverlay()
+        requestRepaint()
     }
 
     func unmarkText() {
         guard markedText != nil else { return }
         markedText = nil
         markedSelectedRange = NSRange(location: 0, length: 0)
-        needsDisplay = true
+        syncIMEOverlay()
+        requestRepaint()
+    }
+
+    /// Push the current composition state into the GPU-mode overlay
+    /// (no-op in CPU mode where `draw(_:)` paints the preedit
+    /// directly).
+    private func syncIMEOverlay() {
+        guard let overlay = imeOverlay else { return }
+        let cursor = snapshotCache?.cursor
+        overlay.updateComposition(
+            markedText: markedText,
+            selectedRange: markedSelectedRange,
+            cursorRow: Int(cursor?.row ?? 0),
+            cursorCol: Int(cursor?.col ?? 0),
+        )
     }
 
     /// IMEs query this to know where the caret sits inside the

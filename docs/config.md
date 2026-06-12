@@ -218,6 +218,21 @@ osc52 = "deny"   # or "allow"
 
 Hot-reloads (no restart needed for live panes).
 
+### [renderer] (macOS only)
+
+```toml
+[renderer]
+transparent_default_bg = false  # default-bg cells transparent when a wallpaper is active
+gpu = false                     # experimental Metal painter (slice 1 — see macos-gpu-renderer-plan.md)
+```
+
+| Key | Default | Effect |
+| --- | --- | --- |
+| `transparent_default_bg` | `false` (auto-`true` when `[background] image` is set) | Lets the wallpaper show through cells with no explicit ANSI bg. |
+| `gpu` | `false` | Metal render path (CAMetalLayer + glyph atlas) instead of the CoreText painter. Both flags are read at **pane creation** — config hot-reload affects new panes only. Falls back to CoreText when no Metal device exists. |
+
+A stale `backend = "swiftterm"` key from pre-10b configs is parsed and ignored.
+
 ## Notes
 
 - All fields have defaults; config file is optional

@@ -91,6 +91,13 @@ struct CopadConfig {
     /// ANSI bg colors and reverse-video cells still materialize opaquely
     /// (Zed pattern).
     let transparentDefaultBg: Bool
+    /// `[renderer] gpu = true` — experimental Metal render path
+    /// (docs/macos-gpu-renderer-plan.md slice 1). Default off. Read at
+    /// pane creation: existing panes keep their painter across config
+    /// hot-reloads (the layer class is committed at view init), new
+    /// panes pick up the new value. Falls back to the CoreText painter
+    /// when no Metal device is available.
+    let rendererGPU: Bool
     /// `[window] opacity` (0.0 = fully transparent, 1.0 = fully opaque,
     /// default 1.0). Controls the window itself + terminal default-bg
     /// cells (Ghostty model). Distinct from `backgroundOpacity` which
@@ -192,6 +199,7 @@ struct CopadConfig {
             // know to set `[renderer] transparent_default_bg = true`.
             transparentDefaultBg: raw.renderer?.transparentDefaultBg
                 ?? (bgPath != nil ? true : defaults.transparentDefaultBg),
+            rendererGPU: raw.renderer?.gpu ?? defaults.rendererGPU,
             windowOpacity: clamp01(raw.window?.opacity ?? defaults.windowOpacity),
             windowBlur: raw.window?.blur ?? defaults.windowBlur,
             tabsPosition: raw.tabs?.position.map(TabsPosition.parse) ?? defaults.tabsPosition,
@@ -228,6 +236,7 @@ struct CopadConfig {
             rotateInterval: 0,
             osc52: .deny,
             transparentDefaultBg: false,
+            rendererGPU: false,
             windowOpacity: 1.0,
             windowBlur: false,
             tabsPosition: .top,
@@ -352,10 +361,12 @@ private struct RendererSection: Decodable {
     /// alacritty controller now.
     var backend: String?
     var transparentDefaultBg: Bool?
+    var gpu: Bool?
 
     enum CodingKeys: String, CodingKey {
         case backend
         case transparentDefaultBg = "transparent_default_bg"
+        case gpu
     }
 }
 
