@@ -108,7 +108,11 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
     init(config: CopadConfig, theme: CopadTheme, cwd: String? = nil, initialInput: String? = nil) {
         self.config = config
         self.theme = theme
-        initialCwd = cwd
+        // Fall back to $HOME so Finder/Dock launches don't land in `/`
+        // (Copad.app inherits launchd's cwd). Explicit callers — session
+        // restore, coctl-launched panels, newTerminalTab(cwd:) — still
+        // win because nil is the only thing the fallback fires on.
+        initialCwd = cwd ?? NSHomeDirectory()
         self.initialInput = initialInput
         let base = CGFloat(config.fontSize)
         configFontSize = base
