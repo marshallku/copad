@@ -58,6 +58,9 @@ pub struct BackgroundLayer {
     // this by broadcasting to every gui-*.sock instead).
     last_mode_active: Cell<bool>,
     mode_monitor: RefCell<Option<gtk4::gio::FileMonitor>>,
+    // One-shot guard so a missing/empty wallpaper list (rotation enabled but
+    // nothing to pick) warns once instead of silently no-op'ing every tick.
+    empty_list_warned: Cell<bool>,
 }
 
 impl BackgroundLayer {
@@ -108,6 +111,7 @@ impl BackgroundLayer {
             rotation_source: RefCell::new(None),
             last_mode_active: Cell::new(copad_core::background::is_active(&bg_paths().mode_file)),
             mode_monitor: RefCell::new(None),
+            empty_list_warned: Cell::new(false),
         });
 
         layer.refresh_window_backdrop();
@@ -197,6 +201,12 @@ impl BackgroundLayer {
         if interval == 0 {
             return;
         }
+        // Surface an empty/missing list now rather than `interval` seconds later
+        // on the first tick — probe only (the actual pick happens on the tick).
+        let paths = bg_paths();
+        if copad_core::background::is_active(&paths.mode_file) {
+            let _ = self.pick_or_warn(&paths);
+        }
         let weak = Rc::downgrade(self);
         let id = glib::timeout_add_seconds_local(interval.min(u32::MAX as u64) as u32, move || {
             let Some(layer) = weak.upgrade() else {
@@ -209,14 +219,38 @@ impl BackgroundLayer {
     }
 
     /// One rotation tick: respect the shared mode flag, pick a random list
-    /// image, apply it. No-op when the list is missing/empty.
+    /// image, apply it. No-op when the list is missing/empty (warned once).
     pub fn rotate_once(&self) {
         let paths = bg_paths();
         if !copad_core::background::is_active(&paths.mode_file) {
             return;
         }
-        if let Some(img) = copad_core::background::pick_random(&paths) {
+        if let Some(img) = self.pick_or_warn(&paths) {
             self.set_image_from_list(Path::new(&img));
+        }
+    }
+
+    /// `pick_random`, but the first time rotation is active yet the list yields
+    /// no image, log the cause — otherwise a user who set `rotate_interval`
+    /// without ever populating `terminal-wallpapers.txt` sees nothing happen
+    /// and no reason why. Warns once per process; a successful pick re-arms it
+    /// so a later emptied list warns again.
+    fn pick_or_warn(&self, paths: &copad_core::background::BackgroundPaths) -> Option<String> {
+        match copad_core::background::pick_random(paths) {
+            Some(img) => {
+                self.empty_list_warned.set(false);
+                Some(img)
+            }
+            None => {
+                if note_empty_list(&self.empty_list_warned) {
+                    eprintln!(
+                        "[copad] background rotation is enabled but no wallpaper is available — \
+                         add image paths (one per line) to {}",
+                        paths.primary_list.display(),
+                    );
+                }
+                None
+            }
         }
     }
 
@@ -254,7 +288,7 @@ impl BackgroundLayer {
             }
             layer.last_mode_active.set(active);
             if active {
-                if let Some(img) = copad_core::background::pick_random(&bg_paths()) {
+                if let Some(img) = layer.pick_or_warn(&bg_paths()) {
                     layer.set_image_from_list(Path::new(&img));
                 }
             } else {
@@ -354,4 +388,34 @@ fn update_tint_css(provider: &gtk4::CssProvider, hex_color: &str, opacity: f64) 
         rgba_css(hex_color, opacity)
     );
     provider.load_from_string(&css);
+}
+
+/// One-shot guard for the empty-wallpaper-list warning: returns `true` the first time the list is
+/// observed empty and flips `warned`, so subsequent ticks stay quiet. A successful pick resets
+/// `warned` to `false` (in `pick_or_warn`), so a list that is later emptied warns again.
+fn note_empty_list(warned: &Cell<bool>) -> bool {
+    !warned.replace(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_list_warns_once_then_rearms_after_a_pick() {
+        let warned = Cell::new(false);
+        // First empty observation warns; the next ones stay quiet.
+        assert!(note_empty_list(&warned), "first empty list must warn");
+        assert!(
+            !note_empty_list(&warned),
+            "second consecutive empty must be quiet"
+        );
+        assert!(!note_empty_list(&warned));
+        // A successful pick resets the guard (as pick_or_warn does) → warns again if re-emptied.
+        warned.set(false);
+        assert!(
+            note_empty_list(&warned),
+            "an emptied-again list warns after a successful pick"
+        );
+    }
 }

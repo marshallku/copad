@@ -17,15 +17,15 @@ pub struct Config {
     pub lookahead_hours: u32,
     pub require_secure_store: bool,
     pub plaintext_path: std::path::PathBuf,
+    /// Set when env validation failed and RPC started in minimal mode — carried so the daemon can
+    /// surface the cause instead of every action silently returning `not_authenticated`.
+    pub fatal_error: Option<String>,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self, String> {
-        let client_id = std::env::var("COPAD_CALENDAR_CLIENT_ID")
-            .map_err(|_| "COPAD_CALENDAR_CLIENT_ID is required".to_string())?;
-        let client_secret = std::env::var("COPAD_CALENDAR_CLIENT_SECRET")
-            .map_err(|_| "COPAD_CALENDAR_CLIENT_SECRET is required".to_string())?;
-
+        // Validate the non-credential knobs first — a malformed value here is a genuine config
+        // error regardless of whether credentials are set, and is the only case `run_rpc` toasts.
         let account_label =
             std::env::var("COPAD_CALENDAR_ACCOUNT").unwrap_or_else(|_| "default".to_string());
         validate_account_label(&account_label)?;
@@ -40,6 +40,15 @@ impl Config {
 
         let plaintext_path = default_plaintext_path(&account_label);
 
+        // The OAuth client id/secret are required to do anything, but "not set yet" is the normal
+        // pre-auth state (`auth_status` reports configured=false / `is_minimal()`), NOT a
+        // misconfiguration — leave them empty and quiet rather than erroring, so run_rpc doesn't
+        // raise a config-error toast on a fresh, never-authed calendar. `run_auth` checks presence
+        // itself before starting the device-code flow. Mirrors slack/jira, where unset credentials
+        // fall back to the store without a config error.
+        let client_id = std::env::var("COPAD_CALENDAR_CLIENT_ID").unwrap_or_default();
+        let client_secret = std::env::var("COPAD_CALENDAR_CLIENT_SECRET").unwrap_or_default();
+
         Ok(Self {
             client_id,
             client_secret,
@@ -49,12 +58,23 @@ impl Config {
             lookahead_hours,
             require_secure_store,
             plaintext_path,
+            fatal_error: None,
         })
     }
 
-    /// Used when env-validation fails but RPC still needs to start so
-    /// the supervisor can register us. All actions will return errors.
+    /// Error-free minimal config (tests only — production always carries the validation error via
+    /// [`Config::minimal_with_error`]).
+    #[cfg(test)]
     pub fn minimal() -> Self {
+        Self::minimal_with_error_opt(None)
+    }
+
+    /// Like [`Config::minimal`] but carries the validation error so the daemon can surface it.
+    pub fn minimal_with_error(error: String) -> Self {
+        Self::minimal_with_error_opt(Some(error))
+    }
+
+    fn minimal_with_error_opt(fatal_error: Option<String>) -> Self {
         Self {
             client_id: String::new(),
             client_secret: String::new(),
@@ -64,6 +84,7 @@ impl Config {
             lookahead_hours: 24,
             require_secure_store: false,
             plaintext_path: default_plaintext_path("default"),
+            fatal_error,
         }
     }
 

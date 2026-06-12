@@ -347,6 +347,30 @@ impl CopadConfig {
         Self::load_from(&Self::config_path())
     }
 
+    /// First-start loader for the GUI: on a parse/IO error, fall back to built-in defaults but
+    /// return a human-readable warning so the caller can surface it loudly (desktop-entry launches
+    /// hide stderr, so a typo in `config.toml` would otherwise silently discard the whole user
+    /// config). Distinct from [`load`](Self::load), which propagates the error, and from the
+    /// hot-reload path, which keeps the already-running config rather than resetting to defaults.
+    /// A missing file is the normal first-run state and yields `(default, None)`.
+    pub fn load_or_default_warning() -> (Self, Option<String>) {
+        Self::load_or_default_warning_from(&Self::config_path())
+    }
+
+    fn load_or_default_warning_from(path: &Path) -> (Self, Option<String>) {
+        match Self::load_from(path) {
+            Ok(config) => (config, None),
+            Err(e) => {
+                let warning = format!(
+                    "{} could not be parsed — built-in defaults are in effect and your settings \
+                     were NOT applied: {e}",
+                    path.display()
+                );
+                (Self::default(), Some(warning))
+            }
+        }
+    }
+
     /// Path-taking loader. Daemon config watcher uses this with a
     /// monitored path; tests use it with an isolated tempfile.
     /// Returns the default config when the path doesn't exist
@@ -604,6 +628,56 @@ subpath = "apps/web"
         std::fs::write(&path, "this is not valid toml = = =").expect("write");
         let err = CopadConfig::load_from(&path).unwrap_err();
         assert!(matches!(err, crate::error::CopadError::Config(_)));
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn load_or_default_warning_missing_file_is_quiet() {
+        let dir = tmp_dir();
+        let path = dir.join("does-not-exist.toml");
+        let (cfg, warning) = CopadConfig::load_or_default_warning_from(&path);
+        assert!(
+            warning.is_none(),
+            "a missing file is the normal first-run state, not a warning"
+        );
+        assert!(cfg.triggers.is_empty());
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn load_or_default_warning_valid_file_is_quiet() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[terminal]\nfont_size = 18\n").expect("write");
+        let (cfg, warning) = CopadConfig::load_or_default_warning_from(&path);
+        assert!(warning.is_none());
+        assert_eq!(cfg.terminal.font_size, 18);
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn load_or_default_warning_parse_error_falls_back_loudly() {
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "this is not valid toml = = =").expect("write");
+        let (cfg, warning) = CopadConfig::load_or_default_warning_from(&path);
+        // Falls back to defaults (so the GUI still starts) ...
+        assert_eq!(
+            cfg.terminal.font_size,
+            CopadConfig::default().terminal.font_size
+        );
+        // ... but loudly: the warning names the offending file so the user can find it.
+        let warning = warning.expect("a parse error must produce a warning");
+        assert!(
+            warning.contains("config.toml"),
+            "warning names the file: {warning}"
+        );
+        assert!(
+            warning.contains("NOT applied"),
+            "warning says config was dropped: {warning}"
+        );
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir(&dir).ok();
     }

@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::csd::{Csd, CsdState};
+use crate::csd::{Csd, CsdError, CsdState};
 use crate::queue::{Goal, Status, Store, detect_completion};
 
 pub fn spawn(
@@ -179,7 +179,7 @@ fn recover_sending(store: &Arc<Mutex<Store>>, csd: &Csd, tx: &Sender<String>, go
                         .unwrap()
                         .update_if(&goal.id, &[Status::Sending], |g| g.status = Status::Running);
                 }
-                Err(e) => fail(store, tx, &goal.id, &e.to_string()),
+                Err(e) => fail_csd(store, tx, &goal.id, &e),
             }
         }
         Ok(CsdState::Dead) | Err(_) => {
@@ -225,7 +225,7 @@ fn start_goal(store: &Arc<Mutex<Store>>, csd: &Csd, tx: &Sender<String>, goal: &
     let info = match csd.spawn(&goal.cwd, &id, &goal.posture) {
         Ok(info) => info,
         Err(e) => {
-            fail(store, tx, &id, &e.to_string());
+            fail_csd(store, tx, &id, &e);
             return;
         }
     };
@@ -274,7 +274,7 @@ fn start_goal(store: &Arc<Mutex<Store>>, csd: &Csd, tx: &Sender<String>, goal: &
                 let _ = csd.kill(&id);
             }
         }
-        Err(e) => fail(store, tx, &id, &e.to_string()),
+        Err(e) => fail_csd(store, tx, &id, &e),
     }
 }
 
@@ -291,7 +291,7 @@ fn poll_goal(
     let state = match csd.state(&id) {
         Ok(s) => s,
         Err(e) => {
-            fail(store, tx, &id, &e.to_string());
+            fail_csd(store, tx, &id, &e);
             return;
         }
     };
@@ -327,7 +327,7 @@ fn poll_goal(
                 {
                     let cont = continue_prompt(&id, &nonce);
                     if let Err(e) = csd.send(&id, &cont) {
-                        fail(store, tx, &id, &e.to_string());
+                        fail_csd(store, tx, &id, &e);
                     }
                 }
             } else if store
@@ -406,6 +406,38 @@ fn fail(store: &Arc<Mutex<Store>>, tx: &Sender<String>, id: &str, message: &str)
             tx,
             "pilot.goal_failed",
             json!({ "id": id, "error": message }),
+        );
+    }
+}
+
+/// `fail` for a classified [`CsdError`]: persists the message with the fix hint appended (so a later
+/// `pilot.list` read still carries it) and publishes `pilot.goal_failed` with a stable `code` +
+/// `remediation` the cockpit can act on, instead of an opaque error string.
+fn fail_csd(store: &Arc<Mutex<Store>>, tx: &Sender<String>, id: &str, e: &CsdError) {
+    let message = match e.remediation() {
+        Some(hint) => format!("{e} — {hint}"),
+        None => e.to_string(),
+    };
+    let applied = store.lock().unwrap().update_if(
+        id,
+        &[
+            Status::Spawning,
+            Status::Sending,
+            Status::Running,
+            Status::AwaitingGate,
+        ],
+        |g| {
+            g.status = Status::Failed;
+            g.error = Some(message.clone());
+            g.gate = None;
+        },
+    );
+    if applied {
+        eprintln!("[pilot] goal {id} failed [{}]: {message}", e.code());
+        publish(
+            tx,
+            "pilot.goal_failed",
+            json!({ "id": id, "error": message, "code": e.code(), "remediation": e.remediation() }),
         );
     }
 }

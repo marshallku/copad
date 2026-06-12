@@ -203,6 +203,10 @@ fn action_add(
             format!("cwd {cwd:?} is not an existing directory"),
         ));
     }
+    // Non-blocking: a goal drives an autonomous coding agent that may edit files. Running it outside
+    // a git work tree means no version control to fall back on, so surface a warning (the cockpit
+    // shows it; the goal still enqueues) rather than silently accepting a risky cwd.
+    let vcs_warning = vcs_warning(&dir);
     let goal = store
         .lock()
         .unwrap()
@@ -221,9 +225,35 @@ fn action_add(
     publish_event(
         tx,
         "pilot.goal_added",
-        json!({ "id": goal.id, "cwd": goal.cwd, "instruction": goal.instruction }),
+        json!({
+            "id": goal.id,
+            "cwd": goal.cwd,
+            "instruction": goal.instruction,
+            "warning": vcs_warning,
+        }),
     );
-    Ok(goal.to_json())
+    let mut out = goal.to_json();
+    if let Some(warning) = vcs_warning
+        && let Some(obj) = out.as_object_mut()
+    {
+        obj.insert("warning".into(), json!(warning));
+    }
+    Ok(out)
+}
+
+/// Warn when `cwd` is not inside a git work tree — walks up looking for a `.git` entry (a dir for a
+/// normal repo, a file for a worktree/submodule checkout), so the check needs neither the `git`
+/// binary nor a subprocess. `None` means "inside a repo, no warning".
+fn vcs_warning(cwd: &std::path::Path) -> Option<String> {
+    let in_repo = cwd.ancestors().any(|p| p.join(".git").exists());
+    if in_repo {
+        None
+    } else {
+        Some(format!(
+            "{} is not inside a git repository — the agent's edits will not be version-controlled",
+            cwd.display()
+        ))
+    }
 }
 
 fn action_list(store: &Arc<Mutex<Store>>) -> Result<Value, (String, String)> {
@@ -580,6 +610,46 @@ mod tests {
     // rx dropped immediately — publish_event sends are best-effort.
     fn null_tx() -> Sender<String> {
         channel::<String>().0
+    }
+
+    #[test]
+    fn vcs_warning_flags_non_git_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        // A bare tempdir is not a git work tree → warned.
+        let warning = vcs_warning(dir.path()).expect("non-git cwd must warn");
+        assert!(
+            warning.contains("not inside a git repository"),
+            "got {warning}"
+        );
+
+        // Plant a `.git` dir → no warning (covers both a repo root and any nested cwd under it).
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        assert_eq!(vcs_warning(dir.path()), None);
+        let nested = dir.path().join("src/deep");
+        std::fs::create_dir_all(&nested).unwrap();
+        assert_eq!(
+            vcs_warning(&nested),
+            None,
+            "nested cwd inherits the ancestor repo"
+        );
+    }
+
+    #[test]
+    fn add_surfaces_vcs_warning_for_non_git_cwd() {
+        let (dir, store) = fixture();
+        let out = action_add(
+            &json!({ "cwd": dir.path().to_str().unwrap(), "instruction": "do it" }),
+            &store,
+            &null_tx(),
+        )
+        .unwrap();
+        // Enqueues anyway (non-blocking) but carries the warning for the cockpit.
+        assert_eq!(out["status"], "queued");
+        assert!(
+            out["warning"].as_str().unwrap().contains("git repository"),
+            "got {}",
+            out["warning"]
+        );
     }
 
     #[test]

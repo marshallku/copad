@@ -42,6 +42,7 @@ use serde_json::{Value, json};
 
 use copad_core::action_registry::{ActionRegistry, ActionResult, internal_error};
 use copad_core::event_bus::{Event as BusEvent, EventBus, pattern_matches};
+use copad_core::notifier::{Level, Notifier};
 use copad_core::plugin::{Activation, LoadedPlugin, PluginServiceDef, RestartPolicy};
 use copad_core::protocol::{Request, Response, ResponseError};
 
@@ -297,6 +298,13 @@ pub struct ServiceSupervisor {
     /// latency without saving real work.
     waiter_active: Arc<AtomicUsize>,
     waiter_max: usize,
+    /// Desktop toast surface for `plugin.config_error` events — the daemon owns toast capability,
+    /// so a misconfigured plugin gets default-on visibility with zero user trigger config. `None`
+    /// on platforms without a notifier impl (the event still publishes to the bus).
+    notifier: Option<Arc<dyn Notifier>>,
+    /// Service names already toasted for a config error this run, so a plugin restart loop or a
+    /// repeated emission can't spam the user with the same misconfiguration toast.
+    config_error_notified: Mutex<HashSet<String>>,
 }
 
 impl ServiceSupervisor {
@@ -425,6 +433,8 @@ impl ServiceSupervisor {
             spawner_thread: Mutex::new(None),
             waiter_active: Arc::new(AtomicUsize::new(0)),
             waiter_max: env_waiter_max("COPADD_WAITER_MAX", 64),
+            notifier: copad_core::notifier::platform_notifier().map(Arc::from),
+            config_error_notified: Mutex::new(HashSet::new()),
         });
 
         // Spawner must be alive before any onEvent / onStartup activation
@@ -1343,6 +1353,16 @@ impl ServiceSupervisor {
                     }
                 };
                 let payload = params.get("payload").cloned().unwrap_or(Value::Null);
+                // Misconfiguration is the most common silent onboarding failure (a plugin keeps
+                // running with empty credentials). Toast it by default — the bus event still
+                // composes with user triggers, but visibility no longer depends on opt-in config.
+                if kind == "plugin.config_error" {
+                    notify_config_error(
+                        self.notifier.as_deref(),
+                        &self.config_error_notified,
+                        &payload,
+                    );
+                }
                 let source = format!("plugin:{}", handle.plugin_name);
                 self.bus.publish(BusEvent::new(kind, source, payload));
             }
@@ -1562,6 +1582,41 @@ fn env_waiter_max(key: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// Raise a desktop toast for a `plugin.config_error` payload, deduped per service against
+/// `notified` so a restart loop can't spam the same toast. The dedup is recorded even when no
+/// notifier is present, keeping behavior identical across headless and desktop runs.
+fn notify_config_error(
+    notifier: Option<&dyn Notifier>,
+    notified: &Mutex<HashSet<String>>,
+    payload: &Value,
+) {
+    let service = payload
+        .get("service")
+        .and_then(Value::as_str)
+        .unwrap_or("plugin");
+    if !notified.lock().unwrap().insert(service.to_string()) {
+        return;
+    }
+    let Some(notifier) = notifier else {
+        return;
+    };
+    let message = payload.get("message").and_then(Value::as_str).unwrap_or("");
+    let remediation = payload
+        .get("remediation")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let body = if remediation.is_empty() {
+        message.to_string()
+    } else {
+        format!("{message}\n{remediation}")
+    };
+    let _ = notifier.notify(
+        &format!("plugin {service} misconfigured"),
+        &body,
+        Level::Error,
+    );
+}
+
 /// Drop guard for the `waiter_active` counter — released when the
 /// waiter thread exits (regardless of success / timeout / panic).
 struct WaiterPermit(Arc<AtomicUsize>);
@@ -1771,9 +1826,70 @@ fn string_array(v: &Value, key: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use copad_core::notifier::NoopNotifier;
     use copad_core::plugin::{
         Activation, PluginManifest, PluginMeta, PluginServiceDef, RestartPolicy,
     };
+
+    #[test]
+    fn config_error_toast_fires_once_per_service() {
+        let notifier = NoopNotifier::default();
+        let seen = Mutex::new(HashSet::new());
+        let payload = json!({
+            "service": "slack",
+            "message": "COPAD_SLACK_BOT_TOKEN is required",
+            "remediation": "set COPAD_SLACK_BOT_TOKEN",
+        });
+        notify_config_error(Some(&notifier), &seen, &payload);
+        // Same service again (e.g. a restart re-emits) must not toast twice.
+        notify_config_error(Some(&notifier), &seen, &payload);
+
+        let captured = notifier.captured.lock().unwrap();
+        assert_eq!(
+            captured.len(),
+            1,
+            "second emission for the same service must dedupe"
+        );
+        let (title, body, level) = &captured[0];
+        assert_eq!(title, "plugin slack misconfigured");
+        assert!(body.contains("COPAD_SLACK_BOT_TOKEN is required"));
+        assert!(
+            body.contains("set COPAD_SLACK_BOT_TOKEN"),
+            "remediation is in the body"
+        );
+        assert_eq!(*level, Level::Error);
+    }
+
+    #[test]
+    fn config_error_toast_is_per_service_distinct() {
+        let notifier = NoopNotifier::default();
+        let seen = Mutex::new(HashSet::new());
+        notify_config_error(
+            Some(&notifier),
+            &seen,
+            &json!({ "service": "slack", "message": "x" }),
+        );
+        notify_config_error(
+            Some(&notifier),
+            &seen,
+            &json!({ "service": "jira", "message": "y" }),
+        );
+        assert_eq!(
+            notifier.captured.lock().unwrap().len(),
+            2,
+            "distinct services each toast once"
+        );
+    }
+
+    #[test]
+    fn config_error_without_notifier_still_dedupes() {
+        // Headless (no platform notifier): the call must not panic and must record the dedup so
+        // behavior matches the desktop path.
+        let seen = Mutex::new(HashSet::new());
+        let payload = json!({ "service": "calendar", "message": "missing creds" });
+        notify_config_error(None, &seen, &payload);
+        assert!(seen.lock().unwrap().contains("calendar"));
+    }
 
     fn mk_plugin(name: &str, services: Vec<PluginServiceDef>) -> LoadedPlugin {
         LoadedPlugin {

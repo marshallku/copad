@@ -430,6 +430,17 @@ erratic. To migrate:
 `next` / `toggle`); on a manually `set` image it errors with
 `no_current` instead of deleting an arbitrary file.
 
+**Rotation enabled but the wallpaper never changes:** rotation needs a
+non-empty `~/.cache/terminal-wallpapers.txt` (one image path per line). If
+that list is missing or empty, rotation used to no-op silently. As of the
+2026-06-12 audit, copad logs once to stderr —
+`[copad] background rotation is enabled but no wallpaper is available — add
+image paths (one per line) to <path>` — at arm time (immediately, not after
+the first interval). Populate the list (the dotfiles `copad-random-bg.sh`
+generator, or any `find … > terminal-wallpapers.txt`) and the next tick
+picks one up. The warning re-arms after a successful pick, so a list that is
+later emptied warns again.
+
 ### Messenger plugin tokens stored in plaintext (no OS keyring)
 
 **Symptom:** copadd stderr shows `[slack] secure keyring unavailable …`
@@ -449,6 +460,58 @@ to a plaintext file when it isn't (headless session, no
 plugin still starts (supervisor handshake stays alive) but token
 operations and auth-dependent actions fail with the keyring error
 instead of silently writing tokens to disk.
+
+### copad started with all default settings (theme/background/keybinds gone)
+
+**Symptom:** after editing `~/.config/copad/config.toml`, copad boots looking stock — your theme,
+wallpaper, opacity, and keybinds are all ignored — with no obvious error (a desktop-entry launch
+hides stderr).
+
+**Cause:** a TOML syntax error in `config.toml`. Startup used to call `load().unwrap_or_default()`,
+which silently swallowed the parse error and fell back to built-in defaults. (The hot-reload path
+already logged this; only first start was silent.)
+
+**Now:** startup falls back to defaults *loudly* — a `[copad] config error — …` line on stderr **and**
+a desktop toast titled `copad config error` whose body names `config.toml` so you can find and fix the
+typo. A **missing** file is unaffected (normal first-run state → silent defaults). After fixing the
+syntax, restart copad (or save the file — the hot-reload watcher reapplies a now-valid config without a
+restart). Validate quickly with `coctl` or any TOML linter against `~/.config/copad/config.toml`.
+
+### Messenger plugin misconfigured — now toasts instead of failing silently
+
+**Symptom (old):** a messenger plugin (slack / discord / jira / calendar) was started with a missing
+or malformed credential env var (e.g. `COPAD_SLACK_BOT_TOKEN` set to a non-`xoxb-` value). The plugin
+logged a `config error` line to copadd stderr and kept running degraded — every action returned
+`not_authenticated` and no event ever arrived, with no signal anywhere the user looks.
+
+**Now:** on the `initialized` handshake the plugin publishes one `plugin.config_error` event
+(`payload = { service, message, remediation }`) and the daemon raises a desktop toast titled
+`plugin <service> misconfigured` whose body names the exact env var / `auth` subcommand to fix. The
+toast fires once per service per copadd run (a restart loop won't spam it). The bus event also
+composes with user `[[triggers]]` if you want to route it elsewhere. See
+`docs/service-plugins.md` → "Reserved event kind: `plugin.config_error`".
+
+**Fix:** read the toast (or `coctl recent --kind 'plugin.config_error'`), set the named env var in the
+daemon environment, and restart copadd. An empty (unset) credential is **not** a config error — it is
+a normal not-yet-authenticated state that falls back to the token store, so it stays quiet.
+
+### Pilot goal failed — reading the classified cause
+
+**Symptom:** a goal goes `Failed` and the cockpit shows an error. As of the 2026-06-12 audit, that
+error is **classified** rather than an opaque string — `pilot.goal_failed` carries a stable `code`
+plus a `remediation` hint:
+
+- `csd_missing` — the `csd` binary couldn't be launched. Install it (`cargo install
+  claude-session-driver`) or point `COPAD_PILOT_CSD_BIN` at the binary. (Under `systemd --user`, set it
+  in the unit's `Environment=` — a login-shell PATH isn't inherited; see Phase 24.1.)
+- `tmux_missing` — `csd` ran but tmux isn't installed / not on copad's PATH. Install tmux.
+- `agent_unresponsive` — `csd` started a session but couldn't drive the claude TUI (claude missing /
+  not logged in, or gate-marker drift after a claude upgrade — see the next entry).
+- `csd_timeout` / `csd_error` — a hang or any other csd failure; the raw message is in `error`.
+
+Inspect with `coctl recent --kind 'pilot.goal_failed'` or the cockpit. Separately, `pilot.add` returns
+a non-blocking `warning` when the goal's `cwd` is **not** a git repo — the goal still enqueues, but the
+agent's edits won't be version-controlled, so confirm that's intended.
 
 ### Pilot goals stall without a gate after a claude upgrade (marker drift)
 

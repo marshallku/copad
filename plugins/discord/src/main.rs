@@ -242,6 +242,9 @@ fn handle_frame(
         }
         "initialized" => {
             initialized.store(true, Ordering::SeqCst);
+            if let Some(err) = &config.fatal_error {
+                emit_config_error(stdout, err);
+            }
         }
         "action.invoke" => {
             let name = params
@@ -439,6 +442,24 @@ fn send_error(stdout: &StdoutHandle, id: &str, code: &str, message: &str) {
         "id": id,
         "ok": false,
         "error": { "code": code, "message": message },
+    });
+    emit(stdout, &frame.to_string());
+}
+
+/// Env vars/steps that fix a fatal config error — quoted verbatim in the toast the supervisor
+/// raises, so a misconfigured plugin tells the user exactly what to set instead of failing silent.
+const CONFIG_REMEDIATION: &str = "set COPAD_DISCORD_BOT_TOKEN, or run `copad-plugin-discord auth`";
+
+/// Publish a one-shot `plugin.config_error` event so the daemon can toast the misconfiguration.
+/// Emitted only after `initialized`, since frames sent while the service is still `Starting` may
+/// be dropped before the supervisor bridges this plugin's stdout onto the bus.
+fn emit_config_error(stdout: &StdoutHandle, message: &str) {
+    let frame = json!({
+        "method": "event.publish",
+        "params": {
+            "kind": "plugin.config_error",
+            "payload": { "service": "discord", "message": message, "remediation": CONFIG_REMEDIATION },
+        }
     });
     emit(stdout, &frame.to_string());
 }

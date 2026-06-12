@@ -27,7 +27,7 @@ pub fn run() {
     });
 
     app.connect_activate(|app| {
-        let config = copad_core::config::CopadConfig::load().unwrap_or_default();
+        let config = load_startup_config();
         let window = CopadWindow::new(app, &config);
         window.present();
 
@@ -55,6 +55,25 @@ pub fn run() {
     });
 
     app.run();
+}
+
+/// Load config for first window start. A parse error used to be swallowed by `unwrap_or_default()`,
+/// silently dropping the entire user config — and a desktop-entry launch hides stderr, so the user
+/// had no signal at all. Now we fall back to defaults loudly: stderr for terminal launches plus a
+/// desktop toast that survives a GUI launch and names the offending file.
+fn load_startup_config() -> copad_core::config::CopadConfig {
+    let (config, warning) = copad_core::config::CopadConfig::load_or_default_warning();
+    if let Some(warning) = warning {
+        eprintln!("[copad] config error — {warning}");
+        if let Some(notifier) = copad_core::notifier::platform_notifier() {
+            let _ = notifier.notify(
+                "copad config error",
+                &format!("Using built-in defaults — {warning}"),
+                copad_core::notifier::Level::Error,
+            );
+        }
+    }
+    config
 }
 
 /// `window.close()` (not `app.quit()`) so destroy signals fire — the

@@ -249,6 +249,20 @@ If `provides` conflicts with another loaded plugin, copad logs a warning and ski
 | `action.invoke` | `{name, params}`   | call ANOTHER service's action                   |
 | `log`           | `{level, message}` | stderr-style logging routed via copad          |
 
+#### Reserved event kind: `plugin.config_error`
+
+A plugin that starts in a degraded state because its env config failed validation (missing/malformed
+credentials) should publish **one** `event.publish` with `kind = "plugin.config_error"` and
+`payload = { service, message, remediation }` — `remediation` naming the exact env vars or `auth`
+subcommand that fixes it. Emit it **after** the `initialized` notification, never during `Starting`
+(frames sent before the supervisor bridges the plugin's stdout can be dropping).
+
+The supervisor special-cases this kind: besides publishing it to the bus (where user `[[triggers]]`
+can still react), it raises a desktop toast by default — `title = "plugin <service> misconfigured"`,
+body = `message` + `remediation` — deduped per service per supervisor run. This makes the single most
+common onboarding failure (a messenger plugin running with empty tokens) loud with zero user trigger
+config. Steady-state plugins emit nothing, so there is no noise once config is fixed.
+
 ### Lifecycle and supervision
 
 **States** per service: `Stopped` → `Starting` → `Running` → (`Crashed` | `Stopped`) → restart-or-stay-stopped.

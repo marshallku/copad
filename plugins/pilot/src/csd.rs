@@ -15,16 +15,91 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+/// Classification of a `csd` failure so the cockpit can show an actionable cause instead of an
+/// opaque string — the three failures a user actually hits are distinct (the tool isn't installed,
+/// its tmux dependency isn't, or the agent never became driveable) and each has a different fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsdErrorKind {
+    /// The `csd` binary itself could not be launched (not installed / not on PATH).
+    CsdMissing,
+    /// `csd` ran but reported tmux is unavailable — no session can be driven without it.
+    TmuxMissing,
+    /// `csd` could not get the agent (claude) to accept input: the TUI never became driveable
+    /// (claude missing / not logged in, or gate-marker drift after a claude upgrade).
+    AgentUnresponsive,
+    /// `csd` exceeded pilot's wall-clock timeout.
+    Timeout,
+    /// Any other csd failure (session gone, bad args, unparseable output).
+    Other,
+}
+
+impl CsdErrorKind {
+    /// Stable machine code surfaced on `pilot.goal_failed` and in `goal.error`.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::CsdMissing => "csd_missing",
+            Self::TmuxMissing => "tmux_missing",
+            Self::AgentUnresponsive => "agent_unresponsive",
+            Self::Timeout => "csd_timeout",
+            Self::Other => "csd_error",
+        }
+    }
+
+    /// One-line fix hint, or `None` when the cause is too generic to advise on.
+    pub fn remediation(self) -> Option<&'static str> {
+        match self {
+            Self::CsdMissing => Some(
+                "install csd (`cargo install claude-session-driver`) or point COPAD_PILOT_CSD_BIN at its binary",
+            ),
+            Self::TmuxMissing => Some("install tmux and make sure it is on copad's PATH"),
+            Self::AgentUnresponsive => Some(
+                "check that `claude` is installed and logged in, and that csd's gate markers match your claude version",
+            ),
+            Self::Timeout | Self::Other => None,
+        }
+    }
+}
+
+/// Classify a csd stderr/error message into a [`CsdErrorKind`]. Matches against csd's stable
+/// `Display` strings (`src/error.rs`): tmux-missing and TUI-not-accepted are the load-bearing ones.
+fn classify_csd_error(message: &str) -> CsdErrorKind {
+    let m = message.to_ascii_lowercase();
+    if m.contains("tmux is not installed") || m.contains("tmux command failed") {
+        CsdErrorKind::TmuxMissing
+    } else if m.contains("not accepted by the tui") {
+        CsdErrorKind::AgentUnresponsive
+    } else {
+        CsdErrorKind::Other
+    }
+}
+
 #[derive(Debug)]
 pub struct CsdError {
     pub message: String,
+    pub kind: CsdErrorKind,
 }
 
 impl CsdError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            kind: CsdErrorKind::Other,
         }
+    }
+
+    fn with_kind(kind: CsdErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind,
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.kind.code()
+    }
+
+    pub fn remediation(&self) -> Option<&'static str> {
+        self.kind.remediation()
     }
 }
 
@@ -147,10 +222,18 @@ impl Csd {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| {
-                CsdError::new(format!(
-                    "cannot run `{}` (is csd on PATH? set COPAD_PILOT_CSD_BIN): {e}",
-                    self.bin
-                ))
+                let kind = if e.kind() == std::io::ErrorKind::NotFound {
+                    CsdErrorKind::CsdMissing
+                } else {
+                    CsdErrorKind::Other
+                };
+                CsdError::with_kind(
+                    kind,
+                    format!(
+                        "cannot run `{}` (is csd on PATH? set COPAD_PILOT_CSD_BIN): {e}",
+                        self.bin
+                    ),
+                )
             })?;
 
         // Drain both pipes on their own threads so a large `csd` stderr
@@ -189,17 +272,21 @@ impl Csd {
                             ))
                         });
                     }
-                    return Err(CsdError::new(extract_error(&err, status.code())));
+                    let detail = extract_error(&err, status.code());
+                    return Err(CsdError::with_kind(classify_csd_error(&detail), detail));
                 }
                 Ok(None) => {
                     if Instant::now() >= deadline {
                         let _ = child.kill();
                         let _ = child.wait();
-                        return Err(CsdError::new(format!(
-                            "csd {} timed out after {:?}",
-                            args.first().cloned().unwrap_or_default(),
-                            timeout
-                        )));
+                        return Err(CsdError::with_kind(
+                            CsdErrorKind::Timeout,
+                            format!(
+                                "csd {} timed out after {:?}",
+                                args.first().cloned().unwrap_or_default(),
+                                timeout
+                            ),
+                        ));
                     }
                     std::thread::sleep(Duration::from_millis(100));
                 }
@@ -385,7 +472,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_binary_surfaces_as_error() {
+    fn missing_binary_surfaces_as_csd_missing() {
         let csd = Csd {
             bin: "definitely-not-a-real-binary-xyz".into(),
             timeout: Duration::from_secs(5),
@@ -393,5 +480,29 @@ mod tests {
         };
         let err = csd.state("whatever").unwrap_err();
         assert!(err.message.contains("cannot run"), "got {}", err.message);
+        assert_eq!(err.kind, CsdErrorKind::CsdMissing);
+        assert_eq!(err.code(), "csd_missing");
+        assert!(err.remediation().unwrap().contains("COPAD_PILOT_CSD_BIN"));
+    }
+
+    #[test]
+    fn classifies_csd_error_messages() {
+        // csd's stable Display strings (see csd src/error.rs).
+        assert_eq!(
+            classify_csd_error("tmux is not installed or not on PATH"),
+            CsdErrorKind::TmuxMissing
+        );
+        assert_eq!(
+            classify_csd_error("tmux command failed: no server running"),
+            CsdErrorKind::TmuxMissing
+        );
+        assert_eq!(
+            classify_csd_error("input was not accepted by the TUI after 30 attempts"),
+            CsdErrorKind::AgentUnresponsive
+        );
+        // An unrecognized csd error stays Other (no misleading remediation).
+        let other = classify_csd_error("session \"x\" does not exist");
+        assert_eq!(other, CsdErrorKind::Other);
+        assert_eq!(other.remediation(), None);
     }
 }
