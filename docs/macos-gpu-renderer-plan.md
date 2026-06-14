@@ -152,6 +152,18 @@ The GPU `drawableWait` p50 is ~0.02 ms (free) but spikes to 7–16 ms when the a
 - **Per-pane atlas sharing: a memory item (~16 MB/pane), not perf** — worth doing for split-heavy users; the perf data does not make it urgent.
 - **ProMotion / present-pacing is the next slice-2 perf unit** — target the drawableWait spikes, not the work number.
 
+## Slice 2 — default-flip readiness audit (2026-06-14)
+
+Verifying the regression surfaces that only matter once GPU is the default (every pane, every split). All on-device with `gpu = true`.
+
+- **Split-pane GPU coexistence — VERIFIED.** Drove 3- then 4-pane splits (`split.horizontal` / `split.vertical` over coctl — synthetic Cmd+D keystrokes proved unreliable, so the socket actions were used). All panes render simultaneously and correctly (漢字 wide cells, ✅ emoji, box-drawing, cursors all live in separate panes); zero Metal/fault lines in stderr. Each pane owns an independent `MetalGridRenderer` (atlas + queue + pipeline + display link) — `MetalGridRenderer` has no shared *mutable* statics (only the immutable shader source + size constants), so there is no cross-pane corruption path.
+- **Per-pane GPU memory is linear** — IOAccelerator(graphics) grew 49 MB (3 panes) → 67 MB (4 panes), ≈ 16–18 MB/pane (the 2048² atlas). Acceptable as a default on modern Macs; this is the concrete motivation for the deferred per-pane atlas-sharing item, not a flip blocker.
+- **Backing-scale on display move — code path sound** (`viewDidChangeBackingProperties` → `contentsScale` update + `setFonts`/atlas flush + repaint, re-rasterizing glyphs at the new DPI; `gpuMetrics()` reads the live `backingScaleFactor`). Dual-DPI hardware not available here, so logic-verified only.
+- **Metal-unavailable fallback** — nil-device guard constructs the pane in CPU mode before the layer class commits (unit-reasoned, slice 1).
+- **Renderer-agnostic automation/IME/selection/copy** — confirmed in slice 1 + user dogfood.
+
+**Readiness verdict:** no regression blocker found. The flip itself is a one-line default change (`CopadConfig.defaults.rendererGPU false → true`) keeping the `gpu = false` opt-out; held for a dogfood window per the slice-3 plan, not done in this unit.
+
 ## Slices
 
 - **Slice 1:** flag + Metal painter at feature parity + unit tests + e2e protocol. Default **off**. ✅ (2026-06-12)
