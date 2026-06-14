@@ -15,7 +15,9 @@
 - Real config (JetBrainsMono Nerd Font 12pt + wallpaper + `[window] opacity 0.8`): pattern renders correctly; Nerd Font powerline/icon glyphs resolve via the cascade (the `?` boxes in the default-font run were missing-glyph parity, as suspected).
 - **Korean IME composition on GPU — verified live**: raw-keycode ㅎㅏㄴㄱㅡㄹ with the 2-Set input source → 한 committed to the grid, 글 painted by `IMEPreeditOverlayView` (opaque bg + underline) mid-composition; Return commits, overlay clears, no residue.
 - **Mouse drag-selection render — verified**: synthetic CGEvent drag paints the surface2 tint over the dragged span.
-- **Unverifiable by automation (painter-agnostic)**: drag → Cmd+C clipboard came back empty under synthetic System Events/CGEvent input on BOTH painters (select-all + copy too), so it is not a GPU regression — either a synthetic-input/responder-chain artifact or a pre-existing copy issue. One manual human drag + Cmd+C settles it; if real copy also fails, file it as its own bug (it predates this work).
+- **Drag → Cmd+C copy — verified by user (2026-06-14)**: real human drag + Cmd+C copies on the GPU path. (Synthetic System Events/CGEvent input had returned an empty clipboard on *both* painters during automation, so the automation gap was an input-injection artifact, not a GPU regression — confirmed.)
+
+**Slice 1 manual-dogfood items are all closed.** Remaining work is slice 2 (perf harness, per-pane atlas sharing, ProMotion/resize polish) and slice 3 (default flip).
 **Predecessor:** [`macos-renderer-migration-plan.md`](./macos-renderer-migration-plan.md) Phase 9 (deferred Metal path). The measurement gate was waived by explicit user decision — GPU rendering work starts now, ahead of a demonstrated CoreText bottleneck, to own the pipeline before scrollback/perf demands force a rushed port.
 
 ## Goal
