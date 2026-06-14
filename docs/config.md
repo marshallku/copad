@@ -223,13 +223,13 @@ Hot-reloads (no restart needed for live panes).
 ```toml
 [renderer]
 transparent_default_bg = false  # default-bg cells transparent when a wallpaper is active
-gpu = false                     # experimental Metal painter (slice 1 — see macos-gpu-renderer-plan.md)
+# gpu = false                   # opt back into the CoreText painter (Metal is the default)
 ```
 
 | Key | Default | Effect |
 | --- | --- | --- |
 | `transparent_default_bg` | `false` (auto-`true` when `[background] image` is set) | Lets the wallpaper show through cells with no explicit ANSI bg. |
-| `gpu` | `false` | Metal render path (CAMetalLayer + glyph atlas) instead of the CoreText painter. Both flags are read at **pane creation** — config hot-reload affects new panes only. Falls back to CoreText when no Metal device exists. |
+| `gpu` | `true` | Metal render path (CAMetalLayer + glyph atlas), the default since the slice-3 flip (~5.5× cheaper main-thread render than CoreText — see [macos-gpu-renderer-plan.md](./macos-gpu-renderer-plan.md)). Set `gpu = false` to opt back into the CoreText painter. Both flags are read at **pane creation** — config hot-reload affects new panes only. Falls back to CoreText automatically when no Metal device exists. |
 
 A stale `backend = "swiftterm"` key from pre-10b configs is parsed and ignored.
 

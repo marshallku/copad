@@ -13,11 +13,13 @@
 ## Overview
 
 Swift/AppKit app. **Current renderer**: `alacritty_terminal` (Rust
-staticlib via `copad-term/`) with a custom AppKit/CoreText draw
-layer, plus an experimental Metal painter behind `[renderer] gpu =
-true` (default off; same `AlacrittyRenderView`, CAMetalLayer backing
-+ `MetalGridRenderer` glyph-atlas pipeline — see
-[macos-gpu-renderer-plan.md](./macos-gpu-renderer-plan.md)).
+staticlib via `copad-term/`) feeding a Metal painter (`MetalGridRenderer`
+glyph-atlas pipeline on a CAMetalLayer-backed `AlacrittyRenderView`) —
+**the default since the slice-3 flip** (~5.5× cheaper main-thread
+render than CoreText). The original AppKit/CoreText draw layer stays
+as the `[renderer] gpu = false` opt-out and the automatic
+Metal-unavailable fallback — see
+[macos-gpu-renderer-plan.md](./macos-gpu-renderer-plan.md).
 **Historical**: started on [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm)
 (commit `e0ddf31` 2026-05-18 flipped default to alacritty; Phase 10b
 2026-06-05 removed SwiftTerm entirely).

@@ -1,6 +1,6 @@
 # macOS GPU (Metal) Renderer Plan
 
-**Status:** Slice 1 shipped 2026-06-12 (flag default off). Slice 2 perf harness done 2026-06-14 — GPU render work ~5.5× cheaper than CoreText; default flip justified, pending dogfood. Remaining slice-2 polish + slice 3 pending.
+**Status:** Slice 3 done 2026-06-14 — **Metal is the default** (`gpu = true`); CoreText painter kept as the `gpu = false` opt-out + Metal-unavailable fallback. Slice 1 (2026-06-12) shipped the painter; slice 2 (2026-06-14) measured GPU render work ~5.5× cheaper than CoreText and verified split coexistence. Remaining: optional slice-2 polish (per-pane atlas sharing, present pacing) as the painter gets dogfood mileage as the default.
 
 ## Slice 1 results (2026-06-12)
 
@@ -17,7 +17,7 @@
 - **Mouse drag-selection render — verified**: synthetic CGEvent drag paints the surface2 tint over the dragged span.
 - **Drag → Cmd+C copy — verified by user (2026-06-14)**: real human drag + Cmd+C copies on the GPU path. (Synthetic System Events/CGEvent input had returned an empty clipboard on *both* painters during automation, so the automation gap was an input-injection artifact, not a GPU regression — confirmed.)
 
-**Slice 1 manual-dogfood items are all closed.** Remaining work is slice 2 (perf harness, per-pane atlas sharing, ProMotion/resize polish) and slice 3 (default flip).
+**Slice 1 manual-dogfood items are all closed.** Slice 2 (perf harness ✅) and slice 3 (default flip ✅) followed; per-pane atlas sharing + ProMotion/present pacing remain as optional polish.
 **Predecessor:** [`macos-renderer-migration-plan.md`](./macos-renderer-migration-plan.md) Phase 9 (deferred Metal path). The measurement gate was waived by explicit user decision — GPU rendering work starts now, ahead of a demonstrated CoreText bottleneck, to own the pipeline before scrollback/perf demands force a rushed port.
 
 ## Goal
@@ -162,10 +162,10 @@ Verifying the regression surfaces that only matter once GPU is the default (ever
 - **Metal-unavailable fallback** — nil-device guard constructs the pane in CPU mode before the layer class commits (unit-reasoned, slice 1).
 - **Renderer-agnostic automation/IME/selection/copy** — confirmed in slice 1 + user dogfood.
 
-**Readiness verdict:** no regression blocker found. The flip itself is a one-line default change (`CopadConfig.defaults.rendererGPU false → true`) keeping the `gpu = false` opt-out; held for a dogfood window per the slice-3 plan, not done in this unit.
+**Readiness verdict:** no regression blocker found — the flip (`CopadConfig.defaults.rendererGPU false → true`, keeping the `gpu = false` opt-out) shipped in slice 3 below.
 
 ## Slices
 
 - **Slice 1:** flag + Metal painter at feature parity + unit tests + e2e protocol. Default **off**. ✅ (2026-06-12)
-- **Slice 2:** perf harness ✅ (numbers above) → next: present pacing for the drawableWait spikes; per-pane atlas sharing for split-heavy memory. Atlas LRU/multi-page deferred (no overflow). Preedit-in-Metal: not worth it (overlay is one tiny transparent layer only while composing).
-- **Slice 3:** default flip after dogfood window; decide whether the CoreText painter stays as fallback or follows SwiftTerm out (10b pattern).
+- **Slice 2:** perf harness ✅ (numbers above) + default-flip readiness audit ✅. Deferred/optional: present pacing for the drawableWait spikes; per-pane atlas sharing for split-heavy memory. Atlas LRU/multi-page deferred (no overflow). Preedit-in-Metal: not worth it (overlay is one tiny transparent layer only while composing).
+- **Slice 3:** ✅ (2026-06-14) — default flipped to `gpu = true`. CoreText painter **stays** as the `gpu = false` opt-out + Metal-unavailable fallback (NOT removed — unlike SwiftTerm's 10b, it's the live fallback for headless/VM/no-Metal contexts and a one-line user escape hatch, so there is no parallel-maintenance burden to retire). A future cleanup pass could revisit removal if the fallback proves unused, but there's no reason to force it.

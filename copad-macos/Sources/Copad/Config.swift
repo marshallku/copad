@@ -91,12 +91,15 @@ struct CopadConfig {
     /// ANSI bg colors and reverse-video cells still materialize opaquely
     /// (Zed pattern).
     let transparentDefaultBg: Bool
-    /// `[renderer] gpu = true` — experimental Metal render path
-    /// (docs/macos-gpu-renderer-plan.md slice 1). Default off. Read at
-    /// pane creation: existing panes keep their painter across config
-    /// hot-reloads (the layer class is committed at view init), new
-    /// panes pick up the new value. Falls back to the CoreText painter
-    /// when no Metal device is available.
+    /// `[renderer] gpu` — Metal render path. **Default on** since the
+    /// slice-3 flip (docs/macos-gpu-renderer-plan.md): measured ~5.5×
+    /// cheaper main-thread render than the CoreText painter, split
+    /// coexistence + IME/selection/copy verified. Set `gpu = false` to
+    /// opt back into the CoreText painter (kept as the fallback —
+    /// 10a/10b pattern). Read at pane creation: existing panes keep
+    /// their painter across config hot-reloads (the layer class is
+    /// committed at view init), new panes pick up the new value. Falls
+    /// back to CoreText automatically when no Metal device is available.
     let rendererGPU: Bool
     /// `[window] opacity` (0.0 = fully transparent, 1.0 = fully opaque,
     /// default 1.0). Controls the window itself + terminal default-bg
@@ -236,7 +239,7 @@ struct CopadConfig {
             rotateInterval: 0,
             osc52: .deny,
             transparentDefaultBg: false,
-            rendererGPU: false,
+            rendererGPU: true,
             windowOpacity: 1.0,
             windowBlur: false,
             tabsPosition: .top,
