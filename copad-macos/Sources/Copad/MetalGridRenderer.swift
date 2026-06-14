@@ -165,6 +165,18 @@ final class MetalGridRenderer {
     private var metrics: Metrics
     private var atlas: GlyphAtlas
 
+    /// Last frame's timing breakdown (ns), populated only when
+    /// `render(measure:)` is called with `measure == true` (the perf
+    /// harness path). Split so the report can separate real render WORK
+    /// (instance assembly + command encoding) from `nextDrawable`'s
+    /// vsync back-pressure — the latter is the main thread parking until
+    /// the display can hand out a drawable, NOT cost, and conflating the
+    /// two inflates the GPU number to ~half a frame whenever the app
+    /// outruns the display. The CPU painter has no equivalent wait, so
+    /// only `lastEncodeNanos` is comparable across painters.
+    private(set) var lastEncodeNanos: UInt64 = 0
+    private(set) var lastDrawableWaitNanos: UInt64 = 0
+
     /// (text, base font) → shaped glyph list. Tint lives per-instance,
     /// so unlike the CPU painter's CTLine cache this survives theme
     /// changes untouched. Flush-all when the (rare) cap is hit —
@@ -251,7 +263,12 @@ final class MetalGridRenderer {
         snap: CopadTermFFI.Snapshot,
         theme: ThemeColors,
         state: FrameState,
+        measure: Bool = false,
     ) -> Bool {
+        if measure {
+            lastEncodeNanos = 0
+            lastDrawableWaitNanos = 0
+        }
         guard let layer else { return true }
         let scale = metrics.scale
         let drawableSize = CGSize(
@@ -265,6 +282,7 @@ final class MetalGridRenderer {
         // Two attempts: an atlas overflow mid-build invalidates every
         // uv already emitted this frame, so flush and rebuild once
         // from the current working set (plan D4 overflow policy).
+        let buildStart = measure ? DispatchTime.now().uptimeNanoseconds : 0
         var instances: [QuadInstance] = []
         for attempt in 0 ..< 2 {
             instances.removeAll(keepingCapacity: true)
@@ -278,9 +296,17 @@ final class MetalGridRenderer {
                 )
             }
         }
+        let buildNanos = measure ? DispatchTime.now().uptimeNanoseconds - buildStart : 0
 
+        // `nextDrawable` can park the main thread waiting for the
+        // display to free a drawable (vsync back-pressure when the app
+        // outruns the refresh). Time it separately so it doesn't masquerade
+        // as render cost.
+        let drawableStart = measure ? DispatchTime.now().uptimeNanoseconds : 0
         guard let drawable = layer.nextDrawable() else { return false }
+        if measure { lastDrawableWaitNanos = DispatchTime.now().uptimeNanoseconds - drawableStart }
 
+        let encodeStart = measure ? DispatchTime.now().uptimeNanoseconds : 0
         let pass = MTLRenderPassDescriptor()
         let attachment = pass.colorAttachments[0]!
         attachment.texture = drawable.texture
@@ -314,6 +340,11 @@ final class MetalGridRenderer {
         encoder.endEncoding()
         cmd.present(drawable)
         cmd.commit()
+        if measure {
+            // Render WORK = instance assembly + command encoding, with
+            // the drawable wait excluded (tracked separately above).
+            lastEncodeNanos = buildNanos + (DispatchTime.now().uptimeNanoseconds - encodeStart)
+        }
         return true
     }
 

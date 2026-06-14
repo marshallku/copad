@@ -816,6 +816,28 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// GPU mode; the CPU painter draws preedit inside `draw(_:)`.
     private var imeOverlay: IMEPreeditOverlayView?
 
+    /// Slice-2 perf harness: when `COPAD_RENDER_METRICS` is set, each
+    /// painter times its main-thread per-frame render work and reports
+    /// windowed percentiles to stderr every `metricsReportInterval`
+    /// frames, labeled `gpu`/`cpu` + grid size so the same workload
+    /// yields directly comparable numbers. Off (zero overhead) when the
+    /// env var is absent — the `enabled` flag short-circuits before any
+    /// clock read. Main-thread time is the apples-to-apples metric: it
+    /// is what governs input latency and main-thread starvation; GPU
+    /// execution time (async) is intentionally out of scope here.
+    private let renderMetricsEnabled =
+        ProcessInfo.processInfo.environment["COPAD_RENDER_METRICS"] != nil
+    /// Render WORK per frame: GPU = instance assembly + command encode
+    /// (drawable wait excluded); CPU = the CoreText `draw(_:)` body.
+    /// This is the apples-to-apples cross-painter number.
+    private var frameMetrics = FrameMetricsRecorder(capacity: 240)
+    /// GPU-only: `nextDrawable` vsync back-pressure, reported alongside
+    /// the work number so a high wait (display throttling) is never
+    /// misread as render cost. Stays empty on the CPU painter.
+    private var drawableWaitMetrics = FrameMetricsRecorder(capacity: 240)
+    private var metricsFrameCounter = 0
+    private static let metricsReportInterval = 120
+
     init(
         theme: CopadTheme,
         font: NSFont,
@@ -1460,8 +1482,16 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             blinkVisible: blinkVisible,
             isKeyWindow: window?.isKeyWindow ?? false,
         )
-        if renderer.render(snap: snap, theme: gpuTheme, state: state) {
+        // The renderer splits its own timing into render WORK vs
+        // `nextDrawable` wait (see `lastEncodeNanos` / `lastDrawableWaitNanos`).
+        // Only a successfully presented frame is recorded so a
+        // nil-drawable retry doesn't pollute the distribution.
+        if renderer.render(snap: snap, theme: gpuTheme, state: state, measure: renderMetricsEnabled) {
             gpuFrameDirty = false
+            if renderMetricsEnabled {
+                drawableWaitMetrics.record(renderer.lastDrawableWaitNanos)
+                recordFrameMetric(renderer.lastEncodeNanos)
+            }
         }
         // Keep the preedit overlay anchored to the (possibly moved)
         // cursor while composing.
@@ -1474,6 +1504,37 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
                 cursorCol: Int(cursor.col),
             )
         }
+    }
+
+    /// Feed one frame duration into the recorder and flush a windowed
+    /// report to stderr every `metricsReportInterval` frames. Only
+    /// reached when `renderMetricsEnabled` (so the recorder stays
+    /// untouched in normal runs).
+    private func recordFrameMetric(_ ns: UInt64) {
+        frameMetrics.record(ns)
+        metricsFrameCounter += 1
+        guard metricsFrameCounter >= Self.metricsReportInterval else { return }
+        metricsFrameCounter = 0
+        guard let s = frameMetrics.stats() else { return }
+        let painter = metalRenderer != nil ? "gpu" : "cpu"
+        let (cols, rows) = computeGrid()
+        let ms = { (v: UInt64) in Double(v) / 1_000_000.0 }
+        var msg = String(
+            format: "[copad-metrics] painter=%@ grid=%dx%d frames=%d work["
+                + "mean=%.3f p50=%.3f p95=%.3f p99=%.3f max=%.3f]ms",
+            painter, Int(cols), Int(rows), s.count,
+            ms(s.meanNs), ms(s.p50Ns), ms(s.p95Ns), ms(s.p99Ns), ms(s.maxNs),
+        )
+        // GPU-only: surface the vsync back-pressure separately so a high
+        // drawable wait reads as display throttling, not render cost.
+        if metalRenderer != nil, let d = drawableWaitMetrics.stats() {
+            msg += String(
+                format: " drawableWait[p50=%.3f p95=%.3f max=%.3f]ms",
+                ms(d.p50Ns), ms(d.p95Ns), ms(d.maxNs),
+            )
+        }
+        msg += "\n"
+        FileHandle.standardError.write(Data(msg.utf8))
     }
 
     /// Convert a list of dirty viewport row indices into AppKit
@@ -1561,6 +1622,17 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         guard let snap = snapshotCache,
               let ctx = NSGraphicsContext.current?.cgContext
         else { return }
+
+        // Perf harness: time the CoreText paint. Note this reflects
+        // PARTIAL repaint (only `dirtyRect`'s rows) — full-screen
+        // workloads (scroll/`yes`) drive the whole view dirty and make
+        // it directly comparable to the GPU full-frame redraw.
+        let metricsStart = renderMetricsEnabled ? DispatchTime.now().uptimeNanoseconds : 0
+        defer {
+            if renderMetricsEnabled {
+                recordFrameMetric(DispatchTime.now().uptimeNanoseconds - metricsStart)
+            }
+        }
 
         // Fill the bounds with theme background unless we're in a
         // transparent-default-bg mode. AppKit clips this context to

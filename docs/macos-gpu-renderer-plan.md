@@ -1,6 +1,6 @@
 # macOS GPU (Metal) Renderer Plan
 
-**Status:** Slice 1 shipped 2026-06-12 (flag default off). Slice 2/3 pending.
+**Status:** Slice 1 shipped 2026-06-12 (flag default off). Slice 2 perf harness done 2026-06-14 — GPU render work ~5.5× cheaper than CoreText; default flip justified, pending dogfood. Remaining slice-2 polish + slice 3 pending.
 
 ## Slice 1 results (2026-06-12)
 
@@ -131,8 +131,29 @@ swiftformat + zero new build warnings (Swift quality gate), `cargo fmt`/`clippy`
 - **R3** "Pixel-parity" stronger than the visual-inspection test gate → claim weakened, gate documented as visual-parity.
 - **R4** nil-device fallback must resolve before the layer class commits → D3 reordered (resolve at controller init, pass mode+device into view).
 
+## Slice 2 — render perf harness + numbers (2026-06-14)
+
+**Harness.** `COPAD_RENDER_METRICS=1` (env, zero overhead when unset) turns on per-frame main-thread timing in both painters. `FrameMetricsRecorder` (CopadCore, pure logic + 10 unit tests) is a 240-frame ring buffer with nearest-rank percentiles; each painter reports a windowed line to stderr every 120 frames, labeled `gpu`/`cpu` + grid size. The GPU path splits its timing into **render work** (instance assembly + command encode) vs **`nextDrawable` wait** (vsync back-pressure) — conflating them inflated the early GPU reads to ~7ms; once split, the work number is rock-steady. Only `work` is cross-painter comparable (the CPU painter has no drawable wait).
+
+**Numbers** (133×36 grid, frontmost window, sustained full-screen `yes` scroll = worst case; 240-frame windows):
+
+| painter | work p50 | work p95 | work max | drawableWait p50 / p95 |
+|---|---|---|---|---|
+| GPU | **0.62 ms** | 0.66 ms | 0.70 ms | 0.02 ms / 7.6 ms |
+| CPU (CoreText) | **3.35 ms** | 3.64 ms | 3.82 ms | — |
+
+A syntax-highlighted vim scroll (1.7k-line Python) gave the same magnitudes. **GPU render work is ~5.5× lower** (0.62 vs 3.35 ms) and tighter; on every full-screen frame the CoreText painter spends ~20% of a 16.7 ms budget on the main thread vs the GPU path's ~4%.
+
+The GPU `drawableWait` p50 is ~0.02 ms (free) but spikes to 7–16 ms when the app outruns the 60 Hz display — that is back-pressure (the main thread parking until a drawable frees), **not** render cost, and it is the real remaining slice-2 perf target (present pacing / `presentsWithTransaction` / display-synced present), NOT the median work.
+
+**Decisions from the data:**
+- **Slice 3 default flip is justified on perf** — clear, steady main-thread win on heavy load; the median-cost "trivially cheap" assumption holds (0.62 ms).
+- **Atlas LRU / multi-page: deferred indefinitely** — zero overflow logs across all workloads; the 2048² atlas never filled. Re-open only if an overflow line appears in the wild.
+- **Per-pane atlas sharing: a memory item (~16 MB/pane), not perf** — worth doing for split-heavy users; the perf data does not make it urgent.
+- **ProMotion / present-pacing is the next slice-2 perf unit** — target the drawableWait spikes, not the work number.
+
 ## Slices
 
-- **Slice 1 (now):** flag + Metal painter at feature parity (list above) + unit tests + e2e protocol. Default **off**.
-- **Slice 2:** perf harness (gpu vs coretext frame times on `yes`/`seq`/vim-scroll workloads), atlas LRU/multi-page, ProMotion/resize polish, preedit-in-Metal evaluation.
+- **Slice 1:** flag + Metal painter at feature parity + unit tests + e2e protocol. Default **off**. ✅ (2026-06-12)
+- **Slice 2:** perf harness ✅ (numbers above) → next: present pacing for the drawableWait spikes; per-pane atlas sharing for split-heavy memory. Atlas LRU/multi-page deferred (no overflow). Preedit-in-Metal: not worth it (overlay is one tiny transparent layer only while composing).
 - **Slice 3:** default flip after dogfood window; decide whether the CoreText painter stays as fallback or follows SwiftTerm out (10b pattern).
