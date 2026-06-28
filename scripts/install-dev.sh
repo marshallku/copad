@@ -174,6 +174,24 @@ if [ -d "$WORKFLOWS_SRC" ]; then
     echo "==> seeded $seeded workflow yaml(s) to $WORKFLOWS_DST (skipped $skipped existing)"
 fi
 
+# Phase 22.1 / 22.3 context bridge (zsh). Linux gets live cwd from VTE
+# (OSC 7) for free, so unlike macOS no copad-cwd hook is needed here —
+# but the richer pane_context (git_remote / branch / tmux) AND the
+# `doc.opened` signal that drives the KB panel's active-note slot +
+# project scoping come ONLY from this prompt hook. Without it those two
+# features are silently inert (the panel's static slots still work).
+# Single source of truth at examples/shell/copad-context.zsh; copied to
+# ~/.config/copad/shell-hooks/ to match the macOS installer. The user
+# sources it from their rc (printed at the end). No-op outside copad PTY
+# children, so sourcing unconditionally is safe.
+CONTEXT_HOOK_SRC="$REPO_ROOT/examples/shell/copad-context.zsh"
+CONTEXT_HOOK_DST="$HOME/.config/copad/shell-hooks/copad-context.zsh"
+if [ -f "$CONTEXT_HOOK_SRC" ]; then
+    mkdir -p "$(dirname "$CONTEXT_HOOK_DST")"
+    cp -f "$CONTEXT_HOOK_SRC" "$CONTEXT_HOOK_DST"
+    echo "==> installed context bridge hook to $CONTEXT_HOOK_DST"
+fi
+
 if $DO_DAEMON; then
     # `systemd --user` unit install. Without this, copadd never starts
     # automatically — every reboot or new SSH session leaves the user
@@ -232,6 +250,38 @@ if $DO_DAEMON; then
         echo "warn: systemctl not on PATH; skipping daemon service install."
         echo "warn: on non-systemd systems, run copadd via your own init"
         echo "warn: (OpenRC / runit / direct nohup ~/.local/bin/copadd)."
+    fi
+fi
+
+# Nudge the user to source the context bridge hook if they haven't.
+# Without it the KB panel's "Active note" slot + project scoping stay
+# inert (doc.opened / pane.context_changed never fire — the symptom is
+# an always-empty "Active note" and no project pill, easily mistaken
+# for "that's just how it is"). Quiet once sourced so re-installs don't
+# nag. Mirrors the macOS installer's post-install instruction.
+#
+# grep returns exit 2 (error) when ANY path argument is missing, even
+# if the pattern matched in another file — and `-s` suppresses only the
+# message, not that code. So check each rc that actually exists rather
+# than passing the whole candidate list to one grep.
+if [ -f "$CONTEXT_HOOK_DST" ]; then
+    NUDGE_NEEDED=true
+    for rc in "$HOME/.zshrc" "$HOME/.zshenv"; do
+        if [ -f "$rc" ] && grep -qsF "shell-hooks/copad-context.zsh" "$rc"; then
+            NUDGE_NEEDED=false
+        fi
+    done
+    if $NUDGE_NEEDED && [ -d "$HOME/.config/zsh" ] \
+        && grep -rqsF "shell-hooks/copad-context.zsh" "$HOME/.config/zsh"; then
+        NUDGE_NEEDED=false
+    fi
+    if $NUDGE_NEEDED; then
+        echo
+        echo "note: the KB panel's active-note + project scoping need the context"
+        echo "      bridge hook (zsh-only in v1). Add this line to your ~/.zshrc,"
+        echo "      then start a new copad shell:"
+        echo "          source ~/.config/copad/shell-hooks/copad-context.zsh"
+        echo "      Safe to source unconditionally — it no-ops outside copad panes."
     fi
 fi
 

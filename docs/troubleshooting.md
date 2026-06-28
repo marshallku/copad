@@ -549,6 +549,36 @@ after manual verification, silence locally with
 
 ---
 
+### KB panel "Active note" always empty / no project scoping (context bridge hook not sourced)
+
+**Symptom.** The Knowledge Base panel (`plugins/docs`) renders backlinks, tags,
+related notes, folders, and recent edits fine, but the **Active note** slot stays
+on "Open a file under your KB root in nvim to see context here." no matter what you
+edit, and the project-scope pill never appears.
+
+**Cause.** Those two slots are driven by the `doc.opened` and `pane.context_changed`
+bus events, which are published only by the Phase 22.1 context bridge shell hook
+(`examples/shell/copad-context.zsh`) from the prompt. The daemon-side wiring is fine
+(`context.snapshot` returns `active_doc` the moment a `doc.opened` event arrives) —
+the events simply never fire because the hook isn't sourced. Live `cwd` still works
+because that comes from VTE's OSC 7 handler, not the hook, which masks the gap.
+
+Before 2026-06-16 the Linux `install-dev.sh` didn't even copy the hook to a stable
+path (only `install-macos.sh` did), so there was nothing to source.
+
+**Fix.** Re-run `./scripts/install-dev.sh` (it now installs the hook to
+`~/.config/copad/shell-hooks/copad-context.zsh` and prints a one-line source
+reminder when your rc doesn't already reference it), then add to `~/.zshrc`:
+
+```sh
+source ~/.config/copad/shell-hooks/copad-context.zsh
+```
+
+Start a new copad shell. The hook no-ops outside copad PTY children, so sourcing it
+unconditionally is safe. zsh-only in v1 (bash/fish ports are roadmap Phase 21).
+
+---
+
 ## macOS App Issues
 
 ### SwiftTerm: `processTerminated` never called after shell exits
