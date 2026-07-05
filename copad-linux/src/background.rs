@@ -61,6 +61,23 @@ pub struct BackgroundLayer {
     // One-shot guard so a missing/empty wallpaper list (rotation enabled but
     // nothing to pick) warns once instead of silently no-op'ing every tick.
     empty_list_warned: Cell<bool>,
+    // Async decode pipeline (mirrors macOS's off-main NSImage decode +
+    // backgroundLoadToken). `gdk::Texture::from_file` decoded on the GTK main
+    // thread, stalling VTE's PTY IO-watch on large wallpapers; now decode runs
+    // on gio's blocking pool and only the ready texture is mounted on main.
+    // Bumped by every transition so a slow decode landing after a newer
+    // request/clear is dropped instead of resurrecting a stale image.
+    load_generation: Cell<u64>,
+    // At most one decode in flight; a request arriving mid-decode is coalesced
+    // into `pending` (latest wins), so `background.next` spam bounds decode
+    // work to 1-in-flight + 1-queued instead of a full 4K decode per keypress.
+    decoding: Cell<bool>,
+    pending: RefCell<Option<(PathBuf, bool)>>,
+    // The image identity actually on screen (set only on a successful mount,
+    // cleared by `clear_image`). `current` tracks the latest *request* for
+    // command semantics; `mounted` is the rollback target when a decode fails
+    // so logical state never claims an image that never painted.
+    mounted: RefCell<Option<(PathBuf, bool)>>,
 }
 
 impl BackgroundLayer {
@@ -112,6 +129,10 @@ impl BackgroundLayer {
             last_mode_active: Cell::new(copad_core::background::is_active(&bg_paths().mode_file)),
             mode_monitor: RefCell::new(None),
             empty_list_warned: Cell::new(false),
+            load_generation: Cell::new(0),
+            decoding: Cell::new(false),
+            pending: RefCell::new(None),
+            mounted: RefCell::new(None),
         });
 
         layer.refresh_window_backdrop();
@@ -126,17 +147,17 @@ impl BackgroundLayer {
         layer
     }
 
-    pub fn set_image(&self, path: &Path) {
+    pub fn set_image(self: &Rc<Self>, path: &Path) {
         self.apply_image(path, false);
     }
 
     /// Like [`set_image`], but marks the image as picked from the wallpaper
     /// list — the only kind `background.delete_current` will delete.
-    pub fn set_image_from_list(&self, path: &Path) {
+    pub fn set_image_from_list(self: &Rc<Self>, path: &Path) {
         self.apply_image(path, true);
     }
 
-    fn apply_image(&self, path: &Path, from_list: bool) {
+    fn apply_image(self: &Rc<Self>, path: &Path, from_list: bool) {
         eprintln!("[copad] background.set_image: {}", path.display());
 
         if !path.exists() {
@@ -147,31 +168,111 @@ impl BackgroundLayer {
             return;
         }
 
-        let file = gtk4::gio::File::for_path(path);
-        match gdk::Texture::from_file(&file) {
-            Ok(texture) => {
-                eprintln!(
-                    "[copad] background texture loaded: {}x{}",
-                    texture.width(),
-                    texture.height()
-                );
-                self.bg_picture.set_paintable(Some(&texture));
-            }
-            Err(e) => {
-                eprintln!(
-                    "[copad] FAILED to load background image {}: {}",
-                    path.display(),
-                    e
-                );
+        // Logical state is synchronous — like macOS setting `currentBackgroundPath`
+        // before the async decode — so `background.next` immediately followed by
+        // `delete_current` operates on the just-picked image, not the previous one.
+        *self.current.borrow_mut() = Some((path.to_path_buf(), from_list));
+        self.has_image.set(true);
+
+        // Every request supersedes any in-flight decode (stale-drop guard).
+        self.load_generation.set(self.load_generation.get() + 1);
+
+        // Coalesce: with a decode already running, keep only the latest request;
+        // the running decode's completion drains it.
+        if self.decoding.get() {
+            *self.pending.borrow_mut() = Some((path.to_path_buf(), from_list));
+            return;
+        }
+
+        self.spawn_decode(path.to_path_buf(), from_list);
+    }
+
+    /// Bump the load generation and drop any queued request so an in-flight
+    /// decode landing later is discarded rather than mounted. Used by paths that
+    /// decide "keep/clear what's shown" without starting a new decode
+    /// (`clear_image`, config reloads that keep the current image).
+    fn invalidate_pending(&self) {
+        self.load_generation.set(self.load_generation.get() + 1);
+        *self.pending.borrow_mut() = None;
+    }
+
+    /// Decode `path` on gio's blocking pool, then mount the texture on the main
+    /// thread if it is still the latest request. Only `glib::Bytes` + dimensions
+    /// cross the thread boundary — GDK/pixbuf objects are not `Send`.
+    fn spawn_decode(self: &Rc<Self>, path: PathBuf, from_list: bool) {
+        let generation = self.load_generation.get();
+        self.decoding.set(true);
+        let weak = Rc::downgrade(self);
+        glib::spawn_future_local(async move {
+            let decode_path = path.clone();
+            let result = gtk4::gio::spawn_blocking(move || decode_image(&decode_path)).await;
+            let Some(layer) = weak.upgrade() else {
                 return;
+            };
+            // `spawn_blocking` reports a panic in the decode as `Err`.
+            let decoded = result.unwrap_or_else(|_| Err("decode task panicked".to_string()));
+            layer.on_decode_complete(generation, path, from_list, decoded);
+        });
+    }
+
+    fn on_decode_complete(
+        self: &Rc<Self>,
+        generation: u64,
+        path: PathBuf,
+        from_list: bool,
+        decoded: Result<DecodedImage, String>,
+    ) {
+        self.decoding.set(false);
+
+        // Mount only if no newer request/clear superseded this decode.
+        if generation == self.load_generation.get() {
+            match decoded {
+                Ok(image) => {
+                    self.mount_texture(image);
+                    *self.mounted.borrow_mut() = Some((path, from_list));
+                }
+                Err(e) => {
+                    eprintln!("[copad] FAILED to load background image: {e}");
+                    // `current`/`has_image` were committed synchronously at
+                    // request time; the requested image never mounted, so roll
+                    // them back to what is actually on screen. Otherwise
+                    // `delete_current` could delete a list image that was never
+                    // displayed (its "currently displayed" contract).
+                    let mounted = self.mounted.borrow().clone();
+                    self.has_image.set(mounted.is_some());
+                    *self.current.borrow_mut() = mounted;
+                }
             }
         }
 
+        // Drain the coalesced request (already bumped to the latest generation).
+        let next = self.pending.borrow_mut().take();
+        if let Some((path, from_list)) = next {
+            self.spawn_decode(path, from_list);
+        }
+    }
+
+    fn mount_texture(&self, image: DecodedImage) {
+        eprintln!(
+            "[copad] background texture loaded: {}x{}",
+            image.width, image.height
+        );
+        let format = if image.has_alpha {
+            gdk::MemoryFormat::R8g8b8a8
+        } else {
+            gdk::MemoryFormat::R8g8b8
+        };
+        let texture = gdk::MemoryTexture::new(
+            image.width,
+            image.height,
+            format,
+            &image.bytes,
+            image.rowstride as usize,
+        );
+        self.bg_picture.set_paintable(Some(&texture));
         self.bg_picture.set_visible(true);
         self.bg_picture.set_opacity(self.image_opacity.get());
         self.tint_overlay.set_visible(true);
-        self.has_image.set(true);
-        *self.current.borrow_mut() = Some((path.to_path_buf(), from_list));
     }
 
     /// The displayed image's path, only when it came from the wallpaper list.
@@ -220,7 +321,7 @@ impl BackgroundLayer {
 
     /// One rotation tick: respect the shared mode flag, pick a random list
     /// image, apply it. No-op when the list is missing/empty (warned once).
-    pub fn rotate_once(&self) {
+    pub fn rotate_once(self: &Rc<Self>) {
         let paths = bg_paths();
         if !copad_core::background::is_active(&paths.mode_file) {
             return;
@@ -313,10 +414,12 @@ impl BackgroundLayer {
 
     pub fn clear_image(&self) {
         eprintln!("[copad] background.clear_image");
+        self.invalidate_pending();
         self.bg_picture.set_visible(false);
         self.tint_overlay.set_visible(false);
         self.has_image.set(false);
         *self.current.borrow_mut() = None;
+        *self.mounted.borrow_mut() = None;
     }
 
     pub fn set_tint(&self, opacity: f64) {
@@ -334,7 +437,7 @@ impl BackgroundLayer {
         );
     }
 
-    pub fn apply_config(&self, config: &CopadConfig, theme_bg: &str) {
+    pub fn apply_config(self: &Rc<Self>, config: &CopadConfig, theme_bg: &str) {
         self.window_opacity.set(norm_opacity(config.window.opacity));
         *self.theme_bg.borrow_mut() = theme_bg.to_string();
         self.refresh_window_backdrop();
@@ -361,9 +464,15 @@ impl BackgroundLayer {
                 if path.exists() {
                     self.set_image(path);
                 } else {
-                    // Don't silently ignore a config typo; surface it
-                    // and keep the previously rendered image so the
-                    // user can fix the path without flicker.
+                    // Don't silently ignore a config typo; surface it and keep
+                    // the previously rendered image so the user can fix the path
+                    // without flicker. Drop a pending *static* decode that's now
+                    // unwanted — but never a list/rotation pick: config changes
+                    // must not disturb rotation (`current` is synchronous, so
+                    // `showing_list_image()` reflects the pending decode's kind).
+                    if !self.showing_list_image() {
+                        self.invalidate_pending();
+                    }
                     eprintln!(
                         "[copad] background.image points at {} which does not exist; \
                          keeping previously rendered image",
@@ -372,14 +481,43 @@ impl BackgroundLayer {
                 }
             }
             None => {
-                // A rotated wallpaper isn't config-driven — a reload that
-                // merely touched tint/opacity/interval must not clear it.
+                // A rotated wallpaper isn't config-driven — a reload that merely
+                // touched tint/opacity/interval must not clear it or drop its
+                // in-flight decode. Only a static image is cleared, and
+                // `clear_image` invalidates that static decode itself.
                 if self.has_image.get() && !self.showing_list_image() {
                     self.clear_image();
                 }
             }
         }
     }
+}
+
+/// Raw decoded pixels handed from the blocking decode thread to the main
+/// thread. Only `Send` types: GDK/pixbuf objects are not `Send`, so the pixbuf
+/// is consumed inside [`decode_image`] and never escapes it.
+struct DecodedImage {
+    bytes: glib::Bytes,
+    width: i32,
+    height: i32,
+    rowstride: i32,
+    has_alpha: bool,
+}
+
+/// Decode an image file to raw pixels off the main thread (runs on gio's
+/// blocking pool via `spawn_blocking`; must not touch GTK widgets).
+fn decode_image(path: &Path) -> Result<DecodedImage, String> {
+    let pixbuf = gtk4::gdk_pixbuf::Pixbuf::from_file(path).map_err(|e| e.to_string())?;
+    // `gdk::Texture::from_file` honors EXIF orientation; pixbuf does not unless
+    // asked, so match it to avoid sideways JPEG wallpapers.
+    let pixbuf = pixbuf.apply_embedded_orientation().unwrap_or(pixbuf);
+    Ok(DecodedImage {
+        width: pixbuf.width(),
+        height: pixbuf.height(),
+        rowstride: pixbuf.rowstride(),
+        has_alpha: pixbuf.has_alpha(),
+        bytes: pixbuf.read_pixel_bytes(),
+    })
 }
 
 fn update_tint_css(provider: &gtk4::CssProvider, hex_color: &str, opacity: f64) {

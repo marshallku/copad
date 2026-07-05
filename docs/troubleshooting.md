@@ -726,3 +726,11 @@ settings:
 ```
 
 Save the manifest, then reinstall the app from the **Install App** sidebar entry so the new scopes/events take effect. Frames should start flowing on the next plugin reconnect.
+
+### Linux: stdin/stdout stutters for ~1s when the background image switches
+
+**Symptom.** On Linux, every background transition (`background.next`, the rotation timer, cross-instance `toggle`) briefly freezes the terminal — typing and command output hitch for a fraction of a second, worse with large (4K+) wallpapers.
+
+**Cause.** VTE runs the PTY read/write loop as a GLib IO-watch on the **same GTK main context** that renders — on Linux there is no separate render/PTY thread (that split exists only on macOS via alacritty's dedicated `EventLoop` reader thread). The old code decoded the image with `gdk::Texture::from_file()` **synchronously on the main thread**, so a large decode blocked the main loop and VTE could not service the PTY until it finished. Measured: up to ~1.3 s PTY stall and ~900 ms socket round-trip per switch on a 13756×5756 wallpaper.
+
+**Fix (decision #59).** `BackgroundLayer` decodes on gio's blocking pool (`gio::spawn_blocking`) and only mounts the finished `MemoryTexture` on main; a `load_generation` counter drops stale decodes and a single-in-flight + latest-pending coalesce bounds work under rapid switching. After the fix the same test shows ≤25 ms PTY gaps (one frame) and 23–56 ms round-trips. If a regression reappears, confirm decode is still off-main: the `[copad] background texture loaded` log should print *after* the socket command returns, not before.
