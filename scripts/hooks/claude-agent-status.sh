@@ -133,6 +133,32 @@ self_test() {
         printf '  FAIL %s\n' "hostile cwd broke JSON"; fails=$((fails + 1))
     fi
 
+    # --- gate tests: exercise main() (not just emit) with a stubbed coctl on
+    # PATH, so the COPAD_PANEL_ID-or-COPAD_SOCKET gate is actually verified. ---
+    local tmp stub captured
+    tmp="$(mktemp -d)"; stub="$tmp/bin"; captured="$tmp/published"
+    mkdir -p "$stub"
+    # stub coctl records "publish <kind>" when invoked as `coctl event publish …`.
+    printf '#!/bin/sh\n[ "$1" = event ] && [ "$2" = publish ] && echo "publish $3" >>"%s"\nexit 0\n' \
+        "$captured" > "$stub/coctl"
+    chmod +x "$stub/coctl"
+    gate() { # desc  env-assignments  expect-published(1/0)
+        local desc="$1" want="$3"
+        : > "$captured"
+        env PATH="$stub:$PATH" $2 bash "$0" stopped \
+            <<<'{"cwd":"/t","session_id":"s"}' >/dev/null 2>&1
+        local got=0; [ -s "$captured" ] && got=1
+        if [ "$got" = "$want" ]; then printf '  ok   %s\n' "$desc"
+        else printf '  FAIL %s (want published=%s got=%s)\n' "$desc" "$want" "$got"; fails=$((fails + 1)); fi
+    }
+    gate "gate: COPAD_SOCKET set, no PANEL_ID → publishes (SSH path)" \
+        "COPAD_SOCKET=/x COPAD_PANEL_ID=" 1
+    gate "gate: COPAD_PANEL_ID set, no SOCKET → publishes (local path)" \
+        "COPAD_PANEL_ID=p COPAD_SOCKET=" 1
+    gate "gate: neither set → no-op (outside copad)" \
+        "COPAD_PANEL_ID= COPAD_SOCKET=" 0
+    rm -rf "$tmp"
+
     if [ "$fails" -eq 0 ]; then
         echo "self-test: all passed"
     else
@@ -148,8 +174,15 @@ main() {
         return
     fi
     local event="$1"
-    # Silent no-op outside copad or without the tools we need.
-    [ -n "${COPAD_PANEL_ID:-}" ] || exit 0
+    # Gate: only act when a copad daemon is reachable. That's true either
+    # inside a local copad pane ($COPAD_PANEL_ID is exported there) or over
+    # SSH when the daemon socket has been forwarded and $COPAD_SOCKET points
+    # at it (see docs/ssh-remote.md). Over SSH $COPAD_PANEL_ID is NOT
+    # forwarded, so requiring it would make the remote path silently no-op;
+    # emit() defaults panel_id to "" and the Slice-1 toast uses cwd anyway.
+    if [ -z "${COPAD_PANEL_ID:-}" ] && [ -z "${COPAD_SOCKET:-}" ]; then
+        exit 0
+    fi
     command -v coctl >/dev/null 2>&1 || exit 0
     command -v jq >/dev/null 2>&1 || exit 0
 

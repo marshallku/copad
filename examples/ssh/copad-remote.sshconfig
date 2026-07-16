@@ -1,0 +1,34 @@
+# copad over SSH — forward the workstation daemon socket to a remote host so the
+# remote shell's `coctl` (Claude hooks, agent-status, `event publish`) reaches
+# your workstation's copadd. Delivers "remote agent finishes → workstation toast."
+#
+# Full guide + the SECURITY trust decision: docs/ssh-remote.md. READ IT before
+# using this — forwarding the socket grants the remote host broad control of your
+# workstation copad (terminal.exec, tab.new, claude.start, plugin actions, …).
+# Only forward to hosts you fully trust (your own machines).
+#
+# Copy this block into ~/.ssh/config and edit the two marked lines.
+# One-time setup on the client: `mkdir -p ~/.ssh/cm && chmod 700 ~/.ssh/cm`
+
+Host my-remote                       # ← rename; a Tailscale *.ts.net host works
+    # --- connection multiplexing: one shared SSH connection (hence ONE forwarded
+    # socket) for all copad panes to this host. Establish the master explicitly
+    # once so panes reuse it: `ssh -Nf my-remote` (see docs/ssh-remote.md § races).
+    ControlMaster auto
+    ControlPath ~/.ssh/cm/%C         # short hashed path — avoids socket-path limits
+    ControlPersist 10m
+
+    # --- the forward. Fail loudly if it can't bind; unlink a stale socket; keep
+    # the socket owner-only (0600-equivalent).
+    ExitOnForwardFailure yes
+    StreamLocalBindUnlink yes
+    StreamLocalBindMask 0177
+
+    # Left  = path ON THE REMOTE (kept distinct from the remote's own copad socket
+    #         so we never clobber a copadd running there). The remote shell-rc
+    #         (examples/ssh/remote-shellrc.sh) exports COPAD_SOCKET to this path.
+    # Right = your WORKSTATION daemon socket — a RESOLVED LITERAL path. ssh_config
+    #         does NOT expand $XDG_RUNTIME_DIR / $(id -u) / ~, so substitute by hand:
+    #           Arch/Linux : /run/user/1000/copad/socket   (replace 1000 = `id -u`)
+    #           macOS      : /Users/YOU/Library/Caches/copad/socket
+    RemoteForward /tmp/copad-ws.sock /run/user/1000/copad/socket   # ← EDIT both
