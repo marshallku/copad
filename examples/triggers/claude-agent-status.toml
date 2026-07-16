@@ -1,0 +1,92 @@
+# Claude Code agent-status → desktop toast (+ presence-gated Discord).
+#
+# Slice 1 of the "agent lifecycle" feature (see docs/orca-feature-analysis.md
+# Tier-1 #1): notify when an AI agent spawned in a copad pane finishes a
+# turn or needs your input. This is notification-only — the per-tab
+# attention badge is Slice 2.
+#
+# Pipeline (all pieces already exist in copad):
+#
+#   Claude Stop/Notification hook
+#     → scripts/hooks/claude-agent-status.sh publishes claude.<event>
+#     → these triggers (accept_external = true) fire notify.show
+#
+# How to use:
+#
+# 1. Wire the hook publisher. Point your Claude Code hooks at the
+#    shipped script (docs/harness-hooks.md § "Agent status → toast"):
+#      Stop         → claude-agent-status.sh stopped
+#      Notification → claude-agent-status.sh notification
+#    It no-ops outside copad ($COPAD_PANEL_ID unset) and when the daemon
+#    is down (--quiet), so it never breaks a hook.
+#
+# 2. Copy the [[triggers]] blocks below into ~/.config/copad/config.toml.
+#    The [triggers.security] accept_external = true line is REQUIRED —
+#    without it these socket-published events are ignored (decisions.md
+#    #37 trust boundary).
+#
+# 3. (Optional Discord) Replace REPLACE_WITH_YOUR_CHANNEL_ID and set
+#    `coctl presence away` to route pings to your phone while you're
+#    stepped out. Drop those two blocks if you only want local toasts.
+#
+# 4. Restart copadd, or wait ~2s for the config-watcher to reload.
+#
+# 5. Verify without a real hook fire:
+#      coctl event publish claude.session_stopped --quiet \
+#        '{"panel_id":"demo","cwd":"/tmp/demo","session":"s1"}'
+#    A toast should pop. Then:
+#      coctl event publish claude.awaiting_input --quiet \
+#        '{"panel_id":"demo","cwd":"/tmp/demo","notification_type":"permission_prompt","message":"Allow Bash?"}'
+
+
+# Agent finished a turn (Stop hook). Occurrence-based: fires on every
+# Stop — a blocking sibling Stop hook may continue the agent, and the
+# hook schema has no reliable "final stop" signal, so we surface each
+# pause rather than risk suppressing the real completion.
+[[triggers]]
+name = "claude-agent-stopped-toast"
+action = "notify.show"
+params = { title = "에이전트 완료", body = "{event.cwd}", level = "info" }
+[triggers.when]
+event_kind = "claude.session_stopped"
+[triggers.security]
+accept_external = true
+
+
+# Agent needs your input/permission (Notification hook, filtered to
+# permission_prompt / elicitation_dialog / agent_needs_input by the
+# publisher script). Warn level so it stands out from a plain "done".
+[[triggers]]
+name = "claude-agent-awaiting-toast"
+action = "notify.show"
+params = { title = "승인/입력 대기", body = "{event.message}", level = "warn" }
+[triggers.when]
+event_kind = "claude.awaiting_input"
+[triggers.security]
+accept_external = true
+
+
+# --- Optional: presence-gated Discord pings (mirror of the pattern in
+# claude-hooks.toml). Only fire when you've run `coctl presence away`,
+# so your phone stays quiet while you're at the keyboard. ---
+
+[[triggers]]
+name = "claude-agent-stopped-discord"
+action = "discord.send_message"
+params = { channel_id = "REPLACE_WITH_YOUR_CHANNEL_ID", content = ":checkered_flag: agent finished in `{event.cwd}`" }
+condition = 'context.presence == "away"'
+[triggers.when]
+event_kind = "claude.session_stopped"
+[triggers.security]
+accept_external = true
+
+
+[[triggers]]
+name = "claude-agent-awaiting-discord"
+action = "discord.send_message"
+params = { channel_id = "REPLACE_WITH_YOUR_CHANNEL_ID", content = ":raised_hand: agent needs you in `{event.cwd}`: {event.message}" }
+condition = 'context.presence == "away"'
+[triggers.when]
+event_kind = "claude.awaiting_input"
+[triggers.security]
+accept_external = true
