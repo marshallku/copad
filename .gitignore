@@ -1,5 +1,7 @@
 target/
 .DS_Store
+# docs/ lives in ~/docs/repo-docs/copad (private SSoT); this is a symlink, tracked there only
+/docs
 *.swp
 *.swo
 .claude/

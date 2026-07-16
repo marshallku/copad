@@ -1,0 +1,15 @@
+# copad
+
+Cross-platform custom terminal emulator with a shared Rust core and platform-native UIs
+(Linux GTK4+VTE4, macOS Swift/AppKit), a control CLI (coctl), and a first-party plugin system.
+
+## Documentation
+
+Contributor-facing docs live in the private SSoT (`~/docs`), not in this repo:
+
+- Repo docs (architecture, decisions, roadmap, troubleshooting, per-subsystem):
+  `~/docs/repo-docs/copad/` — surfaced here as the `docs/` symlink. Start at `docs/INDEX.md`.
+- SSoT topic note (why/history/cross-links): `~/docs/topics/terminal/copad.md`
+
+The `docs/` directory in this repo is a symlink into `~/docs/repo-docs/copad` and is
+gitignored here; those files are tracked only in the `~/docs` repo.
