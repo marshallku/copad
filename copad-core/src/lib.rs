@@ -4,6 +4,7 @@ pub mod background;
 pub mod condition;
 pub mod config;
 pub mod context;
+pub mod design_grab;
 pub mod error;
 pub mod event_bus;
 pub mod fs_atomic;
