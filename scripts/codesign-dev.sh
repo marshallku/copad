@@ -135,12 +135,48 @@ sign_app() {
     codesign --force --deep --sign "$IDENTITY" --timestamp=none "$APP_PATH"
 }
 
+# verify_signature — hard-fail if the freshly-signed bundle does not
+# verify strictly AND carry our identity. A silently-invalid signature
+# (a broken resource seal, or an ad-hoc fallback) is *exactly* what makes
+# macOS deny TCC prompts with no dialog — the folder-access / automation
+# prompts a terminal's child shells trigger just return "Operation not
+# permitted" instead of prompting. That is the symptom this whole script
+# exists to prevent, so we fail the build loudly rather than install a
+# bundle that looks fine but is unsignable to TCC.
+#
+# Note: `codesign --verify` alone passes on an ad-hoc signature too (an
+# ad-hoc seal is still internally consistent), so verifying is not enough
+# — we also assert the leaf Authority is our identity to catch a fallback
+# to ad-hoc.
+verify_signature() {
+    local verr
+    if ! verr=$(codesign --verify --strict --deep "$APP_PATH" 2>&1); then
+        echo "error: signature verification failed for $APP_PATH:" >&2
+        printf '%s\n' "$verr" | sed 's/^/    /' >&2
+        exit 1
+    fi
+    # Grab the leaf (first) Authority line. NB: no `awk exit` here — an
+    # early exit closes the pipe while `codesign -dvv` is still writing,
+    # which under `set -o pipefail` surfaces as SIGPIPE (141) and aborts
+    # the whole script. `!seen` keeps only the first match while still
+    # draining all of codesign's output.
+    local authority
+    authority=$(codesign -dvv "$APP_PATH" 2>&1 | awk -F= '/^Authority=/ && !seen {print $2; seen=1}')
+    if [[ "$authority" != "$IDENTITY" ]]; then
+        echo "error: $APP_PATH is signed by '${authority:-none/ad-hoc}', expected '$IDENTITY'" >&2
+        echo "       (TCC would silently deny permission prompts for this bundle)" >&2
+        exit 1
+    fi
+}
+
 if ! identity_exists; then
     create_identity
 fi
 
 sign_app
+verify_signature
 
-# Sanity check — print the cdhash + Authority so a build log shows the
-# signature is bound to the right identity.
-codesign -dv "$APP_PATH" 2>&1 | grep -E "^(Identifier|Authority|Signature|TeamIdentifier)" || true
+# Sanity check — print the identity + seal so a build log shows the
+# signature is bound to the right cert and the resources are sealed.
+codesign -dvv "$APP_PATH" 2>&1 | grep -E "^(Identifier|Authority|TeamIdentifier|Sealed)" || true
+echo "ok    signature verified: --strict --deep + Authority=$IDENTITY"
