@@ -25,6 +25,7 @@
 mod agents;
 mod cockpit;
 mod daemon_client;
+mod font;
 mod push;
 mod tmux;
 
@@ -230,6 +231,11 @@ fn write_frame(stdout: &StdoutHandle, frame: &Value) {
 struct AppState {
     daemon: DaemonClient,
     token: Arc<String>,
+    /// The terminal font, resolved + validated once at startup. `None` when the
+    /// configured family isn't installed (or the override failed validation) — the
+    /// endpoint then 404s and the PWA keeps its fallback stack, which is exactly
+    /// today's behaviour, so a missing font degrades rather than breaks.
+    font: Option<Arc<font::Font>>,
     /// True only when the HTTP listener is bound to a loopback
     /// address. Header-based Tailscale auth (`Tailscale-User-Login`)
     /// is unsafe on non-loopback binds because any reachable caller
@@ -296,9 +302,44 @@ async fn run_server(
             "[web-bridge] bind={bind} is not loopback; disabling Tailscale-User-Login header auth (bearer token required)"
         );
     }
+    // Resolve the terminal font once, at startup, from the SAME config the desktop
+    // terminal uses — so the phone renders in the user's font rather than a guess.
+    // Failure is non-fatal: the PWA just keeps its fallback stack (today's behaviour).
+    let font = (|| {
+        let family = copad_core::config::CopadConfig::load()
+            .map(|c| c.terminal.font_family)
+            .unwrap_or_else(|_| String::new());
+        if family.is_empty() {
+            return None;
+        }
+        let path = font::resolve(&family)?;
+        match font::load(&path) {
+            Ok(f) => {
+                eprintln!(
+                    "[web-bridge] terminal font: {} ({} KB, {})",
+                    f.path.display(),
+                    f.bytes.len() / 1024,
+                    f.content_type
+                );
+                Some(Arc::new(f))
+            }
+            Err(e) => {
+                eprintln!("[web-bridge] terminal font rejected: {e}");
+                None
+            }
+        }
+    })();
+    if font.is_none() {
+        eprintln!(
+            "[web-bridge] no terminal font served — phone glyphs will fall back \
+             (set COPAD_WEB_BRIDGE_FONT to an absolute font path to override)"
+        );
+    }
+
     let state = AppState {
         daemon: DaemonClient::new(socket_path),
         token: Arc::new(token.to_string()),
+        font,
         allow_tailscale_header,
         tmux_cache: Arc::new(tokio::sync::Mutex::new(None)),
         push_config: Arc::new(push_config),
@@ -346,6 +387,7 @@ async fn run_server(
         .route("/manifest.webmanifest", get(handle_manifest))
         .route("/sw.js", get(handle_service_worker))
         .route("/icon.svg", get(handle_icon))
+        .route("/font/terminal", get(handle_font))
         .layer(axum::middleware::from_fn(
             move |req: axum::extract::Request, next: Next| {
                 let token = auth_state.token.clone();
@@ -364,7 +406,13 @@ async fn run_server(
                         || path == "/healthz"
                         || path == "/manifest.webmanifest"
                         || path == "/sw.js"
-                        || path == "/icon.svg";
+                        || path == "/icon.svg"
+                        // A CSS @font-face fetch sends no Authorization header, so an
+                        // authed font URL would 401 and leave the glyphs broken — the
+                        // very bug it exists to fix. Public is therefore forced, which
+                        // is why font::load() validates magic + size + regular-file
+                        // before a byte is served.
+                        || path == "/font/terminal";
                     let upgrades = path.starts_with("/ws/");
                     if public {
                         return next.run(req).await;
@@ -792,6 +840,54 @@ async fn handle_icon() -> axum::response::Response {
     (
         [(header::CONTENT_TYPE, "image/svg+xml")],
         include_str!("../static/icon.svg"),
+    )
+        .into_response()
+}
+
+/// `GET /font/terminal` — the workstation's terminal font, for the PWA's @font-face.
+///
+/// Public (see the allowlist). `Content-Type` is sniffed from the file's magic rather
+/// than assumed from a path, so the declaration always matches the bytes.
+///
+/// Caching is `private, no-cache` + a strong content-hash ETag, NOT
+/// `immutable`/`max-age`: the URL is stable (the HTML is include_str!'d and can't carry
+/// a build hash), so a long max-age would pin a stale font for its whole lifetime with
+/// the ETag never consulted. `no-cache` still stores the body — it just revalidates —
+/// so the 2.4 MB body transfers once and later loads cost a tiny 304. `private` keeps
+/// shared proxies from storing the user's font bytes.
+async fn handle_font(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::http::{StatusCode, header};
+    use axum::response::IntoResponse;
+
+    let Some(font) = state.font.clone() else {
+        return (StatusCode::NOT_FOUND, "no terminal font resolved\n").into_response();
+    };
+
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == font.etag))
+    {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, font.etag.clone()),
+                (header::CACHE_CONTROL, "private, no-cache".to_string()),
+            ],
+        )
+            .into_response();
+    }
+
+    (
+        [
+            (header::CONTENT_TYPE, font.content_type.to_string()),
+            (header::ETAG, font.etag.clone()),
+            (header::CACHE_CONTROL, "private, no-cache".to_string()),
+        ],
+        font.bytes.clone(),
     )
         .into_response()
 }

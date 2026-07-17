@@ -29,6 +29,19 @@
        so a vh-based terminal stays full height behind the keyboard. The fallback
        only applies before the first JS measurement, or on browsers without
        visualViewport. */
+    /* The workstation's terminal font, served at runtime from whatever it has
+       installed (GET /font/terminal). Without this a phone has no Nerd Font and
+       every powerline/devicon glyph renders as tofu. No format() — the server
+       decides the bytes (ttf/otf/woff2 depending on what's installed) and declares
+       the type, so a hardcoded hint here could contradict them and get the face
+       rejected. font-display: swap so text shows in the fallback immediately
+       instead of an invisible terminal while ~2 MB downloads over cellular.
+       404 (font not resolved) simply leaves the fallback stack in place. */
+    @font-face {
+      font-family: "CopadTerminal";
+      src: url("/font/terminal");
+      font-display: swap;
+    }
     :root { --app-h: 100vh; }
     body { background: var(--bg); color: var(--fg); padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); min-height: var(--app-h); overflow: hidden; }
     header { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; padding: 0.6rem 0.9rem; border-bottom: 1px solid var(--border); background: var(--bg-2); position: sticky; top: 0; z-index: 10; }
@@ -725,7 +738,7 @@
       const host = document.getElementById("term-host");
       const term = new window.Terminal({
         fontSize: 13,
-        fontFamily: 'ui-monospace, "JetBrains Mono", "SF Mono", monospace',
+        fontFamily: '"CopadTerminal", ui-monospace, "JetBrains Mono", "SF Mono", monospace',
         cursorBlink: true,
         scrollback: 5000,
         convertEol: false,
@@ -734,10 +747,21 @@
       const FitAddon = window.FitAddon?.FitAddon;
       const fit = FitAddon ? new FitAddon() : null;
       if (fit) term.loadAddon(fit);
+
       term.open(host);
       if (fit) fit.fit();
       state.term = term;
       state.fit = fit;
+
+      // xterm measures the glyph cell ONCE at open(), so whenever the webfont lands
+      // after that the grid keeps the fallback's cell size and every column sits
+      // wrong. Deliberately NOT awaited before open(): `font-display: swap` already
+      // paints the fallback immediately, so waiting would only buy a blank terminal
+      // for the length of a ~2 MB cellular download — and an await here would open a
+      // window between the idempotence guard above and `state.term` being set, in
+      // which a re-render could spawn a second xterm + WS. Resolves instantly when
+      // the font is already cached (the common case after the first load).
+      whenFontReady(term.options.fontSize, repairFontMetrics);
 
       const proto = location.protocol === "https:" ? "wss" : "ws";
       const ws = new WebSocket(`${proto}://${location.host}/ws/tmux/attach/${encodeURIComponent(state.activePane)}`, wsProtocols());
@@ -1014,6 +1038,47 @@
     }
 
     /* ==== actions ==== */
+    /// Run `cb` once the terminal webfont is actually usable. Never runs it if the
+    /// font can't load (e.g. /font/terminal 404s because the workstation has no such
+    /// font installed) — the fallback stack is then simply what you get, as before.
+    function whenFontReady(px, cb) {
+      if (!document.fonts?.load) return;
+      const spec = `${px || 13}px "CopadTerminal"`;
+      document.fonts
+        .load(spec)
+        .then(() => {
+          // load() resolves even when nothing matched; check() is what proves the
+          // face is really there.
+          if (document.fonts.check(spec)) cb();
+        })
+        .catch(() => {});
+    }
+
+    /// Re-measure after a webfont that landed AFTER term.open().
+    ///
+    /// Reassigning fontFamily is what forces xterm to drop its cached glyph metrics;
+    /// without it the grid keeps the fallback's cell size and the columns stay
+    /// misaligned even though the right glyphs are now available. Then refit and tell
+    /// the PTY, since the cell size (and therefore rows/cols) just changed.
+    function repairFontMetrics() {
+      const term = state.term;
+      if (!term) return;
+      try {
+        // Must assign a DIFFERENT value: xterm's option setter short-circuits when the
+        // value is unchanged, so `x = x` is a no-op and the cached glyph metrics stay.
+        // Round-tripping through a distinct-but-equivalent stack is what actually
+        // triggers the re-measure.
+        const ff = term.options.fontFamily;
+        term.options.fontFamily = "monospace";
+        term.options.fontFamily = ff;
+        state.fit?.fit();
+        const ws = state.ws.attach;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "resize", rows: term.rows, cols: term.cols }));
+        }
+      } catch {}
+    }
+
     /// Publish the VISUAL viewport height as --app-h.
     ///
     /// Every full-height view keys off this instead of 100vh/100dvh, because the
