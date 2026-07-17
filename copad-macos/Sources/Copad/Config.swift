@@ -14,19 +14,25 @@ enum OSC52Policy: String, Decodable {
 }
 
 /// Where the tab bar sits relative to the content area. Linux supports
-/// `top`/`bottom`/`left`/`right`; macOS implements top/bottom now and
-/// defers vertical orientation (left/right) — they require a separate
-/// layout pass that's not worth doing until somebody asks for it.
+/// `top`/`bottom`/`left`/`right`; macOS now implements all four — the
+/// vertical orientations (`left`/`right`) run the bar down one side with
+/// a fixed width (`[tabs] width`), the horizontal ones across top/bottom.
 enum TabsPosition: String, Decodable {
     case top
     case bottom
+    case left
+    case right
 
-    /// Decode permissively: an unrecognized value (e.g. user wrote
-    /// `position = "left"` as on Linux) falls back to `.top` with a
-    /// stderr warning rather than crashing.
+    /// True for the vertical orientations (`left`/`right`), where the tab
+    /// bar runs down one side of the window with a fixed width instead of
+    /// across the top/bottom with a fixed height.
+    var isVertical: Bool { self == .left || self == .right }
+
+    /// Decode permissively: an unrecognized value falls back to `.top`
+    /// with a stderr warning rather than crashing.
     static func parse(_ raw: String) -> TabsPosition {
         if let p = TabsPosition(rawValue: raw.lowercased()) { return p }
-        let msg = "[copad] [tabs] position '\(raw)' not yet supported on macOS — using 'top'\n"
+        let msg = "[copad] [tabs] position '\(raw)' unrecognized — using 'top'\n"
         FileHandle.standardError.write(Data(msg.utf8))
         return .top
     }
@@ -111,8 +117,11 @@ struct CopadConfig {
     /// content view so the desktop is blurred (Ghostty
     /// `background-blur-radius`). No effect when opacity = 1.0.
     let windowBlur: Bool
-    /// Tier 1.4 — `[tabs] position` (top/bottom). left/right deferred.
+    /// Tier 1.4 — `[tabs] position` (top/bottom/left/right).
     let tabsPosition: TabsPosition
+    /// `[tabs] width` — width in points of the vertical (`left`/`right`)
+    /// tab bar. Ignored for `top`/`bottom`. Mirrors the Linux `width = 200`.
+    let tabsWidth: Int
     /// Tier 4.2 — `[statusbar]` config (enabled/position/height). Modules
     /// themselves come from plugin manifests' `[[modules]]` declarations.
     let statusBar: StatusBarConfig
@@ -206,6 +215,12 @@ struct CopadConfig {
             windowOpacity: clamp01(raw.window?.opacity ?? defaults.windowOpacity),
             windowBlur: raw.window?.blur ?? defaults.windowBlur,
             tabsPosition: raw.tabs?.position.map(TabsPosition.parse) ?? defaults.tabsPosition,
+            // Clamp the layout boundary: a vertical tab pill is `barWidth - 8`
+            // wide, so a width below the 8px inset yields a negative
+            // (unsatisfiable) constraint, and anything under `collapsedBarWidth`
+            // (44) makes the expanded bar narrower than its collapsed state.
+            // Floor to the minimum usable width (matches the horizontal min pill).
+            tabsWidth: max(CopadConfig.minTabsWidth, raw.tabs?.width ?? defaults.tabsWidth),
             statusBar: StatusBarConfig(
                 enabled: raw.statusbar?.enabled ?? defaults.statusBar.enabled,
                 position: raw.statusbar?.position ?? defaults.statusBar.position,
@@ -223,6 +238,13 @@ struct CopadConfig {
     static func triggersJSON(from config: CopadConfig) -> [[String: Any]] {
         config.triggers
     }
+
+    /// Minimum usable width for a vertical (`left`/`right`) tab bar. Below
+    /// this the full-width tab pills would clip or, past the 8px inset, hit
+    /// unsatisfiable Auto Layout constraints. Comfortably above
+    /// `TabBarView.collapsedBarWidth` (44) so expanded is never narrower
+    /// than collapsed. Matches the horizontal min pill width.
+    static let minTabsWidth = 80
 
     static var defaults: CopadConfig {
         CopadConfig(
@@ -243,6 +265,7 @@ struct CopadConfig {
             windowOpacity: 1.0,
             windowBlur: false,
             tabsPosition: .top,
+            tabsWidth: 200,
             statusBar: .defaults,
             keybindings: [:],
             triggers: [],
@@ -381,7 +404,8 @@ private struct StatusBarSection: Decodable {
 
 private struct TabsSection: Decodable {
     var position: String?
-    // Linux schema also has `width` and `collapsed`; not consumed on macOS yet.
+    var width: Int?
+    // Linux schema also has `collapsed`; not consumed on macOS yet.
 }
 
 private struct TerminalSection: Decodable {

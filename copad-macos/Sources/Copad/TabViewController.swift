@@ -13,6 +13,10 @@ final class TabViewController: NSViewController {
     private(set) var theme: CopadTheme
 
     private var tabBar: TabBarView!
+    /// The tab bar's primary size constraint — height for horizontal
+    /// (top/bottom) bars, width for vertical (left/right) bars. Held so
+    /// collapse/expand can shrink a vertical bar to icon-only width.
+    private var tabBarSizeConstraint: NSLayoutConstraint?
     private var contentArea: NSView!
     /// Window-level background image (Phase 10b follow-up). One image
     /// fills the entire `contentArea` so splits share the same
@@ -202,7 +206,7 @@ final class TabViewController: NSViewController {
         // `applyConfig`.
         root.layer?.backgroundColor = Self.rootBg(theme: theme, opacity: config.windowOpacity)
 
-        tabBar = TabBarView(theme: theme, windowOpacity: config.windowOpacity)
+        tabBar = TabBarView(theme: theme, windowOpacity: config.windowOpacity, position: config.tabsPosition)
         tabBar.translatesAutoresizingMaskIntoConstraints = false
         tabBar.onSelectTab = { [weak self] i in self?.switchTab(to: i) }
         tabBar.onCloseTab = { [weak self] i in self?.closeTabByButton(at: i) }
@@ -277,30 +281,62 @@ final class TabViewController: NSViewController {
             NSLayoutConstraint.activate(barConstraints)
         }
 
-        // Tier 1.4 — tabs position. The tabBar is always full-width and at
-        // either the top or bottom of root; contentArea fills the rest.
-        // left/right would need a 90-degree rotation of the bar view itself
-        // (different layout pass) and is deferred until requested.
-        var constraints: [NSLayoutConstraint] = [
-            tabBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            tabBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-            tabBar.heightAnchor.constraint(equalToConstant: TabBarView.height),
-            contentArea.leadingAnchor.constraint(equalTo: root.leadingAnchor),
-            contentArea.trailingAnchor.constraint(equalTo: root.trailingAnchor),
-        ]
-        switch config.tabsPosition {
-        case .top:
+        // Tier 1.4 — tabs position. Horizontal (top/bottom): a full-width
+        // bar with a fixed height, content fills the rest vertically.
+        // Vertical (left/right): a full-height bar with a fixed width
+        // (`[tabs] width`, shrunk to icon-only when collapsed) pinned to
+        // the leading/trailing edge, content fills the rest horizontally.
+        var constraints: [NSLayoutConstraint] = []
+        if config.tabsPosition.isVertical {
+            let barWidth = isBarCollapsed ? TabBarView.collapsedBarWidth : CGFloat(config.tabsWidth)
+            let widthC = tabBar.widthAnchor.constraint(equalToConstant: barWidth)
+            tabBarSizeConstraint = widthC
             constraints.append(contentsOf: [
+                widthC,
                 tabBar.topAnchor.constraint(equalTo: topEdge),
-                contentArea.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
+                tabBar.bottomAnchor.constraint(equalTo: bottomEdge),
+                contentArea.topAnchor.constraint(equalTo: topEdge),
                 contentArea.bottomAnchor.constraint(equalTo: bottomEdge),
             ])
-        case .bottom:
+            if config.tabsPosition == .left {
+                constraints.append(contentsOf: [
+                    tabBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+                    contentArea.leadingAnchor.constraint(equalTo: tabBar.trailingAnchor),
+                    contentArea.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+                ])
+            } else {
+                constraints.append(contentsOf: [
+                    tabBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+                    contentArea.trailingAnchor.constraint(equalTo: tabBar.leadingAnchor),
+                    contentArea.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+                ])
+            }
+        } else {
+            let heightC = tabBar.heightAnchor.constraint(equalToConstant: TabBarView.height)
+            tabBarSizeConstraint = heightC
             constraints.append(contentsOf: [
-                contentArea.topAnchor.constraint(equalTo: topEdge),
-                contentArea.bottomAnchor.constraint(equalTo: tabBar.topAnchor),
-                tabBar.bottomAnchor.constraint(equalTo: bottomEdge),
+                tabBar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+                tabBar.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+                heightC,
+                contentArea.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+                contentArea.trailingAnchor.constraint(equalTo: root.trailingAnchor),
             ])
+            switch config.tabsPosition {
+            case .top:
+                constraints.append(contentsOf: [
+                    tabBar.topAnchor.constraint(equalTo: topEdge),
+                    contentArea.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
+                    contentArea.bottomAnchor.constraint(equalTo: bottomEdge),
+                ])
+            case .bottom:
+                constraints.append(contentsOf: [
+                    contentArea.topAnchor.constraint(equalTo: topEdge),
+                    contentArea.bottomAnchor.constraint(equalTo: tabBar.topAnchor),
+                    tabBar.bottomAnchor.constraint(equalTo: bottomEdge),
+                ])
+            case .left, .right:
+                break  // handled in the vertical branch above
+            }
         }
         NSLayoutConstraint.activate(constraints)
 
@@ -460,6 +496,7 @@ final class TabViewController: NSViewController {
         if paneManagers.count == 2, isBarCollapsed, !userToggledBar {
             isBarCollapsed = false
             tabBar.setCollapsed(false)
+            syncVerticalBarWidth()
         }
 
         switchTab(to: tabIndex)
@@ -559,8 +596,19 @@ final class TabViewController: NSViewController {
         if userInitiated { userToggledBar = true }
         isBarCollapsed.toggle()
         tabBar.setCollapsed(isBarCollapsed)
+        syncVerticalBarWidth()
         refreshTabBar()
         eventBus?.broadcast(event: "tab.bar_toggled", data: ["collapsed": isBarCollapsed])
+    }
+
+    /// Vertical (left/right) bars carry their collapsed/expanded state in
+    /// the bar *width* (horizontal bars keep a fixed height and only swap
+    /// tab-pill widths, handled inside `TabBarView`). Re-point the stored
+    /// width constraint whenever `isBarCollapsed` changes. No-op for
+    /// horizontal bars.
+    private func syncVerticalBarWidth() {
+        guard config.tabsPosition.isVertical, let sizeConstraint = tabBarSizeConstraint else { return }
+        sizeConstraint.constant = isBarCollapsed ? TabBarView.collapsedBarWidth : CGFloat(config.tabsWidth)
     }
 
     private func refreshTabBar() {

@@ -498,6 +498,10 @@ private final class AddPanelPopoverController: NSViewController {
 final class TabBarView: NSView {
     static let height: CGFloat = 36
     static let collapsedTabWidth: CGFloat = 36
+    /// Width of a vertical (left/right) bar when collapsed to icon-only.
+    /// A touch wider than a collapsed pill so the toggle / "+" buttons
+    /// still sit centered without clipping.
+    static let collapsedBarWidth: CGFloat = 44
 
     var onSelectTab: ((Int) -> Void)?
     var onCloseTab: ((Int) -> Void)?
@@ -514,6 +518,13 @@ final class TabBarView: NSView {
     private let addButton = NSButton()
     private var tabButtons: [TabButton] = []
     private var theme: CopadTheme
+    /// Vertical (left/right) orientation — the bar runs down one side of
+    /// the window with a fixed width. Horizontal (top/bottom) when false.
+    private let isVertical: Bool
+    /// For a vertical bar, which edge the separator (and thus the content
+    /// area) sits on: leading for `right`-position tabs (content is to the
+    /// left), trailing for `left`-position tabs (content is to the right).
+    private let separatorLeading: Bool
     private var popover: NSPopover?
     /// `[window] opacity` — only applied to the *bar* bg, not the tab
     /// pills. Pills stay opaque so the active tab and hover state read
@@ -523,9 +534,11 @@ final class TabBarView: NSView {
     /// Width constraints for tab buttons (swapped on collapse/expand)
     private var tabWidthConstraints: [NSLayoutConstraint] = []
 
-    init(theme: CopadTheme, windowOpacity: Double = 1.0) {
+    init(theme: CopadTheme, windowOpacity: Double = 1.0, position: TabsPosition = .top) {
         self.theme = theme
         self.windowOpacity = windowOpacity
+        self.isVertical = position.isVertical
+        self.separatorLeading = position == .right
         super.init(frame: .zero)
         setupView()
     }
@@ -539,18 +552,33 @@ final class TabBarView: NSView {
         wantsLayer = true
         layer?.backgroundColor = Self.barBg(theme: theme, opacity: windowOpacity)
 
-        // Bottom border
+        // Separator between the bar and the content area — bottom edge for
+        // a horizontal bar, trailing edge for a vertical (left/right) bar.
         let border = NSView()
         border.wantsLayer = true
         border.layer?.backgroundColor = theme.overlay0.nsColor.cgColor
         border.translatesAutoresizingMaskIntoConstraints = false
         addSubview(border)
-        NSLayoutConstraint.activate([
-            border.leadingAnchor.constraint(equalTo: leadingAnchor),
-            border.trailingAnchor.constraint(equalTo: trailingAnchor),
-            border.bottomAnchor.constraint(equalTo: bottomAnchor),
-            border.heightAnchor.constraint(equalToConstant: 1),
-        ])
+        if isVertical {
+            // Separator on the edge that faces the content area: leading
+            // for `right`-position tabs, trailing for `left`-position tabs.
+            let separatorEdge = separatorLeading
+                ? border.leadingAnchor.constraint(equalTo: leadingAnchor)
+                : border.trailingAnchor.constraint(equalTo: trailingAnchor)
+            NSLayoutConstraint.activate([
+                border.topAnchor.constraint(equalTo: topAnchor),
+                border.bottomAnchor.constraint(equalTo: bottomAnchor),
+                separatorEdge,
+                border.widthAnchor.constraint(equalToConstant: 1),
+            ])
+        } else {
+            NSLayoutConstraint.activate([
+                border.leadingAnchor.constraint(equalTo: leadingAnchor),
+                border.trailingAnchor.constraint(equalTo: trailingAnchor),
+                border.bottomAnchor.constraint(equalTo: bottomAnchor),
+                border.heightAnchor.constraint(equalToConstant: 1),
+            ])
+        }
 
         // Toggle button (leftmost) — sidebar.left icon
         let toggleImg = NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: "Toggle tab bar")?
@@ -565,8 +593,9 @@ final class TabBarView: NSView {
         toggleButton.translatesAutoresizingMaskIntoConstraints = false
         addSubview(toggleButton)
 
-        // Tab stack
-        stackView.orientation = .horizontal
+        // Tab stack — across the top/bottom when horizontal, down the
+        // side when vertical.
+        stackView.orientation = isVertical ? .vertical : .horizontal
         stackView.spacing = 2
         stackView.edgeInsets = NSEdgeInsets(top: 4, left: 4, bottom: 4, right: 4)
         stackView.translatesAutoresizingMaskIntoConstraints = false
@@ -592,22 +621,52 @@ final class TabBarView: NSView {
         addButton.translatesAutoresizingMaskIntoConstraints = false
         addSubview(addButton)
 
-        NSLayoutConstraint.activate([
-            toggleButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
-            toggleButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            toggleButton.widthAnchor.constraint(equalToConstant: 24),
+        if isVertical {
+            // Toggle pinned to the top, "+" to the bottom, tab list scrolls
+            // between them. The scroll viewport spans the bar minus the
+            // trailing 1px border.
+            NSLayoutConstraint.activate([
+                toggleButton.topAnchor.constraint(equalTo: topAnchor, constant: 6),
+                toggleButton.centerXAnchor.constraint(equalTo: centerXAnchor),
+                toggleButton.heightAnchor.constraint(equalToConstant: 24),
 
-            scrollView.leadingAnchor.constraint(equalTo: toggleButton.trailingAnchor, constant: 4),
-            scrollView.topAnchor.constraint(equalTo: topAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: border.topAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: addButton.leadingAnchor, constant: -4),
+                scrollView.topAnchor.constraint(equalTo: toggleButton.bottomAnchor, constant: 4),
+                // Viewport spans from the separator to the far edge — flips
+                // with the separator side so `right`-position tabs don't clip.
+                separatorLeading
+                    ? scrollView.leadingAnchor.constraint(equalTo: border.trailingAnchor)
+                    : scrollView.leadingAnchor.constraint(equalTo: leadingAnchor),
+                separatorLeading
+                    ? scrollView.trailingAnchor.constraint(equalTo: trailingAnchor)
+                    : scrollView.trailingAnchor.constraint(equalTo: border.leadingAnchor),
+                scrollView.bottomAnchor.constraint(equalTo: addButton.topAnchor, constant: -4),
 
-            addButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            addButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            addButton.widthAnchor.constraint(equalToConstant: 28),
-        ])
+                addButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -8),
+                addButton.centerXAnchor.constraint(equalTo: centerXAnchor),
+                addButton.heightAnchor.constraint(equalToConstant: 28),
+            ])
+            // Stack matches the viewport width and grows downward — it
+            // scrolls vertically once the tabs overflow the bar height.
+            stackView.widthAnchor.constraint(equalTo: scrollView.widthAnchor).isActive = true
+            stackView.heightAnchor.constraint(greaterThanOrEqualTo: scrollView.heightAnchor).isActive = true
+        } else {
+            NSLayoutConstraint.activate([
+                toggleButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+                toggleButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+                toggleButton.widthAnchor.constraint(equalToConstant: 24),
 
-        stackView.widthAnchor.constraint(greaterThanOrEqualTo: scrollView.widthAnchor).isActive = true
+                scrollView.leadingAnchor.constraint(equalTo: toggleButton.trailingAnchor, constant: 4),
+                scrollView.topAnchor.constraint(equalTo: topAnchor),
+                scrollView.bottomAnchor.constraint(equalTo: border.topAnchor),
+                scrollView.trailingAnchor.constraint(equalTo: addButton.leadingAnchor, constant: -4),
+
+                addButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+                addButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+                addButton.widthAnchor.constraint(equalToConstant: 28),
+            ])
+
+            stackView.widthAnchor.constraint(greaterThanOrEqualTo: scrollView.widthAnchor).isActive = true
+        }
     }
 
     // MARK: - Public API
@@ -631,7 +690,16 @@ final class TabBarView: NSView {
             tabButtons.append(btn)
 
             let h = TabBarView.height - 8
-            if isCollapsed {
+            if isVertical {
+                // Each tab spans the bar width (minus the stack's 4px insets)
+                // and keeps the standard pill height; the whole bar narrows
+                // to icon-only via its width constraint when collapsed, so
+                // no per-tab width swap is needed here.
+                let w = btn.widthAnchor.constraint(equalTo: stackView.widthAnchor, constant: -8)
+                w.isActive = true
+                tabWidthConstraints.append(w)
+                btn.heightAnchor.constraint(equalToConstant: h).isActive = true
+            } else if isCollapsed {
                 let w = btn.widthAnchor.constraint(equalToConstant: TabBarView.collapsedTabWidth)
                 w.isActive = true
                 tabWidthConstraints.append(w)
