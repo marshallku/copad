@@ -58,15 +58,30 @@ esac
 
 echo
 echo "3) Front it with HTTPS over your tailnet (keeps the bind on loopback):"
-echo "     tailscale serve --bg --https=443 http://127.0.0.1:$PORT"
+echo "     sudo tailscale serve --bg --https=443 http://127.0.0.1:$PORT"
 echo "     tailscale serve status      # your https://<host>.<tailnet>.ts.net URL"
 echo "   Open that URL on the phone → PWA installs, push works, no token page."
+echo "   NOTE: writing a serve config needs root — without it you get"
+echo "         'Access denied: serve config denied'. Either prefix with sudo, or"
+echo "         grant your user the operator role once:"
+echo "           sudo tailscale set --operator=\$USER"
+echo "         (then plain 'tailscale serve' works, and so does --serve below)."
 echo
 
 if [ "$DO_SERVE" = 1 ]; then
     command -v tailscale >/dev/null || { echo "tailscale not installed" >&2; exit 1; }
     echo "Running: tailscale serve --bg --https=443 http://127.0.0.1:$PORT"
-    tailscale serve --bg --https=443 "http://127.0.0.1:$PORT"
+    # Writing a serve config is root-only unless the user holds the operator
+    # role. Say so instead of letting tailscale's bare "Access denied" land.
+    if ! tailscale serve --bg --https=443 "http://127.0.0.1:$PORT"; then
+        echo >&2
+        echo "serve failed (tailscale's own error is above)." >&2
+        echo "If it says 'Access denied: serve config denied', it needs root — retry as:" >&2
+        echo "    sudo tailscale serve --bg --https=443 http://127.0.0.1:$PORT" >&2
+        echo "or grant the operator role once, then re-run this script:" >&2
+        echo "    sudo tailscale set --operator=\$USER" >&2
+        exit 1
+    fi
     tailscale serve status
 else
     echo "(re-run with --serve to run the tailscale serve command)"
