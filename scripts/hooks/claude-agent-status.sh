@@ -37,7 +37,7 @@ set -euo pipefail
 AWAITING_TYPES_RE='^(permission_prompt|elicitation_dialog|agent_needs_input)$'
 
 usage() {
-    printf 'usage: %s <stopped|notification> [--self-test]\n' "${0##*/}" >&2
+    printf 'usage: %s <working|stopped|notification> [--self-test]\n' "${0##*/}" >&2
     exit 2
 }
 
@@ -59,10 +59,24 @@ emit() {
     cwd="$(jq -r '.cwd // empty' <<<"$input" 2>/dev/null || true)"
     [ -n "$cwd" ] || cwd="$PWD"
 
+    local session
+    session="$(jq -r '.session_id // empty' <<<"$input" 2>/dev/null || true)"
+
     case "$event" in
+    working)
+        # UserPromptSubmit → the agent is now working on a turn. Drives the
+        # cockpit's "working" state. Optional wiring (see docs/harness-hooks.md);
+        # note: NOT `claude.session_started`, which is reserved for SessionStart.
+        local payload
+        payload="$(jq -n \
+            --arg panel_id "$panel_id" \
+            --arg cwd "$cwd" \
+            --arg session "$session" \
+            '{panel_id: $panel_id, cwd: $cwd, session: $session}')"
+        printf '%s\t%s\n' "claude.working" "$payload"
+        ;;
     stopped)
-        local session payload
-        session="$(jq -r '.session_id // empty' <<<"$input" 2>/dev/null || true)"
+        local payload
         payload="$(jq -n \
             --arg panel_id "$panel_id" \
             --arg cwd "$cwd" \
@@ -77,12 +91,15 @@ emit() {
         # events; everything else is noise for this feature.
         [[ "$nt" =~ $AWAITING_TYPES_RE ]] || return 0
         msg="$(jq -r '.message // empty' <<<"$input" 2>/dev/null || true)"
+        # `session` is included so the cockpit's per-pane model can display which
+        # session is awaiting (parity with stopped/working).
         payload="$(jq -n \
             --arg panel_id "$panel_id" \
             --arg cwd "$cwd" \
+            --arg session "$session" \
             --arg notification_type "$nt" \
             --arg message "$msg" \
-            '{panel_id: $panel_id, cwd: $cwd, notification_type: $notification_type, message: $message}')"
+            '{panel_id: $panel_id, cwd: $cwd, session: $session, notification_type: $notification_type, message: $message}')"
         printf '%s\t%s\n' "claude.awaiting_input" "$payload"
         ;;
     *)
@@ -105,13 +122,31 @@ self_test() {
         fi
     }
 
+    # Assert the emitted payload's .session equals expected (catches a broken
+    # .session_id extraction, not just the kind).
+    check_session() { # desc expected-session actual-line
+        local desc="$1" want="$2"
+        local got; got="$(printf '%s' "${3#*$'\t'}" | jq -r '.session // empty' 2>/dev/null)"
+        if [ "$got" = "$want" ]; then printf '  ok   %s\n' "$desc"
+        else printf '  FAIL %s (want session=%q got=%q)\n' "$desc" "$want" "$got"; fails=$((fails + 1)); fi
+    }
+
     export COPAD_PANEL_ID="pane-test"
+    # UserPromptSubmit → working.
+    check "working emits claude.working" "claude.working" \
+        "$(emit working '{"cwd":"/tmp/x","session_id":"s1"}')"
+    check_session "working carries session" "s1" \
+        "$(emit working '{"cwd":"/tmp/x","session_id":"s1"}')"
     # Stop always emits.
     check "stop emits session_stopped" "claude.session_stopped" \
+        "$(emit stopped '{"cwd":"/tmp/x","session_id":"s1"}')"
+    check_session "stop carries session" "s1" \
         "$(emit stopped '{"cwd":"/tmp/x","session_id":"s1"}')"
     # Notification: permission_prompt emits awaiting.
     check "notification permission emits" "claude.awaiting_input" \
         "$(emit notification '{"cwd":"/tmp/x","notification_type":"permission_prompt","message":"allow?"}')"
+    check_session "awaiting carries session" "s9" \
+        "$(emit notification '{"session_id":"s9","notification_type":"permission_prompt"}')"
     # elicitation_dialog emits.
     check "notification elicitation emits" "claude.awaiting_input" \
         "$(emit notification '{"notification_type":"elicitation_dialog"}')"

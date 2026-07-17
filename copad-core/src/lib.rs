@@ -1,4 +1,5 @@
 pub mod action_registry;
+pub mod agent_cockpit;
 pub mod background;
 pub mod condition;
 pub mod config;
