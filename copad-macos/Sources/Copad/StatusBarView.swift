@@ -15,11 +15,13 @@ import Foundation
 ///   via `applyTheme(_:)` from the config-reload path. `applyTheme` updates
 ///   the bar bg, the 1px separator, and every module label's text color.
 ///   Module-level CSS classes still ignored (see below).
-/// - Module CSS class (`module.class`) ignored. Linux uses GTK CSS to scope
-///   per-module styling; we don't have a clean macOS equivalent without
-///   reaching for `NSAttributedString` per module. Module authors that want
-///   color cues today should JSON-emit the text with markup or unicode
-///   indicators instead.
+/// - Module CSS class (`module.class`) ignored — on BOTH platforms. It is parsed
+///   into the manifest (`copad-core/src/plugin.rs`) but nothing consumes it:
+///   Linux's statusbar only ever adds `copad-statusbar` to the whole bar, never
+///   a per-module class. (This comment used to claim Linux scoped per-module
+///   styling and that macOS was the laggard — it never did.) A macOS equivalent
+///   would need `NSAttributedString` per module. Module authors that want color
+///   cues today should JSON-emit the text with markup or unicode indicators.
 @MainActor
 final class StatusBarView: NSView {
     private let leftStack = NSStackView()
