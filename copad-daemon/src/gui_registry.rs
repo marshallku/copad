@@ -72,9 +72,14 @@ impl HeartbeatConfig {
 /// Maps a GUI-owned method to its capability. `None` = daemon-owned.
 pub fn method_capability(method: &str) -> Option<&'static str> {
     match method {
-        "tab.new" | "tab.close" | "tab.list" | "tab.info" | "tab.rename" | "tabs.toggle_bar"
-        | "claude.start" => Some("tab"),
-        "split.horizontal" | "split.vertical" => Some("split"),
+        "tab.new" | "tab.close" | "tab.list" | "tab.info" | "tab.rename" | "tab.switch"
+        | "tabs.toggle_bar" | "claude.start" => Some("tab"),
+        // Focus movement rides the pane-geometry capability rather than a new
+        // `pane` one: both are pane-scoped, and `split` is already in the GUI's
+        // advertised CAPABILITIES, so this needs no handshake change.
+        "split.horizontal" | "split.vertical" | "pane.focus_next" | "pane.focus_prev" => {
+            Some("split")
+        }
         "terminal.read" | "terminal.state" | "terminal.exec" | "terminal.feed"
         | "terminal.history" | "terminal.context" => Some("terminal"),
         m if m.starts_with("webview.") => Some("webview"),
@@ -496,6 +501,12 @@ mod tests {
         // The agent cockpit is daemon-routable, so a trigger or an explicit
         // --socket <daemon> call reaches the primary GUI instead of 404ing.
         assert_eq!(method_capability("cockpit.open"), Some("agent.ui"));
+        // Capabilities Linux had but never exposed over RPC — a human could
+        // switch tabs / move pane focus, an agent could not.
+        assert_eq!(method_capability("tab.switch"), Some("tab"));
+        assert_eq!(method_capability("pane.focus_next"), Some("split"));
+        assert_eq!(method_capability("pane.focus_prev"), Some("split"));
+        assert_eq!(method_capability("webview.state"), Some("webview"));
         assert_eq!(method_capability("system.ping"), None);
         assert_eq!(method_capability("kb.search"), None);
     }

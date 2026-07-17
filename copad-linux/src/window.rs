@@ -141,6 +141,25 @@ impl CopadWindow {
         // fires from anything that wants to see the active panel
         // (potentially every keystroke in agent flows).
         actions.register_silent("system.ping", |_| Ok(json!({ "status": "ok" })));
+        {
+            // Mirrors macOS `AppDelegate.registerSilent("system.list_actions")`.
+            // Weak, not a clone: the registry owns the handler, so an Arc here
+            // would be a cycle that never drops. Registered (rather than added
+            // as a socket arm) so it self-lists in the command palette, exactly
+            // like the macOS one. Reachable via the GUI socket; a daemon-routed
+            // call hits the daemon's own registry, which doesn't have it —
+            // same on macOS, since both platforms share `copadd`.
+            let registry = std::sync::Arc::downgrade(&actions);
+            actions.register_silent("system.list_actions", move |_| {
+                let Some(registry) = registry.upgrade() else {
+                    return Err(copad_core::protocol::ResponseError {
+                        code: "unavailable".into(),
+                        message: "action registry gone".into(),
+                    });
+                };
+                Ok(json!({ "count": registry.len(), "names": registry.names() }))
+            });
+        }
         actions.register("system.log", |params| {
             // Built-in observable action — useful as a trigger sink. Falls
             // back to the full params JSON when no `message` field is present

@@ -61,6 +61,11 @@ pub enum Command {
     #[command(subcommand)]
     Split(SplitCommand),
 
+    /// Pane focus movement (the Ctrl+Shift+N / Ctrl+Shift+Left bindings,
+    /// reachable by scripts and agents)
+    #[command(subcommand)]
+    Pane(PaneCommand),
+
     /// Event stream
     #[command(subcommand)]
     Event(EventCommand),
@@ -205,6 +210,11 @@ pub enum TabCommand {
     List,
     /// Extended tab info with panel counts
     Info,
+    /// Switch to a tab by zero-based index (the index `tab info` reports)
+    Switch {
+        /// Zero-based tab index
+        index: usize,
+    },
     /// Toggle tab bar visibility
     ToggleBar,
     /// Rename a tab
@@ -215,6 +225,14 @@ pub enum TabCommand {
         /// New title
         title: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum PaneCommand {
+    /// Focus the next pane in the active tab
+    FocusNext,
+    /// Focus the previous pane in the active tab
+    FocusPrev,
 }
 
 #[derive(Subcommand)]
@@ -618,6 +636,7 @@ impl Cli {
                 TabCommand::Close => "tab.close",
                 TabCommand::List => "tab.list",
                 TabCommand::Info => "tab.info",
+                TabCommand::Switch { .. } => "tab.switch",
                 TabCommand::ToggleBar => "tabs.toggle_bar",
                 TabCommand::Rename { .. } => "tab.rename",
             }
@@ -625,6 +644,11 @@ impl Cli {
             Command::Split(cmd) => match cmd {
                 SplitCommand::Horizontal => "split.horizontal",
                 SplitCommand::Vertical => "split.vertical",
+            }
+            .to_string(),
+            Command::Pane(cmd) => match cmd {
+                PaneCommand::FocusNext => "pane.focus_next",
+                PaneCommand::FocusPrev => "pane.focus_prev",
             }
             .to_string(),
             Command::Event(cmd) => match cmd {
@@ -748,8 +772,10 @@ impl Cli {
             },
             Command::Tab(cmd) => match cmd {
                 TabCommand::Rename { id, title } => json!({ "id": id, "title": title }),
+                TabCommand::Switch { index } => json!({ "index": index }),
                 _ => json!({}),
             },
+            Command::Pane(_) => json!({}),
             Command::Terminal(cmd) => match cmd {
                 TerminalCommand::Read {
                     id,

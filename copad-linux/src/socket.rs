@@ -15,7 +15,7 @@ use vte4::prelude::*;
 
 use crate::background::{BackgroundLayer, bg_paths};
 use crate::panel::Panel;
-use crate::tabs::TabManager;
+use crate::tabs::{FocusDirection, TabManager};
 
 const BUS_SOURCE_COPAD_LINUX: &str = "copad-linux";
 
@@ -425,9 +425,72 @@ pub fn dispatch(
             // Response sent from callback
         }
 
+        // Requires `id`, unlike macOS which falls back to the active webview.
+        // Deliberate: every other Linux `webview.*` method requires `id`, and
+        // internal consistency beats matching macOS's resolver here.
+        "webview.state" => {
+            use webkit6::prelude::WebViewExt;
+            let resp = with_webview_panel(req, mgr, |wv| {
+                Response::success(
+                    req.id.clone(),
+                    json!({
+                        "url": wv.current_url(),
+                        "title": wv.title(),
+                        "can_go_back": wv.webview.can_go_back(),
+                        "can_go_forward": wv.webview.can_go_forward(),
+                        "is_loading": wv.webview.is_loading(),
+                    }),
+                )
+            });
+            cmd.reply_with_completion(event_bus, resp);
+        }
+
         "webview.devtools" => {
             let resp = handle_webview_devtools(req, mgr);
             cmd.reply_with_completion(event_bus, resp);
+        }
+
+        // Zero-based, matching the index `tab.info` reports. Diverges from
+        // macOS (which silently no-ops a bad index) by erroring: a coctl caller
+        // has no other channel to learn the index was wrong.
+        "tab.switch" => {
+            let resp = match req.params.get("index").and_then(|v| v.as_u64()) {
+                Some(index) => {
+                    if mgr.switch_tab(index as usize) {
+                        Response::success(req.id.clone(), json!({ "status": "ok" }))
+                    } else {
+                        Response::error(
+                            req.id.clone(),
+                            "not_found",
+                            &format!("No tab at index {index}"),
+                        )
+                    }
+                }
+                None => Response::error(
+                    req.id.clone(),
+                    "invalid_params",
+                    "Missing or non-integer 'index' param",
+                ),
+            };
+            cmd.reply_with_completion(event_bus, resp);
+        }
+
+        // Pane focus movement. Already keybound (Ctrl+Shift+N / Left); exposing
+        // it so an agent can drive what a human could already do.
+        "pane.focus_next" => {
+            mgr.focus_direction(FocusDirection::Next);
+            cmd.reply_with_completion(
+                event_bus,
+                Response::success(req.id.clone(), json!({ "status": "ok" })),
+            );
+        }
+
+        "pane.focus_prev" => {
+            mgr.focus_direction(FocusDirection::Prev);
+            cmd.reply_with_completion(
+                event_bus,
+                Response::success(req.id.clone(), json!({ "status": "ok" })),
+            );
         }
 
         // -- Tab bar commands --

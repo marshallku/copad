@@ -603,6 +603,18 @@ impl TabManager {
         self.notify_cockpit_views();
     }
 
+    /// Switch to a tab by zero-based index (the same numbering `tab.info`
+    /// reports). `false` if out of range — the socket arm turns that into an
+    /// error rather than silently doing nothing, since a `coctl` caller has no
+    /// other way to learn the index was bad.
+    pub fn switch_tab(&self, index: usize) -> bool {
+        if index >= self.tabs.borrow().len() {
+            return false;
+        }
+        self.notebook.set_current_page(Some(index as u32));
+        true
+    }
+
     pub fn active_panel(&self) -> Option<Rc<PanelVariant>> {
         self.focused.borrow().clone()
     }

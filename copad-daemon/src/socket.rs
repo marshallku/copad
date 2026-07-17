@@ -38,6 +38,11 @@ pub const LEGACY_SILENT_METHODS: &[&str] = &[
     "tab.info",
     "session.list",
     "session.info",
+    // Read-only and pollable — without this, a client polling it over the
+    // daemon emits a `.completed` event per call, which triggers can see.
+    // (`webview.page_info` is missing here for the same reason; pre-existing,
+    // left alone rather than widened into this change.)
+    "webview.state",
 ];
 
 pub fn is_legacy_silent(method: &str) -> bool {
@@ -99,9 +104,12 @@ pub const LEGACY_DISPATCH_METHODS: &[&str] = &[
     "tab.list",
     "tab.info",
     "tab.rename",
+    "tab.switch",
     "tabs.toggle_bar",
     "split.horizontal",
     "split.vertical",
+    "pane.focus_next",
+    "pane.focus_prev",
     "session.list",
     "session.info",
     "webview.open",
@@ -119,6 +127,7 @@ pub const LEGACY_DISPATCH_METHODS: &[&str] = &[
     "webview.fill",
     "webview.scroll",
     "webview.page_info",
+    "webview.state",
     "webview.devtools",
     "terminal.read",
     "terminal.state",
