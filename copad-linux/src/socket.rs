@@ -560,6 +560,18 @@ pub fn dispatch(
             cmd.reply_with_completion(event_bus, resp);
         }
 
+        // Opens the cockpit, or focuses it if already open. The Ctrl+Shift+Y
+        // default can be shadowed by a user `[keybindings]` entry (those are
+        // checked first), so this keeps the panel reachable — and scriptable —
+        // regardless of what the keymap looks like.
+        "cockpit.open" => {
+            mgr.toggle_cockpit();
+            cmd.reply_with_completion(
+                event_bus,
+                Response::success(req.id.clone(), json!({ "status": "ok" })),
+            );
+        }
+
         "statusbar.show" => {
             statusbar.set_visible(true);
             cmd.reply_with_completion(

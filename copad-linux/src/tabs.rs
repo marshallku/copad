@@ -47,6 +47,17 @@ pub struct TabManager {
     project_registry: std::sync::Arc<std::sync::Mutex<copad_core::project::ProjectRegistry>>,
     workflow_registry: std::sync::Arc<copad_core::workflow::WorkflowRegistry>,
     context: std::sync::Arc<copad_core::context::ContextService>,
+    /// App-lifetime agent-status model, pumped by `window.rs`. Cockpit panels
+    /// are views over it, so it outlives any individual panel.
+    cockpit: Rc<RefCell<copad_core::agent_cockpit::AgentCockpit>>,
+    cockpit_css: gtk4::CssProvider,
+}
+
+/// One terminal pane as the cockpit sees it.
+pub struct CockpitPaneInfo {
+    pub panel_id: String,
+    pub title: String,
+    pub cwd: String,
 }
 
 impl TabManager {
@@ -61,6 +72,7 @@ impl TabManager {
         project_registry: std::sync::Arc<std::sync::Mutex<copad_core::project::ProjectRegistry>>,
         workflow_registry: std::sync::Arc<copad_core::workflow::WorkflowRegistry>,
         context: std::sync::Arc<copad_core::context::ContextService>,
+        cockpit: Rc<RefCell<copad_core::agent_cockpit::AgentCockpit>>,
     ) -> Rc<Self> {
         let notebook = gtk4::Notebook::new();
         notebook.set_scrollable(true);
@@ -87,6 +99,16 @@ impl TabManager {
             gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 3,
         );
 
+        // Cockpit CSS rides the same display-wide provider pattern as the tab
+        // bar so `update_config` can hot-reload it on a theme change.
+        let cockpit_css = gtk4::CssProvider::new();
+        cockpit_css.load_from_string(&crate::cockpit_panel::build_cockpit_css(&theme));
+        gtk4::style_context_add_provider_for_display(
+            &gdk::Display::default().unwrap(),
+            &cockpit_css,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 3,
+        );
+
         let manager = Rc::new(Self {
             notebook,
             tabs: Rc::new(RefCell::new(Vec::new())),
@@ -103,6 +125,8 @@ impl TabManager {
             project_registry,
             workflow_registry,
             context,
+            cockpit,
+            cockpit_css,
         });
 
         // Apply initial collapsed state
@@ -281,6 +305,144 @@ impl TabManager {
         Some(panel_id)
     }
 
+    /// Open the agent cockpit, or focus it if it is already open.
+    ///
+    /// Scans for the existing panel rather than caching its id — a cached id
+    /// would dangle once the user closes the tab.
+    pub fn toggle_cockpit(self: &Rc<Self>) {
+        if let Some(id) = self.find_cockpit_panel_id() {
+            self.activate_panel(&id);
+            return;
+        }
+        self.add_cockpit_tab();
+    }
+
+    fn find_cockpit_panel_id(&self) -> Option<String> {
+        for tab in self.tabs.borrow().iter() {
+            let mut panels = Vec::new();
+            tab.root.borrow().collect_panels(&mut panels);
+            if let Some(panel) = panels
+                .iter()
+                .find(|p| matches!(&***p, PanelVariant::Cockpit(_)))
+            {
+                return Some(panel.id().to_string());
+            }
+        }
+        None
+    }
+
+    pub fn add_cockpit_tab(self: &Rc<Self>) -> Option<String> {
+        let panel = Rc::new(PanelVariant::Cockpit(
+            crate::cockpit_panel::CockpitPanel::new(self.cockpit.clone(), Rc::downgrade(self)),
+        ));
+        self.track_focus(&panel);
+        let panel_id = panel.id().to_string();
+
+        let tab_content = TabContent::new(panel.clone());
+        let tab_label = self.make_tab_label(&panel, &tab_content.container);
+
+        self.notebook
+            .append_page(&tab_content.container, Some(&tab_label));
+        self.notebook
+            .set_tab_reorderable(&tab_content.container, true);
+        self.tabs.borrow_mut().push(tab_content);
+
+        let page_num = self.notebook.n_pages() - 1;
+        self.notebook.set_current_page(Some(page_num));
+        *self.focused.borrow_mut() = Some(panel.clone());
+        panel.grab_focus();
+
+        // Populate before the user sees it — the pump only pushes on change.
+        if let PanelVariant::Cockpit(cp) = &*panel {
+            cp.reload_rows();
+        }
+
+        broadcast(
+            &self.event_bus,
+            &Event::new(
+                "tab.created",
+                json!({
+                    "panel_id": panel_id,
+                    "panel_type": "cockpit",
+                    "tab": page_num,
+                }),
+            ),
+        );
+
+        Some(panel_id)
+    }
+
+    /// Redraw every open cockpit view. The pump calls this when the model or
+    /// the pane list actually changed, so the (cheap) scan stays off the hot path.
+    pub fn notify_cockpit_views(&self) {
+        for tab in self.tabs.borrow().iter() {
+            let mut panels = Vec::new();
+            tab.root.borrow().collect_panels(&mut panels);
+            for panel in panels {
+                if let PanelVariant::Cockpit(cp) = &*panel {
+                    cp.reload_rows();
+                }
+            }
+        }
+    }
+
+    /// Terminal panes only — agents run there, so webview/plugin/cockpit panels
+    /// are excluded. `cwd` is pulled live per call (OSC 7 → /proc), matching the
+    /// macOS cockpit's `reportedCwd` read; no polling timer needed.
+    pub fn terminal_pane_snapshot(&self) -> Vec<CockpitPaneInfo> {
+        let custom = self.custom_titles.borrow();
+        let mut out = Vec::new();
+        for tab in self.tabs.borrow().iter() {
+            let mut panels = Vec::new();
+            tab.root.borrow().collect_panels(&mut panels);
+            for panel in panels {
+                if let Some(term) = panel.as_terminal() {
+                    let id = term.id.clone();
+                    out.push(CockpitPaneInfo {
+                        title: custom.get(&id).cloned().unwrap_or_else(|| panel.title()),
+                        cwd: term.current_cwd().unwrap_or_default(),
+                        panel_id: id,
+                    });
+                }
+            }
+        }
+        out
+    }
+
+    /// Live terminal-pane ids — lets the cockpit pump reject events for, and
+    /// evict, panes that no longer exist.
+    pub fn live_terminal_ids(&self) -> std::collections::HashSet<String> {
+        self.terminal_pane_snapshot()
+            .into_iter()
+            .map(|p| p.panel_id)
+            .collect()
+    }
+
+    /// Focus a pane by id from anywhere (a cockpit row click): switch to its
+    /// tab, make it the focused panel, give it keyboard focus.
+    pub fn activate_panel(&self, id: &str) -> bool {
+        let Some(panel) = self.find_panel_by_id(id) else {
+            return false;
+        };
+        let Some(tab_idx) = self.tab_index_of(&panel) else {
+            return false;
+        };
+
+        // Seed `focused` BEFORE switching pages. `connect_switch_page` fires
+        // synchronously and focuses the target tab's FIRST pane whenever
+        // `focused` holds nothing from that tab — which would publish
+        // `panel.focused` for a pane the user never clicked, and the pump would
+        // acknowledge away its attention. Seeding makes that handler's filter
+        // find the intended pane instead. The borrow is a statement temporary:
+        // the handler takes a shared borrow, so holding it here would panic.
+        *self.focused.borrow_mut() = Some(panel.clone());
+        if self.notebook.current_page() != Some(tab_idx as u32) {
+            self.notebook.set_current_page(Some(tab_idx as u32));
+        }
+        panel.grab_focus();
+        true
+    }
+
     pub fn split_focused_plugin(
         self: &Rc<Self>,
         plugin: &LoadedPlugin,
@@ -344,6 +506,11 @@ impl TabManager {
 
         *self.focused.borrow_mut() = Some(new_panel.clone());
         new_panel.grab_focus();
+        // Splitting adds a terminal pane without publishing `tab.created`, and
+        // the `panel.focused` it does emit leaves the pump clean (acknowledging
+        // a fresh idle pane changes nothing) — so an open cockpit would miss the
+        // new pane. Mirror of the close path in `close_focused`.
+        self.reconcile_cockpit();
     }
 
     pub fn split_focused_webview(
@@ -419,8 +586,21 @@ impl TabManager {
                         panel.grab_focus();
                     }
                 }
+                // Closing one pane of a split leaves the tab alive and publishes
+                // NOTHING, so the cockpit pump can't see the pane list shrink —
+                // it would keep rendering the dead pane. Reconcile directly.
+                self.reconcile_cockpit();
             }
         }
+    }
+
+    /// Drop cockpit entries for panes that are gone and repaint open views.
+    /// For pane removals the pump can observe (`panel.exited`, `tab.closed`) it
+    /// does this itself; this is for the paths that emit no event.
+    pub fn reconcile_cockpit(&self) {
+        let live = self.live_terminal_ids();
+        self.cockpit.borrow_mut().retain(|id| live.contains(id));
+        self.notify_cockpit_views();
     }
 
     pub fn active_panel(&self) -> Option<Rc<PanelVariant>> {
@@ -591,6 +771,8 @@ impl TabManager {
         let theme = copad_core::theme::Theme::by_name(&config.theme.name).unwrap_or_default();
         self.tab_css
             .load_from_string(&build_tab_css(config.tabs.width, &theme));
+        self.cockpit_css
+            .load_from_string(&crate::cockpit_panel::build_cockpit_css(&theme));
 
         // Apply collapsed config if user hasn't manually toggled
         if !*self.user_toggled.borrow() {
@@ -713,6 +895,7 @@ impl TabManager {
                             info["plugin"] = json!(pp.plugin_name);
                             info["panel_name"] = json!(pp.panel_name);
                         }
+                        PanelVariant::Cockpit(_) => {}
                     }
                     return Some(info);
                 }
@@ -1031,6 +1214,9 @@ impl TabManager {
             PanelVariant::Plugin(pp) => {
                 pp.webview.add_controller(controller);
             }
+            PanelVariant::Cockpit(cp) => {
+                cp.list.add_controller(controller);
+            }
         }
     }
 
@@ -1171,6 +1357,10 @@ impl TabManager {
                     .unwrap_or_else(|| pp.plugin_name.clone());
                 (icon_name, title)
             }
+            PanelVariant::Cockpit(_) => (
+                "utilities-system-monitor-symbolic".to_string(),
+                "Agents".to_string(),
+            ),
         };
 
         let icon = gtk4::Image::from_icon_name(&icon_name);
@@ -1237,6 +1427,9 @@ impl TabManager {
             }
             PanelVariant::Plugin(_) => {
                 // Plugin panels have a static title set at creation
+            }
+            PanelVariant::Cockpit(_) => {
+                // Static "Agents" title, same as plugin panels
             }
         }
 
@@ -1699,6 +1892,11 @@ fn setup_shortcuts(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
             // keeps that role)
             gdk::Key::P => {
                 crate::command_palette::open(&win, &mgr.actions, &mgr.dispatch_tx, &mgr);
+                glib::Propagation::Stop
+            }
+            // Ctrl+Shift+Y: agent cockpit (macOS binds Cmd+Shift+Y)
+            gdk::Key::Y => {
+                mgr.toggle_cockpit();
                 glib::Propagation::Stop
             }
             // Ctrl+Shift+Tab: next tab

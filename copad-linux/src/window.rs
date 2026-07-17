@@ -484,6 +484,10 @@ impl CopadWindow {
         // and feed the local TriggerEngine.
         crate::gui_client::spawn(dispatch_tx.clone(), event_bus.clone(), ht_tx);
 
+        // App-lifetime agent-status model. Cockpit panels are views over it, so
+        // it must outlive them — opening and closing the panel never loses state.
+        let cockpit = Rc::new(RefCell::new(copad_core::agent_cockpit::AgentCockpit::new()));
+
         let tab_manager = TabManager::new(
             config,
             &window,
@@ -494,6 +498,7 @@ impl CopadWindow {
             project_registry.clone(),
             workflow_registry.clone(),
             context.clone(),
+            cockpit.clone(),
         );
 
         // Try restoring from the previous session, else seed a single
@@ -586,6 +591,24 @@ impl CopadWindow {
             &cached_triggers,
         );
 
+        // ONE receiver for every cockpit-relevant kind, because these events do
+        // not commute: `panel.focused` then `claude.awaiting_input` must end
+        // Awaiting, while the reverse must end Idle. Separate per-kind receivers
+        // would drain in kind order and collapse both to the same result,
+        // silently clearing attention the user never saw. `subscribe("*")` would
+        // also preserve order but shares its buffer with `terminal.output`.
+        let cockpit_rx = event_bus.subscribe_many([
+            "claude.*",
+            "panel.focused",
+            "panel.exited",
+            "tab.created",
+            "tab.closed",
+            "tab.renamed",
+            "panel.title_changed",
+            "terminal.cwd_changed",
+        ]);
+        let cockpit_pump = cockpit.clone();
+
         let mgr = tab_manager.clone();
         let win = window.clone();
         let sb = statusbar.clone();
@@ -653,6 +676,57 @@ impl CopadWindow {
                 socket::dispatch(cmd, &mgr, &win, &sb, &bg, &act, &bus_for_timer);
                 pump_state_timer.borrow().drain_context_only(&ctx_pump);
             }
+
+            // Agent-cockpit pump. Runs after dispatch so a `tab.new` command's
+            // pane exists before an event referencing it is applied. Every
+            // borrow is a statement temporary — the cockpit view re-enters here
+            // through activate_panel's focus handler.
+            let mut cockpit_dirty = false;
+            while let Some(event) = cockpit_rx.try_recv() {
+                let panel_id = event
+                    .payload
+                    .get("panel_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                match event.kind.as_str() {
+                    kind if kind.starts_with("claude.") => {
+                        // Gate on live panes: a late event for an already-closed
+                        // pane would otherwise resurrect a dead entry and inflate
+                        // attention_count. Cheap — agent events are human-paced.
+                        if mgr.live_terminal_ids().contains(&panel_id) {
+                            cockpit_dirty |=
+                                cockpit_pump.borrow_mut().observe(kind, &event.payload);
+                        }
+                    }
+                    "panel.exited" => {
+                        // Always dirty, not just when forget() evicted something:
+                        // a pane the model never tracked (no agent ever ran there)
+                        // still leaves the rendered list when it exits.
+                        cockpit_pump.borrow_mut().forget(&panel_id);
+                        cockpit_dirty = true;
+                    }
+                    "panel.focused" => {
+                        cockpit_dirty |= cockpit_pump.borrow_mut().acknowledge(&panel_id);
+                    }
+                    "tab.closed" => {
+                        // `tab.closed` names only one pane even when the tab held
+                        // several splits, so evict by reconciling against what is
+                        // actually still on screen. Always dirty regardless of
+                        // what retain dropped — the pane list itself shrank.
+                        let live = mgr.live_terminal_ids();
+                        cockpit_pump.borrow_mut().retain(|id| live.contains(id));
+                        cockpit_dirty = true;
+                    }
+                    // Remaining kinds don't touch the model; they just mean the
+                    // rendered pane list (title/cwd/membership) is stale.
+                    _ => cockpit_dirty = true,
+                }
+            }
+            if cockpit_dirty {
+                mgr.notify_cockpit_views();
+            }
+
             glib::ControlFlow::Continue
         });
 

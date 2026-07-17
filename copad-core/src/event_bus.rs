@@ -153,8 +153,17 @@ enum DeliveryResult {
 }
 
 struct Subscriber {
-    pattern: String,
+    /// Matches if ANY pattern matches — overlapping patterns still deliver
+    /// once. Multi-pattern subscribers exist so a consumer whose event kinds
+    /// don't commute gets ONE ordered stream (see `subscribe_many`).
+    patterns: Vec<String>,
     sender: SubscriberSender,
+}
+
+impl Subscriber {
+    fn matches(&self, kind: &str) -> bool {
+        self.patterns.iter().any(|p| pattern_matches(p, kind))
+    }
 }
 
 pub struct EventBus {
@@ -201,9 +210,34 @@ impl EventBus {
         pattern: impl Into<String>,
         buffer: usize,
     ) -> EventReceiver {
+        self.subscribe_many_with_buffer([pattern], buffer)
+    }
+
+    /// Subscribe to several patterns through ONE receiver, preserving
+    /// cross-kind arrival order.
+    ///
+    /// A consumer whose kinds don't commute cannot use one receiver per kind:
+    /// draining receiver-by-receiver applies events in kind order, not bus
+    /// order. The agent cockpit is the motivating case — `panel.focused` then
+    /// `claude.awaiting_input` must end Awaiting, while the reverse must end
+    /// Idle, and per-kind receivers collapse both to whichever drains first.
+    /// `subscribe("*")` is ordered too but shares its buffer with
+    /// high-frequency kinds like `terminal.output`.
+    pub fn subscribe_many(
+        &self,
+        patterns: impl IntoIterator<Item = impl Into<String>>,
+    ) -> EventReceiver {
+        self.subscribe_many_with_buffer(patterns, self.default_buffer)
+    }
+
+    pub fn subscribe_many_with_buffer(
+        &self,
+        patterns: impl IntoIterator<Item = impl Into<String>>,
+        buffer: usize,
+    ) -> EventReceiver {
         let (tx, rx) = sync_channel(buffer);
         self.subscribers.lock().unwrap().push(Subscriber {
-            pattern: pattern.into(),
+            patterns: patterns.into_iter().map(Into::into).collect(),
             sender: SubscriberSender::Bounded(tx),
         });
         EventReceiver { inner: rx }
@@ -214,7 +248,7 @@ impl EventBus {
     pub fn subscribe_unbounded(&self, pattern: impl Into<String>) -> EventReceiver {
         let (tx, rx) = channel();
         self.subscribers.lock().unwrap().push(Subscriber {
-            pattern: pattern.into(),
+            patterns: vec![pattern.into()],
             sender: SubscriberSender::Unbounded(tx),
         });
         EventReceiver { inner: rx }
@@ -242,15 +276,15 @@ impl EventBus {
         }
         let mut subs = self.subscribers.lock().unwrap();
         subs.retain(|sub| {
-            if !pattern_matches(&sub.pattern, &event.kind) {
+            if !sub.matches(&event.kind) {
                 return true;
             }
             match sub.sender.deliver(event.clone()) {
                 DeliveryResult::Ok => true,
                 DeliveryResult::Full => {
                     log::warn!(
-                        "event bus subscriber pattern={:?} buffer full, dropping kind={:?}",
-                        sub.pattern,
+                        "event bus subscriber patterns={:?} buffer full, dropping kind={:?}",
+                        sub.patterns,
                         event.kind
                     );
                     true
@@ -334,6 +368,63 @@ mod tests {
         assert!(!pattern_matches("foo.*", "foo"));
         assert!(!pattern_matches("foo.*", "foobar"));
         assert!(!pattern_matches("foo.*", "bar.foo"));
+    }
+
+    #[test]
+    fn subscribe_many_preserves_cross_pattern_order() {
+        // The whole point of subscribe_many: a consumer whose kinds don't
+        // commute (agent cockpit) must see bus order, not per-kind order.
+        let bus = EventBus::new();
+        let rx = bus.subscribe_many(["claude.*", "panel.focused"]);
+        bus.publish(mk("panel.focused"));
+        bus.publish(mk("claude.awaiting_input"));
+        bus.publish(mk("panel.focused"));
+
+        let kinds: Vec<String> = std::iter::from_fn(|| rx.try_recv())
+            .map(|e| e.kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            ["panel.focused", "claude.awaiting_input", "panel.focused"]
+        );
+    }
+
+    #[test]
+    fn subscribe_many_overlapping_patterns_deliver_once() {
+        let bus = EventBus::new();
+        let rx = bus.subscribe_many(["claude.*", "claude.working", "*"]);
+        bus.publish(mk("claude.working"));
+
+        assert_eq!(
+            rx.try_recv().map(|e| e.kind).as_deref(),
+            Some("claude.working")
+        );
+        assert!(
+            rx.try_recv().is_none(),
+            "overlapping patterns must not duplicate"
+        );
+    }
+
+    #[test]
+    fn subscribe_many_ignores_unmatched_kinds() {
+        let bus = EventBus::new();
+        let rx = bus.subscribe_many(["claude.*", "panel.focused"]);
+        bus.publish(mk("terminal.output")); // the flood subscribe("*") would let in
+        bus.publish(mk("claude.working"));
+
+        assert_eq!(
+            rx.try_recv().map(|e| e.kind).as_deref(),
+            Some("claude.working")
+        );
+        assert!(rx.try_recv().is_none());
+    }
+
+    #[test]
+    fn subscribe_many_empty_patterns_matches_nothing() {
+        let bus = EventBus::new();
+        let rx = bus.subscribe_many(Vec::<String>::new());
+        bus.publish(mk("claude.working"));
+        assert!(rx.try_recv().is_none());
     }
 
     #[test]

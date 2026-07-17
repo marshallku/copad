@@ -1,5 +1,6 @@
 mod app;
 mod background;
+mod cockpit_panel;
 mod command_palette;
 mod daemon_forward;
 mod gui_client;

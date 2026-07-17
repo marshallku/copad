@@ -80,7 +80,9 @@ pub fn method_capability(method: &str) -> Option<&'static str> {
         m if m.starts_with("webview.") => Some("webview"),
         m if m.starts_with("background.") => Some("background"),
         "statusbar.show" | "statusbar.hide" | "statusbar.toggle" => Some("statusbar"),
-        "agent.approve" => Some("agent.ui"),
+        // Both open a GUI-owned panel; `agent.ui` is the capability the cockpit
+        // belongs to, and every GUI that advertises it can render one.
+        "agent.approve" | "cockpit.open" => Some("agent.ui"),
         "plugin.open" => Some("plugin.open"),
         "session.list" | "session.info" => Some("session"),
         // Phase 22.2 — project + workflow surfaces live GUI-side because
@@ -491,6 +493,9 @@ mod tests {
         assert_eq!(method_capability("webview.click"), Some("webview"));
         assert_eq!(method_capability("terminal.exec"), Some("terminal"));
         assert_eq!(method_capability("claude.start"), Some("tab"));
+        // The agent cockpit is daemon-routable, so a trigger or an explicit
+        // --socket <daemon> call reaches the primary GUI instead of 404ing.
+        assert_eq!(method_capability("cockpit.open"), Some("agent.ui"));
         assert_eq!(method_capability("system.ping"), None);
         assert_eq!(method_capability("kb.search"), None);
     }

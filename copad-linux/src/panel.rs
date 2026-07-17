@@ -1,3 +1,4 @@
+use crate::cockpit_panel::CockpitPanel;
 use crate::plugin_panel::PluginPanel;
 use crate::terminal::TerminalPanel;
 use crate::webview::WebViewPanel;
@@ -14,6 +15,7 @@ pub enum PanelVariant {
     Terminal(TerminalPanel),
     WebView(WebViewPanel),
     Plugin(PluginPanel),
+    Cockpit(CockpitPanel),
 }
 
 impl Panel for PanelVariant {
@@ -22,6 +24,7 @@ impl Panel for PanelVariant {
             PanelVariant::Terminal(p) => p.widget(),
             PanelVariant::WebView(p) => p.widget(),
             PanelVariant::Plugin(p) => p.widget(),
+            PanelVariant::Cockpit(p) => p.widget(),
         }
     }
 
@@ -30,6 +33,7 @@ impl Panel for PanelVariant {
             PanelVariant::Terminal(p) => p.title(),
             PanelVariant::WebView(p) => p.title(),
             PanelVariant::Plugin(p) => p.title(),
+            PanelVariant::Cockpit(p) => p.title(),
         }
     }
 
@@ -38,6 +42,7 @@ impl Panel for PanelVariant {
             PanelVariant::Terminal(p) => p.panel_type(),
             PanelVariant::WebView(p) => p.panel_type(),
             PanelVariant::Plugin(p) => p.panel_type(),
+            PanelVariant::Cockpit(p) => p.panel_type(),
         }
     }
 
@@ -46,6 +51,7 @@ impl Panel for PanelVariant {
             PanelVariant::Terminal(p) => p.grab_focus(),
             PanelVariant::WebView(p) => p.grab_focus(),
             PanelVariant::Plugin(p) => p.grab_focus(),
+            PanelVariant::Cockpit(p) => p.grab_focus(),
         }
     }
 
@@ -54,6 +60,7 @@ impl Panel for PanelVariant {
             PanelVariant::Terminal(p) => p.id(),
             PanelVariant::WebView(p) => p.id(),
             PanelVariant::Plugin(p) => p.id(),
+            PanelVariant::Cockpit(p) => p.id(),
         }
     }
 }

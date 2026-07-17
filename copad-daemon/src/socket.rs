@@ -127,6 +127,7 @@ pub const LEGACY_DISPATCH_METHODS: &[&str] = &[
     "terminal.history",
     "terminal.context",
     "agent.approve",
+    "cockpit.open",
     "claude.start",
     "theme.list",
     "plugin.list",

@@ -47,12 +47,24 @@ impl AgentState {
         }
     }
 
-    /// Stable lowercase tag for the wire / UI / tests.
+    /// Stable lowercase tag for the wire / CSS classes / tests.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Idle => "idle",
             Self::Working => "working",
             Self::Awaiting => "awaiting",
+            Self::Done => "done",
+        }
+    }
+
+    /// Human-readable text for a cockpit row. Deliberately separate from
+    /// `as_str()`: that tag is a stable wire/CSS identifier, this is prose and
+    /// may be reworded. Mirrors the Swift port's `AgentState.label`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Working => "working",
+            Self::Awaiting => "needs input",
             Self::Done => "done",
         }
     }
@@ -123,6 +135,19 @@ impl AgentCockpit {
         self.panes.remove(panel_id).is_some()
     }
 
+    /// Drop tracked panes that no longer exist, keeping those `keep` accepts.
+    /// Returns `true` iff anything was evicted.
+    ///
+    /// `forget()` handles the precise case (`panel.exited` names its pane), but
+    /// closing a tab publishes only `tab.closed`, whose payload carries a single
+    /// `panel_id` even when the tab held several split panes — so eviction there
+    /// can't be per-id. The GUI reconciles against its live pane set instead.
+    pub fn retain(&mut self, keep: impl Fn(&str) -> bool) -> bool {
+        let before = self.panes.len();
+        self.panes.retain(|id, _| keep(id));
+        self.panes.len() != before
+    }
+
     /// Reset every pane to Idle — the manual "Reset" that drops stale overlays
     /// after a daemon restart. Real states re-arrive on the next events.
     pub fn reset(&mut self) {
@@ -133,7 +158,10 @@ impl AgentCockpit {
 
     /// Current state for a pane (default `Idle` if untracked).
     pub fn state(&self, panel_id: &str) -> AgentState {
-        self.panes.get(panel_id).map(|e| e.state).unwrap_or_default()
+        self.panes
+            .get(panel_id)
+            .map(|e| e.state)
+            .unwrap_or_default()
     }
 
     /// Current display session for a pane, if any.
@@ -143,7 +171,10 @@ impl AgentCockpit {
 
     /// How many tracked panes currently need attention (for a badge/count).
     pub fn attention_count(&self) -> usize {
-        self.panes.values().filter(|e| e.state.needs_attention()).count()
+        self.panes
+            .values()
+            .filter(|e| e.state.needs_attention())
+            .count()
     }
 }
 
@@ -220,6 +251,33 @@ mod tests {
     }
 
     #[test]
+    fn label_matches_the_swift_port() {
+        // Parity with copad-macos AgentCockpitModel.swift `AgentState.label`.
+        assert_eq!(AgentState::Idle.label(), "idle");
+        assert_eq!(AgentState::Working.label(), "working");
+        assert_eq!(AgentState::Awaiting.label(), "needs input");
+        assert_eq!(AgentState::Done.label(), "done");
+        // The wire/CSS tag stays machine-stable even where prose differs.
+        assert_eq!(AgentState::Awaiting.as_str(), "awaiting");
+    }
+
+    #[test]
+    fn retain_evicts_panes_the_predicate_rejects() {
+        let mut c = AgentCockpit::new();
+        c.observe("claude.awaiting_input", &ev("live", "s1"));
+        c.observe("claude.session_stopped", &ev("dead", "s2"));
+        assert_eq!(c.attention_count(), 2);
+
+        // A tab holding "dead" was closed; only "live" remains on screen.
+        assert!(c.retain(|id| id == "live"));
+        assert_eq!(c.state("dead"), AgentState::Idle); // untracked reads as Idle
+        assert_eq!(c.state("live"), AgentState::Awaiting);
+        assert_eq!(c.attention_count(), 1); // the whole point: no phantom attention
+
+        assert!(!c.retain(|id| id == "live")); // idempotent — nothing left to drop
+    }
+
+    #[test]
     fn session_recorded_for_display() {
         let mut c = AgentCockpit::new();
         c.observe("claude.working", &ev("p", "sess-123"));
@@ -240,7 +298,12 @@ mod tests {
         ranks.sort_by_key(|s| s.rank());
         assert_eq!(
             ranks,
-            [AgentState::Awaiting, AgentState::Done, AgentState::Working, AgentState::Idle]
+            [
+                AgentState::Awaiting,
+                AgentState::Done,
+                AgentState::Working,
+                AgentState::Idle
+            ]
         );
     }
 }
