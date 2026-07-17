@@ -112,6 +112,39 @@ final class TabViewController: NSViewController {
         return nil
     }
 
+    /// Per-pane snapshot for the agent cockpit — terminal panes only (agents run
+    /// there; excludes webview/plugin/cockpit panels). `paneManagers` is private,
+    /// so this is the public enumeration entry point. macOS has no
+    /// `terminal.cwd_changed` event, so cwd is pulled from `reportedCwd` here at
+    /// each refresh rather than tracked incrementally.
+    func terminalPaneSnapshot() -> [(panelID: String, title: String, cwd: String, tabIndex: Int)] {
+        var rows: [(panelID: String, title: String, cwd: String, tabIndex: Int)] = []
+        for (i, manager) in paneManagers.enumerated() {
+            for panel in manager.allPanels() {
+                if let term = panel as? AlacrittyTerminalViewController {
+                    rows.append((term.panelID, term.currentTitle, term.reportedCwd ?? "", i))
+                }
+            }
+        }
+        return rows
+    }
+
+    /// Focus a pane by id from anywhere (cockpit click): switch to its tab, make
+    /// it the active pane, and give it keyboard focus. Composes the primitives —
+    /// there is no single such method otherwise.
+    @discardableResult
+    func activatePanel(id: String) -> Bool {
+        for (i, manager) in paneManagers.enumerated() {
+            if let panel = manager.allPanels().first(where: { $0.panelID == id }) {
+                if i != activeIndex { switchTab(to: i) }
+                manager.setActive(panel)
+                panel.view.window?.makeFirstResponder(panel.focusTarget)
+                return true
+            }
+        }
+        return false
+    }
+
     /// First terminal panel across all tabs in DFS order — matches
     /// Linux's `TabManager::find_first_terminal`. Used by
     /// `resolveTerminalPanel` as the last-resort fallback when the

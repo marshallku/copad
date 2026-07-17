@@ -17,6 +17,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// "apply-before-dispatch" ordering rationale (matches Linux's
     /// `Pump::pump_all` pattern).
     private let contextService = ContextService()
+    /// App-lifetime agent-status model behind the cockpit panel. One pump feeds
+    /// it (`startAgentCockpitPump`); cockpit views observe it. See
+    /// `docs/agent-cockpit.md`.
+    private let agentCockpit = AgentCockpitModel()
+    private weak var cockpitPanel: CockpitViewController?
     /// PR 5c — Rust trigger engine via FFI. Lazy because the underlying
     /// copad_engine_create() must run AFTER process startup; constructing it
     /// at property-init time risks a cold-launch race. Created the first
@@ -250,6 +255,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         self.window = window
         tabVC = vc
         vc.eventBus = eventBus
+        startAgentCockpitPump()
         // "+" popover's plugin-row dispatch — same outcome as the
         // `plugin.open` RPC. Errors stderr-log here (popover is
         // fire-and-forget; surfacing an alert needs UX design we
@@ -559,6 +565,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         toggleTabBarItem.target = self
         viewMenu.addItem(toggleTabBarItem)
 
+        let cockpitItem = NSMenuItem(title: "Agent Cockpit", action: #selector(toggleCockpit), keyEquivalent: "y")
+        cockpitItem.keyEquivalentModifierMask = [.command, .shift]
+        cockpitItem.target = self
+        viewMenu.addItem(cockpitItem)
+
         viewMenu.addItem(.separator())
 
         let zoomIn = NSMenuItem(title: "Zoom In", action: #selector(zoomIn), keyEquivalent: "=")
@@ -614,6 +625,63 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func toggleTabBar() {
         tabVC?.toggleTabBar(userInitiated: true)
+    }
+
+    // MARK: - Agent cockpit
+
+    /// Open the agent cockpit as a tab, or focus the existing one. The cockpit
+    /// view observes `agentCockpit`; the pump below keeps that model current.
+    @objc func toggleCockpit() {
+        guard let tabVC else { return }
+        if let existing = cockpitPanel, tabVC.activatePanel(id: existing.panelID) { return }
+        let cockpit = CockpitViewController(model: agentCockpit, tabVC: tabVC)
+        cockpitPanel = cockpit
+        _ = tabVC.newPluginPanelTab(cockpit)
+    }
+
+    /// The single app-lifetime pump feeding the cockpit model. Reuses the
+    /// untyped `subscribe()` + kind-filter pattern from PluginPanelController
+    /// (Linux's `subscribe("*")` + filter). Agent kinds mutate the model;
+    /// panel.exited evicts; panel.focused acknowledges; every relevant event
+    /// then notifies observers so open cockpit views re-enumerate.
+    private func startAgentCockpitPump() {
+        let channel = eventBus.subscribe()
+        let model = agentCockpit
+        // macOS publishes `tab.opened` locally (Linux uses `tab.created`); include
+        // both + close/rename so the cockpit re-enumerates on pane lifecycle. Title
+        // renames post `.terminalTitleChanged` (a NotificationCenter signal, not a
+        // bus event) — the cockpit view observes that separately.
+        let kinds: Set<String> = [
+            "claude.working", "claude.awaiting_input", "claude.session_stopped",
+            "panel.exited", "panel.focused",
+            "tab.opened", "tab.created", "tab.closed", "tab.renamed", "panel.title_changed",
+        ]
+        Thread.detachNewThread {
+            while let json = channel.receive() {
+                guard let data = json.data(using: .utf8),
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let type = obj["event"] as? String, kinds.contains(type)
+                else { continue }
+                let payload = obj["data"] as? [String: Any] ?? [:]
+                // Serial FIFO hop to the main actor so rapid transitions apply in
+                // arrival order (unstructured `Task`s do not preserve order).
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        switch type {
+                        case "claude.working", "claude.awaiting_input", "claude.session_stopped":
+                            _ = model.observe(kind: type, payload: payload)
+                        case "panel.exited":
+                            if let id = payload["panel_id"] as? String { _ = model.forget(id) }
+                        case "panel.focused":
+                            if let id = payload["panel_id"] as? String { _ = model.acknowledge(id) }
+                        default:
+                            break // tab lifecycle → just re-enumerate
+                        }
+                        model.notifyObservers()
+                    }
+                }
+            }
+        }
     }
 
     // MARK: - Find
