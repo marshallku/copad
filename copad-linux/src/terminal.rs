@@ -13,6 +13,89 @@ use copad_core::theme::Theme;
 use crate::panel::Panel;
 use crate::search::SearchBar;
 
+/// POSIX single-quote escape: every `'` becomes `'\''` and the whole string is
+/// wrapped in `'...'`. Safe for any shell-interpreted character (spaces, `$`,
+/// backticks, `;`, glob chars, newlines). Empty string round-trips as `''`.
+/// Mirrors the Swift port's `shellQuote`.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Turn a dropped `GdkFileList` into one shell-quoted, space-joined payload.
+///
+/// Two cases the naive version gets wrong:
+/// - **Non-local URIs.** GTK deserializes `text/uri-list` into a `FileList`, so a
+///   dragged *web* URL can arrive here rather than as a string, and `File::path()`
+///   is `None` for it. Falling back to the URI keeps the drop useful instead of
+///   silently doing nothing.
+/// - **Non-UTF-8 paths.** Linux filenames are arbitrary bytes but `paste_text`
+///   takes `&str`. `to_string_lossy` would paste a corrupted path that doesn't
+///   exist, so such entries are skipped loudly rather than mangled.
+///
+/// Returns `None` when nothing usable survived (caller rejects the drop).
+fn quote_dropped_files(files: &[gtk4::gio::File]) -> Option<String> {
+    let mut out = Vec::new();
+    for file in files {
+        match file.path() {
+            Some(path) => match path.to_str() {
+                Some(s) => out.push(shell_quote(s)),
+                None => log::warn!(
+                    "[copad] drop: skipping non-UTF-8 path {:?} (cannot be pasted as text)",
+                    path
+                ),
+            },
+            // Non-local (e.g. a web URL, or a remote gvfs mount). Quoted like the
+            // paths beside it — this lands in a shell command line, where an
+            // unquoted `?`/`&` in a URL would break the command.
+            None => out.push(shell_quote(&file.uri())),
+        }
+    }
+    (!out.is_empty()).then(|| out.join(" "))
+}
+
+/// Save dropped image bytes as PNG under `<cache>/drops/` and return the path.
+///
+/// `create_new` + a counter rather than trusting `<millis>-<n>`: two copad
+/// processes start their counters at the same value, so a bare timestamp+counter
+/// name can collide and truncate the other process's file.
+fn save_dropped_image(texture: &gdk::Texture) -> Option<std::path::PathBuf> {
+    let dir = copad_core::paths::cache_dir().join("drops");
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        log::warn!("[copad] drop: cannot create {}: {e}", dir.display());
+        return None;
+    }
+    let bytes = texture.save_to_png_bytes();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    for n in 0..100 {
+        let path = dir.join(format!("{stamp}-{}-{n}.png", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write;
+                return match f.write_all(&bytes) {
+                    Ok(()) => Some(path),
+                    Err(e) => {
+                        log::warn!("[copad] drop: write failed {}: {e}", path.display());
+                        None
+                    }
+                };
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                log::warn!("[copad] drop: create failed {}: {e}", path.display());
+                return None;
+            }
+        }
+    }
+    None
+}
+
 /// VTE reports cwd as `file://<hostname>/abs/path`. Naive
 /// `strip_prefix("file://")` would leave the hostname mixed in. Shared
 /// by `terminal.cwd_changed` emission and `terminal.state` for shape parity.
@@ -119,6 +202,60 @@ impl TerminalPanel {
             }
         });
         terminal.add_controller(zoom_controller);
+
+        // Drag-and-drop: files / images / URLs, mirroring the macOS terminal.
+        // Routed through `paste_text` (not `feed_child`) so bracketed-paste mode
+        // is honored exactly like a clipboard paste — dropping several paths into
+        // an editor must not be interpreted as keystrokes.
+        //
+        // GTK negotiates ONE type and hands back one Value, so unlike macOS
+        // (which probes the pasteboard in priority order) precedence is the
+        // `set_types` order plus the match below. That is also why
+        // `quote_dropped_files` handles non-local URIs itself: a dragged web URL
+        // deserializes to a FileList, and there is no falling back to the String
+        // branch once GTK has chosen.
+        {
+            let drop_target = gtk4::DropTarget::new(glib::Type::INVALID, gdk::DragAction::COPY);
+            drop_target.set_types(&[
+                gdk::FileList::static_type(),
+                gdk::Texture::static_type(),
+                String::static_type(),
+            ]);
+            let term_for_drop = terminal.clone();
+            drop_target.connect_drop(move |_, value, _, _| {
+                if let Ok(files) = value.get::<gdk::FileList>() {
+                    match quote_dropped_files(&files.files()) {
+                        Some(text) => {
+                            term_for_drop.paste_text(&text);
+                            return true;
+                        }
+                        // Everything was unusable (e.g. only non-UTF-8 paths) —
+                        // reject so the user sees the drop bounce back.
+                        None => return false,
+                    }
+                }
+                if let Ok(texture) = value.get::<gdk::Texture>() {
+                    return match save_dropped_image(&texture) {
+                        Some(path) => match path.to_str() {
+                            Some(s) => {
+                                term_for_drop.paste_text(&shell_quote(s));
+                                true
+                            }
+                            None => false,
+                        },
+                        None => false,
+                    };
+                }
+                if let Ok(text) = value.get::<String>() {
+                    // Bare, matching macOS priority 3: a dropped URL is text for
+                    // the shell/CLI to do something with.
+                    term_for_drop.paste_text(&text);
+                    return true;
+                }
+                false
+            });
+            terminal.add_controller(drop_target);
+        }
 
         // Spawn shell. Panel id is allocated here (not in the
         // `Self { id, ... }` initializer below) so it can be
@@ -347,6 +484,64 @@ pub fn rgba_css(hex: &str, alpha: f64) -> String {
         (c.blue() * 255.0) as u8,
         norm_opacity(alpha),
     )
+}
+
+#[cfg(test)]
+mod shell_quote_tests {
+    use super::shell_quote;
+
+    #[test]
+    fn plain_path_is_quoted() {
+        assert_eq!(shell_quote("/home/u/a.txt"), "'/home/u/a.txt'");
+    }
+
+    #[test]
+    fn empty_round_trips_as_empty_quotes() {
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn spaces_survive_as_one_word() {
+        assert_eq!(shell_quote("/tmp/my file.txt"), "'/tmp/my file.txt'");
+    }
+
+    #[test]
+    fn single_quote_is_escaped() {
+        // POSIX has no escape inside '...', so it must be closed, escaped, reopened.
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn shell_metacharacters_are_inert() {
+        // The whole point: a hostile filename must stay one literal argument.
+        assert_eq!(shell_quote("a; rm -rf /"), "'a; rm -rf /'");
+        assert_eq!(shell_quote("$(whoami)"), "'$(whoami)'");
+        assert_eq!(shell_quote("`id`"), "'`id`'");
+        assert_eq!(shell_quote("a && b"), "'a && b'");
+        assert_eq!(shell_quote("*.rs"), "'*.rs'");
+    }
+
+    #[test]
+    fn quote_breakout_attempt_stays_quoted() {
+        // The classic escape: a filename that tries to close our quote and append
+        // a command. Every `'` is neutralized, so the payload stays one word.
+        let hostile = "'; rm -rf / #";
+        let quoted = shell_quote(hostile);
+        assert_eq!(quoted, r"''\''; rm -rf / #'");
+        // No bare (unescaped) closing quote can appear before the final char.
+        assert!(quoted.ends_with('\''));
+        assert!(quoted.starts_with('\''));
+    }
+
+    #[test]
+    fn newline_is_preserved_inside_quotes() {
+        assert_eq!(shell_quote("a\nb"), "'a\nb'");
+    }
+
+    #[test]
+    fn unicode_passes_through() {
+        assert_eq!(shell_quote("/tmp/사진.png"), "'/tmp/사진.png'");
+    }
 }
 
 #[cfg(test)]
