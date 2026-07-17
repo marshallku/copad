@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required for the Keychain (bearer-token persistence). Without a
+         keychain-access-group entitlement, SecItemAdd fails with -34018
+         (errSecMissingEntitlement) on an ad-hoc/unsigned build. The bundle-id
+         group needs no developer team, so ad-hoc ("-") signing still builds on
+         any machine. -->
+    <key>keychain-access-groups</key>
+    <array>
+        <string>com.marshall.copad.ios</string>
+    </array>
+</dict>
+</plist>

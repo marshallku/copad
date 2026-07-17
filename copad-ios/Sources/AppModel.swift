@@ -1,29 +1,59 @@
 import Foundation
 import UserNotifications
 
-/// App state: the validated server URL (persisted) + local-notification
-/// authorization status. No bearer token lives here — auth is entirely the
-/// web-bridge PWA's job (it stores the token in sessionStorage and shows its
-/// own token page); a native token field would be a nonfunctional duplicate
-/// of a high-authority secret.
+/// App state: the validated server URL (persisted in UserDefaults) + the bearer
+/// token (persisted in the **Keychain** — a high-authority secret) + local-
+/// notification status.
+///
+/// The token is optional and additive: when set, the WebView seeds it into the
+/// PWA's `sessionStorage["copad.token"]` at document-start (origin-scoped), so a
+/// native-app user enters it once and the app remembers it across launches
+/// (sessionStorage alone dies with the app). When empty, the PWA falls back to
+/// its own token page — no duplicate, no forced double-entry.
 @MainActor
 final class AppModel: ObservableObject {
     /// The validated, ready-to-load server URL. `nil` → show settings.
     @Published private(set) var serverURL: URL?
+    /// The bearer token to seed into the PWA. Empty → let the PWA prompt.
+    @Published private(set) var token: String = ""
     @Published private(set) var notifStatus: UNAuthorizationStatus = .notDetermined
 
     private let defaultsKey = "serverURLString"
 
     init() {
-        // A `-ServerURL <url>` launch argument overrides persisted state on
+        // `-ServerURL` / `-Token` launch arguments override persisted state on
         // EVERY launch, so headless verification runs are deterministic
-        // regardless of what a prior install left in UserDefaults.
+        // regardless of what a prior install left behind.
         let args = ProcessInfo.processInfo.arguments
         if let i = args.firstIndex(of: "-ServerURL"), i + 1 < args.count {
             UserDefaults.standard.set(args[i + 1], forKey: defaultsKey)
         }
+        if let i = args.firstIndex(of: "-Token"), i + 1 < args.count {
+            // Deterministic override: adopt the arg only on a successful write;
+            // on failure clear the slot so a stale prior token can't be loaded.
+            if !TokenStore.save(args[i + 1]) { TokenStore.clear() }
+        }
         let stored = UserDefaults.standard.string(forKey: defaultsKey) ?? ""
         serverURL = Self.validate(stored)
+        token = TokenStore.load() ?? ""
+    }
+
+    /// Persist + apply the bearer token to the Keychain. Empty clears it.
+    /// Returns whether the Keychain write succeeded — the caller must NOT switch
+    /// origins on failure, or the stale token could be seeded into the new one.
+    /// Only publishes the in-memory token on success, so `token` never claims a
+    /// value that won't survive a relaunch.
+    @discardableResult
+    func applyToken(_ raw: String) -> Bool {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            guard TokenStore.clear() else { return false }
+            token = ""
+        } else {
+            guard TokenStore.save(trimmed) else { return false }
+            token = trimmed
+        }
+        return true
     }
 
     var serverURLString: String {

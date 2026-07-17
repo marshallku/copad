@@ -9,23 +9,37 @@ web-bridge loaded in a `WKWebView`. The native layer adds only:
 - a validated **server-URL** setting (https, or http for loopback only);
 - a **local-notification permission** scaffold + status.
 
-**Auth is the PWA's job.** There is deliberately no native token field — the
-web-bridge page reads `sessionStorage["copad.token"]` and shows its own token
-prompt; a native duplicate would double-entry a high-authority secret and store
-it insecurely. See [docs/mobile-access.md](../docs/mobile-access.md).
+**Token persistence.** The PWA stores the bearer token in `sessionStorage`
+(`copad.token`), which dies with the app — so a native user would retype the
+64-hex token every launch. The shell fixes that: an **optional** token field in
+Settings stores the token in the iOS **Keychain**, and the WebView re-seeds
+`sessionStorage["copad.token"]` via a **document-start `WKUserScript` scoped to
+the configured origin** before the PWA's JS runs, so the token page is skipped.
+Enter once → the app remembers it, and the token is never written on any other
+origin. Leave the field blank to fall back to the PWA's own token page (no
+duplicate, no forced double-entry). See [docs/mobile-access.md](../docs/mobile-access.md).
 
 ## Status
 
-v1 (Simulator-verified 2026-07-17): app builds for the iOS Simulator, loads the
-web-bridge PWA over a configured URL, restricts navigation to that origin, shows
-a failure/retry UI, and surfaces the local-notification permission state.
+Simulator-verified 2026-07-17: app builds + launches, loads the web-bridge PWA
+over a configured URL, restricts navigation to that origin, shows a failure/retry
+UI, surfaces the local-notification permission state, and **persists the bearer
+token in the Keychain + seeds it so the PWA loads straight to the dashboard**
+(confirmed by screenshot: token page skipped, live tmux-pane list shown).
 
 **Not yet built** (needs an Apple developer account + a real device):
 - `registerForRemoteNotifications` + APNs — real background push. Pairs with
   web-bridge **WU2b** (APNs device-token registration + send). v1 intentionally
   does NOT call it (no `aps-environment` entitlement → would only fail).
 - Native keyboard accessory (the PWA ships its own on-screen `.kbd-bar`).
-- Keychain token seeding, biometric gate, TestFlight distribution.
+- Biometric (Face ID) gate on the token, TestFlight distribution.
+
+## Signing
+
+Uses **ad-hoc (`-`) signing** (no developer team needed → still builds on any
+machine) so the Keychain entitlement (`copad-ios.entitlements`,
+`keychain-access-groups`) applies — without it `SecItemAdd` fails `-34018` on the
+Simulator and the token can't persist.
 
 ## Build & run (Simulator)
 

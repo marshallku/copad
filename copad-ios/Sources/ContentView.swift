@@ -20,7 +20,7 @@ struct ContentView: View {
     @ViewBuilder
     private func webScreen(_ url: URL) -> some View {
         ZStack(alignment: .top) {
-            WebView(url: url, state: webState)
+            WebView(url: url, state: webState, token: model.token)
                 .ignoresSafeArea(.container, edges: .bottom)
             if webState.failed {
                 failureBanner(url)
@@ -65,7 +65,9 @@ struct SettingsScreen: View {
     @ObservedObject var model: AppModel
     @Binding var isPresented: Bool
     @State private var input: String = ""
+    @State private var tokenInput: String = ""
     @State private var invalid = false
+    @State private var tokenError = false
 
     var body: some View {
         NavigationStack {
@@ -80,8 +82,27 @@ struct SettingsScreen: View {
                         Text("Enter an https:// URL (http:// allowed only for localhost).")
                             .font(.caption).foregroundStyle(.red)
                     }
+                    SecureField("bearer token (optional)", text: $tokenInput)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .accessibilityIdentifier("tokenField")
+                    if tokenError {
+                        Text("Couldn't save the token to the Keychain. Server unchanged.")
+                            .font(.caption).foregroundStyle(.red)
+                    }
                     Button("Connect") {
-                        if model.apply(input) { isPresented = false } else { invalid = true }
+                        // Order matters for the token-origin guarantee: (1) reject
+                        // a bad URL before touching anything; (2) persist the token
+                        // and only proceed if that SUCCEEDED — otherwise switching
+                        // origins would seed a stale token into the new one; (3)
+                        // apply the URL. Both model mutations run synchronously so
+                        // SwiftUI coalesces them into one reload carrying (new URL,
+                        // new token).
+                        guard AppModel.validate(input) != nil else { invalid = true; return }
+                        guard model.applyToken(tokenInput) else { tokenError = true; return }
+                        tokenError = false
+                        _ = model.apply(input)
+                        isPresented = false
                     }
                     .accessibilityIdentifier("connectButton")
                 }
@@ -96,12 +117,15 @@ struct SettingsScreen: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Section {
-                    Text("The bearer token is entered in the web page itself, not here — copad's web bridge owns authentication.")
+                    Text("The token is stored in the iOS Keychain and seeded into the page so you don't retype it each launch. Leave it blank to use the web page's own token prompt instead.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
             }
             .navigationTitle("copad")
-            .onAppear { input = model.serverURLString }
+            .onAppear {
+                input = model.serverURLString
+                tokenInput = model.token
+            }
         }
     }
 

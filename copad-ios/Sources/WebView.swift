@@ -28,6 +28,9 @@ final class WebViewState: ObservableObject {
 struct WebView: UIViewRepresentable {
     let url: URL
     @ObservedObject var state: WebViewState
+    /// Bearer token to seed into the PWA's sessionStorage. Empty → no seeding
+    /// (the PWA shows its own token page).
+    var token: String = ""
 
     func makeCoordinator() -> Coordinator { Coordinator(state: state) }
 
@@ -41,18 +44,76 @@ struct WebView: UIViewRepresentable {
     func updateUIView(_ web: WKWebView, context: Context) {
         let coord = context.coordinator
         let urlChanged = coord.loadedURL?.absoluteString != url.absoluteString
+        let tokenChanged = coord.lastToken != token
         let reloadRequested = coord.lastReloadToken != state.reloadToken
-        guard urlChanged || reloadRequested else { return }
+        guard urlChanged || tokenChanged || reloadRequested else { return }
         coord.loadedURL = url
+        coord.lastToken = token
         coord.lastReloadToken = state.reloadToken
         state.failed = false
+
+        // At document-start, scoped to the configured origin, either SET the
+        // token into sessionStorage (so the PWA skips its token page) or REMOVE
+        // it when the field is blank (sessionStorage survives reloads, so just
+        // dropping the script would leave a stale token active). Origin-scoped so
+        // the token is never written on any other page the web view reaches.
+        let ucc = web.configuration.userContentController
+        ucc.removeAllUserScripts()
+        if let origin = Self.expectedOrigin(url) {
+            ucc.addUserScript(Self.storageScript(token: token, origin: origin))
+        }
         web.load(URLRequest(url: url))
+    }
+
+    /// The browser-normalized origin (default ports dropped) of `url`, matching
+    /// what `window.location.origin` reports.
+    private static func expectedOrigin(_ url: URL) -> String? {
+        guard let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased() else {
+            return nil
+        }
+        // Bracket IPv6 literals so `::1` becomes `[::1]`, matching what
+        // `window.location.origin` reports (URL.host strips the brackets).
+        let hostPart = host.contains(":") ? "[\(host)]" : host
+        var origin = "\(scheme)://\(hostPart)"
+        if let port = url.port,
+           !(scheme == "https" && port == 443),
+           !(scheme == "http" && port == 80) {
+            origin += ":\(port)"
+        }
+        return origin
+    }
+
+    /// A document-start, origin-scoped script that SETs the token when non-empty
+    /// or REMOVEs it when empty. JSON-encodes values so nothing breaks out of the
+    /// literal; on encoding failure it falls back to a no-op.
+    private static func storageScript(token: String, origin: String) -> WKUserScript {
+        let noop = WKUserScript(source: ";", injectionTime: .atDocumentStart, forMainFrameOnly: true)
+        guard let originJSON = jsonString(origin) else { return noop }
+        let op: String
+        if token.isEmpty {
+            op = "window.sessionStorage.removeItem(\"copad.token\");"
+        } else if let tokenJSON = jsonString(token) {
+            op = "window.sessionStorage.setItem(\"copad.token\",\(tokenJSON));"
+        } else {
+            return noop
+        }
+        let source = "(function(){try{if(window.location.origin===\(originJSON)){\(op)}}catch(e){}})();"
+        return WKUserScript(source: source, injectionTime: .atDocumentStart, forMainFrameOnly: true)
+    }
+
+    private static func jsonString(_ s: String) -> String? {
+        guard let data = try? JSONSerialization.data(withJSONObject: [s], options: []),
+              let arr = String(data: data, encoding: .utf8)
+        else { return nil }
+        // `["..."]` → strip the array brackets to get the bare JSON string literal.
+        return String(arr.dropFirst().dropLast())
     }
 
     @MainActor
     final class Coordinator: NSObject, WKNavigationDelegate {
         let state: WebViewState
         var loadedURL: URL?
+        var lastToken: String?
         var lastReloadToken: Int = 0
         private var activeNavigation: WKNavigation?
 

@@ -9,11 +9,12 @@ options:
   createIntermediateGroups: true
 settings:
   base:
-    # Simulator builds need no signing team; keep it off so `xcodebuild
-    # -sdk iphonesimulator` works on any machine without provisioning.
-    CODE_SIGNING_ALLOWED: "NO"
+    # Ad-hoc ("-") signing needs no developer team, so `xcodebuild -sdk
+    # iphonesimulator` still builds on any machine — but unlike CODE_SIGNING
+    # off, it lets the Keychain entitlement (bearer-token persistence) apply.
+    CODE_SIGNING_ALLOWED: "YES"
     CODE_SIGNING_REQUIRED: "NO"
-    CODE_SIGN_IDENTITY: ""
+    CODE_SIGN_IDENTITY: "-"
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
 targets:
@@ -28,6 +29,7 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         GENERATE_INFOPLIST_FILE: "NO"
         INFOPLIST_FILE: Sources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: copad-ios.entitlements
     info:
       path: Sources/Info.plist
       properties:

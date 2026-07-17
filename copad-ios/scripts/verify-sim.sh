@@ -4,12 +4,14 @@
 # boots it, uninstalls any prior copy, resets notification privacy). Requires
 # Xcode + xcodegen. macOS only.
 #
-#   ./scripts/verify-sim.sh [server-url]
+#   ./scripts/verify-sim.sh [server-url] [bearer-token]
 #
 # server-url (optional, default http://127.0.0.1:7575): passed to the app via a
 # `-ServerURL` launch arg that overrides persisted state every launch. If it's a
 # 127.0.0.1 URL, the script preflights `/healthz` so a dead web-bridge is
 # distinguishable from a shell failure.
+# bearer-token (optional): passed via `-Token`; the app stores it in the Keychain
+# and seeds it into the PWA's sessionStorage so the token page is skipped.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -18,6 +20,7 @@ BUNDLE_ID="com.marshall.copad.ios"
 SCHEME="copad-ios"
 DERIVED="build"
 SERVER_URL="${1:-http://127.0.0.1:7575}"
+BEARER_TOKEN="${2:-}"
 SHOT="${TMPDIR:-/tmp}/copad-ios-sim.png"
 
 log() { printf '[verify-sim] %s\n' "$*" >&2; }
@@ -72,9 +75,11 @@ APP="$DERIVED/Build/Products/Debug-iphonesimulator/$SCHEME.app"
 xcrun simctl uninstall "$UDID" "$BUNDLE_ID" 2>/dev/null || true
 xcrun simctl privacy "$UDID" reset all "$BUNDLE_ID" 2>/dev/null || true
 
-log "installing + launching (ServerURL=$SERVER_URL)"
+log "installing + launching (ServerURL=$SERVER_URL${BEARER_TOKEN:+, with token})"
 xcrun simctl install "$UDID" "$APP"
-xcrun simctl launch "$UDID" "$BUNDLE_ID" -ServerURL "$SERVER_URL" >/dev/null
+LAUNCH_ARGS=(-ServerURL "$SERVER_URL")
+[ -n "$BEARER_TOKEN" ] && LAUNCH_ARGS+=(-Token "$BEARER_TOKEN")
+xcrun simctl launch "$UDID" "$BUNDLE_ID" "${LAUNCH_ARGS[@]}" >/dev/null
 
 sleep 3
 xcrun simctl io "$UDID" screenshot "$SHOT" >/dev/null
