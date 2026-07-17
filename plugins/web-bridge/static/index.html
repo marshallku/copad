@@ -24,7 +24,13 @@
       --border: #313244;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: ui-monospace, "JetBrains Mono", "SF Mono", monospace; }
-    body { background: var(--bg); color: var(--fg); padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); min-height: 100vh; overflow: hidden; }
+    /* --app-h tracks the VISUAL viewport (see setAppHeight in JS). 100vh/100dvh
+       are the LAYOUT viewport: neither shrinks when the on-screen keyboard opens,
+       so a vh-based terminal stays full height behind the keyboard. The fallback
+       only applies before the first JS measurement, or on browsers without
+       visualViewport. */
+    :root { --app-h: 100vh; }
+    body { background: var(--bg); color: var(--fg); padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); min-height: var(--app-h); overflow: hidden; }
     header { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; padding: 0.6rem 0.9rem; border-bottom: 1px solid var(--border); background: var(--bg-2); position: sticky; top: 0; z-index: 10; }
     header h1 { font-size: 0.95rem; font-weight: 500; }
     header h1 .dim { color: var(--fg-dim); }
@@ -35,7 +41,7 @@
     .chip[disabled] { opacity: 0.45; cursor: not-allowed; }
 
     /* ==== overview mode ==== */
-    main.overview { display: flex; flex-direction: column; gap: 0.6rem; padding: 0.6rem; max-width: 800px; margin: 0 auto; height: calc(100vh - 50px); overflow-y: auto; overflow-x: hidden; }
+    main.overview { display: flex; flex-direction: column; gap: 0.6rem; padding: 0.6rem; max-width: 800px; margin: 0 auto; height: calc(var(--app-h) - 50px); overflow-y: auto; overflow-x: hidden; }
     .section-title { font-size: 0.72rem; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.08em; padding: 0 0.2rem; margin-top: 0.25rem; display: flex; justify-content: space-between; align-items: center; }
     /* min-width: 0 on the grid + items lets nowrap+ellipsis actually
        shrink the cell instead of pushing the grid wider than the
@@ -113,7 +119,7 @@
     .chip.ok { color: var(--accent-ok); border-color: var(--accent-ok); }
 
     /* ==== attach mode ==== */
-    main.attach { display: flex; flex-direction: column; height: calc(100vh - 50px); }
+    main.attach { display: flex; flex-direction: column; height: calc(var(--app-h) - 50px); }
     .attach-bar { display: flex; gap: 0.4rem; padding: 0.4rem 0.6rem; background: var(--bg-2); border-bottom: 1px solid var(--border); align-items: center; }
     .attach-bar .back { padding: 0.3rem 0.55rem; }
     .attach-bar .title { flex: 1; font-size: 0.8rem; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -778,7 +784,39 @@
         } catch {}
       };
       window.addEventListener("resize", onResize);
-      state._removeResize = () => window.removeEventListener("resize", onResize);
+
+      // The on-screen keyboard does NOT fire window.resize on iOS — it shrinks the
+      // *visual* viewport while the layout viewport (and 100vh/100dvh) stay put. So
+      // without this the terminal keeps its full height behind the keyboard and the
+      // PTY never learns its new size. visualViewport is the only signal that sees
+      // the keyboard; `scroll` matters too because iOS pans the visual viewport to
+      // keep the focused element visible.
+      const vv = window.visualViewport;
+      let vvRaf = 0;
+      const onViewport = () => {
+        // visualViewport fires a burst during the keyboard animation; coalesce to
+        // one refit per frame so we don't spam PTY resizes mid-animation.
+        if (vvRaf) return;
+        vvRaf = requestAnimationFrame(() => {
+          vvRaf = 0;
+          setAppHeight();
+          onResize();
+        });
+      };
+      if (vv) {
+        vv.addEventListener("resize", onViewport);
+        // passive: the handler never preventDefaults, and a non-passive scroll
+        // listener blocks the compositor during the keyboard animation.
+        vv.addEventListener("scroll", onViewport, { passive: true });
+      }
+      state._removeResize = () => {
+        window.removeEventListener("resize", onResize);
+        if (vv) {
+          vv.removeEventListener("resize", onViewport);
+          vv.removeEventListener("scroll", onViewport);
+        }
+        if (vvRaf) { cancelAnimationFrame(vvRaf); vvRaf = 0; }
+      };
     }
 
     function sendKbdBytes(escape) {
@@ -976,6 +1014,33 @@
     }
 
     /* ==== actions ==== */
+    /// Publish the VISUAL viewport height as --app-h.
+    ///
+    /// Every full-height view keys off this instead of 100vh/100dvh, because the
+    /// layout viewport does not shrink for the on-screen keyboard — only the visual
+    /// viewport does. Without it the phone keyboard covers the terminal (and the
+    /// pilot composer) with no way to see what you're typing at.
+    function setAppHeight() {
+      const vv = window.visualViewport;
+      const h = Math.round(vv ? vv.height : window.innerHeight);
+      if (h > 0) document.documentElement.style.setProperty("--app-h", h + "px");
+    }
+
+    // Global measurement: the overview/pilot views raise the keyboard too (goal
+    // composer). The attach view registers its own handler as well so it can refit
+    // the terminal + resize the PTY; both call setAppHeight so neither depends on
+    // listener registration order.
+    (function trackViewport() {
+      setAppHeight();
+      const vv = window.visualViewport;
+      if (vv) {
+        vv.addEventListener("resize", setAppHeight);
+        vv.addEventListener("scroll", setAppHeight, { passive: true });
+      }
+      window.addEventListener("orientationchange", setAppHeight);
+      window.addEventListener("resize", setAppHeight);
+    })();
+
     async function bootstrap() {
       state.presence = "…";
       try {
