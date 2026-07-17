@@ -19,6 +19,7 @@ Cross-platform custom terminal emulator with shared Rust core and platform-nativ
 - `copad-linux/` — GTK4 + VTE4 native terminal app (binary: `copad`)
 - `copad-cli/` — CLI control tool (binary: `coctl`)
 - `copad-macos/` — Swift/AppKit app (full secondary platform: alacritty_terminal renderer, tabs/splits, webview, plugins, daemon client — see `docs/macos-post-renderer-catchup.md` for the remaining polish backlog)
+- `copad-ios/` — SwiftUI + WKWebView thin native shell around the `web-bridge` PWA (mobile client; xcodegen project, Simulator-verified). See `copad-ios/README.md` and `docs/mobile-access.md`.
 - `plugins/<name>/` — First-party plugins. Each dir holds the Rust crate (`Cargo.toml` + `src/`) and its runtime manifest/assets (`plugin.toml`, `panel.html`, `triggers.example.toml`) together. Crate name remains `copad-plugin-<name>` (binary name unchanged).
 - `examples/plugins/hello/` — Tutorial plugin demonstrating a panel + a bash command (no Rust crate)
 - `docs/` — Project documentation (architecture, decisions, troubleshooting, roadmap)

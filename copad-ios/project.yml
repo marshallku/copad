@@ -1,0 +1,50 @@
+# xcodegen spec for the copad iOS shell. Generate the (gitignored) .xcodeproj:
+#   cd copad-ios && xcodegen generate
+# See README.md. The pbxproj is generated so this YAML stays the reviewable SoT.
+name: copad-ios
+options:
+  bundleIdPrefix: com.marshall.copad
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    # Simulator builds need no signing team; keep it off so `xcodebuild
+    # -sdk iphonesimulator` works on any machine without provisioning.
+    CODE_SIGNING_ALLOWED: "NO"
+    CODE_SIGNING_REQUIRED: "NO"
+    CODE_SIGN_IDENTITY: ""
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  copad-ios:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.marshall.copad.ios
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: "NO"
+        INFOPLIST_FILE: Sources/Info.plist
+    info:
+      path: Sources/Info.plist
+      properties:
+        CFBundleDisplayName: copad
+        UILaunchScreen:
+          UIColorName: LaunchBackground
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # Scoped ATS: allow cleartext ONLY to loopback/*.local for local dev.
+        # The real Tailscale path is https://*.ts.net (needs no exception).
+        # Never NSAllowsArbitraryLoads.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
