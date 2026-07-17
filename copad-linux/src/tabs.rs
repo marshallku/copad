@@ -7,7 +7,7 @@ use gtk4::prelude::*;
 use serde_json::json;
 
 use copad_core::config::CopadConfig;
-use copad_core::protocol::Event;
+use copad_core::protocol::{Event, Request};
 
 use vte4::prelude::*;
 use webkit6::prelude::*;
@@ -1743,6 +1743,86 @@ pub enum FocusDirection {
     Prev,
 }
 
+/// Run a `[keybindings]` value. `spawn:` shells out; `action:` dispatches a
+/// copad method. Mirrors the macOS `Keybindings.dispatch` split.
+///
+/// An unprefixed value keeps working as a bare shell command — macOS warns and
+/// skips, but Linux has always treated it as `spawn:`, and silently breaking
+/// every existing config to match macOS would be the wrong trade.
+fn run_binding(command: &str, dispatch_tx: &std::sync::mpsc::Sender<SocketCommand>) {
+    match command.strip_prefix("action:") {
+        Some(tail) => dispatch_binding_action(tail, dispatch_tx),
+        None => spawn_command(command),
+    }
+}
+
+/// `action:<method> [k=v ...]` — parses macOS's `invokeAction` grammar and
+/// routes through `dispatch_tx`, i.e. the same channel the command palette uses.
+/// That reaches BOTH the ActionRegistry and the legacy socket arms, matching
+/// what macOS gets from `tryDispatchOrFallback`'s registry-then-fallback.
+///
+/// Values are always strings, as on macOS: `index=0` arrives as `"0"`. That
+/// makes `action:tab.switch index=0` fail its `as_u64` parse — noted in the docs
+/// rather than papered over with a guess about which keys are numeric.
+fn dispatch_binding_action(tail: &str, dispatch_tx: &std::sync::mpsc::Sender<SocketCommand>) {
+    let mut parts = tail.split_whitespace();
+    let Some(method) = parts.next() else {
+        eprintln!("[copad] keybinding 'action:' has no method — ignoring");
+        return;
+    };
+    let mut params = serde_json::Map::new();
+    for kv in parts {
+        match kv.split_once('=') {
+            Some((k, v)) => {
+                params.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+            }
+            // Same as macOS: skip a malformed pair rather than abort the action.
+            None => {
+                eprintln!("[copad] keybinding action {method}: ignoring malformed param {kv:?}")
+            }
+        }
+    }
+
+    let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+    let cmd = SocketCommand {
+        request: Request::new(
+            uuid::Uuid::new_v4().to_string(),
+            method,
+            serde_json::Value::Object(params),
+        ),
+        reply: reply_tx,
+        silent_completion: false,
+    };
+    if dispatch_tx.send(cmd).is_err() {
+        eprintln!("[copad] keybinding action {method}: dispatch channel closed");
+        return;
+    }
+
+    // Surface failures the way macOS's completion callback does. Dropping the
+    // receiver instead would leave a typo'd method silently dead — the exact bug
+    // this whole prefix exists to fix. Dispatch is async (the GTK timer drains
+    // the queue), so wait off the main thread; the timeout keeps a handler that
+    // never replies from leaking the thread.
+    let method = method.to_string();
+    std::thread::spawn(move || {
+        match reply_rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(response) => {
+                if let Some(err) = response.error {
+                    eprintln!(
+                        "[copad] keybinding action {method} failed: {} — {}",
+                        err.code, err.message
+                    );
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                eprintln!("[copad] keybinding action {method}: no response within 5s")
+            }
+            // Handler dropped the responder without replying (fire-and-forget arms).
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+    });
+}
+
 fn spawn_command(command: &str) {
     let cmd = command.strip_prefix("spawn:").unwrap_or(command);
 
@@ -1801,13 +1881,13 @@ fn check_custom_keybinding(
             continue;
         }
         if binding.key == key_name {
-            spawn_command(&binding.command);
+            run_binding(&binding.command, &mgr.dispatch_tx);
             return true;
         }
         if let Some(ref unshifted) = unshifted_name
             && binding.key == *unshifted
         {
-            spawn_command(&binding.command);
+            run_binding(&binding.command, &mgr.dispatch_tx);
             return true;
         }
     }
