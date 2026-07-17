@@ -399,6 +399,112 @@ pub struct CopadSnapshot {
 ///
 /// `shell` and `cwd` may be NULL or point to valid C strings. They
 /// are copied; caller retains ownership.
+
+/// Resolve an absolute `tmux` path for the `[terminal] backend = "tmux"`
+/// pane backend. A Finder/launchd-launched Copad.app inherits launchd's
+/// minimal PATH (no Homebrew), so a bare `execvp("tmux")` would fail —
+/// probe `$PATH` first, then the common install dirs, and fall back to the
+/// bare name so PATH-carrying environments (dev direct-exec) still work.
+fn resolve_tmux() -> String {
+    // A regular file that is also executable — so a stale / non-exec `tmux`
+    // file can't shadow a real installation later in the search order.
+    fn is_exec(p: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    }
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let cand = dir.join("tmux");
+            if is_exec(&cand) {
+                return cand.to_string_lossy().into_owned();
+            }
+        }
+    }
+    for cand in ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"] {
+        if is_exec(std::path::Path::new(cand)) {
+            return cand.to_string();
+        }
+    }
+    "tmux".to_string()
+}
+
+/// Build the argv for a tmux-backed pane (decision #60), split out as a pure
+/// function so the identity behavior is unit-testable without a live tmux.
+///
+/// `-e COPAD_PANEL_ID` / `-e COPAD_SOCKET` are REQUIRED, not just nice-to-have:
+/// the private `-L copad` server keeps the FIRST client's global environment,
+/// and these vars are not in tmux's default `update-environment`, so without a
+/// per-session `-e` a second pane's shell would inherit the first pane's
+/// identity + GUI socket and misroute the `copad-cwd` hook and `coctl` calls.
+/// (`-e` on `new-session` needs tmux >= 3.2.) A lone `;` argv element is tmux's
+/// command separator (direct exec, no shell quoting); the trailing `set`s make
+/// the pane read as a native shell (no status bar) with truecolor + mouse.
+fn build_tmux_argv(
+    session: &str,
+    shell: Option<&str>,
+    panel_id: Option<&str>,
+    socket: Option<&str>,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec!["-L".into(), "copad".into(), "new-session".into()];
+    if let Some(id) = panel_id {
+        args.push("-e".into());
+        args.push(format!("COPAD_PANEL_ID={id}"));
+    }
+    if let Some(s) = socket {
+        args.push("-e".into());
+        args.push(format!("COPAD_SOCKET={s}"));
+    }
+    args.push("-A".into());
+    args.push("-s".into());
+    args.push(session.to_string());
+    if let Some(sh) = shell {
+        args.push(sh.to_string());
+    }
+    for extra in [
+        &[";", "set", "-g", "status", "off"][..],
+        &[";", "set", "-g", "mouse", "on"][..],
+        // `-g` (replace), not `-ga` (append): this runs on every pane spawn
+        // against the shared `-L copad` server, so appending would grow the
+        // option with duplicate entries over the server's lifetime. Replacing
+        // a fixed value is idempotent (we own this private server).
+        &[";", "set", "-g", "terminal-overrides", ",xterm-256color:Tc"][..],
+    ] {
+        args.extend(extra.iter().map(|s| s.to_string()));
+    }
+    args
+}
+
+#[cfg(test)]
+mod tmux_argv_tests {
+    use super::build_tmux_argv;
+
+    /// Regression for the shared `-L copad` server env leak: each session must
+    /// carry its own COPAD_PANEL_ID / COPAD_SOCKET via `-e`, placed before the
+    /// `-s` session name, so pane 2 never inherits pane 1's identity/socket.
+    #[test]
+    fn per_session_env_is_injected_before_session_name() {
+        let a = build_tmux_argv("copad-P2", Some("/bin/zsh"), Some("P2"), Some("/tmp/copad-9.sock"));
+        assert_eq!(&a[0..3], &["-L", "copad", "new-session"]);
+        assert!(a.windows(2).any(|w| w[0] == "-e" && w[1] == "COPAD_PANEL_ID=P2"));
+        assert!(a.windows(2).any(|w| w[0] == "-e" && w[1] == "COPAD_SOCKET=/tmp/copad-9.sock"));
+        assert!(a.windows(2).any(|w| w[0] == "-s" && w[1] == "copad-P2"));
+        let first_e = a.iter().position(|x| x == "-e").unwrap();
+        let s_flag = a.iter().position(|x| x == "-s").unwrap();
+        assert!(first_e < s_flag, "new-session -e flags must precede -s");
+    }
+
+    /// No panel/socket → no `-e`; shell still runs, `-A` attach-or-create holds.
+    #[test]
+    fn omits_env_flags_when_absent() {
+        let a = build_tmux_argv("copad-P3", None, None, None);
+        assert!(!a.iter().any(|x| x == "-e"));
+        assert!(a.windows(2).any(|w| w[0] == "-A" && w[1] == "-s"));
+        assert!(a.contains(&"copad-P3".to_string()));
+    }
+}
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn copad_term_create(
     cols: u16,
@@ -407,6 +513,7 @@ pub unsafe extern "C" fn copad_term_create(
     cwd: *const c_char,
     panel_id: *const c_char,
     socket_path: *const c_char,
+    tmux_session: *const c_char,
 ) -> *mut CopadHandle {
     let safe_cols = cols.max(1);
     let safe_rows = rows.max(1);
@@ -419,18 +526,24 @@ pub unsafe extern "C" fn copad_term_create(
     // env the hook short-circuits because `coctl` would otherwise
     // hit the well-known daemon path (not our per-instance GUI socket
     // owning the panel).
-    if !panel_id.is_null() {
-        // SAFETY: caller contract — panel_id, if non-null, is a NUL-
-        // terminated UTF-8 string valid for the call.
-        if let Ok(s) = unsafe { CStr::from_ptr(panel_id) }.to_str() {
-            tty_opts.env.insert("COPAD_PANEL_ID".into(), s.to_owned());
-        }
+    // SAFETY: caller contract — panel_id / socket_path, if non-null, are
+    // NUL-terminated UTF-8 strings valid for the call. Captured as owned
+    // strings so the tmux backend can also inject them per-session (below).
+    let panel_id_str: Option<String> = if panel_id.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(panel_id) }.to_str().ok().map(str::to_owned)
+    };
+    if let Some(s) = &panel_id_str {
+        tty_opts.env.insert("COPAD_PANEL_ID".into(), s.clone());
     }
-    if !socket_path.is_null() {
-        // SAFETY: caller contract.
-        if let Ok(s) = unsafe { CStr::from_ptr(socket_path) }.to_str() {
-            tty_opts.env.insert("COPAD_SOCKET".into(), s.to_owned());
-        }
+    let socket_str: Option<String> = if socket_path.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(socket_path) }.to_str().ok().map(str::to_owned)
+    };
+    if let Some(s) = &socket_str {
+        tty_opts.env.insert("COPAD_SOCKET".into(), s.clone());
     }
     // Force a known-good TERM for the child shell. Without this we
     // inherit whatever the parent process had (e.g. `xterm-ghostty`
@@ -463,11 +576,41 @@ pub unsafe extern "C" fn copad_term_create(
     {
         tty_opts.env.insert("LANG".into(), "C.UTF-8".into());
     }
-    if !shell.is_null() {
+    // Parse the requested login shell (may be NULL — then alacritty falls
+    // back to the system default shell).
+    let shell_prog: Option<String> = if shell.is_null() {
+        None
+    } else {
         // SAFETY: caller contract — non-null pointer is a NUL-terminated C string.
-        if let Ok(s) = unsafe { CStr::from_ptr(shell) }.to_str() {
-            tty_opts.shell = Some(Shell::new(s.to_owned(), Vec::new()));
-        }
+        unsafe { CStr::from_ptr(shell) }.to_str().ok().map(str::to_owned)
+    };
+    // `[terminal] backend = "tmux"` (decision #60): back the pane onto a
+    // dedicated single-pane tmux session instead of a raw shell. The pane's
+    // process + scrollback then live in the tmux server and survive the GUI
+    // process, and the same `COPAD_PANEL_ID`-derived session name is the one
+    // identity the cockpit + mobile attach target (kills the pane-model
+    // split-brain). Uses a private `-L copad` server socket so copad sessions
+    // never mix with the user's own tmux. `new-session -A` attaches if the
+    // session already exists (idempotent reattach), else creates it running
+    // the login shell. A lone `;` argv element is tmux's command separator
+    // (this is a direct exec, not a shell, so no quoting is involved) — the
+    // trailing `set` commands make a copad pane read as a native shell
+    // (no status bar) with truecolor + mouse passthrough.
+    let tmux_session: Option<String> = if tmux_session.is_null() {
+        None
+    } else {
+        unsafe { CStr::from_ptr(tmux_session) }.to_str().ok().map(str::to_owned)
+    };
+    if let Some(session) = tmux_session {
+        let args = build_tmux_argv(
+            &session,
+            shell_prog.as_deref(),
+            panel_id_str.as_deref(),
+            socket_str.as_deref(),
+        );
+        tty_opts.shell = Some(Shell::new(resolve_tmux(), args));
+    } else if let Some(sh) = shell_prog {
+        tty_opts.shell = Some(Shell::new(sh, Vec::new()));
     }
     if !cwd.is_null()
         && let Ok(s) = unsafe { CStr::from_ptr(cwd) }.to_str()

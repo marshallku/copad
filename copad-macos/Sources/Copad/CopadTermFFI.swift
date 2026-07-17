@@ -56,12 +56,14 @@ enum CopadTermFFI {
         /// no thread-affinity.
         private nonisolated(unsafe) var ptr: OpaquePointer?
 
-        init?(cols: UInt16, rows: UInt16, shell: String? = nil, cwd: String? = nil, panelID: String? = nil, socketPath: String? = nil) {
+        init?(cols: UInt16, rows: UInt16, shell: String? = nil, cwd: String? = nil, panelID: String? = nil, socketPath: String? = nil, tmuxSession: String? = nil) {
             let p = shell.withCStringOrNull { shellPtr in
                 cwd.withCStringOrNull { cwdPtr in
                     panelID.withCStringOrNull { panelPtr in
                         socketPath.withCStringOrNull { socketPtr in
-                            copad_term_create(cols, rows, shellPtr, cwdPtr, panelPtr, socketPtr)
+                            tmuxSession.withCStringOrNull { tmuxPtr in
+                                copad_term_create(cols, rows, shellPtr, cwdPtr, panelPtr, socketPtr, tmuxPtr)
+                            }
                         }
                     }
                 }
