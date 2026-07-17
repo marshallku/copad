@@ -1955,6 +1955,15 @@ fn setup_shortcuts(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
                 mgr.add_tab(&win);
                 glib::Propagation::Stop
             }
+            // Ctrl+Shift+U: new web tab. macOS pairs this with New Tab as
+            // Cmd+T / Cmd+Shift+T, which Linux can't mirror — Ctrl-only chords
+            // are reserved for the terminal child, so Ctrl+Shift+T is already
+            // New Tab and there is no shifted slot left. Parity here is
+            // capability-level, not chord-level. `U` for URL.
+            gdk::Key::U => {
+                mgr.add_webview_tab("about:blank", &win);
+                glib::Propagation::Stop
+            }
             // Ctrl+Shift+W: close focused panel (unsplit or close tab)
             gdk::Key::W => {
                 mgr.close_focused(&win);
