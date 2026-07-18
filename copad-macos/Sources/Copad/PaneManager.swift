@@ -348,11 +348,34 @@ final class PaneManager {
             return .terminal(cwd: t.currentCwd, launch: nil, tmuxRef: tmuxRef)
         }
         if let w = panel as? WebViewController {
-            return .webview(url: w.currentURL)
+            return .webview(url: Self.canonicalWebviewURL(w.currentURL))
         }
         // Plugin panels: name resolution lands in slice 6; capture a marker so
         // the leaf isn't lost from the tree in the meantime.
         return .plugin(name: "plugin", version: nil)
+    }
+
+    /// Decision #61 C6: reduce a live webview URL to a safe canonical form for
+    /// persistence — the **origin only** (`scheme://host[:port]`), http(s) only.
+    /// Path, query, fragment, and userinfo are ALL dropped, because every one of
+    /// them can carry credentials or one-time tokens (`user:pass@`, `?code=…`,
+    /// `#access_token=…`, `/reset/<token>`, `/oauth/callback/<code>`). Nothing
+    /// beyond the origin reaches disk. Restore reopens the site root — the safe
+    /// default absent a per-URL user approval. Non-http(s) / hostless / unparseable
+    /// persist as "" and restore to the blank URL-entry placeholder.
+    static func canonicalWebviewURL(_ raw: String) -> String {
+        // Parse first, then compare a lowercased scheme — URL schemes are
+        // case-insensitive, so `HTTPS://…` is valid and must not be dropped.
+        guard let comps = URLComponents(string: raw),
+              let scheme = comps.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = comps.host, !host.isEmpty
+        else { return "" }
+        var origin = URLComponents()
+        origin.scheme = scheme
+        origin.host = host
+        origin.port = comps.port
+        return origin.string ?? ""
     }
 
     /// Fold an n-ary branch into a right-leaning binary PaneNode tree (the v2
