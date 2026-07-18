@@ -25,6 +25,11 @@ final class TabViewController: NSViewController {
     /// single writer. Suppressed during restore so replay doesn't re-save.
     private var sessionSaveTimer: Timer?
     private var suppressSessionSave = false
+
+    /// Reopens a plugin panel by name on session restore (decision #61 slice 6).
+    /// Set by AppDelegate, which owns the manifest store + action registry that
+    /// plugin construction needs. nil-returning name → unavailable placeholder.
+    var pluginFactory: ((_ name: String, _ restoreID: String) -> (any CopadPanel)?)?
     private var contentArea: NSView!
     /// Window-level background image (Phase 10b follow-up). One image
     /// fills the entire `contentArea` so splits share the same
@@ -498,8 +503,9 @@ final class TabViewController: NSViewController {
         // session (multi-session is slice 7).
         guard let session = file.sessions.first else { return }
         for sub in session.subTabs {
-            let initial = PaneManager.panelFromPane(PaneManager.leftmostPane(sub.root), config: config, theme: theme)
+            let initial = PaneManager.panelFromPane(PaneManager.leftmostPane(sub.root), config: config, theme: theme, pluginFactory: pluginFactory)
             let manager = PaneManager(config: config, theme: theme, initialPanel: .pluginPanel(initial))
+            manager.pluginFactory = pluginFactory
             addTab(manager: manager)
             manager.restoreSplitsV2(into: manager.activePane, from: sub.root)
             if let title = sub.name {

@@ -284,6 +284,25 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         startSocketServer()
         startConfigWatcher()
+        // Decision #61 slice 6: give the restore path a factory to reopen a
+        // plugin panel by name (restore reopens the plugin's first panel).
+        // Lives here because plugin construction needs the manifest store +
+        // action registry the pane manager can't reach; MUST be set before the
+        // restore below. nil (plugin uninstalled) → explicit placeholder.
+        vc.pluginFactory = { [weak self, weak vc] name, restoreID in
+            guard let self, let vc,
+                  let manifest = PluginManifestStore.discover().first(where: { $0.manifest.plugin.name == name }),
+                  let panelDef = manifest.manifest.panels.first
+            else { return nil }
+            return PluginPanelController(
+                plugin: manifest,
+                panelDef: panelDef,
+                registry: self.actionRegistry,
+                eventBus: self.eventBus,
+                theme: vc.theme,
+                restoreID: restoreID,
+            )
+        }
         // Session-persistence restore: if a snapshot exists, replay
         // tabs + splits + per-leaf cwd; otherwise seed a single
         // default terminal tab. MUST happen before the daemon starts

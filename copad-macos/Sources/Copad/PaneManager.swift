@@ -342,6 +342,11 @@ final class PaneManager {
 
     private func paneContentV2(_ panel: any CopadPanel) -> Session.PaneContent {
         if let t = panel as? AlacrittyTerminalViewController {
+            // An unavailable-plugin placeholder re-captures as its plugin so the
+            // reference isn't lost on re-save (decision #61 C5).
+            if let pluginRef = t.unavailablePluginRef {
+                return .plugin(name: pluginRef, version: nil)
+            }
             // The tmux-backed session name is `copad-<panelID>` (see the FFI
             // spawn path). Persisting it lets slice-4 restore reattach it.
             let tmuxRef = config.terminalBackend == .tmux ? "copad-\(t.panelID)" : nil
@@ -350,10 +355,19 @@ final class PaneManager {
         if let w = panel as? WebViewController {
             return .webview(url: Self.canonicalWebviewURL(w.currentURL))
         }
-        // Plugin panels: name resolution lands in slice 6; capture a marker so
-        // the leaf isn't lost from the tree in the meantime.
+        if let pl = panel as? PluginPanelController {
+            return .plugin(name: pl.pluginName, version: nil)
+        }
+        // Unknown panel type — keep the leaf with a generic marker.
         return .plugin(name: "plugin", version: nil)
     }
+
+    /// Factory for reopening a plugin panel by name on restore (decision #61
+    /// slice 6). Injected by TabViewController (which gets it from AppDelegate's
+    /// registry) because plugin construction needs the manifest store + action
+    /// registry that PaneManager has no access to. Returns nil when the plugin
+    /// is no longer installed → restore falls back to an explicit placeholder.
+    var pluginFactory: ((_ name: String, _ restoreID: String) -> (any CopadPanel)?)?
 
     /// Decision #61 C6: reduce a live webview URL to a safe canonical form for
     /// persistence — the **origin only** (`scheme://host[:port]`), http(s) only.
@@ -431,14 +445,38 @@ final class PaneManager {
     /// tmux-backed terminal's `copad-<id>` session name matches the survivor
     /// and reattaches. Webview restores its URL; plugin restore lands in slice
     /// 6 (placeholder terminal keeps the layout meanwhile).
-    static func panelFromPane(_ pane: Session.Pane, config: CopadConfig, theme: CopadTheme) -> any CopadPanel {
+    static func panelFromPane(
+        _ pane: Session.Pane,
+        config: CopadConfig,
+        theme: CopadTheme,
+        pluginFactory: ((_ name: String, _ restoreID: String) -> (any CopadPanel)?)? = nil,
+    ) -> any CopadPanel {
         switch pane.content {
         case let .terminal(cwd, _, _):
             return AlacrittyTerminalViewController(config: config, theme: theme, cwd: cwd, initialInput: nil, restoreID: pane.id)
         case let .webview(url):
             return WebViewController(url: URL(string: url), restoreID: pane.id)
-        case .plugin:
-            return AlacrittyTerminalViewController(config: config, theme: theme, restoreID: pane.id)
+        case let .plugin(name, _):
+            if let factory = pluginFactory, let panel = factory(name, pane.id) {
+                return panel
+            }
+            // Plugin uninstalled / no factory: a placeholder terminal that keeps
+            // pane.id and tags itself so the next snapshot re-captures it AS the
+            // plugin (the ref survives re-saves until the plugin returns and
+            // restore reopens it — decision #61 C5). NB: the plugin name is NOT
+            // interpolated into shell input — a crafted session.json name could
+            // otherwise inject commands into the restored shell. The name is
+            // conveyed via the tab title (the sub-tab's persisted name) instead.
+            // Placeholder = a plain terminal that KEEPS pane.id and is tagged
+            // unavailablePluginRef so the snapshot re-captures it as .plugin(name)
+            // — the reference survives re-saves until the plugin returns and
+            // restore reopens it (decision #61 C5, the essential guarantee). No
+            // shell input (a crafted name must not inject commands on restore).
+            // A richer in-pane "plugin unavailable" affordance needs a dedicated
+            // placeholder panel type — deferred; the ref is what must not be lost.
+            let placeholder = AlacrittyTerminalViewController(config: config, theme: theme, restoreID: pane.id)
+            placeholder.unavailablePluginRef = name
+            return placeholder
         }
     }
 
@@ -455,7 +493,7 @@ final class PaneManager {
     /// pane (created by the caller from `leftmostPane`).
     func restoreSplitsV2(into target: any CopadPanel, from node: Session.PaneNode) {
         guard case let .branch(orientation, _, first, second) = node else { return }
-        let newPanel = Self.panelFromPane(Self.leftmostPane(second), config: config, theme: theme)
+        let newPanel = Self.panelFromPane(Self.leftmostPane(second), config: config, theme: theme, pluginFactory: pluginFactory)
         assignEventBus(to: newPanel)
         wirePanel(newPanel)
         let oriented: SplitOrientation = (orientation == .horizontal) ? .horizontal : .vertical

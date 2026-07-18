@@ -33,10 +33,12 @@ import Foundation
 /// thread that we hop to main from.
 @MainActor
 final class PluginPanelController: NSViewController, CopadPanel {
-    let panelID: String = UUID().uuidString
+    let panelID: String
     private(set) var currentTitle: String
 
-    private let pluginName: String
+    /// Exposed so session snapshot can persist which plugin this panel hosts
+    /// (decision #61 slice 6) — restore reopens it by name via the registry.
+    let pluginName: String
     private let panelName: String
     private let panelFileURL: URL
     private let theme: CopadTheme
@@ -56,7 +58,9 @@ final class PluginPanelController: NSViewController, CopadPanel {
         registry: ActionRegistry,
         eventBus: EventBus,
         theme: CopadTheme,
+        restoreID: String? = nil,
     ) {
+        panelID = restoreID ?? UUID().uuidString
         pluginName = plugin.manifest.plugin.name
         panelName = panelDef.name
         currentTitle = panelDef.title

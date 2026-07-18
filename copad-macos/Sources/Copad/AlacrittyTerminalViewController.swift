@@ -36,6 +36,11 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
     /// reattaches the running process instead of spawning a fresh shell.
     let panelID: String
     private(set) var currentTitle: String = "Terminal (alacritty)"
+    /// When this pane is an unavailable-plugin PLACEHOLDER (decision #61 C5),
+    /// holds the plugin's name so the snapshot re-captures it as a plugin pane
+    /// rather than a plain terminal — the plugin reference survives re-saves
+    /// until the plugin is reinstalled and restore can reopen it.
+    var unavailablePluginRef: String?
     /// `tab.rename`-set title override. When non-nil, OSC 0/2 updates
     /// from the running program (shell prompt setting window title)
     /// are ignored — the user's chosen name wins. Mirrors SwiftTerm
