@@ -5,7 +5,7 @@ import AppKit
 
 @MainActor
 final class WebViewController: NSViewController, CopadPanel {
-    let panelID: String = UUID().uuidString
+    let panelID: String
 
     private(set) var webView: WKWebView!
 
@@ -29,7 +29,8 @@ final class WebViewController: NSViewController, CopadPanel {
     /// Set by AppDelegate after EventBus is created.
     weak var eventBus: EventBus?
 
-    init(url: URL? = nil) {
+    init(url: URL? = nil, restoreID: String? = nil) {
+        self.panelID = restoreID ?? UUID().uuidString
         startURL = url
         super.init(nibName: nil, bundle: nil)
     }

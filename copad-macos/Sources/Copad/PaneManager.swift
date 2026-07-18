@@ -319,6 +319,55 @@ final class PaneManager {
         Self.buildSnap(node: root)
     }
 
+    /// v2-native snapshot (decision #61 slice 4): carries each leaf's stable
+    /// panelID + typed content (terminal cwd + tmux_ref / webview url / plugin
+    /// name), unlike `snapshotTree` which is terminal-only and id-less. Used by
+    /// TabViewController.snapshotSessionV2. Instance (not static) so it can read
+    /// `config.terminalBackend` for the tmux_ref.
+    func snapshotTreeV2() -> Session.PaneNode? {
+        buildSnapV2(node: root)
+    }
+
+    private func buildSnapV2(node: SplitNode) -> Session.PaneNode? {
+        switch node {
+        case let .leaf(panel):
+            return .leaf(Session.Pane(id: panel.panelID, content: paneContentV2(panel)))
+        case let .branch(orientation, children):
+            // Runtime SplitOrientation (SplitNode) -> wire Session.SplitOrientation.
+            let wire: Session.SplitOrientation = (orientation == .horizontal) ? .horizontal : .vertical
+            let nodes = children.compactMap { buildSnapV2(node: $0) }
+            return Self.chainBinaryV2(orientation: wire, nodes: nodes)
+        }
+    }
+
+    private func paneContentV2(_ panel: any CopadPanel) -> Session.PaneContent {
+        if let t = panel as? AlacrittyTerminalViewController {
+            // The tmux-backed session name is `copad-<panelID>` (see the FFI
+            // spawn path). Persisting it lets slice-4 restore reattach it.
+            let tmuxRef = config.terminalBackend == .tmux ? "copad-\(t.panelID)" : nil
+            return .terminal(cwd: t.currentCwd, launch: nil, tmuxRef: tmuxRef)
+        }
+        if let w = panel as? WebViewController {
+            return .webview(url: w.currentURL)
+        }
+        // Plugin panels: name resolution lands in slice 6; capture a marker so
+        // the leaf isn't lost from the tree in the meantime.
+        return .plugin(name: "plugin", version: nil)
+    }
+
+    /// Fold an n-ary branch into a right-leaning binary PaneNode tree (the v2
+    /// wire model is pairwise). ratio 0.5 — macOS re-equalizes on restore.
+    private static func chainBinaryV2(
+        orientation: Session.SplitOrientation,
+        nodes: [Session.PaneNode],
+    ) -> Session.PaneNode? {
+        guard let first = nodes.first else { return nil }
+        if nodes.count == 1 { return first }
+        let rest = chainBinaryV2(orientation: orientation, nodes: Array(nodes.dropFirst()))
+        guard let rest else { return first }
+        return .branch(orientation: orientation, ratio: 0.5, first: first, second: rest)
+    }
+
     /// First non-nil custom title in DFS order. Mirrors Linux's
     /// per-tab custom-title lookup (collect panels, find_map). Returns
     /// nil if no panel has a custom title — restored tab falls back to
@@ -351,6 +400,47 @@ final class PaneManager {
         newPanel.startIfNeeded()
         restoreSplits(into: target, from: first)
         restoreSplits(into: newPanel, from: second)
+    }
+
+    // MARK: - v2-native restore (decision #61 slice 4b)
+
+    /// Build a panel for a persisted v2 pane, REUSING its stable id so a
+    /// tmux-backed terminal's `copad-<id>` session name matches the survivor
+    /// and reattaches. Webview restores its URL; plugin restore lands in slice
+    /// 6 (placeholder terminal keeps the layout meanwhile).
+    static func panelFromPane(_ pane: Session.Pane, config: CopadConfig, theme: CopadTheme) -> any CopadPanel {
+        switch pane.content {
+        case let .terminal(cwd, _, _):
+            return AlacrittyTerminalViewController(config: config, theme: theme, cwd: cwd, initialInput: nil, restoreID: pane.id)
+        case let .webview(url):
+            return WebViewController(url: URL(string: url), restoreID: pane.id)
+        case .plugin:
+            return AlacrittyTerminalViewController(config: config, theme: theme, restoreID: pane.id)
+        }
+    }
+
+    static func leftmostPane(_ node: Session.PaneNode) -> Session.Pane {
+        switch node {
+        case let .leaf(pane): pane
+        case let .branch(_, _, first, _): leftmostPane(first)
+        }
+    }
+
+    /// v2 analogue of `restoreSplits`: replays a saved PaneNode onto an existing
+    /// leaf, creating each new pane from its persisted v2 content+id (so tmux
+    /// leaves reattach). The target leaf already represents the tree's leftmost
+    /// pane (created by the caller from `leftmostPane`).
+    func restoreSplitsV2(into target: any CopadPanel, from node: Session.PaneNode) {
+        guard case let .branch(orientation, _, first, second) = node else { return }
+        let newPanel = Self.panelFromPane(Self.leftmostPane(second), config: config, theme: theme)
+        assignEventBus(to: newPanel)
+        wirePanel(newPanel)
+        let oriented: SplitOrientation = (orientation == .horizontal) ? .horizontal : .vertical
+        root = root.splitting(target, with: .leaf(newPanel), orientation: oriented)
+        rebuildViewHierarchy()
+        newPanel.startIfNeeded()
+        restoreSplitsV2(into: target, from: first)
+        restoreSplitsV2(into: newPanel, from: second)
     }
 
     private static func buildSnap(node: SplitNode) -> Session.SplitSnap? {

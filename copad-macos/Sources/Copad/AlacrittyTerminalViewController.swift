@@ -30,7 +30,11 @@ import QuartzCore
 ///   parity (Phases 3.6, 4, 5, 6, 7)
 @MainActor
 final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zoomable, TerminalCapable {
-    let panelID: String = UUID().uuidString
+    /// Stable pane identity. Fresh UUID for a new pane; on session restore a
+    /// persisted id is injected (decision #61 slice 4) so the tmux-backed
+    /// session name `copad-<panelID>` matches the survivor and `new-session -A`
+    /// reattaches the running process instead of spawning a fresh shell.
+    let panelID: String
     private(set) var currentTitle: String = "Terminal (alacritty)"
     /// `tab.rename`-set title override. When non-nil, OSC 0/2 updates
     /// from the running program (shell prompt setting window title)
@@ -108,7 +112,8 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         renderView ?? view
     }
 
-    init(config: CopadConfig, theme: CopadTheme, cwd: String? = nil, initialInput: String? = nil) {
+    init(config: CopadConfig, theme: CopadTheme, cwd: String? = nil, initialInput: String? = nil, restoreID: String? = nil) {
+        self.panelID = restoreID ?? UUID().uuidString
         self.config = config
         self.theme = theme
         // Fall back to $HOME so Finder/Dock launches don't land in `/`

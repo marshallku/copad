@@ -430,9 +430,33 @@ final class TabViewController: NSViewController {
     // reattach — v1 pixel divider positions become an even 0.5 ratio (macOS
     // already re-equalizes on restore, decision #61 I4).
 
-    /// Snapshot the live tabs as a single-session v2 document.
+    /// Snapshot the live tabs as a single-session v2 document — v2-native
+    /// (decision #61 slice 4): each terminal leaf carries its real panelID +
+    /// tmux_ref so restore can reattach the surviving tmux session. Restore
+    /// still bridges through v1 for now, harmlessly ignoring the extra ids.
     func snapshotSessionV2() -> Session.SessionFileV2 {
-        Self.v1ToV2(snapshotSession())
+        var subTabs: [Session.SubTab] = []
+        var activeSubId: String?
+        for (idx, manager) in paneManagers.enumerated() {
+            guard let root = manager.snapshotTreeV2() else { continue }
+            let id = "sub-\(subTabs.count)"
+            if idx == activeIndex { activeSubId = id }
+            subTabs.append(Session.SubTab(
+                id: id,
+                name: manager.customTabTitle(),
+                root: root,
+                focusedPaneId: manager.activePane.panelID,
+            ))
+        }
+        if activeSubId == nil { activeSubId = subTabs.first?.id }
+        let session = Session.WorkspaceSession(
+            id: "sess-0",
+            name: nil,
+            workspace: nil,
+            subTabs: subTabs,
+            activeSubTabId: activeSubId,
+        )
+        return Session.SessionFileV2(version: Session.versionV2, sessions: [session], activeSessionId: "sess-0")
     }
 
     /// Debounced persistence trigger — call after any structural mutation
@@ -463,81 +487,43 @@ final class TabViewController: NSViewController {
         suppressSessionSave = true
         defer {
             suppressSessionSave = false
-            // Persist the migrated/normalized shape once, so a v1 file that was
-            // just migrated forward lands on disk as v2 even without a later edit.
+            // Re-persist once: a just-migrated v1 file lands as v2, and because
+            // panes are rebuilt with their PERSISTED ids (below) this save keeps
+            // the same ids + tmux_ref rather than minting fresh ones.
             scheduleSessionSave()
         }
-        restoreSession(Self.v2ToV1(file))
-    }
-
-    static func v1ToV2(_ snap: Session.Snapshot) -> Session.SessionFileV2 {
-        var subTabs: [Session.SubTab] = []
-        for (i, tab) in snap.tabs.enumerated() {
-            var n = 0
-            subTabs.append(Session.SubTab(
-                id: "sub-\(i)",
-                name: tab.customTitle,
-                root: splitToNode(tab.root, sub: i, n: &n),
-                focusedPaneId: nil,
-            ))
-        }
-        let activeId = subTabs.indices.contains(snap.currentTab) ? subTabs[snap.currentTab].id : subTabs.first?.id
-        let session = Session.WorkspaceSession(
-            id: "sess-0",
-            name: nil,
-            workspace: nil,
-            subTabs: subTabs,
-            activeSubTabId: activeId,
-        )
-        return Session.SessionFileV2(
-            version: Session.versionV2,
-            sessions: [session],
-            activeSessionId: "sess-0",
-        )
-    }
-
-    static func v2ToV1(_ file: Session.SessionFileV2) -> Session.Snapshot {
-        guard let session = file.sessions.first else {
-            return Session.Snapshot(version: Session.version, tabs: [], currentTab: 0)
-        }
-        let tabs = session.subTabs.map { sub in
-            Session.TabSnap(customTitle: sub.name, root: nodeToSplit(sub.root))
-        }
-        let current = session.subTabs.firstIndex { $0.id == session.activeSubTabId } ?? 0
-        return Session.Snapshot(version: Session.version, tabs: tabs, currentTab: current)
-    }
-
-    private static func splitToNode(_ snap: Session.SplitSnap, sub: Int, n: inout Int) -> Session.PaneNode {
-        switch snap {
-        case let .terminal(cwd):
-            let id = "pane-\(sub)-\(n)"
-            n += 1
-            return .leaf(Session.Pane(id: id, content: .terminal(cwd: cwd, launch: nil, tmuxRef: nil)))
-        case let .branch(orientation, _, first, second):
-            return .branch(
-                orientation: orientation,
-                ratio: 0.5,
-                first: splitToNode(first, sub: sub, n: &n),
-                second: splitToNode(second, sub: sub, n: &n),
-            )
-        }
-    }
-
-    private static func nodeToSplit(_ node: Session.PaneNode) -> Session.SplitSnap {
-        switch node {
-        case let .leaf(pane):
-            switch pane.content {
-            case let .terminal(cwd, _, _):
-                return .terminal(cwd: cwd)
-            case .webview, .plugin:
-                // Non-terminal panes have no v1 runtime yet (slices 5/6). Until
-                // then restore them as a plain terminal so the layout survives
-                // rather than dropping the pane.
-                return .terminal(cwd: nil)
+        // v2-native (slice 4b): rebuild each sub-tab's pane tree from the
+        // persisted PaneNode, reusing pane ids so tmux-backed terminals
+        // reattach their surviving `copad-<id>` session. Uses the first
+        // session (multi-session is slice 7).
+        guard let session = file.sessions.first else { return }
+        for sub in session.subTabs {
+            let initial = PaneManager.panelFromPane(PaneManager.leftmostPane(sub.root), config: config, theme: theme)
+            let manager = PaneManager(config: config, theme: theme, initialPanel: .pluginPanel(initial))
+            addTab(manager: manager)
+            manager.restoreSplitsV2(into: manager.activePane, from: sub.root)
+            if let title = sub.name {
+                manager.setCustomTitle(title)
             }
-        case let .branch(orientation, _, first, second):
-            // position is a sentinel; macOS re-equalizes on restore.
-            return .branch(orientation: orientation, position: 0, first: nodeToSplit(first), second: nodeToSplit(second))
+            // Restore the focused pane so the post-restore save doesn't churn it
+            // (decision #61 I3). Falls back to the leftmost pane when absent.
+            if let fid = sub.focusedPaneId,
+               let panel = manager.allPanels().first(where: { $0.panelID == fid })
+            {
+                manager.setActive(panel)
+            }
+        }
+        if let activeId = session.activeSubTabId,
+           let idx = session.subTabs.firstIndex(where: { $0.id == activeId }),
+           paneManagers.indices.contains(idx)
+        {
+            switchTab(to: idx)
+        }
+        // `switchTab` early-returns when the target sub-tab is already active
+        // (addTab selected the last one), so it may skip `makeFirstResponder`.
+        // Hand keyboard focus to the restored active pane explicitly.
+        if let active = activePaneManager {
+            active.activePane.view.window?.makeFirstResponder(active.activePane.focusTarget)
         }
     }
 
