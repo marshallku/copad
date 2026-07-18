@@ -160,3 +160,207 @@ extension Session {
         case vertical
     }
 }
+
+// MARK: - v2 wire model (decision #61)
+
+// Mirrors `copad_core::session::{SessionFileV2, WorkspaceSession, SubTab,
+// PaneNode, Pane, PaneContent, LaunchProfile}`. Structs use auto Codable with
+// snake_case CodingKeys; only the internally-tagged enums (`PaneNode` by
+// `node`, `PaneContent` by `kind`) need manual Codable, like `SplitSnap`.
+// serde accepts both an omitted key and an explicit `null` for its
+// `Option` + `skip_serializing_if` fields, so Swift's optional encoding
+// interoperates either way.
+extension Session {
+    static let versionV2: Int = 2
+
+    /// Load the persisted session as the v2 model, migrating a v1 file forward
+    /// in core (`copad_ffi_session_load_v2`). Nil on absence / parse failure.
+    static func loadV2() -> SessionFileV2? {
+        guard let cstr = copad_ffi_session_load_v2() else { return nil }
+        defer { copad_ffi_free_string(cstr) }
+        guard let data = String(cString: cstr).data(using: .utf8) else { return nil }
+        do {
+            return try JSONDecoder().decode(SessionFileV2.self, from: data)
+        } catch {
+            FileHandle.standardError.write(
+                Data("[copad] session v2 decode (from core JSON) failed: \(error)\n".utf8),
+            )
+            return nil
+        }
+    }
+
+    static func saveV2(_ file: SessionFileV2) {
+        let data: Data
+        do {
+            data = try JSONEncoder().encode(file)
+        } catch {
+            FileHandle.standardError.write(
+                Data("[copad] session v2 encode failed: \(error)\n".utf8),
+            )
+            return
+        }
+        let json = String(decoding: data, as: UTF8.self)
+        let rc = json.withCString { copad_ffi_session_save_v2($0) }
+        if rc != 0 {
+            let msg = copad_ffi_last_error().map { String(cString: $0) } ?? "<unknown>"
+            FileHandle.standardError.write(
+                Data("[copad] session v2 save failed: \(msg)\n".utf8),
+            )
+        }
+    }
+
+    struct SessionFileV2: Codable, Equatable {
+        let version: Int
+        let sessions: [WorkspaceSession]
+        let activeSessionId: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case version, sessions
+            case activeSessionId = "active_session_id"
+        }
+    }
+
+    struct WorkspaceSession: Codable, Equatable {
+        let id: String
+        let name: String?
+        let workspace: String?
+        let subTabs: [SubTab]
+        let activeSubTabId: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case id, name, workspace
+            case subTabs = "sub_tabs"
+            case activeSubTabId = "active_sub_tab_id"
+        }
+    }
+
+    struct SubTab: Codable, Equatable {
+        let id: String
+        let name: String?
+        let root: PaneNode
+        let focusedPaneId: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case id, name, root
+            case focusedPaneId = "focused_pane_id"
+        }
+    }
+
+    /// A leaf pane: stable id + typed content.
+    struct Pane: Equatable {
+        let id: String
+        let content: PaneContent
+    }
+
+    /// serde `#[serde(tag = "node", rename_all = "snake_case")]`.
+    indirect enum PaneNode: Equatable {
+        case leaf(Pane)
+        case branch(orientation: SplitOrientation, ratio: Float, first: PaneNode, second: PaneNode)
+    }
+
+    /// serde `#[serde(tag = "kind", rename_all = "snake_case")]`. `nvim` is a
+    /// terminal launch profile, not a kind.
+    enum PaneContent: Equatable {
+        case terminal(cwd: String?, launch: LaunchProfile?, tmuxRef: String?)
+        case webview(url: String)
+        case plugin(name: String, version: String?)
+    }
+
+    enum LaunchProfile: String, Codable, Equatable {
+        case shell
+        case nvim
+    }
+}
+
+extension Session.PaneNode: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case node, id, content, orientation, ratio, first, second
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        switch try c.decode(String.self, forKey: .node) {
+        case "leaf":
+            // `Leaf(Pane)` is an internally-tagged newtype: the Pane fields
+            // (id, content) sit alongside the `node` tag.
+            let id = try c.decode(String.self, forKey: .id)
+            let content = try c.decode(Session.PaneContent.self, forKey: .content)
+            self = .leaf(Session.Pane(id: id, content: content))
+        case "branch":
+            self = .branch(
+                orientation: try c.decode(Session.SplitOrientation.self, forKey: .orientation),
+                ratio: try c.decode(Float.self, forKey: .ratio),
+                first: try c.decode(Session.PaneNode.self, forKey: .first),
+                second: try c.decode(Session.PaneNode.self, forKey: .second),
+            )
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: .node, in: c, debugDescription: "unknown PaneNode node",
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .leaf(pane):
+            try c.encode("leaf", forKey: .node)
+            try c.encode(pane.id, forKey: .id)
+            try c.encode(pane.content, forKey: .content)
+        case let .branch(orientation, ratio, first, second):
+            try c.encode("branch", forKey: .node)
+            try c.encode(orientation, forKey: .orientation)
+            try c.encode(ratio, forKey: .ratio)
+            try c.encode(first, forKey: .first)
+            try c.encode(second, forKey: .second)
+        }
+    }
+}
+
+extension Session.PaneContent: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case kind, cwd, launch, url, name, version
+        case tmuxRef = "tmux_ref"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        switch try c.decode(String.self, forKey: .kind) {
+        case "terminal":
+            self = .terminal(
+                cwd: try c.decodeIfPresent(String.self, forKey: .cwd),
+                launch: try c.decodeIfPresent(Session.LaunchProfile.self, forKey: .launch),
+                tmuxRef: try c.decodeIfPresent(String.self, forKey: .tmuxRef),
+            )
+        case "webview":
+            self = .webview(url: try c.decode(String.self, forKey: .url))
+        case "plugin":
+            self = .plugin(
+                name: try c.decode(String.self, forKey: .name),
+                version: try c.decodeIfPresent(String.self, forKey: .version),
+            )
+        default:
+            throw DecodingError.dataCorruptedError(
+                forKey: .kind, in: c, debugDescription: "unknown PaneContent kind",
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .terminal(cwd, launch, tmuxRef):
+            try c.encode("terminal", forKey: .kind)
+            try c.encodeIfPresent(cwd, forKey: .cwd)
+            try c.encodeIfPresent(launch, forKey: .launch)
+            try c.encodeIfPresent(tmuxRef, forKey: .tmuxRef)
+        case let .webview(url):
+            try c.encode("webview", forKey: .kind)
+            try c.encode(url, forKey: .url)
+        case let .plugin(name, version):
+            try c.encode("plugin", forKey: .kind)
+            try c.encode(name, forKey: .name)
+            try c.encodeIfPresent(version, forKey: .version)
+        }
+    }
+}
