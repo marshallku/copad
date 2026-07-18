@@ -291,8 +291,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // the restored layout, and before any save-on-terminate path
         // can overwrite the persisted snapshot with an empty one.
         // Mirrors `copad-linux/src/window.rs` post-build sequence.
-        if let snap = Session.load() {
-            vc.restoreSession(snap)
+        // Decision #61 slice 3: restore through the v2 model. `loadV2`
+        // migrates an existing v1 session.json forward automatically. A file
+        // with no sub-tabs (or none at all) falls back to a fresh terminal.
+        if let file = Session.loadV2(), !(file.sessions.first?.subTabs.isEmpty ?? true) {
+            vc.restoreSessionV2(file)
         } else {
             vc.openInitialTab()
         }
@@ -356,11 +359,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // snapshot (no terminal tabs left) clears any prior file so
         // a stale layout doesn't surface on next launch — same
         // contract as `copad-linux/src/window.rs`'s close handler.
-        if let snap = tabVC?.snapshotSession() {
-            if snap.tabs.isEmpty {
+        // Decision #61 slice 3: persist through the v2 model. The debounced
+        // save covers mid-session crashes; this is the orderly-quit flush.
+        if let file = tabVC?.snapshotSessionV2() {
+            if file.sessions.first?.subTabs.isEmpty ?? true {
                 Session.clear()
             } else {
-                Session.save(snap)
+                Session.saveV2(file)
             }
         }
         // Order matters:

@@ -17,6 +17,14 @@ final class TabViewController: NSViewController {
     /// (top/bottom) bars, width for vertical (left/right) bars. Held so
     /// collapse/expand can shrink a vertical bar to icon-only width.
     private var tabBarSizeConstraint: NSLayoutConstraint?
+
+    /// Debounced v2 session persistence (decision #61 C4). Coalesces rapid
+    /// structural mutations into one atomic write so a crash / forced kill
+    /// loses at most the debounce window, not the whole session — the old
+    /// path only saved on orderly `applicationWillTerminate`. This VC is the
+    /// single writer. Suppressed during restore so replay doesn't re-save.
+    private var sessionSaveTimer: Timer?
+    private var suppressSessionSave = false
     private var contentArea: NSView!
     /// Window-level background image (Phase 10b follow-up). One image
     /// fills the entire `contentArea` so splits share the same
@@ -221,7 +229,7 @@ final class TabViewController: NSViewController {
         }
         tabBar.onRenameTab = { [weak self] index, title in
             guard let self else { return }
-            renameTab(at: index, title: title)
+            renameTab(at: index, title: title)  // schedules the save itself
             // Restore focus to the active pane's keyboard view after
             // the tab bar field resigns. `panel.focusTarget` returns
             // the inner input view rather than the layout container.
@@ -411,6 +419,128 @@ final class TabViewController: NSViewController {
         }
     }
 
+    // MARK: - v2 session persistence (decision #61)
+
+    // slice 3d bridges the existing v1 snapshot/restore to the v2 model rather
+    // than rewriting PaneManager: the runtime tree stays SplitSnap and is
+    // converted to/from the v2 SessionFileV2 here. Today's runtime tabs are
+    // terminal split trees, so every tab maps to one sub-tab holding a Terminal
+    // pane tree; multi-session, workspaces, and webview/plugin panes arrive in
+    // later slices. Stable pane ids are informational until slice 4 wires tmux
+    // reattach — v1 pixel divider positions become an even 0.5 ratio (macOS
+    // already re-equalizes on restore, decision #61 I4).
+
+    /// Snapshot the live tabs as a single-session v2 document.
+    func snapshotSessionV2() -> Session.SessionFileV2 {
+        Self.v1ToV2(snapshotSession())
+    }
+
+    /// Debounced persistence trigger — call after any structural mutation
+    /// (new/close/switch tab, rename). Coalesces bursts into one atomic write
+    /// ~800ms later on the main run loop. No-op while restoring.
+    func scheduleSessionSave() {
+        guard !suppressSessionSave else { return }
+        sessionSaveTimer?.invalidate()
+        sessionSaveTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: false) { [weak self] _ in
+            // The timer fires on the main run loop, so the main-actor snapshot
+            // is safe; assumeIsolated makes that explicit for the checker.
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                let snap = self.snapshotSessionV2()
+                if snap.sessions.first?.subTabs.isEmpty ?? true {
+                    Session.clear()
+                } else {
+                    Session.saveV2(snap)
+                }
+            }
+        }
+    }
+
+    /// Restore from a v2 document. Uses the first session (multi-session is
+    /// slice 7). No-op friendly: an empty document leaves the caller to fall
+    /// back to `openInitialTab`.
+    func restoreSessionV2(_ file: Session.SessionFileV2) {
+        suppressSessionSave = true
+        defer {
+            suppressSessionSave = false
+            // Persist the migrated/normalized shape once, so a v1 file that was
+            // just migrated forward lands on disk as v2 even without a later edit.
+            scheduleSessionSave()
+        }
+        restoreSession(Self.v2ToV1(file))
+    }
+
+    static func v1ToV2(_ snap: Session.Snapshot) -> Session.SessionFileV2 {
+        var subTabs: [Session.SubTab] = []
+        for (i, tab) in snap.tabs.enumerated() {
+            var n = 0
+            subTabs.append(Session.SubTab(
+                id: "sub-\(i)",
+                name: tab.customTitle,
+                root: splitToNode(tab.root, sub: i, n: &n),
+                focusedPaneId: nil,
+            ))
+        }
+        let activeId = subTabs.indices.contains(snap.currentTab) ? subTabs[snap.currentTab].id : subTabs.first?.id
+        let session = Session.WorkspaceSession(
+            id: "sess-0",
+            name: nil,
+            workspace: nil,
+            subTabs: subTabs,
+            activeSubTabId: activeId,
+        )
+        return Session.SessionFileV2(
+            version: Session.versionV2,
+            sessions: [session],
+            activeSessionId: "sess-0",
+        )
+    }
+
+    static func v2ToV1(_ file: Session.SessionFileV2) -> Session.Snapshot {
+        guard let session = file.sessions.first else {
+            return Session.Snapshot(version: Session.version, tabs: [], currentTab: 0)
+        }
+        let tabs = session.subTabs.map { sub in
+            Session.TabSnap(customTitle: sub.name, root: nodeToSplit(sub.root))
+        }
+        let current = session.subTabs.firstIndex { $0.id == session.activeSubTabId } ?? 0
+        return Session.Snapshot(version: Session.version, tabs: tabs, currentTab: current)
+    }
+
+    private static func splitToNode(_ snap: Session.SplitSnap, sub: Int, n: inout Int) -> Session.PaneNode {
+        switch snap {
+        case let .terminal(cwd):
+            let id = "pane-\(sub)-\(n)"
+            n += 1
+            return .leaf(Session.Pane(id: id, content: .terminal(cwd: cwd, launch: nil, tmuxRef: nil)))
+        case let .branch(orientation, _, first, second):
+            return .branch(
+                orientation: orientation,
+                ratio: 0.5,
+                first: splitToNode(first, sub: sub, n: &n),
+                second: splitToNode(second, sub: sub, n: &n),
+            )
+        }
+    }
+
+    private static func nodeToSplit(_ node: Session.PaneNode) -> Session.SplitSnap {
+        switch node {
+        case let .leaf(pane):
+            switch pane.content {
+            case let .terminal(cwd, _, _):
+                return .terminal(cwd: cwd)
+            case .webview, .plugin:
+                // Non-terminal panes have no v1 runtime yet (slices 5/6). Until
+                // then restore them as a plain terminal so the layout survives
+                // rather than dropping the pane.
+                return .terminal(cwd: nil)
+            }
+        case let .branch(orientation, _, first, second):
+            // position is a sentinel; macOS re-equalizes on restore.
+            return .branch(orientation: orientation, position: 0, first: nodeToSplit(first), second: nodeToSplit(second))
+        }
+    }
+
     // MARK: - Tab Operations
 
     func newTab() {
@@ -473,6 +603,7 @@ final class TabViewController: NSViewController {
         }
         manager.onActivePaneChanged = { [weak self] in
             self?.refreshTabBar()
+            self?.scheduleSessionSave()  // split / focus changes alter the tree
         }
         manager.onPaneAdded = { [weak self] panel in
             // Fan window-level state onto the new pane. Right now
@@ -484,6 +615,10 @@ final class TabViewController: NSViewController {
             if currentBackgroundPath != nil {
                 panel.applyBackground(path: "", tint: 0, opacity: 0)
             }
+            scheduleSessionSave()  // a split added a pane
+        }
+        manager.onLayoutChanged = { [weak self] in
+            self?.scheduleSessionSave()  // a pane closed (incl. non-active)
         }
 
         NotificationCenter.default.addObserver(
@@ -513,6 +648,7 @@ final class TabViewController: NSViewController {
         if let path = currentBackgroundPath {
             manager.applyBackground(path: path, tint: currentBackgroundTint, opacity: currentBackgroundOpacity)
         }
+        scheduleSessionSave()
     }
 
     func closeTab(at index: Int) {
@@ -522,6 +658,7 @@ final class TabViewController: NSViewController {
         manager.containerView.removeFromSuperview()
         paneManagers.remove(at: index)
         eventBus?.broadcast(event: "tab.closed", data: ["index": index])
+        scheduleSessionSave()
 
         if paneManagers.isEmpty {
             view.window?.close()
@@ -574,6 +711,7 @@ final class TabViewController: NSViewController {
         manager.activePane.view.window?.makeFirstResponder(manager.activePane.focusTarget)
 
         refreshTabBar()
+        scheduleSessionSave()  // active sub-tab changed
     }
 
     // MARK: - Split Operations
@@ -873,6 +1011,7 @@ final class TabViewController: NSViewController {
             view.window?.title = title
         }
         eventBus?.broadcast(event: "tab.renamed", data: ["index": index, "title": title])
+        scheduleSessionSave()  // in renameTab itself so socket-driven tab.rename persists too
     }
 
     func sessionList() -> [[String: Any]] {

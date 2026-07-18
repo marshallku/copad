@@ -95,6 +95,11 @@ final class PaneManager {
     /// pane opaque and cover the wallpaper.
     var onPaneAdded: ((any CopadPanel) -> Void)?
     var onActivePaneChanged: (() -> Void)?
+    /// Fires whenever the split tree changes shape (a pane closes) even if the
+    /// active pane is unchanged — e.g. a background terminal exiting via
+    /// `close_on_exit`. TabViewController uses it to schedule a session save so
+    /// non-active-pane closes aren't lost on crash (decision #61 C4).
+    var onLayoutChanged: (() -> Void)?
 
     /// Propagated from AppDelegate so all panels can emit events.
     weak var eventBus: EventBus? {
@@ -238,6 +243,10 @@ final class PaneManager {
         } else {
             activePane.view.window?.makeFirstResponder(activePane.focusTarget)
         }
+        // The tree changed shape regardless of whether the active pane moved,
+        // so persist it (an active close already notified via setActive, but a
+        // duplicate is harmless — the save is debounced).
+        onLayoutChanged?()
     }
 
     func setActive(_ panel: any CopadPanel) {
