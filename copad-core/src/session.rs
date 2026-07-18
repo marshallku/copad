@@ -276,6 +276,36 @@ pub fn parse_v2(raw: &str) -> Option<SessionFileV2> {
     }
 }
 
+/// Serialize a v2 document to pretty JSON. Split out so the save path and its
+/// round-trip test share one encoder.
+pub fn serialize_v2(file: &SessionFileV2) -> Option<String> {
+    serde_json::to_string_pretty(file)
+        .map_err(|e| eprintln!("[copad] session v2 serialize failed: {e}"))
+        .ok()
+}
+
+/// Persist the v2 document to the session path via a temp-file + atomic rename
+/// (same durability as v1 `save`). Debounce / single-writer coordination is the
+/// CALLER's responsibility (decision #61 C4) — core only does the atomic write.
+pub fn save_v2(file: &SessionFileV2) {
+    let path = session_path();
+    let Some(parent) = path.parent() else { return };
+    if let Err(e) = std::fs::create_dir_all(parent) {
+        eprintln!("[copad] session v2 save: mkdir {} failed: {e}", parent.display());
+        return;
+    }
+    let Some(json) = serialize_v2(file) else { return };
+    let tmp = path.with_extension("json.tmp");
+    if let Err(e) = std::fs::write(&tmp, json) {
+        eprintln!("[copad] session v2 write {} failed: {e}", tmp.display());
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        eprintln!("[copad] session v2 rename failed: {e}");
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
 impl SessionFileV2 {
     /// Clamp divider ratios across every tree so downstream layout never sees
     /// an out-of-band value (defense against hand-edited / corrupt files).
@@ -475,6 +505,49 @@ mod v2_tests {
             }
             _ => panic!("expected branch"),
         }
+    }
+
+    #[test]
+    fn serialized_v2_round_trips_through_the_version_loader() {
+        // Closes the save<->load loop: what save_v2 writes must be exactly what
+        // the version-dispatch loader reads back (version 2 branch of parse_v2).
+        let f = SessionFileV2 {
+            version: SESSION_VERSION_V2,
+            active_session_id: Some("sess-0".into()),
+            sessions: vec![WorkspaceSession {
+                id: "sess-0".into(),
+                name: Some("copad".into()),
+                workspace: Some("/w".into()),
+                active_sub_tab_id: Some("sub-0".into()),
+                sub_tabs: vec![SubTab {
+                    id: "sub-0".into(),
+                    name: None,
+                    focused_pane_id: Some("p1".into()),
+                    root: PaneNode::Branch {
+                        orientation: SplitOrientation::Vertical,
+                        ratio: 0.5,
+                        first: Box::new(PaneNode::Leaf(Pane {
+                            id: "p1".into(),
+                            content: PaneContent::Terminal {
+                                cwd: None,
+                                launch: Some(LaunchProfile::Shell),
+                                tmux_ref: None,
+                            },
+                        })),
+                        second: Box::new(PaneNode::Leaf(Pane {
+                            id: "p2".into(),
+                            content: PaneContent::Plugin {
+                                name: "kb".into(),
+                                version: Some("1".into()),
+                            },
+                        })),
+                    },
+                }],
+            }],
+        };
+        let json = serialize_v2(&f).expect("serialize");
+        let back = parse_v2(&json).expect("version loader reads our own output");
+        assert_eq!(f, back);
     }
 }
 
