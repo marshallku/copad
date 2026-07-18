@@ -987,11 +987,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 Keybindings.dispatch(binding, registry: actionRegistry, socketPath: socketServer.path)
                 return nil
             }
+            // Decision #61 UI-B: opt+1…9 / opt+0 jump sub-tabs (tmux-window
+            // style). Handled here, before the terminal sees the Option key,
+            // and only when that sub-tab exists (else it falls through as a
+            // normal Option keystroke). User `[keybindings]` above win.
+            if let idx = optionDigitSubTabIndex(event), let vc = tabVC, idx < vc.tabCount {
+                vc.switchTab(to: idx)
+                return nil
+            }
             if matchesCommandPaletteShortcut(event), openCommandPalette() {
                 return nil
             }
             return event
         }
+    }
+
+    /// Map a bare-Option digit event to a sub-tab index: opt+1…9 → 0…8,
+    /// opt+0 → 9 (the tenth). Returns nil unless Option is the ONLY modifier
+    /// (cmd/ctrl/shift-digit are left to menus / the responder chain).
+    private func optionDigitSubTabIndex(_ event: NSEvent) -> Int? {
+        let interesting: NSEvent.ModifierFlags = [.command, .control, .shift, .option]
+        guard event.modifierFlags.intersection(interesting) == [.option] else { return nil }
+        guard
+            let ch = event.charactersIgnoringModifiers,
+            ch.count == 1,
+            let digit = ch.first,
+            let n = digit.wholeNumberValue,
+            digit.isNumber
+        else { return nil }
+        return n == 0 ? 9 : n - 1
     }
 
     /// Cmd+Shift+P, mac convention (VSCode/Zed). User keybindings already

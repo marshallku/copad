@@ -47,6 +47,12 @@ final class TabViewController: NSViewController {
     private var paneManagers: [PaneManager] = []
     private(set) var activeIndex: Int = -1
 
+    /// Number of sub-tabs (decision #61: the tabs of the current session).
+    /// Exposed so the `opt+N` numeric jump only swallows the key when that
+    /// sub-tab actually exists — otherwise `opt+5` with 3 sub-tabs should fall
+    /// through to the terminal as a normal Option keystroke.
+    var tabCount: Int { paneManagers.count }
+
     // Retained so new tabs inherit the current background state
     private(set) var currentBackgroundPath: String?
     private(set) var currentBackgroundTint: Double = 0.6
