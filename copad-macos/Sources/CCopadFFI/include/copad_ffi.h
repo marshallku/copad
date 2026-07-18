@@ -184,6 +184,16 @@ int copad_ffi_session_save(const char *json);
 /// Always returns 0; IO failures are logged to stderr.
 int copad_ffi_session_clear(void);
 
+/// Load the persisted session as the v2 model (decision #61), migrating a v1
+/// file forward automatically. Heap-allocated JSON string (free with
+/// copad_ffi_free_string) matching `SessionFileV2`, or NULL when absent /
+/// unparseable / unknown version. Additive alongside copad_ffi_session_load.
+char *copad_ffi_session_load_v2(void);
+
+/// Persist a v2 session document. JSON must match the `SessionFileV2` schema.
+/// 0 on success, -1 on NULL / non-UTF-8 / parse failure.
+int copad_ffi_session_save_v2(const char *json);
+
 // ---------------------------------------------------------------------------
 // Theme FFI
 //

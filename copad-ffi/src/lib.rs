@@ -836,6 +836,77 @@ pub extern "C" fn copad_ffi_session_clear() -> i32 {
     0
 }
 
+/// Load the persisted session as the v2 model (decision #61), migrating a v1
+/// file forward automatically (see `copad_core::session::load_v2`). Returns a
+/// heap-allocated JSON string the caller must free with
+/// `copad_ffi_free_string`, or NULL when no file exists / it fails to parse /
+/// the version is unknown. Additive alongside `copad_ffi_session_load` — a
+/// GUI still on the v1 schema is unaffected.
+#[unsafe(no_mangle)]
+pub extern "C" fn copad_ffi_session_load_v2() -> *mut c_char {
+    let Some(file) = copad_core::session::load_v2() else {
+        clear_last_error();
+        return ptr::null_mut();
+    };
+    let serialized = match serde_json::to_string(&file) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(format!("copad_ffi_session_load_v2: serialize failed: {e}"));
+            return ptr::null_mut();
+        }
+    };
+    match CString::new(serialized) {
+        Ok(c) => {
+            clear_last_error();
+            c.into_raw()
+        }
+        Err(e) => {
+            set_last_error(format!(
+                "copad_ffi_session_load_v2: serialized JSON contained NUL byte: {e}"
+            ));
+            ptr::null_mut()
+        }
+    }
+}
+
+/// Persist a v2 session document (decision #61). `json` must match the
+/// `copad_core::session::SessionFileV2` schema. Returns 0 on success, -1 on
+/// NULL / non-UTF-8 / JSON parse failure (diagnostics via
+/// `copad_ffi_last_error`). IO errors are logged by core to stderr but still
+/// return 0 — best-effort, matching `copad_ffi_session_save`.
+///
+/// # Safety
+///
+/// `json` must be a NUL-terminated UTF-8 pointer valid for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_ffi_session_save_v2(json: *const c_char) -> i32 {
+    if json.is_null() {
+        set_last_error("copad_ffi_session_save_v2: json pointer is NULL");
+        return -1;
+    }
+    // SAFETY: caller contract.
+    let bytes = unsafe { CStr::from_ptr(json) }.to_bytes();
+    let json_str = match std::str::from_utf8(bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            set_last_error(format!(
+                "copad_ffi_session_save_v2: input is not valid UTF-8: {e}"
+            ));
+            return -1;
+        }
+    };
+    let file: copad_core::session::SessionFileV2 = match serde_json::from_str(json_str) {
+        Ok(v) => v,
+        Err(e) => {
+            set_last_error(format!("copad_ffi_session_save_v2: JSON parse error: {e}"));
+            return -1;
+        }
+    };
+    copad_core::session::save_v2(&file);
+    clear_last_error();
+    0
+}
+
 /// Return a JSON array of built-in theme names. Caller must free the
 /// returned pointer with `copad_ffi_free_string`.
 ///
