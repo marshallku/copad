@@ -1022,6 +1022,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             if matchesCommandPaletteShortcut(event), openCommandPalette() {
                 return nil
             }
+            // ⌘⇧W — drop the workspace switcher (tmux-style session list).
+            if matchesWorkspaceSwitcherShortcut(event), let vc = tabVC {
+                vc.showWorkspaceMenu()
+                return nil
+            }
             return event
         }
     }
@@ -1054,6 +1059,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard mods == [.command, .shift] else { return false }
         guard let pCode = Keybindings.nameToKeyCode["p"] else { return false }
         return event.keyCode == pCode
+    }
+
+    /// ⌘⇧W — workspace switcher. ⌘W is "Close Pane"; adding Shift keeps the
+    /// switcher clear of it. Same shared-keyCode approach as the palette.
+    private func matchesWorkspaceSwitcherShortcut(_ event: NSEvent) -> Bool {
+        let interesting: NSEvent.ModifierFlags = [.command, .control, .shift, .option]
+        let mods = event.modifierFlags.intersection(interesting)
+        guard mods == [.command, .shift] else { return false }
+        guard let wCode = Keybindings.nameToKeyCode["w"] else { return false }
+        return event.keyCode == wCode
     }
 
     /// Returns true when the palette opened (event must be swallowed).
@@ -1308,8 +1323,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // with their own workspace + sub-tabs. Named `workspace.*` to avoid
         // colliding with the existing `session.*` (which means sub-tabs).
         case "workspace.new":
-            let ws = params["workspace"] as? String
-            completion(["id": vc.newWorkspace(workspace: ws)])
+            // With a `workspace` dir → create directly (programmatic / socket).
+            // Without one (e.g. the command palette dispatches empty params) →
+            // open the directory picker instead of silently creating a
+            // directory-less workspace.
+            if let ws = params["workspace"] as? String {
+                completion(["id": vc.newWorkspace(workspace: ws)])
+            } else {
+                vc.newWorkspaceInteractive()
+                completion(["ok": true])
+            }
 
         case "workspace.switch":
             guard let id = params["id"] as? String else {
@@ -1325,6 +1348,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     ["id": $0.id, "workspace": $0.workspace ?? NSNull(), "tabs": $0.tabs, "active": $0.active]
                 },
             ])
+
+        case "workspace.cycle":
+            // Param-free next-workspace jump — usable from the command palette
+            // (which dispatches with empty params) and from `[keybindings]`.
+            vc.cycleWorkspace()
+            completion(["active": vc.activeWorkspaceID])
 
         case "terminal.shell_precmd":
             let panelID = params["panel_id"] as? String ?? vc.activeTerminalPanel?.panelID ?? ""

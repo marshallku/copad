@@ -325,6 +325,20 @@ final class TabViewController: NSViewController {
                 onOpenPlugin?(name, panelName, mode)
             }
         }
+        // Workspace switcher — the pull-down fetches the list lazily on open
+        // (snapshot rebuild only happens then) and jumps / creates workspaces.
+        tabBar.workspaceProvider = { [weak self] in
+            guard let self else { return [] }
+            return workspaceSummaries().enumerated().map { i, s in
+                TabBarView.WorkspaceMenuItem(
+                    title: Self.workspaceDisplayName(dir: s.workspace, index: i),
+                    subtitle: s.workspace,
+                    active: s.active,
+                )
+            }
+        }
+        tabBar.onSwitchWorkspace = { [weak self] i in self?.switchWorkspace(to: i) }
+        tabBar.onNewWorkspace = { [weak self] in self?.newWorkspaceInteractive() }
         root.addSubview(tabBar)
 
         contentArea = NSView()
@@ -856,6 +870,53 @@ final class TabViewController: NSViewController {
             m.activePane is WebViewController ? .webview : .terminal
         }
         tabBar.setTabs(titles: titles, types: types, activeIndex: activeIndex)
+        tabBar.setActiveWorkspace(
+            name: Self.workspaceDisplayName(dir: activeWorkspaceDir, index: activeWorkspaceIndex),
+        )
+    }
+
+    /// Short label for a workspace: the directory's last path component, or
+    /// `session N` when the workspace has no declared directory.
+    static func workspaceDisplayName(dir: String?, index: Int) -> String {
+        if let dir, let name = dir.split(separator: "/").last, !name.isEmpty {
+            return String(name)
+        }
+        return "session \(index + 1)"
+    }
+
+    /// ⌘⇧W / switcher menu → tell the tab bar to drop its workspace list.
+    func showWorkspaceMenu() { tabBar.showWorkspaceMenu() }
+
+    /// Cycle to the next workspace (wraps) — param-free, so it works from the
+    /// command palette and `[keybindings]`.
+    func cycleWorkspace() {
+        guard workspaceCount > 1 else { return }
+        switchWorkspace(to: (activeWorkspaceIndex + 1) % workspaceCount)
+    }
+
+    /// "New Workspace…" — ask for a directory, then open a workspace seeded
+    /// with a terminal in it. Cancelling the picker is a no-op. Public so the
+    /// param-free `workspace.new` (command palette) routes here instead of
+    /// silently creating a directory-less workspace.
+    func newWorkspaceInteractive() { promptNewWorkspace() }
+
+    private func promptNewWorkspace() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "New Workspace"
+        panel.message = "Choose a directory for the new workspace"
+        if let dir = activeWorkspaceDir { panel.directoryURL = URL(fileURLWithPath: dir) }
+        let complete: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard response == .OK, let path = panel.url?.path else { return }
+            self?.newWorkspace(workspace: path)
+        }
+        if let window = view.window {
+            panel.beginSheetModal(for: window, completionHandler: complete)
+        } else {
+            complete(panel.runModal())
+        }
     }
 
     // MARK: - Config Hot-Reload

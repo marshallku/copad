@@ -331,6 +331,13 @@ enum CommandPalette {
         "webview.screenshot",
         "webview.scroll",
         "webview.state",
+        // Workspace switcher — `workspace.cycle` is param-free so it works
+        // from the palette; `new`/`switch`/`list` are listed for discovery
+        // (switch needs an id, supplied over the socket, not the palette).
+        "workspace.cycle",
+        "workspace.list",
+        "workspace.new",
+        "workspace.switch",
     ]
 
     @MainActor
