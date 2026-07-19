@@ -113,34 +113,67 @@ pub fn capture_pane(pane_id: &str, last_n: u32) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Safe arbitrary-text send via `load-buffer` (stdin) + `paste-buffer`.
-/// Mirrors `copad-linux::socket::handle_claude_start` (socket.rs:1710)
-/// — multiline / quoted / special-char input round-trips intact.
+/// Safe arbitrary-text send via `load-buffer` (stdin) + `paste-buffer`, with a
+/// trailing newline delivered as a real Enter key so the command actually runs.
+///
+/// Mirrors `copad-linux::socket::handle_claude_start` (socket.rs:1710) —
+/// multiline / quoted / special-char input round-trips intact. But a trailing
+/// `\n` is the "submit": under bracketed paste (modern zsh/bash), a *pasted*
+/// `\n` is inserted literally and does NOT execute — the command just sits on
+/// the prompt. So split the final newline off, paste the body (bracketed for
+/// special-char safety), then send a real `Enter` KEY via `send-keys`, which
+/// submits regardless of bracketed-paste mode. Interior newlines (a genuine
+/// multi-line command) stay in the pasted body.
 pub fn send_text(target: &str, text: &str) -> Result<(), String> {
-    let buf_name = format!("copad-web-{}", uuid::Uuid::new_v4());
-    let mut load = Command::new("tmux")
-        .args(["load-buffer", "-b", &buf_name, "-"])
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("spawn tmux load-buffer: {e}"))?;
-    if let Some(mut stdin) = load.stdin.take() {
-        stdin
-            .write_all(text.as_bytes())
-            .map_err(|e| format!("write tmux stdin: {e}"))?;
+    // Strip a single trailing line terminator as the submit. Try `\r\n` first
+    // (web clients / Windows line endings send CRLF) so a stray `\r` isn't
+    // pasted before Enter; then bare `\n`. Interior / lone `\r` bytes stay in
+    // the body.
+    let (body, submit) = if let Some(rest) = text.strip_suffix("\r\n") {
+        (rest, true)
+    } else if let Some(rest) = text.strip_suffix('\n') {
+        (rest, true)
+    } else {
+        (text, false)
+    };
+
+    if !body.is_empty() {
+        let buf_name = format!("copad-web-{}", uuid::Uuid::new_v4());
+        let mut load = Command::new("tmux")
+            .args(["load-buffer", "-b", &buf_name, "-"])
+            .stdin(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn tmux load-buffer: {e}"))?;
+        if let Some(mut stdin) = load.stdin.take() {
+            stdin
+                .write_all(body.as_bytes())
+                .map_err(|e| format!("write tmux stdin: {e}"))?;
+        }
+        let status = load
+            .wait()
+            .map_err(|e| format!("wait tmux load-buffer: {e}"))?;
+        if !status.success() {
+            return Err(format!("tmux load-buffer failed: {status}"));
+        }
+        let paste = Command::new("tmux")
+            .args(["paste-buffer", "-p", "-d", "-b", &buf_name, "-t", target])
+            .status()
+            .map_err(|e| format!("spawn tmux paste-buffer: {e}"))?;
+        if !paste.success() {
+            return Err(format!("tmux paste-buffer failed: {paste}"));
+        }
     }
-    let status = load
-        .wait()
-        .map_err(|e| format!("wait tmux load-buffer: {e}"))?;
-    if !status.success() {
-        return Err(format!("tmux load-buffer failed: {status}"));
+
+    if submit {
+        let enter = Command::new("tmux")
+            .args(["send-keys", "-t", target, "Enter"])
+            .status()
+            .map_err(|e| format!("spawn tmux send-keys Enter: {e}"))?;
+        if !enter.success() {
+            return Err(format!("tmux send-keys Enter failed: {enter}"));
+        }
     }
-    let paste = Command::new("tmux")
-        .args(["paste-buffer", "-p", "-d", "-b", &buf_name, "-t", target])
-        .status()
-        .map_err(|e| format!("spawn tmux paste-buffer: {e}"))?;
-    if !paste.success() {
-        return Err(format!("tmux paste-buffer failed: {paste}"));
-    }
+
     Ok(())
 }
 
