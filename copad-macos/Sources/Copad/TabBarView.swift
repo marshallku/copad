@@ -531,6 +531,9 @@ final class TabBarView: NSView {
     var onNewWorkspace: (() -> Void)?
 
     private let workspaceButton = NSButton()
+    /// Thin rule under the session header (vertical bar only) that separates the
+    /// session level from its tab list beneath.
+    private let sessionSeparator = NSView()
 
     private(set) var isCollapsed: Bool = false
 
@@ -626,9 +629,22 @@ final class TabBarView: NSView {
         workspaceButton.setButtonType(.momentaryChange)
         workspaceButton.translatesAutoresizingMaskIntoConstraints = false
         if isVertical {
-            workspaceButton.image = NSImage(systemSymbolName: "rectangle.stack", accessibilityDescription: "Workspaces")?
-                .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
-            workspaceButton.imagePosition = .imageOnly
+            // Vertical bar has room for a labelled SESSION header: a stack
+            // glyph + the active session name, styled bolder/brighter than the
+            // tab pills below so the two levels read as distinct (session on
+            // top, its tabs nested beneath). Left-aligned like a section head.
+            workspaceButton.image = NSImage(systemSymbolName: "rectangle.stack", accessibilityDescription: "Session")?
+                .withSymbolConfiguration(.init(pointSize: 12, weight: .semibold))
+            workspaceButton.imagePosition = .imageLeading
+            workspaceButton.imageHugsTitle = true
+            workspaceButton.title = "session 1"
+            workspaceButton.font = .systemFont(ofSize: 12, weight: .semibold)
+            workspaceButton.contentTintColor = theme.text.nsColor
+            (workspaceButton.cell as? NSButtonCell)?.alignment = .left
+            sessionSeparator.wantsLayer = true
+            sessionSeparator.layer?.backgroundColor = theme.overlay0.nsColor.cgColor
+            sessionSeparator.translatesAutoresizingMaskIntoConstraints = false
+            addSubview(sessionSeparator)
         } else {
             workspaceButton.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 9, weight: .semibold))
@@ -676,10 +692,16 @@ final class TabBarView: NSView {
                 toggleButton.heightAnchor.constraint(equalToConstant: 24),
 
                 workspaceButton.topAnchor.constraint(equalTo: toggleButton.bottomAnchor, constant: 6),
-                workspaceButton.centerXAnchor.constraint(equalTo: centerXAnchor),
+                workspaceButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+                workspaceButton.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
                 workspaceButton.heightAnchor.constraint(equalToConstant: 22),
 
-                scrollView.topAnchor.constraint(equalTo: workspaceButton.bottomAnchor, constant: 4),
+                sessionSeparator.topAnchor.constraint(equalTo: workspaceButton.bottomAnchor, constant: 5),
+                sessionSeparator.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+                sessionSeparator.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+                sessionSeparator.heightAnchor.constraint(equalToConstant: 1),
+
+                scrollView.topAnchor.constraint(equalTo: sessionSeparator.bottomAnchor, constant: 4),
                 // Viewport spans from the separator to the far edge — flips
                 // with the separator side so `right`-position tabs don't clip.
                 separatorLeading
@@ -779,13 +801,18 @@ final class TabBarView: NSView {
         // The parent will call setTabs again; just update toggle button appearance here
         let tint = collapsed ? theme.text.nsColor : theme.subtext0.nsColor
         toggleButton.contentTintColor = tint
+        if isVertical {
+            // A collapsed vertical bar is icon-width — drop the session header
+            // to its glyph and hide the divider so the name doesn't clip.
+            workspaceButton.imagePosition = collapsed ? .imageOnly : .imageLeading
+            sessionSeparator.isHidden = collapsed
+        }
     }
 
     /// Cheap per-refresh update of the switcher's active-workspace label
     /// (horizontal only — the vertical bar shows an icon). The full list is
     /// fetched lazily via `workspaceProvider` when the menu opens.
     func setActiveWorkspace(name: String) {
-        guard !isVertical else { return }
         workspaceButton.title = name
     }
 
