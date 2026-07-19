@@ -10,8 +10,11 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# 1. Build the Rust FFI staticlib first so swift build's linker phase finds it.
-(cd .. && cargo build --release -p copad-ffi)
+# 1. Build the Rust staticlibs first so swift build's linker phase finds them.
+#    Package.swift links BOTH libcopad_ffi.a AND libcopad_term.a (the alacritty
+#    renderer/PTY lib), so both crates must be (re)built here — otherwise a
+#    copad-term change (e.g. the terminal spawn) silently ships the stale .a.
+(cd .. && cargo build --release -p copad-ffi -p copad-term)
 
 # 2. Build the Swift app, which links the .a above via Package.swift's
 #    linkerSettings (-L../target/release -lcopad_ffi).

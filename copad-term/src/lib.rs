@@ -610,7 +610,18 @@ pub unsafe extern "C" fn copad_term_create(
         );
         tty_opts.shell = Some(Shell::new(resolve_tmux(), args));
     } else if let Some(sh) = shell_prog {
-        tty_opts.shell = Some(Shell::new(sh, Vec::new()));
+        // Spawn the configured shell as a LOGIN shell (`-l`), matching
+        // Terminal.app / iTerm2 / alacritty's own default-shell path. Copad.app
+        // launched from Finder / Dock / Spotlight inherits launchd's minimal
+        // PATH (`/usr/bin:/bin:/usr/sbin:/sbin`); only a login shell runs
+        // `/etc/zprofile` + `~/.zprofile` (where Homebrew's `brew shellenv`
+        // seeds `/opt/homebrew/bin`) BEFORE `~/.zshrc`. Without `-l`, a
+        // non-login shell skips `~/.zprofile`, so any early `.zshrc` check that
+        // probes PATH (e.g. `command -v gdate`) fails and downstream commands
+        // break — the classic "works after `exec zsh`, fails on a fresh pane".
+        // `-l` is accepted by zsh/bash/fish/dash/tcsh; interactivity is still
+        // auto-detected from the attached PTY, so no `-i` is needed.
+        tty_opts.shell = Some(Shell::new(sh, vec!["-l".to_string()]));
     }
     if !cwd.is_null()
         && let Ok(s) = unsafe { CStr::from_ptr(cwd) }.to_str()
