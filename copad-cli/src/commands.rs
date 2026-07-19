@@ -45,9 +45,15 @@ pub enum Command {
     #[command(subcommand)]
     Presence(PresenceCommand),
 
-    /// Panel management
+    /// Panel management (a "panel" is a sub-tab; use `workspace` for the
+    /// tmux-session-like level)
     #[command(subcommand)]
     Session(SessionCommand),
+
+    /// Workspace-session management — the tmux-session-like top level (each
+    /// holds its own sub-tabs). `workspace new` roots one at the current dir.
+    #[command(subcommand)]
+    Workspace(WorkspaceCommand),
 
     /// Background image management
     #[command(subcommand)]
@@ -182,6 +188,26 @@ pub enum SessionCommand {
         /// Panel ID
         id: String,
     },
+}
+
+#[derive(Subcommand)]
+pub enum WorkspaceCommand {
+    /// Create a new workspace-session rooted at a directory (defaults to the
+    /// current directory — `cd` somewhere, then `coctl workspace new`, the way
+    /// `tmux new-session` roots a session at $PWD).
+    New {
+        /// Directory to root the workspace at (default: current directory)
+        dir: Option<String>,
+    },
+    /// List all workspace-sessions
+    List,
+    /// Switch to a workspace-session by id
+    Switch {
+        /// Workspace id (from `workspace list`)
+        id: String,
+    },
+    /// Jump to the next workspace-session (wraps)
+    Cycle,
 }
 
 #[derive(Subcommand)]
@@ -622,6 +648,13 @@ impl Cli {
                 SessionCommand::Info { .. } => "session.info",
             }
             .to_string(),
+            Command::Workspace(cmd) => match cmd {
+                WorkspaceCommand::New { .. } => "workspace.new",
+                WorkspaceCommand::List => "workspace.list",
+                WorkspaceCommand::Switch { .. } => "workspace.switch",
+                WorkspaceCommand::Cycle => "workspace.cycle",
+            }
+            .to_string(),
             Command::Background(cmd) => match cmd {
                 BackgroundCommand::Set { .. } => "background.set",
                 BackgroundCommand::Clear => "background.clear",
@@ -756,6 +789,43 @@ impl Cli {
             Command::Session(cmd) => match cmd {
                 SessionCommand::List => json!({}),
                 SessionCommand::Info { id } => json!({ "id": id }),
+            },
+            Command::Workspace(cmd) => match cmd {
+                WorkspaceCommand::New { dir } => {
+                    // Root the workspace at an ABSOLUTE, existing directory,
+                    // resolved against the CALLER's cwd — mirrors `tmux
+                    // new-session` inheriting $PWD. Relative `dir` joins the
+                    // caller's cwd (never the GUI process's), and a missing /
+                    // non-directory target is rejected before we send, so we
+                    // never create a workspace rooted at a bad or GUI-relative
+                    // path.
+                    let cwd = std::env::current_dir().unwrap_or_else(|e| {
+                        eprintln!("coctl: cannot read current directory: {e}");
+                        std::process::exit(1);
+                    });
+                    let target = match dir {
+                        Some(d) => {
+                            let p = std::path::Path::new(d);
+                            if p.is_absolute() {
+                                p.to_path_buf()
+                            } else {
+                                cwd.join(p)
+                            }
+                        }
+                        None => cwd,
+                    };
+                    let abs = target.canonicalize().unwrap_or_else(|_| {
+                        eprintln!("coctl: no such directory: {}", target.display());
+                        std::process::exit(1);
+                    });
+                    if !abs.is_dir() {
+                        eprintln!("coctl: not a directory: {}", abs.display());
+                        std::process::exit(1);
+                    }
+                    json!({ "workspace": abs.to_string_lossy() })
+                }
+                WorkspaceCommand::List | WorkspaceCommand::Cycle => json!({}),
+                WorkspaceCommand::Switch { id } => json!({ "id": id }),
             },
             Command::Background(cmd) => match cmd {
                 BackgroundCommand::Set { path } => {
