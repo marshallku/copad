@@ -313,7 +313,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Decision #61 slice 3: restore through the v2 model. `loadV2`
         // migrates an existing v1 session.json forward automatically. A file
         // with no sub-tabs (or none at all) falls back to a fresh terminal.
-        if let file = Session.loadV2(), !(file.sessions.first?.subTabs.isEmpty ?? true) {
+        if let file = Session.loadV2(), file.sessions.contains(where: { !$0.subTabs.isEmpty }) {
             vc.restoreSessionV2(file)
         } else {
             vc.openInitialTab()
@@ -381,7 +381,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Decision #61 slice 3: persist through the v2 model. The debounced
         // save covers mid-session crashes; this is the orderly-quit flush.
         if let file = tabVC?.snapshotSessionV2() {
-            if file.sessions.first?.subTabs.isEmpty ?? true {
+            if file.sessions.allSatisfy(\.subTabs.isEmpty) {
                 Session.clear()
             } else {
                 Session.saveV2(file)
@@ -1303,6 +1303,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case "session.info":
             let index = params["index"] as? Int ?? vc.activeIndex
             completion(vc.sessionInfo(index: index))
+
+        // Workspace-sessions (decision #61 slice 7) — the top-level "tabs" each
+        // with their own workspace + sub-tabs. Named `workspace.*` to avoid
+        // colliding with the existing `session.*` (which means sub-tabs).
+        case "workspace.new":
+            let ws = params["workspace"] as? String
+            completion(["id": vc.newWorkspace(workspace: ws)])
+
+        case "workspace.switch":
+            guard let id = params["id"] as? String else {
+                completion(RPCError(code: "invalid_params", message: "Missing 'id' param"))
+                return
+            }
+            completion(["ok": vc.switchWorkspace(id: id)])
+
+        case "workspace.list":
+            completion([
+                "active": vc.activeWorkspaceID,
+                "workspaces": vc.workspaceSummaries().map {
+                    ["id": $0.id, "workspace": $0.workspace ?? NSNull(), "tabs": $0.tabs, "active": $0.active]
+                },
+            ])
 
         case "terminal.shell_precmd":
             let panelID = params["panel_id"] as? String ?? vc.activeTerminalPanel?.panelID ?? ""

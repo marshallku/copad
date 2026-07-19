@@ -57,8 +57,68 @@ final class TabViewController: NSViewController {
     /// it up post-launch (load modules from discovered plugin manifests
     /// + handle statusbar.show/hide/toggle socket commands).
     private(set) var statusBar: StatusBarView?
+    // The ACTIVE workspace's live tabs. Inactive workspaces keep theirs in
+    // `workspaces`, swapped in on `switchWorkspace` (decision #61 slice 7).
     private var paneManagers: [PaneManager] = []
     private(set) var activeIndex: Int = -1
+
+    /// One workspace-session (decision #61 slice 7 — the owner's top-level
+    /// "tab": a workspace dir + its own sub-tabs). The ACTIVE workspace's tabs
+    /// are the live `paneManagers`; INACTIVE workspaces are parked as a v2
+    /// `snapshot` and rebuilt on switch. Snapshot-and-rebuild (not parking live
+    /// PaneManagers) so a background terminal exiting can't fire callbacks
+    /// against the wrong workspace's live state; tmux-backed terminals reattach
+    /// their surviving session on rebuild, so no process is lost on switch.
+    private struct WorkspaceRuntime {
+        let id: String
+        var workspace: String?
+        var snapshot: Session.WorkspaceSession?
+    }
+
+    private var workspaces: [WorkspaceRuntime] = [
+        WorkspaceRuntime(id: "sess-0", workspace: nil, snapshot: nil),
+    ]
+    private var activeWorkspaceIndex = 0
+
+    /// The active workspace's id / workspace dir (for the indicator + snapshot).
+    var activeWorkspaceID: String { workspaces[activeWorkspaceIndex].id }
+    var activeWorkspaceDir: String? { workspaces[activeWorkspaceIndex].workspace }
+    var workspaceCount: Int { workspaces.count }
+    /// (id, workspace, tabCount, isActive) for each workspace — drives the
+    /// switcher UI + `workspace.list`.
+    func workspaceSummaries() -> [(id: String, workspace: String?, tabs: Int, active: Bool)] {
+        syncActiveWorkspace()
+        return workspaces.enumerated().map { i, w in
+            (w.id, w.workspace, w.snapshot?.subTabs.count ?? 0, i == activeWorkspaceIndex)
+        }
+    }
+
+    /// Fold the live tabs into the active workspace's snapshot (call before any
+    /// snapshot read or workspace switch).
+    private func syncActiveWorkspace() {
+        guard workspaces.indices.contains(activeWorkspaceIndex) else { return }
+        let w = workspaces[activeWorkspaceIndex]
+        workspaces[activeWorkspaceIndex].snapshot = buildWorkspaceSession(id: w.id, workspace: w.workspace)
+    }
+
+    /// Build a v2 WorkspaceSession from the LIVE tabs (`paneManagers`).
+    private func buildWorkspaceSession(id: String, workspace: String?) -> Session.WorkspaceSession {
+        var subTabs: [Session.SubTab] = []
+        var activeSubId: String?
+        for (idx, manager) in paneManagers.enumerated() {
+            guard let root = manager.snapshotTreeV2() else { continue }
+            let subID = "sub-\(subTabs.count)"
+            if idx == activeIndex { activeSubId = subID }
+            subTabs.append(Session.SubTab(
+                id: subID,
+                name: manager.customTabTitle(),
+                root: root,
+                focusedPaneId: manager.activePane.panelID,
+            ))
+        }
+        if activeSubId == nil { activeSubId = subTabs.first?.id }
+        return Session.WorkspaceSession(id: id, name: nil, workspace: workspace, subTabs: subTabs, activeSubTabId: activeSubId)
+    }
 
     /// Number of sub-tabs (decision #61: the tabs of the current session).
     /// Exposed so the `opt+N` numeric jump only swallows the key when that
@@ -435,33 +495,16 @@ final class TabViewController: NSViewController {
     // reattach — v1 pixel divider positions become an even 0.5 ratio (macOS
     // already re-equalizes on restore, decision #61 I4).
 
-    /// Snapshot the live tabs as a single-session v2 document — v2-native
-    /// (decision #61 slice 4): each terminal leaf carries its real panelID +
-    /// tmux_ref so restore can reattach the surviving tmux session. Restore
-    /// still bridges through v1 for now, harmlessly ignoring the extra ids.
+    /// Snapshot ALL workspace-sessions as a v2 document (decision #61 slice 7):
+    /// the active one from its live tabs, the rest from their parked snapshots.
+    /// Each terminal leaf carries its panelID + tmux_ref so restore reattaches.
     func snapshotSessionV2() -> Session.SessionFileV2 {
-        var subTabs: [Session.SubTab] = []
-        var activeSubId: String?
-        for (idx, manager) in paneManagers.enumerated() {
-            guard let root = manager.snapshotTreeV2() else { continue }
-            let id = "sub-\(subTabs.count)"
-            if idx == activeIndex { activeSubId = id }
-            subTabs.append(Session.SubTab(
-                id: id,
-                name: manager.customTabTitle(),
-                root: root,
-                focusedPaneId: manager.activePane.panelID,
-            ))
-        }
-        if activeSubId == nil { activeSubId = subTabs.first?.id }
-        let session = Session.WorkspaceSession(
-            id: "sess-0",
-            name: nil,
-            workspace: nil,
-            subTabs: subTabs,
-            activeSubTabId: activeSubId,
-        )
-        return Session.SessionFileV2(version: Session.versionV2, sessions: [session], activeSessionId: "sess-0")
+        syncActiveWorkspace()
+        let sessions = workspaces.compactMap(\.snapshot)
+        let activeId = workspaces.indices.contains(activeWorkspaceIndex)
+            ? workspaces[activeWorkspaceIndex].id
+            : sessions.first?.id
+        return Session.SessionFileV2(version: Session.versionV2, sessions: sessions, activeSessionId: activeId)
     }
 
     /// Debounced persistence trigger — call after any structural mutation
@@ -476,7 +519,7 @@ final class TabViewController: NSViewController {
             MainActor.assumeIsolated {
                 guard let self else { return }
                 let snap = self.snapshotSessionV2()
-                if snap.sessions.first?.subTabs.isEmpty ?? true {
+                if snap.sessions.allSatisfy(\.subTabs.isEmpty) {
                     Session.clear()
                 } else {
                     Session.saveV2(snap)
@@ -485,23 +528,31 @@ final class TabViewController: NSViewController {
         }
     }
 
-    /// Restore from a v2 document. Uses the first session (multi-session is
-    /// slice 7). No-op friendly: an empty document leaves the caller to fall
-    /// back to `openInitialTab`.
+    /// Restore ALL workspace-sessions from a v2 document (decision #61 slice 7);
+    /// the active workspace's tabs are rebuilt live, the rest are parked as
+    /// snapshots and rebuilt on switch. Empty document → caller falls back to
+    /// `openInitialTab`.
     func restoreSessionV2(_ file: Session.SessionFileV2) {
         suppressSessionSave = true
         defer {
             suppressSessionSave = false
             // Re-persist once: a just-migrated v1 file lands as v2, and because
-            // panes are rebuilt with their PERSISTED ids (below) this save keeps
-            // the same ids + tmux_ref rather than minting fresh ones.
+            // panes are rebuilt with their PERSISTED ids this save keeps the
+            // same ids + tmux_ref rather than minting fresh ones.
             scheduleSessionSave()
         }
-        // v2-native (slice 4b): rebuild each sub-tab's pane tree from the
-        // persisted PaneNode, reusing pane ids so tmux-backed terminals
-        // reattach their surviving `copad-<id>` session. Uses the first
-        // session (multi-session is slice 7).
-        guard let session = file.sessions.first else { return }
+        guard !file.sessions.isEmpty else { return }
+        workspaces = file.sessions.map {
+            WorkspaceRuntime(id: $0.id, workspace: $0.workspace, snapshot: $0)
+        }
+        activeWorkspaceIndex = file.sessions.firstIndex { $0.id == file.activeSessionId } ?? 0
+        rebuildLiveTabs(from: file.sessions[activeWorkspaceIndex])
+    }
+
+    /// Rebuild the LIVE tabs (`paneManagers`) from a workspace-session's
+    /// sub-tabs, reusing pane ids so tmux-backed terminals reattach. Assumes
+    /// live tabs were torn down. Callers keep `suppressSessionSave` on.
+    private func rebuildLiveTabs(from session: Session.WorkspaceSession) {
         for sub in session.subTabs {
             let initial = PaneManager.panelFromPane(PaneManager.leftmostPane(sub.root), config: config, theme: theme, pluginFactory: pluginFactory)
             let manager = PaneManager(config: config, theme: theme, initialPanel: .pluginPanel(initial))
@@ -527,10 +578,62 @@ final class TabViewController: NSViewController {
         }
         // `switchTab` early-returns when the target sub-tab is already active
         // (addTab selected the last one), so it may skip `makeFirstResponder`.
-        // Hand keyboard focus to the restored active pane explicitly.
         if let active = activePaneManager {
             active.activePane.view.window?.makeFirstResponder(active.activePane.focusTarget)
         }
+    }
+
+    // MARK: - Workspace sessions (decision #61 slice 7)
+
+    private func tearDownLiveTabs() {
+        activePaneManager?.containerView.removeFromSuperview()
+        paneManagers.removeAll()
+        activeIndex = -1
+    }
+
+    /// Switch to another workspace-session: park the current live tabs as a
+    /// snapshot, tear them down, and rebuild the target from its snapshot
+    /// (tmux-backed terminals reattach; nothing is lost).
+    func switchWorkspace(to index: Int) {
+        guard index != activeWorkspaceIndex, workspaces.indices.contains(index) else { return }
+        syncActiveWorkspace()
+        suppressSessionSave = true
+        tearDownLiveTabs()
+        activeWorkspaceIndex = index
+        if let snap = workspaces[index].snapshot, !snap.subTabs.isEmpty {
+            rebuildLiveTabs(from: snap)
+        } else {
+            // Empty workspace → seed a terminal in its declared directory.
+            newTerminalTab(cwd: workspaces[index].workspace, initialInput: nil)
+        }
+        suppressSessionSave = false
+        scheduleSessionSave()
+        eventBus?.broadcast(event: "workspace.switched", data: ["id": workspaces[index].id])
+    }
+
+    /// Create a new workspace-session (seeded with one terminal opened in the
+    /// workspace directory) and switch to it.
+    @discardableResult
+    func newWorkspace(workspace: String?) -> String {
+        syncActiveWorkspace()
+        suppressSessionSave = true
+        tearDownLiveTabs()
+        let id = UUID().uuidString
+        workspaces.append(WorkspaceRuntime(id: id, workspace: workspace, snapshot: nil))
+        activeWorkspaceIndex = workspaces.count - 1
+        suppressSessionSave = false
+        newTerminalTab(cwd: workspace, initialInput: nil)  // open in the workspace dir
+        scheduleSessionSave()
+        eventBus?.broadcast(event: "workspace.switched", data: ["id": id])
+        return id
+    }
+
+    /// Switch by workspace id (for `workspace.switch`).
+    @discardableResult
+    func switchWorkspace(id: String) -> Bool {
+        guard let idx = workspaces.firstIndex(where: { $0.id == id }) else { return false }
+        switchWorkspace(to: idx)
+        return true
     }
 
     // MARK: - Tab Operations

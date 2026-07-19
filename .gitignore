@@ -13,3 +13,6 @@ nestty-macos/DerivedData/
 **/.build/
 nestty-macos/*.xcodeproj/xcuserdata/
 nestty-macos/*.xcworkspace/xcuserdata/
+
+# Stray runtime state if Copad is launched with HOME resolving into the repo
+copad-macos/Library/
