@@ -269,6 +269,42 @@ if $DO_DAEMON; then
         else
             echo "==> installing LaunchAgent plist into $PLIST_DST"
             mkdir -p "$(dirname "$PLIST_DST")"
+
+            # Install the copadd launch wrapper + mint the operator secrets
+            # file it sources. The plist runs `/bin/sh <wrapper>`, and the
+            # wrapper sources ~/.config/copad/secrets.env (mode 600) before
+            # exec'ing copadd — so plugin bearer tokens reach copadd's env
+            # (and its plugins) without living in the 644 plist. The token is
+            # minted ONCE and preserved across reinstalls, so a phone that
+            # already paired keeps working after an upgrade.
+            WRAP_SRC="$REPO_ROOT/dist/launchd/copadd-launch.sh"
+            WRAP_DST="$HOME/.config/copad/copadd-launch.sh"
+            SECRETS_ENV="$HOME/.config/copad/secrets.env"
+            mkdir -p "$HOME/.config/copad"
+            if [[ -f "$WRAP_SRC" ]]; then
+                cp -f "$WRAP_SRC" "$WRAP_DST"
+                chmod 755 "$WRAP_DST"
+            else
+                echo "warn: $WRAP_SRC missing — copadd will run without secrets sourcing" >&2
+            fi
+            if [[ ! -f "$SECRETS_ENV" ]]; then
+                # Generate + validate the token BEFORE writing so an openssl
+                # failure never leaves an empty token file behind (which would
+                # then be "preserved" forever on later reinstalls).
+                WB_TOKEN=$(openssl rand -hex 24 2>/dev/null || true)
+                if [[ -z "$WB_TOKEN" ]]; then
+                    echo "warn: openssl rand failed — no web-bridge token minted; add COPAD_WEB_BRIDGE_TOKEN=<≥32 chars> to $SECRETS_ENV manually" >&2
+                else
+                    ( umask 077; printf 'COPAD_WEB_BRIDGE_TOKEN=%s\n' "$WB_TOKEN" > "$SECRETS_ENV" )
+                    chmod 600 "$SECRETS_ENV"
+                    echo "    minted web-bridge token → $SECRETS_ENV (600). View with: cat $SECRETS_ENV"
+                fi
+            else
+                # Re-assert 600 even when preserving — an existing file created
+                # with looser perms would otherwise keep the token exposed.
+                chmod 600 "$SECRETS_ENV"
+                echo "    preserving existing $SECRETS_ENV (web-bridge token kept; perms reasserted 600)"
+            fi
             # XML-escape `$HOME` then drop it into the plist. Two
             # bash-version pitfalls compound here:
             # 1. Bash 5.3+ defaults `patsub_replacement` ON, which

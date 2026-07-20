@@ -6,18 +6,20 @@
     <string>com.marshall.copad.daemon</string>
 
     <!--
-        ProgramArguments points at ~/.cargo/bin/copadd to match what
-        scripts/install-macos.sh installs via `cargo install`. If you
-        ran a system install that lands the binary elsewhere, edit
-        the path here (or send the install script a PR with a
-        $PROGRAM template).
-
-        launchd does not expand ~ — that's why install-macos.sh
-        rewrites the path with the user's HOME at copy time.
+        ProgramArguments runs copadd through a small wrapper
+        (install-macos.sh installs it next to this plist's target) that
+        sources ~/.config/copad/secrets.env before exec'ing
+        ~/.cargo/bin/copadd. That file (mode 600, NOT overwritten by
+        reinstall) carries plugin bearer tokens like
+        COPAD_WEB_BRIDGE_TOKEN so they never live in this world-readable
+        plist. The wrapper itself uses $HOME (launchd sets it for
+        gui/<uid> agents); this path can't, so install-macos.sh rewrites
+        HOME_PLACEHOLDER at copy time (launchd does not expand ~).
     -->
     <key>ProgramArguments</key>
     <array>
-        <string>HOME_PLACEHOLDER/.cargo/bin/copadd</string>
+        <string>/bin/sh</string>
+        <string>HOME_PLACEHOLDER/.config/copad/copadd-launch.sh</string>
     </array>
 
     <!--
