@@ -422,7 +422,11 @@ fn resolve_tmux() -> String {
             }
         }
     }
-    for cand in ["/opt/homebrew/bin/tmux", "/usr/local/bin/tmux", "/usr/bin/tmux"] {
+    for cand in [
+        "/opt/homebrew/bin/tmux",
+        "/usr/local/bin/tmux",
+        "/usr/bin/tmux",
+    ] {
         if is_exec(std::path::Path::new(cand)) {
             return cand.to_string();
         }
@@ -485,10 +489,21 @@ mod tmux_argv_tests {
     /// `-s` session name, so pane 2 never inherits pane 1's identity/socket.
     #[test]
     fn per_session_env_is_injected_before_session_name() {
-        let a = build_tmux_argv("copad-P2", Some("/bin/zsh"), Some("P2"), Some("/tmp/copad-9.sock"));
+        let a = build_tmux_argv(
+            "copad-P2",
+            Some("/bin/zsh"),
+            Some("P2"),
+            Some("/tmp/copad-9.sock"),
+        );
         assert_eq!(&a[0..3], &["-L", "copad", "new-session"]);
-        assert!(a.windows(2).any(|w| w[0] == "-e" && w[1] == "COPAD_PANEL_ID=P2"));
-        assert!(a.windows(2).any(|w| w[0] == "-e" && w[1] == "COPAD_SOCKET=/tmp/copad-9.sock"));
+        assert!(
+            a.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "COPAD_PANEL_ID=P2")
+        );
+        assert!(
+            a.windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "COPAD_SOCKET=/tmp/copad-9.sock")
+        );
         assert!(a.windows(2).any(|w| w[0] == "-s" && w[1] == "copad-P2"));
         let first_e = a.iter().position(|x| x == "-e").unwrap();
         let s_flag = a.iter().position(|x| x == "-s").unwrap();
@@ -532,7 +547,10 @@ pub unsafe extern "C" fn copad_term_create(
     let panel_id_str: Option<String> = if panel_id.is_null() {
         None
     } else {
-        unsafe { CStr::from_ptr(panel_id) }.to_str().ok().map(str::to_owned)
+        unsafe { CStr::from_ptr(panel_id) }
+            .to_str()
+            .ok()
+            .map(str::to_owned)
     };
     if let Some(s) = &panel_id_str {
         tty_opts.env.insert("COPAD_PANEL_ID".into(), s.clone());
@@ -540,7 +558,10 @@ pub unsafe extern "C" fn copad_term_create(
     let socket_str: Option<String> = if socket_path.is_null() {
         None
     } else {
-        unsafe { CStr::from_ptr(socket_path) }.to_str().ok().map(str::to_owned)
+        unsafe { CStr::from_ptr(socket_path) }
+            .to_str()
+            .ok()
+            .map(str::to_owned)
     };
     if let Some(s) = &socket_str {
         tty_opts.env.insert("COPAD_SOCKET".into(), s.clone());
@@ -582,7 +603,10 @@ pub unsafe extern "C" fn copad_term_create(
         None
     } else {
         // SAFETY: caller contract — non-null pointer is a NUL-terminated C string.
-        unsafe { CStr::from_ptr(shell) }.to_str().ok().map(str::to_owned)
+        unsafe { CStr::from_ptr(shell) }
+            .to_str()
+            .ok()
+            .map(str::to_owned)
     };
     // `[terminal] backend = "tmux"` (decision #60): back the pane onto a
     // dedicated single-pane tmux session instead of a raw shell. The pane's
@@ -599,7 +623,10 @@ pub unsafe extern "C" fn copad_term_create(
     let tmux_session: Option<String> = if tmux_session.is_null() {
         None
     } else {
-        unsafe { CStr::from_ptr(tmux_session) }.to_str().ok().map(str::to_owned)
+        unsafe { CStr::from_ptr(tmux_session) }
+            .to_str()
+            .ok()
+            .map(str::to_owned)
     };
     if let Some(session) = tmux_session {
         let args = build_tmux_argv(

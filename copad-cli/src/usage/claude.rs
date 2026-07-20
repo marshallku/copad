@@ -235,7 +235,12 @@ mod tests {
         let proj = dir.path().join("proj-b");
         std::fs::create_dir(&proj).unwrap();
         let mut f = std::fs::File::create(proj.join("s.jsonl")).unwrap();
-        writeln!(f, "{}", assistant_line("m1", "2026-07-20T12:00:00.000Z", 10)).unwrap();
+        writeln!(
+            f,
+            "{}",
+            assistant_line("m1", "2026-07-20T12:00:00.000Z", 10)
+        )
+        .unwrap();
         // simulate an active file with a truncated trailing line
         write!(f, r#"{{"type":"assistant","messag"#).unwrap();
         drop(f);
@@ -273,9 +278,19 @@ mod tests {
         let nested = proj.join("session-1/subagents");
         std::fs::create_dir_all(&nested).unwrap();
         let mut top = std::fs::File::create(proj.join("session-1.jsonl")).unwrap();
-        writeln!(top, "{}", assistant_line("m_top", "2026-07-20T12:00:00.000Z", 100)).unwrap();
+        writeln!(
+            top,
+            "{}",
+            assistant_line("m_top", "2026-07-20T12:00:00.000Z", 100)
+        )
+        .unwrap();
         let mut sub = std::fs::File::create(nested.join("agent-abc.jsonl")).unwrap();
-        writeln!(sub, "{}", assistant_line("m_sub", "2026-07-20T12:01:00.000Z", 40)).unwrap();
+        writeln!(
+            sub,
+            "{}",
+            assistant_line("m_sub", "2026-07-20T12:01:00.000Z", 40)
+        )
+        .unwrap();
         drop((top, sub));
 
         let (records, _) = scan(dir.path(), None);

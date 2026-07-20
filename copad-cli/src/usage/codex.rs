@@ -23,7 +23,10 @@ pub enum CodexLine {
     /// A session-config line declaring the model.
     Model(String),
     /// A per-turn token delta.
-    Tokens { ts: DateTime<Local>, usage: RawUsage },
+    Tokens {
+        ts: DateTime<Local>,
+        usage: RawUsage,
+    },
     /// Anything else (ignored, no warning).
     Other,
 }
@@ -209,9 +212,24 @@ mod tests {
         writeln!(f, r#"{{"payload":{{"model":"gpt-5.6-sol"}}}}"#).unwrap();
         // Every token_count is a real per-turn delta — all three are summed,
         // even two that bill identically (no speculative dup-suppression).
-        writeln!(f, "{}", token_line("2026-07-20T12:00:00.000Z", 100, 0, 20, 0)).unwrap();
-        writeln!(f, "{}", token_line("2026-07-20T12:00:00.000Z", 100, 0, 20, 0)).unwrap();
-        writeln!(f, "{}", token_line("2026-07-20T12:05:00.000Z", 50, 10, 5, 0)).unwrap();
+        writeln!(
+            f,
+            "{}",
+            token_line("2026-07-20T12:00:00.000Z", 100, 0, 20, 0)
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            token_line("2026-07-20T12:00:00.000Z", 100, 0, 20, 0)
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{}",
+            token_line("2026-07-20T12:05:00.000Z", 50, 10, 5, 0)
+        )
+        .unwrap();
         drop(f);
 
         let (records, warns) = scan(dir.path(), None);

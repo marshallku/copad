@@ -156,7 +156,10 @@ fn oneline(agents: &[Agent]) -> String {
     if agents.is_empty() {
         return "no agents".to_string();
     }
-    let busy = agents.iter().filter(|a| classify(&a.status) == Class::Busy).count();
+    let busy = agents
+        .iter()
+        .filter(|a| classify(&a.status) == Class::Busy)
+        .count();
     let waiting = agents
         .iter()
         .filter(|a| classify(&a.status) == Class::Attention)
@@ -194,7 +197,12 @@ fn human(agents: &[Agent]) -> String {
     for a in agents {
         // Status column sized for tmx's longest current label
         // ("awaiting-decision" = 17 chars).
-        out.push_str(&format!("{:<7} {:<18} {}\n", a.kind, a.status, repo_label(a)));
+        out.push_str(&format!(
+            "{:<7} {:<18} {}\n",
+            a.kind,
+            a.status,
+            repo_label(a)
+        ));
     }
     out
 }

@@ -291,10 +291,15 @@ pub fn save_v2(file: &SessionFileV2) {
     let path = session_path();
     let Some(parent) = path.parent() else { return };
     if let Err(e) = std::fs::create_dir_all(parent) {
-        eprintln!("[copad] session v2 save: mkdir {} failed: {e}", parent.display());
+        eprintln!(
+            "[copad] session v2 save: mkdir {} failed: {e}",
+            parent.display()
+        );
         return;
     }
-    let Some(json) = serialize_v2(file) else { return };
+    let Some(json) = serialize_v2(file) else {
+        return;
+    };
     let tmp = path.with_extension("json.tmp");
     if let Err(e) = std::fs::write(&tmp, json) {
         eprintln!("[copad] session v2 write {} failed: {e}", tmp.display());
@@ -312,7 +317,10 @@ impl SessionFileV2 {
     pub fn normalize(&mut self) {
         fn walk(n: &mut PaneNode) {
             if let PaneNode::Branch {
-                ratio, first, second, ..
+                ratio,
+                first,
+                second,
+                ..
             } = n
             {
                 *ratio = clamp_ratio(*ratio);
