@@ -52,6 +52,19 @@ enum AutoSpawn {
             return true
         }
 
+        // If a copadd LaunchAgent is loaded, launchd owns the daemon lifecycle
+        // (RunAtLoad + KeepAlive). Spawning our own copadd here would race the
+        // socket bind and send the launchd-managed one into a crash loop
+        // ("socket … already bound by another copadd; refusing to start"). So
+        // when launchd is in charge, DEFER: wait for it to (re)start copadd
+        // instead of creating a competitor. Only fall through to a self-spawn
+        // when no LaunchAgent manages copadd (Homebrew cask / manual run, or a
+        // failed bootstrap) — there, the GUI is the only thing that will.
+        if launchAgentLoaded() {
+            log("copadd LaunchAgent loaded — deferring to launchd instead of self-spawning")
+            return waitForPing(budget: 5.0, perAttempt: 0.3)
+        }
+
         guard let copaddPath = locateBinary() else {
             log("copadd binary not found in PATH, ~/.cargo/bin, or /opt/homebrew/bin — install via `cargo install --path copad-daemon` or `brew install --cask marshallku/copad/copad`")
             return false
@@ -63,6 +76,28 @@ enum AutoSpawn {
     }
 
     // MARK: - Helpers
+
+    /// True when the copadd LaunchAgent is loaded in this GUI login session, so
+    /// launchd — not us — is responsible for keeping copadd running. Uses
+    /// `launchctl print` (exit 0 iff the service is registered in the domain);
+    /// output is discarded. A missing/never-bootstrapped agent (e.g. a failed
+    /// `launchctl bootstrap`, or a cask install without the plist) returns
+    /// false, so the caller self-spawns as before.
+    private static func launchAgentLoaded() -> Bool {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        proc.arguments = ["print", "gui/\(getuid())/com.marshall.copad.daemon"]
+        proc.standardOutput = FileHandle.nullDevice
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+            return proc.terminationStatus == 0
+        } catch {
+            log("launchctl print probe failed: \(error)")
+            return false
+        }
+    }
 
     private static func locateBinary() -> URL? {
         let env = ProcessInfo.processInfo.environment
