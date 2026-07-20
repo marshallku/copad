@@ -1,10 +1,12 @@
+mod agent_status;
 mod client;
 mod commands;
 mod plugin_cmds;
 mod update;
+mod usage;
 
 use clap::Parser;
-use commands::{Cli, Command, EventCommand, UpdateCommand};
+use commands::{AgentCommand, Cli, Command, EventCommand, UpdateCommand};
 
 fn main() {
     let cli = Cli::parse();
@@ -16,6 +18,16 @@ fn main() {
             UpdateCommand::Apply { version } => update::apply_update(version.clone()),
         }
         return;
+    }
+
+    // `usage` and `agent status` are LOCAL readouts — they parse transcript
+    // files / shell out to `tmx`, never the daemon socket — so they work over
+    // SSH and inside a tmux status bar. Dispatch before any socket resolution.
+    if let Command::Usage(args) = &cli.command {
+        std::process::exit(usage::run(args, cli.json));
+    }
+    if let Command::Agent(AgentCommand::Status { oneline }) = &cli.command {
+        std::process::exit(agent_status::run(*oneline, cli.json));
     }
 
     // `coctl event publish` bypasses the generic `discover_socket`

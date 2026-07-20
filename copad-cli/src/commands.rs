@@ -17,7 +17,7 @@ pub struct Cli {
     pub socket: Option<String>,
 
     /// Output JSON format
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, global = true)]
     pub json: bool,
 
     #[command(subcommand)]
@@ -84,9 +84,15 @@ pub enum Command {
     #[command(subcommand)]
     Terminal(TerminalCommand),
 
-    /// AI agent commands (approval workflow)
+    /// AI agent commands (approval workflow + local status readout)
     #[command(subcommand)]
     Agent(AgentCommand),
+
+    /// Claude/Codex token + cost usage, aggregated from local transcripts
+    /// (`~/.claude/projects`, `~/.codex/sessions`). Runs LOCALLY — no daemon,
+    /// no socket — so it works over SSH. Pipe `--oneline` into a tmux
+    /// `status-right` for an always-on cost readout.
+    Usage(UsageArgs),
 
     /// Theme management
     #[command(subcommand)]
@@ -439,8 +445,37 @@ fn kv_to_object(kv: &[(String, String)]) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
+/// `coctl usage` flags. Window defaults to the current local day; `--since`
+/// overrides it with a rolling wall-clock window (honest naming — copad can't
+/// know Anthropic's exact 5h reset). `--oneline` is the tmux `status-right`
+/// form; `--json` (global) is the machine shape.
+#[derive(clap::Args)]
+pub struct UsageArgs {
+    /// Time window: `today` (local midnight → now, default) or `all`.
+    /// Ignored when `--since` is given.
+    #[arg(long, default_value = "today")]
+    pub window: String,
+    /// Rolling window ending now, e.g. `5h`, `30m`, `2d`. Overrides `--window`.
+    #[arg(long)]
+    pub since: Option<String>,
+    /// Restrict to one tool: `claude` or `codex` (default: both).
+    #[arg(long)]
+    pub tool: Option<String>,
+    /// One-line compact form for a tmux status bar.
+    #[arg(long, default_value_t = false)]
+    pub oneline: bool,
+}
+
 #[derive(Subcommand)]
 pub enum AgentCommand {
+    /// Show running Claude/Codex agents (shells out to `tmx agents --json`,
+    /// the ecosystem's classification source of truth). Runs LOCALLY — no
+    /// socket — so it composes into a tmux status bar. `--oneline` for that.
+    Status {
+        /// One-line compact form for a tmux status bar.
+        #[arg(long, default_value_t = false)]
+        oneline: bool,
+    },
     /// Request user approval for an action (shows dialog, blocks until response)
     Approve {
         /// Dialog message describing the action
@@ -719,8 +754,12 @@ impl Cli {
             .to_string(),
             Command::Agent(cmd) => match cmd {
                 AgentCommand::Approve { .. } => "agent.approve",
+                AgentCommand::Status { .. } => {
+                    unreachable!("agent status is dispatched locally in main.rs")
+                }
             }
             .to_string(),
+            Command::Usage(_) => unreachable!("usage is dispatched locally in main.rs"),
             Command::Theme(cmd) => match cmd {
                 ThemeCommand::List => "theme.list",
             }
@@ -906,7 +945,11 @@ impl Cli {
                     }
                     p
                 }
+                AgentCommand::Status { .. } => {
+                    unreachable!("agent status is dispatched locally in main.rs")
+                }
             },
+            Command::Usage(_) => unreachable!("usage is dispatched locally in main.rs"),
             Command::Plugin(cmd) => match cmd {
                 PluginCommand::List => json!({}),
                 PluginCommand::Open { plugin, panel } => {
