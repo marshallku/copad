@@ -94,8 +94,7 @@ typedef struct {
 CopadHandle* copad_term_create(uint16_t cols, uint16_t rows,
                                   const char* shell, const char* cwd,
                                   const char* panel_id,
-                                  const char* socket_path,
-                                  const char* tmux_session);
+                                  const char* socket_path);
 void copad_term_destroy(CopadHandle* handle);
 
 void copad_term_input(CopadHandle* handle, const uint8_t* bytes, size_t len);

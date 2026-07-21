@@ -510,31 +510,6 @@ final class TabBarView: NSView {
     /// Called when the user commits a double-click inline rename.
     var onRenameTab: ((Int, String) -> Void)?
 
-    // MARK: - Workspace switcher (Decision #61 UI-B)
-    // A copad tab = a tmux-style workspace session. The leading pull-down
-    // lists every workspace (✓ = active) + "New Workspace…", so the user
-    // sees the session list and jumps between them — the sub-tab bar itself
-    // shows only the active workspace's sub-tabs.
-
-    /// One row in the workspace pull-down.
-    struct WorkspaceMenuItem {
-        let title: String
-        let subtitle: String?
-        let active: Bool
-    }
-
-    /// Called on menu-open to fetch the current workspace list — lazy so the
-    /// snapshot rebuild in `workspaceSummaries()` runs only when the menu
-    /// actually opens, not on every tab-title refresh.
-    var workspaceProvider: (() -> [WorkspaceMenuItem])?
-    var onSwitchWorkspace: ((Int) -> Void)?
-    var onNewWorkspace: (() -> Void)?
-
-    private let workspaceButton = NSButton()
-    /// Thin rule under the session header (vertical bar only) that separates the
-    /// session level from its tab list beneath.
-    private let sessionSeparator = NSView()
-
     private(set) var isCollapsed: Bool = false
 
     private let toggleButton = NSButton()
@@ -618,42 +593,6 @@ final class TabBarView: NSView {
         toggleButton.translatesAutoresizingMaskIntoConstraints = false
         addSubview(toggleButton)
 
-        // Workspace switcher — active workspace name + chevron (horizontal)
-        // or a stack icon (vertical); tap drops the workspace pull-down.
-        workspaceButton.isBordered = false
-        workspaceButton.font = .systemFont(ofSize: 12, weight: .medium)
-        workspaceButton.contentTintColor = theme.subtext0.nsColor
-        workspaceButton.target = self
-        workspaceButton.action = #selector(workspaceTapped)
-        workspaceButton.toolTip = "Switch workspace (⌘⇧W)"
-        workspaceButton.setButtonType(.momentaryChange)
-        workspaceButton.translatesAutoresizingMaskIntoConstraints = false
-        if isVertical {
-            // Vertical bar has room for a labelled SESSION header: a stack
-            // glyph + the active session name, styled bolder/brighter than the
-            // tab pills below so the two levels read as distinct (session on
-            // top, its tabs nested beneath). Left-aligned like a section head.
-            workspaceButton.image = NSImage(systemSymbolName: "rectangle.stack", accessibilityDescription: "Session")?
-                .withSymbolConfiguration(.init(pointSize: 12, weight: .semibold))
-            workspaceButton.imagePosition = .imageLeading
-            workspaceButton.imageHugsTitle = true
-            workspaceButton.title = "session 1"
-            workspaceButton.font = .systemFont(ofSize: 12, weight: .semibold)
-            workspaceButton.contentTintColor = theme.text.nsColor
-            (workspaceButton.cell as? NSButtonCell)?.alignment = .left
-            sessionSeparator.wantsLayer = true
-            sessionSeparator.layer?.backgroundColor = theme.overlay0.nsColor.cgColor
-            sessionSeparator.translatesAutoresizingMaskIntoConstraints = false
-            addSubview(sessionSeparator)
-        } else {
-            workspaceButton.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: nil)?
-                .withSymbolConfiguration(.init(pointSize: 9, weight: .semibold))
-            workspaceButton.imagePosition = .imageRight
-            workspaceButton.imageHugsTitle = true
-            workspaceButton.title = "session 1"
-        }
-        addSubview(workspaceButton)
-
         // Tab stack — across the top/bottom when horizontal, down the
         // side when vertical.
         stackView.orientation = isVertical ? .vertical : .horizontal
@@ -691,17 +630,7 @@ final class TabBarView: NSView {
                 toggleButton.centerXAnchor.constraint(equalTo: centerXAnchor),
                 toggleButton.heightAnchor.constraint(equalToConstant: 24),
 
-                workspaceButton.topAnchor.constraint(equalTo: toggleButton.bottomAnchor, constant: 6),
-                workspaceButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-                workspaceButton.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -8),
-                workspaceButton.heightAnchor.constraint(equalToConstant: 22),
-
-                sessionSeparator.topAnchor.constraint(equalTo: workspaceButton.bottomAnchor, constant: 5),
-                sessionSeparator.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-                sessionSeparator.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-                sessionSeparator.heightAnchor.constraint(equalToConstant: 1),
-
-                scrollView.topAnchor.constraint(equalTo: sessionSeparator.bottomAnchor, constant: 4),
+                scrollView.topAnchor.constraint(equalTo: toggleButton.bottomAnchor, constant: 6),
                 // Viewport spans from the separator to the far edge — flips
                 // with the separator side so `right`-position tabs don't clip.
                 separatorLeading
@@ -726,12 +655,7 @@ final class TabBarView: NSView {
                 toggleButton.centerYAnchor.constraint(equalTo: centerYAnchor),
                 toggleButton.widthAnchor.constraint(equalToConstant: 24),
 
-                workspaceButton.leadingAnchor.constraint(equalTo: toggleButton.trailingAnchor, constant: 6),
-                workspaceButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-                workspaceButton.heightAnchor.constraint(equalToConstant: 24),
-                workspaceButton.widthAnchor.constraint(lessThanOrEqualToConstant: 160),
-
-                scrollView.leadingAnchor.constraint(equalTo: workspaceButton.trailingAnchor, constant: 4),
+                scrollView.leadingAnchor.constraint(equalTo: toggleButton.trailingAnchor, constant: 8),
                 scrollView.topAnchor.constraint(equalTo: topAnchor),
                 scrollView.bottomAnchor.constraint(equalTo: border.topAnchor),
                 scrollView.trailingAnchor.constraint(equalTo: addButton.leadingAnchor, constant: -4),
@@ -801,46 +725,7 @@ final class TabBarView: NSView {
         // The parent will call setTabs again; just update toggle button appearance here
         let tint = collapsed ? theme.text.nsColor : theme.subtext0.nsColor
         toggleButton.contentTintColor = tint
-        if isVertical {
-            // A collapsed vertical bar is icon-width — drop the session header
-            // to its glyph and hide the divider so the name doesn't clip.
-            workspaceButton.imagePosition = collapsed ? .imageOnly : .imageLeading
-            sessionSeparator.isHidden = collapsed
-        }
     }
-
-    /// Cheap per-refresh update of the switcher's active-workspace label
-    /// (horizontal only — the vertical bar shows an icon). The full list is
-    /// fetched lazily via `workspaceProvider` when the menu opens.
-    func setActiveWorkspace(name: String) {
-        workspaceButton.title = name
-    }
-
-    /// Open the workspace pull-down (also reachable via ⌘⇧W).
-    func showWorkspaceMenu() { presentWorkspaceMenu() }
-
-    @objc private func workspaceTapped() { presentWorkspaceMenu() }
-
-    private func presentWorkspaceMenu() {
-        let items = workspaceProvider?() ?? []
-        let menu = NSMenu()
-        for (i, item) in items.enumerated() {
-            let title = item.subtitle.map { "\(item.title)  —  \($0)" } ?? item.title
-            let mi = NSMenuItem(title: title, action: #selector(workspaceMenuSelected(_:)), keyEquivalent: "")
-            mi.target = self
-            mi.tag = i
-            mi.state = item.active ? .on : .off
-            menu.addItem(mi)
-        }
-        menu.addItem(.separator())
-        let newItem = NSMenuItem(title: "New Workspace…", action: #selector(newWorkspaceSelected), keyEquivalent: "")
-        newItem.target = self
-        menu.addItem(newItem)
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: workspaceButton.bounds.height + 4), in: workspaceButton)
-    }
-
-    @objc private func workspaceMenuSelected(_ sender: NSMenuItem) { onSwitchWorkspace?(sender.tag) }
-    @objc private func newWorkspaceSelected() { onNewWorkspace?() }
 
     // MARK: - Private
 

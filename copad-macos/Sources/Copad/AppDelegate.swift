@@ -289,19 +289,30 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // Lives here because plugin construction needs the manifest store +
         // action registry the pane manager can't reach; MUST be set before the
         // restore below. nil (plugin uninstalled) → explicit placeholder.
-        vc.pluginFactory = { [weak self, weak vc] name, restoreID in
+        vc.pluginFactory = { [weak self, weak vc] name, panelName in
             guard let self, let vc,
-                  let manifest = PluginManifestStore.discover().first(where: { $0.manifest.plugin.name == name }),
-                  let panelDef = manifest.manifest.panels.first
+                  let manifest = PluginManifestStore.discover().first(where: { $0.manifest.plugin.name == name })
             else { return nil }
+            // Reopen the persisted panel of a multi-panel plugin; fall back to
+            // the plugin's first panel.
+            let panelDef = manifest.manifest.panels.first(where: { $0.name == panelName })
+                ?? manifest.manifest.panels.first
+            guard let panelDef else { return nil }
             return PluginPanelController(
                 plugin: manifest,
                 panelDef: panelDef,
                 registry: self.actionRegistry,
                 eventBus: self.eventBus,
                 theme: vc.theme,
-                restoreID: restoreID,
             )
+        }
+        // Reopen the agent cockpit on restore (a `.cockpit` leaf). AppDelegate
+        // owns the cockpit model; track the panel so toggleCockpit dedupes.
+        vc.cockpitFactory = { [weak self] in
+            guard let self, let tabVC = self.tabVC else { return nil }
+            let cockpit = CockpitViewController(model: self.agentCockpit, tabVC: tabVC)
+            self.cockpitPanel = cockpit
+            return cockpit
         }
         // Session-persistence restore: if a snapshot exists, replay
         // tabs + splits + per-leaf cwd; otherwise seed a single
@@ -310,11 +321,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // the restored layout, and before any save-on-terminate path
         // can overwrite the persisted snapshot with an empty one.
         // Mirrors `copad-linux/src/window.rs` post-build sequence.
-        // Decision #61 slice 3: restore through the v2 model. `loadV2`
-        // migrates an existing v1 session.json forward automatically. A file
-        // with no sub-tabs (or none at all) falls back to a fresh terminal.
-        if let file = Session.loadV2(), file.sessions.contains(where: { !$0.subTabs.isEmpty }) {
-            vc.restoreSessionV2(file)
+        // Decision #64: restore the v3 flat session (tabs + splits + cwd). An
+        // old v1/v2 file is rejected by the loader → fresh terminal (wipe-fresh).
+        if let snap = Session.load(), !snap.tabs.isEmpty {
+            vc.restoreSession(snap)
         } else {
             vc.openInitialTab()
         }
@@ -378,13 +388,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // snapshot (no terminal tabs left) clears any prior file so
         // a stale layout doesn't surface on next launch — same
         // contract as `copad-linux/src/window.rs`'s close handler.
-        // Decision #61 slice 3: persist through the v2 model. The debounced
-        // save covers mid-session crashes; this is the orderly-quit flush.
-        if let file = tabVC?.snapshotSessionV2() {
-            if file.sessions.allSatisfy(\.subTabs.isEmpty) {
+        // Decision #64: persist the v3 flat session. The debounced save covers
+        // mid-session crashes; this is the orderly-quit flush.
+        if let snap = tabVC?.snapshotSession() {
+            if snap.tabs.isEmpty {
                 Session.clear()
             } else {
-                Session.saveV2(file)
+                Session.save(snap)
             }
         }
         // Order matters:
@@ -1011,20 +1021,14 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 Keybindings.dispatch(binding, registry: actionRegistry, socketPath: socketServer.path)
                 return nil
             }
-            // Decision #61 UI-B: opt+1…9 / opt+0 jump sub-tabs (tmux-window
-            // style). Handled here, before the terminal sees the Option key,
-            // and only when that sub-tab exists (else it falls through as a
-            // normal Option keystroke). User `[keybindings]` above win.
-            if let idx = optionDigitSubTabIndex(event), let vc = tabVC, idx < vc.tabCount {
+            // opt+1…9 / opt+0 jump tabs. Handled here, before the terminal sees
+            // the Option key, and only when that tab exists (else it falls
+            // through as a normal Option keystroke). User `[keybindings]` win.
+            if let idx = optionDigitTabIndex(event), let vc = tabVC, idx < vc.tabCount {
                 vc.switchTab(to: idx)
                 return nil
             }
             if matchesCommandPaletteShortcut(event), openCommandPalette() {
-                return nil
-            }
-            // ⌘⇧W — drop the workspace switcher (tmux-style session list).
-            if matchesWorkspaceSwitcherShortcut(event), let vc = tabVC {
-                vc.showWorkspaceMenu()
                 return nil
             }
             return event
@@ -1034,7 +1038,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// Map a bare-Option digit event to a sub-tab index: opt+1…9 → 0…8,
     /// opt+0 → 9 (the tenth). Returns nil unless Option is the ONLY modifier
     /// (cmd/ctrl/shift-digit are left to menus / the responder chain).
-    private func optionDigitSubTabIndex(_ event: NSEvent) -> Int? {
+    private func optionDigitTabIndex(_ event: NSEvent) -> Int? {
         let interesting: NSEvent.ModifierFlags = [.command, .control, .shift, .option]
         guard event.modifierFlags.intersection(interesting) == [.option] else { return nil }
         guard
@@ -1059,16 +1063,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         guard mods == [.command, .shift] else { return false }
         guard let pCode = Keybindings.nameToKeyCode["p"] else { return false }
         return event.keyCode == pCode
-    }
-
-    /// ⌘⇧W — workspace switcher. ⌘W is "Close Pane"; adding Shift keeps the
-    /// switcher clear of it. Same shared-keyCode approach as the palette.
-    private func matchesWorkspaceSwitcherShortcut(_ event: NSEvent) -> Bool {
-        let interesting: NSEvent.ModifierFlags = [.command, .control, .shift, .option]
-        let mods = event.modifierFlags.intersection(interesting)
-        guard mods == [.command, .shift] else { return false }
-        guard let wCode = Keybindings.nameToKeyCode["w"] else { return false }
-        return event.keyCode == wCode
     }
 
     /// Returns true when the palette opened (event must be swallowed).
@@ -1318,42 +1312,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case "session.info":
             let index = params["index"] as? Int ?? vc.activeIndex
             completion(vc.sessionInfo(index: index))
-
-        // Workspace-sessions (decision #61 slice 7) — the top-level "tabs" each
-        // with their own workspace + sub-tabs. Named `workspace.*` to avoid
-        // colliding with the existing `session.*` (which means sub-tabs).
-        case "workspace.new":
-            // With a `workspace` dir → create directly (programmatic / socket).
-            // Without one (e.g. the command palette dispatches empty params) →
-            // open the directory picker instead of silently creating a
-            // directory-less workspace.
-            if let ws = params["workspace"] as? String {
-                completion(["id": vc.newWorkspace(workspace: ws)])
-            } else {
-                vc.newWorkspaceInteractive()
-                completion(["ok": true])
-            }
-
-        case "workspace.switch":
-            guard let id = params["id"] as? String else {
-                completion(RPCError(code: "invalid_params", message: "Missing 'id' param"))
-                return
-            }
-            completion(["ok": vc.switchWorkspace(id: id)])
-
-        case "workspace.list":
-            completion([
-                "active": vc.activeWorkspaceID,
-                "workspaces": vc.workspaceSummaries().map {
-                    ["id": $0.id, "workspace": $0.workspace ?? NSNull(), "tabs": $0.tabs, "active": $0.active]
-                },
-            ])
-
-        case "workspace.cycle":
-            // Param-free next-workspace jump — usable from the command palette
-            // (which dispatches with empty params) and from `[keybindings]`.
-            vc.cycleWorkspace()
-            completion(["active": vc.activeWorkspaceID])
 
         case "terminal.shell_precmd":
             let panelID = params["panel_id"] as? String ?? vc.activeTerminalPanel?.panelID ?? ""

@@ -1591,16 +1591,21 @@ impl TabManager {
     /// WebView/Plugin panels are elided (terminal-only v1). A branch
     /// whose only surviving subtree is a single child is collapsed.
     pub fn snapshot_session(&self) -> crate::session::Session {
-        use crate::session::{Session, SplitOrientation, SplitSnap, TabSnap};
+        use crate::session::{PaneContent, Session, SplitOrientation, SplitSnap, TabSnap};
 
         fn build_snap(node: &crate::split::SplitNode) -> Option<SplitSnap> {
             match node {
                 crate::split::SplitNode::Leaf { panel } => {
-                    panel.as_terminal().map(|t| SplitSnap::Terminal {
+                    // v3: only terminal leaves persist their cwd. Webview /
+                    // plugin / cockpit panels are still elided here — full
+                    // Linux typed-pane persistence is a follow-up slice.
+                    panel.as_terminal().map(|t| SplitSnap::Leaf {
                         // current_cwd() falls back to /proc/<pid>/cwd
                         // for shells that don't emit OSC 7. last_cwd
                         // alone would miss `cd` updates in those shells.
-                        cwd: t.current_cwd(),
+                        content: PaneContent::Terminal {
+                            cwd: t.current_cwd(),
+                        },
                     })
                 }
                 crate::split::SplitNode::Branch {
@@ -1611,15 +1616,29 @@ impl TabManager {
                     let f = build_snap(&first.borrow());
                     let s = build_snap(&second.borrow());
                     match (f, s) {
-                        (Some(f), Some(s)) => Some(SplitSnap::Branch {
-                            orientation: match paned.orientation() {
+                        (Some(f), Some(s)) => {
+                            let orientation = match paned.orientation() {
                                 gtk4::Orientation::Vertical => SplitOrientation::Vertical,
                                 _ => SplitOrientation::Horizontal,
-                            },
-                            position: paned.position(),
-                            first: Box::new(f),
-                            second: Box::new(s),
-                        }),
+                            };
+                            // v3 stores a normalized divider ratio (not pixels):
+                            // position / allocated extent along the split axis.
+                            let total = match paned.orientation() {
+                                gtk4::Orientation::Vertical => paned.height(),
+                                _ => paned.width(),
+                            };
+                            let ratio = if total > 0 {
+                                crate::session::clamp_ratio(paned.position() as f32 / total as f32)
+                            } else {
+                                0.5
+                            };
+                            Some(SplitSnap::Branch {
+                                orientation,
+                                ratio,
+                                first: Box::new(f),
+                                second: Box::new(s),
+                            })
+                        }
                         (Some(only), None) | (None, Some(only)) => Some(only),
                         (None, None) => None,
                     }
@@ -1711,7 +1730,10 @@ impl TabManager {
     ) {
         use crate::session::SplitSnap;
         match snap {
-            SplitSnap::Terminal { .. } => {}
+            // A leaf's panel is already created by its parent (a terminal seeded
+            // with the leftmost cwd). Non-terminal leaves fall back to that
+            // terminal for now — full typed-pane restore is a follow-up slice.
+            SplitSnap::Leaf { .. } => {}
             SplitSnap::Branch {
                 orientation,
                 first,

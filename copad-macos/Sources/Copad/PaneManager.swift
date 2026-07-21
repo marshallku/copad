@@ -315,59 +315,136 @@ final class PaneManager {
     /// when no terminal panel survived the walk (webview-only or
     /// plugin-only tabs are skipped to keep parity with Linux —
     /// `panel.as_terminal()` filter in `tabs.rs::snapshot_session`).
+    /// Build a v3 wire snapshot of this tab's split tree: typed leaves
+    /// (terminal cwd / webview url / plugin ref / cockpit) + normalized divider
+    /// ratios captured from the LIVE split views. Walks the model tree and the
+    /// parallel NSSplitView tree together so `ratio` reflects real sizes.
     func snapshotTree() -> Session.SplitSnap? {
-        Self.buildSnap(node: root)
+        buildSnapV3(node: root, view: containerView.subviews.first)
     }
 
-    /// v2-native snapshot (decision #61 slice 4): carries each leaf's stable
-    /// panelID + typed content (terminal cwd + tmux_ref / webview url / plugin
-    /// name), unlike `snapshotTree` which is terminal-only and id-less. Used by
-    /// TabViewController.snapshotSessionV2. Instance (not static) so it can read
-    /// `config.terminalBackend` for the tmux_ref.
-    func snapshotTreeV2() -> Session.PaneNode? {
-        buildSnapV2(node: root)
-    }
-
-    private func buildSnapV2(node: SplitNode) -> Session.PaneNode? {
+    private func buildSnapV3(node: SplitNode, view: NSView?) -> Session.SplitSnap? {
         switch node {
         case let .leaf(panel):
-            return .leaf(Session.Pane(id: panel.panelID, content: paneContentV2(panel)))
+            return .leaf(content: paneContent(panel))
         case let .branch(orientation, children):
-            // Runtime SplitOrientation (SplitNode) -> wire Session.SplitOrientation.
             let wire: Session.SplitOrientation = (orientation == .horizontal) ? .horizontal : .vertical
-            let nodes = children.compactMap { buildSnapV2(node: $0) }
-            return Self.chainBinaryV2(orientation: wire, nodes: nodes)
+            let sv = view as? NSSplitView
+            // A `.horizontal` SplitNode renders as a vertical NSSplitView
+            // (panes side-by-side), so its split axis is width; `.vertical`
+            // stacks top/bottom, axis is height.
+            let axisIsWidth = (orientation == .horizontal)
+            var pairs: [(Session.SplitSnap, CGFloat)] = []
+            for (i, child) in children.enumerated() {
+                let childView = (sv?.subviews.indices.contains(i) == true) ? sv?.subviews[i] : nil
+                guard let snap = buildSnapV3(node: child, view: childView) else { continue }
+                let size = childView.map { axisIsWidth ? $0.frame.width : $0.frame.height } ?? 0
+                pairs.append((snap, size))
+            }
+            return Self.foldBinary(orientation: wire, pairs: pairs)
         }
     }
 
-    private func paneContentV2(_ panel: any CopadPanel) -> Session.PaneContent {
+    private func paneContent(_ panel: any CopadPanel) -> Session.PaneContent {
         if let t = panel as? AlacrittyTerminalViewController {
             // An unavailable-plugin placeholder re-captures as its plugin so the
             // reference isn't lost on re-save (decision #61 C5).
             if let pluginRef = t.unavailablePluginRef {
-                return .plugin(name: pluginRef, version: nil)
+                return .plugin(name: pluginRef, panelName: nil, version: nil)
             }
-            // The tmux-backed session name is `copad-<panelID>` (see the FFI
-            // spawn path). Persisting it lets slice-4 restore reattach it.
-            let tmuxRef = config.terminalBackend == .tmux ? "copad-\(t.panelID)" : nil
-            return .terminal(cwd: t.currentCwd, launch: nil, tmuxRef: tmuxRef)
+            return .terminal(cwd: t.currentCwd)
         }
         if let w = panel as? WebViewController {
             return .webview(url: Self.canonicalWebviewURL(w.currentURL))
         }
         if let pl = panel as? PluginPanelController {
-            return .plugin(name: pl.pluginName, version: nil)
+            return .plugin(name: pl.pluginName, panelName: pl.currentPanelName, version: nil)
         }
-        // Unknown panel type — keep the leaf with a generic marker.
-        return .plugin(name: "plugin", version: nil)
+        if panel is CockpitViewController {
+            return .cockpit
+        }
+        // Unknown panel type — persist as a fresh terminal (harmless on restore).
+        return .terminal(cwd: nil)
     }
 
-    /// Factory for reopening a plugin panel by name on restore (decision #61
-    /// slice 6). Injected by TabViewController (which gets it from AppDelegate's
-    /// registry) because plugin construction needs the manifest store + action
-    /// registry that PaneManager has no access to. Returns nil when the plugin
-    /// is no longer installed → restore falls back to an explicit placeholder.
-    var pluginFactory: ((_ name: String, _ restoreID: String) -> (any CopadPanel)?)?
+    /// Divider-ratio clamp band (mirrors `copad_core::session::clamp_ratio`).
+    static let minRatio: Float = 0.05
+    static let maxRatio: Float = 0.95
+    static func clampRatio(_ r: Float) -> Float {
+        guard r.isFinite else { return 0.5 }
+        return min(max(r, minRatio), maxRatio)
+    }
+
+    /// Fold an n-ary branch (with each child's live size along the split axis)
+    /// into a right-leaning binary tree, computing each divider's real ratio
+    /// from the cumulative sizes. Falls back to 0.5 when sizes are unknown
+    /// (tab never displayed).
+    private static func foldBinary(
+        orientation: Session.SplitOrientation,
+        pairs: [(Session.SplitSnap, CGFloat)],
+    ) -> Session.SplitSnap? {
+        guard let head = pairs.first else { return nil }
+        if pairs.count == 1 { return head.0 }
+        let rest = Array(pairs.dropFirst())
+        guard let restSnap = foldBinary(orientation: orientation, pairs: rest) else { return head.0 }
+        let restSize = rest.reduce(0) { $0 + $1.1 }
+        let total = head.1 + restSize
+        let ratio: Float = total > 0 ? clampRatio(Float(head.1 / total)) : 0.5
+        return .branch(orientation: orientation, ratio: ratio, first: head.0, second: restSnap)
+    }
+
+    /// Factory for reopening a plugin panel on restore. Injected by
+    /// TabViewController (which gets it from AppDelegate's registry) because
+    /// plugin construction needs the manifest store + action registry PaneManager
+    /// can't reach. `panelName` selects the specific panel of a multi-panel
+    /// plugin. Returns nil when the plugin is uninstalled → placeholder.
+    var pluginFactory: ((_ name: String, _ panelName: String?) -> (any CopadPanel)?)?
+
+    /// Factory for reopening the agent cockpit pane on restore (a `.cockpit`
+    /// leaf). Injected by AppDelegate, which owns the cockpit model. nil →
+    /// placeholder terminal.
+    var cockpitFactory: (() -> (any CopadPanel)?)?
+
+    /// Build a live panel from persisted v3 pane content. Used to seed a
+    /// restored tab's first pane and each split leaf.
+    static func makePanel(
+        from content: Session.PaneContent,
+        config: CopadConfig,
+        theme: CopadTheme,
+        pluginFactory: ((_ name: String, _ panelName: String?) -> (any CopadPanel)?)? = nil,
+        cockpitFactory: (() -> (any CopadPanel)?)? = nil,
+    ) -> any CopadPanel {
+        switch content {
+        case let .terminal(cwd):
+            return AlacrittyTerminalViewController(config: config, theme: theme, cwd: cwd, initialInput: nil)
+        case let .webview(url):
+            return WebViewController(url: URL(string: url))
+        case let .plugin(name, panelName, _):
+            if let factory = pluginFactory, let panel = factory(name, panelName) {
+                return panel
+            }
+            // Plugin uninstalled / no factory: a placeholder terminal tagged with
+            // the plugin ref so the next snapshot re-captures it AS the plugin
+            // (the ref survives re-saves until the plugin returns — decision #61
+            // C5). The name is NOT interpolated into shell input.
+            let placeholder = AlacrittyTerminalViewController(config: config, theme: theme)
+            placeholder.unavailablePluginRef = name
+            return placeholder
+        case .cockpit:
+            if let factory = cockpitFactory, let panel = factory() { return panel }
+            // Cockpit model unavailable → placeholder terminal keeps the layout.
+            return AlacrittyTerminalViewController(config: config, theme: theme)
+        }
+    }
+
+    /// Content of the leftmost (DFS pre-order) leaf — seeds the panel that opens
+    /// a restored tab / split subtree.
+    static func leftmostContent(_ snap: Session.SplitSnap) -> Session.PaneContent {
+        switch snap {
+        case let .leaf(content): return content
+        case let .branch(_, _, first, _): return leftmostContent(first)
+        }
+    }
 
     /// Decision #61 C6: reduce a live webview URL to a safe canonical form for
     /// persistence — the **origin only** (`scheme://host[:port]`), http(s) only.
@@ -392,19 +469,6 @@ final class PaneManager {
         return origin.string ?? ""
     }
 
-    /// Fold an n-ary branch into a right-leaning binary PaneNode tree (the v2
-    /// wire model is pairwise). ratio 0.5 — macOS re-equalizes on restore.
-    private static func chainBinaryV2(
-        orientation: Session.SplitOrientation,
-        nodes: [Session.PaneNode],
-    ) -> Session.PaneNode? {
-        guard let first = nodes.first else { return nil }
-        if nodes.count == 1 { return first }
-        let rest = chainBinaryV2(orientation: orientation, nodes: Array(nodes.dropFirst()))
-        guard let rest else { return first }
-        return .branch(orientation: orientation, ratio: 0.5, first: first, second: rest)
-    }
-
     /// First non-nil custom title in DFS order. Mirrors Linux's
     /// per-tab custom-title lookup (collect panels, find_map). Returns
     /// nil if no panel has a custom title — restored tab falls back to
@@ -418,126 +482,83 @@ final class PaneManager {
         return nil
     }
 
-    /// Replay a saved snap onto an existing leaf panel. Walks the
-    /// snap depth-first: every Branch turns into one new panel
-    /// (seeded with the leftmost cwd of `second`, matching Linux's
-    /// `restore_split`), pushed into the live tree via the same
-    /// `SplitNode.splitting` call that the interactive split path
-    /// uses. Terminal leaves are no-ops — the target leaf already
-    /// represents that cell.
-    func restoreSplits(into target: any CopadPanel, from snap: Session.SplitSnap) {
+    /// Replay a saved v3 snap onto an existing leaf panel. Walks the snap
+    /// depth-first: every Branch turns into one new typed panel (seeded from the
+    /// leftmost content of `second`), pushed into the live tree via the same
+    /// `SplitNode.splitting` the interactive split path uses. Leaf snaps are
+    /// no-ops — the target leaf already represents that cell. Divider ratios are
+    /// applied separately by `applyPendingRatios` once the views are sized.
+    func restoreTree(into target: any CopadPanel, from snap: Session.SplitSnap) {
         guard case let .branch(orientation, _, first, second) = snap else { return }
-        let cwd = Session.leftmostCwd(second)
-        let newPanel = Self.makeTerminalPanel(config: config, theme: theme, cwd: cwd)
+        let newPanel = Self.makePanel(
+            from: Self.leftmostContent(second),
+            config: config,
+            theme: theme,
+            pluginFactory: pluginFactory,
+            cockpitFactory: cockpitFactory,
+        )
         assignEventBus(to: newPanel)
         wirePanel(newPanel)
         let oriented: SplitOrientation = (orientation == .horizontal) ? .horizontal : .vertical
         root = root.splitting(target, with: .leaf(newPanel), orientation: oriented)
         rebuildViewHierarchy()
         newPanel.startIfNeeded()
-        restoreSplits(into: target, from: first)
-        restoreSplits(into: newPanel, from: second)
+        restoreTree(into: target, from: first)
+        restoreTree(into: newPanel, from: second)
     }
 
-    // MARK: - v2-native restore (decision #61 slice 4b)
+    // MARK: - Divider-ratio restore
 
-    /// Build a panel for a persisted v2 pane, REUSING its stable id so a
-    /// tmux-backed terminal's `copad-<id>` session name matches the survivor
-    /// and reattaches. Webview restores its URL; plugin restore lands in slice
-    /// 6 (placeholder terminal keeps the layout meanwhile).
-    static func panelFromPane(
-        _ pane: Session.Pane,
-        config: CopadConfig,
-        theme: CopadTheme,
-        pluginFactory: ((_ name: String, _ restoreID: String) -> (any CopadPanel)?)? = nil,
-    ) -> any CopadPanel {
-        switch pane.content {
-        case let .terminal(cwd, _, _):
-            return AlacrittyTerminalViewController(config: config, theme: theme, cwd: cwd, initialInput: nil, restoreID: pane.id)
-        case let .webview(url):
-            return WebViewController(url: URL(string: url), restoreID: pane.id)
-        case let .plugin(name, _):
-            if let factory = pluginFactory, let panel = factory(name, pane.id) {
-                return panel
+    /// The persisted layout for this tab, held after restore so divider ratios
+    /// can be applied once the split views have a real (non-zero) size — they're
+    /// zero until the tab is displayed. Applied + cleared by `applyPendingRatios`.
+    private var pendingRatioLayout: Session.SplitSnap?
+
+    /// Record the restored layout and start trying to apply its divider ratios.
+    func setPendingRatioLayout(_ snap: Session.SplitSnap) {
+        pendingRatioLayout = snap
+        scheduleApplyRatios()
+    }
+
+    /// Apply persisted divider ratios to the live split views if they are sized;
+    /// no-op (leaves the layout pending) while the tab is still zero-sized.
+    /// Called from `setPendingRatioLayout` (active tab) and `TabViewController.
+    /// switchTab` (when an off-screen tab is first shown).
+    func applyPendingRatios() {
+        guard let snap = pendingRatioLayout, let rootView = containerView.subviews.first else { return }
+        containerView.layoutSubtreeIfNeeded()
+        guard rootView.bounds.width > 1, rootView.bounds.height > 1 else { return }
+        Self.applyRatios(snap: snap, view: rootView)
+        pendingRatioLayout = nil
+    }
+
+    private func scheduleApplyRatios(attempt: Int = 0) {
+        guard pendingRatioLayout != nil else { return }
+        DispatchQueue.main.async { [weak self] in
+            guard let self, pendingRatioLayout != nil else { return }
+            applyPendingRatios()
+            // Retry a bounded number of times while the active tab lays out; if
+            // still pending (off-screen tab), switchTab applies it on display.
+            if pendingRatioLayout != nil, attempt < 20 {
+                scheduleApplyRatios(attempt: attempt + 1)
             }
-            // Plugin uninstalled / no factory: a placeholder terminal that keeps
-            // pane.id and tags itself so the next snapshot re-captures it AS the
-            // plugin (the ref survives re-saves until the plugin returns and
-            // restore reopens it — decision #61 C5). NB: the plugin name is NOT
-            // interpolated into shell input — a crafted session.json name could
-            // otherwise inject commands into the restored shell. The name is
-            // conveyed via the tab title (the sub-tab's persisted name) instead.
-            // Placeholder = a plain terminal that KEEPS pane.id and is tagged
-            // unavailablePluginRef so the snapshot re-captures it as .plugin(name)
-            // — the reference survives re-saves until the plugin returns and
-            // restore reopens it (decision #61 C5, the essential guarantee). No
-            // shell input (a crafted name must not inject commands on restore).
-            // A richer in-pane "plugin unavailable" affordance needs a dedicated
-            // placeholder panel type — deferred; the ref is what must not be lost.
-            let placeholder = AlacrittyTerminalViewController(config: config, theme: theme, restoreID: pane.id)
-            placeholder.unavailablePluginRef = name
-            return placeholder
         }
     }
 
-    static func leftmostPane(_ node: Session.PaneNode) -> Session.Pane {
-        switch node {
-        case let .leaf(pane): pane
-        case let .branch(_, _, first, _): leftmostPane(first)
+    /// Walk the persisted snap alongside the live split-view tree, setting each
+    /// divider to its persisted ratio. The restored tree is binary (each restore
+    /// step creates a 2-child branch), so `first` ↔ subview 0 and `second` ↔
+    /// subview 1, matching `restoreTree`.
+    private static func applyRatios(snap: Session.SplitSnap, view: NSView) {
+        guard case let .branch(_, ratio, first, second) = snap,
+              let sv = view as? NSSplitView, sv.subviews.count >= 2 else { return }
+        let axis = sv.isVertical ? sv.bounds.width : sv.bounds.height
+        if axis > 1 {
+            sv.setPosition(CGFloat(ratio) * axis, ofDividerAt: 0)
+            sv.layoutSubtreeIfNeeded()
         }
-    }
-
-    /// v2 analogue of `restoreSplits`: replays a saved PaneNode onto an existing
-    /// leaf, creating each new pane from its persisted v2 content+id (so tmux
-    /// leaves reattach). The target leaf already represents the tree's leftmost
-    /// pane (created by the caller from `leftmostPane`).
-    func restoreSplitsV2(into target: any CopadPanel, from node: Session.PaneNode) {
-        guard case let .branch(orientation, _, first, second) = node else { return }
-        let newPanel = Self.panelFromPane(Self.leftmostPane(second), config: config, theme: theme, pluginFactory: pluginFactory)
-        assignEventBus(to: newPanel)
-        wirePanel(newPanel)
-        let oriented: SplitOrientation = (orientation == .horizontal) ? .horizontal : .vertical
-        root = root.splitting(target, with: .leaf(newPanel), orientation: oriented)
-        rebuildViewHierarchy()
-        newPanel.startIfNeeded()
-        restoreSplitsV2(into: target, from: first)
-        restoreSplitsV2(into: newPanel, from: second)
-    }
-
-    private static func buildSnap(node: SplitNode) -> Session.SplitSnap? {
-        switch node {
-        case let .leaf(panel):
-            if let a = panel as? AlacrittyTerminalViewController {
-                return .terminal(cwd: a.currentCwd)
-            }
-            return nil
-        case let .branch(orientation, children):
-            let snaps = children.compactMap { buildSnap(node: $0) }
-            return chainBinary(orientation: orientation, snaps: snaps)
-        }
-    }
-
-    /// macOS SplitNode is n-ary; in practice the user can only build
-    /// 2-child branches (Cmd+D / Cmd+Shift+D). Collapse a higher arity
-    /// (which would only happen from a future programmatic API) into
-    /// a left-leaning binary chain so the on-disk schema stays
-    /// pairwise. `position: 0` is the "not tracked" sentinel —
-    /// EqualSplitView re-equalizes on restore. Tracking real divider
-    /// positions would mean walking the live NSSplitView tree
-    /// alongside the SplitNode; deferred for v1.
-    private static func chainBinary(
-        orientation: SplitOrientation,
-        snaps: [Session.SplitSnap],
-    ) -> Session.SplitSnap? {
-        let wire: Session.SplitOrientation = (orientation == .horizontal) ? .horizontal : .vertical
-        switch snaps.count {
-        case 0: return nil
-        case 1: return snaps[0]
-        default:
-            let rest = Array(snaps.dropFirst())
-            let tail = chainBinary(orientation: orientation, snaps: rest) ?? rest[0]
-            return .branch(orientation: wire, position: 0, first: snaps[0], second: tail)
-        }
+        applyRatios(snap: first, view: sv.subviews[0])
+        applyRatios(snap: second, view: sv.subviews[1])
     }
 
     /// Fan a background-applied notification to every pane's render

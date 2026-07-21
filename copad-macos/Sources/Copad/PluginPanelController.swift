@@ -40,6 +40,9 @@ final class PluginPanelController: NSViewController, CopadPanel {
     /// (decision #61 slice 6) — restore reopens it by name via the registry.
     let pluginName: String
     private let panelName: String
+    /// The specific panel of a multi-panel plugin — persisted so restore reopens
+    /// the same one (not just the plugin's default panel).
+    var currentPanelName: String { panelName }
     private let panelFileURL: URL
     private let theme: CopadTheme
     private weak var registry: ActionRegistry?

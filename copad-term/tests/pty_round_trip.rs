@@ -64,7 +64,6 @@ fn printf_round_trip() {
             std::ptr::null(),
             std::ptr::null(),
             std::ptr::null(),
-            std::ptr::null(),
         )
     };
     assert!(!handle.is_null(), "shell spawn failed");
@@ -91,7 +90,6 @@ fn resize_round_trip() {
             80,
             24,
             shell.as_ptr(),
-            std::ptr::null(),
             std::ptr::null(),
             std::ptr::null(),
             std::ptr::null(),

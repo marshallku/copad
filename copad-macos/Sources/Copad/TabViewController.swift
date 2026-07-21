@@ -29,7 +29,7 @@ final class TabViewController: NSViewController {
     /// Reopens a plugin panel by name on session restore (decision #61 slice 6).
     /// Set by AppDelegate, which owns the manifest store + action registry that
     /// plugin construction needs. nil-returning name → unavailable placeholder.
-    var pluginFactory: ((_ name: String, _ restoreID: String) -> (any CopadPanel)?)?
+    var pluginFactory: ((_ name: String, _ panelName: String?) -> (any CopadPanel)?)?
     private var contentArea: NSView!
     /// Window-level background image (Phase 10b follow-up). One image
     /// fills the entire `contentArea` so splits share the same
@@ -57,72 +57,15 @@ final class TabViewController: NSViewController {
     /// it up post-launch (load modules from discovered plugin manifests
     /// + handle statusbar.show/hide/toggle socket commands).
     private(set) var statusBar: StatusBarView?
-    // The ACTIVE workspace's live tabs. Inactive workspaces keep theirs in
-    // `workspaces`, swapped in on `switchWorkspace` (decision #61 slice 7).
     private var paneManagers: [PaneManager] = []
     private(set) var activeIndex: Int = -1
 
-    /// One workspace-session (decision #61 slice 7 — the owner's top-level
-    /// "tab": a workspace dir + its own sub-tabs). The ACTIVE workspace's tabs
-    /// are the live `paneManagers`; INACTIVE workspaces are parked as a v2
-    /// `snapshot` and rebuilt on switch. Snapshot-and-rebuild (not parking live
-    /// PaneManagers) so a background terminal exiting can't fire callbacks
-    /// against the wrong workspace's live state; tmux-backed terminals reattach
-    /// their surviving session on rebuild, so no process is lost on switch.
-    private struct WorkspaceRuntime {
-        let id: String
-        var workspace: String?
-        var snapshot: Session.WorkspaceSession?
-    }
+    /// Reopens the agent cockpit pane on restore (a `.cockpit` leaf). Injected by
+    /// AppDelegate, which owns the cockpit model. nil → placeholder terminal.
+    var cockpitFactory: (() -> (any CopadPanel)?)?
 
-    private var workspaces: [WorkspaceRuntime] = [
-        WorkspaceRuntime(id: "sess-0", workspace: nil, snapshot: nil),
-    ]
-    private var activeWorkspaceIndex = 0
-
-    /// The active workspace's id / workspace dir (for the indicator + snapshot).
-    var activeWorkspaceID: String { workspaces[activeWorkspaceIndex].id }
-    var activeWorkspaceDir: String? { workspaces[activeWorkspaceIndex].workspace }
-    var workspaceCount: Int { workspaces.count }
-    /// (id, workspace, tabCount, isActive) for each workspace — drives the
-    /// switcher UI + `workspace.list`.
-    func workspaceSummaries() -> [(id: String, workspace: String?, tabs: Int, active: Bool)] {
-        syncActiveWorkspace()
-        return workspaces.enumerated().map { i, w in
-            (w.id, w.workspace, w.snapshot?.subTabs.count ?? 0, i == activeWorkspaceIndex)
-        }
-    }
-
-    /// Fold the live tabs into the active workspace's snapshot (call before any
-    /// snapshot read or workspace switch).
-    private func syncActiveWorkspace() {
-        guard workspaces.indices.contains(activeWorkspaceIndex) else { return }
-        let w = workspaces[activeWorkspaceIndex]
-        workspaces[activeWorkspaceIndex].snapshot = buildWorkspaceSession(id: w.id, workspace: w.workspace)
-    }
-
-    /// Build a v2 WorkspaceSession from the LIVE tabs (`paneManagers`).
-    private func buildWorkspaceSession(id: String, workspace: String?) -> Session.WorkspaceSession {
-        var subTabs: [Session.SubTab] = []
-        var activeSubId: String?
-        for (idx, manager) in paneManagers.enumerated() {
-            guard let root = manager.snapshotTreeV2() else { continue }
-            let subID = "sub-\(subTabs.count)"
-            if idx == activeIndex { activeSubId = subID }
-            subTabs.append(Session.SubTab(
-                id: subID,
-                name: manager.customTabTitle(),
-                root: root,
-                focusedPaneId: manager.activePane.panelID,
-            ))
-        }
-        if activeSubId == nil { activeSubId = subTabs.first?.id }
-        return Session.WorkspaceSession(id: id, name: nil, workspace: workspace, subTabs: subTabs, activeSubTabId: activeSubId)
-    }
-
-    /// Number of sub-tabs (decision #61: the tabs of the current session).
-    /// Exposed so the `opt+N` numeric jump only swallows the key when that
-    /// sub-tab actually exists — otherwise `opt+5` with 3 sub-tabs should fall
+    /// Number of tabs. Exposed so the `opt+N` numeric jump only swallows the key
+    /// when that tab actually exists — otherwise `opt+5` with 3 tabs should fall
     /// through to the terminal as a normal Option keystroke.
     var tabCount: Int { paneManagers.count }
 
@@ -325,20 +268,6 @@ final class TabViewController: NSViewController {
                 onOpenPlugin?(name, panelName, mode)
             }
         }
-        // Workspace switcher — the pull-down fetches the list lazily on open
-        // (snapshot rebuild only happens then) and jumps / creates workspaces.
-        tabBar.workspaceProvider = { [weak self] in
-            guard let self else { return [] }
-            return workspaceSummaries().enumerated().map { i, s in
-                TabBarView.WorkspaceMenuItem(
-                    title: Self.workspaceDisplayName(dir: s.workspace, index: i),
-                    subtitle: s.workspace,
-                    active: s.active,
-                )
-            }
-        }
-        tabBar.onSwitchWorkspace = { [weak self] i in self?.switchWorkspace(to: i) }
-        tabBar.onNewWorkspace = { [weak self] in self?.newWorkspaceInteractive() }
         root.addSubview(tabBar)
 
         contentArea = NSView()
@@ -449,48 +378,46 @@ final class TabViewController: NSViewController {
 
     // MARK: - Session persistence
 
-    /// Build a wire snapshot of every live tab. Tabs that boil down to
-    /// zero terminal panels (webview-only or all-plugin) are skipped —
-    /// matches Linux's `snapshot_session` filter. The `current_tab`
-    /// index is remapped onto the surviving tab list so the restored
-    /// session lands on the same logical tab even when others were
-    /// elided.
+    /// Build a wire snapshot of every live tab (v3 — decision #64): the tab list
+    /// plus each tab's split tree of typed panes with normalized divider ratios.
+    /// Terminals carry only their cwd; process/scrollback is the user's own tmux.
     func snapshotSession() -> Session.Snapshot {
         var tabs: [Session.TabSnap] = []
-        var currentTab = 0
-        let activeIdx = activeIndex
-        for (idx, manager) in paneManagers.enumerated() {
+        for manager in paneManagers {
             guard let root = manager.snapshotTree() else { continue }
-            if idx == activeIdx {
-                currentTab = tabs.count
-            } else if idx < activeIdx {
-                // Active tab might be elided itself — the closest
-                // surviving tab BEFORE it is the best fallback.
-                currentTab = tabs.count
-            }
             tabs.append(Session.TabSnap(customTitle: manager.customTabTitle(), root: root))
         }
-        let clamped = max(0, min(currentTab, tabs.count - 1))
+        let clamped = max(0, min(activeIndex, tabs.count - 1))
         return Session.Snapshot(version: Session.version, tabs: tabs, currentTab: clamped)
     }
 
-    /// Build tabs + splits to mirror `snap`. Caller (AppDelegate) is
-    /// responsible for falling back to `openInitialTab` if this is a
-    /// no-op (snap has zero tabs). Restored panels start fresh — we
-    /// can't replay shell history or process state, just cwd + layout.
+    /// Build tabs + splits to mirror `snap` (v3). Restored panels start fresh —
+    /// only cwd + layout + split ratios are replayed, not process/scrollback.
+    /// Caller falls back to `openInitialTab` if `snap` has zero tabs.
     func restoreSession(_ snap: Session.Snapshot) {
+        suppressSessionSave = true
+        defer {
+            suppressSessionSave = false
+            scheduleSessionSave()
+        }
         for tabSnap in snap.tabs {
-            let leftmost = Session.leftmostCwd(tabSnap.root)
-            let manager = PaneManager(
+            let initialPanel = PaneManager.makePanel(
+                from: PaneManager.leftmostContent(tabSnap.root),
                 config: config,
                 theme: theme,
-                initialPanel: .terminalSeed(cwd: leftmost, initialInput: nil),
+                pluginFactory: pluginFactory,
+                cockpitFactory: cockpitFactory,
             )
+            let manager = PaneManager(config: config, theme: theme, initialPanel: .pluginPanel(initialPanel))
+            manager.pluginFactory = pluginFactory
+            manager.cockpitFactory = cockpitFactory
             addTab(manager: manager)
-            manager.restoreSplits(into: manager.activePane, from: tabSnap.root)
+            manager.restoreTree(into: manager.activePane, from: tabSnap.root)
             if let title = tabSnap.customTitle {
                 manager.setCustomTitle(title)
             }
+            // Apply persisted divider ratios once the tab's split views are sized.
+            manager.setPendingRatioLayout(tabSnap.root)
         }
         let clamped = max(0, min(snap.currentTab, paneManagers.count - 1))
         if paneManagers.indices.contains(clamped) {
@@ -498,32 +425,9 @@ final class TabViewController: NSViewController {
         }
     }
 
-    // MARK: - v2 session persistence (decision #61)
-
-    // slice 3d bridges the existing v1 snapshot/restore to the v2 model rather
-    // than rewriting PaneManager: the runtime tree stays SplitSnap and is
-    // converted to/from the v2 SessionFileV2 here. Today's runtime tabs are
-    // terminal split trees, so every tab maps to one sub-tab holding a Terminal
-    // pane tree; multi-session, workspaces, and webview/plugin panes arrive in
-    // later slices. Stable pane ids are informational until slice 4 wires tmux
-    // reattach — v1 pixel divider positions become an even 0.5 ratio (macOS
-    // already re-equalizes on restore, decision #61 I4).
-
-    /// Snapshot ALL workspace-sessions as a v2 document (decision #61 slice 7):
-    /// the active one from its live tabs, the rest from their parked snapshots.
-    /// Each terminal leaf carries its panelID + tmux_ref so restore reattaches.
-    func snapshotSessionV2() -> Session.SessionFileV2 {
-        syncActiveWorkspace()
-        let sessions = workspaces.compactMap(\.snapshot)
-        let activeId = workspaces.indices.contains(activeWorkspaceIndex)
-            ? workspaces[activeWorkspaceIndex].id
-            : sessions.first?.id
-        return Session.SessionFileV2(version: Session.versionV2, sessions: sessions, activeSessionId: activeId)
-    }
-
-    /// Debounced persistence trigger — call after any structural mutation
-    /// (new/close/switch tab, rename). Coalesces bursts into one atomic write
-    /// ~800ms later on the main run loop. No-op while restoring.
+    /// Debounced persistence trigger (v3) — call after any structural mutation
+    /// (new/close/switch tab, split, rename). Coalesces bursts into one atomic
+    /// write ~800ms later on the main run loop. No-op while restoring.
     func scheduleSessionSave() {
         guard !suppressSessionSave else { return }
         sessionSaveTimer?.invalidate()
@@ -532,122 +436,14 @@ final class TabViewController: NSViewController {
             // is safe; assumeIsolated makes that explicit for the checker.
             MainActor.assumeIsolated {
                 guard let self else { return }
-                let snap = self.snapshotSessionV2()
-                if snap.sessions.allSatisfy(\.subTabs.isEmpty) {
+                let snap = self.snapshotSession()
+                if snap.tabs.isEmpty {
                     Session.clear()
                 } else {
-                    Session.saveV2(snap)
+                    Session.save(snap)
                 }
             }
         }
-    }
-
-    /// Restore ALL workspace-sessions from a v2 document (decision #61 slice 7);
-    /// the active workspace's tabs are rebuilt live, the rest are parked as
-    /// snapshots and rebuilt on switch. Empty document → caller falls back to
-    /// `openInitialTab`.
-    func restoreSessionV2(_ file: Session.SessionFileV2) {
-        suppressSessionSave = true
-        defer {
-            suppressSessionSave = false
-            // Re-persist once: a just-migrated v1 file lands as v2, and because
-            // panes are rebuilt with their PERSISTED ids this save keeps the
-            // same ids + tmux_ref rather than minting fresh ones.
-            scheduleSessionSave()
-        }
-        guard !file.sessions.isEmpty else { return }
-        workspaces = file.sessions.map {
-            WorkspaceRuntime(id: $0.id, workspace: $0.workspace, snapshot: $0)
-        }
-        activeWorkspaceIndex = file.sessions.firstIndex { $0.id == file.activeSessionId } ?? 0
-        rebuildLiveTabs(from: file.sessions[activeWorkspaceIndex])
-    }
-
-    /// Rebuild the LIVE tabs (`paneManagers`) from a workspace-session's
-    /// sub-tabs, reusing pane ids so tmux-backed terminals reattach. Assumes
-    /// live tabs were torn down. Callers keep `suppressSessionSave` on.
-    private func rebuildLiveTabs(from session: Session.WorkspaceSession) {
-        for sub in session.subTabs {
-            let initial = PaneManager.panelFromPane(PaneManager.leftmostPane(sub.root), config: config, theme: theme, pluginFactory: pluginFactory)
-            let manager = PaneManager(config: config, theme: theme, initialPanel: .pluginPanel(initial))
-            manager.pluginFactory = pluginFactory
-            addTab(manager: manager)
-            manager.restoreSplitsV2(into: manager.activePane, from: sub.root)
-            if let title = sub.name {
-                manager.setCustomTitle(title)
-            }
-            // Restore the focused pane so the post-restore save doesn't churn it
-            // (decision #61 I3). Falls back to the leftmost pane when absent.
-            if let fid = sub.focusedPaneId,
-               let panel = manager.allPanels().first(where: { $0.panelID == fid })
-            {
-                manager.setActive(panel)
-            }
-        }
-        if let activeId = session.activeSubTabId,
-           let idx = session.subTabs.firstIndex(where: { $0.id == activeId }),
-           paneManagers.indices.contains(idx)
-        {
-            switchTab(to: idx)
-        }
-        // `switchTab` early-returns when the target sub-tab is already active
-        // (addTab selected the last one), so it may skip `makeFirstResponder`.
-        if let active = activePaneManager {
-            active.activePane.view.window?.makeFirstResponder(active.activePane.focusTarget)
-        }
-    }
-
-    // MARK: - Workspace sessions (decision #61 slice 7)
-
-    private func tearDownLiveTabs() {
-        activePaneManager?.containerView.removeFromSuperview()
-        paneManagers.removeAll()
-        activeIndex = -1
-    }
-
-    /// Switch to another workspace-session: park the current live tabs as a
-    /// snapshot, tear them down, and rebuild the target from its snapshot
-    /// (tmux-backed terminals reattach; nothing is lost).
-    func switchWorkspace(to index: Int) {
-        guard index != activeWorkspaceIndex, workspaces.indices.contains(index) else { return }
-        syncActiveWorkspace()
-        suppressSessionSave = true
-        tearDownLiveTabs()
-        activeWorkspaceIndex = index
-        if let snap = workspaces[index].snapshot, !snap.subTabs.isEmpty {
-            rebuildLiveTabs(from: snap)
-        } else {
-            // Empty workspace → seed a terminal in its declared directory.
-            newTerminalTab(cwd: workspaces[index].workspace, initialInput: nil)
-        }
-        suppressSessionSave = false
-        scheduleSessionSave()
-        eventBus?.broadcast(event: "workspace.switched", data: ["id": workspaces[index].id])
-    }
-
-    /// Create a new workspace-session (seeded with one terminal opened in the
-    /// workspace directory) and switch to it.
-    @discardableResult
-    func newWorkspace(workspace: String?) -> String {
-        syncActiveWorkspace()
-        suppressSessionSave = true
-        tearDownLiveTabs()
-        let id = UUID().uuidString
-        workspaces.append(WorkspaceRuntime(id: id, workspace: workspace, snapshot: nil))
-        activeWorkspaceIndex = workspaces.count - 1
-        suppressSessionSave = false
-        newTerminalTab(cwd: workspace, initialInput: nil)  // open in the workspace dir
-        scheduleSessionSave()
-        eventBus?.broadcast(event: "workspace.switched", data: ["id": id])
-        return id
-    }
-
-    /// Switch by workspace id (for `workspace.switch`).
-    @discardableResult
-    func switchWorkspace(id: String) -> Bool {
-        guard let idx = workspaces.firstIndex(where: { $0.id == id }) else { return false }
-        switchWorkspace(to: idx)
-        return true
     }
 
     // MARK: - Tab Operations
@@ -816,11 +612,14 @@ final class TabViewController: NSViewController {
         ])
 
         view.layoutSubtreeIfNeeded()
+        // The tab's split views now have a real size — apply any persisted
+        // divider ratios that couldn't be set while the tab was off-screen.
+        manager.applyPendingRatios()
         manager.allPanels().forEach { $0.startIfNeeded() }
         manager.activePane.view.window?.makeFirstResponder(manager.activePane.focusTarget)
 
         refreshTabBar()
-        scheduleSessionSave()  // active sub-tab changed
+        scheduleSessionSave()  // active tab changed
     }
 
     // MARK: - Split Operations
@@ -870,53 +669,6 @@ final class TabViewController: NSViewController {
             m.activePane is WebViewController ? .webview : .terminal
         }
         tabBar.setTabs(titles: titles, types: types, activeIndex: activeIndex)
-        tabBar.setActiveWorkspace(
-            name: Self.workspaceDisplayName(dir: activeWorkspaceDir, index: activeWorkspaceIndex),
-        )
-    }
-
-    /// Short label for a workspace: the directory's last path component, or
-    /// `session N` when the workspace has no declared directory.
-    static func workspaceDisplayName(dir: String?, index: Int) -> String {
-        if let dir, let name = dir.split(separator: "/").last, !name.isEmpty {
-            return String(name)
-        }
-        return "session \(index + 1)"
-    }
-
-    /// ⌘⇧W / switcher menu → tell the tab bar to drop its workspace list.
-    func showWorkspaceMenu() { tabBar.showWorkspaceMenu() }
-
-    /// Cycle to the next workspace (wraps) — param-free, so it works from the
-    /// command palette and `[keybindings]`.
-    func cycleWorkspace() {
-        guard workspaceCount > 1 else { return }
-        switchWorkspace(to: (activeWorkspaceIndex + 1) % workspaceCount)
-    }
-
-    /// "New Workspace…" — ask for a directory, then open a workspace seeded
-    /// with a terminal in it. Cancelling the picker is a no-op. Public so the
-    /// param-free `workspace.new` (command palette) routes here instead of
-    /// silently creating a directory-less workspace.
-    func newWorkspaceInteractive() { promptNewWorkspace() }
-
-    private func promptNewWorkspace() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "New Workspace"
-        panel.message = "Choose a directory for the new workspace"
-        if let dir = activeWorkspaceDir { panel.directoryURL = URL(fileURLWithPath: dir) }
-        let complete: (NSApplication.ModalResponse) -> Void = { [weak self] response in
-            guard response == .OK, let path = panel.url?.path else { return }
-            self?.newWorkspace(workspace: path)
-        }
-        if let window = view.window {
-            panel.beginSheetModal(for: window, completionHandler: complete)
-        } else {
-            complete(panel.runModal())
-        }
     }
 
     // MARK: - Config Hot-Reload

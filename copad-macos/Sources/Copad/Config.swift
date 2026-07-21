@@ -49,24 +49,8 @@ struct StatusBarConfig {
     static let defaults = StatusBarConfig(enabled: true, position: "bottom", height: 28)
 }
 
-/// `[terminal] backend` — how a pane's PTY is backed (decision #60).
-/// `native` (default) spawns the login shell directly. `tmux` backs each
-/// pane onto a dedicated single-pane tmux session (`-L copad` server,
-/// `copad-<panel_id>`), so the process + scrollback survive the GUI and the
-/// cockpit + mobile attach share one identity. Opt-in during rollout.
-enum TerminalBackend: String {
-    case native
-    case tmux
-
-    static func parse(_ raw: String) -> TerminalBackend {
-        TerminalBackend(rawValue: raw.lowercased()) ?? .native
-    }
-}
-
 struct CopadConfig {
     let shell: String
-    /// `[terminal] backend` — `native` (default) or `tmux` (decision #60).
-    let terminalBackend: TerminalBackend
     let fontFamily: String
     let fontSize: Int
     /// macOS-only: when true, Option+key sends `ESC + key` to the PTY
@@ -208,7 +192,6 @@ struct CopadConfig {
 
         return CopadConfig(
             shell: raw.terminal?.shell ?? defaults.shell,
-            terminalBackend: raw.terminal?.backend.map(TerminalBackend.parse) ?? defaults.terminalBackend,
             fontFamily: raw.terminal?.fontFamily ?? defaults.fontFamily,
             fontSize: raw.terminal?.fontSize ?? defaults.fontSize,
             optionAsAlt: raw.terminal?.optionAsAlt ?? defaults.optionAsAlt,
@@ -266,7 +249,6 @@ struct CopadConfig {
     static var defaults: CopadConfig {
         CopadConfig(
             shell: ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh",
-            terminalBackend: .native,
             fontFamily: "JetBrains Mono",
             fontSize: 14,
             optionAsAlt: true,
@@ -428,7 +410,6 @@ private struct TabsSection: Decodable {
 
 private struct TerminalSection: Decodable {
     var shell: String?
-    var backend: String?
     var fontFamily: String?
     var fontSize: Int?
     var optionAsAlt: Bool?
@@ -437,7 +418,6 @@ private struct TerminalSection: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case shell
-        case backend
         case fontFamily = "font_family"
         case fontSize = "font_size"
         case optionAsAlt = "option_as_alt"

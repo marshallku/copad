@@ -257,12 +257,9 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         // `coctl call` from the in-shell hook hits this exact GUI
         // (not the well-known daemon at `~/Library/Caches/copad/socket`).
         let socketPath = "/tmp/copad-\(ProcessInfo.processInfo.processIdentifier).sock"
-        // Decision #60: when `[terminal] backend = "tmux"`, back this pane
-        // onto a dedicated single-pane tmux session named after the panel id,
-        // so the process + scrollback survive the GUI and the cockpit/mobile
-        // attach share this exact identity. `native` (default) → nil → the
-        // FFI spawns the login shell directly.
-        let tmuxSession = config.terminalBackend == .tmux ? "copad-\(panelID)" : nil
+        // Decision #64 (Model 1): copad no longer manages tmux — panes always
+        // spawn the login shell directly. Process/scrollback persistence is the
+        // user's own tmux, run inside a pane.
         termHandle = CopadTermFFI.Handle(
             cols: cols,
             rows: rows,
@@ -270,7 +267,6 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
             cwd: initialCwd,
             panelID: panelID,
             socketPath: socketPath,
-            tmuxSession: tmuxSession,
         )
         // Push the active palette so the first OSC 4 / 10 / 11 / 12
         // query (often part of nvim / fish prompt init) gets the color
