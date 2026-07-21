@@ -8,7 +8,9 @@
 //! server/client split, and CLI come in later units.
 
 use std::collections::HashMap;
-use std::io::{self, Stdout};
+use std::io::{self, BufRead, BufReader, Stdout, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use ratatui::Frame;
@@ -22,9 +24,55 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::Position;
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::control;
 use crate::model::{ClientId, Dir, PaneId, PaneRect, Rect, Role, TerminalId, WorkspaceId};
-use crate::state::{Command, Event, Origin, State};
+use crate::state::{Command, Event, MuxError, Origin, State};
 use crate::term::{CellColor, PaneTerm};
+
+/// A control request handed from a socket connection thread to the main loop
+/// (which is the single writer of `State`), with a channel for the reply.
+struct ControlMsg {
+    req: control::Req,
+    reply: mpsc::Sender<control::Resp>,
+}
+
+/// Read ndjson requests off one control connection, forward each to the main loop
+/// over `tx`, and write back the reply line. Never touches `State` directly.
+fn handle_conn(stream: UnixStream, tx: mpsc::Sender<ControlMsg>) {
+    let Ok(read_half) = stream.try_clone() else {
+        return;
+    };
+    let mut reader = BufReader::new(read_half);
+    let mut writer = stream;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => return, // EOF or error → connection done
+            Ok(_) => {}
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let resp = match serde_json::from_str::<control::Req>(trimmed) {
+            Ok(req) => {
+                let (rtx, rrx) = mpsc::channel();
+                if tx.send(ControlMsg { req, reply: rtx }).is_err() {
+                    return; // main loop gone
+                }
+                rrx.recv()
+                    .unwrap_or_else(|_| control::Resp::err("mux shutting down"))
+            }
+            Err(e) => control::Resp::err(format!("bad request: {e}")),
+        };
+        let out = serde_json::to_string(&resp).unwrap_or_else(|_| "{\"ok\":false}".to_string());
+        if writeln!(writer, "{out}").is_err() {
+            return;
+        }
+        let _ = writer.flush();
+    }
+}
 
 /// Restores the host terminal (raw mode off + leave alt screen) on drop — so a
 /// panic mid-render never leaves the user's terminal wedged.
@@ -78,10 +126,13 @@ struct App {
     /// When `Some(sel)`, the `Ctrl-f` popup switcher is open with row `sel`
     /// selected; keys drive the popup instead of the shells.
     popup: Option<usize>,
+    /// Env vars injected into every pane's shell (e.g. `COPAD_MUX_SOCK`), so a
+    /// shell inside a pane can control its own mux via `copad-mux ctl`.
+    sock_env: Vec<(String, String)>,
 }
 
 impl App {
-    fn new(cols: u16, rows: u16) -> io::Result<Self> {
+    fn new(cols: u16, rows: u16, sock_env: Vec<(String, String)>) -> io::Result<Self> {
         let mut state = State::new();
         let ws = WorkspaceId::new("local");
         let (_tab, _pane, term0) = state.create_workspace(ws.clone(), None, Rect { cols, rows });
@@ -95,7 +146,8 @@ impl App {
             rows,
         });
         let mut panes = HashMap::new();
-        let Some(pt) = PaneTerm::spawn(cols.max(1), rows.max(1), None, None) else {
+        let Some(pt) = PaneTerm::spawn_with_env(cols.max(1), rows.max(1), None, None, &sock_env)
+        else {
             return Err(io::Error::other("failed to spawn shell PTY"));
         };
         panes.insert(term0, pt);
@@ -108,6 +160,7 @@ impl App {
             rows,
             sidebar: false,
             popup: None,
+            sock_env,
         };
         app.sync_sizes();
         Ok(app)
@@ -230,7 +283,13 @@ impl App {
             }
         }
         if let (Some(nt), Some(np)) = (new_term, new_pane) {
-            match PaneTerm::spawn(self.cols.max(1), self.rows.max(1), None, None) {
+            match PaneTerm::spawn_with_env(
+                self.cols.max(1),
+                self.rows.max(1),
+                None,
+                None,
+                &self.sock_env,
+            ) {
                 Some(pt) => {
                     self.panes.insert(nt, pt);
                     // tmux-style: focus the freshly created pane.
@@ -257,24 +316,122 @@ impl App {
     }
 
     fn close_focused(&mut self) {
-        let Some(pane) = self.focused_pane() else {
-            return;
-        };
-        let events = match self.state.apply(Command::ClosePane {
+        if let Some(pane) = self.focused_pane() {
+            // The `x` key ignores a rejected close (e.g. the last pane stays;
+            // the shell-exit path handles quitting).
+            let _ = self.close_pane(pane);
+        }
+    }
+
+    /// Close a specific pane (used by the `x` key on the focused pane and by the
+    /// control API's `close <index>`).
+    fn close_pane(&mut self, pane: PaneId) -> Result<(), MuxError> {
+        // Propagate the actor's verdict (e.g. `CannotCloseLastPane`) so the
+        // control API reports a real failure instead of a false `ok`.
+        let events = self.state.apply(Command::ClosePane {
             origin: Origin::Client(self.client),
             workspace: self.ws.clone(),
             pane,
             if_rev: None,
-        }) {
-            Ok(e) => e,
-            Err(_) => return, // e.g. last pane — leave it; shell-exit path handles quit
-        };
+        })?;
         for e in &events {
             if let Event::PaneClosed { terminal, .. } = e {
                 self.panes.remove(terminal);
             }
         }
         self.sync_sizes();
+        Ok(())
+    }
+
+    // --- control API (spec §3): applied on the main loop (single writer) ---
+
+    /// Handle one control request, mutating state as the sole writer. Returns the
+    /// wire response. Never blocks.
+    fn handle_control(&mut self, req: &control::Req) -> control::Resp {
+        use control::{PaneInfo, Req, Resp};
+        match req {
+            Req::List => {
+                let order = self.pane_order();
+                let focused = self.focused_pane();
+                let rects = self.layout();
+                let panes = order
+                    .iter()
+                    .enumerate()
+                    .map(|(index, p)| {
+                        let term = self
+                            .state
+                            .workspace(&self.ws)
+                            .and_then(|w| w.tab(&w.active_tab))
+                            .and_then(|t| t.layout.terminal_of(p).cloned());
+                        let (cols, rows) = term
+                            .as_ref()
+                            .and_then(|tid| rects.iter().find(|r| &r.terminal == tid))
+                            .map(|r| (r.cols, r.rows))
+                            .unwrap_or((0, 0));
+                        PaneInfo {
+                            index,
+                            id: p.to_string(),
+                            focused: focused.as_ref() == Some(p),
+                            cols,
+                            rows,
+                        }
+                    })
+                    .collect();
+                let fi = focused
+                    .and_then(|f| order.iter().position(|p| p == &f))
+                    .unwrap_or(0);
+                Resp::list(panes, fi)
+            }
+            Req::Split { dir } => {
+                let d = match dir.as_str() {
+                    "down" => Dir::Down,
+                    "right" => Dir::Right,
+                    other => return Resp::err(format!("bad dir '{other}' (right|down)")),
+                };
+                let before = self.pane_order().len();
+                self.split(d);
+                if self.pane_order().len() > before {
+                    Resp::ok()
+                } else {
+                    Resp::err("split failed (could not spawn a shell)")
+                }
+            }
+            Req::Focus { index } => match self.pane_order().get(*index).cloned() {
+                Some(pane) => {
+                    let _ = self.state.apply(Command::FocusPane {
+                        client: self.client,
+                        pane,
+                    });
+                    Resp::ok()
+                }
+                None => Resp::err(format!("no pane at index {index}")),
+            },
+            Req::Close { index } => match self.pane_order().get(*index).cloned() {
+                Some(pane) => match self.close_pane(pane) {
+                    Ok(()) => Resp::ok(),
+                    Err(e) => Resp::err(e.to_string()),
+                },
+                None => Resp::err(format!("no pane at index {index}")),
+            },
+            Req::SendKeys { index, text } => {
+                let order = self.pane_order();
+                let Some(pane) = order.get(*index) else {
+                    return Resp::err(format!("no pane at index {index}"));
+                };
+                let term = self
+                    .state
+                    .workspace(&self.ws)
+                    .and_then(|w| w.tab(&w.active_tab))
+                    .and_then(|t| t.layout.terminal_of(pane).cloned());
+                match term.and_then(|tid| self.panes.get(&tid)) {
+                    Some(pt) => {
+                        pt.input(text.as_bytes());
+                        Resp::ok()
+                    }
+                    None => Resp::err("pane has no live terminal"),
+                }
+            }
+        }
     }
 
     fn focus_next(&mut self) {
@@ -765,8 +922,49 @@ pub fn run() -> io::Result<()> {
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal: Terminal<CrosstermBackend<Stdout>> = Terminal::new(backend)?;
 
+    // Control socket (spec §3): bind, and let an accept thread forward requests to
+    // this loop over a channel — the socket thread NEVER writes `State`. Env-inject
+    // the socket path so a shell inside a pane can `copad-mux ctl` its own mux.
+    let sock_path = control::socket_path();
+    let (ctl_tx, ctl_rx) = mpsc::channel::<ControlMsg>();
+    let mut sock_env = Vec::new();
+    let mut we_bound_socket = false;
+    // Only clear the socket if it is STALE: probe-connect first so a second
+    // instance never unlinks a still-live server's socket (and its cleanup never
+    // deletes another instance's socket).
+    if UnixStream::connect(&sock_path).is_ok() {
+        eprintln!(
+            "copad-mux: control socket {} is already in use by another instance; \
+             ctl disabled here (set COPAD_MUX_SOCK for a separate socket)",
+            sock_path.display()
+        );
+    } else {
+        let _ = std::fs::remove_file(&sock_path); // clear a stale (dead) socket
+        match UnixListener::bind(&sock_path) {
+            Ok(listener) => {
+                we_bound_socket = true;
+                sock_env.push((
+                    "COPAD_MUX_SOCK".to_string(),
+                    sock_path.to_string_lossy().to_string(),
+                ));
+                let tx = ctl_tx.clone();
+                std::thread::spawn(move || {
+                    for stream in listener.incoming().flatten() {
+                        let tx = tx.clone();
+                        std::thread::spawn(move || handle_conn(stream, tx));
+                    }
+                });
+            }
+            Err(e) => {
+                // Non-fatal: run the TUI without the control API rather than
+                // refusing to start (e.g. path permission issue).
+                eprintln!("copad-mux: control socket unavailable ({e}); ctl disabled");
+            }
+        }
+    }
+
     let size = terminal.size()?;
-    let mut app = App::new(size.width, size.height)?;
+    let mut app = App::new(size.width, size.height, sock_env)?;
 
     let mut prefix = false;
     'main: loop {
@@ -776,6 +974,12 @@ pub fn run() -> io::Result<()> {
         // A pane may have exited while the popup was open — keep its selection
         // index valid (or close it) so it never points past the pane list.
         app.reconcile_popup();
+
+        // Apply any pending control requests as the single writer.
+        while let Ok(msg) = ctl_rx.try_recv() {
+            let resp = app.handle_control(&msg.req);
+            let _ = msg.reply.send(resp);
+        }
 
         terminal.draw(|frame| app.render(frame))?;
 
@@ -840,6 +1044,11 @@ pub fn run() -> io::Result<()> {
         }
     }
 
+    // Best-effort: remove the control socket ONLY if we bound it, so we never
+    // delete another live instance's socket.
+    if we_bound_socket {
+        let _ = std::fs::remove_file(&sock_path);
+    }
     Ok(())
 }
 

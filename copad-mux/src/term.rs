@@ -112,6 +112,19 @@ impl PaneTerm {
         shell: Option<String>,
         cwd: Option<PathBuf>,
     ) -> Option<Self> {
+        Self::spawn_with_env(cols, rows, shell, cwd, &[])
+    }
+
+    /// Like [`spawn`](Self::spawn) but injects extra environment variables into
+    /// the child shell (e.g. `COPAD_MUX_SOCK` so a shell inside a pane can drive
+    /// its own mux via `copad-mux ctl`).
+    pub fn spawn_with_env(
+        cols: u16,
+        rows: u16,
+        shell: Option<String>,
+        cwd: Option<PathBuf>,
+        env: &[(String, String)],
+    ) -> Option<Self> {
         let cols = cols.max(1);
         let rows = rows.max(1);
 
@@ -122,6 +135,9 @@ impl PaneTerm {
         }
         if let Some(dir) = cwd {
             opts.working_directory = Some(dir);
+        }
+        for (k, v) in env {
+            opts.env.insert(k.clone(), v.clone());
         }
 
         let window = WindowSize {
