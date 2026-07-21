@@ -12,6 +12,7 @@
 
 pub mod control;
 pub mod model;
+pub mod procinfo;
 pub mod state;
 pub mod term;
 pub mod tui;

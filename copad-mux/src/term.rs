@@ -5,6 +5,7 @@
 //!
 //! Work-unit 2 hosts exactly one; splits + the multi-pane server come later.
 
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -101,6 +102,13 @@ pub struct PaneTerm {
     sender: EventLoopSender,
     listener: MuxListener,
     io_thread: Option<JoinHandle<(EventLoop<Pty, MuxListener>, State)>>,
+    /// The child shell's pid, captured at spawn. Used to find the pane's
+    /// foreground process (agent/command label). `None` if unavailable.
+    child_pid: Option<u32>,
+    /// A dup of the PTY master fd, kept so we can query the terminal's foreground
+    /// process group (`tcgetpgrp`) — the actual foreground process, not a guess.
+    /// Closed on drop.
+    fg_fd: Option<RawFd>,
 }
 
 impl PaneTerm {
@@ -147,6 +155,15 @@ impl PaneTerm {
             cell_height: 1,
         };
         let pty = tty::new(&opts, window, 0).ok()?;
+        // Capture the child pid + a dup of the master fd before the Pty is moved
+        // into the EventLoop (the dup lets us query the foreground pgrp later).
+        let child_pid = Some(pty.child().id());
+        let fg_fd = {
+            let raw = pty.file().as_raw_fd();
+            // SAFETY: `raw` is a valid open fd for the duration of this call.
+            let d = unsafe { libc::dup(raw) };
+            (d >= 0).then_some(d)
+        };
 
         let term_size = TermSize::new(cols as usize, rows as usize);
         let listener = MuxListener::new();
@@ -164,7 +181,24 @@ impl PaneTerm {
             sender,
             listener,
             io_thread: Some(io_thread),
+            child_pid,
+            fg_fd,
         })
+    }
+
+    /// The child shell's pid (fallback label when no foreground group is set).
+    pub fn pid(&self) -> Option<u32> {
+        self.child_pid
+    }
+
+    /// The pid of the terminal's foreground process GROUP leader — the process
+    /// actually running in the foreground (`sleep`, `claude`, `nvim`, …), via
+    /// `tcgetpgrp` on the PTY master. `None` if unavailable.
+    pub fn foreground_pgid(&self) -> Option<u32> {
+        let fd = self.fg_fd?;
+        // SAFETY: `fd` is our own dup of the master, valid until drop.
+        let pgid = unsafe { libc::tcgetpgrp(fd) };
+        (pgid > 0).then_some(pgid as u32)
     }
 
     /// Feed input bytes to the child shell.
@@ -247,6 +281,10 @@ impl PaneTerm {
 
 impl Drop for PaneTerm {
     fn drop(&mut self) {
+        if let Some(fd) = self.fg_fd.take() {
+            // SAFETY: our own dup'd fd, closed exactly once.
+            unsafe { libc::close(fd) };
+        }
         let _ = self.sender.send(Msg::Shutdown);
         if let Some(jh) = self.io_thread.take() {
             let _ = jh.join();

@@ -839,6 +839,7 @@ name = "copad-mux"
 version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
+ "libc",
  "proptest",
  "ratatui",
  "serde",

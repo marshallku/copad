@@ -35,6 +35,12 @@ pub struct PaneInfo {
     pub focused: bool,
     pub cols: u16,
     pub rows: u16,
+    /// The pane's foreground command (agent / shell / program).
+    #[serde(default)]
+    pub label: String,
+    /// Classification of `label`: `"agent"`, `"shell"`, or `"other"`.
+    #[serde(default)]
+    pub kind: String,
 }
 
 /// A control response. `ok=false` carries `error`; `list` fills `panes`+`focused`.
@@ -198,13 +204,18 @@ fn print_human(req: &Req, resp: &Resp) {
         Req::List => {
             let panes = resp.panes.clone().unwrap_or_default();
             let focused = resp.focused.unwrap_or(usize::MAX);
-            println!("{:<3} {:<8} {:<9} SIZE", "IDX", "PANE", "FOCUS");
+            println!(
+                "{:<3} {:<8} {:<9} {:<8} {:<14} SIZE",
+                "IDX", "PANE", "FOCUS", "KIND", "LABEL"
+            );
             for p in &panes {
                 println!(
-                    "{:<3} {:<8} {:<9} {}x{}",
+                    "{:<3} {:<8} {:<9} {:<8} {:<14} {}x{}",
                     p.index,
                     p.id,
                     if p.index == focused { "*focused" } else { "" },
+                    p.kind,
+                    p.label,
                     p.cols,
                     p.rows,
                 );

@@ -26,6 +26,7 @@ use ratatui::style::{Color, Modifier, Style};
 
 use crate::control;
 use crate::model::{ClientId, Dir, PaneId, PaneRect, Rect, Role, TerminalId, WorkspaceId};
+use crate::procinfo;
 use crate::state::{Command, Event, MuxError, Origin, State};
 use crate::term::{CellColor, PaneTerm};
 
@@ -129,6 +130,11 @@ struct App {
     /// Env vars injected into every pane's shell (e.g. `COPAD_MUX_SOCK`), so a
     /// shell inside a pane can control its own mux via `copad-mux ctl`.
     sock_env: Vec<(String, String)>,
+    /// Per-terminal foreground-process label (agent / shell / command), refreshed
+    /// on a throttled cadence (`refresh_labels`), read by the sidebar/popup/CLI.
+    labels: HashMap<TerminalId, procinfo::Label>,
+    /// When the labels were last refreshed (throttle `ps` to ~2 Hz).
+    last_labels: std::time::Instant,
 }
 
 impl App {
@@ -161,6 +167,10 @@ impl App {
             sidebar: false,
             popup: None,
             sock_env,
+            labels: HashMap::new(),
+            last_labels: std::time::Instant::now()
+                .checked_sub(Duration::from_secs(60))
+                .unwrap_or_else(std::time::Instant::now),
         };
         app.sync_sizes();
         Ok(app)
@@ -368,12 +378,19 @@ impl App {
                             .and_then(|tid| rects.iter().find(|r| &r.terminal == tid))
                             .map(|r| (r.cols, r.rows))
                             .unwrap_or((0, 0));
+                        let kind = match self.pane_label_at(index).map(|l| l.kind) {
+                            Some(procinfo::Kind::Agent) => "agent",
+                            Some(procinfo::Kind::Shell) => "shell",
+                            _ => "other",
+                        };
                         PaneInfo {
                             index,
                             id: p.to_string(),
                             focused: focused.as_ref() == Some(p),
                             cols,
                             rows,
+                            label: self.pane_label(index),
+                            kind: kind.to_string(),
                         }
                     })
                     .collect();
@@ -728,8 +745,47 @@ impl App {
     }
 
     /// A one-line label for a pane row (index + short cwd basename if available).
+    /// Refresh every pane's foreground-process label from a single `ps` sweep
+    /// (throttled by the caller to ~2 Hz — never per frame).
+    fn refresh_labels(&mut self) {
+        let tree = procinfo::ProcTree::snapshot();
+        let mut next = HashMap::new();
+        for (tid, pane) in &self.panes {
+            // The terminal's foreground process GROUP is the real foreground
+            // command (resolve a live member — the pgid leader may have exited in
+            // a pipeline); fall back to descending from the shell pid.
+            let label = pane
+                .foreground_pgid()
+                .and_then(|pg| tree.command_of_pgroup(pg))
+                .or_else(|| pane.pid().and_then(|p| tree.foreground(p)));
+            if let Some(label) = label {
+                next.insert(tid.clone(), label);
+            }
+        }
+        self.labels = next;
+        self.last_labels = std::time::Instant::now();
+    }
+
+    /// The terminal id backing the pane at list index `idx`.
+    fn terminal_at(&self, idx: usize) -> Option<TerminalId> {
+        let pane = self.pane_order().get(idx)?.clone();
+        let w = self.state.workspace(&self.ws)?;
+        let tab = w.tab(&w.active_tab)?;
+        tab.layout.terminal_of(&pane).cloned()
+    }
+
+    /// The classified label for the pane at list index `idx`, if known.
+    fn pane_label_at(&self, idx: usize) -> Option<&procinfo::Label> {
+        let term = self.terminal_at(idx)?;
+        self.labels.get(&term)
+    }
+
+    /// Display text for the pane at list index `idx`: its foreground command
+    /// (agent / shell / program), or a fallback before the first label sweep.
     fn pane_label(&self, idx: usize) -> String {
-        format!("pane {idx}")
+        self.pane_label_at(idx)
+            .map(|l| l.text.clone())
+            .unwrap_or_else(|| format!("pane {idx}"))
     }
 
     /// Left panel: a header + one row per pane, focus-marked.
@@ -781,14 +837,30 @@ impl App {
             }
             let is_focus = focused.as_ref() == Some(pane);
             let marker = if is_focus { "▸" } else { " " };
-            let row = format!(" {marker}{i} {}", self.pane_label(i));
+            let kind = self.pane_label_at(i).map(|l| l.kind);
+            // A filled dot flags an AI agent; shells/others get a blank.
+            let dot = if kind == Some(procinfo::Kind::Agent) {
+                "●"
+            } else {
+                " "
+            };
+            let row = format!(" {marker}{i} {dot}{}", self.pane_label(i));
             let style = if is_focus {
                 Style::default()
                     .fg(Color::White)
                     .bg(Color::Rgb(48, 52, 66))
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray).bg(panel_bg)
+                match kind {
+                    Some(procinfo::Kind::Agent) => Style::default()
+                        .fg(Color::Yellow)
+                        .bg(panel_bg)
+                        .add_modifier(Modifier::BOLD),
+                    Some(procinfo::Kind::Shell) => {
+                        Style::default().fg(Color::DarkGray).bg(panel_bg)
+                    }
+                    _ => Style::default().fg(Color::Gray).bg(panel_bg),
+                }
             };
             put(buf, y, &row, style);
         }
@@ -879,8 +951,14 @@ impl App {
                 break;
             }
             let selected = i == sel;
+            let kind = self.pane_label_at(i).map(|l| l.kind);
+            let dot = if kind == Some(procinfo::Kind::Agent) {
+                "●"
+            } else {
+                " "
+            };
             let row = format!(
-                "{} {i}  {}",
+                "{} {i}  {dot}{}",
                 if selected { "▸" } else { " " },
                 self.pane_label(i)
             );
@@ -888,6 +966,11 @@ impl App {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if kind == Some(procinfo::Kind::Agent) {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .bg(bg)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::Gray).bg(bg)
@@ -974,6 +1057,11 @@ pub fn run() -> io::Result<()> {
         // A pane may have exited while the popup was open — keep its selection
         // index valid (or close it) so it never points past the pane list.
         app.reconcile_popup();
+
+        // Throttled foreground-process/agent label refresh (one `ps` sweep, ~2 Hz).
+        if app.last_labels.elapsed() >= Duration::from_millis(500) {
+            app.refresh_labels();
+        }
 
         // Apply any pending control requests as the single writer.
         while let Ok(msg) = ctl_rx.try_recv() {
