@@ -348,6 +348,53 @@ impl SplitTree {
     }
 }
 
+/// A pane's placed rectangle (position + size in cells) for rendering. Derived
+/// from a split tree tiled into an area; dividers occupy the 1-cell gaps between
+/// adjacent rects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneRect {
+    pub terminal: TerminalId,
+    pub x: u16,
+    pub y: u16,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+impl SplitTree {
+    /// Place every leaf's terminal at an absolute `(x, y)` + size, tiling the
+    /// `(x, y, cols, rows)` area. Uses the same conserving `split3` as
+    /// `derive_sizes`, so the rects + 1-cell dividers exactly fill the area with
+    /// no overlap (the divider sits in the gap between the two children).
+    pub fn derive_layout(&self, x: u16, y: u16, cols: u16, rows: u16, out: &mut Vec<PaneRect>) {
+        match self {
+            SplitTree::Leaf { terminal, .. } => out.push(PaneRect {
+                terminal: terminal.clone(),
+                x,
+                y,
+                cols,
+                rows,
+            }),
+            SplitTree::Branch {
+                dir,
+                ratio,
+                first,
+                second,
+            } => match dir {
+                Dir::Right => {
+                    let (a, b, div) = Self::split3(cols, *ratio);
+                    first.derive_layout(x, y, a, rows, out);
+                    second.derive_layout(x + a + div, y, b, rows, out);
+                }
+                Dir::Down => {
+                    let (a, b, div) = Self::split3(rows, *ratio);
+                    first.derive_layout(x, y, cols, a, out);
+                    second.derive_layout(x, y + a + div, cols, b, out);
+                }
+            },
+        }
+    }
+}
+
 /// A tab: one BSP layout + a focused pane.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tab {
@@ -384,5 +431,73 @@ impl Workspace {
     }
     pub fn tab_of_pane_mut(&mut self, pane: &PaneId) -> Option<&mut Tab> {
         self.tabs.iter_mut().find(|t| t.layout.contains(pane))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn leaf(p: &str, t: &str) -> SplitTree {
+        SplitTree::Leaf {
+            pane: PaneId::new(p),
+            terminal: TerminalId::new(t),
+        }
+    }
+
+    #[test]
+    fn derive_layout_tiles_a_right_split_with_a_divider_gap() {
+        let tree = SplitTree::Branch {
+            dir: Dir::Right,
+            ratio: 0.5,
+            first: Box::new(leaf("p0", "t0")),
+            second: Box::new(leaf("p1", "t1")),
+        };
+        let mut out = Vec::new();
+        tree.derive_layout(0, 0, 80, 24, &mut out);
+        assert_eq!(out.len(), 2);
+        let (a, b) = (&out[0], &out[1]);
+        assert_eq!((a.x, a.y, a.rows), (0, 0, 24));
+        assert_eq!((b.y, b.rows), (0, 24));
+        assert_eq!(b.x, a.cols + 1, "second pane sits after the 1-cell divider");
+        assert_eq!(a.cols + 1 + b.cols, 80, "widths + divider tile the area");
+    }
+
+    #[test]
+    fn derive_layout_agrees_with_sizes_and_stays_in_bounds() {
+        let tree = SplitTree::Branch {
+            dir: Dir::Down,
+            ratio: 0.5,
+            first: Box::new(SplitTree::Branch {
+                dir: Dir::Right,
+                ratio: 0.5,
+                first: Box::new(leaf("p0", "t0")),
+                second: Box::new(leaf("p1", "t1")),
+            }),
+            second: Box::new(leaf("p2", "t2")),
+        };
+        let area = Rect {
+            cols: 100,
+            rows: 40,
+        };
+        assert_eq!(tree.footprint(area), area);
+        let mut rects = Vec::new();
+        tree.derive_layout(0, 0, area.cols, area.rows, &mut rects);
+        assert_eq!(rects.len(), 3);
+        for r in &rects {
+            assert!(r.x + r.cols <= area.cols, "rect within viewport width");
+            assert!(r.y + r.rows <= area.rows, "rect within viewport height");
+        }
+        // derive_layout and derive_sizes agree on each terminal's size.
+        let mut sizes = Vec::new();
+        tree.derive_sizes(area, &mut sizes);
+        for (tid, c, rr) in &sizes {
+            let rect = rects.iter().find(|p| &p.terminal == tid).unwrap();
+            assert_eq!(
+                (rect.cols, rect.rows),
+                (*c, *rr),
+                "layout size == derived size"
+            );
+        }
     }
 }
