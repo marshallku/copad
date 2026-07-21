@@ -57,6 +57,12 @@ enum FocusDir {
     Down,
 }
 
+/// Sidebar width in columns (a 1-col border is added to its right).
+const SIDEBAR_W: u16 = 24;
+/// Below this terminal width the sidebar is suppressed even when toggled on —
+/// the popup switcher is the fallback on narrow / mobile widths (size-adaptive).
+const SIDEBAR_MIN_COLS: u16 = 80;
+
 /// The multi-pane application: the authoritative layout `State` + a live shell per
 /// terminal. The local TUI is the single controller client (`ClientId(0)`).
 struct App {
@@ -66,6 +72,12 @@ struct App {
     panes: HashMap<TerminalId, PaneTerm>,
     cols: u16,
     rows: u16,
+    /// Neovim-style left panel toggle (`Ctrl-b s`). Honored only when the
+    /// terminal is at least `SIDEBAR_MIN_COLS` wide.
+    sidebar: bool,
+    /// When `Some(sel)`, the `Ctrl-f` popup switcher is open with row `sel`
+    /// selected; keys drive the popup instead of the shells.
+    popup: Option<usize>,
 }
 
 impl App {
@@ -94,6 +106,8 @@ impl App {
             panes,
             cols,
             rows,
+            sidebar: false,
+            popup: None,
         };
         app.sync_sizes();
         Ok(app)
@@ -101,13 +115,44 @@ impl App {
 
     // --- reads off the authoritative state ---
 
-    /// Placed rects for the active tab, tiling `cols`×`rows`.
-    fn layout(&self, cols: u16, rows: u16) -> Vec<PaneRect> {
+    /// Is the sidebar actually drawn? Toggled on AND wide enough (size-adaptive:
+    /// narrow / mobile widths fall back to the popup).
+    fn sidebar_visible(&self) -> bool {
+        self.sidebar && self.cols >= SIDEBAR_MIN_COLS
+    }
+
+    /// Left x-offset of the pane grid (the sidebar reserves `SIDEBAR_W` + 1 border).
+    fn content_x(&self) -> u16 {
+        if self.sidebar_visible() {
+            SIDEBAR_W + 1
+        } else {
+            0
+        }
+    }
+
+    /// Width available to the pane grid, right of the sidebar.
+    fn content_cols(&self) -> u16 {
+        if self.sidebar_visible() {
+            self.cols.saturating_sub(SIDEBAR_W + 1)
+        } else {
+            self.cols
+        }
+    }
+
+    /// Placed rects for the active tab, tiling the content area (right of the
+    /// sidebar when it is visible). Rects are already offset by `content_x`.
+    fn layout(&self) -> Vec<PaneRect> {
         let mut out = Vec::new();
         if let Some(w) = self.state.workspace(&self.ws)
             && let Some(tab) = w.tab(&w.active_tab)
         {
-            tab.layout.derive_layout(0, 0, cols, rows, &mut out);
+            tab.layout.derive_layout(
+                self.content_x(),
+                0,
+                self.content_cols(),
+                self.rows,
+                &mut out,
+            );
         }
         out
     }
@@ -148,7 +193,7 @@ impl App {
     /// Resize every hosted PTY to match its on-screen rect, so shell output wraps
     /// at the right width (the layout is the source of truth for geometry).
     fn sync_sizes(&self) {
-        for rect in self.layout(self.cols, self.rows) {
+        for rect in self.layout() {
             if let Some(pt) = self.panes.get(&rect.terminal) {
                 pt.resize(rect.cols, rect.rows);
             }
@@ -250,7 +295,7 @@ impl App {
 
     /// Focus the nearest pane in a direction, by rect-center heuristic.
     fn focus_dir(&mut self, dir: FocusDir) {
-        let rects = self.layout(self.cols, self.rows);
+        let rects = self.layout();
         let Some(cur_term) = self.focused_terminal() else {
             return;
         };
@@ -310,6 +355,63 @@ impl App {
         self.sync_sizes();
     }
 
+    // --- sidebar + popup ---
+
+    /// Toggle the neovim-style left panel (honored only when wide enough). The
+    /// pane content area shrinks/grows, so resize the PTYs to match.
+    fn toggle_sidebar(&mut self) {
+        self.sidebar = !self.sidebar;
+        self.sync_sizes();
+    }
+
+    /// Open the `Ctrl-f` switcher, preselecting the focused pane's row.
+    fn open_popup(&mut self) {
+        let order = self.pane_order();
+        let sel = self
+            .focused_pane()
+            .and_then(|f| order.iter().position(|p| p == &f))
+            .unwrap_or(0);
+        self.popup = Some(sel);
+    }
+
+    /// Keep the popup selection within the current pane list (or close the popup
+    /// if no panes remain). Called each frame so an async pane exit can't leave a
+    /// stale selection index.
+    fn reconcile_popup(&mut self) {
+        if let Some(sel) = self.popup {
+            let n = self.pane_order().len();
+            if n == 0 {
+                self.popup = None;
+            } else if sel >= n {
+                self.popup = Some(n - 1);
+            }
+        }
+    }
+
+    /// Move the popup selection by `delta`, wrapping.
+    fn popup_move(&mut self, delta: i32) {
+        let n = self.pane_order().len() as i32;
+        if n == 0 {
+            self.popup = None;
+            return;
+        }
+        if let Some(sel) = self.popup {
+            self.popup = Some((sel as i32 + delta).rem_euclid(n) as usize);
+        }
+    }
+
+    /// Focus the selected pane and close the popup.
+    fn popup_select(&mut self) {
+        if let Some(sel) = self.popup.take()
+            && let Some(pane) = self.pane_order().get(sel).cloned()
+        {
+            let _ = self.state.apply(Command::FocusPane {
+                client: self.client,
+                pane,
+            });
+        }
+    }
+
     /// Close panes whose shell has exited. Returns true if the app is now empty.
     fn reap_exited(&mut self) -> bool {
         let exited: Vec<TerminalId> = self
@@ -354,7 +456,7 @@ impl App {
 
     fn render(&self, frame: &mut Frame) {
         let area = frame.area();
-        let rects = self.layout(area.width, area.height);
+        let rects = self.layout();
         let focused_term = self.focused_terminal();
         let mut cursor_pos: Option<Position> = None;
 
@@ -427,10 +529,12 @@ impl App {
                 }
             }
         }
+        let content_x = self.content_x();
         let buf = frame.buffer_mut();
         for yy in 0..area.height {
             for xx in 0..area.width {
-                if covered[yy as usize][xx as usize] {
+                // The sidebar owns the left strip; don't paint dividers there.
+                if xx < content_x || covered[yy as usize][xx as usize] {
                     continue;
                 }
                 let left = xx > 0 && covered[yy as usize][(xx - 1) as usize];
@@ -448,8 +552,192 @@ impl App {
             }
         }
 
-        if let Some(p) = cursor_pos {
+        // 3) the neovim-style left panel, over the reserved strip.
+        if self.sidebar_visible() {
+            self.render_sidebar(frame);
+        }
+
+        // 4) the Ctrl-f switcher popup, over everything.
+        if self.popup.is_some() {
+            self.render_popup(frame);
+        }
+
+        // The shell cursor shows only when no popup is capturing input.
+        if self.popup.is_none()
+            && let Some(p) = cursor_pos
+        {
             frame.set_cursor_position(p);
+        }
+    }
+
+    /// A one-line label for a pane row (index + short cwd basename if available).
+    fn pane_label(&self, idx: usize) -> String {
+        format!("pane {idx}")
+    }
+
+    /// Left panel: a header + one row per pane, focus-marked.
+    fn render_sidebar(&self, frame: &mut Frame) {
+        let area = frame.area();
+        let h = area.height;
+        let order = self.pane_order();
+        let focused = self.focused_pane();
+        let panel_bg = Color::Rgb(28, 30, 38);
+        let buf = frame.buffer_mut();
+
+        // Fill the strip + the border column.
+        for y in 0..h {
+            for x in 0..SIDEBAR_W {
+                if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
+                    bc.set_symbol(" ");
+                    bc.set_style(Style::default().bg(panel_bg));
+                }
+            }
+            if let Some(bc) = buf.cell_mut(Position::new(SIDEBAR_W, y)) {
+                bc.set_symbol("│");
+                bc.set_style(Style::default().fg(Color::DarkGray).bg(panel_bg));
+            }
+        }
+
+        let put = |buf: &mut ratatui::buffer::Buffer, y: u16, s: &str, style: Style| {
+            for (i, ch) in s.chars().take(SIDEBAR_W as usize).enumerate() {
+                if let Some(bc) = buf.cell_mut(Position::new(i as u16, y)) {
+                    let mut sb = [0u8; 4];
+                    bc.set_symbol(ch.encode_utf8(&mut sb));
+                    bc.set_style(style);
+                }
+            }
+        };
+
+        put(
+            buf,
+            0,
+            &format!(" PANES ({})", order.len()),
+            Style::default()
+                .fg(Color::Cyan)
+                .bg(panel_bg)
+                .add_modifier(Modifier::BOLD),
+        );
+        for (i, pane) in order.iter().enumerate() {
+            let y = i as u16 + 1;
+            if y >= h {
+                break;
+            }
+            let is_focus = focused.as_ref() == Some(pane);
+            let marker = if is_focus { "▸" } else { " " };
+            let row = format!(" {marker}{i} {}", self.pane_label(i));
+            let style = if is_focus {
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(48, 52, 66))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray).bg(panel_bg)
+            };
+            put(buf, y, &row, style);
+        }
+    }
+
+    /// Centered `Ctrl-f` switcher over the panes: a bordered box listing panes with
+    /// a selection cursor.
+    fn render_popup(&self, frame: &mut Frame) {
+        let Some(sel) = self.popup else { return };
+        let area = frame.area();
+        let order = self.pane_order();
+
+        // Clamp bounds so `min <= max` even on tiny/narrow terminals (the popup
+        // is the narrow/mobile fallback, so it must never panic there).
+        let maxw = area.width.saturating_sub(2).max(1);
+        let w = (area.width / 2).clamp(24.min(maxw), maxw);
+        let maxh = area.height.saturating_sub(2).max(1);
+        let h = ((area.height as u32 * 3 / 5) as u16).clamp(5.min(maxh), maxh);
+        let x0 = (area.width.saturating_sub(w)) / 2;
+        let y0 = (area.height.saturating_sub(h)) / 2;
+        let bg = Color::Rgb(20, 22, 30);
+        let border = Style::default().fg(Color::Cyan).bg(bg);
+        let buf = frame.buffer_mut();
+
+        // Box background + border.
+        for y in y0..(y0 + h).min(area.height) {
+            for x in x0..(x0 + w).min(area.width) {
+                let sym = if y == y0 && x == x0 {
+                    "┌"
+                } else if y == y0 && x == x0 + w - 1 {
+                    "┐"
+                } else if y == y0 + h - 1 && x == x0 {
+                    "└"
+                } else if y == y0 + h - 1 && x == x0 + w - 1 {
+                    "┘"
+                } else if y == y0 || y == y0 + h - 1 {
+                    "─"
+                } else if x == x0 || x == x0 + w - 1 {
+                    "│"
+                } else {
+                    " "
+                };
+                if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
+                    bc.set_symbol(sym);
+                    bc.set_skip(false);
+                    let edge = y == y0 || y == y0 + h - 1 || x == x0 || x == x0 + w - 1;
+                    bc.set_style(if edge {
+                        border
+                    } else {
+                        Style::default().bg(bg)
+                    });
+                }
+            }
+        }
+
+        let put =
+            |buf: &mut ratatui::buffer::Buffer, y: u16, x: u16, maxw: u16, s: &str, st: Style| {
+                for (i, ch) in s.chars().take(maxw as usize).enumerate() {
+                    if let Some(bc) = buf.cell_mut(Position::new(x + i as u16, y)) {
+                        let mut sb = [0u8; 4];
+                        bc.set_symbol(ch.encode_utf8(&mut sb));
+                        // Clear any wide-char skip flag inherited from the pane cell
+                        // underneath, or buffer-diffing omits the overlay cell.
+                        bc.set_skip(false);
+                        bc.set_style(st);
+                    }
+                }
+            };
+
+        // Title in the top border.
+        put(
+            buf,
+            y0,
+            x0 + 2,
+            w.saturating_sub(4),
+            " switch pane ",
+            Style::default()
+                .fg(Color::Cyan)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        );
+
+        let inner_x = x0 + 2;
+        let inner_w = w.saturating_sub(4);
+        for (i, _pane) in order.iter().enumerate() {
+            let y = y0 + 1 + i as u16;
+            if y >= y0 + h - 1 {
+                break;
+            }
+            let selected = i == sel;
+            let row = format!(
+                "{} {i}  {}",
+                if selected { "▸" } else { " " },
+                self.pane_label(i)
+            );
+            let st = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray).bg(bg)
+            };
+            // pad the selected row across the inner width so the highlight is a full bar
+            let padded = format!("{row:<width$}", width = inner_w as usize);
+            put(buf, y, inner_x, inner_w, &padded, st);
         }
     }
 }
@@ -485,6 +773,9 @@ pub fn run() -> io::Result<()> {
         if app.reap_exited() {
             break;
         }
+        // A pane may have exited while the popup was open — keep its selection
+        // index valid (or close it) so it never points past the pane list.
+        app.reconcile_popup();
 
         terminal.draw(|frame| app.render(frame))?;
 
@@ -497,13 +788,25 @@ pub fn run() -> io::Result<()> {
         loop {
             match event::read()? {
                 CEvent::Key(k) if k.kind != KeyEventKind::Release => {
-                    if prefix {
+                    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                    if app.popup.is_some() {
+                        // The switcher captures all input while open.
+                        match k.code {
+                            KeyCode::Char('j') | KeyCode::Down => app.popup_move(1),
+                            KeyCode::Char('k') | KeyCode::Up => app.popup_move(-1),
+                            KeyCode::Enter => app.popup_select(),
+                            KeyCode::Esc | KeyCode::Char('\u{6}') => app.popup = None,
+                            KeyCode::Char('f') if ctrl => app.popup = None,
+                            _ => {}
+                        }
+                    } else if prefix {
                         prefix = false;
                         match k.code {
                             KeyCode::Char('%') => app.split(Dir::Right),
                             KeyCode::Char('"') => app.split(Dir::Down),
                             KeyCode::Char('o') => app.focus_next(),
                             KeyCode::Char('x') => app.close_focused(),
+                            KeyCode::Char('s') => app.toggle_sidebar(),
                             KeyCode::Char('q') => break 'main,
                             KeyCode::Left => app.focus_dir(FocusDir::Left),
                             KeyCode::Right => app.focus_dir(FocusDir::Right),
@@ -512,13 +815,16 @@ pub fn run() -> io::Result<()> {
                             _ => {}
                         }
                     } else {
-                        // Ctrl-b enters prefix mode. Depending on the terminal /
-                        // keyboard protocol, crossterm delivers it as `Char('b')`
-                        // with CONTROL, or as the raw control byte `Char('\u{2}')`.
+                        // `Ctrl-f` opens the switcher popup (matches the owner's tmux
+                        // binding). `Ctrl-b` enters prefix mode. Both may arrive as a
+                        // raw control byte (`\u{6}`/`\u{2}`) or `Char(_)`+CONTROL.
+                        let is_popup_key = matches!(k.code, KeyCode::Char('\u{6}'))
+                            || (k.code == KeyCode::Char('f') && ctrl);
                         let is_prefix_key = matches!(k.code, KeyCode::Char('\u{2}'))
-                            || (k.code == KeyCode::Char('b')
-                                && k.modifiers.contains(KeyModifiers::CONTROL));
-                        if is_prefix_key {
+                            || (k.code == KeyCode::Char('b') && ctrl);
+                        if is_popup_key {
+                            app.open_popup();
+                        } else if is_prefix_key {
                             prefix = true;
                         } else if let Some(bytes) = key_to_bytes(k.code, k.modifiers) {
                             app.input_focused(&bytes);
