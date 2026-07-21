@@ -9,6 +9,12 @@ repository.workspace = true
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+alacritty_terminal = "0.26"
+ratatui = "0.29"
+
+[[bin]]
+name = "copad-mux"
+path = "src/bin/copad-mux.rs"
 
 [dev-dependencies]
 proptest = "1"

@@ -12,6 +12,8 @@
 
 pub mod model;
 pub mod state;
+pub mod term;
+pub mod tui;
 
 pub use model::{
     AgentState, ClientId, Dir, PaneId, Rect, Role, SplitTree, Tab, TabId, Terminal, TerminalId,
