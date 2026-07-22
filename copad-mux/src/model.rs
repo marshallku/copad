@@ -233,6 +233,44 @@ impl SplitTree {
         matches!(self, SplitTree::Leaf { .. })
     }
 
+    /// Nudge the divider of the DEEPEST ancestor branch on `axis` that contains
+    /// `pane`, growing (or shrinking) `pane`'s share by `step` (a 0..1 fraction of
+    /// that branch's extent). Returns false if no such branch exists (e.g. a single
+    /// pane, or no split on that axis). The ratio is clamped to `[0.05, 0.95]` so
+    /// geometry still conserves (G2).
+    pub fn resize(&mut self, pane: &PaneId, axis: Dir, grow: bool, step: f32) -> bool {
+        let SplitTree::Branch {
+            dir,
+            ratio,
+            first,
+            second,
+        } = self
+        else {
+            return false;
+        };
+        // Deepest-first: let a nested branch on this axis handle it before we do.
+        if first.resize(pane, axis, grow, step) || second.resize(pane, axis, grow, step) {
+            return true;
+        }
+        if *dir == axis {
+            let in_first = first.contains(pane);
+            let in_second = second.contains(pane);
+            if in_first || in_second {
+                // `ratio` is first's share. Growing the side holding `pane` means
+                // +step when it's `first`, -step when it's `second`.
+                let delta = if in_first == grow { step } else { -step };
+                let new = (*ratio + delta).clamp(0.05, 0.95);
+                // Already at the clamp boundary → no real change (don't churn revs).
+                if (new - *ratio).abs() <= f32::EPSILON {
+                    return false;
+                }
+                *ratio = new;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Split an extent (cols for `Right`, rows for `Down`) into
     /// `(first, second, divider)` such that `first + second + divider == extent`
     /// EXACTLY — cells are conserved with no over-allocation. The divider costs 1
@@ -461,6 +499,31 @@ mod tests {
         assert_eq!((b.y, b.rows), (0, 24));
         assert_eq!(b.x, a.cols + 1, "second pane sits after the 1-cell divider");
         assert_eq!(a.cols + 1 + b.cols, 80, "widths + divider tile the area");
+    }
+
+    #[test]
+    fn resize_nudges_the_nearest_axis_branch_and_conserves() {
+        // p0 | p1  (a horizontal / Right split)
+        let mut tree = SplitTree::Branch {
+            dir: Dir::Right,
+            ratio: 0.5,
+            first: Box::new(leaf("p0", "t0")),
+            second: Box::new(leaf("p1", "t1")),
+        };
+        // grow p0 (left pane) to the right → ratio increases
+        assert!(tree.resize(&PaneId::new("p0"), Dir::Right, true, 0.1));
+        let SplitTree::Branch { ratio, .. } = &tree else {
+            panic!()
+        };
+        assert!((*ratio - 0.6).abs() < 1e-4, "p0 grew: ratio 0.5→0.6");
+        // a vertical resize has no Down branch here → no-op
+        assert!(!tree.resize(&PaneId::new("p0"), Dir::Down, true, 0.1));
+        // geometry still conserves at the new ratio
+        let area = Rect {
+            cols: 100,
+            rows: 40,
+        };
+        assert_eq!(tree.footprint(area), area);
     }
 
     #[test]

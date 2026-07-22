@@ -371,6 +371,27 @@ impl App {
         self.sync_sizes();
     }
 
+    /// Grow/shrink the focused pane along an axis (`Right` = width, `Down` = height)
+    /// by nudging its split divider.
+    fn resize_focused(&mut self, axis: Dir, grow: bool) {
+        let Some(pane) = self.focused_pane() else {
+            return;
+        };
+        if self
+            .state
+            .apply(Command::ResizePane {
+                origin: Origin::Client(self.client),
+                workspace: self.ws.clone(),
+                pane,
+                axis,
+                grow,
+            })
+            .is_ok()
+        {
+            self.sync_sizes();
+        }
+    }
+
     fn close_focused(&mut self) {
         if let Some(pane) = self.focused_pane() {
             // The `x` key ignores a rejected close (e.g. the last pane stays;
@@ -650,6 +671,29 @@ impl App {
                     Resp::err("split failed (could not spawn a shell)")
                 }
             }
+            Req::ResizePane { index, dir } => {
+                let (axis, grow) = match dir.as_str() {
+                    "right" => (Dir::Right, true),
+                    "left" => (Dir::Right, false),
+                    "down" => (Dir::Down, true),
+                    "up" => (Dir::Down, false),
+                    other => return Resp::err(format!("bad dir '{other}' (left|right|up|down)")),
+                };
+                match self.pane_order().get(*index).cloned() {
+                    Some(pane) => {
+                        let _ = self.state.apply(Command::ResizePane {
+                            origin: Origin::Client(self.client),
+                            workspace: self.ws.clone(),
+                            pane,
+                            axis,
+                            grow,
+                        });
+                        self.sync_sizes();
+                        Resp::ok()
+                    }
+                    None => Resp::err(format!("no pane at index {index}")),
+                }
+            }
             Req::Focus { index } => match self.pane_order().get(*index).cloned() {
                 Some(pane) => {
                     let _ = self.state.apply(Command::FocusPane {
@@ -854,6 +898,11 @@ impl App {
                 KeyCode::Char('j') | KeyCode::Down => self.focus_dir(FocusDir::Down),
                 KeyCode::Char('k') | KeyCode::Up => self.focus_dir(FocusDir::Up),
                 KeyCode::Char('l') | KeyCode::Right => self.focus_dir(FocusDir::Right),
+                // pane resize — vim-uppercase `HJKL`: L/H widen/narrow, J/K taller/shorter
+                KeyCode::Char('L') => self.resize_focused(Dir::Right, true),
+                KeyCode::Char('H') => self.resize_focused(Dir::Right, false),
+                KeyCode::Char('J') => self.resize_focused(Dir::Down, true),
+                KeyCode::Char('K') => self.resize_focused(Dir::Down, false),
                 _ => {}
             }
             return KeyAction::Continue;

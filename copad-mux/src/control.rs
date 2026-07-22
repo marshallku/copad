@@ -19,6 +19,9 @@ pub enum Req {
     List,
     /// Split the focused pane. `dir` = `"right"` (side by side) | `"down"` (stacked).
     Split { dir: String },
+    /// Grow the pane at `index` toward `dir` (`left`/`right`/`up`/`down`) by nudging
+    /// its split divider.
+    ResizePane { index: usize, dir: String },
     /// Focus the pane at `index` (as printed by `list`).
     Focus { index: usize },
     /// Close the pane at `index`.
@@ -186,7 +189,7 @@ pub fn run_client(args: &[String]) -> i32 {
     }
     let Some(cmd) = rest.first().map(|s| s.as_str()) else {
         eprintln!(
-            "usage: copad-mux ctl <list|split|focus|close|send|list-tabs|new-tab|select-tab|\
+            "usage: copad-mux ctl <list|split|resize|focus|close|send|list-tabs|new-tab|select-tab|\
              list-sessions|new-session|select-session|kill-server> [args]"
         );
         return 2;
@@ -232,6 +235,18 @@ pub fn run_client(args: &[String]) -> i32 {
                 Req::Focus { index: idx }
             } else {
                 Req::Close { index: idx }
+            }
+        }
+        "resize" => {
+            let idx = rest.get(1).and_then(|s| s.parse::<usize>().ok());
+            let dir = rest.get(2).map(|s| s.as_str());
+            let (Some(idx), Some(dir)) = (idx, dir) else {
+                eprintln!("usage: copad-mux ctl resize <index> <left|right|up|down>");
+                return 2;
+            };
+            Req::ResizePane {
+                index: idx,
+                dir: dir.to_string(),
             }
         }
         "send" | "send-keys" => {

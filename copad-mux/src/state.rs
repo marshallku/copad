@@ -90,6 +90,16 @@ pub enum Command {
         workspace: WorkspaceId,
         tab: TabId,
     },
+    /// Nudge the split divider so the focused `pane` grows/shrinks along `axis`
+    /// (`Right` = width, `Down` = height). Controller/API only. No-op if there is no
+    /// split on that axis around the pane.
+    ResizePane {
+        origin: Origin,
+        workspace: WorkspaceId,
+        pane: PaneId,
+        axis: Dir,
+        grow: bool,
+    },
 }
 
 /// A terminal's derived geometry + its new revision, carried in `Resized` so a
@@ -400,6 +410,13 @@ impl State {
                 workspace,
                 tab,
             } => self.close_tab(origin, workspace, tab),
+            Command::ResizePane {
+                origin,
+                workspace,
+                pane,
+                axis,
+                grow,
+            } => self.resize_pane(origin, workspace, pane, axis, grow),
         }
     }
 
@@ -917,6 +934,46 @@ impl State {
                 workspace_rev: ws_rev,
             },
         ])
+    }
+
+    fn resize_pane(
+        &mut self,
+        origin: Origin,
+        workspace: WorkspaceId,
+        pane: PaneId,
+        axis: Dir,
+        grow: bool,
+    ) -> Result<Vec<Event>, MuxError> {
+        self.authorize_mutation(&origin, &workspace)?;
+        let idx = self.ws_index(&workspace)?;
+        let tab_id = self.workspaces[idx]
+            .tab_of_pane(&pane)
+            .map(|t| t.id.clone())
+            .ok_or(MuxError::NoSuchPane)?;
+        // ~4% of the branch extent per press (repeatable), clamped inside resize().
+        const STEP: f32 = 0.04;
+        let tab = self.workspaces[idx].tab_mut(&tab_id).unwrap();
+        let changed = tab.layout.resize(&pane, axis, grow, STEP);
+        if !changed {
+            return Ok(vec![]); // no split on that axis — nothing to do
+        }
+        tab.rev += 1;
+        self.workspaces[idx].rev += 1;
+        let ws_rev = self.workspaces[idx].rev;
+        let mut evs = Vec::new();
+        // A ratio change redistributes sizes within the current viewport.
+        if self.workspaces[idx].active_tab == tab_id {
+            let terms = self.recompute_sizes(idx);
+            let vp = self.workspaces[idx].viewport;
+            evs.push(Event::Resized {
+                workspace,
+                cols: vp.cols,
+                rows: vp.rows,
+                terminals: terms,
+                workspace_rev: ws_rev,
+            });
+        }
+        Ok(evs)
     }
 
     fn require_controller_of_attached(&self, client: ClientId) -> Result<WorkspaceId, MuxError> {
