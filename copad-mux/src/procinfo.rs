@@ -65,7 +65,7 @@ pub enum Kind {
 }
 
 /// A pane's foreground command + its classification.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Label {
     pub text: String,
     pub kind: Kind,

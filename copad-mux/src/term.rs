@@ -66,6 +66,10 @@ pub struct Snapshot {
 struct MuxListener {
     sender: Arc<std::sync::Mutex<Option<EventLoopSender>>>,
     child_exited: Arc<AtomicBool>,
+    /// Set whenever the terminal's visible state changed (alacritty `Wakeup`, or a
+    /// query reply that writes back). The render loop reads+clears it via
+    /// [`PaneTerm::take_dirty`] to skip composing frames when nothing changed.
+    dirty: Arc<AtomicBool>,
 }
 
 impl MuxListener {
@@ -73,6 +77,8 @@ impl MuxListener {
         Self {
             sender: Arc::new(std::sync::Mutex::new(None)),
             child_exited: Arc::new(AtomicBool::new(false)),
+            // Start dirty so the very first frame is composed.
+            dirty: Arc::new(AtomicBool::new(true)),
         }
     }
     fn set_sender(&self, s: EventLoopSender) {
@@ -83,7 +89,12 @@ impl MuxListener {
 impl EventListener for MuxListener {
     fn send_event(&self, event: Event) {
         match event {
+            // The terminal processed output and wants a redraw — mark this pane dirty.
+            Event::Wakeup => {
+                self.dirty.store(true, Ordering::Relaxed);
+            }
             Event::PtyWrite(reply) => {
+                self.dirty.store(true, Ordering::Relaxed);
                 if let Some(s) = self.sender.lock().unwrap().as_ref() {
                     let _ = s.send(Msg::Input(reply.into_bytes().into()));
                 }
@@ -228,6 +239,7 @@ impl PaneTerm {
         self.term
             .lock()
             .resize(TermSize::new(cols as usize, rows as usize));
+        self.mark_dirty(); // a reflow changes the visible grid but may not Wakeup
     }
 
     /// Has the child shell exited?
@@ -235,17 +247,31 @@ impl PaneTerm {
         self.listener.child_exited.load(Ordering::Relaxed)
     }
 
+    /// Read AND clear this pane's dirty flag (set by the io-thread on any screen change).
+    /// The render loop ORs this across panes to decide whether a frame needs composing.
+    pub fn take_dirty(&self) -> bool {
+        self.listener.dirty.swap(false, Ordering::Relaxed)
+    }
+
+    /// Force this pane dirty (e.g. after a resize/scroll that changes what's visible but
+    /// may not emit a `Wakeup`).
+    pub fn mark_dirty(&self) {
+        self.listener.dirty.store(true, Ordering::Relaxed);
+    }
+
     /// Scroll the viewport through scrollback: positive `lines` = UP (older),
     /// negative = DOWN (newer). `snapshot` then renders at the new offset.
     pub fn scroll(&self, lines: i32) {
         if lines != 0 {
             self.term.lock().scroll_display(Scroll::Delta(lines));
+            self.mark_dirty();
         }
     }
 
     /// Jump the viewport back to the live bottom (offset 0).
     pub fn scroll_to_bottom(&self) {
         self.term.lock().scroll_display(Scroll::Bottom);
+        self.mark_dirty();
     }
 
     /// How many lines the viewport is scrolled up from the live bottom (0 = live).

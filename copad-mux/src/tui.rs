@@ -1480,7 +1480,10 @@ impl App {
     /// Keep the popup selection within the current pane list (or close the popup
     /// if no panes remain). Called each frame so an async pane exit can't leave a
     /// stale selection index.
-    pub fn reconcile_popup(&mut self) {
+    /// Keep the popup selection valid as panes come/go. Returns whether it changed the
+    /// selection (so the render loop repaints the switcher).
+    pub fn reconcile_popup(&mut self) -> bool {
+        let before = self.popup;
         if let Some(sel) = self.popup {
             let n = self.pane_order().len();
             if n == 0 {
@@ -1489,6 +1492,7 @@ impl App {
                 self.popup = Some(n - 1);
             }
         }
+        before != self.popup
     }
 
     /// Move the popup selection by `delta`, wrapping.
@@ -1523,13 +1527,15 @@ impl App {
 
     /// Keep the center selection valid as notifications arrive/dismiss (called each
     /// frame). Stays open (empty state) when the log is empty.
-    pub fn reconcile_center(&mut self) {
+    pub fn reconcile_center(&mut self) -> bool {
+        let before = self.center;
         if let Some(sel) = self.center {
             let n = self.notifications.len();
             if n > 0 && sel >= n {
                 self.center = Some(n - 1);
             }
         }
+        before != self.center
     }
 
     fn center_move(&mut self, delta: i32) {
@@ -1580,6 +1586,9 @@ impl App {
     /// Close panes whose shell has exited (in ANY tab). Returns true if the app is
     /// now empty (last pane of the last tab exited → quit). A tab whose last pane
     /// exits is closed whole; other tabs keep running in the background.
+    /// Reap any exited shells, collapsing panes/tabs/sessions as needed. Returns
+    /// whether it CHANGED visible state (so the render loop repaints the removed pane);
+    /// the caller checks [`is_empty`](Self::is_empty) separately to decide whether to quit.
     pub fn reap_exited(&mut self) -> bool {
         let exited: Vec<TerminalId> = self
             .panes
@@ -1590,7 +1599,7 @@ impl App {
         // Fast path: nothing exited this tick — don't reflow (which would bump the
         // workspace rev + resize every PTY) on every idle main-loop iteration.
         if exited.is_empty() {
-            return self.is_empty();
+            return false;
         }
         for term in exited {
             let Some((wid, tab_id, pane)) = self.locate_terminal(&term) else {
@@ -1684,7 +1693,7 @@ impl App {
         }
         // Reaping may have closed a tab or session (changing chrome) → re-derive.
         self.reflow();
-        self.is_empty()
+        true
     }
 
     // --- render ---
@@ -1838,17 +1847,42 @@ impl App {
 
     /// Refresh foreground-process labels at most ~2 Hz (throttled internally), so
     /// the server loop can call it every tick without hammering `ps`.
-    pub fn maybe_refresh_labels(&mut self) {
+    /// Read+clear the dirty flag of EVERY hosted pane (must drain all, not short-circuit,
+    /// so no pane's pending change is lost), returning whether any pane's screen changed
+    /// since the last frame. The render loop ORs this into its dirty decision.
+    pub fn drain_pane_dirty(&self) -> bool {
+        let mut dirty = false;
+        for pt in self.panes.values() {
+            if pt.take_dirty() {
+                dirty = true;
+            }
+        }
+        dirty
+    }
+
+    /// Wall-clock minute-of-day (`hour*60 + minute`), for the render loop to force a
+    /// repaint when the status-bar `HH:MM` rolls over while otherwise idle.
+    pub fn clock_minute(&self) -> u32 {
+        local_minute()
+    }
+
+    /// Returns whether any chrome-affecting data (labels / agent statuses / branches)
+    /// actually CHANGED, so the render loop only recomposes when the sidebar/status bar
+    /// would differ (throttled to ~2 Hz; unchanged refreshes are free of a repaint).
+    pub fn maybe_refresh_labels(&mut self) -> bool {
         if self.last_labels.elapsed() >= Duration::from_millis(500) {
-            self.refresh_labels();
-            self.refresh_agent_statuses();
-            self.refresh_branches();
+            let a = self.refresh_labels();
+            let b = self.refresh_agent_statuses();
+            let c = self.refresh_branches();
+            a || b || c
+        } else {
+            false
         }
     }
 
     /// Recompute each session's git branch from its focused pane's shell cwd (for the
     /// `spaces` subtitle). Rebuilt each pass so a `cd` out of a repo clears it.
-    fn refresh_branches(&mut self) {
+    fn refresh_branches(&mut self) -> bool {
         let mut next = HashMap::new();
         for wid in self.state.workspace_ids() {
             let branch = self
@@ -1864,13 +1898,15 @@ impl App {
                 next.insert(wid, branch);
             }
         }
+        let changed = next != self.branches;
         self.branches = next;
+        changed
     }
 
     /// Recompute each agent pane's status (working/ready/blocked/idle) from Claude's
     /// session file + a screen-text fallback (`agentstate`). Agent panes only; the map
     /// is rebuilt each pass so closed/reclassified panes drop out.
-    fn refresh_agent_statuses(&mut self) {
+    fn refresh_agent_statuses(&mut self) -> bool {
         use agentstate::AgentStatus;
         let mut next = HashMap::new();
         // Meaningful status TRANSITIONS to notify on (fired after the borrow ends).
@@ -1898,6 +1934,7 @@ impl App {
             }
             next.insert(tid.clone(), status);
         }
+        let changed = next != self.agent_statuses;
         self.agent_statuses = next;
 
         // Fire desktop toasts (best-effort, non-blocking) — the server does this, so
@@ -1935,6 +1972,7 @@ impl App {
         while self.notifications.len() > NOTIFY_LOG_CAP {
             self.notifications.pop_back();
         }
+        changed
     }
 
     /// Number of agent panes currently BLOCKED (awaiting input) — the status-bar
@@ -1957,7 +1995,7 @@ impl App {
     /// A one-line label for a pane row (index + short cwd basename if available).
     /// Refresh every pane's foreground-process label from a single `ps` sweep
     /// (throttled by the caller to ~2 Hz — never per frame).
-    fn refresh_labels(&mut self) {
+    fn refresh_labels(&mut self) -> bool {
         let tree = procinfo::ProcTree::snapshot();
         let mut next = HashMap::new();
         for (tid, pane) in &self.panes {
@@ -1972,8 +2010,10 @@ impl App {
                 next.insert(tid.clone(), label);
             }
         }
+        let changed = next != self.labels;
         self.labels = next;
         self.last_labels = std::time::Instant::now();
+        changed
     }
 
     /// The terminal id backing the pane at list index `idx`.
@@ -2799,6 +2839,22 @@ fn local_hhmm() -> String {
         return "--:--".to_string();
     }
     format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+}
+
+/// Local minute-of-day (`hour*60 + minute`), for the idle render loop to detect an
+/// `HH:MM` rollover. Falls back to a monotonic-ish value on error (never panics).
+fn local_minute() -> u32 {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `secs` is a valid time_t; `tm` is a zeroed, correctly-sized out-param.
+    let r = unsafe { libc::localtime_r(&secs as *const libc::time_t, &mut tm) };
+    if r.is_null() {
+        return (secs / 60) as u32;
+    }
+    (tm.tm_hour.max(0) as u32) * 60 + tm.tm_min.max(0) as u32
 }
 
 /// The short hostname (before the first dot) for the status bar.

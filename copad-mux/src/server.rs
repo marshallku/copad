@@ -30,9 +30,10 @@ use crate::control::{self, runtime_dir, socket_path};
 use crate::proto::{ClientMsg, FrameMsg, ServerMsg, WireCell};
 use crate::tui::{App, KeyAction};
 
-/// ~30 Hz frame cadence. The PTY runtime exposes no damage signal, so we render
-/// unconditionally on this tick and rely on the buffer diff to make idle output
-/// (an empty delta) free on the wire.
+/// ~30 Hz max frame cadence: the loop wakes at least this often to check for changes,
+/// but only COMPOSES a frame when a dirty signal fired since the last render (PTY
+/// `Wakeup`, input, chrome-data change, clock rollover) — an idle attached session
+/// composes nothing. The per-client buffer diff then keeps the wire delta minimal.
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
 /// A message funneled to the single-writer main loop from a connection thread.
@@ -69,8 +70,14 @@ struct Client {
     /// frame is actually enqueued, so a dropped (channel-full) frame re-diffs and
     /// catches up without desync.
     last: Buffer,
-    /// The next frame must be a `full` baseline repaint (set on attach + resize).
+    /// The next frame must be a `full` baseline repaint (set on attach + resize). MUST
+    /// be paired with `last = empty` so the diff yields every cell.
     needs_full: bool,
+    /// A frame was dropped under backpressure (bounded channel full) and NOT acked, so
+    /// this client is behind `last` and needs a re-send. Distinct from `needs_full`: the
+    /// resend is a normal delta vs the un-advanced `last` (not a full repaint), so it
+    /// must NOT wipe the client's buffer. Cleared on the next successful send.
+    pending: bool,
     /// The cursor position the client last received, so a cursor-only move (no cell
     /// change) still gets shipped instead of leaving a stale cursor.
     last_cursor: Option<(u16, u16)>,
@@ -161,18 +168,22 @@ pub fn run() -> io::Result<()> {
     let mut clients: Vec<Client> = Vec::new();
     let mut kill = false;
     let mut last_frame = Instant::now();
+    let mut last_min = app.clock_minute();
+    // Idle-skip: only compose+diff a frame when something that affects it changed since
+    // the last render (tmx-style). Start dirty so the first frame is always drawn.
+    let mut dirty = true;
 
     loop {
         match rx.recv_timeout(FRAME_INTERVAL) {
             Ok(msg) => {
-                handle_incoming(msg, &mut app, &mut clients, &mut kill);
+                dirty |= handle_incoming(msg, &mut app, &mut clients, &mut kill);
                 // Bound the drain so a key/ctl flood can't starve rendering, PTY
                 // reaping, or shutdown — fall back to the frame tick after a batch.
                 let mut budget = 256u32;
                 while budget > 0
                     && let Ok(m) = rx.try_recv()
                 {
-                    handle_incoming(m, &mut app, &mut clients, &mut kill);
+                    dirty |= handle_incoming(m, &mut app, &mut clients, &mut kill);
                     budget -= 1;
                 }
             }
@@ -184,15 +195,26 @@ pub fn run() -> io::Result<()> {
         }
         // The server itself quits only when the last shell exits (app empty) — NOT
         // when the last client detaches (the whole point of detach: shells live on).
-        if app.reap_exited() {
+        let reaped = app.reap_exited();
+        if app.is_empty() {
             break;
         }
-        app.reconcile_popup();
-        app.reconcile_center();
-        app.maybe_refresh_labels();
-        if last_frame.elapsed() >= FRAME_INTERVAL {
+        // Collect every dirty signal (err toward rendering; missing one shows stale).
+        dirty |= reaped; // a reaped pane changed the layout
+        dirty |= app.reconcile_popup();
+        dirty |= app.reconcile_center();
+        dirty |= app.maybe_refresh_labels(); // sidebar/status data actually changed
+        dirty |= app.drain_pane_dirty(); // any pane's screen advanced (PTY output)
+        let min = app.clock_minute();
+        dirty |= min != last_min; // status-bar HH:MM rolled over
+        // A frame dropped under backpressure (or a fresh attach) leaves the client
+        // behind; reschedule a render to catch it up.
+        dirty |= clients.iter().any(|c| c.needs_full || c.pending);
+        if dirty && last_frame.elapsed() >= FRAME_INTERVAL {
             last_frame = Instant::now();
+            last_min = min;
             push_frames(&mut app, &mut clients);
+            dirty = false;
         }
     }
 
@@ -403,17 +425,34 @@ fn detach_client(c: Client) {
     let _ = c.conn.shutdown(std::net::Shutdown::Both);
 }
 
-/// Apply one funneled message to the app / clients on the single-writer loop.
-fn handle_incoming(msg: Incoming, app: &mut App, clients: &mut Vec<Client>, kill: &mut bool) {
+/// Read-only control requests never change what's rendered, so they must NOT trigger a
+/// frame recompose (else a status-bar script polling `ctl list` would defeat idle-skip).
+fn ctl_mutates(req: &control::Req) -> bool {
+    !matches!(
+        req,
+        control::Req::List | control::Req::ListTabs | control::Req::ListSessions
+    )
+}
+
+/// Apply one funneled message to the app / clients on the single-writer loop. Returns
+/// whether it changed anything the render depends on (so the loop composes a frame).
+fn handle_incoming(
+    msg: Incoming,
+    app: &mut App,
+    clients: &mut Vec<Client>,
+    kill: &mut bool,
+) -> bool {
     match msg {
         Incoming::Ctl { req, reply } => {
             if matches!(req, control::Req::KillServer) {
                 *kill = true;
                 let _ = reply.send(control::Resp::ok());
-                return;
+                return false;
             }
+            let mutates = ctl_mutates(&req);
             let resp = app.handle_control(&req);
             let _ = reply.send(resp);
+            mutates
         }
         Incoming::Attach {
             id,
@@ -429,6 +468,7 @@ fn handle_incoming(msg: Incoming, app: &mut App, clients: &mut Vec<Client>, kill
                 conn,
                 last: Buffer::empty(RRect::new(0, 0, cols.max(1), rows.max(1))),
                 needs_full: true,
+                pending: false,
                 last_cursor: None,
                 prefix: false,
                 epoch: 0,
@@ -436,11 +476,12 @@ fn handle_incoming(msg: Incoming, app: &mut App, clients: &mut Vec<Client>, kill
                 rows,
             });
             recompute_viewport(app, clients);
+            true // a new client needs a (full) frame
         }
         Incoming::Client { id, msg } => {
             // Only accept from a currently-attached client (ignore stale ids).
             if !clients.iter().any(|c| c.id == id) {
-                return;
+                return false;
             }
             match msg {
                 ClientMsg::Key(k) => {
@@ -458,11 +499,13 @@ fn handle_incoming(msg: Incoming, app: &mut App, clients: &mut Vec<Client>, kill
                         detach_client(clients.remove(pos));
                         recompute_viewport(app, clients);
                     }
+                    true // a key may change any visible state
                 }
                 ClientMsg::Mouse { x, y, kind } => {
                     // Scroll the pane under the cursor / click-to-focus — shared, so
                     // any client's wheel drives the one composite.
                     app.mouse_at(x, y, kind);
+                    true
                 }
                 ClientMsg::Resize { cols, rows } => {
                     if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
@@ -470,14 +513,16 @@ fn handle_incoming(msg: Incoming, app: &mut App, clients: &mut Vec<Client>, kill
                         c.rows = rows;
                     }
                     recompute_viewport(app, clients);
+                    true
                 }
                 ClientMsg::Detach => {
                     if let Some(pos) = clients.iter().position(|c| c.id == id) {
                         detach_client(clients.remove(pos));
                         recompute_viewport(app, clients);
                     }
+                    true
                 }
-                ClientMsg::Attach { .. } => {}
+                ClientMsg::Attach { .. } => false,
             }
         }
         Incoming::Disconnect { id } => {
@@ -486,6 +531,7 @@ fn handle_incoming(msg: Incoming, app: &mut App, clients: &mut Vec<Client>, kill
                 clients.remove(pos);
                 recompute_viewport(app, clients);
             }
+            true
         }
     }
 }
@@ -538,10 +584,39 @@ fn push_frames(app: &mut App, clients: &mut [Client]) {
             Ok(()) => {
                 c.last = buf.clone();
                 c.needs_full = false;
+                c.pending = false;
                 c.last_cursor = cursor;
             }
-            Err(TrySendError::Full(_)) => {}
+            // Coalesced under backpressure: the client did NOT get this frame. Leave
+            // `last` un-advanced (so the next diff is the delta that catches it up) and
+            // just flag it pending so the main loop reschedules a render. Do NOT set
+            // needs_full — that would send a `full` frame carrying only a delta and wipe
+            // the client's buffer.
+            Err(TrySendError::Full(_)) => {
+                c.pending = true;
+            }
             Err(TrySendError::Disconnected(_)) => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ctl_mutates;
+    use crate::control::Req;
+
+    #[test]
+    fn read_only_ctl_requests_do_not_force_a_render() {
+        // Read-only queries must NOT dirty the frame (else `ctl list` polling defeats
+        // idle-skip). Everything that changes state must.
+        assert!(!ctl_mutates(&Req::List));
+        assert!(!ctl_mutates(&Req::ListTabs));
+        assert!(!ctl_mutates(&Req::ListSessions));
+        assert!(ctl_mutates(&Req::NewTab));
+        assert!(ctl_mutates(&Req::Split {
+            dir: "right".into()
+        }));
+        assert!(ctl_mutates(&Req::Focus { index: 0 }));
+        assert!(ctl_mutates(&Req::NewSession { name: None }));
     }
 }
