@@ -18,6 +18,7 @@ use ratatui::buffer::Buffer;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Position;
 use ratatui::style::{Color, Modifier, Style};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::control;
 use crate::model::{ClientId, Dir, PaneId, PaneRect, Rect, Role, TabId, TerminalId, WorkspaceId};
@@ -47,8 +48,20 @@ pub enum KeyAction {
 
 /// Lines scrolled per mouse-wheel notch.
 const SCROLL_STEP: i32 = 3;
+/// Height of the always-on bottom status bar (tmux-style).
+const STATUS_H: u16 = 1;
 /// Sidebar width in columns (a 1-col border is added to its right).
 const SIDEBAR_W: u16 = 24;
+
+// Catppuccin Mocha — the owner's tmux status palette (`~/dotfiles/tmux/.tmux.conf`).
+const CAT_BASE: Color = Color::Rgb(0x1e, 0x1e, 0x2e);
+const CAT_MAUVE: Color = Color::Rgb(0xcb, 0xa6, 0xf7);
+const CAT_SURFACE0: Color = Color::Rgb(0x31, 0x32, 0x44);
+const CAT_BLUE: Color = Color::Rgb(0x89, 0xb4, 0xfa);
+const CAT_YELLOW: Color = Color::Rgb(0xf9, 0xe2, 0xaf);
+const CAT_SUBTEXT: Color = Color::Rgb(0xba, 0xc2, 0xde);
+const CAT_OVERLAY: Color = Color::Rgb(0x6c, 0x70, 0x86);
+const CAT_GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
 /// Below this terminal width the sidebar is suppressed even when toggled on —
 /// the popup switcher is the fallback on narrow / mobile widths (size-adaptive).
 const SIDEBAR_MIN_COLS: u16 = 80;
@@ -205,20 +218,15 @@ impl App {
         })
     }
 
-    /// The tab bar occupies the top row only when there is more than one tab
-    /// (a single tab needs no chooser, so it keeps the full height).
-    fn tabbar_visible(&self) -> bool {
-        self.tab_count() > 1
-    }
-
-    /// Top y-offset of the pane grid (the tab bar reserves row 0 when visible).
+    /// Top y-offset of the pane grid. Tabs live in the bottom status bar now, so
+    /// there is no top bar — the grid starts at row 0.
     fn content_y(&self) -> u16 {
-        if self.tabbar_visible() { 1 } else { 0 }
+        0
     }
 
-    /// Height available to the pane grid, below the tab bar.
+    /// Height available to the pane grid, above the always-on bottom status bar.
     fn content_rows(&self) -> u16 {
-        self.rows.saturating_sub(self.content_y())
+        self.rows.saturating_sub(STATUS_H)
     }
 
     /// Placed rects for the active tab, tiling the content area (right of the
@@ -1353,12 +1361,12 @@ impl App {
             }
         }
         let content_x = self.content_x();
-        let content_y = self.content_y();
+        let content_rows = self.content_rows();
         for yy in 0..area.height {
             for xx in 0..area.width {
-                // The tab bar owns row 0 and the sidebar owns the left strip; don't
-                // paint dividers over either.
-                if yy < content_y || xx < content_x || covered[yy as usize][xx as usize] {
+                // The sidebar owns the left strip and the status bar owns the bottom
+                // row; don't paint dividers over either.
+                if yy >= content_rows || xx < content_x || covered[yy as usize][xx as usize] {
                     continue;
                 }
                 let left = xx > 0 && covered[yy as usize][(xx - 1) as usize];
@@ -1381,35 +1389,12 @@ impl App {
             self.render_sidebar(buf);
         }
 
-        // 4) the tab bar across the top row (over the sidebar's top too).
-        if self.tabbar_visible() {
-            self.render_tabbar(buf);
-        }
+        // 4) the always-on bottom status bar (session · tabs · scroll/agents/clock/host).
+        self.render_status_bar(buf);
 
         // 5) the Ctrl-f switcher popup, over everything.
         if self.popup.is_some() {
             self.render_popup(buf);
-        }
-
-        // 6) a scrollback-mode tag in the top-right.
-        if self.scroll_pane.is_some() {
-            let tag = " SCROLL  k/j · PgUp/Dn · g/G · q ";
-            let x0 = area.width.saturating_sub(tag.chars().count() as u16);
-            let st = Style::default()
-                .fg(Color::Black)
-                .bg(Color::Yellow)
-                .add_modifier(Modifier::BOLD);
-            for (i, ch) in tag.chars().enumerate() {
-                let x = x0 + i as u16;
-                if x < area.width
-                    && let Some(bc) = buf.cell_mut(Position::new(x, content_y))
-                {
-                    let mut sb = [0u8; 4];
-                    bc.set_symbol(ch.encode_utf8(&mut sb));
-                    bc.set_skip(false);
-                    bc.set_style(st);
-                }
-            }
         }
 
         // The shell cursor shows only when nothing modal is capturing input.
@@ -1621,57 +1606,147 @@ impl App {
         })
     }
 
-    /// Top-row tab bar: one 1-based chip per tab, active highlighted, with a `●`
-    /// flag on any tab that hosts an agent.
-    fn render_tabbar(&self, buf: &mut Buffer) {
+    /// Number of agent panes across the ACTIVE session (all its tabs).
+    fn active_session_agent_count(&self) -> usize {
+        let Some(w) = self.state.workspace(&self.ws) else {
+            return 0;
+        };
+        let mut n = 0;
+        for t in &w.tabs {
+            for p in t.layout.panes() {
+                let is_agent = t
+                    .layout
+                    .terminal_of(&p)
+                    .and_then(|tid| self.labels.get(tid))
+                    .map(|l| l.kind == procinfo::Kind::Agent)
+                    .unwrap_or(false);
+                if is_agent {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// The always-on bottom status bar (Catppuccin Mocha, matching the owner's tmux):
+    /// LEFT = session pill + tab chips (active highlighted, agent `●`); RIGHT =
+    /// scroll flag · agent count · clock · host.
+    fn render_status_bar(&self, buf: &mut Buffer) {
         let area = buf.area;
         let w = area.width;
-        let ids = self.tab_ids();
-        let active = self.active_tab_id();
-        let bg = Color::Rgb(20, 22, 30);
+        let y = area.height.saturating_sub(1);
 
-        // Clear row 0 (also lifts any wide-char skip flag left by a pane cell).
+        // Fill the row (also lifts any wide-char skip flag left by a pane cell).
         for x in 0..w {
-            if let Some(bc) = buf.cell_mut(Position::new(x, 0)) {
+            if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
                 bc.set_symbol(" ");
                 bc.set_skip(false);
-                bc.set_style(Style::default().bg(bg));
+                bc.set_style(Style::default().bg(CAT_BASE));
             }
         }
 
-        let mut x = 0u16;
-        let put = |buf: &mut ratatui::buffer::Buffer, s: &str, st: Style, x: &mut u16| {
+        // Display-width-aware: advance by each glyph's terminal width and mark the
+        // continuation cell of a wide (CJK/emoji) glyph, so a wide session name
+        // can't corrupt the chips to its right.
+        let put = |buf: &mut Buffer, x: &mut u16, s: &str, st: Style| {
             for ch in s.chars() {
-                if *x >= w {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+                if cw == 0 {
+                    continue;
+                }
+                if *x + cw > w {
                     break;
                 }
-                if let Some(bc) = buf.cell_mut(Position::new(*x, 0)) {
+                if let Some(bc) = buf.cell_mut(Position::new(*x, y)) {
                     let mut sb = [0u8; 4];
                     bc.set_symbol(ch.encode_utf8(&mut sb));
                     bc.set_skip(false);
                     bc.set_style(st);
                 }
-                *x += 1;
+                if cw == 2
+                    && let Some(bc) = buf.cell_mut(Position::new(*x + 1, y))
+                {
+                    bc.set_symbol(" ");
+                    bc.set_skip(true);
+                    bc.set_style(st);
+                }
+                *x += cw;
             }
         };
 
+        // LEFT: session pill + tab chips.
+        let mut x = 0u16;
+        let sname = self
+            .state
+            .workspace(&self.ws)
+            .and_then(|w| w.name.clone())
+            .unwrap_or_else(|| self.ws.to_string());
+        put(
+            buf,
+            &mut x,
+            &format!(" {sname} "),
+            Style::default()
+                .fg(CAT_BASE)
+                .bg(CAT_MAUVE)
+                .add_modifier(Modifier::BOLD),
+        );
+        put(buf, &mut x, " ", Style::default().bg(CAT_BASE));
+        let ids = self.tab_ids();
+        let active = self.active_tab_id();
         for (i, id) in ids.iter().enumerate() {
             let is_active = active.as_ref() == Some(id);
-            let dot = if self.tab_has_agent(id) { "●" } else { "" };
-            let label = format!(" {dot}{} ", i + 1);
-            let style = if is_active {
+            let agent = self.tab_has_agent(id);
+            let label = format!(" {}{} ", if agent { "●" } else { "" }, i + 1);
+            let st = if is_active {
                 Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
+                    .fg(CAT_BASE)
+                    .bg(CAT_MAUVE)
                     .add_modifier(Modifier::BOLD)
-            } else if !dot.is_empty() {
-                Style::default().fg(Color::Yellow).bg(bg)
+            } else if agent {
+                Style::default().fg(CAT_YELLOW).bg(CAT_BASE)
             } else {
-                Style::default().fg(Color::Gray).bg(bg)
+                Style::default().fg(CAT_OVERLAY).bg(CAT_BASE)
             };
-            put(buf, &label, style, &mut x);
-            // one-column gap between chips
-            put(buf, " ", Style::default().bg(bg), &mut x);
+            put(buf, &mut x, &label, st);
+        }
+
+        // RIGHT: scroll · agents · clock · host, right-aligned.
+        let mut segs: Vec<(String, Style)> = Vec::new();
+        if self.scroll_pane.is_some() {
+            segs.push((
+                " SCROLL ".to_string(),
+                Style::default()
+                    .fg(CAT_BASE)
+                    .bg(CAT_YELLOW)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        let agents = self.active_session_agent_count();
+        if agents > 0 {
+            segs.push((
+                format!(" ●{agents} "),
+                Style::default()
+                    .fg(CAT_GREEN)
+                    .bg(CAT_SURFACE0)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        segs.push((
+            format!(" {} ", local_hhmm()),
+            Style::default().fg(CAT_SUBTEXT).bg(CAT_SURFACE0),
+        ));
+        segs.push((
+            format!(" {} ", hostname()),
+            Style::default()
+                .fg(CAT_BASE)
+                .bg(CAT_BLUE)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let total: u16 = segs.iter().map(|(s, _)| s.width() as u16).sum();
+        // Don't overwrite the left cluster on a narrow bar.
+        let mut rx = w.saturating_sub(total).max(x);
+        for (s, st) in &segs {
+            put(buf, &mut rx, s, *st);
         }
     }
 
@@ -1797,6 +1872,34 @@ fn divider_touches(fr: &PaneRect, x: u16, y: u16) -> bool {
     let vert = in_y && (x + 1 == fr.x || x == fr.x + fr.cols);
     let horiz = in_x && (y + 1 == fr.y || y == fr.y + fr.rows);
     vert || horiz
+}
+
+/// Local `HH:MM` for the status-bar clock (via libc `localtime_r`, no chrono dep).
+fn local_hhmm() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: `secs` is a valid time_t; `tm` is a zeroed, correctly-sized out-param.
+    let r = unsafe { libc::localtime_r(&secs as *const libc::time_t, &mut tm) };
+    if r.is_null() {
+        return "--:--".to_string();
+    }
+    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
+}
+
+/// The short hostname (before the first dot) for the status bar.
+fn hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: writing at most `buf.len()` bytes into our own buffer.
+    let r = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+    if r != 0 {
+        return "host".to_string();
+    }
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    let full = String::from_utf8_lossy(&buf[..end]);
+    full.split('.').next().unwrap_or("host").to_string()
 }
 
 fn to_color(c: CellColor) -> Color {

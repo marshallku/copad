@@ -17,6 +17,8 @@ ratatui = { version = "0.29", features = ["serde"] }
 # to the exact version ratatui 0.29 re-exports so cargo unifies (no duplicate crate).
 crossterm = { version = "0.28.1", features = ["serde"] }
 libc = "0.2"
+# Display-width-aware status-bar text placement (already in-tree via ratatui).
+unicode-width = "0.2"
 
 [[bin]]
 name = "copad-mux"
