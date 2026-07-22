@@ -1021,10 +1021,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 Keybindings.dispatch(binding, registry: actionRegistry, socketPath: socketServer.path)
                 return nil
             }
-            // opt+1…9 / opt+0 jump tabs. Handled here, before the terminal sees
-            // the Option key, and only when that tab exists (else it falls
-            // through as a normal Option keystroke). User `[keybindings]` win.
-            if let idx = optionDigitTabIndex(event), let vc = tabVC, idx < vc.tabCount {
+            // cmd+shift+1…9 / cmd+shift+0 jump tabs. Bare Option is left for the
+            // terminal (opt+digit conflicts with tmux, which reads Meta+digit).
+            // Only fires when that tab exists (else it falls through as a normal
+            // keystroke). User `[keybindings]` win.
+            if let idx = commandShiftDigitTabIndex(event), let vc = tabVC, idx < vc.tabCount {
                 vc.switchTab(to: idx)
                 return nil
             }
@@ -1035,21 +1036,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Map a bare-Option digit event to a sub-tab index: opt+1…9 → 0…8,
-    /// opt+0 → 9 (the tenth). Returns nil unless Option is the ONLY modifier
-    /// (cmd/ctrl/shift-digit are left to menus / the responder chain).
-    private func optionDigitTabIndex(_ event: NSEvent) -> Int? {
+    /// Map a Cmd+Shift+digit event to a sub-tab index: cmd+shift+1…9 → 0…8,
+    /// cmd+shift+0 → 9 (the tenth). Returns nil unless Command+Shift are the ONLY
+    /// modifiers. Matched on keyCode, not character: Shift rewrites the digit's
+    /// character (Shift+1 → "!"), so `charactersIgnoringModifiers` can't be used.
+    private func commandShiftDigitTabIndex(_ event: NSEvent) -> Int? {
         let interesting: NSEvent.ModifierFlags = [.command, .control, .shift, .option]
-        guard event.modifierFlags.intersection(interesting) == [.option] else { return nil }
-        guard
-            let ch = event.charactersIgnoringModifiers,
-            ch.count == 1,
-            let digit = ch.first,
-            let n = digit.wholeNumberValue,
-            digit.isNumber
-        else { return nil }
-        return n == 0 ? 9 : n - 1
+        guard event.modifierFlags.intersection(interesting) == [.command, .shift] else { return nil }
+        guard let digit = Self.digitKeyCodeToValue[event.keyCode] else { return nil }
+        return digit == 0 ? 9 : digit - 1
     }
+
+    /// Layout-position keyCode → the digit it produces on the number row.
+    /// Derived from `Keybindings.nameToKeyCode` so a keyCode change flows through
+    /// both. Position-based, so it stays correct when Shift alters the character.
+    private static let digitKeyCodeToValue: [UInt16: Int] = {
+        var map: [UInt16: Int] = [:]
+        for n in 0...9 {
+            if let code = Keybindings.nameToKeyCode[String(n)] {
+                map[code] = n
+            }
+        }
+        return map
+    }()
 
     /// Cmd+Shift+P, mac convention (VSCode/Zed). User keybindings already
     /// run before this — a `cmd+shift+p` entry in `[keybindings]` shadows

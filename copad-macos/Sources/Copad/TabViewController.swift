@@ -64,9 +64,9 @@ final class TabViewController: NSViewController {
     /// AppDelegate, which owns the cockpit model. nil → placeholder terminal.
     var cockpitFactory: (() -> (any CopadPanel)?)?
 
-    /// Number of tabs. Exposed so the `opt+N` numeric jump only swallows the key
-    /// when that tab actually exists — otherwise `opt+5` with 3 tabs should fall
-    /// through to the terminal as a normal Option keystroke.
+    /// Number of tabs. Exposed so the `cmd+shift+N` numeric jump only swallows the
+    /// key when that tab actually exists — otherwise `cmd+shift+5` with 3 tabs
+    /// should fall through as a normal keystroke.
     var tabCount: Int { paneManagers.count }
 
     // Retained so new tabs inherit the current background state
