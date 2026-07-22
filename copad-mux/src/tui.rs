@@ -24,6 +24,7 @@ use crate::agentstate;
 use crate::control;
 use crate::gitinfo;
 use crate::model::{ClientId, Dir, PaneId, PaneRect, Rect, Role, TabId, TerminalId, WorkspaceId};
+use crate::notify;
 use crate::procinfo;
 use crate::proto::MouseKind;
 use crate::state::{Command, Event, MuxError, Origin, State};
@@ -616,6 +617,45 @@ impl App {
         self.switch_session(next);
     }
 
+    /// Jump to an agent pane that is BLOCKED (awaiting input) — switch to its session
+    /// and tab and focus it, cycling to the next blocked agent after the current focus
+    /// (the retired tmux `prefix+a` jump-to-attention).
+    fn jump_to_attention(&mut self) {
+        let mut blocked: Vec<TerminalId> = self
+            .agent_statuses
+            .iter()
+            .filter(|(_, s)| **s == agentstate::AgentStatus::Blocked)
+            .map(|(tid, _)| tid.clone())
+            .collect();
+        if blocked.is_empty() {
+            return;
+        }
+        blocked.sort_by_key(|t| t.to_string()); // stable order
+        // Cycle: the blocked agent immediately AFTER the current focus (wrapping), so
+        // repeated presses visit every one.
+        let cur = self.focused_terminal();
+        let target = match cur
+            .as_ref()
+            .and_then(|c| blocked.iter().position(|t| t == c))
+        {
+            Some(i) => blocked[(i + 1) % blocked.len()].clone(),
+            None => blocked[0].clone(),
+        };
+        if let Some((wid, tab, pane)) = self.locate_terminal(&target) {
+            self.switch_session(wid.clone());
+            let _ = self.state.apply(Command::SelectTab {
+                origin: Origin::Client(self.client),
+                workspace: wid,
+                tab,
+            });
+            let _ = self.state.apply(Command::FocusPane {
+                client: self.client,
+                pane,
+            });
+            self.reflow();
+        }
+    }
+
     /// Switch to the session at 0-based `index` (as listed by `list-sessions`).
     fn select_session_index(&mut self, index: usize) {
         if let Some(id) = self.session_ids().get(index).cloned() {
@@ -960,6 +1000,8 @@ impl App {
                 KeyCode::Char('C') => self.new_session(),
                 KeyCode::Char(')') => self.cycle_session(1),
                 KeyCode::Char('(') => self.cycle_session(-1),
+                // jump to the next agent awaiting input (attention)
+                KeyCode::Char('!') => self.jump_to_attention(),
                 // Detach — leave the server + shells running. Both `d` and `q`
                 // detach; NO key kills the server (that would drop every shell).
                 KeyCode::Char('d') | KeyCode::Char('q') => return KeyAction::Detach,
@@ -1470,7 +1512,10 @@ impl App {
     /// session file + a screen-text fallback (`agentstate`). Agent panes only; the map
     /// is rebuilt each pass so closed/reclassified panes drop out.
     fn refresh_agent_statuses(&mut self) {
+        use agentstate::AgentStatus;
         let mut next = HashMap::new();
+        // Meaningful status TRANSITIONS to notify on (fired after the borrow ends).
+        let mut events: Vec<(TerminalId, String, &'static str)> = Vec::new();
         for (tid, pane) in &self.panes {
             let Some(label) = self.labels.get(tid) else {
                 continue;
@@ -1479,9 +1524,46 @@ impl App {
                 continue;
             }
             let status = agentstate::resolve(Some(label.pid), &pane.snapshot());
+            let body = match (self.agent_statuses.get(tid).copied(), status) {
+                // turn just finished (was running, now parked at the prompt)
+                (Some(AgentStatus::Working), AgentStatus::Ready) => Some("turn finished"),
+                // just started blocking — only a real transition (require a KNOWN old
+                // status, so a server restart that first observes `Blocked` is silent).
+                (Some(old), AgentStatus::Blocked) if old != AgentStatus::Blocked => {
+                    Some("awaiting input")
+                }
+                _ => None,
+            };
+            if let Some(body) = body {
+                events.push((tid.clone(), label.text.clone(), body));
+            }
             next.insert(tid.clone(), status);
         }
         self.agent_statuses = next;
+
+        // Fire desktop toasts (best-effort, non-blocking) — the server does this, so
+        // they arrive even while detached. Replaces the retired `~/.claude` notify hooks.
+        for (tid, tool, body) in events {
+            let space = self
+                .locate_terminal(&tid)
+                .map(|(w, _, _)| {
+                    self.state
+                        .workspace(&w)
+                        .and_then(|ws| ws.name.clone())
+                        .unwrap_or_else(|| w.to_string())
+                })
+                .unwrap_or_default();
+            notify::desktop(&format!("{tool} · {space}"), body);
+        }
+    }
+
+    /// Number of agent panes currently BLOCKED (awaiting input) — the status-bar
+    /// attention count (`⚑N`), replacing the retired tmux `⚑N` chip.
+    fn attention_count(&self) -> usize {
+        self.agent_statuses
+            .values()
+            .filter(|s| **s == agentstate::AgentStatus::Blocked)
+            .count()
     }
 
     /// An agent pane's rolled-up status label for the sidebar (`idle` if unknown).
@@ -1844,8 +1926,18 @@ impl App {
             put(buf, &mut x, &label, st);
         }
 
-        // RIGHT: scroll · agents · clock · host, right-aligned.
+        // RIGHT: attention · scroll · agents · clock · host, right-aligned.
         let mut segs: Vec<(String, Style)> = Vec::new();
+        let attn = self.attention_count();
+        if attn > 0 {
+            segs.push((
+                format!(" ⚑{attn} "),
+                Style::default()
+                    .fg(CAT_BASE)
+                    .bg(CAT_PEACH)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if self.scroll_pane.is_some() {
             segs.push((
                 " SCROLL ".to_string(),

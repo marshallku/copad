@@ -15,6 +15,7 @@ pub mod client;
 pub mod control;
 pub mod gitinfo;
 pub mod model;
+pub mod notify;
 pub mod procinfo;
 pub mod proto;
 pub mod server;
