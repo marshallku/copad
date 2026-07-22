@@ -245,6 +245,13 @@ impl State {
     pub fn workspace(&self, id: &WorkspaceId) -> Option<&Workspace> {
         self.workspaces.iter().find(|w| &w.id == id)
     }
+    /// All workspace (session) ids in creation order.
+    pub fn workspace_ids(&self) -> Vec<WorkspaceId> {
+        self.workspaces.iter().map(|w| w.id.clone()).collect()
+    }
+    pub fn workspace_count(&self) -> usize {
+        self.workspaces.len()
+    }
     pub fn terminal(&self, id: &TerminalId) -> Option<&Terminal> {
         self.terminals.get(id)
     }
@@ -286,6 +293,30 @@ impl State {
             rev: 0,
         });
         (tab_id, pane, term)
+    }
+
+    /// Remove a whole workspace (session) and drop all its terminals + any client
+    /// attachments to it. Returns the removed terminal ids so the caller can reap
+    /// their PTYs, or `None` if it is the only workspace (refused — a mux always has
+    /// ≥1 session) or absent. (Server-level lifecycle; not a `Command`.)
+    pub fn remove_workspace(&mut self, id: &WorkspaceId) -> Option<Vec<TerminalId>> {
+        if self.workspaces.len() <= 1 {
+            return None;
+        }
+        let pos = self.workspaces.iter().position(|w| &w.id == id)?;
+        let ws = self.workspaces.remove(pos);
+        let mut terms = Vec::new();
+        for t in &ws.tabs {
+            for p in t.layout.panes() {
+                if let Some(tid) = t.layout.terminal_of(&p) {
+                    self.terminals.remove(tid);
+                    terms.push(tid.clone());
+                }
+            }
+        }
+        // Any client attached to the removed workspace is now detached.
+        self.clients.retain(|_, a| a.workspace != *id);
+        Some(terms)
     }
 
     fn mint_pane(&mut self) -> PaneId {
@@ -1586,6 +1617,29 @@ mod tests {
         assert_ne!(w.active_tab, new_tab, "active moved off the closed tab");
         assert!(s.terminal(&new_term).is_none(), "the tab's PTY is dropped");
         assert!(s.check_tree_consistency());
+    }
+
+    #[test]
+    fn remove_workspace_drops_terminals_and_refuses_the_last() {
+        let (mut s, ws, _p) = seed();
+        // a second session
+        let ws2 = WorkspaceId::new("w2");
+        let (_t, _p2, term2) = s.create_workspace(ws2.clone(), None, Rect { cols: 80, rows: 24 });
+        assert_eq!(s.workspace_count(), 2);
+        assert!(s.terminal(&term2).is_some());
+
+        let removed = s
+            .remove_workspace(&ws2)
+            .expect("second workspace removable");
+        assert!(removed.contains(&term2));
+        assert!(s.terminal(&term2).is_none(), "its PTY is dropped");
+        assert_eq!(s.workspace_count(), 1);
+        assert!(s.workspace(&ws2).is_none());
+        assert!(s.check_tree_consistency());
+
+        // the last remaining workspace cannot be removed
+        assert!(s.remove_workspace(&ws).is_none());
+        assert_eq!(s.workspace_count(), 1);
     }
 
     #[test]

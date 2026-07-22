@@ -31,6 +31,12 @@ pub enum Req {
     NewTab,
     /// Make the tab at `index` (as printed by `list-tabs`) active.
     SelectTab { index: usize },
+    /// List the sessions (workspaces).
+    ListSessions,
+    /// Create a new session and switch to it.
+    NewSession,
+    /// Make the session at `index` (as printed by `list-sessions`) active.
+    SelectSession { index: usize },
     /// Shut the persistent server down (drops every shell). The only key-free way to
     /// stop a detached server short of exiting its last shell.
     KillServer,
@@ -64,6 +70,20 @@ pub struct TabInfo {
     pub agents: usize,
 }
 
+/// One session (workspace) in a `list-sessions` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionInfo {
+    pub index: usize,
+    pub id: String,
+    pub active: bool,
+    /// Number of tabs in the session.
+    pub tabs: usize,
+    /// Number of panes across all its tabs.
+    pub panes: usize,
+    /// Number of those panes running a classified AI agent.
+    pub agents: usize,
+}
+
 /// A control response. `ok=false` carries `error`; `list` fills `panes`+`focused`;
 /// `list-tabs` fills `tabs`+`active_tab`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +99,10 @@ pub struct Resp {
     pub tabs: Option<Vec<TabInfo>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_tab: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sessions: Option<Vec<SessionInfo>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_session: Option<usize>,
 }
 
 impl Resp {
@@ -90,16 +114,15 @@ impl Resp {
             focused: None,
             tabs: None,
             active_tab: None,
+            sessions: None,
+            active_session: None,
         }
     }
     pub fn err(msg: impl Into<String>) -> Self {
         Self {
             ok: false,
             error: Some(msg.into()),
-            panes: None,
-            focused: None,
-            tabs: None,
-            active_tab: None,
+            ..Self::ok()
         }
     }
     pub fn list(panes: Vec<PaneInfo>, focused: usize) -> Self {
@@ -113,6 +136,13 @@ impl Resp {
         Self {
             tabs: Some(tabs),
             active_tab: Some(active_tab),
+            ..Self::ok()
+        }
+    }
+    pub fn session_list(sessions: Vec<SessionInfo>, active_session: usize) -> Self {
+        Self {
+            sessions: Some(sessions),
+            active_session: Some(active_session),
             ..Self::ok()
         }
     }
@@ -156,7 +186,8 @@ pub fn run_client(args: &[String]) -> i32 {
     }
     let Some(cmd) = rest.first().map(|s| s.as_str()) else {
         eprintln!(
-            "usage: copad-mux ctl <list|split|focus|close|send|list-tabs|new-tab|select-tab|kill-server> [args]"
+            "usage: copad-mux ctl <list|split|focus|close|send|list-tabs|new-tab|select-tab|\
+             list-sessions|new-session|select-session|kill-server> [args]"
         );
         return 2;
     };
@@ -166,6 +197,15 @@ pub fn run_client(args: &[String]) -> i32 {
         "kill-server" => Req::KillServer,
         "list-tabs" | "tabs" => Req::ListTabs,
         "new-tab" => Req::NewTab,
+        "list-sessions" | "sessions" => Req::ListSessions,
+        "new-session" => Req::NewSession,
+        "select-session" => {
+            let Some(idx) = rest.get(1).and_then(|s| s.parse::<usize>().ok()) else {
+                eprintln!("usage: copad-mux ctl select-session <index>");
+                return 2;
+            };
+            Req::SelectSession { index: idx }
+        }
         "select-tab" => {
             let Some(idx) = rest.get(1).and_then(|s| s.parse::<usize>().ok()) else {
                 eprintln!("usage: copad-mux ctl select-tab <index>");
@@ -297,6 +337,25 @@ fn print_human(req: &Req, resp: &Resp) {
                     t.id,
                     t.panes,
                     t.agents,
+                );
+            }
+        }
+        Req::ListSessions => {
+            let sessions = resp.sessions.clone().unwrap_or_default();
+            let active = resp.active_session.unwrap_or(usize::MAX);
+            println!(
+                "{:<3} {:<9} {:<16} {:<5} {:<6} AGENTS",
+                "IDX", "ACTIVE", "SESSION", "TABS", "PANES"
+            );
+            for s in &sessions {
+                println!(
+                    "{:<3} {:<9} {:<16} {:<5} {:<6} {}",
+                    s.index,
+                    if s.index == active { "*active" } else { "" },
+                    s.id,
+                    s.tabs,
+                    s.panes,
+                    s.agents,
                 );
             }
         }

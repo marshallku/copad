@@ -75,6 +75,9 @@ pub struct App {
     labels: HashMap<TerminalId, procinfo::Label>,
     /// When the labels were last refreshed (throttle `ps` to ~2 Hz).
     last_labels: std::time::Instant,
+    /// Monotonic counter for minting unique session (workspace) ids (`local` is the
+    /// first, so new sessions start at `s1`).
+    next_session: u64,
 }
 
 impl App {
@@ -112,6 +115,7 @@ impl App {
             last_labels: std::time::Instant::now()
                 .checked_sub(Duration::from_secs(60))
                 .unwrap_or_else(std::time::Instant::now),
+            next_session: 1,
         };
         app.reflow();
         Ok(app)
@@ -161,6 +165,39 @@ impl App {
 
     fn active_tab_id(&self) -> Option<TabId> {
         self.state.workspace(&self.ws).map(|w| w.active_tab.clone())
+    }
+
+    // --- sessions (workspaces) ---
+
+    fn session_ids(&self) -> Vec<WorkspaceId> {
+        self.state.workspace_ids()
+    }
+
+    fn session_count(&self) -> usize {
+        self.state.workspace_count()
+    }
+
+    fn active_session_index(&self) -> usize {
+        self.session_ids()
+            .iter()
+            .position(|w| w == &self.ws)
+            .unwrap_or(0)
+    }
+
+    /// Does session `wid` host any classified AI agent (across all its tabs)?
+    fn session_has_agent(&self, wid: &WorkspaceId) -> bool {
+        let Some(w) = self.state.workspace(wid) else {
+            return false;
+        };
+        w.tabs.iter().any(|t| {
+            t.layout.panes().iter().any(|p| {
+                t.layout
+                    .terminal_of(p)
+                    .and_then(|tid| self.labels.get(tid))
+                    .map(|l| l.kind == procinfo::Kind::Agent)
+                    .unwrap_or(false)
+            })
+        })
     }
 
     /// The tab bar occupies the top row only when there is more than one tab
@@ -236,6 +273,22 @@ impl App {
         for rect in self.layout() {
             if let Some(pt) = self.panes.get(&rect.terminal) {
                 pt.resize(rect.cols, rect.rows);
+            }
+        }
+    }
+
+    /// Apply any `Resized` geometry carried in `events` directly to the matching
+    /// PaneTerms. Needed for BACKGROUND sessions/tabs: `sync_sizes`/`reflow` only
+    /// touch the ACTIVE session's layout, but a reap in a background session
+    /// recomputes ITS surviving terminals (G3) — those PTYs must still be SIGWINCH'd.
+    fn apply_resized_events(&self, events: &[Event]) {
+        for e in events {
+            if let Event::Resized { terminals, .. } = e {
+                for tg in terminals {
+                    if let Some(pt) = self.panes.get(&tg.id) {
+                        pt.resize(tg.cols, tg.rows);
+                    }
+                }
             }
         }
     }
@@ -449,14 +502,91 @@ impl App {
         self.reflow();
     }
 
-    /// Locate a terminal's `(tab, pane)` across ALL tabs (not just the active one),
-    /// so a background tab's exited shell can be reaped correctly.
-    fn find_tab_pane_of_terminal(&self, term: &TerminalId) -> Option<(TabId, PaneId)> {
-        let w = self.state.workspace(&self.ws)?;
-        for t in &w.tabs {
-            for p in t.layout.panes() {
-                if t.layout.terminal_of(&p) == Some(term) {
-                    return Some((t.id.clone(), p));
+    /// Make `wid` the active session, re-attaching the local client as its controller
+    /// (takeover releases the previous session's lease → it freezes, G3; shells keep
+    /// running in the background). Reflows the new session to the current size.
+    fn switch_session(&mut self, wid: WorkspaceId) {
+        if self.ws == wid || self.state.workspace(&wid).is_none() {
+            return;
+        }
+        self.ws = wid.clone();
+        let cols = self.content_cols().max(1);
+        let rows = self.content_rows().max(1);
+        let _ = self.state.apply(Command::Attach {
+            client: self.client,
+            workspace: wid,
+            role: Role::Controller,
+            takeover: true,
+            cols,
+            rows,
+        });
+        self.sync_sizes();
+    }
+
+    /// Create a new session (a fresh single-pane workspace) and switch to it. Rolls
+    /// the session back if the PTY can't spawn (never leave a blank session).
+    fn new_session(&mut self) {
+        let n = self.next_session;
+        self.next_session += 1;
+        let id = WorkspaceId::new(format!("s{n}"));
+        let cols = self.content_cols().max(1);
+        let rows = self.content_rows().max(1);
+        let (_tab, _pane, term0) =
+            self.state
+                .create_workspace(id.clone(), None, Rect { cols, rows });
+        match PaneTerm::spawn_with_env(
+            self.cols.max(1),
+            self.rows.max(1),
+            None,
+            None,
+            &self.sock_env,
+        ) {
+            Some(pt) => {
+                self.panes.insert(term0, pt);
+                self.switch_session(id);
+            }
+            None => {
+                // Spawn failed — drop the just-created session so state never holds a
+                // session whose pane has no live terminal.
+                if let Some(terms) = self.state.remove_workspace(&id) {
+                    for t in &terms {
+                        self.panes.remove(t);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Switch to the next/previous session (wrapping): `+1` next, `-1` previous.
+    fn cycle_session(&mut self, delta: i32) {
+        let ids = self.session_ids();
+        if ids.len() < 2 {
+            return;
+        }
+        let cur = self.active_session_index();
+        let next = ids[(cur as i32 + delta).rem_euclid(ids.len() as i32) as usize].clone();
+        self.switch_session(next);
+    }
+
+    /// Switch to the session at 0-based `index` (as listed by `list-sessions`).
+    fn select_session_index(&mut self, index: usize) {
+        if let Some(id) = self.session_ids().get(index).cloned() {
+            self.switch_session(id);
+        }
+    }
+
+    /// Locate a terminal's `(workspace, tab, pane)` across ALL sessions and tabs (not
+    /// just the active one), so a background session's/tab's exited shell is reaped.
+    fn locate_terminal(&self, term: &TerminalId) -> Option<(WorkspaceId, TabId, PaneId)> {
+        for wid in self.state.workspace_ids() {
+            let Some(w) = self.state.workspace(&wid) else {
+                continue;
+            };
+            for t in &w.tabs {
+                for p in t.layout.panes() {
+                    if t.layout.terminal_of(&p) == Some(term) {
+                        return Some((wid.clone(), t.id.clone(), p));
+                    }
                 }
             }
         }
@@ -612,6 +742,65 @@ impl App {
                     Resp::err(format!("no tab at index {index}"))
                 }
             }
+            Req::ListSessions => {
+                let ids = self.session_ids();
+                let active_idx = self.active_session_index();
+                let infos = ids
+                    .iter()
+                    .enumerate()
+                    .map(|(i, wid)| {
+                        let (tabs, panes, agents) = self
+                            .state
+                            .workspace(wid)
+                            .map(|w| {
+                                let mut panes = 0usize;
+                                let mut agents = 0usize;
+                                for t in &w.tabs {
+                                    for p in t.layout.panes() {
+                                        panes += 1;
+                                        let is_agent = t
+                                            .layout
+                                            .terminal_of(&p)
+                                            .and_then(|tid| self.labels.get(tid))
+                                            .map(|l| l.kind == procinfo::Kind::Agent)
+                                            .unwrap_or(false);
+                                        if is_agent {
+                                            agents += 1;
+                                        }
+                                    }
+                                }
+                                (w.tabs.len(), panes, agents)
+                            })
+                            .unwrap_or((0, 0, 0));
+                        control::SessionInfo {
+                            index: i,
+                            id: wid.to_string(),
+                            active: i == active_idx,
+                            tabs,
+                            panes,
+                            agents,
+                        }
+                    })
+                    .collect();
+                Resp::session_list(infos, active_idx)
+            }
+            Req::NewSession => {
+                let before = self.session_count();
+                self.new_session();
+                if self.session_count() > before {
+                    Resp::ok()
+                } else {
+                    Resp::err("new-session failed (could not spawn a shell)")
+                }
+            }
+            Req::SelectSession { index } => {
+                if self.session_ids().get(*index).is_some() {
+                    self.select_session_index(*index);
+                    Resp::ok()
+                } else {
+                    Resp::err(format!("no session at index {index}"))
+                }
+            }
             // Intercepted by the server before it reaches here; answered ok for a
             // (hypothetical) direct call so the match stays exhaustive.
             Req::KillServer => Resp::ok(),
@@ -652,6 +841,10 @@ impl App {
                 KeyCode::Char('p') => self.cycle_tab(-1),
                 KeyCode::Char('&') => self.close_active_tab(),
                 KeyCode::Char(d @ '1'..='9') => self.select_tab_index(d as usize - '1' as usize),
+                // sessions (workspaces): `C` new, `)`/`(` next/prev (tmux-style)
+                KeyCode::Char('C') => self.new_session(),
+                KeyCode::Char(')') => self.cycle_session(1),
+                KeyCode::Char('(') => self.cycle_session(-1),
                 // Detach — leave the server + shells running. Both `d` and `q`
                 // detach; NO key kills the server (that would drop every shell).
                 KeyCode::Char('d') | KeyCode::Char('q') => return KeyAction::Detach,
@@ -834,22 +1027,31 @@ impl App {
             return self.is_empty();
         }
         for term in exited {
-            let Some((tab_id, pane)) = self.find_tab_pane_of_terminal(&term) else {
-                // No longer in any tab (already collapsed) — just drop the runtime.
+            let Some((wid, tab_id, pane)) = self.locate_terminal(&term) else {
+                // No longer in any session/tab (already collapsed) — drop the runtime.
                 self.panes.remove(&term);
                 continue;
             };
-            let tab_is_single = self
+            // Read the tab/session shape of the OWNING session (may be a background
+            // one), using Api-origin mutations since the client controls only the
+            // active session.
+            let (tab_is_single, ws_tab_count) = self
                 .state
-                .workspace(&self.ws)
-                .and_then(|w| w.tab(&tab_id))
-                .map(|t| t.layout.is_single_leaf())
-                .unwrap_or(true);
+                .workspace(&wid)
+                .map(|w| {
+                    let single = w
+                        .tab(&tab_id)
+                        .map(|t| t.layout.is_single_leaf())
+                        .unwrap_or(true);
+                    (single, w.tabs.len())
+                })
+                .unwrap_or((true, 0));
+
             if !tab_is_single {
                 // The tab has other panes — collapse just this one.
                 match self.state.apply(Command::ClosePane {
-                    origin: Origin::Client(self.client),
-                    workspace: self.ws.clone(),
+                    origin: Origin::Api,
+                    workspace: wid,
                     pane,
                     if_rev: None,
                 }) {
@@ -859,16 +1061,19 @@ impl App {
                                 self.panes.remove(terminal);
                             }
                         }
+                        // Reflow the OWNING session's survivors (works for background
+                        // sessions, which `reflow()` below would otherwise miss).
+                        self.apply_resized_events(&evs);
                     }
                     Err(_) => {
                         self.panes.remove(&term);
                     }
                 }
-            } else if self.tab_count() > 1 {
+            } else if ws_tab_count > 1 {
                 // Last pane of this tab, but other tabs survive — close the tab.
                 match self.state.apply(Command::CloseTab {
-                    origin: Origin::Client(self.client),
-                    workspace: self.ws.clone(),
+                    origin: Origin::Api,
+                    workspace: wid,
                     tab: tab_id,
                 }) {
                     Ok(evs) => {
@@ -879,18 +1084,39 @@ impl App {
                                 }
                             }
                         }
+                        // Reflow the owning session's now-active tab (background-safe).
+                        self.apply_resized_events(&evs);
                     }
                     Err(_) => {
                         self.panes.remove(&term);
                     }
                 }
+            } else if self.session_count() > 1 {
+                // Last pane of the last tab of a NON-last session — drop the whole
+                // session; if it was the active one, switch to another.
+                let was_active = self.ws == wid;
+                match self.state.remove_workspace(&wid) {
+                    Some(terms) => {
+                        for t in &terms {
+                            self.panes.remove(t);
+                        }
+                        if was_active
+                            && let Some(next) = self.state.workspace_ids().into_iter().next()
+                        {
+                            self.switch_session(next);
+                        }
+                    }
+                    None => {
+                        self.panes.remove(&term);
+                    }
+                }
             } else {
-                // Last pane of the last tab — its exit means "quit": drop it so the
-                // app becomes empty and the main loop terminates.
+                // Last pane / last tab / only session — its exit means "quit": drop it
+                // so the app becomes empty and the main loop terminates.
                 self.panes.remove(&term);
             }
         }
-        // Reaping may have closed a tab (hiding the tab bar) → re-derive viewport.
+        // Reaping may have closed a tab or session (changing chrome) → re-derive.
         self.reflow();
         self.is_empty()
     }
@@ -1114,17 +1340,64 @@ impl App {
 
         // Leave row 0 for the tab bar when it is showing.
         let cy = self.content_y();
+        let mut y = cy;
+
+        // SESSIONS — the herdr-style session list (the owner's "좌측 세션 목록").
+        let sids = self.session_ids();
+        let active_si = self.active_session_index();
         put(
             buf,
-            cy,
-            &format!(" PANES ({})", order.len()),
+            y,
+            &format!(" SESSIONS ({})", sids.len()),
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Magenta)
                 .bg(panel_bg)
                 .add_modifier(Modifier::BOLD),
         );
+        y += 1;
+        for (i, sid) in sids.iter().enumerate() {
+            if y >= h {
+                break;
+            }
+            let is_active = i == active_si;
+            let marker = if is_active { "▸" } else { " " };
+            let has_agent = self.session_has_agent(sid);
+            let dot = if has_agent { "●" } else { " " };
+            let name = self
+                .state
+                .workspace(sid)
+                .and_then(|w| w.name.clone())
+                .unwrap_or_else(|| sid.to_string());
+            let row = format!(" {marker}{i} {dot}{name}");
+            let style = if is_active {
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(48, 52, 66))
+                    .add_modifier(Modifier::BOLD)
+            } else if has_agent {
+                Style::default().fg(Color::Yellow).bg(panel_bg)
+            } else {
+                Style::default().fg(Color::Gray).bg(panel_bg)
+            };
+            put(buf, y, &row, style);
+            y += 1;
+        }
+        y += 1; // spacer between sections
+
+        // PANES — the active session's panes (focus-marked).
+        if y < h {
+            put(
+                buf,
+                y,
+                &format!(" PANES ({})", order.len()),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .bg(panel_bg)
+                    .add_modifier(Modifier::BOLD),
+            );
+            y += 1;
+        }
         for (i, pane) in order.iter().enumerate() {
-            let y = cy + 1 + i as u16;
             if y >= h {
                 break;
             }
@@ -1156,6 +1429,7 @@ impl App {
                 }
             };
             put(buf, y, &row, style);
+            y += 1;
         }
     }
 
