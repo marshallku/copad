@@ -1,0 +1,61 @@
+# copad-mux configuration — copy to ~/.config/copad/mux.toml and edit.
+#
+# EVERYTHING here is optional. An absent file, or any omitted key, uses the built-in
+# default (which reproduces copad-mux's out-of-the-box bindings). Bad values are warned
+# about on startup (foreground `copad-mux server`, or the client at attach) and fall
+# back to their default, so a typo never breaks the mux.
+#
+# Chord syntax (tmux-like): `C-` = Ctrl, `M-` = Alt/Meta (Option on macOS), `S-` = Shift.
+#   examples: "C-b", "M-1", "C-S-h", "%", "Left", "Enter", "X"
+# A letter's case implies Shift ("X" == "S-x"). `M-…` needs the terminal to send
+# Option/Alt as Meta (iTerm: Left Option = Esc+; ghostty: macos-option-as-alt = true).
+
+# ---- options ----
+prefix = "C-b"            # the prefix key (tmux default)
+mouse = true              # mouse: wheel-scroll, click-to-focus, click chrome to navigate
+notify = true             # agent turn-completion desktop toasts (env COPAD_MUX_NOTIFY wins)
+sidebar = true            # show the spaces+agents sidebar by default (Ctrl-b s toggles)
+sidebar_width = 24        # sidebar columns            (clamped to 8..80)
+sidebar_min_cols = 80     # hide the sidebar below this terminal width (>= width + 20)
+scroll_step = 3           # lines per mouse-wheel notch (1..50)
+
+# ---- prefix bindings (pressed AFTER the prefix) ----
+# Rebinding a key replaces that action's WHOLE default chord set. A value can be one
+# chord or a list. Any action you don't mention keeps its default.
+[keys]
+# split-right = "%"
+# split-down = "\""
+# new-tab = "c"
+# next-tab = "n"
+# prev-tab = "p"
+# close-tab = "&"
+# tab-1 = "1"   … tab-9 = "9"
+# new-session = "C"       # opens an inline name prompt
+# rename-session = "$"
+# kill-session = "X"      # y/n confirm
+# next-session = ")"
+# prev-session = "("
+# notification-center = "a"
+# jump-attention = "!"
+# detach = ["d", "q"]
+# close-pane = "x"
+# toggle-sidebar = "s"
+# scrollback = "["
+# focus-next = "o"
+# focus-left = ["h", "Left"]
+# focus-down = ["j", "Down"]
+# focus-up = ["k", "Up"]
+# focus-right = ["l", "Right"]
+# resize-left = "H"
+# resize-down = "J"
+# resize-up = "K"
+# resize-right = "L"
+
+# ---- prefix-less bindings (tmux `bind -n`) ----
+[global]
+# popup = "C-f"                       # the Ctrl-f pane switcher
+# tab-1 = "M-1"  … tab-9 = "M-9"      # Alt/Opt+number jump to a tab
+# focus-left = ["C-S-h", "C-S-Left"]
+# focus-down = ["C-S-j", "C-S-Down"]
+# focus-up = ["C-S-k", "C-S-Up"]
+# focus-right = ["C-S-l", "C-S-Right"]

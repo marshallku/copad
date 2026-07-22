@@ -9,6 +9,8 @@ repository.workspace = true
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# User config parsing (~/.config/copad/mux.toml).
+toml = "0.8"
 thiserror = "2"
 alacritty_terminal = "0.26"
 # serde feature: lets Color/Modifier cross the client render protocol wire.

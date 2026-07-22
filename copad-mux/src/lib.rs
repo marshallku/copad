@@ -12,6 +12,7 @@
 
 pub mod agentstate;
 pub mod client;
+pub mod config;
 pub mod control;
 pub mod gitinfo;
 pub mod model;

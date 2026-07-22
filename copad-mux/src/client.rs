@@ -27,30 +27,53 @@ use crate::control::socket_path;
 use crate::proto::{ClientMsg, MouseKind, ServerMsg};
 
 /// Restores the host terminal (raw mode off + leave alt screen) on drop — so a
-/// panic or an abrupt server exit never leaves the user's terminal wedged.
-struct TermGuard;
+/// panic or an abrupt server exit never leaves the user's terminal wedged. Mouse
+/// capture is enabled lazily via [`TermGuard::enable_mouse`] when the server's `Hello`
+/// says so (server-authoritative), and disabled on drop only if it was enabled.
+struct TermGuard {
+    mouse: bool,
+}
 
 impl TermGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        let guard = Self;
-        // Mouse capture drives scrollback (wheel) + click-to-focus. Trade-off: this
-        // takes over native selection; most terminals let you hold Shift to bypass.
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
-        Ok(guard)
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        Ok(Self { mouse: false })
+    }
+
+    /// Turn on mouse capture (wheel scrollback + click-to-focus/navigate). Trade-off:
+    /// takes over native selection; most terminals let you hold Shift to bypass. Called
+    /// once when the server's `Hello { mouse: true }` arrives.
+    fn enable_mouse(&mut self) -> io::Result<()> {
+        if !self.mouse {
+            execute!(io::stdout(), EnableMouseCapture)?;
+            self.mouse = true;
+        }
+        Ok(())
     }
 }
 
 impl Drop for TermGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        if self.mouse {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+        }
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
     }
 }
 
 /// Connect to the running server, spawning a detached one if none answers, then run
 /// the attach loop until detach / server exit.
 pub fn run() -> io::Result<()> {
+    // Print any config warnings NOW, before raw/alt-screen — an auto-spawned server's
+    // stderr is /dev/null, so this is the user's reliable view of config diagnostics.
+    // (The effective mouse setting is the SERVER's, delivered in its `Hello`; the client
+    // never applies its own local config to behavior — only surfaces its warnings.)
+    let (_cfg, warnings) = crate::config::MuxConfig::load();
+    for w in &warnings {
+        eprintln!("copad-mux config: {w}");
+    }
     let sock = socket_path();
     let stream = connect_or_spawn(&sock)?;
     run_attached(stream)
@@ -114,7 +137,7 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
         default_hook(info);
     }));
 
-    let _guard = TermGuard::enter()?;
+    let mut guard = TermGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal: Terminal<CrosstermBackend<Stdout>> = Terminal::new(backend)?;
     let size = terminal.size()?;
@@ -227,6 +250,13 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     cursor = f.cursor;
                     have_frame = true;
                     dirty = true;
+                }
+                Ok(ServerMsg::Hello { mouse }) => {
+                    // Server-authoritative: only now (not from local config) do we decide
+                    // whether to capture the mouse, so every client agrees with the server.
+                    if mouse {
+                        let _ = guard.enable_mouse();
+                    }
                 }
                 Ok(ServerMsg::Bye) => return Ok(()),
                 Err(TryRecvError::Empty) => break,

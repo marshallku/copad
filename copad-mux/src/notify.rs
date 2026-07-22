@@ -8,13 +8,23 @@
 
 use std::process::{Command, Stdio};
 
+/// The `COPAD_MUX_NOTIFY` override, if set to a RECOGNIZED value: `Some(false)` for
+/// `0`/`off`/`false`/`no`, `Some(true)` for `1`/`on`/`true`/`yes`, `None` otherwise (unset
+/// or unrecognized). The env value takes precedence over the config `notify` flag; when it
+/// is `None` the caller falls back to config (see `MuxConfig::notify`).
+pub fn env_override() -> Option<bool> {
+    match std::env::var("COPAD_MUX_NOTIFY").ok().as_deref() {
+        Some("0") | Some("off") | Some("false") | Some("no") => Some(false),
+        Some("1") | Some("on") | Some("true") | Some("yes") => Some(true),
+        _ => None,
+    }
+}
+
 /// Is desktop notification enabled? (Default on; the whole point is to replace the
-/// hook-based notifier.)
+/// hook-based notifier.) Env-only; config-aware callers compute
+/// `env_override().unwrap_or(cfg.notify)` and gate before calling [`desktop`].
 pub fn enabled() -> bool {
-    !matches!(
-        std::env::var("COPAD_MUX_NOTIFY").ok().as_deref(),
-        Some("0") | Some("off") | Some("false") | Some("no")
-    )
+    env_override().unwrap_or(true)
 }
 
 /// Spawn a command detached (stdio nulled) and REAP it in a short-lived thread so a

@@ -22,6 +22,7 @@ use ratatui::style::{Color, Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agentstate;
+use crate::config::{self, Action, MuxConfig};
 use crate::control;
 use crate::gitinfo;
 use crate::model::{ClientId, Dir, PaneId, PaneRect, Rect, Role, TabId, TerminalId, WorkspaceId};
@@ -93,6 +94,20 @@ struct Prompt {
     buf: String,
 }
 
+/// A pending destructive action awaiting a `y`/`n` confirmation (tmux `confirm-before`).
+/// The target is captured at open time so a focus/session change while the prompt is up
+/// can't retarget it (codex review).
+enum ConfirmAction {
+    /// Kill (remove) this workspace/session.
+    KillSession(WorkspaceId),
+}
+
+/// An open confirm modal: a message + the action to run on `y`.
+struct Confirm {
+    message: String,
+    action: ConfirmAction,
+}
+
 /// What feeding one key to the app implies for the caller (the server loop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyAction {
@@ -103,12 +118,8 @@ pub enum KeyAction {
     Detach,
 }
 
-/// Lines scrolled per mouse-wheel notch.
-const SCROLL_STEP: i32 = 3;
 /// Height of the always-on bottom status bar (tmux-style).
 const STATUS_H: u16 = 1;
-/// Sidebar width in columns (a 1-col border is added to its right).
-const SIDEBAR_W: u16 = 24;
 
 // Catppuccin Mocha — the owner's tmux status palette (`~/dotfiles/tmux/.tmux.conf`).
 const CAT_BASE: Color = Color::Rgb(0x1e, 0x1e, 0x2e);
@@ -121,9 +132,6 @@ const CAT_SUBTEXT: Color = Color::Rgb(0xba, 0xc2, 0xde);
 const CAT_OVERLAY: Color = Color::Rgb(0x6c, 0x70, 0x86);
 const CAT_GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
 const CAT_PEACH: Color = Color::Rgb(0xfa, 0xb3, 0x87);
-/// Below this terminal width the sidebar is suppressed even when toggled on —
-/// the popup switcher is the fallback on narrow / mobile widths (size-adaptive).
-const SIDEBAR_MIN_COLS: u16 = 80;
 
 /// The multi-pane application: the authoritative layout `State` + a live shell per
 /// terminal. The local TUI is the single controller client (`ClientId(0)`).
@@ -168,6 +176,10 @@ pub struct App {
     /// When `Some`, an inline text prompt (new-session name / rename) is open and
     /// captures keystrokes until Enter (commit) or Esc (cancel).
     prompt: Option<Prompt>,
+    /// When `Some`, a `y`/`n` confirm modal (e.g. kill-session) is open.
+    confirm: Option<Confirm>,
+    /// The effective user config (keybindings + options), loaded once at server start.
+    cfg: MuxConfig,
     /// Clickable chrome regions (tab chips, sidebar rows), rebuilt every render so
     /// `mouse_at` can hit-test a click on the status bar / sidebar. Interior mutability
     /// because rendering is `&self`; only ever touched on the single main-loop thread.
@@ -175,7 +187,12 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cols: u16, rows: u16, sock_env: Vec<(String, String)>) -> io::Result<Self> {
+    pub fn new(
+        cols: u16,
+        rows: u16,
+        sock_env: Vec<(String, String)>,
+        cfg: MuxConfig,
+    ) -> io::Result<Self> {
         let mut state = State::new();
         let ws = WorkspaceId::new("local");
         let (_tab, _pane, term0) = state.create_workspace(ws.clone(), None, Rect { cols, rows });
@@ -201,9 +218,9 @@ impl App {
             panes,
             cols,
             rows,
-            // On by default (herdr-style always-on spaces + agents panel); still
-            // size-adaptive (hidden below SIDEBAR_MIN_COLS) and toggleable via Ctrl-b s.
-            sidebar: true,
+            // Default from config (herdr-style always-on spaces + agents panel); still
+            // size-adaptive (hidden below sidebar_min_cols) and toggleable via Ctrl-b s.
+            sidebar: cfg.sidebar,
             popup: None,
             scroll_pane: None,
             notifications: VecDeque::new(),
@@ -217,6 +234,8 @@ impl App {
             branches: HashMap::new(),
             next_session: 1,
             prompt: None,
+            confirm: None,
+            cfg,
             click_zones: RefCell::new(Vec::new()),
         };
         app.reflow();
@@ -228,13 +247,18 @@ impl App {
     /// Is the sidebar actually drawn? Toggled on AND wide enough (size-adaptive:
     /// narrow / mobile widths fall back to the popup).
     fn sidebar_visible(&self) -> bool {
-        self.sidebar && self.cols >= SIDEBAR_MIN_COLS
+        self.sidebar && self.cols >= self.cfg.sidebar_min_cols
     }
 
-    /// Left x-offset of the pane grid (the sidebar reserves `SIDEBAR_W` + 1 border).
+    /// Sidebar width in columns (configurable; a 1-col border is added to its right).
+    fn sidebar_w(&self) -> u16 {
+        self.cfg.sidebar_width
+    }
+
+    /// Left x-offset of the pane grid (the sidebar reserves `sidebar_w` + 1 border).
     fn content_x(&self) -> u16 {
         if self.sidebar_visible() {
-            SIDEBAR_W + 1
+            self.sidebar_w() + 1
         } else {
             0
         }
@@ -243,7 +267,7 @@ impl App {
     /// Width available to the pane grid, right of the sidebar.
     fn content_cols(&self) -> u16 {
         if self.sidebar_visible() {
-            self.cols.saturating_sub(SIDEBAR_W + 1)
+            self.cols.saturating_sub(self.sidebar_w() + 1)
         } else {
             self.cols
         }
@@ -681,6 +705,49 @@ impl App {
         self.state.set_workspace_name(&self.ws, name);
     }
 
+    /// Open the kill-session confirm modal (`Ctrl-b X`, tmux `prefix X`). No-op when
+    /// only one session exists (a mux always keeps ≥1). Captures the TARGET workspace so
+    /// a focus/session change while the prompt is up can't retarget it.
+    fn open_kill_session_confirm(&mut self) {
+        if self.state.workspace_count() <= 1 {
+            return;
+        }
+        let name = self
+            .state
+            .workspace(&self.ws)
+            .and_then(|w| w.name.clone())
+            .unwrap_or_else(|| self.ws.to_string());
+        self.confirm = Some(Confirm {
+            message: format!("kill session '{name}'? (y/n)"),
+            action: ConfirmAction::KillSession(self.ws.clone()),
+        });
+    }
+
+    fn perform_confirm(&mut self, action: ConfirmAction) {
+        match action {
+            ConfirmAction::KillSession(wid) => self.kill_session(&wid),
+        }
+    }
+
+    /// Remove a session (workspace), reap its PTYs, and switch to a survivor if it was
+    /// active. Revalidates the target still exists and isn't the last session (it may
+    /// have changed between opening the confirm and pressing `y`).
+    fn kill_session(&mut self, wid: &WorkspaceId) {
+        if self.state.workspace(wid).is_none() || self.state.workspace_count() <= 1 {
+            return;
+        }
+        let killing_active = &self.ws == wid;
+        if let Some(terms) = self.state.remove_workspace(wid) {
+            for t in &terms {
+                self.panes.remove(t);
+            }
+        }
+        if killing_active && let Some(surv) = self.session_ids().into_iter().next() {
+            // `self.ws` still names the removed session, so `switch_session` proceeds.
+            self.switch_session(surv);
+        }
+    }
+
     /// Open the inline new-session name prompt (`Ctrl-b C`); Enter commits, Esc cancels.
     fn open_new_session_prompt(&mut self) {
         self.prompt = Some(Prompt {
@@ -1066,6 +1133,16 @@ impl App {
             return KeyAction::Continue;
         }
 
+        // A y/n confirm modal (kill-session) captures input while open: `y`/`Y`
+        // performs the captured action, anything else cancels.
+        if let Some(cf) = self.confirm.take() {
+            *prefix = false;
+            if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                self.perform_confirm(cf.action);
+            }
+            return KeyAction::Continue;
+        }
+
         // The switcher captures all input while open. Clear THIS client's pending
         // prefix too: the popup is shared state, so a `Ctrl-b` armed on one client
         // must not survive another client's popup interaction and fire a stray mux
@@ -1125,75 +1202,76 @@ impl App {
             return KeyAction::Continue;
         }
 
+        // From here on, keys resolve through the configurable keymap (see `config.rs`).
+        // A key we never bind (function keys, etc.) can't form a chord — treat it as
+        // shell input (and disarm a dangling prefix).
+        let Some(chord) = config::chord_of(&k) else {
+            *prefix = false;
+            if let Some(bytes) = key_to_bytes(k.code, k.modifiers) {
+                self.input_focused(&bytes);
+            }
+            return KeyAction::Continue;
+        };
+
+        // Prefix armed: the next chord is a prefix-table binding (or nothing).
         if *prefix {
             *prefix = false;
-            match k.code {
-                KeyCode::Char('%') => self.split(Dir::Right),
-                KeyCode::Char('a') => self.open_center(), // notification center
-                KeyCode::Char('"') => self.split(Dir::Down),
-                // enter scrollback, bound to the currently focused pane
-                KeyCode::Char('[') => self.scroll_pane = self.focused_terminal(),
-                KeyCode::Char('o') => self.focus_next(),
-                KeyCode::Char('x') => self.close_focused(),
-                KeyCode::Char('s') => self.toggle_sidebar(),
-                // tabs: `c` new, `n`/`p` next/prev, `&` close, `1`-`9` jump
-                KeyCode::Char('c') => self.new_tab(),
-                KeyCode::Char('n') => self.cycle_tab(1),
-                KeyCode::Char('p') => self.cycle_tab(-1),
-                KeyCode::Char('&') => self.close_active_tab(),
-                KeyCode::Char(d @ '1'..='9') => self.select_tab_index(d as usize - '1' as usize),
-                // sessions (workspaces): `C` new (named prompt), `$` rename, `)`/`(`
-                // next/prev (tmux-style)
-                KeyCode::Char('C') => self.open_new_session_prompt(),
-                KeyCode::Char('$') => self.open_rename_prompt(),
-                KeyCode::Char(')') => self.cycle_session(1),
-                KeyCode::Char('(') => self.cycle_session(-1),
-                // jump to the next agent awaiting input (attention)
-                KeyCode::Char('!') => self.jump_to_attention(),
-                // Detach — leave the server + shells running. Both `d` and `q`
-                // detach; NO key kills the server (that would drop every shell).
-                KeyCode::Char('d') | KeyCode::Char('q') => return KeyAction::Detach,
-                // directional pane focus — vim `hjkl` (preferred) or arrows (fallback)
-                KeyCode::Char('h') | KeyCode::Left => self.focus_dir(FocusDir::Left),
-                KeyCode::Char('j') | KeyCode::Down => self.focus_dir(FocusDir::Down),
-                KeyCode::Char('k') | KeyCode::Up => self.focus_dir(FocusDir::Up),
-                KeyCode::Char('l') | KeyCode::Right => self.focus_dir(FocusDir::Right),
-                // pane resize — vim-uppercase `HJKL`: L/H widen/narrow, J/K taller/shorter
-                KeyCode::Char('L') => self.resize_focused(Dir::Right, true),
-                KeyCode::Char('H') => self.resize_focused(Dir::Right, false),
-                KeyCode::Char('J') => self.resize_focused(Dir::Down, true),
-                KeyCode::Char('K') => self.resize_focused(Dir::Down, false),
-                _ => {}
+            if let Some(action) = self.cfg.keymap.prefix_action(&chord) {
+                return self.dispatch(action);
             }
             return KeyAction::Continue;
         }
 
-        // Direct (prefix-less) pane navigation: Ctrl+Shift+arrow.
-        if let Some(dir) = ctrl_shift_nav(k.code, k.modifiers) {
-            self.focus_dir(dir);
-            return KeyAction::Continue;
+        // Prefix-less: a global binding wins (incl. entering the prefix); otherwise the
+        // key is shell input.
+        if let Some(action) = self.cfg.keymap.global_action(&chord) {
+            if action == Action::EnterPrefix {
+                *prefix = true;
+                return KeyAction::Continue;
+            }
+            return self.dispatch(action);
         }
-
-        // Direct (prefix-less) tab jump: Alt/Opt+number (Meta+N), like a tmux
-        // `bind -n M-1 select-window -t 1`. Requires the terminal to send Option
-        // (macOS) / Alt (Linux) as Meta — the same prerequisite tmux has.
-        if let Some(idx) = alt_digit_tab(k.code, k.modifiers) {
-            self.select_tab_index(idx);
-            return KeyAction::Continue;
-        }
-
-        // `Ctrl-f` opens the switcher; `Ctrl-b` enters prefix mode; both may arrive
-        // as a raw control byte or `Char(_)`+CONTROL. Everything else is shell input.
-        let is_popup_key =
-            matches!(k.code, KeyCode::Char('\u{6}')) || (k.code == KeyCode::Char('f') && ctrl);
-        let is_prefix_key =
-            matches!(k.code, KeyCode::Char('\u{2}')) || (k.code == KeyCode::Char('b') && ctrl);
-        if is_popup_key {
-            self.open_popup();
-        } else if is_prefix_key {
-            *prefix = true;
-        } else if let Some(bytes) = key_to_bytes(k.code, k.modifiers) {
+        if let Some(bytes) = key_to_bytes(k.code, k.modifiers) {
             self.input_focused(&bytes);
+        }
+        KeyAction::Continue
+    }
+
+    /// Execute a resolved keymap [`Action`]. Returns [`KeyAction::Detach`] for the
+    /// detach action, [`KeyAction::Continue`] otherwise.
+    fn dispatch(&mut self, action: Action) -> KeyAction {
+        use Action::*;
+        match action {
+            SplitRight => self.split(Dir::Right),
+            SplitDown => self.split(Dir::Down),
+            NewTab => self.new_tab(),
+            NextTab => self.cycle_tab(1),
+            PrevTab => self.cycle_tab(-1),
+            CloseTab => self.close_active_tab(),
+            SelectTab(n) => self.select_tab_index(n as usize),
+            NewSession => self.open_new_session_prompt(),
+            RenameSession => self.open_rename_prompt(),
+            NextSession => self.cycle_session(1),
+            PrevSession => self.cycle_session(-1),
+            KillSession => self.open_kill_session_confirm(),
+            NotificationCenter => self.open_center(),
+            JumpAttention => self.jump_to_attention(),
+            Detach => return KeyAction::Detach,
+            ClosePane => self.close_focused(),
+            ToggleSidebar => self.toggle_sidebar(),
+            Scrollback => self.scroll_pane = self.focused_terminal(),
+            FocusNext => self.focus_next(),
+            FocusLeft => self.focus_dir(FocusDir::Left),
+            FocusDown => self.focus_dir(FocusDir::Down),
+            FocusUp => self.focus_dir(FocusDir::Up),
+            FocusRight => self.focus_dir(FocusDir::Right),
+            // L/H widen/narrow (Right axis), J/K taller/shorter (Down axis).
+            ResizeRight => self.resize_focused(Dir::Right, true),
+            ResizeLeft => self.resize_focused(Dir::Right, false),
+            ResizeDown => self.resize_focused(Dir::Down, true),
+            ResizeUp => self.resize_focused(Dir::Down, false),
+            Popup => self.open_popup(),
+            EnterPrefix => {} // handled by the caller (arms the prefix)
         }
         KeyAction::Continue
     }
@@ -1272,6 +1350,9 @@ impl App {
     /// pane UNDER the cursor (falling back to the focused pane); a left click focuses
     /// the pane under the cursor.
     pub fn mouse_at(&mut self, x: u16, y: u16, kind: MouseKind) {
+        if !self.cfg.mouse {
+            return; // mouse disabled in config (client also skips capture)
+        }
         let target = self
             .layout()
             .into_iter()
@@ -1279,9 +1360,9 @@ impl App {
         match kind {
             MouseKind::ScrollUp | MouseKind::ScrollDown => {
                 let lines = if matches!(kind, MouseKind::ScrollUp) {
-                    SCROLL_STEP
+                    self.cfg.scroll_step
                 } else {
-                    -SCROLL_STEP
+                    -self.cfg.scroll_step
                 };
                 let term = target
                     .map(|r| r.terminal)
@@ -1733,12 +1814,16 @@ impl App {
         if self.prompt.is_some() {
             self.render_prompt(buf);
         }
+        if self.confirm.is_some() {
+            self.render_confirm(buf);
+        }
 
         // The shell cursor shows only when nothing modal is capturing input.
         if self.popup.is_none()
             && self.scroll_pane.is_none()
             && self.center.is_none()
             && self.prompt.is_none()
+            && self.confirm.is_none()
         {
             cursor_pos
         } else {
@@ -1827,7 +1912,11 @@ impl App {
                         .unwrap_or_else(|| w.to_string())
                 })
                 .unwrap_or_default();
-            notify::desktop(&format!("{tool} · {space}"), body);
+            // Desktop toast: env override wins, else the config `notify` flag. The
+            // in-app center below is logged regardless (it's not a desktop toast).
+            if notify::env_override().unwrap_or(self.cfg.notify) {
+                notify::desktop(&format!("{tool} · {space}"), body);
+            }
             // Also log it in the notification center (Ctrl-b a).
             let kind = if body == "awaiting input" {
                 "blocked"
@@ -1958,17 +2047,18 @@ impl App {
     fn render_sidebar(&self, buf: &mut Buffer) {
         let h = self.content_rows(); // above the bottom status bar
         let panel_bg = CAT_BASE;
+        let sidebar_w = self.sidebar_w();
 
         // Fill the strip + the right border column (down to the status bar).
         for y in 0..h {
-            for x in 0..SIDEBAR_W {
+            for x in 0..sidebar_w {
                 if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
                     bc.set_symbol(" ");
                     bc.set_skip(false);
                     bc.set_style(Style::default().bg(panel_bg));
                 }
             }
-            if let Some(bc) = buf.cell_mut(Position::new(SIDEBAR_W, y)) {
+            if let Some(bc) = buf.cell_mut(Position::new(sidebar_w, y)) {
                 bc.set_symbol("│");
                 bc.set_skip(false);
                 bc.set_style(Style::default().fg(CAT_SURFACE0).bg(panel_bg));
@@ -1983,7 +2073,7 @@ impl App {
                 if cw == 0 {
                     continue;
                 }
-                if *x + cw > SIDEBAR_W {
+                if *x + cw > sidebar_w {
                     break;
                 }
                 if let Some(bc) = buf.cell_mut(Position::new(*x, y)) {
@@ -2061,7 +2151,7 @@ impl App {
             // Both rows (name + subtitle) click to switch to this session.
             self.click_zones.borrow_mut().push(ClickZone {
                 x0: 0,
-                x1: SIDEBAR_W - 1,
+                x1: sidebar_w - 1,
                 y0: y,
                 y1: y + 1,
                 target: ClickTarget::Session(sid.clone()),
@@ -2109,7 +2199,7 @@ impl App {
             // Both rows click to jump to this agent's pane.
             self.click_zones.borrow_mut().push(ClickZone {
                 x0: 0,
-                x1: SIDEBAR_W - 1,
+                x1: sidebar_w - 1,
                 y0: y,
                 y1: y + 1,
                 target: ClickTarget::Agent(term.clone()),
@@ -2505,6 +2595,62 @@ impl App {
         );
     }
 
+    /// Draw the `y`/`n` confirm modal (kill-session) as a small centered box holding the
+    /// message. Reuses `render_prompt`'s box geometry; clamps on tiny terminals.
+    fn render_confirm(&self, buf: &mut Buffer) {
+        let Some(cf) = self.confirm.as_ref() else {
+            return;
+        };
+        let area = buf.area;
+        let msg_w = UnicodeWidthStr::width(cf.message.as_str()) as u16 + 4;
+        let maxw = area.width.saturating_sub(2).max(1);
+        let w = msg_w.clamp(24.min(maxw), maxw);
+        let h = 3u16.min(area.height.max(1));
+        let x0 = (area.width.saturating_sub(w)) / 2;
+        let y0 = (area.height.saturating_sub(h)) / 2;
+        let bg = Color::Rgb(20, 22, 30);
+        let border = Style::default().fg(CAT_PEACH).bg(bg);
+
+        for y in y0..(y0 + h).min(area.height) {
+            for x in x0..(x0 + w).min(area.width) {
+                let sym = if y == y0 && x == x0 {
+                    "┌"
+                } else if y == y0 && x == x0 + w - 1 {
+                    "┐"
+                } else if y == y0 + h - 1 && x == x0 {
+                    "└"
+                } else if y == y0 + h - 1 && x == x0 + w - 1 {
+                    "┘"
+                } else if y == y0 || y == y0 + h - 1 {
+                    "─"
+                } else if x == x0 || x == x0 + w - 1 {
+                    "│"
+                } else {
+                    " "
+                };
+                if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
+                    bc.set_symbol(sym);
+                    bc.set_skip(false);
+                    let edge = y == y0 || y == y0 + h - 1 || x == x0 || x == x0 + w - 1;
+                    bc.set_style(if edge {
+                        border
+                    } else {
+                        Style::default().bg(bg)
+                    });
+                }
+            }
+        }
+        let inner_w = w.saturating_sub(4);
+        for (i, ch) in cf.message.chars().take(inner_w as usize).enumerate() {
+            if let Some(bc) = buf.cell_mut(Position::new(x0 + 2 + i as u16, y0 + 1)) {
+                let mut sb = [0u8; 4];
+                bc.set_symbol(ch.encode_utf8(&mut sb));
+                bc.set_skip(false);
+                bc.set_style(Style::default().fg(CAT_TEXT).bg(bg));
+            }
+        }
+    }
+
     fn render_center(&self, buf: &mut Buffer) {
         let Some(sel) = self.center else { return };
         let area = buf.area;
@@ -2676,43 +2822,6 @@ fn to_color(c: CellColor) -> Color {
     }
 }
 
-/// Map a `Ctrl+Shift+<arrow>` chord to a focus direction, or `None` for anything
-/// else. Requires BOTH modifiers so plain arrows still reach the shell and
-/// `Ctrl+<arrow>` stays free for shell word-motion. Standard xterm CSI modifier
-/// encoding (`ESC[1;6<dir>`) delivers this without kitty keyboard enhancement, so
-/// it works over ssh / inside tmux (with `xterm-keys on`).
-fn ctrl_shift_nav(code: KeyCode, mods: KeyModifiers) -> Option<FocusDir> {
-    if !(mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT)) {
-        return None;
-    }
-    match code {
-        // vim `hjkl` (preferred) or arrows (fallback). Match BOTH cases: holding Shift
-        // usually reports the letter uppercased (`H`/`J`/…). This chord is best-effort
-        // (some terminals can't distinguish Ctrl+Shift+letter without the kitty
-        // keyboard protocol) — the always-reliable hjkl path is `Ctrl-b h/j/k/l`.
-        // Plain hjkl still reaches the shell — only the chord navigates.
-        KeyCode::Char('h' | 'H') | KeyCode::Left => Some(FocusDir::Left),
-        KeyCode::Char('j' | 'J') | KeyCode::Down => Some(FocusDir::Down),
-        KeyCode::Char('k' | 'K') | KeyCode::Up => Some(FocusDir::Up),
-        KeyCode::Char('l' | 'L') | KeyCode::Right => Some(FocusDir::Right),
-        _ => None,
-    }
-}
-
-/// Prefix-less tab jump: Alt/Opt+`1`..`9` (Meta+N) → tab index `0..8`, mirroring a
-/// tmux `bind -n M-1 select-window -t 1`. crossterm surfaces macOS Option / Linux Alt
-/// as [`KeyModifiers::ALT`] only when the terminal is set to send it as Meta (the same
-/// prerequisite tmux has). Ctrl+Alt is excluded so it can't shadow other chords.
-fn alt_digit_tab(code: KeyCode, mods: KeyModifiers) -> Option<usize> {
-    if !mods.contains(KeyModifiers::ALT) || mods.contains(KeyModifiers::CONTROL) {
-        return None;
-    }
-    match code {
-        KeyCode::Char(d @ '1'..='9') => Some(d as usize - '1' as usize),
-        _ => None,
-    }
-}
-
 /// Translate a key event into the bytes a PTY expects.
 fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
     let alt = mods.contains(KeyModifiers::ALT);
@@ -2761,33 +2870,4 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(esc(bytes))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn alt_digit_maps_meta_number_to_zero_based_tab() {
-        let alt = KeyModifiers::ALT;
-        assert_eq!(alt_digit_tab(KeyCode::Char('1'), alt), Some(0));
-        assert_eq!(alt_digit_tab(KeyCode::Char('9'), alt), Some(8));
-    }
-
-    #[test]
-    fn alt_digit_ignores_plain_and_ctrl_alt() {
-        // No Alt → shell input, not a tab jump.
-        assert_eq!(alt_digit_tab(KeyCode::Char('1'), KeyModifiers::NONE), None);
-        // Ctrl+Alt is reserved for other chords.
-        assert_eq!(
-            alt_digit_tab(
-                KeyCode::Char('1'),
-                KeyModifiers::ALT | KeyModifiers::CONTROL
-            ),
-            None
-        );
-        // `0` has no window in a 1-based scheme; non-digits pass through.
-        assert_eq!(alt_digit_tab(KeyCode::Char('0'), KeyModifiers::ALT), None);
-        assert_eq!(alt_digit_tab(KeyCode::Char('a'), KeyModifiers::ALT), None);
-    }
 }

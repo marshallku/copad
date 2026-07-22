@@ -141,11 +141,19 @@ pub fn run() -> io::Result<()> {
         "COPAD_MUX_SOCK".to_string(),
         sock.to_string_lossy().to_string(),
     )];
+    // Load user config (~/.config/copad/mux.toml); surface any warnings to stderr
+    // (a foreground `copad-mux server` shows them — an auto-spawned server's stderr is
+    // /dev/null, so the client prints its own copy of the diagnostics too).
+    let (cfg, warnings) = crate::config::MuxConfig::load();
+    for w in &warnings {
+        eprintln!("copad-mux config: {w}");
+    }
+    let mouse = cfg.mouse;
     // Headless default size until the first client attaches (then reflowed).
-    let mut app = App::new(80, 24, sock_env)?;
+    let mut app = App::new(80, 24, sock_env, cfg)?;
 
     let (tx, rx) = mpsc::channel::<Incoming>();
-    spawn_accept_loop(listener, tx);
+    spawn_accept_loop(listener, tx, mouse);
 
     // Multiple clients may attach at once (tmux-style shared view). The app is sized
     // to the SMALLEST attached client so everyone sees the whole thing; the same
@@ -217,20 +225,20 @@ fn recompute_viewport(app: &mut App, clients: &mut [Client]) {
 
 /// Accept connections forever, assigning each a unique (never-reused) id and a
 /// handler thread that funnels into `tx`.
-fn spawn_accept_loop(listener: UnixListener, tx: Sender<Incoming>) {
+fn spawn_accept_loop(listener: UnixListener, tx: Sender<Incoming>, mouse: bool) {
     std::thread::spawn(move || {
         let next_id = AtomicU64::new(1);
         for stream in listener.incoming().flatten() {
             let id = next_id.fetch_add(1, Ordering::SeqCst);
             let tx = tx.clone();
-            std::thread::spawn(move || handle_conn(stream, id, tx));
+            std::thread::spawn(move || handle_conn(stream, id, tx, mouse));
         }
     });
 }
 
 /// Read a connection's first line to select its role: `ctl` (one-shot request/reply)
 /// or `attach` (streaming client). Rejects cross-uid peers.
-fn handle_conn(stream: UnixStream, id: u64, tx: Sender<Incoming>) {
+fn handle_conn(stream: UnixStream, id: u64, tx: Sender<Incoming>, mouse: bool) {
     // Fail CLOSED: reject cross-uid peers AND peers whose credentials can't be
     // established (this socket permits input injection, takeover, and shutdown).
     match peer_uid(&stream) {
@@ -251,7 +259,7 @@ fn handle_conn(stream: UnixStream, id: u64, tx: Sender<Incoming>) {
     if let Ok(req) = serde_json::from_str::<control::Req>(&first) {
         serve_ctl(Some(req), reader, stream, tx);
     } else if let Ok(ClientMsg::Attach { cols, rows }) = serde_json::from_str::<ClientMsg>(&first) {
-        serve_client(id, cols, rows, reader, stream, tx);
+        serve_client(id, cols, rows, reader, stream, tx, mouse);
     } else {
         let mut w = stream;
         let _ = writeln!(
@@ -321,11 +329,19 @@ fn serve_client(
     cols: u16,
     rows: u16,
     mut reader: BufReader<UnixStream>,
-    writer: UnixStream,
+    mut writer: UnixStream,
     tx: Sender<Incoming>,
+    mouse: bool,
 ) {
     // A clone the main loop can shut down to force-detach this client reliably.
     let Ok(conn) = writer.try_clone() else { return };
+    // Server-authoritative handshake FIRST (before any frame): tell the client whether
+    // to enable mouse capture, so every client agrees with the server's config even if
+    // its own local mux.toml differs (the server owns the effective setting).
+    if writeln!(writer, "{}", json(&ServerMsg::Hello { mouse })).is_err() || writer.flush().is_err()
+    {
+        return;
+    }
     // bounded(1): a slow/suspended client can never grow the server's memory —
     // frames coalesce (the main loop skips + re-diffs on the next tick).
     let (out_tx, out_rx) = mpsc::sync_channel::<ServerMsg>(1);

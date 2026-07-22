@@ -56,6 +56,11 @@ pub struct FrameMsg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "kebab-case")]
 pub enum ServerMsg {
+    /// Sent once, first, on attach: the server-authoritative settings a client needs
+    /// before it touches its terminal. `mouse` = whether to enable mouse capture (the
+    /// server is the single config authority, so all clients agree regardless of what
+    /// each one's local `mux.toml` says).
+    Hello { mouse: bool },
     /// A render frame (delta or full).
     Frame(FrameMsg),
     /// Detach acknowledged / forced (Ctrl-b d, takeover, or server shutdown): the
