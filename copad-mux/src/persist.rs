@@ -41,6 +41,9 @@ pub const MAX_TOTAL_PANES: usize = 100;
 pub const MAX_FILE_BYTES: u64 = 1 << 20;
 /// Defense-in-depth cap on session count after parse (the file-size cap already bounds this).
 pub const MAX_SESSIONS: usize = 64;
+/// Max length of a restored `command` injected into a shell (guards against a hostile file
+/// injecting a huge/absurd command line).
+pub const MAX_COMMAND_LEN: usize = 512;
 
 /// The whole persisted mux state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -82,6 +85,11 @@ pub enum PLayout {
         /// as UTF-8; a non-UTF-8 path is saved as `None` for that pane only.
         #[serde(default)]
         cwd: Option<String>,
+        /// The argv of a whitelisted program (agent) that was running in this pane, to
+        /// RE-RUN on restore (shell-quoted + injected into the fresh shell). Structural so
+        /// argument boundaries survive. `None`/missing = restore a bare shell.
+        #[serde(default)]
+        command: Option<Vec<String>>,
     },
     Branch {
         dir: Dir,
@@ -260,8 +268,12 @@ mod tests {
                             ratio: 0.4,
                             first: Box::new(PLayout::Leaf {
                                 cwd: Some("/tmp".into()),
+                                command: Some(vec!["claude".into(), "--resume".into()]),
                             }),
-                            second: Box::new(PLayout::Leaf { cwd: None }),
+                            second: Box::new(PLayout::Leaf {
+                                cwd: None,
+                                command: None,
+                            }),
                         },
                     }],
                 },
@@ -271,12 +283,16 @@ mod tests {
                     tabs: vec![
                         PTab {
                             name: None,
-                            layout: PLayout::Leaf { cwd: None },
+                            layout: PLayout::Leaf {
+                                cwd: None,
+                                command: None,
+                            },
                         },
                         PTab {
                             name: Some("logs".into()),
                             layout: PLayout::Leaf {
                                 cwd: Some("/var".into()),
+                                command: None,
                             },
                         },
                     ],

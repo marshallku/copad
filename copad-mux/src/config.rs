@@ -36,6 +36,14 @@ pub const DEFAULT_AUTOSAVE_SECS: u32 = 15;
 /// the whole viewport.
 const MIN_CONTENT_COLS: u16 = 20;
 
+/// The default `restore_processes` whitelist: the built-in AI-agent basenames.
+fn default_restore_processes() -> Vec<String> {
+    crate::procinfo::agent_basenames()
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Every user-bindable action (each current binding, plus `KillSession`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -367,6 +375,10 @@ pub struct MuxConfig {
     pub persist: bool,
     /// Periodic autosave interval in seconds; `0` disables periodic saves.
     pub autosave_secs: u32,
+    /// Process basenames whose running command is saved and RE-RUN on restore (tmux
+    /// -resurrect's process whitelist). Default = the built-in AI agents; an empty list
+    /// disables program re-execution (panes restore as bare shells).
+    pub restore_processes: Vec<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -380,6 +392,7 @@ struct RawConfig {
     scroll_step: Option<i64>,
     persist: Option<bool>,
     autosave_secs: Option<i64>,
+    restore_processes: Option<Vec<String>>,
     keys: Option<HashMap<String, ChordSpec>>,
     global: Option<HashMap<String, ChordSpec>>,
 }
@@ -451,6 +464,7 @@ impl MuxConfig {
             scroll_step: DEFAULT_SCROLL_STEP,
             persist: true,
             autosave_secs: DEFAULT_AUTOSAVE_SECS,
+            restore_processes: default_restore_processes(),
         }
     }
 
@@ -533,6 +547,9 @@ impl MuxConfig {
                 scroll_step,
                 persist: raw.persist.unwrap_or(true),
                 autosave_secs,
+                restore_processes: raw
+                    .restore_processes
+                    .unwrap_or_else(default_restore_processes),
             },
             warnings,
         )
@@ -901,6 +918,17 @@ mod tests {
         let cfg = MuxConfig::default();
         assert!(cfg.persist);
         assert_eq!(cfg.autosave_secs, DEFAULT_AUTOSAVE_SECS);
+        // restore_processes defaults to the built-in agents (claude et al.).
+        assert!(cfg.restore_processes.iter().any(|p| p == "claude"));
+    }
+
+    #[test]
+    fn restore_processes_override_replaces_default() {
+        let (cfg, _) = load_str(r#"restore_processes = ["nvim", "python"]"#);
+        assert_eq!(cfg.restore_processes, vec!["nvim", "python"]);
+        // Empty list disables program re-execution.
+        let (off, _) = load_str("restore_processes = []");
+        assert!(off.restore_processes.is_empty());
     }
 
     #[test]

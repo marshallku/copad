@@ -1927,7 +1927,8 @@ impl App {
         }
     }
 
-    /// Convert a live `SplitTree` to its persisted form, reading each leaf's shell cwd.
+    /// Convert a live `SplitTree` to its persisted form, reading each leaf's shell cwd and
+    /// (for a whitelisted foreground program, e.g. an agent) its command to re-run.
     fn layout_to_persist(&self, tree: &SplitTree) -> PLayout {
         match tree {
             SplitTree::Leaf { terminal, .. } => {
@@ -1938,7 +1939,27 @@ impl App {
                     .and_then(|p| p.pid())
                     .and_then(procinfo::process_cwd)
                     .and_then(|p| p.to_str().map(|s| s.to_string()));
-                PLayout::Leaf { cwd }
+                // Save the running command's argv only when its basename is whitelisted
+                // (`restore_processes`, default = the AI agents), so restore re-runs it.
+                // Capped at SAVE time (argv count + total length) so an absurd command can't
+                // bloat the snapshot past its size limit and get the whole session rejected.
+                let command = self.labels.get(terminal).and_then(|label| {
+                    let whitelisted = self
+                        .cfg
+                        .restore_processes
+                        .iter()
+                        .any(|p| p.eq_ignore_ascii_case(&label.text));
+                    if !whitelisted {
+                        return None;
+                    }
+                    let argv = procinfo::process_command(label.pid)?;
+                    let total: usize = argv.iter().map(|a| a.len() + 1).sum();
+                    if argv.is_empty() || argv.len() > 64 || total > persist::MAX_COMMAND_LEN {
+                        return None;
+                    }
+                    Some(argv)
+                });
+                PLayout::Leaf { cwd, command }
             }
             SplitTree::Branch {
                 dir,
@@ -3009,13 +3030,22 @@ fn spawn_layout(
     sock_env: &[(String, String)],
 ) -> Option<(LayoutSpec, Vec<PaneTerm>)> {
     match node {
-        PLayout::Leaf { cwd } => {
+        PLayout::Leaf { cwd, command } => {
             if *budget == 0 {
                 return None;
             }
             let dir = resolve_cwd(cwd.as_deref());
             let pt = PaneTerm::spawn_with_env(cols.max(1), rows.max(1), None, dir, sock_env)?;
             *budget -= 1;
+            // Re-run a whitelisted program (agent): shell-quote each argv element and
+            // inject the line into the fresh shell. Quoting preserves argument boundaries
+            // and neutralizes metacharacters/newlines (a saved `claude "a; b"` stays one
+            // arg, never two shell commands); the shell buffers it until its prompt is ready.
+            if let Some(argv) = command
+                && let Some(line) = build_command_line(argv)
+            {
+                pt.input(format!("{line}\n").as_bytes());
+            }
             Some((LayoutSpec::Leaf, vec![pt]))
         }
         PLayout::Branch {
@@ -3048,6 +3078,28 @@ fn spawn_layout(
             }
         }
     }
+}
+
+/// Build a shell command line from a saved argv by POSIX single-quoting each argument, so
+/// argument boundaries + any metacharacters/newlines are preserved literally (the shell
+/// runs exactly this argv, never re-splitting a quoted arg into extra commands). Returns
+/// `None` for an empty argv or if the result exceeds the length cap.
+fn build_command_line(argv: &[String]) -> Option<String> {
+    if argv.is_empty() {
+        return None;
+    }
+    let line = argv
+        .iter()
+        .map(|a| shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ");
+    (line.len() <= persist::MAX_COMMAND_LEN).then_some(line)
+}
+
+/// POSIX single-quote one argument: wrap in `'…'` and turn any embedded `'` into `'\''`.
+/// Safe for sh/bash/zsh (fish quoting differs — a niche the owner's agents don't hit).
+fn shell_quote(arg: &str) -> String {
+    format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
 /// Resolve a saved cwd to a concrete directory for a restored shell: the saved path if it
@@ -3162,4 +3214,29 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(esc(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_command_line, shell_quote};
+
+    #[test]
+    fn shell_quote_neutralizes_metacharacters() {
+        assert_eq!(shell_quote("claude"), "'claude'");
+        // A `;` inside an arg stays inside the quotes — not a command separator.
+        assert_eq!(shell_quote("a; rm -rf /"), "'a; rm -rf /'");
+        // An embedded single quote is escaped.
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn build_command_line_quotes_each_arg_and_preserves_boundaries() {
+        // `claude "review; touch x"` stays TWO argv → one quoted arg, never re-split.
+        let argv = vec!["claude".to_string(), "review; touch x".to_string()];
+        assert_eq!(
+            build_command_line(&argv).as_deref(),
+            Some("'claude' 'review; touch x'")
+        );
+        assert_eq!(build_command_line(&[]), None);
+    }
 }

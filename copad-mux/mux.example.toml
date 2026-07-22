@@ -27,6 +27,12 @@ persist = true            # restore the saved layout on server start (delete the
                           #   file, or set false, for a fresh start)
 autosave_secs = 15        # periodic save interval; 0 disables (clamped to 5..3600)
                           # state file: $COPAD_MUX_STATE else ~/.local/state/copad/mux-session.json
+# Re-run these programs on restore (by their command basename), tmux-resurrect style: if a
+# pane's foreground command matches, its full command line is saved and re-run in the fresh
+# shell. Default = the built-in AI agents (claude, codex, aider, cursor, gemini, opencode,
+# droid, copilot, qwen, crush). Set [] to restore bare shells only; add your own (e.g.
+# "nvim") to extend. (Restored panes start at the scrollback bottom — history isn't saved.)
+# restore_processes = ["claude", "codex", "nvim"]
 
 # ---- prefix bindings (pressed AFTER the prefix) ----
 # Rebinding a key replaces that action's WHOLE default chord set. A value can be one

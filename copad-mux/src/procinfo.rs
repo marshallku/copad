@@ -53,6 +53,87 @@ pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
     None
 }
 
+/// The argv (structural, NOT space-joined) of `pid`, for restoring a whitelisted program
+/// (agent) on session restore. Structural so argument boundaries + quoting survive
+/// (`claude "a; b"` stays ONE arg, re-quoted on restore — never re-split into two shell
+/// commands). Linux reads `/proc/<pid>/cmdline`; macOS uses `sysctl KERN_PROCARGS2`. `None`
+/// if the process is gone or has no readable argv.
+#[cfg(target_os = "linux")]
+pub fn process_command(pid: u32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let args: Vec<String> = raw
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect();
+    (!args.is_empty()).then_some(args)
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_command(pid: u32) -> Option<Vec<String>> {
+    // KERN_PROCARGS2 buffer: [argc: i32][exec_path\0][padding \0…][argv0\0 argv1\0 …][env…].
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+    let mut size: libc::size_t = 0;
+    // SAFETY: standard two-call sysctl — first sizes the buffer.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size < 4 {
+        return None;
+    }
+    let mut buf = vec![0u8; size];
+    // SAFETY: `buf` holds `size` bytes for sysctl to fill.
+    let rc = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 || size < 4 {
+        return None;
+    }
+    buf.truncate(size);
+    let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]).max(0) as usize;
+    let mut p = 4;
+    // Skip the exec_path string and any NUL padding after it.
+    while p < buf.len() && buf[p] != 0 {
+        p += 1;
+    }
+    while p < buf.len() && buf[p] == 0 {
+        p += 1;
+    }
+    // Read exactly `argc` NUL-terminated args.
+    let mut args = Vec::with_capacity(argc.min(256));
+    for _ in 0..argc {
+        if p >= buf.len() {
+            break;
+        }
+        let start = p;
+        while p < buf.len() && buf[p] != 0 {
+            p += 1;
+        }
+        args.push(String::from_utf8_lossy(&buf[start..p]).into_owned());
+        p += 1; // skip the NUL
+    }
+    (!args.is_empty()).then_some(args)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_command(_pid: u32) -> Option<Vec<String>> {
+    None
+}
+
 /// What a pane is running, for styling the sidebar/popup row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -78,6 +159,12 @@ pub struct Label {
 const AGENTS: &[&str] = &[
     "claude", "codex", "aider", "cursor", "gemini", "opencode", "droid", "copilot", "qwen", "crush",
 ];
+
+/// The built-in AI-agent basenames — the default whitelist for restoring running
+/// programs on session restore (config `restore_processes` overrides/extends it).
+pub fn agent_basenames() -> &'static [&'static str] {
+    AGENTS
+}
 /// Interactive shells (also matched with a leading `-` for login shells).
 const SHELLS: &[&str] = &["zsh", "bash", "fish", "sh", "nu", "dash", "tcsh", "ksh"];
 
