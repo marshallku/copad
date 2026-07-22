@@ -1,26 +1,21 @@
-//! The multi-pane TUI: a ratatui front-end over the authoritative `State` (layout
-//! authority) plus one `PaneTerm` (real shell PTY) per terminal. It renders every
-//! pane in its derived rect with dividers, highlights the focused pane, and routes
-//! keys to the focused pane. tmux-style prefix `Ctrl-b` then: `%` split right,
-//! `"` split down, `o`/arrows focus, `x` close, `q` quit.
+//! The mux [`App`]: the authoritative `State` (layout authority) + one `PaneTerm`
+//! (real shell PTY) per terminal, plus the composition logic. It renders the whole
+//! workspace into a `Buffer` ([`App::render_to`]) and interprets keys
+//! ([`App::feed_key`]) — tmux-style prefix `Ctrl-b` then `%`/`"` split, `o`/arrows
+//! focus, `x` close, `c`/`n`/`p`/`&` tabs, `d` detach; plus prefix-less
+//! `Ctrl+Shift+arrow` nav and the `Ctrl-f` switcher.
 //!
-//! Work-unit 3: multi-pane splits in one workspace/tab. The sidebar, popup,
-//! server/client split, and CLI come in later units.
+//! `App` is transport-agnostic: it owns no terminal I/O and no socket. The headless
+//! [`crate::server`] drives it (render → ship cell diffs; forwarded keys → feed_key)
+//! and the thin [`crate::client`] renders + forwards input, so the same App serves
+//! local and detached/reattached sessions.
 
 use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Stdout, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::mpsc;
+use std::io;
 use std::time::Duration;
 
-use ratatui::Frame;
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, Event as CEvent, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::crossterm::execute;
-use ratatui::crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use ratatui::buffer::Buffer;
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Position;
 use ratatui::style::{Color, Modifier, Style};
 
@@ -29,73 +24,6 @@ use crate::model::{ClientId, Dir, PaneId, PaneRect, Rect, Role, TabId, TerminalI
 use crate::procinfo;
 use crate::state::{Command, Event, MuxError, Origin, State};
 use crate::term::{CellColor, PaneTerm};
-
-/// A control request handed from a socket connection thread to the main loop
-/// (which is the single writer of `State`), with a channel for the reply.
-struct ControlMsg {
-    req: control::Req,
-    reply: mpsc::Sender<control::Resp>,
-}
-
-/// Read ndjson requests off one control connection, forward each to the main loop
-/// over `tx`, and write back the reply line. Never touches `State` directly.
-fn handle_conn(stream: UnixStream, tx: mpsc::Sender<ControlMsg>) {
-    let Ok(read_half) = stream.try_clone() else {
-        return;
-    };
-    let mut reader = BufReader::new(read_half);
-    let mut writer = stream;
-    let mut line = String::new();
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) | Err(_) => return, // EOF or error → connection done
-            Ok(_) => {}
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let resp = match serde_json::from_str::<control::Req>(trimmed) {
-            Ok(req) => {
-                let (rtx, rrx) = mpsc::channel();
-                if tx.send(ControlMsg { req, reply: rtx }).is_err() {
-                    return; // main loop gone
-                }
-                rrx.recv()
-                    .unwrap_or_else(|_| control::Resp::err("mux shutting down"))
-            }
-            Err(e) => control::Resp::err(format!("bad request: {e}")),
-        };
-        let out = serde_json::to_string(&resp).unwrap_or_else(|_| "{\"ok\":false}".to_string());
-        if writeln!(writer, "{out}").is_err() {
-            return;
-        }
-        let _ = writer.flush();
-    }
-}
-
-/// Restores the host terminal (raw mode off + leave alt screen) on drop — so a
-/// panic mid-render never leaves the user's terminal wedged.
-struct TermGuard;
-
-impl TermGuard {
-    fn enter() -> io::Result<Self> {
-        enable_raw_mode()?;
-        // Construct the guard immediately so that if EnterAlternateScreen below
-        // fails, its Drop still disables raw mode (no wedged terminal).
-        let guard = Self;
-        execute!(io::stdout(), EnterAlternateScreen)?;
-        Ok(guard)
-    }
-}
-
-impl Drop for TermGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-    }
-}
 
 /// Direction for focus navigation with the arrow keys.
 #[derive(Clone, Copy)]
@@ -106,6 +34,16 @@ enum FocusDir {
     Down,
 }
 
+/// What feeding one key to the app implies for the caller (the server loop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAction {
+    /// Keep the session going.
+    Continue,
+    /// The user pressed the detach chord (`Ctrl-b d` / `Ctrl-b q`): the client should
+    /// leave, but the server + shells keep running.
+    Detach,
+}
+
 /// Sidebar width in columns (a 1-col border is added to its right).
 const SIDEBAR_W: u16 = 24;
 /// Below this terminal width the sidebar is suppressed even when toggled on —
@@ -114,7 +52,7 @@ const SIDEBAR_MIN_COLS: u16 = 80;
 
 /// The multi-pane application: the authoritative layout `State` + a live shell per
 /// terminal. The local TUI is the single controller client (`ClientId(0)`).
-struct App {
+pub struct App {
     state: State,
     ws: WorkspaceId,
     client: ClientId,
@@ -127,6 +65,8 @@ struct App {
     /// When `Some(sel)`, the `Ctrl-f` popup switcher is open with row `sel`
     /// selected; keys drive the popup instead of the shells.
     popup: Option<usize>,
+    /// True after a `Ctrl-b` prefix keypress; the next key is a mux command.
+    prefix: bool,
     /// Env vars injected into every pane's shell (e.g. `COPAD_MUX_SOCK`), so a
     /// shell inside a pane can control its own mux via `copad-mux ctl`.
     sock_env: Vec<(String, String)>,
@@ -138,7 +78,7 @@ struct App {
 }
 
 impl App {
-    fn new(cols: u16, rows: u16, sock_env: Vec<(String, String)>) -> io::Result<Self> {
+    pub fn new(cols: u16, rows: u16, sock_env: Vec<(String, String)>) -> io::Result<Self> {
         let mut state = State::new();
         let ws = WorkspaceId::new("local");
         let (_tab, _pane, term0) = state.create_workspace(ws.clone(), None, Rect { cols, rows });
@@ -166,6 +106,7 @@ impl App {
             rows,
             sidebar: false,
             popup: None,
+            prefix: false,
             sock_env,
             labels: HashMap::new(),
             last_labels: std::time::Instant::now()
@@ -285,7 +226,7 @@ impl App {
             .find(|p| tab.layout.terminal_of(p) == Some(term))
     }
 
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.panes.is_empty()
     }
 
@@ -526,7 +467,7 @@ impl App {
 
     /// Handle one control request, mutating state as the sole writer. Returns the
     /// wire response. Never blocks.
-    fn handle_control(&mut self, req: &control::Req) -> control::Resp {
+    pub fn handle_control(&mut self, req: &control::Req) -> control::Resp {
         use control::{PaneInfo, Req, Resp};
         match req {
             Req::List => {
@@ -671,7 +612,78 @@ impl App {
                     Resp::err(format!("no tab at index {index}"))
                 }
             }
+            // Intercepted by the server before it reaches here; answered ok for a
+            // (hypothetical) direct call so the match stays exhaustive.
+            Req::KillServer => Resp::ok(),
         }
+    }
+
+    /// Route one key event through the mux (popup → prefix → direct-nav → shell),
+    /// exactly as the local loop used to. Returns [`KeyAction::Detach`] on the
+    /// detach chord. The `Ctrl-b` prefix state lives in `self.prefix` so a forwarded
+    /// key stream (from a remote client) is handled identically to local input.
+    pub fn feed_key(&mut self, k: KeyEvent) -> KeyAction {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+
+        // The switcher captures all input while open.
+        if self.popup.is_some() {
+            match k.code {
+                KeyCode::Char('j') | KeyCode::Down => self.popup_move(1),
+                KeyCode::Char('k') | KeyCode::Up => self.popup_move(-1),
+                KeyCode::Enter => self.popup_select(),
+                KeyCode::Esc | KeyCode::Char('\u{6}') => self.popup = None,
+                KeyCode::Char('f') if ctrl => self.popup = None,
+                _ => {}
+            }
+            return KeyAction::Continue;
+        }
+
+        if self.prefix {
+            self.prefix = false;
+            match k.code {
+                KeyCode::Char('%') => self.split(Dir::Right),
+                KeyCode::Char('"') => self.split(Dir::Down),
+                KeyCode::Char('o') => self.focus_next(),
+                KeyCode::Char('x') => self.close_focused(),
+                KeyCode::Char('s') => self.toggle_sidebar(),
+                // tabs: `c` new, `n`/`p` next/prev, `&` close, `1`-`9` jump
+                KeyCode::Char('c') => self.new_tab(),
+                KeyCode::Char('n') => self.cycle_tab(1),
+                KeyCode::Char('p') => self.cycle_tab(-1),
+                KeyCode::Char('&') => self.close_active_tab(),
+                KeyCode::Char(d @ '1'..='9') => self.select_tab_index(d as usize - '1' as usize),
+                // Detach — leave the server + shells running. Both `d` and `q`
+                // detach; NO key kills the server (that would drop every shell).
+                KeyCode::Char('d') | KeyCode::Char('q') => return KeyAction::Detach,
+                KeyCode::Left => self.focus_dir(FocusDir::Left),
+                KeyCode::Right => self.focus_dir(FocusDir::Right),
+                KeyCode::Up => self.focus_dir(FocusDir::Up),
+                KeyCode::Down => self.focus_dir(FocusDir::Down),
+                _ => {}
+            }
+            return KeyAction::Continue;
+        }
+
+        // Direct (prefix-less) pane navigation: Ctrl+Shift+arrow.
+        if let Some(dir) = ctrl_shift_nav(k.code, k.modifiers) {
+            self.focus_dir(dir);
+            return KeyAction::Continue;
+        }
+
+        // `Ctrl-f` opens the switcher; `Ctrl-b` enters prefix mode; both may arrive
+        // as a raw control byte or `Char(_)`+CONTROL. Everything else is shell input.
+        let is_popup_key =
+            matches!(k.code, KeyCode::Char('\u{6}')) || (k.code == KeyCode::Char('f') && ctrl);
+        let is_prefix_key =
+            matches!(k.code, KeyCode::Char('\u{2}')) || (k.code == KeyCode::Char('b') && ctrl);
+        if is_popup_key {
+            self.open_popup();
+        } else if is_prefix_key {
+            self.prefix = true;
+        } else if let Some(bytes) = key_to_bytes(k.code, k.modifiers) {
+            self.input_focused(&bytes);
+        }
+        KeyAction::Continue
     }
 
     fn focus_next(&mut self) {
@@ -741,7 +753,7 @@ impl App {
         }
     }
 
-    fn resize(&mut self, cols: u16, rows: u16) {
+    pub fn resize(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
         // reflow derives the content-area viewport (minus chrome) and pushes it.
@@ -771,7 +783,7 @@ impl App {
     /// Keep the popup selection within the current pane list (or close the popup
     /// if no panes remain). Called each frame so an async pane exit can't leave a
     /// stale selection index.
-    fn reconcile_popup(&mut self) {
+    pub fn reconcile_popup(&mut self) {
         if let Some(sel) = self.popup {
             let n = self.pane_order().len();
             if n == 0 {
@@ -809,7 +821,7 @@ impl App {
     /// Close panes whose shell has exited (in ANY tab). Returns true if the app is
     /// now empty (last pane of the last tab exited → quit). A tab whose last pane
     /// exits is closed whole; other tabs keep running in the background.
-    fn reap_exited(&mut self) -> bool {
+    pub fn reap_exited(&mut self) -> bool {
         let exited: Vec<TerminalId> = self
             .panes
             .iter()
@@ -885,8 +897,13 @@ impl App {
 
     // --- render ---
 
-    fn render(&self, frame: &mut Frame) {
-        let area = frame.area();
+    /// Render the whole composite (panes + dividers + sidebar + tab bar + popup)
+    /// into `buf`, returning the desired cursor position (or `None` when a popup
+    /// captures input). Rendering targets a plain `Buffer` — not a `Frame` — so the
+    /// same code path serves both the local terminal and the (headless) server that
+    /// ships cell diffs to a remote client.
+    pub fn render_to(&self, buf: &mut Buffer) -> Option<Position> {
+        let area = buf.area;
         let rects = self.layout();
         let focused_term = self.focused_terminal();
         let mut cursor_pos: Option<Position> = None;
@@ -898,7 +915,6 @@ impl App {
             };
             let snap = pt.snapshot();
             let is_focused = Some(&rect.terminal) == focused_term.as_ref();
-            let buf = frame.buffer_mut();
             for (ry, row) in snap.cells.iter().enumerate() {
                 if ry as u16 >= rect.rows {
                     break;
@@ -962,7 +978,6 @@ impl App {
         }
         let content_x = self.content_x();
         let content_y = self.content_y();
-        let buf = frame.buffer_mut();
         for yy in 0..area.height {
             for xx in 0..area.width {
                 // The tab bar owns row 0 and the sidebar owns the left strip; don't
@@ -987,24 +1002,37 @@ impl App {
 
         // 3) the neovim-style left panel, over the reserved strip.
         if self.sidebar_visible() {
-            self.render_sidebar(frame);
+            self.render_sidebar(buf);
         }
 
         // 4) the tab bar across the top row (over the sidebar's top too).
         if self.tabbar_visible() {
-            self.render_tabbar(frame);
+            self.render_tabbar(buf);
         }
 
         // 5) the Ctrl-f switcher popup, over everything.
         if self.popup.is_some() {
-            self.render_popup(frame);
+            self.render_popup(buf);
         }
 
         // The shell cursor shows only when no popup is capturing input.
-        if self.popup.is_none()
-            && let Some(p) = cursor_pos
-        {
-            frame.set_cursor_position(p);
+        if self.popup.is_none() {
+            cursor_pos
+        } else {
+            None
+        }
+    }
+
+    /// The current viewport size (terminal size the app renders at).
+    pub fn size(&self) -> (u16, u16) {
+        (self.cols, self.rows)
+    }
+
+    /// Refresh foreground-process labels at most ~2 Hz (throttled internally), so
+    /// the server loop can call it every tick without hammering `ps`.
+    pub fn maybe_refresh_labels(&mut self) {
+        if self.last_labels.elapsed() >= Duration::from_millis(500) {
+            self.refresh_labels();
         }
     }
 
@@ -1053,13 +1081,12 @@ impl App {
     }
 
     /// Left panel: a header + one row per pane, focus-marked.
-    fn render_sidebar(&self, frame: &mut Frame) {
-        let area = frame.area();
+    fn render_sidebar(&self, buf: &mut Buffer) {
+        let area = buf.area;
         let h = area.height;
         let order = self.pane_order();
         let focused = self.focused_pane();
         let panel_bg = Color::Rgb(28, 30, 38);
-        let buf = frame.buffer_mut();
 
         // Fill the strip + the border column.
         for y in 0..h {
@@ -1151,13 +1178,12 @@ impl App {
 
     /// Top-row tab bar: one 1-based chip per tab, active highlighted, with a `●`
     /// flag on any tab that hosts an agent.
-    fn render_tabbar(&self, frame: &mut Frame) {
-        let area = frame.area();
+    fn render_tabbar(&self, buf: &mut Buffer) {
+        let area = buf.area;
         let w = area.width;
         let ids = self.tab_ids();
         let active = self.active_tab_id();
         let bg = Color::Rgb(20, 22, 30);
-        let buf = frame.buffer_mut();
 
         // Clear row 0 (also lifts any wide-char skip flag left by a pane cell).
         for x in 0..w {
@@ -1206,9 +1232,9 @@ impl App {
 
     /// Centered `Ctrl-f` switcher over the panes: a bordered box listing panes with
     /// a selection cursor.
-    fn render_popup(&self, frame: &mut Frame) {
+    fn render_popup(&self, buf: &mut Buffer) {
         let Some(sel) = self.popup else { return };
-        let area = frame.area();
+        let area = buf.area;
         let order = self.pane_order();
 
         // Clamp bounds so `min <= max` even on tiny/narrow terminals (the popup
@@ -1221,7 +1247,6 @@ impl App {
         let y0 = (area.height.saturating_sub(h)) / 2;
         let bg = Color::Rgb(20, 22, 30);
         let border = Style::default().fg(Color::Cyan).bg(bg);
-        let buf = frame.buffer_mut();
 
         // Box background + border.
         for y in y0..(y0 + h).min(area.height) {
@@ -1327,170 +1352,6 @@ fn divider_touches(fr: &PaneRect, x: u16, y: u16) -> bool {
     let vert = in_y && (x + 1 == fr.x || x == fr.x + fr.cols);
     let horiz = in_x && (y + 1 == fr.y || y == fr.y + fr.rows);
     vert || horiz
-}
-
-/// Run the multi-pane TUI to completion (quit with `Ctrl-b q` or when every shell
-/// has exited).
-pub fn run() -> io::Result<()> {
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        default_hook(info);
-    }));
-
-    let _guard = TermGuard::enter()?;
-    let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal: Terminal<CrosstermBackend<Stdout>> = Terminal::new(backend)?;
-
-    // Control socket (spec §3): bind, and let an accept thread forward requests to
-    // this loop over a channel — the socket thread NEVER writes `State`. Env-inject
-    // the socket path so a shell inside a pane can `copad-mux ctl` its own mux.
-    let sock_path = control::socket_path();
-    let (ctl_tx, ctl_rx) = mpsc::channel::<ControlMsg>();
-    let mut sock_env = Vec::new();
-    let mut we_bound_socket = false;
-    // Only clear the socket if it is STALE: probe-connect first so a second
-    // instance never unlinks a still-live server's socket (and its cleanup never
-    // deletes another instance's socket).
-    if UnixStream::connect(&sock_path).is_ok() {
-        eprintln!(
-            "copad-mux: control socket {} is already in use by another instance; \
-             ctl disabled here (set COPAD_MUX_SOCK for a separate socket)",
-            sock_path.display()
-        );
-    } else {
-        let _ = std::fs::remove_file(&sock_path); // clear a stale (dead) socket
-        match UnixListener::bind(&sock_path) {
-            Ok(listener) => {
-                we_bound_socket = true;
-                sock_env.push((
-                    "COPAD_MUX_SOCK".to_string(),
-                    sock_path.to_string_lossy().to_string(),
-                ));
-                let tx = ctl_tx.clone();
-                std::thread::spawn(move || {
-                    for stream in listener.incoming().flatten() {
-                        let tx = tx.clone();
-                        std::thread::spawn(move || handle_conn(stream, tx));
-                    }
-                });
-            }
-            Err(e) => {
-                // Non-fatal: run the TUI without the control API rather than
-                // refusing to start (e.g. path permission issue).
-                eprintln!("copad-mux: control socket unavailable ({e}); ctl disabled");
-            }
-        }
-    }
-
-    let size = terminal.size()?;
-    let mut app = App::new(size.width, size.height, sock_env)?;
-
-    let mut prefix = false;
-    'main: loop {
-        if app.reap_exited() {
-            break;
-        }
-        // A pane may have exited while the popup was open — keep its selection
-        // index valid (or close it) so it never points past the pane list.
-        app.reconcile_popup();
-
-        // Throttled foreground-process/agent label refresh (one `ps` sweep, ~2 Hz).
-        if app.last_labels.elapsed() >= Duration::from_millis(500) {
-            app.refresh_labels();
-        }
-
-        // Apply any pending control requests as the single writer.
-        while let Ok(msg) = ctl_rx.try_recv() {
-            let resp = app.handle_control(&msg.req);
-            let _ = msg.reply.send(resp);
-        }
-
-        terminal.draw(|frame| app.render(frame))?;
-
-        if !event::poll(Duration::from_millis(16))? {
-            continue;
-        }
-        // Drain the whole pending input burst before the next render, so a prefix
-        // and its command (`Ctrl-b` then `%`) are always processed together and no
-        // event is deferred across frames (rapid/pasted input stays correct).
-        loop {
-            match event::read()? {
-                CEvent::Key(k) if k.kind != KeyEventKind::Release => {
-                    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-                    if app.popup.is_some() {
-                        // The switcher captures all input while open.
-                        match k.code {
-                            KeyCode::Char('j') | KeyCode::Down => app.popup_move(1),
-                            KeyCode::Char('k') | KeyCode::Up => app.popup_move(-1),
-                            KeyCode::Enter => app.popup_select(),
-                            KeyCode::Esc | KeyCode::Char('\u{6}') => app.popup = None,
-                            KeyCode::Char('f') if ctrl => app.popup = None,
-                            _ => {}
-                        }
-                    } else if prefix {
-                        prefix = false;
-                        match k.code {
-                            KeyCode::Char('%') => app.split(Dir::Right),
-                            KeyCode::Char('"') => app.split(Dir::Down),
-                            KeyCode::Char('o') => app.focus_next(),
-                            KeyCode::Char('x') => app.close_focused(),
-                            KeyCode::Char('s') => app.toggle_sidebar(),
-                            // tabs: `c` new, `n`/`p` next/prev, `&` close, `1`-`9` jump
-                            KeyCode::Char('c') => app.new_tab(),
-                            KeyCode::Char('n') => app.cycle_tab(1),
-                            KeyCode::Char('p') => app.cycle_tab(-1),
-                            KeyCode::Char('&') => app.close_active_tab(),
-                            KeyCode::Char(d @ '1'..='9') => {
-                                app.select_tab_index(d as usize - '1' as usize)
-                            }
-                            KeyCode::Char('q') => break 'main,
-                            KeyCode::Left => app.focus_dir(FocusDir::Left),
-                            KeyCode::Right => app.focus_dir(FocusDir::Right),
-                            KeyCode::Up => app.focus_dir(FocusDir::Up),
-                            KeyCode::Down => app.focus_dir(FocusDir::Down),
-                            _ => {}
-                        }
-                    } else if let Some(dir) = ctrl_shift_nav(k.code, k.modifiers) {
-                        // Direct (prefix-less) pane navigation: hold `Ctrl+Shift` and
-                        // press an arrow to jump focus to the neighbouring pane. Faster
-                        // than the `Ctrl-b <arrow>` prefix form (which stays as a
-                        // fallback for terminals that don't deliver modified arrows —
-                        // e.g. tmux without `xterm-keys on`).
-                        app.focus_dir(dir);
-                    } else {
-                        // `Ctrl-f` opens the switcher popup (matches the owner's tmux
-                        // binding). `Ctrl-b` enters prefix mode. Both may arrive as a
-                        // raw control byte (`\u{6}`/`\u{2}`) or `Char(_)`+CONTROL.
-                        let is_popup_key = matches!(k.code, KeyCode::Char('\u{6}'))
-                            || (k.code == KeyCode::Char('f') && ctrl);
-                        let is_prefix_key = matches!(k.code, KeyCode::Char('\u{2}'))
-                            || (k.code == KeyCode::Char('b') && ctrl);
-                        if is_popup_key {
-                            app.open_popup();
-                        } else if is_prefix_key {
-                            prefix = true;
-                        } else if let Some(bytes) = key_to_bytes(k.code, k.modifiers) {
-                            app.input_focused(&bytes);
-                        }
-                    }
-                }
-                CEvent::Resize(w, h) => app.resize(w, h),
-                _ => {}
-            }
-            if !event::poll(Duration::from_millis(0))? {
-                break;
-            }
-        }
-    }
-
-    // Best-effort: remove the control socket ONLY if we bound it, so we never
-    // delete another live instance's socket.
-    if we_bound_socket {
-        let _ = std::fs::remove_file(&sock_path);
-    }
-    Ok(())
 }
 
 fn to_color(c: CellColor) -> Color {

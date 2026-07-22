@@ -31,6 +31,9 @@ pub enum Req {
     NewTab,
     /// Make the tab at `index` (as printed by `list-tabs`) active.
     SelectTab { index: usize },
+    /// Shut the persistent server down (drops every shell). The only key-free way to
+    /// stop a detached server short of exiting its last shell.
+    KillServer,
 }
 
 /// One pane in a `list` response.
@@ -115,15 +118,28 @@ impl Resp {
     }
 }
 
-/// The control-socket path: `$COPAD_MUX_SOCK`, else `$TMPDIR/copad-mux.sock`
-/// (TMPDIR is per-user on macOS; `$USER` disambiguates on shared `/tmp`).
+/// The per-user private runtime directory holding the server socket + lock. Prefer
+/// `$XDG_RUNTIME_DIR` (already 0700 on Linux), else `$TMPDIR` (per-user on macOS),
+/// else `/tmp`; the `copad-mux-<user>` component is created 0700 by the server so
+/// the socket is not world-reachable (the socket accepts input injection + takeover,
+/// so it must be a private boundary — `$USER` alone is not one).
+pub fn runtime_dir() -> PathBuf {
+    let base = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("TMPDIR").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "/tmp".to_string());
+    let user = std::env::var("USER").unwrap_or_else(|_| "default".to_string());
+    PathBuf::from(base.trim_end_matches('/')).join(format!("copad-mux-{user}"))
+}
+
+/// The control/attach socket path: `$COPAD_MUX_SOCK` if set (caller-managed, e.g.
+/// tests), else `<runtime_dir>/sock`.
 pub fn socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("COPAD_MUX_SOCK") {
         return PathBuf::from(p);
     }
-    let tmp = std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".to_string());
-    let user = std::env::var("USER").unwrap_or_else(|_| "default".to_string());
-    PathBuf::from(tmp.trim_end_matches('/')).join(format!("copad-mux-{user}.sock"))
+    runtime_dir().join("sock")
 }
 
 /// The `copad-mux ctl ...` CLI client: parse args, round-trip one request over the
@@ -140,13 +156,14 @@ pub fn run_client(args: &[String]) -> i32 {
     }
     let Some(cmd) = rest.first().map(|s| s.as_str()) else {
         eprintln!(
-            "usage: copad-mux ctl <list|split|focus|close|send|list-tabs|new-tab|select-tab> [args]"
+            "usage: copad-mux ctl <list|split|focus|close|send|list-tabs|new-tab|select-tab|kill-server> [args]"
         );
         return 2;
     };
 
     let req = match cmd {
         "list" => Req::List,
+        "kill-server" => Req::KillServer,
         "list-tabs" | "tabs" => Req::ListTabs,
         "new-tab" => Req::NewTab,
         "select-tab" => {

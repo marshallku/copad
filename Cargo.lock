@@ -720,6 +720,7 @@ dependencies = [
  "itoa",
  "rustversion",
  "ryu",
+ "serde",
  "static_assertions",
 ]
 
@@ -839,6 +840,7 @@ name = "copad-mux"
 version = "0.2.0"
 dependencies = [
  "alacritty_terminal",
+ "crossterm",
  "libc",
  "proptest",
  "ratatui",
@@ -1111,6 +1113,7 @@ dependencies = [
  "mio",
  "parking_lot",
  "rustix 0.38.44",
+ "serde",
  "signal-hook 0.3.18",
  "signal-hook-mio",
  "winapi",
@@ -3640,6 +3643,7 @@ dependencies = [
  "itertools",
  "lru",
  "paste",
+ "serde",
  "strum",
  "unicode-segmentation",
  "unicode-truncate",

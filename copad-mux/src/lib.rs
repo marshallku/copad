@@ -10,9 +10,12 @@
 //! actor + `Command`/`Event` + invariant checks). No I/O, no PTYs — so the state
 //! machines are unit- and property-testable in isolation.
 
+pub mod client;
 pub mod control;
 pub mod model;
 pub mod procinfo;
+pub mod proto;
+pub mod server;
 pub mod state;
 pub mod term;
 pub mod tui;
