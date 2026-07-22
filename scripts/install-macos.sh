@@ -23,6 +23,7 @@
 #   ./scripts/install-macos.sh --no-build   # skip swift build (use existing .build/release/Copad)
 #   ./scripts/install-macos.sh --no-coctl # skip cargo install of coctl
 #   ./scripts/install-macos.sh --no-copadd # skip cargo install of copadd (daemon)
+#   ./scripts/install-macos.sh --no-mux   # skip cargo install of copad-mux (multiplexer)
 #   ./scripts/install-macos.sh --no-plugins # skip building/installing plugin binaries
 #   ./scripts/install-macos.sh --launch     # open the installed app afterwards
 #
@@ -50,6 +51,7 @@ DO_BUILD=true
 SYSTEM_INSTALL=false
 DO_COCTL=true
 DO_COPADD=true
+DO_MUX=true
 DO_PLUGINS=true
 DO_DAEMON=true
 DO_LAUNCH=false
@@ -78,6 +80,7 @@ while [[ $# -gt 0 ]]; do
         --no-build)    DO_BUILD=false ; shift ;;
         --no-coctl)  DO_COCTL=false ; shift ;;
         --no-copadd)  DO_COPADD=false ; shift ;;
+        --no-mux)  DO_MUX=false ; shift ;;
         --no-plugins)  DO_PLUGINS=false ; shift ;;
         --no-daemon)   DO_DAEMON=false ; shift ;;
         --with-daemon) DO_DAEMON=true ; shift ;;
@@ -211,6 +214,13 @@ fi
 if $DO_COPADD; then
     echo "==> cargo install --path copad-daemon (copadd → ~/.cargo/bin)"
     cargo install --path "$REPO_ROOT/copad-daemon"
+fi
+if $DO_MUX; then
+    # copad-mux: the standalone agent-orchestration terminal multiplexer
+    # (splits + sidebar + Ctrl-f popup + `copad-mux ctl` control API). Same
+    # cargo-install rationale as coctl — not on crates.io, so install by path.
+    echo "==> cargo install --path copad-mux (copad-mux → ~/.cargo/bin)"
+    cargo install --path "$REPO_ROOT/copad-mux"
 fi
 
 # 7. Build + install macOS-buildable plugins. PluginSupervisor (PR 3) reads
@@ -383,6 +393,9 @@ if $DO_COCTL; then
 fi
 if $DO_COPADD; then
     echo "  $HOME/.cargo/bin/copadd"
+fi
+if $DO_MUX; then
+    echo "  $HOME/.cargo/bin/copad-mux"
 fi
 if $DO_PLUGINS; then
     echo "  $PLUGIN_DEST/{$(IFS=,; echo "${MACOS_PLUGINS[*]}")}"

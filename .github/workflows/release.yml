@@ -38,6 +38,7 @@ jobs:
           mkdir -p dist
           cp target/release/copad dist/
           cp target/release/coctl dist/
+          cp target/release/copad-mux dist/
           # Desktop file basename matches the GTK app_id so Wayland
           # compositors map running windows to this launcher entry.
           cp copad-linux/com.marshall.copad.desktop dist/
@@ -88,6 +89,7 @@ jobs:
             -p copad-ffi \
             -p copad-term \
             -p copad-cli \
+            -p copad-mux \
             -p copad-daemon \
             -p copad-plugin-echo \
             -p copad-plugin-git \
@@ -170,6 +172,7 @@ jobs:
           # ---- Top-level CLI binaries ----
           cp target/release/coctl "$DIST/coctl"
           cp target/release/copadd "$DIST/copadd"
+          cp target/release/copad-mux "$DIST/copad-mux"
 
           # ---- Plugins (binary + plugin.toml + panel.html / triggers.example.toml) ----
           # Layout matches what install-macos.sh writes into

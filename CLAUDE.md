@@ -18,6 +18,7 @@ Cross-platform custom terminal emulator with shared Rust core and platform-nativ
 - `copad-core/` — Shared Rust library (config, background, plugin, protocol, theme, error)
 - `copad-linux/` — GTK4 + VTE4 native terminal app (binary: `copad`)
 - `copad-cli/` — CLI control tool (binary: `coctl`)
+- `copad-mux/` — standalone agent-orchestration terminal multiplexer (binary: `copad-mux`): multi-pane splits + neovim-style sidebar + `Ctrl-f` popup switcher + `copad-mux ctl` control API, hosting real shells via `alacritty_terminal`. Built on an authoritative single-writer state model (control lease / geometry / mutation, property-tested). See `docs/agent-mux-spec.md` + decisions #63–#65.
 - `copad-macos/` — Swift/AppKit app (full secondary platform: alacritty_terminal renderer, tabs/splits, webview, plugins, daemon client — see `docs/macos-post-renderer-catchup.md` for the remaining polish backlog)
 - `copad-ios/` — SwiftUI + WKWebView thin native shell around the `web-bridge` PWA (mobile client; xcodegen project, Simulator-verified). See `copad-ios/README.md` and `docs/mobile-access.md`.
 - `plugins/<name>/` — First-party plugins. Each dir holds the Rust crate (`Cargo.toml` + `src/`) and its runtime manifest/assets (`plugin.toml`, `panel.html`, `triggers.example.toml`) together. Crate name remains `copad-plugin-<name>` (binary name unchanged).
@@ -43,12 +44,12 @@ cargo run -p copad-cli -- <command>
 
 ```bash
 # Linux
-./scripts/install-dev.sh           # cargo build --release + install ~/.local/bin/{copad,coctl} + plugins (no sudo)
+./scripts/install-dev.sh           # cargo build --release + install ~/.local/bin/{copad,coctl,copadd,copad-mux} + plugins (no sudo)
 ./scripts/install-dev.sh --system  # /usr/local/bin instead of ~/.local/bin (requires sudo)
 ./scripts/install-dev.sh --restart # also pkill -x copad afterwards
 
 # macOS
-./scripts/install-macos.sh             # swift build -c release + ~/Applications/Copad.app + ~/.cargo/bin/coctl (no sudo)
+./scripts/install-macos.sh             # swift build -c release + ~/Applications/Copad.app + ~/.cargo/bin/{coctl,copadd,copad-mux} (no sudo)
 ./scripts/install-macos.sh --system    # /Applications/Copad.app instead (sudo for /Applications)
 ./scripts/install-macos.sh --launch    # open the installed .app afterwards
 ```
@@ -97,4 +98,4 @@ git config core.hooksPath .githooks
 
 - **Background images**: Must call `terminal.set_clear_background(false)` for VTE transparency
 - **GTK thread safety**: D-Bus → mpsc channel → glib::timeout_add_local polling
-- **Binary names**: `copad` (app) and `coctl` (CLI) — do not rename to collide
+- **Binary names**: `copad` (app), `coctl` (CLI), `copadd` (daemon), `copad-mux` (multiplexer) — do not rename to collide

@@ -78,7 +78,7 @@ if $DO_BUILD; then
     cargo build --release --workspace --manifest-path "$REPO_ROOT/Cargo.toml"
 fi
 
-for bin in copad coctl copadd; do
+for bin in copad coctl copadd copad-mux; do
     src="$TARGET/$bin"
     if [ ! -x "$src" ]; then
         echo "error: $src not built — run with default flags or 'cargo build --release'" >&2
@@ -86,20 +86,23 @@ for bin in copad coctl copadd; do
     fi
 done
 
-echo "==> installing copad + coctl + copadd into $INSTALL_DIR"
+echo "==> installing copad + coctl + copadd + copad-mux into $INSTALL_DIR"
 if [ -n "$SUDO" ]; then
     # `install -m755` on existing files just rewrites; safe to repeat.
     # copadd is the always-on daemon for trigger dispatch + plugin
-    # supervision — bundling it here means a single install gives
-    # the user the full GUI + CLI + daemon set.
+    # supervision; copad-mux is the standalone agent-orchestration
+    # terminal multiplexer — bundling them here means a single install
+    # gives the user the full GUI + CLI + daemon + mux set.
     $SUDO install -Dm755 "$TARGET/copad" "$INSTALL_DIR/copad"
     $SUDO install -Dm755 "$TARGET/coctl" "$INSTALL_DIR/coctl"
     $SUDO install -Dm755 "$TARGET/copadd" "$INSTALL_DIR/copadd"
+    $SUDO install -Dm755 "$TARGET/copad-mux" "$INSTALL_DIR/copad-mux"
 else
     mkdir -p "$INSTALL_DIR"
     install -Dm755 "$TARGET/copad" "$INSTALL_DIR/copad"
     install -Dm755 "$TARGET/coctl" "$INSTALL_DIR/coctl"
     install -Dm755 "$TARGET/copadd" "$INSTALL_DIR/copadd"
+    install -Dm755 "$TARGET/copad-mux" "$INSTALL_DIR/copad-mux"
 fi
 
 echo "==> installing desktop entry + hicolor icons into ${DESKTOP_DIR%/applications} / $ICON_BASE"
