@@ -10,7 +10,7 @@
 //! and the thin [`crate::client`] renders + forwards input, so the same App serves
 //! local and detached/reattached sessions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::Duration;
 
@@ -38,6 +38,23 @@ enum FocusDir {
     Up,
     Down,
 }
+
+/// One logged agent-turn event, shown in the notification center (`Ctrl-b a`).
+#[derive(Debug, Clone)]
+struct Notification {
+    /// Wall-clock `HH:MM` when it happened.
+    when: String,
+    /// `"done"` (turn finished) or `"blocked"` (awaiting input).
+    kind: &'static str,
+    tool: String,
+    space: String,
+    body: &'static str,
+    /// The pane it came from — `Enter` in the center jumps here.
+    terminal: TerminalId,
+}
+
+/// Max notifications retained in the center.
+const NOTIFY_LOG_CAP: usize = 100;
 
 /// What feeding one key to the app implies for the caller (the server loop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +107,10 @@ pub struct App {
     /// terminal it was entered on, so a focus change (click / another client) can't
     /// strand that pane scrolled-up. Keys scroll it; exit bottoms it. Shared state.
     scroll_pane: Option<TerminalId>,
+    /// The logged agent-turn notifications (newest first), shown in the center.
+    notifications: VecDeque<Notification>,
+    /// When `Some(sel)`, the notification center (`Ctrl-b a`) is open at row `sel`.
+    center: Option<usize>,
     /// Env vars injected into every pane's shell (e.g. `COPAD_MUX_SOCK`), so a
     /// shell inside a pane can control its own mux via `copad-mux ctl`.
     sock_env: Vec<(String, String)>,
@@ -141,6 +162,8 @@ impl App {
             sidebar: true,
             popup: None,
             scroll_pane: None,
+            notifications: VecDeque::new(),
+            center: None,
             sock_env,
             labels: HashMap::new(),
             last_labels: std::time::Instant::now()
@@ -980,10 +1003,26 @@ impl App {
             }
         }
 
+        // Notification center (`Ctrl-b a`) captures input while open.
+        if self.center.is_some() {
+            match k.code {
+                KeyCode::Char('j') | KeyCode::Down => self.center_move(1),
+                KeyCode::Char('k') | KeyCode::Up => self.center_move(-1),
+                KeyCode::Enter => self.center_jump(),
+                KeyCode::Char('d') => self.center_dismiss(),
+                KeyCode::Char('D') => self.notifications.clear(),
+                KeyCode::Esc | KeyCode::Char('q') => self.center = None,
+                _ => {}
+            }
+            *prefix = false;
+            return KeyAction::Continue;
+        }
+
         if *prefix {
             *prefix = false;
             match k.code {
                 KeyCode::Char('%') => self.split(Dir::Right),
+                KeyCode::Char('a') => self.open_center(), // notification center
                 KeyCode::Char('"') => self.split(Dir::Down),
                 // enter scrollback, bound to the currently focused pane
                 KeyCode::Char('[') => self.scroll_pane = self.focused_terminal(),
@@ -1236,6 +1275,68 @@ impl App {
         }
     }
 
+    // --- notification center (Ctrl-b a) ---
+
+    fn open_center(&mut self) {
+        self.center = Some(0);
+    }
+
+    /// Keep the center selection valid as notifications arrive/dismiss (called each
+    /// frame). Stays open (empty state) when the log is empty.
+    pub fn reconcile_center(&mut self) {
+        if let Some(sel) = self.center {
+            let n = self.notifications.len();
+            if n > 0 && sel >= n {
+                self.center = Some(n - 1);
+            }
+        }
+    }
+
+    fn center_move(&mut self, delta: i32) {
+        let n = self.notifications.len() as i32;
+        if n == 0 {
+            return;
+        }
+        if let Some(sel) = self.center {
+            self.center = Some((sel as i32 + delta).rem_euclid(n) as usize);
+        }
+    }
+
+    fn center_dismiss(&mut self) {
+        if let Some(sel) = self.center
+            && sel < self.notifications.len()
+        {
+            self.notifications.remove(sel);
+            let n = self.notifications.len();
+            if n > 0 && sel >= n {
+                self.center = Some(n - 1);
+            }
+        }
+    }
+
+    /// Jump to the selected notification's source pane (session + tab + focus) and
+    /// close the center.
+    fn center_jump(&mut self) {
+        if let Some(sel) = self.center
+            && let Some(note) = self.notifications.get(sel).cloned()
+        {
+            self.center = None;
+            if let Some((wid, tab, pane)) = self.locate_terminal(&note.terminal) {
+                self.switch_session(wid.clone());
+                let _ = self.state.apply(Command::SelectTab {
+                    origin: Origin::Client(self.client),
+                    workspace: wid,
+                    tab,
+                });
+                let _ = self.state.apply(Command::FocusPane {
+                    client: self.client,
+                    pane,
+                });
+                self.reflow();
+            }
+        }
+    }
+
     /// Close panes whose shell has exited (in ANY tab). Returns true if the app is
     /// now empty (last pane of the last tab exited → quit). A tab whose last pane
     /// exits is closed whole; other tabs keep running in the background.
@@ -1459,13 +1560,16 @@ impl App {
         // 4) the always-on bottom status bar (session · tabs · scroll/agents/clock/host).
         self.render_status_bar(buf);
 
-        // 5) the Ctrl-f switcher popup, over everything.
+        // 5) the Ctrl-f switcher popup / notification center, over everything.
         if self.popup.is_some() {
             self.render_popup(buf);
         }
+        if self.center.is_some() {
+            self.render_center(buf);
+        }
 
         // The shell cursor shows only when nothing modal is capturing input.
-        if self.popup.is_none() && self.scroll_pane.is_none() {
+        if self.popup.is_none() && self.scroll_pane.is_none() && self.center.is_none() {
             cursor_pos
         } else {
             None
@@ -1554,6 +1658,23 @@ impl App {
                 })
                 .unwrap_or_default();
             notify::desktop(&format!("{tool} · {space}"), body);
+            // Also log it in the notification center (Ctrl-b a).
+            let kind = if body == "awaiting input" {
+                "blocked"
+            } else {
+                "done"
+            };
+            self.notifications.push_front(Notification {
+                when: local_hhmm(),
+                kind,
+                tool,
+                space,
+                body,
+                terminal: tid,
+            });
+        }
+        while self.notifications.len() > NOTIFY_LOG_CAP {
+            self.notifications.pop_back();
         }
     }
 
@@ -2085,6 +2206,133 @@ impl App {
                 Style::default().fg(Color::Gray).bg(bg)
             };
             // pad the selected row across the inner width so the highlight is a full bar
+            let padded = format!("{row:<width$}", width = inner_w as usize);
+            put(buf, y, inner_x, inner_w, &padded, st);
+        }
+    }
+
+    /// The notification center (`Ctrl-b a`): a centered box listing logged agent-turn
+    /// events, newest first — Enter jumps to the source pane, `d` dismisses.
+    fn render_center(&self, buf: &mut Buffer) {
+        let Some(sel) = self.center else { return };
+        let area = buf.area;
+        let maxw = area.width.saturating_sub(2).max(1);
+        let w = ((area.width as u32 * 3 / 4) as u16).clamp(30.min(maxw), maxw);
+        let maxh = area.height.saturating_sub(2).max(1);
+        let h = ((area.height as u32 * 3 / 5) as u16).clamp(6.min(maxh), maxh);
+        let x0 = (area.width.saturating_sub(w)) / 2;
+        let y0 = (area.height.saturating_sub(h)) / 2;
+        let bg = Color::Rgb(20, 22, 30);
+        let border = Style::default().fg(CAT_MAUVE).bg(bg);
+
+        for y in y0..(y0 + h).min(area.height) {
+            for x in x0..(x0 + w).min(area.width) {
+                let sym = if y == y0 && x == x0 {
+                    "┌"
+                } else if y == y0 && x == x0 + w - 1 {
+                    "┐"
+                } else if y == y0 + h - 1 && x == x0 {
+                    "└"
+                } else if y == y0 + h - 1 && x == x0 + w - 1 {
+                    "┘"
+                } else if y == y0 || y == y0 + h - 1 {
+                    "─"
+                } else if x == x0 || x == x0 + w - 1 {
+                    "│"
+                } else {
+                    " "
+                };
+                if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
+                    bc.set_symbol(sym);
+                    bc.set_skip(false);
+                    let edge = y == y0 || y == y0 + h - 1 || x == x0 || x == x0 + w - 1;
+                    bc.set_style(if edge {
+                        border
+                    } else {
+                        Style::default().bg(bg)
+                    });
+                }
+            }
+        }
+
+        let put =
+            |buf: &mut ratatui::buffer::Buffer, y: u16, x: u16, maxw: u16, s: &str, st: Style| {
+                for (i, ch) in s.chars().take(maxw as usize).enumerate() {
+                    if let Some(bc) = buf.cell_mut(Position::new(x + i as u16, y)) {
+                        let mut sb = [0u8; 4];
+                        bc.set_symbol(ch.encode_utf8(&mut sb));
+                        bc.set_skip(false);
+                        bc.set_style(st);
+                    }
+                }
+            };
+
+        let inner_x = x0 + 2;
+        let inner_w = w.saturating_sub(4);
+        put(
+            buf,
+            y0,
+            inner_x,
+            inner_w,
+            &format!(
+                " notifications ({}) — j/k · enter jump · d dismiss · D clear · q ",
+                self.notifications.len()
+            ),
+            Style::default()
+                .fg(CAT_MAUVE)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        );
+
+        if self.notifications.is_empty() {
+            put(
+                buf,
+                y0 + 2,
+                inner_x,
+                inner_w,
+                "  (no notifications yet)",
+                Style::default().fg(CAT_OVERLAY).bg(bg),
+            );
+            return;
+        }
+
+        // Scroll the viewport so the selected row is always visible.
+        let visible = h.saturating_sub(2) as usize; // rows between the borders
+        let start = if visible > 0 && sel >= visible {
+            sel + 1 - visible
+        } else {
+            0
+        };
+        for (j, note) in self
+            .notifications
+            .iter()
+            .skip(start)
+            .take(visible)
+            .enumerate()
+        {
+            let i = start + j;
+            let y = y0 + 1 + j as u16;
+            let selected = i == sel;
+            let glyph = if note.kind == "blocked" { "▲" } else { "✓" };
+            let row = format!(
+                "{} {} {} {} · {}  {}",
+                if selected { "▸" } else { " " },
+                note.when,
+                glyph,
+                note.tool,
+                note.space,
+                note.body
+            );
+            let st = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(CAT_MAUVE)
+                    .add_modifier(Modifier::BOLD)
+            } else if note.kind == "blocked" {
+                Style::default().fg(CAT_YELLOW).bg(bg)
+            } else {
+                Style::default().fg(CAT_SUBTEXT).bg(bg)
+            };
             let padded = format!("{row:<width$}", width = inner_w as usize);
             put(buf, y, inner_x, inner_w, &padded, st);
         }

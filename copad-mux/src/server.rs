@@ -180,6 +180,7 @@ pub fn run() -> io::Result<()> {
             break;
         }
         app.reconcile_popup();
+        app.reconcile_center();
         app.maybe_refresh_labels();
         if last_frame.elapsed() >= FRAME_INTERVAL {
             last_frame = Instant::now();
