@@ -6,7 +6,52 @@
 //! run on a throttled cadence (~2 Hz), never per frame.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::process::Command;
+
+/// The current working directory of a process (Linux `/proc/<pid>/cwd`, macOS
+/// libproc `PROC_PIDVNODEPATHINFO`). Used to derive a session's git branch.
+#[cfg(target_os = "linux")]
+pub fn process_cwd(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_cwd(pid: u32) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let sz = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    // SAFETY: `info` is a zeroed, correctly-sized out-param for this pid.
+    let r = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            sz,
+        )
+    };
+    if r <= 0 {
+        return None;
+    }
+    // `vip_path` is a fixed C char buffer (its Rust type varies across libc versions —
+    // sometimes a nested array), so read it as a flat NUL-terminated byte buffer.
+    let path = &info.pvi_cdir.vip_path;
+    let len = std::mem::size_of_val(path);
+    // SAFETY: `path` is a live, `len`-byte contiguous C char array.
+    let bytes = unsafe { std::slice::from_raw_parts(path.as_ptr() as *const u8, len) };
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(len);
+    if end == 0 {
+        return None;
+    }
+    Some(PathBuf::from(OsStr::from_bytes(&bytes[..end])))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
+    None
+}
 
 /// What a pane is running, for styling the sidebar/popup row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

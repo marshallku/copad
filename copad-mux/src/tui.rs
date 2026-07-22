@@ -22,6 +22,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agentstate;
 use crate::control;
+use crate::gitinfo;
 use crate::model::{ClientId, Dir, PaneId, PaneRect, Rect, Role, TabId, TerminalId, WorkspaceId};
 use crate::procinfo;
 use crate::proto::MouseKind;
@@ -99,6 +100,9 @@ pub struct App {
     /// Per-agent rolled-up status (working/ready/blocked/idle), refreshed at the
     /// label cadence from Claude's session file + a screen-text fallback (`agentstate`).
     agent_statuses: HashMap<TerminalId, agentstate::AgentStatus>,
+    /// Per-session git branch (its focused pane's cwd) for the `spaces` subtitle,
+    /// refreshed at the label cadence.
+    branches: HashMap<WorkspaceId, String>,
     /// Monotonic counter for minting unique session (workspace) ids (`local` is the
     /// first, so new sessions start at `s1`).
     next_session: u64,
@@ -142,6 +146,7 @@ impl App {
                 .checked_sub(Duration::from_secs(60))
                 .unwrap_or_else(std::time::Instant::now),
             agent_statuses: HashMap::new(),
+            branches: HashMap::new(),
             next_session: 1,
         };
         app.reflow();
@@ -1436,7 +1441,29 @@ impl App {
         if self.last_labels.elapsed() >= Duration::from_millis(500) {
             self.refresh_labels();
             self.refresh_agent_statuses();
+            self.refresh_branches();
         }
+    }
+
+    /// Recompute each session's git branch from its focused pane's shell cwd (for the
+    /// `spaces` subtitle). Rebuilt each pass so a `cd` out of a repo clears it.
+    fn refresh_branches(&mut self) {
+        let mut next = HashMap::new();
+        for wid in self.state.workspace_ids() {
+            let branch = self
+                .state
+                .workspace(&wid)
+                .and_then(|w| w.tab(&w.active_tab))
+                .and_then(|t| t.layout.terminal_of(&t.focused).cloned())
+                .and_then(|tid| self.panes.get(&tid))
+                .and_then(|pane| pane.pid())
+                .and_then(procinfo::process_cwd)
+                .and_then(|cwd| gitinfo::branch(&cwd));
+            if let Some(branch) = branch {
+                next.insert(wid, branch);
+            }
+        }
+        self.branches = next;
     }
 
     /// Recompute each agent pane's status (working/ready/blocked/idle) from Claude's
@@ -1643,14 +1670,15 @@ impl App {
             );
             put(buf, &mut x, y, " ", name_style);
             put(buf, &mut x, y, &name, name_style);
+            // subtitle: git branch (herdr-style), falling back to the focused command
+            // when the cwd isn't a git repo.
+            let sub = self
+                .branches
+                .get(sid)
+                .cloned()
+                .unwrap_or_else(|| self.session_focus_label(sid));
             let mut sx = 4u16;
-            put(
-                buf,
-                &mut sx,
-                y + 1,
-                &self.session_focus_label(sid),
-                sub_style,
-            );
+            put(buf, &mut sx, y + 1, &sub, sub_style);
             y += 2;
         }
 

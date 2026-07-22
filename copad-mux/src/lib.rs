@@ -13,6 +13,7 @@
 pub mod agentstate;
 pub mod client;
 pub mod control;
+pub mod gitinfo;
 pub mod model;
 pub mod procinfo;
 pub mod proto;
