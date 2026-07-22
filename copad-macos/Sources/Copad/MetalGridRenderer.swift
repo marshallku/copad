@@ -571,8 +571,14 @@ final class MetalGridRenderer {
             guard !entry.isEmpty else { continue }
             let x = originX + Double(pg.position.x) + Double(entry.bearingX)
             let y = baselineY - Double(pg.position.y) - Double(entry.bearingMaxY)
+            // Snap the glyph's device-pixel origin to the integer pixel grid.
+            // The atlas quad is exactly the glyph bitmap's pixel size and the
+            // fragment sampler is nearest-neighbor, so a fractional origin
+            // resamples the bitmap and shifts each glyph by a different subpixel
+            // amount — visible as baseline jitter / uneven spacing. An integer
+            // origin maps atlas texels 1:1 onto screen pixels.
             instances.append(QuadInstance(
-                origin: SIMD2(Float(x * Double(scale)), Float(y * Double(scale))),
+                origin: SIMD2(Float((x * Double(scale)).rounded()), Float((y * Double(scale)).rounded())),
                 size: SIMD2(Float(entry.pixelSize.width), Float(entry.pixelSize.height)),
                 uvOrigin: entry.uvOrigin,
                 uvSize: entry.uvSize,
