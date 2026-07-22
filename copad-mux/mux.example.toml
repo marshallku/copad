@@ -19,6 +19,15 @@ sidebar_width = 24        # sidebar columns            (clamped to 8..80)
 sidebar_min_cols = 80     # hide the sidebar below this terminal width (>= width + 20)
 scroll_step = 3           # lines per mouse-wheel notch (1..50)
 
+# ---- session persistence (tmux-resurrect / continuum style) ----
+# The layout (sessions, tabs, splits, per-pane cwd) is autosaved and restored when the
+# server next starts, so a reboot/crash brings your workspace back. Shells restart fresh
+# in their saved directory (running programs are NOT re-launched).
+persist = true            # restore the saved layout on server start (delete the state
+                          #   file, or set false, for a fresh start)
+autosave_secs = 15        # periodic save interval; 0 disables (clamped to 5..3600)
+                          # state file: $COPAD_MUX_STATE else ~/.local/state/copad/mux-session.json
+
 # ---- prefix bindings (pressed AFTER the prefix) ----
 # Rebinding a key replaces that action's WHOLE default chord set. A value can be one
 # chord or a list. Any action you don't mention keeps its default.

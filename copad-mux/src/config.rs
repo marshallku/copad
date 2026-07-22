@@ -29,6 +29,8 @@ use serde::Deserialize;
 pub const DEFAULT_SIDEBAR_WIDTH: u16 = 24;
 pub const DEFAULT_SIDEBAR_MIN_COLS: u16 = 80;
 pub const DEFAULT_SCROLL_STEP: i32 = 3;
+/// Default periodic autosave interval (seconds) for session persistence.
+pub const DEFAULT_AUTOSAVE_SECS: u32 = 15;
 /// Minimum pane-content width kept to the right of the sidebar; `sidebar_min_cols`
 /// is forced to at least `sidebar_width + this` so a visible sidebar can never eat
 /// the whole viewport.
@@ -361,6 +363,10 @@ pub struct MuxConfig {
     pub sidebar_width: u16,
     pub sidebar_min_cols: u16,
     pub scroll_step: i32,
+    /// Restore the saved session layout on server start (continuum-style autorestore).
+    pub persist: bool,
+    /// Periodic autosave interval in seconds; `0` disables periodic saves.
+    pub autosave_secs: u32,
 }
 
 #[derive(Deserialize, Default)]
@@ -372,6 +378,8 @@ struct RawConfig {
     sidebar_width: Option<i64>,
     sidebar_min_cols: Option<i64>,
     scroll_step: Option<i64>,
+    persist: Option<bool>,
+    autosave_secs: Option<i64>,
     keys: Option<HashMap<String, ChordSpec>>,
     global: Option<HashMap<String, ChordSpec>>,
 }
@@ -441,6 +449,8 @@ impl MuxConfig {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_min_cols: DEFAULT_SIDEBAR_MIN_COLS,
             scroll_step: DEFAULT_SCROLL_STEP,
+            persist: true,
+            autosave_secs: DEFAULT_AUTOSAVE_SECS,
         }
     }
 
@@ -497,6 +507,20 @@ impl MuxConfig {
             "scroll_step",
             &mut warnings,
         ) as i32;
+        // autosave: 0 explicitly disables periodic saves; any other value is clamped to
+        // a sane [5, 3600] s (a bad-but-nonzero value shouldn't hammer the disk).
+        let autosave_secs = match raw.autosave_secs {
+            None => DEFAULT_AUTOSAVE_SECS,
+            Some(0) => 0,
+            Some(v) if !(5..=3600).contains(&v) => {
+                let c = v.clamp(5, 3600);
+                warnings.push(format!(
+                    "autosave_secs ({v}) out of range [5,3600] (or 0 to disable) — clamped to {c}"
+                ));
+                c as u32
+            }
+            Some(v) => v as u32,
+        };
 
         (
             MuxConfig {
@@ -507,6 +531,8 @@ impl MuxConfig {
                 sidebar_width,
                 sidebar_min_cols,
                 scroll_step,
+                persist: raw.persist.unwrap_or(true),
+                autosave_secs,
             },
             warnings,
         )
@@ -868,6 +894,24 @@ mod tests {
             Some(Action::EnterPrefix)
         );
         assert!(warns.iter().any(|w| w.contains("shadow")));
+    }
+
+    #[test]
+    fn persist_defaults_on_and_autosave_has_a_default() {
+        let cfg = MuxConfig::default();
+        assert!(cfg.persist);
+        assert_eq!(cfg.autosave_secs, DEFAULT_AUTOSAVE_SECS);
+    }
+
+    #[test]
+    fn autosave_zero_disables_and_out_of_range_clamps() {
+        let (z, _) = load_str("autosave_secs = 0");
+        assert_eq!(z.autosave_secs, 0); // 0 is a valid "disabled" value, not clamped
+        let (hi, warns) = load_str("autosave_secs = 100000");
+        assert_eq!(hi.autosave_secs, 3600);
+        assert!(warns.iter().any(|w| w.contains("autosave_secs")));
+        let (off, _) = load_str("persist = false");
+        assert!(!off.persist);
     }
 
     fn load_str(toml: &str) -> (MuxConfig, Vec<String>) {

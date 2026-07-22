@@ -6,9 +6,16 @@
 use std::collections::HashMap;
 
 use crate::model::{
-    AgentState, ClientId, Dir, PaneId, Rect, Role, SplitTree, Tab, TabId, Terminal, TerminalId,
-    Workspace, WorkspaceId,
+    AgentState, ClientId, Dir, LayoutSpec, PaneId, Rect, Role, SplitTree, Tab, TabId, Terminal,
+    TerminalId, Workspace, WorkspaceId,
 };
+
+/// One tab to restore: its name, split-layout shape, and whether it was the active tab.
+pub struct RestoredTab {
+    pub name: Option<String>,
+    pub layout: LayoutSpec,
+    pub active: bool,
+}
 
 /// Who issued a mutation. Client mutations require the client hold the control
 /// lease (I1); API mutations are authorized separately (spec §6, not modeled
@@ -334,6 +341,87 @@ impl State {
         // Any client attached to the removed workspace is now detached.
         self.clients.retain(|_, a| a.workspace != *id);
         Some(terms)
+    }
+
+    /// Install a whole restored session (workspace) built from `tabs`. Mints fresh ids,
+    /// registers each leaf's terminal at `viewport`, sets the active tab (the one flagged
+    /// `active`, else the first), and pushes the `Workspace`. Returns, per tab in order,
+    /// the leaf `TerminalId`s in DFS pre-order so the caller can attach its already-spawned
+    /// `PaneTerm`s. Trusts each tab's `LayoutSpec` has ≥1 leaf and `tabs` is non-empty
+    /// (the caller prunes empties). Bootstrap-only (single writer, no clients yet) — not a
+    /// `Command`. This is the single atomic commit point of a transactional restore: State
+    /// only ever sees fully-built, non-empty trees.
+    pub fn install_restored_session(
+        &mut self,
+        id: WorkspaceId,
+        name: Option<String>,
+        tabs: Vec<RestoredTab>,
+        viewport: Rect,
+    ) -> Vec<Vec<TerminalId>> {
+        let mut per_tab_terms: Vec<Vec<TerminalId>> = Vec::with_capacity(tabs.len());
+        let mut built: Vec<Tab> = Vec::with_capacity(tabs.len());
+        let mut active_tab_id: Option<TabId> = None;
+        for (i, rt) in tabs.iter().enumerate() {
+            let tab_id = TabId::new(format!("{id}:t{i}"));
+            let mut terms = Vec::new();
+            let layout = self.build_tree(&rt.layout, viewport, &mut terms);
+            let focused = layout.leftmost_pane();
+            if rt.active && active_tab_id.is_none() {
+                active_tab_id = Some(tab_id.clone());
+            }
+            built.push(Tab {
+                id: tab_id,
+                name: rt.name.clone(),
+                layout,
+                focused,
+                rev: 0,
+            });
+            per_tab_terms.push(terms);
+        }
+        let active_tab = active_tab_id.unwrap_or_else(|| built[0].id.clone());
+        self.workspaces.push(Workspace {
+            id,
+            name,
+            tabs: built,
+            active_tab,
+            controller: None,
+            viewport,
+            rev: 0,
+        });
+        per_tab_terms
+    }
+
+    /// Recursively build a `SplitTree` from a `LayoutSpec`, minting a pane+terminal per
+    /// leaf (collected in DFS pre-order into `out_terms`) and clamping branch ratios.
+    fn build_tree(
+        &mut self,
+        spec: &LayoutSpec,
+        viewport: Rect,
+        out_terms: &mut Vec<TerminalId>,
+    ) -> SplitTree {
+        match spec {
+            LayoutSpec::Leaf => {
+                let pane = self.mint_pane();
+                let terminal = self.mint_terminal(viewport.cols, viewport.rows);
+                out_terms.push(terminal.clone());
+                SplitTree::Leaf { pane, terminal }
+            }
+            LayoutSpec::Branch {
+                dir,
+                ratio,
+                first,
+                second,
+            } => {
+                let first = Box::new(self.build_tree(first, viewport, out_terms));
+                let second = Box::new(self.build_tree(second, viewport, out_terms));
+                SplitTree::Branch {
+                    dir: *dir,
+                    ratio: ratio.clamp(0.05, 0.95),
+                    first,
+                    second,
+                }
+            }
+        }
     }
 
     fn mint_pane(&mut self) -> PaneId {
@@ -1072,6 +1160,89 @@ mod tests {
         let ws = WorkspaceId::new("w1");
         let (_tab, pane, _term) = s.create_workspace(ws.clone(), None, Rect { cols: 80, rows: 24 });
         (s, ws, pane)
+    }
+
+    #[test]
+    fn install_restored_session_builds_tree_and_returns_leaves_in_dfs_order() {
+        use crate::model::LayoutSpec;
+        let mut s = State::new();
+        // A tab: Branch(Right, [Leaf, Branch(Down, [Leaf, Leaf])]) → 3 leaves.
+        let layout = LayoutSpec::Branch {
+            dir: Dir::Right,
+            ratio: 0.5,
+            first: Box::new(LayoutSpec::Leaf),
+            second: Box::new(LayoutSpec::Branch {
+                dir: Dir::Down,
+                ratio: 0.5,
+                first: Box::new(LayoutSpec::Leaf),
+                second: Box::new(LayoutSpec::Leaf),
+            }),
+        };
+        let tabs = vec![
+            RestoredTab {
+                name: None,
+                layout: LayoutSpec::Leaf,
+                active: false,
+            },
+            RestoredTab {
+                name: Some("work".into()),
+                layout,
+                active: true,
+            },
+        ];
+        let per_tab = s.install_restored_session(
+            WorkspaceId::new("local"),
+            Some("proj".into()),
+            tabs,
+            Rect { cols: 80, rows: 24 },
+        );
+        let w = s.workspace(&WorkspaceId::new("local")).unwrap();
+        assert_eq!(w.name.as_deref(), Some("proj"));
+        assert_eq!(w.tabs.len(), 2);
+        // The active tab is the one flagged `active` (the second), by identity.
+        assert_eq!(w.active_tab, w.tabs[1].id);
+        assert_eq!(w.tabs[1].name.as_deref(), Some("work"));
+        // Per-tab leaf counts + DFS order: tab 0 has 1 leaf, tab 1 has 3.
+        assert_eq!(per_tab[0].len(), 1);
+        assert_eq!(per_tab[1].len(), 3);
+        // Every returned terminal id is registered in State.
+        for tab_terms in &per_tab {
+            for tid in tab_terms {
+                assert!(
+                    s.terminal(tid).is_some(),
+                    "terminal {tid:?} must be registered"
+                );
+            }
+        }
+        // The tree's own panes match the returned leaf count.
+        assert_eq!(w.tabs[1].layout.panes().len(), 3);
+        assert!(s.check_g1());
+    }
+
+    #[test]
+    fn install_restored_session_falls_back_to_first_tab_when_none_active() {
+        use crate::model::LayoutSpec;
+        let mut s = State::new();
+        let tabs = vec![
+            RestoredTab {
+                name: None,
+                layout: LayoutSpec::Leaf,
+                active: false,
+            },
+            RestoredTab {
+                name: None,
+                layout: LayoutSpec::Leaf,
+                active: false,
+            },
+        ];
+        s.install_restored_session(
+            WorkspaceId::new("local"),
+            None,
+            tabs,
+            Rect { cols: 80, rows: 24 },
+        );
+        let w = s.workspace(&WorkspaceId::new("local")).unwrap();
+        assert_eq!(w.active_tab, w.tabs[0].id);
     }
 
     #[test]

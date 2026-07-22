@@ -109,6 +109,21 @@ pub enum SplitTree {
     },
 }
 
+/// A layout description used to REBUILD a [`SplitTree`] at restore time. It carries the
+/// tree SHAPE (branch dirs + ratios) but no ids — the builder mints fresh pane/terminal
+/// ids per leaf and reports them back in DFS pre-order. (Persistence keeps the runtime
+/// ids out of the on-disk snapshot; they're regenerated on restore.)
+#[derive(Debug, Clone, PartialEq)]
+pub enum LayoutSpec {
+    Leaf,
+    Branch {
+        dir: Dir,
+        ratio: f32,
+        first: Box<LayoutSpec>,
+        second: Box<LayoutSpec>,
+    },
+}
+
 /// A rectangle in terminal cells, used to derive per-pane geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rect {

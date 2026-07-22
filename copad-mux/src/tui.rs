@@ -13,6 +13,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ratatui::buffer::Buffer;
@@ -25,11 +26,15 @@ use crate::agentstate;
 use crate::config::{self, Action, MuxConfig};
 use crate::control;
 use crate::gitinfo;
-use crate::model::{ClientId, Dir, PaneId, PaneRect, Rect, Role, TabId, TerminalId, WorkspaceId};
+use crate::model::{
+    ClientId, Dir, LayoutSpec, PaneId, PaneRect, Rect, Role, SplitTree, TabId, TerminalId,
+    WorkspaceId,
+};
 use crate::notify;
+use crate::persist::{self, MAX_LEAVES_PER_TAB, MAX_TOTAL_PANES, PLayout};
 use crate::procinfo;
 use crate::proto::MouseKind;
-use crate::state::{Command, Event, MuxError, Origin, State};
+use crate::state::{Command, Event, MuxError, Origin, RestoredTab, State};
 use crate::term::{CellColor, PaneTerm};
 
 /// Direction for focus navigation with the arrow keys.
@@ -194,9 +199,34 @@ impl App {
         cfg: MuxConfig,
     ) -> io::Result<Self> {
         let mut state = State::new();
-        let ws = WorkspaceId::new("local");
-        let (_tab, _pane, term0) = state.create_workspace(ws.clone(), None, Rect { cols, rows });
+        let mut panes = HashMap::new();
         let client = ClientId(0);
+
+        // Try to restore the saved session layout (continuum-style). Falls back to a
+        // fresh single `local` workspace when persistence is off, there's no snapshot, or
+        // nothing could be restored (never boot empty).
+        let restored = if cfg.persist {
+            persist::load().and_then(|snap| {
+                restore_sessions(&mut state, &mut panes, &snap, cols, rows, &sock_env)
+            })
+        } else {
+            None
+        };
+        let (ws, next_session) = match restored {
+            Some(r) => r,
+            None => {
+                let ws = WorkspaceId::new("local");
+                let (_tab, _pane, term0) =
+                    state.create_workspace(ws.clone(), None, Rect { cols, rows });
+                let Some(pt) =
+                    PaneTerm::spawn_with_env(cols.max(1), rows.max(1), None, None, &sock_env)
+                else {
+                    return Err(io::Error::other("failed to spawn shell PTY"));
+                };
+                panes.insert(term0, pt);
+                (ws, 1)
+            }
+        };
         let _ = state.apply(Command::Attach {
             client,
             workspace: ws.clone(),
@@ -205,12 +235,6 @@ impl App {
             cols,
             rows,
         });
-        let mut panes = HashMap::new();
-        let Some(pt) = PaneTerm::spawn_with_env(cols.max(1), rows.max(1), None, None, &sock_env)
-        else {
-            return Err(io::Error::other("failed to spawn shell PTY"));
-        };
-        panes.insert(term0, pt);
         let mut app = Self {
             state,
             ws,
@@ -232,7 +256,7 @@ impl App {
                 .unwrap_or_else(std::time::Instant::now),
             agent_statuses: HashMap::new(),
             branches: HashMap::new(),
-            next_session: 1,
+            next_session,
             prompt: None,
             confirm: None,
             cfg,
@@ -1866,6 +1890,70 @@ impl App {
         local_minute()
     }
 
+    /// Build the on-disk snapshot of the current session layout (names + tabs + BSP split
+    /// trees + per-leaf cwd). Read-only — safe to call on the render loop for autosave.
+    pub fn snapshot(&self) -> persist::PersistState {
+        let mut sessions = Vec::new();
+        let mut active_session = 0;
+        for wid in self.state.workspace_ids() {
+            let Some(w) = self.state.workspace(&wid) else {
+                continue;
+            };
+            if wid == self.ws {
+                active_session = sessions.len(); // index in the vec we're building
+            }
+            let mut tabs = Vec::new();
+            let mut active_tab = 0;
+            for t in &w.tabs {
+                if t.id == w.active_tab {
+                    active_tab = tabs.len();
+                }
+                tabs.push(persist::PTab {
+                    name: t.name.clone(),
+                    layout: self.layout_to_persist(&t.layout),
+                });
+            }
+            sessions.push(persist::PSession {
+                name: w.name.clone(),
+                active_tab,
+                tabs,
+            });
+        }
+        persist::PersistState {
+            version: persist::SCHEMA_VERSION,
+            saved_at: now_secs(),
+            active_session,
+            sessions,
+        }
+    }
+
+    /// Convert a live `SplitTree` to its persisted form, reading each leaf's shell cwd.
+    fn layout_to_persist(&self, tree: &SplitTree) -> PLayout {
+        match tree {
+            SplitTree::Leaf { terminal, .. } => {
+                // Non-UTF-8 cwd → None (that pane restores to $HOME); the save never fails.
+                let cwd = self
+                    .panes
+                    .get(terminal)
+                    .and_then(|p| p.pid())
+                    .and_then(procinfo::process_cwd)
+                    .and_then(|p| p.to_str().map(|s| s.to_string()));
+                PLayout::Leaf { cwd }
+            }
+            SplitTree::Branch {
+                dir,
+                ratio,
+                first,
+                second,
+            } => PLayout::Branch {
+                dir: *dir,
+                ratio: *ratio,
+                first: Box::new(self.layout_to_persist(first)),
+                second: Box::new(self.layout_to_persist(second)),
+            },
+        }
+    }
+
     /// Returns whether any chrome-affecting data (labels / agent statuses / branches)
     /// actually CHANGED, so the render loop only recomposes when the sidebar/status bar
     /// would differ (throttled to ~2 Hz; unchanged refreshes are free of a repaint).
@@ -2824,6 +2912,154 @@ fn divider_touches(fr: &PaneRect, x: u16, y: u16) -> bool {
     let vert = in_y && (x + 1 == fr.x || x == fr.x + fr.cols);
     let horiz = in_x && (y + 1 == fr.y || y == fr.y + fr.rows);
     vert || horiz
+}
+
+/// Current Unix time in seconds (0 on a clock before the epoch — informational only).
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Restore saved sessions into `state`/`panes` (continuum-style). Returns the active
+/// workspace + the `next_session` counter (so freshly created sessions can't collide with
+/// restored `sN` ids), or `None` if nothing valid could be restored. Transactional per
+/// session: PTYs are spawned OFF-STATE and pruned on failure, so `State` only ever gets
+/// fully-built, non-empty trees (no dangling leaves).
+fn restore_sessions(
+    state: &mut State,
+    panes: &mut HashMap<TerminalId, PaneTerm>,
+    snap: &persist::PersistState,
+    cols: u16,
+    rows: u16,
+    sock_env: &[(String, String)],
+) -> Option<(WorkspaceId, u64)> {
+    let viewport = Rect { cols, rows };
+    let mut budget = MAX_TOTAL_PANES; // total panes across all sessions
+    let mut installed: Vec<WorkspaceId> = Vec::new();
+    let mut active_ws: Option<WorkspaceId> = None;
+
+    for (si, ps) in snap.sessions.iter().enumerate() {
+        // Phase 1: spawn+prune every tab OFF-STATE.
+        let mut restored_tabs: Vec<RestoredTab> = Vec::new();
+        let mut tab_paneterms: Vec<Vec<PaneTerm>> = Vec::new();
+        for (ti, pt) in ps.tabs.iter().enumerate() {
+            // Reject a suspiciously large tab outright (untrusted file).
+            if pt.layout.leaf_count() > MAX_LEAVES_PER_TAB {
+                continue;
+            }
+            if let Some((spec, pts)) =
+                spawn_layout(&pt.layout, cols, rows, 0, &mut budget, sock_env)
+            {
+                restored_tabs.push(RestoredTab {
+                    name: pt.name.clone(),
+                    layout: spec,
+                    // Active-by-IDENTITY: flag the tab that was active by its ORIGINAL
+                    // index, so pruning earlier tabs can't misselect (codex review).
+                    active: ti == ps.active_tab,
+                });
+                tab_paneterms.push(pts);
+            }
+        }
+        if restored_tabs.is_empty() {
+            continue; // whole session died / empty → skip it
+        }
+
+        // Phase 2: single atomic commit into State (mints ids, registers terminals).
+        let idx = installed.len();
+        let id = if idx == 0 {
+            WorkspaceId::new("local")
+        } else {
+            WorkspaceId::new(format!("s{idx}"))
+        };
+        let per_tab_terms =
+            state.install_restored_session(id.clone(), ps.name.clone(), restored_tabs, viewport);
+
+        // Phase 3: attach the already-spawned PaneTerms by the ids State minted (DFS order
+        // matches spawn order, since both walk the same pruned spec first-then-second).
+        for (terms, pts) in per_tab_terms.into_iter().zip(tab_paneterms) {
+            for (tid, pane_term) in terms.into_iter().zip(pts) {
+                panes.insert(tid, pane_term);
+            }
+        }
+        if si == snap.active_session {
+            active_ws = Some(id.clone());
+        }
+        installed.push(id);
+    }
+
+    if installed.is_empty() {
+        return None;
+    }
+    let active = active_ws.unwrap_or_else(|| installed[0].clone());
+    // Restored ids are `local, s1, .., s{n-1}`; next new session must be `s{n}`.
+    Some((active, installed.len() as u64))
+}
+
+/// Spawn PTYs for a persisted layout, pruning any leaf whose shell can't spawn. Returns
+/// the pruned `LayoutSpec` (live leaves only) + the `PaneTerm`s in DFS pre-order, or `None`
+/// if the whole subtree died. Enforces the depth cap and the shared pane `budget`.
+fn spawn_layout(
+    node: &PLayout,
+    cols: u16,
+    rows: u16,
+    depth: usize,
+    budget: &mut usize,
+    sock_env: &[(String, String)],
+) -> Option<(LayoutSpec, Vec<PaneTerm>)> {
+    match node {
+        PLayout::Leaf { cwd } => {
+            if *budget == 0 {
+                return None;
+            }
+            let dir = resolve_cwd(cwd.as_deref());
+            let pt = PaneTerm::spawn_with_env(cols.max(1), rows.max(1), None, dir, sock_env)?;
+            *budget -= 1;
+            Some((LayoutSpec::Leaf, vec![pt]))
+        }
+        PLayout::Branch {
+            dir,
+            ratio,
+            first,
+            second,
+        } => {
+            if depth >= persist::MAX_DEPTH {
+                return None; // too deep (untrusted) → prune this subtree
+            }
+            let f = spawn_layout(first, cols, rows, depth + 1, budget, sock_env);
+            let s = spawn_layout(second, cols, rows, depth + 1, budget, sock_env);
+            match (f, s) {
+                (Some((lf, mut pf)), Some((ls, ps))) => {
+                    pf.extend(ps);
+                    Some((
+                        LayoutSpec::Branch {
+                            dir: *dir,
+                            ratio: *ratio,
+                            first: Box::new(lf),
+                            second: Box::new(ls),
+                        },
+                        pf,
+                    ))
+                }
+                // One child died → collapse to the survivor (prune the dead branch).
+                (Some(one), None) | (None, Some(one)) => Some(one),
+                (None, None) => None,
+            }
+        }
+    }
+}
+
+/// Resolve a saved cwd to a concrete directory for a restored shell: the saved path if it
+/// still exists, else `$HOME` (never `None` when a home is known, so the shell doesn't
+/// silently inherit the SERVER's cwd).
+fn resolve_cwd(cwd: Option<&str>) -> Option<PathBuf> {
+    if let Some(s) = cwd
+        && Path::new(s).is_dir()
+    {
+        return Some(PathBuf::from(s));
+    }
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 /// Local `HH:MM` for the status-bar clock (via libc `localtime_r`, no chrono dep).

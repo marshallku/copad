@@ -156,6 +156,14 @@ pub fn run() -> io::Result<()> {
         eprintln!("copad-mux config: {w}");
     }
     let mouse = cfg.mouse;
+    // Session persistence (continuum-style): a background writer autosaves the layout so a
+    // reboot/crash can restore it (App::new already restored on boot). Disabled when
+    // `persist = false` or `autosave_secs = 0`.
+    let persist_enabled = cfg.persist;
+    let state_path = crate::persist::state_path();
+    let saver = (cfg.persist && cfg.autosave_secs > 0)
+        .then(|| crate::persist::Saver::new(state_path.clone()));
+    let autosave = Duration::from_secs(cfg.autosave_secs.max(1) as u64);
     // Headless default size until the first client attaches (then reflowed).
     let mut app = App::new(80, 24, sock_env, cfg)?;
 
@@ -169,6 +177,7 @@ pub fn run() -> io::Result<()> {
     let mut kill = false;
     let mut last_frame = Instant::now();
     let mut last_min = app.clock_minute();
+    let mut last_save = Instant::now();
     // Idle-skip: only compose+diff a frame when something that affects it changed since
     // the last render (tmx-style). Start dirty so the first frame is always drawn.
     let mut dirty = true;
@@ -216,6 +225,31 @@ pub fn run() -> io::Result<()> {
             push_frames(&mut app, &mut clients);
             dirty = false;
         }
+        // Periodic autosave: hand a fresh snapshot to the off-loop writer. Reset the timer
+        // from now (not fixed cadence) so a delayed loop can't trigger catch-up bursts.
+        // Read-only, so it does NOT set `dirty` (never defeats the idle-skip).
+        if let Some(saver) = &saver
+            && last_save.elapsed() >= autosave
+        {
+            saver.request(app.snapshot());
+            last_save = Instant::now();
+        }
+    }
+
+    // Join the periodic writer (drains any queued autosave) BEFORE the final save, so the
+    // synchronous save below is strictly last and its LATEST snapshot wins.
+    drop(saver);
+    // On an explicit `kill-server` (not a last-shell exit, which empties the app), write
+    // the latest layout SYNCHRONOUSLY so an immediate reboot restores it even if no
+    // periodic autosave fired yet. Synchronous (not the coalescing queue, which could drop
+    // it behind an in-flight write) so the latest is guaranteed durable. Safe: no tombstone
+    // → nothing races this delete-free write.
+    if kill
+        && persist_enabled
+        && !app.is_empty()
+        && let Err(e) = crate::persist::save_blocking(&state_path, &app.snapshot())
+    {
+        eprintln!("copad-mux persist: final save failed: {e}");
     }
 
     for c in clients.drain(..) {
