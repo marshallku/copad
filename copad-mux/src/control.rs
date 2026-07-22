@@ -59,6 +59,10 @@ pub struct PaneInfo {
     /// Classification of `label`: `"agent"`, `"shell"`, or `"other"`.
     #[serde(default)]
     pub kind: String,
+    /// For agent panes: rolled-up status `working`/`ready`/`blocked`/`idle` (empty
+    /// otherwise).
+    #[serde(default)]
+    pub status: String,
 }
 
 /// One tab in a `list-tabs` response.
@@ -321,17 +325,18 @@ fn print_human(req: &Req, resp: &Resp) {
             let panes = resp.panes.clone().unwrap_or_default();
             let focused = resp.focused.unwrap_or(usize::MAX);
             println!(
-                "{:<3} {:<8} {:<9} {:<8} {:<14} SIZE",
-                "IDX", "PANE", "FOCUS", "KIND", "LABEL"
+                "{:<3} {:<8} {:<9} {:<8} {:<14} {:<9} SIZE",
+                "IDX", "PANE", "FOCUS", "KIND", "LABEL", "STATUS"
             );
             for p in &panes {
                 println!(
-                    "{:<3} {:<8} {:<9} {:<8} {:<14} {}x{}",
+                    "{:<3} {:<8} {:<9} {:<8} {:<14} {:<9} {}x{}",
                     p.index,
                     p.id,
                     if p.index == focused { "*focused" } else { "" },
                     p.kind,
                     p.label,
+                    p.status,
                     p.cols,
                     p.rows,
                 );

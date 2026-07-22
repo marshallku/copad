@@ -20,6 +20,7 @@ use ratatui::layout::Position;
 use ratatui::style::{Color, Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::agentstate;
 use crate::control;
 use crate::model::{ClientId, Dir, PaneId, PaneRect, Rect, Role, TabId, TerminalId, WorkspaceId};
 use crate::procinfo;
@@ -63,7 +64,6 @@ const CAT_YELLOW: Color = Color::Rgb(0xf9, 0xe2, 0xaf);
 const CAT_SUBTEXT: Color = Color::Rgb(0xba, 0xc2, 0xde);
 const CAT_OVERLAY: Color = Color::Rgb(0x6c, 0x70, 0x86);
 const CAT_GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
-const CAT_RED: Color = Color::Rgb(0xf3, 0x8b, 0xa8);
 const CAT_PEACH: Color = Color::Rgb(0xfa, 0xb3, 0x87);
 /// Below this terminal width the sidebar is suppressed even when toggled on —
 /// the popup switcher is the fallback on narrow / mobile widths (size-adaptive).
@@ -96,10 +96,9 @@ pub struct App {
     labels: HashMap<TerminalId, procinfo::Label>,
     /// When the labels were last refreshed (throttle `ps` to ~2 Hz).
     last_labels: std::time::Instant,
-    /// Per-terminal output-activity: a cheap screen signature + when it last changed,
-    /// so an agent pane reads as `working` (recent output) vs `idle`. Refreshed at the
-    /// label cadence.
-    activity: HashMap<TerminalId, (u64, std::time::Instant)>,
+    /// Per-agent rolled-up status (working/ready/blocked/idle), refreshed at the
+    /// label cadence from Claude's session file + a screen-text fallback (`agentstate`).
+    agent_statuses: HashMap<TerminalId, agentstate::AgentStatus>,
     /// Monotonic counter for minting unique session (workspace) ids (`local` is the
     /// first, so new sessions start at `s1`).
     next_session: u64,
@@ -142,7 +141,7 @@ impl App {
             last_labels: std::time::Instant::now()
                 .checked_sub(Duration::from_secs(60))
                 .unwrap_or_else(std::time::Instant::now),
-            activity: HashMap::new(),
+            agent_statuses: HashMap::new(),
             next_session: 1,
         };
         app.reflow();
@@ -662,10 +661,20 @@ impl App {
                             .and_then(|tid| rects.iter().find(|r| &r.terminal == tid))
                             .map(|r| (r.cols, r.rows))
                             .unwrap_or((0, 0));
-                        let kind = match self.pane_label_at(index).map(|l| l.kind) {
-                            Some(procinfo::Kind::Agent) => "agent",
-                            Some(procinfo::Kind::Shell) => "shell",
-                            _ => "other",
+                        let is_agent = self.pane_label_at(index).map(|l| l.kind)
+                            == Some(procinfo::Kind::Agent);
+                        let kind = if is_agent {
+                            "agent"
+                        } else if self.pane_label_at(index).map(|l| l.kind)
+                            == Some(procinfo::Kind::Shell)
+                        {
+                            "shell"
+                        } else {
+                            "other"
+                        };
+                        let status = match (is_agent, term.as_ref()) {
+                            (true, Some(tid)) => self.agent_status(tid).to_string(),
+                            _ => String::new(),
                         };
                         PaneInfo {
                             index,
@@ -675,6 +684,7 @@ impl App {
                             rows,
                             label: self.pane_label(index),
                             kind: kind.to_string(),
+                            status,
                         }
                     })
                     .collect();
@@ -1425,52 +1435,34 @@ impl App {
     pub fn maybe_refresh_labels(&mut self) {
         if self.last_labels.elapsed() >= Duration::from_millis(500) {
             self.refresh_labels();
-            self.refresh_activity();
+            self.refresh_agent_statuses();
         }
     }
 
-    /// Update per-agent output activity (a cheap screen signature + change time), so
-    /// the sidebar can show `working` (recent output) vs `idle`. Agent panes only.
-    fn refresh_activity(&mut self) {
-        use std::hash::{Hash, Hasher};
-        let now = std::time::Instant::now();
-        let mut next: HashMap<TerminalId, (u64, std::time::Instant)> = HashMap::new();
+    /// Recompute each agent pane's status (working/ready/blocked/idle) from Claude's
+    /// session file + a screen-text fallback (`agentstate`). Agent panes only; the map
+    /// is rebuilt each pass so closed/reclassified panes drop out.
+    fn refresh_agent_statuses(&mut self) {
+        let mut next = HashMap::new();
         for (tid, pane) in &self.panes {
-            let is_agent = self
-                .labels
-                .get(tid)
-                .map(|l| l.kind == procinfo::Kind::Agent)
-                .unwrap_or(false);
-            if !is_agent {
+            let Some(label) = self.labels.get(tid) else {
+                continue;
+            };
+            if label.kind != procinfo::Kind::Agent {
                 continue;
             }
-            let snap = pane.snapshot();
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            snap.cursor.hash(&mut h);
-            for row in &snap.cells {
-                for c in row {
-                    c.sym.hash(&mut h);
-                }
-            }
-            let sig = h.finish();
-            // Keep the old change-time if the screen is unchanged; else it's now.
-            let last = match self.activity.get(tid) {
-                Some((old_sig, last_change)) if *old_sig == sig => *last_change,
-                _ => now,
-            };
-            next.insert(tid.clone(), (sig, last));
+            let status = agentstate::resolve(Some(label.pid), &pane.snapshot());
+            next.insert(tid.clone(), status);
         }
-        self.activity = next;
+        self.agent_statuses = next;
     }
 
-    /// An agent pane's rolled-up state for the sidebar. `working` if it produced
-    /// output in the last ~1.5s, else `idle`. (blocked/done need semantic agent-state
-    /// reading — a later unit.)
+    /// An agent pane's rolled-up status label for the sidebar (`idle` if unknown).
     fn agent_status(&self, tid: &TerminalId) -> &'static str {
-        match self.activity.get(tid) {
-            Some((_, last)) if last.elapsed() < Duration::from_millis(1500) => "working",
-            _ => "idle",
-        }
+        self.agent_statuses
+            .get(tid)
+            .map(|s| s.label())
+            .unwrap_or("idle")
     }
 
     /// A one-line label for a pane row (index + short cwd basename if available).
@@ -1670,10 +1662,11 @@ impl App {
             if y + 1 >= h {
                 break;
             }
+            // tmx-style glyph + colour per status (all width-1 geometric shapes).
             let (dot, scolor) = match status {
-                "working" => ("●", CAT_PEACH),
-                "blocked" => ("●", CAT_RED),
-                "done" => ("●", CAT_BLUE),
+                "working" => ("●", CAT_GREEN),
+                "ready" => ("◐", CAT_BLUE),
+                "blocked" => ("▲", CAT_YELLOW),
                 _ => ("○", CAT_OVERLAY), // idle
             };
             let mut x = 1u16;

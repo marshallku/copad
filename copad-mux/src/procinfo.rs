@@ -24,6 +24,9 @@ pub enum Kind {
 pub struct Label {
     pub text: String,
     pub kind: Kind,
+    /// The pid of the resolved foreground process (the agent process for an agent
+    /// pane) — used to read its `~/.claude/sessions/<pid>.json` status.
+    pub pid: u32,
 }
 
 /// Case-insensitive basenames treated as AI agents.
@@ -132,6 +135,7 @@ impl ProcTree {
         self.procs.get(&pick).map(|r| Label {
             kind: classify(&r.comm),
             text: r.comm.clone(),
+            pid: pick,
         })
     }
 
@@ -161,6 +165,7 @@ impl ProcTree {
         Some(Label {
             kind: classify(&comm),
             text: comm,
+            pid: cur,
         })
     }
 }
