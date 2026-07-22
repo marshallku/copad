@@ -65,8 +65,6 @@ pub struct App {
     /// When `Some(sel)`, the `Ctrl-f` popup switcher is open with row `sel`
     /// selected; keys drive the popup instead of the shells.
     popup: Option<usize>,
-    /// True after a `Ctrl-b` prefix keypress; the next key is a mux command.
-    prefix: bool,
     /// Env vars injected into every pane's shell (e.g. `COPAD_MUX_SOCK`), so a
     /// shell inside a pane can control its own mux via `copad-mux ctl`.
     sock_env: Vec<(String, String)>,
@@ -109,7 +107,6 @@ impl App {
             rows,
             sidebar: false,
             popup: None,
-            prefix: false,
             sock_env,
             labels: HashMap::new(),
             last_labels: std::time::Instant::now()
@@ -807,15 +804,19 @@ impl App {
         }
     }
 
-    /// Route one key event through the mux (popup → prefix → direct-nav → shell),
-    /// exactly as the local loop used to. Returns [`KeyAction::Detach`] on the
-    /// detach chord. The `Ctrl-b` prefix state lives in `self.prefix` so a forwarded
-    /// key stream (from a remote client) is handled identically to local input.
-    pub fn feed_key(&mut self, k: KeyEvent) -> KeyAction {
+    /// Route one key event through the mux (popup → prefix → direct-nav → shell).
+    /// Returns [`KeyAction::Detach`] on the detach chord. The `Ctrl-b` prefix state is
+    /// PER-CLIENT (`prefix`, owned by the caller) so a chord can't span connections
+    /// when several clients share input; the popup is shared workspace state.
+    pub fn feed_key(&mut self, k: KeyEvent, prefix: &mut bool) -> KeyAction {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
 
-        // The switcher captures all input while open.
+        // The switcher captures all input while open. Clear THIS client's pending
+        // prefix too: the popup is shared state, so a `Ctrl-b` armed on one client
+        // must not survive another client's popup interaction and fire a stray mux
+        // command (close/detach) after the popup closes.
         if self.popup.is_some() {
+            *prefix = false;
             match k.code {
                 KeyCode::Char('j') | KeyCode::Down => self.popup_move(1),
                 KeyCode::Char('k') | KeyCode::Up => self.popup_move(-1),
@@ -827,8 +828,8 @@ impl App {
             return KeyAction::Continue;
         }
 
-        if self.prefix {
-            self.prefix = false;
+        if *prefix {
+            *prefix = false;
             match k.code {
                 KeyCode::Char('%') => self.split(Dir::Right),
                 KeyCode::Char('"') => self.split(Dir::Down),
@@ -848,10 +849,11 @@ impl App {
                 // Detach — leave the server + shells running. Both `d` and `q`
                 // detach; NO key kills the server (that would drop every shell).
                 KeyCode::Char('d') | KeyCode::Char('q') => return KeyAction::Detach,
-                KeyCode::Left => self.focus_dir(FocusDir::Left),
-                KeyCode::Right => self.focus_dir(FocusDir::Right),
-                KeyCode::Up => self.focus_dir(FocusDir::Up),
-                KeyCode::Down => self.focus_dir(FocusDir::Down),
+                // directional pane focus — vim `hjkl` (preferred) or arrows (fallback)
+                KeyCode::Char('h') | KeyCode::Left => self.focus_dir(FocusDir::Left),
+                KeyCode::Char('j') | KeyCode::Down => self.focus_dir(FocusDir::Down),
+                KeyCode::Char('k') | KeyCode::Up => self.focus_dir(FocusDir::Up),
+                KeyCode::Char('l') | KeyCode::Right => self.focus_dir(FocusDir::Right),
                 _ => {}
             }
             return KeyAction::Continue;
@@ -872,7 +874,7 @@ impl App {
         if is_popup_key {
             self.open_popup();
         } else if is_prefix_key {
-            self.prefix = true;
+            *prefix = true;
         } else if let Some(bytes) = key_to_bytes(k.code, k.modifiers) {
             self.input_focused(&bytes);
         }
@@ -1646,10 +1648,15 @@ fn ctrl_shift_nav(code: KeyCode, mods: KeyModifiers) -> Option<FocusDir> {
         return None;
     }
     match code {
-        KeyCode::Left => Some(FocusDir::Left),
-        KeyCode::Right => Some(FocusDir::Right),
-        KeyCode::Up => Some(FocusDir::Up),
-        KeyCode::Down => Some(FocusDir::Down),
+        // vim `hjkl` (preferred) or arrows (fallback). Match BOTH cases: holding Shift
+        // usually reports the letter uppercased (`H`/`J`/…). This chord is best-effort
+        // (some terminals can't distinguish Ctrl+Shift+letter without the kitty
+        // keyboard protocol) — the always-reliable hjkl path is `Ctrl-b h/j/k/l`.
+        // Plain hjkl still reaches the shell — only the chord navigates.
+        KeyCode::Char('h' | 'H') | KeyCode::Left => Some(FocusDir::Left),
+        KeyCode::Char('j' | 'J') | KeyCode::Down => Some(FocusDir::Down),
+        KeyCode::Char('k' | 'K') | KeyCode::Up => Some(FocusDir::Up),
+        KeyCode::Char('l' | 'L') | KeyCode::Right => Some(FocusDir::Right),
         _ => None,
     }
 }

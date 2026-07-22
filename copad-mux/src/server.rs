@@ -7,6 +7,11 @@
 //! Ownership is atomic: a would-be server takes an exclusive `flock` on
 //! `<runtime>/lock`; only the lock holder may unlink a stale socket + bind (no
 //! TOCTOU race between competing starts). Same-uid peers only (`getpeereid`).
+//!
+//! Multiple clients may attach at once (tmux-style shared view): the app is sized to
+//! the SMALLEST attached client so all of them see the whole thing, one composite is
+//! broadcast to every client (each diffed against its own baseline), and all share
+//! input. Detach (`Ctrl-b d`) removes only the client that pressed it.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -69,6 +74,9 @@ struct Client {
     /// The cursor position the client last received, so a cursor-only move (no cell
     /// change) still gets shipped instead of leaving a stale cursor.
     last_cursor: Option<(u16, u16)>,
+    /// This client's OWN `Ctrl-b` prefix state — per-connection so a chord can't span
+    /// clients when input is shared.
+    prefix: bool,
     epoch: u64,
     cols: u16,
     rows: u16,
@@ -139,21 +147,24 @@ pub fn run() -> io::Result<()> {
     let (tx, rx) = mpsc::channel::<Incoming>();
     spawn_accept_loop(listener, tx);
 
-    let mut client: Option<Client> = None;
+    // Multiple clients may attach at once (tmux-style shared view). The app is sized
+    // to the SMALLEST attached client so everyone sees the whole thing; the same
+    // composite is broadcast to all (each with its own diff baseline).
+    let mut clients: Vec<Client> = Vec::new();
     let mut kill = false;
     let mut last_frame = Instant::now();
 
     loop {
         match rx.recv_timeout(FRAME_INTERVAL) {
             Ok(msg) => {
-                handle_incoming(msg, &mut app, &mut client, &mut kill);
+                handle_incoming(msg, &mut app, &mut clients, &mut kill);
                 // Bound the drain so a key/ctl flood can't starve rendering, PTY
                 // reaping, or shutdown — fall back to the frame tick after a batch.
                 let mut budget = 256u32;
                 while budget > 0
                     && let Ok(m) = rx.try_recv()
                 {
-                    handle_incoming(m, &mut app, &mut client, &mut kill);
+                    handle_incoming(m, &mut app, &mut clients, &mut kill);
                     budget -= 1;
                 }
             }
@@ -163,7 +174,8 @@ pub fn run() -> io::Result<()> {
         if kill {
             break;
         }
-        // The server itself quits only when the last shell exits (app empty).
+        // The server itself quits only when the last shell exits (app empty) — NOT
+        // when the last client detaches (the whole point of detach: shells live on).
         if app.reap_exited() {
             break;
         }
@@ -171,15 +183,35 @@ pub fn run() -> io::Result<()> {
         app.maybe_refresh_labels();
         if last_frame.elapsed() >= FRAME_INTERVAL {
             last_frame = Instant::now();
-            push_frame(&mut app, &mut client);
+            push_frames(&mut app, &mut clients);
         }
     }
 
-    if let Some(c) = client.take() {
+    for c in clients.drain(..) {
         detach_client(c);
     }
     let _ = std::fs::remove_file(&sock);
     Ok(())
+}
+
+/// Re-derive the shared viewport = the SMALLEST attached client (min cols, min rows),
+/// resize the app to it, and — if the size changed — force a full repaint to every
+/// client. With no clients attached the size freezes (G3). Returns nothing; callers
+/// push frames afterwards.
+fn recompute_viewport(app: &mut App, clients: &mut [Client]) {
+    if clients.is_empty() {
+        return; // detached: freeze at the last size
+    }
+    let cols = clients.iter().map(|c| c.cols).min().unwrap_or(80).max(1);
+    let rows = clients.iter().map(|c| c.rows).min().unwrap_or(24).max(1);
+    let (cur_c, cur_r) = app.size();
+    if (cols, rows) != (cur_c, cur_r) {
+        app.resize(cols, rows);
+        for c in clients.iter_mut() {
+            c.needs_full = true;
+            c.last = Buffer::empty(RRect::new(0, 0, cols, rows));
+        }
+    }
 }
 
 /// Accept connections forever, assigning each a unique (never-reused) id and a
@@ -354,8 +386,8 @@ fn detach_client(c: Client) {
     let _ = c.conn.shutdown(std::net::Shutdown::Both);
 }
 
-/// Apply one funneled message to the app / client on the single-writer loop.
-fn handle_incoming(msg: Incoming, app: &mut App, client: &mut Option<Client>, kill: &mut bool) {
+/// Apply one funneled message to the app / clients on the single-writer loop.
+fn handle_incoming(msg: Incoming, app: &mut App, clients: &mut Vec<Client>, kill: &mut bool) {
     match msg {
         Incoming::Ctl { req, reply } => {
             if matches!(req, control::Req::KillServer) {
@@ -373,113 +405,121 @@ fn handle_incoming(msg: Incoming, app: &mut App, client: &mut Option<Client>, ki
             out,
             conn,
         } => {
-            // Takeover: displace the incumbent (atomic — the old id is dropped before
-            // any further event is accepted, so its late EOF can't detach the new one).
-            if let Some(old) = client.take() {
-                detach_client(old);
-            }
-            app.resize(cols, rows);
-            *client = Some(Client {
+            // Shared attach: ADD the client (no takeover), then re-fit to the smallest.
+            clients.push(Client {
                 id,
                 out,
                 conn,
                 last: Buffer::empty(RRect::new(0, 0, cols.max(1), rows.max(1))),
                 needs_full: true,
                 last_cursor: None,
+                prefix: false,
                 epoch: 0,
                 cols,
                 rows,
             });
+            recompute_viewport(app, clients);
         }
         Incoming::Client { id, msg } => {
-            // Ignore messages from a displaced/stale connection.
-            if client.as_ref().map(|c| c.id) != Some(id) {
+            // Only accept from a currently-attached client (ignore stale ids).
+            if !clients.iter().any(|c| c.id == id) {
                 return;
             }
             match msg {
                 ClientMsg::Key(k) => {
-                    if app.feed_key(k) == KeyAction::Detach
-                        && let Some(c) = client.take()
+                    // All attached clients share input (tmux-style), but each carries
+                    // its OWN prefix state so a `Ctrl-b` from one client can't be
+                    // completed by another's key. Detach removes ONLY the client that
+                    // pressed the chord; the others keep going.
+                    let mut action = KeyAction::Continue;
+                    if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
+                        action = app.feed_key(k, &mut c.prefix);
+                    }
+                    if action == KeyAction::Detach
+                        && let Some(pos) = clients.iter().position(|c| c.id == id)
                     {
-                        detach_client(c);
+                        detach_client(clients.remove(pos));
+                        recompute_viewport(app, clients);
                     }
                 }
                 ClientMsg::Resize { cols, rows } => {
-                    app.resize(cols, rows);
-                    if let Some(c) = client.as_mut() {
+                    if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
                         c.cols = cols;
                         c.rows = rows;
-                        c.epoch += 1;
-                        c.needs_full = true;
-                        c.last_cursor = None;
-                        c.last = Buffer::empty(RRect::new(0, 0, cols.max(1), rows.max(1)));
                     }
+                    recompute_viewport(app, clients);
                 }
                 ClientMsg::Detach => {
-                    if let Some(c) = client.take() {
-                        detach_client(c);
+                    if let Some(pos) = clients.iter().position(|c| c.id == id) {
+                        detach_client(clients.remove(pos));
+                        recompute_viewport(app, clients);
                     }
                 }
                 ClientMsg::Attach { .. } => {}
             }
         }
         Incoming::Disconnect { id } => {
-            if client.as_ref().map(|c| c.id) == Some(id) {
-                *client = None; // detach; shells keep running (G3 freeze)
+            // The socket is already gone — drop the client WITHOUT another shutdown.
+            if let Some(pos) = clients.iter().position(|c| c.id == id) {
+                clients.remove(pos);
+                recompute_viewport(app, clients);
             }
         }
     }
 }
 
-/// Render the app for the attached client and ship the changed cells (or a full
-/// baseline). No-op when nobody is attached (the server renders only for a client).
-fn push_frame(app: &mut App, client: &mut Option<Client>) {
-    let Some(c) = client.as_mut() else { return };
+/// Render the app ONCE and broadcast the changed cells (or a full baseline) to every
+/// attached client — each diffed against its OWN last-sent buffer, so a freshly
+/// attached client gets a full frame while up-to-date ones get small deltas. No-op
+/// with no clients (the server renders only for someone watching).
+fn push_frames(app: &mut App, clients: &mut [Client]) {
+    if clients.is_empty() {
+        return;
+    }
     let (cols, rows) = app.size();
     let area = RRect::new(0, 0, cols.max(1), rows.max(1));
-    if c.last.area != area {
-        c.last = Buffer::empty(area);
-        c.needs_full = true;
-    }
     let mut buf = Buffer::empty(area);
     let cursor = app.render_to(&mut buf).map(|p| (p.x, p.y));
 
-    let changed = c.last.diff(&buf);
-    // Send when cells changed, a baseline is due, OR the cursor moved (a cursor-only
-    // move produces no cell diff but must still reach the client).
-    if changed.is_empty() && !c.needs_full && cursor == c.last_cursor {
-        return; // idle: nothing to send
-    }
-    let cells: Vec<WireCell> = changed
-        .iter()
-        .map(|(x, y, cell)| WireCell {
-            x: *x,
-            y: *y,
-            sym: cell.symbol().to_string(),
-            fg: cell.fg,
-            bg: cell.bg,
-            mods: cell.modifier,
-            skip: cell.skip,
-        })
-        .collect();
-    let frame = FrameMsg {
-        epoch: c.epoch,
-        cols,
-        rows,
-        full: c.needs_full,
-        cells,
-        cursor,
-    };
-    match c.out.try_send(ServerMsg::Frame(frame)) {
-        // Advance the diff baseline only once the client actually has the frame.
-        Ok(()) => {
-            c.last = buf;
-            c.needs_full = false;
-            c.last_cursor = cursor;
+    for c in clients.iter_mut() {
+        if c.last.area != area {
+            c.last = Buffer::empty(area);
+            c.needs_full = true;
         }
-        // Client slow/suspended — skip; next tick re-diffs vs the same baseline.
-        Err(TrySendError::Full(_)) => {}
-        // Writer thread gone; the reader's EOF will produce a Disconnect.
-        Err(TrySendError::Disconnected(_)) => {}
+        let changed = c.last.diff(&buf);
+        // Send when cells changed, a baseline is due, OR the cursor moved.
+        if changed.is_empty() && !c.needs_full && cursor == c.last_cursor {
+            continue;
+        }
+        let cells: Vec<WireCell> = changed
+            .iter()
+            .map(|(x, y, cell)| WireCell {
+                x: *x,
+                y: *y,
+                sym: cell.symbol().to_string(),
+                fg: cell.fg,
+                bg: cell.bg,
+                mods: cell.modifier,
+                skip: cell.skip,
+            })
+            .collect();
+        let frame = FrameMsg {
+            epoch: c.epoch,
+            cols,
+            rows,
+            full: c.needs_full,
+            cells,
+            cursor,
+        };
+        match c.out.try_send(ServerMsg::Frame(frame)) {
+            // Advance this client's baseline only once it actually has the frame.
+            Ok(()) => {
+                c.last = buf.clone();
+                c.needs_full = false;
+                c.last_cursor = cursor;
+            }
+            Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {}
+        }
     }
 }

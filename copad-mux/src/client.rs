@@ -145,12 +145,16 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
         });
     }
 
-    // Client-side framebuffer, kept in lockstep with the server's composition.
-    let mut buf = Buffer::empty(RRect::new(0, 0, cols, rows));
+    // Client-side framebuffer sized to the SERVER's frame — which may be SMALLER than
+    // this terminal when another attached client is smaller (tmux-style shared view).
+    // The margin is letterboxed blank. Starts as a placeholder until the first frame.
+    let mut buf = Buffer::empty(RRect::new(0, 0, 1, 1));
+    let mut have_frame = false;
     let mut cursor: Option<(u16, u16)> = None;
 
     loop {
         // 1) forward input
+        let mut need_redraw = false;
         if event::poll(Duration::from_millis(16))? {
             loop {
                 match event::read()? {
@@ -160,10 +164,11 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     CEvent::Resize(w, h) => {
                         cols = w.max(1);
                         rows = h.max(1);
-                        // Rebuild the local buffer; the server sends a matching full
-                        // frame next, and stale-size frames are dropped until then.
-                        buf = Buffer::empty(RRect::new(0, 0, cols, rows));
+                        // The server re-fits to the smallest client; our frame buffer
+                        // follows the SERVER size, so don't rebuild it — just
+                        // re-letterbox into the new terminal size on the next draw.
                         let _ = send(&mut wr, &ClientMsg::Resize { cols, rows });
+                        need_redraw = true;
                     }
                     _ => {}
                 }
@@ -173,17 +178,17 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
             }
         }
 
-        // 2) apply incoming frames
+        // 2) apply incoming frames (buffer follows the server's frame size)
         let mut dirty = false;
         loop {
             match rx.try_recv() {
                 Ok(ServerMsg::Frame(f)) => {
-                    // Drop frames from before the last local resize (wrong size).
-                    if f.cols != cols || f.rows != rows {
-                        continue;
-                    }
+                    let fsize = RRect::new(0, 0, f.cols.max(1), f.rows.max(1));
                     if f.full {
-                        buf = Buffer::empty(RRect::new(0, 0, cols, rows));
+                        buf = Buffer::empty(fsize);
+                    } else if buf.area != fsize {
+                        // A delta for a size we don't hold yet — wait for its full.
+                        continue;
                     }
                     for c in &f.cells {
                         if let Some(cell) = buf.cell_mut(Position::new(c.x, c.y)) {
@@ -195,6 +200,7 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                         }
                     }
                     cursor = f.cursor;
+                    have_frame = true;
                     dirty = true;
                 }
                 Ok(ServerMsg::Bye) => return Ok(()),
@@ -203,12 +209,33 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
             }
         }
 
-        // 3) draw (ratatui diffs our buffer against the TTY's last frame)
-        if dirty {
+        // 3) draw — blit the server frame into this terminal's top-left, blanking the
+        // letterbox margin when our terminal is bigger than the shared (min) frame.
+        if (dirty || need_redraw) && have_frame {
+            let src = buf.clone();
+            let cur = cursor;
             terminal.draw(|frame| {
-                *frame.buffer_mut() = buf.clone();
-                if let Some((x, y)) = cursor {
-                    frame.set_cursor_position(Position::new(x, y));
+                let area = frame.area();
+                let out = frame.buffer_mut();
+                for y in 0..area.height {
+                    for x in 0..area.width {
+                        let Some(dst) = out.cell_mut(Position::new(x, y)) else {
+                            continue;
+                        };
+                        if x < src.area.width && y < src.area.height {
+                            if let Some(s) = src.cell(Position::new(x, y)) {
+                                *dst = s.clone();
+                            }
+                        } else {
+                            dst.reset(); // letterbox margin
+                        }
+                    }
+                }
+                if let Some((cx, cy)) = cur
+                    && cx < area.width
+                    && cy < area.height
+                {
+                    frame.set_cursor_position(Position::new(cx, cy));
                 }
             })?;
         }
