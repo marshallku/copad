@@ -25,7 +25,7 @@ use ratatui::layout::Position;
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::control;
-use crate::model::{ClientId, Dir, PaneId, PaneRect, Rect, Role, TerminalId, WorkspaceId};
+use crate::model::{ClientId, Dir, PaneId, PaneRect, Rect, Role, TabId, TerminalId, WorkspaceId};
 use crate::procinfo;
 use crate::state::{Command, Event, MuxError, Origin, State};
 use crate::term::{CellColor, PaneTerm};
@@ -157,7 +157,7 @@ impl App {
             return Err(io::Error::other("failed to spawn shell PTY"));
         };
         panes.insert(term0, pt);
-        let app = Self {
+        let mut app = Self {
             state,
             ws,
             client,
@@ -172,7 +172,7 @@ impl App {
                 .checked_sub(Duration::from_secs(60))
                 .unwrap_or_else(std::time::Instant::now),
         };
-        app.sync_sizes();
+        app.reflow();
         Ok(app)
     }
 
@@ -202,6 +202,42 @@ impl App {
         }
     }
 
+    // --- tabs ---
+
+    fn tab_count(&self) -> usize {
+        self.state
+            .workspace(&self.ws)
+            .map(|w| w.tabs.len())
+            .unwrap_or(0)
+    }
+
+    fn tab_ids(&self) -> Vec<TabId> {
+        self.state
+            .workspace(&self.ws)
+            .map(|w| w.tabs.iter().map(|t| t.id.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    fn active_tab_id(&self) -> Option<TabId> {
+        self.state.workspace(&self.ws).map(|w| w.active_tab.clone())
+    }
+
+    /// The tab bar occupies the top row only when there is more than one tab
+    /// (a single tab needs no chooser, so it keeps the full height).
+    fn tabbar_visible(&self) -> bool {
+        self.tab_count() > 1
+    }
+
+    /// Top y-offset of the pane grid (the tab bar reserves row 0 when visible).
+    fn content_y(&self) -> u16 {
+        if self.tabbar_visible() { 1 } else { 0 }
+    }
+
+    /// Height available to the pane grid, below the tab bar.
+    fn content_rows(&self) -> u16 {
+        self.rows.saturating_sub(self.content_y())
+    }
+
     /// Placed rects for the active tab, tiling the content area (right of the
     /// sidebar when it is visible). Rects are already offset by `content_x`.
     fn layout(&self) -> Vec<PaneRect> {
@@ -211,9 +247,9 @@ impl App {
         {
             tab.layout.derive_layout(
                 self.content_x(),
-                0,
+                self.content_y(),
                 self.content_cols(),
-                self.rows,
+                self.content_rows(),
                 &mut out,
             );
         }
@@ -261,6 +297,25 @@ impl App {
                 pt.resize(rect.cols, rect.rows);
             }
         }
+    }
+
+    /// Push the CONTENT-area size (terminal minus sidebar + tab-bar chrome) to the
+    /// authoritative `State` as the workspace viewport, then resize every PTY.
+    /// Keeping the viewport equal to the real pane area means the authoritative
+    /// geometry — and the `Resized` events a remote client will rely on — matches
+    /// the actual PTY sizes (G2), even as chrome toggles. Call this on any change
+    /// that alters the chrome footprint (terminal resize, sidebar toggle, tab
+    /// add/remove); a pure in-tab layout change (split/close/focus) can use
+    /// `sync_sizes` since the viewport is unchanged.
+    fn reflow(&mut self) {
+        let cols = self.content_cols().max(1);
+        let rows = self.content_rows().max(1);
+        let _ = self.state.apply(Command::Resize {
+            client: self.client,
+            cols,
+            rows,
+        });
+        self.sync_sizes();
     }
 
     // --- mutations (through the authoritative actor) ---
@@ -351,6 +406,120 @@ impl App {
         }
         self.sync_sizes();
         Ok(())
+    }
+
+    /// Create a new tab (a fresh single-pane layout) and switch to it, spawning its
+    /// shell. Rolls the tab back if the PTY can't spawn (never leave a blank tab).
+    fn new_tab(&mut self) {
+        let events = match self.state.apply(Command::NewTab {
+            origin: Origin::Client(self.client),
+            workspace: self.ws.clone(),
+        }) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        let mut created: Option<(TabId, TerminalId)> = None;
+        for e in &events {
+            if let Event::TabCreated { tab, terminal, .. } = e {
+                created = Some((tab.clone(), terminal.clone()));
+            }
+        }
+        if let Some((tab_id, term)) = created {
+            match PaneTerm::spawn_with_env(
+                self.cols.max(1),
+                self.rows.max(1),
+                None,
+                None,
+                &self.sock_env,
+            ) {
+                Some(pt) => {
+                    self.panes.insert(term, pt);
+                }
+                None => {
+                    // Spawn failed — close the just-created tab so state never holds a
+                    // tab whose pane has no live terminal (blank render + dropped input).
+                    let _ = self.state.apply(Command::CloseTab {
+                        origin: Origin::Client(self.client),
+                        workspace: self.ws.clone(),
+                        tab: tab_id,
+                    });
+                }
+            }
+        }
+        // A new tab may make the tab bar appear (1→2 tabs), shrinking the content
+        // height → re-derive the viewport, not just PTY sizes.
+        self.reflow();
+    }
+
+    /// Switch the active tab by `delta` (wrapping): `+1` next, `-1` previous.
+    fn cycle_tab(&mut self, delta: i32) {
+        let ids = self.tab_ids();
+        if ids.len() < 2 {
+            return;
+        }
+        let Some(active) = self.active_tab_id() else {
+            return;
+        };
+        let cur = ids.iter().position(|t| t == &active).unwrap_or(0);
+        let next = ids[(cur as i32 + delta).rem_euclid(ids.len() as i32) as usize].clone();
+        let _ = self.state.apply(Command::SelectTab {
+            origin: Origin::Client(self.client),
+            workspace: self.ws.clone(),
+            tab: next,
+        });
+        self.sync_sizes();
+    }
+
+    /// Switch to the tab at 0-based `index` (the tab bar shows 1-based labels, so
+    /// `Ctrl-b 1` → index 0). Out-of-range is ignored.
+    fn select_tab_index(&mut self, index: usize) {
+        if let Some(tab) = self.tab_ids().get(index).cloned() {
+            let _ = self.state.apply(Command::SelectTab {
+                origin: Origin::Client(self.client),
+                workspace: self.ws.clone(),
+                tab,
+            });
+            self.sync_sizes();
+        }
+    }
+
+    /// Close the active tab (and reap its shells). Rejected when it is the last tab.
+    fn close_active_tab(&mut self) {
+        let Some(active) = self.active_tab_id() else {
+            return;
+        };
+        let events = match self.state.apply(Command::CloseTab {
+            origin: Origin::Client(self.client),
+            workspace: self.ws.clone(),
+            tab: active,
+        }) {
+            Ok(e) => e,
+            Err(_) => return, // e.g. last tab — keep it
+        };
+        for e in &events {
+            if let Event::TabClosed { terminals, .. } = e {
+                for t in terminals {
+                    self.panes.remove(t);
+                }
+            }
+        }
+        // Closing a tab may hide the tab bar (2→1 tabs), growing the content
+        // height → re-derive the viewport.
+        self.reflow();
+    }
+
+    /// Locate a terminal's `(tab, pane)` across ALL tabs (not just the active one),
+    /// so a background tab's exited shell can be reaped correctly.
+    fn find_tab_pane_of_terminal(&self, term: &TerminalId) -> Option<(TabId, PaneId)> {
+        let w = self.state.workspace(&self.ws)?;
+        for t in &w.tabs {
+            for p in t.layout.panes() {
+                if t.layout.terminal_of(&p) == Some(term) {
+                    return Some((t.id.clone(), p));
+                }
+            }
+        }
+        None
     }
 
     // --- control API (spec §3): applied on the main loop (single writer) ---
@@ -448,6 +617,60 @@ impl App {
                     None => Resp::err("pane has no live terminal"),
                 }
             }
+            Req::ListTabs => {
+                let Some(w) = self.state.workspace(&self.ws) else {
+                    return Resp::err("no workspace");
+                };
+                let active_id = w.active_tab.clone();
+                let mut active_idx = 0;
+                let infos = w
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| {
+                        let panes = t.layout.panes();
+                        let agents = panes
+                            .iter()
+                            .filter(|p| {
+                                t.layout
+                                    .terminal_of(p)
+                                    .and_then(|tid| self.labels.get(tid))
+                                    .map(|l| l.kind == procinfo::Kind::Agent)
+                                    .unwrap_or(false)
+                            })
+                            .count();
+                        let active = t.id == active_id;
+                        if active {
+                            active_idx = i;
+                        }
+                        control::TabInfo {
+                            index: i,
+                            id: t.id.to_string(),
+                            active,
+                            panes: panes.len(),
+                            agents,
+                        }
+                    })
+                    .collect();
+                Resp::tab_list(infos, active_idx)
+            }
+            Req::NewTab => {
+                let before = self.tab_count();
+                self.new_tab();
+                if self.tab_count() > before {
+                    Resp::ok()
+                } else {
+                    Resp::err("new-tab failed (could not spawn a shell)")
+                }
+            }
+            Req::SelectTab { index } => {
+                if self.tab_ids().get(*index).is_some() {
+                    self.select_tab_index(*index);
+                    Resp::ok()
+                } else {
+                    Resp::err(format!("no tab at index {index}"))
+                }
+            }
         }
     }
 
@@ -521,12 +744,8 @@ impl App {
     fn resize(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
-        let _ = self.state.apply(Command::Resize {
-            client: self.client,
-            cols,
-            rows,
-        });
-        self.sync_sizes();
+        // reflow derives the content-area viewport (minus chrome) and pushes it.
+        self.reflow();
     }
 
     // --- sidebar + popup ---
@@ -535,7 +754,8 @@ impl App {
     /// pane content area shrinks/grows, so resize the PTYs to match.
     fn toggle_sidebar(&mut self) {
         self.sidebar = !self.sidebar;
-        self.sync_sizes();
+        // The content width changes → re-derive the viewport, not just PTY sizes.
+        self.reflow();
     }
 
     /// Open the `Ctrl-f` switcher, preselecting the focused pane's row.
@@ -586,7 +806,9 @@ impl App {
         }
     }
 
-    /// Close panes whose shell has exited. Returns true if the app is now empty.
+    /// Close panes whose shell has exited (in ANY tab). Returns true if the app is
+    /// now empty (last pane of the last tab exited → quit). A tab whose last pane
+    /// exits is closed whole; other tabs keep running in the background.
     fn reap_exited(&mut self) -> bool {
         let exited: Vec<TerminalId> = self
             .panes
@@ -594,35 +816,70 @@ impl App {
             .filter(|(_, p)| p.has_exited())
             .map(|(id, _)| id.clone())
             .collect();
+        // Fast path: nothing exited this tick — don't reflow (which would bump the
+        // workspace rev + resize every PTY) on every idle main-loop iteration.
+        if exited.is_empty() {
+            return self.is_empty();
+        }
         for term in exited {
-            match self.pane_of_terminal(&term) {
-                Some(pane) => {
-                    match self.state.apply(Command::ClosePane {
-                        origin: Origin::Client(self.client),
-                        workspace: self.ws.clone(),
-                        pane,
-                        if_rev: None,
-                    }) {
-                        Ok(evs) => {
-                            for e in &evs {
-                                if let Event::PaneClosed { terminal, .. } = e {
-                                    self.panes.remove(terminal);
+            let Some((tab_id, pane)) = self.find_tab_pane_of_terminal(&term) else {
+                // No longer in any tab (already collapsed) — just drop the runtime.
+                self.panes.remove(&term);
+                continue;
+            };
+            let tab_is_single = self
+                .state
+                .workspace(&self.ws)
+                .and_then(|w| w.tab(&tab_id))
+                .map(|t| t.layout.is_single_leaf())
+                .unwrap_or(true);
+            if !tab_is_single {
+                // The tab has other panes — collapse just this one.
+                match self.state.apply(Command::ClosePane {
+                    origin: Origin::Client(self.client),
+                    workspace: self.ws.clone(),
+                    pane,
+                    if_rev: None,
+                }) {
+                    Ok(evs) => {
+                        for e in &evs {
+                            if let Event::PaneClosed { terminal, .. } = e {
+                                self.panes.remove(terminal);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        self.panes.remove(&term);
+                    }
+                }
+            } else if self.tab_count() > 1 {
+                // Last pane of this tab, but other tabs survive — close the tab.
+                match self.state.apply(Command::CloseTab {
+                    origin: Origin::Client(self.client),
+                    workspace: self.ws.clone(),
+                    tab: tab_id,
+                }) {
+                    Ok(evs) => {
+                        for e in &evs {
+                            if let Event::TabClosed { terminals, .. } = e {
+                                for t in terminals {
+                                    self.panes.remove(t);
                                 }
                             }
                         }
-                        // The last pane can't be closed in the layout — its shell
-                        // exiting means "quit": drop it so the app becomes empty.
-                        Err(_) => {
-                            self.panes.remove(&term);
-                        }
+                    }
+                    Err(_) => {
+                        self.panes.remove(&term);
                     }
                 }
-                None => {
-                    self.panes.remove(&term);
-                }
+            } else {
+                // Last pane of the last tab — its exit means "quit": drop it so the
+                // app becomes empty and the main loop terminates.
+                self.panes.remove(&term);
             }
         }
-        self.sync_sizes();
+        // Reaping may have closed a tab (hiding the tab bar) → re-derive viewport.
+        self.reflow();
         self.is_empty()
     }
 
@@ -704,11 +961,13 @@ impl App {
             }
         }
         let content_x = self.content_x();
+        let content_y = self.content_y();
         let buf = frame.buffer_mut();
         for yy in 0..area.height {
             for xx in 0..area.width {
-                // The sidebar owns the left strip; don't paint dividers there.
-                if xx < content_x || covered[yy as usize][xx as usize] {
+                // The tab bar owns row 0 and the sidebar owns the left strip; don't
+                // paint dividers over either.
+                if yy < content_y || xx < content_x || covered[yy as usize][xx as usize] {
                     continue;
                 }
                 let left = xx > 0 && covered[yy as usize][(xx - 1) as usize];
@@ -731,7 +990,12 @@ impl App {
             self.render_sidebar(frame);
         }
 
-        // 4) the Ctrl-f switcher popup, over everything.
+        // 4) the tab bar across the top row (over the sidebar's top too).
+        if self.tabbar_visible() {
+            self.render_tabbar(frame);
+        }
+
+        // 5) the Ctrl-f switcher popup, over everything.
         if self.popup.is_some() {
             self.render_popup(frame);
         }
@@ -821,9 +1085,11 @@ impl App {
             }
         };
 
+        // Leave row 0 for the tab bar when it is showing.
+        let cy = self.content_y();
         put(
             buf,
-            0,
+            cy,
             &format!(" PANES ({})", order.len()),
             Style::default()
                 .fg(Color::Cyan)
@@ -831,7 +1097,7 @@ impl App {
                 .add_modifier(Modifier::BOLD),
         );
         for (i, pane) in order.iter().enumerate() {
-            let y = i as u16 + 1;
+            let y = cy + 1 + i as u16;
             if y >= h {
                 break;
             }
@@ -863,6 +1129,78 @@ impl App {
                 }
             };
             put(buf, y, &row, style);
+        }
+    }
+
+    /// Does any pane in `tab_id` currently run a classified AI agent?
+    fn tab_has_agent(&self, tab_id: &TabId) -> bool {
+        let Some(w) = self.state.workspace(&self.ws) else {
+            return false;
+        };
+        let Some(t) = w.tab(tab_id) else {
+            return false;
+        };
+        t.layout.panes().iter().any(|p| {
+            t.layout
+                .terminal_of(p)
+                .and_then(|tid| self.labels.get(tid))
+                .map(|l| l.kind == procinfo::Kind::Agent)
+                .unwrap_or(false)
+        })
+    }
+
+    /// Top-row tab bar: one 1-based chip per tab, active highlighted, with a `●`
+    /// flag on any tab that hosts an agent.
+    fn render_tabbar(&self, frame: &mut Frame) {
+        let area = frame.area();
+        let w = area.width;
+        let ids = self.tab_ids();
+        let active = self.active_tab_id();
+        let bg = Color::Rgb(20, 22, 30);
+        let buf = frame.buffer_mut();
+
+        // Clear row 0 (also lifts any wide-char skip flag left by a pane cell).
+        for x in 0..w {
+            if let Some(bc) = buf.cell_mut(Position::new(x, 0)) {
+                bc.set_symbol(" ");
+                bc.set_skip(false);
+                bc.set_style(Style::default().bg(bg));
+            }
+        }
+
+        let mut x = 0u16;
+        let put = |buf: &mut ratatui::buffer::Buffer, s: &str, st: Style, x: &mut u16| {
+            for ch in s.chars() {
+                if *x >= w {
+                    break;
+                }
+                if let Some(bc) = buf.cell_mut(Position::new(*x, 0)) {
+                    let mut sb = [0u8; 4];
+                    bc.set_symbol(ch.encode_utf8(&mut sb));
+                    bc.set_skip(false);
+                    bc.set_style(st);
+                }
+                *x += 1;
+            }
+        };
+
+        for (i, id) in ids.iter().enumerate() {
+            let is_active = active.as_ref() == Some(id);
+            let dot = if self.tab_has_agent(id) { "●" } else { "" };
+            let label = format!(" {dot}{} ", i + 1);
+            let style = if is_active {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if !dot.is_empty() {
+                Style::default().fg(Color::Yellow).bg(bg)
+            } else {
+                Style::default().fg(Color::Gray).bg(bg)
+            };
+            put(buf, &label, style, &mut x);
+            // one-column gap between chips
+            put(buf, " ", Style::default().bg(bg), &mut x);
         }
     }
 
@@ -1099,6 +1437,14 @@ pub fn run() -> io::Result<()> {
                             KeyCode::Char('o') => app.focus_next(),
                             KeyCode::Char('x') => app.close_focused(),
                             KeyCode::Char('s') => app.toggle_sidebar(),
+                            // tabs: `c` new, `n`/`p` next/prev, `&` close, `1`-`9` jump
+                            KeyCode::Char('c') => app.new_tab(),
+                            KeyCode::Char('n') => app.cycle_tab(1),
+                            KeyCode::Char('p') => app.cycle_tab(-1),
+                            KeyCode::Char('&') => app.close_active_tab(),
+                            KeyCode::Char(d @ '1'..='9') => {
+                                app.select_tab_index(d as usize - '1' as usize)
+                            }
                             KeyCode::Char('q') => break 'main,
                             KeyCode::Left => app.focus_dir(FocusDir::Left),
                             KeyCode::Right => app.focus_dir(FocusDir::Right),
@@ -1106,6 +1452,13 @@ pub fn run() -> io::Result<()> {
                             KeyCode::Down => app.focus_dir(FocusDir::Down),
                             _ => {}
                         }
+                    } else if let Some(dir) = ctrl_shift_nav(k.code, k.modifiers) {
+                        // Direct (prefix-less) pane navigation: hold `Ctrl+Shift` and
+                        // press an arrow to jump focus to the neighbouring pane. Faster
+                        // than the `Ctrl-b <arrow>` prefix form (which stays as a
+                        // fallback for terminals that don't deliver modified arrows —
+                        // e.g. tmux without `xterm-keys on`).
+                        app.focus_dir(dir);
                     } else {
                         // `Ctrl-f` opens the switcher popup (matches the owner's tmux
                         // binding). `Ctrl-b` enters prefix mode. Both may arrive as a
@@ -1145,6 +1498,24 @@ fn to_color(c: CellColor) -> Color {
         CellColor::Default => Color::Reset,
         CellColor::Indexed(i) => Color::Indexed(i),
         CellColor::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+/// Map a `Ctrl+Shift+<arrow>` chord to a focus direction, or `None` for anything
+/// else. Requires BOTH modifiers so plain arrows still reach the shell and
+/// `Ctrl+<arrow>` stays free for shell word-motion. Standard xterm CSI modifier
+/// encoding (`ESC[1;6<dir>`) delivers this without kitty keyboard enhancement, so
+/// it works over ssh / inside tmux (with `xterm-keys on`).
+fn ctrl_shift_nav(code: KeyCode, mods: KeyModifiers) -> Option<FocusDir> {
+    if !(mods.contains(KeyModifiers::CONTROL) && mods.contains(KeyModifiers::SHIFT)) {
+        return None;
+    }
+    match code {
+        KeyCode::Left => Some(FocusDir::Left),
+        KeyCode::Right => Some(FocusDir::Right),
+        KeyCode::Up => Some(FocusDir::Up),
+        KeyCode::Down => Some(FocusDir::Down),
+        _ => None,
     }
 }
 

@@ -71,6 +71,25 @@ pub enum Command {
         pane: PaneId,
         if_rev: Option<u64>,
     },
+    /// Create a new single-pane tab and make it active. Controller/API only.
+    NewTab {
+        origin: Origin,
+        workspace: WorkspaceId,
+    },
+    /// Make `tab` the active tab; its geometry is re-derived while non-active tabs
+    /// keep their frozen sizes. Controller/API only.
+    SelectTab {
+        origin: Origin,
+        workspace: WorkspaceId,
+        tab: TabId,
+    },
+    /// Close `tab` and drop all its terminals. Rejects closing a workspace's last
+    /// tab. Controller/API only.
+    CloseTab {
+        origin: Origin,
+        workspace: WorkspaceId,
+        tab: TabId,
+    },
 }
 
 /// A terminal's derived geometry + its new revision, carried in `Resized` so a
@@ -138,6 +157,31 @@ pub enum Event {
         tab_rev: u64,
         workspace_rev: u64,
     },
+    /// A new tab was created and made active. `terminal` is its lone pane's PTY,
+    /// which the server must spawn.
+    TabCreated {
+        workspace: WorkspaceId,
+        tab: TabId,
+        pane: PaneId,
+        terminal: TerminalId,
+        workspace_rev: u64,
+    },
+    /// The active tab changed (geometry of the newly-active tab is re-derived and
+    /// carried in the accompanying `Resized`).
+    TabSelected {
+        workspace: WorkspaceId,
+        tab: TabId,
+        workspace_rev: u64,
+    },
+    /// A tab was closed; `terminals` are its now-dead PTYs (the server must reap
+    /// them), and `active` is the tab that became active in its place.
+    TabClosed {
+        workspace: WorkspaceId,
+        tab: TabId,
+        terminals: Vec<TerminalId>,
+        active: TabId,
+        workspace_rev: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -158,6 +202,10 @@ pub enum MuxError {
     StaleRev { current: u64 },
     #[error("cannot close the last pane of a tab")]
     CannotCloseLastPane,
+    #[error("no such tab")]
+    NoSuchTab,
+    #[error("cannot close the last tab of a workspace")]
+    CannotCloseLastTab,
 }
 
 struct Attach {
@@ -176,6 +224,9 @@ pub struct State {
     clients: HashMap<ClientId, Attach>,
     next_pane: u64,
     next_term: u64,
+    /// Monotonic tab counter for minting unique tab ids (`create_workspace` seeds
+    /// `t0`, so new tabs start at `t1`).
+    next_tab: u64,
 }
 
 impl State {
@@ -186,6 +237,7 @@ impl State {
             clients: HashMap::new(),
             next_pane: 0,
             next_term: 0,
+            next_tab: 1,
         }
     }
 
@@ -306,6 +358,17 @@ impl State {
                 pane,
                 if_rev,
             } => self.close(origin, workspace, pane, if_rev),
+            Command::NewTab { origin, workspace } => self.new_tab(origin, workspace),
+            Command::SelectTab {
+                origin,
+                workspace,
+                tab,
+            } => self.select_tab(origin, workspace, tab),
+            Command::CloseTab {
+                origin,
+                workspace,
+                tab,
+            } => self.close_tab(origin, workspace, tab),
         }
     }
 
@@ -681,6 +744,148 @@ impl State {
             });
         }
         Ok(evs)
+    }
+
+    // --- tabs (spec §1: multiple layouts per workspace) ---
+
+    fn new_tab(&mut self, origin: Origin, workspace: WorkspaceId) -> Result<Vec<Event>, MuxError> {
+        self.authorize_mutation(&origin, &workspace)?;
+        let idx = self.ws_index(&workspace)?;
+        let n = self.next_tab;
+        self.next_tab += 1;
+        let tab_id = TabId::new(format!("{workspace}:t{n}"));
+        let pane = self.mint_pane();
+        let vp = self.workspaces[idx].viewport;
+        let term = self.mint_terminal(vp.cols, vp.rows);
+        let tab = Tab {
+            id: tab_id.clone(),
+            name: None,
+            layout: SplitTree::Leaf {
+                pane: pane.clone(),
+                terminal: term.clone(),
+            },
+            focused: pane.clone(),
+            rev: 0,
+        };
+        self.workspaces[idx].tabs.push(tab);
+        self.workspaces[idx].active_tab = tab_id.clone();
+        self.workspaces[idx].rev += 1;
+        let ws_rev = self.workspaces[idx].rev;
+        let terms = self.recompute_sizes(idx);
+        let vp = self.workspaces[idx].viewport;
+        Ok(vec![
+            Event::TabCreated {
+                workspace: workspace.clone(),
+                tab: tab_id,
+                pane,
+                terminal: term,
+                workspace_rev: ws_rev,
+            },
+            Event::Resized {
+                workspace,
+                cols: vp.cols,
+                rows: vp.rows,
+                terminals: terms,
+                workspace_rev: ws_rev,
+            },
+        ])
+    }
+
+    fn select_tab(
+        &mut self,
+        origin: Origin,
+        workspace: WorkspaceId,
+        tab: TabId,
+    ) -> Result<Vec<Event>, MuxError> {
+        self.authorize_mutation(&origin, &workspace)?;
+        let idx = self.ws_index(&workspace)?;
+        if self.workspaces[idx].tab(&tab).is_none() {
+            return Err(MuxError::NoSuchTab);
+        }
+        // Selecting the already-active tab is a no-op (no rev bump, no events).
+        if self.workspaces[idx].active_tab == tab {
+            return Ok(vec![]);
+        }
+        self.workspaces[idx].active_tab = tab.clone();
+        self.workspaces[idx].rev += 1;
+        let ws_rev = self.workspaces[idx].rev;
+        // Re-derive the newly-active tab's geometry from the (unchanged) viewport,
+        // so a tab created/reflowed under a different size catches up (G2).
+        let terms = self.recompute_sizes(idx);
+        let vp = self.workspaces[idx].viewport;
+        Ok(vec![
+            Event::TabSelected {
+                workspace: workspace.clone(),
+                tab,
+                workspace_rev: ws_rev,
+            },
+            Event::Resized {
+                workspace,
+                cols: vp.cols,
+                rows: vp.rows,
+                terminals: terms,
+                workspace_rev: ws_rev,
+            },
+        ])
+    }
+
+    fn close_tab(
+        &mut self,
+        origin: Origin,
+        workspace: WorkspaceId,
+        tab: TabId,
+    ) -> Result<Vec<Event>, MuxError> {
+        self.authorize_mutation(&origin, &workspace)?;
+        let idx = self.ws_index(&workspace)?;
+        let pos = self.workspaces[idx]
+            .tabs
+            .iter()
+            .position(|t| t.id == tab)
+            .ok_or(MuxError::NoSuchTab)?;
+        if self.workspaces[idx].tabs.len() == 1 {
+            return Err(MuxError::CannotCloseLastTab);
+        }
+        // Collect + drop the tab's terminals so no orphan runtime survives it.
+        let terminals: Vec<TerminalId> = {
+            let t = &self.workspaces[idx].tabs[pos];
+            t.layout
+                .panes()
+                .iter()
+                .filter_map(|p| t.layout.terminal_of(p).cloned())
+                .collect()
+        };
+        for term in &terminals {
+            self.terminals.remove(term);
+        }
+        let removed_active = self.workspaces[idx].active_tab == tab;
+        self.workspaces[idx].tabs.remove(pos);
+        // If we closed the active tab, fall to the neighbour (prefer the tab that
+        // shifted into this slot, else the new last tab).
+        if removed_active {
+            let new_pos = pos.min(self.workspaces[idx].tabs.len() - 1);
+            self.workspaces[idx].active_tab = self.workspaces[idx].tabs[new_pos].id.clone();
+        }
+        self.workspaces[idx].rev += 1;
+        let ws_rev = self.workspaces[idx].rev;
+        let active = self.workspaces[idx].active_tab.clone();
+        let terms = self.recompute_sizes(idx);
+        let vp = self.workspaces[idx].viewport;
+        Ok(vec![
+            Event::TabClosed {
+                workspace: workspace.clone(),
+                tab,
+                terminals,
+                active,
+                workspace_rev: ws_rev,
+            },
+            Event::Resized {
+                workspace,
+                cols: vp.cols,
+                rows: vp.rows,
+                terminals: terms,
+                workspace_rev: ws_rev,
+            },
+        ])
     }
 
     fn require_controller_of_attached(&self, client: ClientId) -> Result<WorkspaceId, MuxError> {
@@ -1267,6 +1472,146 @@ mod tests {
         );
         assert!(s.check_g1());
     }
+
+    #[test]
+    fn new_tab_becomes_active_with_a_fresh_single_pane() {
+        let (mut s, ws, _p) = seed();
+        let c = ClientId(1);
+        s.apply(Command::Attach {
+            client: c,
+            workspace: ws.clone(),
+            role: Role::Controller,
+            takeover: false,
+            cols: 80,
+            rows: 24,
+        })
+        .unwrap();
+        let ev = s
+            .apply(Command::NewTab {
+                origin: Origin::Client(c),
+                workspace: ws.clone(),
+            })
+            .unwrap();
+        let Event::TabCreated { tab, .. } = &ev[0] else {
+            panic!("first event must be TabCreated")
+        };
+        let w = s.workspace(&ws).unwrap();
+        assert_eq!(w.tabs.len(), 2, "a second tab exists");
+        assert_eq!(&w.active_tab, tab, "the new tab is active");
+        assert!(
+            w.tab(tab).unwrap().layout.is_single_leaf(),
+            "a fresh tab has exactly one pane"
+        );
+        assert!(s.check_tree_consistency());
+    }
+
+    #[test]
+    fn select_tab_switches_active_and_is_noop_when_already_active() {
+        let (mut s, ws, _p) = seed();
+        let c = ClientId(1);
+        s.apply(Command::Attach {
+            client: c,
+            workspace: ws.clone(),
+            role: Role::Controller,
+            takeover: false,
+            cols: 80,
+            rows: 24,
+        })
+        .unwrap();
+        let first = s.workspace(&ws).unwrap().active_tab.clone();
+        s.apply(Command::NewTab {
+            origin: Origin::Client(c),
+            workspace: ws.clone(),
+        })
+        .unwrap();
+        // switch back to the original tab
+        let ev = s
+            .apply(Command::SelectTab {
+                origin: Origin::Client(c),
+                workspace: ws.clone(),
+                tab: first.clone(),
+            })
+            .unwrap();
+        assert_eq!(s.workspace(&ws).unwrap().active_tab, first);
+        assert!(matches!(ev[0], Event::TabSelected { .. }));
+        // re-selecting the active tab is a no-op (empty event stream, no rev bump)
+        let rev = s.workspace(&ws).unwrap().rev;
+        let ev = s
+            .apply(Command::SelectTab {
+                origin: Origin::Client(c),
+                workspace: ws.clone(),
+                tab: first,
+            })
+            .unwrap();
+        assert!(ev.is_empty());
+        assert_eq!(s.workspace(&ws).unwrap().rev, rev);
+    }
+
+    #[test]
+    fn close_tab_drops_terminals_and_reassigns_active() {
+        let (mut s, ws, _p) = seed();
+        let c = ClientId(1);
+        s.apply(Command::Attach {
+            client: c,
+            workspace: ws.clone(),
+            role: Role::Controller,
+            takeover: false,
+            cols: 80,
+            rows: 24,
+        })
+        .unwrap();
+        let ev = s
+            .apply(Command::NewTab {
+                origin: Origin::Client(c),
+                workspace: ws.clone(),
+            })
+            .unwrap();
+        let Event::TabCreated { tab, terminal, .. } = &ev[0] else {
+            panic!()
+        };
+        let (new_tab, new_term) = (tab.clone(), terminal.clone());
+        assert!(s.terminal(&new_term).is_some());
+        let ev = s
+            .apply(Command::CloseTab {
+                origin: Origin::Client(c),
+                workspace: ws.clone(),
+                tab: new_tab.clone(),
+            })
+            .unwrap();
+        assert!(
+            matches!(&ev[0], Event::TabClosed { terminals, .. } if terminals.contains(&new_term))
+        );
+        let w = s.workspace(&ws).unwrap();
+        assert_eq!(w.tabs.len(), 1, "back to a single tab");
+        assert_ne!(w.active_tab, new_tab, "active moved off the closed tab");
+        assert!(s.terminal(&new_term).is_none(), "the tab's PTY is dropped");
+        assert!(s.check_tree_consistency());
+    }
+
+    #[test]
+    fn cannot_close_the_last_tab() {
+        let (mut s, ws, _p) = seed();
+        let c = ClientId(1);
+        s.apply(Command::Attach {
+            client: c,
+            workspace: ws.clone(),
+            role: Role::Controller,
+            takeover: false,
+            cols: 80,
+            rows: 24,
+        })
+        .unwrap();
+        let only = s.workspace(&ws).unwrap().active_tab.clone();
+        assert_eq!(
+            s.apply(Command::CloseTab {
+                origin: Origin::Client(c),
+                workspace: ws.clone(),
+                tab: only,
+            })
+            .unwrap_err(),
+            MuxError::CannotCloseLastTab
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1286,6 +1631,9 @@ mod proptests {
         SplitClient(u64, usize, bool),
         CloseApi(usize),
         Focus(u64, usize),
+        NewTab,
+        SelectTab(usize),
+        CloseTab(usize),
     }
 
     fn op_strategy() -> impl Strategy<Value = Op> {
@@ -1299,12 +1647,24 @@ mod proptests {
             (0u64..3, 0usize..6, any::<bool>()).prop_map(|(c, p, d)| Op::SplitClient(c, p, d)),
             (0usize..6).prop_map(Op::CloseApi),
             (0u64..3, 0usize..6).prop_map(|(c, p)| Op::Focus(c, p)),
+            Just(Op::NewTab),
+            (0usize..6).prop_map(Op::SelectTab),
+            (0usize..6).prop_map(Op::CloseTab),
         ]
     }
 
     fn panes(s: &State, ws: &WorkspaceId) -> Vec<PaneId> {
         let w = s.workspace(ws).unwrap();
         w.tabs.iter().flat_map(|t| t.layout.panes()).collect()
+    }
+
+    fn tab_ids(s: &State, ws: &WorkspaceId) -> Vec<TabId> {
+        s.workspace(ws)
+            .unwrap()
+            .tabs
+            .iter()
+            .map(|t| t.id.clone())
+            .collect()
     }
 
     proptest! {
@@ -1370,6 +1730,19 @@ mod proptests {
                         let ctl_before = is_ctl(&s, c);
                         let r = s.apply(Command::FocusPane { client: ClientId(c), pane: p });
                         if r.is_ok() { prop_assert!(ctl_before, "I1: focus succeeded from a non-controller"); }
+                    }
+                    Op::NewTab => {
+                        let _ = s.apply(Command::NewTab { origin: Origin::Api, workspace: ws.clone() });
+                    }
+                    Op::SelectTab(ti) => {
+                        let tabs = tab_ids(&s, &ws);
+                        let t = tabs[ti % tabs.len()].clone();
+                        let _ = s.apply(Command::SelectTab { origin: Origin::Api, workspace: ws.clone(), tab: t });
+                    }
+                    Op::CloseTab(ti) => {
+                        let tabs = tab_ids(&s, &ws);
+                        let t = tabs[ti % tabs.len()].clone();
+                        let _ = s.apply(Command::CloseTab { origin: Origin::Api, workspace: ws.clone(), tab: t });
                     }
                 }
 

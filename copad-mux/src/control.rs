@@ -25,6 +25,12 @@ pub enum Req {
     Close { index: usize },
     /// Inject `text` as input bytes into the pane at `index` (like `tmux send-keys`).
     SendKeys { index: usize, text: String },
+    /// List the workspace's tabs.
+    ListTabs,
+    /// Create a new tab and make it active.
+    NewTab,
+    /// Make the tab at `index` (as printed by `list-tabs`) active.
+    SelectTab { index: usize },
 }
 
 /// One pane in a `list` response.
@@ -43,7 +49,20 @@ pub struct PaneInfo {
     pub kind: String,
 }
 
-/// A control response. `ok=false` carries `error`; `list` fills `panes`+`focused`.
+/// One tab in a `list-tabs` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TabInfo {
+    pub index: usize,
+    pub id: String,
+    pub active: bool,
+    /// Number of panes in the tab.
+    pub panes: usize,
+    /// Number of those panes running a classified AI agent.
+    pub agents: usize,
+}
+
+/// A control response. `ok=false` carries `error`; `list` fills `panes`+`focused`;
+/// `list-tabs` fills `tabs`+`active_tab`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resp {
     pub ok: bool,
@@ -53,6 +72,10 @@ pub struct Resp {
     pub panes: Option<Vec<PaneInfo>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub focused: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tabs: Option<Vec<TabInfo>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_tab: Option<usize>,
 }
 
 impl Resp {
@@ -62,6 +85,8 @@ impl Resp {
             error: None,
             panes: None,
             focused: None,
+            tabs: None,
+            active_tab: None,
         }
     }
     pub fn err(msg: impl Into<String>) -> Self {
@@ -70,14 +95,22 @@ impl Resp {
             error: Some(msg.into()),
             panes: None,
             focused: None,
+            tabs: None,
+            active_tab: None,
         }
     }
     pub fn list(panes: Vec<PaneInfo>, focused: usize) -> Self {
         Self {
-            ok: true,
-            error: None,
             panes: Some(panes),
             focused: Some(focused),
+            ..Self::ok()
+        }
+    }
+    pub fn tab_list(tabs: Vec<TabInfo>, active_tab: usize) -> Self {
+        Self {
+            tabs: Some(tabs),
+            active_tab: Some(active_tab),
+            ..Self::ok()
         }
     }
 }
@@ -106,12 +139,23 @@ pub fn run_client(args: &[String]) -> i32 {
         }
     }
     let Some(cmd) = rest.first().map(|s| s.as_str()) else {
-        eprintln!("usage: copad-mux ctl <list|split|focus|close|send> [args]");
+        eprintln!(
+            "usage: copad-mux ctl <list|split|focus|close|send|list-tabs|new-tab|select-tab> [args]"
+        );
         return 2;
     };
 
     let req = match cmd {
         "list" => Req::List,
+        "list-tabs" | "tabs" => Req::ListTabs,
+        "new-tab" => Req::NewTab,
+        "select-tab" => {
+            let Some(idx) = rest.get(1).and_then(|s| s.parse::<usize>().ok()) else {
+                eprintln!("usage: copad-mux ctl select-tab <index>");
+                return 2;
+            };
+            Req::SelectTab { index: idx }
+        }
         "split" => {
             // -h/--horizontal → side by side (right); -v/--vertical → stacked (down).
             let dir = match rest.get(1).map(|s| s.as_str()) {
@@ -218,6 +262,24 @@ fn print_human(req: &Req, resp: &Resp) {
                     p.label,
                     p.cols,
                     p.rows,
+                );
+            }
+        }
+        Req::ListTabs => {
+            let tabs = resp.tabs.clone().unwrap_or_default();
+            let active = resp.active_tab.unwrap_or(usize::MAX);
+            println!(
+                "{:<3} {:<9} {:<16} {:<6} AGENTS",
+                "IDX", "ACTIVE", "TAB", "PANES"
+            );
+            for t in &tabs {
+                println!(
+                    "{:<3} {:<9} {:<16} {:<6} {}",
+                    t.index,
+                    if t.index == active { "*active" } else { "" },
+                    t.id,
+                    t.panes,
+                    t.agents,
                 );
             }
         }
