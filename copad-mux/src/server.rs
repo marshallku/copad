@@ -153,7 +153,7 @@ pub fn run() -> io::Result<()> {
     // /dev/null, so the client prints its own copy of the diagnostics too).
     let (cfg, warnings) = crate::config::MuxConfig::load();
     for w in &warnings {
-        eprintln!("copad-mux config: {w}");
+        eprintln!("comux config: {w}");
     }
     let mouse = cfg.mouse;
     // Session persistence (continuum-style): a background writer autosaves the layout so a
@@ -249,7 +249,7 @@ pub fn run() -> io::Result<()> {
         && !app.is_empty()
         && let Err(e) = crate::persist::save_blocking(&state_path, &app.snapshot())
     {
-        eprintln!("copad-mux persist: final save failed: {e}");
+        eprintln!("comux persist: final save failed: {e}");
     }
 
     for c in clients.drain(..) {

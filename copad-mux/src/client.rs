@@ -72,7 +72,7 @@ pub fn run() -> io::Result<()> {
     // never applies its own local config to behavior — only surfaces its warnings.)
     let (_cfg, warnings) = crate::config::MuxConfig::load();
     for w in &warnings {
-        eprintln!("copad-mux config: {w}");
+        eprintln!("comux config: {w}");
     }
     let sock = socket_path();
     let stream = connect_or_spawn(&sock)?;
@@ -95,7 +95,7 @@ fn connect_or_spawn(sock: &Path) -> io::Result<UnixStream> {
     }
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
-        "copad-mux server did not come up",
+        "comux server did not come up",
     ))
 }
 

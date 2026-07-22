@@ -23,8 +23,8 @@ libc = "0.2"
 unicode-width = "0.2"
 
 [[bin]]
-name = "copad-mux"
-path = "src/bin/copad-mux.rs"
+name = "comux"
+path = "src/bin/comux.rs"
 
 [dev-dependencies]
 proptest = "1"

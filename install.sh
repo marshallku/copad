@@ -1,5 +1,5 @@
 #!/bin/bash
-# End-user install script: downloads copad + coctl (+ copad-mux, v0.2+) from the
+# End-user install script: downloads copad + coctl (+ comux, v0.2+) from the
 # latest GitHub Release tag and lays them out at ~/.local/bin (or
 # /usr/local/bin with --system).
 #
@@ -128,9 +128,11 @@ if ${SYSTEM_INSTALL}; then
     echo "Installing to ${INSTALL_DIR} (requires sudo)..."
     sudo install -Dm755 "${TMPDIR}/copad" "${INSTALL_DIR}/copad"
     sudo install -Dm755 "${TMPDIR}/coctl" "${INSTALL_DIR}/coctl"
-    # copad-mux (the terminal multiplexer) ships in v0.2+ tarballs; guard so
+    # comux (the terminal multiplexer) ships in v0.2+ tarballs; guard so
     # older releases without it still install cleanly.
-    [[ -f "${TMPDIR}/copad-mux" ]] && sudo install -Dm755 "${TMPDIR}/copad-mux" "${INSTALL_DIR}/copad-mux"
+    [[ -f "${TMPDIR}/comux" ]] && sudo install -Dm755 "${TMPDIR}/comux" "${INSTALL_DIR}/comux"
+    # Drop the pre-rename copad-mux binary so an upgrade leaves only comux.
+    [[ -e "${INSTALL_DIR}/copad-mux" ]] && sudo rm -f "${INSTALL_DIR}/copad-mux"
     if [[ -n "$DESKTOP_SRC" ]]; then
         sudo install -Dm644 "$DESKTOP_SRC" "${DESKTOP_DIR}/${DESKTOP_DEST_NAME}"
         # Drop the pre-rename copy if both are about to coexist.
@@ -150,7 +152,8 @@ else
     mkdir -p "${INSTALL_DIR}" "${DESKTOP_DIR}"
     install -m755 "${TMPDIR}/copad" "${INSTALL_DIR}/copad"
     install -m755 "${TMPDIR}/coctl" "${INSTALL_DIR}/coctl"
-    [[ -f "${TMPDIR}/copad-mux" ]] && install -m755 "${TMPDIR}/copad-mux" "${INSTALL_DIR}/copad-mux"
+    [[ -f "${TMPDIR}/comux" ]] && install -m755 "${TMPDIR}/comux" "${INSTALL_DIR}/comux"
+    [[ -e "${INSTALL_DIR}/copad-mux" ]] && rm -f "${INSTALL_DIR}/copad-mux"
     if [[ -n "$DESKTOP_SRC" ]]; then
         install -Dm644 "$DESKTOP_SRC" "${DESKTOP_DIR}/${DESKTOP_DEST_NAME}"
         if [[ "$DESKTOP_DEST_NAME" = "com.marshall.copad.desktop" ]]; then
@@ -182,4 +185,4 @@ echo "  copad    -> ${INSTALL_DIR}/copad"
 echo "  coctl -> ${INSTALL_DIR}/coctl"
 # Report from the tarball contents (what THIS run installed), not the
 # destination — an old release over an existing mux shouldn't claim it.
-[[ -f "${TMPDIR}/copad-mux" ]] && echo "  copad-mux -> ${INSTALL_DIR}/copad-mux"
+[[ -f "${TMPDIR}/comux" ]] && echo "  comux -> ${INSTALL_DIR}/comux"

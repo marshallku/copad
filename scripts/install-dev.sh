@@ -78,7 +78,7 @@ if $DO_BUILD; then
     cargo build --release --workspace --manifest-path "$REPO_ROOT/Cargo.toml"
 fi
 
-for bin in copad coctl copadd copad-mux; do
+for bin in copad coctl copadd comux; do
     src="$TARGET/$bin"
     if [ ! -x "$src" ]; then
         echo "error: $src not built — run with default flags or 'cargo build --release'" >&2
@@ -86,23 +86,29 @@ for bin in copad coctl copadd copad-mux; do
     fi
 done
 
-echo "==> installing copad + coctl + copadd + copad-mux into $INSTALL_DIR"
+echo "==> installing copad + coctl + copadd + comux into $INSTALL_DIR"
 if [ -n "$SUDO" ]; then
     # `install -m755` on existing files just rewrites; safe to repeat.
     # copadd is the always-on daemon for trigger dispatch + plugin
-    # supervision; copad-mux is the standalone agent-orchestration
+    # supervision; comux is the standalone agent-orchestration
     # terminal multiplexer — bundling them here means a single install
     # gives the user the full GUI + CLI + daemon + mux set.
     $SUDO install -Dm755 "$TARGET/copad" "$INSTALL_DIR/copad"
     $SUDO install -Dm755 "$TARGET/coctl" "$INSTALL_DIR/coctl"
     $SUDO install -Dm755 "$TARGET/copadd" "$INSTALL_DIR/copadd"
-    $SUDO install -Dm755 "$TARGET/copad-mux" "$INSTALL_DIR/copad-mux"
+    $SUDO install -Dm755 "$TARGET/comux" "$INSTALL_DIR/comux"
 else
     mkdir -p "$INSTALL_DIR"
     install -Dm755 "$TARGET/copad" "$INSTALL_DIR/copad"
     install -Dm755 "$TARGET/coctl" "$INSTALL_DIR/coctl"
     install -Dm755 "$TARGET/copadd" "$INSTALL_DIR/copadd"
-    install -Dm755 "$TARGET/copad-mux" "$INSTALL_DIR/copad-mux"
+    install -Dm755 "$TARGET/comux" "$INSTALL_DIR/comux"
+fi
+# The multiplexer was renamed copad-mux → comux; remove a stale legacy binary so an
+# upgrade doesn't leave two commands pointing at different versions.
+if [ -e "$INSTALL_DIR/copad-mux" ]; then
+    echo "==> removing legacy $INSTALL_DIR/copad-mux (renamed to comux)"
+    $SUDO rm -f "$INSTALL_DIR/copad-mux"
 fi
 
 echo "==> installing desktop entry + hicolor icons into ${DESKTOP_DIR%/applications} / $ICON_BASE"

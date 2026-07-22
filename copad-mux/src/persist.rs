@@ -143,7 +143,7 @@ pub fn load_from(path: &std::path::Path) -> Option<PersistState> {
     // fresh session, not exhaust memory during deserialization.
     if std::fs::metadata(path).ok()?.len() > MAX_FILE_BYTES {
         eprintln!(
-            "copad-mux persist: {} exceeds {MAX_FILE_BYTES} bytes — ignoring",
+            "comux persist: {} exceeds {MAX_FILE_BYTES} bytes — ignoring",
             path.display()
         );
         return None;
@@ -177,7 +177,7 @@ impl Saver {
                     && !warned
                 {
                     // Surface the first failure so persistence isn't silently broken.
-                    eprintln!("copad-mux persist: save to {} failed: {e}", path.display());
+                    eprintln!("comux persist: save to {} failed: {e}", path.display());
                     warned = true;
                 }
             }

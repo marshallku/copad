@@ -1,4 +1,4 @@
-//! The control API: a Unix-socket protocol that lets `copad-mux ctl <cmd>` drive
+//! The control API: a Unix-socket protocol that lets `comux ctl <cmd>` drive
 //! a running TUI (like `tmux`/`tmx`). This module holds the wire types, the socket
 //! path resolution, and the CLI client. The server side lives in [`crate::tui`]
 //! and honors the single-writer rule (spec §1): the socket thread never touches
@@ -189,7 +189,7 @@ pub fn socket_path() -> PathBuf {
     runtime_dir().join("sock")
 }
 
-/// The `copad-mux ctl ...` CLI client: parse args, round-trip one request over the
+/// The `comux ctl ...` CLI client: parse args, round-trip one request over the
 /// socket, print the response. Returns a process exit code.
 pub fn run_client(args: &[String]) -> i32 {
     let mut json_out = false;
@@ -203,7 +203,7 @@ pub fn run_client(args: &[String]) -> i32 {
     }
     let Some(cmd) = rest.first().map(|s| s.as_str()) else {
         eprintln!(
-            "usage: copad-mux ctl <list|split|resize|focus|close|send|list-tabs|new-tab|select-tab|\
+            "usage: comux <list|split|resize|focus|close|send|list-tabs|new-tab|select-tab|\
              list-sessions|new-session [name]|rename-session <index> <name>|select-session|\
              kill-server> [args]"
         );
@@ -230,7 +230,7 @@ pub fn run_client(args: &[String]) -> i32 {
         }
         "rename-session" | "rename" => {
             let Some(idx) = rest.get(1).and_then(|s| s.parse::<usize>().ok()) else {
-                eprintln!("usage: copad-mux ctl rename-session <index> <name...>");
+                eprintln!("usage: comux rename-session <index> <name...>");
                 return 2;
             };
             let name = rest
@@ -246,14 +246,14 @@ pub fn run_client(args: &[String]) -> i32 {
         }
         "select-session" => {
             let Some(idx) = rest.get(1).and_then(|s| s.parse::<usize>().ok()) else {
-                eprintln!("usage: copad-mux ctl select-session <index>");
+                eprintln!("usage: comux select-session <index>");
                 return 2;
             };
             Req::SelectSession { index: idx }
         }
         "select-tab" => {
             let Some(idx) = rest.get(1).and_then(|s| s.parse::<usize>().ok()) else {
-                eprintln!("usage: copad-mux ctl select-tab <index>");
+                eprintln!("usage: comux select-tab <index>");
                 return 2;
             };
             Req::SelectTab { index: idx }
@@ -270,7 +270,7 @@ pub fn run_client(args: &[String]) -> i32 {
         }
         "focus" | "close" => {
             let Some(idx) = rest.get(1).and_then(|s| s.parse::<usize>().ok()) else {
-                eprintln!("usage: copad-mux ctl {cmd} <index>");
+                eprintln!("usage: comux {cmd} <index>");
                 return 2;
             };
             if cmd == "focus" {
@@ -283,7 +283,7 @@ pub fn run_client(args: &[String]) -> i32 {
             let idx = rest.get(1).and_then(|s| s.parse::<usize>().ok());
             let dir = rest.get(2).map(|s| s.as_str());
             let (Some(idx), Some(dir)) = (idx, dir) else {
-                eprintln!("usage: copad-mux ctl resize <index> <left|right|up|down>");
+                eprintln!("usage: comux resize <index> <left|right|up|down>");
                 return 2;
             };
             Req::ResizePane {
@@ -293,7 +293,7 @@ pub fn run_client(args: &[String]) -> i32 {
         }
         "send" | "send-keys" => {
             let Some(idx) = rest.get(1).and_then(|s| s.parse::<usize>().ok()) else {
-                eprintln!("usage: copad-mux ctl send <index> <text...>");
+                eprintln!("usage: comux send <index> <text...>");
                 return 2;
             };
             let text = rest
@@ -305,7 +305,7 @@ pub fn run_client(args: &[String]) -> i32 {
             Req::SendKeys { index: idx, text }
         }
         other => {
-            eprintln!("copad-mux ctl: unknown command '{other}'");
+            eprintln!("comux: unknown command '{other}'");
             return 2;
         }
     };
@@ -313,7 +313,7 @@ pub fn run_client(args: &[String]) -> i32 {
     let resp = match round_trip(&req) {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("copad-mux ctl: {e}");
+            eprintln!("comux: {e}");
             return 1;
         }
     };
@@ -330,7 +330,7 @@ fn round_trip(req: &Req) -> Result<Resp, String> {
     let path = socket_path();
     let mut stream = UnixStream::connect(&path).map_err(|e| {
         format!(
-            "no running copad-mux at {} ({e}). Start one, or set COPAD_MUX_SOCK.",
+            "no running comux at {} ({e}). Start one, or set COPAD_MUX_SOCK.",
             path.display()
         )
     })?;
@@ -345,7 +345,7 @@ fn round_trip(req: &Req) -> Result<Resp, String> {
         .read_line(&mut resp_line)
         .map_err(|e| e.to_string())?;
     if resp_line.trim().is_empty() {
-        return Err("empty response from copad-mux".to_string());
+        return Err("empty response from comux".to_string());
     }
     serde_json::from_str(resp_line.trim()).map_err(|e| format!("bad response: {e}"))
 }
