@@ -63,6 +63,18 @@ pub enum ServerMsg {
     Bye,
 }
 
+/// A forwarded mouse action. The server maps `(x, y)` (frame cells) to a pane.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MouseKind {
+    /// Wheel up → scroll that pane back into history.
+    ScrollUp,
+    /// Wheel down → scroll that pane toward the live bottom.
+    ScrollDown,
+    /// Left click → focus that pane.
+    Click,
+}
+
 /// Client → server messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "kebab-case")]
@@ -72,6 +84,8 @@ pub enum ClientMsg {
     Attach { cols: u16, rows: u16 },
     /// A forwarded key event (interpreted server-side: prefix/nav/tabs/input).
     Key(KeyEvent),
+    /// A forwarded mouse action at frame cell `(x, y)`.
+    Mouse { x: u16, y: u16, kind: MouseKind },
     /// The client's terminal was resized.
     Resize { cols: u16, rows: u16 },
     /// Explicit detach request (a dropped connection detaches too).

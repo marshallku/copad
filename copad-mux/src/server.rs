@@ -442,6 +442,11 @@ fn handle_incoming(msg: Incoming, app: &mut App, clients: &mut Vec<Client>, kill
                         recompute_viewport(app, clients);
                     }
                 }
+                ClientMsg::Mouse { x, y, kind } => {
+                    // Scroll the pane under the cursor / click-to-focus — shared, so
+                    // any client's wheel drives the one composite.
+                    app.mouse_at(x, y, kind);
+                }
                 ClientMsg::Resize { cols, rows } => {
                     if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
                         c.cols = cols;

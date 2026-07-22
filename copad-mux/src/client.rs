@@ -13,7 +13,10 @@ use std::time::Duration;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
-use ratatui::crossterm::event::{self, Event as CEvent, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyEventKind, MouseButton,
+    MouseEventKind,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -21,7 +24,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::layout::{Position, Rect as RRect};
 
 use crate::control::socket_path;
-use crate::proto::{ClientMsg, ServerMsg};
+use crate::proto::{ClientMsg, MouseKind, ServerMsg};
 
 /// Restores the host terminal (raw mode off + leave alt screen) on drop — so a
 /// panic or an abrupt server exit never leaves the user's terminal wedged.
@@ -31,7 +34,9 @@ impl TermGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let guard = Self;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        // Mouse capture drives scrollback (wheel) + click-to-focus. Trade-off: this
+        // takes over native selection; most terminals let you hold Shift to bypass.
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         Ok(guard)
     }
 }
@@ -39,7 +44,7 @@ impl TermGuard {
 impl Drop for TermGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
     }
 }
 
@@ -105,7 +110,7 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
         default_hook(info);
     }));
 
@@ -160,6 +165,26 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                 match event::read()? {
                     CEvent::Key(k) if k.kind != KeyEventKind::Release => {
                         let _ = send(&mut wr, &ClientMsg::Key(k));
+                    }
+                    CEvent::Mouse(m) => {
+                        // Forward wheel + left-click at their cell; the server maps to
+                        // a pane (letterbox is top-left aligned, so coords pass through).
+                        let kind = match m.kind {
+                            MouseEventKind::ScrollUp => Some(MouseKind::ScrollUp),
+                            MouseEventKind::ScrollDown => Some(MouseKind::ScrollDown),
+                            MouseEventKind::Down(MouseButton::Left) => Some(MouseKind::Click),
+                            _ => None,
+                        };
+                        if let Some(kind) = kind {
+                            let _ = send(
+                                &mut wr,
+                                &ClientMsg::Mouse {
+                                    x: m.column,
+                                    y: m.row,
+                                    kind,
+                                },
+                            );
+                        }
                     }
                     CEvent::Resize(w, h) => {
                         cols = w.max(1);

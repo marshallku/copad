@@ -22,6 +22,7 @@ use ratatui::style::{Color, Modifier, Style};
 use crate::control;
 use crate::model::{ClientId, Dir, PaneId, PaneRect, Rect, Role, TabId, TerminalId, WorkspaceId};
 use crate::procinfo;
+use crate::proto::MouseKind;
 use crate::state::{Command, Event, MuxError, Origin, State};
 use crate::term::{CellColor, PaneTerm};
 
@@ -44,6 +45,8 @@ pub enum KeyAction {
     Detach,
 }
 
+/// Lines scrolled per mouse-wheel notch.
+const SCROLL_STEP: i32 = 3;
 /// Sidebar width in columns (a 1-col border is added to its right).
 const SIDEBAR_W: u16 = 24;
 /// Below this terminal width the sidebar is suppressed even when toggled on —
@@ -65,6 +68,10 @@ pub struct App {
     /// When `Some(sel)`, the `Ctrl-f` popup switcher is open with row `sel`
     /// selected; keys drive the popup instead of the shells.
     popup: Option<usize>,
+    /// Keyboard scrollback mode (`Ctrl-b [`): `Some(term)` binds the mode to the
+    /// terminal it was entered on, so a focus change (click / another client) can't
+    /// strand that pane scrolled-up. Keys scroll it; exit bottoms it. Shared state.
+    scroll_pane: Option<TerminalId>,
     /// Env vars injected into every pane's shell (e.g. `COPAD_MUX_SOCK`), so a
     /// shell inside a pane can control its own mux via `copad-mux ctl`.
     sock_env: Vec<(String, String)>,
@@ -107,6 +114,7 @@ impl App {
             rows,
             sidebar: false,
             popup: None,
+            scroll_pane: None,
             sock_env,
             labels: HashMap::new(),
             last_labels: std::time::Instant::now()
@@ -872,11 +880,40 @@ impl App {
             return KeyAction::Continue;
         }
 
+        // Scrollback mode (`Ctrl-b [`): keys drive the BOUND pane's history (bound at
+        // entry, so a focus change can't strand it). If that pane is gone, drop out.
+        if let Some(term) = self.scroll_pane.clone() {
+            if !self.panes.contains_key(&term) {
+                self.scroll_pane = None;
+            } else {
+                let page = (self.term_rows(&term) / 2).max(1) as i32;
+                match k.code {
+                    KeyCode::Char('k') | KeyCode::Up => self.scroll_term(&term, 1),
+                    KeyCode::Char('j') | KeyCode::Down => self.scroll_term(&term, -1),
+                    KeyCode::PageUp => self.scroll_term(&term, page),
+                    KeyCode::PageDown => self.scroll_term(&term, -page),
+                    KeyCode::Char('u') if ctrl => self.scroll_term(&term, page),
+                    KeyCode::Char('d') if ctrl => self.scroll_term(&term, -page),
+                    KeyCode::Char('g') => self.scroll_term(&term, 1_000_000), // clamps to top
+                    // `G`/`q`/`Esc` return the bound pane to the live bottom AND exit.
+                    KeyCode::Char('G') | KeyCode::Char('q') | KeyCode::Esc => {
+                        self.scroll_pane = None;
+                        self.scroll_term_to_bottom(&term);
+                    }
+                    _ => {}
+                }
+                *prefix = false;
+                return KeyAction::Continue;
+            }
+        }
+
         if *prefix {
             *prefix = false;
             match k.code {
                 KeyCode::Char('%') => self.split(Dir::Right),
                 KeyCode::Char('"') => self.split(Dir::Down),
+                // enter scrollback, bound to the currently focused pane
+                KeyCode::Char('[') => self.scroll_pane = self.focused_terminal(),
                 KeyCode::Char('o') => self.focus_next(),
                 KeyCode::Char('x') => self.close_focused(),
                 KeyCode::Char('s') => self.toggle_sidebar(),
@@ -993,8 +1030,70 @@ impl App {
         if let Some(term) = self.focused_terminal()
             && let Some(pt) = self.panes.get(&term)
         {
+            pt.scroll_to_bottom(); // typing returns to the live bottom
             pt.input(bytes);
         }
+    }
+
+    // --- scrollback ---
+
+    /// Handle a forwarded mouse action at frame cell `(x, y)`: the wheel scrolls the
+    /// pane UNDER the cursor (falling back to the focused pane); a left click focuses
+    /// the pane under the cursor.
+    pub fn mouse_at(&mut self, x: u16, y: u16, kind: MouseKind) {
+        let target = self
+            .layout()
+            .into_iter()
+            .find(|r| x >= r.x && x < r.x + r.cols && y >= r.y && y < r.y + r.rows);
+        match kind {
+            MouseKind::ScrollUp | MouseKind::ScrollDown => {
+                let lines = if matches!(kind, MouseKind::ScrollUp) {
+                    SCROLL_STEP
+                } else {
+                    -SCROLL_STEP
+                };
+                let term = target
+                    .map(|r| r.terminal)
+                    .or_else(|| self.focused_terminal());
+                if let Some(t) = term
+                    && let Some(pt) = self.panes.get(&t)
+                {
+                    pt.scroll(lines);
+                }
+            }
+            MouseKind::Click => {
+                if let Some(r) = target
+                    && let Some(pane) = self.pane_of_terminal(&r.terminal)
+                {
+                    let _ = self.state.apply(Command::FocusPane {
+                        client: self.client,
+                        pane,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Scroll a specific terminal by `lines` (positive = up / older).
+    fn scroll_term(&self, term: &TerminalId, lines: i32) {
+        if let Some(pt) = self.panes.get(term) {
+            pt.scroll(lines);
+        }
+    }
+
+    fn scroll_term_to_bottom(&self, term: &TerminalId) {
+        if let Some(pt) = self.panes.get(term) {
+            pt.scroll_to_bottom();
+        }
+    }
+
+    /// On-screen rows of a terminal (the page size for page scrolling).
+    fn term_rows(&self, term: &TerminalId) -> u16 {
+        self.layout()
+            .into_iter()
+            .find(|r| &r.terminal == term)
+            .map(|r| r.rows)
+            .unwrap_or(24)
     }
 
     pub fn resize(&mut self, cols: u16, rows: u16) {
@@ -1292,8 +1391,29 @@ impl App {
             self.render_popup(buf);
         }
 
-        // The shell cursor shows only when no popup is capturing input.
-        if self.popup.is_none() {
+        // 6) a scrollback-mode tag in the top-right.
+        if self.scroll_pane.is_some() {
+            let tag = " SCROLL  k/j · PgUp/Dn · g/G · q ";
+            let x0 = area.width.saturating_sub(tag.chars().count() as u16);
+            let st = Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD);
+            for (i, ch) in tag.chars().enumerate() {
+                let x = x0 + i as u16;
+                if x < area.width
+                    && let Some(bc) = buf.cell_mut(Position::new(x, content_y))
+                {
+                    let mut sb = [0u8; 4];
+                    bc.set_symbol(ch.encode_utf8(&mut sb));
+                    bc.set_skip(false);
+                    bc.set_style(st);
+                }
+            }
+        }
+
+        // The shell cursor shows only when nothing modal is capturing input.
+        if self.popup.is_none() && self.scroll_pane.is_none() {
             cursor_pos
         } else {
             None

@@ -13,7 +13,7 @@ use std::thread::JoinHandle;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
 use alacritty_terminal::event_loop::{EventLoop, EventLoopSender, Msg, State};
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
@@ -167,7 +167,12 @@ impl PaneTerm {
 
         let term_size = TermSize::new(cols as usize, rows as usize);
         let listener = MuxListener::new();
-        let term = Term::new(Config::default(), &term_size, listener.clone());
+        // A generous scrollback so panes have history to scroll back through.
+        let config = Config {
+            scrolling_history: 10_000,
+            ..Config::default()
+        };
+        let term = Term::new(config, &term_size, listener.clone());
         let term = Arc::new(FairMutex::new(term));
 
         let event_loop =
@@ -228,6 +233,24 @@ impl PaneTerm {
     /// Has the child shell exited?
     pub fn has_exited(&self) -> bool {
         self.listener.child_exited.load(Ordering::Relaxed)
+    }
+
+    /// Scroll the viewport through scrollback: positive `lines` = UP (older),
+    /// negative = DOWN (newer). `snapshot` then renders at the new offset.
+    pub fn scroll(&self, lines: i32) {
+        if lines != 0 {
+            self.term.lock().scroll_display(Scroll::Delta(lines));
+        }
+    }
+
+    /// Jump the viewport back to the live bottom (offset 0).
+    pub fn scroll_to_bottom(&self) {
+        self.term.lock().scroll_display(Scroll::Bottom);
+    }
+
+    /// How many lines the viewport is scrolled up from the live bottom (0 = live).
+    pub fn scroll_offset(&self) -> usize {
+        self.term.lock().grid().display_offset()
     }
 
     /// Snapshot the visible viewport for rendering. Keeps the term lock only for
