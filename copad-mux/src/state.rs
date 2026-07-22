@@ -262,6 +262,13 @@ impl State {
     pub fn workspace_count(&self) -> usize {
         self.workspaces.len()
     }
+    /// Set (or clear, with `None`) a workspace's display name (tmux-style session
+    /// rename). No-op if the id is unknown. Server-level metadata, not a `Command`.
+    pub fn set_workspace_name(&mut self, id: &WorkspaceId, name: Option<String>) {
+        if let Some(w) = self.workspaces.iter_mut().find(|w| &w.id == id) {
+            w.name = name;
+        }
+    }
     pub fn terminal(&self, id: &TerminalId) -> Option<&Terminal> {
         self.terminals.get(id)
     }
@@ -1065,6 +1072,19 @@ mod tests {
         let ws = WorkspaceId::new("w1");
         let (_tab, pane, _term) = s.create_workspace(ws.clone(), None, Rect { cols: 80, rows: 24 });
         (s, ws, pane)
+    }
+
+    #[test]
+    fn set_workspace_name_sets_clears_and_ignores_unknown() {
+        let (mut s, ws, _p) = seed();
+        assert_eq!(s.workspace(&ws).unwrap().name, None);
+        s.set_workspace_name(&ws, Some("api".to_string()));
+        assert_eq!(s.workspace(&ws).unwrap().name.as_deref(), Some("api"));
+        // Clearing reverts to the id-shown state.
+        s.set_workspace_name(&ws, None);
+        assert_eq!(s.workspace(&ws).unwrap().name, None);
+        // Unknown id is a silent no-op (no panic).
+        s.set_workspace_name(&WorkspaceId::new("nope"), Some("x".to_string()));
     }
 
     #[test]

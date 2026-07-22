@@ -36,8 +36,15 @@ pub enum Req {
     SelectTab { index: usize },
     /// List the sessions (workspaces).
     ListSessions,
-    /// Create a new session and switch to it.
-    NewSession,
+    /// Create a new session and switch to it. `name` is the tmux-style display name
+    /// (`None` → shown by its generated `sN` id).
+    NewSession {
+        #[serde(default)]
+        name: Option<String>,
+    },
+    /// Rename the session at `index` (as printed by `list-sessions`). An empty `name`
+    /// clears it back to the generated id.
+    RenameSession { index: usize, name: String },
     /// Make the session at `index` (as printed by `list-sessions`) active.
     SelectSession { index: usize },
     /// Shut the persistent server down (drops every shell). The only key-free way to
@@ -82,6 +89,9 @@ pub struct TabInfo {
 pub struct SessionInfo {
     pub index: usize,
     pub id: String,
+    /// The tmux-style display name, or empty when unnamed (shown by `id`).
+    #[serde(default)]
+    pub name: String,
     pub active: bool,
     /// Number of tabs in the session.
     pub tabs: usize,
@@ -194,7 +204,8 @@ pub fn run_client(args: &[String]) -> i32 {
     let Some(cmd) = rest.first().map(|s| s.as_str()) else {
         eprintln!(
             "usage: copad-mux ctl <list|split|resize|focus|close|send|list-tabs|new-tab|select-tab|\
-             list-sessions|new-session|select-session|kill-server> [args]"
+             list-sessions|new-session [name]|rename-session <index> <name>|select-session|\
+             kill-server> [args]"
         );
         return 2;
     };
@@ -205,7 +216,34 @@ pub fn run_client(args: &[String]) -> i32 {
         "list-tabs" | "tabs" => Req::ListTabs,
         "new-tab" => Req::NewTab,
         "list-sessions" | "sessions" => Req::ListSessions,
-        "new-session" => Req::NewSession,
+        "new-session" => {
+            // Optional name: everything after the verb, space-joined (tmux `new -s`).
+            let name = rest
+                .iter()
+                .skip(1)
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            Req::NewSession {
+                name: (!name.trim().is_empty()).then(|| name.trim().to_string()),
+            }
+        }
+        "rename-session" | "rename" => {
+            let Some(idx) = rest.get(1).and_then(|s| s.parse::<usize>().ok()) else {
+                eprintln!("usage: copad-mux ctl rename-session <index> <name...>");
+                return 2;
+            };
+            let name = rest
+                .iter()
+                .skip(2)
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            Req::RenameSession {
+                index: idx,
+                name: name.trim().to_string(),
+            }
+        }
         "select-session" => {
             let Some(idx) = rest.get(1).and_then(|s| s.parse::<usize>().ok()) else {
                 eprintln!("usage: copad-mux ctl select-session <index>");
@@ -364,15 +402,16 @@ fn print_human(req: &Req, resp: &Resp) {
             let sessions = resp.sessions.clone().unwrap_or_default();
             let active = resp.active_session.unwrap_or(usize::MAX);
             println!(
-                "{:<3} {:<9} {:<16} {:<5} {:<6} AGENTS",
-                "IDX", "ACTIVE", "SESSION", "TABS", "PANES"
+                "{:<3} {:<9} {:<16} {:<16} {:<5} {:<6} AGENTS",
+                "IDX", "ACTIVE", "SESSION", "NAME", "TABS", "PANES"
             );
             for s in &sessions {
                 println!(
-                    "{:<3} {:<9} {:<16} {:<5} {:<6} {}",
+                    "{:<3} {:<9} {:<16} {:<16} {:<5} {:<6} {}",
                     s.index,
                     if s.index == active { "*active" } else { "" },
                     s.id,
+                    if s.name.is_empty() { "-" } else { &s.name },
                     s.tabs,
                     s.panes,
                     s.agents,

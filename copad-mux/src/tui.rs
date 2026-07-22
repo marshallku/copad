@@ -10,6 +10,7 @@
 //! and the thin [`crate::client`] renders + forwards input, so the same App serves
 //! local and detached/reattached sessions.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::time::Duration;
@@ -55,6 +56,42 @@ struct Notification {
 
 /// Max notifications retained in the center.
 const NOTIFY_LOG_CAP: usize = 100;
+
+/// What a click on a piece of chrome should do. Recorded per rendered chip/row so
+/// [`App::mouse_at`] can turn a click on the status bar or sidebar into navigation.
+#[derive(Clone)]
+enum ClickTarget {
+    /// A status-bar tab chip → select that tab in the active session.
+    Tab(TabId),
+    /// A sidebar `spaces` row → switch to that session.
+    Session(WorkspaceId),
+    /// A sidebar `agents` row → jump to that agent's pane (its session + tab + focus).
+    Agent(TerminalId),
+}
+
+/// A rectangular hit region (inclusive `x0..=x1`, `y0..=y1`) recorded during render.
+struct ClickZone {
+    x0: u16,
+    x1: u16,
+    y0: u16,
+    y1: u16,
+    target: ClickTarget,
+}
+
+/// An inline single-line text prompt (session name entry / rename), tmux `command-prompt`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PromptKind {
+    /// `Ctrl-b C`: create a session with the typed name (empty → auto `sN`).
+    NewSession,
+    /// `Ctrl-b $`: rename the active session (empty → revert to its id).
+    RenameSession,
+}
+
+/// State of the open inline prompt: what it will do + the text typed so far.
+struct Prompt {
+    kind: PromptKind,
+    buf: String,
+}
 
 /// What feeding one key to the app implies for the caller (the server loop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,6 +165,13 @@ pub struct App {
     /// Monotonic counter for minting unique session (workspace) ids (`local` is the
     /// first, so new sessions start at `s1`).
     next_session: u64,
+    /// When `Some`, an inline text prompt (new-session name / rename) is open and
+    /// captures keystrokes until Enter (commit) or Esc (cancel).
+    prompt: Option<Prompt>,
+    /// Clickable chrome regions (tab chips, sidebar rows), rebuilt every render so
+    /// `mouse_at` can hit-test a click on the status bar / sidebar. Interior mutability
+    /// because rendering is `&self`; only ever touched on the single main-loop thread.
+    click_zones: RefCell<Vec<ClickZone>>,
 }
 
 impl App {
@@ -172,6 +216,8 @@ impl App {
             agent_statuses: HashMap::new(),
             branches: HashMap::new(),
             next_session: 1,
+            prompt: None,
+            click_zones: RefCell::new(Vec::new()),
         };
         app.reflow();
         Ok(app)
@@ -595,9 +641,10 @@ impl App {
         self.sync_sizes();
     }
 
-    /// Create a new session (a fresh single-pane workspace) and switch to it. Rolls
-    /// the session back if the PTY can't spawn (never leave a blank session).
-    fn new_session(&mut self) {
+    /// Create a new session (a fresh single-pane workspace) and switch to it. `name`
+    /// is the tmux-style session name (`None` → shown by its `sN` id). Rolls the
+    /// session back if the PTY can't spawn (never leave a blank session).
+    fn new_session(&mut self, name: Option<String>) {
         let n = self.next_session;
         self.next_session += 1;
         let id = WorkspaceId::new(format!("s{n}"));
@@ -605,7 +652,7 @@ impl App {
         let rows = self.content_rows().max(1);
         let (_tab, _pane, term0) =
             self.state
-                .create_workspace(id.clone(), None, Rect { cols, rows });
+                .create_workspace(id.clone(), name, Rect { cols, rows });
         match PaneTerm::spawn_with_env(
             self.cols.max(1),
             self.rows.max(1),
@@ -626,6 +673,42 @@ impl App {
                     }
                 }
             }
+        }
+    }
+
+    /// Set (or clear, with `None`) the active session's display name.
+    fn rename_session(&mut self, name: Option<String>) {
+        self.state.set_workspace_name(&self.ws, name);
+    }
+
+    /// Open the inline new-session name prompt (`Ctrl-b C`); Enter commits, Esc cancels.
+    fn open_new_session_prompt(&mut self) {
+        self.prompt = Some(Prompt {
+            kind: PromptKind::NewSession,
+            buf: String::new(),
+        });
+    }
+
+    /// Open the inline rename prompt (`Ctrl-b $`), seeded with the current name.
+    fn open_rename_prompt(&mut self) {
+        let seed = self
+            .state
+            .workspace(&self.ws)
+            .and_then(|w| w.name.clone())
+            .unwrap_or_default();
+        self.prompt = Some(Prompt {
+            kind: PromptKind::RenameSession,
+            buf: seed,
+        });
+    }
+
+    /// Apply the open prompt on Enter: create (name → `None` when blank) or rename.
+    fn commit_prompt(&mut self, p: Prompt) {
+        let trimmed = p.buf.trim();
+        let name = (!trimmed.is_empty()).then(|| trimmed.to_string());
+        match p.kind {
+            PromptKind::NewSession => self.new_session(name),
+            PromptKind::RenameSession => self.rename_session(name),
         }
     }
 
@@ -664,19 +747,7 @@ impl App {
             Some(i) => blocked[(i + 1) % blocked.len()].clone(),
             None => blocked[0].clone(),
         };
-        if let Some((wid, tab, pane)) = self.locate_terminal(&target) {
-            self.switch_session(wid.clone());
-            let _ = self.state.apply(Command::SelectTab {
-                origin: Origin::Client(self.client),
-                workspace: wid,
-                tab,
-            });
-            let _ = self.state.apply(Command::FocusPane {
-                client: self.client,
-                pane,
-            });
-            self.reflow();
-        }
+        self.jump_to_terminal(&target);
     }
 
     /// Switch to the session at 0-based `index` (as listed by `list-sessions`).
@@ -917,9 +988,15 @@ impl App {
                                 (w.tabs.len(), panes, agents)
                             })
                             .unwrap_or((0, 0, 0));
+                        let name = self
+                            .state
+                            .workspace(wid)
+                            .and_then(|w| w.name.clone())
+                            .unwrap_or_default();
                         control::SessionInfo {
                             index: i,
                             id: wid.to_string(),
+                            name,
                             active: i == active_idx,
                             tabs,
                             panes,
@@ -929,13 +1006,22 @@ impl App {
                     .collect();
                 Resp::session_list(infos, active_idx)
             }
-            Req::NewSession => {
+            Req::NewSession { name } => {
                 let before = self.session_count();
-                self.new_session();
+                self.new_session(name.clone());
                 if self.session_count() > before {
                     Resp::ok()
                 } else {
                     Resp::err("new-session failed (could not spawn a shell)")
+                }
+            }
+            Req::RenameSession { index, name } => {
+                if let Some(wid) = self.session_ids().get(*index).cloned() {
+                    let new = (!name.trim().is_empty()).then(|| name.trim().to_string());
+                    self.state.set_workspace_name(&wid, new);
+                    Resp::ok()
+                } else {
+                    Resp::err(format!("no session at index {index}"))
                 }
             }
             Req::SelectSession { index } => {
@@ -958,6 +1044,27 @@ impl App {
     /// when several clients share input; the popup is shared workspace state.
     pub fn feed_key(&mut self, k: KeyEvent, prefix: &mut bool) -> KeyAction {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+
+        // An open inline prompt (new-session name / rename) captures all input: type
+        // to edit, Enter commits, Esc cancels. Shared state, so clear this client's
+        // pending prefix too.
+        if let Some(mut p) = self.prompt.take() {
+            *prefix = false;
+            match k.code {
+                KeyCode::Enter => self.commit_prompt(p),
+                KeyCode::Esc => {} // cancel: dropped by the take()
+                KeyCode::Backspace => {
+                    p.buf.pop();
+                    self.prompt = Some(p);
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    p.buf.push(c);
+                    self.prompt = Some(p);
+                }
+                _ => self.prompt = Some(p),
+            }
+            return KeyAction::Continue;
+        }
 
         // The switcher captures all input while open. Clear THIS client's pending
         // prefix too: the popup is shared state, so a `Ctrl-b` armed on one client
@@ -1035,8 +1142,10 @@ impl App {
                 KeyCode::Char('p') => self.cycle_tab(-1),
                 KeyCode::Char('&') => self.close_active_tab(),
                 KeyCode::Char(d @ '1'..='9') => self.select_tab_index(d as usize - '1' as usize),
-                // sessions (workspaces): `C` new, `)`/`(` next/prev (tmux-style)
-                KeyCode::Char('C') => self.new_session(),
+                // sessions (workspaces): `C` new (named prompt), `$` rename, `)`/`(`
+                // next/prev (tmux-style)
+                KeyCode::Char('C') => self.open_new_session_prompt(),
+                KeyCode::Char('$') => self.open_rename_prompt(),
                 KeyCode::Char(')') => self.cycle_session(1),
                 KeyCode::Char('(') => self.cycle_session(-1),
                 // jump to the next agent awaiting input (attention)
@@ -1062,6 +1171,14 @@ impl App {
         // Direct (prefix-less) pane navigation: Ctrl+Shift+arrow.
         if let Some(dir) = ctrl_shift_nav(k.code, k.modifiers) {
             self.focus_dir(dir);
+            return KeyAction::Continue;
+        }
+
+        // Direct (prefix-less) tab jump: Alt/Opt+number (Meta+N), like a tmux
+        // `bind -n M-1 select-window -t 1`. Requires the terminal to send Option
+        // (macOS) / Alt (Linux) as Meta — the same prerequisite tmux has.
+        if let Some(idx) = alt_digit_tab(k.code, k.modifiers) {
+            self.select_tab_index(idx);
             return KeyAction::Continue;
         }
 
@@ -1176,6 +1293,20 @@ impl App {
                 }
             }
             MouseKind::Click => {
+                // Chrome first: a click on a tab chip / sidebar row navigates. Only if
+                // it misses all zones does it fall through to click-to-focus a pane.
+                if let Some(t) = self.click_target_at(x, y) {
+                    match t {
+                        ClickTarget::Tab(id) => {
+                            if let Some(i) = self.tab_ids().iter().position(|t| t == &id) {
+                                self.select_tab_index(i);
+                            }
+                        }
+                        ClickTarget::Session(wid) => self.switch_session(wid),
+                        ClickTarget::Agent(term) => self.jump_to_terminal(&term),
+                    }
+                    return;
+                }
                 if let Some(r) = target
                     && let Some(pane) = self.pane_of_terminal(&r.terminal)
                 {
@@ -1185,6 +1316,34 @@ impl App {
                     });
                 }
             }
+        }
+    }
+
+    /// The chrome action for a click at frame cell `(x, y)`, if it lands on a recorded
+    /// tab chip / sidebar row (first match wins).
+    fn click_target_at(&self, x: u16, y: u16) -> Option<ClickTarget> {
+        self.click_zones
+            .borrow()
+            .iter()
+            .find(|z| x >= z.x0 && x <= z.x1 && y >= z.y0 && y <= z.y1)
+            .map(|z| z.target.clone())
+    }
+
+    /// Switch to a specific agent/pane by terminal id: its session, then its tab, then
+    /// focus it. Shared with sidebar agent-row clicks (cf. [`Self::jump_to_attention`]).
+    fn jump_to_terminal(&mut self, term: &TerminalId) {
+        if let Some((wid, tab, pane)) = self.locate_terminal(term) {
+            self.switch_session(wid.clone());
+            let _ = self.state.apply(Command::SelectTab {
+                origin: Origin::Client(self.client),
+                workspace: wid,
+                tab,
+            });
+            let _ = self.state.apply(Command::FocusPane {
+                client: self.client,
+                pane,
+            });
+            self.reflow();
         }
     }
 
@@ -1460,6 +1619,10 @@ impl App {
         let focused_term = self.focused_terminal();
         let mut cursor_pos: Option<Position> = None;
 
+        // Rebuild clickable-chrome hit regions from scratch each frame (tab chips +
+        // sidebar rows push into this as they render).
+        self.click_zones.borrow_mut().clear();
+
         // 1) pane contents (inactive panes dimmed so the focused one stands out).
         for rect in &rects {
             let Some(pt) = self.panes.get(&rect.terminal) else {
@@ -1567,9 +1730,16 @@ impl App {
         if self.center.is_some() {
             self.render_center(buf);
         }
+        if self.prompt.is_some() {
+            self.render_prompt(buf);
+        }
 
         // The shell cursor shows only when nothing modal is capturing input.
-        if self.popup.is_none() && self.scroll_pane.is_none() && self.center.is_none() {
+        if self.popup.is_none()
+            && self.scroll_pane.is_none()
+            && self.center.is_none()
+            && self.prompt.is_none()
+        {
             cursor_pos
         } else {
             None
@@ -1755,8 +1925,9 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Every agent pane across ALL sessions: `(space, tool, status)`.
-    fn agent_rows(&self) -> Vec<(String, String, &'static str)> {
+    /// Every agent pane across ALL sessions: `(space, tool, status, terminal)`. The
+    /// terminal id lets the sidebar make each agent row clickable (jump to its pane).
+    fn agent_rows(&self) -> Vec<(String, String, &'static str, TerminalId)> {
         let mut out = Vec::new();
         for wid in self.state.workspace_ids() {
             let Some(w) = self.state.workspace(&wid) else {
@@ -1769,7 +1940,12 @@ impl App {
                         && let Some(label) = self.labels.get(tid)
                         && label.kind == procinfo::Kind::Agent
                     {
-                        out.push((space.clone(), label.text.clone(), self.agent_status(tid)));
+                        out.push((
+                            space.clone(),
+                            label.text.clone(),
+                            self.agent_status(tid),
+                            tid.clone(),
+                        ));
                     }
                 }
             }
@@ -1882,6 +2058,14 @@ impl App {
                 .unwrap_or_else(|| self.session_focus_label(sid));
             let mut sx = 4u16;
             put(buf, &mut sx, y + 1, &sub, sub_style);
+            // Both rows (name + subtitle) click to switch to this session.
+            self.click_zones.borrow_mut().push(ClickZone {
+                x0: 0,
+                x1: SIDEBAR_W - 1,
+                y0: y,
+                y1: y + 1,
+                target: ClickTarget::Session(sid.clone()),
+            });
             y += 2;
         }
 
@@ -1889,7 +2073,7 @@ impl App {
         let mut y = mid;
         put(buf, &mut 0, y, " agents", header);
         y += 1;
-        for (space, tool, status) in self.agent_rows() {
+        for (space, tool, status, term) in self.agent_rows() {
             if y + 1 >= h {
                 break;
             }
@@ -1922,6 +2106,14 @@ impl App {
                 &format!("{status} · {tool}"),
                 sub_style,
             );
+            // Both rows click to jump to this agent's pane.
+            self.click_zones.borrow_mut().push(ClickZone {
+                x0: 0,
+                x1: SIDEBAR_W - 1,
+                y0: y,
+                y1: y + 1,
+                target: ClickTarget::Agent(term.clone()),
+            });
             y += 2;
         }
     }
@@ -2044,7 +2236,17 @@ impl App {
             } else {
                 Style::default().fg(CAT_OVERLAY).bg(CAT_BASE)
             };
+            let chip_x0 = x;
             put(buf, &mut x, &label, st);
+            if x > chip_x0 {
+                self.click_zones.borrow_mut().push(ClickZone {
+                    x0: chip_x0,
+                    x1: x - 1,
+                    y0: y,
+                    y1: y,
+                    target: ClickTarget::Tab(id.clone()),
+                });
+            }
         }
 
         // RIGHT: attention · scroll · agents · clock · host, right-aligned.
@@ -2213,6 +2415,96 @@ impl App {
 
     /// The notification center (`Ctrl-b a`): a centered box listing logged agent-turn
     /// events, newest first — Enter jumps to the source pane, `d` dismisses.
+    /// Draw the inline single-line prompt (new-session name / rename) as a small
+    /// centered box with the typed text + a block cursor. Clamps on tiny terminals.
+    fn render_prompt(&self, buf: &mut Buffer) {
+        let Some(p) = self.prompt.as_ref() else {
+            return;
+        };
+        let area = buf.area;
+        let maxw = area.width.saturating_sub(2).max(1);
+        let w = ((area.width as u32 * 3 / 5) as u16).clamp(24.min(maxw), maxw);
+        let h = 3u16.min(area.height.max(1));
+        let x0 = (area.width.saturating_sub(w)) / 2;
+        let y0 = (area.height.saturating_sub(h)) / 2;
+        let bg = Color::Rgb(20, 22, 30);
+        let border = Style::default().fg(CAT_MAUVE).bg(bg);
+
+        for y in y0..(y0 + h).min(area.height) {
+            for x in x0..(x0 + w).min(area.width) {
+                let sym = if y == y0 && x == x0 {
+                    "┌"
+                } else if y == y0 && x == x0 + w - 1 {
+                    "┐"
+                } else if y == y0 + h - 1 && x == x0 {
+                    "└"
+                } else if y == y0 + h - 1 && x == x0 + w - 1 {
+                    "┘"
+                } else if y == y0 || y == y0 + h - 1 {
+                    "─"
+                } else if x == x0 || x == x0 + w - 1 {
+                    "│"
+                } else {
+                    " "
+                };
+                if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
+                    bc.set_symbol(sym);
+                    bc.set_skip(false);
+                    let edge = y == y0 || y == y0 + h - 1 || x == x0 || x == x0 + w - 1;
+                    bc.set_style(if edge {
+                        border
+                    } else {
+                        Style::default().bg(bg)
+                    });
+                }
+            }
+        }
+
+        let put = |buf: &mut Buffer, y: u16, x: u16, maxw: u16, s: &str, st: Style| {
+            for (i, ch) in s.chars().take(maxw as usize).enumerate() {
+                if let Some(bc) = buf.cell_mut(Position::new(x + i as u16, y)) {
+                    let mut sb = [0u8; 4];
+                    bc.set_symbol(ch.encode_utf8(&mut sb));
+                    bc.set_skip(false);
+                    bc.set_style(st);
+                }
+            }
+        };
+
+        let title = match p.kind {
+            PromptKind::NewSession => " new session ",
+            PromptKind::RenameSession => " rename session ",
+        };
+        put(
+            buf,
+            y0,
+            x0 + 2,
+            w.saturating_sub(4),
+            title,
+            border.add_modifier(Modifier::BOLD),
+        );
+        // Text line with a trailing block cursor; right-truncate so the caret stays
+        // visible as the input grows past the box width.
+        let inner_w = w.saturating_sub(4) as usize;
+        let shown: String = {
+            let with_caret = format!("{}█", p.buf);
+            let chars: Vec<char> = with_caret.chars().collect();
+            if chars.len() > inner_w {
+                chars[chars.len() - inner_w..].iter().collect()
+            } else {
+                with_caret
+            }
+        };
+        put(
+            buf,
+            y0 + 1,
+            x0 + 2,
+            w.saturating_sub(4),
+            &shown,
+            Style::default().fg(CAT_TEXT).bg(bg),
+        );
+    }
+
     fn render_center(&self, buf: &mut Buffer) {
         let Some(sel) = self.center else { return };
         let area = buf.area;
@@ -2407,6 +2699,20 @@ fn ctrl_shift_nav(code: KeyCode, mods: KeyModifiers) -> Option<FocusDir> {
     }
 }
 
+/// Prefix-less tab jump: Alt/Opt+`1`..`9` (Meta+N) → tab index `0..8`, mirroring a
+/// tmux `bind -n M-1 select-window -t 1`. crossterm surfaces macOS Option / Linux Alt
+/// as [`KeyModifiers::ALT`] only when the terminal is set to send it as Meta (the same
+/// prerequisite tmux has). Ctrl+Alt is excluded so it can't shadow other chords.
+fn alt_digit_tab(code: KeyCode, mods: KeyModifiers) -> Option<usize> {
+    if !mods.contains(KeyModifiers::ALT) || mods.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match code {
+        KeyCode::Char(d @ '1'..='9') => Some(d as usize - '1' as usize),
+        _ => None,
+    }
+}
+
 /// Translate a key event into the bytes a PTY expects.
 fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
     let alt = mods.contains(KeyModifiers::ALT);
@@ -2455,4 +2761,33 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
         _ => return None,
     };
     Some(esc(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alt_digit_maps_meta_number_to_zero_based_tab() {
+        let alt = KeyModifiers::ALT;
+        assert_eq!(alt_digit_tab(KeyCode::Char('1'), alt), Some(0));
+        assert_eq!(alt_digit_tab(KeyCode::Char('9'), alt), Some(8));
+    }
+
+    #[test]
+    fn alt_digit_ignores_plain_and_ctrl_alt() {
+        // No Alt → shell input, not a tab jump.
+        assert_eq!(alt_digit_tab(KeyCode::Char('1'), KeyModifiers::NONE), None);
+        // Ctrl+Alt is reserved for other chords.
+        assert_eq!(
+            alt_digit_tab(
+                KeyCode::Char('1'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL
+            ),
+            None
+        );
+        // `0` has no window in a 1-based scheme; non-digits pass through.
+        assert_eq!(alt_digit_tab(KeyCode::Char('0'), KeyModifiers::ALT), None);
+        assert_eq!(alt_digit_tab(KeyCode::Char('a'), KeyModifiers::ALT), None);
+    }
 }
