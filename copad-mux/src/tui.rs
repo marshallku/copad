@@ -55,6 +55,7 @@ const SIDEBAR_W: u16 = 24;
 
 // Catppuccin Mocha — the owner's tmux status palette (`~/dotfiles/tmux/.tmux.conf`).
 const CAT_BASE: Color = Color::Rgb(0x1e, 0x1e, 0x2e);
+const CAT_TEXT: Color = Color::Rgb(0xcd, 0xd6, 0xf4);
 const CAT_MAUVE: Color = Color::Rgb(0xcb, 0xa6, 0xf7);
 const CAT_SURFACE0: Color = Color::Rgb(0x31, 0x32, 0x44);
 const CAT_BLUE: Color = Color::Rgb(0x89, 0xb4, 0xfa);
@@ -62,6 +63,8 @@ const CAT_YELLOW: Color = Color::Rgb(0xf9, 0xe2, 0xaf);
 const CAT_SUBTEXT: Color = Color::Rgb(0xba, 0xc2, 0xde);
 const CAT_OVERLAY: Color = Color::Rgb(0x6c, 0x70, 0x86);
 const CAT_GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
+const CAT_RED: Color = Color::Rgb(0xf3, 0x8b, 0xa8);
+const CAT_PEACH: Color = Color::Rgb(0xfa, 0xb3, 0x87);
 /// Below this terminal width the sidebar is suppressed even when toggled on —
 /// the popup switcher is the fallback on narrow / mobile widths (size-adaptive).
 const SIDEBAR_MIN_COLS: u16 = 80;
@@ -93,6 +96,10 @@ pub struct App {
     labels: HashMap<TerminalId, procinfo::Label>,
     /// When the labels were last refreshed (throttle `ps` to ~2 Hz).
     last_labels: std::time::Instant,
+    /// Per-terminal output-activity: a cheap screen signature + when it last changed,
+    /// so an agent pane reads as `working` (recent output) vs `idle`. Refreshed at the
+    /// label cadence.
+    activity: HashMap<TerminalId, (u64, std::time::Instant)>,
     /// Monotonic counter for minting unique session (workspace) ids (`local` is the
     /// first, so new sessions start at `s1`).
     next_session: u64,
@@ -125,7 +132,9 @@ impl App {
             panes,
             cols,
             rows,
-            sidebar: false,
+            // On by default (herdr-style always-on spaces + agents panel); still
+            // size-adaptive (hidden below SIDEBAR_MIN_COLS) and toggleable via Ctrl-b s.
+            sidebar: true,
             popup: None,
             scroll_pane: None,
             sock_env,
@@ -133,6 +142,7 @@ impl App {
             last_labels: std::time::Instant::now()
                 .checked_sub(Duration::from_secs(60))
                 .unwrap_or_else(std::time::Instant::now),
+            activity: HashMap::new(),
             next_session: 1,
         };
         app.reflow();
@@ -1415,6 +1425,51 @@ impl App {
     pub fn maybe_refresh_labels(&mut self) {
         if self.last_labels.elapsed() >= Duration::from_millis(500) {
             self.refresh_labels();
+            self.refresh_activity();
+        }
+    }
+
+    /// Update per-agent output activity (a cheap screen signature + change time), so
+    /// the sidebar can show `working` (recent output) vs `idle`. Agent panes only.
+    fn refresh_activity(&mut self) {
+        use std::hash::{Hash, Hasher};
+        let now = std::time::Instant::now();
+        let mut next: HashMap<TerminalId, (u64, std::time::Instant)> = HashMap::new();
+        for (tid, pane) in &self.panes {
+            let is_agent = self
+                .labels
+                .get(tid)
+                .map(|l| l.kind == procinfo::Kind::Agent)
+                .unwrap_or(false);
+            if !is_agent {
+                continue;
+            }
+            let snap = pane.snapshot();
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            snap.cursor.hash(&mut h);
+            for row in &snap.cells {
+                for c in row {
+                    c.sym.hash(&mut h);
+                }
+            }
+            let sig = h.finish();
+            // Keep the old change-time if the screen is unchanged; else it's now.
+            let last = match self.activity.get(tid) {
+                Some((old_sig, last_change)) if *old_sig == sig => *last_change,
+                _ => now,
+            };
+            next.insert(tid.clone(), (sig, last));
+        }
+        self.activity = next;
+    }
+
+    /// An agent pane's rolled-up state for the sidebar. `working` if it produced
+    /// output in the last ~1.5s, else `idle`. (blocked/done need semantic agent-state
+    /// reading — a later unit.)
+    fn agent_status(&self, tid: &TerminalId) -> &'static str {
+        match self.activity.get(tid) {
+            Some((_, last)) if last.elapsed() < Duration::from_millis(1500) => "working",
+            _ => "idle",
         }
     }
 
@@ -1462,130 +1517,188 @@ impl App {
             .unwrap_or_else(|| format!("pane {idx}"))
     }
 
-    /// Left panel: a header + one row per pane, focus-marked.
-    fn render_sidebar(&self, buf: &mut Buffer) {
-        let area = buf.area;
-        let h = area.height;
-        let order = self.pane_order();
-        let focused = self.focused_pane();
-        let panel_bg = Color::Rgb(28, 30, 38);
+    /// The foreground command of a session's focused pane (its "what's happening"
+    /// subtitle), e.g. `claude` / `zsh` / `nvim`.
+    fn session_focus_label(&self, wid: &WorkspaceId) -> String {
+        let Some(w) = self.state.workspace(wid) else {
+            return String::new();
+        };
+        let Some(t) = w.tab(&w.active_tab) else {
+            return String::new();
+        };
+        t.layout
+            .terminal_of(&t.focused)
+            .and_then(|tid| self.labels.get(tid))
+            .map(|l| l.text.clone())
+            .unwrap_or_default()
+    }
 
-        // Fill the strip + the border column.
+    /// Every agent pane across ALL sessions: `(space, tool, status)`.
+    fn agent_rows(&self) -> Vec<(String, String, &'static str)> {
+        let mut out = Vec::new();
+        for wid in self.state.workspace_ids() {
+            let Some(w) = self.state.workspace(&wid) else {
+                continue;
+            };
+            let space = w.name.clone().unwrap_or_else(|| wid.to_string());
+            for t in &w.tabs {
+                for p in t.layout.panes() {
+                    if let Some(tid) = t.layout.terminal_of(&p)
+                        && let Some(label) = self.labels.get(tid)
+                        && label.kind == procinfo::Kind::Agent
+                    {
+                        out.push((space.clone(), label.text.clone(), self.agent_status(tid)));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The herdr-style left panel: `spaces` (sessions, top half) + `agents` (agent
+    /// panes with status·tool, bottom half). Always on when wide enough.
+    fn render_sidebar(&self, buf: &mut Buffer) {
+        let h = self.content_rows(); // above the bottom status bar
+        let panel_bg = CAT_BASE;
+
+        // Fill the strip + the right border column (down to the status bar).
         for y in 0..h {
             for x in 0..SIDEBAR_W {
                 if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
                     bc.set_symbol(" ");
+                    bc.set_skip(false);
                     bc.set_style(Style::default().bg(panel_bg));
                 }
             }
             if let Some(bc) = buf.cell_mut(Position::new(SIDEBAR_W, y)) {
                 bc.set_symbol("│");
-                bc.set_style(Style::default().fg(Color::DarkGray).bg(panel_bg));
+                bc.set_skip(false);
+                bc.set_style(Style::default().fg(CAT_SURFACE0).bg(panel_bg));
             }
         }
 
-        let put = |buf: &mut ratatui::buffer::Buffer, y: u16, s: &str, style: Style| {
-            for (i, ch) in s.chars().take(SIDEBAR_W as usize).enumerate() {
-                if let Some(bc) = buf.cell_mut(Position::new(i as u16, y)) {
+        // Display-width-aware writer that ADVANCES `x` (so a colored dot and the name
+        // after it don't overwrite each other). Clipped to the strip.
+        let put = |buf: &mut Buffer, x: &mut u16, y: u16, s: &str, style: Style| {
+            for ch in s.chars() {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+                if cw == 0 {
+                    continue;
+                }
+                if *x + cw > SIDEBAR_W {
+                    break;
+                }
+                if let Some(bc) = buf.cell_mut(Position::new(*x, y)) {
                     let mut sb = [0u8; 4];
                     bc.set_symbol(ch.encode_utf8(&mut sb));
+                    bc.set_skip(false);
                     bc.set_style(style);
                 }
+                if cw == 2
+                    && let Some(bc) = buf.cell_mut(Position::new(*x + 1, y))
+                {
+                    bc.set_symbol(" ");
+                    bc.set_skip(true);
+                    bc.set_style(style);
+                }
+                *x += cw;
             }
         };
+        let header = Style::default()
+            .fg(CAT_OVERLAY)
+            .bg(panel_bg)
+            .add_modifier(Modifier::BOLD);
+        let sub_style = Style::default().fg(CAT_OVERLAY).bg(panel_bg);
 
-        // Leave row 0 for the tab bar when it is showing.
-        let cy = self.content_y();
-        let mut y = cy;
-
-        // SESSIONS — the herdr-style session list (the owner's "좌측 세션 목록").
+        // ---- spaces (top half) ----
+        let mid = (h / 2).max(2);
+        put(buf, &mut 0, 0, " spaces", header);
         let sids = self.session_ids();
         let active_si = self.active_session_index();
-        put(
-            buf,
-            y,
-            &format!(" SESSIONS ({})", sids.len()),
-            Style::default()
-                .fg(Color::Magenta)
-                .bg(panel_bg)
-                .add_modifier(Modifier::BOLD),
-        );
-        y += 1;
+        let mut y = 1u16;
         for (i, sid) in sids.iter().enumerate() {
-            if y >= h {
+            if y + 1 >= mid {
                 break;
             }
             let is_active = i == active_si;
-            let marker = if is_active { "▸" } else { " " };
-            let has_agent = self.session_has_agent(sid);
-            let dot = if has_agent { "●" } else { " " };
             let name = self
                 .state
                 .workspace(sid)
                 .and_then(|w| w.name.clone())
                 .unwrap_or_else(|| sid.to_string());
-            let row = format!(" {marker}{i} {dot}{name}");
-            let style = if is_active {
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(48, 52, 66))
-                    .add_modifier(Modifier::BOLD)
-            } else if has_agent {
-                Style::default().fg(Color::Yellow).bg(panel_bg)
+            let dot_color = if is_active {
+                CAT_MAUVE
+            } else if self.session_has_agent(sid) {
+                CAT_PEACH
             } else {
-                Style::default().fg(Color::Gray).bg(panel_bg)
+                CAT_OVERLAY
             };
-            put(buf, y, &row, style);
-            y += 1;
-        }
-        y += 1; // spacer between sections
-
-        // PANES — the active session's panes (focus-marked).
-        if y < h {
+            let name_style = Style::default()
+                .fg(if is_active { CAT_TEXT } else { CAT_SUBTEXT })
+                .bg(panel_bg)
+                .add_modifier(if is_active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                });
+            let mut x = 1u16;
             put(
                 buf,
+                &mut x,
                 y,
-                &format!(" PANES ({})", order.len()),
-                Style::default()
-                    .fg(Color::Cyan)
-                    .bg(panel_bg)
-                    .add_modifier(Modifier::BOLD),
+                "●",
+                Style::default().fg(dot_color).bg(panel_bg),
             );
-            y += 1;
+            put(buf, &mut x, y, " ", name_style);
+            put(buf, &mut x, y, &name, name_style);
+            let mut sx = 4u16;
+            put(
+                buf,
+                &mut sx,
+                y + 1,
+                &self.session_focus_label(sid),
+                sub_style,
+            );
+            y += 2;
         }
-        for (i, pane) in order.iter().enumerate() {
-            if y >= h {
+
+        // ---- agents (bottom half) ----
+        let mut y = mid;
+        put(buf, &mut 0, y, " agents", header);
+        y += 1;
+        for (space, tool, status) in self.agent_rows() {
+            if y + 1 >= h {
                 break;
             }
-            let is_focus = focused.as_ref() == Some(pane);
-            let marker = if is_focus { "▸" } else { " " };
-            let kind = self.pane_label_at(i).map(|l| l.kind);
-            // A filled dot flags an AI agent; shells/others get a blank.
-            let dot = if kind == Some(procinfo::Kind::Agent) {
-                "●"
-            } else {
-                " "
+            let (dot, scolor) = match status {
+                "working" => ("●", CAT_PEACH),
+                "blocked" => ("●", CAT_RED),
+                "done" => ("●", CAT_BLUE),
+                _ => ("○", CAT_OVERLAY), // idle
             };
-            let row = format!(" {marker}{i} {dot}{}", self.pane_label(i));
-            let style = if is_focus {
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(48, 52, 66))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                match kind {
-                    Some(procinfo::Kind::Agent) => Style::default()
-                        .fg(Color::Yellow)
-                        .bg(panel_bg)
-                        .add_modifier(Modifier::BOLD),
-                    Some(procinfo::Kind::Shell) => {
-                        Style::default().fg(Color::DarkGray).bg(panel_bg)
-                    }
-                    _ => Style::default().fg(Color::Gray).bg(panel_bg),
-                }
-            };
-            put(buf, y, &row, style);
-            y += 1;
+            let mut x = 1u16;
+            put(
+                buf,
+                &mut x,
+                y,
+                dot,
+                Style::default().fg(scolor).bg(panel_bg),
+            );
+            let name_style = Style::default()
+                .fg(CAT_TEXT)
+                .bg(panel_bg)
+                .add_modifier(Modifier::BOLD);
+            put(buf, &mut x, y, " ", name_style);
+            put(buf, &mut x, y, &space, name_style);
+            let mut sx = 4u16;
+            put(
+                buf,
+                &mut sx,
+                y + 1,
+                &format!("{status} · {tool}"),
+                sub_style,
+            );
+            y += 2;
         }
     }
 
