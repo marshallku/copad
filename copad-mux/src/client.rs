@@ -225,18 +225,16 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
     // is wiped and EVERY cell is re-emitted — otherwise a cell the real terminal lost
     // (nested emulator, resize, alt-screen transition) lingers as a ghost.
     let mut force_clear = false;
-    // Self-healing full repaint. A nested/custom outer emulator (e.g. copad hosting comux)
-    // can drift from ratatui's incremental cell output over time — the outer terminal renders
-    // a cell differently than ratatui's cached previous-buffer believes, and the diff then
-    // never repaints it (persistent ghost/garble). A full repaint corrects it, so do one
-    // automatically at a low rate WHILE frames are actively flowing, so drift never lingers
-    // longer than this interval. It's a purely LOCAL client→terminal re-emit (no server
-    // round-trip), and copad renders on vsync so the clear+repaint lands in one burst with no
-    // visible flash. Tune / disable with `COPAD_MUX_REDRAW_MS` (0 = off).
+    // Optional self-healing full repaint, DEFAULT OFF. The wide-char spacer desync that used to
+    // force this is now root-fixed (see `fix_wide_spacers`), so the periodic clear+repaint —
+    // whose `Clear(All)` flashes a blank frame each tick (visible flicker) — is no longer worth
+    // its cost by default. Kept as an opt-in escape hatch for any residual OUTER-emulator drift
+    // (e.g. copad-term GPU damage tracking): set `COPAD_MUX_REDRAW_MS=<ms>` to re-enable. The
+    // manual `Ctrl-b r` redraw covers the occasional case without the steady flicker.
     let self_heal = std::env::var("COPAD_MUX_REDRAW_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .map_or(Duration::from_millis(1000), Duration::from_millis);
+        .map_or(Duration::ZERO, Duration::from_millis);
     let mut last_repaint = Instant::now();
 
     loop {
