@@ -188,7 +188,7 @@ fn run_limits(args: &UsageArgs, json: bool) -> i32 {
         eprintln!("coctl usage: HOME is not set");
         return 2;
     };
-    let l = limits::collect(
+    let (l, stale, diags) = limits::resolve(
         &home,
         tool.is_none_or(|t| t == "claude"),
         tool.is_none_or(|t| t == "codex"),
@@ -196,10 +196,15 @@ fn run_limits(args: &UsageArgs, json: bool) -> i32 {
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&limits::to_json(&l)).unwrap()
+            serde_json::to_string_pretty(&limits::to_json(&l, &stale)).unwrap()
         );
     } else {
-        println!("{}", limits::oneline(&l));
+        println!("{}", limits::oneline(&l, &stale));
+    }
+    // Reasons a provider is missing go to stderr (comux reads only stdout, so the
+    // status bar is unaffected) — makes "why is Claude missing?" self-answering.
+    for d in &diags {
+        eprintln!("coctl usage: {d}");
     }
     0
 }
