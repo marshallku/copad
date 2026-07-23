@@ -651,6 +651,9 @@ mod tests {
             dir: "right".into()
         }));
         assert!(ctl_mutates(&Req::Focus { index: 0 }));
-        assert!(ctl_mutates(&Req::NewSession { name: None }));
+        assert!(ctl_mutates(&Req::NewSession {
+            name: None,
+            cwd: None
+        }));
     }
 }

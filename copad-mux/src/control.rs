@@ -37,10 +37,14 @@ pub enum Req {
     /// List the sessions (workspaces).
     ListSessions,
     /// Create a new session and switch to it. `name` is the tmux-style display name
-    /// (`None` → shown by its generated `sN` id).
+    /// (`None` → shown by its generated `sN` id); `cwd` is the directory to start its
+    /// shell in (the CLI fills it with the caller's cwd, so `comux new-session` starts
+    /// where you ran it — like `tmx`).
     NewSession {
         #[serde(default)]
         name: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
     },
     /// Rename the session at `index` (as printed by `list-sessions`). An empty `name`
     /// clears it back to the generated id.
@@ -226,6 +230,10 @@ pub fn run_client(args: &[String]) -> i32 {
                 .join(" ");
             Req::NewSession {
                 name: (!name.trim().is_empty()).then(|| name.trim().to_string()),
+                // Start the session's shell where the CLI was invoked (like `tmx $name`).
+                cwd: std::env::current_dir()
+                    .ok()
+                    .and_then(|p| p.to_str().map(|s| s.to_string())),
             }
         }
         "rename-session" | "rename" => {

@@ -113,6 +113,30 @@ struct Confirm {
     action: ConfirmAction,
 }
 
+/// A destination in the `Ctrl-f` fuzzy switcher.
+#[derive(Clone)]
+enum PopupTarget {
+    /// Switch to this session (workspace).
+    Session(WorkspaceId),
+    /// Jump to this agent's pane (its session + tab + focus).
+    Agent(TerminalId),
+}
+
+/// One rendered row of the `Ctrl-f` switcher (post-filter).
+struct PopupRow {
+    target: PopupTarget,
+    glyph: &'static str,
+    color: Color,
+    /// The matchable + displayed text (`name  branch` / `tool · status  (space)`).
+    text: String,
+}
+
+/// The `Ctrl-f` fuzzy switcher state: the typed filter + the selected row.
+struct PopupState {
+    filter: String,
+    sel: usize,
+}
+
 /// What feeding one key to the app implies for the caller (the server loop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyAction {
@@ -150,9 +174,9 @@ pub struct App {
     /// Neovim-style left panel toggle (`Ctrl-b s`). Honored only when the
     /// terminal is at least `SIDEBAR_MIN_COLS` wide.
     sidebar: bool,
-    /// When `Some(sel)`, the `Ctrl-f` popup switcher is open with row `sel`
-    /// selected; keys drive the popup instead of the shells.
-    popup: Option<usize>,
+    /// When `Some`, the `Ctrl-f` fuzzy switcher is open (filter + selected row); keys
+    /// drive it instead of the shells. Switches SESSIONS + jumps to AGENTS.
+    popup: Option<PopupState>,
     /// Keyboard scrollback mode (`Ctrl-b [`): `Some(term)` binds the mode to the
     /// terminal it was entered on, so a focus change (click / another client) can't
     /// strand that pane scrolled-up. Keys scroll it; exit bottoms it. Shared state.
@@ -463,6 +487,8 @@ impl App {
         let Some(pane) = self.focused_pane() else {
             return;
         };
+        // Inherit the split source pane's cwd (tmux `-c '#{pane_current_path}'`).
+        let cwd = self.focused_cwd();
         let events = match self.state.apply(Command::SplitPane {
             origin: Origin::Client(self.client),
             workspace: self.ws.clone(),
@@ -491,7 +517,7 @@ impl App {
                 self.cols.max(1),
                 self.rows.max(1),
                 None,
-                None,
+                cwd,
                 &self.sock_env,
             ) {
                 Some(pt) => {
@@ -571,6 +597,8 @@ impl App {
     /// Create a new tab (a fresh single-pane layout) and switch to it, spawning its
     /// shell. Rolls the tab back if the PTY can't spawn (never leave a blank tab).
     fn new_tab(&mut self) {
+        // Inherit the current pane's cwd into the new tab's shell (tmux-style).
+        let cwd = self.focused_cwd();
         let events = match self.state.apply(Command::NewTab {
             origin: Origin::Client(self.client),
             workspace: self.ws.clone(),
@@ -589,7 +617,7 @@ impl App {
                 self.cols.max(1),
                 self.rows.max(1),
                 None,
-                None,
+                cwd,
                 &self.sock_env,
             ) {
                 Some(pt) => {
@@ -689,10 +717,20 @@ impl App {
         self.sync_sizes();
     }
 
+    /// The working directory of the focused pane's shell, for inheriting into a new
+    /// session/tab/split (tmux `-c '#{pane_current_path}'`). `None` if unreadable.
+    fn focused_cwd(&self) -> Option<PathBuf> {
+        self.focused_terminal()
+            .and_then(|t| self.panes.get(&t))
+            .and_then(|p| p.pid())
+            .and_then(procinfo::process_cwd)
+    }
+
     /// Create a new session (a fresh single-pane workspace) and switch to it. `name`
-    /// is the tmux-style session name (`None` → shown by its `sN` id). Rolls the
-    /// session back if the PTY can't spawn (never leave a blank session).
-    fn new_session(&mut self, name: Option<String>) {
+    /// is the tmux-style session name (`None` → shown by its `sN` id); `cwd` is the
+    /// directory to start its shell in (`None` → the server's cwd). Rolls the session
+    /// back if the PTY can't spawn (never leave a blank session).
+    fn new_session(&mut self, name: Option<String>, cwd: Option<PathBuf>) {
         let n = self.next_session;
         self.next_session += 1;
         let id = WorkspaceId::new(format!("s{n}"));
@@ -705,7 +743,7 @@ impl App {
             self.cols.max(1),
             self.rows.max(1),
             None,
-            None,
+            cwd,
             &self.sock_env,
         ) {
             Some(pt) => {
@@ -798,7 +836,8 @@ impl App {
         let trimmed = p.buf.trim();
         let name = (!trimmed.is_empty()).then(|| trimmed.to_string());
         match p.kind {
-            PromptKind::NewSession => self.new_session(name),
+            // A session created from the TUI inherits the focused pane's cwd (tmux-style).
+            PromptKind::NewSession => self.new_session(name, self.focused_cwd()),
             PromptKind::RenameSession => self.rename_session(name),
         }
     }
@@ -1097,9 +1136,15 @@ impl App {
                     .collect();
                 Resp::session_list(infos, active_idx)
             }
-            Req::NewSession { name } => {
+            Req::NewSession { name, cwd } => {
                 let before = self.session_count();
-                self.new_session(name.clone());
+                // Prefer the caller's cwd (CLI); fall back to the focused pane's.
+                let dir = cwd
+                    .clone()
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_dir())
+                    .or_else(|| self.focused_cwd());
+                self.new_session(name.clone(), dir);
                 if self.session_count() > before {
                     Resp::ok()
                 } else {
@@ -1174,11 +1219,17 @@ impl App {
         if self.popup.is_some() {
             *prefix = false;
             match k.code {
-                KeyCode::Char('j') | KeyCode::Down => self.popup_move(1),
-                KeyCode::Char('k') | KeyCode::Up => self.popup_move(-1),
+                // Navigate with arrows or fzf-style Ctrl-n/Ctrl-p (letters type the filter).
+                KeyCode::Down => self.popup_move(1),
+                KeyCode::Up => self.popup_move(-1),
+                KeyCode::Char('n') if ctrl => self.popup_move(1),
+                KeyCode::Char('p') if ctrl => self.popup_move(-1),
                 KeyCode::Enter => self.popup_select(),
                 KeyCode::Esc | KeyCode::Char('\u{6}') => self.popup = None,
-                KeyCode::Char('f') if ctrl => self.popup = None,
+                KeyCode::Char('f') if ctrl => self.popup = None, // Ctrl-f toggles closed
+                KeyCode::Backspace => self.popup_backspace(),
+                // Any other printable char extends the fuzzy filter.
+                KeyCode::Char(c) if !ctrl => self.popup_type(c),
                 _ => {}
             }
             return KeyAction::Continue;
@@ -1491,55 +1542,131 @@ impl App {
         self.reflow();
     }
 
-    /// Open the `Ctrl-f` switcher, preselecting the focused pane's row.
+    /// Open the `Ctrl-f` fuzzy switcher (empty filter, first row selected).
     fn open_popup(&mut self) {
-        let order = self.pane_order();
-        let sel = self
-            .focused_pane()
-            .and_then(|f| order.iter().position(|p| p == &f))
-            .unwrap_or(0);
-        self.popup = Some(sel);
+        self.popup = Some(PopupState {
+            filter: String::new(),
+            sel: 0,
+        });
     }
 
-    /// Keep the popup selection within the current pane list (or close the popup
-    /// if no panes remain). Called each frame so an async pane exit can't leave a
-    /// stale selection index.
-    /// Keep the popup selection valid as panes come/go. Returns whether it changed the
-    /// selection (so the render loop repaints the switcher).
-    pub fn reconcile_popup(&mut self) -> bool {
-        let before = self.popup;
-        if let Some(sel) = self.popup {
-            let n = self.pane_order().len();
-            if n == 0 {
-                self.popup = None;
-            } else if sel >= n {
-                self.popup = Some(n - 1);
+    /// The switcher rows matching `filter`: every SESSION (name + git branch) then every
+    /// AGENT (tool · status · space), fuzzy-filtered (subsequence, case-insensitive).
+    /// Mirrors the owner's tmux `Ctrl-f` (session switch) + `prefix g` (agent list).
+    fn popup_items(&self, filter: &str) -> Vec<PopupRow> {
+        let mut rows = Vec::new();
+        for wid in self.session_ids() {
+            let name = self
+                .state
+                .workspace(&wid)
+                .and_then(|w| w.name.clone())
+                .unwrap_or_else(|| wid.to_string());
+            let branch = self.branches.get(&wid).cloned().unwrap_or_default();
+            let is_active = wid == self.ws;
+            let color = if is_active {
+                CAT_MAUVE
+            } else if self.session_has_agent(&wid) {
+                CAT_PEACH
+            } else {
+                CAT_OVERLAY
+            };
+            let text = if branch.is_empty() {
+                name.clone()
+            } else {
+                format!("{name}  ({branch})")
+            };
+            if fuzzy_match(filter, &format!("{name} {branch}")) {
+                rows.push(PopupRow {
+                    target: PopupTarget::Session(wid),
+                    glyph: "▪",
+                    color,
+                    text,
+                });
             }
         }
-        before != self.popup
+        for (space, tool, status, term) in self.agent_rows() {
+            let (glyph, color) = match status {
+                "working" => ("●", CAT_GREEN),
+                "ready" => ("◐", CAT_BLUE),
+                "blocked" => ("▲", CAT_YELLOW),
+                _ => ("○", CAT_OVERLAY),
+            };
+            if fuzzy_match(filter, &format!("{space} {tool} {status}")) {
+                rows.push(PopupRow {
+                    target: PopupTarget::Agent(term),
+                    glyph,
+                    color,
+                    text: format!("{tool} · {status}  ({space})"),
+                });
+            }
+        }
+        rows
     }
 
-    /// Move the popup selection by `delta`, wrapping.
+    /// Keep the switcher selection in range as its (filtered) row set changes. Returns
+    /// whether it moved (so the render loop repaints). Never closes on an empty result —
+    /// an over-narrow filter just shows the empty state.
+    pub fn reconcile_popup(&mut self) -> bool {
+        let Some(filter) = self.popup.as_ref().map(|p| p.filter.clone()) else {
+            return false;
+        };
+        let n = self.popup_items(&filter).len();
+        if let Some(p) = &mut self.popup {
+            let clamped = if n == 0 { 0 } else { p.sel.min(n - 1) };
+            if clamped != p.sel {
+                p.sel = clamped;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Move the switcher selection by `delta`, wrapping over the filtered rows.
     fn popup_move(&mut self, delta: i32) {
-        let n = self.pane_order().len() as i32;
+        let Some(filter) = self.popup.as_ref().map(|p| p.filter.clone()) else {
+            return;
+        };
+        let n = self.popup_items(&filter).len() as i32;
         if n == 0 {
-            self.popup = None;
             return;
         }
-        if let Some(sel) = self.popup {
-            self.popup = Some((sel as i32 + delta).rem_euclid(n) as usize);
+        if let Some(p) = &mut self.popup {
+            p.sel = (p.sel as i32 + delta).rem_euclid(n) as usize;
         }
     }
 
-    /// Focus the selected pane and close the popup.
+    /// Append `c` to the switcher filter (resets the selection to the top).
+    fn popup_type(&mut self, c: char) {
+        if let Some(p) = &mut self.popup {
+            p.filter.push(c);
+            p.sel = 0;
+        }
+    }
+
+    /// Delete the last filter char.
+    fn popup_backspace(&mut self) {
+        if let Some(p) = &mut self.popup {
+            p.filter.pop();
+            p.sel = 0;
+        }
+    }
+
+    /// Act on the selected row (switch session / jump to agent) and close the switcher.
+    /// With no matching row (over-narrow filter) Enter is a no-op — the switcher stays
+    /// open showing the empty state rather than closing on nothing.
     fn popup_select(&mut self) {
-        if let Some(sel) = self.popup.take()
-            && let Some(pane) = self.pane_order().get(sel).cloned()
-        {
-            let _ = self.state.apply(Command::FocusPane {
-                client: self.client,
-                pane,
-            });
+        let Some(p) = self.popup.as_ref() else {
+            return;
+        };
+        let items = self.popup_items(&p.filter);
+        let Some(row) = items.get(p.sel) else {
+            return; // no valid row → keep the switcher open
+        };
+        let target = row.target.clone();
+        self.popup = None; // resolved a target — close now
+        match target {
+            PopupTarget::Session(wid) => self.switch_session(wid),
+            PopupTarget::Agent(term) => self.jump_to_terminal(&term),
         }
     }
 
@@ -2541,9 +2668,9 @@ impl App {
     /// Centered `Ctrl-f` switcher over the panes: a bordered box listing panes with
     /// a selection cursor.
     fn render_popup(&self, buf: &mut Buffer) {
-        let Some(sel) = self.popup else { return };
+        let Some(p) = self.popup.as_ref() else { return };
         let area = buf.area;
-        let order = self.pane_order();
+        let items = self.popup_items(&p.filter);
 
         // Clamp bounds so `min <= max` even on tiny/narrow terminals (the popup
         // is the narrow/mobile fallback, so it must never panic there).
@@ -2607,7 +2734,7 @@ impl App {
             y0,
             x0 + 2,
             w.saturating_sub(4),
-            " switch pane ",
+            " go to — session / agent ",
             Style::default()
                 .fg(Color::Cyan)
                 .bg(bg)
@@ -2616,38 +2743,50 @@ impl App {
 
         let inner_x = x0 + 2;
         let inner_w = w.saturating_sub(4);
-        for (i, _pane) in order.iter().enumerate() {
-            let y = y0 + 1 + i as u16;
-            if y >= y0 + h - 1 {
-                break;
-            }
-            let selected = i == sel;
-            let kind = self.pane_label_at(i).map(|l| l.kind);
-            let dot = if kind == Some(procinfo::Kind::Agent) {
-                "●"
-            } else {
-                " "
-            };
-            let row = format!(
-                "{} {i}  {dot}{}",
-                if selected { "▸" } else { " " },
-                self.pane_label(i)
+
+        // Row 1: the fuzzy filter input with a block cursor.
+        put(
+            buf,
+            y0 + 1,
+            inner_x,
+            inner_w,
+            &format!("> {}█", p.filter),
+            Style::default().fg(CAT_TEXT).bg(bg),
+        );
+
+        // Remaining rows: the filtered items, scrolled so the selection stays visible.
+        let list_top = y0 + 2;
+        let visible = (h.saturating_sub(3)) as usize; // minus borders + filter line
+        if items.is_empty() {
+            put(
+                buf,
+                list_top,
+                inner_x,
+                inner_w,
+                "  (no match)",
+                Style::default().fg(CAT_OVERLAY).bg(bg),
             );
+            return;
+        }
+        let start = if p.sel >= visible {
+            p.sel + 1 - visible
+        } else {
+            0
+        };
+        for (row_i, item) in items.iter().enumerate().skip(start).take(visible) {
+            let y = list_top + (row_i - start) as u16;
+            let selected = row_i == p.sel;
+            let arrow = if selected { "▸" } else { " " };
+            let text = format!("{arrow} {} {}", item.glyph, item.text);
+            let padded = format!("{text:<width$}", width = inner_w as usize);
             let st = if selected {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
-            } else if kind == Some(procinfo::Kind::Agent) {
-                Style::default()
-                    .fg(Color::Yellow)
-                    .bg(bg)
-                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray).bg(bg)
+                Style::default().fg(item.color).bg(bg)
             };
-            // pad the selected row across the inner width so the highlight is a full bar
-            let padded = format!("{row:<width$}", width = inner_w as usize);
             put(buf, y, inner_x, inner_w, &padded, st);
         }
     }
@@ -3102,6 +3241,17 @@ fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
+/// Case-insensitive SUBSEQUENCE match (fzf-style): every char of `needle` appears in
+/// `hay` in order. An empty needle matches everything.
+fn fuzzy_match(needle: &str, hay: &str) -> bool {
+    let hay = hay.to_ascii_lowercase();
+    let mut chars = hay.chars();
+    needle
+        .to_ascii_lowercase()
+        .chars()
+        .all(|nc| chars.any(|hc| hc == nc))
+}
+
 /// Resolve a saved cwd to a concrete directory for a restored shell: the saved path if it
 /// still exists, else `$HOME` (never `None` when a home is known, so the shell doesn't
 /// silently inherit the SERVER's cwd).
@@ -3218,7 +3368,18 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_command_line, shell_quote};
+    use super::{build_command_line, fuzzy_match, shell_quote};
+
+    #[test]
+    fn fuzzy_match_is_case_insensitive_subsequence() {
+        assert!(fuzzy_match("", "anything")); // empty matches all
+        assert!(fuzzy_match("api", "api-server"));
+        assert!(fuzzy_match("api", "API-Server")); // case-insensitive
+        assert!(fuzzy_match("aps", "api-server")); // subsequence (a..p..s)
+        assert!(fuzzy_match("cld", "claude")); // c..l..d
+        assert!(!fuzzy_match("xyz", "claude"));
+        assert!(!fuzzy_match("sa", "api-server")); // order matters (no 's' before 'a')
+    }
 
     #[test]
     fn shell_quote_neutralizes_metacharacters() {
