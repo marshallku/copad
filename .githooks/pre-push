@@ -10,9 +10,19 @@ if ! command -v cargo >/dev/null 2>&1; then
     exit 0
 fi
 
-echo "pre-push: running cargo clippy --workspace --all-targets -- -D warnings" >&2
+# copad-linux is GTK4/VTE4/webkit — it only builds on Linux (needs pkg-config +
+# libsoup/gtk system libs). Off Linux, exclude it so clippy still lints every
+# other crate instead of hard-failing on a crate that can't compile here. CI and
+# Linux dev machines run the full workspace, so copad-linux is never unlinted.
+EXCLUDES=()
+if [ "$(uname -s)" != "Linux" ]; then
+    EXCLUDES=(--exclude copad-linux)
+    echo "pre-push: non-Linux host — excluding copad-linux (GTK) from clippy." >&2
+fi
 
-if ! cargo clippy --workspace --all-targets -- -D warnings; then
+echo "pre-push: running cargo clippy --workspace ${EXCLUDES[*]} --all-targets -- -D warnings" >&2
+
+if ! cargo clippy --workspace "${EXCLUDES[@]}" --all-targets -- -D warnings; then
     echo "" >&2
     echo "pre-push: clippy failed. Fix the warnings above before pushing." >&2
     echo "          (bypass with 'git push --no-verify' if you really must.)" >&2
