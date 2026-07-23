@@ -8,7 +8,7 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -198,6 +198,19 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
     // is wiped and EVERY cell is re-emitted — otherwise a cell the real terminal lost
     // (nested emulator, resize, alt-screen transition) lingers as a ghost.
     let mut force_clear = false;
+    // Self-healing full repaint. A nested/custom outer emulator (e.g. copad hosting comux)
+    // can drift from ratatui's incremental cell output over time — the outer terminal renders
+    // a cell differently than ratatui's cached previous-buffer believes, and the diff then
+    // never repaints it (persistent ghost/garble). A full repaint corrects it, so do one
+    // automatically at a low rate WHILE frames are actively flowing, so drift never lingers
+    // longer than this interval. It's a purely LOCAL client→terminal re-emit (no server
+    // round-trip), and copad renders on vsync so the clear+repaint lands in one burst with no
+    // visible flash. Tune / disable with `COPAD_MUX_REDRAW_MS` (0 = off).
+    let self_heal = std::env::var("COPAD_MUX_REDRAW_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map_or(Duration::from_millis(1000), Duration::from_millis);
+    let mut last_repaint = Instant::now();
 
     loop {
         // 1) forward input
@@ -287,11 +300,17 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
         // 3) draw — blit the server frame into this terminal's top-left, blanking the
         // letterbox margin when our terminal is bigger than the shared (min) frame.
         if (dirty || need_redraw) && have_frame {
-            // A `full` frame resets the diff baseline: clear the screen + ratatui's cached
-            // previous-buffer so the upcoming draw re-emits every cell (no lingering ghost).
+            // Force a full repaint on a `full` frame OR when the self-heal interval has
+            // elapsed since the last one (drift correction — see `self_heal` above).
+            if !force_clear && !self_heal.is_zero() && last_repaint.elapsed() >= self_heal {
+                force_clear = true;
+            }
+            // A `full` frame / self-heal resets the diff baseline: clear the screen + ratatui's
+            // cached previous-buffer so the upcoming draw re-emits every cell (no lingering ghost).
             if force_clear {
                 terminal.clear()?;
                 force_clear = false;
+                last_repaint = Instant::now();
             }
             let src = buf.clone();
             let cur = cursor;

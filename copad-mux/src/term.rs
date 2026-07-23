@@ -392,7 +392,12 @@ fn wheel_bytes_for_mode(mode: TermMode, up: bool, col: u16, row: u16) -> Option<
             for v in [button, col, row] {
                 let cp = (v as u32 + 32).min(0x7ff);
                 let mut b = [0u8; 4];
-                out.extend_from_slice(char::from_u32(cp).unwrap_or(' ').encode_utf8(&mut b).as_bytes());
+                out.extend_from_slice(
+                    char::from_u32(cp)
+                        .unwrap_or(' ')
+                        .encode_utf8(&mut b)
+                        .as_bytes(),
+                );
             }
             return Some(out);
         }
@@ -593,7 +598,11 @@ mod render_repro {
     #[test]
     fn wide_chars_then_clear_leaves_no_ghost() {
         // CJK fills each row with wide glyph + spacer; clearing must wipe both halves.
-        assert_pipeline(10, 2, &[b"\xea\xb0\x80\xeb\x82\x98\xeb\x8b\xa4", b"\x1b[2J\x1b[H"]);
+        assert_pipeline(
+            10,
+            2,
+            &[b"\xea\xb0\x80\xeb\x82\x98\xeb\x8b\xa4", b"\x1b[2J\x1b[H"],
+        );
     }
 
     #[test]
@@ -608,7 +617,12 @@ mod render_repro {
     /// is NOT delivered and `last` is NOT advanced (server semantics); the main loop keeps
     /// re-composing (pending) until the client drains, so the delta must catch up. After the
     /// last batch we flush all pending deliveries. Final screen must equal the final snapshot.
-    fn assert_pipeline_backpressure(cols: usize, rows: usize, batches: &[&[u8]], drain_every: usize) {
+    fn assert_pipeline_backpressure(
+        cols: usize,
+        rows: usize,
+        batches: &[&[u8]],
+        drain_every: usize,
+    ) {
         let (mut t, mut p) = term(cols, rows);
         let mut cterm = Terminal::new(TestBackend::new(cols as u16, rows as u16)).unwrap();
         let area = Rect::new(0, 0, cols as u16, rows as u16);
@@ -656,7 +670,10 @@ mod render_repro {
         }
         let want = snap_text(&snap);
         let got = screen(&mut cterm, &client);
-        assert_eq!(got, want, "\nbackpressure divergence\n got: {got:?}\nwant: {want:?}");
+        assert_eq!(
+            got, want,
+            "\nbackpressure divergence\n got: {got:?}\nwant: {want:?}"
+        );
     }
 
     /// Apply one wire frame to the client buffer (full = clear+apply, delta = apply in place).
@@ -668,7 +685,11 @@ mod render_repro {
         // composed server buffer, so re-derive the changed set against an empty baseline for
         // full, or trust the caller advanced last. We instead just copy non-skip cells that
         // differ — equivalent to applying the delta the server would have sent.
-        let base = if full { Buffer::empty(frame.area) } else { client.clone() };
+        let base = if full {
+            Buffer::empty(frame.area)
+        } else {
+            client.clone()
+        };
         for (x, y, cell) in base.diff(frame) {
             if let Some(bc) = client.cell_mut(Position::new(x, y)) {
                 bc.set_symbol(cell.symbol());
@@ -700,7 +721,10 @@ mod render_repro {
     fn wheel_sgr_mouse_mode() {
         // App negotiated SGR mouse reporting → SGR wheel button (64 up / 65 down) at coords.
         let m = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
-        assert_eq!(wheel_bytes_for_mode(m, true, 5, 9).unwrap(), b"\x1b[<64;5;9M");
+        assert_eq!(
+            wheel_bytes_for_mode(m, true, 5, 9).unwrap(),
+            b"\x1b[<64;5;9M"
+        );
         assert_eq!(
             wheel_bytes_for_mode(m, false, 5, 9).unwrap(),
             b"\x1b[<65;5;9M"
