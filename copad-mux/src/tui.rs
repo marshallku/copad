@@ -2379,10 +2379,22 @@ impl App {
         put(buf, &mut 0, 0, " spaces", header);
         let sids = self.session_ids();
         let active_si = self.active_session_index();
+        // Window the list so the ACTIVE session stays visible with many sessions; reserve
+        // a row for a "+N more" hint when truncated (the full list is in `Ctrl-f`). Only
+        // window when there's room for at least a session + hint (≥2 slots); otherwise show
+        // what fits with no fabricated/overlapping row.
+        let space_max = (mid.saturating_sub(1) / 2) as usize; // 2 rows per session
+        let space_total = sids.len();
+        let (space_start, space_vis, space_trunc) = if space_total <= space_max || space_max < 2 {
+            (0, space_max.min(space_total), false)
+        } else {
+            let vis = space_max - 1; // reserve one row for the "+N more" hint
+            (list_window_start(space_total, active_si, vis), vis, true)
+        };
         let mut y = 1u16;
-        for (i, sid) in sids.iter().enumerate() {
+        for (i, sid) in sids.iter().enumerate().skip(space_start).take(space_vis) {
             if y + 1 >= mid {
-                break;
+                break; // safety: never spill into the agents half
             }
             let is_active = i == active_si;
             let name = self
@@ -2434,12 +2446,32 @@ impl App {
             });
             y += 2;
         }
+        if space_trunc {
+            let hidden = space_total - space_vis;
+            let mut hx = 1u16;
+            put(
+                buf,
+                &mut hx,
+                y,
+                &format!("+{hidden} more · Ctrl-f"),
+                sub_style,
+            );
+        }
 
         // ---- agents (bottom half) ----
         let mut y = mid;
         put(buf, &mut 0, y, " agents", header);
         y += 1;
-        for (space, tool, status, term) in self.agent_rows() {
+        // Window agents too (first N + a "+M more" hint); the full list is in Ctrl-f.
+        let agent_rows = self.agent_rows();
+        let agent_max = (h.saturating_sub(mid + 1) / 2) as usize;
+        let agent_total = agent_rows.len();
+        let (agent_vis, agent_trunc) = if agent_total <= agent_max || agent_max < 2 {
+            (agent_max.min(agent_total), false)
+        } else {
+            (agent_max - 1, true) // reserve one row for the "+M more" hint
+        };
+        for (space, tool, status, term) in agent_rows.into_iter().take(agent_vis) {
             if y + 1 >= h {
                 break;
             }
@@ -2481,6 +2513,17 @@ impl App {
                 target: ClickTarget::Agent(term.clone()),
             });
             y += 2;
+        }
+        if agent_trunc && y < h {
+            let hidden = agent_total - agent_vis;
+            let mut hx = 1u16;
+            put(
+                buf,
+                &mut hx,
+                y,
+                &format!("+{hidden} more · Ctrl-f"),
+                sub_style,
+            );
         }
     }
 
@@ -2586,41 +2629,14 @@ impl App {
                 .add_modifier(Modifier::BOLD),
         );
         put(buf, &mut x, " ", Style::default().bg(CAT_BASE));
-        let ids = self.tab_ids();
-        let active = self.active_tab_id();
-        for (i, id) in ids.iter().enumerate() {
-            let is_active = active.as_ref() == Some(id);
-            let agent = self.tab_has_agent(id);
-            let label = format!(" {}{} ", if agent { "●" } else { "" }, i + 1);
-            let st = if is_active {
-                Style::default()
-                    .fg(CAT_BASE)
-                    .bg(CAT_MAUVE)
-                    .add_modifier(Modifier::BOLD)
-            } else if agent {
-                Style::default().fg(CAT_YELLOW).bg(CAT_BASE)
-            } else {
-                Style::default().fg(CAT_OVERLAY).bg(CAT_BASE)
-            };
-            let chip_x0 = x;
-            put(buf, &mut x, &label, st);
-            if x > chip_x0 {
-                self.click_zones.borrow_mut().push(ClickZone {
-                    x0: chip_x0,
-                    x1: x - 1,
-                    y0: y,
-                    y1: y,
-                    target: ClickTarget::Tab(id.clone()),
-                });
-            }
-        }
 
-        // RIGHT: attention · scroll · agents · clock · host, right-aligned.
+        // RIGHT cluster (attention · scroll · agents · clock · host) — built FIRST so the
+        // tab chips know how much width they may use before it.
         let mut segs: Vec<(String, Style)> = Vec::new();
         let attn = self.attention_count();
         if attn > 0 {
             segs.push((
-                format!(" ⚑{attn} "),
+                format!(" ⚑ {attn} "),
                 Style::default()
                     .fg(CAT_BASE)
                     .bg(CAT_PEACH)
@@ -2638,8 +2654,9 @@ impl App {
         }
         let agents = self.active_session_agent_count();
         if agents > 0 {
+            // A space between the agent dot and the count so they don't read as one blob.
             segs.push((
-                format!(" ●{agents} "),
+                format!(" ● {agents} "),
                 Style::default()
                     .fg(CAT_GREEN)
                     .bg(CAT_SURFACE0)
@@ -2657,9 +2674,72 @@ impl App {
                 .bg(CAT_BLUE)
                 .add_modifier(Modifier::BOLD),
         ));
-        let total: u16 = segs.iter().map(|(s, _)| s.width() as u16).sum();
-        // Don't overwrite the left cluster on a narrow bar.
-        let mut rx = w.saturating_sub(total).max(x);
+        let right_total: u16 = segs.iter().map(|(s, _)| s.width() as u16).sum();
+
+        // TAB chips, windowed around the active tab so it STAYS VISIBLE when there are
+        // more tabs than fit (‹ / › flag hidden tabs). Agent tabs are yellow + carry a
+        // `● ` marker (spaced from the number); active is the mauve pill.
+        let ids = self.tab_ids();
+        let active = self.active_tab_id();
+        let active_idx = active
+            .as_ref()
+            .and_then(|a| ids.iter().position(|t| t == a))
+            .unwrap_or(0);
+        let chips: Vec<(String, bool)> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| {
+                let agent = self.tab_has_agent(id);
+                (
+                    format!(" {}{} ", if agent { "● " } else { "" }, i + 1),
+                    agent,
+                )
+            })
+            .collect();
+        let widths: Vec<u16> = chips.iter().map(|(s, _)| s.width() as u16).collect();
+        let tab_end = w.saturating_sub(right_total);
+        let avail = tab_end.saturating_sub(x);
+        let (start, end, marker_l, marker_r) = tab_window(&widths, active_idx, avail);
+        let dim = Style::default().fg(CAT_OVERLAY).bg(CAT_BASE);
+        // Hard-clip every chip at `tab_end` so tabs can NEVER cross into the right cluster
+        // (even if the window math is generous on a very narrow bar).
+        if marker_l && x < tab_end {
+            put(buf, &mut x, "‹", dim);
+        }
+        for i in start..end {
+            let (label, agent) = &chips[i];
+            if x + widths[i] > tab_end {
+                break; // no room for this (or any further) chip
+            }
+            let is_active = active.as_ref() == Some(&ids[i]);
+            let st = if is_active {
+                Style::default()
+                    .fg(CAT_BASE)
+                    .bg(CAT_MAUVE)
+                    .add_modifier(Modifier::BOLD)
+            } else if *agent {
+                Style::default().fg(CAT_YELLOW).bg(CAT_BASE)
+            } else {
+                Style::default().fg(CAT_OVERLAY).bg(CAT_BASE)
+            };
+            let chip_x0 = x;
+            put(buf, &mut x, label, st);
+            if x > chip_x0 {
+                self.click_zones.borrow_mut().push(ClickZone {
+                    x0: chip_x0,
+                    x1: x - 1,
+                    y0: y,
+                    y1: y,
+                    target: ClickTarget::Tab(ids[i].clone()),
+                });
+            }
+        }
+        if marker_r && x < tab_end {
+            put(buf, &mut x, "›", dim);
+        }
+
+        // Draw the right cluster, right-aligned, never overwriting the left content.
+        let mut rx = w.saturating_sub(right_total).max(x);
         for (s, st) in &segs {
             put(buf, &mut rx, s, *st);
         }
@@ -3241,6 +3321,53 @@ fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
+/// The start index of a vertical list window that keeps `active` visible when `total`
+/// items don't fit in `visible` rows (centers `active`, clamped to the ends).
+fn list_window_start(total: usize, active: usize, visible: usize) -> usize {
+    if visible == 0 || total <= visible {
+        return 0;
+    }
+    active.saturating_sub(visible / 2).min(total - visible)
+}
+
+/// Choose a contiguous window of tab chips to show when they don't all fit in `avail`
+/// columns, ALWAYS including `active` and expanding around it. Returns `(start, end,
+/// show_left_marker, show_right_marker)` — the `[start, end)` index range plus whether a
+/// `‹`/`›` overflow marker should flag hidden tabs on each side.
+fn tab_window(widths: &[u16], active: usize, avail: u16) -> (usize, usize, bool, bool) {
+    let n = widths.len();
+    if n == 0 || avail == 0 {
+        return (0, 0, false, false);
+    }
+    // u32 accumulation so a huge tab count can't overflow u16.
+    let total: u32 = widths.iter().map(|&w| w as u32).sum();
+    if total <= avail as u32 {
+        return (0, n, false, false); // everything fits — no window, no markers
+    }
+    let inner = avail.saturating_sub(2) as u32; // reserve ~2 cols for the ‹ › markers
+    let mut lo = active.min(n - 1);
+    let mut hi = lo;
+    let mut used = (widths[lo] as u32).min(inner);
+    loop {
+        let mut grew = false;
+        // Prefer growing right, then left, so the active tab keeps some trailing context.
+        if hi + 1 < n && used + widths[hi + 1] as u32 <= inner {
+            hi += 1;
+            used += widths[hi] as u32;
+            grew = true;
+        }
+        if lo > 0 && used + widths[lo - 1] as u32 <= inner {
+            lo -= 1;
+            used += widths[lo] as u32;
+            grew = true;
+        }
+        if !grew {
+            break;
+        }
+    }
+    (lo, hi + 1, lo > 0, hi + 1 < n)
+}
+
 /// Case-insensitive SUBSEQUENCE match (fzf-style): every char of `needle` appears in
 /// `hay` in order. An empty needle matches everything.
 fn fuzzy_match(needle: &str, hay: &str) -> bool {
@@ -3368,7 +3495,41 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_command_line, fuzzy_match, shell_quote};
+    use super::{build_command_line, fuzzy_match, list_window_start, shell_quote, tab_window};
+
+    #[test]
+    fn tab_window_shows_all_when_they_fit() {
+        let w = [4u16, 4, 4];
+        assert_eq!(tab_window(&w, 1, 100), (0, 3, false, false));
+    }
+
+    #[test]
+    fn tab_window_narrow_and_huge_are_safe() {
+        assert_eq!(tab_window(&[4, 4, 4], 1, 0), (0, 0, false, false)); // no room
+        assert_eq!(tab_window(&[], 0, 50), (0, 0, false, false)); // no tabs
+        // A huge tab count must not overflow the width accumulator (u32 internally).
+        let many = vec![9u16; 40000];
+        let (s, e, _, _) = tab_window(&many, 20000, 30);
+        assert!(s <= 20000 && 20000 < e);
+    }
+
+    #[test]
+    fn tab_window_keeps_active_visible_with_overflow() {
+        let w = [4u16; 10]; // 10 tabs, 4 cols each = 40; only ~12 cols available
+        let (start, end, ml, mr) = tab_window(&w, 8, 12);
+        assert!(start <= 8 && 8 < end, "active 8 must be in [{start},{end})");
+        assert!(ml, "tabs before the window → left marker");
+        // active is near the end, so nothing hidden on the right
+        assert!(!mr || end < 10);
+    }
+
+    #[test]
+    fn list_window_start_centers_active_and_clamps() {
+        assert_eq!(list_window_start(3, 1, 5), 0); // all fit
+        assert_eq!(list_window_start(20, 0, 6), 0); // active at top
+        assert_eq!(list_window_start(20, 19, 6), 14); // active at bottom → clamp
+        assert_eq!(list_window_start(20, 10, 6), 7); // centered (10 - 3)
+    }
 
     #[test]
     fn fuzzy_match_is_case_insensitive_subsequence() {

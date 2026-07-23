@@ -318,6 +318,15 @@ pub fn run_client(args: &[String]) -> i32 {
         }
     };
 
+    // `new-session` starts the server if it isn't running yet (like tmux `new-session`),
+    // so `cd dir; comux new-session name` works from a cold start.
+    if matches!(req, Req::NewSession { .. })
+        && let Err(e) = crate::client::ensure_running(&socket_path())
+    {
+        eprintln!("comux: could not start server: {e}");
+        return 1;
+    }
+
     let resp = match round_trip(&req) {
         Ok(r) => r,
         Err(e) => {

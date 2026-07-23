@@ -99,6 +99,13 @@ fn connect_or_spawn(sock: &Path) -> io::Result<UnixStream> {
     ))
 }
 
+/// Ensure a server is running at `sock` (spawn one detached + wait), WITHOUT attaching —
+/// for control commands like `new-session` that should start the mux if it isn't up yet
+/// (tmux `new-session` starts the server). Reuses [`connect_or_spawn`].
+pub fn ensure_running(sock: &Path) -> io::Result<()> {
+    connect_or_spawn(sock).map(|_| ())
+}
+
 /// Spawn `copad-mux server` detached (new session, stdio to /dev/null) so it outlives
 /// this client's terminal.
 fn spawn_server() -> io::Result<()> {
