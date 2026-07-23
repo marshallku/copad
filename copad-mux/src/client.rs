@@ -80,16 +80,23 @@ pub fn run() -> io::Result<()> {
 }
 
 /// Connect to `sock`; if nothing is listening, spawn a server and retry with backoff.
+/// Re-spawns periodically during the wait: a server spawned while a PRIOR one is still
+/// shutting down loses the flock race and exits, so a single spawn can silently do nothing
+/// (e.g. right after `kill-server`). Re-spawning every ~500ms guarantees one eventually
+/// wins the freed flock. Only the flock winner binds; the losers exit harmlessly.
 fn connect_or_spawn(sock: &Path) -> io::Result<UnixStream> {
     if let Ok(s) = UnixStream::connect(sock) {
         return Ok(s);
     }
     spawn_server()?;
-    // The server takes ~a few ms to flock + bind. Racing clients each spawn one, but
-    // only the flock winner binds; everyone connects to it. ~2s budget.
-    for _ in 0..80 {
+    let mut last_spawn = std::time::Instant::now();
+    for _ in 0..160 {
         if let Ok(s) = UnixStream::connect(sock) {
             return Ok(s);
+        }
+        if last_spawn.elapsed() >= Duration::from_millis(500) {
+            spawn_server()?;
+            last_spawn = std::time::Instant::now();
         }
         std::thread::sleep(Duration::from_millis(25));
     }

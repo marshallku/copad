@@ -6,7 +6,8 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -335,12 +336,45 @@ pub fn run_client(args: &[String]) -> i32 {
         }
     };
 
+    // `kill-server` replies OK the instant the shutdown is *initiated*, but the server then
+    // finishes its final save + removes the socket + exits over the next moment. Wait for it
+    // to actually be gone so a following `comux` doesn't attach to the dying server (TUI
+    // flashes + exits) or race its still-held flock.
+    if matches!(req, Req::KillServer)
+        && resp.ok
+        && !wait_for_server_gone(&socket_path(), Duration::from_secs(5))
+    {
+        eprintln!(
+            "comux: server still shutting down (socket present after 5s) — \
+             wait a moment before restarting, or `pkill -x comux`"
+        );
+        return 1;
+    }
+
     if json_out {
         println!("{}", serde_json::to_string(&resp).unwrap_or_default());
     } else {
         print_human(&req, &resp);
     }
     if resp.ok { 0 } else { 1 }
+}
+
+/// Block until the server at `path` is fully gone (its socket removed → it's about to exit
+/// and release its flock), up to `timeout`. Returns `true` once gone (after a small
+/// flock-release grace), or `false` if the socket is STILL present at the deadline (the
+/// caller should then report failure rather than let a restart race the lingering server).
+fn wait_for_server_gone(path: &Path, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while path.exists() && start.elapsed() < timeout {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if path.exists() {
+        return false; // still shutting down at the deadline
+    }
+    // The server removes the socket immediately before `process::exit`; give the flock a
+    // beat to release so the next server's `acquire_lock` succeeds.
+    std::thread::sleep(Duration::from_millis(60));
+    true
 }
 
 fn round_trip(req: &Req) -> Result<Resp, String> {
