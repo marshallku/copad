@@ -168,6 +168,9 @@ pub fn run() -> io::Result<()> {
     let autosave = Duration::from_secs(cfg.autosave_secs.max(1) as u64);
     // Headless default size until the first client attaches (then reflowed).
     let mut app = App::new(80, 24, sock_env, cfg)?;
+    // Kick off the background usage/limits poller (Claude 5h+weekly · Codex weekly)
+    // that feeds the status bar. Detached thread; `COPAD_MUX_USAGE=0` disables it.
+    app.start_usage_poll();
 
     let (tx, rx) = mpsc::channel::<Incoming>();
     spawn_accept_loop(listener, tx, mouse);

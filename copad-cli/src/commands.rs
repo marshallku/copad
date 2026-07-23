@@ -438,6 +438,12 @@ pub struct UsageArgs {
     /// One-line compact form for a tmux status bar.
     #[arg(long, default_value_t = false)]
     pub oneline: bool,
+    /// Subscription rate-limit window utilization instead of token/cost:
+    /// Claude 5h + weekly (live `/api/oauth/usage`), Codex weekly (newest
+    /// rollout snapshot). Ignores `--window`/`--since`. Pair with `--oneline`
+    /// for a status bar; `--json` for the machine shape.
+    #[arg(long, default_value_t = false)]
+    pub limits: bool,
 }
 
 #[derive(Subcommand)]

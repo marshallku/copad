@@ -6,6 +6,7 @@
 
 mod claude;
 mod codex;
+mod limits;
 mod model;
 mod pricing;
 mod render;
@@ -108,6 +109,9 @@ fn aggregate(records: Vec<Record>, warns: Warnings, label: String) -> Aggregate 
 
 /// Entry point for `main.rs`'s local dispatch. Returns a process exit code.
 pub fn run(args: &UsageArgs, json: bool) -> i32 {
+    if args.limits {
+        return run_limits(args, json);
+    }
     let now = Local::now();
     let (since, label) = match resolve_window(args, now) {
         Ok(v) => v,
@@ -167,6 +171,39 @@ pub fn run(args: &UsageArgs, json: bool) -> i32 {
     0
 }
 
+/// `--limits`: subscription rate-limit window utilization (percent), a
+/// different data source than the token/cost aggregation (see `limits.rs`).
+/// Honors `--tool`; `--window`/`--since` don't apply (the windows are fixed by
+/// the provider). `--oneline` is implied — the plain form is already one line.
+fn run_limits(args: &UsageArgs, json: bool) -> i32 {
+    let tool = args.tool.as_deref();
+    if let Some(t) = tool
+        && t != "claude"
+        && t != "codex"
+    {
+        eprintln!("coctl usage: --tool must be claude|codex (got '{t}')");
+        return 2;
+    }
+    let Ok(home) = std::env::var("HOME") else {
+        eprintln!("coctl usage: HOME is not set");
+        return 2;
+    };
+    let l = limits::collect(
+        &home,
+        tool.is_none_or(|t| t == "claude"),
+        tool.is_none_or(|t| t == "codex"),
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&limits::to_json(&l)).unwrap()
+        );
+    } else {
+        println!("{}", limits::oneline(&l));
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,6 +230,7 @@ mod tests {
             since: None,
             tool: None,
             oneline: false,
+            limits: false,
         };
         let (since, label) = resolve_window(&args, now).unwrap();
         let start = since.unwrap();
@@ -210,6 +248,7 @@ mod tests {
             since: Some("5h".into()),
             tool: None,
             oneline: false,
+            limits: false,
         };
         let (since, label) = resolve_window(&args, now).unwrap();
         assert_eq!(label, "last 5h");
@@ -223,6 +262,7 @@ mod tests {
             since: None,
             tool: None,
             oneline: false,
+            limits: false,
         };
         let (since, label) = resolve_window(&args, Local::now()).unwrap();
         assert!(since.is_none());

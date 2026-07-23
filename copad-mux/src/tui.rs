@@ -36,6 +36,7 @@ use crate::procinfo;
 use crate::proto::MouseKind;
 use crate::state::{Command, Event, MuxError, Origin, RestoredTab, State};
 use crate::term::{CellColor, PaneTerm};
+use crate::usagepoll;
 
 /// Direction for focus navigation with the arrow keys.
 #[derive(Clone, Copy)]
@@ -237,6 +238,12 @@ pub struct App {
     /// `mouse_at` can hit-test a click on the status bar / sidebar. Interior mutability
     /// because rendering is `&self`; only ever touched on the single main-loop thread.
     click_zones: RefCell<Vec<ClickZone>>,
+    /// Shared usage/limits readout (`coctl usage --limits`), written by a background
+    /// poller thread (`usagepoll`), read into `usage_shown` at the label cadence.
+    usage_poll: usagepoll::Shared,
+    /// The usage string currently folded into the rendered status bar; compared to
+    /// the shared handle so a change triggers a repaint through `maybe_refresh_labels`.
+    usage_shown: String,
 }
 
 impl App {
@@ -312,6 +319,10 @@ impl App {
             sidebar_focus: None,
             cfg,
             click_zones: RefCell::new(Vec::new()),
+            // Idle until `start_usage_poll` (called by the server); tests that build an
+            // App without a server never spawn the poller thread.
+            usage_poll: usagepoll::idle(),
+            usage_shown: String::new(),
         };
         app.reflow();
         Ok(app)
@@ -2348,7 +2359,30 @@ impl App {
             let a = self.refresh_labels();
             let b = self.refresh_agent_statuses();
             let c = self.refresh_branches();
-            a || b || c
+            let d = self.refresh_usage();
+            a || b || c || d
+        } else {
+            false
+        }
+    }
+
+    /// Start the background usage/limits poller (server-only; see `usagepoll`).
+    /// Replaces the idle handle installed by `new` with a live one.
+    pub fn start_usage_poll(&mut self) {
+        self.usage_poll = usagepoll::spawn();
+    }
+
+    /// Fold the latest polled usage string into `usage_shown`; returns whether it
+    /// changed (so the loop repaints the status bar). Poison-safe read.
+    fn refresh_usage(&mut self) -> bool {
+        let current = self
+            .usage_poll
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        if current != self.usage_shown {
+            self.usage_shown = current;
+            true
         } else {
             false
         }
@@ -2933,6 +2967,15 @@ impl App {
                     .fg(CAT_GREEN)
                     .bg(CAT_SURFACE0)
                     .add_modifier(Modifier::BOLD),
+            ));
+        }
+        // Usage/limits readout (Claude 5h+weekly · Codex weekly), left of the clock.
+        // Only on wide-enough terminals — it's ~30 cols and would crowd out tab chips
+        // on a narrow/mobile view (same size-adaptive spirit as the sidebar).
+        if !self.usage_shown.is_empty() && self.cols >= 100 {
+            segs.push((
+                format!(" {} ", self.usage_shown),
+                Style::default().fg(CAT_SUBTEXT).bg(CAT_SURFACE0),
             ));
         }
         segs.push((
