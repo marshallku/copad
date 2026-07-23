@@ -910,6 +910,15 @@ private final class GlyphAtlas {
                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue,
             ) else { return false }
             ctx.scaleBy(x: scale, y: scale)
+            // Grayscale antialiasing only — no font smoothing / stem
+            // darkening. Apple thickens stems when drawing light glyphs into
+            // an offscreen bitmap; baked into the atlas coverage that reads as
+            // a fake-bold weight (and, blended again on the GPU, worse). The
+            // old CPU painter drew via CTLineDraw into the window context and
+            // so never saw this. Keep pure outline coverage instead.
+            ctx.setShouldAntialias(true)
+            ctx.setShouldSmoothFonts(false)
+            ctx.setAllowsFontSmoothing(false)
             if !isColor {
                 ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
             }
