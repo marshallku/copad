@@ -120,6 +120,10 @@ pub struct PaneTerm {
     /// process group (`tcgetpgrp`) — the actual foreground process, not a guess.
     /// Closed on drop.
     fg_fd: Option<RawFd>,
+    /// The directory the shell was spawned in. A stable fallback for liveness checks
+    /// (e.g. worktree-removal safety) when the live `process_cwd` is momentarily
+    /// unreadable — a pane never spawns "below" its initial cwd without our knowing.
+    spawn_cwd: Option<PathBuf>,
 }
 
 impl PaneTerm {
@@ -152,6 +156,7 @@ impl PaneTerm {
             // Login shell so PATH / profile are set up as in a normal terminal.
             opts.shell = Some(Shell::new(sh, vec!["-l".to_string()]));
         }
+        let spawn_cwd = cwd.clone();
         if let Some(dir) = cwd {
             opts.working_directory = Some(dir);
         }
@@ -199,12 +204,19 @@ impl PaneTerm {
             io_thread: Some(io_thread),
             child_pid,
             fg_fd,
+            spawn_cwd,
         })
     }
 
     /// The child shell's pid (fallback label when no foreground group is set).
     pub fn pid(&self) -> Option<u32> {
         self.child_pid
+    }
+
+    /// The directory the shell was spawned in (liveness fallback when the live
+    /// `process_cwd` can't be read).
+    pub fn spawn_cwd(&self) -> Option<&PathBuf> {
+        self.spawn_cwd.as_ref()
     }
 
     /// The pid of the terminal's foreground process GROUP leader — the process
@@ -525,7 +537,13 @@ mod render_repro {
                 row.iter()
                     .map(|c| {
                         if c.spacer {
-                            (String::new(), CellColor::Default, CellColor::Default, false, false)
+                            (
+                                String::new(),
+                                CellColor::Default,
+                                CellColor::Default,
+                                false,
+                                false,
+                            )
                         } else {
                             (c.sym.clone(), c.fg, c.bg, c.bold, c.reverse)
                         }
@@ -713,17 +731,17 @@ mod render_repro {
             24,
             6,
             &[
-                "\x1b[?1049h\x1b[2J\x1b[H".as_bytes(),                 // enter alt screen + clear
-                "\x1b[H┌─ 세션 ─────────────┐".as_bytes(),            // top border + wide title
+                "\x1b[?1049h\x1b[2J\x1b[H".as_bytes(), // enter alt screen + clear
+                "\x1b[H┌─ 세션 ─────────────┐".as_bytes(), // top border + wide title
                 "\x1b[2;1H│ \x1b[32mready\x1b[0m            │".as_bytes(), // colored body
-                "\x1b[3;1H│ 작업 중…            │".as_bytes(),          // wide chars
-                "\x1b[4;1H└────────────────────┘".as_bytes(),          // bottom border
-                "\x1b[2;4H\x1b[31mBUSY \x1b[0m".as_bytes(),            // partial redraw over 'ready'
-                "\x1b[3;4H가나다라마".as_bytes(),                       // overwrite with more wide
-                "\x1b[3;4Habcde".as_bytes(),                            // wide→narrow at same origin
-                "\x1b[2;2H\x1b[K│".as_bytes(),                          // erase-to-EOL mid-line
+                "\x1b[3;1H│ 작업 중…            │".as_bytes(), // wide chars
+                "\x1b[4;1H└────────────────────┘".as_bytes(), // bottom border
+                "\x1b[2;4H\x1b[31mBUSY \x1b[0m".as_bytes(), // partial redraw over 'ready'
+                "\x1b[3;4H가나다라마".as_bytes(),      // overwrite with more wide
+                "\x1b[3;4Habcde".as_bytes(),           // wide→narrow at same origin
+                "\x1b[2;2H\x1b[K│".as_bytes(),         // erase-to-EOL mid-line
                 "\x1b[5;1H\x1b[38;5;39m▓▓▓▓▓▓\x1b[0m spinner".as_bytes(), // 256-color run
-                "\x1b[5;1H\x1b[2Kdone".as_bytes(),                      // clear line + replace
+                "\x1b[5;1H\x1b[2Kdone".as_bytes(),     // clear line + replace
             ],
             &[8], // force a refresh (self-heal) before tick 8
         );
