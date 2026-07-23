@@ -9,7 +9,7 @@
 //!
 //! Control commands: list | split | resize | focus | close | send | list-tabs | new-tab |
 //! select-tab | list-sessions | new-session [name] | rename-session | select-session |
-//! kill-server.
+//! worktree <create|list|rm> | kill-server.
 //!
 //! The server holds the shells; the client renders + forwards input and can detach
 //! (`Ctrl-b d`) / reattach, so a session survives the terminal that launched it.
@@ -30,10 +30,11 @@ fn print_usage() {
          \x20 comux select-session <i>    switch to a session\n\
          \x20 comux new-tab               create a tab\n\
          \x20 comux split -h|-v           split the focused pane\n\
+         \x20 comux worktree create <br>  git worktree + a session in it (also list|rm)\n\
          \x20 comux kill-server           stop the server\n\
          \n\
-         inside the TUI: Ctrl-b C new session (name prompt) · Ctrl-b c new tab · \
-         Ctrl-b % / \" split"
+         inside the TUI: Ctrl-b C new session (name prompt) · Ctrl-b W new worktree · \
+         Ctrl-b c new tab · Ctrl-b % / \" split"
     );
 }
 

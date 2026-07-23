@@ -52,6 +52,34 @@ pub enum Req {
     RenameSession { index: usize, name: String },
     /// Make the session at `index` (as printed by `list-sessions`) active.
     SelectSession { index: usize },
+    /// Create a git worktree for `branch` (sibling of the repo's MAIN worktree) and open
+    /// a session in it, switching to it. `cwd` is the caller's dir (the repo is resolved
+    /// from it); `from` is the base ref for the new branch (`None` → HEAD).
+    WorktreeCreate {
+        branch: String,
+        #[serde(default)]
+        from: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
+    /// List the git worktrees of the repo containing `cwd`, flagging which ones a comux
+    /// session is currently inside (`live`).
+    WorktreeList {
+        #[serde(default)]
+        cwd: Option<String>,
+    },
+    /// Remove the worktree matching `target` (a path or short branch, main excluded).
+    /// Refuses a live-session worktree unless `force` (which first kills those sessions);
+    /// `delete_branch` also deletes the branch.
+    WorktreeRm {
+        target: String,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        delete_branch: bool,
+        #[serde(default)]
+        cwd: Option<String>,
+    },
     /// Shut the persistent server down (drops every shell). The only key-free way to
     /// stop a detached server short of exiting its last shell.
     KillServer,
@@ -106,13 +134,34 @@ pub struct SessionInfo {
     pub agents: usize,
 }
 
+/// One git worktree in a `worktree list` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeInfo {
+    pub path: String,
+    /// Short branch name, or empty when detached.
+    #[serde(default)]
+    pub branch: String,
+    /// The main worktree (never a removal target).
+    pub is_main: bool,
+    /// A comux session currently has a pane inside this worktree.
+    pub live: bool,
+    /// `git worktree lock`ed.
+    #[serde(default)]
+    pub locked: bool,
+}
+
 /// A control response. `ok=false` carries `error`; `list` fills `panes`+`focused`;
-/// `list-tabs` fills `tabs`+`active_tab`.
+/// `list-tabs` fills `tabs`+`active_tab`; `worktree` verbs fill `worktrees`/`message`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resp {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Human-readable outcome for a mutating verb (e.g. the created worktree path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktrees: Option<Vec<WorktreeInfo>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panes: Option<Vec<PaneInfo>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,12 +181,30 @@ impl Resp {
         Self {
             ok: true,
             error: None,
+            message: None,
+            worktrees: None,
             panes: None,
             focused: None,
             tabs: None,
             active_tab: None,
             sessions: None,
             active_session: None,
+        }
+    }
+
+    /// An `ok` response carrying a human-readable outcome message.
+    pub fn message(msg: impl Into<String>) -> Self {
+        Self {
+            message: Some(msg.into()),
+            ..Self::ok()
+        }
+    }
+
+    /// A `worktree list` response.
+    pub fn worktree_list(worktrees: Vec<WorktreeInfo>) -> Self {
+        Self {
+            worktrees: Some(worktrees),
+            ..Self::ok()
         }
     }
     pub fn err(msg: impl Into<String>) -> Self {
@@ -197,6 +264,12 @@ pub fn socket_path() -> PathBuf {
 /// The `comux ctl ...` CLI client: parse args, round-trip one request over the
 /// socket, print the response. Returns a process exit code.
 pub fn run_client(args: &[String]) -> i32 {
+    // `worktree` has its own nested grammar (subcommands + `--from`/`--plain`/`-d`), so it
+    // is parsed BEFORE the flat `--json`-stripping path below could reinterpret its flags.
+    if args.first().map(|s| s.as_str()) == Some("worktree") {
+        return run_worktree_client(&args[1..]);
+    }
+
     let mut json_out = false;
     let mut rest: Vec<&String> = Vec::new();
     for a in args {
@@ -210,7 +283,7 @@ pub fn run_client(args: &[String]) -> i32 {
         eprintln!(
             "usage: comux <list|split|resize|focus|close|send|list-tabs|new-tab|select-tab|\
              list-sessions|new-session [name]|rename-session <index> <name>|select-session|\
-             kill-server> [args]"
+             worktree <create|list|rm>|kill-server> [args]"
         );
         return 2;
     };
@@ -470,5 +543,342 @@ fn print_human(req: &Req, resp: &Resp) {
             }
         }
         _ => println!("ok"),
+    }
+}
+
+/// The caller's cwd as a wire string (the repo is resolved from it server-side).
+fn caller_cwd() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+}
+
+/// Is a comux server currently accepting on the control socket?
+fn server_running() -> bool {
+    UnixStream::connect(socket_path()).is_ok()
+}
+
+fn print_worktree_usage() {
+    eprintln!(
+        "usage:\n\
+         \x20 comux worktree create <branch> [--from <ref>] [--json]\n\
+         \x20 comux worktree list [--plain|--json]\n\
+         \x20 comux worktree rm <path|branch> [-f|--force] [-d|--delete-branch] [--json]"
+    );
+}
+
+/// `comux worktree <sub> …` — a nested grammar parsed independently of the flat client.
+fn run_worktree_client(args: &[String]) -> i32 {
+    let Some(sub) = args.first().map(|s| s.as_str()) else {
+        print_worktree_usage();
+        return 2;
+    };
+    let rest = &args[1..];
+    match sub {
+        "create" | "new" | "add" => worktree_create_client(rest),
+        "list" | "ls" => worktree_list_client(rest),
+        "rm" | "remove" => worktree_rm_client(rest),
+        "help" | "-h" | "--help" => {
+            print_worktree_usage();
+            0
+        }
+        other => {
+            eprintln!("comux worktree: unknown subcommand '{other}'");
+            print_worktree_usage();
+            2
+        }
+    }
+}
+
+/// Print a mutating-verb response (`--json` → raw Resp; else the message / error).
+fn print_worktree_result(resp: &Resp, json: bool) -> i32 {
+    if json {
+        println!("{}", serde_json::to_string(resp).unwrap_or_default());
+    } else if resp.ok {
+        if let Some(m) = &resp.message {
+            println!("{m}");
+        } else {
+            println!("ok");
+        }
+    } else {
+        eprintln!(
+            "error: {}",
+            resp.error.as_deref().unwrap_or("(unspecified)")
+        );
+    }
+    if resp.ok { 0 } else { 1 }
+}
+
+fn worktree_create_client(rest: &[String]) -> i32 {
+    let mut branch: Option<&str> = None;
+    let mut from = String::new();
+    let mut json = false;
+    let mut flags_done = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        if !flags_done && a == "--" {
+            flags_done = true;
+        } else if !flags_done && a.starts_with('-') {
+            match a {
+                "--from" => {
+                    i += 1;
+                    match rest.get(i) {
+                        Some(v) => from = v.clone(),
+                        None => {
+                            eprintln!("comux worktree create: --from needs a value");
+                            return 2;
+                        }
+                    }
+                }
+                "--json" => json = true,
+                _ => {
+                    eprintln!("comux worktree create: unknown flag '{a}'");
+                    return 2;
+                }
+            }
+        } else if branch.is_some() {
+            eprintln!("comux worktree create: unexpected extra argument '{a}'");
+            return 2;
+        } else {
+            branch = Some(a);
+        }
+        i += 1;
+    }
+    let Some(branch) = branch else {
+        eprintln!("usage: comux worktree create <branch> [--from <ref>]");
+        return 2;
+    };
+    let req = Req::WorktreeCreate {
+        branch: branch.to_string(),
+        from: (!from.is_empty()).then(|| from.clone()),
+        cwd: caller_cwd(),
+    };
+    // Create opens a session, so it needs a server — start one if none is running.
+    if let Err(e) = crate::client::ensure_running(&socket_path()) {
+        eprintln!("comux: could not start server: {e}");
+        return 1;
+    }
+    match round_trip(&req) {
+        Ok(resp) => print_worktree_result(&resp, json),
+        Err(e) => {
+            eprintln!("comux: {e}");
+            1
+        }
+    }
+}
+
+fn worktree_list_client(rest: &[String]) -> i32 {
+    let mut json = false;
+    let mut plain = false;
+    for a in rest {
+        match a.as_str() {
+            "--json" => json = true,
+            "--plain" => plain = true,
+            other => {
+                eprintln!("comux worktree list: unexpected argument '{other}'");
+                return 2;
+            }
+        }
+    }
+    if json && plain {
+        eprintln!("comux worktree list: --plain and --json conflict");
+        return 2;
+    }
+    // A running server annotates `live`; with no server there are no comux sessions, so
+    // list locally (all `live=false`) — matching tmx's "works with no server" behavior.
+    if server_running() {
+        let req = Req::WorktreeList { cwd: caller_cwd() };
+        match round_trip(&req) {
+            Ok(resp) if resp.ok => {
+                print_worktrees(&resp.worktrees.unwrap_or_default(), json, plain);
+                0
+            }
+            Ok(resp) => {
+                eprintln!(
+                    "error: {}",
+                    resp.error.as_deref().unwrap_or("(unspecified)")
+                );
+                1
+            }
+            Err(e) => {
+                eprintln!("comux: {e}");
+                1
+            }
+        }
+    } else {
+        worktree_list_local(json, plain)
+    }
+}
+
+fn worktree_list_local(json: bool, plain: bool) -> i32 {
+    let Some(cwd) = std::env::current_dir().ok() else {
+        eprintln!("comux: could not resolve current directory");
+        return 1;
+    };
+    let repo = match crate::worktree::resolve_repo_root(&cwd) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("comux: {e}");
+            return 1;
+        }
+    };
+    let entries = match crate::worktree::list_entries(&repo) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("comux: {e}");
+            return 1;
+        }
+    };
+    let infos: Vec<WorktreeInfo> = entries
+        .iter()
+        .map(|e| WorktreeInfo {
+            path: e.path.display().to_string(),
+            branch: e.branch.clone().unwrap_or_default(),
+            is_main: e.is_main,
+            live: false,
+            locked: e.locked,
+        })
+        .collect();
+    print_worktrees(&infos, json, plain);
+    0
+}
+
+fn worktree_rm_client(rest: &[String]) -> i32 {
+    let mut target: Option<&str> = None;
+    let mut force = false;
+    let mut delete_branch = false;
+    let mut json = false;
+    let mut flags_done = false;
+    let mut i = 0;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        if !flags_done && a == "--" {
+            flags_done = true;
+        } else if !flags_done && a.starts_with('-') {
+            match a {
+                "-f" | "--force" => force = true,
+                "-d" | "--delete-branch" => delete_branch = true,
+                "--json" => json = true,
+                _ => {
+                    eprintln!("comux worktree rm: unknown flag '{a}'");
+                    return 2;
+                }
+            }
+        } else if target.is_some() {
+            eprintln!("comux worktree rm: unexpected extra argument '{a}'");
+            return 2;
+        } else {
+            target = Some(a);
+        }
+        i += 1;
+    }
+    let Some(target) = target else {
+        eprintln!("usage: comux worktree rm <path|branch> [-f] [-d]");
+        return 2;
+    };
+
+    // A running server owns liveness + the removal (single writer). With no server there
+    // are no live sessions; take the server flock so none can start under us, then remove
+    // locally — race-free, and without leaving a spurious server behind.
+    match crate::server::try_acquire_lock() {
+        Some(_guard) => worktree_rm_local(target, force, delete_branch, json),
+        None => {
+            let req = Req::WorktreeRm {
+                target: target.to_string(),
+                force,
+                delete_branch,
+                cwd: caller_cwd(),
+            };
+            match round_trip(&req) {
+                Ok(resp) => print_worktree_result(&resp, json),
+                Err(e) => {
+                    eprintln!("comux: {e}");
+                    1
+                }
+            }
+        }
+    }
+}
+
+fn worktree_rm_local(target: &str, force: bool, delete_branch: bool, json: bool) -> i32 {
+    let Some(cwd) = std::env::current_dir().ok() else {
+        eprintln!("comux: could not resolve current directory");
+        return 1;
+    };
+    let repo = match crate::worktree::resolve_repo_root(&cwd) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("comux: {e}");
+            return 1;
+        }
+    };
+    let entries = match crate::worktree::list_entries(&repo) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("comux: {e}");
+            return 1;
+        }
+    };
+    let entry = match crate::worktree::validate_removal(&entries, target, &cwd, delete_branch) {
+        Ok(e) => e,
+        Err(e) => {
+            let resp = Resp::err(e);
+            return print_worktree_result(&resp, json);
+        }
+    };
+    if let Err(e) = crate::worktree::remove(&repo, &entry.path, force) {
+        let resp = Resp::err(e);
+        return print_worktree_result(&resp, json);
+    }
+    let resp = finish_branch_delete(&repo, &entry, delete_branch, force);
+    print_worktree_result(&resp, json)
+}
+
+/// After a worktree was removed, optionally delete its branch and build the outcome
+/// response (branch-delete failure is a partial success → `ok=false` with a message
+/// naming exactly what happened).
+pub fn finish_branch_delete(
+    repo: &Path,
+    entry: &crate::worktree::Entry,
+    delete_branch: bool,
+    force: bool,
+) -> Resp {
+    let mut msg = format!("removed worktree {}", entry.path.display());
+    if delete_branch && let Some(b) = &entry.branch {
+        match crate::worktree::delete_branch(repo, b, force) {
+            Ok(()) => msg.push_str(&format!("; deleted branch {b}")),
+            Err(e) => {
+                return Resp::err(format!("{msg}, but branch '{b}' was not deleted: {e}"));
+            }
+        }
+    }
+    Resp::message(msg)
+}
+
+fn print_worktrees(infos: &[WorktreeInfo], json: bool, plain: bool) {
+    if json {
+        println!("{}", serde_json::to_string(infos).unwrap_or_default());
+        return;
+    }
+    if plain {
+        for w in infos {
+            println!("{}", w.path);
+        }
+        return;
+    }
+    println!(
+        "{:<44} {:<20} {:<5} {:<5} LOCKED",
+        "PATH", "BRANCH", "MAIN", "LIVE"
+    );
+    for w in infos {
+        println!(
+            "{:<44} {:<20} {:<5} {:<5} {}",
+            w.path,
+            if w.branch.is_empty() { "-" } else { &w.branch },
+            if w.is_main { "*" } else { "" },
+            if w.live { "*" } else { "" },
+            if w.locked { "*" } else { "" },
+        );
     }
 }

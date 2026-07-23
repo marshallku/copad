@@ -90,8 +90,18 @@ struct ClickZone {
 enum PromptKind {
     /// `Ctrl-b C`: create a session with the typed name (empty → auto `sN`).
     NewSession,
+    /// `Ctrl-b W`: create a git worktree for the typed branch + a session in it.
+    NewWorktree,
     /// `Ctrl-b $`: rename the active session (empty → revert to its id).
     RenameSession,
+}
+
+/// Outcome of [`App::create_worktree_session`]: a human status line and a non-fatal
+/// warning (a post-create hook failure — the worktree was still created) surfaced
+/// separately so BOTH the CLI response and the TUI toast report it.
+struct WorktreeCreated {
+    message: String,
+    warning: Option<String>,
 }
 
 /// State of the open inline prompt: what it will do + the text typed so far.
@@ -868,6 +878,147 @@ impl App {
         self.state.set_workspace_name(&self.ws, name);
     }
 
+    /// Sessions with at least one pane whose cwd is inside `path` (the worktree). Used
+    /// for `worktree`-session reuse and removal safety. Each pane is tested by its live
+    /// `process_cwd`, falling back to its recorded `spawn_cwd` so a momentary read
+    /// failure on a worktree session still counts it as live (fail-safe for removal).
+    fn sessions_in_path(&self, path: &std::path::Path) -> Vec<WorkspaceId> {
+        let target = crate::worktree::canonical_or_lexical(path);
+        let mut hits = Vec::new();
+        for wid in self.session_ids() {
+            let Some(w) = self.state.workspace(&wid) else {
+                continue;
+            };
+            let inside = w.tabs.iter().any(|t| {
+                t.layout.panes().iter().any(|p| {
+                    let Some(tid) = t.layout.terminal_of(p) else {
+                        return false;
+                    };
+                    let Some(pane) = self.panes.get(tid) else {
+                        return false;
+                    };
+                    let cwd = pane
+                        .pid()
+                        .and_then(procinfo::process_cwd)
+                        .or_else(|| pane.spawn_cwd().cloned());
+                    cwd.map(|c| crate::worktree::canonical_or_lexical(&c).starts_with(&target))
+                        .unwrap_or(false)
+                })
+            });
+            if inside {
+                hits.push(wid);
+            }
+        }
+        hits
+    }
+
+    /// Create a git worktree for `branch` (sibling of the repo's MAIN worktree) and open
+    /// a comux session in it, switching to it — the `comux worktree create` core, shared
+    /// by the control API and the `Ctrl-b W` prompt. Returns `(worktree_path, status)`.
+    ///
+    /// Identity is anchored on git, never the bare computed path (naming is
+    /// non-injective): if the target path is already a registered worktree for the SAME
+    /// branch we reuse/recover it; a different branch or a non-worktree directory there
+    /// is an error. The `git worktree add` is the sole durable side effect — a failing
+    /// post-create hook or session spawn is reported, never rolled back.
+    fn create_worktree_session(
+        &mut self,
+        branch: &str,
+        from: &str,
+        start: Option<PathBuf>,
+    ) -> Result<WorktreeCreated, String> {
+        // Normalize the input branch the same way parsed porcelain branches are (short
+        // form), so naming, identity comparison, and `git worktree add -b` all agree even
+        // if a caller passes a fully-qualified `refs/heads/…` ref.
+        let branch = branch.trim();
+        let branch = branch.strip_prefix("refs/heads/").unwrap_or(branch);
+        if branch.is_empty() {
+            return Err("branch name is required".into());
+        }
+        let start = start
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or_else(|| "could not resolve a starting directory".to_string())?;
+        let repo_root = crate::worktree::resolve_repo_root(&start)?;
+        let entries = crate::worktree::list_entries(&repo_root)?;
+        let planned = crate::worktree::plan_path(&entries, &self.cfg.worktree.naming, branch)?;
+        let wt = planned.worktree_path.clone();
+        let wt_key = crate::worktree::canonical_or_lexical(&wt);
+
+        if let Some(e) = entries
+            .iter()
+            .find(|e| crate::worktree::canonical_or_lexical(&e.path) == wt_key)
+        {
+            // A registered worktree already occupies the target path.
+            if e.branch.as_deref() != Some(branch) {
+                return Err(format!(
+                    "{} already holds branch '{}' — pick another branch name",
+                    wt.display(),
+                    e.branch.as_deref().unwrap_or("(detached)")
+                ));
+            }
+            if !wt.exists() {
+                return Err(format!(
+                    "worktree {} is registered but missing on disk — \
+                     run `git worktree prune` first",
+                    wt.display()
+                ));
+            }
+            // Recover: reuse a live session inside it, else open a fresh one.
+            if let Some(wid) = self.sessions_in_path(&wt).into_iter().next() {
+                self.switch_session(wid);
+                return Ok(WorktreeCreated {
+                    message: format!("switched to session for {}", planned.dir_name),
+                    warning: None,
+                });
+            }
+            self.spawn_worktree_session(&planned)?;
+            return Ok(WorktreeCreated {
+                message: format!("opened session in worktree {}", planned.dir_name),
+                warning: None,
+            });
+        }
+        if wt.exists() {
+            return Err(format!(
+                "{} already exists but is not a git worktree — \
+                 remove it or pick another branch",
+                wt.display()
+            ));
+        }
+
+        // Fresh worktree: `git worktree add` is the sole durable side effect.
+        crate::worktree::add(&repo_root, &wt, branch, from)?;
+        let script_err = self
+            .cfg
+            .worktree
+            .script_for(&planned.main_root)
+            .and_then(|s| crate::worktree::run_hook(s, &wt));
+
+        self.spawn_worktree_session(&planned)?;
+        Ok(WorktreeCreated {
+            message: format!("created worktree {}", wt.display()),
+            warning: script_err,
+        })
+    }
+
+    /// Open a session named after the worktree dir, in the worktree. Detects a shell
+    /// spawn failure via the session-count delta and reports it (the worktree stays).
+    fn spawn_worktree_session(&mut self, planned: &crate::worktree::Planned) -> Result<(), String> {
+        let before = self.session_count();
+        self.new_session(
+            Some(planned.dir_name.clone()),
+            Some(planned.worktree_path.clone()),
+        );
+        if self.session_count() > before {
+            Ok(())
+        } else {
+            Err(format!(
+                "worktree {} created, but its session failed to spawn — \
+                 rerun `comux worktree create` to open it",
+                planned.worktree_path.display()
+            ))
+        }
+    }
+
     /// Open the kill-session confirm modal (`Ctrl-b X`, tmux `prefix X`). No-op when
     /// only one session exists (a mux always keeps ≥1). Captures the TARGET workspace so
     /// a focus/session change while the prompt is up can't retarget it.
@@ -919,6 +1070,15 @@ impl App {
         });
     }
 
+    /// Open the inline new-worktree prompt (`Ctrl-b W`): the typed text is the branch
+    /// for `worktree create`. Enter commits, Esc cancels.
+    fn open_new_worktree_prompt(&mut self) {
+        self.prompt = Some(Prompt {
+            kind: PromptKind::NewWorktree,
+            buf: String::new(),
+        });
+    }
+
     /// Open the inline rename prompt (`Ctrl-b $`), seeded with the current name.
     fn open_rename_prompt(&mut self) {
         let seed = self
@@ -939,6 +1099,26 @@ impl App {
         match p.kind {
             // A session created from the TUI inherits the focused pane's cwd (tmux-style).
             PromptKind::NewSession => self.new_session(name, self.focused_cwd()),
+            PromptKind::NewWorktree => {
+                let Some(branch) = name else { return };
+                // The worktree is resolved from the focused pane's repo (tmux-style cwd).
+                // The CLI returns errors/warnings directly; the TUI has no inline message
+                // line, so a failure OR a non-fatal hook warning is surfaced as a toast.
+                // This is direct feedback for a key the user just pressed, so — unlike the
+                // routine agent-turn toasts — it is NOT gated by the `notify` config (else
+                // a `notify=false` user would get NO signal that their action failed).
+                // `COPAD_MUX_NOTIFY=0` still hard-disables all toasts. Success needs no
+                // note — the session visibly switched.
+                let note = match self.create_worktree_session(&branch, "", self.focused_cwd()) {
+                    Ok(c) => c.warning,
+                    Err(e) => Some(e),
+                };
+                if let Some(msg) = note
+                    && notify::env_override().unwrap_or(true)
+                {
+                    notify::desktop("comux worktree", &msg);
+                }
+            }
             PromptKind::RenameSession => self.rename_session(name),
         }
     }
@@ -1274,10 +1454,129 @@ impl App {
                     Resp::err(format!("no session at index {index}"))
                 }
             }
+            Req::WorktreeCreate { branch, from, cwd } => {
+                let start = cwd
+                    .clone()
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_dir())
+                    .or_else(|| self.focused_cwd());
+                match self.create_worktree_session(branch, from.as_deref().unwrap_or(""), start) {
+                    Ok(c) => Resp::message(match c.warning {
+                        Some(w) => format!("{} (warning: {w})", c.message),
+                        None => c.message,
+                    }),
+                    Err(e) => Resp::err(e),
+                }
+            }
+            Req::WorktreeList { cwd } => {
+                let start = cwd
+                    .clone()
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_dir())
+                    .or_else(|| self.focused_cwd());
+                match self.worktree_list_infos(start) {
+                    Ok(infos) => Resp::worktree_list(infos),
+                    Err(e) => Resp::err(e),
+                }
+            }
+            Req::WorktreeRm {
+                target,
+                force,
+                delete_branch,
+                cwd,
+            } => {
+                let start = cwd
+                    .clone()
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_dir())
+                    .or_else(|| self.focused_cwd());
+                self.worktree_rm(target, *force, *delete_branch, start)
+            }
             // Intercepted by the server before it reaches here; answered ok for a
             // (hypothetical) direct call so the match stays exhaustive.
             Req::KillServer => Resp::ok(),
         }
+    }
+
+    /// Enumerate the repo's worktrees (resolved from `start`) with a `live` flag for
+    /// worktrees a comux session is currently inside.
+    fn worktree_list_infos(
+        &self,
+        start: Option<PathBuf>,
+    ) -> Result<Vec<control::WorktreeInfo>, String> {
+        let start = start
+            .or_else(|| std::env::current_dir().ok())
+            .ok_or("could not resolve a starting directory")?;
+        let repo = crate::worktree::resolve_repo_root(&start)?;
+        let entries = crate::worktree::list_entries(&repo)?;
+        Ok(entries
+            .iter()
+            .map(|e| control::WorktreeInfo {
+                path: e.path.display().to_string(),
+                branch: e.branch.clone().unwrap_or_default(),
+                is_main: e.is_main,
+                live: !self.sessions_in_path(&e.path).is_empty(),
+                locked: e.locked,
+            })
+            .collect())
+    }
+
+    /// Remove a worktree (resolved from `start`), enforcing live-session safety: refuse a
+    /// worktree a session is inside unless `force`, which first kills those sessions —
+    /// but only after a preflight guarantees ≥1 workspace survives (the mux keeps the
+    /// last), then re-checks the worktree is truly vacated before touching git.
+    fn worktree_rm(
+        &mut self,
+        target: &str,
+        force: bool,
+        delete_branch: bool,
+        start: Option<PathBuf>,
+    ) -> control::Resp {
+        let Some(start) = start.or_else(|| std::env::current_dir().ok()) else {
+            return control::Resp::err("could not resolve a starting directory");
+        };
+        let repo = match crate::worktree::resolve_repo_root(&start) {
+            Ok(r) => r,
+            Err(e) => return control::Resp::err(e),
+        };
+        let entries = match crate::worktree::list_entries(&repo) {
+            Ok(e) => e,
+            Err(e) => return control::Resp::err(e),
+        };
+        let entry = match crate::worktree::validate_removal(&entries, target, &start, delete_branch)
+        {
+            Ok(e) => e,
+            Err(e) => return control::Resp::err(e),
+        };
+        let live = self.sessions_in_path(&entry.path);
+        if !live.is_empty() {
+            if !force {
+                return control::Resp::err(format!(
+                    "{} live session(s) are inside {} — use --force to kill them",
+                    live.len(),
+                    entry.path.display()
+                ));
+            }
+            // Killing every live session must leave ≥1 workspace (the mux refuses to
+            // remove the last), else the worktree can never be fully vacated.
+            if live.len() >= self.session_count() {
+                return control::Resp::err(
+                    "refusing to remove: every session is inside this worktree (the mux keeps ≥1)",
+                );
+            }
+            for wid in &live {
+                self.kill_session(wid);
+            }
+            if !self.sessions_in_path(&entry.path).is_empty() {
+                return control::Resp::err(
+                    "could not vacate the worktree (a session survived) — not removing",
+                );
+            }
+        }
+        if let Err(e) = crate::worktree::remove(&repo, &entry.path, force) {
+            return control::Resp::err(e);
+        }
+        control::finish_branch_delete(&repo, &entry, delete_branch, force)
     }
 
     /// Route one key event through the mux (popup → prefix → direct-nav → shell).
@@ -1453,6 +1752,7 @@ impl App {
             CloseTab => self.close_active_tab(),
             SelectTab(n) => self.select_tab_index(n as usize),
             NewSession => self.open_new_session_prompt(),
+            NewWorktree => self.open_new_worktree_prompt(),
             RenameSession => self.open_rename_prompt(),
             NextSession => self.cycle_session(1),
             PrevSession => self.cycle_session(-1),
@@ -3279,6 +3579,7 @@ impl App {
 
         let title = match p.kind {
             PromptKind::NewSession => " new session ",
+            PromptKind::NewWorktree => " new worktree (branch) ",
             PromptKind::RenameSession => " rename session ",
         };
         put(

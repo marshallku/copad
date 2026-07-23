@@ -36,6 +36,18 @@ autosave_secs = 15        # periodic save interval; 0 disables (clamped to 5..36
 # "nvim") to extend. (Restored panes start at the scrollback bottom — history isn't saved.)
 # restore_processes = ["claude", "codex", "nvim"]
 
+# ---- git worktrees (`comux worktree create|list|rm`, tmx `twt`-style) ----
+# `comux worktree create <branch>` runs `git worktree add -b <branch>` placing the new
+# worktree as a SIBLING of the repo's main worktree, then opens a session in it and
+# switches (Ctrl-b W does the same from the TUI, prompting for the branch).
+[worktree]
+# naming = "{repo}-{branch}"   # worktree dir name; tokens {repo} (main worktree dir) and
+                               #   {branch} (with '/' -> '-'). Default shown.
+# Per-repo post-create hook: repo main-worktree path -> shell command run via `bash -c`
+# in the new worktree with $WORKTREE_PATH set (keys are ~-expanded).
+# [worktree.scripts]
+# "~/dev/copad" = "mise trust && yarn"
+
 # ---- prefix bindings (pressed AFTER the prefix) ----
 # Rebinding a key replaces that action's WHOLE default chord set. A value can be one
 # chord or a list. Any action you don't mention keeps its default.
@@ -48,6 +60,7 @@ autosave_secs = 15        # periodic save interval; 0 disables (clamped to 5..36
 # close-tab = "&"
 # tab-1 = "1"   … tab-9 = "9"
 # new-session = "C"       # opens an inline name prompt
+# new-worktree = "W"      # opens a branch prompt → git worktree + session
 # rename-session = "$"
 # kill-session = "X"      # y/n confirm
 # next-session = ")"

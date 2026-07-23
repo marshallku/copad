@@ -129,6 +129,15 @@ fn prepare_paths() -> io::Result<(PathBuf, PathBuf)> {
     Ok((sock, lock))
 }
 
+/// Try to take the server's exclusive flock WITHOUT starting a server. `Some(guard)`
+/// means no server is running (and none can start while the returned file is held);
+/// `None` means a server currently owns it. Used by `comux worktree rm` to remove a
+/// worktree locally, race-free, when there's no server — without leaving one behind.
+pub fn try_acquire_lock() -> Option<File> {
+    let (_sock, lock_path) = prepare_paths().ok()?;
+    acquire_lock(&lock_path).ok()
+}
+
 /// Run the server to completion (exits when its last shell exits, on `kill-server`,
 /// or if another server already owns the lock).
 pub fn run() -> io::Result<()> {

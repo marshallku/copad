@@ -81,6 +81,8 @@ pub enum Action {
     /// Jump to tab index `0..=8` (`Ctrl-b 1`..`9`, `Alt-1`..`9`).
     SelectTab(u8),
     NewSession,
+    /// `Ctrl-b W`: create a git worktree + a session in it (name prompt).
+    NewWorktree,
     RenameSession,
     NextSession,
     PrevSession,
@@ -279,6 +281,7 @@ fn action_from_name(name: &str) -> Option<Action> {
         "prev-tab" => Action::PrevTab,
         "close-tab" => Action::CloseTab,
         "new-session" => Action::NewSession,
+        "new-worktree" => Action::NewWorktree,
         "rename-session" => Action::RenameSession,
         "next-session" => Action::NextSession,
         "prev-session" => Action::PrevSession,
@@ -360,6 +363,7 @@ fn default_bindings() -> Vec<(Action, Ctx, &'static [&'static str])> {
         (SelectTab(7), Prefix, &["8"]),
         (SelectTab(8), Prefix, &["9"]),
         (NewSession, Prefix, &["C"]),
+        (NewWorktree, Prefix, &["W"]),
         (RenameSession, Prefix, &["$"]),
         (KillSession, Prefix, &["X"]),
         (NextSession, Prefix, &[")"]),
@@ -396,6 +400,27 @@ impl Keymap {
     }
 }
 
+/// `[worktree]` configuration for `comux worktree create` (mirrors `tmx`'s
+/// `[worktree]`): the directory-naming pattern and per-repo post-create hooks.
+#[derive(Debug, Clone)]
+pub struct WorktreeConfig {
+    /// Directory naming pattern; tokens `{repo}` / `{branch}` (default
+    /// `{repo}-{branch}`). See [`crate::worktree::render_naming`].
+    pub naming: String,
+    /// Per-repo post-create hook: canonical main-worktree path → shell command run via
+    /// `bash -c` (cwd = new worktree, `WORKTREE_PATH` exported). Keys are `~`-expanded
+    /// then canonicalized so a linked-worktree caller still matches.
+    pub scripts: HashMap<PathBuf, String>,
+}
+
+impl WorktreeConfig {
+    /// The post-create hook for `main_root`, if any (canonical-path keyed).
+    pub fn script_for(&self, main_root: &std::path::Path) -> Option<&str> {
+        let key = crate::worktree::canonical_or_lexical(main_root);
+        self.scripts.get(&key).map(|s| s.as_str())
+    }
+}
+
 /// Effective configuration.
 #[derive(Debug, Clone)]
 pub struct MuxConfig {
@@ -416,6 +441,8 @@ pub struct MuxConfig {
     pub restore_processes: Vec<String>,
     /// Session ordering in the sidebar / switcher / cycle.
     pub sort_by: SortBy,
+    /// `comux worktree create` naming + post-create hooks.
+    pub worktree: WorktreeConfig,
 }
 
 #[derive(Deserialize, Default)]
@@ -433,6 +460,13 @@ struct RawConfig {
     sort_by: Option<String>,
     keys: Option<HashMap<String, ChordSpec>>,
     global: Option<HashMap<String, ChordSpec>>,
+    worktree: Option<RawWorktree>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawWorktree {
+    naming: Option<String>,
+    scripts: Option<HashMap<String, String>>,
 }
 
 /// A binding value: one chord or a list of chords.
@@ -504,6 +538,10 @@ impl MuxConfig {
             autosave_secs: DEFAULT_AUTOSAVE_SECS,
             restore_processes: default_restore_processes(),
             sort_by: SortBy::Created,
+            worktree: WorktreeConfig {
+                naming: crate::worktree::DEFAULT_NAMING.to_string(),
+                scripts: HashMap::new(),
+            },
         }
     }
 
@@ -575,6 +613,8 @@ impl MuxConfig {
             Some(v) => v as u32,
         };
 
+        let worktree = build_worktree(raw.worktree, &mut warnings);
+
         (
             MuxConfig {
                 keymap,
@@ -599,10 +639,44 @@ impl MuxConfig {
                         SortBy::Created
                     }),
                 },
+                worktree,
             },
             warnings,
         )
     }
+}
+
+/// Build the `[worktree]` config: naming (empty → default) and per-repo hooks whose
+/// path keys are `~`-expanded then canonicalized (so a linked-worktree caller matches
+/// the same repo hook). Duplicate canonical keys are last-wins with a warning.
+fn build_worktree(raw: Option<RawWorktree>, warnings: &mut Vec<String>) -> WorktreeConfig {
+    let raw = raw.unwrap_or_default();
+    let naming = match raw.naming {
+        Some(n) if !n.trim().is_empty() => n,
+        _ => crate::worktree::DEFAULT_NAMING.to_string(),
+    };
+    let mut scripts: HashMap<PathBuf, String> = HashMap::new();
+    for (k, v) in raw.scripts.unwrap_or_default() {
+        let key = crate::worktree::canonical_or_lexical(&expand_tilde(&k));
+        if scripts.insert(key.clone(), v).is_some() {
+            warnings.push(format!(
+                "worktree.scripts: duplicate repo key resolves to {} — last value wins",
+                key.display()
+            ));
+        }
+    }
+    WorktreeConfig { naming, scripts }
+}
+
+/// Expand a leading `~` / `~/` to `$HOME` (config keys are written with `~`).
+fn expand_tilde(p: &str) -> PathBuf {
+    if (p == "~" || p.starts_with("~/"))
+        && let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        return PathBuf::from(home).join(p.trim_start_matches('~').trim_start_matches('/'));
+    }
+    PathBuf::from(p)
 }
 
 fn collect_overrides(
