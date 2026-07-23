@@ -531,11 +531,24 @@ fn handle_incoming(
                     if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
                         action = app.feed_key(k, &mut c.prefix);
                     }
-                    if action == KeyAction::Detach
-                        && let Some(pos) = clients.iter().position(|c| c.id == id)
-                    {
-                        detach_client(clients.remove(pos));
-                        recompute_viewport(app, clients);
+                    match action {
+                        KeyAction::Detach => {
+                            if let Some(pos) = clients.iter().position(|c| c.id == id) {
+                                detach_client(clients.remove(pos));
+                                recompute_viewport(app, clients);
+                            }
+                        }
+                        // Force a full repaint to the client that asked: clear its diff
+                        // baseline so the next frame carries EVERY cell and is flagged
+                        // `full` (the client then clears its terminal). Fixes drift/ghosts
+                        // from a resize, alt-screen transition, or a nested emulator.
+                        KeyAction::Redraw => {
+                            if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
+                                c.needs_full = true;
+                                c.last = Buffer::empty(c.last.area);
+                            }
+                        }
+                        KeyAction::Continue => {}
                     }
                     true // a key may change any visible state
                 }

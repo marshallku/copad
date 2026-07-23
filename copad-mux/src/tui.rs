@@ -160,6 +160,9 @@ pub enum KeyAction {
     /// The user pressed the detach chord (`Ctrl-b d` / `Ctrl-b q`): the client should
     /// leave, but the server + shells keep running.
     Detach,
+    /// The user pressed the redraw chord (`Ctrl-b r`): force a full repaint to the client
+    /// that asked (server re-sends a `full` frame; the client clears + repaints).
+    Redraw,
 }
 
 /// Height of the always-on bottom status bar (tmux-style).
@@ -1460,6 +1463,7 @@ impl App {
             ResizeDown => self.resize_focused(Dir::Down, true),
             ResizeUp => self.resize_focused(Dir::Down, false),
             Popup => self.open_popup(),
+            Redraw => return KeyAction::Redraw,
             FocusSidebar => self.open_sidebar_focus(),
             EnterPrefix => {} // handled by the caller (arms the prefix)
         }
@@ -1549,18 +1553,33 @@ impl App {
             .find(|r| x >= r.x && x < r.x + r.cols && y >= r.y && y < r.y + r.rows);
         match kind {
             MouseKind::ScrollUp | MouseKind::ScrollDown => {
-                let lines = if matches!(kind, MouseKind::ScrollUp) {
-                    self.cfg.scroll_step
-                } else {
-                    -self.cfg.scroll_step
-                };
-                let term = target
-                    .map(|r| r.terminal)
-                    .or_else(|| self.focused_terminal());
-                if let Some(t) = term
-                    && let Some(pt) = self.panes.get(&t)
+                let up = matches!(kind, MouseKind::ScrollUp);
+                // The pane under the cursor, else the focused one (tmux forwards to the
+                // pane the pointer is over).
+                let rect = target.clone().or_else(|| {
+                    let f = self.focused_terminal()?;
+                    self.layout().into_iter().find(|r| r.terminal == f)
+                });
+                if let Some(rect) = rect
+                    && let Some(pt) = self.panes.get(&rect.terminal)
                 {
-                    pt.scroll(lines);
+                    // 1-based cell coords within the pane (clamped for the focused-pane
+                    // fallback, where the pointer can sit outside it).
+                    let col = x.saturating_sub(rect.x).min(rect.cols.saturating_sub(1)) + 1;
+                    let row = y.saturating_sub(rect.y).min(rect.rows.saturating_sub(1)) + 1;
+                    if let Some(bytes) = pt.wheel_bytes(up, col, row) {
+                        // The app is listening for the wheel (mouse mode / alternate-scroll)
+                        // — forward it so its OWN scroll advances (Claude Code, less, nvim).
+                        pt.input(&bytes);
+                    } else {
+                        // No mouse app in the pane: scroll comux's own scrollback.
+                        let lines = if up {
+                            self.cfg.scroll_step
+                        } else {
+                            -self.cfg.scroll_step
+                        };
+                        pt.scroll(lines);
+                    }
                 }
             }
             MouseKind::Click => {

@@ -101,6 +101,10 @@ pub enum Action {
     ResizeUp,
     ResizeRight,
     Popup,
+    /// Force a full client repaint (`Ctrl-b r`, tmux `refresh-client`). The server re-sends
+    /// a `full` frame and the client clears its terminal, wiping any drift/ghosting left by a
+    /// resize, an alt-screen transition, or a nested emulator that lost a cell.
+    Redraw,
     /// Focus the always-on left sidebar for keyboard navigation (nvim-explorer-style).
     FocusSidebar,
     /// Arm the prefix (`Ctrl-b`). A global-table action like any other, but prefix
@@ -295,6 +299,7 @@ fn action_from_name(name: &str) -> Option<Action> {
         "resize-up" => Action::ResizeUp,
         "resize-right" => Action::ResizeRight,
         "popup" => Action::Popup,
+        "redraw" => Action::Redraw,
         "focus-sidebar" => Action::FocusSidebar,
         "prefix" => Action::EnterPrefix,
         _ => {
@@ -339,6 +344,7 @@ fn default_bindings() -> Vec<(Action, Ctx, &'static [&'static str])> {
         (FocusNext, Prefix, &["o"]),
         (ClosePane, Prefix, &["x"]),
         (ToggleSidebar, Prefix, &["s"]),
+        (Redraw, Prefix, &["r"]),
         (FocusSidebar, Prefix, &["e"]),
         (NewTab, Prefix, &["c"]),
         (NextTab, Prefix, &["n"]),

@@ -57,6 +57,7 @@ autosave_secs = 15        # periodic save interval; 0 disables (clamped to 5..36
 # detach = ["d", "q"]
 # close-pane = "x"
 # toggle-sidebar = "s"
+# redraw = "r"            # force a full repaint (tmux refresh-client) — clears any ghosting
 # focus-sidebar = "e"     # keyboard-focus the sidebar (↑↓ list, ←→ spaces/agents, Enter, Esc)
 # scrollback = "["
 # focus-next = "o"

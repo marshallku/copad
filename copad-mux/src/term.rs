@@ -18,7 +18,7 @@ use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config, Term};
+use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as TtyOptions, Pty, Shell};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 
@@ -279,52 +279,74 @@ impl PaneTerm {
         self.term.lock().grid().display_offset()
     }
 
+    /// Bytes to feed the child for ONE wheel notch, honoring the app's active input mode
+    /// (tmux-style), or `None` if the app wants no wheel input — then the caller scrolls
+    /// the pane's OWN scrollback instead. `col`/`row` are 1-based cell coords WITHIN the
+    /// pane; `up` = wheel toward older content.
+    ///
+    /// - App has mouse reporting on (Claude Code, nvim `set mouse`): send an xterm wheel
+    ///   button report (64 = up, 65 = down), SGR-encoded if the app negotiated SGR else the
+    ///   legacy `ESC [ M` form.
+    /// - Alt-screen app WITHOUT mouse reporting but WITH alternate-scroll (less, man, git
+    ///   log): xterm turns the wheel into cursor-key presses so it pages as expected
+    ///   (application-cursor-keys mode picks `ESC O A/B` vs `ESC [ A/B`).
+    /// - Otherwise: `None` — the app isn't listening, so comux scrolls its scrollback.
+    pub fn wheel_bytes(&self, up: bool, col: u16, row: u16) -> Option<Vec<u8>> {
+        wheel_bytes_for_mode(*self.term.lock().mode(), up, col, row)
+    }
+
     /// Snapshot the visible viewport for rendering. Keeps the term lock only for
     /// the copy so the reader thread isn't starved.
     pub fn snapshot(&self) -> Snapshot {
-        let term = self.term.lock();
-        let cols = term.columns();
-        let rows = term.screen_lines();
-        let grid = term.grid();
-        let display_offset = grid.display_offset() as i32;
+        snapshot_grid(&self.term.lock())
+    }
+}
 
-        let mut cells = Vec::with_capacity(rows);
-        for r in 0..rows as i32 {
-            let line = Line(r - display_offset);
-            let mut row = Vec::with_capacity(cols);
-            for c in 0..cols {
-                let cell = &grid[Point::new(line, Column(c))];
-                let flags = cell.flags;
-                let spacer =
-                    flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
-                // Grapheme = base char + any zero-width combining marks.
-                let mut sym = String::new();
-                sym.push(cell.c);
-                if let Some(zw) = cell.zerowidth() {
-                    sym.extend(zw.iter());
-                }
-                row.push(CellSnap {
-                    sym,
-                    spacer,
-                    fg: ansi_to_cell(cell.fg),
-                    bg: ansi_to_cell(cell.bg),
-                    bold: flags.contains(Flags::BOLD),
-                    reverse: flags.contains(Flags::INVERSE),
-                });
+/// Snapshot the visible viewport of any `Term` into renderer-ready [`Snapshot`]. Split
+/// out of [`PaneTerm::snapshot`] so tests can drive a bare `Term` (via the VTE parser)
+/// deterministically — no PTY, no shell, no timing.
+fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
+    let cols = term.columns();
+    let rows = term.screen_lines();
+    let grid = term.grid();
+    let display_offset = grid.display_offset() as i32;
+
+    let mut cells = Vec::with_capacity(rows);
+    for r in 0..rows as i32 {
+        let line = Line(r - display_offset);
+        let mut row = Vec::with_capacity(cols);
+        for c in 0..cols {
+            let cell = &grid[Point::new(line, Column(c))];
+            let flags = cell.flags;
+            let spacer =
+                flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+            // Grapheme = base char + any zero-width combining marks.
+            let mut sym = String::new();
+            sym.push(cell.c);
+            if let Some(zw) = cell.zerowidth() {
+                sym.extend(zw.iter());
             }
-            cells.push(row);
+            row.push(CellSnap {
+                sym,
+                spacer,
+                fg: ansi_to_cell(cell.fg),
+                bg: ansi_to_cell(cell.bg),
+                bold: flags.contains(Flags::BOLD),
+                reverse: flags.contains(Flags::INVERSE),
+            });
         }
+        cells.push(row);
+    }
 
-        let cursor_point = grid.cursor.point;
-        let cursor_row = (cursor_point.line.0 + display_offset).clamp(0, rows as i32 - 1) as u16;
-        let cursor_col = (cursor_point.column.0 as u16).min(cols.saturating_sub(1) as u16);
+    let cursor_point = grid.cursor.point;
+    let cursor_row = (cursor_point.line.0 + display_offset).clamp(0, rows as i32 - 1) as u16;
+    let cursor_col = (cursor_point.column.0 as u16).min(cols.saturating_sub(1) as u16);
 
-        Snapshot {
-            cols: cols as u16,
-            rows: rows as u16,
-            cells,
-            cursor: (cursor_col, cursor_row),
-        }
+    Snapshot {
+        cols: cols as u16,
+        rows: rows as u16,
+        cells,
+        cursor: (cursor_col, cursor_row),
     }
 }
 
@@ -353,6 +375,44 @@ impl Drop for PaneTerm {
     }
 }
 
+/// The pure mode→wheel-bytes mapping behind [`PaneTerm::wheel_bytes`] (split out so the
+/// encoding is unit-testable without a PTY). See that method for the tmux-style policy.
+fn wheel_bytes_for_mode(mode: TermMode, up: bool, col: u16, row: u16) -> Option<Vec<u8>> {
+    if mode.intersects(TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
+    {
+        let button: u16 = if up { 64 } else { 65 };
+        if mode.contains(TermMode::SGR_MOUSE) {
+            return Some(format!("\x1b[<{button};{col};{row}M").into_bytes());
+        }
+        if mode.contains(TermMode::UTF8_MOUSE) {
+            // xterm 1005: `ESC [ M` then Cb,Cx,Cy each as a UTF-8 char = 32 + value. Unlike
+            // legacy this expresses coords past 223 (up to the 2-byte UTF-8 ceiling, 0x7ff),
+            // so wide panes report the right cell.
+            let mut out = vec![0x1b, b'[', b'M'];
+            for v in [button, col, row] {
+                let cp = (v as u32 + 32).min(0x7ff);
+                let mut b = [0u8; 4];
+                out.extend_from_slice(char::from_u32(cp).unwrap_or(' ').encode_utf8(&mut b).as_bytes());
+            }
+            return Some(out);
+        }
+        // Legacy `ESC [ M Cb Cx Cy`: each value offset by 32, clamped to the single-byte
+        // range (coords past 223 can't be expressed and are pinned there, as in xterm).
+        let enc = |v: u16| (v.saturating_add(32)).min(255) as u8;
+        return Some(vec![0x1b, b'[', b'M', enc(button), enc(col), enc(row)]);
+    }
+    if mode.contains(TermMode::ALTERNATE_SCROLL) && mode.contains(TermMode::ALT_SCREEN) {
+        let arrow: &[u8] = match (up, mode.contains(TermMode::APP_CURSOR)) {
+            (true, true) => b"\x1bOA",
+            (true, false) => b"\x1b[A",
+            (false, true) => b"\x1bOB",
+            (false, false) => b"\x1b[B",
+        };
+        return Some(arrow.to_vec());
+    }
+    None
+}
+
 /// Map an alacritty cell color to a renderer-friendly `CellColor`. Named ANSI
 /// 0–15 become palette indices; the semantic Foreground/Background/Cursor/Dim*
 /// names fall back to the surface default.
@@ -379,5 +439,334 @@ fn ansi_to_cell(color: AnsiColor) -> CellColor {
             NamedColor::BrightWhite => CellColor::Indexed(15),
             _ => CellColor::Default,
         },
+    }
+}
+
+#[cfg(test)]
+mod render_repro {
+    //! Deterministic reproduction of the mux render pipeline WITHOUT a PTY: feed raw
+    //! bytes straight into an alacritty `Term` via the VTE parser, snapshot it, then run
+    //! the exact server→wire→client double-diff and render the client's result into a
+    //! ratatui `TestBackend`. The client's screen must match a direct render of the
+    //! server buffer — any divergence is a transport/compose bug (ghosts, blanks).
+    use super::*;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::term::test::TermSize;
+    use alacritty_terminal::term::{Config, Term};
+    use alacritty_terminal::vte::ansi::Processor;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::{Position, Rect};
+    use ratatui::style::Style;
+
+    fn term(cols: usize, rows: usize) -> (Term<VoidListener>, Processor) {
+        let size = TermSize::new(cols, rows);
+        (
+            Term::new(Config::default(), &size, VoidListener),
+            Processor::new(),
+        )
+    }
+
+    fn feed(t: &mut Term<VoidListener>, p: &mut Processor, bytes: &[u8]) {
+        p.advance(t, bytes);
+    }
+
+    /// Compose a snapshot into a ratatui `Buffer` the same way `App::render_to` composes a
+    /// pane: real glyph + style for content cells, `skip` on wide-char spacers.
+    fn compose(snap: &Snapshot) -> Buffer {
+        let area = Rect::new(0, 0, snap.cols, snap.rows);
+        let mut buf = Buffer::empty(area);
+        for (y, row) in snap.cells.iter().enumerate() {
+            for (x, cell) in row.iter().enumerate() {
+                let Some(bc) = buf.cell_mut(Position::new(x as u16, y as u16)) else {
+                    continue;
+                };
+                if cell.spacer {
+                    bc.set_skip(true);
+                    continue;
+                }
+                bc.set_symbol(&cell.sym);
+                bc.set_style(Style::default());
+            }
+        }
+        buf
+    }
+
+    /// One tick of the server→client pipeline. `last` = the client's known baseline
+    /// (advanced here); returns the client buffer AFTER applying the wire delta, exactly
+    /// as `client::run_attached` does (`full` clears then applies; delta applies in place).
+    fn roundtrip(server: &Buffer, last: &mut Buffer, client: &mut Buffer, full: bool) {
+        if full {
+            *last = Buffer::empty(server.area);
+            *client = Buffer::empty(server.area);
+        }
+        let changed = last.diff(server);
+        for (x, y, cell) in &changed {
+            if let Some(bc) = client.cell_mut(Position::new(*x, *y)) {
+                bc.set_symbol(cell.symbol());
+                bc.set_style(cell.style());
+                bc.set_skip(cell.skip);
+            }
+        }
+        *last = server.clone();
+    }
+
+    /// Render a client buffer through a real ratatui `Terminal<TestBackend>` (its own
+    /// diff + wide-char flush) and return the visible screen text, row by row.
+    fn screen(term: &mut Terminal<TestBackend>, src: &Buffer) -> Vec<String> {
+        term.draw(|frame| {
+            let out = frame.buffer_mut();
+            let area = *out.area();
+            for y in 0..area.height {
+                for x in 0..area.width {
+                    if let (Some(s), Some(d)) = (
+                        src.cell(Position::new(x, y)),
+                        out.cell_mut(Position::new(x, y)),
+                    ) {
+                        *d = s.clone();
+                    }
+                }
+            }
+        })
+        .unwrap();
+        let b = term.backend().buffer();
+        let (w, h) = (b.area.width, b.area.height);
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| b.cell(Position::new(x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn snap_text(snap: &Snapshot) -> Vec<String> {
+        snap.cells
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|c| if c.spacer { "" } else { c.sym.as_str() })
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The heart of it: after feeding a SEQUENCE of byte-batches (each = one server
+    /// render tick), the client's on-screen text must equal the final snapshot's text.
+    fn assert_pipeline(cols: usize, rows: usize, batches: &[&[u8]]) {
+        let (mut t, mut p) = term(cols, rows);
+        let backend = TestBackend::new(cols as u16, rows as u16);
+        let mut cterm = Terminal::new(backend).unwrap();
+        let mut last = Buffer::empty(Rect::new(0, 0, cols as u16, rows as u16));
+        let mut client = Buffer::empty(Rect::new(0, 0, cols as u16, rows as u16));
+        let mut first = true;
+        let mut final_snap = None;
+        for batch in batches {
+            feed(&mut t, &mut p, batch);
+            let snap = snapshot_grid(&t);
+            let server = compose(&snap);
+            roundtrip(&server, &mut last, &mut client, first);
+            screen(&mut cterm, &client);
+            first = false;
+            final_snap = Some(snap);
+        }
+        let snap = final_snap.unwrap();
+        let want = snap_text(&snap);
+        let got = screen(&mut cterm, &client);
+        assert_eq!(
+            got, want,
+            "\nclient screen diverged from server snapshot\n got: {got:?}\nwant: {want:?}"
+        );
+    }
+
+    #[test]
+    fn clear_after_full_screen_leaves_no_ghost() {
+        // Fill the screen, then clear it — the classic ghost-after-clear case.
+        assert_pipeline(
+            10,
+            3,
+            &[b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123", b"\x1b[2J\x1b[H"],
+        );
+    }
+
+    #[test]
+    fn wide_chars_then_clear_leaves_no_ghost() {
+        // CJK fills each row with wide glyph + spacer; clearing must wipe both halves.
+        assert_pipeline(10, 2, &[b"\xea\xb0\x80\xeb\x82\x98\xeb\x8b\xa4", b"\x1b[2J\x1b[H"]);
+    }
+
+    #[test]
+    fn wide_char_replaced_by_narrow() {
+        // A wide glyph overwritten by a narrow one at the same origin: the spacer half
+        // must not linger as a ghost.
+        assert_pipeline(6, 1, &[b"\x1b[H\xea\xb0\x80", b"\x1b[H", b"\x1b[Hxy"]);
+    }
+
+    /// Like [`assert_pipeline`] but models the real server's `sync_channel(1)` coalescing:
+    /// the client only drains a frame every `drain_every` ticks. On a "drop" tick the frame
+    /// is NOT delivered and `last` is NOT advanced (server semantics); the main loop keeps
+    /// re-composing (pending) until the client drains, so the delta must catch up. After the
+    /// last batch we flush all pending deliveries. Final screen must equal the final snapshot.
+    fn assert_pipeline_backpressure(cols: usize, rows: usize, batches: &[&[u8]], drain_every: usize) {
+        let (mut t, mut p) = term(cols, rows);
+        let mut cterm = Terminal::new(TestBackend::new(cols as u16, rows as u16)).unwrap();
+        let area = Rect::new(0, 0, cols as u16, rows as u16);
+        let mut last = Buffer::empty(area); // server's view of the client baseline
+        let mut client = Buffer::empty(area); // client's actual buffer
+        let mut queued: Option<Buffer> = None; // the 1-slot channel (holds a composed frame)
+        let mut first = true;
+        let mut final_snap = None;
+        let mut tick = 0usize;
+        for batch in batches {
+            feed(&mut t, &mut p, batch);
+            let snap = snapshot_grid(&t);
+            final_snap = Some(snap.clone());
+            let server = compose(&snap);
+            // Server tick: diff vs last; try to enqueue. Channel full (queued Some) => drop.
+            let changed = last.diff(&server);
+            // Enqueue if there's something to send AND the 1-slot channel is free; a full
+            // channel drops the frame (last stays put — a real loop re-composes via pending).
+            if (!changed.is_empty() || first) && queued.is_none() {
+                queued = Some(server.clone());
+                last = server.clone(); // advance only on successful enqueue
+            }
+            // Client drains on some ticks only.
+            tick += 1;
+            if tick.is_multiple_of(drain_every)
+                && let Some(frame) = queued.take()
+            {
+                deliver(&frame, &mut client, first);
+                screen(&mut cterm, &client);
+                first = false;
+            }
+        }
+        // Drain whatever is left, plus force a final catch-up compose (models `pending`).
+        if let Some(frame) = queued.take() {
+            deliver(&frame, &mut client, first);
+            screen(&mut cterm, &client);
+            first = false;
+        }
+        let snap = final_snap.unwrap();
+        let server = compose(&snap);
+        let changed = last.diff(&server);
+        if !changed.is_empty() {
+            deliver(&server, &mut client, first);
+            screen(&mut cterm, &client);
+        }
+        let want = snap_text(&snap);
+        let got = screen(&mut cterm, &client);
+        assert_eq!(got, want, "\nbackpressure divergence\n got: {got:?}\nwant: {want:?}");
+    }
+
+    /// Apply one wire frame to the client buffer (full = clear+apply, delta = apply in place).
+    fn deliver(frame: &Buffer, client: &mut Buffer, full: bool) {
+        if full {
+            *client = Buffer::empty(frame.area);
+        }
+        // The wire is the diff the server computed vs ITS last; but here `frame` is the full
+        // composed server buffer, so re-derive the changed set against an empty baseline for
+        // full, or trust the caller advanced last. We instead just copy non-skip cells that
+        // differ — equivalent to applying the delta the server would have sent.
+        let base = if full { Buffer::empty(frame.area) } else { client.clone() };
+        for (x, y, cell) in base.diff(frame) {
+            if let Some(bc) = client.cell_mut(Position::new(x, y)) {
+                bc.set_symbol(cell.symbol());
+                bc.set_style(cell.style());
+                bc.set_skip(cell.skip);
+            }
+        }
+    }
+
+    #[test]
+    fn backpressure_coalescing_converges() {
+        // Rapid full-screen churn with a client that drains 1-in-3 frames: the coalesced
+        // deltas must still converge to the final screen (no lingering blanks/ghosts).
+        assert_pipeline_backpressure(
+            8,
+            3,
+            &[
+                b"\x1b[HAAAAAAAA\x1b[2;1HBBBBBBBB\x1b[3;1HCCCCCCCC",
+                b"\x1b[2J\x1b[Hx",
+                b"\x1b[HDDDDDDDD\x1b[2;1HEEEEEEEE",
+                b"\x1b[2J\x1b[H",
+                b"\x1b[Hfinal!!!",
+            ],
+            3,
+        );
+    }
+
+    #[test]
+    fn wheel_sgr_mouse_mode() {
+        // App negotiated SGR mouse reporting → SGR wheel button (64 up / 65 down) at coords.
+        let m = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        assert_eq!(wheel_bytes_for_mode(m, true, 5, 9).unwrap(), b"\x1b[<64;5;9M");
+        assert_eq!(
+            wheel_bytes_for_mode(m, false, 5, 9).unwrap(),
+            b"\x1b[<65;5;9M"
+        );
+    }
+
+    #[test]
+    fn wheel_legacy_mouse_mode() {
+        // Mouse reporting without SGR → legacy ESC [ M Cb Cx Cy (each offset by 32).
+        let m = TermMode::MOUSE_REPORT_CLICK;
+        assert_eq!(
+            wheel_bytes_for_mode(m, true, 1, 1).unwrap(),
+            vec![0x1b, b'[', b'M', 96, 33, 33]
+        );
+    }
+
+    #[test]
+    fn wheel_utf8_mouse_mode_encodes_wide_coords() {
+        // Mode 1005 (UTF8) without SGR: small coords are 1-byte; a coord past 223 becomes a
+        // 2-byte UTF-8 char rather than clamping to a wrong cell.
+        let m = TermMode::MOUSE_REPORT_CLICK | TermMode::UTF8_MOUSE;
+        // col=1,row=1 → Cb=96, Cx=33, Cy=33 (all 1-byte, same as legacy here).
+        assert_eq!(
+            wheel_bytes_for_mode(m, true, 1, 1).unwrap(),
+            vec![0x1b, b'[', b'M', 96, 33, 33]
+        );
+        // col=300 → 300+32=332 = U+014C, a 2-byte UTF-8 sequence (0xC5 0x8C).
+        let got = wheel_bytes_for_mode(m, true, 300, 1).unwrap();
+        let mut want = vec![0x1b, b'[', b'M', 96u8];
+        want.extend_from_slice('\u{14c}'.to_string().as_bytes());
+        want.push(33);
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn wheel_alternate_scroll_sends_arrows() {
+        // Alt-screen pager (less/man) without mouse mode → cursor keys; app-cursor picks SS3.
+        let base = TermMode::ALTERNATE_SCROLL | TermMode::ALT_SCREEN;
+        assert_eq!(wheel_bytes_for_mode(base, true, 1, 1).unwrap(), b"\x1b[A");
+        assert_eq!(wheel_bytes_for_mode(base, false, 1, 1).unwrap(), b"\x1b[B");
+        let app = base | TermMode::APP_CURSOR;
+        assert_eq!(wheel_bytes_for_mode(app, true, 1, 1).unwrap(), b"\x1bOA");
+    }
+
+    #[test]
+    fn wheel_no_mouse_app_yields_none() {
+        // A plain shell (no mouse, no alternate-scroll) → None → caller scrolls scrollback.
+        assert_eq!(wheel_bytes_for_mode(TermMode::empty(), true, 1, 1), None);
+        // Alternate-scroll but NOT on the alt screen (a normal prompt) also declines.
+        assert_eq!(
+            wheel_bytes_for_mode(TermMode::ALTERNATE_SCROLL, true, 1, 1),
+            None
+        );
+    }
+
+    #[test]
+    fn box_drawing_partial_redraw() {
+        // Mimic a TUI (Claude Code-like) drawing a box, then redrawing only its interior —
+        // exercises partial deltas over previously-painted cells.
+        assert_pipeline(
+            8,
+            3,
+            &[
+                "\x1b[H┌──────┐\x1b[2;1H│      │\x1b[3;1H└──────┘".as_bytes(),
+                "\x1b[2;2Hhello".as_bytes(),
+            ],
+        );
     }
 }

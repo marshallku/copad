@@ -193,6 +193,11 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
     let mut buf = Buffer::empty(RRect::new(0, 0, 1, 1));
     let mut have_frame = false;
     let mut cursor: Option<(u16, u16)> = None;
+    // A `full` frame means "repaint everything" (attach / resize / takeover / Ctrl-b r).
+    // Honor it by clearing the ratatui terminal before the next draw so its diff baseline
+    // is wiped and EVERY cell is re-emitted — otherwise a cell the real terminal lost
+    // (nested emulator, resize, alt-screen transition) lingers as a ghost.
+    let mut force_clear = false;
 
     loop {
         // 1) forward input
@@ -248,6 +253,7 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     let fsize = RRect::new(0, 0, f.cols.max(1), f.rows.max(1));
                     if f.full {
                         buf = Buffer::empty(fsize);
+                        force_clear = true;
                     } else if buf.area != fsize {
                         // A delta for a size we don't hold yet — wait for its full.
                         continue;
@@ -281,6 +287,12 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
         // 3) draw — blit the server frame into this terminal's top-left, blanking the
         // letterbox margin when our terminal is bigger than the shared (min) frame.
         if (dirty || need_redraw) && have_frame {
+            // A `full` frame resets the diff baseline: clear the screen + ratatui's cached
+            // previous-buffer so the upcoming draw re-emits every cell (no lingering ghost).
+            if force_clear {
+                terminal.clear()?;
+                force_clear = false;
+            }
             let src = buf.clone();
             let cur = cursor;
             terminal.draw(|frame| {
