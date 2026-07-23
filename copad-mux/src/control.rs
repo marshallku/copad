@@ -561,7 +561,7 @@ fn server_running() -> bool {
 fn print_worktree_usage() {
     eprintln!(
         "usage:\n\
-         \x20 comux worktree create <branch> [--from <ref>] [--json]\n\
+         \x20 comux worktree create <branch> [--from <ref>] [--no-attach] [--json]\n\
          \x20 comux worktree list [--plain|--json]\n\
          \x20 comux worktree rm <path|branch> [-f|--force] [-d|--delete-branch] [--json]"
     );
@@ -613,6 +613,7 @@ fn worktree_create_client(rest: &[String]) -> i32 {
     let mut branch: Option<&str> = None;
     let mut from = String::new();
     let mut json = false;
+    let mut no_attach = false;
     let mut flags_done = false;
     let mut i = 0;
     while i < rest.len() {
@@ -632,6 +633,9 @@ fn worktree_create_client(rest: &[String]) -> i32 {
                     }
                 }
                 "--json" => json = true,
+                // tmx `twt --keep-current`: create the session but stay in the current
+                // shell (don't drop into it) — implied by `--json` (scripting) too.
+                "--no-attach" | "--keep-current" => no_attach = true,
                 _ => {
                     eprintln!("comux worktree create: unknown flag '{a}'");
                     return 2;
@@ -646,7 +650,7 @@ fn worktree_create_client(rest: &[String]) -> i32 {
         i += 1;
     }
     let Some(branch) = branch else {
-        eprintln!("usage: comux worktree create <branch> [--from <ref>]");
+        eprintln!("usage: comux worktree create <branch> [--from <ref>] [--no-attach]");
         return 2;
     };
     let req = Req::WorktreeCreate {
@@ -659,13 +663,27 @@ fn worktree_create_client(rest: &[String]) -> i32 {
         eprintln!("comux: could not start server: {e}");
         return 1;
     }
-    match round_trip(&req) {
+    let code = match round_trip(&req) {
         Ok(resp) => print_worktree_result(&resp, json),
         Err(e) => {
             eprintln!("comux: {e}");
-            1
+            return 1;
         }
+    };
+    // tmx `twt` parity: when run from a plain shell (NOT inside a comux pane), drop into
+    // the freshly-switched session by attaching a client — this call blocks the TUI until
+    // detach. Skipped inside comux (the attached view already followed the switch — a
+    // nested client would recurse), in `--json`/`--no-attach` mode, and on failure.
+    if code == 0
+        && !json
+        && !no_attach
+        && std::env::var_os("COPAD_MUX").is_none()
+        && let Err(e) = crate::client::run()
+    {
+        eprintln!("comux: attach failed: {e}");
+        return 1;
     }
+    code
 }
 
 fn worktree_list_client(rest: &[String]) -> i32 {

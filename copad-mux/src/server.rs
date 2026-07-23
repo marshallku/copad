@@ -153,10 +153,17 @@ pub fn run() -> io::Result<()> {
     let listener = UnixListener::bind(&sock)?;
     let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
 
-    let sock_env = vec![(
-        "COPAD_MUX_SOCK".to_string(),
-        sock.to_string_lossy().to_string(),
-    )];
+    let sock_env = vec![
+        (
+            "COPAD_MUX_SOCK".to_string(),
+            sock.to_string_lossy().to_string(),
+        ),
+        // A tmux-`$TMUX`-style marker: set ONLY in shells spawned as comux panes, so a
+        // command run inside the mux (e.g. `comux worktree create`) can tell it is already
+        // attached and must not spawn a nested client. Distinct from `COPAD_MUX_SOCK`, which
+        // doubles as a user-facing socket override and so can't imply "inside comux".
+        ("COPAD_MUX".to_string(), "1".to_string()),
+    ];
     // Load user config (~/.config/copad/mux.toml); surface any warnings to stderr
     // (a foreground `copad-mux server` shows them — an auto-spawned server's stderr is
     // /dev/null, so the client prints its own copy of the diagnostics too).
