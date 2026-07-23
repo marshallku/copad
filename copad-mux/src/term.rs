@@ -459,11 +459,13 @@ mod render_repro {
     use alacritty_terminal::term::test::TermSize;
     use alacritty_terminal::term::{Config, Term};
     use alacritty_terminal::vte::ansi::Processor;
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
+    use ratatui::backend::{CrosstermBackend, TestBackend};
     use ratatui::buffer::Buffer;
     use ratatui::layout::{Position, Rect};
-    use ratatui::style::Style;
+    use ratatui::style::{Modifier, Style};
+    use ratatui::{Terminal, TerminalOptions, Viewport};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn term(cols: usize, rows: usize) -> (Term<VoidListener>, Processor) {
         let size = TermSize::new(cols, rows);
@@ -478,8 +480,15 @@ mod render_repro {
     }
 
     /// Compose a snapshot into a ratatui `Buffer` the same way `App::render_to` composes a
-    /// pane: real glyph + style for content cells, `skip` on wide-char spacers.
+    /// pane: real glyph + FULL style (fg/bg/bold/reverse, mirroring `tui::to_color`) for content
+    /// cells, `skip` on wide-char spacers. Carrying the style is what lets the relay test emit
+    /// real SGR and validate colour/attribute fidelity, not just glyphs.
     fn compose(snap: &Snapshot) -> Buffer {
+        let to_color = |c: CellColor| match c {
+            CellColor::Default => ratatui::style::Color::Reset,
+            CellColor::Indexed(i) => ratatui::style::Color::Indexed(i),
+            CellColor::Rgb(r, g, b) => ratatui::style::Color::Rgb(r, g, b),
+        };
         let area = Rect::new(0, 0, snap.cols, snap.rows);
         let mut buf = Buffer::empty(area);
         for (y, row) in snap.cells.iter().enumerate() {
@@ -491,11 +500,39 @@ mod render_repro {
                     bc.set_skip(true);
                     continue;
                 }
+                let mut style = Style::default().fg(to_color(cell.fg)).bg(to_color(cell.bg));
+                if cell.bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if cell.reverse {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
                 bc.set_symbol(&cell.sym);
-                bc.set_style(Style::default());
+                bc.set_style(style);
             }
         }
         buf
+    }
+
+    /// A style-aware comparable view of a snapshot for the relay test: content cells carry
+    /// `(sym, fg, bg, bold, reverse)`; spacer cells collapse to a sentinel (their own colour is
+    /// irrelevant — the wide glyph before them covers those columns and is never emitted).
+    #[allow(clippy::type_complexity)]
+    fn cells_norm(snap: &Snapshot) -> Vec<Vec<(String, CellColor, CellColor, bool, bool)>> {
+        snap.cells
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|c| {
+                        if c.spacer {
+                            (String::new(), CellColor::Default, CellColor::Default, false, false)
+                        } else {
+                            (c.sym.clone(), c.fg, c.bg, c.bold, c.reverse)
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     /// One tick of the server→client pipeline. `last` = the client's known baseline
@@ -583,6 +620,141 @@ mod render_repro {
             got, want,
             "\nclient screen diverged from server snapshot\n got: {got:?}\nwant: {want:?}"
         );
+    }
+
+    /// A `Write` sink shared with the caller so we can read back the exact escape-sequence
+    /// bytes ratatui's `CrosstermBackend` emits (its `writer_mut` is feature-gated).
+    #[derive(Clone)]
+    struct SharedBytes(Rc<RefCell<Vec<u8>>>);
+    impl std::io::Write for SharedBytes {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// END-TO-END FIDELITY: does comux faithfully relay one alacritty screen to another THROUGH
+    /// the real emit path? Feed app bytes to a SOURCE `Term`; each tick compose → wire delta →
+    /// client buffer → drive a real ratatui `Terminal<CrosstermBackend>` (its own diff + escape
+    /// output) → replay the EMITTED BYTES into a spec-correct REFERENCE `Term`. If the reference
+    /// screen matches the source, comux's emitted escape stream is correct — so any on-screen
+    /// drift the owner sees is the OUTER emulator (copad) mis-rendering that stream, NOT comux.
+    /// (`refresh_at` forces a full repaint before those ticks, exercising the clear+repaint path.)
+    fn assert_relay_fidelity(cols: usize, rows: usize, batches: &[&[u8]], refresh_at: &[usize]) {
+        let (mut src_t, mut src_p) = term(cols, rows);
+        let (mut ref_t, mut ref_p) = term(cols, rows);
+        let sink = SharedBytes(Rc::new(RefCell::new(Vec::new())));
+        let area = Rect::new(0, 0, cols as u16, rows as u16);
+        let mut cterm = Terminal::with_options(
+            CrosstermBackend::new(sink.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .unwrap();
+        let mut client = Buffer::empty(area);
+        for (i, batch) in batches.iter().enumerate() {
+            feed(&mut src_t, &mut src_p, batch);
+            let snap = snapshot_grid(&src_t);
+            let server = compose(&snap);
+            // First tick = full baseline; a `refresh_at` tick forces a clear+full repaint
+            // (the self-heal / Ctrl-b r path); everything else is an incremental delta.
+            let full = i == 0 || refresh_at.contains(&i);
+            deliver(&server, &mut client, full);
+            // The real client reconstructs wide-char spacers after applying each frame so its
+            // buffer matches the server's (the wire omits them); model that here.
+            crate::client::fix_wide_spacers(&mut client);
+            if full {
+                cterm.clear().unwrap();
+            }
+            let src_buf = client.clone();
+            cterm
+                .draw(|frame| {
+                    let out = frame.buffer_mut();
+                    for y in 0..area.height {
+                        for x in 0..area.width {
+                            if let (Some(s), Some(d)) = (
+                                src_buf.cell(Position::new(x, y)),
+                                out.cell_mut(Position::new(x, y)),
+                            ) {
+                                *d = s.clone();
+                            }
+                        }
+                    }
+                })
+                .unwrap();
+            let bytes = std::mem::take(&mut *sink.0.borrow_mut());
+            feed(&mut ref_t, &mut ref_p, &bytes);
+        }
+        let src_snap = snapshot_grid(&src_t);
+        let ref_snap = snapshot_grid(&ref_t);
+        // Full-style comparison (glyph + fg/bg/bold/reverse), so a lost colour or attribute
+        // fails too — not just a wrong glyph. The `snap_text` lines make the message readable.
+        assert_eq!(
+            cells_norm(&ref_snap),
+            cells_norm(&src_snap),
+            "\nRELAYED screen (via comux's emitted escapes) diverged from the SOURCE screen\n \
+             got:  {:?}\n want: {:?}",
+            snap_text(&ref_snap),
+            snap_text(&src_snap),
+        );
+    }
+
+    #[test]
+    fn relay_fidelity_claude_code_like_session() {
+        // A Claude-Code-ish full-screen session: alt-screen enter, a box with a wide-char
+        // title, colored text, cursor jumps, PARTIAL interior redraws, a wide→narrow swap, a
+        // mid-region clear, and a forced refresh — fed as many small server ticks so the
+        // incremental-diff path is heavily exercised.
+        assert_relay_fidelity(
+            24,
+            6,
+            &[
+                "\x1b[?1049h\x1b[2J\x1b[H".as_bytes(),                 // enter alt screen + clear
+                "\x1b[H┌─ 세션 ─────────────┐".as_bytes(),            // top border + wide title
+                "\x1b[2;1H│ \x1b[32mready\x1b[0m            │".as_bytes(), // colored body
+                "\x1b[3;1H│ 작업 중…            │".as_bytes(),          // wide chars
+                "\x1b[4;1H└────────────────────┘".as_bytes(),          // bottom border
+                "\x1b[2;4H\x1b[31mBUSY \x1b[0m".as_bytes(),            // partial redraw over 'ready'
+                "\x1b[3;4H가나다라마".as_bytes(),                       // overwrite with more wide
+                "\x1b[3;4Habcde".as_bytes(),                            // wide→narrow at same origin
+                "\x1b[2;2H\x1b[K│".as_bytes(),                          // erase-to-EOL mid-line
+                "\x1b[5;1H\x1b[38;5;39m▓▓▓▓▓▓\x1b[0m spinner".as_bytes(), // 256-color run
+                "\x1b[5;1H\x1b[2Kdone".as_bytes(),                      // clear line + replace
+            ],
+            &[8], // force a refresh (self-heal) before tick 8
+        );
+    }
+
+    #[test]
+    fn relay_fidelity_pure_delta_churn() {
+        // Heavy PURE-INCREMENTAL path (no refresh): a scrolling/progress-style redraw that
+        // rewrites the whole screen every tick with shifting wide+narrow content — the exact
+        // churn where drift would accumulate. Fidelity must hold with deltas alone.
+        let batches: Vec<Vec<u8>> = (0..20)
+            .map(|i| {
+                let mut s = String::from("\x1b[H");
+                for row in 1..=5 {
+                    let n = (i + row) % 7;
+                    // Mix wide CJK, ASCII, and a moving colored marker per row.
+                    s.push_str(&format!("\x1b[{row};1H\x1b[2K"));
+                    for c in 0..6 {
+                        if (c + n) % 3 == 0 {
+                            s.push('가');
+                        } else {
+                            s.push_str(&format!("\x1b[3{}mX\x1b[0m", (c % 7) + 1));
+                        }
+                    }
+                    s.push_str(&format!(" r{row}n{n}"));
+                }
+                s.into_bytes()
+            })
+            .collect();
+        let refs: Vec<&[u8]> = batches.iter().map(|b| b.as_slice()).collect();
+        assert_relay_fidelity(20, 6, &refs, &[]); // no refresh — deltas only
     }
 
     #[test]

@@ -22,9 +22,36 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::{Position, Rect as RRect};
+use unicode_width::UnicodeWidthStr;
 
 use crate::control::socket_path;
 use crate::proto::{ClientMsg, MouseKind, ServerMsg};
+
+/// Re-derive wide-char spacer cells so a client buffer (built from wire deltas that omit the
+/// trailing half of every wide glyph) matches the server's composed buffer exactly. For each
+/// row: the cell after a width≥2 symbol becomes a blank `skip` spacer; every other cell has its
+/// `skip` cleared. Using the SAME width function ratatui uses for its emit keeps the buffer
+/// self-consistent with how ratatui will render it — the fix for stale wide glyphs desyncing
+/// the row (see term.rs `relay_fidelity_pure_delta_churn`).
+pub(crate) fn fix_wide_spacers(buf: &mut ratatui::buffer::Buffer) {
+    let (w, h) = (buf.area.width, buf.area.height);
+    for y in 0..h {
+        let mut prev_wide = false;
+        for x in 0..w {
+            let Some(cell) = buf.cell_mut(Position::new(x, y)) else {
+                continue;
+            };
+            if prev_wide {
+                cell.set_symbol(" ");
+                cell.set_skip(true);
+                prev_wide = false;
+            } else {
+                cell.set_skip(false);
+                prev_wide = UnicodeWidthStr::width(cell.symbol()) >= 2;
+            }
+        }
+    }
+}
 
 /// Restores the host terminal (raw mode off + leave alt screen) on drop — so a
 /// panic or an abrupt server exit never leaves the user's terminal wedged. Mouse
@@ -280,6 +307,13 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                             cell.set_skip(c.skip);
                         }
                     }
+                    // Rebuild wide-char spacer structure so the client buffer EXACTLY matches
+                    // the server's — the wire omits trailing spacer cells (ratatui's diff drops
+                    // the cell after a wide glyph), so without this a wide char that MOVED leaves
+                    // a stale width-2 glyph behind, and ratatui's own emit then skips the real
+                    // cell after it (a narrow char vanishes / the row shifts). See term.rs
+                    // `relay_fidelity_pure_delta_churn`.
+                    fix_wide_spacers(&mut buf);
                     cursor = f.cursor;
                     have_frame = true;
                     dirty = true;
