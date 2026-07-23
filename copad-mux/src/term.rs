@@ -336,7 +336,19 @@ impl Drop for PaneTerm {
         }
         let _ = self.sender.send(Msg::Shutdown);
         if let Some(jh) = self.io_thread.take() {
-            let _ = jh.join();
+            // Bounded join: normally the io-thread exits immediately on `Shutdown`, but a
+            // wedged PTY/shell must NOT hang teardown (that would strand a live server
+            // holding its flock). Give it a short grace, then DETACH (drop the handle) and
+            // let the OS reap it — never block forever.
+            for _ in 0..50 {
+                if jh.is_finished() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if jh.is_finished() {
+                let _ = jh.join();
+            }
         }
     }
 }

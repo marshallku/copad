@@ -20,6 +20,7 @@
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc::{SyncSender, TrySendError};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -196,15 +197,62 @@ impl Saver {
             }
         }
     }
+
+    /// Shutdown save: push `final_state` as the writer's LAST item, then close + join it —
+    /// all within `timeout` total. Because the SAME single writer performs every rename in
+    /// order, the final (newest) snapshot is guaranteed to be the last write on disk (no
+    /// race with a separate writer). `timeout` bounds it so a hung/networked filesystem can
+    /// never block shutdown — on timeout it detaches (the last autosave remains on disk).
+    pub fn finish(mut self, final_state: PersistState, timeout: Duration) {
+        let start = Instant::now();
+        // Push the final state, retrying briefly so a coalescing-full queue doesn't drop it.
+        if let Some(tx) = self.tx.as_ref() {
+            let mut pending = Some(final_state);
+            while let Some(s) = pending.take() {
+                match tx.try_send(s) {
+                    Ok(()) => break,
+                    Err(TrySendError::Full(s)) => {
+                        if start.elapsed() >= timeout {
+                            break; // give up pushing (writer wedged) — will exit anyway
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                        pending = Some(s);
+                    }
+                    Err(TrySendError::Disconnected(_)) => break,
+                }
+            }
+        }
+        // Close the channel so the writer drains + exits, then bounded-join (Drop would also
+        // run, but its handle is already taken here → no double work).
+        self.tx.take();
+        if let Some(h) = self.handle.take() {
+            while !h.is_finished() && start.elapsed() < timeout {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            }
+        }
+    }
 }
 
 impl Drop for Saver {
     fn drop(&mut self) {
         // Close the channel FIRST (drop the sender) so the writer's `for state in rx` loop
-        // drains its last item and ends, then join it — the final autosave lands on disk.
+        // drains its last item and ends, then BOUNDED-join it — a completed autosave lands
+        // on disk, but a writer wedged in `fsync` (slow/networked FS) must NOT hang teardown.
         self.tx.take();
         if let Some(h) = self.handle.take() {
-            let _ = h.join();
+            for _ in 0..300 {
+                if h.is_finished() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            }
+            // else: detach — the process is exiting anyway; the OS reaps it.
         }
     }
 }
@@ -216,7 +264,14 @@ pub fn save_blocking(path: &std::path::Path, state: &PersistState) -> std::io::R
     write_durably(path, state)
 }
 
-/// Durably write `state` to `path`: temp file → `fsync` → rename → `fsync` parent dir.
+/// Monotonic sequence for UNIQUE temp file names, so two writers in the same process (the
+/// periodic autosave thread + a bounded final save on `kill-server`) never share a temp path
+/// and can't truncate/rename/remove each other's file.
+static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Durably write `state` to `path`: temp file → `fsync` → rename → `fsync` parent dir. The
+/// temp file is UNIQUE per write (`…json.<pid>.<seq>.tmp`) so concurrent writers don't
+/// collide; it is removed on any error so a failed write leaves no orphan.
 fn write_durably(path: &std::path::Path, state: &PersistState) -> std::io::Result<()> {
     let parent = path
         .parent()
@@ -224,8 +279,9 @@ fn write_durably(path: &std::path::Path, state: &PersistState) -> std::io::Resul
     std::fs::create_dir_all(parent)?;
     let json = serde_json::to_vec_pretty(state).map_err(std::io::Error::other)?;
 
-    let tmp = path.with_extension("json.tmp");
-    {
+    let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.{}.{seq}.tmp", std::process::id()));
+    let res = (|| -> std::io::Result<()> {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .write(true)
@@ -238,13 +294,18 @@ fn write_durably(path: &std::path::Path, state: &PersistState) -> std::io::Resul
         }
         f.write_all(&json)?;
         f.sync_all()?; // the bytes are on disk before the rename
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        // fsync the directory so the rename itself survives power loss. Propagate a failure
+        // here — otherwise we'd report a durable save that the rename might not survive.
+        let dir = std::fs::File::open(parent)?;
+        dir.sync_all()?;
+        Ok(())
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp); // don't leave an orphan on failure
     }
-    std::fs::rename(&tmp, path)?;
-    // fsync the directory so the rename itself survives power loss. Propagate a failure
-    // here — otherwise we'd report a durable save that the rename might not survive.
-    let dir = std::fs::File::open(parent)?;
-    dir.sync_all()?;
-    Ok(())
+    res
 }
 
 #[cfg(test)]

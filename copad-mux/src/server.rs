@@ -160,9 +160,11 @@ pub fn run() -> io::Result<()> {
     // reboot/crash can restore it (App::new already restored on boot). Disabled when
     // `persist = false` or `autosave_secs = 0`.
     let persist_enabled = cfg.persist;
+    let autosave_on = cfg.autosave_secs > 0;
     let state_path = crate::persist::state_path();
-    let saver = (cfg.persist && cfg.autosave_secs > 0)
-        .then(|| crate::persist::Saver::new(state_path.clone()));
+    // The writer exists whenever persistence is on (it also does the final save on
+    // kill-server); periodic autosaves only fire when `autosave_secs > 0`.
+    let saver = persist_enabled.then(|| crate::persist::Saver::new(state_path.clone()));
     let autosave = Duration::from_secs(cfg.autosave_secs.max(1) as u64);
     // Headless default size until the first client attaches (then reflowed).
     let mut app = App::new(80, 24, sock_env, cfg)?;
@@ -228,7 +230,8 @@ pub fn run() -> io::Result<()> {
         // Periodic autosave: hand a fresh snapshot to the off-loop writer. Reset the timer
         // from now (not fixed cadence) so a delayed loop can't trigger catch-up bursts.
         // Read-only, so it does NOT set `dirty` (never defeats the idle-skip).
-        if let Some(saver) = &saver
+        if autosave_on
+            && let Some(saver) = &saver
             && last_save.elapsed() >= autosave
         {
             saver.request(app.snapshot());
@@ -236,27 +239,28 @@ pub fn run() -> io::Result<()> {
         }
     }
 
-    // Join the periodic writer (drains any queued autosave) BEFORE the final save, so the
-    // synchronous save below is strictly last and its LATEST snapshot wins.
-    drop(saver);
-    // On an explicit `kill-server` (not a last-shell exit, which empties the app), write
-    // the latest layout SYNCHRONOUSLY so an immediate reboot restores it even if no
-    // periodic autosave fired yet. Synchronous (not the coalescing queue, which could drop
-    // it behind an in-flight write) so the latest is guaranteed durable. Safe: no tombstone
-    // → nothing races this delete-free write.
-    if kill
-        && persist_enabled
-        && !app.is_empty()
-        && let Err(e) = crate::persist::save_blocking(&state_path, &app.snapshot())
-    {
-        eprintln!("comux persist: final save failed: {e}");
+    // Persist on shutdown. On an explicit `kill-server` (not a last-shell exit, which empties
+    // the app) the latest layout is pushed as the writer's LAST item and the writer is joined
+    // — one writer, so renames are serialized and the newest snapshot wins (no race with a
+    // separate save). Bounded (3s total) so a hung/networked filesystem can't strand the
+    // process holding its flock; on that pathology we exit and rely on the last autosave.
+    // Otherwise just stop the writer.
+    match saver {
+        Some(s) if kill && persist_enabled && !app.is_empty() => {
+            s.finish(app.snapshot(), Duration::from_secs(3));
+        }
+        other => drop(other),
     }
 
     for c in clients.drain(..) {
         detach_client(c);
     }
     let _ = std::fs::remove_file(&sock);
-    Ok(())
+    // Exit NOW instead of returning (which would drop `app` → every `PaneTerm::drop` joins
+    // its PTY io-thread; a single wedged shell would then hang teardown forever, leaving a
+    // live process + held flock + no socket — blocking restart). The save + socket removal
+    // are done; the OS reaps the threads/PTYs and releases the flock on exit.
+    std::process::exit(0);
 }
 
 /// Re-derive the shared viewport = the SMALLEST attached client (min cols, min rows),
