@@ -23,7 +23,7 @@ use ratatui::style::{Color, Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agentstate;
-use crate::config::{self, Action, MuxConfig};
+use crate::config::{self, Action, MuxConfig, SortBy};
 use crate::control;
 use crate::gitinfo;
 use crate::model::{
@@ -131,9 +131,24 @@ struct PopupRow {
     text: String,
 }
 
-/// The `Ctrl-f` fuzzy switcher state: the typed filter + the selected row.
+/// Which list the `Ctrl-f` switcher is showing (Left/Right switches).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PopupTab {
+    Sessions,
+    Agents,
+}
+
+/// The `Ctrl-f` fuzzy switcher state: which tab, the typed filter, the selected row.
 struct PopupState {
+    tab: PopupTab,
     filter: String,
+    sel: usize,
+}
+
+/// Keyboard-focus state for the always-on left sidebar (`Ctrl-b e`): which group
+/// (spaces/agents) + the selected row. Arrows navigate, Enter selects, Esc exits.
+struct SidebarFocus {
+    tab: PopupTab,
     sel: usize,
 }
 
@@ -202,11 +217,17 @@ pub struct App {
     /// Monotonic counter for minting unique session (workspace) ids (`local` is the
     /// first, so new sessions start at `s1`).
     next_session: u64,
+    /// Per-session last-activated tick (for `sort_by = recent`), bumped on switch.
+    session_activity: HashMap<WorkspaceId, u64>,
+    /// Monotonic tick source for `session_activity`.
+    activity_clock: u64,
     /// When `Some`, an inline text prompt (new-session name / rename) is open and
     /// captures keystrokes until Enter (commit) or Esc (cancel).
     prompt: Option<Prompt>,
     /// When `Some`, a `y`/`n` confirm modal (e.g. kill-session) is open.
     confirm: Option<Confirm>,
+    /// When `Some`, the sidebar has keyboard focus (`Ctrl-b e`) for in-place navigation.
+    sidebar_focus: Option<SidebarFocus>,
     /// The effective user config (keybindings + options), loaded once at server start.
     cfg: MuxConfig,
     /// Clickable chrome regions (tab chips, sidebar rows), rebuilt every render so
@@ -281,8 +302,11 @@ impl App {
             agent_statuses: HashMap::new(),
             branches: HashMap::new(),
             next_session,
+            session_activity: HashMap::new(),
+            activity_clock: 0,
             prompt: None,
             confirm: None,
+            sidebar_focus: None,
             cfg,
             click_zones: RefCell::new(Vec::new()),
         };
@@ -343,16 +367,75 @@ impl App {
 
     // --- sessions (workspaces) ---
 
+    /// Session ids in CREATION order (stable; used by the `ctl` API for stable indices).
     fn session_ids(&self) -> Vec<WorkspaceId> {
         self.state.workspace_ids()
+    }
+
+    /// A session's display name (its `name`, else its id).
+    fn session_display_name(&self, wid: &WorkspaceId) -> String {
+        self.state
+            .workspace(wid)
+            .and_then(|w| w.name.clone())
+            .unwrap_or_else(|| wid.to_string())
+    }
+
+    /// Session ids in the configured DISPLAY order (`sort_by`) — for the sidebar, the
+    /// `Ctrl-f` switcher, and `)`/`(` cycling. A stable sort keeps creation order on ties.
+    fn sorted_session_ids(&self) -> Vec<WorkspaceId> {
+        let mut ids = self.session_ids(); // creation order
+        match self.cfg.sort_by {
+            SortBy::Created => {}
+            SortBy::Alphabetical => {
+                ids.sort_by_key(|w| self.session_display_name(w).to_lowercase())
+            }
+            SortBy::Recent => {
+                // Most-recently-switched-to first (0 = never activated → last).
+                ids.sort_by(|a, b| {
+                    self.session_activity
+                        .get(b)
+                        .copied()
+                        .unwrap_or(0)
+                        .cmp(&self.session_activity.get(a).copied().unwrap_or(0))
+                });
+            }
+            SortBy::Activity => {
+                // Sessions with an active agent (working/blocked) first.
+                ids.sort_by_key(|w| u8::from(!self.session_has_active_agent(w)));
+            }
+        }
+        ids
+    }
+
+    /// Does session `wid` have an agent that is working or blocked (not idle/ready)?
+    fn session_has_active_agent(&self, wid: &WorkspaceId) -> bool {
+        let Some(w) = self.state.workspace(wid) else {
+            return false;
+        };
+        w.tabs.iter().any(|t| {
+            t.layout.panes().iter().any(|p| {
+                t.layout
+                    .terminal_of(p)
+                    .and_then(|tid| self.agent_statuses.get(tid))
+                    .map(|s| {
+                        matches!(
+                            s,
+                            agentstate::AgentStatus::Working | agentstate::AgentStatus::Blocked
+                        )
+                    })
+                    .unwrap_or(false)
+            })
+        })
     }
 
     fn session_count(&self) -> usize {
         self.state.workspace_count()
     }
 
+    /// The active session's index within the DISPLAY (sorted) order — for sidebar
+    /// windowing centered on the active session.
     fn active_session_index(&self) -> usize {
-        self.session_ids()
+        self.sorted_session_ids()
             .iter()
             .position(|w| w == &self.ws)
             .unwrap_or(0)
@@ -703,6 +786,10 @@ impl App {
         if self.ws == wid || self.state.workspace(&wid).is_none() {
             return;
         }
+        // Record recency for `sort_by = recent`.
+        self.activity_clock += 1;
+        self.session_activity
+            .insert(wid.clone(), self.activity_clock);
         self.ws = wid.clone();
         let cols = self.content_cols().max(1);
         let rows = self.content_rows().max(1);
@@ -844,11 +931,14 @@ impl App {
 
     /// Switch to the next/previous session (wrapping): `+1` next, `-1` previous.
     fn cycle_session(&mut self, delta: i32) {
+        // Cycle in STABLE creation order (not the display sort): `sort_by = recent` mutates
+        // the sorted order on every switch, so cycling by it would ping-pong between two
+        // sessions and never reach the rest. Creation order always visits every session.
         let ids = self.session_ids();
         if ids.len() < 2 {
             return;
         }
-        let cur = self.active_session_index();
+        let cur = ids.iter().position(|w| w == &self.ws).unwrap_or(0);
         let next = ids[(cur as i32 + delta).rem_euclid(ids.len() as i32) as usize].clone();
         self.switch_session(next);
     }
@@ -1090,7 +1180,9 @@ impl App {
             }
             Req::ListSessions => {
                 let ids = self.session_ids();
-                let active_idx = self.active_session_index();
+                // `ctl` uses CREATION order for stable indices — find active in THAT order
+                // (not the sorted display order).
+                let active_idx = ids.iter().position(|w| w == &self.ws).unwrap_or(0);
                 let infos = ids
                     .iter()
                     .enumerate()
@@ -1212,6 +1304,22 @@ impl App {
             return KeyAction::Continue;
         }
 
+        // Sidebar keyboard-focus mode (`Ctrl-b e`): hjkl/arrows navigate the spaces/agents
+        // lists (h/l or ←/→ switch group, j/k or ↑/↓ move), Enter selects, Esc/q exits.
+        if self.sidebar_focus.is_some() {
+            *prefix = false;
+            match k.code {
+                KeyCode::Down | KeyCode::Char('j') => self.sidebar_focus_move(1),
+                KeyCode::Up | KeyCode::Char('k') => self.sidebar_focus_move(-1),
+                KeyCode::Left | KeyCode::Char('h') => self.sidebar_focus_tab(PopupTab::Sessions),
+                KeyCode::Right | KeyCode::Char('l') => self.sidebar_focus_tab(PopupTab::Agents),
+                KeyCode::Enter => self.sidebar_focus_select(),
+                KeyCode::Esc | KeyCode::Char('q') => self.sidebar_focus = None,
+                _ => {}
+            }
+            return KeyAction::Continue;
+        }
+
         // The switcher captures all input while open. Clear THIS client's pending
         // prefix too: the popup is shared state, so a `Ctrl-b` armed on one client
         // must not survive another client's popup interaction and fire a stray mux
@@ -1219,12 +1327,18 @@ impl App {
         if self.popup.is_some() {
             *prefix = false;
             match k.code {
-                // Navigate with arrows or fzf-style Ctrl-n/Ctrl-p (letters type the filter).
+                // ↑/↓ (or Ctrl-n/p) move the list; ←/→ switch the sessions/agents tab.
                 KeyCode::Down => self.popup_move(1),
                 KeyCode::Up => self.popup_move(-1),
                 KeyCode::Char('n') if ctrl => self.popup_move(1),
                 KeyCode::Char('p') if ctrl => self.popup_move(-1),
+                KeyCode::Left => self.popup_tab(PopupTab::Sessions),
+                KeyCode::Right => self.popup_tab(PopupTab::Agents),
                 KeyCode::Enter => self.popup_select(),
+                // Ctrl-r / F2: rename the selected session inline.
+                KeyCode::Char('r') if ctrl => self.popup_rename(),
+                KeyCode::Char('\u{12}') => self.popup_rename(),
+                KeyCode::F(2) => self.popup_rename(),
                 KeyCode::Esc | KeyCode::Char('\u{6}') => self.popup = None,
                 KeyCode::Char('f') if ctrl => self.popup = None, // Ctrl-f toggles closed
                 KeyCode::Backspace => self.popup_backspace(),
@@ -1346,6 +1460,7 @@ impl App {
             ResizeDown => self.resize_focused(Dir::Down, true),
             ResizeUp => self.resize_focused(Dir::Down, false),
             Popup => self.open_popup(),
+            FocusSidebar => self.open_sidebar_focus(),
             EnterPrefix => {} // handled by the caller (arms the prefix)
         }
         KeyAction::Continue
@@ -1542,62 +1657,69 @@ impl App {
         self.reflow();
     }
 
-    /// Open the `Ctrl-f` fuzzy switcher (empty filter, first row selected).
+    /// Open the `Ctrl-f` fuzzy switcher (Sessions tab, empty filter, first row selected).
     fn open_popup(&mut self) {
         self.popup = Some(PopupState {
+            tab: PopupTab::Sessions,
             filter: String::new(),
             sel: 0,
         });
     }
 
-    /// The switcher rows matching `filter`: every SESSION (name + git branch) then every
-    /// AGENT (tool · status · space), fuzzy-filtered (subsequence, case-insensitive).
-    /// Mirrors the owner's tmux `Ctrl-f` (session switch) + `prefix g` (agent list).
-    fn popup_items(&self, filter: &str) -> Vec<PopupRow> {
+    /// The switcher rows for `tab` matching `filter`: SESSIONS (name + git branch) or
+    /// AGENTS (tool · status · space), fuzzy-filtered (subsequence, case-insensitive).
+    /// Left/Right switch the tab (owner's tmux `Ctrl-f` session switch + `prefix g` agents).
+    fn popup_items(&self, tab: PopupTab, filter: &str) -> Vec<PopupRow> {
         let mut rows = Vec::new();
-        for wid in self.session_ids() {
-            let name = self
-                .state
-                .workspace(&wid)
-                .and_then(|w| w.name.clone())
-                .unwrap_or_else(|| wid.to_string());
-            let branch = self.branches.get(&wid).cloned().unwrap_or_default();
-            let is_active = wid == self.ws;
-            let color = if is_active {
-                CAT_MAUVE
-            } else if self.session_has_agent(&wid) {
-                CAT_PEACH
-            } else {
-                CAT_OVERLAY
-            };
-            let text = if branch.is_empty() {
-                name.clone()
-            } else {
-                format!("{name}  ({branch})")
-            };
-            if fuzzy_match(filter, &format!("{name} {branch}")) {
-                rows.push(PopupRow {
-                    target: PopupTarget::Session(wid),
-                    glyph: "▪",
-                    color,
-                    text,
-                });
+        match tab {
+            PopupTab::Sessions => {
+                for wid in self.sorted_session_ids() {
+                    let name = self
+                        .state
+                        .workspace(&wid)
+                        .and_then(|w| w.name.clone())
+                        .unwrap_or_else(|| wid.to_string());
+                    let branch = self.branches.get(&wid).cloned().unwrap_or_default();
+                    let is_active = wid == self.ws;
+                    let color = if is_active {
+                        CAT_MAUVE
+                    } else if self.session_has_agent(&wid) {
+                        CAT_PEACH
+                    } else {
+                        CAT_OVERLAY
+                    };
+                    let text = if branch.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{name}  ({branch})")
+                    };
+                    if fuzzy_match(filter, &format!("{name} {branch}")) {
+                        rows.push(PopupRow {
+                            target: PopupTarget::Session(wid),
+                            glyph: "▪",
+                            color,
+                            text,
+                        });
+                    }
+                }
             }
-        }
-        for (space, tool, status, term) in self.agent_rows() {
-            let (glyph, color) = match status {
-                "working" => ("●", CAT_GREEN),
-                "ready" => ("◐", CAT_BLUE),
-                "blocked" => ("▲", CAT_YELLOW),
-                _ => ("○", CAT_OVERLAY),
-            };
-            if fuzzy_match(filter, &format!("{space} {tool} {status}")) {
-                rows.push(PopupRow {
-                    target: PopupTarget::Agent(term),
-                    glyph,
-                    color,
-                    text: format!("{tool} · {status}  ({space})"),
-                });
+            PopupTab::Agents => {
+                for (space, tool, status, term) in self.agent_rows() {
+                    let (glyph, color) = match status {
+                        "working" => ("●", CAT_GREEN),
+                        "ready" => ("◐", CAT_BLUE),
+                        "blocked" => ("▲", CAT_YELLOW),
+                        _ => ("○", CAT_OVERLAY),
+                    };
+                    if fuzzy_match(filter, &format!("{space} {tool} {status}")) {
+                        rows.push(PopupRow {
+                            target: PopupTarget::Agent(term),
+                            glyph,
+                            color,
+                            text: format!("{tool} · {status}  ({space})"),
+                        });
+                    }
+                }
             }
         }
         rows
@@ -1607,10 +1729,10 @@ impl App {
     /// whether it moved (so the render loop repaints). Never closes on an empty result —
     /// an over-narrow filter just shows the empty state.
     pub fn reconcile_popup(&mut self) -> bool {
-        let Some(filter) = self.popup.as_ref().map(|p| p.filter.clone()) else {
+        let Some((tab, filter)) = self.popup.as_ref().map(|p| (p.tab, p.filter.clone())) else {
             return false;
         };
-        let n = self.popup_items(&filter).len();
+        let n = self.popup_items(tab, &filter).len();
         if let Some(p) = &mut self.popup {
             let clamped = if n == 0 { 0 } else { p.sel.min(n - 1) };
             if clamped != p.sel {
@@ -1621,12 +1743,20 @@ impl App {
         false
     }
 
+    /// Switch the switcher tab (Left/Right), resetting the selection to the top.
+    fn popup_tab(&mut self, to: PopupTab) {
+        if let Some(p) = &mut self.popup {
+            p.tab = to;
+            p.sel = 0;
+        }
+    }
+
     /// Move the switcher selection by `delta`, wrapping over the filtered rows.
     fn popup_move(&mut self, delta: i32) {
-        let Some(filter) = self.popup.as_ref().map(|p| p.filter.clone()) else {
+        let Some((tab, filter)) = self.popup.as_ref().map(|p| (p.tab, p.filter.clone())) else {
             return;
         };
-        let n = self.popup_items(&filter).len() as i32;
+        let n = self.popup_items(tab, &filter).len() as i32;
         if n == 0 {
             return;
         }
@@ -1658,7 +1788,7 @@ impl App {
         let Some(p) = self.popup.as_ref() else {
             return;
         };
-        let items = self.popup_items(&p.filter);
+        let items = self.popup_items(p.tab, &p.filter);
         let Some(row) = items.get(p.sel) else {
             return; // no valid row → keep the switcher open
         };
@@ -1667,6 +1797,94 @@ impl App {
         match target {
             PopupTarget::Session(wid) => self.switch_session(wid),
             PopupTarget::Agent(term) => self.jump_to_terminal(&term),
+        }
+    }
+
+    /// Rename the SELECTED session from the switcher (Sessions tab): switch to it and open
+    /// the inline rename prompt. No-op on the Agents tab or an empty selection.
+    fn popup_rename(&mut self) {
+        let Some(p) = self.popup.as_ref() else {
+            return;
+        };
+        if p.tab != PopupTab::Sessions {
+            return;
+        }
+        let items = self.popup_items(p.tab, &p.filter);
+        let Some(PopupRow {
+            target: PopupTarget::Session(wid),
+            ..
+        }) = items.get(p.sel)
+        else {
+            return;
+        };
+        let wid = wid.clone();
+        self.popup = None;
+        self.switch_session(wid);
+        self.open_rename_prompt();
+    }
+
+    // --- sidebar keyboard focus (Ctrl-b e) ---
+
+    /// Focus the sidebar for keyboard nav, revealing it if hidden. Falls back to the
+    /// `Ctrl-f` switcher when the sidebar can't show (too narrow / mobile).
+    fn open_sidebar_focus(&mut self) {
+        if !self.sidebar {
+            self.sidebar = true;
+            self.reflow();
+        }
+        if !self.sidebar_visible() {
+            self.open_popup();
+            return;
+        }
+        self.sidebar_focus = Some(SidebarFocus {
+            tab: PopupTab::Sessions,
+            sel: 0,
+        });
+    }
+
+    fn sidebar_focus_len(&self, tab: PopupTab) -> usize {
+        match tab {
+            PopupTab::Sessions => self.sorted_session_ids().len(),
+            PopupTab::Agents => self.agent_rows().len(),
+        }
+    }
+
+    fn sidebar_focus_move(&mut self, delta: i32) {
+        let Some(tab) = self.sidebar_focus.as_ref().map(|f| f.tab) else {
+            return;
+        };
+        let n = self.sidebar_focus_len(tab) as i32;
+        if n == 0 {
+            return;
+        }
+        if let Some(f) = &mut self.sidebar_focus {
+            f.sel = (f.sel as i32 + delta).rem_euclid(n) as usize;
+        }
+    }
+
+    fn sidebar_focus_tab(&mut self, to: PopupTab) {
+        if let Some(f) = &mut self.sidebar_focus {
+            f.tab = to;
+            f.sel = 0;
+        }
+    }
+
+    /// Act on the focused sidebar row (switch session / jump to agent) and exit focus.
+    fn sidebar_focus_select(&mut self) {
+        let Some(f) = self.sidebar_focus.take() else {
+            return;
+        };
+        match f.tab {
+            PopupTab::Sessions => {
+                if let Some(wid) = self.sorted_session_ids().get(f.sel).cloned() {
+                    self.switch_session(wid);
+                }
+            }
+            PopupTab::Agents => {
+                if let Some((_, _, _, term)) = self.agent_rows().get(f.sel).cloned() {
+                    self.jump_to_terminal(&term);
+                }
+            }
         }
     }
 
@@ -1984,6 +2202,7 @@ impl App {
             && self.center.is_none()
             && self.prompt.is_none()
             && self.confirm.is_none()
+            && self.sidebar_focus.is_none()
         {
             cursor_pos
         } else {
@@ -2377,9 +2596,16 @@ impl App {
         // ---- spaces (top half) ----
         let mid = (h / 2).max(2);
         put(buf, &mut 0, 0, " spaces", header);
-        let sids = self.session_ids();
+        let sids = self.sorted_session_ids();
         let active_si = self.active_session_index();
-        // Window the list so the ACTIVE session stays visible with many sessions; reserve
+        // When the sidebar has keyboard focus on Sessions, center the window on the FOCUSED
+        // row (and highlight it) instead of the active session.
+        let space_focus = match &self.sidebar_focus {
+            Some(f) if f.tab == PopupTab::Sessions => Some(f.sel.min(sids.len().saturating_sub(1))),
+            _ => None,
+        };
+        let space_center = space_focus.unwrap_or(active_si);
+        // Window the list so the centered session stays visible with many sessions; reserve
         // a row for a "+N more" hint when truncated (the full list is in `Ctrl-f`). Only
         // window when there's room for at least a session + hint (≥2 slots); otherwise show
         // what fits with no fabricated/overlapping row.
@@ -2389,7 +2615,7 @@ impl App {
             (0, space_max.min(space_total), false)
         } else {
             let vis = space_max - 1; // reserve one row for the "+N more" hint
-            (list_window_start(space_total, active_si, vis), vis, true)
+            (list_window_start(space_total, space_center, vis), vis, true)
         };
         let mut y = 1u16;
         for (i, sid) in sids.iter().enumerate().skip(space_start).take(space_vis) {
@@ -2397,6 +2623,7 @@ impl App {
                 break; // safety: never spill into the agents half
             }
             let is_active = i == active_si;
+            let is_focused = space_focus == Some(i);
             let name = self
                 .state
                 .workspace(sid)
@@ -2409,14 +2636,21 @@ impl App {
             } else {
                 CAT_OVERLAY
             };
-            let name_style = Style::default()
-                .fg(if is_active { CAT_TEXT } else { CAT_SUBTEXT })
-                .bg(panel_bg)
-                .add_modifier(if is_active {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                });
+            let name_style = if is_focused {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(if is_active { CAT_TEXT } else { CAT_SUBTEXT })
+                    .bg(panel_bg)
+                    .add_modifier(if is_active {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    })
+            };
             let mut x = 1u16;
             put(
                 buf,
@@ -2462,19 +2696,31 @@ impl App {
         let mut y = mid;
         put(buf, &mut 0, y, " agents", header);
         y += 1;
-        // Window agents too (first N + a "+M more" hint); the full list is in Ctrl-f.
+        // Window agents (around the keyboard-focused row when focusing Agents, else the
+        // top) with a "+M more" hint; the full list is in Ctrl-f.
         let agent_rows = self.agent_rows();
         let agent_max = (h.saturating_sub(mid + 1) / 2) as usize;
         let agent_total = agent_rows.len();
+        let agent_focus = match &self.sidebar_focus {
+            Some(f) if f.tab == PopupTab::Agents => Some(f.sel.min(agent_total.saturating_sub(1))),
+            _ => None,
+        };
         let (agent_vis, agent_trunc) = if agent_total <= agent_max || agent_max < 2 {
             (agent_max.min(agent_total), false)
         } else {
             (agent_max - 1, true) // reserve one row for the "+M more" hint
         };
-        for (space, tool, status, term) in agent_rows.into_iter().take(agent_vis) {
+        let agent_start = list_window_start(agent_total, agent_focus.unwrap_or(0), agent_vis);
+        for (ai, (space, tool, status, term)) in agent_rows
+            .into_iter()
+            .enumerate()
+            .skip(agent_start)
+            .take(agent_vis)
+        {
             if y + 1 >= h {
                 break;
             }
+            let is_focused = agent_focus == Some(ai);
             // tmx-style glyph + colour per status (all width-1 geometric shapes).
             let (dot, scolor) = match status {
                 "working" => ("●", CAT_GREEN),
@@ -2490,10 +2736,17 @@ impl App {
                 dot,
                 Style::default().fg(scolor).bg(panel_bg),
             );
-            let name_style = Style::default()
-                .fg(CAT_TEXT)
-                .bg(panel_bg)
-                .add_modifier(Modifier::BOLD);
+            let name_style = if is_focused {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(CAT_TEXT)
+                    .bg(panel_bg)
+                    .add_modifier(Modifier::BOLD)
+            };
             put(buf, &mut x, y, " ", name_style);
             put(buf, &mut x, y, &space, name_style);
             let mut sx = 4u16;
@@ -2750,7 +3003,7 @@ impl App {
     fn render_popup(&self, buf: &mut Buffer) {
         let Some(p) = self.popup.as_ref() else { return };
         let area = buf.area;
-        let items = self.popup_items(&p.filter);
+        let items = self.popup_items(p.tab, &p.filter);
 
         // Clamp bounds so `min <= max` even on tiny/narrow terminals (the popup
         // is the narrow/mobile fallback, so it must never panic there).
@@ -2808,13 +3061,13 @@ impl App {
                 }
             };
 
-        // Title in the top border.
+        // Title in the top border (with the key hints).
         put(
             buf,
             y0,
             x0 + 2,
             w.saturating_sub(4),
-            " go to — session / agent ",
+            " go to  (←/→ tab · ^R rename) ",
             Style::default()
                 .fg(Color::Cyan)
                 .bg(bg)
@@ -2824,10 +3077,43 @@ impl App {
         let inner_x = x0 + 2;
         let inner_w = w.saturating_sub(4);
 
-        // Row 1: the fuzzy filter input with a block cursor.
+        // Row 1: the two tabs (Left/Right switches), active one highlighted.
+        let tab_hi = Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD);
+        let tab_lo = Style::default().fg(CAT_OVERLAY).bg(bg);
+        let mut tx = inner_x;
         put(
             buf,
             y0 + 1,
+            tx,
+            10,
+            " sessions ",
+            if p.tab == PopupTab::Sessions {
+                tab_hi
+            } else {
+                tab_lo
+            },
+        );
+        tx += 10;
+        put(
+            buf,
+            y0 + 1,
+            tx,
+            8,
+            " agents ",
+            if p.tab == PopupTab::Agents {
+                tab_hi
+            } else {
+                tab_lo
+            },
+        );
+
+        // Row 2: the fuzzy filter input with a block cursor.
+        put(
+            buf,
+            y0 + 2,
             inner_x,
             inner_w,
             &format!("> {}█", p.filter),
@@ -2835,8 +3121,8 @@ impl App {
         );
 
         // Remaining rows: the filtered items, scrolled so the selection stays visible.
-        let list_top = y0 + 2;
-        let visible = (h.saturating_sub(3)) as usize; // minus borders + filter line
+        let list_top = y0 + 3;
+        let visible = (h.saturating_sub(4)) as usize; // borders + tab + filter lines
         if items.is_empty() {
             put(
                 buf,

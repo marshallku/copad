@@ -44,6 +44,31 @@ fn default_restore_processes() -> Vec<String> {
         .collect()
 }
 
+/// How sessions are ordered in the sidebar + `Ctrl-f` switcher + `)`/`(` cycling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortBy {
+    /// Creation order (default; new sessions append).
+    Created,
+    /// By name, case-insensitive (like `tmx`).
+    Alphabetical,
+    /// Most-recently-switched-to first (MRU).
+    Recent,
+    /// Sessions with an active (working/blocked) agent first.
+    Activity,
+}
+
+impl SortBy {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "created" | "creation" => SortBy::Created,
+            "alphabetical" | "alpha" | "name" => SortBy::Alphabetical,
+            "recent" | "mru" => SortBy::Recent,
+            "activity" | "active" => SortBy::Activity,
+            _ => return None,
+        })
+    }
+}
+
 /// Every user-bindable action (each current binding, plus `KillSession`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -76,6 +101,8 @@ pub enum Action {
     ResizeUp,
     ResizeRight,
     Popup,
+    /// Focus the always-on left sidebar for keyboard navigation (nvim-explorer-style).
+    FocusSidebar,
     /// Arm the prefix (`Ctrl-b`). A global-table action like any other, but prefix
     /// entry always wins over a colliding user binding.
     EnterPrefix,
@@ -268,6 +295,7 @@ fn action_from_name(name: &str) -> Option<Action> {
         "resize-up" => Action::ResizeUp,
         "resize-right" => Action::ResizeRight,
         "popup" => Action::Popup,
+        "focus-sidebar" => Action::FocusSidebar,
         "prefix" => Action::EnterPrefix,
         _ => {
             // tab-1 .. tab-9
@@ -311,6 +339,7 @@ fn default_bindings() -> Vec<(Action, Ctx, &'static [&'static str])> {
         (FocusNext, Prefix, &["o"]),
         (ClosePane, Prefix, &["x"]),
         (ToggleSidebar, Prefix, &["s"]),
+        (FocusSidebar, Prefix, &["e"]),
         (NewTab, Prefix, &["c"]),
         (NextTab, Prefix, &["n"]),
         (PrevTab, Prefix, &["p"]),
@@ -379,6 +408,8 @@ pub struct MuxConfig {
     /// -resurrect's process whitelist). Default = the built-in AI agents; an empty list
     /// disables program re-execution (panes restore as bare shells).
     pub restore_processes: Vec<String>,
+    /// Session ordering in the sidebar / switcher / cycle.
+    pub sort_by: SortBy,
 }
 
 #[derive(Deserialize, Default)]
@@ -393,6 +424,7 @@ struct RawConfig {
     persist: Option<bool>,
     autosave_secs: Option<i64>,
     restore_processes: Option<Vec<String>>,
+    sort_by: Option<String>,
     keys: Option<HashMap<String, ChordSpec>>,
     global: Option<HashMap<String, ChordSpec>>,
 }
@@ -465,6 +497,7 @@ impl MuxConfig {
             persist: true,
             autosave_secs: DEFAULT_AUTOSAVE_SECS,
             restore_processes: default_restore_processes(),
+            sort_by: SortBy::Created,
         }
     }
 
@@ -550,6 +583,16 @@ impl MuxConfig {
                 restore_processes: raw
                     .restore_processes
                     .unwrap_or_else(default_restore_processes),
+                sort_by: match raw.sort_by.as_deref() {
+                    None => SortBy::Created,
+                    Some(s) => SortBy::parse(s).unwrap_or_else(|| {
+                        warnings.push(format!(
+                            "sort_by '{s}' unknown (created|alphabetical|recent|activity) — \
+                             using created"
+                        ));
+                        SortBy::Created
+                    }),
+                },
             },
             warnings,
         )
@@ -920,6 +963,24 @@ mod tests {
         assert_eq!(cfg.autosave_secs, DEFAULT_AUTOSAVE_SECS);
         // restore_processes defaults to the built-in agents (claude et al.).
         assert!(cfg.restore_processes.iter().any(|p| p == "claude"));
+    }
+
+    #[test]
+    fn sort_by_parses_and_defaults() {
+        assert_eq!(MuxConfig::default().sort_by, SortBy::Created);
+        assert_eq!(
+            load_str("sort_by = \"alphabetical\"").0.sort_by,
+            SortBy::Alphabetical
+        );
+        assert_eq!(load_str("sort_by = \"recent\"").0.sort_by, SortBy::Recent);
+        assert_eq!(
+            load_str("sort_by = \"activity\"").0.sort_by,
+            SortBy::Activity
+        );
+        // Unknown → default + warning.
+        let (cfg, warns) = load_str("sort_by = \"bogus\"");
+        assert_eq!(cfg.sort_by, SortBy::Created);
+        assert!(warns.iter().any(|w| w.contains("sort_by")));
     }
 
     #[test]

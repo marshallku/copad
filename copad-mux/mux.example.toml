@@ -18,6 +18,8 @@ sidebar = true            # show the spaces+agents sidebar by default (Ctrl-b s 
 sidebar_width = 24        # sidebar columns            (clamped to 8..80)
 sidebar_min_cols = 80     # hide the sidebar below this terminal width (>= width + 20)
 scroll_step = 3           # lines per mouse-wheel notch (1..50)
+sort_by = "created"       # session order in the sidebar / Ctrl-f switcher / )( cycle:
+                          #   created (default) | alphabetical | recent | activity
 
 # ---- session persistence (tmux-resurrect / continuum style) ----
 # The layout (sessions, tabs, splits, per-pane cwd) is autosaved and restored when the
@@ -55,6 +57,7 @@ autosave_secs = 15        # periodic save interval; 0 disables (clamped to 5..36
 # detach = ["d", "q"]
 # close-pane = "x"
 # toggle-sidebar = "s"
+# focus-sidebar = "e"     # keyboard-focus the sidebar (↑↓ list, ←→ spaces/agents, Enter, Esc)
 # scrollback = "["
 # focus-next = "o"
 # focus-left = ["h", "Left"]
