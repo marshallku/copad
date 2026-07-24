@@ -89,7 +89,30 @@ struct Client {
     rows: u16,
 }
 
-/// The uid on the other end of a Unix socket (same on Linux + macOS via getpeereid).
+/// The uid on the other end of a Unix socket. `libc::getpeereid` is only bound for
+/// BSD/macOS in the `libc` crate, so Linux uses the `SO_PEERCRED` socket option instead.
+/// (`UnixStream::peer_cred` would be cross-platform but is still unstable.)
+#[cfg(target_os = "linux")]
+fn peer_uid(stream: &UnixStream) -> Option<u32> {
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::from_mut(&mut cred).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0).then_some(cred.uid)
+}
+
+#[cfg(not(target_os = "linux"))]
 fn peer_uid(stream: &UnixStream) -> Option<u32> {
     let mut uid: libc::uid_t = 0;
     let mut gid: libc::gid_t = 0;
