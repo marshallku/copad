@@ -20,6 +20,12 @@ sidebar_min_cols = 80     # hide the sidebar below this terminal width (>= width
 scroll_step = 3           # lines per mouse-wheel notch (1..50)
 sort_by = "created"       # session order in the sidebar / Ctrl-f switcher / )( cycle:
                           #   created (default) | alphabetical | recent | activity
+usage = "bar"             # status-bar Claude/Codex rate-limit readout:
+                          #   bar (default) — a progress bar per window on wide terminals
+                          #     (5h ━━━╌╌╌╌╌ 34%), falling back to percentages when narrow
+                          #   text — percentages only (claude 5h 5% wk 34% · codex wk 60%)
+                          #   off  — hidden (same as COPAD_MUX_USAGE=0)
+usage_bar_width = 8       # cells per progress bar when usage = "bar"  (3..30)
 
 # ---- session persistence (tmux-resurrect / continuum style) ----
 # The layout (sessions, tabs, splits, per-pane cwd) is autosaved and restored when the

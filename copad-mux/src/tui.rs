@@ -23,7 +23,7 @@ use ratatui::style::{Color, Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agentstate;
-use crate::config::{self, Action, MuxConfig, SortBy};
+use crate::config::{self, Action, MuxConfig, SortBy, UsageStyle};
 use crate::control;
 use crate::gitinfo;
 use crate::model::{
@@ -36,7 +36,7 @@ use crate::procinfo;
 use crate::proto::MouseKind;
 use crate::state::{Command, Event, MuxError, Origin, RestoredTab, State};
 use crate::term::{CellColor, PaneTerm};
-use crate::usagepoll;
+use crate::usagepoll::{self, UsageSnapshot};
 
 /// Direction for focus navigation with the arrow keys.
 #[derive(Clone, Copy)]
@@ -251,9 +251,9 @@ pub struct App {
     /// Shared usage/limits readout (`coctl usage --limits`), written by a background
     /// poller thread (`usagepoll`), read into `usage_shown` at the label cadence.
     usage_poll: usagepoll::Shared,
-    /// The usage string currently folded into the rendered status bar; compared to
+    /// The usage snapshot currently folded into the rendered status bar; compared to
     /// the shared handle so a change triggers a repaint through `maybe_refresh_labels`.
-    usage_shown: String,
+    usage_shown: Option<UsageSnapshot>,
 }
 
 impl App {
@@ -332,7 +332,7 @@ impl App {
             // Idle until `start_usage_poll` (called by the server); tests that build an
             // App without a server never spawn the poller thread.
             usage_poll: usagepoll::idle(),
-            usage_shown: String::new(),
+            usage_shown: None,
         };
         app.reflow();
         Ok(app)
@@ -2681,19 +2681,20 @@ impl App {
     }
 
     /// Start the background usage/limits poller (server-only; see `usagepoll`).
-    /// Replaces the idle handle installed by `new` with a live one.
+    /// Replaces the idle handle installed by `new` with a live one. Skipped when
+    /// `usage = "off"` so a disabled readout costs no `coctl`/network polling
+    /// (matching `COPAD_MUX_USAGE=0`).
     pub fn start_usage_poll(&mut self) {
+        if self.cfg.usage == UsageStyle::Off {
+            return;
+        }
         self.usage_poll = usagepoll::spawn();
     }
 
-    /// Fold the latest polled usage string into `usage_shown`; returns whether it
+    /// Fold the latest polled usage snapshot into `usage_shown`; returns whether it
     /// changed (so the loop repaints the status bar). Poison-safe read.
     fn refresh_usage(&mut self) -> bool {
-        let current = self
-            .usage_poll
-            .lock()
-            .map(|g| g.clone())
-            .unwrap_or_default();
+        let current = self.usage_poll.lock().map(|g| g.clone()).unwrap_or(None);
         if current != self.usage_shown {
             self.usage_shown = current;
             true
@@ -3284,11 +3285,33 @@ impl App {
             ));
         }
         // Usage/limits readout (Claude 5h+weekly · Codex weekly), left of the clock.
-        // Only on wide-enough terminals — it's ~30 cols and would crowd out tab chips
-        // on a narrow/mobile view (same size-adaptive spirit as the sidebar).
-        if !self.usage_shown.is_empty() && self.cols >= 100 {
+        // `usage = "bar"` draws a progress bar per window when the terminal is wide
+        // enough for it, else falls back to percentages; `"text"` is always
+        // percentages; `"off"` hides it. Either form only shows at cols >= 100 —
+        // it would crowd out tab chips on a narrow/mobile view (size-adaptive, like
+        // the sidebar).
+        if let Some(u) = &self.usage_shown
+            && !u.is_empty()
+            && self.cfg.usage != UsageStyle::Off
+            && self.cols >= 100
+        {
+            // Bars are wider than text, so only draw them when the WHOLE bar
+            // segment fits alongside `USAGE_BARS_RESERVE_COLS` kept for the rest of
+            // the right cluster (session pill · counts · clock · host) plus a couple
+            // of tab chips; below that, fall back to percentages. Tabs window on
+            // overflow, so this reserve is about readability, not correctness.
+            const USAGE_BARS_RESERVE_COLS: usize = 64;
+            let seg = if self.cfg.usage == UsageStyle::Bar
+                && (self.cols as usize)
+                    >= USAGE_BARS_RESERVE_COLS
+                        + usagepoll::bar_display_width(u, self.cfg.usage_bar_width)
+            {
+                u.bar(self.cfg.usage_bar_width)
+            } else {
+                u.text()
+            };
             segs.push((
-                format!(" {} ", self.usage_shown),
+                format!(" {seg} "),
                 Style::default().fg(CAT_SUBTEXT).bg(CAT_SURFACE0),
             ));
         }

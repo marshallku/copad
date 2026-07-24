@@ -31,6 +31,8 @@ pub const DEFAULT_SIDEBAR_MIN_COLS: u16 = 80;
 pub const DEFAULT_SCROLL_STEP: i32 = 3;
 /// Default periodic autosave interval (seconds) for session persistence.
 pub const DEFAULT_AUTOSAVE_SECS: u32 = 15;
+/// Default cells per progress bar for `usage = "bar"`.
+pub const DEFAULT_USAGE_BAR_WIDTH: u16 = 8;
 /// Minimum pane-content width kept to the right of the sidebar; `sidebar_min_cols`
 /// is forced to at least `sidebar_width + this` so a visible sidebar can never eat
 /// the whole viewport.
@@ -64,6 +66,29 @@ impl SortBy {
             "alphabetical" | "alpha" | "name" => SortBy::Alphabetical,
             "recent" | "mru" => SortBy::Recent,
             "activity" | "active" => SortBy::Activity,
+            _ => return None,
+        })
+    }
+}
+
+/// How the status-bar usage/limits readout is rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageStyle {
+    /// Hidden entirely (equivalent to `COPAD_MUX_USAGE=0`).
+    Off,
+    /// Percentages only: `claude 5h 5% wk 34% · codex wk 60%`.
+    Text,
+    /// A progress bar per window on wide terminals (`5h ━━━╌╌╌╌╌ 34%`),
+    /// falling back to `Text` when the terminal is too narrow for the bars.
+    Bar,
+}
+
+impl UsageStyle {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" | "hidden" => UsageStyle::Off,
+            "text" | "percent" | "pct" => UsageStyle::Text,
+            "bar" | "bars" | "progress" => UsageStyle::Bar,
             _ => return None,
         })
     }
@@ -445,6 +470,10 @@ pub struct MuxConfig {
     pub restore_agent_sessions: bool,
     /// Session ordering in the sidebar / switcher / cycle.
     pub sort_by: SortBy,
+    /// How the status-bar usage/limits readout is rendered (off/text/bar).
+    pub usage: UsageStyle,
+    /// Width in cells of each progress bar when `usage = "bar"`.
+    pub usage_bar_width: u16,
     /// `comux worktree create` naming + post-create hooks.
     pub worktree: WorktreeConfig,
 }
@@ -463,6 +492,8 @@ struct RawConfig {
     restore_processes: Option<Vec<String>>,
     restore_agent_sessions: Option<bool>,
     sort_by: Option<String>,
+    usage: Option<String>,
+    usage_bar_width: Option<i64>,
     keys: Option<HashMap<String, ChordSpec>>,
     global: Option<HashMap<String, ChordSpec>>,
     worktree: Option<RawWorktree>,
@@ -544,6 +575,8 @@ impl MuxConfig {
             restore_processes: default_restore_processes(),
             restore_agent_sessions: true,
             sort_by: SortBy::Created,
+            usage: UsageStyle::Bar,
+            usage_bar_width: DEFAULT_USAGE_BAR_WIDTH,
             worktree: WorktreeConfig {
                 naming: crate::worktree::DEFAULT_NAMING.to_string(),
                 scripts: HashMap::new(),
@@ -646,6 +679,21 @@ impl MuxConfig {
                         SortBy::Created
                     }),
                 },
+                usage: match raw.usage.as_deref() {
+                    None => UsageStyle::Bar,
+                    Some(s) => UsageStyle::parse(s).unwrap_or_else(|| {
+                        warnings.push(format!("usage '{s}' unknown (off|text|bar) — using bar"));
+                        UsageStyle::Bar
+                    }),
+                },
+                usage_bar_width: clamp_field(
+                    raw.usage_bar_width,
+                    DEFAULT_USAGE_BAR_WIDTH as i64,
+                    3,
+                    30,
+                    "usage_bar_width",
+                    &mut warnings,
+                ) as u16,
                 worktree,
             },
             warnings,
@@ -1041,6 +1089,27 @@ mod tests {
             Some(Action::EnterPrefix)
         );
         assert!(warns.iter().any(|w| w.contains("shadow")));
+    }
+
+    #[test]
+    fn usage_style_parses_and_defaults() {
+        assert_eq!(MuxConfig::default().usage, UsageStyle::Bar);
+        assert_eq!(
+            MuxConfig::default().usage_bar_width,
+            DEFAULT_USAGE_BAR_WIDTH
+        );
+        assert_eq!(load_str("usage = \"text\"").0.usage, UsageStyle::Text);
+        assert_eq!(load_str("usage = \"off\"").0.usage, UsageStyle::Off);
+        assert_eq!(load_str("usage = \"bar\"").0.usage, UsageStyle::Bar);
+        // unknown → warns, falls back to bar
+        let (cfg, warns) = load_str("usage = \"bogus\"");
+        assert_eq!(cfg.usage, UsageStyle::Bar);
+        assert!(warns.iter().any(|w| w.contains("usage")));
+        // bar width clamps into [3,30]
+        assert_eq!(load_str("usage_bar_width = 12").0.usage_bar_width, 12);
+        let (cfg, warns) = load_str("usage_bar_width = 999");
+        assert_eq!(cfg.usage_bar_width, 30);
+        assert!(warns.iter().any(|w| w.contains("usage_bar_width")));
     }
 
     #[test]
