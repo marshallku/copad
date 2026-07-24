@@ -1364,7 +1364,7 @@ async fn handle_ws_tmux_overview(
     axum::extract::State(state): axum::extract::State<AppState>,
     ws: axum::extract::WebSocketUpgrade,
 ) -> impl axum::response::IntoResponse {
-    let proto = format!("bearer.{}", &state.token);
+    let proto = format!("bearer.{}", state.token);
     ws.protocols([proto]).on_upgrade(move |socket| async move {
         use axum::extract::ws::Message;
         use futures_util::{SinkExt, StreamExt};
@@ -1430,7 +1430,7 @@ async fn handle_ws_tmux_attach(
     let Some(pane) = tmux::find_pane(&panes, &pane_id).cloned() else {
         return (StatusCode::NOT_FOUND, format!("pane {pane_id} not found\n")).into_response();
     };
-    let proto = format!("bearer.{}", &state.token);
+    let proto = format!("bearer.{}", state.token);
     ws.protocols([proto])
         .on_upgrade(move |socket| async move {
             if let Err(e) = run_attach(socket, pane).await {
@@ -1651,7 +1651,7 @@ async fn handle_ws_events(
     // string. axum filters out non-matches automatically — wrong
     // tokens are already rejected by the auth middleware upstream,
     // so by the time we're here we trust the token in state.
-    let proto = format!("bearer.{}", &state.token);
+    let proto = format!("bearer.{}", state.token);
     ws.protocols([proto]).on_upgrade(move |socket| async move {
         let (mut sink, mut stream) = futures_split(socket);
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(64);
