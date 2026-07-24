@@ -439,6 +439,10 @@ pub struct MuxConfig {
     /// -resurrect's process whitelist). Default = the built-in AI agents; an empty list
     /// disables program re-execution (panes restore as bare shells).
     pub restore_processes: Vec<String>,
+    /// When re-running a restored agent (`restore_processes`), resume its live conversation
+    /// instead of starting fresh — `claude --resume <id>` / `codex resume <id>`, using the
+    /// session the process was actually in. Default on; set false to always restart cleanly.
+    pub restore_agent_sessions: bool,
     /// Session ordering in the sidebar / switcher / cycle.
     pub sort_by: SortBy,
     /// `comux worktree create` naming + post-create hooks.
@@ -457,6 +461,7 @@ struct RawConfig {
     persist: Option<bool>,
     autosave_secs: Option<i64>,
     restore_processes: Option<Vec<String>>,
+    restore_agent_sessions: Option<bool>,
     sort_by: Option<String>,
     keys: Option<HashMap<String, ChordSpec>>,
     global: Option<HashMap<String, ChordSpec>>,
@@ -537,6 +542,7 @@ impl MuxConfig {
             persist: true,
             autosave_secs: DEFAULT_AUTOSAVE_SECS,
             restore_processes: default_restore_processes(),
+            restore_agent_sessions: true,
             sort_by: SortBy::Created,
             worktree: WorktreeConfig {
                 naming: crate::worktree::DEFAULT_NAMING.to_string(),
@@ -629,6 +635,7 @@ impl MuxConfig {
                 restore_processes: raw
                     .restore_processes
                     .unwrap_or_else(default_restore_processes),
+                restore_agent_sessions: raw.restore_agent_sessions.unwrap_or(true),
                 sort_by: match raw.sort_by.as_deref() {
                     None => SortBy::Created,
                     Some(s) => SortBy::parse(s).unwrap_or_else(|| {
@@ -1043,6 +1050,13 @@ mod tests {
         assert_eq!(cfg.autosave_secs, DEFAULT_AUTOSAVE_SECS);
         // restore_processes defaults to the built-in agents (claude et al.).
         assert!(cfg.restore_processes.iter().any(|p| p == "claude"));
+        // Resuming the live agent conversation on restore is on by default.
+        assert!(cfg.restore_agent_sessions);
+        assert!(
+            !load_str("restore_agent_sessions = false")
+                .0
+                .restore_agent_sessions
+        );
     }
 
     #[test]

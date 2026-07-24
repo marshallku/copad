@@ -35,6 +35,12 @@ autosave_secs = 15        # periodic save interval; 0 disables (clamped to 5..36
 # droid, copilot, qwen, crush). Set [] to restore bare shells only; add your own (e.g.
 # "nvim") to extend. (Restored panes start at the scrollback bottom — history isn't saved.)
 # restore_processes = ["claude", "codex", "nvim"]
+# When re-running a restored agent, RESUME its live conversation rather than starting fresh:
+# claude → `claude --resume <id>`, codex → `codex resume <id>`, using the session the process
+# was actually in (Claude's session id comes from ~/.claude/sessions/<pid>.json; Codex's from
+# the rollout file it holds open). Safe runtime flags (e.g. --dangerously-skip-permissions,
+# --model) carry over; the prompt and one-shot `-p` runs don't. Set false to always restart clean.
+restore_agent_sessions = true
 
 # ---- git worktrees (`comux worktree create|list|rm`, tmx `twt`-style) ----
 # `comux worktree create <branch>` runs `git worktree add -b <branch>` placing the new

@@ -2628,7 +2628,21 @@ impl App {
                     if !whitelisted {
                         return None;
                     }
-                    let argv = procinfo::process_command(label.pid)?;
+                    let mut argv = procinfo::process_command(label.pid)?;
+                    // Resume the live conversation instead of re-running the agent fresh:
+                    // rebuild the command to resume the agent's current session. Gated on the
+                    // pid still hosting the same agent we labeled (guards a pid reused between
+                    // the process-tree snapshot and this read) so we never splice a session id
+                    // onto an unrelated process's argv.
+                    if self.cfg.restore_agent_sessions
+                        && argv
+                            .first()
+                            .map(|p| p.rsplit('/').next().unwrap_or(p))
+                            .is_some_and(|base| base.eq_ignore_ascii_case(&label.text))
+                        && let Some(id) = agentstate::agent_session_id(&label.text, label.pid)
+                    {
+                        argv = agentstate::resume_argv(&label.text, &argv, &id);
+                    }
                     let total: usize = argv.iter().map(|a| a.len() + 1).sum();
                     if argv.is_empty() || argv.len() > 64 || total > persist::MAX_COMMAND_LEN {
                         return None;

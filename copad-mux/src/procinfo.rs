@@ -134,6 +134,47 @@ pub fn process_command(_pid: u32) -> Option<Vec<String>> {
     None
 }
 
+/// The regular files a process holds open, used to resolve an agent's live session file
+/// (e.g. the Codex rollout `…/rollout-<ts>-<uuid>.jsonl` an interactive TUI keeps open).
+/// Linux reads the `/proc/<pid>/fd` symlinks; macOS shells out to `lsof -p <pid> -Fn`. Empty
+/// on failure (the caller then falls back to a fresh restart, never a wrong session).
+#[cfg(target_os = "linux")]
+pub fn open_files(pid: u32) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
+        for entry in rd.flatten() {
+            if let Ok(target) = std::fs::read_link(entry.path()) {
+                out.push(target);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(target_os = "macos")]
+pub fn open_files(pid: u32) -> Vec<PathBuf> {
+    // `lsof -Fn` emits one field per line prefixed by its type letter; `n` = the file name.
+    let Ok(output) = Command::new("lsof")
+        .args(["-p", &pid.to_string(), "-Fn"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix('n'))
+        .map(PathBuf::from)
+        .collect()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn open_files(_pid: u32) -> Vec<PathBuf> {
+    Vec::new()
+}
+
 /// What a pane is running, for styling the sidebar/popup row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {

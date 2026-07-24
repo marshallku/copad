@@ -45,15 +45,44 @@ pub fn resolve(pid: Option<u32>, snap: &Snapshot) -> AgentStatus {
     screen_status(snap)
 }
 
+/// Path of Claude's per-process status file, `~/.claude/sessions/<pid>.json`.
+fn claude_session_file(pid: u32) -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        std::path::Path::new(&home)
+            .join(".claude")
+            .join("sessions")
+            .join(format!("{pid}.json")),
+    )
+}
+
 /// Read `~/.claude/sessions/<pid>.json` → `status` field. `None` on any failure
 /// (missing/unreadable/malformed/unknown status) so the caller falls back.
 pub fn claude_session_status(pid: u32) -> Option<AgentStatus> {
-    let home = std::env::var_os("HOME")?;
-    let path = std::path::Path::new(&home)
-        .join(".claude")
-        .join("sessions")
-        .join(format!("{pid}.json"));
-    parse_session_status(&std::fs::read_to_string(path).ok()?)
+    parse_session_status(&std::fs::read_to_string(claude_session_file(pid)?).ok()?)
+}
+
+/// Read Claude's live conversation id from `~/.claude/sessions/<pid>.json` → `sessionId`.
+/// This is the AUTHORITATIVE current session for the process, even if it was launched with
+/// `--resume <old-id>` / `--continue` (Claude may have forked to a new id) — so restore
+/// resumes what's actually on screen, not the stale launch argument. `None` on any failure
+/// or a value that isn't a UUID (reject rather than resume the wrong thing).
+pub fn claude_session_id(pid: u32) -> Option<String> {
+    let json = std::fs::read_to_string(claude_session_file(pid)?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&json).ok()?;
+    let id = v.get("sessionId").and_then(|s| s.as_str())?;
+    is_session_uuid(id).then(|| id.to_string())
+}
+
+/// A Claude/Codex session id is a UUID (`8-4-4-4-12` hex groups). Validate strictly so a
+/// malformed/hostile value never lands on a restored command line.
+pub fn is_session_uuid(s: &str) -> bool {
+    let groups: Vec<&str> = s.split('-').collect();
+    groups.len() == 5
+        && [8usize, 4, 4, 4, 12]
+            .iter()
+            .zip(&groups)
+            .all(|(&len, g)| g.len() == len && g.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// Parse Claude's session JSON → status. `None` on malformed JSON or an unrecognized
@@ -137,6 +166,203 @@ fn is_ready_prompt(line: &str) -> bool {
         return false;
     }
     true
+}
+
+// ===== session restore: resume the actual conversation, not just re-run the agent =====
+//
+// On session restore, comux re-runs a whitelisted agent's saved argv. Bare re-execution
+// starts a FRESH conversation, losing the work in progress. These helpers rebuild the
+// command so it RESUMES the live conversation instead: they resolve the agent's current
+// session id (Claude: a pid-keyed status file; Codex: the rollout file the process holds
+// open) and reconstruct a canonical resume command.
+//
+// Reconstruction is canonical (not a surgical argv edit) on purpose: without each flag's
+// arity we can't reliably tell an option's value from a positional prompt, so re-running an
+// edited argv risks replaying the initial prompt or carrying a conflicting selector. Instead
+// we rebuild `claude --resume <id> <safe-flags…>` / `codex resume <id>` from scratch, keeping
+// only an allowlist of arity-known, session-independent runtime flags.
+
+/// Resolve an agent's live session id from its pid, dispatching on the command basename.
+/// `None` (→ leave the argv untouched → fresh start) when the agent is unknown or its id
+/// can't be resolved.
+pub fn agent_session_id(comm: &str, pid: u32) -> Option<String> {
+    match comm.to_ascii_lowercase().as_str() {
+        "claude" => claude_session_id(pid),
+        "codex" => codex_session_id(pid),
+        _ => None,
+    }
+}
+
+/// Rebuild a whitelisted agent's argv into a resume command for `session_id`. `comm` is the
+/// program basename; `argv` is what it was launched with. Returns the argv unchanged when the
+/// agent is unknown, the invocation shouldn't be resumed (one-shot / non-interactive), or
+/// `session_id` isn't a UUID.
+pub fn resume_argv(comm: &str, argv: &[String], session_id: &str) -> Vec<String> {
+    if argv.is_empty() || !is_session_uuid(session_id) {
+        return argv.to_vec();
+    }
+    match comm.to_ascii_lowercase().as_str() {
+        "claude" => claude_resume_argv(argv, session_id),
+        "codex" => codex_resume_argv(argv, session_id),
+        _ => argv.to_vec(),
+    }
+}
+
+/// Claude runtime flags safe to carry into a resumed session, with their arity. Session
+/// SELECTORS (`--resume`/`-r`/`--continue`/`-c`/`--session-id`/`--fork-session`) are
+/// deliberately absent — the injected `--resume <id>` is the single source of truth. So are
+/// value flags whose arity is variadic/ambiguous (`--add-dir`, `--mcp-config`), which we drop
+/// rather than risk mis-parsing.
+const CLAUDE_BOOL_FLAGS: &[&str] = &[
+    "--dangerously-skip-permissions",
+    "--verbose",
+    "--ide",
+    "--safe-mode",
+    "--bare",
+];
+const CLAUDE_VALUE_FLAGS: &[&str] = &["--model", "--permission-mode", "--settings", "--agent"];
+
+/// `claude … → claude --resume <id> <carried-flags…>`. Skips (returns argv unchanged) for
+/// non-interactive `-p`/`--print` and `--no-session-persistence` invocations, which have no
+/// resumable interactive conversation.
+fn claude_resume_argv(argv: &[String], session_id: &str) -> Vec<String> {
+    if argv
+        .iter()
+        .any(|a| matches!(a.as_str(), "-p" | "--print" | "--no-session-persistence"))
+    {
+        return argv.to_vec();
+    }
+    let mut out = vec![
+        argv[0].clone(),
+        "--resume".to_string(),
+        session_id.to_string(),
+    ];
+    out.extend(carry_flags(
+        &argv[1..],
+        CLAUDE_BOOL_FLAGS,
+        CLAUDE_VALUE_FLAGS,
+    ));
+    out
+}
+
+/// `codex [flags] [prompt] → codex resume <id>`. Only rebuilt for the interactive TUI form;
+/// an explicit subcommand (`codex exec`, `codex resume`, `codex review`, …) is left as-is so
+/// we never wrap a non-interactive run or double a resume. Codex `resume` accepts a UUID
+/// directly; flags/prompt are dropped (the conversation they seeded is already in the rollout).
+fn codex_resume_argv(argv: &[String], session_id: &str) -> Vec<String> {
+    // Skip if ANY token is a subcommand name, not just the first non-option one: a value-taking
+    // global flag can put a non-option token AHEAD of the subcommand (`codex --cd /repo exec …`),
+    // and we don't track per-flag arity. Over-approximating toward "skip" is the safe direction —
+    // a missed resume just restarts fresh, whereas wrapping a real `exec`/`review` run would break
+    // it. A bare prompt equal to a subcommand word (`codex review`) is ambiguous; skipping is safe.
+    if argv[1..].iter().any(|a| is_codex_subcommand(a)) {
+        return argv.to_vec();
+    }
+    vec![
+        argv[0].clone(),
+        "resume".to_string(),
+        session_id.to_string(),
+    ]
+}
+
+fn is_codex_subcommand(s: &str) -> bool {
+    const SUBCOMMANDS: &[&str] = &[
+        "exec",
+        "e",
+        "review",
+        "login",
+        "logout",
+        "mcp",
+        "plugin",
+        "mcp-server",
+        "app-server",
+        "remote-control",
+        "app",
+        "completion",
+        "update",
+        "doctor",
+        "sandbox",
+        "debug",
+        "apply",
+        "a",
+        "resume",
+        "archive",
+        "delete",
+        "unarchive",
+        "fork",
+        "cloud",
+        "exec-server",
+        "features",
+        "help",
+    ];
+    SUBCOMMANDS.contains(&s)
+}
+
+/// Filter an argv tail to an allowlist of boolean (arity-0) and value (arity-1) flags,
+/// carrying each recognized flag (and, for value flags, its following argument) through and
+/// dropping everything else (positional prompt, unknown flags, session selectors).
+fn carry_flags(tail: &[String], bool_flags: &[&str], value_flags: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < tail.len() {
+        let a = tail[i].as_str();
+        if bool_flags.contains(&a) {
+            out.push(tail[i].clone());
+        } else if let Some(eq) = a.find('=') {
+            // `--flag=value` form: carry whole if the flag part is an allowed value flag.
+            if value_flags.contains(&&a[..eq]) {
+                out.push(tail[i].clone());
+            }
+        } else if value_flags.contains(&a) {
+            out.push(tail[i].clone());
+            if i + 1 < tail.len() {
+                out.push(tail[i + 1].clone());
+                i += 1; // consume the value
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Read Codex's live conversation id from the rollout file the process holds open
+/// (`~/.codex/sessions/**/rollout-<ts>-<uuid>.jsonl`). An interactive Codex TUI keeps exactly
+/// its one session file open; if several are open (broker/subsessions), the most-recently
+/// modified one is the live session. `None` if no rollout is open (→ fresh start on restore).
+pub fn codex_session_id(pid: u32) -> Option<String> {
+    let mut best: Option<(std::time::SystemTime, String)> = None;
+    for path in crate::procinfo::open_files(pid) {
+        let Some(id) = rollout_session_id(&path) else {
+            continue;
+        };
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(bm, _)| mtime >= *bm) {
+            best = Some((mtime, id));
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
+/// Extract the UUID from a Codex rollout path `…/sessions/…/rollout-<ts>-<uuid>.jsonl`. The
+/// timestamp segment also contains dashes, so the id is the trailing five hex groups. `None`
+/// unless the path is under a `sessions` dir and ends in a valid rollout filename.
+fn rollout_session_id(path: &std::path::Path) -> Option<String> {
+    if !path.components().any(|c| c.as_os_str() == "sessions") {
+        return None;
+    }
+    let stem = path
+        .file_name()?
+        .to_str()?
+        .strip_prefix("rollout-")?
+        .strip_suffix(".jsonl")?;
+    let groups: Vec<&str> = stem.split('-').collect();
+    if groups.len() < 5 {
+        return None;
+    }
+    let id = groups[groups.len() - 5..].join("-");
+    is_session_uuid(&id).then_some(id)
 }
 
 #[cfg(test)]
@@ -224,5 +450,149 @@ mod tests {
         assert_eq!(parse_session_status(r#"{"status":"weird"}"#), None);
         assert_eq!(parse_session_status(r#"{"other":1}"#), None);
         assert_eq!(parse_session_status("not json"), None);
+    }
+
+    const ID: &str = "36213526-fd15-4fc9-b146-842f71382088";
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn is_session_uuid_validates_shape() {
+        assert!(is_session_uuid(ID));
+        assert!(is_session_uuid("019f91a2-b982-7681-9493-14ad6d653f1e"));
+        assert!(!is_session_uuid("not-a-uuid"));
+        assert!(!is_session_uuid("36213526fd154fc9b146842f71382088")); // no dashes
+        assert!(!is_session_uuid("36213526-fd15-4fc9-b146-842f7138208g")); // non-hex
+        assert!(!is_session_uuid("")); // empty
+    }
+
+    #[test]
+    fn claude_resume_rebuilds_and_carries_safe_flags() {
+        // Bare launch → resume with the live id.
+        assert_eq!(
+            resume_argv("claude", &argv(&["claude"]), ID),
+            argv(&["claude", "--resume", ID])
+        );
+        // A full path basename still classifies as claude via the caller; here comm is passed.
+        assert_eq!(
+            resume_argv(
+                "claude",
+                &argv(&["claude", "--dangerously-skip-permissions"]),
+                ID
+            ),
+            argv(&["claude", "--resume", ID, "--dangerously-skip-permissions"])
+        );
+        // Value flag + its argument carried; unknown flag + positional prompt dropped.
+        assert_eq!(
+            resume_argv(
+                "claude",
+                &argv(&["claude", "--model", "opus", "--unknown", "fix the bug"]),
+                ID
+            ),
+            argv(&["claude", "--resume", ID, "--model", "opus"])
+        );
+        // `--model=opus` (equals form) carried whole.
+        assert_eq!(
+            resume_argv("claude", &argv(&["claude", "--model=opus"]), ID),
+            argv(&["claude", "--resume", ID, "--model=opus"])
+        );
+    }
+
+    #[test]
+    fn claude_resume_replaces_stale_selectors_with_live_id() {
+        // Launched with an explicit (now stale) --resume: the live id wins, the old id is gone.
+        assert_eq!(
+            resume_argv(
+                "claude",
+                &argv(&["claude", "--resume", "00000000-0000-0000-0000-000000000000"]),
+                ID
+            ),
+            argv(&["claude", "--resume", ID])
+        );
+        // Bare --resume (interactive picker) / --continue likewise collapse to the live id.
+        assert_eq!(
+            resume_argv("claude", &argv(&["claude", "--resume"]), ID),
+            argv(&["claude", "--resume", ID])
+        );
+        assert_eq!(
+            resume_argv("claude", &argv(&["claude", "--continue"]), ID),
+            argv(&["claude", "--resume", ID])
+        );
+        // --session-id / --fork-session must not survive alongside the injected --resume.
+        assert_eq!(
+            resume_argv(
+                "claude",
+                &argv(&["claude", "--session-id", ID, "--fork-session"]),
+                ID
+            ),
+            argv(&["claude", "--resume", ID])
+        );
+    }
+
+    #[test]
+    fn claude_resume_skips_non_interactive() {
+        // -p / --print one-shots and --no-session-persistence are left verbatim (nothing to
+        // resume interactively).
+        for flag in ["-p", "--print", "--no-session-persistence"] {
+            let a = argv(&["claude", flag]);
+            assert_eq!(resume_argv("claude", &a, ID), a);
+        }
+    }
+
+    #[test]
+    fn resume_argv_rejects_bad_input() {
+        // Non-UUID id → untouched.
+        assert_eq!(
+            resume_argv("claude", &argv(&["claude"]), "bogus"),
+            argv(&["claude"])
+        );
+        // Unknown agent → untouched.
+        assert_eq!(
+            resume_argv("vim", &argv(&["vim", "file"]), ID),
+            argv(&["vim", "file"])
+        );
+        // Empty argv → untouched.
+        assert!(resume_argv("claude", &[], ID).is_empty());
+    }
+
+    #[test]
+    fn codex_resume_uses_subcommand_form() {
+        assert_eq!(
+            resume_argv("codex", &argv(&["codex"]), ID),
+            argv(&["codex", "resume", ID])
+        );
+        // Flags and a prompt are dropped (already captured in the rollout being resumed).
+        assert_eq!(
+            resume_argv("codex", &argv(&["codex", "-m", "gpt-5", "do it"]), ID),
+            argv(&["codex", "resume", ID])
+        );
+        // An explicit subcommand is never wrapped (would break a non-interactive run / double
+        // a resume).
+        for sub in ["exec", "resume", "review", "apply"] {
+            let a = argv(&["codex", sub, "arg"]);
+            assert_eq!(resume_argv("codex", &a, ID), a);
+        }
+        // A subcommand preceded by a value-taking global flag (whose value is a bare token) is
+        // still detected — we scan every token, not just the first non-option one.
+        let a = argv(&["codex", "--cd", "/repo", "exec", "run tests"]);
+        assert_eq!(resume_argv("codex", &a, ID), a);
+    }
+
+    #[test]
+    fn rollout_session_id_parses_trailing_uuid() {
+        let p = std::path::Path::new(
+            "/home/u/.codex/sessions/2026/07/24/rollout-2026-07-24T09-59-48-36213526-fd15-4fc9-b146-842f71382088.jsonl",
+        );
+        assert_eq!(rollout_session_id(p).as_deref(), Some(ID));
+        // Not under a `sessions` dir → rejected.
+        let outside = std::path::Path::new(
+            "/tmp/rollout-2026-07-24T09-59-48-36213526-fd15-4fc9-b146-842f71382088.jsonl",
+        );
+        assert_eq!(rollout_session_id(outside), None);
+        // Wrong shape → rejected.
+        let bad = std::path::Path::new("/x/sessions/rollout-nope.jsonl");
+        assert_eq!(rollout_session_id(bad), None);
     }
 }
