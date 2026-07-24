@@ -563,22 +563,25 @@ final class MetalGridRenderer {
         baselineY: Double,
         tint: UInt32,
     ) -> Bool {
-        let scale = metrics.scale
+        let scale = Double(metrics.scale)
+        // One integer baseline for the whole row. The atlas quad is exactly
+        // the glyph bitmap's pixel size and the fragment sampler is
+        // nearest-neighbor, so origins MUST be whole device pixels or the
+        // bitmap resamples (blur) and shifts per glyph. Because bearingTopPx
+        // is a whole-pixel baseline→top distance, `baselinePx - bearingTopPx`
+        // keeps every cell's baseline identical instead of jittering.
+        let baselinePx = (baselineY * scale).rounded()
         for pg in shaped {
             guard let entry = atlas.entry(glyph: pg.glyph, font: pg.font, isColor: pg.isColor) else {
                 return false
             }
             guard !entry.isEmpty else { continue }
-            let x = originX + Double(pg.position.x) + Double(entry.bearingX)
-            let y = baselineY - Double(pg.position.y) - Double(entry.bearingMaxY)
-            // Snap the glyph's device-pixel origin to the integer pixel grid.
-            // The atlas quad is exactly the glyph bitmap's pixel size and the
-            // fragment sampler is nearest-neighbor, so a fractional origin
-            // resamples the bitmap and shifts each glyph by a different subpixel
-            // amount — visible as baseline jitter / uneven spacing. An integer
-            // origin maps atlas texels 1:1 onto screen pixels.
+            let penXPx = ((originX + Double(pg.position.x)) * scale).rounded()
+            let penYPx = baselinePx - (Double(pg.position.y) * scale).rounded()
+            let x = penXPx + Double(entry.bearingXPx)
+            let y = penYPx - Double(entry.bearingTopPx)
             instances.append(QuadInstance(
-                origin: SIMD2(Float((x * Double(scale)).rounded()), Float((y * Double(scale)).rounded())),
+                origin: SIMD2(Float(x), Float(y)),
                 size: SIMD2(Float(entry.pixelSize.width), Float(entry.pixelSize.height)),
                 uvOrigin: entry.uvOrigin,
                 uvSize: entry.uvSize,
@@ -810,12 +813,16 @@ private final class GlyphAtlas {
         let uvSize: SIMD2<Float>
         /// Quad extent in device pixels (the bitmap is 1:1).
         let pixelSize: CGSize
-        /// Bitmap left edge in glyph space, points (negative for
-        /// glyphs with left overhang — italics, combining marks).
-        let bearingX: CGFloat
-        /// Bitmap top edge above the baseline, points (y-up). The
-        /// flipped-view quad top is `baselineY - bearingMaxY`.
-        let bearingMaxY: CGFloat
+        /// Bitmap left edge relative to the pen, **whole device pixels**
+        /// (negative for glyphs with left overhang — italics, combining
+        /// marks). Integer-valued so the quad lands on the pixel grid.
+        let bearingXPx: CGFloat
+        /// Bitmap top edge above the baseline, **whole device pixels**
+        /// (y-up). The flipped-view quad top is
+        /// `round(baseline*scale) - bearingTopPx` — both integers, and
+        /// `round(baseline*scale)` is shared across the row, so every
+        /// cell's baseline aligns exactly.
+        let bearingTopPx: CGFloat
         /// Zero-coverage glyph (space): no quad to emit.
         let isEmpty: Bool
     }
@@ -882,17 +889,30 @@ private final class GlyphAtlas {
         guard rect.width > 0, rect.height > 0 else {
             let empty = Entry(
                 uvOrigin: .zero, uvSize: .zero, pixelSize: .zero,
-                bearingX: 0, bearingMaxY: 0, isEmpty: true,
+                bearingXPx: 0, bearingTopPx: 0, isEmpty: true,
             )
             entries[key] = empty
             return empty
         }
 
-        // 1px guard band on every side for antialiasing bleed.
-        let padPx = 1
-        let padPts = CGFloat(padPx) / scale
-        let widthPx = Int(ceil(rect.width * scale)) + 2 * padPx
-        let heightPx = Int(ceil(rect.height * scale)) + 2 * padPx
+        // Pixel-snap the glyph to the device grid: bitmap bounds and
+        // bearings are whole device pixels, and the pen is placed so the
+        // baseline (glyph-space y=0) and ink-left land on integer pixels.
+        // This is what keeps every cell on one baseline — a fractional
+        // ink-top-to-baseline distance would round differently per glyph
+        // and jitter the baseline. 1px guard band on every side for AA
+        // bleed.
+        let padPx: CGFloat = 1
+        let inkLeft = rect.minX * scale
+        let inkRight = rect.maxX * scale
+        let inkBottom = rect.minY * scale // below baseline (may be negative)
+        let inkTop = rect.maxY * scale
+        let x0 = floor(inkLeft) - padPx // bitmap left, device px from pen
+        let y0 = floor(inkBottom) - padPx // bitmap bottom, device px below baseline
+        let x1 = ceil(inkRight) + padPx
+        let y1 = ceil(inkTop) + padPx // bitmap top, device px above baseline
+        let widthPx = Int(x1 - x0)
+        let heightPx = Int(y1 - y0)
 
         guard let placement = packer.place(width: widthPx, height: heightPx) else {
             return nil
@@ -922,7 +942,9 @@ private final class GlyphAtlas {
             if !isColor {
                 ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
             }
-            var position = CGPoint(x: -rect.minX + padPts, y: -rect.minY + padPts)
+            // Pen in points; after the scale it lands the baseline and
+            // ink-left on the integer device grid defined by x0/y0.
+            var position = CGPoint(x: -x0 / scale, y: -y0 / scale)
             var glyphCopy = glyph
             CTFontDrawGlyphs(font, &glyphCopy, &position, 1, ctx)
             return true
@@ -941,8 +963,8 @@ private final class GlyphAtlas {
             uvOrigin: SIMD2(Float(placement.x) / atlasSize, Float(placement.y) / atlasSize),
             uvSize: SIMD2(Float(widthPx) / atlasSize, Float(heightPx) / atlasSize),
             pixelSize: CGSize(width: widthPx, height: heightPx),
-            bearingX: rect.minX - padPts,
-            bearingMaxY: rect.maxY + padPts,
+            bearingXPx: x0,
+            bearingTopPx: y1,
             isEmpty: false,
         )
         entries[key] = entry
