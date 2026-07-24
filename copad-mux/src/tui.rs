@@ -36,7 +36,7 @@ use crate::procinfo;
 use crate::proto::MouseKind;
 use crate::state::{Command, Event, MuxError, Origin, RestoredTab, State};
 use crate::term::{CellColor, PaneTerm};
-use crate::usagepoll::{self, UsageSnapshot};
+use crate::usagepoll::{self, UsagePart, UsageSnapshot};
 
 /// Direction for focus navigation with the arrow keys.
 #[derive(Clone, Copy)]
@@ -190,6 +190,19 @@ const CAT_SUBTEXT: Color = Color::Rgb(0xba, 0xc2, 0xde);
 const CAT_OVERLAY: Color = Color::Rgb(0x6c, 0x70, 0x86);
 const CAT_GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
 const CAT_PEACH: Color = Color::Rgb(0xfa, 0xb3, 0x87);
+const CAT_RED: Color = Color::Rgb(0xf3, 0x8b, 0xa8);
+
+/// Color a usage gauge by how full it is: calm green under 70%, yellow warning
+/// from 70%, red alert from 90%.
+fn usage_threshold_color(pct: f64) -> Color {
+    if pct >= 90.0 {
+        CAT_RED
+    } else if pct >= 70.0 {
+        CAT_YELLOW
+    } else {
+        CAT_GREEN
+    }
+}
 
 /// The multi-pane application: the authoritative layout `State` + a live shell per
 /// terminal. The local TUI is the single controller client (`ClientId(0)`).
@@ -3301,19 +3314,23 @@ impl App {
             // of tab chips; below that, fall back to percentages. Tabs window on
             // overflow, so this reserve is about readability, not correctness.
             const USAGE_BARS_RESERVE_COLS: usize = 64;
-            let seg = if self.cfg.usage == UsageStyle::Bar
+            let bar_width = (self.cfg.usage == UsageStyle::Bar
                 && (self.cols as usize)
                     >= USAGE_BARS_RESERVE_COLS
-                        + usagepoll::bar_display_width(u, self.cfg.usage_bar_width)
-            {
-                u.bar(self.cfg.usage_bar_width)
-            } else {
-                u.text()
-            };
-            segs.push((
-                format!(" {seg} "),
-                Style::default().fg(CAT_SUBTEXT).bg(CAT_SURFACE0),
-            ));
+                        + usagepoll::bar_display_width(u, self.cfg.usage_bar_width))
+            .then_some(self.cfg.usage_bar_width);
+            // Each window's gauge is colored by its utilization (green < 70 ≤ yellow
+            // < 90 ≤ red); labels and separators stay muted. One segment per part.
+            let pad = Style::default().bg(CAT_SURFACE0);
+            segs.push((" ".to_string(), pad));
+            for part in u.parts(bar_width) {
+                let (text, fg) = match part {
+                    UsagePart::Window { text, pct } => (text, usage_threshold_color(pct)),
+                    UsagePart::Neutral(s) => (s, CAT_SUBTEXT),
+                };
+                segs.push((text, Style::default().fg(fg).bg(CAT_SURFACE0)));
+            }
+            segs.push((" ".to_string(), pad));
         }
         segs.push((
             format!(" {} ", local_hhmm()),
@@ -4181,7 +4198,20 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_command_line, fuzzy_match, list_window_start, shell_quote, tab_window};
+    use super::{
+        CAT_GREEN, CAT_RED, CAT_YELLOW, build_command_line, fuzzy_match, list_window_start,
+        shell_quote, tab_window, usage_threshold_color,
+    };
+
+    #[test]
+    fn usage_threshold_colors_by_severity() {
+        assert_eq!(usage_threshold_color(0.0), CAT_GREEN);
+        assert_eq!(usage_threshold_color(69.0), CAT_GREEN);
+        assert_eq!(usage_threshold_color(70.0), CAT_YELLOW); // 70% boundary → yellow
+        assert_eq!(usage_threshold_color(89.0), CAT_YELLOW);
+        assert_eq!(usage_threshold_color(90.0), CAT_RED); // 90% boundary → red
+        assert_eq!(usage_threshold_color(100.0), CAT_RED);
+    }
 
     #[test]
     fn tab_window_shows_all_when_they_fit() {

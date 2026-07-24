@@ -38,41 +38,80 @@ impl UsageSnapshot {
 
     /// Percentages: `claude 5h 5% wk 34% · codex wk 60%` (stale provider `~`-prefixed).
     pub fn text(&self) -> String {
-        self.render(None)
+        self.parts(None).iter().map(UsagePart::text).collect()
     }
 
     /// A progress bar per window: `claude 5h ━━╌╌╌╌╌╌ 5% wk ━━━╌╌╌╌╌ 34% · codex wk …`.
     pub fn bar(&self, width: u16) -> String {
-        self.render(Some(width))
+        self.parts(Some(width))
+            .iter()
+            .map(UsagePart::text)
+            .collect()
     }
 
-    /// Shared builder — `bar_width = None` renders text, `Some(w)` inserts a
-    /// `w`-cell bar before each percent.
-    fn render(&self, bar_width: Option<u16>) -> String {
+    /// The readout broken into render parts so the status bar can color each
+    /// window by its utilization (threshold coloring) while leaving labels and
+    /// separators neutral. `bar_width = None` = text; `Some(w)` = a `w`-cell bar
+    /// before each percent. The concatenation equals [`Self::text`]/[`Self::bar`].
+    pub fn parts(&self, bar_width: Option<u16>) -> Vec<UsagePart> {
         let cell = |pct: f64| match bar_width {
             Some(w) => format!("{} ", bar_glyphs(pct, w)),
             None => String::new(),
         };
-        let mut parts = Vec::new();
-        if self.claude_5h.is_some() || self.claude_wk.is_some() {
-            let mut seg = String::from(if self.claude_stale {
-                "~claude"
-            } else {
-                "claude"
-            });
+        // A window = neutral " <label> " + a gauge (`bar %`) colored by threshold.
+        let window = |out: &mut Vec<UsagePart>, label: &str, pct: f64| {
+            out.push(UsagePart::Neutral(format!(" {label} ")));
+            out.push(UsagePart::window(format!("{}{pct:.0}%", cell(pct)), pct));
+        };
+        let mut out = Vec::new();
+        let has_claude = self.claude_5h.is_some() || self.claude_wk.is_some();
+        if has_claude {
+            out.push(UsagePart::Neutral(
+                if self.claude_stale {
+                    "~claude"
+                } else {
+                    "claude"
+                }
+                .to_string(),
+            ));
             if let Some(p) = self.claude_5h {
-                seg.push_str(&format!(" 5h {}{p:.0}%", cell(p)));
+                window(&mut out, "5h", p);
             }
             if let Some(p) = self.claude_wk {
-                seg.push_str(&format!(" wk {}{p:.0}%", cell(p)));
+                window(&mut out, "wk", p);
             }
-            parts.push(seg);
         }
         if let Some(p) = self.codex_wk {
-            let label = if self.codex_stale { "~codex" } else { "codex" };
-            parts.push(format!("{label} wk {}{p:.0}%", cell(p)));
+            if has_claude {
+                out.push(UsagePart::Neutral(" · ".to_string()));
+            }
+            out.push(UsagePart::Neutral(
+                if self.codex_stale { "~codex" } else { "codex" }.to_string(),
+            ));
+            window(&mut out, "wk", p);
         }
-        parts.join(" · ")
+        out
+    }
+}
+
+/// One piece of the rendered readout. `Window` chunks carry their utilization so
+/// the caller can color them by threshold; `Neutral` is labels/separators.
+#[derive(Debug, Clone, PartialEq)]
+pub enum UsagePart {
+    Window { text: String, pct: f64 },
+    Neutral(String),
+}
+
+impl UsagePart {
+    fn window(text: String, pct: f64) -> Self {
+        UsagePart::Window { text, pct }
+    }
+
+    pub fn text(&self) -> &str {
+        match self {
+            UsagePart::Window { text, .. } => text,
+            UsagePart::Neutral(s) => s,
+        }
     }
 }
 
@@ -211,6 +250,24 @@ mod tests {
     #[test]
     fn text_matches_percent_format() {
         assert_eq!(full().text(), "claude 5h 5% wk 34% · codex wk 60%");
+    }
+
+    #[test]
+    fn parts_carry_pct_and_concat_to_text() {
+        let parts = full().parts(None);
+        // Each gauge chunk carries its utilization (for threshold coloring); the
+        // order is claude 5h, claude wk, codex wk.
+        let pcts: Vec<f64> = parts
+            .iter()
+            .filter_map(|p| match p {
+                UsagePart::Window { pct, .. } => Some(*pct),
+                UsagePart::Neutral(_) => None,
+            })
+            .collect();
+        assert_eq!(pcts, vec![5.0, 34.0, 60.0]);
+        // Concatenation is byte-identical to the flat text form.
+        let concat: String = parts.iter().map(UsagePart::text).collect();
+        assert_eq!(concat, full().text());
     }
 
     #[test]
