@@ -5,10 +5,11 @@
 //! your 5h limit"), sourced per provider:
 //!
 //!   * **Claude** — a live `GET https://api.anthropic.com/api/oauth/usage`
-//!     with the OAuth bearer token from `~/.claude/.credentials.json`. Returns
-//!     `five_hour.utilization` / `seven_day.utilization` (already a percent).
-//!     Skipped (→ `None`) when the token is missing or already expired —
-//!     refreshing the OAuth token is Claude Code's job, not ours.
+//!     with the OAuth bearer token from `~/.claude/.credentials.json` (or, on
+//!     macOS with a keychain-only login, the `Claude Code-credentials` login
+//!     Keychain item). Returns `five_hour.utilization` / `seven_day.utilization`
+//!     (already a percent). Skipped (→ `None`) when the token is missing or
+//!     already expired — refreshing the OAuth token is Claude Code's job, not ours.
 //!   * **Codex** — the newest `~/.codex/sessions/**/rollout-*.jsonl` records a
 //!     `rate_limits` snapshot (`payload.rate_limits`) on every turn. Read the
 //!     most recent one — no auth, no network, but only as fresh as the last
@@ -297,11 +298,7 @@ fn save_json<T: Serialize + serde::de::DeserializeOwned + Stamped>(path: &Path, 
 // ── Claude: live OAuth usage endpoint ──────────────────────────────────────
 
 fn claude_limits(home: &str) -> Result<ClaudeLimits, String> {
-    let path = Path::new(home).join(".claude/.credentials.json");
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
-    let creds: Value =
-        serde_json::from_str(&raw).map_err(|e| format!("credentials not valid JSON: {e}"))?;
+    let creds = load_claude_credentials(home)?;
     let oauth = creds
         .get("claudeAiOauth")
         .ok_or("no `claudeAiOauth` in credentials (not logged in?)")?;
@@ -339,6 +336,50 @@ fn claude_limits(home: &str) -> Result<ClaudeLimits, String> {
     }
     let body: Value = resp.json().map_err(|e| format!("response not JSON: {e}"))?;
     Ok(parse_claude_usage(&body))
+}
+
+/// Load Claude's OAuth credentials JSON. Prefers the plaintext file
+/// `~/.claude/.credentials.json`; on macOS — where Claude Code may keep the credentials
+/// in the login Keychain with NO file on disk — falls back to the Keychain, which stores
+/// the same JSON blob. If both fail, surfaces the file error (readout hides, as before).
+fn load_claude_credentials(home: &str) -> Result<Value, String> {
+    let path = Path::new(home).join(".claude/.credentials.json");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        // File missing/unreadable → try the Keychain (macOS keychain-only logins land here).
+        Err(file_err) => claude_keychain_credentials()
+            .ok_or_else(|| format!("cannot read {}: {file_err}", path.display()))?,
+    };
+    serde_json::from_str(&raw).map_err(|e| format!("credentials not valid JSON: {e}"))
+}
+
+/// Read the Claude OAuth credentials blob from the macOS login Keychain
+/// (`security find-generic-password -s "Claude Code-credentials" -w`, the same JSON Claude
+/// Code writes). `None` off macOS, or when the item is absent / access is denied / headless —
+/// the Keychain item is ACL-restricted, so a first read from a new binary may prompt for
+/// access in a GUI session and fails silently when denied or without a GUI.
+#[cfg(target_os = "macos")]
+fn claude_keychain_credentials() -> Option<String> {
+    let out = std::process::Command::new("security")
+        .args([
+            "find-generic-password",
+            "-s",
+            "Claude Code-credentials",
+            "-w",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let blob = String::from_utf8(out.stdout).ok()?;
+    let blob = blob.trim();
+    (!blob.is_empty()).then(|| blob.to_string())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn claude_keychain_credentials() -> Option<String> {
+    None
 }
 
 /// Pull the two window utilizations out of the `/api/oauth/usage` body. Pure so
@@ -538,6 +579,30 @@ mod tests {
         let c = parse_claude_usage(&body);
         assert_eq!(c.five_hour, Some(5.0));
         assert_eq!(c.seven_day, None);
+    }
+
+    #[test]
+    fn load_claude_credentials_reads_the_file_first() {
+        // A present, valid file is parsed directly (no Keychain needed on any platform).
+        let dir = std::env::temp_dir().join(format!("copad-cli-creds-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(dir.join(".claude"));
+        let creds = r#"{"claudeAiOauth":{"accessToken":"tok","expiresAt":9999999999999}}"#;
+        std::fs::write(dir.join(".claude/.credentials.json"), creds).unwrap();
+        let v = load_claude_credentials(dir.to_str().unwrap()).unwrap();
+        assert_eq!(v["claudeAiOauth"]["accessToken"], "tok");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Non-macOS only: on macOS this would invoke the real login Keychain (`security`), which
+    // can display or block on an ACL prompt during `cargo test`. Off macOS the fallback is a
+    // compile-time no-op, so a missing file deterministically yields the file read error.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn load_claude_credentials_errors_when_absent() {
+        let missing = std::env::temp_dir().join(format!("copad-cli-none-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let err = load_claude_credentials(missing.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("cannot read"));
     }
 
     #[test]
