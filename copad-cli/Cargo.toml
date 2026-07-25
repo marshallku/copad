@@ -16,7 +16,12 @@ clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# rustls with BOTH the OS trust store (native-roots) and the bundled Mozilla roots (webpki).
+# native-roots makes reqwest load the system cert store (macOS Keychain / Linux /etc/ssl), so a
+# corporate CA that re-signs TLS (MITM proxy) is trusted like curl/claude/codex already are —
+# rustls-tls alone only trusts the bundled webpki roots and rejects the corporate CA. webpki is
+# kept as a fallback so a minimal environment with no system cert store doesn't lose all trust.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
 flate2 = "1"
 tar = "0.4"
 semver = "1"

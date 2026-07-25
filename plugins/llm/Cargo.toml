@@ -13,7 +13,10 @@ path = "src/main.rs"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+# native-certs = trust the OS store (macOS Keychain / Linux /etc/ssl) so a corporate CA that
+# re-signs TLS is trusted (curl/claude/codex already do). ureq's default swaps webpki→native
+# with this flag (either/or, unlike reqwest); real machines have a populated system store.
+ureq = { version = "2", default-features = false, features = ["json", "tls", "native-certs"] }
 keyring = { version = "3", default-features = false, features = [
     "apple-native",
     "sync-secret-service",
