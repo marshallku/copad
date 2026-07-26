@@ -2922,7 +2922,9 @@ impl App {
     /// panes with status·tool, bottom half). Always on when wide enough.
     fn render_sidebar(&self, buf: &mut Buffer) {
         let h = self.content_rows(); // above the bottom status bar
-        let panel_bg = CAT_BASE;
+        // Transparent fill (default terminal bg) so a configured background image shows
+        // through the sidebar — the right-border `│` column is the only visual separator.
+        let panel_bg = Color::Reset;
         let sidebar_w = self.sidebar_w();
 
         // Fill the strip + the right border column (down to the status bar).
@@ -3429,7 +3431,9 @@ impl App {
         let h = ((area.height as u32 * 3 / 5) as u16).clamp(5.min(maxh), maxh);
         let x0 = (area.width.saturating_sub(w)) / 2;
         let y0 = (area.height.saturating_sub(h)) / 2;
-        let bg = Color::Rgb(20, 22, 30);
+        // Transparent interior (default terminal bg) so a background image shows through;
+        // only the border + selection highlights remain painted.
+        let bg = Color::Reset;
         let border = Style::default().fg(Color::Cyan).bg(bg);
 
         // Box background + border.
@@ -3587,7 +3591,9 @@ impl App {
         let h = 3u16.min(area.height.max(1));
         let x0 = (area.width.saturating_sub(w)) / 2;
         let y0 = (area.height.saturating_sub(h)) / 2;
-        let bg = Color::Rgb(20, 22, 30);
+        // Transparent interior (default terminal bg) so a background image shows through;
+        // only the border + selection highlights remain painted.
+        let bg = Color::Reset;
         let border = Style::default().fg(CAT_MAUVE).bg(bg);
 
         for y in y0..(y0 + h).min(area.height) {
@@ -3679,7 +3685,9 @@ impl App {
         let h = 3u16.min(area.height.max(1));
         let x0 = (area.width.saturating_sub(w)) / 2;
         let y0 = (area.height.saturating_sub(h)) / 2;
-        let bg = Color::Rgb(20, 22, 30);
+        // Transparent interior (default terminal bg) so a background image shows through;
+        // only the border + selection highlights remain painted.
+        let bg = Color::Reset;
         let border = Style::default().fg(CAT_PEACH).bg(bg);
 
         for y in y0..(y0 + h).min(area.height) {
@@ -3731,7 +3739,9 @@ impl App {
         let h = ((area.height as u32 * 3 / 5) as u16).clamp(6.min(maxh), maxh);
         let x0 = (area.width.saturating_sub(w)) / 2;
         let y0 = (area.height.saturating_sub(h)) / 2;
-        let bg = Color::Rgb(20, 22, 30);
+        // Transparent interior (default terminal bg) so a background image shows through;
+        // only the border + selection highlights remain painted.
+        let bg = Color::Reset;
         let border = Style::default().fg(CAT_MAUVE).bg(bg);
 
         for y in y0..(y0 + h).min(area.height) {
