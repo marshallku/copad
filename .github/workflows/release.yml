@@ -83,9 +83,10 @@ jobs:
     # docs/macos-signing-notarization.md.
     env:
       MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
-      MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
-      MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
-      MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
+      # Notarization via App Store Connect API key (notarytool --key/--key-id/--issuer).
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_STORE_CONNECT_KEY_P8: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
     steps:
       - uses: actions/checkout@v4
 
@@ -276,14 +277,15 @@ jobs:
           # build still works on forks. See docs/macos-signing-notarization.md.
           #
           # Gate on ALL required inputs, not just the identity: require the
-          # identity + the three notary secrets AND that the cert actually
-          # imported into the keychain (so a partial config — e.g. identity set
-          # but cert or notary password missing — takes the ad-hoc fallback
-          # instead of failing the release at codesign/notarytool).
+          # signing identity + the three App Store Connect API-key secrets
+          # (notarytool auth) AND that the cert actually imported into the
+          # keychain (so a partial config — e.g. identity set but cert or an API
+          # secret missing — takes the ad-hoc fallback instead of failing the
+          # release at codesign/notarytool).
           if [ -n "${MACOS_SIGNING_IDENTITY:-}" ] \
-             && [ -n "${MACOS_NOTARY_APPLE_ID:-}" ] \
-             && [ -n "${MACOS_NOTARY_PASSWORD:-}" ] \
-             && [ -n "${MACOS_NOTARY_TEAM_ID:-}" ] \
+             && [ -n "${APP_STORE_CONNECT_KEY_ID:-}" ] \
+             && [ -n "${APP_STORE_CONNECT_ISSUER_ID:-}" ] \
+             && [ -n "${APP_STORE_CONNECT_KEY_P8:-}" ] \
              && security find-identity -v -p codesigning | grep -qF "$MACOS_SIGNING_IDENTITY"; then
             echo "==> Developer ID signing (identity: $MACOS_SIGNING_IDENTITY)"
             # Sign leaf binaries first (inside-out): CLIs, then every plugin.
@@ -301,18 +303,29 @@ jobs:
               --sign "$MACOS_SIGNING_IDENTITY" "$STAGING"
             codesign --verify --strict --verbose=2 "$STAGING"
 
-            echo "==> notarizing $STAGING"
+            echo "==> notarizing $STAGING (App Store Connect API key)"
+            # Restore the .p8 from the secret — accept either a raw PEM key or a
+            # base64-encoded one (the setup guide recommends base64).
+            P8="$RUNNER_TEMP/AuthKey.p8"
+            # Guarantee the private key is wiped even if decode/ditto/submit
+            # fails under set -e — don't leave it in $RUNNER_TEMP.
+            trap 'rm -f "$P8"' EXIT
+            if printf '%s' "$APP_STORE_CONNECT_KEY_P8" | grep -q 'BEGIN PRIVATE KEY'; then
+              printf '%s' "$APP_STORE_CONNECT_KEY_P8" > "$P8"
+            else
+              printf '%s' "$APP_STORE_CONNECT_KEY_P8" | base64 --decode > "$P8"
+            fi
             ditto -c -k --keepParent "$STAGING" "$RUNNER_TEMP/Copad.zip"
             xcrun notarytool submit "$RUNNER_TEMP/Copad.zip" \
-              --apple-id "$MACOS_NOTARY_APPLE_ID" \
-              --password "$MACOS_NOTARY_PASSWORD" \
-              --team-id "$MACOS_NOTARY_TEAM_ID" \
+              --key "$P8" \
+              --key-id "$APP_STORE_CONNECT_KEY_ID" \
+              --issuer "$APP_STORE_CONNECT_ISSUER_ID" \
               --wait
             xcrun stapler staple "$STAGING"
             xcrun stapler validate "$STAGING"
             spctl -a -vvv --type exec "$STAGING" || true
           else
-            echo "==> signing not fully configured (need identity + 3 notary secrets + an importable cert) — ad-hoc signing (Gatekeeper needs quarantine strip; not Tahoe-safe)"
+            echo "==> signing not fully configured (need MACOS_SIGNING_IDENTITY + APP_STORE_CONNECT_{KEY_ID,ISSUER_ID,KEY_P8} + an importable cert) — ad-hoc signing (Gatekeeper needs quarantine strip; not Tahoe-safe)"
             codesign --force --deep --sign - --timestamp=none "$STAGING"
             codesign -dv "$STAGING" 2>&1 | head -5 || true
           fi
