@@ -17,6 +17,16 @@ A cross-platform terminal emulator built around a shared Rust core and platform-
 - **Dynamic font scaling** — `Ctrl+=`/`Ctrl+-`/`Ctrl+0` (Linux) / `Cmd+=`/`Cmd+-`/`Cmd+0` (macOS)
 - **Custom keybindings** — bind any chord to a shell command (`spawn:`); the spawned command inherits `COPAD_SOCKET`, so `spawn:coctl …` reaches the binding instance's socket actions
 
+### Multiplexer (`comux`)
+
+A standalone, tmux-style terminal multiplexer (binary `comux`) with a persistent server/client split — the server owns the panes and survives the launching terminal. Runs anywhere as a single self-contained binary (no GTK, no daemon); [install it on its own](#just-comux-the-multiplexer-standalone).
+
+- **Splits, tabs, and multi-session workspaces** — vim-style pane focus/resize, `Ctrl-b` prefix bindings, prefix-less `Alt`+`1`–`9`, named sessions
+- **git worktree integration** — `comux worktree create <branch>` spins up a worktree + a session in it (tmux `twt` parity)
+- **Session persistence** — autosaves sessions/tabs/split-layout/per-pane cwd and restores on server start; whitelisted agent processes re-run and **AI agents resume their live conversation** (`claude --resume` / `codex resume`)
+- **Agent-aware** — an always-on status bar (session · tabs · agent count · subscription usage/limits readout) and a left sidebar listing every agent pane with live `status · tool`; `Ctrl-f` fuzzy switcher; native desktop notifications on agent turn-finished / awaiting-input, even while detached
+- **Full multiplexer kit** — scrollback/copy-mode, mouse (wheel forwarded to mouse-aware apps), detach/reattach, shared multi-client, all configurable via `~/.config/copad/mux.toml`
+
 ### Panels
 
 - **Terminal panel** — VTE4 on Linux, `alacritty_terminal` + custom AppKit/CoreText renderer on macOS; PTY handled internally on both platforms
@@ -64,7 +74,8 @@ A cross-platform terminal emulator built around a shared Rust core and platform-
 ### Platforms
 
 - **Linux** — GTK4 + VTE4, full feature set
-- **macOS** — Swift/AppKit + `alacritty_terminal` renderer (custom AppKit/CoreText), near-parity (terminal, tabs, splits, search, themes, webview, plugins, status bar, keybindings, background images, AI agent API). See [`docs/macos-parity-plan.md`](./docs/macos-parity-plan.md).
+- **macOS** — Swift/AppKit + `alacritty_terminal`, rendered on a **Metal** GPU path by default (~5.5× cheaper main-thread render; CoreText kept as the `gpu = false` fallback). Full secondary platform: terminal, tabs, splits, search, themes, webview, plugins, status bar, keybindings, background images, AI agent API, daemon-client. See [`docs/macos-app.md`](./docs/macos-app.md).
+- **iOS / mobile** — `copad-ios`, a SwiftUI + WKWebView native shell around the `web-bridge` PWA: attach to a terminal, agent presence/attention, and push, over Tailscale or an SSH tunnel. See [`docs/mobile-access.md`](./docs/mobile-access.md).
 
 ## Requirements
 
@@ -172,7 +183,7 @@ Restart copad after installing/updating plugins — `discover_plugins()` only ru
 
 ```bash
 coctl update check    # check for new versions
-coctl update apply    # download and install latest (Linux only — macOS users re-run install-macos.sh)
+coctl update apply    # download and install latest (Linux only — macOS users re-run install.sh, brew upgrade --cask, or install-macos.sh)
 ```
 
 ### Daemon autostart (Linux)
@@ -259,8 +270,11 @@ copad/
 ├── copad-ffi/                 # Rust staticlib for Swift FFI (macOS bridge)
 ├── copad-linux/               # GTK4 + VTE4 native terminal app (binary: copad)
 ├── copad-macos/               # Swift/AppKit + alacritty_terminal app (Copad.app)
+├── copad-ios/                 # SwiftUI + WKWebView mobile shell over the web-bridge PWA
 ├── copad-term/                # Rust staticlib wrapping alacritty_terminal for the macOS renderer
 ├── copad-cli/                 # CLI control tool (binary: coctl)
+├── copad-daemon/              # Background daemon (binary: copadd) — triggers, plugins, web-bridge
+├── copad-mux/                 # Standalone terminal multiplexer (binary: comux)
 ├── plugins/<name>/             # First-party service plugins. Each subdir holds the
 │                                 # Rust crate (Cargo.toml + src/) and its manifest/assets
 │                                 # (plugin.toml, panel.html, triggers.example.toml) together.
