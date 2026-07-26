@@ -8,7 +8,7 @@ import Foundation
 ///   1. `lockf(F_TLOCK)` `~/Library/Caches/copad/.spawn.lock` — held → bail.
 ///   2. Live socket probe — another process may have won the race between
 ///      our failed connect and lock acquisition.
-///   3. Locate `copadd` binary (PATH, then `~/.cargo/bin/copadd`).
+///   3. Locate `copadd` binary (PATH, then `~/.local/bin`, `~/.cargo/bin`, `/opt/homebrew/bin`).
 ///   4. Detached spawn via `nohup copadd … &`.
 ///   5. `system.ping` probe with 3s budget — bind happens before plugin
 ///      activation but manifest discovery + command registration happen
@@ -66,7 +66,7 @@ enum AutoSpawn {
         }
 
         guard let copaddPath = locateBinary() else {
-            log("copadd binary not found in PATH, ~/.cargo/bin, or /opt/homebrew/bin — install via `cargo install --path copad-daemon` or `brew install --cask marshallku/copad/copad`")
+            log("copadd binary not found in PATH, ~/.local/bin, ~/.cargo/bin, or /opt/homebrew/bin — install via the release installer (curl … | bash) or `cargo install --path copad-daemon`")
             return false
         }
         if !spawnDetached(path: copaddPath) {
@@ -103,14 +103,16 @@ enum AutoSpawn {
         let env = ProcessInfo.processInfo.environment
         let pathString = env["PATH"] ?? "/usr/local/bin:/usr/bin:/bin"
         var dirs = pathString.split(separator: ":").map { String($0) }
-        // Augment with the two install dirs that a Finder-launched .app
-        // does NOT inherit from the user's shell env:
+        // Augment with the install dirs that a Finder-launched .app does
+        // NOT inherit from the user's shell env:
+        // - `~/.local/bin` for the prebuilt-release `install.sh` path (the
+        //   default download-and-run install location).
         // - `~/.cargo/bin` for the `scripts/install-macos.sh` path
         //   (cargo install --path copad-daemon).
         // - `/opt/homebrew/bin` for the Homebrew cask path. Intel Macs use
         //   `/usr/local/bin`, which is already in the `pathString` fallback
         //   above, so this only needs to add the arm64 prefix.
-        for extra in ["\(NSHomeDirectory())/.cargo/bin", "/opt/homebrew/bin"] {
+        for extra in ["\(NSHomeDirectory())/.local/bin", "\(NSHomeDirectory())/.cargo/bin", "/opt/homebrew/bin"] {
             if !dirs.contains(extra) { dirs.append(extra) }
         }
         let fm = FileManager.default

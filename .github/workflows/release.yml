@@ -100,7 +100,11 @@ jobs:
             -p copad-plugin-bookmark \
             -p copad-plugin-slack \
             -p copad-plugin-discord \
-            -p copad-plugin-jira
+            -p copad-plugin-jira \
+            -p copad-plugin-docs \
+            -p copad-plugin-claude \
+            -p copad-plugin-pilot \
+            -p copad-plugin-web-bridge
 
       - name: Build Swift app
         working-directory: copad-macos
@@ -179,8 +183,10 @@ jobs:
           # ~/Library/Application Support/copad/plugins/<name>/. PluginSupervisor
           # resolves `services.exec` against the plugin dir first, so the
           # binary co-located with the manifest wins over $PATH lookup.
+          # Keep this list in sync with install-macos.sh's MACOS_PLUGINS array
+          # AND the Build Rust crates step above.
           mkdir -p "$DIST/plugins"
-          for name in echo git llm calendar kb todo bookmark slack discord jira; do
+          for name in echo git llm calendar kb todo bookmark slack discord jira docs claude pilot web-bridge; do
             crate="copad-plugin-$name"
             src_dir="plugins/$name"
             bin_src="target/release/$crate"
@@ -195,11 +201,19 @@ jobs:
           # ---- Shell hooks (live-cwd tracking for session restore) ----
           mkdir -p "$DIST/shell-hooks"
           cp copad-macos/shell-hooks/copad-cwd.* "$DIST/shell-hooks/"
+          # Phase 22.1 context bridge (zsh) — install-macos.sh ships this too;
+          # keep the prebuilt installer's shell-hook set in parity.
+          cp examples/shell/copad-context.zsh "$DIST/shell-hooks/"
 
-          # ---- LaunchAgent plist (HOME_PLACEHOLDER unexpanded; downstream
-          #      consumers — install-macos.sh and the brew cask postflight —
-          #      substitute their own path, since launchd does not expand `~`) ----
+          # ---- LaunchAgent plist + launch wrapper (HOME_PLACEHOLDER
+          #      unexpanded; downstream consumers — install.sh, install-macos.sh —
+          #      substitute their own path, since launchd does not expand `~`).
+          #      The plist runs copadd through the wrapper (sources
+          #      ~/.config/copad/secrets.env before exec), so ship BOTH: an
+          #      installer that lays down the plist without the wrapper would
+          #      create a LaunchAgent pointing at a missing script. ----
           cp dist/launchd/com.marshall.copad.daemon.plist "$DIST/com.marshall.copad.daemon.plist"
+          cp dist/launchd/copadd-launch.sh "$DIST/copadd-launch.sh"
 
           # ---- Pack ----
           # Strip the dist-macos/ prefix so consumers see Copad.app / coctl / …

@@ -267,7 +267,7 @@ final class DaemonClient: @unchecked Sendable {
                 "window_id": UUID().uuidString,
                 "capabilities": capabilities,
                 "want_primary": true,
-                "version": "0.1.0",
+                "version": "1.0.0",
                 "protocol_version": 1,
                 // Daemon's `GUI_ENV_ALLOWED_KEYS` is currently a Linux/
                 // Wayland-only set (HYPRLAND_INSTANCE_SIGNATURE,

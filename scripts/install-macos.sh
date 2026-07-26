@@ -169,9 +169,9 @@ cat > "$CONTENTS/Info.plist" <<'EOF'
     <key>CFBundleDisplayName</key>
     <string>copad</string>
     <key>CFBundleVersion</key>
-    <string>0.1.0</string>
+    <string>1.0.0</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>1.0.0</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
@@ -214,6 +214,11 @@ fi
 if $DO_COPADD; then
     echo "==> cargo install --path copad-daemon (copadd → ~/.cargo/bin)"
     cargo install --path "$REPO_ROOT/copad-daemon"
+    # Pin the copadd path for the LaunchAgent wrapper (see copadd-launch.sh) so
+    # it launches THIS binary rather than a stale copy a prior release-installer
+    # (`install.sh`, which uses ~/.local/bin) may have left behind.
+    mkdir -p "$HOME/.config/copad"
+    printf '%s\n' "$HOME/.cargo/bin/copadd" > "$HOME/.config/copad/copadd.path"
 fi
 if $DO_MUX; then
     # comux: the standalone agent-orchestration terminal multiplexer
