@@ -48,12 +48,20 @@ jobs:
           cp -r copad-linux/icons dist/icons
           tar -czf "${ARCHIVE}" -C dist .
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+          # Also publish comux as a standalone release asset — a single
+          # self-contained binary (no GTK / no daemon) for users who want only
+          # the multiplexer. install-comux.sh downloads exactly this.
+          COMUX_ASSET="comux-v${VERSION}-x86_64-linux"
+          cp target/release/comux "${COMUX_ASSET}"
+          echo "COMUX_ASSET=${COMUX_ASSET}" >> "$GITHUB_ENV"
 
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
           name: linux-x86_64
-          path: ${{ env.ARCHIVE }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.COMUX_ASSET }}
           if-no-files-found: error
 
   build-macos:
@@ -68,6 +76,16 @@ jobs:
     # the toolchain selection explicit instead of relying on whichever
     # Xcode happens to be at /Applications/Xcode.app.
     runs-on: macos-15
+    # Developer ID signing + notarization is gated on these secrets. When they
+    # are absent (a fork, or before they are configured) the Stage step logs
+    # "signing secrets absent" and falls back to ad-hoc signing, so the build
+    # never fails for lack of credentials. Setup guide:
+    # docs/macos-signing-notarization.md.
+    env:
+      MACOS_SIGNING_IDENTITY: ${{ secrets.MACOS_SIGNING_IDENTITY }}
+      MACOS_NOTARY_APPLE_ID: ${{ secrets.MACOS_NOTARY_APPLE_ID }}
+      MACOS_NOTARY_PASSWORD: ${{ secrets.MACOS_NOTARY_PASSWORD }}
+      MACOS_NOTARY_TEAM_ID: ${{ secrets.MACOS_NOTARY_TEAM_ID }}
     steps:
       - uses: actions/checkout@v4
 
@@ -79,6 +97,41 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      # Import the Developer ID Application cert into a throwaway keychain so
+      # codesign can find the identity by name in the Stage step. No-op when the
+      # cert secret is absent (ad-hoc fallback). See docs/macos-signing-notarization.md.
+      - name: Import Developer ID certificate
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          # NOTE: -e is intentionally OFF. A cert-import failure (missing
+          # password, wrong password, malformed p12) must NOT abort the job —
+          # the Stage step's all-secrets gate then finds no identity and falls
+          # back to ad-hoc signing. So every failure here warns and exit 0s.
+          set -uo pipefail
+          if [ -z "${MACOS_CERTIFICATE_BASE64:-}" ] || [ -z "${MACOS_CERTIFICATE_PASSWORD:-}" ]; then
+            echo "signing cert secrets incomplete (need BASE64 + PASSWORD) — skipping import (ad-hoc fallback)"
+            exit 0
+          fi
+          fallback() { echo "WARNING: $1 — release will fall back to ad-hoc signing. Check the MACOS_CERTIFICATE_* secrets."; exit 0; }
+          KEYCHAIN="$RUNNER_TEMP/copad-signing.keychain-db"
+          KEYCHAIN_PWD="$(openssl rand -hex 24)"
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN" || fallback "create-keychain failed"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN" || true
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN" || fallback "unlock-keychain failed"
+          echo "$MACOS_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12" || fallback "base64 decode of cert failed"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" \
+            -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign \
+            || fallback "cert import failed (wrong password or malformed .p12?)"
+          # Allow codesign to use the key without an interactive prompt.
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN" >/dev/null \
+            || fallback "set-key-partition-list failed"
+          # Put our keychain first in the search list so the identity resolves.
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | sed s/\"//g) || true
+          rm -f "$RUNNER_TEMP/cert.p12"
+          echo "imported: $(security find-identity -v -p codesigning "$KEYCHAIN" | grep -c 'Developer ID Application') Developer ID Application identity(ies)"
 
       # copad-linux depends on GTK4/VTE so `cargo build --workspace` fails
       # on Darwin. List the macOS-buildable crates explicitly. Keep the
@@ -165,13 +218,9 @@ jobs:
           </plist>
           EOF
 
-          # Ad-hoc sign for distribution. scripts/codesign-dev.sh uses a
-          # login-keychain self-signed cert to keep TCC grants stable across
-          # local rebuilds; that's a dev-loop concern, not a distribution
-          # one. Cask removes quarantine on install, so an ad-hoc signature
-          # is enough for Gatekeeper to let the app launch.
-          codesign --force --deep --sign - --timestamp=none "$STAGING"
-          codesign -dv "$STAGING" 2>&1 | head -5 || true
+          # Signing is DEFERRED until after every binary (CLIs + plugins) is
+          # staged into $DIST, so a single pass can Developer-ID-sign them all
+          # and then notarize the app. See the "Sign + notarize" block below.
 
           # ---- Top-level CLI binaries ----
           cp target/release/coctl "$DIST/coctl"
@@ -215,17 +264,79 @@ jobs:
           cp dist/launchd/com.marshall.copad.daemon.plist "$DIST/com.marshall.copad.daemon.plist"
           cp dist/launchd/copadd-launch.sh "$DIST/copadd-launch.sh"
 
+          # ---- Sign + notarize ----
+          # With signing secrets present: Developer-ID-sign EVERY Mach-O
+          # (CLIs + plugin binaries + the app) with a hardened runtime and a
+          # secure timestamp, then notarize + staple the .app only (the CLIs
+          # are terminal-run, where a Developer ID signature already suffices,
+          # and per the chosen scope only the app is notarized). Signing all
+          # binaries — not just the app — is required so macOS 26 (Tahoe) does
+          # not delete the ad-hoc executables (copadd, plugins) on first spawn.
+          # Without secrets: fall back to the previous ad-hoc signature so the
+          # build still works on forks. See docs/macos-signing-notarization.md.
+          #
+          # Gate on ALL required inputs, not just the identity: require the
+          # identity + the three notary secrets AND that the cert actually
+          # imported into the keychain (so a partial config — e.g. identity set
+          # but cert or notary password missing — takes the ad-hoc fallback
+          # instead of failing the release at codesign/notarytool).
+          if [ -n "${MACOS_SIGNING_IDENTITY:-}" ] \
+             && [ -n "${MACOS_NOTARY_APPLE_ID:-}" ] \
+             && [ -n "${MACOS_NOTARY_PASSWORD:-}" ] \
+             && [ -n "${MACOS_NOTARY_TEAM_ID:-}" ] \
+             && security find-identity -v -p codesigning | grep -qF "$MACOS_SIGNING_IDENTITY"; then
+            echo "==> Developer ID signing (identity: $MACOS_SIGNING_IDENTITY)"
+            # Sign leaf binaries first (inside-out): CLIs, then every plugin.
+            for b in "$DIST/coctl" "$DIST/copadd" "$DIST/comux"; do
+              codesign --force --options runtime --timestamp \
+                --sign "$MACOS_SIGNING_IDENTITY" "$b"
+            done
+            find "$DIST/plugins" -type f -name 'copad-plugin-*' -perm -u+x -print0 \
+              | while IFS= read -r -d '' pbin; do
+                  codesign --force --options runtime --timestamp \
+                    --sign "$MACOS_SIGNING_IDENTITY" "$pbin"
+                done
+            # Then the app bundle (signs its Contents/MacOS/Copad executable).
+            codesign --force --options runtime --timestamp \
+              --sign "$MACOS_SIGNING_IDENTITY" "$STAGING"
+            codesign --verify --strict --verbose=2 "$STAGING"
+
+            echo "==> notarizing $STAGING"
+            ditto -c -k --keepParent "$STAGING" "$RUNNER_TEMP/Copad.zip"
+            xcrun notarytool submit "$RUNNER_TEMP/Copad.zip" \
+              --apple-id "$MACOS_NOTARY_APPLE_ID" \
+              --password "$MACOS_NOTARY_PASSWORD" \
+              --team-id "$MACOS_NOTARY_TEAM_ID" \
+              --wait
+            xcrun stapler staple "$STAGING"
+            xcrun stapler validate "$STAGING"
+            spctl -a -vvv --type exec "$STAGING" || true
+          else
+            echo "==> signing not fully configured (need identity + 3 notary secrets + an importable cert) — ad-hoc signing (Gatekeeper needs quarantine strip; not Tahoe-safe)"
+            codesign --force --deep --sign - --timestamp=none "$STAGING"
+            codesign -dv "$STAGING" 2>&1 | head -5 || true
+          fi
+
           # ---- Pack ----
           # Strip the dist-macos/ prefix so consumers see Copad.app / coctl / …
           # at the tarball root.
           tar -czf "$ARCHIVE" -C "$DIST" .
           echo "ARCHIVE=${ARCHIVE}" >> "$GITHUB_ENV"
+          # Standalone comux binary asset (see the Linux job + install-comux.sh).
+          # Copy from $DIST/comux — the copy the Sign+notarize block above
+          # signed — so the comux-only installer gets a Developer-ID-signed
+          # (Tahoe-safe) binary, not the unsigned target/release/comux.
+          COMUX_ASSET="comux-v${VERSION}-aarch64-apple-darwin"
+          cp "$DIST/comux" "$COMUX_ASSET"
+          echo "COMUX_ASSET=${COMUX_ASSET}" >> "$GITHUB_ENV"
 
       - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
           name: macos-aarch64
-          path: ${{ env.ARCHIVE }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.COMUX_ASSET }}
           if-no-files-found: error
 
   release:
@@ -255,4 +366,6 @@ jobs:
           files: |
             artifacts/linux-x86_64/*.tar.gz
             artifacts/macos-aarch64/*.tar.gz
+            artifacts/linux-x86_64/comux-*
+            artifacts/macos-aarch64/comux-*
           generate_release_notes: false

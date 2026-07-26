@@ -109,13 +109,25 @@ For macOS dev iteration: `cd copad-macos && ./run.sh` (debug bundle, opened in p
 
 ## Install
 
-### Linux — GitHub Releases (recommended)
+### Linux & macOS — GitHub Releases (recommended)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/marshallku/copad/master/install.sh | bash
 ```
 
-Options: `--version vX.Y.Z` to pin a release, `--system` to install to `/usr/local/bin` (requires sudo).
+One command for both platforms — it detects the OS and installs the matching release: on **Linux** the GTK app + `coctl`/`comux`; on **macOS** (Apple Silicon) `Copad.app` + `coctl`/`copadd`/`comux` + all first-party plugins + the `copadd` LaunchAgent (quarantine stripped for the ad-hoc-signed bundle).
+
+Options (pass after `bash -s --` when piping): `--version vX.Y.Z` to pin a release, `--system` to install system-wide (`/usr/local/bin`, `/Applications`; requires sudo).
+
+### Just comux (the multiplexer, standalone)
+
+`comux` is a self-contained tmux-style multiplexer with no GTK/daemon dependency. To install only it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/marshallku/copad/master/install-comux.sh | bash
+```
+
+Downloads a single `comux` binary (Linux x86_64 / macOS arm64) into `~/.local/bin` (`--system` for `/usr/local/bin`). The status-bar usage readout needs `coctl` on PATH; everything else works alone.
 
 ### Linux — From source
 
@@ -133,9 +145,9 @@ Builds a release binary, installs the desktop entry, and lays down all first-par
 brew install --cask marshallku/copad/copad
 ```
 
-Installs `Copad.app` to `/Applications`, `coctl` + `copadd` into `$(brew --prefix)/bin`, and lays out the 10 macOS plugins, shell hooks, and the `copadd` LaunchAgent (auto-starts at login). Requires Apple Silicon. The tap repo is [marshallku/homebrew-copad](https://github.com/marshallku/homebrew-copad).
+Installs `Copad.app` to `/Applications`, `coctl` + `copadd` into `$(brew --prefix)/bin`, and lays out the 14 macOS plugins, shell hooks, and the `copadd` LaunchAgent (auto-starts at login). Requires Apple Silicon. The tap repo is [marshallku/homebrew-copad](https://github.com/marshallku/homebrew-copad).
 
-**Supported macOS versions:** 14 (Sonoma), 15 (Sequoia). On **macOS 26 (Tahoe) and later** the brew install path is currently broken — Tahoe's tightened App Verification policy deletes ad-hoc-signed executables on first `launchd` spawn, which removes `copadd` and the plugin binaries the cask ships. Tahoe users should install from source via `scripts/install-macos.sh` (next section), which signs the binaries with a locally-trusted self-signed identity (`scripts/codesign-dev.sh`) and survives Tahoe's policy. Proper fix for the brew path is Apple Developer ID + notarization; tracked as follow-up work.
+**Supported macOS versions:** 14 (Sonoma), 15 (Sequoia). On **macOS 26 (Tahoe) and later**, ad-hoc-signed releases break — Tahoe's tightened App Verification policy deletes ad-hoc-signed executables on first `launchd` spawn, which removes `copadd` and the plugin binaries. The proper fix — Developer ID signing of every binary + notarization of `Copad.app` — is implemented in the release CI (`.github/workflows/release.yml`) and **activates automatically once the signing secrets are configured** (see [docs/macos-signing-notarization.md](docs/macos-signing-notarization.md)); releases cut before that fall back to ad-hoc. Until a signed release is published, Tahoe users should install from source via `scripts/install-macos.sh` (next section), which signs with a locally-trusted self-signed identity (`scripts/codesign-dev.sh`) and survives Tahoe's policy.
 
 ### macOS — From source
 
