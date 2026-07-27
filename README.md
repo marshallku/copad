@@ -47,6 +47,7 @@ copad is a cross-platform terminal emulator built on a shared Rust core with pla
 - **Turn notifications** — a native desktop toast fires the instant an agent finishes or blocks for input, *even while you're detached*; `Ctrl-b !` jumps to the blocked one, `Ctrl-b a` opens a notification center
 - **Detach & resume** — close the client and the agents keep running on the server; reattach anytime and pick up exactly where you left off
 - **Restart-proof — including the AI conversation** — kill the server or reboot the machine, and comux restores your whole layout *and* relaunches each agent mid-conversation via `claude --resume <id>` / `codex resume <id>`. Where tmux-resurrect brings back your shells, comux brings back the live chat
+- **One-command server restart** — `comux server restart` (also `start`/`stop`/`status`, and a flat `restart-server`) stops the server with a final save and brings a fresh one up with your workspace restored — no manual `kill-server`-then-reattach dance when you upgrade the binary or need to clear drift
 - **Subscription usage in the status bar** — per-window rate-limit utilization (Claude 5h + weekly, Codex weekly) rendered as threshold-colored bars
 - **Update hint** — a background check against GitHub releases shows a `⬆ x.y.z` marker in the status bar when a newer version is out, so remote-script installs know when to update (`update_check = false` to disable)
 

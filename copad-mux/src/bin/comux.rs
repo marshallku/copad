@@ -3,13 +3,14 @@
 //!   comux                    attach a client (spawning the server if needed)
 //!   comux attach             same as bare invocation
 //!   comux server             run the headless server in the foreground
+//!   comux server <sub>       manage the persistent server: start|stop|restart|status
 //!   comux ctl <cmd> …        control the running server (explicit form)
 //!   comux <cmd> …            shorthand: any other verb is a control command, so
 //!                            `comux new-session work` == `comux ctl new-session work`
 //!
 //! Control commands: list | split | resize | focus | close | send | list-tabs | new-tab |
 //! select-tab | list-sessions | new-session [name] | rename-session | select-session |
-//! worktree <create|list|rm> | kill-server.
+//! worktree <create|list|rm> | kill-server | restart-server | stop-server.
 //!
 //! The server holds the shells; the client renders + forwards input and can detach
 //! (`Ctrl-b d`) / reattach, so a session survives the terminal that launched it.
@@ -21,6 +22,7 @@ fn print_usage() {
          usage:\n\
          \x20 comux                       attach (spawns the server if needed)\n\
          \x20 comux server                run the headless server in the foreground\n\
+         \x20 comux server <sub>          manage the server: start|stop|restart|status\n\
          \x20 comux <cmd> [args]          run a control command (shorthand for `comux ctl <cmd>`)\n\
          \x20 comux ctl <cmd> [args]      run a control command (explicit)\n\
          \n\
@@ -31,6 +33,7 @@ fn print_usage() {
          \x20 comux new-tab               create a tab\n\
          \x20 comux split -h|-v           split the focused pane\n\
          \x20 comux worktree create <br>  git worktree + a session in it (also list|rm)\n\
+         \x20 comux server restart        stop + restart the server (restores the workspace)\n\
          \x20 comux kill-server           stop the server\n\
          \n\
          inside the TUI: Ctrl-b C new session (name prompt) · Ctrl-b W new worktree · \
@@ -42,7 +45,12 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(|s| s.as_str()) {
         Some("ctl") => std::process::exit(copad_mux::control::run_client(&args[1..])),
-        Some("server") => copad_mux::server::run(),
+        // Bare `comux server` runs the headless server in the foreground (unchanged). With a
+        // subcommand it's a lifecycle verb (start|stop|restart|status) handled by the client.
+        Some("server") => match args.get(1).map(|s| s.as_str()) {
+            None => copad_mux::server::run(),
+            Some(sub) => std::process::exit(copad_mux::control::run_server_admin(sub)),
+        },
         Some("attach") | Some("run") | None => copad_mux::client::run(),
         Some("help" | "-h" | "--help") => {
             print_usage();

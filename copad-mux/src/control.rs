@@ -270,6 +270,18 @@ pub fn run_client(args: &[String]) -> i32 {
         return run_worktree_client(&args[1..]);
     }
 
+    // Flat server-lifecycle aliases (tmux has none of these, but they read naturally and
+    // match the "any control verb works without `ctl`" ethos): `restart-server` and
+    // `stop-server` map onto the grouped `server restart|stop`. `kill-server` keeps its
+    // own path below for back-compat (it round-trips like the other requests).
+    if let Some(action) = args.first().and_then(|c| match c.as_str() {
+        "restart-server" => Some("restart"),
+        "stop-server" => Some("stop"),
+        _ => None,
+    }) {
+        return run_server_admin(action);
+    }
+
     let mut json_out = false;
     let mut rest: Vec<&String> = Vec::new();
     for a in args {
@@ -430,6 +442,129 @@ pub fn run_client(args: &[String]) -> i32 {
         print_human(&req, &resp);
     }
     if resp.ok { 0 } else { 1 }
+}
+
+/// `comux server <start|stop|restart|status>` (and the flat `restart-server` /
+/// `stop-server` aliases) — manage the persistent server's lifecycle so users don't have
+/// to hand-roll `kill-server` + a re-attach. `restart` leans on session persistence: the
+/// server saves its layout on shutdown and the fresh one restores it, so a restart brings
+/// the workspace back (whitelisted agents even resume). Returns a process exit code.
+pub fn run_server_admin(action: &str) -> i32 {
+    let sock = socket_path();
+    match action {
+        // `status` is a point-in-time query — a connect probe is exactly right (there's no
+        // action whose correctness a later state change could invalidate).
+        "status" => {
+            if UnixStream::connect(&sock).is_ok() {
+                println!("comux server: running ({})", sock.display());
+                0
+            } else {
+                println!("comux server: not running");
+                1
+            }
+        }
+        // `start`/`stop` probe ONLY to pick the human message; the end state is guaranteed by
+        // `ensure_running`/`ensure_server_stopped`, both idempotent, so a server exiting or
+        // appearing between the probe and the action can at worst mislabel — never misact.
+        "start" => {
+            let already = UnixStream::connect(&sock).is_ok();
+            match crate::client::ensure_running(&sock) {
+                Ok(()) => {
+                    println!(
+                        "comux server: {}",
+                        if already {
+                            "already running"
+                        } else {
+                            "started"
+                        }
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("comux: could not start server: {e}");
+                    1
+                }
+            }
+        }
+        "stop" => {
+            let was_running = UnixStream::connect(&sock).is_ok();
+            match ensure_server_stopped(&sock) {
+                Ok(()) => {
+                    println!(
+                        "comux server: {}",
+                        if was_running {
+                            "stopped"
+                        } else {
+                            "not running"
+                        }
+                    );
+                    0
+                }
+                Err(code) => code,
+            }
+        }
+        "restart" => {
+            // Idempotent stop then start — works whether or not a server was running, and a
+            // concurrent exit during the stop is treated as already-stopped, not a failure.
+            if let Err(code) = ensure_server_stopped(&sock) {
+                return code;
+            }
+            // `ensure_running` re-spawns on a backoff, which is exactly what handles the
+            // flock hand-off from the just-stopped server (see `connect_or_spawn`).
+            match crate::client::ensure_running(&sock) {
+                Ok(()) => {
+                    println!(
+                        "comux server: restarted (workspace restored — run `comux` to reattach)"
+                    );
+                    0
+                }
+                Err(e) => {
+                    eprintln!("comux: could not start server: {e}");
+                    1
+                }
+            }
+        }
+        other => {
+            eprintln!("comux: unknown server command '{other}' (start|stop|restart|status)");
+            2
+        }
+    }
+}
+
+/// Ensure no server is listening on `sock`: if one is up, send `KillServer` and block until
+/// it has fully exited (final save done, socket removed, flock released) so a following
+/// start/restart can't race the dying server. Idempotent — a connect refusal (nothing there,
+/// including one that vanished mid-request) is success, since the desired end state (stopped)
+/// already holds. `Err(code)` only on a real request/protocol failure or a stuck shutdown.
+fn ensure_server_stopped(sock: &Path) -> Result<(), i32> {
+    if UnixStream::connect(sock).is_err() {
+        return Ok(()); // nothing listening — already stopped
+    }
+    match round_trip(&Req::KillServer) {
+        Ok(r) if r.ok => {}
+        Ok(r) => {
+            eprintln!(
+                "comux: {}",
+                r.error.as_deref().unwrap_or("kill-server failed")
+            );
+            return Err(1);
+        }
+        // Raced: the server exited between our probe and this request. A fresh connect that
+        // also refuses confirms it's gone → treat as already-stopped rather than an error.
+        Err(_) if UnixStream::connect(sock).is_err() => return Ok(()),
+        Err(e) => {
+            eprintln!("comux: {e}");
+            return Err(1);
+        }
+    }
+    if !wait_for_server_gone(sock, Duration::from_secs(5)) {
+        eprintln!(
+            "comux: server still shutting down (socket present after 5s) — \
+             wait a moment before restarting, or `pkill -x comux`"
+        );
+        return Err(1);
+    }
+    Ok(())
 }
 
 /// Block until the server at `path` is fully gone (its socket removed → it's about to exit
@@ -898,5 +1033,43 @@ fn print_worktrees(infos: &[WorktreeInfo], json: bool, plain: bool) {
             if w.live { "*" } else { "" },
             if w.locked { "*" } else { "" },
         );
+    }
+}
+
+#[cfg(test)]
+mod server_admin_tests {
+    use super::*;
+
+    /// Point the socket at a path with no listener so `run_server_admin` sees "not running"
+    /// deterministically — the branches that don't spawn a server (status/stop/unknown) are
+    /// the ones safe to assert on in a unit test.
+    fn with_dead_socket<T>(f: impl FnOnce() -> T) -> T {
+        // Unique-ish per test via the thread name so parallel tests don't collide.
+        let name = std::thread::current()
+            .name()
+            .unwrap_or("t")
+            .replace(':', "_");
+        let path = std::env::temp_dir().join(format!("copad-mux-admin-test-{name}.sock"));
+        let _ = std::fs::remove_file(&path);
+        // SAFETY: single-threaded within this closure; the var is restored on the way out.
+        unsafe { std::env::set_var("COPAD_MUX_SOCK", &path) };
+        let out = f();
+        unsafe { std::env::remove_var("COPAD_MUX_SOCK") };
+        out
+    }
+
+    #[test]
+    fn status_reports_not_running_when_absent() {
+        with_dead_socket(|| assert_eq!(run_server_admin("status"), 1));
+    }
+
+    #[test]
+    fn stop_is_a_noop_success_when_not_running() {
+        with_dead_socket(|| assert_eq!(run_server_admin("stop"), 0));
+    }
+
+    #[test]
+    fn unknown_action_is_a_usage_error() {
+        with_dead_socket(|| assert_eq!(run_server_admin("frobnicate"), 2));
     }
 }
