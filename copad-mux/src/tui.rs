@@ -281,6 +281,11 @@ pub struct App {
     /// The usage snapshot currently folded into the rendered status bar; compared to
     /// the shared handle so a change triggers a repaint through `maybe_refresh_labels`.
     usage_shown: Option<UsageSnapshot>,
+    /// Last-seen alternate-screen bit per VISIBLE pane, polled every render by
+    /// [`Self::take_alt_screen_exit`]. Watching the true→false edge lets the render loop
+    /// force a full repaint when a full-screen app (nvim, less, …) exits, wiping the
+    /// incremental-diff residue the alt→primary grid swap leaves behind.
+    alt_screen: HashMap<TerminalId, bool>,
 }
 
 impl App {
@@ -372,6 +377,7 @@ impl App {
             version_poll: versionpoll::idle(),
             version_shown: None,
             usage_shown: None,
+            alt_screen: HashMap::new(),
         };
         app.reflow();
         Ok(app)
@@ -2600,6 +2606,34 @@ impl App {
         dirty
     }
 
+    /// Poll the VISIBLE panes' alternate-screen bits and report whether any just LEFT it
+    /// (true→false) — a full-screen app (nvim, less, htop, …) exited. The render loop reacts
+    /// by forcing a full repaint so the restored primary screen is clean: during the app's
+    /// life the client's unicode-width render can desync from alacritty's grid on wide
+    /// graphemes (e.g. VS16 emoji), and the alt→primary grid swap is where that residue shows;
+    /// only a full frame guarantees a clean screen. This updates the stored per-pane state.
+    ///
+    /// Scoped to the active tab's panes (a background pane toggling alt-screen doesn't affect
+    /// the composed frame; when its tab is next shown the whole buffer recomposes anyway).
+    /// Detection is a per-render poll — alacritty applies `?1049h`/`?1049l` on its own reader
+    /// thread with no callback we can hook — so an app that enters AND exits within a single
+    /// render interval (e.g. `nvim +q` from a script) can be missed. That isn't the interactive
+    /// full-screen case the user hits, and the wholesale content change usually clears it.
+    pub fn take_alt_screen_exit(&mut self) -> bool {
+        let visible: Vec<(TerminalId, bool)> = self
+            .layout()
+            .iter()
+            .map(|r| {
+                let alt = self
+                    .panes
+                    .get(&r.terminal)
+                    .is_some_and(|p| p.in_alt_screen());
+                (r.terminal.clone(), alt)
+            })
+            .collect();
+        detect_alt_screen_exit(&mut self.alt_screen, &visible)
+    }
+
     /// Wall-clock minute-of-day (`hour*60 + minute`), for the render loop to force a
     /// repaint when the status-bar `HH:MM` rolls over while otherwise idle.
     pub fn clock_minute(&self) -> u32 {
@@ -4129,6 +4163,25 @@ fn shell_quote(arg: &str) -> String {
 
 /// The start index of a vertical list window that keeps `active` visible when `total`
 /// items don't fit in `visible` rows (centers `active`, clamped to the ends).
+/// Update `prev` with the visible panes' current alt-screen bits and report whether any pane
+/// just LEFT the alternate screen (its bit went true→false). Panes no longer visible are
+/// dropped from `prev` so a later re-appearance re-seeds cleanly (and can't spuriously fire).
+/// Split out as a pure function so the edge logic is unit-testable without a live PTY.
+fn detect_alt_screen_exit(
+    prev: &mut HashMap<TerminalId, bool>,
+    visible: &[(TerminalId, bool)],
+) -> bool {
+    let mut exited = false;
+    for (tid, now) in visible {
+        let was = prev.insert(tid.clone(), *now).unwrap_or(false);
+        if was && !*now {
+            exited = true;
+        }
+    }
+    prev.retain(|tid, _| visible.iter().any(|(v, _)| v == tid));
+    exited
+}
+
 fn list_window_start(total: usize, active: usize, visible: usize) -> usize {
     if visible == 0 || total <= visible {
         return 0;
@@ -4302,9 +4355,53 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CAT_GREEN, CAT_RED, CAT_YELLOW, build_command_line, filter_env, fuzzy_match,
-        list_window_start, merge_env, shell_quote, tab_window, usage_threshold_color,
+        CAT_GREEN, CAT_RED, CAT_YELLOW, build_command_line, detect_alt_screen_exit, filter_env,
+        fuzzy_match, list_window_start, merge_env, shell_quote, tab_window, usage_threshold_color,
     };
+    use crate::model::TerminalId;
+    use std::collections::HashMap;
+
+    fn tid(s: &str) -> TerminalId {
+        TerminalId::new(s)
+    }
+
+    #[test]
+    fn alt_screen_exit_fires_only_on_true_to_false_edge() {
+        let mut prev = HashMap::new();
+        let t = tid("t1");
+        // First observation while already in alt screen: seeds true, not an exit.
+        assert!(!detect_alt_screen_exit(&mut prev, &[(t.clone(), true)]));
+        // Still in alt screen: no edge.
+        assert!(!detect_alt_screen_exit(&mut prev, &[(t.clone(), true)]));
+        // Leaves the alt screen: the true→false edge fires exactly once.
+        assert!(detect_alt_screen_exit(&mut prev, &[(t.clone(), false)]));
+        // Staying on the primary screen: no repeat fire.
+        assert!(!detect_alt_screen_exit(&mut prev, &[(t.clone(), false)]));
+        // Entering alt screen (false→true) is NOT an exit.
+        assert!(!detect_alt_screen_exit(&mut prev, &[(t, true)]));
+    }
+
+    #[test]
+    fn alt_screen_exit_drops_hidden_panes_and_never_fires_spuriously() {
+        let mut prev = HashMap::new();
+        let (a, b) = (tid("a"), tid("b"));
+        // Pane a is in alt screen while visible; pane b is not.
+        assert!(!detect_alt_screen_exit(
+            &mut prev,
+            &[(a.clone(), true), (b.clone(), false)]
+        ));
+        // Pane a becomes hidden (only b visible): a is dropped from the store, and b staying on
+        // the primary screen must NOT be read as an exit.
+        assert!(!detect_alt_screen_exit(&mut prev, &[(b.clone(), false)]));
+        assert!(!prev.contains_key(&a));
+        // Pane a reappears STILL on the primary screen (it left alt while hidden): because it was
+        // dropped, it re-seeds as false and does not spuriously fire — the tab switch that
+        // revealed it recomposes the whole frame, so there is no residue to clear here.
+        assert!(!detect_alt_screen_exit(
+            &mut prev,
+            &[(a, false), (b, false)]
+        ));
+    }
 
     fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs

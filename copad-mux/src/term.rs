@@ -307,6 +307,14 @@ impl PaneTerm {
         wheel_bytes_for_mode(*self.term.lock().mode(), up, col, row)
     }
 
+    /// Whether the pane is currently on the ALTERNATE screen (`?1049h`) — i.e. a
+    /// full-screen app (nvim, less, htop, …) is running. The render loop polls this to
+    /// notice when such an app EXITS (alt → primary), so it can force a full repaint and
+    /// wipe any incremental-diff residue the alt→primary grid swap left behind.
+    pub fn in_alt_screen(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::ALT_SCREEN)
+    }
+
     /// Snapshot the visible viewport for rendering. Keeps the term lock only for
     /// the copy so the reader thread isn't starved.
     pub fn snapshot(&self) -> Snapshot {
@@ -719,6 +727,186 @@ mod render_repro {
             snap_text(&ref_snap),
             snap_text(&src_snap),
         );
+    }
+
+    /// Production-accurate relay (mirrors `server::push_frames` + `client::run_attached`).
+    ///
+    /// The difference from [`assert_relay_fidelity`]: that harness's `deliver` re-derives the
+    /// wire delta from the client's ALREADY-normalized buffer (`client.clone().diff(frame)`),
+    /// which silently models the server as diffing against the client's post-`fix_wide_spacers`
+    /// buffer. Production does NOT: `push_frames` keeps `c.last = <raw composed buffer>` and diffs
+    /// the next raw compose against THAT. This harness keeps that independent RAW baseline, so it
+    /// exposes any ghost caused by the server's baseline disagreeing with the client's normalized
+    /// buffer (the trailing-spacer width-oracle asymmetry).
+    fn assert_relay_fidelity_prod(
+        cols: usize,
+        rows: usize,
+        batches: &[&[u8]],
+        refresh_at: &[usize],
+    ) {
+        let (mut src_t, mut src_p) = term(cols, rows);
+        let (mut ref_t, mut ref_p) = term(cols, rows);
+        let sink = SharedBytes(Rc::new(RefCell::new(Vec::new())));
+        let area = Rect::new(0, 0, cols as u16, rows as u16);
+        let mut cterm = Terminal::with_options(
+            CrosstermBackend::new(sink.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .unwrap();
+        let mut server_last = Buffer::empty(area); // the server's `c.last` (RAW composed buffer)
+        let mut client = Buffer::empty(area);
+        for (i, batch) in batches.iter().enumerate() {
+            feed(&mut src_t, &mut src_p, batch);
+            let snap = snapshot_grid(&src_t);
+            let server = compose(&snap); // RAW composed, exactly like `App::render_to`
+            let full = i == 0 || refresh_at.contains(&i);
+            if full {
+                server_last = Buffer::empty(area);
+                client = Buffer::empty(area);
+            }
+            // `push_frames`: diff the raw compose against the raw baseline, ship changed cells.
+            let changed = server_last.diff(&server);
+            for (x, y, cell) in &changed {
+                if let Some(bc) = client.cell_mut(Position::new(*x, *y)) {
+                    bc.set_symbol(cell.symbol());
+                    bc.set_style(cell.style());
+                    bc.set_skip(cell.skip);
+                }
+            }
+            server_last = server.clone(); // advance the RAW baseline (production semantics)
+            // `run_attached`: normalize spacers, then emit through a real ratatui terminal.
+            crate::client::fix_wide_spacers(&mut client);
+            if full {
+                cterm.clear().unwrap();
+            }
+            let src_buf = client.clone();
+            cterm
+                .draw(|frame| {
+                    let out = frame.buffer_mut();
+                    for y in 0..area.height {
+                        for x in 0..area.width {
+                            if let (Some(s), Some(d)) = (
+                                src_buf.cell(Position::new(x, y)),
+                                out.cell_mut(Position::new(x, y)),
+                            ) {
+                                *d = s.clone();
+                            }
+                        }
+                    }
+                })
+                .unwrap();
+            let bytes = std::mem::take(&mut *sink.0.borrow_mut());
+            feed(&mut ref_t, &mut ref_p, &bytes);
+        }
+        let src_snap = snapshot_grid(&src_t);
+        let ref_snap = snapshot_grid(&ref_t);
+        assert_eq!(
+            cells_norm(&ref_snap),
+            cells_norm(&src_snap),
+            "\nPROD-accurate relay diverged from the SOURCE screen\n got:  {:?}\n want: {:?}",
+            snap_text(&ref_snap),
+            snap_text(&src_snap),
+        );
+    }
+
+    #[test]
+    fn prod_relay_passes_on_normal_content() {
+        // Sanity: the production-accurate harness (independent raw baseline) relays ordinary
+        // wide-CJK + colored content faithfully — same script as the claude-code-like session.
+        assert_relay_fidelity_prod(
+            24,
+            6,
+            &[
+                "\x1b[?1049h\x1b[2J\x1b[H".as_bytes(),
+                "\x1b[H┌─ 세션 ─────────────┐".as_bytes(),
+                "\x1b[2;1H│ \x1b[32mready\x1b[0m            │".as_bytes(),
+                "\x1b[3;1H│ 작업 중…            │".as_bytes(),
+                "\x1b[4;1H└────────────────────┘".as_bytes(),
+                "\x1b[2;4H\x1b[31mBUSY \x1b[0m".as_bytes(),
+                "\x1b[3;4H가나다라마".as_bytes(),
+                "\x1b[3;4Habcde".as_bytes(),
+                "\x1b[2;2H\x1b[K│".as_bytes(),
+                "\x1b[5;1H\x1b[38;5;39m▓▓▓▓▓▓\x1b[0m spinner".as_bytes(),
+                "\x1b[5;1H\x1b[2Kdone".as_bytes(),
+            ],
+            &[],
+        );
+    }
+
+    #[test]
+    #[ignore = "documents a KNOWN, deep limitation: alacritty and unicode-width disagree on \
+                some graphemes (VS16 emoji like ❤\u{fe0f}, ZWJ sequences). alacritty lays ❤\u{fe0f} as 1 \
+                column; ratatui's emit AND fix_wide_spacers measure it as 2 via unicode-width, so \
+                the client desyncs from the source grid mid-app. Fixing this needs the client to \
+                render with alacritty's width model instead of ratatui/unicode-width — out of scope \
+                (see full-screen-exit forced-full workaround). Run with --ignored to observe."]
+    fn prod_relay_known_wide_char_desync() {
+        // A pure-delta emoji/CJK churn: mixes VS16 ❤️ (alacritty width 1, unicode-width 2) with
+        // 가 (both 2) and X. Through the production-accurate baseline this DIVERGES — a 가 that
+        // replaces an ❤️ is never re-sent, leaving a stale ❤️ ghost. This is the root the user's
+        // "sometimes ghost" traces to; the shipped fix forces a full repaint at the alt-screen
+        // seam rather than trying to reconcile the two width tables.
+        let batches: Vec<Vec<u8>> = (0..20)
+            .map(|i| {
+                let mut s = String::from("\x1b[H");
+                for row in 1..=3 {
+                    let n = (i + row) % 7;
+                    s.push_str(&format!("\x1b[{row};1H\x1b[2K"));
+                    for c in 0..5 {
+                        if (c + n) % 3 == 0 {
+                            s.push('❤');
+                            s.push('\u{fe0f}');
+                        } else if (c + n) % 3 == 1 {
+                            s.push('가');
+                        } else {
+                            s.push('X');
+                        }
+                    }
+                    s.push_str(&format!(" r{row}"));
+                }
+                s.into_bytes()
+            })
+            .collect();
+        let refs: Vec<&[u8]> = batches.iter().map(|b| b.as_slice()).collect();
+        assert_relay_fidelity_prod(20, 4, &refs, &[]);
+    }
+
+    #[test]
+    fn full_frame_on_alt_exit_clears_wide_char_residue() {
+        // The shipped fix's MECHANISM: a full repaint forced at the alt-screen EXIT wipes any
+        // wide-char desync residue accumulated during the app's life, so the restored primary
+        // (shell) screen is clean. Ticks 0-2 accumulate VS16/emoji desync on the alt screen;
+        // tick 3 leaves the alt screen (`?1049l`) and `refresh_at: [3]` models the server forcing
+        // `needs_full` on THAT exit transition (the production edge); tick 4 draws the ASCII shell
+        // prompt. The restored primary screen (width-agreement content) must match the source
+        // exactly — no residue. (Without the forced full — see `prod_relay_known_wide_char_desync`
+        // — the stale alt-screen cells the incremental diff wrongly deems unchanged would linger.)
+        assert_relay_fidelity_prod(
+            20,
+            4,
+            &[
+                "\x1b[?1049h\x1b[2J\x1b[H❤\u{fe0f}가X❤\u{fe0f}가 alt".as_bytes(), // 0: enter + emoji churn
+                "\x1b[2;1H가❤\u{fe0f}X가❤\u{fe0f} row2".as_bytes(), // 1: more desync-prone content
+                "\x1b[3;1H❤\u{fe0f}❤\u{fe0f}❤\u{fe0f} spin".as_bytes(), // 2: dense VS16
+                "\x1b[?1049l".as_bytes(),                           // 3: EXIT alt screen
+                "\x1b[H$ ls -la\r\ntotal 0".as_bytes(),             // 4: ASCII shell prompt
+            ],
+            &[3], // server forces a full repaint ON the alt-screen exit tick (the production edge)
+        );
+    }
+
+    #[test]
+    fn alt_screen_bit_tracks_enter_exit() {
+        // The signal the fix polls: `?1049h` sets `ALT_SCREEN`, `?1049l` clears it. This is what
+        // `PaneTerm::in_alt_screen` reads and the render loop watches for the true->false edge.
+        let (mut t, mut p) = term(10, 3);
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
+        feed(&mut t, &mut p, b"\x1b[?1049h");
+        assert!(t.mode().contains(TermMode::ALT_SCREEN));
+        feed(&mut t, &mut p, b"\x1b[?1049l");
+        assert!(!t.mode().contains(TermMode::ALT_SCREEN));
     }
 
     #[test]

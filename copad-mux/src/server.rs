@@ -300,7 +300,21 @@ pub fn run() -> io::Result<()> {
         dirty |= app.reconcile_popup();
         dirty |= app.reconcile_center();
         dirty |= app.maybe_refresh_labels(); // sidebar/status data actually changed
-        dirty |= app.drain_pane_dirty(); // any pane's screen advanced (PTY output)
+        let pane_dirty = app.drain_pane_dirty(); // any pane's screen advanced (PTY output)
+        dirty |= pane_dirty;
+        // A full-screen app (nvim/less/htop/…) just LEFT the alternate screen: force a full
+        // repaint for every client so the restored primary screen is clean. The alt→primary
+        // grid swap is where incremental-diff residue shows (the client's unicode-width render
+        // desyncs from alacritty's grid on wide graphemes during the app's life); a full frame
+        // is the proven residue-clear (same path as Ctrl-b r). Gated on `pane_dirty` so the
+        // per-pane alt-screen poll only runs when a pane actually advanced.
+        if pane_dirty && app.take_alt_screen_exit() {
+            for c in clients.iter_mut() {
+                c.needs_full = true;
+                c.last = Buffer::empty(c.last.area);
+            }
+            dirty = true;
+        }
         let min = app.clock_minute();
         dirty |= min != last_min; // status-bar HH:MM rolled over
         // A frame dropped under backpressure (or a fresh attach) leaves the client
