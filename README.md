@@ -1,6 +1,7 @@
+
 # copad
 
-<img width="3440" height="1440" alt="image" src="https://github.com/user-attachments/assets/a1392646-1255-40ed-9722-ea8523a5c342" />
+<img width="1200" height="502" alt="out" src="https://github.com/user-attachments/assets/fb9996a7-f131-4265-84ae-cb2c6183bc50" />
 
 A cross-platform terminal emulator built around a shared Rust core and platform-native UIs. copad fuses the terminal with a workflow runtime — Event Bus, Action Registry, Context Service, Trigger Engine — and a plugin system, so calendars, notes, Slack, todos, and Claude Code spawns can compose with the editor as one orchestratable surface.
 
