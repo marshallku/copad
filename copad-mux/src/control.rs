@@ -270,18 +270,6 @@ pub fn run_client(args: &[String]) -> i32 {
         return run_worktree_client(&args[1..]);
     }
 
-    // Flat server-lifecycle aliases (tmux has none of these, but they read naturally and
-    // match the "any control verb works without `ctl`" ethos): `restart-server` and
-    // `stop-server` map onto the grouped `server restart|stop`. `kill-server` keeps its
-    // own path below for back-compat (it round-trips like the other requests).
-    if let Some(action) = args.first().and_then(|c| match c.as_str() {
-        "restart-server" => Some("restart"),
-        "stop-server" => Some("stop"),
-        _ => None,
-    }) {
-        return run_server_admin(action);
-    }
-
     let mut json_out = false;
     let mut rest: Vec<&String> = Vec::new();
     for a in args {
@@ -444,9 +432,9 @@ pub fn run_client(args: &[String]) -> i32 {
     if resp.ok { 0 } else { 1 }
 }
 
-/// `comux server <start|stop|restart|status>` (and the flat `restart-server` /
-/// `stop-server` aliases) — manage the persistent server's lifecycle so users don't have
-/// to hand-roll `kill-server` + a re-attach. `restart` leans on session persistence: the
+/// `comux server <start|stop|restart|status>` — manage the persistent server's lifecycle
+/// so users don't have to hand-roll `kill-server` + a re-attach. `restart` leans on session
+/// persistence: the
 /// server saves its layout on shutdown and the fresh one restores it, so a restart brings
 /// the workspace back (whitelisted agents even resume). Returns a process exit code.
 pub fn run_server_admin(action: &str) -> i32 {

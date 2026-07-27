@@ -10,7 +10,7 @@
 //!
 //! Control commands: list | split | resize | focus | close | send | list-tabs | new-tab |
 //! select-tab | list-sessions | new-session [name] | rename-session | select-session |
-//! worktree <create|list|rm> | kill-server | restart-server | stop-server.
+//! worktree <create|list|rm> | kill-server.
 //!
 //! The server holds the shells; the client renders + forwards input and can detach
 //! (`Ctrl-b d`) / reattach, so a session survives the terminal that launched it.
