@@ -759,7 +759,7 @@ checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
 
 [[package]]
 name = "copad-cli"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "chrono",
  "clap",
@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "copad-core"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "crossbeam-channel",
  "dirs 6.0.0",
@@ -793,7 +793,7 @@ dependencies = [
 
 [[package]]
 name = "copad-daemon"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "chrono",
  "copad-core",
@@ -809,7 +809,7 @@ dependencies = [
 
 [[package]]
 name = "copad-ffi"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "copad-core",
  "serde_json",
@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "copad-linux"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "copad-core",
  "copad-daemon",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "copad-mux"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "alacritty_terminal",
  "copad-usage",
@@ -846,6 +846,8 @@ dependencies = [
  "libc",
  "proptest",
  "ratatui",
+ "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -855,7 +857,7 @@ dependencies = [
 
 [[package]]
 name = "copad-plugin-bookmark"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "chrono",
  "copad-core",
@@ -869,7 +871,7 @@ dependencies = [
 
 [[package]]
 name = "copad-plugin-calendar"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "chrono",
  "keyring",
@@ -882,14 +884,14 @@ dependencies = [
 
 [[package]]
 name = "copad-plugin-claude"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "copad-plugin-discord"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "keyring",
  "serde",
@@ -900,21 +902,21 @@ dependencies = [
 
 [[package]]
 name = "copad-plugin-docs"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "copad-core",
 ]
 
 [[package]]
 name = "copad-plugin-echo"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "copad-plugin-git"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -924,7 +926,7 @@ dependencies = [
 
 [[package]]
 name = "copad-plugin-jira"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "chrono",
  "keyring",
@@ -936,7 +938,7 @@ dependencies = [
 
 [[package]]
 name = "copad-plugin-kb"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "copad-core",
  "libc",
@@ -945,7 +947,7 @@ dependencies = [
 
 [[package]]
 name = "copad-plugin-llm"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "chrono",
  "keyring",
@@ -958,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "copad-plugin-pilot"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "dirs 5.0.1",
  "serde",
@@ -968,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "copad-plugin-slack"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "keyring",
  "regex",
@@ -982,7 +984,7 @@ dependencies = [
 
 [[package]]
 name = "copad-plugin-todo"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "chrono",
  "copad-core",
@@ -994,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "copad-plugin-web-bridge"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "axum",
  "copad-core",
@@ -1014,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "copad-term"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "alacritty_terminal",
  "libc",
@@ -1022,7 +1024,7 @@ dependencies = [
 
 [[package]]
 name = "copad-usage"
-version = "1.0.0"
+version = "1.0.2"
 dependencies = [
  "chrono",
  "reqwest",

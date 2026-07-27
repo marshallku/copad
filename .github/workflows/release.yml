@@ -29,7 +29,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build release
-        run: cargo build --workspace --release
+        run: |
+          # Stamp the tag's version into the workspace so built binaries
+          # self-report their true version via CARGO_PKG_VERSION. Git tags alone
+          # don't bump Cargo.toml, and comux's status-bar update check +
+          # `coctl update check` compare the running version against the latest
+          # release — a stale CARGO_PKG_VERSION would make them misreport forever.
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
+          cargo build --workspace --release
 
       - name: Bundle tarball
         run: |
@@ -139,6 +147,10 @@ jobs:
       # plugin set in sync with install-macos.sh's MACOS_PLUGINS array.
       - name: Build Rust crates (workspace minus copad-linux)
         run: |
+          # Stamp the tag's version into the workspace (see the Linux job) so
+          # comux/coctl self-report their true version.
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i '' "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
           cargo build --release \
             -p copad-ffi \
             -p copad-term \

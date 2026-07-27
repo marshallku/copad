@@ -26,6 +26,9 @@ usage = "bar"             # status-bar Claude/Codex rate-limit readout:
                           #   text — percentages only (claude 5h 5% wk 34% · codex wk 60%)
                           #   off  — hidden (same as COPAD_MUX_USAGE=0)
 usage_bar_width = 8       # cells per progress bar when usage = "bar"  (3..30)
+update_check = true       # check GitHub releases in the background and show a
+                          #   ⬆ x.y.z hint in the status bar when a newer version
+                          #   exists (false / COPAD_MUX_UPDATE_CHECK=0 disables it)
 
 # ---- session persistence (tmux-resurrect / continuum style) ----
 # The layout (sessions, tabs, splits, per-pane cwd) is autosaved and restored when the

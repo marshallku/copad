@@ -25,6 +25,7 @@ pub mod state;
 pub mod term;
 pub mod tui;
 pub mod usagepoll;
+pub mod versionpoll;
 pub mod worktree;
 
 pub use model::{

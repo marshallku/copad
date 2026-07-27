@@ -37,6 +37,7 @@ use crate::proto::MouseKind;
 use crate::state::{Command, Event, MuxError, Origin, RestoredTab, State};
 use crate::term::{CellColor, PaneTerm};
 use crate::usagepoll::{self, UsagePart, UsageSnapshot};
+use crate::versionpoll::{self, VersionStatus};
 
 /// Direction for focus navigation with the arrow keys.
 #[derive(Clone, Copy)]
@@ -264,6 +265,11 @@ pub struct App {
     /// Shared usage/limits readout (`coctl usage --limits`), written by a background
     /// poller thread (`usagepoll`), read into `usage_shown` at the label cadence.
     usage_poll: usagepoll::Shared,
+    /// Shared "update available" hint, written by the `versionpoll` thread
+    /// (server-only); read into `version_shown` at the label cadence.
+    version_poll: versionpoll::Shared,
+    /// The update hint currently folded into the rendered status bar.
+    version_shown: Option<VersionStatus>,
     /// The usage snapshot currently folded into the rendered status bar; compared to
     /// the shared handle so a change triggers a repaint through `maybe_refresh_labels`.
     usage_shown: Option<UsageSnapshot>,
@@ -345,6 +351,8 @@ impl App {
             // Idle until `start_usage_poll` (called by the server); tests that build an
             // App without a server never spawn the poller thread.
             usage_poll: usagepoll::idle(),
+            version_poll: versionpoll::idle(),
+            version_shown: None,
             usage_shown: None,
         };
         app.reflow();
@@ -2687,7 +2695,8 @@ impl App {
             let b = self.refresh_agent_statuses();
             let c = self.refresh_branches();
             let d = self.refresh_usage();
-            a || b || c || d
+            let e = self.refresh_version();
+            a || b || c || d || e
         } else {
             false
         }
@@ -2704,12 +2713,34 @@ impl App {
         self.usage_poll = usagepoll::spawn();
     }
 
+    /// Start the background GitHub-release update checker (server-only; see
+    /// `versionpoll`). Skipped when `update_check = false` so a disabled check
+    /// costs no network polling (matching `COPAD_MUX_UPDATE_CHECK=0`).
+    pub fn start_version_poll(&mut self) {
+        if !self.cfg.update_check {
+            return;
+        }
+        self.version_poll = versionpoll::spawn();
+    }
+
     /// Fold the latest polled usage snapshot into `usage_shown`; returns whether it
     /// changed (so the loop repaints the status bar). Poison-safe read.
     fn refresh_usage(&mut self) -> bool {
         let current = self.usage_poll.lock().map(|g| g.clone()).unwrap_or(None);
         if current != self.usage_shown {
             self.usage_shown = current;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Fold the latest polled update hint into `version_shown`; returns whether it
+    /// changed (so the loop repaints the status bar). Poison-safe read.
+    fn refresh_version(&mut self) -> bool {
+        let current = self.version_poll.lock().map(|g| g.clone()).unwrap_or(None);
+        if current != self.version_shown {
+            self.version_shown = current;
             true
         } else {
             false
@@ -3295,6 +3326,18 @@ impl App {
                 format!(" ● {agents} "),
                 Style::default()
                     .fg(CAT_GREEN)
+                    .bg(CAT_SURFACE0)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        // "Update available" hint — only present when the versionpoll thread has
+        // seen a release newer than this build. A passive nudge for users who
+        // installed via install-comux.sh; hidden entirely when up to date.
+        if let Some(v) = &self.version_shown {
+            segs.push((
+                format!(" ⬆ {} ", v.latest),
+                Style::default()
+                    .fg(CAT_YELLOW)
                     .bg(CAT_SURFACE0)
                     .add_modifier(Modifier::BOLD),
             ));

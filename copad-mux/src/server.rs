@@ -210,6 +210,10 @@ pub fn run() -> io::Result<()> {
     // Kick off the background usage/limits poller (Claude 5h+weekly · Codex weekly)
     // that feeds the status bar. Detached thread; `COPAD_MUX_USAGE=0` disables it.
     app.start_usage_poll();
+    // And the background GitHub-release update checker (status-bar `⬆ x.y.z`
+    // hint). Detached thread; `COPAD_MUX_UPDATE_CHECK=0` / `update_check = false`
+    // disables it.
+    app.start_version_poll();
 
     let (tx, rx) = mpsc::channel::<Incoming>();
     spawn_accept_loop(listener, tx, mouse);

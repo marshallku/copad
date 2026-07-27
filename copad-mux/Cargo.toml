@@ -25,6 +25,11 @@ crossterm = { version = "0.28.1", features = ["serde"] }
 libc = "0.2"
 # Display-width-aware status-bar text placement (already in-tree via ratatui).
 unicode-width = "0.2"
+# GitHub-release update check for the status-bar "update available" hint
+# (versionpoll). reqwest is already in-tree via copad-usage; mirror its TLS
+# features (OS trust store + webpki roots) so a corporate CA is trusted.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
+semver = "1"
 
 [[bin]]
 name = "comux"

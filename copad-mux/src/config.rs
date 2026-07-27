@@ -474,6 +474,10 @@ pub struct MuxConfig {
     pub usage: UsageStyle,
     /// Width in cells of each progress bar when `usage = "bar"`.
     pub usage_bar_width: u16,
+    /// Check GitHub releases in the background and show a `⬆ x.y.z` hint in the
+    /// status bar when a newer version exists (equivalent to
+    /// `COPAD_MUX_UPDATE_CHECK=0` when false).
+    pub update_check: bool,
     /// `comux worktree create` naming + post-create hooks.
     pub worktree: WorktreeConfig,
 }
@@ -494,6 +498,7 @@ struct RawConfig {
     sort_by: Option<String>,
     usage: Option<String>,
     usage_bar_width: Option<i64>,
+    update_check: Option<bool>,
     keys: Option<HashMap<String, ChordSpec>>,
     global: Option<HashMap<String, ChordSpec>>,
     worktree: Option<RawWorktree>,
@@ -577,6 +582,7 @@ impl MuxConfig {
             sort_by: SortBy::Created,
             usage: UsageStyle::Bar,
             usage_bar_width: DEFAULT_USAGE_BAR_WIDTH,
+            update_check: true,
             worktree: WorktreeConfig {
                 naming: crate::worktree::DEFAULT_NAMING.to_string(),
                 scripts: HashMap::new(),
@@ -694,6 +700,7 @@ impl MuxConfig {
                     "usage_bar_width",
                     &mut warnings,
                 ) as u16,
+                update_check: raw.update_check.unwrap_or(true),
                 worktree,
             },
             warnings,
