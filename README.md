@@ -1,11 +1,22 @@
-
 # copad
 
-<img width="1200" height="502" alt="out" src="https://github.com/user-attachments/assets/fb9996a7-f131-4265-84ae-cb2c6183bc50" />
+<img width="1200" height="502" alt="copad — a terminal built for orchestrating AI agents" src="https://github.com/user-attachments/assets/fb9996a7-f131-4265-84ae-cb2c6183bc50" />
 
-A cross-platform terminal emulator built around a shared Rust core and platform-native UIs. copad fuses the terminal with a workflow runtime — Event Bus, Action Registry, Context Service, Trigger Engine — and a plugin system, so calendars, notes, Slack, todos, and Claude Code spawns can compose with the editor as one orchestratable surface.
+> **The terminal as an orchestration surface — for your shells, your plugins, and your AI agents.**
+
+copad is a cross-platform terminal emulator built on a shared Rust core with platform-native UIs — GTK4 on Linux, Swift/AppKit on macOS, SwiftUI on iOS. But it's more than an emulator: a workflow runtime (Event Bus, Action Registry, Context Service, Trigger Engine) and a plugin system turn the terminal into one programmable surface, where shells, AI agents, calendars, notes, Slack, and todos all compose and react to one another.
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
+![Platforms](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20macOS%20%C2%B7%20iOS-blue)
+![Core](https://img.shields.io/badge/core-Rust%20edition%202024-orange)
+
+**[Install](#install) · [Just comux](#just-comux-the-multiplexer-standalone) · [Configuration](#configuration) · [Docs](#documentation)**
+
+## Highlights
+
+- **Built for AI agents** — [`comux`](#multiplexer-comux) runs a whole team of `claude` / `codex` sessions in one terminal: live per-agent status, a desktop ping the moment one needs you, and a restart that brings every agent back *mid-conversation* — even after a reboot.
+- **Programmable, not just configurable** — an event bus and trigger engine let plugins react to each other, while the `coctl` CLI and a Unix-socket API drive every pane, tab, and panel from a script.
+- **Truly cross-platform** — one Rust core, native UIs on Linux, macOS (Metal-accelerated), and iOS.
 
 ## Features
 
@@ -20,13 +31,30 @@ A cross-platform terminal emulator built around a shared Rust core and platform-
 
 ### Multiplexer (`comux`)
 
-A standalone, tmux-style terminal multiplexer (binary `comux`) with a persistent server/client split — the server owns the panes and survives the launching terminal. Runs anywhere as a single self-contained binary (no GTK, no daemon); [install it on its own](#just-comux-the-multiplexer-standalone).
+**Run a team of AI coding agents in one terminal — see every agent's status at a glance, get pinged the moment one needs you, and detach without stopping any of them.**
 
-- **Splits, tabs, and multi-session workspaces** — vim-style pane focus/resize, `Ctrl-b` prefix bindings, prefix-less `Alt`+`1`–`9`, named sessions
-- **git worktree integration** — `comux worktree create <branch>` spins up a worktree + a session in it (tmux `twt` parity)
-- **Session persistence** — autosaves sessions/tabs/split-layout/per-pane cwd and restores on server start; whitelisted agent processes re-run and **AI agents resume their live conversation** (`claude --resume` / `codex resume`)
-- **Agent-aware** — an always-on status bar (session · tabs · agent count · subscription usage/limits readout) and a left sidebar listing every agent pane with live `status · tool`; `Ctrl-f` fuzzy switcher; native desktop notifications on agent turn-finished / awaiting-input, even while detached
-- **Full multiplexer kit** — scrollback/copy-mode, mouse (wheel forwarded to mouse-aware apps), detach/reattach, shared multi-client, all configurable via `~/.config/copad/mux.toml`
+`comux` is a standalone, tmux-style multiplexer: a single self-contained binary (no GTK, no daemon) with a persistent server/client split, so the server owns your panes and outlives the terminal that launched it. It's a complete multiplexer — but it's built for the workflow tmux never was: driving several `claude` / `codex` sessions at once.
+
+> **Just want the multiplexer?** `comux` needs no other part of copad. It's a single static binary you can drop onto any machine — including a headless server over SSH — and use anywhere you'd reach for tmux:
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/marshallku/copad/master/install-comux.sh | bash
+> ```
+
+**Made for orchestrating agents**
+
+- **Live agent status** — an always-on sidebar lists every agent pane across every session with a real `status · tool` readout (`working` / `ready` / `blocked`), so you always know who's busy and who's waiting on you
+- **Turn notifications** — a native desktop toast fires the instant an agent finishes or blocks for input, *even while you're detached*; `Ctrl-b !` jumps to the blocked one, `Ctrl-b a` opens a notification center
+- **Detach & resume** — close the client and the agents keep running on the server; reattach anytime and pick up exactly where you left off
+- **Restart-proof — including the AI conversation** — kill the server or reboot the machine, and comux restores your whole layout *and* relaunches each agent mid-conversation via `claude --resume <id>` / `codex resume <id>`. Where tmux-resurrect brings back your shells, comux brings back the live chat
+- **Subscription usage in the status bar** — per-window rate-limit utilization (Claude 5h + weekly, Codex weekly) rendered as threshold-colored bars
+
+**A full multiplexer, too**
+
+- **Splits, tabs, multi-session workspaces** — vim-style pane focus/resize, `Ctrl-b` prefix bindings, prefix-less `Alt`+`1`–`9`, named sessions
+- **git worktree integration** — `comux worktree create <branch>` spins up a worktree plus a session inside it (tmux `twt` parity)
+- **`Ctrl-f` fuzzy switcher** — jump across sessions and agents just by typing
+- **Everything you'd expect** — scrollback/copy-mode, mouse (wheel forwarded to mouse-aware apps), shared multi-client, all configurable via `~/.config/copad/mux.toml`
 
 ### Panels
 

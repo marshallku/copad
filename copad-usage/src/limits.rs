@@ -1,8 +1,9 @@
-//! `coctl usage --limits` — subscription rate-limit window utilization.
+//! Subscription rate-limit window utilization — the shared readout behind
+//! `coctl usage --limits` and the comux status bar.
 //!
-//! A DIFFERENT data source than the token/cost aggregation in this module:
-//! percentages are what Claude Code's `/usage` and Codex's TUI show ("X% of
-//! your 5h limit"), sourced per provider:
+//! A DIFFERENT data source than coctl's token/cost aggregation: percentages are
+//! what Claude Code's `/usage` and Codex's TUI show ("X% of your 5h limit"),
+//! sourced per provider:
 //!
 //!   * **Claude** — a live `GET https://api.anthropic.com/api/oauth/usage`
 //!     with the OAuth bearer token from `~/.claude/.credentials.json` (or, on
@@ -107,11 +108,11 @@ impl Stamped for CodexCache {
     }
 }
 
-/// Gather both providers' limits, honoring a `--tool` filter. The second tuple
-/// element is human-readable diagnostics for any provider that was requested but
-/// came back empty — printed to stderr by `run_limits` (comux reads only stdout,
-/// so this never pollutes the status bar) so a "why is Claude missing?" is
-/// answerable without a debugger.
+/// Gather both providers' limits, honoring a `want_claude`/`want_codex` filter.
+/// The second tuple element is human-readable diagnostics for any provider that
+/// was requested but came back empty — coctl prints them to stderr (the status
+/// bar reads only the values), so a "why is Claude missing?" is answerable
+/// without a debugger; comux ignores them.
 pub fn collect(home: &str, want_claude: bool, want_codex: bool) -> (Limits, Vec<String>) {
     let mut diags = Vec::new();
     // A parsed-but-empty result (200 with no window fields) is treated as
@@ -269,8 +270,8 @@ fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
 }
 
 /// Best-effort atomic, monotonic write. The temp file is PER-PROCESS
-/// (`.<pid>.tmp`) so two concurrent `coctl` invocations (the comux poller + a
-/// manual run) never write the same inode; each renames its own temp over `path`
+/// (`.<pid>.tmp`) so two concurrent writers (the comux poller thread + a manual
+/// `coctl usage --limits` run) never write the same inode; each renames its own temp over `path`
 /// (rename is atomic on one filesystem, so a reader always sees a whole file).
 /// Before writing we re-read the file and SKIP if it already holds a newer entry
 /// — so a delayed process can't regress a fresher value another just wrote (the
