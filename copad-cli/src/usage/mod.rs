@@ -6,13 +6,13 @@
 
 mod claude;
 mod codex;
-mod limits;
 mod model;
 mod pricing;
 mod render;
 
 use crate::commands::UsageArgs;
 use chrono::{DateTime, Duration, Local, Timelike};
+use copad_usage::limits;
 use model::{Aggregate, Record, Tool, Warnings};
 use std::path::Path;
 

@@ -1,14 +1,14 @@
 //! Background poller for the status-bar usage/limits readout.
 //!
-//! Fetches `coctl usage --limits --json` — Claude 5h + weekly (a live OAuth
-//! call) and Codex weekly (newest rollout snapshot) — parses the percentages
-//! into a [`UsageSnapshot`], and shares it with the render loop. Numbers (not a
-//! pre-formatted string) so the status bar can render either text or a progress
-//! bar per config + width. Shelling out does network I/O, so it runs on a
-//! dedicated thread, never the render loop. `COPAD_MUX_USAGE=0` disables it.
+//! Resolves the subscription rate-limit windows in-process via the shared
+//! `copad_usage::limits` crate — Claude 5h + weekly (a live OAuth call) and
+//! Codex weekly (newest rollout snapshot) — into a [`UsageSnapshot`], and shares
+//! it with the render loop. Numbers (not a pre-formatted string) so the status
+//! bar can render either text or a progress bar per config + width. Calling it
+//! does network + disk I/O, so it runs on a dedicated thread, never the render
+//! loop. Reading the limits in-process (not by shelling out to `coctl`) is what
+//! lets comux install standalone. `COPAD_MUX_USAGE=0` disables it.
 
-use std::ffi::{OsStr, OsString};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use unicode_width::UnicodeWidthStr;
@@ -21,7 +21,7 @@ const BAR_FILLED: char = '━';
 const BAR_EMPTY: char = '╌';
 
 /// Parsed rate-limit percentages. `None` window = unavailable (omitted); `stale`
-/// = the provider was served from coctl's cache (rendered with a `~`).
+/// = the provider was served from the on-disk cache (rendered with a `~`).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct UsageSnapshot {
     pub claude_5h: Option<f64>,
@@ -154,9 +154,8 @@ pub fn spawn() -> Shared {
     let _ = std::thread::Builder::new()
         .name("usage-poll".into())
         .spawn(move || {
-            let coctl = coctl_path();
             loop {
-                if let Some(s) = fetch(&coctl)
+                if let Some(s) = fetch()
                     && let Ok(mut g) = out.lock()
                 {
                     *g = Some(s);
@@ -167,48 +166,27 @@ pub fn spawn() -> Shared {
     shared
 }
 
-/// Run `coctl usage --limits --json` and parse it. `None` = the command couldn't
-/// run / errored → keep the previous snapshot rather than blanking on a transient
-/// failure; `Some(snapshot)` (possibly empty) = a fresh reading.
-fn fetch(coctl: &OsStr) -> Option<UsageSnapshot> {
-    let out = Command::new(coctl)
-        .args(["usage", "--limits", "--json"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    parse_json(&String::from_utf8_lossy(&out.stdout))
-}
-
-fn parse_json(s: &str) -> Option<UsageSnapshot> {
-    let v: serde_json::Value = serde_json::from_str(s).ok()?;
+/// Resolve both providers' rate-limit windows in-process. `None` = `HOME` is
+/// unset (can't locate credentials/rollouts) → keep the previous snapshot;
+/// `Some(snapshot)` (possibly empty) = a fresh reading. The shared crate never
+/// fails the call itself — an unavailable provider is simply an empty window
+/// (backfilled from the short-lived cache and flagged stale where possible).
+fn fetch() -> Option<UsageSnapshot> {
+    let home = std::env::var("HOME").ok()?;
+    // Diagnostics (why a provider is missing) are for `coctl`'s stderr; the
+    // status bar only shows values, so ignore them here.
+    let (limits, stale, _diags) = copad_usage::limits::resolve(&home, true, true);
     let mut snap = UsageSnapshot::default();
-    if let Some(c) = v.get("claude") {
-        snap.claude_5h = c.get("five_hour").and_then(serde_json::Value::as_f64);
-        snap.claude_wk = c.get("seven_day").and_then(serde_json::Value::as_f64);
-        snap.claude_stale = c.get("stale").and_then(serde_json::Value::as_bool) == Some(true);
+    if let Some(c) = &limits.claude {
+        snap.claude_5h = c.five_hour;
+        snap.claude_wk = c.seven_day;
+        snap.claude_stale = stale.claude;
     }
-    if let Some(x) = v.get("codex") {
-        snap.codex_wk = x.get("weekly").and_then(serde_json::Value::as_f64);
-        snap.codex_stale = x.get("stale").and_then(serde_json::Value::as_bool) == Some(true);
+    if let Some(x) = &limits.codex {
+        snap.codex_wk = x.weekly;
+        snap.codex_stale = stale.codex;
     }
     Some(snap)
-}
-
-/// Prefer the `coctl` next to the running `comux` binary (install scripts drop
-/// them together) — the server is often launched from a desktop entry / cron
-/// with a PATH that lacks `~/.local/bin`. Fall back to bare `coctl` on PATH.
-fn coctl_path() -> OsString {
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let sibling = dir.join("coctl");
-        if sibling.is_file() {
-            return sibling.into_os_string();
-        }
-    }
-    "coctl".into()
 }
 
 #[cfg(test)]
@@ -223,28 +201,6 @@ mod tests {
             codex_wk: Some(60.0),
             codex_stale: false,
         }
-    }
-
-    #[test]
-    fn parses_json_shape() {
-        let s = r#"{"claude":{"five_hour":5.0,"seven_day":34.0},"codex":{"weekly":60.0}}"#;
-        assert_eq!(parse_json(s).unwrap(), full());
-    }
-
-    #[test]
-    fn parses_stale_and_partial() {
-        let s = r#"{"claude":{"five_hour":5.0,"stale":true}}"#;
-        let snap = parse_json(s).unwrap();
-        assert_eq!(snap.claude_5h, Some(5.0));
-        assert_eq!(snap.claude_wk, None);
-        assert!(snap.claude_stale);
-        assert!(snap.codex_wk.is_none());
-    }
-
-    #[test]
-    fn empty_json_is_empty_snapshot() {
-        assert!(parse_json("{}").unwrap().is_empty());
-        assert!(parse_json("not json").is_none());
     }
 
     #[test]

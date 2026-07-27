@@ -764,6 +764,7 @@ dependencies = [
  "chrono",
  "clap",
  "copad-core",
+ "copad-usage",
  "flate2",
  "reqwest",
  "semver",
@@ -840,6 +841,7 @@ name = "copad-mux"
 version = "1.0.0"
 dependencies = [
  "alacritty_terminal",
+ "copad-usage",
  "crossterm",
  "libc",
  "proptest",
@@ -1016,6 +1018,16 @@ version = "1.0.0"
 dependencies = [
  "alacritty_terminal",
  "libc",
+]
+
+[[package]]
+name = "copad-usage"
+version = "1.0.0"
+dependencies = [
+ "chrono",
+ "reqwest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

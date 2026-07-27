@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 copad-core = { path = "../copad-core" }
+copad-usage = { path = "../copad-usage" }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }
