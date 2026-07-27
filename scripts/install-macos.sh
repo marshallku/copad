@@ -47,6 +47,22 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="Copad.app"
+
+# Re-sign a cargo-installed CLI with a fresh ad-hoc signature.
+#
+# `cargo install` ships the binary with the Rust/LLVM linker-signed ad-hoc
+# signature. On macOS 26 the kernel's Code Signing Monitor sometimes rejects
+# that linker signature at exec time — even though `codesign -v` passes on
+# disk — killing the process instantly with "SIGKILL (Code Signature
+# Invalid)" before main() runs (observed on comux). `codesign --force --sign -`
+# replaces it with a plain ad-hoc signature the kernel accepts, and is a no-op
+# for binaries that were already fine. Cheap insurance; apply to every CLI.
+resign_cli() {
+    local bin="$1"
+    [ -e "$bin" ] || return 0
+    echo "==> codesign --force --sign - $bin"
+    codesign --force --sign - "$bin"
+}
 DO_BUILD=true
 SYSTEM_INSTALL=false
 DO_COCTL=true
@@ -210,10 +226,12 @@ $SUDO_APP mv "$STAGING" "$APP_DEST/$APP_NAME"
 if $DO_COCTL; then
     echo "==> cargo install --path copad-cli (coctl → ~/.cargo/bin)"
     cargo install --path "$REPO_ROOT/copad-cli"
+    resign_cli "$HOME/.cargo/bin/coctl"
 fi
 if $DO_COPADD; then
     echo "==> cargo install --path copad-daemon (copadd → ~/.cargo/bin)"
     cargo install --path "$REPO_ROOT/copad-daemon"
+    resign_cli "$HOME/.cargo/bin/copadd"
     # Pin the copadd path for the LaunchAgent wrapper (see copadd-launch.sh) so
     # it launches THIS binary rather than a stale copy a prior release-installer
     # (`install.sh`, which uses ~/.local/bin) may have left behind.
@@ -226,6 +244,7 @@ if $DO_MUX; then
     # cargo-install rationale as coctl — not on crates.io, so install by path.
     echo "==> cargo install --path copad-mux (comux → ~/.cargo/bin)"
     cargo install --path "$REPO_ROOT/copad-mux"
+    resign_cli "$HOME/.cargo/bin/comux"
     # Renamed copad-mux → comux; drop a stale legacy binary from a prior install.
     [ -e "$HOME/.cargo/bin/copad-mux" ] && rm -f "$HOME/.cargo/bin/copad-mux"
 fi
