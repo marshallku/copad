@@ -25,3 +25,8 @@ uuid = { version = "1", features = ["v4"] }
 wait-timeout = "0.2"
 cron = "0.16"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# GitHub-release update check (update_check module): a daily poll that fires a
+# native toast + `update.available` bus event when a newer release exists. Same
+# TLS features as coctl (OS trust store + webpki roots) for corporate CAs.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
+semver = "1"

@@ -24,6 +24,7 @@ set -euo pipefail
 REPO="marshallku/copad"
 TARGET_VERSION=""
 SYSTEM_INSTALL=false
+DO_DAEMON=true
 
 usage() {
     echo "Usage: $0 [OPTIONS]"
@@ -33,6 +34,9 @@ usage() {
     echo "Options:"
     echo "  --version VERSION    Install a specific version (e.g., v1.0.0)"
     echo "  --system             Install system-wide (/usr/local/bin, /Applications; requires sudo)"
+    echo "  --no-daemon          Don't enable/start the copadd background daemon, and"
+    echo "                       stop + disable any existing one (Linux systemd --user"
+    echo "                       unit / macOS LaunchAgent). The binary is still installed."
     echo "  -h, --help           Show this help message"
 }
 
@@ -44,6 +48,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --system)
             SYSTEM_INSTALL=true
+            shift
+            ;;
+        --no-daemon)
+            DO_DAEMON=false
             shift
             ;;
         -h|--help)
@@ -143,6 +151,8 @@ install_linux() {
     # comux (the terminal multiplexer) ships in v0.2+ tarballs; guard so
     # older releases without it still install cleanly.
     [[ -f "${TMPDIR}/comux" ]] && ${SUDO} install -Dm755 "${TMPDIR}/comux" "${INSTALL_DIR}/comux"
+    # copadd (the background daemon) ships in v1.0.3+ tarballs; guard for older.
+    [[ -f "${TMPDIR}/copadd" ]] && ${SUDO} install -Dm755 "${TMPDIR}/copadd" "${INSTALL_DIR}/copadd"
     # Drop the pre-rename copad-mux binary so an upgrade leaves only comux.
     [[ -e "${INSTALL_DIR}/copad-mux" ]] && ${SUDO} rm -f "${INSTALL_DIR}/copad-mux"
 
@@ -174,6 +184,43 @@ install_linux() {
         echo "copad requires these libraries to run. Install them via your package manager."
     fi
 
+    # copadd systemd --user unit: start the daemon now + on login so Linux
+    # release users get the background daemon (update-check notifications,
+    # triggers, status bar), matching the from-source install-dev.sh path. The
+    # unit ships in the tarball under systemd/; COPADD_BIN_PATH is rewritten to
+    # the chosen install dir (systemd doesn't expand ~ or pick user/system dirs).
+    if ${DO_DAEMON} && [[ -f "${TMPDIR}/copadd" && -f "${TMPDIR}/systemd/copad-daemon.service" ]]; then
+        if command -v systemctl >/dev/null 2>&1; then
+            local unit_dst="${HOME}/.config/systemd/user"
+            echo "==> installing copadd systemd --user unit into ${unit_dst}"
+            mkdir -p "${unit_dst}"
+            # Disable bash 5.3+ patsub_replacement so `&` in the replacement is
+            # literal (the path has none, but be safe — matches install-dev.sh).
+            shopt -u patsub_replacement 2>/dev/null || true
+            local unit_text; unit_text="$(cat "${TMPDIR}/systemd/copad-daemon.service")"
+            unit_text="${unit_text//COPADD_BIN_PATH/${INSTALL_DIR}/copadd}"
+            printf '%s\n' "${unit_text}" > "${unit_dst}/copad-daemon.service"
+            chmod 644 "${unit_dst}/copad-daemon.service"
+            systemctl --user daemon-reload || true
+            systemctl --user enable copad-daemon.service 2>/dev/null || true
+            # restart covers both first install and re-install (pick up new binary).
+            systemctl --user restart copad-daemon.service 2>/dev/null || \
+                echo "note: could not start copad-daemon (no running user session?). It will start on next login."
+            if ! loginctl show-user "$USER" --property=Linger 2>/dev/null | grep -q '^Linger=yes$'; then
+                echo "note: linger is OFF — copadd stops on last logout. For boot/SSH persistence: sudo loginctl enable-linger $USER"
+            fi
+        else
+            echo "note: systemctl not found — skipping the copadd daemon. Run it manually or via your init system."
+        fi
+    elif ! ${DO_DAEMON} && command -v systemctl >/dev/null 2>&1; then
+        # --no-daemon: honor the opt-out by tearing down any unit a prior install
+        # left running/enabled, so an upgrade doesn't silently keep the daemon.
+        systemctl --user disable --now copad-daemon.service 2>/dev/null || true
+        rm -f "${HOME}/.config/systemd/user/copad-daemon.service"
+        systemctl --user daemon-reload 2>/dev/null || true
+        echo "note: --no-daemon — stopped & disabled the copadd systemd unit (binary left in place)."
+    fi
+
     warn_path "${INSTALL_DIR}"
 
     echo ""
@@ -183,6 +230,7 @@ install_linux() {
     # Report from the tarball contents (what THIS run installed), not the
     # destination — an old release over an existing mux shouldn't claim it.
     [[ -f "${TMPDIR}/comux" ]] && echo "  comux -> ${INSTALL_DIR}/comux"
+    [[ -f "${TMPDIR}/copadd" ]] && echo "  copadd -> ${INSTALL_DIR}/copadd"
 }
 
 # ===========================================================================
@@ -298,6 +346,19 @@ install_macos() {
 # proven logic in scripts/install-macos.sh (HOME_PLACEHOLDER rewrite +
 # secrets.env minting), adapted to read the plist/wrapper from the tarball.
 install_macos_launchagent() {
+    if ! ${DO_DAEMON}; then
+        # --no-daemon: tear down any LaunchAgent a prior install left, so an
+        # upgrade honors the opt-out. (The app itself still auto-spawns copadd
+        # when it's open — the LaunchAgent only governs login persistence.)
+        launchctl bootout "gui/$UID/com.marshall.copad.daemon" 2>/dev/null || true
+        rm -f "${HOME}/Library/LaunchAgents/com.marshall.copad.daemon.plist"
+        # Also stop a copadd the app auto-spawned (a detached process with no
+        # launchd label, so bootout doesn't reach it). It re-spawns next time the
+        # app launches — that path is inherent to Copad.app and documented.
+        pkill -x copadd 2>/dev/null || true
+        echo "note: --no-daemon — stopped copadd + removed the LaunchAgent (the app re-spawns it when opened)."
+        return 0
+    fi
     local plist_src="${TMPDIR}/com.marshall.copad.daemon.plist"
     local wrap_src="${TMPDIR}/copadd-launch.sh"
 

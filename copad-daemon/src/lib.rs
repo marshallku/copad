@@ -9,3 +9,4 @@ pub mod service_supervisor;
 pub mod socket;
 pub mod trigger_pump;
 pub mod trigger_sink;
+pub mod update_check;

@@ -47,6 +47,11 @@ jobs:
           cp target/release/copad dist/
           cp target/release/coctl dist/
           cp target/release/comux dist/
+          # copadd: the background daemon. install.sh installs it + starts the
+          # systemd --user unit (already shipped under dist/systemd/), so Linux
+          # release users get the daemon (update-check notifications, triggers,
+          # status bar) — not just the GUI.
+          cp target/release/copadd dist/
           # Desktop file basename matches the GTK app_id so Wayland
           # compositors map running windows to this launcher entry.
           cp copad-linux/com.marshall.copad.desktop dist/

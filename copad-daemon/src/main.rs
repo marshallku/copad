@@ -151,6 +151,13 @@ fn main() -> ExitCode {
     let (triggers_cfg, initial_mtime) = load_triggers_config();
     let cached_triggers = Arc::new(Mutex::new(triggers_cfg.clone()));
     let engine = build_trigger_engine(&actions, &gui, &context, &event_bus, &triggers_cfg);
+    // Daily GitHub-release update check → `update.available` bus event + a native
+    // toast when a newer version ships (the update path for install.sh users).
+    // Runs regardless of trigger hosting; `COPAD_UPDATE_CHECK=0` disables it.
+    copad_daemon::update_check::spawn(
+        event_bus.clone(),
+        copad_core::notifier::platform_notifier().map(Arc::from),
+    );
     // PumpState — and the bus subscriptions it owns — only exists when
     // the daemon is dispatch-authoritative. With host_triggers=false
     // the engine holds the trigger set internally but no receivers are

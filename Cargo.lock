@@ -801,6 +801,8 @@ dependencies = [
  "env_logger",
  "libc",
  "log",
+ "reqwest",
+ "semver",
  "serde",
  "serde_json",
  "uuid",

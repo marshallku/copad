@@ -156,9 +156,9 @@ For macOS dev iteration: `cd copad-macos && ./run.sh` (debug bundle, opened in p
 curl -fsSL https://raw.githubusercontent.com/marshallku/copad/master/install.sh | bash
 ```
 
-One command for both platforms — it detects the OS and installs the matching release: on **Linux** the GTK app + `coctl`/`comux`; on **macOS** (Apple Silicon) `Copad.app` + `coctl`/`copadd`/`comux` + all first-party plugins + the `copadd` LaunchAgent (quarantine stripped for the ad-hoc-signed bundle).
+One command for both platforms — it detects the OS and installs the matching release: on **Linux** the GTK app + `coctl`/`comux`/`copadd` (and starts the `copadd` systemd --user unit); on **macOS** (Apple Silicon) `Copad.app` + `coctl`/`copadd`/`comux` + all first-party plugins + the `copadd` LaunchAgent (quarantine stripped for the ad-hoc-signed bundle).
 
-Options (pass after `bash -s --` when piping): `--version vX.Y.Z` to pin a release, `--system` to install system-wide (`/usr/local/bin`, `/Applications`; requires sudo).
+Options (pass after `bash -s --` when piping): `--version vX.Y.Z` to pin a release, `--system` to install system-wide (`/usr/local/bin`, `/Applications`; requires sudo), `--no-daemon` to not enable/start `copadd` (and stop + disable an existing one).
 
 ### Just comux (the multiplexer, standalone)
 
@@ -215,6 +215,8 @@ Restart copad after installing/updating plugins — `discover_plugins()` only ru
 coctl update check    # check for new versions
 coctl update apply    # download and install latest (Linux only — macOS users re-run install.sh, brew upgrade --cask, or install-macos.sh)
 ```
+
+The `copadd` daemon checks GitHub releases **once a day in the background** and fires a native desktop notification (plus an `update.available` bus event) when a newer version ships — so you find out without polling. `install.sh` installs and starts `copadd` on both platforms (Linux systemd --user unit / macOS LaunchAgent), so this reaches release installs too; `--no-daemon` opts out, and `COPAD_UPDATE_CHECK=0` disables just the check. comux shows the same signal as a `⬆ x.y.z` status-bar hint.
 
 ### Daemon autostart (Linux)
 
