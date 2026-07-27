@@ -87,6 +87,19 @@ struct Client {
     epoch: u64,
     cols: u16,
     rows: u16,
+    /// This client's refreshed session vars (tmux `update-environment`), sent right after
+    /// attach via [`ClientMsg::Env`]. Adopted as the pane-spawn env source when this client's
+    /// input is dispatched, so a pane it creates inherits ITS live SSH/display session.
+    env: Vec<(String, String)>,
+}
+
+/// Per-connection handshake config threaded from [`run`] to each attaching client: the
+/// server's authoritative mouse setting plus the `update_environment` variable names
+/// advertised in `Hello` (tmux `update-environment`). Cheap to clone (one `bool` + an `Arc`).
+#[derive(Clone)]
+struct AttachCfg {
+    mouse: bool,
+    env_names: std::sync::Arc<Vec<String>>,
 }
 
 /// The uid on the other end of a Unix socket. `libc::getpeereid` is only bound for
@@ -195,6 +208,32 @@ pub fn run() -> io::Result<()> {
         eprintln!("comux config: {w}");
     }
     let mouse = cfg.mouse;
+    // The variable names the server refreshes from each attaching client (tmux
+    // `update-environment`), advertised in every `Hello`. Shared read-only across
+    // connection threads.
+    let env_names = std::sync::Arc::new(cfg.update_environment.clone());
+    // Capture the daemon's OWN (birth) values for those names, then scrub them from the
+    // daemon's environment. The snapshot seeds the first pane (so it's unchanged from
+    // today); the scrub means every LATER pane starts without the session the server was
+    // born in, receiving refreshed values only from the attaching client. This runs while
+    // still single-threaded — before `App::new` spawns PTY event-loop threads and before
+    // the accept/poll threads below — so mutating the process environment here is sound.
+    let mut boot_env: Vec<(String, String)> = Vec::new();
+    for name in &cfg.update_environment {
+        // A non-UTF-8 value can't ride the String-typed pane env nor the client handshake,
+        // so it could never be refreshed anyway: skip it here, which ALSO skips the scrub
+        // below — leaving it in the daemon env (inherited as-is) so the boot pane keeps it.
+        if let Some(val) = std::env::var_os(name)
+            && let Ok(s) = val.into_string()
+        {
+            boot_env.push((name.clone(), s));
+            // SAFETY: no other threads exist yet (see the ordering note above), so there is
+            // no concurrent reader/writer of the environment.
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
+    }
     // Session persistence (continuum-style): a background writer autosaves the layout so a
     // reboot/crash can restore it (App::new already restored on boot). Disabled when
     // `persist = false` or `autosave_secs = 0`.
@@ -206,7 +245,7 @@ pub fn run() -> io::Result<()> {
     let saver = persist_enabled.then(|| crate::persist::Saver::new(state_path.clone()));
     let autosave = Duration::from_secs(cfg.autosave_secs.max(1) as u64);
     // Headless default size until the first client attaches (then reflowed).
-    let mut app = App::new(80, 24, sock_env, cfg)?;
+    let mut app = App::new(80, 24, sock_env, boot_env, cfg)?;
     // Kick off the background usage/limits poller (Claude 5h+weekly · Codex weekly)
     // that feeds the status bar. Detached thread; `COPAD_MUX_USAGE=0` disables it.
     app.start_usage_poll();
@@ -216,7 +255,7 @@ pub fn run() -> io::Result<()> {
     app.start_version_poll();
 
     let (tx, rx) = mpsc::channel::<Incoming>();
-    spawn_accept_loop(listener, tx, mouse);
+    spawn_accept_loop(listener, tx, AttachCfg { mouse, env_names });
 
     // Multiple clients may attach at once (tmux-style shared view). The app is sized
     // to the SMALLEST attached client so everyone sees the whole thing; the same
@@ -331,20 +370,21 @@ fn recompute_viewport(app: &mut App, clients: &mut [Client]) {
 
 /// Accept connections forever, assigning each a unique (never-reused) id and a
 /// handler thread that funnels into `tx`.
-fn spawn_accept_loop(listener: UnixListener, tx: Sender<Incoming>, mouse: bool) {
+fn spawn_accept_loop(listener: UnixListener, tx: Sender<Incoming>, cfg: AttachCfg) {
     std::thread::spawn(move || {
         let next_id = AtomicU64::new(1);
         for stream in listener.incoming().flatten() {
             let id = next_id.fetch_add(1, Ordering::SeqCst);
             let tx = tx.clone();
-            std::thread::spawn(move || handle_conn(stream, id, tx, mouse));
+            let cfg = cfg.clone();
+            std::thread::spawn(move || handle_conn(stream, id, tx, cfg));
         }
     });
 }
 
 /// Read a connection's first line to select its role: `ctl` (one-shot request/reply)
 /// or `attach` (streaming client). Rejects cross-uid peers.
-fn handle_conn(stream: UnixStream, id: u64, tx: Sender<Incoming>, mouse: bool) {
+fn handle_conn(stream: UnixStream, id: u64, tx: Sender<Incoming>, cfg: AttachCfg) {
     // Fail CLOSED: reject cross-uid peers AND peers whose credentials can't be
     // established (this socket permits input injection, takeover, and shutdown).
     match peer_uid(&stream) {
@@ -365,7 +405,7 @@ fn handle_conn(stream: UnixStream, id: u64, tx: Sender<Incoming>, mouse: bool) {
     if let Ok(req) = serde_json::from_str::<control::Req>(&first) {
         serve_ctl(Some(req), reader, stream, tx);
     } else if let Ok(ClientMsg::Attach { cols, rows }) = serde_json::from_str::<ClientMsg>(&first) {
-        serve_client(id, cols, rows, reader, stream, tx, mouse);
+        serve_client(id, cols, rows, reader, stream, tx, cfg);
     } else {
         let mut w = stream;
         let _ = writeln!(
@@ -437,15 +477,18 @@ fn serve_client(
     mut reader: BufReader<UnixStream>,
     mut writer: UnixStream,
     tx: Sender<Incoming>,
-    mouse: bool,
+    cfg: AttachCfg,
 ) {
     // A clone the main loop can shut down to force-detach this client reliably.
     let Ok(conn) = writer.try_clone() else { return };
     // Server-authoritative handshake FIRST (before any frame): tell the client whether
-    // to enable mouse capture, so every client agrees with the server's config even if
-    // its own local mux.toml differs (the server owns the effective setting).
-    if writeln!(writer, "{}", json(&ServerMsg::Hello { mouse })).is_err() || writer.flush().is_err()
-    {
+    // to enable mouse capture (the server owns the effective setting) and which env vars
+    // to send back (tmux `update-environment`).
+    let hello = ServerMsg::Hello {
+        mouse: cfg.mouse,
+        update_environment: (*cfg.env_names).clone(),
+    };
+    if writeln!(writer, "{}", json(&hello)).is_err() || writer.flush().is_err() {
         return;
     }
     // bounded(1): a slow/suspended client can never grow the server's memory —
@@ -558,6 +601,7 @@ fn handle_incoming(
                 epoch: 0,
                 cols,
                 rows,
+                env: Vec::new(),
             });
             recompute_viewport(app, clients);
             true // a new client needs a (full) frame
@@ -568,7 +612,21 @@ fn handle_incoming(
                 return false;
             }
             match msg {
+                ClientMsg::Env { vars } => {
+                    // tmux update-environment: store this client's session vars and adopt
+                    // them now, so the next pane it spawns inherits its live SSH/display env.
+                    if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
+                        c.env = vars.clone();
+                    }
+                    app.set_client_env(vars);
+                    false
+                }
                 ClientMsg::Key(k) => {
+                    // A pane spawned by THIS client's key must inherit THIS client's env
+                    // (not whichever client attached last) — adopt it before dispatch (C4).
+                    if let Some(e) = clients.iter().find(|c| c.id == id).map(|c| c.env.clone()) {
+                        app.set_client_env(e);
+                    }
                     // All attached clients share input (tmux-style), but each carries
                     // its OWN prefix state so a `Ctrl-b` from one client can't be
                     // completed by another's key. Detach removes ONLY the client that

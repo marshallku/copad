@@ -231,6 +231,14 @@ pub struct App {
     /// Env vars injected into every pane's shell (e.g. `COPAD_MUX_SOCK`), so a
     /// shell inside a pane can control its own mux via `copad-mux ctl`.
     sock_env: Vec<(String, String)>,
+    /// The active client's live values for [`Self::env_update`] (tmux `update-environment`).
+    /// Set from the initiating client before its input is dispatched, so a pane it spawns
+    /// inherits that client's SSH/display session rather than the one the server was born in.
+    /// Seeded at boot from the daemon's own (pre-scrub) values so the first pane is unchanged.
+    client_env: Vec<(String, String)>,
+    /// Variable names refreshed from the client (from `cfg.update_environment`); the filter
+    /// applied to any incoming client env before it lands in [`Self::client_env`].
+    env_update: Vec<String>,
     /// Per-terminal foreground-process label (agent / shell / command), refreshed
     /// on a throttled cadence (`refresh_labels`), read by the sidebar/popup/CLI.
     labels: HashMap<TerminalId, procinfo::Label>,
@@ -280,18 +288,26 @@ impl App {
         cols: u16,
         rows: u16,
         sock_env: Vec<(String, String)>,
+        client_env: Vec<(String, String)>,
         cfg: MuxConfig,
     ) -> io::Result<Self> {
         let mut state = State::new();
         let mut panes = HashMap::new();
         let client = ClientId(0);
 
+        let env_update = cfg.update_environment.clone();
+        // The boot seed (daemon's pre-scrub values) is filtered to the whitelist, then merged
+        // over sock_env so the initial/restored panes inherit exactly the daemon's birth
+        // environment — the daemon env itself is scrubbed by `server::run` before this call.
+        let client_env = filter_env(client_env, &env_update);
+        let boot_env = merge_env(&sock_env, &client_env);
+
         // Try to restore the saved session layout (continuum-style). Falls back to a
         // fresh single `local` workspace when persistence is off, there's no snapshot, or
         // nothing could be restored (never boot empty).
         let restored = if cfg.persist {
             persist::load().and_then(|snap| {
-                restore_sessions(&mut state, &mut panes, &snap, cols, rows, &sock_env)
+                restore_sessions(&mut state, &mut panes, &snap, cols, rows, &boot_env)
             })
         } else {
             None
@@ -303,7 +319,7 @@ impl App {
                 let (_tab, _pane, term0) =
                     state.create_workspace(ws.clone(), None, Rect { cols, rows });
                 let Some(pt) =
-                    PaneTerm::spawn_with_env(cols.max(1), rows.max(1), None, None, &sock_env)
+                    PaneTerm::spawn_with_env(cols.max(1), rows.max(1), None, None, &boot_env)
                 else {
                     return Err(io::Error::other("failed to spawn shell PTY"));
                 };
@@ -334,6 +350,8 @@ impl App {
             notifications: VecDeque::new(),
             center: None,
             sock_env,
+            client_env,
+            env_update,
             labels: HashMap::new(),
             last_labels: std::time::Instant::now()
                 .checked_sub(Duration::from_secs(60))
@@ -357,6 +375,20 @@ impl App {
         };
         app.reflow();
         Ok(app)
+    }
+
+    /// The environment injected into a NEWLY spawned pane: the socket markers plus the
+    /// active client's refreshed session vars (tmux `update-environment`). The daemon's
+    /// own env was scrubbed of these names at startup, so this is the sole source of a
+    /// pane's SSH/display session.
+    fn pane_env(&self) -> Vec<(String, String)> {
+        merge_env(&self.sock_env, &self.client_env)
+    }
+
+    /// Adopt an attaching/initiating client's environment as the source for future panes,
+    /// filtered to the configured whitelist. Called before dispatching that client's input.
+    pub fn set_client_env(&mut self, env: Vec<(String, String)>) {
+        self.client_env = filter_env(env, &self.env_update);
     }
 
     // --- reads off the authoritative state ---
@@ -641,13 +673,9 @@ impl App {
             }
         }
         if let (Some(nt), Some(np)) = (new_term, new_pane) {
-            match PaneTerm::spawn_with_env(
-                self.cols.max(1),
-                self.rows.max(1),
-                None,
-                cwd,
-                &self.sock_env,
-            ) {
+            let pane_env = self.pane_env();
+            match PaneTerm::spawn_with_env(self.cols.max(1), self.rows.max(1), None, cwd, &pane_env)
+            {
                 Some(pt) => {
                     self.panes.insert(nt, pt);
                     // tmux-style: focus the freshly created pane.
@@ -741,13 +769,9 @@ impl App {
             }
         }
         if let Some((tab_id, term)) = created {
-            match PaneTerm::spawn_with_env(
-                self.cols.max(1),
-                self.rows.max(1),
-                None,
-                cwd,
-                &self.sock_env,
-            ) {
+            let pane_env = self.pane_env();
+            match PaneTerm::spawn_with_env(self.cols.max(1), self.rows.max(1), None, cwd, &pane_env)
+            {
                 Some(pt) => {
                     self.panes.insert(term, pt);
                 }
@@ -871,13 +895,8 @@ impl App {
         let (_tab, _pane, term0) =
             self.state
                 .create_workspace(id.clone(), name, Rect { cols, rows });
-        match PaneTerm::spawn_with_env(
-            self.cols.max(1),
-            self.rows.max(1),
-            None,
-            cwd,
-            &self.sock_env,
-        ) {
+        let pane_env = self.pane_env();
+        match PaneTerm::spawn_with_env(self.cols.max(1), self.rows.max(1), None, cwd, &pane_env) {
             Some(pt) => {
                 self.panes.insert(term0, pt);
                 self.switch_session(id);
@@ -3918,6 +3937,37 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Keep only the entries whose name is in `whitelist` (order preserved, last value wins on
+/// a duplicate name). Applied to a client's advertised env before it becomes `client_env`.
+fn filter_env(env: Vec<(String, String)>, whitelist: &[String]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (k, v) in env {
+        if !whitelist.iter().any(|w| w == &k) {
+            continue;
+        }
+        if let Some(slot) = out.iter_mut().find(|(ek, _)| ek == &k) {
+            slot.1 = v;
+        } else {
+            out.push((k, v));
+        }
+    }
+    out
+}
+
+/// `base` with `over` layered on top: `over`'s value replaces a matching key, otherwise it
+/// appends. Used to build a pane's env = socket markers (base) + client session vars (over).
+fn merge_env(base: &[(String, String)], over: &[(String, String)]) -> Vec<(String, String)> {
+    let mut out = base.to_vec();
+    for (k, v) in over {
+        if let Some(slot) = out.iter_mut().find(|(ek, _)| ek == k) {
+            slot.1 = v.clone();
+        } else {
+            out.push((k.clone(), v.clone()));
+        }
+    }
+    out
+}
+
 /// Restore saved sessions into `state`/`panes` (continuum-style). Returns the active
 /// workspace + the `next_session` counter (so freshly created sessions can't collide with
 /// restored `sN` ids), or `None` if nothing valid could be restored. Transactional per
@@ -4252,9 +4302,42 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CAT_GREEN, CAT_RED, CAT_YELLOW, build_command_line, fuzzy_match, list_window_start,
-        shell_quote, tab_window, usage_threshold_color,
+        CAT_GREEN, CAT_RED, CAT_YELLOW, build_command_line, filter_env, fuzzy_match,
+        list_window_start, merge_env, shell_quote, tab_window, usage_threshold_color,
     };
+
+    fn kv(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn filter_env_keeps_only_whitelisted_last_wins() {
+        let wl = vec!["DISPLAY".to_string(), "SSH_CONNECTION".to_string()];
+        let got = filter_env(
+            kv(&[("DISPLAY", ":0"), ("SECRET", "x"), ("DISPLAY", ":1")]),
+            &wl,
+        );
+        // SECRET dropped; DISPLAY kept with the LAST value; SSH_CONNECTION absent (not added).
+        assert_eq!(got, kv(&[("DISPLAY", ":1")]));
+    }
+
+    #[test]
+    fn merge_env_overrides_then_appends() {
+        let base = kv(&[("COPAD_MUX", "1"), ("DISPLAY", ":0")]);
+        let over = kv(&[("DISPLAY", ":9"), ("SSH_CONNECTION", "1.2.3.4")]);
+        // DISPLAY overridden in place; SSH_CONNECTION appended; COPAD_MUX untouched.
+        assert_eq!(
+            merge_env(&base, &over),
+            kv(&[
+                ("COPAD_MUX", "1"),
+                ("DISPLAY", ":9"),
+                ("SSH_CONNECTION", "1.2.3.4"),
+            ])
+        );
+    }
 
     #[test]
     fn usage_threshold_colors_by_severity() {

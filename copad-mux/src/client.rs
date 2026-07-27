@@ -115,6 +115,20 @@ fn connect_or_spawn(sock: &Path) -> io::Result<UnixStream> {
     if let Ok(s) = UnixStream::connect(sock) {
         return Ok(s);
     }
+    // We're about to BIRTH a new server (no one was listening). A server started from an
+    // SSH session freezes that session's kernel context (logind seat / macOS bootstrap):
+    // per-pane `update_environment` refreshes the SSH/display ENV, but local-only
+    // privileges (polkit shutdown, GUI-app access like Claude in Chrome) follow where the
+    // server was born and can't be moved per-pane. Nudge the user once, before the spawn.
+    if std::env::var_os("SSH_CONNECTION").is_some()
+        && std::env::var_os("COPAD_MUX_QUIET_SSH").is_none()
+    {
+        eprintln!(
+            "comux: starting the server from an SSH session — for local-only features \
+             (Claude in Chrome, system power actions) start it from a local console instead. \
+             (COPAD_MUX_QUIET_SSH=1 silences this.)"
+        );
+    }
     spawn_server()?;
     let mut last_spawn = std::time::Instant::now();
     for _ in 0..160 {
@@ -187,13 +201,67 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
     let mut wr = stream.try_clone()?;
     send(&mut wr, &ClientMsg::Attach { cols, rows })?;
 
+    // The server's `Hello` is always its first message. Consume it SYNCHRONOUSLY here —
+    // before the input loop starts — and reply with our `Env` so a fast pane-creation
+    // keystroke can never race ahead of the environment handshake (tmux update-environment).
+    // The SAME reader is then moved into the reader thread so no buffered bytes are lost.
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut pending_first: Option<ServerMsg> = None;
+    {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => return Ok(()), // server gone before it said hello
+                Ok(_) => {}
+            }
+            let t = line.trim();
+            if t.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<ServerMsg>(t) {
+                Ok(ServerMsg::Hello {
+                    mouse,
+                    update_environment,
+                }) => {
+                    // Server-authoritative: only now (not from local config) do we decide
+                    // whether to capture the mouse, so every client agrees with the server.
+                    if mouse {
+                        let _ = guard.enable_mouse();
+                    }
+                    // Reply with our live values for exactly the vars the server asked for,
+                    // reading each via `var_os` (never `env::vars()`, which panics on a
+                    // non-UTF-8 entry) and keeping only those present and valid UTF-8.
+                    let env: Vec<(String, String)> = update_environment
+                        .into_iter()
+                        .filter_map(|name| {
+                            std::env::var_os(&name)
+                                .and_then(|v| v.into_string().ok())
+                                .map(|v| (name, v))
+                        })
+                        .collect();
+                    let _ = send(&mut wr, &ClientMsg::Env { vars: env });
+                    break;
+                }
+                Ok(ServerMsg::Bye) => return Ok(()),
+                // Shouldn't precede Hello, but forward anything else so no frame is lost.
+                Ok(other) => {
+                    pending_first = Some(other);
+                    break;
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+
     // Reader thread: server frames → channel; dropping the sender on EOF signals the
     // main loop (recv → Disconnected) that the server went away.
     let (tx, rx) = mpsc::channel::<ServerMsg>();
     {
-        let rd = stream.try_clone()?;
+        if let Some(m) = pending_first.take() {
+            let _ = tx.send(m);
+        }
         std::thread::spawn(move || {
-            let mut reader = BufReader::new(rd);
             let mut line = String::new();
             loop {
                 line.clear();
@@ -316,13 +384,9 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     have_frame = true;
                     dirty = true;
                 }
-                Ok(ServerMsg::Hello { mouse }) => {
-                    // Server-authoritative: only now (not from local config) do we decide
-                    // whether to capture the mouse, so every client agrees with the server.
-                    if mouse {
-                        let _ = guard.enable_mouse();
-                    }
-                }
+                // Hello is consumed synchronously during the handshake above; a server
+                // never sends a second one, so this arm is unreachable in practice.
+                Ok(ServerMsg::Hello { .. }) => {}
                 Ok(ServerMsg::Bye) => return Ok(()),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()), // server gone

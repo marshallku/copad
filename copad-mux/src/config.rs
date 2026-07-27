@@ -46,6 +46,53 @@ fn default_restore_processes() -> Vec<String> {
         .collect()
 }
 
+/// The default `update_environment` list — the volatile per-login-session variables
+/// that a persistent server must refresh from the attaching client (tmux
+/// `update-environment` plus the modern-desktop set). Deliberately excludes anything
+/// load-bearing for a shell (see [`ENV_UPDATE_BLOCKLIST`]); these names are both
+/// scrubbed from the daemon at startup and re-injected per-pane from the latest client,
+/// so a pane never inherits a stale SSH/display session from wherever the server was born.
+pub fn default_update_environment() -> Vec<String> {
+    [
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XAUTHORITY",
+        "XDG_SESSION_TYPE",
+        "DBUS_SESSION_BUS_ADDRESS",
+        "SSH_ASKPASS",
+        "SSH_AUTH_SOCK",
+        "SSH_AGENT_PID",
+        "SSH_CONNECTION",
+        "SSH_CLIENT",
+        "SSH_TTY",
+        "WINDOWID",
+        "KRB5CCNAME",
+        "TERM_PROGRAM",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// Names refused in `update_environment`: load-bearing shell/process variables whose
+/// removal (daemon scrub) or client-driven override would break PATH lookup, the login
+/// shell, the home dir, or comux's own pane markers. A configured entry matching this
+/// list is dropped with a warning rather than silently honored.
+const ENV_UPDATE_BLOCKLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "SHELL",
+    "USER",
+    "LOGNAME",
+    "PWD",
+    "OLDPWD",
+    "TERM",
+    "SHLVL",
+    "_",
+    "COPAD_MUX",
+    "COPAD_MUX_SOCK",
+];
+
 /// How sessions are ordered in the sidebar + `Ctrl-f` switcher + `)`/`(` cycling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortBy {
@@ -478,6 +525,11 @@ pub struct MuxConfig {
     /// status bar when a newer version exists (equivalent to
     /// `COPAD_MUX_UPDATE_CHECK=0` when false).
     pub update_check: bool,
+    /// Environment variables refreshed from the attaching client into new panes
+    /// (tmux `update-environment`). Scrubbed from the daemon at startup so a pane
+    /// never inherits the session the server was born in; re-injected per-pane from
+    /// the latest client. Empty list = no refresh (panes inherit the daemon env as-is).
+    pub update_environment: Vec<String>,
     /// `comux worktree create` naming + post-create hooks.
     pub worktree: WorktreeConfig,
 }
@@ -499,6 +551,7 @@ struct RawConfig {
     usage: Option<String>,
     usage_bar_width: Option<i64>,
     update_check: Option<bool>,
+    update_environment: Option<Vec<String>>,
     keys: Option<HashMap<String, ChordSpec>>,
     global: Option<HashMap<String, ChordSpec>>,
     worktree: Option<RawWorktree>,
@@ -583,6 +636,7 @@ impl MuxConfig {
             usage: UsageStyle::Bar,
             usage_bar_width: DEFAULT_USAGE_BAR_WIDTH,
             update_check: true,
+            update_environment: default_update_environment(),
             worktree: WorktreeConfig {
                 naming: crate::worktree::DEFAULT_NAMING.to_string(),
                 scripts: HashMap::new(),
@@ -659,6 +713,7 @@ impl MuxConfig {
         };
 
         let worktree = build_worktree(raw.worktree, &mut warnings);
+        let update_environment = build_update_environment(raw.update_environment, &mut warnings);
 
         (
             MuxConfig {
@@ -701,11 +756,49 @@ impl MuxConfig {
                     &mut warnings,
                 ) as u16,
                 update_check: raw.update_check.unwrap_or(true),
+                update_environment,
                 worktree,
             },
             warnings,
         )
     }
+}
+
+/// Resolve `update_environment`: default when absent, else the configured list with
+/// load-bearing names ([`ENV_UPDATE_BLOCKLIST`]) dropped + warned and duplicates removed
+/// (order preserved). An explicit empty list is honored (disables env refresh).
+fn build_update_environment(raw: Option<Vec<String>>, warnings: &mut Vec<String>) -> Vec<String> {
+    let Some(list) = raw else {
+        return default_update_environment();
+    };
+    let mut out: Vec<String> = Vec::with_capacity(list.len());
+    for name in list {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        // A name with `=` or a NUL byte would panic `std::env::remove_var` when the server
+        // scrubs it at startup — reject it here so a config typo can never crash the daemon.
+        if name.contains('=') || name.contains('\0') {
+            warnings.push(format!(
+                "update_environment: '{name}' is not a valid variable name — ignoring"
+            ));
+            continue;
+        }
+        if ENV_UPDATE_BLOCKLIST
+            .iter()
+            .any(|b| b.eq_ignore_ascii_case(&name))
+        {
+            warnings.push(format!(
+                "update_environment: '{name}' is load-bearing and cannot be refreshed — ignoring"
+            ));
+            continue;
+        }
+        if !out.iter().any(|e| e == &name) {
+            out.push(name);
+        }
+    }
+    out
 }
 
 /// Build the `[worktree]` config: naming (empty → default) and per-repo hooks whose
@@ -1160,6 +1253,30 @@ mod tests {
         // Empty list disables program re-execution.
         let (off, _) = load_str("restore_processes = []");
         assert!(off.restore_processes.is_empty());
+    }
+
+    #[test]
+    fn update_environment_default_override_and_blocklist() {
+        // Default (no key) carries the volatile session vars, incl. the SSH_* set.
+        let (def, _) = load_str("");
+        assert!(def.update_environment.iter().any(|v| v == "SSH_CONNECTION"));
+        assert!(def.update_environment.iter().any(|v| v == "DISPLAY"));
+        // Explicit override replaces the default.
+        let (cfg, _) = load_str(r#"update_environment = ["FOO", "BAR"]"#);
+        assert_eq!(cfg.update_environment, vec!["FOO", "BAR"]);
+        // Empty list is honored (disables env refresh).
+        let (off, _) = load_str("update_environment = []");
+        assert!(off.update_environment.is_empty());
+        // Load-bearing names are dropped + warned; duplicates collapse.
+        let (guarded, warns) =
+            load_str(r#"update_environment = ["PATH", "HOME", "DISPLAY", "DISPLAY"]"#);
+        assert_eq!(guarded.update_environment, vec!["DISPLAY"]);
+        assert!(warns.iter().any(|w| w.contains("PATH")));
+        assert!(warns.iter().any(|w| w.contains("HOME")));
+        // Invalid names (`=`) are dropped + warned — they would panic env::remove_var.
+        let (bad, badwarn) = load_str(r#"update_environment = ["BAD=NAME", "OK"]"#);
+        assert_eq!(bad.update_environment, vec!["OK"]);
+        assert!(badwarn.iter().any(|w| w.contains("valid variable name")));
     }
 
     #[test]

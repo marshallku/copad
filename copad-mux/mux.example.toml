@@ -51,6 +51,18 @@ autosave_secs = 15        # periodic save interval; 0 disables (clamped to 5..36
 # --model) carry over; the prompt and one-shot `-p` runs don't. Set false to always restart clean.
 restore_agent_sessions = true
 
+# ---- environment refresh (tmux `update-environment`) ----
+# The persistent server freezes the environment it was BORN in, and every pane inherits it —
+# so a server first started over SSH would leave every pane thinking it's remote (breaking
+# local-only features like Claude in Chrome) even after you attach locally. These variable
+# names are scrubbed from the server at startup and RE-INJECTED into each new pane from the
+# CLIENT that spawns it, so a pane always reflects the session you attached from — not the one
+# the server was born in. The first (boot) pane keeps the server's birth values. Load-bearing
+# names (PATH, HOME, SHELL, …) are refused. Set [] to disable; the default is below.
+# update_environment = ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_SESSION_TYPE",
+#   "DBUS_SESSION_BUS_ADDRESS", "SSH_ASKPASS", "SSH_AUTH_SOCK", "SSH_AGENT_PID",
+#   "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "WINDOWID", "KRB5CCNAME", "TERM_PROGRAM"]
+
 # ---- git worktrees (`comux worktree create|list|rm`, tmx `twt`-style) ----
 # `comux worktree create <branch>` runs `git worktree add -b <branch>` placing the new
 # worktree as a SIBLING of the repo's main worktree, then opens a session in it and

@@ -59,8 +59,14 @@ pub enum ServerMsg {
     /// Sent once, first, on attach: the server-authoritative settings a client needs
     /// before it touches its terminal. `mouse` = whether to enable mouse capture (the
     /// server is the single config authority, so all clients agree regardless of what
-    /// each one's local `mux.toml` says).
-    Hello { mouse: bool },
+    /// each one's local `mux.toml` says). `update_environment` = the variable names the
+    /// server wants refreshed from this client (tmux `update-environment`); the client
+    /// replies with a [`ClientMsg::Env`] carrying just those it holds, BEFORE any input.
+    Hello {
+        mouse: bool,
+        #[serde(default)]
+        update_environment: Vec<String>,
+    },
     /// A render frame (delta or full).
     Frame(FrameMsg),
     /// Detach acknowledged / forced (Ctrl-b d, takeover, or server shutdown): the
@@ -87,6 +93,13 @@ pub enum ClientMsg {
     /// Open a streaming session at the client's terminal size (must be the first
     /// line on the connection).
     Attach { cols: u16, rows: u16 },
+    /// The client's values for the variables the server advertised in
+    /// [`ServerMsg::Hello::update_environment`] (only those the client actually has,
+    /// valid UTF-8). Sent immediately after `Hello`, before any input, so new panes
+    /// this client spawns inherit its live SSH/display session (tmux `update-environment`).
+    /// A struct variant (named `vars`) — an internally-tagged enum (`tag = "t"`) cannot
+    /// serialize a newtype variant whose payload is a sequence, so this must NOT be `Env(Vec<…>)`.
+    Env { vars: Vec<(String, String)> },
     /// A forwarded key event (interpreted server-side: prefix/nav/tabs/input).
     Key(KeyEvent),
     /// A forwarded mouse action at frame cell `(x, y)`.
@@ -95,4 +108,48 @@ pub enum ClientMsg {
     Resize { cols: u16, rows: u16 },
     /// Explicit detach request (a dropped connection detaches too).
     Detach,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `ClientMsg::Env` MUST be a struct variant: an internally-tagged enum can't tag a
+    /// newtype variant carrying a sequence, so `Env(Vec<…>)` would fail to serialize and
+    /// the client's environment handshake would silently never send. Lock the round-trip.
+    #[test]
+    fn client_env_round_trips() {
+        let msg = ClientMsg::Env {
+            vars: vec![
+                ("DISPLAY".to_string(), ":0".to_string()),
+                ("SSH_CONNECTION".to_string(), "1.2.3.4 5 6".to_string()),
+            ],
+        };
+        let line = serde_json::to_string(&msg).expect("Env must serialize");
+        assert!(line.contains("\"t\":\"env\""));
+        match serde_json::from_str::<ClientMsg>(&line).expect("Env must deserialize") {
+            ClientMsg::Env { vars } => {
+                assert_eq!(vars.len(), 2);
+                assert_eq!(vars[0], ("DISPLAY".to_string(), ":0".to_string()));
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// A `Hello` written by an older server (no `update_environment`) must still parse
+    /// (the field defaults to empty) so the client degrades to "no refresh" rather than erroring.
+    #[test]
+    fn hello_without_update_environment_defaults_empty() {
+        let m: ServerMsg = serde_json::from_str(r#"{"t":"hello","mouse":true}"#).unwrap();
+        match m {
+            ServerMsg::Hello {
+                mouse,
+                update_environment,
+            } => {
+                assert!(mouse);
+                assert!(update_environment.is_empty());
+            }
+            _ => panic!("expected Hello"),
+        }
+    }
 }
