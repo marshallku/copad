@@ -379,6 +379,13 @@ impl State {
             per_tab_terms.push(terms);
         }
         let active_tab = active_tab_id.unwrap_or_else(|| built[0].id.clone());
+        // The restored tabs took ids `{id}:t0..t{len-1}` minted DIRECTLY above, bypassing the
+        // `next_tab` counter. Advance it past them so a later `new_tab` in this workspace can't
+        // mint a COLLIDING TabId: `Workspace::tab`'s `.find()` returns the FIRST match, so a
+        // duplicate id makes `active_tab` resolve to the OLD restored tab — the new tab then
+        // renders and routes input to that tab's terminal (the "new tab shows another tab's
+        // screen" bug). `next_pane`/`next_term` need no such fix — `build_tree` minted them.
+        self.next_tab = self.next_tab.max(tabs.len() as u64);
         self.workspaces.push(Workspace {
             id,
             name,
@@ -1243,6 +1250,53 @@ mod tests {
         );
         let w = s.workspace(&WorkspaceId::new("local")).unwrap();
         assert_eq!(w.active_tab, w.tabs[0].id);
+    }
+
+    #[test]
+    fn new_tab_after_restore_mints_unique_id_not_colliding_with_restored_tabs() {
+        use crate::model::LayoutSpec;
+        // Restore a 3-tab session: ids `local:t0`, `local:t1`, `local:t2` minted directly.
+        let mut s = State::new();
+        let ws = WorkspaceId::new("local");
+        let tabs = (0..3)
+            .map(|_| RestoredTab {
+                name: None,
+                layout: LayoutSpec::Leaf,
+                active: false,
+            })
+            .collect();
+        s.install_restored_session(ws.clone(), None, tabs, Rect { cols: 80, rows: 24 });
+
+        // Creating a new tab must NOT reuse `local:t1` (the pre-fix bug: `next_tab` was still 1,
+        // so this collided, and `Workspace::tab`'s `.find()` made `active_tab` resolve to the
+        // old tab — the new tab then aliased that tab's screen).
+        s.apply(Command::NewTab {
+            origin: Origin::Api,
+            workspace: ws.clone(),
+        })
+        .unwrap();
+
+        let w = s.workspace(&ws).unwrap();
+        assert_eq!(w.tabs.len(), 4);
+        // Every tab id is distinct (no collision).
+        let ids: std::collections::HashSet<_> = w.tabs.iter().map(|t| &t.id).collect();
+        assert_eq!(
+            ids.len(),
+            4,
+            "tab ids must be unique after restore + new_tab"
+        );
+        // `active_tab` resolves to the freshly pushed tab, not a stale restored one.
+        assert_eq!(w.active_tab, w.tabs[3].id);
+        // …and that tab owns a terminal distinct from every restored tab's.
+        let new_term = w.tabs[3].layout.terminal_of(&w.tabs[3].focused).unwrap();
+        for old in &w.tabs[..3] {
+            let old_term = old.layout.terminal_of(&old.focused).unwrap();
+            assert_ne!(
+                new_term, old_term,
+                "new tab must not alias a restored terminal"
+            );
+        }
+        assert!(s.check_g1());
     }
 
     #[test]
