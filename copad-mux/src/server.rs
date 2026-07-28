@@ -27,6 +27,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect as RRect;
 
 use crate::control::{self, runtime_dir, socket_path};
+use crate::model::ClientId;
 use crate::proto::{ClientMsg, FrameMsg, ServerMsg, WireCell};
 use crate::tui::{App, KeyAction};
 
@@ -91,6 +92,11 @@ struct Client {
     /// attach via [`ClientMsg::Env`]. Adopted as the pane-spawn env source when this client's
     /// input is dispatched, so a pane it creates inherits ITS live SSH/display session.
     env: Vec<(String, String)>,
+    /// Text from this client's drag-selection awaiting delivery as a `Copy` (OSC 52). Held here
+    /// and retried each loop because the frame channel is cap-1: a drag redraw may be queued when
+    /// the copy is ready, so `try_send` can transiently fail. Latest-copy-wins (a newer selection
+    /// overwrites an unsent one — a human can't complete two drags within a frame interval).
+    pending_copy: Option<String>,
 }
 
 /// Per-connection handshake config threaded from [`run`] to each attaching client: the
@@ -320,6 +326,12 @@ pub fn run() -> io::Result<()> {
         // A frame dropped under backpressure (or a fresh attach) leaves the client
         // behind; reschedule a render to catch it up.
         dirty |= clients.iter().any(|c| c.needs_full || c.pending);
+        // Deliver any pending drag-selection clipboard copies (OSC 52) BEFORE frames, so a
+        // one-shot copy takes priority for the cap-1 channel slot and can't be perpetually
+        // starved by sustained frame output. Non-blocking (a suspended client can't stall us):
+        // on `Full` it retries next loop; a delivered copy just delays that client's frame by
+        // one tick (which then re-sends as a normal delta).
+        drain_pending_copies(&mut clients);
         if dirty && last_frame.elapsed() >= FRAME_INTERVAL {
             last_frame = Instant::now();
             last_min = min;
@@ -616,6 +628,7 @@ fn handle_incoming(
                 cols,
                 rows,
                 env: Vec::new(),
+                pending_copy: None,
             });
             recompute_viewport(app, clients);
             true // a new client needs a (full) frame
@@ -636,6 +649,8 @@ fn handle_incoming(
                     false
                 }
                 ClientMsg::Key(k) => {
+                    // Any key input ends an in-progress drag-selection (the user moved on).
+                    app.clear_selection();
                     // A pane spawned by THIS client's key must inherit THIS client's env
                     // (not whichever client attached last) — adopt it before dispatch (C4).
                     if let Some(e) = clients.iter().find(|c| c.id == id).map(|c| c.env.clone()) {
@@ -671,9 +686,14 @@ fn handle_incoming(
                     true // a key may change any visible state
                 }
                 ClientMsg::Mouse { x, y, kind } => {
-                    // Scroll the pane under the cursor / click-to-focus — shared, so
-                    // any client's wheel drives the one composite.
-                    app.mouse_at(x, y, kind);
+                    // Scroll the pane under the cursor / click-to-focus / drag-select — shared,
+                    // so any client's wheel drives the one composite. A drag-release returns the
+                    // selected pane text, which we hand back to THIS client to copy (OSC 52).
+                    if let Some(text) = app.mouse_at(ClientId(id), x, y, kind)
+                        && let Some(c) = clients.iter_mut().find(|c| c.id == id)
+                    {
+                        c.pending_copy = Some(text);
+                    }
                     true
                 }
                 ClientMsg::Resize { cols, rows } => {
@@ -698,9 +718,27 @@ fn handle_incoming(
             // The socket is already gone — drop the client WITHOUT another shutdown.
             if let Some(pos) = clients.iter().position(|c| c.id == id) {
                 clients.remove(pos);
+                // Drop a drag-selection the departing client owned (no live owner to finish it).
+                app.clear_selection_of(ClientId(id));
                 recompute_viewport(app, clients);
             }
             true
+        }
+    }
+}
+
+/// Try to deliver each client's pending drag-selection copy (OSC 52) without blocking. The
+/// frame channel is cap-1 and shared with frames, so a `Copy` can transiently fail to enqueue;
+/// leave it pending (retry next tick) on `Full`, clear it on success, drop it on disconnect.
+fn drain_pending_copies(clients: &mut [Client]) {
+    for c in clients.iter_mut() {
+        let Some(text) = c.pending_copy.take() else {
+            continue;
+        };
+        match c.out.try_send(ServerMsg::Copy { text: text.clone() }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => c.pending_copy = Some(text), // retry next loop
+            Err(TrySendError::Disconnected(_)) => {}                   // gone; drop it
         }
     }
 }

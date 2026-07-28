@@ -386,10 +386,12 @@ mod tests {
                     .collect()
             })
             .collect();
+        let wrapped = vec![false; cells.len()];
         Snapshot {
             cols: 80,
             rows: cells.len() as u16,
             cells,
+            wrapped,
             cursor: (0, 0),
         }
     }

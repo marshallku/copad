@@ -69,6 +69,10 @@ pub enum ServerMsg {
     },
     /// A render frame (delta or full).
     Frame(FrameMsg),
+    /// Put `text` on the system clipboard (the result of a mouse-drag selection copy). The
+    /// client emits an OSC 52 sequence to its own terminal — so it works over SSH, unlike a
+    /// server-side `pbcopy`/`xclip`. Sent only to the client that made the selection.
+    Copy { text: String },
     /// Detach acknowledged / forced (Ctrl-b d, takeover, or server shutdown): the
     /// client restores its terminal and exits; the server keeps running.
     Bye,
@@ -82,8 +86,12 @@ pub enum MouseKind {
     ScrollUp,
     /// Wheel down → scroll that pane toward the live bottom.
     ScrollDown,
-    /// Left click → focus that pane.
+    /// Left button down → focus that pane and anchor a drag-selection there.
     Click,
+    /// Left button held + moved → extend the drag-selection (clamped to the origin pane).
+    Drag,
+    /// Left button released → finish the selection; if it moved, copy the pane text.
+    Up,
 }
 
 /// Client → server messages.

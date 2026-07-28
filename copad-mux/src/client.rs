@@ -53,6 +53,44 @@ pub(crate) fn fix_wide_spacers(buf: &mut ratatui::buffer::Buffer) {
     }
 }
 
+/// Standard base64 (RFC 4648, `+`/`/`, `=` padding) of arbitrary bytes — for the OSC 52
+/// clipboard payload. Hand-rolled to avoid a dependency for ~15 trivial, stable lines;
+/// round-trip-locked by a unit test so malformed padding can't slip through silently.
+fn base64(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[(n >> 18 & 63) as usize] as char);
+        out.push(T[(n >> 12 & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            T[(n >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Set the system clipboard via OSC 52: `ESC ] 52 ; c ; <base64> BEL`. Written to stdout and
+/// flushed (before+after) so it doesn't interleave with a ratatui draw. Most terminals honor it
+/// (iTerm2/kitty/wezterm/alacritty); a terminal that ignores it simply doesn't copy (no error).
+/// NOTE: an ENCLOSING tmux/screen needs clipboard passthrough (`set-clipboard on`) to forward it.
+fn write_osc52(text: &str) -> io::Result<()> {
+    let mut out = io::stdout();
+    out.flush()?;
+    write!(out, "\x1b]52;c;{}\x07", base64(text.as_bytes()))?;
+    out.flush()
+}
+
 /// Restores the host terminal (raw mode off + leave alt screen) on drop — so a
 /// panic or an abrupt server exit never leaves the user's terminal wedged. Mouse
 /// capture is enabled lazily via [`TermGuard::enable_mouse`] when the server's `Hello`
@@ -321,6 +359,10 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                             MouseEventKind::ScrollUp => Some(MouseKind::ScrollUp),
                             MouseEventKind::ScrollDown => Some(MouseKind::ScrollDown),
                             MouseEventKind::Down(MouseButton::Left) => Some(MouseKind::Click),
+                            // Button-held motion + release drive the drag-selection (crossterm's
+                            // mouse capture enables button-event tracking, so these are reported).
+                            MouseEventKind::Drag(MouseButton::Left) => Some(MouseKind::Drag),
+                            MouseEventKind::Up(MouseButton::Left) => Some(MouseKind::Up),
                             _ => None,
                         };
                         if let Some(kind) = kind {
@@ -384,6 +426,12 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     have_frame = true;
                     dirty = true;
                 }
+                // A drag-selection copy: set the SYSTEM clipboard via OSC 52 through this
+                // client's own terminal (works over SSH). A one-shot, non-rendering control —
+                // written straight to stdout (flushed) outside ratatui's draw.
+                Ok(ServerMsg::Copy { text }) => {
+                    let _ = write_osc52(&text);
+                }
                 // Hello is consumed synchronously during the handshake above; a server
                 // never sends a second one, so this arm is unreachable in practice.
                 Ok(ServerMsg::Hello { .. }) => {}
@@ -435,5 +483,24 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                 }
             })?;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::base64;
+
+    #[test]
+    fn base64_matches_known_vectors() {
+        // RFC 4648 test vectors + padding cases (0/1/2 trailing bytes).
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foo"), "Zm9v");
+        assert_eq!(base64(b"foob"), "Zm9vYg==");
+        assert_eq!(base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        // Non-ASCII payload (a drag-copy can contain UTF-8) encodes its bytes.
+        assert_eq!(base64("가".as_bytes()), "6rCA");
     }
 }

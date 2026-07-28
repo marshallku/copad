@@ -192,6 +192,9 @@ const CAT_OVERLAY: Color = Color::Rgb(0x6c, 0x70, 0x86);
 const CAT_GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
 const CAT_PEACH: Color = Color::Rgb(0xfa, 0xb3, 0x87);
 const CAT_RED: Color = Color::Rgb(0xf3, 0x8b, 0xa8);
+/// Background tint for cells inside an in-progress drag-selection (Catppuccin surface2 —
+/// clearly lighter than the base so the selection is visible without hiding the glyphs).
+const SEL_BG: Color = Color::Rgb(0x58, 0x5b, 0x70);
 
 /// Color a usage gauge by how full it is: calm green under 70%, yellow warning
 /// from 70%, red alert from 90%.
@@ -203,6 +206,24 @@ fn usage_threshold_color(pct: f64) -> Color {
     } else {
         CAT_GREEN
     }
+}
+
+/// An in-progress mouse drag-selection (tmux-style copy). Lives only between button-down and
+/// button-up. Coordinates are PANE-RELATIVE viewport cells; `owner` is the client connection
+/// that started it, so a concurrent client's Drag/Up can't hijack it (input is multi-client).
+#[derive(Clone)]
+struct Sel {
+    /// The pane the drag started in — the selection is clamped to it, so the sidebar / status
+    /// bar / other panes are never included.
+    term: TerminalId,
+    owner: ClientId,
+    /// Where the drag started (pane-relative viewport cell `(col, row)`).
+    anchor: (u16, u16),
+    /// The current drag position (clamped to the pane).
+    head: (u16, u16),
+    /// True once the pointer actually moved — distinguishes a real selection from a plain
+    /// click (which just focuses and copies nothing).
+    moved: bool,
 }
 
 /// The multi-pane application: the authoritative layout `State` + a live shell per
@@ -286,6 +307,9 @@ pub struct App {
     /// force a full repaint when a full-screen app (nvim, less, …) exits, wiping the
     /// incremental-diff residue the alt→primary grid swap leaves behind.
     alt_screen: HashMap<TerminalId, bool>,
+    /// The in-progress mouse drag-selection, if any (tmux-style copy). `None` except between
+    /// a button-down and its button-up; the highlight only shows during the drag.
+    selection: Option<Sel>,
 }
 
 impl App {
@@ -378,6 +402,7 @@ impl App {
             version_shown: None,
             usage_shown: None,
             alt_screen: HashMap::new(),
+            selection: None,
         };
         app.reflow();
         Ok(app)
@@ -603,8 +628,13 @@ impl App {
     }
 
     /// Resize every hosted PTY to match its on-screen rect, so shell output wraps
-    /// at the right width (the layout is the source of truth for geometry).
-    fn sync_sizes(&self) {
+    /// at the right width (the layout is the source of truth for geometry). Also the
+    /// central hook where any LAYOUT change (split / pane-resize / close / tab / session)
+    /// cancels an in-progress drag-selection — its pane-relative coords are only valid for
+    /// the layout at button-down, so applying them to a resized snapshot would copy the
+    /// wrong range.
+    fn sync_sizes(&mut self) {
+        self.selection = None;
         for rect in self.layout() {
             if let Some(pt) = self.panes.get(&rect.terminal) {
                 pt.resize(rect.cols, rect.rows);
@@ -637,6 +667,8 @@ impl App {
     /// add/remove); a pure in-tab layout change (split/close/focus) can use
     /// `sync_sizes` since the viewport is unchanged.
     fn reflow(&mut self) {
+        // Any chrome/layout change invalidates a drag-selection's pane-relative coords.
+        self.selection = None;
         let cols = self.content_cols().max(1);
         let rows = self.content_rows().max(1);
         let _ = self.state.apply(Command::Resize {
@@ -820,6 +852,7 @@ impl App {
     /// `Ctrl-b 1` → index 0). Out-of-range is ignored.
     fn select_tab_index(&mut self, index: usize) {
         if let Some(tab) = self.tab_ids().get(index).cloned() {
+            self.selection = None; // switching tabs invalidates a drag-selection
             let _ = self.state.apply(Command::SelectTab {
                 origin: Origin::Client(self.client),
                 workspace: self.ws.clone(),
@@ -1900,9 +1933,18 @@ impl App {
     /// Handle a forwarded mouse action at frame cell `(x, y)`: the wheel scrolls the
     /// pane UNDER the cursor (falling back to the focused pane); a left click focuses
     /// the pane under the cursor.
-    pub fn mouse_at(&mut self, x: u16, y: u16, kind: MouseKind) {
+    ///
+    /// Returns `Some(text)` only on a button-up that ends a real drag — the pane text the
+    /// server should ship to the initiating `client` as an OSC 52 clipboard copy.
+    pub fn mouse_at(
+        &mut self,
+        client: ClientId,
+        x: u16,
+        y: u16,
+        kind: MouseKind,
+    ) -> Option<String> {
         if !self.cfg.mouse {
-            return; // mouse disabled in config (client also skips capture)
+            return None; // mouse disabled in config (client also skips capture)
         }
         let target = self
             .layout()
@@ -1938,11 +1980,21 @@ impl App {
                         pt.scroll(lines);
                     }
                 }
+                None
             }
             MouseKind::Click => {
+                // Don't disturb ANOTHER client's in-progress drag (input is multi-client): its
+                // owner alone may end it. This client's own click still acts normally.
+                let other_dragging = self
+                    .selection
+                    .as_ref()
+                    .is_some_and(|s| s.owner != client && s.moved);
                 // Chrome first: a click on a tab chip / sidebar row navigates. Only if
                 // it misses all zones does it fall through to click-to-focus a pane.
                 if let Some(t) = self.click_target_at(x, y) {
+                    if !other_dragging {
+                        self.selection = None; // a chrome click never starts a selection
+                    }
                     match t {
                         ClickTarget::Tab(id) => {
                             if let Some(i) = self.tab_ids().iter().position(|t| t == &id) {
@@ -1952,17 +2004,85 @@ impl App {
                         ClickTarget::Session(wid) => self.switch_session(wid),
                         ClickTarget::Agent(term) => self.jump_to_terminal(&term),
                     }
-                    return;
+                    return None;
                 }
-                if let Some(r) = target
-                    && let Some(pane) = self.pane_of_terminal(&r.terminal)
-                {
-                    let _ = self.state.apply(Command::FocusPane {
-                        client: self.client,
-                        pane,
-                    });
+                if let Some(r) = target {
+                    if let Some(pane) = self.pane_of_terminal(&r.terminal) {
+                        let _ = self.state.apply(Command::FocusPane {
+                            client: self.client,
+                            pane,
+                        });
+                    }
+                    // Anchor a drag-selection at this pane-relative cell. A plain click (no
+                    // drag) just leaves `moved: false` and copies nothing on release. Guarded by
+                    // `other_dragging` so a fresh selection can't clobber another client's active
+                    // drag — it waits until that drag releases.
+                    if !other_dragging {
+                        self.selection = Some(Sel {
+                            term: r.terminal.clone(),
+                            owner: client,
+                            anchor: (x - r.x, y - r.y),
+                            head: (x - r.x, y - r.y),
+                            moved: false,
+                        });
+                    }
+                } else if !other_dragging {
+                    self.selection = None; // clicked chrome gap / letterbox
                 }
+                None
             }
+            MouseKind::Drag => {
+                // Only the owning client extends its own selection.
+                let owner = self.selection.as_ref().map(|s| s.owner);
+                if owner != Some(client) {
+                    return None;
+                }
+                let term = self.selection.as_ref().map(|s| s.term.clone())?;
+                // Re-look-up the pane rect in the CURRENT layout — it may have moved/vanished
+                // since button-down. Gone → drop the selection (no stale coords).
+                let Some(rect) = self.layout().into_iter().find(|r| r.terminal == term) else {
+                    self.selection = None;
+                    return None;
+                };
+                // CLAMP the pointer to the origin pane, so the selection can never extend into
+                // the sidebar / status bar / dividers / another pane.
+                let cx = x.clamp(rect.x, rect.x + rect.cols.saturating_sub(1));
+                let cy = y.clamp(rect.y, rect.y + rect.rows.saturating_sub(1));
+                if let Some(sel) = self.selection.as_mut() {
+                    sel.head = (cx - rect.x, cy - rect.y);
+                    sel.moved = true;
+                }
+                None
+            }
+            MouseKind::Up => {
+                // Only the owner finishes its selection; a non-owner release is ignored.
+                if self.selection.as_ref().map(|s| s.owner) != Some(client) {
+                    return None;
+                }
+                let sel = self.selection.take()?; // release always ends the selection
+                if !sel.moved {
+                    return None; // it was a plain click, not a drag — nothing to copy
+                }
+                // Extract from the CURRENT snapshot (WYSIWYG: copy what's highlighted now).
+                let rect = self.layout().into_iter().find(|r| r.terminal == sel.term)?;
+                let _ = rect; // presence check: the pane is still visible
+                let snap = self.panes.get(&sel.term)?.snapshot();
+                let text = extract_selection(&snap, sel.anchor, sel.head);
+                (!text.is_empty()).then_some(text)
+            }
+        }
+    }
+
+    /// Cancel any in-progress drag-selection (its coords are only valid for the layout at
+    /// button-down). Called on layout mutations and on the owner's key input / disconnect.
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Drop the selection if it belongs to `client` (its owner detached).
+    pub fn clear_selection_of(&mut self, client: ClientId) {
+        if self.selection.as_ref().is_some_and(|s| s.owner == client) {
+            self.selection = None;
         }
     }
 
@@ -2465,6 +2585,16 @@ impl App {
             };
             let snap = pt.snapshot();
             let is_focused = Some(&rect.terminal) == focused_term.as_ref();
+            // Drag-selection highlight: only the pane the drag started in, once it has moved.
+            // Normalize the start the SAME way extraction does so the tint matches the copy.
+            let sel_span = self
+                .selection
+                .as_ref()
+                .filter(|s| s.moved && s.term == rect.terminal)
+                .map(|s| {
+                    let (start, end) = sel_bounds(s.anchor, s.head);
+                    (sel_start_norm(&snap, start), end)
+                });
             for (ry, row) in snap.cells.iter().enumerate() {
                 if ry as u16 >= rect.rows {
                     break;
@@ -2473,6 +2603,8 @@ impl App {
                 if y >= area.height {
                     break;
                 }
+                // The selected column span for this row (if any), computed once per row.
+                let row_sel = sel_span.and_then(|(a, b)| sel_cols(a, b, rect.cols, ry as u16));
                 for (rx, cell) in row.iter().enumerate() {
                     if rx as u16 >= rect.cols {
                         break;
@@ -2496,6 +2628,11 @@ impl App {
                         }
                         if !is_focused {
                             style = style.add_modifier(Modifier::DIM);
+                        }
+                        // A selected cell gets the selection background (the leading cell of a
+                        // wide glyph tints both of its columns). Overrides the cell's own bg.
+                        if row_sel.is_some_and(|(c0, c1)| rx as u16 >= c0 && rx as u16 <= c1) {
+                            style = style.bg(SEL_BG);
                         }
                         bc.set_symbol(&cell.sym);
                         bc.set_style(style);
@@ -4182,6 +4319,91 @@ fn detect_alt_screen_exit(
     exited
 }
 
+/// Normalize two selection endpoints into `(start, end)` in reading order (row, then column).
+fn sel_bounds(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
+    if (a.1, a.0) <= (b.1, b.0) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+/// The inclusive selected column range `[c0, c1]` for viewport `row` in a LINEAR selection
+/// `start..=end` over `cols`-wide rows (first row runs to the right edge, last row from the
+/// left edge, middle rows full-width). `None` if the row is outside the selection.
+fn sel_cols(start: (u16, u16), end: (u16, u16), cols: u16, row: u16) -> Option<(u16, u16)> {
+    if cols == 0 || row < start.1 || row > end.1 {
+        return None;
+    }
+    let last = cols - 1;
+    let c0 = if row == start.1 { start.0 } else { 0 };
+    let c1 = if row == end.1 { end.0 } else { last };
+    Some((c0.min(last), c1.min(last)))
+}
+
+/// Extract the text of a linear selection from a pane snapshot (tmux-style copy). Skips
+/// wide-glyph trailing spacers (the grapheme lives on the leading cell), trims trailing
+/// whitespace per visual line, and joins rows with `\n` EXCEPT at a soft-wrap seam (a row
+/// alacritty marked `WRAPLINE` and selected to its right edge continues the same logical line).
+/// If `start` lands on a wide glyph's trailing spacer (the glyph's right half), snap it left to
+/// the leading cell — so a drag begun there includes AND highlights the whole glyph. Guarded on
+/// the previous cell being a genuine wide leading glyph, so a right-margin `LEADING_WIDE_CHAR_SPACER`
+/// (whose glyph is on the NEXT row) doesn't wrongly pull in an unrelated preceding cell. Shared by
+/// extraction and the render highlight so the tinted span and the copied text agree exactly.
+fn sel_start_norm(snap: &crate::term::Snapshot, start: (u16, u16)) -> (u16, u16) {
+    if start.0 > 0
+        && let Some(row) = snap.cells.get(start.1 as usize)
+        && row.get(start.0 as usize).is_some_and(|c| c.spacer)
+        && row
+            .get((start.0 - 1) as usize)
+            .is_some_and(|c| !c.spacer && UnicodeWidthStr::width(c.sym.as_str()) >= 2)
+    {
+        (start.0 - 1, start.1)
+    } else {
+        start
+    }
+}
+
+fn extract_selection(snap: &crate::term::Snapshot, anchor: (u16, u16), head: (u16, u16)) -> String {
+    let (start, end) = sel_bounds(anchor, head);
+    let start = sel_start_norm(snap, start);
+    let mut out = String::new();
+    let mut row = start.1;
+    while row <= end.1 {
+        let Some(cells) = snap.cells.get(row as usize) else {
+            break;
+        };
+        let cols = cells.len() as u16;
+        if let Some((c0, c1)) = sel_cols(start, end, cols, row) {
+            let mut line = String::new();
+            for c in c0..=c1 {
+                let cell = &cells[c as usize];
+                if cell.spacer {
+                    continue; // wide-glyph right half: the grapheme is on the leading cell
+                }
+                line.push_str(&cell.sym);
+            }
+            // A soft-wrap seam = this row (not the last) wraps into the next AND the selection
+            // reached its right edge. At a seam the row continues the SAME logical line, so keep
+            // its trailing space (trimming would fuse "word " + "next" → "wordnext") and emit no
+            // newline. Everywhere else, trim trailing whitespace and break the line.
+            let soft = row < end.1
+                && snap.wrapped.get(row as usize).copied().unwrap_or(false)
+                && c1 + 1 >= cols;
+            if soft {
+                out.push_str(&line);
+            } else {
+                out.push_str(line.trim_end());
+                if row < end.1 {
+                    out.push('\n');
+                }
+            }
+        }
+        row += 1;
+    }
+    out
+}
+
 fn list_window_start(total: usize, active: usize, visible: usize) -> usize {
     if visible == 0 || total <= visible {
         return 0;
@@ -4355,14 +4577,139 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CAT_GREEN, CAT_RED, CAT_YELLOW, build_command_line, detect_alt_screen_exit, filter_env,
-        fuzzy_match, list_window_start, merge_env, shell_quote, tab_window, usage_threshold_color,
+        CAT_GREEN, CAT_RED, CAT_YELLOW, build_command_line, detect_alt_screen_exit,
+        extract_selection, filter_env, fuzzy_match, list_window_start, merge_env, sel_bounds,
+        sel_cols, shell_quote, tab_window, usage_threshold_color,
     };
     use crate::model::TerminalId;
+    use crate::term::{CellColor, CellSnap, Snapshot};
     use std::collections::HashMap;
 
     fn tid(s: &str) -> TerminalId {
         TerminalId::new(s)
+    }
+
+    /// Build a snapshot from row strings (one cell per char, no wide chars, no wrap).
+    fn snap(rows: &[&str]) -> Snapshot {
+        let cells: Vec<Vec<CellSnap>> = rows
+            .iter()
+            .map(|r| {
+                r.chars()
+                    .map(|ch| CellSnap {
+                        sym: ch.to_string(),
+                        spacer: false,
+                        fg: CellColor::Default,
+                        bg: CellColor::Default,
+                        bold: false,
+                        reverse: false,
+                    })
+                    .collect()
+            })
+            .collect();
+        let cols = cells.iter().map(|r| r.len()).max().unwrap_or(0) as u16;
+        Snapshot {
+            cols,
+            rows: cells.len() as u16,
+            wrapped: vec![false; cells.len()],
+            cells,
+            cursor: (0, 0),
+        }
+    }
+
+    #[test]
+    fn sel_bounds_orders_by_row_then_col() {
+        assert_eq!(sel_bounds((5, 2), (1, 0)), ((1, 0), (5, 2)));
+        assert_eq!(sel_bounds((1, 0), (5, 2)), ((1, 0), (5, 2)));
+        assert_eq!(sel_bounds((5, 1), (2, 1)), ((2, 1), (5, 1))); // same row → by col
+    }
+
+    #[test]
+    fn sel_cols_linear_spans() {
+        // Single-row selection: just the [c0,c1] on that row.
+        assert_eq!(sel_cols((2, 0), (5, 0), 10, 0), Some((2, 5)));
+        assert_eq!(sel_cols((2, 0), (5, 0), 10, 1), None); // outside
+        // Multi-row: first row runs to the right edge, middle full, last from the left.
+        assert_eq!(sel_cols((3, 0), (2, 2), 10, 0), Some((3, 9)));
+        assert_eq!(sel_cols((3, 0), (2, 2), 10, 1), Some((0, 9)));
+        assert_eq!(sel_cols((3, 0), (2, 2), 10, 2), Some((0, 2)));
+        assert_eq!(sel_cols((0, 0), (0, 0), 0, 0), None); // zero-width guard
+    }
+
+    #[test]
+    fn extract_selection_multiline_trims_trailing_ws() {
+        let s = snap(&["hi   ", "yo   "]);
+        // Full both rows: trailing spaces trimmed, joined with a newline.
+        assert_eq!(extract_selection(&s, (0, 0), (4, 1)), "hi\nyo");
+    }
+
+    #[test]
+    fn extract_selection_single_row_substring() {
+        let s = snap(&["hello world"]);
+        assert_eq!(extract_selection(&s, (6, 0), (10, 0)), "world");
+    }
+
+    #[test]
+    fn extract_selection_skips_wide_char_spacer() {
+        // A wide glyph occupies a leading cell + a trailing spacer; extraction keeps the
+        // leading grapheme and skips the spacer, so "가X" comes out intact.
+        let cells = vec![vec![
+            CellSnap {
+                sym: "가".into(),
+                spacer: false,
+                fg: CellColor::Default,
+                bg: CellColor::Default,
+                bold: false,
+                reverse: false,
+            },
+            CellSnap {
+                sym: " ".into(),
+                spacer: true,
+                fg: CellColor::Default,
+                bg: CellColor::Default,
+                bold: false,
+                reverse: false,
+            },
+            CellSnap {
+                sym: "X".into(),
+                spacer: false,
+                fg: CellColor::Default,
+                bg: CellColor::Default,
+                bold: false,
+                reverse: false,
+            },
+        ]];
+        let s = Snapshot {
+            cols: 3,
+            rows: 1,
+            wrapped: vec![false],
+            cells,
+            cursor: (0, 0),
+        };
+        assert_eq!(extract_selection(&s, (0, 0), (2, 0)), "가X");
+        // Starting the drag on the glyph's RIGHT half (the spacer at col 1) must still include
+        // the leading 가 — a normalization, not the declared oracle edge case.
+        assert_eq!(extract_selection(&s, (1, 0), (2, 0)), "가X");
+    }
+
+    #[test]
+    fn extract_selection_softwrap_joins_without_newline() {
+        // Row 0 is soft-wrapped (fills to the edge) and selected to its right edge → the two
+        // rows form one logical line, so no '\n' at the seam.
+        let mut s = snap(&["abcde", "fgh  "]);
+        s.wrapped[0] = true;
+        assert_eq!(extract_selection(&s, (0, 0), (4, 1)), "abcdefgh");
+        // But a NON-wrapped row keeps the newline.
+        s.wrapped[0] = false;
+        assert_eq!(extract_selection(&s, (0, 0), (4, 1)), "abcde\nfgh");
+    }
+
+    #[test]
+    fn extract_selection_softwrap_keeps_meaningful_seam_space() {
+        // A wrapped row ending in a MEANINGFUL space must NOT be trimmed at the seam, else
+        // "word " + "next" fuses into "wordnext". (The trailing space is a real word boundary.)
+        let mut s = snap(&["word ", "next "]);
+        s.wrapped[0] = true;
+        assert_eq!(extract_selection(&s, (0, 0), (4, 1)), "word next");
     }
 
     #[test]

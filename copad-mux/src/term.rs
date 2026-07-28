@@ -55,6 +55,9 @@ pub struct Snapshot {
     pub rows: u16,
     /// `rows` × `cols` cells, row-major, top-to-bottom of the viewport.
     pub cells: Vec<Vec<CellSnap>>,
+    /// Per-row soft-wrap flag: `wrapped[r]` is true when viewport row `r` continues onto row
+    /// `r+1` (no logical line break), so a drag-copy across the seam joins them without a `\n`.
+    pub wrapped: Vec<bool>,
     /// Cursor position in viewport coordinates `(col, row)`.
     pub cursor: (u16, u16),
 }
@@ -332,6 +335,7 @@ fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
     let display_offset = grid.display_offset() as i32;
 
     let mut cells = Vec::with_capacity(rows);
+    let mut wrapped = Vec::with_capacity(rows);
     for r in 0..rows as i32 {
         let line = Line(r - display_offset);
         let mut row = Vec::with_capacity(cols);
@@ -355,6 +359,13 @@ fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
                 reverse: flags.contains(Flags::INVERSE),
             });
         }
+        // alacritty marks the LAST cell of a soft-wrapped row with `WRAPLINE` (the row
+        // continues onto the next). Used by drag-copy to avoid a spurious newline at the seam.
+        let last_wrapped = cols > 0
+            && grid[Point::new(line, Column(cols - 1))]
+                .flags
+                .contains(Flags::WRAPLINE);
+        wrapped.push(last_wrapped);
         cells.push(row);
     }
 
@@ -366,6 +377,7 @@ fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
         cols: cols as u16,
         rows: rows as u16,
         cells,
+        wrapped,
         cursor: (cursor_col, cursor_row),
     }
 }
