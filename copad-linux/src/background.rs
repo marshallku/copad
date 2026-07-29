@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::SystemTime;
@@ -127,6 +128,11 @@ pub struct BackgroundLayer {
     source: RefCell<WallpaperSource>,
     list_path: RefCell<PathBuf>,
     dir_cache: RefCell<Option<DirCache>>,
+    // Entries found missing on disk. The legacy list file accumulates deleted
+    // paths and is never rewritten by a failed pick (it may be hand-curated),
+    // so without remembering the misses every retry re-rolls against the same
+    // dead lines. Reset whenever the source is re-resolved.
+    missing: RefCell<HashSet<PathBuf>>,
     // Cross-instance toggle propagation: every instance watches the shared
     // mode file and applies clear/pick on a flip, so `background.toggle`
     // against ONE instance reaches all of them (the retired script did
@@ -204,6 +210,7 @@ impl BackgroundLayer {
             source: RefCell::new(WallpaperSource::resolve(config)),
             list_path: RefCell::new(bg_paths(config).primary_list),
             dir_cache: RefCell::new(None),
+            missing: RefCell::new(HashSet::new()),
             last_mode_active: Cell::new(copad_core::background::is_active(&mode_file())),
             mode_monitor: RefCell::new(None),
             empty_list_warned: Cell::new(false),
@@ -437,14 +444,17 @@ impl BackgroundLayer {
     /// Pick a wallpaper from whichever source is configured, skipping entries
     /// that have disappeared. A stale entry is expected — the 24k-line legacy
     /// list accumulates deleted files, and a cached directory listing can lag
-    /// a deletion — so a few retries turn "File not found" into a working
-    /// rotation. Bounded so a wholly-missing source still fails fast.
+    /// a deletion — so retrying turns "File not found" into a working
+    /// rotation. Every miss is remembered (see `missing`) so the candidate
+    /// pool shrinks monotonically and retries can't re-roll the same dead
+    /// entry. Bounded anyway: a mostly-dead source must fail in bounded time
+    /// on the GTK main loop rather than stat its way through 24k lines.
     pub fn pick(&self) -> Option<String> {
-        const ATTEMPTS: usize = 4;
+        const ATTEMPTS: usize = 16;
         for _ in 0..ATTEMPTS {
             let candidate = match &*self.source.borrow() {
                 WallpaperSource::Dir(source) => self.pick_from_dir(source),
-                WallpaperSource::List => copad_core::background::pick_random(&self.paths()),
+                WallpaperSource::List => self.pick_from_list(),
             }?;
             if Path::new(&candidate).exists() {
                 return Some(candidate);
@@ -453,6 +463,21 @@ impl BackgroundLayer {
             self.forget_entry(Path::new(&candidate));
         }
         None
+    }
+
+    /// List-file pick, minus entries already found missing this process. The
+    /// list is deliberately NOT rewritten here — it may be hand-curated, and a
+    /// temporarily unreachable path (unmounted drive) must not be destroyed by
+    /// a rotation tick. `background.delete_current` is the one path that edits
+    /// it, because there the deletion is what the user asked for.
+    fn pick_from_list(&self) -> Option<String> {
+        let entries = copad_core::background::list_entries(&self.paths());
+        let missing = self.missing.borrow();
+        let live: Vec<&String> = entries
+            .iter()
+            .filter(|e| !missing.contains(Path::new(e.as_str())))
+            .collect();
+        copad_core::background::pick_one(&live).map(|e| (*e).clone())
     }
 
     fn paths(&self) -> copad_core::background::BackgroundPaths {
@@ -501,10 +526,13 @@ impl BackgroundLayer {
         });
     }
 
-    /// Drop `path` from the in-memory directory listing. Deleting a file
-    /// nested under a `recursive` root does not move the root's mtime, so
-    /// without this the deleted entry would keep being picked.
+    /// Stop picking `path`: remember it as missing (the only thing that helps
+    /// a list source, whose file we won't rewrite) and drop it from the
+    /// in-memory directory listing — deleting a file nested under a
+    /// `recursive` root does not move the root's mtime, so the cache would
+    /// otherwise keep offering it.
     fn forget_entry(&self, path: &Path) {
+        self.missing.borrow_mut().insert(path.to_path_buf());
         if let Some(cache) = self.dir_cache.borrow_mut().as_mut() {
             cache.entries.retain(|p| p != path);
         }
@@ -673,6 +701,9 @@ impl BackgroundLayer {
         *self.source.borrow_mut() = WallpaperSource::resolve(config);
         *self.list_path.borrow_mut() = bg_paths(config).primary_list;
         *self.dir_cache.borrow_mut() = None;
+        // A reload is also the retry point for paths that were missing
+        // earlier: the drive may be mounted now, or the list replaced.
+        self.missing.borrow_mut().clear();
 
         match static_image(config) {
             Some(path) => {

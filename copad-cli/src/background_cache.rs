@@ -48,14 +48,22 @@ pub fn run(
     // Overwriting silently would destroy a hand-curated list (the legacy
     // `terminal-wallpapers.txt` is a *filtered* subset of its source
     // directory, so a naive rescan would quietly re-add everything).
+    // Existence is decided by `symlink_metadata`, not by whether we can read
+    // the contents: an unreadable, binary, or dangling-symlink output path is
+    // still something the write would destroy. The line count is reporting
+    // detail only.
     let existing = existing_line_count(&out);
-    if let Some(count) = existing
-        && !force
-    {
-        eprintln!(
-            "{} already exists ({count} entries). Re-run with --force to replace it.",
-            out.display()
-        );
+    if out.symlink_metadata().is_ok() && !force {
+        match existing {
+            Some(count) => eprintln!(
+                "{} already exists ({count} entries). Re-run with --force to replace it.",
+                out.display()
+            ),
+            None => eprintln!(
+                "{} already exists. Re-run with --force to replace it.",
+                out.display()
+            ),
+        }
         return 1;
     }
 

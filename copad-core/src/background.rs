@@ -66,14 +66,27 @@ const MAX_SCAN_DEPTH: usize = 16;
 /// should suppress the call (matches Linux's existing
 /// `background.next` socket handler semantics).
 pub fn pick_random(paths: &BackgroundPaths) -> Option<String> {
-    let contents = read_list(&paths.primary_list)
-        .or_else(|| paths.fallback_list.as_deref().and_then(read_list))?;
-    // Preserve verbatim line content (matches Linux's prior
-    // `socket.rs::select_random_image` semantics — paths can legally
-    // contain leading/trailing spaces). Only skip empty-after-LF
-    // entries; `lines()` already drops the trailing newline.
-    let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
-    Some(pick_one(&lines)?.to_string())
+    pick_one(&list_entries(paths)).cloned()
+}
+
+/// Every usable line of the configured list, in file order. Split out of
+/// [`pick_random`] so a caller that must exclude entries (e.g. ones already
+/// found missing on disk) can filter before picking instead of re-rolling
+/// against the same stale lines.
+///
+/// Preserves verbatim line content — paths can legally contain
+/// leading/trailing spaces — and only drops empty lines.
+pub fn list_entries(paths: &BackgroundPaths) -> Vec<String> {
+    read_list(&paths.primary_list)
+        .or_else(|| paths.fallback_list.as_deref().and_then(read_list))
+        .map(|contents| {
+            contents
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Walk `source` and collect every matching image file, sorted so the
@@ -347,6 +360,35 @@ mod tests {
         // An unreadable/missing ROOT is an error the caller must see —
         // silently returning an empty list would look like "no wallpapers".
         assert!(scan_dir(&DirSource::new(d.join("nope"), false, &[])).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn list_entries_returns_every_usable_line_in_order() {
+        let d = tmpdir("entries");
+        let list = d.join("wallpapers.txt");
+        std::fs::write(&list, "/a.png\n\n/b with space.png\n/c.png\n").unwrap();
+        let paths = BackgroundPaths {
+            primary_list: list,
+            fallback_list: None,
+            mode_file: PathBuf::from("/nonexistent/m"),
+        };
+        // Callers filter this list (e.g. to exclude paths already found
+        // missing) before picking, so order and verbatim content must survive.
+        assert_eq!(
+            list_entries(&paths),
+            vec!["/a.png", "/b with space.png", "/c.png"]
+        );
+
+        // A missing list is an empty pool, not a panic — `pick_random`
+        // returning None is the caller's "nothing to show" signal.
+        let absent = BackgroundPaths {
+            primary_list: d.join("nope.txt"),
+            fallback_list: None,
+            mode_file: PathBuf::from("/nonexistent/m"),
+        };
+        assert!(list_entries(&absent).is_empty());
+        assert!(pick_random(&absent).is_none());
         let _ = std::fs::remove_dir_all(&d);
     }
 
