@@ -13,7 +13,7 @@ use copad_core::protocol::{Event, Request, Response};
 
 use vte4::prelude::*;
 
-use crate::background::{BackgroundLayer, bg_paths};
+use crate::background::BackgroundLayer;
 use crate::panel::Panel;
 use crate::tabs::{FocusDirection, TabManager};
 
@@ -680,6 +680,19 @@ fn handle_bg_set(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
                     &format!("File not found: {p}"),
                 );
             }
+            // A directory is a valid *config* source but not something we can
+            // decode. Without this it reaches the decoder and fails with an
+            // opaque pixbuf error.
+            if path.is_dir() {
+                return Response::error(
+                    req.id.clone(),
+                    "invalid_params",
+                    &format!(
+                        "{p} is a directory — set `[background] image` to it in config.toml to \
+                         use it as the rotation source"
+                    ),
+                );
+            }
             bg.set_image(path);
             // A manual pick restarts the rotation countdown so the timer
             // doesn't replace it a moment later.
@@ -696,37 +709,35 @@ fn handle_bg_clear(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
 }
 
 fn handle_bg_next(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
-    if !is_bg_active() {
+    if !bg.is_active() {
         return Response::success(
             req.id.clone(),
             json!({ "status": "ok", "mode": "deactive" }),
         );
     }
-    match select_random_image() {
+    // `pick` already skips vanished entries, so a `None` here means the
+    // source is genuinely empty rather than merely stale.
+    match bg.pick() {
         Some(img) => {
-            let path = Path::new(&img);
-            if !path.exists() {
-                return Response::error(
-                    req.id.clone(),
-                    "not_found",
-                    &format!("File not found: {img}"),
-                );
-            }
-            bg.set_image_from_list(path);
+            bg.set_image_from_list(Path::new(&img));
             bg.arm_rotation();
             Response::success(req.id.clone(), json!({ "status": "ok", "path": img }))
         }
-        None => Response::error(req.id.clone(), "no_images", "No images in wallpaper cache"),
+        None => Response::error(
+            req.id.clone(),
+            "no_images",
+            "No images available from the configured background source",
+        ),
     }
 }
 
 fn handle_bg_toggle(req: &Request, bg: &Rc<BackgroundLayer>) -> Response {
-    let now_active = toggle_bg_mode();
+    let now_active = bg.toggle_mode();
     // Mark before the watcher's echo of our own write arrives — other
     // instances react via their own mode-file monitors.
     bg.note_mode_applied(now_active);
     if now_active {
-        if let Some(img) = select_random_image() {
+        if let Some(img) = bg.pick() {
             bg.set_image_from_list(Path::new(&img));
         }
     } else {
@@ -758,16 +769,14 @@ fn handle_bg_delete_current(req: &Request, bg: &Rc<BackgroundLayer>) -> Response
             &format!("delete {}: {e}", img.display()),
         );
     }
-    if let Err(e) =
-        copad_core::background::remove_from_list(&bg_paths().primary_list, &img.to_string_lossy())
-    {
+    if let Err(e) = bg.drop_from_source(&img) {
         return Response::error(
             req.id.clone(),
             "io_error",
             &format!("rewrite wallpaper list: {e}"),
         );
     }
-    let next = select_random_image();
+    let next = bg.pick();
     match &next {
         Some(n) => {
             bg.set_image_from_list(Path::new(n));
@@ -1330,18 +1339,6 @@ fn resolve_workflow_workspace(
         Some(p) => p.workspace_path(),
         None => active_cwd.unwrap_or_else(home_dir),
     }
-}
-
-fn select_random_image() -> Option<String> {
-    copad_core::background::pick_random(&bg_paths())
-}
-
-fn is_bg_active() -> bool {
-    copad_core::background::is_active(&bg_paths().mode_file)
-}
-
-fn toggle_bg_mode() -> bool {
-    copad_core::background::toggle(&bg_paths().mode_file)
 }
 
 pub fn cleanup(socket_path: &str) {

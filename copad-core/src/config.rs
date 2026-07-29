@@ -30,6 +30,15 @@ fn default_opacity() -> f64 {
     0.95
 }
 
+/// Image extensions scanned when `[background] image` is a directory —
+/// the same set the retired `kitty-random-bg.sh` `find` used.
+fn default_extensions() -> Vec<String> {
+    ["jpg", "jpeg", "png", "webp"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 fn default_window_opacity() -> f64 {
     1.0
 }
@@ -84,8 +93,30 @@ impl Default for TerminalConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BackgroundConfig {
-    #[serde(default)]
+    /// A single image file *or* a directory to pick random wallpapers
+    /// from — resolved by `stat` at use time, so one key covers both
+    /// (`path` is accepted as an alias; macOS's Swift config has always
+    /// taken both spellings). A directory makes this the rotation
+    /// source and `list` is not consulted.
+    #[serde(default, alias = "path")]
     pub image: Option<String>,
+
+    /// Explicit wallpaper list file (one path per line). Used when
+    /// `image` is unset or points at a plain file. Defaults to the
+    /// platform cache location when unset. This is what
+    /// `coctl background cache` writes.
+    #[serde(default)]
+    pub list: Option<String>,
+
+    /// Extensions treated as images when `image` is a directory.
+    /// Matched case-insensitively, with or without a leading dot.
+    #[serde(default = "default_extensions")]
+    pub extensions: Vec<String>,
+
+    /// Descend into subdirectories when `image` is a directory.
+    /// Off by default (the retired rotation script was `-maxdepth 1`).
+    #[serde(default)]
+    pub recursive: bool,
 
     #[serde(default = "default_tint")]
     pub tint: f64,
@@ -97,7 +128,7 @@ pub struct BackgroundConfig {
     pub opacity: f64,
 
     /// Auto-rotation cadence in seconds for random wallpapers from the
-    /// platform list file. 0 (default) disables the timer — manual
+    /// configured source. 0 (default) disables the timer — manual
     /// `background.next` keeps working either way. A static `image` is
     /// applied at startup; the first rotation tick then takes over.
     #[serde(default)]
@@ -108,11 +139,49 @@ impl Default for BackgroundConfig {
     fn default() -> Self {
         Self {
             image: None,
+            list: None,
+            extensions: default_extensions(),
+            recursive: false,
             tint: default_tint(),
             tint_color: default_tint_color(),
             opacity: default_opacity(),
             rotate_interval: 0,
         }
+    }
+}
+
+impl BackgroundConfig {
+    /// `image`, tilde-expanded. Whether it names a file or a directory is
+    /// decided by the caller at use time (it may not exist yet).
+    pub fn source_path(&self) -> Option<PathBuf> {
+        self.image
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(expand_tilde)
+    }
+
+    /// `list`, tilde-expanded. `None` means "use the platform default".
+    pub fn list_path(&self) -> Option<PathBuf> {
+        self.list
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(expand_tilde)
+    }
+}
+
+/// Expand a leading `~` / `~/` against `$HOME`. Only the leading segment —
+/// `~user` is left verbatim (we have no passwd lookup and a literal path
+/// beating a wrong guess is the safer failure).
+pub fn expand_tilde(raw: &str) -> PathBuf {
+    let Some(rest) = raw.strip_prefix('~') else {
+        return PathBuf::from(raw);
+    };
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return PathBuf::from(raw);
+    }
+    match dirs::home_dir() {
+        Some(home) => home.join(rest.trim_start_matches('/')),
+        None => PathBuf::from(raw),
     }
 }
 
@@ -396,12 +465,18 @@ font_family = "JetBrainsMono Nerd Font Mono"
 font_size = 14
 
 [background]
-# image = "/path/to/wallpaper.jpg"
+# image = "/path/to/wallpaper.jpg"   # a FILE = fixed wallpaper
+# image = "~/wallpapers"             # a DIRECTORY = random pick from it
+# recursive = false      # descend into subdirectories (directory source only)
+# extensions = ["jpg", "jpeg", "png", "webp"]
+# list = "~/.cache/terminal-wallpapers.txt"  # explicit list file (one path per
+#                        # line), used when `image` is unset or is a plain file;
+#                        # `coctl background cache` writes this file
 # tint = 0.85
 # tint_color = "#1e1e2e"
 # opacity = 0.95
-# rotate_interval = 300  # seconds between random wallpapers from the
-#                        # platform list file; 0 (default) = no auto-rotation
+# rotate_interval = 300  # seconds between random wallpapers; 0 (default) = no
+#                        # auto-rotation (`coctl background next` still works)
 
 [window]
 # opacity = 0.85        # 0.0 = fully transparent, 1.0 = fully opaque (default)
@@ -495,6 +570,71 @@ close_on_exit = false
         assert!(!cfg.terminal.close_on_exit);
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn background_accepts_path_as_an_alias_for_image() {
+        // macOS's Swift config has always taken both spellings; the Rust
+        // side must agree or the same config.toml behaves differently per
+        // platform.
+        let dir = tmp_dir();
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[background]
+path = "/wallpapers"
+"#,
+        )
+        .expect("write");
+        let cfg = CopadConfig::load_from(&path).expect("load");
+        assert_eq!(cfg.background.image.as_deref(), Some("/wallpapers"));
+        assert_eq!(
+            cfg.background.source_path(),
+            Some(PathBuf::from("/wallpapers"))
+        );
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn background_source_and_list_expand_tilde() {
+        let home = dirs::home_dir().expect("home");
+        let cfg = BackgroundConfig {
+            image: Some("~/wallpapers".to_string()),
+            list: Some("~/.cache/list.txt".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(cfg.source_path(), Some(home.join("wallpapers")));
+        assert_eq!(cfg.list_path(), Some(home.join(".cache/list.txt")));
+
+        // An empty string is "unset", not "the home directory" — otherwise
+        // `image = ""` would silently make $HOME the wallpaper source.
+        let blank = BackgroundConfig {
+            image: Some(String::new()),
+            list: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(blank.source_path(), None);
+        assert_eq!(blank.list_path(), None);
+    }
+
+    #[test]
+    fn expand_tilde_leaves_non_leading_and_named_tildes_alone() {
+        assert_eq!(expand_tilde("/a/~/b"), PathBuf::from("/a/~/b"));
+        // No passwd lookup available — a literal path beats a wrong guess.
+        assert_eq!(expand_tilde("~other/pics"), PathBuf::from("~other/pics"));
+        assert_eq!(expand_tilde("relative/dir"), PathBuf::from("relative/dir"));
+    }
+
+    #[test]
+    fn background_defaults_keep_the_pre_directory_source_behavior() {
+        let cfg = BackgroundConfig::default();
+        // Directory scanning must be opt-in: an existing install with only
+        // `image = "/some.jpg"` must not start recursing anything.
+        assert!(!cfg.recursive);
+        assert_eq!(cfg.list, None);
+        assert_eq!(cfg.extensions, vec!["jpg", "jpeg", "png", "webp"]);
     }
 
     #[test]

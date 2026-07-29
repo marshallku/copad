@@ -1,11 +1,13 @@
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::SystemTime;
 
 use gtk4::gdk;
 use gtk4::glib;
 use gtk4::prelude::*;
 
+use copad_core::background::DirSource;
 use copad_core::config::CopadConfig;
 
 use crate::terminal::{norm_opacity, parse_color, rgba_css};
@@ -13,15 +15,83 @@ use crate::terminal::{norm_opacity, parse_color, rgba_css};
 const WALLPAPER_CACHE: &str = ".cache/terminal-wallpapers.txt";
 const BG_MODE_FILE: &str = ".cache/copad-bg-mode";
 
-/// Linux locations of the wallpaper list + rotation mode flag — shared by
-/// the socket handlers and the native rotation timer.
-pub fn bg_paths() -> copad_core::background::BackgroundPaths {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+fn home_dir() -> PathBuf {
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+/// Rotation on/off flag. Deliberately NOT configurable: it is internal
+/// cross-instance state, not user content, and every instance must agree on
+/// the path for `background.toggle` to propagate.
+pub fn mode_file() -> PathBuf {
+    home_dir().join(BG_MODE_FILE)
+}
+
+/// Where the wallpaper list lives when `[background] list` is unset.
+fn default_list_path() -> PathBuf {
+    home_dir().join(WALLPAPER_CACHE)
+}
+
+/// Linux locations of the wallpaper list + rotation mode flag. The list is
+/// `[background] list` when set, else the legacy cache path (so an existing
+/// install keeps working with no config).
+pub fn bg_paths(config: &CopadConfig) -> copad_core::background::BackgroundPaths {
     copad_core::background::BackgroundPaths {
-        primary_list: home.join(WALLPAPER_CACHE),
+        primary_list: config
+            .background
+            .list_path()
+            .unwrap_or_else(default_list_path),
         fallback_list: None,
-        mode_file: home.join(BG_MODE_FILE),
+        mode_file: mode_file(),
     }
+}
+
+/// Where random picks come from. `[background] image` pointing at a
+/// directory makes it the source and bypasses the list file entirely;
+/// anything else (a plain file, or unset) falls back to the list.
+enum WallpaperSource {
+    Dir(DirSource),
+    List,
+}
+
+impl WallpaperSource {
+    fn resolve(config: &CopadConfig) -> Self {
+        match config.background.source_path() {
+            // A path that doesn't exist yet is NOT a directory, so it falls
+            // through to `static_image` and gets the existing "does not
+            // exist" warning rather than being silently treated as a source.
+            Some(p) if p.is_dir() => Self::Dir(DirSource::new(
+                p,
+                config.background.recursive,
+                &config.background.extensions,
+            )),
+            _ => Self::List,
+        }
+    }
+}
+
+/// `[background] image` when it names a static file — i.e. everything a
+/// directory source is not. Returns None for a directory so the rotation
+/// source is never also mounted as a literal image.
+fn static_image(config: &CopadConfig) -> Option<PathBuf> {
+    config.background.source_path().filter(|p| !p.is_dir())
+}
+
+/// Memoized directory listing. Scanning ~30k entries costs ~30ms, which is a
+/// dropped frame on the GTK main loop, so the result is cached and only
+/// rebuilt when the source config or the root's mtime changes.
+///
+/// Caveat for `recursive = true`: only the ROOT's mtime is watched, so a file
+/// added deep in a subtree is picked up on the next config reload or restart
+/// rather than immediately. Adding/removing files directly under the root
+/// (the common case, and what `delete_current` does) invalidates correctly.
+struct DirCache {
+    source: DirSource,
+    mtime: Option<SystemTime>,
+    entries: Vec<PathBuf>,
+}
+
+fn dir_mtime(root: &Path) -> Option<SystemTime> {
+    std::fs::metadata(root).ok().and_then(|m| m.modified().ok())
 }
 
 /// Image + tint mounted as the `gtk4::Overlay` base child in
@@ -52,6 +122,11 @@ pub struct BackgroundLayer {
     current: RefCell<Option<(PathBuf, bool)>>,
     rotate_interval: Cell<u64>,
     rotation_source: RefCell<Option<glib::SourceId>>,
+    // Where `next`/rotation picks come from, and the list file backing the
+    // `WallpaperSource::List` case. Both re-resolved on config reload.
+    source: RefCell<WallpaperSource>,
+    list_path: RefCell<PathBuf>,
+    dir_cache: RefCell<Option<DirCache>>,
     // Cross-instance toggle propagation: every instance watches the shared
     // mode file and applies clear/pick on a flip, so `background.toggle`
     // against ONE instance reaches all of them (the retired script did
@@ -126,7 +201,10 @@ impl BackgroundLayer {
             current: RefCell::new(None),
             rotate_interval: Cell::new(config.background.rotate_interval),
             rotation_source: RefCell::new(None),
-            last_mode_active: Cell::new(copad_core::background::is_active(&bg_paths().mode_file)),
+            source: RefCell::new(WallpaperSource::resolve(config)),
+            list_path: RefCell::new(bg_paths(config).primary_list),
+            dir_cache: RefCell::new(None),
+            last_mode_active: Cell::new(copad_core::background::is_active(&mode_file())),
             mode_monitor: RefCell::new(None),
             empty_list_warned: Cell::new(false),
             load_generation: Cell::new(0),
@@ -137,14 +215,30 @@ impl BackgroundLayer {
 
         layer.refresh_window_backdrop();
 
-        if let Some(ref path) = config.background.image {
-            let p = Path::new(path);
-            if p.exists() {
-                layer.set_image(p);
-            }
+        match static_image(config) {
+            Some(path) if path.exists() => layer.set_image(&path),
+            _ => layer.apply_initial_dir_pick(),
         }
 
         layer
+    }
+
+    /// Mount a wallpaper immediately when `[background] image` names a
+    /// directory. A static image applies at startup, so a directory source
+    /// must too — otherwise pointing the key at a wallpaper folder shows
+    /// nothing at all until the first rotation tick, and at the default
+    /// `rotate_interval = 0` there is no tick, so it would look broken.
+    ///
+    /// Deliberately NOT done for a list source: that would change what
+    /// existing installs (populated list, `rotate_interval = 0`) render at
+    /// startup. A directory source is new, so nothing regresses.
+    fn apply_initial_dir_pick(self: &Rc<Self>) {
+        if !matches!(&*self.source.borrow(), WallpaperSource::Dir(_)) || !self.is_active() {
+            return;
+        }
+        if let Some(img) = self.pick_or_warn() {
+            self.set_image_from_list(Path::new(&img));
+        }
     }
 
     pub fn set_image(self: &Rc<Self>, path: &Path) {
@@ -302,11 +396,11 @@ impl BackgroundLayer {
         if interval == 0 {
             return;
         }
-        // Surface an empty/missing list now rather than `interval` seconds later
-        // on the first tick — probe only (the actual pick happens on the tick).
-        let paths = bg_paths();
-        if copad_core::background::is_active(&paths.mode_file) {
-            let _ = self.pick_or_warn(&paths);
+        // Surface an empty/missing source now rather than `interval` seconds
+        // later on the first tick — probe only (the actual pick happens on the
+        // tick). Also warms the directory cache so the first tick is instant.
+        if self.is_active() {
+            let _ = self.pick_or_warn();
         }
         let weak = Rc::downgrade(self);
         let id = glib::timeout_add_seconds_local(interval.min(u32::MAX as u64) as u32, move || {
@@ -322,22 +416,139 @@ impl BackgroundLayer {
     /// One rotation tick: respect the shared mode flag, pick a random list
     /// image, apply it. No-op when the list is missing/empty (warned once).
     pub fn rotate_once(self: &Rc<Self>) {
-        let paths = bg_paths();
-        if !copad_core::background::is_active(&paths.mode_file) {
+        if !self.is_active() {
             return;
         }
-        if let Some(img) = self.pick_or_warn(&paths) {
+        if let Some(img) = self.pick_or_warn() {
             self.set_image_from_list(Path::new(&img));
         }
     }
 
-    /// `pick_random`, but the first time rotation is active yet the list yields
-    /// no image, log the cause — otherwise a user who set `rotate_interval`
-    /// without ever populating `terminal-wallpapers.txt` sees nothing happen
-    /// and no reason why. Warns once per process; a successful pick re-arms it
-    /// so a later emptied list warns again.
-    fn pick_or_warn(&self, paths: &copad_core::background::BackgroundPaths) -> Option<String> {
-        match copad_core::background::pick_random(paths) {
+    /// Rotation on/off, shared across instances via the mode file.
+    pub fn is_active(&self) -> bool {
+        copad_core::background::is_active(&mode_file())
+    }
+
+    /// Flip the shared rotation flag; returns the new state.
+    pub fn toggle_mode(&self) -> bool {
+        copad_core::background::toggle(&mode_file())
+    }
+
+    /// Pick a wallpaper from whichever source is configured, skipping entries
+    /// that have disappeared. A stale entry is expected — the 24k-line legacy
+    /// list accumulates deleted files, and a cached directory listing can lag
+    /// a deletion — so a few retries turn "File not found" into a working
+    /// rotation. Bounded so a wholly-missing source still fails fast.
+    pub fn pick(&self) -> Option<String> {
+        const ATTEMPTS: usize = 4;
+        for _ in 0..ATTEMPTS {
+            let candidate = match &*self.source.borrow() {
+                WallpaperSource::Dir(source) => self.pick_from_dir(source),
+                WallpaperSource::List => copad_core::background::pick_random(&self.paths()),
+            }?;
+            if Path::new(&candidate).exists() {
+                return Some(candidate);
+            }
+            // Don't let a vanished file be re-picked on the next attempt.
+            self.forget_entry(Path::new(&candidate));
+        }
+        None
+    }
+
+    fn paths(&self) -> copad_core::background::BackgroundPaths {
+        copad_core::background::BackgroundPaths {
+            primary_list: self.list_path.borrow().clone(),
+            fallback_list: None,
+            mode_file: mode_file(),
+        }
+    }
+
+    fn pick_from_dir(&self, source: &DirSource) -> Option<String> {
+        self.ensure_dir_cache(source);
+        let cache = self.dir_cache.borrow();
+        let entries = &cache.as_ref()?.entries;
+        copad_core::background::pick_one(entries).map(|p| p.to_string_lossy().into_owned())
+    }
+
+    /// Rescan only when the source config or the root's mtime moved. On a
+    /// scan failure the cache is stored EMPTY (rather than left stale or
+    /// cleared) so the failure is reported once by `pick_or_warn` instead of
+    /// re-scanning on every tick.
+    fn ensure_dir_cache(&self, source: &DirSource) {
+        let mtime = dir_mtime(&source.root);
+        let fresh = self
+            .dir_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| c.source == *source && c.mtime == mtime);
+        if fresh {
+            return;
+        }
+        let entries = match copad_core::background::scan_dir(source) {
+            Ok(entries) => entries,
+            Err(e) => {
+                eprintln!(
+                    "[copad] cannot scan background directory {}: {e}",
+                    source.root.display()
+                );
+                Vec::new()
+            }
+        };
+        *self.dir_cache.borrow_mut() = Some(DirCache {
+            source: source.clone(),
+            mtime,
+            entries,
+        });
+    }
+
+    /// Drop `path` from the in-memory directory listing. Deleting a file
+    /// nested under a `recursive` root does not move the root's mtime, so
+    /// without this the deleted entry would keep being picked.
+    fn forget_entry(&self, path: &Path) {
+        if let Some(cache) = self.dir_cache.borrow_mut().as_mut() {
+            cache.entries.retain(|p| p != path);
+        }
+    }
+
+    /// Remove `path` from whatever source produced it: the list file for a
+    /// list source, the in-memory listing for a directory source (the file
+    /// itself is deleted by the caller). Returns whether anything changed.
+    pub fn drop_from_source(&self, path: &Path) -> std::io::Result<bool> {
+        self.forget_entry(path);
+        match &*self.source.borrow() {
+            // A directory source has no list to rewrite — the file is gone
+            // from disk, which is the whole record.
+            WallpaperSource::Dir(_) => Ok(true),
+            WallpaperSource::List => copad_core::background::remove_from_list(
+                &self.list_path.borrow(),
+                &path.to_string_lossy(),
+            ),
+        }
+    }
+
+    /// Human-readable description of the active source, for error messages.
+    fn source_hint(&self) -> String {
+        match &*self.source.borrow() {
+            WallpaperSource::Dir(source) => format!(
+                "no images matching {:?} found in {}",
+                source.extensions,
+                source.root.display()
+            ),
+            WallpaperSource::List => format!(
+                "add image paths (one per line) to {}, or point `[background] image` at a \
+                 directory",
+                self.list_path.borrow().display()
+            ),
+        }
+    }
+
+    /// [`pick`](Self::pick), but the first time rotation is active yet the
+    /// source yields no image, log the cause — otherwise a user who set
+    /// `rotate_interval` without a usable source sees nothing happen and no
+    /// reason why. Warns once per process; a successful pick re-arms it so a
+    /// source that later empties warns again.
+    fn pick_or_warn(&self) -> Option<String> {
+        match self.pick() {
             Some(img) => {
                 self.empty_list_warned.set(false);
                 Some(img)
@@ -345,9 +556,8 @@ impl BackgroundLayer {
             None => {
                 if note_empty_list(&self.empty_list_warned) {
                     eprintln!(
-                        "[copad] background rotation is enabled but no wallpaper is available — \
-                         add image paths (one per line) to {}",
-                        paths.primary_list.display(),
+                        "[copad] background rotation is enabled but no wallpaper is available — {}",
+                        self.source_hint(),
                     );
                 }
                 None
@@ -368,8 +578,7 @@ impl BackgroundLayer {
     /// `rotate_interval` — the retired script broadcast its toggle to
     /// every instance, and interval-less instances still participated.
     pub fn arm_mode_watch(self: &Rc<Self>) {
-        let mode_file = bg_paths().mode_file;
-        let gfile = gtk4::gio::File::for_path(&mode_file);
+        let gfile = gtk4::gio::File::for_path(mode_file());
         let monitor = match gfile.monitor_file(
             gtk4::gio::FileMonitorFlags::NONE,
             gtk4::gio::Cancellable::NONE,
@@ -383,13 +592,13 @@ impl BackgroundLayer {
         let weak = Rc::downgrade(self);
         monitor.connect_changed(move |_, _, _, _| {
             let Some(layer) = weak.upgrade() else { return };
-            let active = copad_core::background::is_active(&bg_paths().mode_file);
+            let active = layer.is_active();
             if active == layer.last_mode_active.get() {
                 return;
             }
             layer.last_mode_active.set(active);
             if active {
-                if let Some(img) = layer.pick_or_warn(&bg_paths()) {
+                if let Some(img) = layer.pick_or_warn() {
                     layer.set_image_from_list(Path::new(&img));
                 }
             } else {
@@ -458,9 +667,16 @@ impl BackgroundLayer {
 
         self.rotate_interval.set(config.background.rotate_interval);
 
-        match &config.background.image {
-            Some(image) => {
-                let path = Path::new(image);
+        // Re-resolve the pick source. Dropping the directory cache is what
+        // makes a hot reload pick up files added under a `recursive` root,
+        // whose subtree mtimes the cache doesn't watch.
+        *self.source.borrow_mut() = WallpaperSource::resolve(config);
+        *self.list_path.borrow_mut() = bg_paths(config).primary_list;
+        *self.dir_cache.borrow_mut() = None;
+
+        match static_image(config) {
+            Some(path) => {
+                let path = path.as_path();
                 if path.exists() {
                     self.set_image(path);
                 } else {
@@ -487,6 +703,14 @@ impl BackgroundLayer {
                 // `clear_image` invalidates that static decode itself.
                 if self.has_image.get() && !self.showing_list_image() {
                     self.clear_image();
+                }
+                // Switching `image` from a file to a DIRECTORY lands here (the
+                // static image was just cleared above). Mount a pick right away
+                // for the same reason startup does — otherwise the reload leaves
+                // a blank background until a tick that never comes at
+                // `rotate_interval = 0`.
+                if !self.has_image.get() {
+                    self.apply_initial_dir_pick();
                 }
             }
         }

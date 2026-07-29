@@ -19,6 +19,47 @@ pub struct BackgroundPaths {
     pub mode_file: PathBuf,
 }
 
+/// A directory used as the wallpaper source (`[background] image` pointing
+/// at a directory instead of a file). Kept separate from [`BackgroundPaths`]
+/// because a directory source bypasses the list file entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirSource {
+    pub root: PathBuf,
+    pub recursive: bool,
+    /// Lowercase, dot-less extensions. Empty = accept every file.
+    pub extensions: Vec<String>,
+}
+
+impl DirSource {
+    /// Normalize user-supplied extensions: strip a leading dot, lowercase,
+    /// drop blanks. `[".JPG"]` and `["jpg"]` must behave identically.
+    pub fn new(root: PathBuf, recursive: bool, extensions: &[String]) -> Self {
+        let extensions = extensions
+            .iter()
+            .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
+            .filter(|e| !e.is_empty())
+            .collect();
+        Self {
+            root,
+            recursive,
+            extensions,
+        }
+    }
+
+    fn accepts(&self, path: &Path) -> bool {
+        if self.extensions.is_empty() {
+            return true;
+        }
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| self.extensions.contains(&e.to_ascii_lowercase()))
+    }
+}
+
+/// Guard against a pathological tree (or a symlink cycle reachable through
+/// a bind mount) turning a wallpaper scan into an unbounded walk.
+const MAX_SCAN_DEPTH: usize = 16;
+
 /// Pick a random image path from the configured list. Returns None when
 /// neither file exists, both are empty, or every line is blank. Doesn't
 /// gate on `is_active` — the caller decides whether deactive rotation
@@ -32,7 +73,57 @@ pub fn pick_random(paths: &BackgroundPaths) -> Option<String> {
     // contain leading/trailing spaces). Only skip empty-after-LF
     // entries; `lines()` already drops the trailing newline.
     let lines: Vec<&str> = contents.lines().filter(|l| !l.is_empty()).collect();
-    if lines.is_empty() {
+    Some(pick_one(&lines)?.to_string())
+}
+
+/// Walk `source` and collect every matching image file, sorted so the
+/// result is stable across runs (readdir order is filesystem-dependent,
+/// and a stable list makes `coctl background cache` diffs meaningful).
+///
+/// Only real directories are descended into — `DirEntry::file_type` does
+/// not follow symlinks, so a symlinked directory is skipped and cannot
+/// form a cycle. Symlinked *files* are still collected: `accepts` works on
+/// the name, and a dangling link just fails the later existence check.
+/// Unreadable subdirectories are skipped rather than failing the scan; only
+/// an unreadable root is an error.
+pub fn scan_dir(source: &DirSource) -> std::io::Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    let mut stack = vec![(source.root.clone(), 0usize)];
+    let mut first = true;
+
+    while let Some((dir, depth)) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            // The root must be readable; a subdirectory we cannot open is
+            // skipped so one bad permission doesn't void the whole scan.
+            Err(e) if first => return Err(e),
+            Err(_) => continue,
+        };
+        first = false;
+
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let path = entry.path();
+            if file_type.is_dir() {
+                if source.recursive && depth + 1 < MAX_SCAN_DEPTH {
+                    stack.push((path, depth + 1));
+                }
+            } else if source.accepts(&path) {
+                found.push(path);
+            }
+        }
+    }
+
+    found.sort();
+    Ok(found)
+}
+
+/// Pick one entry at random. Shared by the list-file and directory paths so
+/// both use the same selection semantics.
+pub fn pick_one<T>(entries: &[T]) -> Option<&T> {
+    if entries.is_empty() {
         return None;
     }
     // Same poor-man's entropy Linux's socket.rs has used for ages —
@@ -42,7 +133,27 @@ pub fn pick_random(paths: &BackgroundPaths) -> Option<String> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
         .subsec_nanos() as usize;
-    Some(lines[seed % lines.len()].to_string())
+    entries.get(seed % entries.len())
+}
+
+/// Write `entries` to a list file, one path per line, creating the parent
+/// directory if needed. Temp + rename like [`remove_from_list`] so an
+/// interrupted write can't truncate a list the GUI is reading. Returns the
+/// number of lines written. Paths that aren't valid UTF-8 are skipped —
+/// the list format is line-based and cannot represent them.
+pub fn write_list(list: &Path, entries: &[PathBuf]) -> std::io::Result<usize> {
+    if let Some(parent) = list.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lines: Vec<&str> = entries.iter().filter_map(|p| p.to_str()).collect();
+    let mut body = lines.join("\n");
+    if !body.is_empty() {
+        body.push('\n');
+    }
+    let tmp = list.with_extension("tmp");
+    std::fs::write(&tmp, &body)?;
+    std::fs::rename(&tmp, list)?;
+    Ok(lines.len())
 }
 
 /// True if rotation is active. Missing mode file = active (default).
@@ -172,6 +283,105 @@ mod tests {
         assert!(remove_from_list(&p, "/only.png").unwrap());
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "");
         let _ = std::fs::remove_file(&p);
+    }
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("copad-bg-dir-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    fn touch(dir: &Path, name: &str) {
+        if let Some(parent) = Path::new(name).parent() {
+            std::fs::create_dir_all(dir.join(parent)).unwrap();
+        }
+        std::fs::File::create(dir.join(name)).unwrap();
+    }
+
+    #[test]
+    fn scan_dir_filters_by_extension_case_insensitively() {
+        let d = tmpdir("ext");
+        for f in ["a.jpg", "b.JPG", "c.PnG", "d.txt", "e", "f.jpeg"] {
+            touch(&d, f);
+        }
+        let src = DirSource::new(d.clone(), false, &[".JPG".into(), "png".into()]);
+        let found = scan_dir(&src).unwrap();
+        let names: Vec<_> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        // `.jpeg` must NOT match `jpg`, and the dot/case of the config value
+        // is normalized away by `DirSource::new`.
+        assert_eq!(names, vec!["a.jpg", "b.JPG", "c.PnG"]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn scan_dir_honors_recursive_flag() {
+        let d = tmpdir("rec");
+        touch(&d, "top.png");
+        touch(&d, "sub/nested.png");
+        touch(&d, "sub/deeper/deep.png");
+
+        let flat = scan_dir(&DirSource::new(d.clone(), false, &["png".into()])).unwrap();
+        assert_eq!(flat.len(), 1, "non-recursive must stay at maxdepth 1");
+
+        let deep = scan_dir(&DirSource::new(d.clone(), true, &["png".into()])).unwrap();
+        assert_eq!(deep.len(), 3);
+        // Sorted output — readdir order is filesystem-dependent, callers
+        // (and `coctl background cache` diffs) rely on it being stable.
+        let mut sorted = deep.clone();
+        sorted.sort();
+        assert_eq!(deep, sorted);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn scan_dir_empty_extensions_accepts_everything_and_errors_on_missing_root() {
+        let d = tmpdir("any");
+        touch(&d, "a.txt");
+        touch(&d, "b");
+        let all = scan_dir(&DirSource::new(d.clone(), false, &[])).unwrap();
+        assert_eq!(all.len(), 2);
+        // An unreadable/missing ROOT is an error the caller must see —
+        // silently returning an empty list would look like "no wallpapers".
+        assert!(scan_dir(&DirSource::new(d.join("nope"), false, &[])).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn pick_one_is_none_for_empty_and_in_range_otherwise() {
+        let empty: Vec<u8> = vec![];
+        assert!(pick_one(&empty).is_none());
+        let items = vec![1, 2, 3, 4, 5];
+        for _ in 0..50 {
+            assert!(items.contains(pick_one(&items).unwrap()));
+        }
+    }
+
+    #[test]
+    fn write_list_round_trips_through_pick_random() {
+        let d = tmpdir("write");
+        let list = d.join("nested").join("wallpapers.txt");
+        let entries = vec![PathBuf::from("/a.png"), PathBuf::from("/b.png")];
+        // Parent directory is created on demand — the cache dir may not exist.
+        assert_eq!(write_list(&list, &entries).unwrap(), 2);
+        assert_eq!(std::fs::read_to_string(&list).unwrap(), "/a.png\n/b.png\n");
+
+        let picked = pick_random(&BackgroundPaths {
+            primary_list: list.clone(),
+            fallback_list: None,
+            mode_file: PathBuf::from("/nonexistent/m"),
+        })
+        .unwrap();
+        assert!(picked == "/a.png" || picked == "/b.png");
+
+        // Empty input truncates to an empty file rather than leaving a
+        // trailing blank line that would read back as a bogus entry.
+        assert_eq!(write_list(&list, &[]).unwrap(), 0);
+        assert_eq!(std::fs::read_to_string(&list).unwrap(), "");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

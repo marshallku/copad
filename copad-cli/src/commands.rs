@@ -209,6 +209,26 @@ pub enum BackgroundCommand {
     Toggle,
     /// Delete the current list-picked wallpaper (disk + list) and rotate
     DeleteCurrent,
+    /// Rebuild the wallpaper list file by scanning a directory (local; no
+    /// running copad required). Only needed when you want the rotation source
+    /// to be a curated file — pointing `[background] image` at a directory
+    /// scans it live and needs no cache.
+    Cache {
+        /// Directory to scan. Defaults to `[background] image` when it names
+        /// a directory.
+        #[arg(long)]
+        path: Option<String>,
+        /// List file to write. Defaults to `[background] list`, else
+        /// `~/.cache/terminal-wallpapers.txt`.
+        #[arg(long)]
+        output: Option<String>,
+        /// Descend into subdirectories (overrides `[background] recursive`)
+        #[arg(long)]
+        recursive: bool,
+        /// Overwrite an existing list file
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -675,6 +695,9 @@ impl Cli {
                 BackgroundCommand::Next => "background.next",
                 BackgroundCommand::Toggle => "background.toggle",
                 BackgroundCommand::DeleteCurrent => "background.delete_current",
+                BackgroundCommand::Cache { .. } => {
+                    unreachable!("background cache is dispatched locally in main.rs")
+                }
             }
             .to_string(),
             Command::Tab(cmd) => match cmd {
@@ -822,6 +845,9 @@ impl Cli {
                 BackgroundCommand::Next
                 | BackgroundCommand::Toggle
                 | BackgroundCommand::DeleteCurrent => json!({}),
+                BackgroundCommand::Cache { .. } => {
+                    unreachable!("background cache is dispatched locally in main.rs")
+                }
             },
             Command::Tab(cmd) => match cmd {
                 TabCommand::Rename { id, title } => json!({ "id": id, "title": title }),
