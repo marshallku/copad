@@ -1,4 +1,5 @@
 mod agent_status;
+mod background_cache;
 mod client;
 mod commands;
 mod plugin_cmds;
@@ -6,7 +7,7 @@ mod update;
 mod usage;
 
 use clap::Parser;
-use commands::{AgentCommand, Cli, Command, EventCommand, UpdateCommand};
+use commands::{AgentCommand, BackgroundCommand, Cli, Command, EventCommand, UpdateCommand};
 
 fn main() {
     let cli = Cli::parse();
@@ -28,6 +29,25 @@ fn main() {
     }
     if let Command::Agent(AgentCommand::Status { oneline }) = &cli.command {
         std::process::exit(agent_status::run(*oneline, cli.json));
+    }
+
+    // `background cache` rebuilds the wallpaper list from a directory — pure
+    // config-read + filesystem work, so it must not require a running GUI
+    // (you populate the list BEFORE copad has anything to rotate).
+    if let Command::Background(BackgroundCommand::Cache {
+        path,
+        output,
+        recursive,
+        force,
+    }) = &cli.command
+    {
+        std::process::exit(background_cache::run(
+            path.as_deref(),
+            output.as_deref(),
+            *recursive,
+            *force,
+            cli.json,
+        ));
     }
 
     // `coctl event publish` bypasses the generic `discover_socket`
