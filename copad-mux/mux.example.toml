@@ -25,7 +25,15 @@ usage = "bar"             # status-bar Claude/Codex rate-limit readout:
                           #     (5h ━━━╌╌╌╌╌ 34%), falling back to percentages when narrow
                           #   text — percentages only (claude 5h 5% wk 34% · codex wk 60%)
                           #   off  — hidden (same as COPAD_MUX_USAGE=0)
+# Which rate-limit windows the readout shows. Default = all three. Ids:
+#   claude-5h | claude-wk | codex-wk   (aliases: claude = both Claude windows, codex)
+# An empty list hides the readout; unknown ids warn and are ignored.
+# usage_windows = ["claude-wk", "codex-wk"]   # e.g. weekly windows only
 usage_bar_width = 8       # cells per progress bar when usage = "bar"  (3..30)
+tab_labels = "number"     # what each status-bar tab chip shows:
+                          #   number (default) — the 1-based index: ` 1 ` ` 2 `
+                          #   name  — the tab's focused-pane process: ` claude ` ` nvim `
+                          #   both  — index + process:  ` 1:claude `  (keeps Ctrl-b <n>)
 update_check = true       # check GitHub releases in the background and show a
                           #   ⬆ x.y.z hint in the status bar when a newer version
                           #   exists (false / COPAD_MUX_UPDATE_CHECK=0 disables it)

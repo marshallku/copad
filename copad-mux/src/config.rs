@@ -141,6 +141,30 @@ impl UsageStyle {
     }
 }
 
+/// What each status-bar tab chip shows. Zero-config default is [`TabLabels::Number`]
+/// (identical to the historical `1`/`2`/`3` chips); the other styles surface the tab's
+/// focused-pane foreground command (e.g. `claude` / `nvim`) so tabs read at a glance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabLabels {
+    /// Just the 1-based index: ` 1 ` (the original behavior).
+    Number,
+    /// Just the process name: ` claude ` (index dropped).
+    Name,
+    /// Index + process name: ` 1:claude ` (keeps the `Ctrl-b <n>` mapping visible).
+    Both,
+}
+
+impl TabLabels {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "number" | "index" | "num" => TabLabels::Number,
+            "name" | "process" | "command" | "cmd" => TabLabels::Name,
+            "both" | "number-name" | "index-name" => TabLabels::Both,
+            _ => return None,
+        })
+    }
+}
+
 /// Every user-bindable action (each current binding, plus `KillSession`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
@@ -519,8 +543,14 @@ pub struct MuxConfig {
     pub sort_by: SortBy,
     /// How the status-bar usage/limits readout is rendered (off/text/bar).
     pub usage: UsageStyle,
+    /// Which rate-limit windows the readout shows (config `usage_windows`); a window
+    /// renders only if both available and enabled. Default = all (Claude 5h + weekly,
+    /// Codex weekly).
+    pub usage_windows: crate::usagepoll::UsageWindows,
     /// Width in cells of each progress bar when `usage = "bar"`.
     pub usage_bar_width: u16,
+    /// What each status-bar tab chip shows (number / process name / both).
+    pub tab_labels: TabLabels,
     /// Check GitHub releases in the background and show a `⬆ x.y.z` hint in the
     /// status bar when a newer version exists (equivalent to
     /// `COPAD_MUX_UPDATE_CHECK=0` when false).
@@ -549,7 +579,9 @@ struct RawConfig {
     restore_agent_sessions: Option<bool>,
     sort_by: Option<String>,
     usage: Option<String>,
+    usage_windows: Option<Vec<String>>,
     usage_bar_width: Option<i64>,
+    tab_labels: Option<String>,
     update_check: Option<bool>,
     update_environment: Option<Vec<String>>,
     keys: Option<HashMap<String, ChordSpec>>,
@@ -634,7 +666,9 @@ impl MuxConfig {
             restore_agent_sessions: true,
             sort_by: SortBy::Created,
             usage: UsageStyle::Bar,
+            usage_windows: crate::usagepoll::UsageWindows::all(),
             usage_bar_width: DEFAULT_USAGE_BAR_WIDTH,
+            tab_labels: TabLabels::Number,
             update_check: true,
             update_environment: default_update_environment(),
             worktree: WorktreeConfig {
@@ -747,6 +781,7 @@ impl MuxConfig {
                         UsageStyle::Bar
                     }),
                 },
+                usage_windows: build_usage_windows(raw.usage_windows, &mut warnings),
                 usage_bar_width: clamp_field(
                     raw.usage_bar_width,
                     DEFAULT_USAGE_BAR_WIDTH as i64,
@@ -755,6 +790,15 @@ impl MuxConfig {
                     "usage_bar_width",
                     &mut warnings,
                 ) as u16,
+                tab_labels: match raw.tab_labels.as_deref() {
+                    None => TabLabels::Number,
+                    Some(s) => TabLabels::parse(s).unwrap_or_else(|| {
+                        warnings.push(format!(
+                            "tab_labels '{s}' unknown (number|name|both) — using number"
+                        ));
+                        TabLabels::Number
+                    }),
+                },
                 update_check: raw.update_check.unwrap_or(true),
                 update_environment,
                 worktree,
@@ -762,6 +806,40 @@ impl MuxConfig {
             warnings,
         )
     }
+}
+
+/// Resolve `usage_windows`: default (all windows) when absent, else the configured
+/// list of window ids (`claude-5h` / `claude-wk` / `codex-wk`) turned into an enabled
+/// set. Unknown ids warn and are ignored; an explicit empty list hides every window
+/// (the readout disappears, like `usage = "off"` but per-window). Aliases: `claude`
+/// enables both Claude windows, `codex` the Codex weekly one.
+fn build_usage_windows(
+    raw: Option<Vec<String>>,
+    warnings: &mut Vec<String>,
+) -> crate::usagepoll::UsageWindows {
+    use crate::usagepoll::UsageWindows;
+    let Some(list) = raw else {
+        return UsageWindows::all();
+    };
+    let mut sel = UsageWindows::none();
+    for name in list {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "" => {}
+            "claude-5h" | "claude_5h" | "claude5h" => sel.claude_5h = true,
+            "claude-wk" | "claude_wk" | "claude-week" | "claude-weekly" => sel.claude_wk = true,
+            "codex-wk" | "codex_wk" | "codex-week" | "codex-weekly" => sel.codex_wk = true,
+            "claude" => {
+                sel.claude_5h = true;
+                sel.claude_wk = true;
+            }
+            "codex" => sel.codex_wk = true,
+            other => warnings.push(format!(
+                "usage_windows: '{other}' unknown \
+                 (claude-5h|claude-wk|codex-wk, or claude|codex) — ignored"
+            )),
+        }
+    }
+    sel
 }
 
 /// Resolve `update_environment`: default when absent, else the configured list with
@@ -1210,6 +1288,49 @@ mod tests {
         let (cfg, warns) = load_str("usage_bar_width = 999");
         assert_eq!(cfg.usage_bar_width, 30);
         assert!(warns.iter().any(|w| w.contains("usage_bar_width")));
+    }
+
+    #[test]
+    fn tab_labels_parse_and_default() {
+        assert_eq!(MuxConfig::default().tab_labels, TabLabels::Number);
+        assert_eq!(
+            load_str("tab_labels = \"name\"").0.tab_labels,
+            TabLabels::Name
+        );
+        assert_eq!(
+            load_str("tab_labels = \"both\"").0.tab_labels,
+            TabLabels::Both
+        );
+        assert_eq!(
+            load_str("tab_labels = \"number\"").0.tab_labels,
+            TabLabels::Number
+        );
+        // Unknown → default + warning.
+        let (cfg, warns) = load_str("tab_labels = \"bogus\"");
+        assert_eq!(cfg.tab_labels, TabLabels::Number);
+        assert!(warns.iter().any(|w| w.contains("tab_labels")));
+    }
+
+    #[test]
+    fn usage_windows_parse_default_and_filter() {
+        // Absent → all windows enabled (historical readout).
+        let def = MuxConfig::default().usage_windows;
+        assert!(def.claude_5h && def.claude_wk && def.codex_wk);
+        // Selecting only the weekly windows.
+        let sel = load_str(r#"usage_windows = ["claude-wk", "codex-wk"]"#)
+            .0
+            .usage_windows;
+        assert!(!sel.claude_5h && sel.claude_wk && sel.codex_wk);
+        // `claude` alias enables both Claude windows.
+        let sel = load_str(r#"usage_windows = ["claude"]"#).0.usage_windows;
+        assert!(sel.claude_5h && sel.claude_wk && !sel.codex_wk);
+        // Empty list hides every window.
+        let sel = load_str("usage_windows = []").0.usage_windows;
+        assert!(!sel.claude_5h && !sel.claude_wk && !sel.codex_wk);
+        // Unknown id warns and is ignored (others still take).
+        let (cfg, warns) = load_str(r#"usage_windows = ["bogus", "codex-wk"]"#);
+        assert!(!cfg.usage_windows.claude_5h && cfg.usage_windows.codex_wk);
+        assert!(warns.iter().any(|w| w.contains("usage_windows")));
     }
 
     #[test]

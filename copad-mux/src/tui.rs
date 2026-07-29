@@ -23,7 +23,7 @@ use ratatui::style::{Color, Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agentstate;
-use crate::config::{self, Action, MuxConfig, SortBy, UsageStyle};
+use crate::config::{self, Action, MuxConfig, SortBy, TabLabels, UsageStyle};
 use crate::control;
 use crate::gitinfo;
 use crate::model::{
@@ -3385,6 +3385,40 @@ impl App {
     }
 
     /// Does any pane in `tab_id` currently run a classified AI agent?
+    /// The focused pane's foreground-command name for a tab (e.g. `claude` / `nvim`),
+    /// truncated to a chip-friendly width and cleaned of a login-shell leading `-`.
+    /// `None` when the tab / focused terminal has no resolved label yet, so the caller
+    /// falls back to the bare index. Used for the `name`/`both` tab-label styles.
+    fn tab_focus_label(&self, tab_id: &TabId) -> Option<String> {
+        /// Max display cells for the process-name part of a chip; `comm` is already
+        /// short (≤15 on Linux) but a long name still shouldn't dominate the bar.
+        const MAX: usize = 12;
+        let w = self.state.workspace(&self.ws)?;
+        let t = w.tab(tab_id)?;
+        let tid = t.layout.terminal_of(&t.focused)?;
+        let raw = self.labels.get(tid)?.text.trim();
+        let name = raw.strip_prefix('-').unwrap_or(raw); // login shell `-zsh` → `zsh`
+        if name.is_empty() {
+            return None;
+        }
+        // Truncate on display width, adding an ellipsis if clipped.
+        if name.width() <= MAX {
+            return Some(name.to_string());
+        }
+        let mut out = String::new();
+        let mut used = 0usize;
+        for ch in name.chars() {
+            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if used + cw > MAX - 1 {
+                break;
+            }
+            out.push(ch);
+            used += cw;
+        }
+        out.push('…');
+        Some(out)
+    }
+
     fn tab_has_agent(&self, tab_id: &TabId) -> bool {
         let Some(w) = self.state.workspace(&self.ws) else {
             return false;
@@ -3539,7 +3573,7 @@ impl App {
         // it would crowd out tab chips on a narrow/mobile view (size-adaptive, like
         // the sidebar).
         if let Some(u) = &self.usage_shown
-            && !u.is_empty()
+            && u.has_visible(self.cfg.usage_windows)
             && self.cfg.usage != UsageStyle::Off
             && self.cols >= 100
         {
@@ -3552,13 +3586,17 @@ impl App {
             let bar_width = (self.cfg.usage == UsageStyle::Bar
                 && (self.cols as usize)
                     >= USAGE_BARS_RESERVE_COLS
-                        + usagepoll::bar_display_width(u, self.cfg.usage_bar_width))
+                        + usagepoll::bar_display_width(
+                            u,
+                            self.cfg.usage_bar_width,
+                            self.cfg.usage_windows,
+                        ))
             .then_some(self.cfg.usage_bar_width);
             // Each window's gauge is colored by its utilization (green < 70 ≤ yellow
             // < 90 ≤ red); labels and separators stay muted. One segment per part.
             let pad = Style::default().bg(CAT_SURFACE0);
             segs.push((" ".to_string(), pad));
-            for part in u.parts(bar_width) {
+            for part in u.parts(bar_width, self.cfg.usage_windows) {
                 let (text, fg) = match part {
                     UsagePart::Window { text, pct } => (text, usage_threshold_color(pct)),
                     UsagePart::Neutral(s) => (s, CAT_SUBTEXT),
@@ -3594,10 +3632,23 @@ impl App {
             .enumerate()
             .map(|(i, id)| {
                 let agent = self.tab_has_agent(id);
-                (
-                    format!(" {}{} ", if agent { "● " } else { "" }, i + 1),
-                    agent,
-                )
+                let dot = if agent { "● " } else { "" };
+                let n = i + 1;
+                // `tab_labels` picks number / process name / both. `name`/`both` fall back
+                // to the bare number when the pane has no resolved label yet (or a blank one),
+                // so a fresh tab is never an empty chip.
+                let inner = match self.cfg.tab_labels {
+                    TabLabels::Number => n.to_string(),
+                    TabLabels::Name => match self.tab_focus_label(id) {
+                        Some(name) => name,
+                        None => n.to_string(),
+                    },
+                    TabLabels::Both => match self.tab_focus_label(id) {
+                        Some(name) => format!("{n}:{name}"),
+                        None => n.to_string(),
+                    },
+                };
+                (format!(" {dot}{inner} "), agent)
             })
             .collect();
         let widths: Vec<u16> = chips.iter().map(|(s, _)| s.width() as u16).collect();

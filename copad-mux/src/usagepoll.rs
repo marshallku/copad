@@ -20,6 +20,43 @@ const POLL: Duration = Duration::from_secs(60);
 const BAR_FILLED: char = '━';
 const BAR_EMPTY: char = '╌';
 
+/// Which rate-limit windows the status bar is allowed to show (config
+/// `usage_windows`). A window is rendered only if it is BOTH available in the
+/// snapshot AND enabled here — so a user can hide, e.g., Claude's 5h window and
+/// keep only the weekly ones. Default = all on (the historical readout).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UsageWindows {
+    pub claude_5h: bool,
+    pub claude_wk: bool,
+    pub codex_wk: bool,
+}
+
+impl Default for UsageWindows {
+    fn default() -> Self {
+        Self::all()
+    }
+}
+
+impl UsageWindows {
+    /// Every window enabled (the zero-config readout: Claude 5h + weekly, Codex weekly).
+    pub fn all() -> Self {
+        UsageWindows {
+            claude_5h: true,
+            claude_wk: true,
+            codex_wk: true,
+        }
+    }
+
+    /// No window enabled (starting point when a config list is given).
+    pub fn none() -> Self {
+        UsageWindows {
+            claude_5h: false,
+            claude_wk: false,
+            codex_wk: false,
+        }
+    }
+}
+
 /// Parsed rate-limit percentages. `None` window = unavailable (omitted); `stale`
 /// = the provider was served from the on-disk cache (rendered with a `~`).
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -36,14 +73,26 @@ impl UsageSnapshot {
         self.claude_5h.is_none() && self.claude_wk.is_none() && self.codex_wk.is_none()
     }
 
+    /// Whether any window would render given the config selection `sel` — a window
+    /// shows only when it is both available AND enabled. The status bar uses this
+    /// (rather than [`Self::is_empty`]) so hiding every enabled window hides the readout.
+    pub fn has_visible(&self, sel: UsageWindows) -> bool {
+        (self.claude_5h.is_some() && sel.claude_5h)
+            || (self.claude_wk.is_some() && sel.claude_wk)
+            || (self.codex_wk.is_some() && sel.codex_wk)
+    }
+
     /// Percentages: `claude 5h 5% wk 34% · codex wk 60%` (stale provider `~`-prefixed).
     pub fn text(&self) -> String {
-        self.parts(None).iter().map(UsagePart::text).collect()
+        self.parts(None, UsageWindows::all())
+            .iter()
+            .map(UsagePart::text)
+            .collect()
     }
 
     /// A progress bar per window: `claude 5h ━━╌╌╌╌╌╌ 5% wk ━━━╌╌╌╌╌ 34% · codex wk …`.
     pub fn bar(&self, width: u16) -> String {
-        self.parts(Some(width))
+        self.parts(Some(width), UsageWindows::all())
             .iter()
             .map(UsagePart::text)
             .collect()
@@ -52,8 +101,10 @@ impl UsageSnapshot {
     /// The readout broken into render parts so the status bar can color each
     /// window by its utilization (threshold coloring) while leaving labels and
     /// separators neutral. `bar_width = None` = text; `Some(w)` = a `w`-cell bar
-    /// before each percent. The concatenation equals [`Self::text`]/[`Self::bar`].
-    pub fn parts(&self, bar_width: Option<u16>) -> Vec<UsagePart> {
+    /// before each percent. Only windows enabled in `sel` are emitted, and a
+    /// provider label is dropped when none of its windows survive. The concatenation
+    /// equals [`Self::text`]/[`Self::bar`] when `sel` is [`UsageWindows::all`].
+    pub fn parts(&self, bar_width: Option<u16>, sel: UsageWindows) -> Vec<UsagePart> {
         let cell = |pct: f64| match bar_width {
             Some(w) => format!("{} ", bar_glyphs(pct, w)),
             None => String::new(),
@@ -63,8 +114,12 @@ impl UsageSnapshot {
             out.push(UsagePart::Neutral(format!(" {label} ")));
             out.push(UsagePart::window(format!("{}{pct:.0}%", cell(pct)), pct));
         };
+        // A window renders only when both available and enabled in `sel`.
+        let claude_5h = self.claude_5h.filter(|_| sel.claude_5h);
+        let claude_wk = self.claude_wk.filter(|_| sel.claude_wk);
+        let codex_wk = self.codex_wk.filter(|_| sel.codex_wk);
         let mut out = Vec::new();
-        let has_claude = self.claude_5h.is_some() || self.claude_wk.is_some();
+        let has_claude = claude_5h.is_some() || claude_wk.is_some();
         if has_claude {
             out.push(UsagePart::Neutral(
                 if self.claude_stale {
@@ -74,14 +129,14 @@ impl UsageSnapshot {
                 }
                 .to_string(),
             ));
-            if let Some(p) = self.claude_5h {
+            if let Some(p) = claude_5h {
                 window(&mut out, "5h", p);
             }
-            if let Some(p) = self.claude_wk {
+            if let Some(p) = claude_wk {
                 window(&mut out, "wk", p);
             }
         }
-        if let Some(p) = self.codex_wk {
+        if let Some(p) = codex_wk {
             if has_claude {
                 out.push(UsagePart::Neutral(" · ".to_string()));
             }
@@ -127,10 +182,14 @@ fn bar_glyphs(pct: f64, width: u16) -> String {
     s
 }
 
-/// Display width of the bar rendering — used by the status bar to decide whether
-/// the terminal is wide enough for bars before falling back to text.
-pub fn bar_display_width(u: &UsageSnapshot, width: u16) -> usize {
-    u.bar(width).width()
+/// Display width of the bar rendering (only the windows enabled in `sel`) — used by
+/// the status bar to decide whether the terminal is wide enough for bars before
+/// falling back to text.
+pub fn bar_display_width(u: &UsageSnapshot, width: u16, sel: UsageWindows) -> usize {
+    u.parts(Some(width), sel)
+        .iter()
+        .map(|p| p.text().width())
+        .sum()
 }
 
 /// Latest snapshot shared with the render loop. `None` = nothing fetched yet /
@@ -210,7 +269,7 @@ mod tests {
 
     #[test]
     fn parts_carry_pct_and_concat_to_text() {
-        let parts = full().parts(None);
+        let parts = full().parts(None, UsageWindows::all());
         // Each gauge chunk carries its utilization (for threshold coloring); the
         // order is claude 5h, claude wk, codex wk.
         let pcts: Vec<f64> = parts
@@ -224,6 +283,47 @@ mod tests {
         // Concatenation is byte-identical to the flat text form.
         let concat: String = parts.iter().map(UsagePart::text).collect();
         assert_eq!(concat, full().text());
+    }
+
+    #[test]
+    fn window_selection_filters_and_drops_empty_labels() {
+        let u = full();
+        // Claude weekly only + Codex weekly → 5h is dropped, claude label stays.
+        let sel = UsageWindows {
+            claude_5h: false,
+            claude_wk: true,
+            codex_wk: true,
+        };
+        let s: String = u.parts(None, sel).iter().map(UsagePart::text).collect();
+        assert_eq!(s, "claude wk 34% · codex wk 60%");
+        assert!(u.has_visible(sel));
+
+        // Disabling every Claude window drops the whole `claude` label (no orphan).
+        let codex_only = UsageWindows {
+            claude_5h: false,
+            claude_wk: false,
+            codex_wk: true,
+        };
+        let s: String = u
+            .parts(None, codex_only)
+            .iter()
+            .map(UsagePart::text)
+            .collect();
+        assert_eq!(s, "codex wk 60%");
+
+        // Nothing enabled → nothing rendered, and `has_visible` is false so the bar hides.
+        assert!(u.parts(None, UsageWindows::none()).is_empty());
+        assert!(!u.has_visible(UsageWindows::none()));
+
+        // An enabled-but-unavailable window doesn't make it visible.
+        let missing = UsageSnapshot {
+            claude_5h: None,
+            claude_wk: None,
+            claude_stale: false,
+            codex_wk: None,
+            codex_stale: false,
+        };
+        assert!(!missing.has_visible(UsageWindows::all()));
     }
 
     #[test]
