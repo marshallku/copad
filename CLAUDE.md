@@ -91,7 +91,7 @@ git config core.hooksPath .githooks
 - VTE handles PTY on Linux (no custom PTY management)
 - Unix sockets for IPC: GUI per-instance at `$XDG_RUNTIME_DIR/copad/gui-{PID}.sock`, daemon at its well-known path (`copad_core::paths`); legacy `/tmp/copad-{PID}.sock` recognized for back-compat
 - Config: `~/.config/copad/config.toml` (TOML)
-- Cache: `~/.cache/terminal-wallpapers.txt` (Linux) / `~/Library/Caches/copad/wallpapers.txt` (macOS, falls back to Linux path)
+- Cache: `~/.cache/terminal-wallpapers.txt` (Linux) / `~/Library/Caches/copad/wallpapers.txt` (macOS, falls back to Linux path). Default only — `[background] list` overrides it, and a directory `[background] image` (Linux) bypasses the list file entirely (decision #78)
 - Theme: configurable via `[theme] name` — 10 built-ins (catppuccin variants, dracula, nord, tokyo-night, gruvbox-dark, one-dark, solarized-dark), default `catppuccin-mocha`, hot-reloads
 - Dark theme forced via GTK settings
 
