@@ -21,6 +21,7 @@ use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as TtyOptions, Pty, Shell};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// A cell color resolved to something a renderer can map directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +350,30 @@ fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
             sym.push(cell.c);
             if let Some(zw) = cell.zerowidth() {
                 sym.extend(zw.iter());
+            }
+            // ROOT FIX for wide-glyph ghosts: the whole render pipeline downstream (ratatui's
+            // `Buffer::diff` omission, the client's `fix_wide_spacers`, and ratatui's cell emit)
+            // measures width via `unicode-width`, but alacritty lays the grid out with its OWN
+            // width table. When they disagree on a grapheme — a VS16 emoji like "❤\u{fe0f}" that
+            // alacritty gives 1 column but unicode-width calls 2, or a ZWJ sequence — the client
+            // desyncs from the server's grid and a cell the diff wrongly deems unchanged is never
+            // re-sent → residue. Force the emitted grapheme's unicode-width to equal the number of
+            // columns alacritty allotted it (`span`: 2 for a WIDE_CHAR leading cell, else 1), so
+            // every stage agrees. Width-inflating marks (VS/ZWJ) are dropped to the base scalar;
+            // ordinary zero-width combining marks (accents) don't change width and are kept.
+            if !spacer {
+                let span = if flags.contains(Flags::WIDE_CHAR) {
+                    2
+                } else {
+                    1
+                };
+                if UnicodeWidthStr::width(sym.as_str()) != span {
+                    sym = if UnicodeWidthChar::width(cell.c).unwrap_or(0) == span {
+                        cell.c.to_string()
+                    } else {
+                        " ".repeat(span) // unrepresentable at this width — blank the leading cell
+                    };
+                }
             }
             row.push(CellSnap {
                 sym,
@@ -824,6 +849,23 @@ mod render_repro {
     }
 
     #[test]
+    fn snapshot_coerces_grapheme_width_to_alacritty_span() {
+        // The root fix: a grapheme whose unicode-width disagrees with alacritty's column span is
+        // coerced so the two agree (VS16 ❤️ → ❤, width 1). CJK is untouched (both models say 2).
+        let (mut t, mut p) = term(10, 1);
+        feed(&mut t, &mut p, "❤\u{fe0f}가X".as_bytes());
+        let row = &snapshot_grid(&t).cells[0];
+        // ❤️ occupies 1 alacritty column → the VS16 is dropped so the sym is the width-1 base.
+        assert_eq!(row[0].sym, "❤");
+        assert!(!row[0].spacer);
+        // 가 is genuinely wide (2 cols) → unchanged, with a trailing spacer at col 2.
+        assert_eq!(row[1].sym, "가");
+        assert!(row[2].spacer);
+        // X sits at col 3 (right after 가's spacer), proving ❤️ consumed exactly ONE column.
+        assert_eq!(row[3].sym, "X");
+    }
+
+    #[test]
     fn prod_relay_passes_on_normal_content() {
         // Sanity: the production-accurate harness (independent raw baseline) relays ordinary
         // wide-CJK + colored content faithfully — same script as the claude-code-like session.
@@ -848,18 +890,13 @@ mod render_repro {
     }
 
     #[test]
-    #[ignore = "documents a KNOWN, deep limitation: alacritty and unicode-width disagree on \
-                some graphemes (VS16 emoji like ❤\u{fe0f}, ZWJ sequences). alacritty lays ❤\u{fe0f} as 1 \
-                column; ratatui's emit AND fix_wide_spacers measure it as 2 via unicode-width, so \
-                the client desyncs from the source grid mid-app. Fixing this needs the client to \
-                render with alacritty's width model instead of ratatui/unicode-width — out of scope \
-                (see full-screen-exit forced-full workaround). Run with --ignored to observe."]
-    fn prod_relay_known_wide_char_desync() {
+    fn prod_relay_wide_char_desync_is_fixed() {
         // A pure-delta emoji/CJK churn: mixes VS16 ❤️ (alacritty width 1, unicode-width 2) with
-        // 가 (both 2) and X. Through the production-accurate baseline this DIVERGES — a 가 that
-        // replaces an ❤️ is never re-sent, leaving a stale ❤️ ghost. This is the root the user's
-        // "sometimes ghost" traces to; the shipped fix forces a full repaint at the alt-screen
-        // seam rather than trying to reconcile the two width tables.
+        // 가 (both 2) and X. This USED to diverge through the production-accurate baseline — a 가
+        // that replaced an ❤️ was never re-sent, leaving a stale ❤️ ghost (the root of the user's
+        // "sometimes ghost"). Now `snapshot_grid` coerces each grapheme's unicode-width to match
+        // alacritty's column span (❤️ → ❤, width 1), so every pipeline stage agrees and the relay
+        // stays faithful with deltas alone — no forced repaint needed. This test now PASSES.
         let batches: Vec<Vec<u8>> = (0..20)
             .map(|i| {
                 let mut s = String::from("\x1b[H");
