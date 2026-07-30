@@ -93,6 +93,7 @@ restore_agent_sessions = true
 # next-tab = "n"
 # prev-tab = "p"
 # close-tab = "&"
+# rename-tab = ","        # custom tab name (shown over the process label; empty clears)
 # tab-1 = "1"   … tab-9 = "9"
 # new-session = "C"       # opens an inline name prompt
 # new-worktree = "W"      # opens a branch prompt → git worktree + session

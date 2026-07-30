@@ -276,6 +276,16 @@ impl State {
             w.name = name;
         }
     }
+    /// Set (or clear, with `None`) a tab's display name (tmux-style window rename).
+    /// A custom name takes display precedence over the tab's foreground-process
+    /// label. No-op if either id is unknown. Server-level metadata, not a `Command`.
+    pub fn set_tab_name(&mut self, ws: &WorkspaceId, tab: &TabId, name: Option<String>) {
+        if let Some(w) = self.workspaces.iter_mut().find(|w| &w.id == ws)
+            && let Some(t) = w.tab_mut(tab)
+        {
+            t.name = name;
+        }
+    }
     pub fn terminal(&self, id: &TerminalId) -> Option<&Terminal> {
         self.terminals.get(id)
     }
@@ -1310,6 +1320,25 @@ mod tests {
         assert_eq!(s.workspace(&ws).unwrap().name, None);
         // Unknown id is a silent no-op (no panic).
         s.set_workspace_name(&WorkspaceId::new("nope"), Some("x".to_string()));
+    }
+
+    #[test]
+    fn set_tab_name_sets_clears_and_ignores_unknown() {
+        let (mut s, ws, _p) = seed();
+        let tab = s.workspace(&ws).unwrap().active_tab.clone();
+        assert_eq!(s.workspace(&ws).unwrap().tab(&tab).unwrap().name, None);
+        s.set_tab_name(&ws, &tab, Some("build".to_string()));
+        assert_eq!(
+            s.workspace(&ws).unwrap().tab(&tab).unwrap().name.as_deref(),
+            Some("build")
+        );
+        // Clearing reverts to the default (process/index) label.
+        s.set_tab_name(&ws, &tab, None);
+        assert_eq!(s.workspace(&ws).unwrap().tab(&tab).unwrap().name, None);
+        // Unknown workspace or tab id is a silent no-op (no panic).
+        s.set_tab_name(&WorkspaceId::new("nope"), &tab, Some("x".to_string()));
+        s.set_tab_name(&ws, &TabId::new("nope"), Some("x".to_string()));
+        assert_eq!(s.workspace(&ws).unwrap().tab(&tab).unwrap().name, None);
     }
 
     #[test]

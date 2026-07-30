@@ -176,6 +176,9 @@ pub enum Action {
     CloseTab,
     /// Jump to tab index `0..=8` (`Ctrl-b 1`..`9`, `Alt-1`..`9`).
     SelectTab(u8),
+    /// `Ctrl-b ,` (tmux rename-window): give the active tab a custom name that takes
+    /// display precedence over its foreground-process label (empty → clear).
+    RenameTab,
     NewSession,
     /// `Ctrl-b W`: create a git worktree + a session in it (name prompt).
     NewWorktree,
@@ -376,6 +379,7 @@ fn action_from_name(name: &str) -> Option<Action> {
         "next-tab" => Action::NextTab,
         "prev-tab" => Action::PrevTab,
         "close-tab" => Action::CloseTab,
+        "rename-tab" => Action::RenameTab,
         "new-session" => Action::NewSession,
         "new-worktree" => Action::NewWorktree,
         "rename-session" => Action::RenameSession,
@@ -449,6 +453,7 @@ fn default_bindings() -> Vec<(Action, Ctx, &'static [&'static str])> {
         (NextTab, Prefix, &["n"]),
         (PrevTab, Prefix, &["p"]),
         (CloseTab, Prefix, &["&"]),
+        (RenameTab, Prefix, &[","]),
         (SelectTab(0), Prefix, &["1"]),
         (SelectTab(1), Prefix, &["2"]),
         (SelectTab(2), Prefix, &["3"]),
@@ -1165,6 +1170,10 @@ mod tests {
         assert_eq!(
             km.prefix_action(&parse_chord("X").unwrap()),
             Some(Action::KillSession)
+        );
+        assert_eq!(
+            km.prefix_action(&parse_chord(",").unwrap()),
+            Some(Action::RenameTab)
         );
         // global table
         assert_eq!(

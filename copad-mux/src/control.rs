@@ -35,6 +35,14 @@ pub enum Req {
     NewTab,
     /// Make the tab at `index` (as printed by `list-tabs`) active.
     SelectTab { index: usize },
+    /// Rename the tab at `index` (as printed by `list-tabs`), or the ACTIVE tab when
+    /// `index` is `None` — so a shell inside a pane can rename its own tab without
+    /// knowing its position. An empty `name` clears back to the process/index label.
+    RenameTab {
+        #[serde(default)]
+        index: Option<usize>,
+        name: String,
+    },
     /// List the sessions (workspaces).
     ListSessions,
     /// Create a new session and switch to it. `name` is the tmux-style display name
@@ -47,9 +55,14 @@ pub enum Req {
         #[serde(default)]
         cwd: Option<String>,
     },
-    /// Rename the session at `index` (as printed by `list-sessions`). An empty `name`
-    /// clears it back to the generated id.
-    RenameSession { index: usize, name: String },
+    /// Rename the session at `index` (as printed by `list-sessions`), or the ACTIVE
+    /// session when `index` is `None`. An empty `name` clears it back to the
+    /// generated id.
+    RenameSession {
+        #[serde(default)]
+        index: Option<usize>,
+        name: String,
+    },
     /// Make the session at `index` (as printed by `list-sessions`) active.
     SelectSession { index: usize },
     /// Create a git worktree for `branch` (sibling of the repo's MAIN worktree) and open
@@ -111,6 +124,10 @@ pub struct TabInfo {
     pub index: usize,
     pub id: String,
     pub active: bool,
+    /// The custom display name (tmux-style window name), or empty when unnamed
+    /// (shown by its process/index label instead).
+    #[serde(default)]
+    pub name: String,
     /// Number of panes in the tab.
     pub panes: usize,
     /// Number of those panes running a classified AI agent.
@@ -282,7 +299,8 @@ pub fn run_client(args: &[String]) -> i32 {
     let Some(cmd) = rest.first().map(|s| s.as_str()) else {
         eprintln!(
             "usage: comux <list|split|resize|focus|close|send|list-tabs|new-tab|select-tab|\
-             list-sessions|new-session [name]|rename-session <index> <name>|select-session|\
+             rename-tab [index] <name>|list-sessions|new-session [name]|\
+             rename-session [index] <name>|select-session|\
              worktree <create|list|rm>|kill-server> [args]"
         );
         return 2;
@@ -311,20 +329,18 @@ pub fn run_client(args: &[String]) -> i32 {
             }
         }
         "rename-session" | "rename" => {
-            let Some(idx) = rest.get(1).and_then(|s| s.parse::<usize>().ok()) else {
-                eprintln!("usage: comux rename-session <index> <name...>");
+            let Some((index, name)) = parse_rename(&rest) else {
+                eprintln!("usage: comux rename-session [index] <name...>   (no index = active)");
                 return 2;
             };
-            let name = rest
-                .iter()
-                .skip(2)
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
-            Req::RenameSession {
-                index: idx,
-                name: name.trim().to_string(),
-            }
+            Req::RenameSession { index, name }
+        }
+        "rename-tab" => {
+            let Some((index, name)) = parse_rename(&rest) else {
+                eprintln!("usage: comux rename-tab [index] <name...>   (no index = active)");
+                return 2;
+            };
+            Req::RenameTab { index, name }
         }
         "select-session" => {
             let Some(idx) = rest.get(1).and_then(|s| s.parse::<usize>().ok()) else {
@@ -631,15 +647,16 @@ fn print_human(req: &Req, resp: &Resp) {
             let tabs = resp.tabs.clone().unwrap_or_default();
             let active = resp.active_tab.unwrap_or(usize::MAX);
             println!(
-                "{:<3} {:<9} {:<16} {:<6} AGENTS",
-                "IDX", "ACTIVE", "TAB", "PANES"
+                "{:<3} {:<9} {:<16} {:<16} {:<6} AGENTS",
+                "IDX", "ACTIVE", "TAB", "NAME", "PANES"
             );
             for t in &tabs {
                 println!(
-                    "{:<3} {:<9} {:<16} {:<6} {}",
+                    "{:<3} {:<9} {:<16} {:<16} {:<6} {}",
                     t.index,
                     if t.index == active { "*active" } else { "" },
                     t.id,
+                    if t.name.is_empty() { "-" } else { &t.name },
                     t.panes,
                     t.agents,
                 );
@@ -667,6 +684,28 @@ fn print_human(req: &Req, resp: &Resp) {
         }
         _ => println!("ok"),
     }
+}
+
+/// `rename-*` CLI argument shape, shared by tabs and sessions: `rename-x <name...>`
+/// targets the ACTIVE one; `rename-x <index> <name...>` targets by list index. `rest`
+/// includes the verb at `[0]`. A leading integer is read as an index only when a name
+/// follows it, so `rename-tab 2` names the active tab "2" rather than erroring on a
+/// missing name. An explicit empty name (`rename-tab ""`) clears back to the default.
+fn parse_rename(rest: &[&String]) -> Option<(Option<usize>, String)> {
+    let args = &rest[1..];
+    let (index, name_args) = match args.first().and_then(|s| s.parse::<usize>().ok()) {
+        Some(idx) if args.len() > 1 => (Some(idx), &args[1..]),
+        _ => (None, args),
+    };
+    if name_args.is_empty() {
+        return None;
+    }
+    let name = name_args
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some((index, name.trim().to_string()))
 }
 
 /// The caller's cwd as a wire string (the repo is resolved from it server-side).
@@ -1059,5 +1098,53 @@ mod server_admin_tests {
     #[test]
     fn unknown_action_is_a_usage_error() {
         with_dead_socket(|| assert_eq!(run_server_admin("frobnicate"), 2));
+    }
+
+    /// Build the `&[&String]` shape `run_client` passes to `parse_rename`.
+    fn rename_args(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn parse_rename_targets_active_or_index() {
+        let check = |args: &[&str], want: Option<(Option<usize>, &str)>| {
+            let owned = rename_args(args);
+            let refs: Vec<&String> = owned.iter().collect();
+            assert_eq!(
+                parse_rename(&refs),
+                want.map(|(i, n)| (i, n.to_string())),
+                "args: {args:?}"
+            );
+        };
+        // Plain name → the ACTIVE tab/session.
+        check(&["rename-tab", "build"], Some((None, "build")));
+        // Leading integer + name → index form, name space-joined.
+        check(
+            &["rename-tab", "2", "build", "tools"],
+            Some((Some(2), "build tools")),
+        );
+        // A lone integer is a NAME (no name follows it), not a missing-name error.
+        check(&["rename-tab", "2"], Some((None, "2")));
+        // An explicit empty name clears (Some with empty string), no args is usage.
+        check(&["rename-tab", ""], Some((None, "")));
+        check(&["rename-tab"], None);
+    }
+
+    /// An old client's `rename-session` (bare `index`) and a new index-less request must
+    /// both deserialize — `index` is `Option` + `#[serde(default)]` for wire back-compat.
+    #[test]
+    fn rename_reqs_round_trip_with_and_without_index() {
+        let old: Req = serde_json::from_str(r#"{"cmd":"rename-session","index":1,"name":"api"}"#)
+            .expect("indexed form must parse");
+        assert!(matches!(
+            old,
+            Req::RenameSession { index: Some(1), ref name } if name == "api"
+        ));
+        let new: Req = serde_json::from_str(r#"{"cmd":"rename-tab","name":"build"}"#)
+            .expect("index-less form must parse");
+        assert!(matches!(
+            new,
+            Req::RenameTab { index: None, ref name } if name == "build"
+        ));
     }
 }

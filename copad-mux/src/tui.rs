@@ -87,7 +87,7 @@ struct ClickZone {
 }
 
 /// An inline single-line text prompt (session name entry / rename), tmux `command-prompt`.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum PromptKind {
     /// `Ctrl-b C`: create a session with the typed name (empty → auto `sN`).
     NewSession,
@@ -95,6 +95,27 @@ enum PromptKind {
     NewWorktree,
     /// `Ctrl-b $`: rename the active session (empty → revert to its id).
     RenameSession,
+    /// `Ctrl-b ,` (tmux rename-window): rename the active tab (empty → revert to its
+    /// process/index label). Captures the TARGET workspace + tab so a tab or session
+    /// switch (this client or a concurrent one) while the prompt is up can't retarget
+    /// or silently drop it.
+    RenameTab(WorkspaceId, TabId),
+}
+
+/// One sidebar/switcher agent row: where the agent pane lives + what it runs.
+struct AgentRow {
+    /// Display title: the pane's TAB custom name when set (so multiple agents in one
+    /// space stay distinguishable), else the session (space) name.
+    title: String,
+    /// The session (space) name — kept alongside `title` so the switcher can filter on
+    /// it and show it even when a tab name overrides the title.
+    space: String,
+    /// The agent's foreground command (e.g. `claude` / `codex`).
+    tool: String,
+    /// Rolled-up status: `working` / `ready` / `blocked` / `idle`.
+    status: &'static str,
+    /// The pane's terminal, so the row is clickable (jump to its pane).
+    term: TerminalId,
 }
 
 /// Outcome of [`App::create_worktree_session`]: a human status line and a non-fatal
@@ -957,6 +978,14 @@ impl App {
         self.state.set_workspace_name(&self.ws, name);
     }
 
+    /// Set (or clear, with `None`) a tab's custom display name. The name takes display
+    /// precedence over the tab's foreground-process label (chips, sidebar agents, Ctrl-f).
+    /// Takes the owning workspace explicitly so a prompt committed after a session
+    /// switch still renames the tab it was opened on.
+    fn rename_tab(&mut self, ws: &WorkspaceId, tab: &TabId, name: Option<String>) {
+        self.state.set_tab_name(ws, tab, name);
+    }
+
     /// Sessions with at least one pane whose cwd is inside `path` (the worktree). Used
     /// for `worktree`-session reuse and removal safety. Each pane is tested by its live
     /// `process_cwd`, falling back to its recorded `spawn_cwd` so a momentary read
@@ -1171,6 +1200,24 @@ impl App {
         });
     }
 
+    /// Open the inline rename-tab prompt (`Ctrl-b ,`), seeded with the active tab's
+    /// current custom name.
+    fn open_rename_tab_prompt(&mut self) {
+        let Some(tab) = self.active_tab_id() else {
+            return;
+        };
+        let seed = self
+            .state
+            .workspace(&self.ws)
+            .and_then(|w| w.tab(&tab))
+            .and_then(|t| t.name.clone())
+            .unwrap_or_default();
+        self.prompt = Some(Prompt {
+            kind: PromptKind::RenameTab(self.ws.clone(), tab),
+            buf: seed,
+        });
+    }
+
     /// Apply the open prompt on Enter: create (name → `None` when blank) or rename.
     fn commit_prompt(&mut self, p: Prompt) {
         let trimmed = p.buf.trim();
@@ -1199,6 +1246,7 @@ impl App {
                 }
             }
             PromptKind::RenameSession => self.rename_session(name),
+            PromptKind::RenameTab(ws, tab) => self.rename_tab(&ws, &tab, name),
         }
     }
 
@@ -1427,6 +1475,7 @@ impl App {
                             index: i,
                             id: t.id.to_string(),
                             active,
+                            name: t.name.clone().unwrap_or_default(),
                             panes: panes.len(),
                             agents,
                         }
@@ -1449,6 +1498,24 @@ impl App {
                     Resp::ok()
                 } else {
                     Resp::err(format!("no tab at index {index}"))
+                }
+            }
+            Req::RenameTab { index, name } => {
+                // No index → the ACTIVE tab (so a pane's shell can rename its own tab).
+                let tab = match index {
+                    Some(i) => self.tab_ids().get(*i).cloned(),
+                    None => self.active_tab_id(),
+                };
+                match tab {
+                    Some(tab) => {
+                        let new = (!name.trim().is_empty()).then(|| name.trim().to_string());
+                        self.rename_tab(&self.ws.clone(), &tab, new);
+                        Resp::ok()
+                    }
+                    None => Resp::err(match index {
+                        Some(i) => format!("no tab at index {i}"),
+                        None => "no active tab".to_string(),
+                    }),
                 }
             }
             Req::ListSessions => {
@@ -1517,12 +1584,21 @@ impl App {
                 }
             }
             Req::RenameSession { index, name } => {
-                if let Some(wid) = self.session_ids().get(*index).cloned() {
-                    let new = (!name.trim().is_empty()).then(|| name.trim().to_string());
-                    self.state.set_workspace_name(&wid, new);
-                    Resp::ok()
-                } else {
-                    Resp::err(format!("no session at index {index}"))
+                // No index → the ACTIVE session (mirrors `rename-tab`).
+                let wid = match index {
+                    Some(i) => self.session_ids().get(*i).cloned(),
+                    None => Some(self.ws.clone()),
+                };
+                match wid {
+                    Some(wid) => {
+                        let new = (!name.trim().is_empty()).then(|| name.trim().to_string());
+                        self.state.set_workspace_name(&wid, new);
+                        Resp::ok()
+                    }
+                    None => Resp::err(format!(
+                        "no session at index {}",
+                        index.expect("None resolves to the active session")
+                    )),
                 }
             }
             Req::SelectSession { index } => {
@@ -1829,6 +1905,7 @@ impl App {
             NextTab => self.cycle_tab(1),
             PrevTab => self.cycle_tab(-1),
             CloseTab => self.close_active_tab(),
+            RenameTab => self.open_rename_tab_prompt(),
             SelectTab(n) => self.select_tab_index(n as usize),
             NewSession => self.open_new_session_prompt(),
             NewWorktree => self.open_new_worktree_prompt(),
@@ -2200,19 +2277,29 @@ impl App {
                 }
             }
             PopupTab::Agents => {
-                for (space, tool, status, term) in self.agent_rows() {
-                    let (glyph, color) = match status {
+                for row in self.agent_rows() {
+                    let (glyph, color) = match row.status {
                         "working" => ("●", CAT_GREEN),
                         "ready" => ("◐", CAT_BLUE),
                         "blocked" => ("▲", CAT_YELLOW),
                         _ => ("○", CAT_OVERLAY),
                     };
-                    if fuzzy_match(filter, &format!("{space} {tool} {status}")) {
+                    // With a custom tab name the title differs from the space — show both
+                    // (the switcher is wide enough), and let the filter match either.
+                    let place = if row.title == row.space {
+                        row.space.clone()
+                    } else {
+                        format!("{} · {}", row.space, row.title)
+                    };
+                    if fuzzy_match(
+                        filter,
+                        &format!("{} {} {} {}", row.space, row.title, row.tool, row.status),
+                    ) {
                         rows.push(PopupRow {
-                            target: PopupTarget::Agent(term),
+                            target: PopupTarget::Agent(row.term),
                             glyph,
                             color,
-                            text: format!("{tool} · {status}  ({space})"),
+                            text: format!("{} · {}  ({place})", row.tool, row.status),
                         });
                     }
                 }
@@ -2377,7 +2464,7 @@ impl App {
                 }
             }
             PopupTab::Agents => {
-                if let Some((_, _, _, term)) = self.agent_rows().get(f.sel).cloned() {
+                if let Some(term) = self.agent_rows().get(f.sel).map(|r| r.term.clone()) {
                     self.jump_to_terminal(&term);
                 }
             }
@@ -3111,9 +3198,9 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Every agent pane across ALL sessions: `(space, tool, status, terminal)`. The
-    /// terminal id lets the sidebar make each agent row clickable (jump to its pane).
-    fn agent_rows(&self) -> Vec<(String, String, &'static str, TerminalId)> {
+    /// Every agent pane across ALL sessions. The terminal id lets the sidebar make
+    /// each agent row clickable (jump to its pane).
+    fn agent_rows(&self) -> Vec<AgentRow> {
         let mut out = Vec::new();
         for wid in self.state.workspace_ids() {
             let Some(w) = self.state.workspace(&wid) else {
@@ -3121,17 +3208,21 @@ impl App {
             };
             let space = w.name.clone().unwrap_or_else(|| wid.to_string());
             for t in &w.tabs {
+                // The tab's custom name titles its agent rows, so several agents in ONE
+                // space stay distinguishable (the reason tab rename exists).
+                let tab_name = t.name.as_deref().map(str::trim).filter(|n| !n.is_empty());
                 for p in t.layout.panes() {
                     if let Some(tid) = t.layout.terminal_of(&p)
                         && let Some(label) = self.labels.get(tid)
                         && label.kind == procinfo::Kind::Agent
                     {
-                        out.push((
-                            space.clone(),
-                            label.text.clone(),
-                            self.agent_status(tid),
-                            tid.clone(),
-                        ));
+                        out.push(AgentRow {
+                            title: tab_name.unwrap_or(&space).to_string(),
+                            space: space.clone(),
+                            tool: label.text.clone(),
+                            status: self.agent_status(tid),
+                            term: tid.clone(),
+                        });
                     }
                 }
             }
@@ -3315,7 +3406,7 @@ impl App {
             (agent_max - 1, true) // reserve one row for the "+M more" hint
         };
         let agent_start = list_window_start(agent_total, agent_focus.unwrap_or(0), agent_vis);
-        for (ai, (space, tool, status, term)) in agent_rows
+        for (ai, row) in agent_rows
             .into_iter()
             .enumerate()
             .skip(agent_start)
@@ -3326,7 +3417,7 @@ impl App {
             }
             let is_focused = agent_focus == Some(ai);
             // tmx-style glyph + colour per status (all width-1 geometric shapes).
-            let (dot, scolor) = match status {
+            let (dot, scolor) = match row.status {
                 "working" => ("●", CAT_GREEN),
                 "ready" => ("◐", CAT_BLUE),
                 "blocked" => ("▲", CAT_YELLOW),
@@ -3352,13 +3443,13 @@ impl App {
                     .add_modifier(Modifier::BOLD)
             };
             put(buf, &mut x, y, " ", name_style);
-            put(buf, &mut x, y, &space, name_style);
+            put(buf, &mut x, y, &row.title, name_style);
             let mut sx = 4u16;
             put(
                 buf,
                 &mut sx,
                 y + 1,
-                &format!("{status} · {tool}"),
+                &format!("{} · {}", row.status, row.tool),
                 sub_style,
             );
             // Both rows click to jump to this agent's pane.
@@ -3367,7 +3458,7 @@ impl App {
                 x1: sidebar_w - 1,
                 y0: y,
                 y1: y + 1,
-                target: ClickTarget::Agent(term.clone()),
+                target: ClickTarget::Agent(row.term.clone()),
             });
             y += 2;
         }
@@ -3384,15 +3475,19 @@ impl App {
         }
     }
 
-    /// Does any pane in `tab_id` currently run a classified AI agent?
+    /// The tab's CUSTOM display name (`Ctrl-b ,` / `comux rename-tab`), chip-truncated.
+    /// Takes display precedence over the process label in every `tab_labels` style.
+    fn tab_custom_name(&self, tab_id: &TabId) -> Option<String> {
+        let w = self.state.workspace(&self.ws)?;
+        let name = w.tab(tab_id)?.name.as_deref()?.trim();
+        (!name.is_empty()).then(|| clip_chip(name))
+    }
+
     /// The focused pane's foreground-command name for a tab (e.g. `claude` / `nvim`),
     /// truncated to a chip-friendly width and cleaned of a login-shell leading `-`.
     /// `None` when the tab / focused terminal has no resolved label yet, so the caller
     /// falls back to the bare index. Used for the `name`/`both` tab-label styles.
     fn tab_focus_label(&self, tab_id: &TabId) -> Option<String> {
-        /// Max display cells for the process-name part of a chip; `comm` is already
-        /// short (≤15 on Linux) but a long name still shouldn't dominate the bar.
-        const MAX: usize = 12;
         let w = self.state.workspace(&self.ws)?;
         let t = w.tab(tab_id)?;
         let tid = t.layout.terminal_of(&t.focused)?;
@@ -3401,24 +3496,10 @@ impl App {
         if name.is_empty() {
             return None;
         }
-        // Truncate on display width, adding an ellipsis if clipped.
-        if name.width() <= MAX {
-            return Some(name.to_string());
-        }
-        let mut out = String::new();
-        let mut used = 0usize;
-        for ch in name.chars() {
-            let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if used + cw > MAX - 1 {
-                break;
-            }
-            out.push(ch);
-            used += cw;
-        }
-        out.push('…');
-        Some(out)
+        Some(clip_chip(name))
     }
 
+    /// Does any pane in `tab_id` currently run a classified AI agent?
     fn tab_has_agent(&self, tab_id: &TabId) -> bool {
         let Some(w) = self.state.workspace(&self.ws) else {
             return false;
@@ -3634,16 +3715,23 @@ impl App {
                 let agent = self.tab_has_agent(id);
                 let dot = if agent { "● " } else { "" };
                 let n = i + 1;
-                // `tab_labels` picks number / process name / both. `name`/`both` fall back
-                // to the bare number when the pane has no resolved label yet (or a blank one),
-                // so a fresh tab is never an empty chip.
+                // `tab_labels` picks number / process name / both. A CUSTOM name (`Ctrl-b ,`
+                // / `comux rename-tab`) takes precedence over the process label in every
+                // style — even `number` shows it (as `n:name`, keeping the jump index),
+                // since renaming is explicit intent to see that name. `name`/`both` fall
+                // back to the bare number when the pane has no resolved label yet (or a
+                // blank one), so a fresh tab is never an empty chip.
+                let custom = self.tab_custom_name(id);
                 let inner = match self.cfg.tab_labels {
-                    TabLabels::Number => n.to_string(),
-                    TabLabels::Name => match self.tab_focus_label(id) {
+                    TabLabels::Number => match custom {
+                        Some(name) => format!("{n}:{name}"),
+                        None => n.to_string(),
+                    },
+                    TabLabels::Name => match custom.or_else(|| self.tab_focus_label(id)) {
                         Some(name) => name,
                         None => n.to_string(),
                     },
-                    TabLabels::Both => match self.tab_focus_label(id) {
+                    TabLabels::Both => match custom.or_else(|| self.tab_focus_label(id)) {
                         Some(name) => format!("{n}:{name}"),
                         None => n.to_string(),
                     },
@@ -3925,6 +4013,7 @@ impl App {
             PromptKind::NewSession => " new session ",
             PromptKind::NewWorktree => " new worktree (branch) ",
             PromptKind::RenameSession => " rename session ",
+            PromptKind::RenameTab(..) => " rename tab ",
         };
         put(
             buf,
@@ -4149,6 +4238,28 @@ fn divider_touches(fr: &PaneRect, x: u16, y: u16) -> bool {
     let vert = in_y && (x + 1 == fr.x || x == fr.x + fr.cols);
     let horiz = in_x && (y + 1 == fr.y || y == fr.y + fr.rows);
     vert || horiz
+}
+
+/// Truncate a tab-chip label on DISPLAY width (max 12 cells; `comm` is already ≤15 on
+/// Linux but a long process or custom name still shouldn't dominate the bar), adding an
+/// ellipsis when clipped. Width-aware so CJK/emoji names truncate cleanly.
+fn clip_chip(name: &str) -> String {
+    const MAX: usize = 12;
+    if name.width() <= MAX {
+        return name.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in name.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + cw > MAX - 1 {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out.push('…');
+    out
 }
 
 /// Current Unix time in seconds (0 on a clock before the epoch — informational only).
