@@ -23,6 +23,7 @@ members = [
     "plugins/web-bridge",
     "plugins/pilot",
     "plugins/claude",
+    "plugins/pomodoro",
 ]
 
 [workspace.package]

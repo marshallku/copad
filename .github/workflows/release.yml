@@ -197,6 +197,7 @@ jobs:
             -p copad-plugin-calendar \
             -p copad-plugin-kb \
             -p copad-plugin-todo \
+            -p copad-plugin-pomodoro \
             -p copad-plugin-bookmark \
             -p copad-plugin-slack \
             -p copad-plugin-discord \
@@ -282,7 +283,7 @@ jobs:
           # Keep this list in sync with install-macos.sh's MACOS_PLUGINS array
           # AND the Build Rust crates step above.
           mkdir -p "$DIST/plugins"
-          for name in echo git llm calendar kb todo bookmark slack discord jira docs claude pilot web-bridge; do
+          for name in echo git llm calendar kb todo pomodoro bookmark slack discord jira docs claude pilot web-bridge; do
             crate="copad-plugin-$name"
             src_dir="plugins/$name"
             bin_src="target/release/$crate"

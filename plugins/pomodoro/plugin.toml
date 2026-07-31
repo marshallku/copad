@@ -1,0 +1,42 @@
+[plugin]
+name = "pomodoro"
+title = "Pomodoro"
+version = "0.1.0"
+description = "Focus timer that renders in the status bar: work/break countdown with auto-switch to a break and a desktop toast at each transition. Standalone — link it to todo (or anything) via a [[triggers]] rule, not a hard dependency."
+
+[[services]]
+name = "main"
+# onStartup so the timer thread is alive and can fire completion toasts
+# even while nothing is polling it. It also means the status bar can read
+# `pomodoro.status` (or subscribe to `pomodoro.state`) the moment copad
+# starts.
+exec = "copad-plugin-pomodoro"
+activation = "onStartup"
+restart = "on-crash"
+provides = [
+    "pomodoro.start",
+    "pomodoro.pause",
+    "pomodoro.resume",
+    "pomodoro.toggle",
+    "pomodoro.reset",
+    "pomodoro.status",
+    "pomodoro.set_durations",
+]
+# Decoupled by design: the pomodoro plugin does NOT subscribe to todo (or
+# anything). Cross-plugin wiring is the user's `[[triggers]]` config — see
+# triggers.example.toml.
+subscribes = []
+# Optional env:
+#   COPAD_POMODORO_STATE — override the durations state file
+#                          (default <state_dir>/pomodoro.json)
+
+# A status-bar module so the countdown shows with zero GUI code. The exec
+# prints the current status line (e.g. "🍅 24:13 · refactor"); the host
+# polls it once a second. A richer event-driven / circular renderer that
+# consumes `pomodoro.state` is a platform-specific follow-up (Phase 2).
+[[modules]]
+name = "timer"
+exec = "coctl pomodoro status"
+interval = 1
+position = "right"
+order = 45

@@ -1,0 +1,27 @@
+# Example triggers for the Pomodoro plugin.
+#
+# The pomodoro plugin is standalone — it does NOT know about todo (or any
+# other plugin). You wire it up by copying a block like the ones below into
+# your `~/.config/copad/config.toml` (the `[[triggers]]` array). copad's
+# trigger engine matches events on the bus and invokes the action, so no
+# plugin depends on any other.
+
+# --- Start a pomodoro whenever you start a todo ---------------------------
+# `todo.start` emits `todo.start_requested` carrying the full todo payload;
+# we forward its title as the timer label. Removing this block fully
+# decouples the two again.
+[[triggers]]
+name   = "pomodoro-on-todo-start"
+action = "pomodoro.start"
+params = { label = "{event.title}" }
+[triggers.when]
+event_kind = "todo.start_requested"
+
+# --- A 50/10 timer for a specific project, by hand ------------------------
+# You can also just run it from the CLI:
+#   coctl pomodoro start --minutes 50 --label "deep work"
+#   coctl pomodoro pause
+#   coctl pomodoro status
+#
+# Or override the default durations (persisted by the plugin):
+#   coctl pomodoro set-durations --work 50 --break 10 --long-break 30 --rounds 4

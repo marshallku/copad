@@ -52,9 +52,13 @@ changes apply on the next click without restarting copad.
 (stub created by scripts/install-plugins.sh — replace with your
 own coding rules, language conventions, project-wide reminders.)"
 
-# Default to every plugin that has a plugin.toml.
+# Default to every plugin that has a plugin.toml. Derive the dir name from
+# the match path (strip leading ./ and trailing /plugin.toml) rather than
+# `find -printf '%h'` — `-printf` is GNU-only and absent on macOS/BSD find,
+# so it silently produced an empty list there.
 if [ "$#" -eq 0 ]; then
-    set -- $(cd "$PLUGINS_SRC_DIR" && find . -mindepth 2 -maxdepth 2 -name plugin.toml -printf '%h\n' | sed 's|^./||' | sort)
+    set -- $(cd "$PLUGINS_SRC_DIR" && find . -mindepth 2 -maxdepth 2 -name plugin.toml \
+        | sed -e 's|^\./||' -e 's|/plugin\.toml$||' | sort)
 fi
 
 mkdir -p "$PLUGIN_DIR"

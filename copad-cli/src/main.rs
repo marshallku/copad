@@ -74,6 +74,9 @@ fn main() {
     if let Command::Todo(cmd) = &cli.command {
         std::process::exit(plugin_cmds::todo::dispatch(cmd, &socket_path, cli.json));
     }
+    if let Command::Pomodoro(cmd) = &cli.command {
+        std::process::exit(plugin_cmds::pomodoro::dispatch(cmd, &socket_path, cli.json));
+    }
     if let Command::Git(cmd) = &cli.command {
         std::process::exit(plugin_cmds::git::dispatch(cmd, &socket_path, cli.json));
     }

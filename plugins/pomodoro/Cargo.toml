@@ -1,0 +1,17 @@
+[package]
+name = "copad-plugin-pomodoro"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "First-party Pomodoro focus-timer service plugin for copad — status-bar countdown, work/break auto-switch, decoupled from todo via the trigger engine."
+repository.workspace = true
+
+[[bin]]
+name = "copad-plugin-pomodoro"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+copad-core = { path = "../../copad-core" }

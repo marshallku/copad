@@ -971,6 +971,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "copad-plugin-pomodoro"
+version = "1.0.2"
+dependencies = [
+ "copad-core",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "copad-plugin-slack"
 version = "1.0.2"
 dependencies = [

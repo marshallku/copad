@@ -5,6 +5,7 @@ use crate::plugin_cmds::bookmark::BookmarkCommand;
 use crate::plugin_cmds::calendar::CalendarCommand;
 use crate::plugin_cmds::git::GitCommand;
 use crate::plugin_cmds::jira::JiraCommand;
+use crate::plugin_cmds::pomodoro::PomodoroCommand;
 use crate::plugin_cmds::recent::RecentArgs;
 use crate::plugin_cmds::slack::SlackCommand;
 use crate::plugin_cmds::todo::TodoCommand;
@@ -99,6 +100,10 @@ pub enum Command {
     /// Todo shortcuts (`todo.*` actions with prefix-resolved ids + list view)
     #[command(subcommand)]
     Todo(TodoCommand),
+
+    /// Pomodoro focus timer (`pomodoro.*` actions: start/pause/status/…)
+    #[command(subcommand)]
+    Pomodoro(PomodoroCommand),
 
     /// Git shortcuts (`git.*` actions with cwd-derived workspace defaulting
     /// + table renderers for workspaces / worktrees / status)
@@ -767,6 +772,9 @@ impl Cli {
             Command::Todo(_) => {
                 unreachable!("todo commands are dispatched via plugin_cmds::todo")
             }
+            Command::Pomodoro(_) => {
+                unreachable!("pomodoro commands are dispatched via plugin_cmds::pomodoro")
+            }
             Command::Git(_) => {
                 unreachable!("git commands are dispatched via plugin_cmds::git")
             }
@@ -904,6 +912,9 @@ impl Cli {
             }
             Command::Todo(_) => {
                 unreachable!("todo commands are dispatched via plugin_cmds::todo")
+            }
+            Command::Pomodoro(_) => {
+                unreachable!("pomodoro commands are dispatched via plugin_cmds::pomodoro")
             }
             Command::Git(_) => {
                 unreachable!("git commands are dispatched via plugin_cmds::git")
