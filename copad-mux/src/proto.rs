@@ -92,6 +92,14 @@ pub enum MouseKind {
     Drag,
     /// Left button released → finish the selection; if it moved, copy the pane text.
     Up,
+    /// Right button down → open a context menu on chrome (tab chip / session pill /
+    /// sidebar row), tmux `display-menu` style.
+    RightClick,
+    /// Right button held + moved → hover-highlight the menu item under the pointer.
+    RightDrag,
+    /// Right button released → over a menu item executes it; elsewhere the menu stays
+    /// open for left-click / keyboard selection.
+    RightUp,
 }
 
 /// Client → server messages.
@@ -141,6 +149,25 @@ mod tests {
                 assert_eq!(vars[0], ("DISPLAY".to_string(), ":0".to_string()));
             }
             other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// The right-button kinds must round-trip in kebab-case (`right-click` …) — the
+    /// context-menu feature rides entirely on these three wire values.
+    #[test]
+    fn right_mouse_kinds_round_trip() {
+        for (kind, wire) in [
+            (MouseKind::RightClick, "right-click"),
+            (MouseKind::RightDrag, "right-drag"),
+            (MouseKind::RightUp, "right-up"),
+        ] {
+            let msg = ClientMsg::Mouse { x: 3, y: 7, kind };
+            let line = serde_json::to_string(&msg).unwrap();
+            assert!(line.contains(&format!("\"{wire}\"")), "wire form: {line}");
+            match serde_json::from_str::<ClientMsg>(&line).unwrap() {
+                ClientMsg::Mouse { x: 3, y: 7, .. } => {}
+                other => panic!("wrong round-trip: {other:?}"),
+            }
         }
     }
 

@@ -75,6 +75,10 @@ enum ClickTarget {
     Session(WorkspaceId),
     /// A sidebar `agents` row → jump to that agent's pane (its session + tab + focus).
     Agent(TerminalId),
+    /// The status-bar session pill. A left click is a no-op (switching to the already
+    /// active session would steal the controller lease); it exists as a RIGHT-click
+    /// context-menu anchor for session actions.
+    SessionPill(WorkspaceId),
 }
 
 /// A rectangular hit region (inclusive `x0..=x1`, `y0..=y1`) recorded during render.
@@ -93,8 +97,9 @@ enum PromptKind {
     NewSession,
     /// `Ctrl-b W`: create a git worktree for the typed branch + a session in it.
     NewWorktree,
-    /// `Ctrl-b $`: rename the active session (empty → revert to its id).
-    RenameSession,
+    /// `Ctrl-b $`: rename this session (empty → revert to its id). Captures the TARGET
+    /// workspace so a session switch while the prompt is open can't retarget it.
+    RenameSession(WorkspaceId),
     /// `Ctrl-b ,` (tmux rename-window): rename the active tab (empty → revert to its
     /// process/index label). Captures the TARGET workspace + tab so a tab or session
     /// switch (this client or a concurrent one) while the prompt is up can't retarget
@@ -130,6 +135,79 @@ struct WorktreeCreated {
 struct Prompt {
     kind: PromptKind,
     buf: String,
+}
+
+/// What a selected context-menu item does. Targets are captured at MENU OPEN so a
+/// tab/session switch (this client or a concurrent one) while the menu is up can't
+/// retarget them; execution re-validates ids against current state.
+#[derive(Clone)]
+enum MenuAction {
+    /// Open the rename-tab prompt for this tab.
+    RenameTab(WorkspaceId, TabId),
+    /// Close this tab (rejected on the last tab, like `Ctrl-b &`).
+    CloseTab(WorkspaceId, TabId),
+    /// Create a new tab in this session (a no-op if it is no longer the active one —
+    /// `new_tab` spawns into + switches the ACTIVE session, so running it after a
+    /// concurrent session switch would land the tab somewhere else).
+    NewTab(WorkspaceId),
+    /// Open the rename-session prompt for this session.
+    RenameSession(WorkspaceId),
+    /// Open the new-session name prompt.
+    NewSession,
+    /// Open the kill-session y/n confirm for this session.
+    KillSession(WorkspaceId),
+    /// Jump to this agent's pane (session + tab + focus).
+    JumpAgent(TerminalId),
+}
+
+/// A tmux `display-menu`-style context menu, opened by a RIGHT-click on chrome (tab
+/// chip / session pill / sidebar row). Two selection modes, matching tmux: hold the
+/// right button and RELEASE over an item to run it; or release elsewhere first, then
+/// left-click an item (or navigate with `j`/`k` + Enter, Esc/q closes). The box rect
+/// is fixed at open (clamped to the frame); any layout change closes the menu.
+struct Menu {
+    /// Title shown in the top border (the clicked thing's display name).
+    title: String,
+    items: Vec<(&'static str, MenuAction)>,
+    /// Box rect in frame cells (borders included).
+    x0: u16,
+    y0: u16,
+    w: u16,
+    h: u16,
+    /// Hover/keyboard-selected item index (`None` = nothing highlighted).
+    sel: Option<usize>,
+    /// The client whose right-click opened it: only its right-drag/-release drive the
+    /// hold-mode selection (mirrors drag-selection ownership).
+    owner: ClientId,
+    /// Right button still held since open — a release over an item executes it. After
+    /// a release elsewhere the menu stays open in click/keyboard mode.
+    held: bool,
+}
+
+impl Menu {
+    /// The item index at frame cell `(x, y)`, if it lands on an item row.
+    fn item_at(&self, x: u16, y: u16) -> Option<usize> {
+        // Items occupy the interior rows (inside the border), full inner width.
+        if x <= self.x0 || x >= self.x0 + self.w.saturating_sub(1) {
+            return None;
+        }
+        let row = y.checked_sub(self.y0 + 1)? as usize;
+        (row < self.items.len()).then_some(row)
+    }
+}
+
+/// Place a context-menu box of `w`×`h` cells near the click at `(ax, ay)` inside a
+/// `cols`×`rows` frame: prefer opening BELOW-RIGHT of the pointer, flip ABOVE when the
+/// lower half has no room (the status bar case), and clamp into the frame either way.
+fn menu_origin(ax: u16, ay: u16, w: u16, h: u16, cols: u16, rows: u16) -> (u16, u16) {
+    let x0 = ax.min(cols.saturating_sub(w));
+    // Below needs rows ay+1 .. ay+h; above needs ay-h .. ay-1.
+    let y0 = if ay + 1 + h <= rows {
+        ay + 1
+    } else {
+        ay.saturating_sub(h)
+    };
+    (x0, y0.min(rows.saturating_sub(h)))
 }
 
 /// A pending destructive action awaiting a `y`/`n` confirmation (tmux `confirm-before`).
@@ -304,6 +382,8 @@ pub struct App {
     prompt: Option<Prompt>,
     /// When `Some`, a `y`/`n` confirm modal (e.g. kill-session) is open.
     confirm: Option<Confirm>,
+    /// When `Some`, a right-click context menu (tmux `display-menu`) is open.
+    menu: Option<Menu>,
     /// When `Some`, the sidebar has keyboard focus (`Ctrl-b e`) for in-place navigation.
     sidebar_focus: Option<SidebarFocus>,
     /// The effective user config (keybindings + options), loaded once at server start.
@@ -413,6 +493,7 @@ impl App {
             activity_clock: 0,
             prompt: None,
             confirm: None,
+            menu: None,
             sidebar_focus: None,
             cfg,
             click_zones: RefCell::new(Vec::new()),
@@ -656,6 +737,8 @@ impl App {
     /// wrong range.
     fn sync_sizes(&mut self) {
         self.selection = None;
+        // Any layout/viewport change invalidates the menu's fixed box rect too.
+        self.menu = None;
         for rect in self.layout() {
             if let Some(pt) = self.panes.get(&rect.terminal) {
                 pt.resize(rect.cols, rect.rows);
@@ -888,10 +971,16 @@ impl App {
         let Some(active) = self.active_tab_id() else {
             return;
         };
+        self.close_tab(&self.ws.clone(), active);
+    }
+
+    /// Close a specific tab of `ws` (context menu can target a non-active one) and reap
+    /// its shells. Rejected when it is the workspace's last tab.
+    fn close_tab(&mut self, ws: &WorkspaceId, tab: TabId) {
         let events = match self.state.apply(Command::CloseTab {
             origin: Origin::Client(self.client),
-            workspace: self.ws.clone(),
-            tab: active,
+            workspace: ws.clone(),
+            tab,
         }) {
             Ok(e) => e,
             Err(_) => return, // e.g. last tab — keep it
@@ -973,9 +1062,9 @@ impl App {
         }
     }
 
-    /// Set (or clear, with `None`) the active session's display name.
-    fn rename_session(&mut self, name: Option<String>) {
-        self.state.set_workspace_name(&self.ws, name);
+    /// Set (or clear, with `None`) a session's display name.
+    fn rename_session(&mut self, ws: &WorkspaceId, name: Option<String>) {
+        self.state.set_workspace_name(ws, name);
     }
 
     /// Set (or clear, with `None`) a tab's custom display name. The name takes display
@@ -1127,21 +1216,28 @@ impl App {
         }
     }
 
-    /// Open the kill-session confirm modal (`Ctrl-b X`, tmux `prefix X`). No-op when
-    /// only one session exists (a mux always keeps ≥1). Captures the TARGET workspace so
-    /// a focus/session change while the prompt is up can't retarget it.
+    /// Open the kill-session confirm modal (`Ctrl-b X`, tmux `prefix X`) for the
+    /// active session.
     fn open_kill_session_confirm(&mut self) {
+        self.open_kill_session_confirm_for(self.ws.clone());
+    }
+
+    /// Open the kill-session confirm for a specific session (context menu can target a
+    /// non-active one). No-op when only one session exists (a mux always keeps ≥1).
+    /// Captures the TARGET workspace so a focus/session change while the prompt is up
+    /// can't retarget it.
+    fn open_kill_session_confirm_for(&mut self, ws: WorkspaceId) {
         if self.state.workspace_count() <= 1 {
             return;
         }
         let name = self
             .state
-            .workspace(&self.ws)
+            .workspace(&ws)
             .and_then(|w| w.name.clone())
-            .unwrap_or_else(|| self.ws.to_string());
+            .unwrap_or_else(|| ws.to_string());
         self.confirm = Some(Confirm {
             message: format!("kill session '{name}'? (y/n)"),
-            action: ConfirmAction::KillSession(self.ws.clone()),
+            action: ConfirmAction::KillSession(ws),
         });
     }
 
@@ -1187,33 +1283,44 @@ impl App {
         });
     }
 
-    /// Open the inline rename prompt (`Ctrl-b $`), seeded with the current name.
+    /// Open the inline rename prompt (`Ctrl-b $`) for the active session.
     fn open_rename_prompt(&mut self) {
+        self.open_rename_prompt_for(self.ws.clone());
+    }
+
+    /// Open the inline rename prompt for a specific session (context menu can target a
+    /// non-active one), seeded with its current name.
+    fn open_rename_prompt_for(&mut self, ws: WorkspaceId) {
         let seed = self
             .state
-            .workspace(&self.ws)
+            .workspace(&ws)
             .and_then(|w| w.name.clone())
             .unwrap_or_default();
         self.prompt = Some(Prompt {
-            kind: PromptKind::RenameSession,
+            kind: PromptKind::RenameSession(ws),
             buf: seed,
         });
     }
 
-    /// Open the inline rename-tab prompt (`Ctrl-b ,`), seeded with the active tab's
-    /// current custom name.
+    /// Open the inline rename-tab prompt (`Ctrl-b ,`) for the active tab.
     fn open_rename_tab_prompt(&mut self) {
         let Some(tab) = self.active_tab_id() else {
             return;
         };
+        self.open_rename_tab_prompt_for(self.ws.clone(), tab);
+    }
+
+    /// Open the inline rename-tab prompt for a specific tab (context menu can target a
+    /// non-active one), seeded with its current custom name.
+    fn open_rename_tab_prompt_for(&mut self, ws: WorkspaceId, tab: TabId) {
         let seed = self
             .state
-            .workspace(&self.ws)
+            .workspace(&ws)
             .and_then(|w| w.tab(&tab))
             .and_then(|t| t.name.clone())
             .unwrap_or_default();
         self.prompt = Some(Prompt {
-            kind: PromptKind::RenameTab(self.ws.clone(), tab),
+            kind: PromptKind::RenameTab(ws, tab),
             buf: seed,
         });
     }
@@ -1245,7 +1352,7 @@ impl App {
                     notify::desktop("comux worktree", &msg);
                 }
             }
-            PromptKind::RenameSession => self.rename_session(name),
+            PromptKind::RenameSession(ws) => self.rename_session(&ws, name),
             PromptKind::RenameTab(ws, tab) => self.rename_tab(&ws, &tab, name),
         }
     }
@@ -1772,6 +1879,27 @@ impl App {
             return KeyAction::Continue;
         }
 
+        // An open right-click context menu captures input (tmux display-menu keys):
+        // `j`/`k`/arrows navigate, Enter runs the selection, anything else closes.
+        if self.menu.is_some() {
+            *prefix = false;
+            match k.code {
+                KeyCode::Down | KeyCode::Char('j') => self.menu_move(1),
+                KeyCode::Up | KeyCode::Char('k') => self.menu_move(-1),
+                KeyCode::Enter => {
+                    let action = self
+                        .menu
+                        .take()
+                        .and_then(|m| m.sel.map(|i| m.items[i].1.clone()));
+                    if let Some(a) = action {
+                        self.run_menu_action(a);
+                    }
+                }
+                _ => self.menu = None,
+            }
+            return KeyAction::Continue;
+        }
+
         // Sidebar keyboard-focus mode (`Ctrl-b e`): hjkl/arrows navigate the spaces/agents
         // lists (h/l or ←/→ switch group, j/k or ↑/↓ move), Enter selects, Esc/q exits.
         if self.sidebar_focus.is_some() {
@@ -2023,6 +2151,27 @@ impl App {
         if !self.cfg.mouse {
             return None; // mouse disabled in config (client also skips capture)
         }
+        // Right-button events + clicks on an OPEN menu belong to the context menu.
+        match kind {
+            MouseKind::RightClick | MouseKind::RightDrag | MouseKind::RightUp => {
+                return self.menu_mouse(client, x, y, kind);
+            }
+            MouseKind::Click if self.menu.is_some() => {
+                // Left click while the menu is open: on an item runs it (any client —
+                // input is shared, tmux-style); elsewhere it just dismisses. Either
+                // way the click is CONSUMED — it never falls through to the panes.
+                let hit = self
+                    .menu
+                    .as_ref()
+                    .and_then(|m| m.item_at(x, y).map(|i| m.items[i].1.clone()));
+                self.menu = None;
+                if let Some(a) = hit {
+                    self.run_menu_action(a);
+                }
+                return None;
+            }
+            _ => {}
+        }
         let target = self
             .layout()
             .into_iter()
@@ -2080,6 +2229,9 @@ impl App {
                         }
                         ClickTarget::Session(wid) => self.switch_session(wid),
                         ClickTarget::Agent(term) => self.jump_to_terminal(&term),
+                        // Right-click menu anchor only — a left click must NOT
+                        // re-attach to the active session (lease churn).
+                        ClickTarget::SessionPill(_) => {}
                     }
                     return None;
                 }
@@ -2147,6 +2299,8 @@ impl App {
                 let text = extract_selection(&snap, sel.anchor, sel.head);
                 (!text.is_empty()).then_some(text)
             }
+            // Routed to `menu_mouse` by the early match above.
+            MouseKind::RightClick | MouseKind::RightDrag | MouseKind::RightUp => None,
         }
     }
 
@@ -2188,6 +2342,185 @@ impl App {
                 pane,
             });
             self.reflow();
+        }
+    }
+
+    // --- context menu (right-click on chrome, tmux `display-menu`) ---
+
+    /// Handle a right-button event: down on chrome opens the menu (hold mode), drag
+    /// hovers its items, release over an item runs it — release elsewhere leaves the
+    /// menu open for left-click / keyboard selection (tmux behavior). Never copies.
+    fn menu_mouse(&mut self, client: ClientId, x: u16, y: u16, kind: MouseKind) -> Option<String> {
+        match kind {
+            MouseKind::RightClick => {
+                // A text prompt / y-n confirm owns the keyboard (feed_key handles them
+                // before the menu), so a menu opened over one would render on top while
+                // keystrokes still edit the overlay underneath. Refuse instead.
+                if self.prompt.is_some() || self.confirm.is_some() {
+                    return None;
+                }
+                // A re-press on the open menu's items re-arms hold-release mode.
+                let mut handled = false;
+                if let Some(m) = self.menu.as_mut()
+                    && m.owner == client
+                    && let Some(i) = m.item_at(x, y)
+                {
+                    m.sel = Some(i);
+                    m.held = true;
+                    handled = true;
+                }
+                if !handled {
+                    self.menu = None; // dismiss any open menu…
+                    if let Some(t) = self.click_target_at(x, y) {
+                        self.open_menu(client, x, y, t); // …and reopen on a new target
+                    }
+                }
+            }
+            MouseKind::RightDrag => {
+                if let Some(m) = self.menu.as_mut()
+                    && m.owner == client
+                    && m.held
+                {
+                    m.sel = m.item_at(x, y);
+                }
+            }
+            MouseKind::RightUp => {
+                let mut fire = None;
+                if let Some(m) = self.menu.as_mut()
+                    && m.owner == client
+                {
+                    match m.held.then(|| m.item_at(x, y)).flatten() {
+                        Some(i) => fire = Some(m.items[i].1.clone()),
+                        // Released off the items: keep the menu, drop hold mode.
+                        None => m.held = false,
+                    }
+                }
+                if let Some(a) = fire {
+                    self.menu = None;
+                    self.run_menu_action(a);
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
+    /// Build + open the context menu for a right-clicked chrome target at frame cell
+    /// `(x, y)`. Item targets are captured NOW (menu-open time), not at selection.
+    fn open_menu(&mut self, client: ClientId, x: u16, y: u16, target: ClickTarget) {
+        let (title, items): (String, Vec<(&'static str, MenuAction)>) = match target {
+            ClickTarget::Tab(id) => {
+                let n = self
+                    .tab_ids()
+                    .iter()
+                    .position(|t| t == &id)
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                let title = self
+                    .tab_custom_name(&id)
+                    .unwrap_or_else(|| format!("tab {n}"));
+                (
+                    title,
+                    vec![
+                        (
+                            "rename tab",
+                            MenuAction::RenameTab(self.ws.clone(), id.clone()),
+                        ),
+                        ("close tab", MenuAction::CloseTab(self.ws.clone(), id)),
+                        ("new tab", MenuAction::NewTab(self.ws.clone())),
+                    ],
+                )
+            }
+            ClickTarget::Session(wid) | ClickTarget::SessionPill(wid) => {
+                let title = self
+                    .state
+                    .workspace(&wid)
+                    .and_then(|w| w.name.clone())
+                    .unwrap_or_else(|| wid.to_string());
+                (
+                    title,
+                    vec![
+                        ("rename session", MenuAction::RenameSession(wid.clone())),
+                        ("new session", MenuAction::NewSession),
+                        ("kill session", MenuAction::KillSession(wid)),
+                    ],
+                )
+            }
+            ClickTarget::Agent(term) => {
+                let title = self
+                    .labels
+                    .get(&term)
+                    .map(|l| l.text.clone())
+                    .unwrap_or_else(|| "agent".to_string());
+                let mut items = vec![("jump to pane", MenuAction::JumpAgent(term.clone()))];
+                // Rename the agent's TAB — the alias shown for it in the sidebar.
+                if let Some((wid, tab, _)) = self.locate_terminal(&term) {
+                    items.push(("rename tab", MenuAction::RenameTab(wid, tab)));
+                }
+                (title, items)
+            }
+        };
+        // Box size: widest of items / bordered title, + 1-cell item padding each side.
+        let inner = items
+            .iter()
+            .map(|(l, _)| l.width())
+            .max()
+            .unwrap_or(0)
+            .max(title.width() + 2);
+        let w = (inner as u16 + 4).min(self.cols.max(1));
+        let h = (items.len() as u16 + 2).min(self.rows.max(1));
+        let (x0, y0) = menu_origin(x, y, w, h, self.cols, self.rows);
+        self.menu = Some(Menu {
+            title,
+            items,
+            x0,
+            y0,
+            w,
+            h,
+            sel: None,
+            owner: client,
+            held: true,
+        });
+    }
+
+    /// Run a selected menu item. The menu is closed by the caller; captured ids are
+    /// re-validated by each operation (a vanished tab/session is a no-op).
+    fn run_menu_action(&mut self, action: MenuAction) {
+        match action {
+            MenuAction::RenameTab(ws, tab) => self.open_rename_tab_prompt_for(ws, tab),
+            MenuAction::CloseTab(ws, tab) => self.close_tab(&ws, tab),
+            MenuAction::NewTab(ws) => {
+                if self.ws == ws {
+                    self.new_tab();
+                }
+            }
+            MenuAction::RenameSession(ws) => self.open_rename_prompt_for(ws),
+            MenuAction::NewSession => self.open_new_session_prompt(),
+            MenuAction::KillSession(ws) => self.open_kill_session_confirm_for(ws),
+            MenuAction::JumpAgent(term) => self.jump_to_terminal(&term),
+        }
+    }
+
+    /// Move the menu's keyboard selection by `delta`, wrapping. From no selection,
+    /// `j` enters at the top and `k` at the bottom.
+    fn menu_move(&mut self, delta: i32) {
+        if let Some(m) = self.menu.as_mut() {
+            let n = m.items.len() as i32;
+            if n == 0 {
+                return;
+            }
+            m.sel = Some(match m.sel {
+                Some(s) => (s as i32 + delta).rem_euclid(n) as usize,
+                None if delta > 0 => 0,
+                None => (n - 1) as usize,
+            });
+        }
+    }
+
+    /// Drop the context menu if it belongs to `client` (its owner disconnected).
+    pub fn close_menu_of(&mut self, client: ClientId) {
+        if self.menu.as_ref().is_some_and(|m| m.owner == client) {
+            self.menu = None;
         }
     }
 
@@ -2795,6 +3128,9 @@ impl App {
         if self.confirm.is_some() {
             self.render_confirm(buf);
         }
+        if self.menu.is_some() {
+            self.render_menu(buf);
+        }
 
         // The shell cursor shows only when nothing modal is capturing input.
         if self.popup.is_none()
@@ -2802,6 +3138,7 @@ impl App {
             && self.center.is_none()
             && self.prompt.is_none()
             && self.confirm.is_none()
+            && self.menu.is_none()
             && self.sidebar_focus.is_none()
         {
             cursor_pos
@@ -3600,6 +3937,17 @@ impl App {
                 .bg(CAT_MAUVE)
                 .add_modifier(Modifier::BOLD),
         );
+        // The pill is a RIGHT-click context-menu anchor (rename/new/kill session);
+        // a left click on it is a no-op.
+        if x > 0 {
+            self.click_zones.borrow_mut().push(ClickZone {
+                x0: 0,
+                x1: x - 1,
+                y0: y,
+                y1: y,
+                target: ClickTarget::SessionPill(self.ws.clone()),
+            });
+        }
         put(buf, &mut x, " ", Style::default().bg(CAT_BASE));
 
         // RIGHT cluster (attention · scroll · agents · clock · host) — built FIRST so the
@@ -4012,7 +4360,7 @@ impl App {
         let title = match p.kind {
             PromptKind::NewSession => " new session ",
             PromptKind::NewWorktree => " new worktree (branch) ",
-            PromptKind::RenameSession => " rename session ",
+            PromptKind::RenameSession(_) => " rename session ",
             PromptKind::RenameTab(..) => " rename tab ",
         };
         put(
@@ -4100,6 +4448,107 @@ impl App {
                 bc.set_skip(false);
                 bc.set_style(Style::default().fg(CAT_TEXT).bg(bg));
             }
+        }
+    }
+
+    /// Draw the right-click context menu at its fixed rect: a bordered box with the
+    /// clicked thing's name in the top border and one item per row (the hovered /
+    /// keyboard-selected one highlighted). Anchored near the click, not centered.
+    fn render_menu(&self, buf: &mut Buffer) {
+        let Some(m) = self.menu.as_ref() else { return };
+        let area = buf.area;
+        let (x0, y0, w, h) = (m.x0, m.y0, m.w, m.h);
+        let bg = Color::Reset;
+        let border = Style::default().fg(CAT_MAUVE).bg(bg);
+
+        for y in y0..(y0 + h).min(area.height) {
+            for x in x0..(x0 + w).min(area.width) {
+                let sym = if y == y0 && x == x0 {
+                    "┌"
+                } else if y == y0 && x == x0 + w - 1 {
+                    "┐"
+                } else if y == y0 + h - 1 && x == x0 {
+                    "└"
+                } else if y == y0 + h - 1 && x == x0 + w - 1 {
+                    "┘"
+                } else if y == y0 || y == y0 + h - 1 {
+                    "─"
+                } else if x == x0 || x == x0 + w - 1 {
+                    "│"
+                } else {
+                    " "
+                };
+                if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
+                    bc.set_symbol(sym);
+                    bc.set_skip(false);
+                    let edge = y == y0 || y == y0 + h - 1 || x == x0 || x == x0 + w - 1;
+                    bc.set_style(if edge {
+                        border
+                    } else {
+                        Style::default().bg(bg)
+                    });
+                }
+            }
+        }
+
+        // Width-aware writer (a wide session/tab name must not corrupt the border).
+        let put = |buf: &mut Buffer, mut x: u16, y: u16, max_x: u16, s: &str, st: Style| {
+            for ch in s.chars() {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+                if cw == 0 {
+                    continue;
+                }
+                if x + cw > max_x || y >= area.height {
+                    break;
+                }
+                if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
+                    let mut sb = [0u8; 4];
+                    bc.set_symbol(ch.encode_utf8(&mut sb));
+                    bc.set_skip(false);
+                    bc.set_style(st);
+                }
+                if cw == 2
+                    && let Some(bc) = buf.cell_mut(Position::new(x + 1, y))
+                {
+                    bc.set_symbol(" ");
+                    bc.set_skip(true);
+                    bc.set_style(st);
+                }
+                x += cw;
+            }
+        };
+
+        // Title in the top border.
+        put(
+            buf,
+            x0 + 1,
+            y0,
+            (x0 + w).saturating_sub(1).min(area.width),
+            &format!(" {} ", m.title),
+            border.add_modifier(Modifier::BOLD),
+        );
+        // Items: one per interior row, padded to the full inner width so the
+        // hover highlight reads as a bar.
+        let inner_w = w.saturating_sub(2) as usize;
+        for (i, (label, _)) in m.items.iter().enumerate() {
+            let yy = y0 + 1 + i as u16;
+            let st = if m.sel == Some(i) {
+                Style::default()
+                    .fg(CAT_BASE)
+                    .bg(CAT_MAUVE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(CAT_TEXT).bg(bg)
+            };
+            let text = format!(" {label:<width$}", width = inner_w.saturating_sub(1));
+            put(
+                buf,
+                x0 + 1,
+                yy,
+                (x0 + w).saturating_sub(1).min(area.width),
+                &text,
+                st,
+            );
         }
     }
 
@@ -4739,9 +5188,10 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CAT_GREEN, CAT_RED, CAT_YELLOW, build_command_line, detect_alt_screen_exit,
-        extract_selection, filter_env, fuzzy_match, list_window_start, merge_env, sel_bounds,
-        sel_cols, shell_quote, tab_window, usage_threshold_color,
+        CAT_GREEN, CAT_RED, CAT_YELLOW, Menu, MenuAction, build_command_line,
+        detect_alt_screen_exit, extract_selection, filter_env, fuzzy_match, list_window_start,
+        menu_origin, merge_env, sel_bounds, sel_cols, shell_quote, tab_window,
+        usage_threshold_color,
     };
     use crate::model::TerminalId;
     use crate::term::{CellColor, CellSnap, Snapshot};
@@ -5018,5 +5468,46 @@ mod tests {
             Some("'claude' 'review; touch x'")
         );
         assert_eq!(build_command_line(&[]), None);
+    }
+
+    #[test]
+    fn menu_origin_flips_above_at_the_status_bar_and_clamps() {
+        // Plenty of room below → opens below-right of the pointer.
+        assert_eq!(menu_origin(10, 2, 14, 5, 100, 24), (10, 3));
+        // Status-bar click (bottom row): no room below → flips fully above.
+        assert_eq!(menu_origin(10, 23, 14, 5, 100, 24), (10, 18));
+        // Near the right edge → clamped left so the box fits.
+        assert_eq!(menu_origin(95, 2, 14, 5, 100, 24), (86, 3));
+        // Tiny frame: clamps into bounds instead of overflowing.
+        let (x0, y0) = menu_origin(0, 0, 14, 5, 10, 4);
+        assert_eq!((x0, y0), (0, 0));
+    }
+
+    #[test]
+    fn menu_item_at_maps_interior_rows_only() {
+        let ws = crate::model::WorkspaceId::new("w");
+        let m = Menu {
+            title: "tab 1".into(),
+            items: vec![
+                ("rename tab", MenuAction::NewTab(ws.clone())),
+                ("close tab", MenuAction::NewTab(ws.clone())),
+                ("new tab", MenuAction::NewTab(ws)),
+            ],
+            x0: 10,
+            y0: 18,
+            w: 14,
+            h: 5,
+            sel: None,
+            owner: crate::model::ClientId(1),
+            held: true,
+        };
+        // Interior rows y0+1..y0+3 hit items 0..2; borders and outside miss.
+        assert_eq!(m.item_at(12, 19), Some(0));
+        assert_eq!(m.item_at(12, 21), Some(2));
+        assert_eq!(m.item_at(12, 18), None, "top border row");
+        assert_eq!(m.item_at(12, 22), None, "bottom border row");
+        assert_eq!(m.item_at(10, 19), None, "left border column");
+        assert_eq!(m.item_at(23, 19), None, "right border column");
+        assert_eq!(m.item_at(30, 19), None, "outside");
     }
 }

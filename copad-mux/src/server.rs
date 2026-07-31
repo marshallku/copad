@@ -668,6 +668,10 @@ fn handle_incoming(
                         KeyAction::Detach => {
                             if let Some(pos) = clients.iter().position(|c| c.id == id) {
                                 detach_client(clients.remove(pos));
+                                // Reap the departing client's owned overlays (a menu it
+                                // opened must not linger capturing others' input).
+                                app.clear_selection_of(ClientId(id));
+                                app.close_menu_of(ClientId(id));
                                 recompute_viewport(app, clients);
                             }
                         }
@@ -707,6 +711,9 @@ fn handle_incoming(
                 ClientMsg::Detach => {
                     if let Some(pos) = clients.iter().position(|c| c.id == id) {
                         detach_client(clients.remove(pos));
+                        // Same overlay reaping as the key-detach / disconnect paths.
+                        app.clear_selection_of(ClientId(id));
+                        app.close_menu_of(ClientId(id));
                         recompute_viewport(app, clients);
                     }
                     true
@@ -718,8 +725,10 @@ fn handle_incoming(
             // The socket is already gone — drop the client WITHOUT another shutdown.
             if let Some(pos) = clients.iter().position(|c| c.id == id) {
                 clients.remove(pos);
-                // Drop a drag-selection the departing client owned (no live owner to finish it).
+                // Drop a drag-selection / context menu the departing client owned (no
+                // live owner to finish them).
                 app.clear_selection_of(ClientId(id));
+                app.close_menu_of(ClientId(id));
                 recompute_viewport(app, clients);
             }
             true

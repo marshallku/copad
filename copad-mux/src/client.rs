@@ -363,6 +363,11 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                             // mouse capture enables button-event tracking, so these are reported).
                             MouseEventKind::Drag(MouseButton::Left) => Some(MouseKind::Drag),
                             MouseEventKind::Up(MouseButton::Left) => Some(MouseKind::Up),
+                            // Right button drives the chrome context menu (tmux display-menu:
+                            // hold → hover → release-to-select).
+                            MouseEventKind::Down(MouseButton::Right) => Some(MouseKind::RightClick),
+                            MouseEventKind::Drag(MouseButton::Right) => Some(MouseKind::RightDrag),
+                            MouseEventKind::Up(MouseButton::Right) => Some(MouseKind::RightUp),
                             _ => None,
                         };
                         if let Some(kind) = kind {
