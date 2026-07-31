@@ -17,6 +17,7 @@ set -euo pipefail
 REPO="marshallku/copad"
 TARGET_VERSION=""
 SYSTEM_INSTALL=false
+FORCE_MUSL=false
 
 usage() {
     echo "Usage: $0 [OPTIONS]"
@@ -26,6 +27,10 @@ usage() {
     echo "Options:"
     echo "  --version VERSION    Install a specific version (e.g., v1.0.0)"
     echo "  --system             Install to /usr/local/bin (requires sudo)"
+    echo "  --musl               Force the fully-static musl build (glibc-free)."
+    echo "                       Auto-selected on musl-libc systems (Alpine); use"
+    echo "                       this to force it on a glibc host too old to run"
+    echo "                       the default build. (Linux x86_64 only.)"
     echo "  -h, --help           Show this help message"
 }
 
@@ -33,17 +38,43 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --version) TARGET_VERSION="$2"; shift 2 ;;
         --system)  SYSTEM_INSTALL=true; shift ;;
+        --musl)    FORCE_MUSL=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: $1"; usage; exit 1 ;;
     esac
 done
 
+# True when the running system's C library is musl (Alpine et al.), where the
+# default glibc-linked asset would not load at all. `ldd --version` prints "musl"
+# to stderr on musl systems; the loader-file check is a fallback for hosts where
+# ldd is absent or gated.
+is_musl_libc() {
+    if command -v ldd >/dev/null 2>&1 && ldd --version 2>&1 | grep -qi musl; then
+        return 0
+    fi
+    [[ -e /lib/ld-musl-x86_64.so.1 ]]
+}
+
 # Map the running platform to the release asset name (raw binary per target).
 OS="$(uname -s)"
 ARCH="$(uname -m)"
 case "${OS}:${ARCH}" in
-    Linux:x86_64)  TARGET="x86_64-linux" ;;
-    Darwin:arm64)  TARGET="aarch64-apple-darwin" ;;
+    Linux:x86_64)
+        # Fully-static musl asset on musl-libc hosts (where the glibc build can't
+        # run) or when the user forces it (glibc too old for the default build).
+        if ${FORCE_MUSL} || is_musl_libc; then
+            TARGET="x86_64-linux-musl"
+        else
+            TARGET="x86_64-linux"
+        fi
+        ;;
+    Darwin:arm64)
+        if ${FORCE_MUSL}; then
+            echo "Error: --musl is Linux x86_64 only; macOS has no musl build."
+            exit 1
+        fi
+        TARGET="aarch64-apple-darwin"
+        ;;
     *)
         echo "Error: unsupported platform '${OS} ${ARCH}'. comux ships x86_64 Linux and"
         echo "arm64 macOS builds. On another platform, build from source: cargo build"
@@ -87,9 +118,15 @@ echo "Downloading ${ASSET}..."
 # Fall back with a clear message if the release predates the standalone asset.
 if ! curl -fsSL -o "${TMPDIR}/comux" "${URL}"; then
     echo "Error: ${ASSET} not found in release ${VERSION}."
-    echo "Releases before v1.0.1 do not ship a standalone comux binary — comux is"
-    echo "bundled in the full tarball there. Use install.sh, or pass a newer"
-    echo "--version."
+    if [[ "${TARGET}" == *-musl ]]; then
+        echo "The static (musl) comux asset is only published by newer releases. If this"
+        echo "release predates it, pass a newer --version, or build from source on the"
+        echo "target machine: cargo build --release --target x86_64-unknown-linux-musl -p copad-mux."
+    else
+        echo "Releases before v1.0.1 do not ship a standalone comux binary — comux is"
+        echo "bundled in the full tarball there. Use install.sh, or pass a newer"
+        echo "--version."
+    fi
     exit 1
 fi
 

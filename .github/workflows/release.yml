@@ -24,7 +24,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libvte-2.91-gtk4-dev libwebkitgtk-6.0-dev libdbus-1-dev
 
+      # Add the musl target for the fully-static comux build (see "Build static
+      # comux"). rustup provides the target's std; zig (below) provides the C
+      # cross-linker — plain musl-gcc can't build copad-mux's C dep (ring, via
+      # reqwest's rustls: it rejects musl-gcc's -m64), so cargo-zigbuild is used.
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
 
       - uses: Swatinem/rust-cache@v2
 
@@ -38,6 +44,23 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           sed -i "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml
           cargo build --workspace --release
+
+      # Toolchain for the static musl build: zig as the C cross-linker + the
+      # cargo-zigbuild cargo wrapper. Needed because copad-mux pulls in ring (C)
+      # via reqwest's rustls, which fails to build under Debian's musl-gcc.
+      - name: Set up Zig
+        uses: mlugg/setup-zig@v2
+
+      - name: Install cargo-zigbuild
+        run: cargo install --locked cargo-zigbuild
+
+      # Fully-static comux for glibc-incompatible machines (musl-libc distros like
+      # Alpine, or hosts whose glibc is older than the runner's ~2.39). Runs after
+      # the version sed above so the static binary self-reports the right version.
+      # Only copad-mux is built here — the GTK app / daemon can't be static-linked.
+      - name: Build static comux (musl)
+        run: |
+          cargo zigbuild --release --target x86_64-unknown-linux-musl -p copad-mux
 
       - name: Bundle tarball
         run: |
@@ -67,6 +90,11 @@ jobs:
           COMUX_ASSET="comux-v${VERSION}-x86_64-linux"
           cp target/release/comux "${COMUX_ASSET}"
           echo "COMUX_ASSET=${COMUX_ASSET}" >> "$GITHUB_ENV"
+          # Static (musl) comux asset — the `-musl` suffix distinguishes it from the
+          # glibc-linked one above. install-comux.sh auto-picks this on musl systems.
+          COMUX_MUSL_ASSET="comux-v${VERSION}-x86_64-linux-musl"
+          cp target/x86_64-unknown-linux-musl/release/comux "${COMUX_MUSL_ASSET}"
+          echo "COMUX_MUSL_ASSET=${COMUX_MUSL_ASSET}" >> "$GITHUB_ENV"
 
       - name: Upload archive
         uses: actions/upload-artifact@v4
@@ -75,6 +103,7 @@ jobs:
           path: |
             ${{ env.ARCHIVE }}
             ${{ env.COMUX_ASSET }}
+            ${{ env.COMUX_MUSL_ASSET }}
           if-no-files-found: error
 
   build-macos:

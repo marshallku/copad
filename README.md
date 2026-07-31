@@ -171,6 +171,8 @@ curl -fsSL https://raw.githubusercontent.com/marshallku/copad/master/install-com
 
 Downloads a single `comux` binary (Linux x86_64 / macOS arm64) into `~/.local/bin` (`--system` for `/usr/local/bin`). The status-bar usage readout needs `coctl` on PATH; everything else works alone.
 
+On **glibc-incompatible Linux hosts** — musl-libc distros like Alpine, or a machine whose glibc is older than the release runner's — the installer auto-picks a **fully-static `comux` build** (the `-musl` release asset, statically linked, zero libc dependency). musl-libc systems are detected automatically; on an old-glibc host pass `--musl` to force it. Build it yourself with `cargo zigbuild --release --target x86_64-unknown-linux-musl -p copad-mux` (or `cargo build --target x86_64-unknown-linux-musl` natively on a musl host).
+
 ### Linux — From source
 
 ```bash
