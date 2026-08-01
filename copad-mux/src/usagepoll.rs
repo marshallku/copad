@@ -371,10 +371,13 @@ pub fn page_parts(
             && let Some(r) = e.reset
             && let Some(s) = format_reset(r, now, reset_style)
         {
-            // A leading space only when a gauge precedes it (`… 4% ⟳5d19h`); on a
+            // A leading space only when a gauge precedes it (`… 4% ⟳ 5d19h`); on a
             // reset-only page the window label already carries the trailing space.
+            // The space AFTER `⟳` is load-bearing: `⟳` (U+27F3) is ambiguous-width
+            // and some fonts draw it wider than its one cell, so butting a digit
+            // against it overlaps — same reason the `●`/`⬆`/`⚑` chips are spaced.
             let sep = if show_gauge { " " } else { "" };
-            out.push(UsagePart::Neutral(format!("{sep}⟳{s}")));
+            out.push(UsagePart::Neutral(format!("{sep}⟳ {s}")));
         }
     }
     out
@@ -721,7 +724,7 @@ mod tests {
         let s: String = parts.iter().map(UsagePart::text).collect();
         assert!(s.starts_with("claude 5h "), "got: {s}");
         assert!(s.contains("5%"), "got: {s}");
-        assert!(s.contains("⟳2h13m"), "got: {s}");
+        assert!(s.contains("⟳ 2h13m"), "got: {s}");
         // The gauge chunk carries its pct (threshold coloring by the tui layer).
         assert!(
             parts
@@ -803,7 +806,7 @@ mod tests {
             .iter()
             .map(UsagePart::text)
             .collect();
-        assert_eq!(reset, "claude wk ⟳5d19h · codex wk ⟳6d21h");
+        assert_eq!(reset, "claude wk ⟳ 5d19h · codex wk ⟳ 6d21h");
     }
 
     #[test]
@@ -820,7 +823,7 @@ mod tests {
             .iter()
             .map(UsagePart::text)
             .collect();
-        assert_eq!(reset, "codex wk ⟳6d21h");
+        assert_eq!(reset, "codex wk ⟳ 6d21h");
     }
 
     /// Live smoke: resolve the REAL rate-limit windows (Codex works offline; Claude

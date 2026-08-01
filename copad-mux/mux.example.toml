@@ -41,8 +41,8 @@ usage_page_unit = "window"  # carousel page granularity (usage_layout = "paged")
                           #   metric — split by metric: page 1 = every window's usage %,
                           #     page 2 = every window's reset time (2 pages)
 usage_reset = "relative"  # how the carousel shows a window's reset time:
-                          #   relative (default) — countdown, e.g. ⟳2h13m
-                          #   absolute — local clock, e.g. ⟳14:32 / ⟳Wed 09:00
+                          #   relative (default) — countdown, e.g. ⟳ 2h13m
+                          #   absolute — local clock, e.g. ⟳ 14:32 / ⟳ Wed 09:00
                           #   off — hide the reset
 tab_labels = "number"     # what each status-bar tab chip shows:
                           #   number (default) — the 1-based index: ` 1 ` ` 2 `
