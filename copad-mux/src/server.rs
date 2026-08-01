@@ -306,6 +306,7 @@ pub fn run() -> io::Result<()> {
         dirty |= app.reconcile_popup();
         dirty |= app.reconcile_center();
         dirty |= app.maybe_refresh_labels(); // sidebar/status data actually changed
+        dirty |= app.maybe_auto_roll_usage(); // usage carousel auto-advance (usage_rotate_secs)
         let pane_dirty = app.drain_pane_dirty(); // any pane's screen advanced (PTY output)
         dirty |= pane_dirty;
         // A full-screen app (nvim/less/htop/…) just LEFT the alternate screen: force a full

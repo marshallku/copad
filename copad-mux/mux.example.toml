@@ -44,6 +44,9 @@ usage_reset = "relative"  # how the carousel shows a window's reset time:
                           #   relative (default) — countdown, e.g. ⟳ 2h13m
                           #   absolute — local clock, e.g. ⟳ 14:32 / ⟳ Wed 09:00
                           #   off — hide the reset
+usage_rotate_secs = 0     # auto-advance the carousel every N seconds (0 = off,
+                          #   manual wheel/click only). A manual page resets the
+                          #   timer. (clamped to 0..3600)
 tab_labels = "number"     # what each status-bar tab chip shows:
                           #   number (default) — the 1-based index: ` 1 ` ` 2 `
                           #   name  — the tab's focused-pane process: ` claude ` ` nvim `

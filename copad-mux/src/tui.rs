@@ -409,6 +409,10 @@ pub struct App {
     /// Which carousel page the usage readout shows (`usage_layout = paged`). Advanced
     /// by a wheel/click over the readout; clamped to the live page count at render.
     usage_page: usize,
+    /// When the carousel last advanced — a manual page OR an auto-rotate tick resets
+    /// it, so `usage_rotate_secs` counts from the last change, not a fixed cadence
+    /// (a manual scroll never jumps again immediately after).
+    usage_rolled_at: std::time::Instant,
     /// Last-seen alternate-screen bit per VISIBLE pane, polled every render by
     /// [`Self::take_alt_screen_exit`]. Watching the true→false edge lets the render loop
     /// force a full repaint when a full-screen app (nvim, less, …) exits, wiping the
@@ -510,6 +514,7 @@ impl App {
             version_shown: None,
             usage_shown: None,
             usage_page: 0,
+            usage_rolled_at: std::time::Instant::now(),
             alt_screen: HashMap::new(),
             selection: None,
         };
@@ -3338,30 +3343,58 @@ impl App {
     /// inline, or nothing visible). Recomputed from the live snapshot + config —
     /// cheap (a handful of windows) and always consistent with what renders.
     fn usage_page_count(&self) -> usize {
-        if self.cfg.usage_layout != UsageLayout::Paged {
+        // Mirror the render gate exactly (cols >= 100, not Off, paged, something
+        // visible) so auto-rotate/manual paging only act when the carousel actually
+        // shows — a hidden readout must not force needless repaints.
+        if self.cfg.usage_layout != UsageLayout::Paged
+            || self.cfg.usage == UsageStyle::Off
+            || self.cols < 100
+        {
             return 0;
         }
-        self.usage_shown
-            .as_ref()
-            .map(|u| {
-                u.pages(
+        match &self.usage_shown {
+            Some(u) if u.has_visible(self.cfg.usage_windows) => u
+                .pages(
                     self.cfg.usage_windows,
                     self.cfg.usage_page_unit,
                     self.cfg.usage_reset,
                 )
-                .len()
-            })
-            .unwrap_or(0)
+                .len(),
+            _ => 0,
+        }
     }
 
     /// Move the usage carousel by `delta` pages, wrapping. No-op when there's 0 or 1
-    /// page (nothing to page through).
+    /// page (nothing to page through). Resets the auto-rotate timer so a manual page
+    /// isn't immediately followed by an auto one.
     fn page_usage(&mut self, delta: i32) {
         let n = self.usage_page_count();
         if n <= 1 {
             return;
         }
         self.usage_page = wrap_page(self.usage_page, delta, n);
+        self.usage_rolled_at = std::time::Instant::now();
+    }
+
+    /// Auto-rotate hook, called every render tick (~30 fps) by the server loop.
+    /// Advances the carousel one page when `usage_rotate_secs` has elapsed since the
+    /// last change AND there's more than one page; returns whether it advanced (→
+    /// repaint). Off (`usage_rotate_secs = 0`), single-page, and non-paged layouts
+    /// never roll. The cheap interval gate runs first so the hot path avoids
+    /// recomputing the page list every tick.
+    pub fn maybe_auto_roll_usage(&mut self) -> bool {
+        if !usage_should_roll(self.cfg.usage_rotate_secs, self.usage_rolled_at.elapsed()) {
+            return false;
+        }
+        let n = self.usage_page_count();
+        // The interval elapsed: reset the timer regardless, so a 1-page readout
+        // doesn't recompute the page list every single tick once it's due.
+        self.usage_rolled_at = std::time::Instant::now();
+        if n <= 1 {
+            return false;
+        }
+        self.usage_page = wrap_page(self.usage_page, 1, n);
+        true
     }
 
     /// Start the background usage/limits poller (server-only; see `usagepoll`).
@@ -4847,6 +4880,13 @@ fn clip_chip(name: &str) -> String {
     out
 }
 
+/// Cheap gate for the usage carousel's auto-rotate: is it enabled and has the
+/// interval elapsed? `secs == 0` means off. Kept separate (and pure) so the hot
+/// 30 fps render tick avoids recomputing the page list until the interval is due.
+fn usage_should_roll(secs: u32, elapsed: std::time::Duration) -> bool {
+    secs != 0 && elapsed >= std::time::Duration::from_secs(secs as u64)
+}
+
 /// Wrap `cur + delta` into `0..n` for the usage carousel (n ≥ 1). A stale `cur`
 /// (page count shrank) is clamped into range before stepping, so a scroll always
 /// lands on a valid page. `n == 0` is a defensive no-op.
@@ -5337,7 +5377,7 @@ mod tests {
     use super::{
         CAT_GREEN, CAT_RED, CAT_YELLOW, Menu, MenuAction, build_command_line,
         detect_alt_screen_exit, extract_selection, filter_env, fuzzy_match, list_window_start,
-        menu_origin, merge_env, sel_bounds, sel_cols, shell_quote, tab_window,
+        menu_origin, merge_env, sel_bounds, sel_cols, shell_quote, tab_window, usage_should_roll,
         usage_threshold_color, wrap_page,
     };
     use crate::model::TerminalId;
@@ -5373,6 +5413,15 @@ mod tests {
             cells,
             cursor: (0, 0),
         }
+    }
+
+    #[test]
+    fn usage_should_roll_respects_interval_and_off() {
+        use std::time::Duration;
+        assert!(!usage_should_roll(0, Duration::from_secs(999))); // 0 = off, never rolls
+        assert!(!usage_should_roll(10, Duration::from_secs(9))); // interval not reached
+        assert!(usage_should_roll(10, Duration::from_secs(10))); // exactly due
+        assert!(usage_should_roll(10, Duration::from_secs(11))); // past due
     }
 
     #[test]

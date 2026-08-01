@@ -603,6 +603,9 @@ pub struct MuxConfig {
     pub usage_page_unit: crate::usagepoll::PageUnit,
     /// How the carousel shows a window's reset time (relative / absolute / off).
     pub usage_reset: crate::usagepoll::ResetStyle,
+    /// Auto-advance the carousel every N seconds (0 = off, manual paging only). A
+    /// manual wheel/click resets the timer so it doesn't jump right after you page.
+    pub usage_rotate_secs: u32,
     /// What each status-bar tab chip shows (number / process name / both).
     pub tab_labels: TabLabels,
     /// Check GitHub releases in the background and show a `⬆ x.y.z` hint in the
@@ -638,6 +641,7 @@ struct RawConfig {
     usage_layout: Option<String>,
     usage_page_unit: Option<String>,
     usage_reset: Option<String>,
+    usage_rotate_secs: Option<i64>,
     tab_labels: Option<String>,
     update_check: Option<bool>,
     update_environment: Option<Vec<String>>,
@@ -728,6 +732,7 @@ impl MuxConfig {
             usage_layout: UsageLayout::Paged,
             usage_page_unit: crate::usagepoll::PageUnit::Window,
             usage_reset: crate::usagepoll::ResetStyle::Relative,
+            usage_rotate_secs: 0,
             tab_labels: TabLabels::Number,
             update_check: true,
             update_environment: default_update_environment(),
@@ -877,6 +882,14 @@ impl MuxConfig {
                         crate::usagepoll::ResetStyle::Relative
                     }),
                 },
+                usage_rotate_secs: clamp_field(
+                    raw.usage_rotate_secs,
+                    0,
+                    0,
+                    3600,
+                    "usage_rotate_secs",
+                    &mut warnings,
+                ) as u32,
                 tab_labels: match raw.tab_labels.as_deref() {
                     None => TabLabels::Number,
                     Some(s) => TabLabels::parse(s).unwrap_or_else(|| {
