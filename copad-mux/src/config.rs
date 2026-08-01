@@ -141,6 +141,49 @@ impl UsageStyle {
     }
 }
 
+/// Whether the usage/limits readout is a paged carousel or the legacy inline row.
+/// `UsageStyle` above still selects the gauge (bar/text/off) WITHIN either layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageLayout {
+    /// One window (or provider) per page with a reset countdown, wheel-scrollable
+    /// and click-paged. The default — the only layout that shows reset times.
+    Paged,
+    /// The historical single row with every window inline (no room for resets).
+    Inline,
+}
+
+impl UsageLayout {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s.trim().to_ascii_lowercase().as_str() {
+            "paged" | "page" | "carousel" => UsageLayout::Paged,
+            "inline" | "row" | "all" => UsageLayout::Inline,
+            _ => return None,
+        })
+    }
+}
+
+/// Config-string → [`crate::usagepoll::PageUnit`] (carousel page granularity).
+fn parse_page_unit(s: &str) -> Option<crate::usagepoll::PageUnit> {
+    use crate::usagepoll::PageUnit;
+    Some(match s.trim().to_ascii_lowercase().as_str() {
+        "window" | "windows" => PageUnit::Window,
+        "provider" | "providers" => PageUnit::Provider,
+        "metric" | "metrics" => PageUnit::Metric,
+        _ => return None,
+    })
+}
+
+/// Config-string → [`crate::usagepoll::ResetStyle`] (how the reset time is shown).
+fn parse_reset_style(s: &str) -> Option<crate::usagepoll::ResetStyle> {
+    use crate::usagepoll::ResetStyle;
+    Some(match s.trim().to_ascii_lowercase().as_str() {
+        "relative" | "rel" | "countdown" => ResetStyle::Relative,
+        "absolute" | "abs" | "clock" => ResetStyle::Absolute,
+        "off" | "none" | "hidden" => ResetStyle::Off,
+        _ => return None,
+    })
+}
+
 /// What each status-bar tab chip shows. Zero-config default is [`TabLabels::Number`]
 /// (identical to the historical `1`/`2`/`3` chips); the other styles surface the tab's
 /// focused-pane foreground command (e.g. `claude` / `nvim`) so tabs read at a glance.
@@ -554,6 +597,12 @@ pub struct MuxConfig {
     pub usage_windows: crate::usagepoll::UsageWindows,
     /// Width in cells of each progress bar when `usage = "bar"`.
     pub usage_bar_width: u16,
+    /// Paged carousel (default) vs the legacy inline row for the usage readout.
+    pub usage_layout: UsageLayout,
+    /// Carousel page granularity: one window per page (default) or one provider.
+    pub usage_page_unit: crate::usagepoll::PageUnit,
+    /// How the carousel shows a window's reset time (relative / absolute / off).
+    pub usage_reset: crate::usagepoll::ResetStyle,
     /// What each status-bar tab chip shows (number / process name / both).
     pub tab_labels: TabLabels,
     /// Check GitHub releases in the background and show a `⬆ x.y.z` hint in the
@@ -586,6 +635,9 @@ struct RawConfig {
     usage: Option<String>,
     usage_windows: Option<Vec<String>>,
     usage_bar_width: Option<i64>,
+    usage_layout: Option<String>,
+    usage_page_unit: Option<String>,
+    usage_reset: Option<String>,
     tab_labels: Option<String>,
     update_check: Option<bool>,
     update_environment: Option<Vec<String>>,
@@ -673,6 +725,9 @@ impl MuxConfig {
             usage: UsageStyle::Bar,
             usage_windows: crate::usagepoll::UsageWindows::all(),
             usage_bar_width: DEFAULT_USAGE_BAR_WIDTH,
+            usage_layout: UsageLayout::Paged,
+            usage_page_unit: crate::usagepoll::PageUnit::Window,
+            usage_reset: crate::usagepoll::ResetStyle::Relative,
             tab_labels: TabLabels::Number,
             update_check: true,
             update_environment: default_update_environment(),
@@ -795,6 +850,33 @@ impl MuxConfig {
                     "usage_bar_width",
                     &mut warnings,
                 ) as u16,
+                usage_layout: match raw.usage_layout.as_deref() {
+                    None => UsageLayout::Paged,
+                    Some(s) => UsageLayout::parse(s).unwrap_or_else(|| {
+                        warnings.push(format!(
+                            "usage_layout '{s}' unknown (paged|inline) — using paged"
+                        ));
+                        UsageLayout::Paged
+                    }),
+                },
+                usage_page_unit: match raw.usage_page_unit.as_deref() {
+                    None => crate::usagepoll::PageUnit::Window,
+                    Some(s) => parse_page_unit(s).unwrap_or_else(|| {
+                        warnings.push(format!(
+                            "usage_page_unit '{s}' unknown (window|provider|metric) — using window"
+                        ));
+                        crate::usagepoll::PageUnit::Window
+                    }),
+                },
+                usage_reset: match raw.usage_reset.as_deref() {
+                    None => crate::usagepoll::ResetStyle::Relative,
+                    Some(s) => parse_reset_style(s).unwrap_or_else(|| {
+                        warnings.push(format!(
+                            "usage_reset '{s}' unknown (relative|absolute|off) — using relative"
+                        ));
+                        crate::usagepoll::ResetStyle::Relative
+                    }),
+                },
                 tab_labels: match raw.tab_labels.as_deref() {
                     None => TabLabels::Number,
                     Some(s) => TabLabels::parse(s).unwrap_or_else(|| {

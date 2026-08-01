@@ -30,6 +30,20 @@ usage = "bar"             # status-bar Claude/Codex rate-limit readout:
 # An empty list hides the readout; unknown ids warn and are ignored.
 # usage_windows = ["claude-wk", "codex-wk"]   # e.g. weekly windows only
 usage_bar_width = 8       # cells per progress bar when usage = "bar"  (3..30)
+usage_layout = "paged"    # how the readout is laid out:
+                          #   paged (default) — ONE window at a time as a wheel/click-paged
+                          #     carousel WITH a reset countdown + `n/N` indicator (scroll or
+                          #     click the readout to page). The only layout that shows resets.
+                          #   inline — the legacy single row of every window (no reset shown)
+usage_page_unit = "window"  # carousel page granularity (usage_layout = "paged"):
+                          #   window (default) — one rate-limit window per page (3 pages)
+                          #   provider — all of a provider's windows on one page (2 pages)
+                          #   metric — split by metric: page 1 = every window's usage %,
+                          #     page 2 = every window's reset time (2 pages)
+usage_reset = "relative"  # how the carousel shows a window's reset time:
+                          #   relative (default) — countdown, e.g. ⟳2h13m
+                          #   absolute — local clock, e.g. ⟳14:32 / ⟳Wed 09:00
+                          #   off — hide the reset
 tab_labels = "number"     # what each status-bar tab chip shows:
                           #   number (default) — the 1-based index: ` 1 ` ` 2 `
                           #   name  — the tab's focused-pane process: ` claude ` ` nvim `

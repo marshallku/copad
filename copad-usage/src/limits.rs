@@ -41,6 +41,12 @@ pub struct Limits {
 pub struct ClaudeLimits {
     pub five_hour: Option<f64>,
     pub seven_day: Option<f64>,
+    /// UNIX epoch SECONDS at which each window's utilization resets. `None` when
+    /// the backend omitted it (older API shape) — the readout then shows the
+    /// percent with no countdown. Kept parallel to the pct fields (rather than a
+    /// `{pct, reset}` struct) so adding reset didn't break existing constructors.
+    pub five_hour_reset: Option<i64>,
+    pub seven_day_reset: Option<i64>,
 }
 
 impl ClaudeLimits {
@@ -54,6 +60,8 @@ impl ClaudeLimits {
 #[derive(Debug, Clone, Default)]
 pub struct CodexLimits {
     pub weekly: Option<f64>,
+    /// UNIX epoch SECONDS at which the weekly window resets. See [`ClaudeLimits`].
+    pub weekly_reset: Option<i64>,
 }
 
 impl CodexLimits {
@@ -80,17 +88,22 @@ struct Cache {
     codex: Option<CodexCache>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 struct ClaudeCache {
     ts: i64,
     five_hour: Option<f64>,
     seven_day: Option<f64>,
+    // Absent in caches written before reset plumbing → serde defaults an absent
+    // `Option` field to `None`, so an old cache file still deserializes.
+    five_hour_reset: Option<i64>,
+    seven_day_reset: Option<i64>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 struct CodexCache {
     ts: i64,
     weekly: Option<f64>,
+    weekly_reset: Option<i64>,
 }
 
 /// A cache entry's write timestamp, for the monotonic-write guard.
@@ -211,6 +224,8 @@ fn apply_cache(
                 ts: now,
                 five_hour: c.five_hour,
                 seven_day: c.seven_day,
+                five_hour_reset: c.five_hour_reset,
+                seven_day_reset: c.seven_day_reset,
             });
         }
         None if want_claude => {
@@ -221,6 +236,8 @@ fn apply_cache(
                 live.claude = Some(ClaudeLimits {
                     five_hour: cc.five_hour,
                     seven_day: cc.seven_day,
+                    five_hour_reset: cc.five_hour_reset,
+                    seven_day_reset: cc.seven_day_reset,
                 });
                 stale.claude = true;
             }
@@ -232,6 +249,7 @@ fn apply_cache(
             cache.codex = Some(CodexCache {
                 ts: now,
                 weekly: x.weekly,
+                weekly_reset: x.weekly_reset,
             });
         }
         None if want_codex => {
@@ -239,7 +257,10 @@ fn apply_cache(
                 && fresh_enough(now, xc.ts)
                 && xc.weekly.is_some()
             {
-                live.codex = Some(CodexLimits { weekly: xc.weekly });
+                live.codex = Some(CodexLimits {
+                    weekly: xc.weekly,
+                    weekly_reset: xc.weekly_reset,
+                });
                 stale.codex = true;
             }
         }
@@ -383,18 +404,44 @@ fn claude_keychain_credentials() -> Option<String> {
     None
 }
 
-/// Pull the two window utilizations out of the `/api/oauth/usage` body. Pure so
-/// it can be tested against a captured response.
+/// Pull the two window utilizations (and their reset times) out of the
+/// `/api/oauth/usage` body. Pure so it can be tested against a captured response.
 fn parse_claude_usage(body: &Value) -> ClaudeLimits {
     let pct = |k: &str| {
         body.get(k)
             .and_then(|w| w.get("utilization"))
             .and_then(Value::as_f64)
     };
+    let reset = |k: &str| {
+        body.get(k)
+            .and_then(|w| w.get("resets_at"))
+            .and_then(parse_epoch)
+    };
     ClaudeLimits {
         five_hour: pct("five_hour"),
         seven_day: pct("seven_day"),
+        five_hour_reset: reset("five_hour"),
+        seven_day_reset: reset("seven_day"),
     }
+}
+
+/// Read a `resets_at` value as UNIX epoch SECONDS. Accepts an integer/float epoch
+/// (Codex, and newer Claude) or an RFC3339 string (older Claude), so the readout
+/// survives either backend shape. `None` for anything else (incl. a placeholder
+/// like `"..."`), which simply hides the countdown for that window.
+fn parse_epoch(v: &Value) -> Option<i64> {
+    if let Some(n) = v.as_i64() {
+        return Some(n);
+    }
+    if let Some(f) = v.as_f64() {
+        return Some(f as i64);
+    }
+    if let Some(s) = v.as_str() {
+        return chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|dt| dt.timestamp());
+    }
+    None
 }
 
 // ── Codex: newest rollout rate_limits snapshot ─────────────────────────────
@@ -471,6 +518,7 @@ fn find_key<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
 fn parse_codex_rate_limits(rl: &Value) -> CodexLimits {
     const DAY_MINUTES: f64 = 1440.0;
     let mut weekly = None;
+    let mut weekly_reset = None;
     let mut widest = -1.0;
     for slot in ["primary", "secondary"] {
         let Some(w) = rl.get(slot).filter(|w| w.is_object()) else {
@@ -487,9 +535,15 @@ fn parse_codex_rate_limits(rl: &Value) -> CodexLimits {
         {
             widest = window;
             weekly = Some(used);
+            // Codex already reports `resets_at` as an absolute epoch (seconds),
+            // so no anchoring to the rollout event time is needed.
+            weekly_reset = w.get("resets_at").and_then(parse_epoch);
         }
     }
-    CodexLimits { weekly }
+    CodexLimits {
+        weekly,
+        weekly_reset,
+    }
 }
 
 // ── Rendering ──────────────────────────────────────────────────────────────
@@ -535,8 +589,14 @@ pub fn to_json(l: &Limits, stale: &Stale) -> Value {
         if let Some(p) = c.five_hour {
             m.insert("five_hour".into(), json!(p));
         }
+        if let Some(r) = c.five_hour_reset {
+            m.insert("five_hour_reset".into(), json!(r));
+        }
         if let Some(p) = c.seven_day {
             m.insert("seven_day".into(), json!(p));
+        }
+        if let Some(r) = c.seven_day_reset {
+            m.insert("seven_day_reset".into(), json!(r));
         }
         if !m.is_empty() {
             if stale.claude {
@@ -550,6 +610,9 @@ pub fn to_json(l: &Limits, stale: &Stale) -> Value {
     {
         let mut m = serde_json::Map::new();
         m.insert("weekly".into(), json!(p));
+        if let Some(r) = x.weekly_reset {
+            m.insert("weekly_reset".into(), json!(r));
+        }
         if stale.codex {
             m.insert("stale".into(), json!(true));
         }
@@ -565,6 +628,8 @@ mod tests {
 
     #[test]
     fn parses_claude_usage_body() {
+        // A non-timestamp placeholder (`"..."`) simply yields no reset — the pct
+        // still parses. Real reset formats are covered by `parses_claude_reset`.
         let body = json!({
             "five_hour": {"utilization": 5.0, "resets_at": "..."},
             "seven_day": {"utilization": 27.0, "resets_at": "..."},
@@ -572,6 +637,32 @@ mod tests {
         let c = parse_claude_usage(&body);
         assert_eq!(c.five_hour, Some(5.0));
         assert_eq!(c.seven_day, Some(27.0));
+        assert_eq!(c.five_hour_reset, None);
+    }
+
+    #[test]
+    fn parses_claude_reset() {
+        // Integer epoch seconds …
+        let body = json!({
+            "five_hour": {"utilization": 5.0, "resets_at": 1_786_160_089_i64},
+            // … or an RFC3339 string → converted to the same epoch seconds.
+            "seven_day": {"utilization": 27.0, "resets_at": "2026-08-06T00:00:00Z"},
+        });
+        let c = parse_claude_usage(&body);
+        assert_eq!(c.five_hour_reset, Some(1_786_160_089));
+        assert_eq!(c.seven_day_reset, Some(1_785_974_400)); // 2026-08-06T00:00:00Z
+    }
+
+    #[test]
+    fn parse_epoch_accepts_int_string_and_rejects_junk() {
+        assert_eq!(parse_epoch(&json!(1_786_160_089_i64)), Some(1_786_160_089));
+        assert_eq!(parse_epoch(&json!(1_786_160_089.0)), Some(1_786_160_089));
+        assert_eq!(
+            parse_epoch(&json!("2026-08-06T00:00:00Z")),
+            Some(1_785_974_400)
+        );
+        assert_eq!(parse_epoch(&json!("...")), None);
+        assert_eq!(parse_epoch(&json!(null)), None);
     }
 
     #[test]
@@ -580,6 +671,7 @@ mod tests {
         let c = parse_claude_usage(&body);
         assert_eq!(c.five_hour, Some(5.0));
         assert_eq!(c.seven_day, None);
+        assert_eq!(c.five_hour_reset, None);
     }
 
     #[test]
@@ -626,6 +718,18 @@ mod tests {
     }
 
     #[test]
+    fn codex_captures_weekly_reset() {
+        // Codex reports `resets_at` as an absolute epoch already — carried as-is.
+        let rl = json!({
+            "primary": {"used_percent": 1.0, "window_minutes": 10080, "resets_at": 1_786_160_089_i64},
+            "secondary": null,
+        });
+        let x = parse_codex_rate_limits(&rl);
+        assert_eq!(x.weekly, Some(1.0));
+        assert_eq!(x.weekly_reset, Some(1_786_160_089));
+    }
+
+    #[test]
     fn weekly_from_single_primary() {
         let rl = json!({
             "primary": {"used_percent": 45.0, "window_minutes": 10080},
@@ -650,8 +754,12 @@ mod tests {
             claude: Some(ClaudeLimits {
                 five_hour: Some(5.0),
                 seven_day: Some(27.0),
+                ..Default::default()
             }),
-            codex: Some(CodexLimits { weekly: Some(45.0) }),
+            codex: Some(CodexLimits {
+                weekly: Some(45.0),
+                ..Default::default()
+            }),
         };
         assert_eq!(
             oneline(&l, &Stale::default()),
@@ -665,6 +773,7 @@ mod tests {
             claude: Some(ClaudeLimits {
                 five_hour: Some(80.0),
                 seven_day: None,
+                ..Default::default()
             }),
             codex: None,
         };
@@ -676,7 +785,10 @@ mod tests {
         // --tool codex: no claude key at all (not `"claude": null`).
         let l = Limits {
             claude: None,
-            codex: Some(CodexLimits { weekly: Some(45.0) }),
+            codex: Some(CodexLimits {
+                weekly: Some(45.0),
+                ..Default::default()
+            }),
         };
         let v = to_json(&l, &Stale::default());
         assert!(v.get("claude").is_none());
@@ -687,6 +799,7 @@ mod tests {
             claude: Some(ClaudeLimits {
                 five_hour: Some(6.0),
                 seven_day: None,
+                ..Default::default()
             }),
             codex: None,
         };
@@ -704,13 +817,17 @@ mod tests {
         // Live has codex but not claude; a recent cache entry fills claude in.
         let mut live = Limits {
             claude: None,
-            codex: Some(CodexLimits { weekly: Some(50.0) }),
+            codex: Some(CodexLimits {
+                weekly: Some(50.0),
+                ..Default::default()
+            }),
         };
         let mut cache = Cache {
             claude: Some(ClaudeCache {
                 ts: 1000,
                 five_hour: Some(6.0),
                 seven_day: Some(27.0),
+                ..Default::default()
             }),
             codex: None,
         };
@@ -734,6 +851,7 @@ mod tests {
                 ts: 1000,
                 five_hour: Some(6.0),
                 seven_day: None,
+                ..Default::default()
             }),
             codex: None,
         };
@@ -750,12 +868,19 @@ mod tests {
         assert!(
             ClaudeLimits {
                 five_hour: Some(1.0),
-                seven_day: None
+                seven_day: None,
+                ..Default::default()
             }
             .has_window()
         );
         assert!(!CodexLimits::default().has_window());
-        assert!(CodexLimits { weekly: Some(1.0) }.has_window());
+        assert!(
+            CodexLimits {
+                weekly: Some(1.0),
+                ..Default::default()
+            }
+            .has_window()
+        );
     }
 
     #[test]
@@ -764,12 +889,14 @@ mod tests {
             ts: 42,
             five_hour: None,
             seven_day: None,
+            ..Default::default()
         };
         assert_eq!(c.ts(), 42);
         assert_eq!(
             CodexCache {
                 ts: 7,
-                weekly: None
+                weekly: None,
+                ..Default::default()
             }
             .ts(),
             7
@@ -795,6 +922,7 @@ mod tests {
                 ts: 1000,
                 five_hour: Some(6.0),
                 seven_day: None,
+                ..Default::default()
             }),
             codex: None,
         };
@@ -810,6 +938,7 @@ mod tests {
             claude: Some(ClaudeLimits {
                 five_hour: Some(6.0),
                 seven_day: None,
+                ..Default::default()
             }),
             codex: None,
         };

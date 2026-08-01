@@ -23,7 +23,7 @@ use ratatui::style::{Color, Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agentstate;
-use crate::config::{self, Action, MuxConfig, SortBy, TabLabels, UsageStyle};
+use crate::config::{self, Action, MuxConfig, SortBy, TabLabels, UsageLayout, UsageStyle};
 use crate::control;
 use crate::gitinfo;
 use crate::model::{
@@ -79,6 +79,9 @@ enum ClickTarget {
     /// active session would steal the controller lease); it exists as a RIGHT-click
     /// context-menu anchor for session actions.
     SessionPill(WorkspaceId),
+    /// The status-bar usage/limits readout (`usage_layout = paged`). Wheel over it
+    /// pages the carousel; a left click advances one page (wrapping).
+    Usage,
 }
 
 /// A rectangular hit region (inclusive `x0..=x1`, `y0..=y1`) recorded during render.
@@ -403,6 +406,9 @@ pub struct App {
     /// The usage snapshot currently folded into the rendered status bar; compared to
     /// the shared handle so a change triggers a repaint through `maybe_refresh_labels`.
     usage_shown: Option<UsageSnapshot>,
+    /// Which carousel page the usage readout shows (`usage_layout = paged`). Advanced
+    /// by a wheel/click over the readout; clamped to the live page count at render.
+    usage_page: usize,
     /// Last-seen alternate-screen bit per VISIBLE pane, polled every render by
     /// [`Self::take_alt_screen_exit`]. Watching the true→false edge lets the render loop
     /// force a full repaint when a full-screen app (nvim, less, …) exits, wiping the
@@ -503,6 +509,7 @@ impl App {
             version_poll: versionpoll::idle(),
             version_shown: None,
             usage_shown: None,
+            usage_page: 0,
             alt_screen: HashMap::new(),
             selection: None,
         };
@@ -2179,6 +2186,12 @@ impl App {
         match kind {
             MouseKind::ScrollUp | MouseKind::ScrollDown => {
                 let up = matches!(kind, MouseKind::ScrollUp);
+                // A wheel over the usage readout pages the carousel (up = previous,
+                // down = next; wraps) instead of scrolling a pane.
+                if matches!(self.click_target_at(x, y), Some(ClickTarget::Usage)) {
+                    self.page_usage(if up { -1 } else { 1 });
+                    return None;
+                }
                 // The pane under the cursor, else the focused one (tmux forwards to the
                 // pane the pointer is over).
                 let rect = target.clone().or_else(|| {
@@ -2232,6 +2245,9 @@ impl App {
                         // Right-click menu anchor only — a left click must NOT
                         // re-attach to the active session (lease churn).
                         ClickTarget::SessionPill(_) => {}
+                        // A left click advances the carousel one page (wraps) — the
+                        // no-wheel fallback for paging the usage readout.
+                        ClickTarget::Usage => self.page_usage(1),
                     }
                     return None;
                 }
@@ -2409,6 +2425,8 @@ impl App {
     /// `(x, y)`. Item targets are captured NOW (menu-open time), not at selection.
     fn open_menu(&mut self, client: ClientId, x: u16, y: u16, target: ClickTarget) {
         let (title, items): (String, Vec<(&'static str, MenuAction)>) = match target {
+            // The usage readout has no context menu (v1) — a right-click on it is inert.
+            ClickTarget::Usage => return,
             ClickTarget::Tab(id) => {
                 let n = self
                     .tab_ids()
@@ -3316,6 +3334,36 @@ impl App {
         }
     }
 
+    /// Number of carousel pages the usage readout currently has (0 when hidden,
+    /// inline, or nothing visible). Recomputed from the live snapshot + config —
+    /// cheap (a handful of windows) and always consistent with what renders.
+    fn usage_page_count(&self) -> usize {
+        if self.cfg.usage_layout != UsageLayout::Paged {
+            return 0;
+        }
+        self.usage_shown
+            .as_ref()
+            .map(|u| {
+                u.pages(
+                    self.cfg.usage_windows,
+                    self.cfg.usage_page_unit,
+                    self.cfg.usage_reset,
+                )
+                .len()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Move the usage carousel by `delta` pages, wrapping. No-op when there's 0 or 1
+    /// page (nothing to page through).
+    fn page_usage(&mut self, delta: i32) {
+        let n = self.usage_page_count();
+        if n <= 1 {
+            return;
+        }
+        self.usage_page = wrap_page(self.usage_page, delta, n);
+    }
+
     /// Start the background usage/limits poller (server-only; see `usagepoll`).
     /// Replaces the idle handle installed by `new` with a live one. Skipped when
     /// `usage = "off"` so a disabled readout costs no `coctl`/network polling
@@ -3996,43 +4044,113 @@ impl App {
             ));
         }
         // Usage/limits readout (Claude 5h+weekly · Codex weekly), left of the clock.
-        // `usage = "bar"` draws a progress bar per window when the terminal is wide
-        // enough for it, else falls back to percentages; `"text"` is always
-        // percentages; `"off"` hides it. Either form only shows at cols >= 100 —
-        // it would crowd out tab chips on a narrow/mobile view (size-adaptive, like
-        // the sidebar).
+        // `usage_layout = paged` (default) shows ONE window (or provider) at a time as a
+        // wheel-/click-paged carousel WITH a reset countdown and an `n/N` indicator;
+        // `inline` is the legacy single row of every window (no room for resets). The
+        // gauge (bar/text/off) is `usage`. Either layout only shows at cols >= 100 —
+        // it would crowd out tab chips on a narrow/mobile view (size-adaptive).
+        // `usage_zone` records the paged segment's seg-index span so the draw loop can
+        // register a `ClickTarget::Usage` hit region for wheel/click paging.
+        let mut usage_zone: Option<(usize, usize)> = None;
         if let Some(u) = &self.usage_shown
             && u.has_visible(self.cfg.usage_windows)
             && self.cfg.usage != UsageStyle::Off
             && self.cols >= 100
         {
-            // Bars are wider than text, so only draw them when the WHOLE bar
-            // segment fits alongside `USAGE_BARS_RESERVE_COLS` kept for the rest of
-            // the right cluster (session pill · counts · clock · host) plus a couple
-            // of tab chips; below that, fall back to percentages. Tabs window on
-            // overflow, so this reserve is about readability, not correctness.
-            const USAGE_BARS_RESERVE_COLS: usize = 64;
-            let bar_width = (self.cfg.usage == UsageStyle::Bar
-                && (self.cols as usize)
-                    >= USAGE_BARS_RESERVE_COLS
-                        + usagepoll::bar_display_width(
-                            u,
-                            self.cfg.usage_bar_width,
-                            self.cfg.usage_windows,
-                        ))
-            .then_some(self.cfg.usage_bar_width);
-            // Each window's gauge is colored by its utilization (green < 70 ≤ yellow
-            // < 90 ≤ red); labels and separators stay muted. One segment per part.
             let pad = Style::default().bg(CAT_SURFACE0);
-            segs.push((" ".to_string(), pad));
-            for part in u.parts(bar_width, self.cfg.usage_windows) {
-                let (text, fg) = match part {
-                    UsagePart::Window { text, pct } => (text, usage_threshold_color(pct)),
-                    UsagePart::Neutral(s) => (s, CAT_SUBTEXT),
-                };
-                segs.push((text, Style::default().fg(fg).bg(CAT_SURFACE0)));
+            // Each window's gauge is colored by its utilization (green < 70 ≤ yellow
+            // < 90 ≤ red); labels/separators/resets stay muted. One segment per part.
+            let push_parts = |segs: &mut Vec<(String, Style)>, parts: Vec<UsagePart>| {
+                for part in parts {
+                    let (text, fg) = match part {
+                        UsagePart::Window { text, pct } => (text, usage_threshold_color(pct)),
+                        UsagePart::Neutral(s) => (s, CAT_SUBTEXT),
+                    };
+                    segs.push((text, Style::default().fg(fg).bg(CAT_SURFACE0)));
+                }
+            };
+            let width = |parts: &[UsagePart]| parts.iter().map(|p| p.text().width()).sum::<usize>();
+            match self.cfg.usage_layout {
+                UsageLayout::Inline => {
+                    // Bars are wider than text, so only draw them when the WHOLE bar
+                    // segment fits alongside `USAGE_BARS_RESERVE_COLS` kept for the rest of
+                    // the right cluster plus a couple of tab chips; else fall back to text.
+                    const USAGE_BARS_RESERVE_COLS: usize = 64;
+                    let bar_width = (self.cfg.usage == UsageStyle::Bar
+                        && (self.cols as usize)
+                            >= USAGE_BARS_RESERVE_COLS
+                                + usagepoll::bar_display_width(
+                                    u,
+                                    self.cfg.usage_bar_width,
+                                    self.cfg.usage_windows,
+                                ))
+                    .then_some(self.cfg.usage_bar_width);
+                    segs.push((" ".to_string(), pad));
+                    push_parts(&mut segs, u.parts(bar_width, self.cfg.usage_windows));
+                    segs.push((" ".to_string(), pad));
+                }
+                UsageLayout::Paged => {
+                    let pages = u.pages(
+                        self.cfg.usage_windows,
+                        self.cfg.usage_page_unit,
+                        self.cfg.usage_reset,
+                    );
+                    if !pages.is_empty() {
+                        let now = now_secs() as i64;
+                        let n = pages.len();
+                        let idx = self.usage_page.min(n - 1);
+                        // Bars only when the WIDEST page still leaves room for the rest of
+                        // the right cluster; else percentages. A single page is far narrower
+                        // than the inline row, so this reserve is smaller.
+                        const USAGE_PAGE_RESERVE_COLS: usize = 56;
+                        let bar_width = if self.cfg.usage == UsageStyle::Bar {
+                            let w = self.cfg.usage_bar_width;
+                            let widest = pages
+                                .iter()
+                                .map(|p| {
+                                    width(&usagepoll::page_parts(
+                                        p,
+                                        Some(w),
+                                        now,
+                                        self.cfg.usage_reset,
+                                    ))
+                                })
+                                .max()
+                                .unwrap_or(0);
+                            ((self.cols as usize) >= USAGE_PAGE_RESERVE_COLS + widest).then_some(w)
+                        } else {
+                            None
+                        };
+                        // Render every page to find the fixed (widest) width, then PAD the
+                        // shown page to it — the segment width stays CONSTANT across pages so
+                        // tab chips never shift as you scroll (relative countdowns vary in
+                        // width too, e.g. `3d04h` vs `<1m`).
+                        let rendered: Vec<Vec<UsagePart>> = pages
+                            .iter()
+                            .map(|p| usagepoll::page_parts(p, bar_width, now, self.cfg.usage_reset))
+                            .collect();
+                        let maxw = rendered.iter().map(|r| width(r)).max().unwrap_or(0);
+                        segs.push((" ".to_string(), pad));
+                        let start = segs.len();
+                        let shown = &rendered[idx];
+                        let shown_w = width(shown);
+                        push_parts(&mut segs, shown.clone());
+                        if maxw > shown_w {
+                            segs.push((" ".repeat(maxw - shown_w), pad));
+                        }
+                        // `n/N` page indicator (only with >1 page); else a trailing pad.
+                        if n > 1 {
+                            segs.push((
+                                format!(" {}/{} ", idx + 1, n),
+                                Style::default().fg(CAT_SUBTEXT).bg(CAT_SURFACE0),
+                            ));
+                        } else {
+                            segs.push((" ".to_string(), pad));
+                        }
+                        usage_zone = Some((start, segs.len()));
+                    }
+                }
             }
-            segs.push((" ".to_string(), pad));
         }
         segs.push((
             format!(" {} ", local_hhmm()),
@@ -4130,9 +4248,27 @@ impl App {
         }
 
         // Draw the right cluster, right-aligned, never overwriting the left content.
+        // While drawing, capture the x-span of the paged usage segment (seg indices in
+        // `usage_zone`) and register it as a `ClickTarget::Usage` hit region for paging.
         let mut rx = w.saturating_sub(right_total).max(x);
-        for (s, st) in &segs {
+        let mut usage_x0: Option<u16> = None;
+        for (i, (s, st)) in segs.iter().enumerate() {
+            if usage_zone.is_some_and(|(a, _)| a == i) {
+                usage_x0 = Some(rx);
+            }
             put(buf, &mut rx, s, *st);
+            if let Some((_, end)) = usage_zone
+                && end == i + 1
+                && let Some(x0) = usage_x0
+            {
+                self.click_zones.borrow_mut().push(ClickZone {
+                    x0,
+                    x1: rx.saturating_sub(1),
+                    y0: y,
+                    y1: y,
+                    target: ClickTarget::Usage,
+                });
+            }
         }
     }
 
@@ -4711,6 +4847,17 @@ fn clip_chip(name: &str) -> String {
     out
 }
 
+/// Wrap `cur + delta` into `0..n` for the usage carousel (n ≥ 1). A stale `cur`
+/// (page count shrank) is clamped into range before stepping, so a scroll always
+/// lands on a valid page. `n == 0` is a defensive no-op.
+fn wrap_page(cur: usize, delta: i32, n: usize) -> usize {
+    if n == 0 {
+        return 0;
+    }
+    let cur = cur.min(n - 1) as i32;
+    (cur + delta).rem_euclid(n as i32) as usize
+}
+
 /// Current Unix time in seconds (0 on a clock before the epoch — informational only).
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -5191,7 +5338,7 @@ mod tests {
         CAT_GREEN, CAT_RED, CAT_YELLOW, Menu, MenuAction, build_command_line,
         detect_alt_screen_exit, extract_selection, filter_env, fuzzy_match, list_window_start,
         menu_origin, merge_env, sel_bounds, sel_cols, shell_quote, tab_window,
-        usage_threshold_color,
+        usage_threshold_color, wrap_page,
     };
     use crate::model::TerminalId;
     use crate::term::{CellColor, CellSnap, Snapshot};
@@ -5226,6 +5373,17 @@ mod tests {
             cells,
             cursor: (0, 0),
         }
+    }
+
+    #[test]
+    fn wrap_page_wraps_both_directions() {
+        assert_eq!(wrap_page(0, 1, 3), 1);
+        assert_eq!(wrap_page(2, 1, 3), 0); // forward past the end wraps to 0
+        assert_eq!(wrap_page(0, -1, 3), 2); // backward past 0 wraps to the end
+        assert_eq!(wrap_page(5, 1, 3), 0); // stale index clamped to 2, then +1 → 0
+        assert_eq!(wrap_page(1, 0, 3), 1);
+        assert_eq!(wrap_page(0, 1, 1), 0); // a single page stays put
+        assert_eq!(wrap_page(0, 1, 0), 0); // defensive: no pages
     }
 
     #[test]
