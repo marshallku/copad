@@ -279,7 +279,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         // supervisor too — second walk is cheap.
         if let bar = vc.statusBar, let client = daemonClient {
             let manifests = PluginManifestStore.discover()
-            bar.loadModules(manifests, daemonClient: client)
+            bar.loadModules(manifests, daemonClient: client, eventBus: eventBus)
         }
 
         startSocketServer()

@@ -32,6 +32,10 @@ final class StatusBarView: NSView {
     /// (push from plugin instead of poll) can target a specific module.
     /// Not used yet; kept so the API doesn't have to change later.
     private var labels: [String: NSTextField] = [:]
+    /// The pomodoro plugin's `timer` module is rendered as a native
+    /// event-driven ring (Phase 2) instead of the poll-text label, so it's
+    /// held separately for theme re-color + teardown.
+    private var pomodoroRing: PomodoroRingView?
     /// Retained so `applyTheme` can re-color it. Without this we'd have to
     /// walk `subviews` and identify the separator by frame/size — fragile.
     private let separator = NSView()
@@ -95,7 +99,11 @@ final class StatusBarView: NSView {
     /// Build module labels + start their runners. Called once at app launch
     /// from `TabViewController.loadView`. Each `LoadedPluginManifest` may
     /// contribute zero or more modules.
-    func loadModules(_ plugins: [LoadedPluginManifest], daemonClient: DaemonClient) {
+    func loadModules(
+        _ plugins: [LoadedPluginManifest],
+        daemonClient: DaemonClient,
+        eventBus: EventBus,
+    ) {
         var byZone: [String: [(plugin: LoadedPluginManifest, module: PluginModuleDef)]] = [
             "left": [], "center": [], "right": [],
         ]
@@ -109,6 +117,20 @@ final class StatusBarView: NSView {
             let entries = byZone[zone, default: []].sorted { $0.module.order < $1.module.order }
             let stack = stackForZone(zone)
             for (plugin, module) in entries {
+                // The pomodoro `timer` module gets a native ring, not a
+                // poll-text label — this REPLACES the module's text segment
+                // on macOS (Linux keeps the poll text). Match on both plugin
+                // AND module name so other pomodoro modules aren't captured.
+                if plugin.manifest.plugin.name == "pomodoro", module.name == "timer" {
+                    let ring = PomodoroRingView(
+                        theme: theme,
+                        daemonClient: daemonClient,
+                        eventBus: eventBus,
+                    )
+                    stack.addArrangedSubview(ring)
+                    pomodoroRing = ring
+                    continue
+                }
                 let label = NSTextField(labelWithString: "...")
                 label.textColor = theme.text.nsColor
                 label.font = .systemFont(ofSize: 12)
@@ -141,6 +163,8 @@ final class StatusBarView: NSView {
             r.stop()
         }
         runners.removeAll()
+        pomodoroRing?.stop()
+        pomodoroRing = nil
     }
 
     /// `statusbar.show/hide/toggle` socket commands route through this.
@@ -185,6 +209,7 @@ final class StatusBarView: NSView {
         for label in labels.values {
             label.textColor = newTheme.text.nsColor
         }
+        pomodoroRing?.applyTheme(newTheme)
     }
 
     private static func barBg(theme: CopadTheme, opacity: Double) -> CGColor {

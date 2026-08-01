@@ -160,6 +160,13 @@ pub struct PomodoroState {
     label: String,
     completed_work_rounds: u32,
     durations: Durations,
+    /// Full length of the CURRENTLY active phase, in millis (0 when Idle).
+    /// Stored rather than derived: `start(minutes)` can override the work
+    /// length and `set_durations` only affects future phases, so the
+    /// configured duration is not a reliable denominator for a progress
+    /// ring. Set when a phase begins, preserved across pause/resume, cleared
+    /// on idle/reset.
+    current_phase_total_ms: u64,
 }
 
 impl PomodoroState {
@@ -171,6 +178,7 @@ impl PomodoroState {
             label: String::new(),
             completed_work_rounds: 0,
             durations,
+            current_phase_total_ms: 0,
         }
     }
 
@@ -199,6 +207,7 @@ impl PomodoroState {
         self.phase = Phase::Work;
         self.ends_at_ms = Some(now_ms.saturating_add(dur_ms));
         self.paused_remaining_ms = None;
+        self.current_phase_total_ms = dur_ms;
         if let Some(l) = label {
             self.label = sanitize_label(l);
         }
@@ -258,6 +267,7 @@ impl PomodoroState {
         self.phase = Phase::Idle;
         self.ends_at_ms = None;
         self.paused_remaining_ms = None;
+        self.current_phase_total_ms = 0;
         self.label.clear();
         self.completed_work_rounds = 0;
     }
@@ -296,6 +306,7 @@ impl PomodoroState {
                 // (laptop suspend) does not double-expire it.
                 self.ends_at_ms = Some(now_ms.saturating_add(dur_ms));
                 self.paused_remaining_ms = None;
+                self.current_phase_total_ms = dur_ms;
                 Some(Transition {
                     toast_title: "Pomodoro — work done".to_string(),
                     toast_body: with_label(&format!("Time for a {kind} break"), &self.label),
@@ -306,6 +317,7 @@ impl PomodoroState {
                 self.phase = Phase::Idle;
                 self.ends_at_ms = None;
                 self.paused_remaining_ms = None;
+                self.current_phase_total_ms = 0;
                 if was_long {
                     // A long break closes the set.
                     self.completed_work_rounds = 0;
@@ -369,6 +381,9 @@ impl PomodoroState {
             "ends_at_ms": self.ends_at_ms,
             "paused": self.is_paused(),
             "remaining_ms": self.remaining_ms(now_ms),
+            // Full length of the active phase (0 when idle) — the GUI ring's
+            // denominator for its progress fraction.
+            "phase_total_ms": self.current_phase_total_ms,
             "label": self.label,
             "round": self.completed_work_rounds,
             "rounds_before_long": self.durations.rounds_before_long,
@@ -599,6 +614,26 @@ mod tests {
         assert!(s.is_paused());
         s.toggle(T0); // paused -> resume
         assert!(!s.is_paused());
+    }
+
+    #[test]
+    fn phase_total_ms_tracks_actual_phase_length() {
+        let mut s = state();
+        // Overridden work length is the stored total, not the configured 25.
+        s.start(T0, Some(10), None).unwrap();
+        assert_eq!(s.event_payload(T0)["phase_total_ms"], 10 * 60_000);
+        // Transition to a short break: total becomes the break length.
+        let end = T0 + 10 * 60_000;
+        s.tick_if_due(end).unwrap();
+        assert_eq!(s.event_payload(end)["phase_total_ms"], 5 * 60_000);
+        // Preserved across pause.
+        s.pause(end + 60_000);
+        assert_eq!(s.event_payload(end + 60_000)["phase_total_ms"], 5 * 60_000);
+        // Cleared on idle after the break completes.
+        s.resume(end + 60_000);
+        let be = end + 60_000 + s.remaining_ms(end + 60_000);
+        s.tick_if_due(be).unwrap();
+        assert_eq!(s.event_payload(be)["phase_total_ms"], 0);
     }
 
     #[test]

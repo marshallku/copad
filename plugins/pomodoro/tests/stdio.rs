@@ -137,6 +137,7 @@ fn start_status_pause_resume_reset() {
     );
     let r = h.response("s1");
     assert_eq!(r["result"]["phase"], "work");
+    assert_eq!(r["result"]["phase_total_ms"], 25 * 60_000);
     let text = r["result"]["text"].as_str().unwrap();
     assert!(text.starts_with("🍅 25:00"), "text was {text:?}");
     assert!(text.contains("refactor"));
