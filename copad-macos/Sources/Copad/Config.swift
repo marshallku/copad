@@ -169,66 +169,144 @@ struct CopadConfig {
         return try parse(contents)
     }
 
-    /// Decode a TOML config string into CopadConfig. Throws on
-    /// malformed input; the parse error is written to stderr so the
-    /// user sees the line/column. Unknown sections (e.g. `[[triggers]]`,
-    /// `[keybindings]`, `[statusbar]` from the Linux schema) are
-    /// tolerated — we only decode the fields the macOS app currently
-    /// uses, and the rest stay intact for future parity work.
+    /// Decode a TOML config string into CopadConfig. Throws only on a genuine
+    /// TOML *syntax* error (an unparseable file); the error is written to stderr
+    /// so the user sees the line/column. Unknown sections (e.g. `[[triggers]]`,
+    /// `[keybindings]` from the Linux schema) are tolerated — we only read the
+    /// fields the macOS app currently uses, and the rest stay intact for future
+    /// parity work.
+    ///
+    /// Fields are read directly off the raw `TOMLTable` rather than strict-decoded
+    /// into a Codable struct. This is deliberate, and both reasons were learned
+    /// the hard way:
+    ///   1. **Type coercion.** TOMLKit's strict decoder rejects an integer literal
+    ///      for a `Double` field (`tint = 0` instead of `0.0`) and throws. That
+    ///      throw USED to discard the ENTIRE config and silently fall back to
+    ///      defaults — whose font is a non-Nerd family, so every glyph icon
+    ///      rendered as tofu. Linux/serde coerces int→float, so a shared dotfiles
+    ///      config that worked on Linux broke only on macOS. `tomlDouble`/`tomlInt`
+    ///      coerce across TOML's number types the same way serde does.
+    ///   2. **Graceful degradation.** Strict decoding is all-or-nothing: one bad
+    ///      field nuked every other setting. Per-field reads fall back to that
+    ///      field's own default and preserve the rest of the config.
+    /// If you must diagnose a config, `comux doctor` lints these exact issues.
     static func parse(_ contents: String) throws -> CopadConfig {
-        let decoder = TOMLDecoder()
-        let raw: RawConfig
+        let table: TOMLTable
         do {
-            raw = try decoder.decode(RawConfig.self, from: contents)
+            table = try TOMLTable(string: contents)
         } catch {
-            let msg = "[copad] config.toml parse failed: \(error.localizedDescription)\n"
+            let msg = "[copad] config.toml parse failed (syntax error): "
+                + "\(error.localizedDescription)\n"
             FileHandle.standardError.write(Data(msg.utf8))
             throw error
         }
 
-        let defaults = CopadConfig.defaults
-        let bgImage = raw.background?.path ?? raw.background?.image
+        let d = CopadConfig.defaults
+        let terminal = table["terminal"]?.table
+        let theme = table["theme"]?.table
+        let background = table["background"]?.table
+        let security = table["security"]?.table
+        let renderer = table["renderer"]?.table
+        let window = table["window"]?.table
+        let tabs = table["tabs"]?.table
+        let statusbar = table["statusbar"]?.table
+
+        let bgImage = tomlString(background, "path") ?? tomlString(background, "image")
         let bgPath: String? = if let bgImage, !bgImage.isEmpty { expandTilde(bgImage) } else { nil }
+        let osc52 = tomlString(security, "osc52").flatMap(OSC52Policy.init(rawValue:))
 
         return CopadConfig(
-            shell: raw.terminal?.shell ?? defaults.shell,
-            fontFamily: raw.terminal?.fontFamily ?? defaults.fontFamily,
-            fontSize: raw.terminal?.fontSize ?? defaults.fontSize,
-            optionAsAlt: raw.terminal?.optionAsAlt ?? defaults.optionAsAlt,
-            forceMetaKeys: raw.terminal?.forceMetaKeys ?? defaults.forceMetaKeys,
-            closeOnExit: raw.terminal?.closeOnExit ?? defaults.closeOnExit,
-            themeName: raw.theme?.name ?? defaults.themeName,
+            shell: tomlString(terminal, "shell") ?? d.shell,
+            fontFamily: tomlString(terminal, "font_family") ?? d.fontFamily,
+            fontSize: tomlInt(terminal, "font_size") ?? d.fontSize,
+            optionAsAlt: tomlBool(terminal, "option_as_alt") ?? d.optionAsAlt,
+            forceMetaKeys: tomlStringArray(terminal, "force_meta_keys") ?? d.forceMetaKeys,
+            closeOnExit: tomlBool(terminal, "close_on_exit") ?? d.closeOnExit,
+            themeName: tomlString(theme, "name") ?? d.themeName,
             backgroundPath: bgPath,
-            backgroundTint: clamp01(raw.background?.tint ?? defaults.backgroundTint),
-            backgroundOpacity: clamp01(raw.background?.opacity ?? defaults.backgroundOpacity),
-            rotateInterval: raw.background?.rotateInterval ?? defaults.rotateInterval,
-            osc52: raw.security?.osc52 ?? defaults.osc52,
+            backgroundTint: clamp01(tomlDouble(background, "tint") ?? d.backgroundTint),
+            backgroundOpacity: clamp01(tomlDouble(background, "opacity") ?? d.backgroundOpacity),
+            rotateInterval: tomlInt(background, "rotate_interval").map { UInt(max(0, $0)) }
+                ?? d.rotateInterval,
+            osc52: osc52 ?? d.osc52,
             // Smart default: a wallpaper config implies the user wants
             // to see the wallpaper, so default to transparent-default-
             // bg unless they explicitly say otherwise. Without this the
             // alacritty backend's opaque-default-fill design means the
             // wallpaper is invisible to anyone who didn't separately
             // know to set `[renderer] transparent_default_bg = true`.
-            transparentDefaultBg: raw.renderer?.transparentDefaultBg
-                ?? (bgPath != nil ? true : defaults.transparentDefaultBg),
-            rendererGPU: raw.renderer?.gpu ?? defaults.rendererGPU,
-            windowOpacity: clamp01(raw.window?.opacity ?? defaults.windowOpacity),
-            windowBlur: raw.window?.blur ?? defaults.windowBlur,
-            tabsPosition: raw.tabs?.position.map(TabsPosition.parse) ?? defaults.tabsPosition,
+            transparentDefaultBg: tomlBool(renderer, "transparent_default_bg")
+                ?? (bgPath != nil ? true : d.transparentDefaultBg),
+            rendererGPU: tomlBool(renderer, "gpu") ?? d.rendererGPU,
+            windowOpacity: clamp01(tomlDouble(window, "opacity") ?? d.windowOpacity),
+            windowBlur: tomlBool(window, "blur") ?? d.windowBlur,
+            tabsPosition: tomlString(tabs, "position").map(TabsPosition.parse) ?? d.tabsPosition,
             // Clamp the layout boundary: a vertical tab pill is `barWidth - 8`
             // wide, so a width below the 8px inset yields a negative
             // (unsatisfiable) constraint, and anything under `collapsedBarWidth`
             // (44) makes the expanded bar narrower than its collapsed state.
             // Floor to the minimum usable width (matches the horizontal min pill).
-            tabsWidth: max(CopadConfig.minTabsWidth, raw.tabs?.width ?? defaults.tabsWidth),
+            tabsWidth: max(CopadConfig.minTabsWidth, tomlInt(tabs, "width") ?? d.tabsWidth),
             statusBar: StatusBarConfig(
-                enabled: raw.statusbar?.enabled ?? defaults.statusBar.enabled,
-                position: raw.statusbar?.position ?? defaults.statusBar.position,
-                height: raw.statusbar?.height ?? defaults.statusBar.height,
+                enabled: tomlBool(statusbar, "enabled") ?? d.statusBar.enabled,
+                position: tomlString(statusbar, "position") ?? d.statusBar.position,
+                height: tomlInt(statusbar, "height") ?? d.statusBar.height,
             ),
             keybindings: parseKeybindings(from: contents),
             triggers: parseTriggersArray(from: contents),
         )
+    }
+
+    // MARK: - Lenient TOML field reads
+    //
+    // Read a single field off a section table, coercing across TOML's number
+    // types the way serde does on Linux, so a shared config behaves identically
+    // on both platforms. A missing OR wrong-typed field returns nil, letting the
+    // caller fall back to that field's own default instead of aborting the whole
+    // parse. See `parse(_:)` for why this replaced strict Codable decoding.
+
+    private static func tomlString(_ table: TOMLTable?, _ key: String) -> String? {
+        table?[key]?.string
+    }
+
+    private static func tomlBool(_ table: TOMLTable?, _ key: String) -> Bool? {
+        table?[key]?.bool
+    }
+
+    /// Prefer an integer; tolerate a float literal (`font_size = 14.0`) by
+    /// truncating. TOMLKit reports exactly one of `.int`/`.double` per value.
+    /// `Int(exactly:)` (not `Int(_:)`) is deliberate: a raw `Int(dbl)` traps on
+    /// `nan`/`inf`/out-of-range floats — all representable in TOML — which would
+    /// turn one malformed field into a crash instead of a per-field fallback.
+    private static func tomlInt(_ table: TOMLTable?, _ key: String) -> Int? {
+        guard let v = table?[key] else { return nil }
+        if let i = v.int { return i }
+        if let dbl = v.double { return Int(exactly: dbl.rounded(.towardZero)) }
+        return nil
+    }
+
+    /// Prefer a float; tolerate an integer literal (`tint = 0`) by widening —
+    /// this is the coercion whose absence broke the whole config on macOS.
+    private static func tomlDouble(_ table: TOMLTable?, _ key: String) -> Double? {
+        guard let v = table?[key] else { return nil }
+        if let dbl = v.double { return dbl }
+        if let i = v.int { return Double(i) }
+        return nil
+    }
+
+    /// A homogeneous string array, or nil. If ANY element is not a string the
+    /// whole field is treated as malformed and returns nil (→ the caller's
+    /// default) rather than silently dropping bad elements — otherwise
+    /// `force_meta_keys = [1]` would collapse to `[]` and disable the default
+    /// binding instead of falling back to it. An explicit `[]` is honored.
+    private static func tomlStringArray(_ table: TOMLTable?, _ key: String) -> [String]? {
+        guard let arr = table?[key]?.array else { return nil }
+        var result: [String] = []
+        for element in arr {
+            guard let s = element.string else { return nil }
+            result.append(s)
+        }
+        return result
     }
 
     /// JSON-friendly trigger list ready to ship through `CopadEngine.setTriggers`.
@@ -355,97 +433,10 @@ struct CopadConfig {
     }
 }
 
-// MARK: - Decodable shadow types
-
-/// TOML shape for the macOS-relevant subset of the shared config schema. Sections
-/// we don't decode yet (`[tabs]`, `[statusbar]`, `[keybindings]`, `[[triggers]]`)
-/// are silently dropped — TOML decoding ignores unknown keys at the top level, so
-/// users can keep their full Linux-shape config and the macOS app just picks out
-/// what it understands. TOMLKit 0.6 has no `keyDecodingStrategy`, so snake_case
-/// keys need explicit `CodingKeys`.
-private struct RawConfig: Decodable {
-    var terminal: TerminalSection?
-    var theme: ThemeSection?
-    var background: BackgroundSection?
-    var security: SecuritySection?
-    var renderer: RendererSection?
-    var window: WindowSection?
-    var tabs: TabsSection?
-    var statusbar: StatusBarSection?
-}
-
-private struct WindowSection: Decodable {
-    var opacity: Double?
-    var blur: Bool?
-}
-
-private struct RendererSection: Decodable {
-    /// Stale-config tolerance: Phase 10b removed the SwiftTerm
-    /// backend, but configs that still carry `[renderer] backend =
-    /// "swiftterm"` should parse cleanly. The value is read into this
-    /// field and ignored — `makeTerminalPanel` always constructs an
-    /// alacritty controller now.
-    var backend: String?
-    var transparentDefaultBg: Bool?
-    var gpu: Bool?
-
-    enum CodingKeys: String, CodingKey {
-        case backend
-        case transparentDefaultBg = "transparent_default_bg"
-        case gpu
-    }
-}
-
-private struct StatusBarSection: Decodable {
-    var enabled: Bool?
-    var position: String?
-    var height: Int?
-}
-
-private struct TabsSection: Decodable {
-    var position: String?
-    var width: Int?
-    // Linux schema also has `collapsed`; not consumed on macOS yet.
-}
-
-private struct TerminalSection: Decodable {
-    var shell: String?
-    var fontFamily: String?
-    var fontSize: Int?
-    var optionAsAlt: Bool?
-    var forceMetaKeys: [String]?
-    var closeOnExit: Bool?
-
-    enum CodingKeys: String, CodingKey {
-        case shell
-        case fontFamily = "font_family"
-        case fontSize = "font_size"
-        case optionAsAlt = "option_as_alt"
-        case forceMetaKeys = "force_meta_keys"
-        case closeOnExit = "close_on_exit"
-    }
-}
-
-private struct ThemeSection: Decodable {
-    var name: String?
-}
-
-private struct BackgroundSection: Decodable {
-    var path: String?
-    var image: String?
-    var tint: Double?
-    var opacity: Double?
-    var rotateInterval: UInt?
-
-    enum CodingKeys: String, CodingKey {
-        case path
-        case image
-        case tint
-        case opacity
-        case rotateInterval = "rotate_interval"
-    }
-}
-
-private struct SecuritySection: Decodable {
-    var osc52: OSC52Policy?
-}
+// Note: the former private `RawConfig`/`*Section` Codable shadow structs were
+// removed when `parse(_:)` switched to lenient per-field `TOMLTable` reads. A
+// single field with the wrong TOML number type (e.g. `tint = 0` for a Double)
+// made the strict decoder throw and discard the entire config; the per-field
+// reader coerces and degrades gracefully instead. `OSC52Policy` and
+// `TabsPosition` remain as `Decodable` enums but are now decoded from a raw
+// string via their `init(rawValue:)` / `parse(_:)` helpers, not a struct.

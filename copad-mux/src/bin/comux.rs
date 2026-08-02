@@ -5,6 +5,7 @@
 //!   comux server             run the headless server in the foreground
 //!   comux server <sub>       manage the persistent server: start|stop|restart|status
 //!   comux ctl <cmd> …        control the running server (explicit form)
+//!   comux doctor [--json]    diagnose config problems (runs locally, no server)
 //!   comux <cmd> …            shorthand: any other verb is a control command, so
 //!                            `comux new-session work` == `comux ctl new-session work`
 //!
@@ -35,6 +36,7 @@ fn print_usage() {
          \x20 comux split -h|-v           split the focused pane\n\
          \x20 comux worktree create <br>  git worktree + a session in it (also list|rm)\n\
          \x20 comux reload                re-read mux.toml on the live server (tmux source-file)\n\
+         \x20 comux doctor [--json]       diagnose config problems (mux.toml + config.toml)\n\
          \x20 comux server restart        stop + restart the server (restores the workspace)\n\
          \x20 comux kill-server           stop the server\n\
          \n\
@@ -54,6 +56,9 @@ fn main() {
             Some(sub) => std::process::exit(copad_mux::control::run_server_admin(sub)),
         },
         Some("attach") | Some("run") | None => copad_mux::client::run(),
+        // `doctor` is a local diagnostic — it must run without (and report on) the
+        // server, so it's dispatched here rather than through the control client.
+        Some("doctor") => std::process::exit(copad_mux::doctor::run(&args[1..])),
         Some("help" | "-h" | "--help") => {
             print_usage();
             std::process::exit(0);

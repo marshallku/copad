@@ -14,6 +14,7 @@ pub mod agentstate;
 pub mod client;
 pub mod config;
 pub mod control;
+pub mod doctor;
 pub mod gitinfo;
 pub mod model;
 pub mod notify;

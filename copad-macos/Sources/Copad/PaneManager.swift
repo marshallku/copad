@@ -168,8 +168,8 @@ final class PaneManager {
 
     /// Factory: construct the terminal renderer. Phase 10b removed
     /// the SwiftTerm fallback — alacritty is the only macOS backend
-    /// now. Stale `[renderer] backend = "swiftterm"` config keys are
-    /// parsed but ignored (see `RendererSection.backend`).
+    /// now. A stale `[renderer] backend = "swiftterm"` config key is
+    /// simply never read by `CopadConfig.parse`, so it's tolerated.
     static func makeTerminalPanel(
         config: CopadConfig,
         theme: CopadTheme,
