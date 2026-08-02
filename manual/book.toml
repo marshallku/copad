@@ -1,0 +1,32 @@
+[book]
+title = "copad Manual"
+description = "User manual for copad — a cross-platform terminal built for orchestrating AI agents (copad · comux · coctl)."
+authors = ["Marshall Ku"]
+language = "en"
+src = "src"
+
+[rust]
+edition = "2024"
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/marshallku/copad"
+edit-url-template = "https://github.com/marshallku/copad/edit/master/manual/{path}"
+site-url = "/copad/"
+no-section-label = false
+
+[output.html.playground]
+runnable = false
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 30
+use-boolean-and = true
+boost-title = 2
+boost-hierarchy = 2
+boost-paragraph = 1
