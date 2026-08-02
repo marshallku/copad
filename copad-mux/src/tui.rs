@@ -1766,6 +1766,27 @@ impl App {
                     .or_else(|| self.focused_cwd());
                 self.worktree_rm(target, *force, *delete_branch, start)
             }
+            Req::ReloadConfig => {
+                // Re-read mux.toml and swap the whole config (tmux `source-file`). Every
+                // live-read field takes effect on the next frame because rendering/input
+                // read straight off `self.cfg`: keymap, mouse, sidebar_width, all usage_*,
+                // tab_labels, notify, scroll_step, sort_by, worktree — and ALSO
+                // restore_processes/restore_agent_sessions, which are read at SAVE time
+                // (see `snapshot_*` at ~3300), so a reloaded restore list governs the next
+                // autosave/shutdown-save. The genuinely frozen fields are the ones whose
+                // runtime copy lives OUTSIDE `self.cfg`: update_environment (a destructive
+                // one-time daemon env-scrub + per-connection frozen env) and the
+                // persistence toggle/cadence (persist/autosave_secs captured into run()
+                // loop vars) — hence the restart hint in the message. The live
+                // sidebar-visibility toggle (`self.sidebar`) is intentionally left alone so
+                // a reload never yanks a sidebar the user toggled with Ctrl-b s.
+                let (cfg, warnings) = crate::config::MuxConfig::load();
+                self.cfg = cfg;
+                Resp::message(reload_note(
+                    &crate::config::MuxConfig::config_path(),
+                    &warnings,
+                ))
+            }
             // Intercepted by the server before it reaches here; answered ok for a
             // (hypothetical) direct call so the match stays exhaustive.
             Req::KillServer => Resp::ok(),
@@ -4880,6 +4901,25 @@ fn clip_chip(name: &str) -> String {
     out
 }
 
+/// The human outcome message for a `reload` (tmux `source-file`): the reloaded path,
+/// any parse warnings (one per line), and the standing reminder that server-lifetime
+/// settings still need a restart. Pure so it can be asserted without spawning a server.
+fn reload_note(path: &std::path::Path, warnings: &[String]) -> String {
+    let mut msg = format!("reloaded {}", path.display());
+    if !warnings.is_empty() {
+        msg.push_str("\n  warnings:");
+        for w in warnings {
+            msg.push_str("\n    ");
+            msg.push_str(w);
+        }
+    }
+    msg.push_str(
+        "\n  note: environment refresh and the persistence toggle/cadence (persist, \
+         autosave_secs) are fixed at server start — run `comux server restart` to change those",
+    );
+    msg
+}
+
 /// Cheap gate for the usage carousel's auto-rotate: is it enabled and has the
 /// interval elapsed? `secs == 0` means off. Kept separate (and pure) so the hot
 /// 30 fps render tick avoids recomputing the page list until the interval is due.
@@ -5377,8 +5417,8 @@ mod tests {
     use super::{
         CAT_GREEN, CAT_RED, CAT_YELLOW, Menu, MenuAction, build_command_line,
         detect_alt_screen_exit, extract_selection, filter_env, fuzzy_match, list_window_start,
-        menu_origin, merge_env, sel_bounds, sel_cols, shell_quote, tab_window, usage_should_roll,
-        usage_threshold_color, wrap_page,
+        menu_origin, merge_env, reload_note, sel_bounds, sel_cols, shell_quote, tab_window,
+        usage_should_roll, usage_threshold_color, wrap_page,
     };
     use crate::model::TerminalId;
     use crate::term::{CellColor, CellSnap, Snapshot};
@@ -5413,6 +5453,28 @@ mod tests {
             cells,
             cursor: (0, 0),
         }
+    }
+
+    #[test]
+    fn reload_note_reports_path_warnings_and_restart_hint() {
+        let path = std::path::Path::new("/home/u/.config/copad/mux.toml");
+        // Clean reload: path + restart hint, no warnings block.
+        let clean = reload_note(path, &[]);
+        assert!(clean.starts_with("reloaded /home/u/.config/copad/mux.toml"));
+        assert!(!clean.contains("warnings:"));
+        assert!(clean.contains("comux server restart"));
+        // With warnings: each is listed under a warnings header, hint still present.
+        let warned = reload_note(
+            path,
+            &[
+                "bad chord 'Ctrl-'".to_string(),
+                "sidebar_width out of range".to_string(),
+            ],
+        );
+        assert!(warned.contains("\n  warnings:"));
+        assert!(warned.contains("bad chord 'Ctrl-'"));
+        assert!(warned.contains("sidebar_width out of range"));
+        assert!(warned.contains("comux server restart"));
     }
 
     #[test]

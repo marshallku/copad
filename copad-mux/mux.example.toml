@@ -5,6 +5,14 @@
 # about on startup (foreground `copad-mux server`, or the client at attach) and fall
 # back to their default, so a typo never breaks the mux.
 #
+# APPLYING CHANGES: run `comux reload` (alias `comux source-file`) to re-read this file on
+# the running server WITHOUT a restart (tmux `source-file`) — keybindings, mouse, sidebar
+# width, the usage/tab-label display, notify, worktree config, and the restore lists
+# (`restore_processes`/`restore_agent_sessions`, applied on the next save) take effect
+# without a restart, and any parse warnings are printed. Only `update_environment` and the
+# persistence toggle/cadence (`persist`, `autosave_secs`) are fixed at server start; changing
+# those still needs `comux server restart`.
+#
 # Chord syntax (tmux-like): `C-` = Ctrl, `M-` = Alt/Meta (Option on macOS), `S-` = Shift.
 #   examples: "C-b", "M-1", "C-S-h", "%", "Left", "Enter", "X"
 # A letter's case implies Shift ("X" == "S-x"). `M-…` needs the terminal to send

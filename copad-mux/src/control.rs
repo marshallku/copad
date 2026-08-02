@@ -93,6 +93,13 @@ pub enum Req {
         #[serde(default)]
         cwd: Option<String>,
     },
+    /// Re-read `mux.toml` and apply the live-reloadable settings to the running server
+    /// WITHOUT restarting it — like tmux `source-file`. Keybindings, mouse, sidebar
+    /// width, usage/tab-label display, notify, and worktree config take effect on the
+    /// next frame. Settings baked in at server start (environment refresh, persistence
+    /// cadence, restore lists) are NOT changed — those still need `comux server restart`.
+    /// `Resp.message` carries the config path + any parse warnings + the restart hint.
+    ReloadConfig,
     /// Shut the persistent server down (drops every shell). The only key-free way to
     /// stop a detached server short of exiting its last shell.
     KillServer,
@@ -301,13 +308,14 @@ pub fn run_client(args: &[String]) -> i32 {
             "usage: comux <list|split|resize|focus|close|send|list-tabs|new-tab|select-tab|\
              rename-tab [index] <name>|list-sessions|new-session [name]|\
              rename-session [index] <name>|select-session|\
-             worktree <create|list|rm>|kill-server> [args]"
+             worktree <create|list|rm>|reload|kill-server> [args]"
         );
         return 2;
     };
 
     let req = match cmd {
         "list" => Req::List,
+        "reload" | "source-file" => Req::ReloadConfig,
         "kill-server" => Req::KillServer,
         "list-tabs" | "tabs" => Req::ListTabs,
         "new-tab" => Req::NewTab,
@@ -682,7 +690,12 @@ fn print_human(req: &Req, resp: &Resp) {
                 );
             }
         }
-        _ => println!("ok"),
+        // Message-carrying verbs (e.g. `reload`) print their outcome; everything else
+        // just confirms with `ok`.
+        _ => match &resp.message {
+            Some(m) => println!("{m}"),
+            None => println!("ok"),
+        },
     }
 }
 
