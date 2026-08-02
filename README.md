@@ -10,7 +10,7 @@ copad is a cross-platform terminal emulator built on a shared Rust core with pla
 ![Platforms](https://img.shields.io/badge/platforms-Linux%20%C2%B7%20macOS%20%C2%B7%20iOS-blue)
 ![Core](https://img.shields.io/badge/core-Rust%20edition%202024-orange)
 
-**[Install](#install) · [Just comux](#just-comux-the-multiplexer-standalone) · [Configuration](#configuration) · [Docs](#documentation)**
+**[Manual](https://copad.marshallku.dev) · [Install](#install) · [Just comux](#just-comux-the-multiplexer-standalone) · [Configuration](#configuration) · [Docs](#documentation)**
 
 ## Highlights
 
@@ -321,7 +321,9 @@ copad/
 
 ## Documentation
 
-Start at [`docs/INDEX.md`](./docs/INDEX.md). Highlights:
+**New here? Read the [user manual](https://copad.marshallku.dev)** — install, configuration, and full command references for `copad`, `comux`, and `coctl`, with examples.
+
+The docs below are developer-oriented internals. Start at [`docs/INDEX.md`](./docs/INDEX.md). Highlights:
 
 - [`architecture.md`](./docs/architecture.md) — crate layout, socket protocol, panel system
 - [`workflow-runtime.md`](./docs/workflow-runtime.md) — Event Bus, Action Registry, Context Service, triggers

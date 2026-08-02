@@ -13,7 +13,8 @@ default-theme = "navy"
 preferred-dark-theme = "navy"
 git-repository-url = "https://github.com/marshallku/copad"
 edit-url-template = "https://github.com/marshallku/copad/edit/master/manual/{path}"
-site-url = "/copad/"
+site-url = "/"
+cname = "copad.marshallku.dev"
 no-section-label = false
 
 [output.html.playground]
