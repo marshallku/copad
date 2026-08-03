@@ -332,7 +332,7 @@ pub fn run() -> io::Result<()> {
         // starved by sustained frame output. Non-blocking (a suspended client can't stall us):
         // on `Full` it retries next loop; a delivered copy just delays that client's frame by
         // one tick (which then re-sends as a normal delta).
-        drain_pending_copies(&mut clients);
+        drain_pending_copies(&mut app, &mut clients);
         if dirty && last_frame.elapsed() >= FRAME_INTERVAL {
             last_frame = Instant::now();
             last_min = min;
@@ -737,10 +737,48 @@ fn handle_incoming(
     }
 }
 
+/// Remove clients whose writer thread has gone away (their `out` channel reported
+/// `Disconnected`), clean up any overlays they still owned, and re-fit the viewport.
+///
+/// This is the recovery for a HALF-DEAD connection: when a client's socket dies such
+/// that writes fail but the reader thread stays blocked in `read_line` (no EOF), the
+/// `Disconnect` message from `serve_client` never arrives. Without this, the dead client
+/// lingers in `clients` and its (often smaller) size permanently pins `recompute_viewport`'s
+/// `min()`, so the shared view can never grow past the stale client — the very bug this fixes.
+/// A `Disconnected` sender is an unambiguous signal: the writer thread only ends on a write
+/// failure or after sending `Bye` (a clean detach, which already removed the client), so
+/// pruning here is always correct.
+fn prune_dead_clients(app: &mut App, clients: &mut Vec<Client>, dead: &[u64]) -> bool {
+    if dead.is_empty() {
+        return false;
+    }
+    // Tear each dead client DOWN via `detach_client` (socket `shutdown`), not a bare drop:
+    // the matching reader thread in `serve_client` holds its OWN dup of the socket, so
+    // dropping only the server's `conn` clone leaves it blocked forever in `read_line` on
+    // the half-dead fd (a thread leak). `shutdown(Both)` unblocks it so it exits — its late
+    // `Disconnect` then finds no client and is a harmless no-op. The `Bye` try_send inside
+    // `detach_client` also just fails (the channel is already `Disconnected`), which is fine.
+    let mut i = 0;
+    while i < clients.len() {
+        if dead.contains(&clients[i].id) {
+            let c = clients.remove(i);
+            // Drop any drag-selection / context menu the departing client owned.
+            app.clear_selection_of(ClientId(c.id));
+            app.close_menu_of(ClientId(c.id));
+            detach_client(c);
+        } else {
+            i += 1;
+        }
+    }
+    recompute_viewport(app, clients);
+    true
+}
+
 /// Try to deliver each client's pending drag-selection copy (OSC 52) without blocking. The
 /// frame channel is cap-1 and shared with frames, so a `Copy` can transiently fail to enqueue;
-/// leave it pending (retry next tick) on `Full`, clear it on success, drop it on disconnect.
-fn drain_pending_copies(clients: &mut [Client]) {
+/// leave it pending (retry next tick) on `Full`, prune the client on `Disconnected`.
+fn drain_pending_copies(app: &mut App, clients: &mut Vec<Client>) {
+    let mut dead = Vec::new();
     for c in clients.iter_mut() {
         let Some(text) = c.pending_copy.take() else {
             continue;
@@ -748,16 +786,17 @@ fn drain_pending_copies(clients: &mut [Client]) {
         match c.out.try_send(ServerMsg::Copy { text: text.clone() }) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => c.pending_copy = Some(text), // retry next loop
-            Err(TrySendError::Disconnected(_)) => {}                   // gone; drop it
+            Err(TrySendError::Disconnected(_)) => dead.push(c.id),     // writer gone; prune
         }
     }
+    prune_dead_clients(app, clients, &dead);
 }
 
 /// Render the app ONCE and broadcast the changed cells (or a full baseline) to every
 /// attached client — each diffed against its OWN last-sent buffer, so a freshly
 /// attached client gets a full frame while up-to-date ones get small deltas. No-op
 /// with no clients (the server renders only for someone watching).
-fn push_frames(app: &mut App, clients: &mut [Client]) {
+fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
     if clients.is_empty() {
         return;
     }
@@ -766,6 +805,7 @@ fn push_frames(app: &mut App, clients: &mut [Client]) {
     let mut buf = Buffer::empty(area);
     let cursor = app.render_to(&mut buf).map(|p| (p.x, p.y));
 
+    let mut dead = Vec::new();
     for c in clients.iter_mut() {
         if c.last.area != area {
             c.last = Buffer::empty(area);
@@ -812,15 +852,97 @@ fn push_frames(app: &mut App, clients: &mut [Client]) {
             Err(TrySendError::Full(_)) => {
                 c.pending = true;
             }
-            Err(TrySendError::Disconnected(_)) => {}
+            // The writer thread is gone: the socket died with writes failing while the
+            // reader thread stayed blocked (no `Disconnect` will arrive). Prune it below so
+            // its size stops pinning the shared viewport.
+            Err(TrySendError::Disconnected(_)) => dead.push(c.id),
         }
     }
+    prune_dead_clients(app, clients, &dead);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::ctl_mutates;
+    use super::{Client, ctl_mutates, push_frames};
+    use crate::config::MuxConfig;
     use crate::control::Req;
+    use crate::proto::ServerMsg;
+    use crate::tui::App;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect as RRect;
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+
+    /// Keeps the peer ends of a test client's channel + socket alive: while held the frame
+    /// sender stays connected, so a client is "live"; dropping the guard closes the receiver
+    /// and its `out` sender reports `Disconnected` on the next send — a half-dead connection
+    /// whose writer thread has gone away.
+    struct ClientGuard {
+        _rx: mpsc::Receiver<ServerMsg>,
+        _peer: UnixStream,
+    }
+
+    /// Build a minimal `Client` at `(cols, rows)` plus its liveness guard. Drop the guard
+    /// to simulate the writer thread dying (frame receiver gone) without an EOF/`Disconnect`.
+    fn test_client(id: u64, cols: u16, rows: u16) -> (Client, ClientGuard) {
+        let (out, rx) = mpsc::sync_channel::<ServerMsg>(1);
+        let (conn, peer) = UnixStream::pair().expect("socketpair");
+        let client = Client {
+            id,
+            out,
+            conn,
+            last: Buffer::empty(RRect::new(0, 0, cols.max(1), rows.max(1))),
+            needs_full: true,
+            pending: false,
+            last_cursor: None,
+            prefix: false,
+            epoch: 0,
+            cols,
+            rows,
+            env: Vec::new(),
+            pending_copy: None,
+        };
+        (
+            client,
+            ClientGuard {
+                _rx: rx,
+                _peer: peer,
+            },
+        )
+    }
+
+    #[test]
+    fn dead_client_is_pruned_so_the_viewport_can_grow() {
+        // Regression: a half-dead client (writer gone, no `Disconnect`) used to linger in
+        // the client list and pin `recompute_viewport`'s `min()` at its small size forever,
+        // so the shared view could never grow. `push_frames` must now prune it on the
+        // `Disconnected` send and re-fit to the remaining (larger) client.
+        // A non-existent path yields the built-in defaults (the private `default()` isn't
+        // reachable here); persistence off so we boot a fresh workspace and never restore
+        // the user's saved sessions.
+        let (mut cfg, _) = MuxConfig::load_from(std::path::Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false;
+        let mut app = App::new(80, 24, Vec::new(), Vec::new(), cfg).expect("app");
+
+        // A live client that wants a big view, and a dead one stuck at a small size.
+        let (big, _big_guard) = test_client(1, 200, 60);
+        let (small, small_guard) = test_client(2, 80, 24);
+        drop(small_guard); // the small client's writer is gone — it's now half-dead
+        let mut clients = vec![big, small];
+
+        super::recompute_viewport(&mut app, &mut clients);
+        assert_eq!(app.size(), (80, 24), "the small dead client pins the min");
+
+        push_frames(&mut app, &mut clients);
+
+        assert_eq!(clients.len(), 1, "the dead client is pruned");
+        assert_eq!(clients[0].id, 1);
+        assert_eq!(
+            app.size(),
+            (200, 60),
+            "the viewport grows to the surviving client"
+        );
+    }
 
     #[test]
     fn read_only_ctl_requests_do_not_force_a_render() {
