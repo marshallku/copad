@@ -309,13 +309,15 @@ pub fn run() -> io::Result<()> {
         dirty |= app.maybe_auto_roll_usage(); // usage carousel auto-advance (usage_rotate_secs)
         let pane_dirty = app.drain_pane_dirty(); // any pane's screen advanced (PTY output)
         dirty |= pane_dirty;
-        // A full-screen app (nvim/less/htop/…) just LEFT the alternate screen: force a full
-        // repaint for every client so the restored primary screen is clean. The alt→primary
-        // grid swap is where incremental-diff residue shows (the client's unicode-width render
-        // desyncs from alacritty's grid on wide graphemes during the app's life); a full frame
-        // is the proven residue-clear (same path as Ctrl-b r). Gated on `pane_dirty` so the
-        // per-pane alt-screen poll only runs when a pane actually advanced.
-        if pane_dirty && app.take_alt_screen_exit() {
+        // A full-screen app (nvim/less/htop/…) just ENTERED or LEFT the alternate screen:
+        // force a full repaint for every client so both the app's first screen and the
+        // restored primary screen are clean. Either grid swap is where incremental-diff
+        // residue shows (the client's unicode-width render desyncs from alacritty's grid on
+        // wide graphemes during the app's life) and is also a large wholesale change an outer
+        // terminal (Windows Terminal over SSH, a nested emulator) can drop cells on; a full
+        // frame is the proven residue-clear (same path as Ctrl-b r). Gated on `pane_dirty` so
+        // the per-pane alt-screen poll only runs when a pane actually advanced.
+        if pane_dirty && app.take_alt_screen_transition() {
             for c in clients.iter_mut() {
                 c.needs_full = true;
                 c.last = Buffer::empty(c.last.area);

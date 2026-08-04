@@ -342,6 +342,18 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
         .and_then(|v| v.parse::<u64>().ok())
         .map_or(Duration::ZERO, Duration::from_millis);
     let mut last_repaint = Instant::now();
+    // Periodic winsize reconciliation. A terminal normally delivers a `CEvent::Resize` when it
+    // is resized, but that event can be LOST — crossterm coalescing a rapid burst, or an outer
+    // terminal that updated the tty's winsize without a clean SIGWINCH to us. When it is lost we
+    // keep composing at the STALE size and the status bar lands off the true bottom (reported
+    // over SSH from Windows Terminal after a sleep/wake). So once a second we re-read the tty
+    // size directly and, if it moved without an event, send the resize ourselves. NOTE: this
+    // only recovers cases where the tty winsize (TIOCGWINSZ) is actually current — if the outer
+    // terminal never propagated the new size to the remote pty at all (the sleep/wake case where
+    // sshd got no window-change), the OS still reports the old size and only a real resize
+    // (re-maximize) or reattach fixes it. See docs/troubleshooting.md.
+    let size_poll = Duration::from_millis(1000);
+    let mut last_size_poll = Instant::now();
 
     loop {
         // 1) forward input
@@ -394,6 +406,21 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                 }
                 if !event::poll(Duration::from_millis(0))? {
                     break;
+                }
+            }
+        }
+
+        // 1b) reconcile a resize event we may have MISSED: re-read the tty size once a second
+        // and, if it moved without a `CEvent::Resize`, drive the same path an event would.
+        if last_size_poll.elapsed() >= size_poll {
+            last_size_poll = Instant::now();
+            if let Ok(sz) = terminal.size() {
+                let (w, h) = (sz.width.max(1), sz.height.max(1));
+                if (w, h) != (cols, rows) {
+                    cols = w;
+                    rows = h;
+                    let _ = send(&mut wr, &ClientMsg::Resize { cols, rows });
+                    need_redraw = true;
                 }
             }
         }
