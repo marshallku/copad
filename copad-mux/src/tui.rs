@@ -3835,6 +3835,10 @@ impl App {
         let mut y = mid;
         put(buf, &mut 0, y, " agents", header);
         y += 1;
+        // The agent whose pane is currently in focus (active session's focused pane), so
+        // it can be highlighted like the active `spaces` row — bright/bold name vs the
+        // dimmed siblings — instead of every agent looking identical.
+        let active_agent_term = self.focused_terminal();
         // Window agents (around the keyboard-focused row when focusing Agents, else the
         // top) with a "+M more" hint; the full list is in Ctrl-f.
         let agent_rows = self.agent_rows();
@@ -3860,6 +3864,8 @@ impl App {
                 break;
             }
             let is_focused = agent_focus == Some(ai);
+            // The active pane's agent — highlighted like the active `spaces` row.
+            let is_active = active_agent_term.as_ref() == Some(&row.term);
             // tmx-style glyph + colour per status (all width-1 geometric shapes).
             let (dot, scolor) = match row.status {
                 "working" => ("●", CAT_GREEN),
@@ -3868,23 +3874,36 @@ impl App {
                 _ => ("○", CAT_OVERLAY), // idle
             };
             let mut x = 1u16;
+            // Keep the status colour on the dot; bold it for the focused agent so the
+            // icon reads as "selected" (mirrors the active space's brighter dot).
             put(
                 buf,
                 &mut x,
                 y,
                 dot,
-                Style::default().fg(scolor).bg(panel_bg),
+                Style::default()
+                    .fg(scolor)
+                    .bg(panel_bg)
+                    .add_modifier(if is_active {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
             );
             let name_style = if is_focused {
                 Style::default()
                     .fg(Color::Black)
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
-            } else {
+            } else if is_active {
+                // The pane you're looking at: bright + bold, like the active space name.
                 Style::default()
                     .fg(CAT_TEXT)
                     .bg(panel_bg)
                     .add_modifier(Modifier::BOLD)
+            } else {
+                // Other agents: dimmed to subtext so the focused one stands out.
+                Style::default().fg(CAT_SUBTEXT).bg(panel_bg)
             };
             put(buf, &mut x, y, " ", name_style);
             put(buf, &mut x, y, &row.title, name_style);
