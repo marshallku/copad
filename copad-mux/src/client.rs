@@ -10,18 +10,19 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::{Duration, Instant};
 
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
+use ratatui::crossterm::cursor::{self, MoveTo, RestorePosition, SavePosition};
 use ratatui::crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event as CEvent, KeyEventKind, MouseButton,
-    MouseEventKind,
+    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+    Event as CEvent, KeyEventKind, MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::layout::{Position, Rect as RRect};
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use unicode_width::UnicodeWidthStr;
 
 use crate::control::socket_path;
@@ -91,6 +92,52 @@ fn write_osc52(text: &str) -> io::Result<()> {
     out.flush()
 }
 
+/// Ask the TERMINAL its true text-area size, bypassing the OS pty winsize (`TIOCGWINSZ`) — the
+/// recovery path when a stale winsize survives a sleep/wake that never propagated the new size to
+/// the remote pty (so `terminal.size()` keeps returning the OLD value). crossterm 0.28 silently
+/// DROPS the `CSI 8;h;w t` reply to a `CSI 18 t` query (its parser errors on the `t` final byte
+/// and clears the buffer — see `event/source/unix/tty.rs`), so that report can't be read through
+/// the event loop. Instead we use the report crossterm DOES parse: park the cursor far past the
+/// bottom-right (the terminal clamps it to the real last cell), read where it landed via DSR
+/// (`crossterm::cursor::position`), then restore it. Size = clamped position + 1.
+/// `SavePosition`/`RestorePosition` round-trip to the same spot, so ratatui's cursor cache stays
+/// valid. Returns `None` if the terminal didn't respond or didn't clamp, so a non-conforming
+/// terminal can never inject a bogus giant size. Timing: a terminal that simply doesn't answer DSR
+/// bounds the call at crossterm's ~2s poll timeout (then `position()` returns `Err` → `None`); the
+/// only unbounded path is a PERSISTENT stdin poll error inside crossterm's retry loop, which means
+/// the fd is already broken and the client is dead regardless. Triggered only on the rare
+/// stale-size signals (focus regain / resume-from-sleep), so the 2s worst case is not hit in steady
+/// state.
+fn probe_true_size() -> Option<(u16, u16)> {
+    let mut out = io::stdout();
+    execute!(out, SavePosition, MoveTo(PROBE_CORNER, PROBE_CORNER)).ok()?;
+    let pos = cursor::position();
+    let _ = execute!(out, RestorePosition);
+    let (col, row) = pos.ok()?;
+    size_from_clamped_cursor(col, row)
+}
+
+/// The far corner we park the cursor at so the terminal clamps it to the real bottom-right cell.
+const PROBE_CORNER: u16 = 9998;
+
+/// Upper bound (exclusive) on a probed dimension. Real terminals are well under this; a larger
+/// value means the terminal didn't clamp (echoing `PROBE_CORNER` back) or is lying. This is a
+/// trust boundary: the value flows into `Terminal::resize`, which allocates cols×rows cells TWICE,
+/// so an unbounded dimension is a memory-exhaustion vector. 1000×1000 is already generous.
+const PROBE_MAX: u16 = 1000;
+
+/// Turn the clamped cursor position from [`probe_true_size`] into a `(cols, rows)` size, or `None`
+/// if it looks unreliable. Rejects any dimension at/above [`PROBE_MAX`] — which covers both the
+/// non-clamping terminal (echoes `PROBE_CORNER`) and any other absurd value — so a hostile or buggy
+/// terminal can never drive a giant allocation. Pure so the guard is unit-tested without a live
+/// terminal.
+fn size_from_clamped_cursor(col: u16, row: u16) -> Option<(u16, u16)> {
+    if col >= PROBE_MAX || row >= PROBE_MAX {
+        return None;
+    }
+    Some((col.saturating_add(1).max(1), row.saturating_add(1).max(1)))
+}
+
 /// Restores the host terminal (raw mode off + leave alt screen) on drop — so a
 /// panic or an abrupt server exit never leaves the user's terminal wedged. Mouse
 /// capture is enabled lazily via [`TermGuard::enable_mouse`] when the server's `Hello`
@@ -102,7 +149,10 @@ struct TermGuard {
 impl TermGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        // Focus reporting lets us re-probe the true terminal size when the window regains focus
+        // (e.g. after the display woke from sleep) — the sanctioned recovery for a stale OS
+        // winsize. Harmless on terminals that ignore it.
+        execute!(io::stdout(), EnterAlternateScreen, EnableFocusChange)?;
         Ok(Self { mouse: false })
     }
 
@@ -124,7 +174,7 @@ impl Drop for TermGuard {
         if self.mouse {
             let _ = execute!(io::stdout(), DisableMouseCapture);
         }
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableFocusChange, LeaveAlternateScreen);
     }
 }
 
@@ -221,6 +271,21 @@ fn send(w: &mut UnixStream, msg: &ClientMsg) -> io::Result<()> {
     w.flush()
 }
 
+/// Drive ratatui's render area to `(cols, rows)` AND tell the server. With a `Viewport::Fixed`
+/// terminal, `resize` reallocates the buffers and clears the screen — a clean full repaint at the
+/// new size, independent of the (possibly stale) OS winsize — which is exactly what we want on any
+/// size change (real resize, missed-event poll, or true-size probe). Errors are swallowed: a failed
+/// resize/send self-corrects on the next size signal.
+fn apply_size(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    wr: &mut UnixStream,
+    cols: u16,
+    rows: u16,
+) {
+    let _ = terminal.resize(RRect::new(0, 0, cols, rows));
+    let _ = send(wr, &ClientMsg::Resize { cols, rows });
+}
+
 /// The attach loop: forward input, apply incoming frames, draw.
 fn run_attached(stream: UnixStream) -> io::Result<()> {
     let default_hook = std::panic::take_hook();
@@ -231,10 +296,19 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
     }));
 
     let mut guard = TermGuard::enter()?;
+    // Fixed viewport (NOT Fullscreen): ratatui must not autoresize its render area to the OS
+    // winsize each draw, because the self-heal below can drive the area to the terminal's TRUE
+    // size while the OS winsize is still stale (sleep/wake). We own the size and apply it via
+    // `apply_size`. Seed from the OS size (correct at attach).
+    let (tw, th) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
+    let (mut cols, mut rows) = (tw.max(1), th.max(1));
     let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal: Terminal<CrosstermBackend<Stdout>> = Terminal::new(backend)?;
-    let size = terminal.size()?;
-    let (mut cols, mut rows) = (size.width.max(1), size.height.max(1));
+    let mut terminal: Terminal<CrosstermBackend<Stdout>> = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Fixed(RRect::new(0, 0, cols, rows)),
+        },
+    )?;
 
     let mut wr = stream.try_clone()?;
     send(&mut wr, &ClientMsg::Attach { cols, rows })?;
@@ -346,18 +420,35 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
     // is resized, but that event can be LOST — crossterm coalescing a rapid burst, or an outer
     // terminal that updated the tty's winsize without a clean SIGWINCH to us. When it is lost we
     // keep composing at the STALE size and the status bar lands off the true bottom (reported
-    // over SSH from Windows Terminal after a sleep/wake). So once a second we re-read the tty
-    // size directly and, if it moved without an event, send the resize ourselves. NOTE: this
-    // only recovers cases where the tty winsize (TIOCGWINSZ) is actually current — if the outer
-    // terminal never propagated the new size to the remote pty at all (the sleep/wake case where
-    // sshd got no window-change), the OS still reports the old size and only a real resize
-    // (re-maximize) or reattach fixes it. See docs/troubleshooting.md.
+    // over SSH from Windows Terminal after a sleep/wake). So once a second we re-read the tty size
+    // and adopt it WHEN IT CHANGES from the last value we saw — i.e. a genuine winsize update the
+    // OS got but we missed the event for. Comparing against the last OS value (not the render size)
+    // is deliberate: `probe_true_size` below can set the render size to a value the OS winsize does
+    // NOT yet agree with (a stale winsize), and this poll must not clobber that recovery back to the
+    // stale OS value — it stays quiet until the OS winsize genuinely moves. `last_os_size` seeds
+    // from the attach size (itself a TIOCGWINSZ read) and advances on every acknowledged OS change
+    // (this poll and `CEvent::Resize`), never on a probe. See docs/troubleshooting.md.
     let size_poll = Duration::from_millis(1000);
     let mut last_size_poll = Instant::now();
+    let mut last_os_size = (cols, rows);
+    // A deeper recovery for when the tty winsize itself is STALE — the sleep/wake case where the
+    // outer terminal never propagated the new size to the remote pty, so the OS size above keeps
+    // returning the OLD value and the 1s poll can't help. We instead ask the TERMINAL its true
+    // size directly (see `probe_true_size`), triggered by a `FocusGained` event: the window
+    // regaining focus is exactly when the user returns after a wake and when a stale size is
+    // likely, and it is delivered over SSH (unlike a suspend, which Rust's monotonic `Instant`
+    // can't even observe — it pauses across suspend — and which anyway never freezes THIS process
+    // when it is the far end of an SSH session whose local terminal slept). Bypasses the OS
+    // winsize entirely.
 
     loop {
         // 1) forward input
         let mut need_redraw = false;
+        // Any size change (event / poll / probe) updates cols+rows here, then a single
+        // `apply_size` at the end drives ratatui + the server once — no mid-drain flicker.
+        let mut size_changed = false;
+        // Set by a `FocusGained` event to run the true-size probe (1c) this iteration.
+        let mut probe_needed = false;
         if event::poll(Duration::from_millis(16))? {
             loop {
                 match event::read()? {
@@ -394,14 +485,20 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                         }
                     }
                     CEvent::Resize(w, h) => {
-                        cols = w.max(1);
-                        rows = h.max(1);
-                        // The server re-fits to the smallest client; our frame buffer
-                        // follows the SERVER size, so don't rebuild it — just
-                        // re-letterbox into the new terminal size on the next draw.
-                        let _ = send(&mut wr, &ClientMsg::Resize { cols, rows });
-                        need_redraw = true;
+                        let os = (w.max(1), h.max(1));
+                        // Gate on the OS value actually CHANGING, exactly like the 1s poll — so a
+                        // delayed/duplicate resize event carrying the stale winsize can't clobber a
+                        // `probe_true_size` recovery. Keeping `last_os_size` in step also stops the
+                        // poll from re-detecting this as a change and resending redundantly.
+                        if os != last_os_size {
+                            last_os_size = os;
+                            (cols, rows) = os;
+                            size_changed = true;
+                        }
                     }
+                    // Window regained focus (e.g. the display woke): the OS winsize may be stale,
+                    // so probe the terminal's true size below.
+                    CEvent::FocusGained => probe_needed = true,
                     _ => {}
                 }
                 if !event::poll(Duration::from_millis(0))? {
@@ -410,19 +507,39 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
             }
         }
 
-        // 1b) reconcile a resize event we may have MISSED: re-read the tty size once a second
-        // and, if it moved without a `CEvent::Resize`, drive the same path an event would.
+        // 1b) reconcile a resize event we may have MISSED: re-read the tty size once a second and,
+        // if the OS winsize CHANGED since we last saw it (a genuine update whose event we missed),
+        // adopt it. Gated on the OS value moving — not on it differing from the render size — so a
+        // stale OS winsize can't undo a `probe_true_size` recovery (see `last_os_size` above).
         if last_size_poll.elapsed() >= size_poll {
             last_size_poll = Instant::now();
-            if let Ok(sz) = terminal.size() {
-                let (w, h) = (sz.width.max(1), sz.height.max(1));
-                if (w, h) != (cols, rows) {
-                    cols = w;
-                    rows = h;
-                    let _ = send(&mut wr, &ClientMsg::Resize { cols, rows });
-                    need_redraw = true;
+            if let Ok((w, h)) = ratatui::crossterm::terminal::size() {
+                let os = (w.max(1), h.max(1));
+                if os != last_os_size {
+                    last_os_size = os;
+                    if os != (cols, rows) {
+                        (cols, rows) = os;
+                        size_changed = true;
+                    }
                 }
             }
+        }
+
+        // 1c) deeper recovery: when a stale OS winsize is LIKELY (resume from sleep, or the window
+        // regaining focus), ask the terminal its true size directly and reconcile if it disagrees
+        // with what we track — recovering the case the tty-winsize poll above cannot see.
+        if probe_needed
+            && let Some((w, h)) = probe_true_size()
+            && (w, h) != (cols, rows)
+        {
+            (cols, rows) = (w, h);
+            size_changed = true;
+        }
+
+        // Drive ratatui + the server ONCE for whatever moved the size this iteration.
+        if size_changed {
+            apply_size(&mut terminal, &mut wr, cols, rows);
+            need_redraw = true;
         }
 
         // 2) apply incoming frames (buffer follows the server's frame size)
@@ -520,7 +637,26 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::base64;
+    use super::{PROBE_CORNER, PROBE_MAX, base64, size_from_clamped_cursor};
+
+    #[test]
+    fn size_from_clamped_cursor_converts_and_guards() {
+        // A normal clamped bottom-right cell → size is position + 1.
+        assert_eq!(size_from_clamped_cursor(79, 23), Some((80, 24)));
+        assert_eq!(size_from_clamped_cursor(0, 0), Some((1, 1)));
+        // Just under the cap is accepted (the largest plausible real terminal).
+        assert_eq!(
+            size_from_clamped_cursor(PROBE_MAX - 1, PROBE_MAX - 1),
+            Some((PROBE_MAX, PROBE_MAX))
+        );
+        // A terminal that didn't clamp echoes the target corner back → rejected.
+        assert_eq!(size_from_clamped_cursor(PROBE_CORNER, PROBE_CORNER), None);
+        // Absurd values BELOW the corner but at/above the cap are also rejected — the
+        // memory-exhaustion guard (else ~1e8 cells could reach Terminal::resize).
+        assert_eq!(size_from_clamped_cursor(9997, 9997), None);
+        assert_eq!(size_from_clamped_cursor(PROBE_MAX, 10), None);
+        assert_eq!(size_from_clamped_cursor(10, PROBE_MAX), None);
+    }
 
     #[test]
     fn base64_matches_known_vectors() {
