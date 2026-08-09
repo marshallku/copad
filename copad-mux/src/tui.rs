@@ -32,6 +32,9 @@ use crate::model::{
 };
 use crate::notify;
 use crate::persist::{self, MAX_LEAVES_PER_TAB, MAX_TOTAL_PANES, PLayout};
+// The `Ctrl-f` switcher and the CLI's fuzzy picker share one filter, so typing the
+// same query narrows both lists identically.
+use crate::picker::fuzzy_match;
 use crate::procinfo;
 use crate::proto::MouseKind;
 use crate::state::{Command, Event, MuxError, Origin, RestoredTab, State};
@@ -5312,17 +5315,6 @@ fn tab_window(widths: &[u16], active: usize, avail: u16) -> (usize, usize, bool,
     (lo, hi + 1, lo > 0, hi + 1 < n)
 }
 
-/// Case-insensitive SUBSEQUENCE match (fzf-style): every char of `needle` appears in
-/// `hay` in order. An empty needle matches everything.
-fn fuzzy_match(needle: &str, hay: &str) -> bool {
-    let hay = hay.to_ascii_lowercase();
-    let mut chars = hay.chars();
-    needle
-        .to_ascii_lowercase()
-        .chars()
-        .all(|nc| chars.any(|hc| hc == nc))
-}
-
 /// Resolve a saved cwd to a concrete directory for a restored shell: the saved path if it
 /// still exists, else `$HOME` (never `None` when a home is known, so the shell doesn't
 /// silently inherit the SERVER's cwd).
@@ -5441,9 +5433,9 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
 mod tests {
     use super::{
         CAT_GREEN, CAT_RED, CAT_YELLOW, Menu, MenuAction, build_command_line,
-        detect_alt_screen_transition, extract_selection, filter_env, fuzzy_match,
-        list_window_start, menu_origin, merge_env, reload_note, sel_bounds, sel_cols, shell_quote,
-        tab_window, usage_should_roll, usage_threshold_color, wrap_page,
+        detect_alt_screen_transition, extract_selection, filter_env, list_window_start,
+        menu_origin, merge_env, reload_note, sel_bounds, sel_cols, shell_quote, tab_window,
+        usage_should_roll, usage_threshold_color, wrap_page,
     };
     use crate::model::TerminalId;
     use crate::term::{CellColor, CellSnap, Snapshot};
@@ -5755,17 +5747,6 @@ mod tests {
         assert_eq!(list_window_start(20, 0, 6), 0); // active at top
         assert_eq!(list_window_start(20, 19, 6), 14); // active at bottom → clamp
         assert_eq!(list_window_start(20, 10, 6), 7); // centered (10 - 3)
-    }
-
-    #[test]
-    fn fuzzy_match_is_case_insensitive_subsequence() {
-        assert!(fuzzy_match("", "anything")); // empty matches all
-        assert!(fuzzy_match("api", "api-server"));
-        assert!(fuzzy_match("api", "API-Server")); // case-insensitive
-        assert!(fuzzy_match("aps", "api-server")); // subsequence (a..p..s)
-        assert!(fuzzy_match("cld", "claude")); // c..l..d
-        assert!(!fuzzy_match("xyz", "claude"));
-        assert!(!fuzzy_match("sa", "api-server")); // order matters (no 's' before 'a')
     }
 
     #[test]

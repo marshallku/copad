@@ -24,6 +24,8 @@ Split the focused pane and move around inside a tab:
 | Resize left / down / up / right | `Ctrl-b H`/`J`/`K`/`L` | `comux resize <index> <dir>` |
 | Close the focused pane | `Ctrl-b x` | `comux close <index>` |
 
+`comux focus` / `close` / `select-tab` / `select-session` with **no index** open a fuzzy picker over the live listing instead of erroring — see [Leave the argument out and pick](./index.md#leave-the-argument-out-and-pick).
+
 Directional focus also has **prefix-less** bindings so you don't need to reach for `Ctrl-b` every time: `Ctrl+Shift+h/j/k/l` or `Ctrl+Shift+Arrow`.
 
 Send text straight into a pane from a script:

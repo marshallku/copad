@@ -19,6 +19,7 @@ pub mod gitinfo;
 pub mod model;
 pub mod notify;
 pub mod persist;
+pub mod picker;
 pub mod procinfo;
 pub mod proto;
 pub mod server;

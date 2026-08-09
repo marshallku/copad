@@ -69,7 +69,10 @@ The output shows each worktree's path, branch, whether it's the main worktree, w
 ```bash
 comux worktree rm feat/login          # by branch
 comux worktree rm ~/dev/copad-feat-login   # by path
+comux worktree rm                     # no target → fuzzy-pick one
 ```
+
+With no target it lists the repo's removable worktrees and lets you type to narrow them (`Enter` removes, `Esc` cancels). The main worktree, locked worktrees, and the one you're standing in are left out — they'd be refused anyway — and the header counts the locked/current ones it hid, so a missing entry is never a mystery. (The main worktree isn't counted; it's never a removal target.) A worktree with a live session **is** offered and marked `· live`; removing it still needs `-f`.
 
 | Flag | Effect |
 | --- | --- |

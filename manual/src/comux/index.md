@@ -45,22 +45,35 @@ The full verb list:
 | `list` | — | List panes of the active tab |
 | `split` | `-h` (default) \| `-v`/`down` | Split the focused pane |
 | `resize` | `<index> <left\|right\|up\|down>` | Grow a pane toward a direction |
-| `focus` | `<index>` | Focus a pane |
-| `close` | `<index>` | Close a pane |
+| `focus` | `[index]` | Focus a pane (no index → fuzzy picker) |
+| `close` | `[index]` | Close a pane (no index → fuzzy picker) |
 | `send` / `send-keys` | `<index> <text…>` | Inject text as input into a pane |
 | `list-tabs` / `tabs` | — | List the workspace's tabs |
 | `new-tab` | — | Create + activate a tab |
-| `select-tab` | `<index>` | Activate a tab by index |
+| `select-tab` | `[index]` | Activate a tab by index (no index → fuzzy picker) |
 | `rename-tab` | `[index] <name…>` | Rename a tab (no index = active; `""` clears) |
 | `list-sessions` / `sessions` | — | List sessions |
 | `new-session` | `[name…]` | Create + switch to a session (starts the server if needed) |
 | `rename-session` / `rename` | `[index] <name…>` | Rename a session (no index = active) |
-| `select-session` | `<index>` | Switch to a session |
+| `select-session` | `[index]` | Switch to a session (no index → fuzzy picker) |
 | `worktree create` (`new`/`add`) | `<branch> [--from <ref>] [--no-attach] [--json]` | Create a git worktree + a session in it |
 | `worktree list` (`ls`) | `[--plain\|--json]` | List worktrees (flags which have a live session) |
-| `worktree rm` (`remove`) | `<path\|branch> [-f] [-d] [--json]` | Remove a worktree |
+| `worktree rm` (`remove`) | `[path\|branch] [-f] [-d] [--json]` | Remove a worktree (no target → fuzzy picker) |
 | `reload` / `source-file` | — | Re-read `mux.toml` on the running server |
 | `kill-server` | — | Shut the server down |
+
+### Leave the argument out and pick
+
+Every verb above whose argument is written `[index]` / `[path|branch]` opens a **fuzzy picker** when you omit it, so you never have to run `list` first and copy an index or a path back:
+
+```bash
+comux worktree rm      # lists the repo's removable worktrees — type to narrow, Enter to remove
+comux select-session   # same for sessions; also select-tab, focus, close
+```
+
+Type to filter (fzf-style subsequence, matching the name *and* the dim detail column), `↑`/`↓` or `Ctrl-n`/`Ctrl-p` to move, `Enter` to pick, `Esc` (or `Ctrl-c`) to cancel — cancelling exits `130` and does nothing. The picker draws inline below your prompt and erases itself on exit, so your scrollback stays clean.
+
+It only opens when it can: with `--json`, or when stderr isn't a terminal (a pipe, a script, CI), the old usage error stands so nothing ever blocks waiting for a prompt no one can answer. A *malformed* index (`comux focus abc`) is still an error too — the picker is for an argument you left out, not one you got wrong.
 
 > See [Sessions, Tabs & Panes](./sessions-tabs-panes.md) for how these map to the in-app keys, and [Git Worktrees](./worktrees.md) for the worktree workflow.
 

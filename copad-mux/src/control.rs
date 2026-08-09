@@ -11,6 +11,8 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::picker;
+
 /// A control request. Wire form: one JSON object per line, tagged by `cmd`
 /// (e.g. `{"cmd":"list"}`, `{"cmd":"split","dir":"right"}`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -350,17 +352,20 @@ pub fn run_client(args: &[String]) -> i32 {
             };
             Req::RenameTab { index, name }
         }
+        // The index-taking verbs below share one shape: an omitted index opens the fuzzy
+        // picker over a live listing instead of failing with a usage line (see
+        // `pick_index`), while a MALFORMED index still fails — the user meant something.
         "select-session" => {
-            let Some(idx) = rest.get(1).and_then(|s| s.parse::<usize>().ok()) else {
-                eprintln!("usage: comux select-session <index>");
-                return 2;
+            let idx = match pick_index(rest.get(1), json_out, Target::Session) {
+                Ok(i) => i,
+                Err(code) => return code,
             };
             Req::SelectSession { index: idx }
         }
         "select-tab" => {
-            let Some(idx) = rest.get(1).and_then(|s| s.parse::<usize>().ok()) else {
-                eprintln!("usage: comux select-tab <index>");
-                return 2;
+            let idx = match pick_index(rest.get(1), json_out, Target::Tab) {
+                Ok(i) => i,
+                Err(code) => return code,
             };
             Req::SelectTab { index: idx }
         }
@@ -375,9 +380,14 @@ pub fn run_client(args: &[String]) -> i32 {
             }
         }
         "focus" | "close" => {
-            let Some(idx) = rest.get(1).and_then(|s| s.parse::<usize>().ok()) else {
-                eprintln!("usage: comux {cmd} <index>");
-                return 2;
+            let target = if cmd == "focus" {
+                Target::PaneFocus
+            } else {
+                Target::PaneClose
+            };
+            let idx = match pick_index(rest.get(1), json_out, target) {
+                Ok(i) => i,
+                Err(code) => return code,
             };
             if cmd == "focus" {
                 Req::Focus { index: idx }
@@ -454,6 +464,189 @@ pub fn run_client(args: &[String]) -> i32 {
         print_human(&req, &resp);
     }
     if resp.ok { 0 } else { 1 }
+}
+
+/// Exit code for "the user cancelled the picker" — fzf's (and SIGINT's) convention, so a
+/// shell wrapper can tell a deliberate abort apart from a real failure.
+const EXIT_CANCELLED: i32 = 130;
+
+/// Which live listing an omitted argument should be fuzzy-picked from.
+#[derive(Clone, Copy)]
+enum Target {
+    Session,
+    Tab,
+    PaneFocus,
+    PaneClose,
+}
+
+impl Target {
+    /// The usage line printed when we can't prompt (`--json`, non-terminal stderr) or
+    /// when an index WAS given but isn't a number.
+    fn usage(self) -> &'static str {
+        match self {
+            Target::Session => "comux select-session [index]   (no index → fuzzy picker)",
+            Target::Tab => "comux select-tab [index]   (no index → fuzzy picker)",
+            Target::PaneFocus => "comux focus [index]   (no index → fuzzy picker)",
+            Target::PaneClose => "comux close [index]   (no index → fuzzy picker)",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Target::Session => "switch to session",
+            Target::Tab => "switch to tab",
+            Target::PaneFocus => "focus a pane",
+            Target::PaneClose => "close a pane",
+        }
+    }
+
+    /// Message for "the listing came back empty" — a picker with nothing in it is a
+    /// failure, not a cancellation.
+    fn empty(self) -> &'static str {
+        match self {
+            Target::Session => "no sessions to pick from",
+            Target::Tab => "no tabs to pick from",
+            Target::PaneFocus | Target::PaneClose => "no panes to pick from",
+        }
+    }
+
+    /// Fetch the listing and render it as picker rows paired with the index each row
+    /// resolves to (paired so the two can never drift apart while filtering).
+    fn rows(self) -> Result<Vec<(picker::Item, usize)>, i32> {
+        match self {
+            Target::Session => {
+                let sessions = query(&Req::ListSessions)?.sessions.unwrap_or_default();
+                Ok(sessions
+                    .iter()
+                    .map(|s| {
+                        let name = if s.name.is_empty() {
+                            s.id.as_str()
+                        } else {
+                            s.name.as_str()
+                        };
+                        let mut detail = format!("{} tabs · {} panes", s.tabs, s.panes);
+                        if s.agents > 0 {
+                            detail.push_str(&format!(" · {} agents", s.agents));
+                        }
+                        if s.active {
+                            detail.push_str(" · active");
+                        }
+                        (
+                            picker::Item::new(format!("{}: {name}", s.index), detail),
+                            s.index,
+                        )
+                    })
+                    .collect())
+            }
+            Target::Tab => {
+                let tabs = query(&Req::ListTabs)?.tabs.unwrap_or_default();
+                Ok(tabs
+                    .iter()
+                    .map(|t| {
+                        let name = if t.name.is_empty() {
+                            t.id.as_str()
+                        } else {
+                            t.name.as_str()
+                        };
+                        let mut detail = format!("{} panes", t.panes);
+                        if t.agents > 0 {
+                            detail.push_str(&format!(" · {} agents", t.agents));
+                        }
+                        if t.active {
+                            detail.push_str(" · active");
+                        }
+                        (
+                            picker::Item::new(format!("{}: {name}", t.index), detail),
+                            t.index,
+                        )
+                    })
+                    .collect())
+            }
+            Target::PaneFocus | Target::PaneClose => {
+                let panes = query(&Req::List)?.panes.unwrap_or_default();
+                Ok(panes
+                    .iter()
+                    .map(|p| {
+                        let label = if p.label.is_empty() {
+                            p.id.as_str()
+                        } else {
+                            p.label.as_str()
+                        };
+                        let mut detail = format!("{}x{}", p.cols, p.rows);
+                        if !p.status.is_empty() {
+                            detail = format!("{} · {detail}", p.status);
+                        }
+                        if p.focused {
+                            detail.push_str(" · focused");
+                        }
+                        (
+                            picker::Item::new(format!("{}: {label}", p.index), detail),
+                            p.index,
+                        )
+                    })
+                    .collect())
+            }
+        }
+    }
+}
+
+/// Resolve an index argument: parse it when one was given, otherwise fuzzy-pick from
+/// the server's live listing. `Err` carries the process exit code (2 usage · 1 failure ·
+/// [`EXIT_CANCELLED`] when the user aborted the picker).
+fn pick_index(arg: Option<&&String>, json: bool, target: Target) -> Result<usize, i32> {
+    if let Some(a) = arg {
+        return a.parse::<usize>().map_err(|_| {
+            eprintln!("usage: {}", target.usage());
+            2
+        });
+    }
+    prompt_ok(json, target.usage())?;
+    let rows = target.rows()?;
+    choose(target.title(), target.empty(), rows)
+}
+
+/// The gate every "argument omitted → picker" path shares: only prompt on a real
+/// terminal and outside `--json`. A script or a pipe keeps the old usage error, so it
+/// fails fast instead of blocking on a prompt nobody can answer.
+fn prompt_ok(json: bool, usage: &str) -> Result<(), i32> {
+    if json || !picker::interactive() {
+        eprintln!("usage: {usage}");
+        return Err(2);
+    }
+    Ok(())
+}
+
+/// Run the picker over `rows` and return the chosen row's value.
+fn choose<T>(title: &str, empty: &str, rows: Vec<(picker::Item, T)>) -> Result<T, i32> {
+    if rows.is_empty() {
+        eprintln!("comux: {empty}");
+        return Err(1);
+    }
+    let (items, values): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+    match picker::pick(title, &items) {
+        Ok(Some(i)) => values.into_iter().nth(i).ok_or(1),
+        Ok(None) => Err(EXIT_CANCELLED),
+        Err(e) => {
+            eprintln!("comux: {e}");
+            Err(1)
+        }
+    }
+}
+
+/// One round trip for a picker's listing, mapping a transport error or a server refusal
+/// to an exit code (the picker can't run without the listing).
+fn query(req: &Req) -> Result<Resp, i32> {
+    match round_trip(req) {
+        Ok(r) if r.ok => Ok(r),
+        Ok(r) => {
+            eprintln!("error: {}", r.error.as_deref().unwrap_or("(unspecified)"));
+            Err(1)
+        }
+        Err(e) => {
+            eprintln!("comux: {e}");
+            Err(1)
+        }
+    }
 }
 
 /// `comux server <start|stop|restart|status>` — manage the persistent server's lifecycle
@@ -738,7 +931,9 @@ fn print_worktree_usage() {
         "usage:\n\
          \x20 comux worktree create <branch> [--from <ref>] [--no-attach] [--json]\n\
          \x20 comux worktree list [--plain|--json]\n\
-         \x20 comux worktree rm <path|branch> [-f|--force] [-d|--delete-branch] [--json]"
+         \x20 comux worktree rm [<path|branch>] [-f|--force] [-d|--delete-branch] [--json]\n\
+         \n\
+         omitting the `rm` target opens a fuzzy picker over the repo's worktrees."
     );
 }
 
@@ -878,52 +1073,41 @@ fn worktree_list_client(rest: &[String]) -> i32 {
         eprintln!("comux worktree list: --plain and --json conflict");
         return 2;
     }
-    // A running server annotates `live`; with no server there are no comux sessions, so
-    // list locally (all `live=false`) — matching tmx's "works with no server" behavior.
-    if server_running() {
-        let req = Req::WorktreeList { cwd: caller_cwd() };
-        match round_trip(&req) {
-            Ok(resp) if resp.ok => {
-                print_worktrees(&resp.worktrees.unwrap_or_default(), json, plain);
-                0
-            }
-            Ok(resp) => {
-                eprintln!(
-                    "error: {}",
-                    resp.error.as_deref().unwrap_or("(unspecified)")
-                );
-                1
-            }
-            Err(e) => {
-                eprintln!("comux: {e}");
-                1
-            }
+    match collect_worktrees() {
+        Ok(infos) => {
+            print_worktrees(&infos, json, plain);
+            0
         }
-    } else {
-        worktree_list_local(json, plain)
+        Err(msg) => {
+            eprintln!("{msg}");
+            1
+        }
     }
 }
 
-fn worktree_list_local(json: bool, plain: bool) -> i32 {
-    let Some(cwd) = std::env::current_dir().ok() else {
-        eprintln!("comux: could not resolve current directory");
-        return 1;
-    };
-    let repo = match crate::worktree::resolve_repo_root(&cwd) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("comux: {e}");
-            return 1;
-        }
-    };
-    let entries = match crate::worktree::list_entries(&repo) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("comux: {e}");
-            return 1;
-        }
-    };
-    let infos: Vec<WorktreeInfo> = entries
+/// The git worktrees of the repo containing the cwd — from the server when one is
+/// running (so `live` is annotated), else straight from git, matching tmx's "works with
+/// no server" behavior. Shared by `worktree list` and the `worktree rm` picker.
+///
+/// The error string arrives PRE-PREFIXED (`error:` = the server refused · `comux:` =
+/// local or transport) so callers just print it and keep the CLI's existing wording.
+fn collect_worktrees() -> Result<Vec<WorktreeInfo>, String> {
+    if server_running() {
+        let req = Req::WorktreeList { cwd: caller_cwd() };
+        return match round_trip(&req) {
+            Ok(resp) if resp.ok => Ok(resp.worktrees.unwrap_or_default()),
+            Ok(resp) => Err(format!(
+                "error: {}",
+                resp.error.as_deref().unwrap_or("(unspecified)")
+            )),
+            Err(e) => Err(format!("comux: {e}")),
+        };
+    }
+    let cwd = std::env::current_dir()
+        .map_err(|_| "comux: could not resolve current directory".to_string())?;
+    let repo = crate::worktree::resolve_repo_root(&cwd).map_err(|e| format!("comux: {e}"))?;
+    let entries = crate::worktree::list_entries(&repo).map_err(|e| format!("comux: {e}"))?;
+    Ok(entries
         .iter()
         .map(|e| WorktreeInfo {
             path: e.path.display().to_string(),
@@ -932,9 +1116,7 @@ fn worktree_list_local(json: bool, plain: bool) -> i32 {
             live: false,
             locked: e.locked,
         })
-        .collect();
-    print_worktrees(&infos, json, plain);
-    0
+        .collect())
 }
 
 fn worktree_rm_client(rest: &[String]) -> i32 {
@@ -966,19 +1148,24 @@ fn worktree_rm_client(rest: &[String]) -> i32 {
         }
         i += 1;
     }
-    let Some(target) = target else {
-        eprintln!("usage: comux worktree rm <path|branch> [-f] [-d]");
-        return 2;
+    // No target → fuzzy-pick one from the repo's worktrees instead of failing with a
+    // usage line (the whole point: you rarely remember the sibling path by heart).
+    let target: String = match target {
+        Some(t) => t.to_string(),
+        None => match pick_worktree(json) {
+            Ok(t) => t,
+            Err(code) => return code,
+        },
     };
 
     // A running server owns liveness + the removal (single writer). With no server there
     // are no live sessions; take the server flock so none can start under us, then remove
     // locally — race-free, and without leaving a spurious server behind.
     match crate::server::try_acquire_lock() {
-        Some(_guard) => worktree_rm_local(target, force, delete_branch, json),
+        Some(_guard) => worktree_rm_local(&target, force, delete_branch, json),
         None => {
             let req = Req::WorktreeRm {
-                target: target.to_string(),
+                target: target.clone(),
                 force,
                 delete_branch,
                 cwd: caller_cwd(),
@@ -992,6 +1179,55 @@ fn worktree_rm_client(rest: &[String]) -> i32 {
             }
         }
     }
+}
+
+/// Fuzzy-pick a worktree for a bare `comux worktree rm`. Candidates exclude the main
+/// worktree, `git worktree lock`ed ones, and the one the caller is standing in — all
+/// three are refused unconditionally by [`crate::worktree::validate_removal`], so
+/// offering them would only dead-end. The locked/current count goes in the title so a
+/// missing entry is never a mystery; the MAIN worktree is not counted — it is never a
+/// removal target anywhere, so reporting it would put a "1 hidden" on every ordinary
+/// repo. A `live` worktree IS offered (it is removable with `--force`) and marked.
+fn pick_worktree(json: bool) -> Result<String, i32> {
+    const USAGE: &str = "comux worktree rm [<path|branch>] [-f] [-d]   (no target → fuzzy picker)";
+    prompt_ok(json, USAGE)?;
+    let infos = collect_worktrees().map_err(|msg| {
+        eprintln!("{msg}");
+        1
+    })?;
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|p| crate::worktree::canonical_or_lexical(&p));
+    let mut hidden = 0usize;
+    let mut rows = Vec::new();
+    for w in &infos {
+        if w.is_main {
+            continue;
+        }
+        let inside = cwd.as_ref().is_some_and(|c| {
+            c.starts_with(crate::worktree::canonical_or_lexical(Path::new(&w.path)))
+        });
+        if w.locked || inside {
+            hidden += 1;
+            continue;
+        }
+        let label = if w.branch.is_empty() {
+            "(detached)".to_string()
+        } else {
+            w.branch.clone()
+        };
+        let mut detail = w.path.clone();
+        if w.live {
+            detail.push_str(" · live");
+        }
+        rows.push((picker::Item::new(label, detail), w.path.clone()));
+    }
+    let title = if hidden > 0 {
+        format!("remove which worktree?  ({hidden} hidden: locked or current)")
+    } else {
+        "remove which worktree?".to_string()
+    };
+    choose(&title, "no removable worktrees in this repo", rows)
 }
 
 fn worktree_rm_local(target: &str, force: bool, delete_branch: bool, json: bool) -> i32 {
