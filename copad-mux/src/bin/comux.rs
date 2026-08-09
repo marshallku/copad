@@ -11,7 +11,7 @@
 //!
 //! Control commands: list | split | resize | focus | close | send | list-tabs | new-tab |
 //! select-tab | rename-tab | list-sessions | new-session [name] | rename-session |
-//! select-session | worktree <create|list|rm> | reload | kill-server.
+//! select-session | worktree <create|list|rm> | reload | health | kill-server.
 //!
 //! The server holds the shells; the client renders + forwards input and can detach
 //! (`Ctrl-b d`) / reattach, so a session survives the terminal that launched it.
@@ -37,6 +37,7 @@ fn print_usage() {
          \x20 comux worktree create <br>  git worktree + a session in it (also list|rm)\n\
          \x20 comux reload                re-read mux.toml on the live server (tmux source-file)\n\
          \x20 comux doctor [--json]       diagnose config problems (mux.toml + config.toml)\n\
+         \x20 comux health                live server counters (panes/labeled/sweep failures)\n\
          \x20 comux server restart        stop + restart the server (restores the workspace)\n\
          \x20 comux kill-server           stop the server\n\
          \n\

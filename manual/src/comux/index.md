@@ -60,7 +60,13 @@ The full verb list:
 | `worktree list` (`ls`) | `[--plain\|--json]` | List worktrees (flags which have a live session) |
 | `worktree rm` (`remove`) | `[path\|branch] [-f] [-d] [--json]` | Remove a worktree (no target → fuzzy picker) |
 | `reload` / `source-file` | — | Re-read `mux.toml` on the running server |
+| `health` | `[--json]` | Live server counters: panes, labeled panes, process-sweep failures |
 | `kill-server` | — | Shut the server down |
+
+`health` is the readout to check if tab names or the sidebar's `agents` list ever look empty:
+`sweeps failed` above zero means comux could not read the process table at some point and reused the
+previous labels rather than blanking them. `comux doctor` reports the same counters in its `server`
+section.
 
 ### Leave the argument out and pick
 

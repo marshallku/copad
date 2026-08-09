@@ -268,17 +268,55 @@ fn check_mux_toml(path: &Path) -> Section {
 }
 
 /// Report whether a server is running, via a cheap connect probe on the control
-/// socket (the same signal `comux server status` uses).
+/// socket (the same signal `comux server status` uses), plus — when one IS running
+/// — its live label/sweep counters. Those counters are the only way to see, after
+/// the fact, that a process sweep failed: the visible symptom (tab names and the
+/// sidebar agents list blinking out together) is transient and leaves no trace.
 fn check_server() -> Section {
     let sock = crate::control::socket_path();
     let running = std::os::unix::net::UnixStream::connect(&sock).is_ok();
-    let finding = if running {
-        Finding::new(Level::Ok, "running")
-    } else {
-        Finding::new(Level::Note, "not running")
-            .with_hint("start it with `comux` (attach) or `comux server start`")
-    };
-    section("server", Some(&sock), vec![finding])
+    if !running {
+        let finding = Finding::new(Level::Note, "not running")
+            .with_hint("start it with `comux` (attach) or `comux server start`");
+        return section("server", Some(&sock), vec![finding]);
+    }
+
+    let mut findings = vec![Finding::new(Level::Ok, "running")];
+    // A server that answers `list` but not `health` is an OLDER binary than this
+    // client — worth naming, since the counters silently reading zero would be
+    // indistinguishable from a healthy server.
+    match crate::control::round_trip(&crate::control::Req::Health) {
+        Ok(resp) => match resp.health {
+            Some(h) => {
+                findings.push(Finding::new(
+                    Level::Note,
+                    format!("{} panes, {} labeled", h.panes, h.labeled),
+                ));
+                findings.push(if h.label_sweeps_failed == 0 {
+                    Finding::new(Level::Ok, "process sweeps: no failures")
+                } else {
+                    Finding::new(
+                        Level::Warn,
+                        format!("process sweeps: {} failed", h.label_sweeps_failed),
+                    )
+                    .with_hint(
+                        "labels were carried forward instead of refreshed; \
+                         tab names/agent list may lag. Please report this with the count.",
+                    )
+                });
+            }
+            None => findings.push(
+                Finding::new(Level::Note, "health counters unavailable").with_hint(
+                    "the running server predates `comux health` — `comux server restart`",
+                ),
+            ),
+        },
+        Err(e) => findings.push(Finding::new(
+            Level::Warn,
+            format!("health probe failed: {e}"),
+        )),
+    }
+    section("server", Some(&sock), findings)
 }
 
 /// Report the persisted-session file. A missing file is the normal "no saved

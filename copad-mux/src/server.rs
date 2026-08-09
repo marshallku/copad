@@ -586,7 +586,10 @@ fn detach_client(c: Client) {
 fn ctl_mutates(req: &control::Req) -> bool {
     !matches!(
         req,
-        control::Req::List | control::Req::ListTabs | control::Req::ListSessions
+        control::Req::List
+            | control::Req::ListTabs
+            | control::Req::ListSessions
+            | control::Req::Health
     )
 }
 

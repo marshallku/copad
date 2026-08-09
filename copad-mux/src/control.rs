@@ -102,9 +102,26 @@ pub enum Req {
     /// cadence, restore lists) are NOT changed — those still need `comux server restart`.
     /// `Resp.message` carries the config path + any parse warnings + the restart hint.
     ReloadConfig,
+    /// Runtime counters of the RUNNING server (pane/label coverage + process-sweep
+    /// failures), for `comux doctor`. Read-only; safe to poll.
+    Health,
     /// Shut the persistent server down (drops every shell). The only key-free way to
     /// stop a detached server short of exiting its last shell.
     KillServer,
+}
+
+/// Runtime counters from a live server (`health`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthInfo {
+    /// Panes the server currently hosts.
+    pub panes: usize,
+    /// How many of those have a resolved foreground-process label. A shortfall that
+    /// persists means the sweep can see the pane's shell but not classify it.
+    pub labeled: usize,
+    /// Process sweeps that failed OUTRIGHT since server start. Non-zero means labels
+    /// were carried forward rather than refreshed — the condition that used to show
+    /// up only as tab names and the sidebar agents list blinking out together.
+    pub label_sweeps_failed: u64,
 }
 
 /// One pane in a `list` response.
@@ -200,6 +217,8 @@ pub struct Resp {
     pub sessions: Option<Vec<SessionInfo>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_session: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<HealthInfo>,
 }
 
 impl Resp {
@@ -215,6 +234,15 @@ impl Resp {
             active_tab: None,
             sessions: None,
             active_session: None,
+            health: None,
+        }
+    }
+
+    /// A `health` response.
+    pub fn health(health: HealthInfo) -> Self {
+        Self {
+            health: Some(health),
+            ..Self::ok()
         }
     }
 
@@ -310,13 +338,14 @@ pub fn run_client(args: &[String]) -> i32 {
             "usage: comux <list|split|resize|focus|close|send|list-tabs|new-tab|select-tab|\
              rename-tab [index] <name>|list-sessions|new-session [name]|\
              rename-session [index] <name>|select-session|\
-             worktree <create|list|rm>|reload|kill-server> [args]"
+             worktree <create|list|rm>|reload|health|kill-server> [args]"
         );
         return 2;
     };
 
     let req = match cmd {
         "list" => Req::List,
+        "health" => Req::Health,
         "reload" | "source-file" => Req::ReloadConfig,
         "kill-server" => Req::KillServer,
         "list-tabs" | "tabs" => Req::ListTabs,
@@ -790,7 +819,7 @@ fn wait_for_server_gone(path: &Path, timeout: Duration) -> bool {
     true
 }
 
-fn round_trip(req: &Req) -> Result<Resp, String> {
+pub(crate) fn round_trip(req: &Req) -> Result<Resp, String> {
     let path = socket_path();
     let mut stream = UnixStream::connect(&path).map_err(|e| {
         format!(
@@ -823,6 +852,14 @@ fn print_human(req: &Req, resp: &Resp) {
         return;
     }
     match req {
+        Req::Health => {
+            let Some(h) = resp.health.as_ref() else {
+                return;
+            };
+            println!("panes           {}", h.panes);
+            println!("labeled         {}", h.labeled);
+            println!("sweeps failed   {}", h.label_sweeps_failed);
+        }
         Req::List => {
             let panes = resp.panes.clone().unwrap_or_default();
             let focused = resp.focused.unwrap_or(usize::MAX);

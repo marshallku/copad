@@ -368,8 +368,11 @@ pub struct App {
     /// Per-terminal foreground-process label (agent / shell / command), refreshed
     /// on a throttled cadence (`refresh_labels`), read by the sidebar/popup/CLI.
     labels: HashMap<TerminalId, procinfo::Label>,
-    /// When the labels were last refreshed (throttle `ps` to ~2 Hz).
+    /// When the labels were last refreshed (throttle the sweep to ~2 Hz).
     last_labels: std::time::Instant,
+    /// Cumulative count of process sweeps that failed outright (see
+    /// [`Self::label_sweeps_failed`]). Diagnostic only — never resets.
+    label_sweeps_failed: u64,
     /// Per-agent rolled-up status (working/ready/blocked/idle), refreshed at the
     /// label cadence from Claude's session file + a screen-text fallback (`agentstate`).
     agent_statuses: HashMap<TerminalId, agentstate::AgentStatus>,
@@ -501,6 +504,7 @@ impl App {
             last_labels: std::time::Instant::now()
                 .checked_sub(Duration::from_secs(60))
                 .unwrap_or_else(std::time::Instant::now),
+            label_sweeps_failed: 0,
             agent_statuses: HashMap::new(),
             branches: HashMap::new(),
             next_session,
@@ -1447,6 +1451,11 @@ impl App {
     pub fn handle_control(&mut self, req: &control::Req) -> control::Resp {
         use control::{PaneInfo, Req, Resp};
         match req {
+            Req::Health => Resp::health(control::HealthInfo {
+                panes: self.panes.len(),
+                labeled: self.labels.len(),
+                label_sweeps_failed: self.label_sweeps_failed,
+            }),
             Req::List => {
                 let order = self.pane_order();
                 let focused = self.focused_pane();
@@ -3587,24 +3596,42 @@ impl App {
     /// Refresh every pane's foreground-process label from a single `ps` sweep
     /// (throttled by the caller to ~2 Hz — never per frame).
     fn refresh_labels(&mut self) -> bool {
-        let tree = procinfo::ProcTree::snapshot();
-        let mut next = HashMap::new();
-        for (tid, pane) in &self.panes {
-            // The terminal's foreground process GROUP is the real foreground
-            // command (resolve a live member — the pgid leader may have exited in
-            // a pipeline); fall back to descending from the shell pid.
-            let label = pane
-                .foreground_pgid()
-                .and_then(|pg| tree.command_of_pgroup(pg))
-                .or_else(|| pane.pid().and_then(|p| tree.foreground(p)));
-            if let Some(label) = label {
-                next.insert(tid.clone(), label);
-            }
-        }
+        self.last_labels = std::time::Instant::now();
+        let swept = procinfo::ProcTree::snapshot().map(|tree| {
+            self.panes
+                .iter()
+                .map(|(tid, pane)| {
+                    // The terminal's foreground process GROUP is the real foreground
+                    // command (resolve a live member — the pgid leader may have exited
+                    // in a pipeline); fall back to descending from the shell pid.
+                    let mut label = pane
+                        .foreground_pgid()
+                        .and_then(|pg| tree.command_of_pgroup(pg))
+                        .or_else(|| pane.pid().and_then(|p| tree.foreground(p)));
+                    // One extra lookup for the ONE resolved pid, so the chip keeps
+                    // naming what the user typed rather than the shim it resolved to.
+                    if let Some(l) = label.as_mut() {
+                        procinfo::refine_label(l);
+                    }
+                    (tid.clone(), label)
+                })
+                .collect::<Vec<_>>()
+        });
+        let Some(next) = merge_labels(&self.labels, swept) else {
+            self.label_sweeps_failed = self.label_sweeps_failed.saturating_add(1);
+            return false;
+        };
         let changed = next != self.labels;
         self.labels = next;
-        self.last_labels = std::time::Instant::now();
         changed
+    }
+
+    /// How many process sweeps have FAILED outright since the server started (the
+    /// tree could not be read at all). Non-zero means labels are being carried
+    /// forward rather than refreshed; surfaced by `comux doctor` so the condition
+    /// that used to be an unexplained "my tab names vanished" is observable.
+    pub fn label_sweeps_failed(&self) -> u64 {
+        self.label_sweeps_failed
     }
 
     /// The terminal id backing the pane at list index `idx`.
@@ -4973,6 +5000,35 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Fold one process sweep into the pane-label map.
+///
+/// `swept` is `None` when the SWEEP ITSELF failed, and `Some(answer per live pane)`
+/// otherwise — where a pane's `None` means the sweep ran but could not resolve that
+/// one pane. Both levels RETAIN the previous label, because an absent label is never
+/// merely cosmetic: it drops the tab chip to a bare index, empties the sidebar agents
+/// list and `● N` counts, clears that pane's agent status (swallowing the next
+/// turn-finished/awaiting-input toast, which needs a KNOWN previous status), and makes
+/// an autosave landing in the window write a snapshot with NO agent restore command
+/// (`layout_to_persist` gates on the label), so the next server restart silently comes
+/// back as a bare shell. A whole-sweep failure used to blank all of that at once.
+///
+/// Returns `None` for a failed sweep (caller keeps its map untouched). On a successful
+/// sweep, panes absent from `swept` have been reaped and are dropped — so a retained
+/// label can only ever belong to a pane that still exists.
+fn merge_labels(
+    prev: &HashMap<TerminalId, procinfo::Label>,
+    swept: Option<Vec<(TerminalId, Option<procinfo::Label>)>>,
+) -> Option<HashMap<TerminalId, procinfo::Label>> {
+    let swept = swept?;
+    let mut next = HashMap::with_capacity(swept.len());
+    for (tid, label) in swept {
+        if let Some(label) = label.or_else(|| prev.get(&tid).cloned()) {
+            next.insert(tid, label);
+        }
+    }
+    Some(next)
+}
+
 /// Keep only the entries whose name is in `whitelist` (order preserved, last value wins on
 /// a duplicate name). Applied to a client's advertised env before it becomes `client_env`.
 fn filter_env(env: Vec<(String, String)>, whitelist: &[String]) -> Vec<(String, String)> {
@@ -5434,15 +5490,71 @@ mod tests {
     use super::{
         CAT_GREEN, CAT_RED, CAT_YELLOW, Menu, MenuAction, build_command_line,
         detect_alt_screen_transition, extract_selection, filter_env, list_window_start,
-        menu_origin, merge_env, reload_note, sel_bounds, sel_cols, shell_quote, tab_window,
-        usage_should_roll, usage_threshold_color, wrap_page,
+        menu_origin, merge_env, merge_labels, reload_note, sel_bounds, sel_cols, shell_quote,
+        tab_window, usage_should_roll, usage_threshold_color, wrap_page,
     };
     use crate::model::TerminalId;
+    use crate::procinfo::{Kind, Label};
     use crate::term::{CellColor, CellSnap, Snapshot};
     use std::collections::HashMap;
 
     fn tid(s: &str) -> TerminalId {
         TerminalId::new(s)
+    }
+
+    fn label(text: &str, kind: Kind) -> Label {
+        Label {
+            text: text.to_string(),
+            kind,
+            pid: 1,
+        }
+    }
+
+    #[test]
+    fn a_failed_sweep_keeps_every_label_instead_of_blanking_them() {
+        let prev = HashMap::from([
+            (tid("t1"), label("claude", Kind::Agent)),
+            (tid("t2"), label("zsh", Kind::Shell)),
+        ]);
+        // The sweep itself failed: the caller must be told "no change" so the tab
+        // chips, sidebar agents list, agent statuses and the next autosave's restore
+        // commands all keep working off the last-known labels.
+        assert!(merge_labels(&prev, None).is_none());
+    }
+
+    #[test]
+    fn a_pane_the_sweep_cannot_resolve_keeps_its_previous_label() {
+        let prev = HashMap::from([
+            (tid("t1"), label("claude", Kind::Agent)),
+            (tid("t2"), label("zsh", Kind::Shell)),
+        ]);
+        let next = merge_labels(
+            &prev,
+            Some(vec![
+                // t1 resolved to something new — the fresh answer wins.
+                (tid("t1"), Some(label("nvim", Kind::Other))),
+                // t2 missed this sweep (mid-exec / briefly a zombie) — retained, so
+                // its chip does not flicker back to a bare index for one frame.
+                (tid("t2"), None),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(next[&tid("t1")].text, "nvim");
+        assert_eq!(next[&tid("t2")].text, "zsh");
+    }
+
+    #[test]
+    fn a_reaped_pane_is_dropped_rather_than_retained() {
+        let prev = HashMap::from([
+            (tid("t1"), label("zsh", Kind::Shell)),
+            (tid("gone"), label("claude", Kind::Agent)),
+        ]);
+        // `gone` is absent from the sweep list (built from live panes), so retention
+        // must NOT resurrect it — otherwise a closed agent pane would haunt the
+        // sidebar forever.
+        let next = merge_labels(&prev, Some(vec![(tid("t1"), None)])).unwrap();
+        assert_eq!(next.len(), 1);
+        assert!(!next.contains_key(&tid("gone")));
     }
 
     /// Build a snapshot from row strings (one cell per char, no wide chars, no wrap).
