@@ -60,6 +60,18 @@ Why these exist:
 - **Linux**: `install-dev.sh` defaults to user install at `~/.local/bin/copad` (no sudo) — matches `install.sh`'s end-user default and avoids sudo prompts during dev iteration. Use `--system` explicitly when you want the system-wide copy at `/usr/local/bin`. If both `~/.local/bin/copad` and `/usr/local/bin/copad` exist and differ, PATH lookup typically picks `/usr/local/bin` first, so a stale system copy can silently shadow your fresh user-local build (and a desktop-entry-launched copad will use the system copy too). The script warns loudly in that case and lists the four resolutions.
 - **macOS**: `cargo install copad-cli` fails (not on crates.io) and `cargo install --path .` fails from the repo root (workspace virtual manifest). The `copad` GUI app is SwiftPM, not cargo. Before this script, `copad-macos/run.sh` was the only path and it only built an ephemeral debug bundle under `.build/debug/`. The script wraps `swift build -c release` + bundle layout + `cargo install --path copad-cli` so the user gets a real `/Applications`-style install.
 
+## Homebrew tap (generated — do not edit the tap by hand)
+
+`marshallku/homebrew-copad` serves the `copad` cask and the standalone `comux` formula, and **both files are generated**: `dist/homebrew/{copad,comux}.rb.tmpl` are the source of truth, and `.github/workflows/homebrew.yml` renders them (version + sha256 substitution) and pushes to the tap after every release. Editing the tap directly is overwritten by the next release. Requires the `HOMEBREW_TAP_TOKEN` secret (fine-grained PAT, contents:write on the tap repo).
+
+The job runs on a macOS runner and **refuses to publish an unsigned build**: it downloads the release assets and gates the push on Developer ID authority + hardened runtime for every Mach-O, plus `stapler validate` / `spctl` on `Copad.app`. That gate is what allows the cask to install on macOS 26 (Tahoe), which deletes ad-hoc-signed executables on `launchd` spawn (decision #89).
+
+Re-publish an existing tag to the tap without cutting a release:
+
+```bash
+gh workflow run homebrew.yml -f version=v1.0.5
+```
+
 ## Install first-party plugins
 
 `install-dev.sh` runs `install-plugins.sh` automatically. To install plugins on their own (e.g. you only changed a plugin manifest):

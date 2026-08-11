@@ -191,7 +191,17 @@ brew install --cask marshallku/copad/copad
 
 Installs `Copad.app` to `/Applications`, `coctl` + `copadd` into `$(brew --prefix)/bin`, and lays out the 14 macOS plugins, shell hooks, and the `copadd` LaunchAgent (auto-starts at login). Requires Apple Silicon. The tap repo is [marshallku/homebrew-copad](https://github.com/marshallku/homebrew-copad).
 
-**Supported macOS versions:** 14 (Sonoma), 15 (Sequoia). On **macOS 26 (Tahoe) and later**, ad-hoc-signed releases break — Tahoe's tightened App Verification policy deletes ad-hoc-signed executables on first `launchd` spawn, which removes `copadd` and the plugin binaries. The proper fix — Developer ID signing of every binary + notarization of `Copad.app` — is implemented in the release CI (`.github/workflows/release.yml`) and **activates automatically once the signing secrets are configured** (see [docs/macos-signing-notarization.md](docs/macos-signing-notarization.md)); releases cut before that fall back to ad-hoc. Until a signed release is published, Tahoe users should install from source via `scripts/install-macos.sh` (next section), which signs with a locally-trusted self-signed identity (`scripts/codesign-dev.sh`) and survives Tahoe's policy.
+The multiplexer is a separate formula — **also available on Linux** (statically linked, so any glibc):
+
+```bash
+brew install marshallku/copad/comux
+```
+
+It is deliberately not part of the cask (two artifacts cannot both own `$(brew --prefix)/bin/comux`), so install it alongside the cask if you want both.
+
+Both are published by the release CI: `.github/workflows/homebrew.yml` renders [`dist/homebrew/*.rb.tmpl`](dist/homebrew/) with the release's version + checksums and pushes them to the tap, after verifying the published artifacts really are Developer ID signed and notarized. The tap files are generated — edit the templates here, not the tap.
+
+**macOS versions:** 14 (Sonoma) and later, including **26 (Tahoe)**. Every Mach-O in a release (CLIs, `copadd`, plugin binaries, `Copad.app`) is Developer ID signed with a hardened runtime and secure timestamp, and `Copad.app` is notarized + stapled — see [docs/macos-signing-notarization.md](docs/macos-signing-notarization.md). That is what makes Tahoe safe: its App Verification policy deletes *ad-hoc*-signed executables on first `launchd` spawn, which used to remove `copadd` and the plugins. Releases cut before the signing secrets landed (v1.0.0 and earlier) are ad-hoc and still break there; **v1.0.1 onwards are signed** (verified against the published assets).
 
 ### macOS — From source
 

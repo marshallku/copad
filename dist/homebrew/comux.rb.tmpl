@@ -1,0 +1,71 @@
+# typed: true
+# frozen_string_literal: true
+
+# GENERATED FILE — do not edit in the tap.
+# Source of truth: marshallku/copad → dist/homebrew/comux.rb.tmpl
+# Rendered and pushed to marshallku/homebrew-copad by .github/workflows/homebrew.yml
+# on every release tag. Local edits to Formula/comux.rb are overwritten by the
+# next release; change the template in the copad repo instead.
+#
+# This ships the prebuilt release asset rather than building from source: comux
+# is one self-contained binary (no GTK, no daemon), and the macOS asset is the
+# Developer-ID-signed + hardened-runtime copy the release workflow produced —
+# rebuilding it from source in the Homebrew sandbox would throw that signature
+# away.
+class Comux < Formula
+  desc "Terminal multiplexer for AI agents — tmux-style sessions, splits, agent status"
+  homepage "https://github.com/marshallku/copad"
+  license "MIT"
+  # No explicit `version` stanza: Homebrew scans it out of the release URL, and
+  # `brew audit` rejects the redundant declaration. The URLs below still carry
+  # __VERSION__ so the render step is what pins it.
+
+  # A plain conditional, not `on_macos do … end`: the Homebrew style cops reject
+  # `url`/`sha256` inside an on_system block (`brew style` → FormulaAudit/
+  # ComponentsOrder), so per-platform assets have to branch at the class body
+  # level. `else` (rather than `on_linux`) so an unsupported host still fails
+  # with the arch requirement's message instead of "no url specified".
+  if OS.mac?
+    depends_on arch: :arm64
+
+    url "https://github.com/marshallku/copad/releases/download/v__VERSION__/comux-v__VERSION__-aarch64-apple-darwin"
+    sha256 "__SHA256_MACOS_ARM64__"
+  else
+    depends_on arch: :x86_64
+
+    # The statically linked (musl) asset, not the glibc one. Homebrew on Linux
+    # runs on hosts whose glibc is frequently older than the release runner's
+    # (the glibc build needs 2.39+), and brew's own glibc formula does not help
+    # a prebuilt binary that the system loader resolves. The static build has no
+    # libc dependency at all, so it runs on every supported host.
+    url "https://github.com/marshallku/copad/releases/download/v__VERSION__/comux-v__VERSION__-x86_64-linux-musl"
+    sha256 "__SHA256_LINUX_MUSL__"
+  end
+
+  def install
+    # The release asset is a bare executable, not an archive, so it lands in the
+    # staging dir under its full versioned name and WITHOUT the execute bit
+    # (curl does not preserve one). Rename on install and set the mode.
+    asset = Dir["comux-v*"].first
+    odie "comux release asset missing from the download" if asset.nil?
+    bin.install asset => "comux"
+    chmod 0755, bin/"comux"
+  end
+
+  def caveats
+    <<~EOS
+      comux is self-contained — nothing else needs installing. Configure
+      keybindings and options in ~/.config/copad/mux.toml:
+        https://github.com/marshallku/copad/blob/master/copad-mux/mux.example.toml
+
+      For the full copad (GUI app + coctl + copadd + plugins):
+        brew install --cask marshallku/copad/copad
+    EOS
+  end
+
+  test do
+    # `comux help` prints usage to stderr and exits 0 without touching the
+    # server socket, so it is safe inside the sandbox.
+    assert_match "copad terminal multiplexer", shell_output("#{bin}/comux help 2>&1")
+  end
+end

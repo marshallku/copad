@@ -429,3 +429,15 @@ jobs:
             artifacts/linux-x86_64/comux-*
             artifacts/macos-aarch64/comux-*
           generate_release_notes: false
+
+  # Publish the just-released artifacts to the Homebrew tap (cask + comux
+  # formula). Runs after the release exists because it downloads the published
+  # assets to checksum and signature-verify them. Backfill an older tag with
+  # `gh workflow run homebrew.yml -f version=vX.Y.Z`.
+  homebrew:
+    name: Update Homebrew tap
+    needs: [release]
+    uses: ./.github/workflows/homebrew.yml
+    with:
+      version: ${{ github.ref_name }}
+    secrets: inherit

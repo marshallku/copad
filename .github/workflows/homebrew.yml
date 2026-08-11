@@ -1,0 +1,189 @@
+name: Homebrew tap
+
+# Publishes the released macOS/Linux artifacts to the Homebrew tap
+# (marshallku/homebrew-copad): the `copad` cask (GUI + coctl + copadd + plugins)
+# and the standalone `comux` formula.
+#
+# Called by release.yml after the GitHub Release is published, and dispatchable
+# on its own to backfill / re-render the tap for an existing tag without cutting
+# a new release:
+#
+#     gh workflow run homebrew.yml -f version=v1.0.5
+#
+# The cask/formula bodies are NOT maintained in the tap — they are rendered from
+# dist/homebrew/*.rb.tmpl in this repo so the packaging lives next to the release
+# workflow that produces the artifacts it points at.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: "Release tag to publish, e.g. v1.0.5"
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release tag to publish, e.g. v1.0.5"
+        required: true
+        type: string
+
+env:
+  TAP_REPO: marshallku/homebrew-copad
+
+jobs:
+  update-tap:
+    name: Render + push cask/formula
+    # macOS runner on purpose: the signing verification below uses codesign /
+    # stapler on the actual published bytes. That check is what lets the cask
+    # drop its old "macOS 26 (Tahoe) is unsupported" preflight — brew users must
+    # never be handed an ad-hoc-signed build, whose copadd + plugin binaries
+    # Tahoe's App Verification deletes on first launchd spawn.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          mkdir -p assets
+          gh release download "$TAG" -R "$GITHUB_REPOSITORY" -D assets \
+            -p "copad-v${VERSION}-aarch64-apple-darwin.tar.gz" \
+            -p "comux-v${VERSION}-aarch64-apple-darwin" \
+            -p "comux-v${VERSION}-x86_64-linux-musl"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          ls -l assets
+
+      # Gate the tap update on the published artifacts actually carrying the
+      # owner's Developer ID signature + a stapled notarization ticket. The
+      # release job falls back to ad-hoc signing whenever a signing secret is
+      # missing or the cert fails to import (deliberately — so forks still
+      # build), and that fallback must not reach Homebrew users.
+      - name: Verify Developer ID signature + notarization
+        run: |
+          set -euo pipefail
+          APP_TARBALL="assets/copad-v${VERSION}-aarch64-apple-darwin.tar.gz"
+
+          fail() { echo "::error::$1"; exit 1; }
+
+          # Deliberately no `codesign … | grep -q` pipelines: grep -q exits at the
+          # first match, codesign then dies of SIGPIPE, and `set -o pipefail` turns
+          # that into a failed step on a PERFECTLY SIGNED binary. Capture first,
+          # match the captured text.
+          require_devid() {
+            local out
+            # `codesign -d` only DISPLAYS the signature — a tampered binary keeps
+            # its Developer ID metadata and would sail past a metadata-only check.
+            # Verify the seal first, then read who signed it.
+            codesign --verify --strict "$1" 2>/dev/null \
+              || fail "$1 is unsigned or its signature does not verify"
+            out="$(codesign -dvv "$1" 2>&1)" || fail "$1 has no readable signature"
+            grep -q "Authority=Developer ID Application" <<<"$out" \
+              || fail "$1 is not Developer ID signed (the release took its ad-hoc fallback) — check the MACOS_* secrets"
+            grep -q "flags=.*runtime" <<<"$out" \
+              || fail "$1 is signed without the hardened runtime"
+          }
+
+          # comux ships as a bare Mach-O in the comux formula, so it carries its
+          # signature alone — the cask's tarball contents are checked below.
+          require_devid "assets/comux-v${VERSION}-aarch64-apple-darwin"
+
+          mkdir -p verify && tar -xzf "$APP_TARBALL" -C verify
+          codesign --verify --strict --verbose=2 verify/Copad.app \
+            || fail "Copad.app failed strict signature verification"
+          xcrun stapler validate verify/Copad.app \
+            || fail "Copad.app has no stapled notarization ticket"
+          gatekeeper="$(spctl -a -vvv --type exec verify/Copad.app 2>&1)" \
+            || fail "Copad.app is rejected by Gatekeeper"
+          grep -q "source=Notarized Developer ID" <<<"$gatekeeper" \
+            || fail "Copad.app is not accepted as Notarized Developer ID"
+
+          # copadd and the plugins are the binaries Tahoe deletes when they are
+          # ad-hoc-signed, and the cask's postflight copies them out past Cask's
+          # own quarantine handling — so verify them too.
+          for b in verify/coctl verify/copadd verify/comux; do
+            require_devid "$b"
+          done
+          plugins=0
+          while IFS= read -r -d '' p; do
+            require_devid "$p"
+            plugins=$((plugins + 1))
+          done < <(find verify/plugins -type f -name 'copad-plugin-*' -perm -u+x -print0)
+          # Zero matches would let a layout change pass this gate vacuously.
+          [ "$plugins" -gt 0 ] || fail "no plugin binaries found in the release tarball"
+
+          echo "signature + notarization OK (${plugins} plugin binaries checked)"
+
+      - name: Render cask + formula
+        run: |
+          set -euo pipefail
+          SHA_APP="$(shasum -a 256 "assets/copad-v${VERSION}-aarch64-apple-darwin.tar.gz" | cut -d' ' -f1)"
+          SHA_COMUX_MAC="$(shasum -a 256 "assets/comux-v${VERSION}-aarch64-apple-darwin" | cut -d' ' -f1)"
+          SHA_COMUX_LINUX="$(shasum -a 256 "assets/comux-v${VERSION}-x86_64-linux-musl" | cut -d' ' -f1)"
+
+          # A truncated / empty checksum would sed in as `sha256 ""` and still
+          # pass the placeholder check below, publishing a cask nobody can
+          # install. Assert the shape before it reaches the template.
+          for s in "$SHA_APP" "$SHA_COMUX_MAC" "$SHA_COMUX_LINUX"; do
+            [[ "$s" =~ ^[0-9a-f]{64}$ ]] || { echo "::error::bad sha256: '$s'"; exit 1; }
+          done
+
+          mkdir -p rendered
+          sed -e "s/__VERSION__/${VERSION}/g" \
+              -e "s/__SHA256_MACOS_TARBALL__/${SHA_APP}/g" \
+              dist/homebrew/copad.rb.tmpl > rendered/copad.rb
+          sed -e "s/__VERSION__/${VERSION}/g" \
+              -e "s/__SHA256_MACOS_ARM64__/${SHA_COMUX_MAC}/g" \
+              -e "s/__SHA256_LINUX_MUSL__/${SHA_COMUX_LINUX}/g" \
+              dist/homebrew/comux.rb.tmpl > rendered/comux.rb
+
+          # A leftover placeholder means the template grew a field the render
+          # step does not substitute — that would publish a broken cask.
+          if grep -lE '__[A-Z0-9_]+__' rendered/*.rb; then
+            echo "::error::unsubstituted placeholder left in the rendered tap files"
+            exit 1
+          fi
+          ruby -c rendered/copad.rb
+          ruby -c rendered/comux.rb
+
+      - name: Push to tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAP_TOKEN:-}" ]; then
+            msg="HOMEBREW_TAP_TOKEN is not set — ${TAP_REPO} was NOT updated, brew users stay on the previous version. Add a fine-grained PAT with contents:write on ${TAP_REPO}."
+            if [ "$GITHUB_REPOSITORY" = "marshallku/copad" ]; then
+              echo "::error::$msg"; exit 1
+            fi
+            echo "::warning::$msg (fork — skipping)"; exit 0
+          fi
+
+          git clone --depth 1 "https://x-access-token:${TAP_TOKEN}@github.com/${TAP_REPO}.git" tap
+          mkdir -p tap/Casks tap/Formula
+          cp rendered/copad.rb tap/Casks/copad.rb
+          cp rendered/comux.rb tap/Formula/comux.rb
+
+          cd tap
+          git add Casks/copad.rb Formula/comux.rb
+          if git diff --cached --quiet; then
+            echo "tap already at ${VERSION} — nothing to push"
+            echo "tap already at \`${VERSION}\` — nothing to push" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "copad ${VERSION}: update cask + comux formula" \
+                     -m "Rendered from marshallku/copad dist/homebrew/*.rb.tmpl by the release workflow."
+          git push
+          {
+            echo "### Homebrew tap updated"
+            echo ""
+            echo "- \`${TAP_REPO}\` → \`Casks/copad.rb\` + \`Formula/comux.rb\` @ **${VERSION}**"
+            echo "- \`brew install --cask marshallku/copad/copad\`"
+            echo "- \`brew install marshallku/copad/comux\`"
+          } >> "$GITHUB_STEP_SUMMARY"

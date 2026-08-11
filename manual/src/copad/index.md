@@ -20,7 +20,7 @@ From source: `cargo run -p copad-linux` (append `-- --init-config` to write a de
 
 Open `Copad.app` from `/Applications` or `~/Applications` — via Spotlight, the Dock, or `open -a Copad`. For a dev loop from source, `cd copad-macos && ./run.sh` builds and opens a fresh debug bundle.
 
-Supported: macOS 14 (Sonoma) and 15 (Sequoia). See the [installation notes](../installation.md#macos-via-homebrew) for macOS 26 (Tahoe).
+Supported: macOS 14 (Sonoma) and later — including 26 (Tahoe) from release v1.0.1, where every shipped binary is Developer ID signed and `Copad.app` is notarized. See the [installation notes](../installation.md#macos-via-homebrew).
 
 ---
 

@@ -64,6 +64,12 @@ If all you want is the multiplexer, install just `comux` — no GUI app, no daem
 curl -fsSL https://raw.githubusercontent.com/marshallku/copad/master/install-comux.sh | bash
 ```
 
+On either platform Homebrew works too — same binary, upgraded with `brew upgrade`:
+
+```bash
+brew install marshallku/copad/comux
+```
+
 | Flag | Effect |
 | --- | --- |
 | `--version VERSION` | Pin a release tag. |
@@ -94,9 +100,17 @@ Apple Silicon only:
 brew install --cask marshallku/copad/copad
 ```
 
-This installs `Copad.app` to `/Applications`, `coctl` + `copadd` + `comux` to `$(brew --prefix)/bin`, the first-party plugins, shell hooks, and the `copadd` LaunchAgent.
+This installs `Copad.app` to `/Applications`, `coctl` + `copadd` to `$(brew --prefix)/bin`, the first-party plugins, shell hooks, and the `copadd` LaunchAgent.
 
-> **macOS 26 (Tahoe) and later.** Ad-hoc-signed releases stop launching on Tahoe until a Developer-ID-signed release is published. Until then, [install from source](#building-from-source) with `scripts/install-macos.sh` — a self-signed identity survives Tahoe. Supported today: macOS 14 (Sonoma) and 15 (Sequoia).
+`comux` is a separate formula — on **macOS and Linux** (the Linux build is statically linked, so it runs on any glibc):
+
+```bash
+brew install marshallku/copad/comux
+```
+
+It is not bundled into the cask because both would claim `$(brew --prefix)/bin/comux`; install it alongside the cask if you want the GUI and the multiplexer.
+
+> **macOS 26 (Tahoe).** Supported from **v1.0.1** onward. Every binary in a release is Developer ID signed with a hardened runtime, and `Copad.app` is notarized + stapled, so Tahoe's App Verification no longer deletes `copadd` and the plugins on first launch. Older (ad-hoc-signed) releases do still break there — [install from source](#building-from-source) with `scripts/install-macos.sh` if you need one.
 
 ---
 
