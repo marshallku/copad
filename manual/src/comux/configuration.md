@@ -12,7 +12,7 @@ Most settings apply on the running server without a restart:
 comux reload          # re-read mux.toml on the live server (alias: comux source-file)
 ```
 
-`reload` re-reads the file, swaps the config in place, and prints the config path plus any parse warnings — it never breaks the running mux. Keybindings, mouse, `sidebar_width`, all `usage_*`, `tab_labels`, `notify`, and worktree settings apply on the next frame.
+`reload` re-reads the file, swaps the config in place, and prints the config path plus any parse warnings — it never breaks the running mux. Keybindings, mouse, `osc52`, `sidebar_width`, all `usage_*`, `tab_labels`, `notify`, and worktree settings apply on the next frame.
 
 **Three settings are fixed at server boot** and need `comux server restart` instead: `persist`, `autosave_secs`, and `update_environment`. (`restore_processes` / `restore_agent_sessions` are read at save time, so `reload` does update them for the next save.)
 
@@ -24,6 +24,7 @@ comux reload          # re-read mux.toml on the live server (alias: comux source
 | --- | --- | --- | --- |
 | `prefix` | `"C-b"` | any chord | The prefix key |
 | `mouse` | `true` | bool | Wheel-scroll, click-to-focus, click chrome to navigate |
+| `osc52` | `true` | bool | Relay a pane program's OSC 52 clipboard write to the attached clients (tmux `set-clipboard`). Clipboard *reads* are never answered |
 | `notify` | `true` | bool | Agent turn-completion desktop toasts (`COPAD_MUX_NOTIFY` wins) |
 | `sidebar` | `true` | bool | Show the spaces+agents sidebar by default |
 | `sidebar_width` | `24` | `8`–`80` | Sidebar columns |
@@ -119,6 +120,7 @@ See [Git Worktrees](./worktrees.md) for the full workflow.
 # ---- prefix & input ----
 prefix      = "C-a"
 mouse       = true
+osc52       = true
 scroll_step = 5
 
 # ---- sidebar ----

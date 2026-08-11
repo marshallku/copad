@@ -21,6 +21,8 @@
 # ---- options ----
 prefix = "C-b"            # the prefix key (tmux default)
 mouse = true              # mouse: wheel-scroll, click-to-focus, click chrome to navigate
+osc52 = true              # let a pane's program set the clipboard via OSC 52 (tmux set-clipboard).
+                          # false stops a background pane clobbering it; reads are never answered.
 notify = true             # agent turn-completion desktop toasts (env COPAD_MUX_NOTIFY wins)
 sidebar = true            # show the spaces+agents sidebar by default (Ctrl-b s toggles)
 sidebar_width = 24        # sidebar columns            (clamped to 8..80)

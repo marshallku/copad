@@ -92,11 +92,16 @@ struct Client {
     /// attach via [`ClientMsg::Env`]. Adopted as the pane-spawn env source when this client's
     /// input is dispatched, so a pane it creates inherits ITS live SSH/display session.
     env: Vec<(String, String)>,
-    /// Text from this client's drag-selection awaiting delivery as a `Copy` (OSC 52). Held here
-    /// and retried each loop because the frame channel is cap-1: a drag redraw may be queued when
-    /// the copy is ready, so `try_send` can transiently fail. Latest-copy-wins (a newer selection
-    /// overwrites an unsent one — a human can't complete two drags within a frame interval).
-    pending_copy: Option<String>,
+    /// Text awaiting delivery to this client as a `Copy` (OSC 52) — from its own drag-selection
+    /// or from a pane program's OSC 52 write. Held here and retried each loop because the frame
+    /// channel is cap-1: a drag redraw may be queued when the copy is ready, so `try_send` can
+    /// transiently fail.
+    ///
+    /// The `u64` is a clipboard sequence ([`term::next_clipboard_seq`]) and BOTH sources draw
+    /// from it, so latest-wins is decided by when the copy was actually produced. Without it, a
+    /// pane that writes the clipboard every tick would overwrite — and with backpressure, starve
+    /// — an undelivered drag copy that happened later.
+    pending_copy: Option<(u64, String)>,
 }
 
 /// Per-connection handshake config threaded from [`run`] to each attaching client: the
@@ -334,6 +339,15 @@ pub fn run() -> io::Result<()> {
         // starved by sustained frame output. Non-blocking (a suspended client can't stall us):
         // on `Full` it retries next loop; a delivered copy just delays that client's frame by
         // one tick (which then re-sends as a normal delta).
+        // A pane program's OSC 52 write (nvim yank, a `yank` helper) goes to EVERY attached
+        // client, which re-emits it to its own terminal — tmux `set-clipboard` semantics.
+        // Unlike a drag-copy there is no originating client to target: the write came from
+        // inside the mux, so every viewer's clipboard is an equally valid destination.
+        if let Some((seq, text)) = app.drain_pane_clipboard() {
+            for c in clients.iter_mut() {
+                queue_copy(c, seq, &text);
+            }
+        }
         drain_pending_copies(&mut app, &mut clients);
         if dirty && last_frame.elapsed() >= FRAME_INTERVAL {
             last_frame = Instant::now();
@@ -702,7 +716,7 @@ fn handle_incoming(
                     if let Some(text) = app.mouse_at(ClientId(id), x, y, kind)
                         && let Some(c) = clients.iter_mut().find(|c| c.id == id)
                     {
-                        c.pending_copy = Some(text);
+                        queue_copy(c, crate::term::next_clipboard_seq(), &text);
                     }
                     true
                 }
@@ -785,16 +799,28 @@ fn prune_dead_clients(app: &mut App, clients: &mut Vec<Client>, dead: &[u64]) ->
 fn drain_pending_copies(app: &mut App, clients: &mut Vec<Client>) {
     let mut dead = Vec::new();
     for c in clients.iter_mut() {
-        let Some(text) = c.pending_copy.take() else {
+        let Some((seq, text)) = c.pending_copy.take() else {
             continue;
         };
         match c.out.try_send(ServerMsg::Copy { text: text.clone() }) {
             Ok(()) => {}
-            Err(TrySendError::Full(_)) => c.pending_copy = Some(text), // retry next loop
-            Err(TrySendError::Disconnected(_)) => dead.push(c.id),     // writer gone; prune
+            // Retry next loop — but through `queue_copy`, so a copy produced while this one
+            // was blocked isn't demoted back to the older text.
+            Err(TrySendError::Full(_)) => queue_copy(c, seq, &text),
+            Err(TrySendError::Disconnected(_)) => dead.push(c.id), // writer gone; prune
         }
     }
     prune_dead_clients(app, clients, &dead);
+}
+
+/// Queue `text` for delivery to `c` as an OSC 52 copy, keeping only the LATEST by clipboard
+/// sequence. The clipboard has one slot, so an older copy must never displace a newer one —
+/// which is exactly what an unguarded assignment does when a pane writes the clipboard on
+/// the same tick a drag copy is still waiting out channel backpressure.
+fn queue_copy(c: &mut Client, seq: u64, text: &str) {
+    if c.pending_copy.as_ref().is_none_or(|(prev, _)| seq > *prev) {
+        c.pending_copy = Some((seq, text.to_string()));
+    }
 }
 
 /// Render the app ONCE and broadcast the changed cells (or a full baseline) to every
@@ -914,6 +940,65 @@ mod tests {
                 _peer: peer,
             },
         )
+    }
+
+    #[test]
+    fn a_newer_copy_wins_and_an_older_one_cannot_demote_it() {
+        let (mut c, _guard) = test_client(1, 80, 24);
+
+        super::queue_copy(&mut c, 5, "drag selection");
+        assert_eq!(
+            c.pending_copy.as_ref().map(|(s, t)| (*s, t.as_str())),
+            Some((5, "drag selection"))
+        );
+
+        // A pane's OSC 52 write that happened EARLIER must not replace it — that is the
+        // starvation/regression path: an undelivered drag copy silently becoming older text.
+        super::queue_copy(&mut c, 4, "stale pane write");
+        assert_eq!(
+            c.pending_copy.as_ref().map(|(_, t)| t.as_str()),
+            Some("drag selection")
+        );
+
+        // A genuinely later write does win — the clipboard has one slot.
+        super::queue_copy(&mut c, 6, "later pane write");
+        assert_eq!(
+            c.pending_copy.as_ref().map(|(_, t)| t.as_str()),
+            Some("later pane write")
+        );
+    }
+
+    #[test]
+    fn a_backpressured_copy_stays_pending_and_keeps_its_sequence() {
+        let (mut c, guard) = test_client(1, 80, 24);
+        // Fill the cap-1 channel so the copy's `try_send` reports `Full`.
+        c.out
+            .try_send(ServerMsg::Copy {
+                text: "occupant".into(),
+            })
+            .expect("fill");
+
+        let (mut cfg, _) = MuxConfig::load_from(std::path::Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false;
+        let mut app = App::new(80, 24, Vec::new(), Vec::new(), cfg).expect("app");
+
+        super::queue_copy(&mut c, 9, "blocked copy");
+        let mut clients = vec![c];
+        super::drain_pending_copies(&mut app, &mut clients);
+
+        // Still queued for the next tick, and still at seq 9 — so an older pane write that
+        // arrives in the meantime cannot take its place.
+        let pending = clients[0].pending_copy.clone();
+        assert_eq!(
+            pending.as_ref().map(|(s, t)| (*s, t.as_str())),
+            Some((9, "blocked copy"))
+        );
+        super::queue_copy(&mut clients[0], 8, "older");
+        assert_eq!(
+            clients[0].pending_copy.as_ref().map(|(_, t)| t.as_str()),
+            Some("blocked copy")
+        );
+        drop(guard);
     }
 
     #[test]

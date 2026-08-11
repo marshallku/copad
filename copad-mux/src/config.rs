@@ -570,6 +570,12 @@ impl WorktreeConfig {
 pub struct MuxConfig {
     pub keymap: Keymap,
     pub mouse: bool,
+    /// Relay a pane program's OSC 52 clipboard write out to the attached clients (tmux
+    /// `set-clipboard`). On by default, matching tmux — comux hosts your own shells, and
+    /// without it nothing inside a pane (nvim's osc52 provider, a `yank` helper) can reach
+    /// the clipboard. Set `false` to keep a background pane from clobbering it. Clipboard
+    /// READS are never answered regardless (see `term.rs`).
+    pub osc52: bool,
     pub notify: bool,
     pub sidebar: bool,
     pub sidebar_width: u16,
@@ -625,6 +631,7 @@ pub struct MuxConfig {
 struct RawConfig {
     prefix: Option<String>,
     mouse: Option<bool>,
+    osc52: Option<bool>,
     notify: Option<bool>,
     sidebar: Option<bool>,
     sidebar_width: Option<i64>,
@@ -716,6 +723,7 @@ impl MuxConfig {
         MuxConfig {
             keymap,
             mouse: true,
+            osc52: true,
             notify: true,
             sidebar: true,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
@@ -818,6 +826,7 @@ impl MuxConfig {
             MuxConfig {
                 keymap,
                 mouse: raw.mouse.unwrap_or(true),
+                osc52: raw.osc52.unwrap_or(true),
                 notify: raw.notify.unwrap_or(true),
                 sidebar: raw.sidebar.unwrap_or(true),
                 sidebar_width,

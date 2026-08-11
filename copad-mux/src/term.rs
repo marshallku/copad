@@ -18,7 +18,7 @@ use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{ClipboardType, Config, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as TtyOptions, Pty, Shell};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -63,9 +63,32 @@ pub struct Snapshot {
     pub cursor: (u16, u16),
 }
 
+/// Largest OSC 52 payload a pane app may put on the clipboard, in bytes of decoded text.
+/// A runaway/hostile program must not be able to pin unbounded memory in the server between
+/// render ticks — anything past this is dropped whole (a truncated clipboard would be worse
+/// than none: you'd paste a silently-cut command).
+const MAX_CLIPBOARD_BYTES: usize = 1 << 20; // 1 MiB
+
+/// Ticket dispenser stamping every captured clipboard write, so the drain can pick the
+/// genuinely LATEST one across panes. Panes live in a `HashMap`, whose iteration order is
+/// arbitrary — without a sequence, two panes writing inside one render tick would relay
+/// whichever the traversal happened to reach last, which can be the older write.
+/// Starts at 1 so that 0 is a usable "nothing relayed yet" sentinel for the drain's
+/// high-water mark — with a 0-based counter the very FIRST write compares equal to it and
+/// is dropped.
+static CLIPBOARD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Take the next clipboard sequence number. Drag-selection copies draw from the SAME
+/// dispenser as pane writes, so the two sources can be ordered against each other and
+/// neither can silently overwrite a newer copy that has not been delivered yet.
+pub fn next_clipboard_seq() -> u64 {
+    CLIPBOARD_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Minimal `EventListener`: forwards `PtyWrite` replies (DSR/DA/OSC answers) so
-/// prompts that query the terminal don't hang, and latches child-exit. Other
-/// events (clipboard, color queries, title, bell) are dropped in this scaffold.
+/// prompts that query the terminal don't hang, latches child-exit, and captures
+/// OSC 52 clipboard WRITES for the render loop to relay. Other events (color
+/// queries, title, bell) are dropped in this scaffold.
 #[derive(Clone)]
 struct MuxListener {
     sender: Arc<std::sync::Mutex<Option<EventLoopSender>>>,
@@ -74,6 +97,11 @@ struct MuxListener {
     /// query reply that writes back). The render loop reads+clears it via
     /// [`PaneTerm::take_dirty`] to skip composing frames when nothing changed.
     dirty: Arc<AtomicBool>,
+    /// Text a program in this pane asked to put on the clipboard via OSC 52 (tmux
+    /// `set-clipboard`), stamped with a global sequence number. Latest-wins — a clipboard
+    /// has one slot, so queueing stale writes would only paste the wrong one later. Drained
+    /// by [`PaneTerm::take_clipboard`].
+    clipboard: Arc<std::sync::Mutex<Option<(u64, String)>>>,
 }
 
 impl MuxListener {
@@ -83,6 +111,7 @@ impl MuxListener {
             child_exited: Arc::new(AtomicBool::new(false)),
             // Start dirty so the very first frame is composed.
             dirty: Arc::new(AtomicBool::new(true)),
+            clipboard: Arc::new(std::sync::Mutex::new(None)),
         }
     }
     fn set_sender(&self, s: EventLoopSender) {
@@ -106,6 +135,29 @@ impl EventListener for MuxListener {
             Event::ChildExit(_status) => {
                 self.child_exited.store(true, Ordering::Relaxed);
             }
+            // A program in the pane wrote the clipboard (`ESC ] 52 ; c ; <base64> BEL`).
+            // Stash it for the render loop to relay to the attached clients, which re-emit
+            // it as their OWN OSC 52 — so it lands on the clipboard of the machine you are
+            // SITTING AT, not the server's. Deliberately does NOT mark the pane dirty:
+            // nothing on screen changed.
+            // An EMPTY payload is a legitimate request to CLEAR the clipboard, not a no-op,
+            // so it is captured like any other write.
+            Event::ClipboardStore(ClipboardType::Clipboard, text) => {
+                if text.len() <= MAX_CLIPBOARD_BYTES {
+                    // Stamp INSIDE the critical section: taking the ticket first would let two
+                    // writers commit in the opposite order and leave the older text in the slot.
+                    let mut slot = self.clipboard.lock().unwrap();
+                    *slot = Some((next_clipboard_seq(), text));
+                }
+            }
+            // The X11 PRIMARY selection (OSC 52 selector `p`/`s`). comux has no notion of it
+            // (and macOS has none at all), so it is dropped rather than silently aliased onto
+            // the real clipboard — an app asking for PRIMARY does not expect a Cmd-V clobber.
+            Event::ClipboardStore(ClipboardType::Selection, _) => {}
+            // OSC 52 clipboard READ (`ESC ] 52 ; c ; ? BEL`). Never answered: replying would
+            // hand the host's clipboard contents to any program running in a pane. Dropping
+            // it is also what VTE and (by default) most terminals do.
+            Event::ClipboardLoad(..) => {}
             _ => {}
         }
     }
@@ -190,6 +242,10 @@ impl PaneTerm {
         // A generous scrollback so panes have history to scroll back through.
         let config = Config {
             scrolling_history: 10_000,
+            // Pin the parser-level OSC 52 policy to copy-only. This is alacritty's own
+            // default today; pinning it means a future default change can never hand a pane
+            // program the PASTE direction (reading the host clipboard) behind our back.
+            osc52: alacritty_terminal::term::Osc52::OnlyCopy,
             ..Config::default()
         };
         let term = Term::new(config, &term_size, listener.clone());
@@ -267,6 +323,13 @@ impl PaneTerm {
     /// The render loop ORs this across panes to decide whether a frame needs composing.
     pub fn take_dirty(&self) -> bool {
         self.listener.dirty.swap(false, Ordering::Relaxed)
+    }
+
+    /// Take any text a program in this pane asked to put on the clipboard via OSC 52,
+    /// clearing the slot. `None` when nothing was written since the last call; the `u64`
+    /// orders writes across panes. An empty string is a real value — "clear the clipboard".
+    pub fn take_clipboard(&self) -> Option<(u64, String)> {
+        self.listener.clipboard.lock().unwrap().take()
     }
 
     /// Force this pane dirty (e.g. after a resize/scroll that changes what's visible but
@@ -501,6 +564,113 @@ fn ansi_to_cell(color: AnsiColor) -> CellColor {
             NamedColor::BrightWhite => CellColor::Indexed(15),
             _ => CellColor::Default,
         },
+    }
+}
+
+#[cfg(test)]
+mod clipboard {
+    //! OSC 52 capture policy on the pane listener (tmux `set-clipboard`). No PTY needed —
+    //! the listener is fed the same `Event`s alacritty's parser would emit.
+    use super::*;
+
+    fn store(kind: ClipboardType, text: &str) -> Option<String> {
+        let l = MuxListener::new();
+        l.send_event(Event::ClipboardStore(kind, text.to_string()));
+        let taken = l.clipboard.lock().unwrap().take();
+        taken.map(|(_, t)| t)
+    }
+
+    #[test]
+    fn captures_a_clipboard_write() {
+        assert_eq!(
+            store(ClipboardType::Clipboard, "yanked"),
+            Some("yanked".into())
+        );
+    }
+
+    #[test]
+    fn captures_an_empty_write_as_a_clear() {
+        // OSC 52 with no payload means "clear the clipboard" — a real request, not a no-op.
+        assert_eq!(store(ClipboardType::Clipboard, ""), Some(String::new()));
+    }
+
+    #[test]
+    fn sequences_start_above_the_not_yet_relayed_sentinel() {
+        // Regression: with a 0-based dispenser the FIRST clipboard write in the server's life
+        // compared equal to the drain's `last_clipboard_seq = 0` and was silently dropped —
+        // the passthrough relayed nothing at all until a second write happened.
+        assert!(next_clipboard_seq() > 0);
+    }
+
+    #[test]
+    fn writes_are_sequenced_across_panes() {
+        // The drain picks the max sequence, because pane iteration order is arbitrary.
+        let (a, b) = (MuxListener::new(), MuxListener::new());
+        a.send_event(Event::ClipboardStore(
+            ClipboardType::Clipboard,
+            "old".into(),
+        ));
+        b.send_event(Event::ClipboardStore(
+            ClipboardType::Clipboard,
+            "new".into(),
+        ));
+        let sa = a.clipboard.lock().unwrap().take().unwrap();
+        let sb = b.clipboard.lock().unwrap().take().unwrap();
+        assert!(sb.0 > sa.0, "later write must carry the higher sequence");
+    }
+
+    #[test]
+    fn ignores_the_primary_selection() {
+        // No PRIMARY on macOS and no notion of it in comux — must NOT alias onto Cmd-V.
+        assert_eq!(store(ClipboardType::Selection, "yanked"), None);
+    }
+
+    #[test]
+    fn drops_an_oversize_payload_whole() {
+        let big = "x".repeat(MAX_CLIPBOARD_BYTES + 1);
+        // Dropped, not truncated: pasting a silently-cut command is worse than pasting nothing.
+        assert_eq!(store(ClipboardType::Clipboard, &big), None);
+        assert!(store(ClipboardType::Clipboard, &"x".repeat(MAX_CLIPBOARD_BYTES)).is_some());
+    }
+
+    #[test]
+    fn latest_write_wins() {
+        let l = MuxListener::new();
+        l.send_event(Event::ClipboardStore(
+            ClipboardType::Clipboard,
+            "first".into(),
+        ));
+        l.send_event(Event::ClipboardStore(
+            ClipboardType::Clipboard,
+            "second".into(),
+        ));
+        let taken = l.clipboard.lock().unwrap().take();
+        assert_eq!(taken.map(|(_, t)| t), Some("second".into()));
+    }
+
+    #[test]
+    fn a_clipboard_write_does_not_dirty_the_pane() {
+        let l = MuxListener::new();
+        l.dirty.store(false, Ordering::Relaxed);
+        l.send_event(Event::ClipboardStore(
+            ClipboardType::Clipboard,
+            "yanked".into(),
+        ));
+        // Nothing on screen changed — dirtying here would cost a frame per yank.
+        assert!(!l.dirty.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_clipboard_read_is_never_answered() {
+        // Replying would hand the host's clipboard to any program in a pane.
+        let l = MuxListener::new();
+        l.dirty.store(false, Ordering::Relaxed);
+        l.send_event(Event::ClipboardLoad(
+            ClipboardType::Clipboard,
+            Arc::new(|s: &str| s.to_string()),
+        ));
+        assert!(l.clipboard.lock().unwrap().is_none());
+        assert!(!l.dirty.load(Ordering::Relaxed));
     }
 }
 

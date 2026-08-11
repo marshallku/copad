@@ -146,6 +146,10 @@ A left-**drag** inside a pane runs comux's own selection (clamped to that pane, 
 
 > **Known v1 limits (deliberate):** no scrollback-drag, no block selection, and a VS16/ZWJ emoji copies as its base glyph (`❤️` → `❤`). There is no keyboard yank binding — selection is mouse-only.
 
+Programs **inside** a pane can set the clipboard too: comux relays their OSC 52 writes out to every attached client, which re-emits them to its own terminal (tmux `set-clipboard`). So `nvim` with `set clipboard=unnamedplus` and an osc52 provider, or any `yank`-style helper, lands on the clipboard of the machine you are sitting at — including over SSH. Set `osc52 = false` in `mux.toml` to stop a background pane from clobbering your clipboard. Clipboard **reads** (`OSC 52 ... ?`) are never answered, so no program in a pane can exfiltrate what you have copied.
+
+Either path needs your terminal to accept OSC 52: kitty, WezTerm, Alacritty and Ghostty do by default; **iTerm2** needs *Settings → General → Selection → "Applications in terminal may access clipboard"*; macOS Terminal.app does not support it at all. An enclosing `tmux`/`screen` swallows the sequence unless it has `set -g set-clipboard on`.
+
 ---
 
 ## Detach & re-attach

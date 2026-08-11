@@ -429,6 +429,10 @@ pub struct App {
     /// The in-progress mouse drag-selection, if any (tmux-style copy). `None` except between
     /// a button-down and its button-up; the highlight only shows during the drag.
     selection: Option<Sel>,
+    /// Highest clipboard sequence already relayed out of a pane (OSC 52 passthrough). Guards
+    /// against a write that reached its pane's slot late being broadcast after a newer one.
+    /// `0` = nothing relayed yet; sequences are 1-based (see `term::CLIPBOARD_SEQ`).
+    last_clipboard_seq: u64,
 }
 
 impl App {
@@ -526,6 +530,7 @@ impl App {
             usage_rolled_at: std::time::Instant::now(),
             alt_screen: HashMap::new(),
             selection: None,
+            last_clipboard_seq: 0,
         };
         app.reflow();
         Ok(app)
@@ -3215,6 +3220,38 @@ impl App {
     /// Read+clear the dirty flag of EVERY hosted pane (must drain all, not short-circuit,
     /// so no pane's pending change is lost), returning whether any pane's screen changed
     /// since the last frame. The render loop ORs this into its dirty decision.
+    /// Collect any OSC 52 clipboard write a program in ANY pane made since the last call
+    /// (tmux `set-clipboard`). The clipboard has one slot, so on the rare tick where two
+    /// panes both wrote, only the latest survives — chosen by the write's sequence number,
+    /// NOT by `HashMap` traversal order, which is arbitrary.
+    ///
+    /// An empty payload is kept: OSC 52 with no data means "clear the clipboard", which is
+    /// a real operation a pane program can ask for.
+    ///
+    /// Every pane is drained even when the feature is off, so flipping `osc52` back on via
+    /// `comux reload` can't suddenly paste something a background pane wrote hours ago.
+    /// Read live off `self.cfg` for that same reason.
+    pub fn drain_pane_clipboard(&mut self) -> Option<(u64, String)> {
+        let mut latest: Option<(u64, String)> = None;
+        for pt in self.panes.values() {
+            if let Some((seq, text)) = pt.take_clipboard()
+                && latest.as_ref().is_none_or(|(prev, _)| seq > *prev)
+            {
+                latest = Some((seq, text));
+            }
+        }
+        let (seq, text) = latest?;
+        // A write that committed to its pane's slot only AFTER a newer one had already been
+        // broadcast must not resurrect — the clipboard would regress to older content a tick
+        // later. The high-water mark is advanced even when the feature is off, so re-enabling
+        // it can't replay anything either.
+        if seq <= self.last_clipboard_seq {
+            return None;
+        }
+        self.last_clipboard_seq = seq;
+        self.cfg.osc52.then_some((seq, text))
+    }
+
     pub fn drain_pane_dirty(&self) -> bool {
         let mut dirty = false;
         for pt in self.panes.values() {
