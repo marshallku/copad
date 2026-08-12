@@ -23,10 +23,17 @@
 # is a mechanical chore commit that doesn't need the review gates save.sh runs.
 #
 # Usage:
+#   ./scripts/release.sh                  # pick patch/minor/major interactively
+#   ./scripts/release.sh patch            # bump a level without picking (also: minor, major)
 #   ./scripts/release.sh <version>        # e.g. ./scripts/release.sh 1.0.4
 #   ./scripts/release.sh v1.0.4           # a leading `v` is tolerated + stripped
 #   ./scripts/release.sh 1.0.4 --dry-run  # show every step, change nothing
 #   ./scripts/release.sh --help
+#
+# With no argument it reads the current version out of Cargo.toml, offers the
+# three bumps (plus a free-form "custom") and lets you choose — with `fzf` if
+# it's installed, otherwise the bash `select` menu. Non-interactive callers
+# (CI, a pipe) must still pass an explicit version or level.
 #
 # After it pushes the tag, watch the build at:
 #   https://github.com/marshallku/copad/actions
@@ -39,24 +46,123 @@ die() { echo "release: $*" >&2; exit 1; }
 
 usage() {
     # Print the header block (lines starting with "# ") as help text.
-    sed -n '2,/^set -euo/p' "$0" | grep -E '^#( |$)' | sed 's/^# \?//'
+    # `sed -E` for the optional-space strip: BSD sed's BRE has no `\?`, so the
+    # portable-looking `s/^# \?//` left every `#` in place on macOS.
+    sed -n '2,/^set -euo/p' "$0" | grep -E '^#( |$)' | sed -E 's/^# ?//'
 }
 
 VERSION=""
+LEVEL=""
 DRY_RUN=0
 for arg in "$@"; do
     case "$arg" in
         -h|--help) usage; exit 0 ;;
         --dry-run) DRY_RUN=1 ;;
         -*) die "unknown flag: $arg (see --help)" ;;
+        major|minor|patch)
+            [ -z "$LEVEL" ] && [ -z "$VERSION" ] || die "version/level given twice: '${VERSION}${LEVEL}' and '$arg'"
+            LEVEL="$arg"
+            ;;
         *)
-            [ -z "$VERSION" ] || die "version given twice: '$VERSION' and '$arg'"
+            [ -z "$VERSION" ] && [ -z "$LEVEL" ] || die "version/level given twice: '${VERSION}${LEVEL}' and '$arg'"
             VERSION="$arg"
             ;;
     esac
 done
 
-[ -n "$VERSION" ] || { usage; echo; die "a version is required, e.g. ./scripts/release.sh 1.0.4"; }
+# Everything runs from the repo root so the awk/git paths are unambiguous.
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
+cd "$ROOT"
+
+read_workspace_version() {
+    awk -F'"' '/^\[workspace.package\]/{s=1;next} s&&/^version[[:space:]]*=/{print $2;exit}' "$1"
+}
+
+# The branch + clean-tree guards run BEFORE the version is resolved: failing
+# them after making the user pick a bump would waste the prompt.
+BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+[ "$BRANCH" = "$DEFAULT_BRANCH" ] || die "on branch '$BRANCH', not '$DEFAULT_BRANCH' — release from $DEFAULT_BRANCH (or edit DEFAULT_BRANCH)"
+
+[ -z "$(git status --porcelain)" ] || die "working tree is dirty — commit or stash first (a release must be a clean, reproducible snapshot)"
+
+CURRENT="$(read_workspace_version Cargo.toml)"
+[ -n "$CURRENT" ] || die "could not read [workspace.package] version from Cargo.toml"
+
+# --- Resolve the target version --------------------------------------------
+
+# Next version for a bump level. A prerelease/build suffix is dropped, and a
+# `patch` bump off a PRERELEASE releases it (1.0.5-rc.1 -> 1.0.5) rather than
+# skipping to 1.0.6 — that is what semver ordering means. Build metadata does
+# NOT count: it carries no precedence, so 1.0.5+build must still patch to
+# 1.0.6, not back to a 1.0.5 that ranks equal to what's already released.
+bump() {
+    local core rest pre major minor patch
+    core="${CURRENT%%[-+]*}"
+    rest="${CURRENT#"$core"}"
+    case "$rest" in
+        -*) pre="$rest" ;;   # -rc.1, or -rc.1+build
+        *)  pre="" ;;        # empty, or +build only
+    esac
+    IFS=. read -r major minor patch <<< "$core"
+    case "${major}${minor}${patch}" in
+        *[!0-9]*|"") die "current version '${CURRENT}' is not X.Y.Z — pass an explicit version" ;;
+    esac
+    case "$1" in
+        major) major=$((major + 1)); minor=0; patch=0 ;;
+        minor) minor=$((minor + 1)); patch=0 ;;
+        patch) [ -n "$pre" ] || patch=$((patch + 1)) ;;
+    esac
+    printf '%s.%s.%s\n' "$major" "$minor" "$patch"
+}
+
+# Present the three bumps and let the user choose. Rows are
+# "<level> <version> <what it means>"; only the second field is consumed, so
+# the description is free to change.
+pick_level() {
+    # `choice`/`line` are initialized, not just declared: a bare `local x` is
+    # UNSET, and under `set -u` bash 5 aborts on `$x` when a picker exits
+    # without choosing (Ctrl-D out of `select`). bash 3.2 tolerates it, so this
+    # only bites on a modern bash.
+    local rows prompt typed PS3 choice="" line=""
+    rows="$(printf '%s\n' \
+        "patch   $(bump patch)   backwards-compatible fixes" \
+        "minor   $(bump minor)   backwards-compatible features" \
+        "major   $(bump major)   breaking changes" \
+        "custom  -       type an exact version")"
+    prompt="release: current ${CURRENT} — bump which part?"
+
+    if command -v fzf >/dev/null 2>&1; then
+        choice="$(printf '%s\n' "$rows" | fzf --height=~8 --reverse --no-multi \
+            --header="$prompt" --prompt='bump> ')" || true
+    else
+        # `select` writes its menu + PS3 to stderr and reads stdin, so the
+        # picker never pollutes the captured stdout.
+        echo "$prompt" >&2
+        PS3="choice> "
+        select line in $(printf '%s\n' "$rows" | awk '{print $1}'); do
+            [ -n "$line" ] || { echo "release: pick a number (or Ctrl-C to abort)" >&2; continue; }
+            choice="$(printf '%s\n' "$rows" | awk -v l="$line" '$1 == l')"
+            break
+        done < /dev/tty
+    fi
+
+    [ -n "$choice" ] || die "no version chosen — aborted"
+    if [ "${choice%% *}" = "custom" ]; then
+        read -r -p "release: version (current ${CURRENT}): " typed < /dev/tty || die "aborted"
+        printf '%s\n' "$typed"
+    else
+        printf '%s\n' "$choice" | awk '{print $2}'
+    fi
+}
+
+if [ -n "$LEVEL" ]; then
+    VERSION="$(bump "$LEVEL")"
+elif [ -z "$VERSION" ]; then
+    [ -t 0 ] && [ -t 2 ] \
+        || { usage; echo; die "a version or bump level is required when not interactive, e.g. ./scripts/release.sh patch"; }
+    VERSION="$(pick_level)"
+    [ -n "$VERSION" ] || die "no version chosen — aborted"
+fi
 
 # Tolerate a leading `v` (the tag carries it; the Cargo.toml version does not).
 VERSION="${VERSION#v}"
@@ -80,22 +186,13 @@ if ! printf '%s' "$VERSION" | grep -qE "^${SEMVER_CORE}${SEMVER_PRE}${SEMVER_BUI
 fi
 TAG="v${VERSION}"
 
-# Everything runs from the repo root so the awk/git paths are unambiguous.
-ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
-cd "$ROOT"
-
 run() {
     # Echo the command; execute it unless --dry-run.
     echo "  + $*"
     [ "$DRY_RUN" -eq 1 ] || "$@"
 }
 
-# --- Preflight guards -------------------------------------------------------
-
-BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-[ "$BRANCH" = "$DEFAULT_BRANCH" ] || die "on branch '$BRANCH', not '$DEFAULT_BRANCH' — release from $DEFAULT_BRANCH (or edit DEFAULT_BRANCH)"
-
-[ -z "$(git status --porcelain)" ] || die "working tree is dirty — commit or stash first (a release must be a clean, reproducible snapshot)"
+# --- Preflight guards (branch + clean tree already checked above) -----------
 
 git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1 \
     && die "tag ${TAG} already exists locally — bump to a new version"
@@ -112,9 +209,6 @@ else
         [ "$BEHIND" -eq 0 ] || die "local ${DEFAULT_BRANCH} is behind origin by ${BEHIND} commit(s) — pull first so the tag points at the pushed tip"
     fi
 fi
-
-CURRENT="$(awk -F'"' '/^\[workspace.package\]/{s=1;next} s&&/^version[[:space:]]*=/{print $2;exit}' Cargo.toml)"
-[ -n "$CURRENT" ] || die "could not read [workspace.package] version from Cargo.toml"
 
 echo "release: ${CURRENT} -> ${VERSION}  (tag ${TAG}, branch ${BRANCH})"
 [ "$DRY_RUN" -eq 1 ] && echo "release: --dry-run — no files written, no commit, no tag, no push"
@@ -134,7 +228,7 @@ else
         { print }
     ' Cargo.toml > "$TMP"
 
-    NEW="$(awk -F'"' '/^\[workspace.package\]/{s=1;next} s&&/^version[[:space:]]*=/{print $2;exit}' "$TMP")"
+    NEW="$(read_workspace_version "$TMP")"
     [ "$NEW" = "$VERSION" ] || { rm -f "$TMP"; die "version rewrite failed (got '${NEW}') — Cargo.toml unchanged"; }
 
     if [ "$DRY_RUN" -eq 1 ]; then
