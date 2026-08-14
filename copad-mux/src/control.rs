@@ -122,6 +122,27 @@ pub struct HealthInfo {
     /// were carried forward rather than refreshed — the condition that used to show
     /// up only as tab names and the sidebar agents list blinking out together.
     pub label_sweeps_failed: u64,
+    /// The server's soft `RLIMIT_NOFILE`. Every pane costs about
+    /// [`crate::fdlimit::FDS_PER_PANE`] descriptors, so this is the real ceiling on
+    /// how many panes the server can host — and the one that used to make new-tab /
+    /// new-session fail with no visible reason.
+    ///
+    /// `serde(default)` on the fd fields: a server started from an OLDER binary
+    /// answers `health` without them, and a hard parse failure there would turn a
+    /// working (if outdated) server into "health probe failed".
+    #[serde(default)]
+    pub fd_soft: Option<u64>,
+    /// Descriptors the server currently holds open, when countable.
+    #[serde(default)]
+    pub fd_open: Option<usize>,
+}
+
+impl HealthInfo {
+    /// Panes that still fit in the descriptor budget, when both numbers are known.
+    pub fn panes_remaining(&self) -> Option<usize> {
+        let (soft, open) = (self.fd_soft?, self.fd_open?);
+        Some((soft.saturating_sub(open as u64) as usize) / crate::fdlimit::FDS_PER_PANE)
+    }
 }
 
 /// One pane in a `list` response.
@@ -859,6 +880,16 @@ fn print_human(req: &Req, resp: &Resp) {
             println!("panes           {}", h.panes);
             println!("labeled         {}", h.labeled);
             println!("sweeps failed   {}", h.label_sweeps_failed);
+            if let Some(soft) = h.fd_soft {
+                match h.fd_open {
+                    Some(open) => println!("fds             {open}/{soft}"),
+                    None => println!("fds             ?/{soft}"),
+                }
+            }
+            // The number that actually answers "why won't a new tab open?".
+            if let Some(room) = h.panes_remaining() {
+                println!("panes headroom  {room}");
+            }
         }
         Req::List => {
             let panes = resp.panes.clone().unwrap_or_default();

@@ -354,6 +354,13 @@ pub struct App {
     notifications: VecDeque<Notification>,
     /// When `Some(sel)`, the notification center (`Ctrl-b a`) is open at row `sel`.
     center: Option<usize>,
+    /// Why the most recent pane spawn failed, recorded by [`Self::report_spawn_failure`]
+    /// so the control API can report the SAME reason the TUI toasted. The CLI handlers
+    /// detect failure by pane count and would otherwise only be able to say "could not
+    /// spawn a shell", hiding the one detail that makes it fixable (fd exhaustion).
+    /// Taken (not read) by whoever reports it, so a stale reason can't attach itself
+    /// to a later, unrelated failure.
+    last_spawn_error: Option<String>,
     /// Env vars injected into every pane's shell (e.g. `COPAD_MUX_SOCK`), so a
     /// shell inside a pane can control its own mux via `copad-mux ctl`.
     sock_env: Vec<(String, String)>,
@@ -470,11 +477,8 @@ impl App {
                 let ws = WorkspaceId::new("local");
                 let (_tab, _pane, term0) =
                     state.create_workspace(ws.clone(), None, Rect { cols, rows });
-                let Some(pt) =
-                    PaneTerm::spawn_with_env(cols.max(1), rows.max(1), None, None, &boot_env)
-                else {
-                    return Err(io::Error::other("failed to spawn shell PTY"));
-                };
+                let pt = PaneTerm::spawn_with_env(cols.max(1), rows.max(1), None, None, &boot_env)
+                    .map_err(|e| io::Error::other(format!("failed to spawn shell PTY: {e}")))?;
                 panes.insert(term0, pt);
                 (ws, 1)
             }
@@ -501,6 +505,7 @@ impl App {
             scroll_pane: None,
             notifications: VecDeque::new(),
             center: None,
+            last_spawn_error: None,
             sock_env,
             client_env,
             env_update,
@@ -844,7 +849,7 @@ impl App {
             let pane_env = self.pane_env();
             match PaneTerm::spawn_with_env(self.cols.max(1), self.rows.max(1), None, cwd, &pane_env)
             {
-                Some(pt) => {
+                Ok(pt) => {
                     self.panes.insert(nt, pt);
                     // tmux-style: focus the freshly created pane.
                     let _ = self.state.apply(Command::FocusPane {
@@ -852,7 +857,7 @@ impl App {
                         pane: np,
                     });
                 }
-                None => {
+                Err(reason) => {
                     // PTY spawn failed — roll the split back so authoritative state
                     // never holds a pane without a matching PaneTerm (which would
                     // render blank + silently drop input). Closing `np` collapses the
@@ -863,6 +868,7 @@ impl App {
                         pane: np,
                         if_rev: None,
                     });
+                    self.report_spawn_failure("split", &reason);
                 }
             }
         }
@@ -940,10 +946,10 @@ impl App {
             let pane_env = self.pane_env();
             match PaneTerm::spawn_with_env(self.cols.max(1), self.rows.max(1), None, cwd, &pane_env)
             {
-                Some(pt) => {
+                Ok(pt) => {
                     self.panes.insert(term, pt);
                 }
-                None => {
+                Err(reason) => {
                     // Spawn failed — close the just-created tab so state never holds a
                     // tab whose pane has no live terminal (blank render + dropped input).
                     let _ = self.state.apply(Command::CloseTab {
@@ -951,6 +957,7 @@ impl App {
                         workspace: self.ws.clone(),
                         tab: tab_id,
                     });
+                    self.report_spawn_failure("new tab", &reason);
                 }
             }
         }
@@ -1072,11 +1079,11 @@ impl App {
                 .create_workspace(id.clone(), name, Rect { cols, rows });
         let pane_env = self.pane_env();
         match PaneTerm::spawn_with_env(self.cols.max(1), self.rows.max(1), None, cwd, &pane_env) {
-            Some(pt) => {
+            Ok(pt) => {
                 self.panes.insert(term0, pt);
                 self.switch_session(id);
             }
-            None => {
+            Err(reason) => {
                 // Spawn failed — drop the just-created session so state never holds a
                 // session whose pane has no live terminal.
                 if let Some(terms) = self.state.remove_workspace(&id) {
@@ -1084,7 +1091,43 @@ impl App {
                         self.panes.remove(t);
                     }
                 }
+                self.report_spawn_failure("new session", &reason);
             }
+        }
+    }
+
+    /// Tell the user why a pane they just asked for did not appear.
+    ///
+    /// The TUI has no inline message line, so this goes out as a desktop toast — the
+    /// same channel, and for the same reason, as a failed `Ctrl-b W` worktree create:
+    /// it is direct feedback for a key the user just pressed, so it is deliberately
+    /// NOT gated on the `notify` config (a `notify = false` user would otherwise get
+    /// no signal at all that their keypress failed). `COPAD_MUX_NOTIFY=0` still
+    /// hard-disables every toast.
+    fn report_spawn_failure(&mut self, what: &str, reason: &str) {
+        self.last_spawn_error = Some(reason.to_string());
+        if notify::env_override().unwrap_or(true) {
+            notify::desktop(&format!("comux: {what} failed"), reason);
+        }
+    }
+
+    /// Drop any recorded spawn reason before attempting a new pane-creating mutation.
+    ///
+    /// Without this, a reason left behind by a TUI keypress sits in the field
+    /// indefinitely, and the next control request that fails for an entirely different
+    /// cause — one the actor rejected before any spawn was attempted — would take it and
+    /// report a descriptor problem that had nothing to do with it.
+    fn clear_spawn_error(&mut self) {
+        self.last_spawn_error = None;
+    }
+
+    /// The reason the last pane spawn failed, consumed for a control-API error line.
+    /// Falls back to the generic wording when a failure had no recorded reason (the
+    /// actor refused the mutation before any spawn was attempted).
+    fn take_spawn_error(&mut self, what: &str) -> String {
+        match self.last_spawn_error.take() {
+            Some(reason) => format!("{what} failed: {reason}"),
+            None => format!("{what} failed (could not spawn a shell)"),
         }
     }
 
@@ -1456,11 +1499,16 @@ impl App {
     pub fn handle_control(&mut self, req: &control::Req) -> control::Resp {
         use control::{PaneInfo, Req, Resp};
         match req {
-            Req::Health => Resp::health(control::HealthInfo {
-                panes: self.panes.len(),
-                labeled: self.labels.len(),
-                label_sweeps_failed: self.label_sweeps_failed,
-            }),
+            Req::Health => {
+                let fd = crate::fdlimit::snapshot().ok();
+                Resp::health(control::HealthInfo {
+                    panes: self.panes.len(),
+                    labeled: self.labels.len(),
+                    label_sweeps_failed: self.label_sweeps_failed,
+                    fd_soft: fd.map(|b| b.soft),
+                    fd_open: fd.and_then(|b| b.open),
+                })
+            }
             Req::List => {
                 let order = self.pane_order();
                 let focused = self.focused_pane();
@@ -1518,11 +1566,12 @@ impl App {
                     other => return Resp::err(format!("bad dir '{other}' (right|down)")),
                 };
                 let before = self.pane_order().len();
+                self.clear_spawn_error();
                 self.split(d);
                 if self.pane_order().len() > before {
                     Resp::ok()
                 } else {
-                    Resp::err("split failed (could not spawn a shell)")
+                    Resp::err(self.take_spawn_error("split"))
                 }
             }
             Req::ResizePane { index, dir } => {
@@ -1623,11 +1672,12 @@ impl App {
             }
             Req::NewTab => {
                 let before = self.tab_count();
+                self.clear_spawn_error();
                 self.new_tab();
                 if self.tab_count() > before {
                     Resp::ok()
                 } else {
-                    Resp::err("new-tab failed (could not spawn a shell)")
+                    Resp::err(self.take_spawn_error("new-tab"))
                 }
             }
             Req::SelectTab { index } => {
@@ -1714,11 +1764,12 @@ impl App {
                     .map(PathBuf::from)
                     .filter(|p| p.is_dir())
                     .or_else(|| self.focused_cwd());
+                self.clear_spawn_error();
                 self.new_session(name.clone(), dir);
                 if self.session_count() > before {
                     Resp::ok()
                 } else {
-                    Resp::err("new-session failed (could not spawn a shell)")
+                    Resp::err(self.take_spawn_error("new-session"))
                 }
             }
             Req::RenameSession { index, name } => {
@@ -3400,9 +3451,25 @@ impl App {
 
     /// Returns whether any chrome-affecting data (labels / agent statuses / branches)
     /// actually CHANGED, so the render loop only recomposes when the sidebar/status bar
-    /// would differ (throttled to ~2 Hz; unchanged refreshes are free of a repaint).
-    pub fn maybe_refresh_labels(&mut self) -> bool {
-        if self.last_labels.elapsed() >= Duration::from_millis(500) {
+    /// would differ (unchanged refreshes are free of a repaint).
+    ///
+    /// `min_interval` is the caller's throttle: this sweep enumerates every process on
+    /// the machine, so it — not the frame cadence — is what a long-lived server
+    /// actually spends its CPU on. The render loop passes a wider interval while
+    /// detached, where the only consumer left is the agent-turn notifier and nobody is
+    /// looking at the chrome it feeds.
+    /// Force the next [`Self::maybe_refresh_labels`] to actually sweep, whatever its
+    /// throttle. Called when a client attaches: while detached the sweep runs on a wide
+    /// interval, so the first frame would otherwise render tab labels and agent
+    /// statuses that are seconds stale.
+    pub fn invalidate_labels(&mut self) {
+        self.last_labels = std::time::Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(std::time::Instant::now);
+    }
+
+    pub fn maybe_refresh_labels(&mut self, min_interval: Duration) -> bool {
+        if self.last_labels.elapsed() >= min_interval {
             let a = self.refresh_labels();
             let b = self.refresh_agent_statuses();
             let c = self.refresh_branches();
@@ -5189,7 +5256,12 @@ fn spawn_layout(
                 return None;
             }
             let dir = resolve_cwd(cwd.as_deref());
-            let pt = PaneTerm::spawn_with_env(cols.max(1), rows.max(1), None, dir, sock_env)?;
+            // A pane that can't spawn is pruned from the restore (transactional restore
+            // drops failures rather than materializing a dead pane); the reason is not
+            // actionable per-pane here, and `health` reports the budget if it was fd
+            // exhaustion that pruned them.
+            let pt =
+                PaneTerm::spawn_with_env(cols.max(1), rows.max(1), None, dir, sock_env).ok()?;
             *budget -= 1;
             // Re-run a whitelisted program (agent): shell-quote each argv element and
             // inject the line into the fresh shell. Quoting preserves argument boundaries

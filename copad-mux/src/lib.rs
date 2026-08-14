@@ -15,6 +15,7 @@ pub mod client;
 pub mod config;
 pub mod control;
 pub mod doctor;
+pub mod fdlimit;
 pub mod gitinfo;
 pub mod model;
 pub mod notify;

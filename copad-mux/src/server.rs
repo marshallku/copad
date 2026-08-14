@@ -37,6 +37,28 @@ use crate::tui::{App, KeyAction};
 /// composes nothing. The per-client buffer diff then keeps the wire delta minimal.
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 
+/// Loop cadence while **no client is attached**. With nobody watching there is no
+/// frame to compose, so waking 30 times a second only pays for the loop body itself —
+/// which a detached server does for as long as it lives (days, for a server whose
+/// panes outlive the terminal that launched them). Slowing to this interval keeps the
+/// server responsive to the things that still matter while detached — a client
+/// attaching, a `ctl` request, a pane exiting, and the agent-status sweep that drives
+/// turn notifications (itself already throttled to 500 ms) — because each of those
+/// arrives as a channel message that wakes `recv_timeout` immediately rather than
+/// waiting out the tick.
+const IDLE_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How often the chrome/label sweep runs while a client is attached. It enumerates
+/// every process on the machine, so it is the dominant cost of an otherwise idle
+/// server — measured at ~1.5% of a core on its own.
+const LABEL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The same sweep while **detached**. Nothing renders the labels it produces; its one
+/// remaining consumer is the agent-turn notifier, for which a couple of seconds of
+/// extra latency on a desktop toast is imperceptible. This is what keeps a server
+/// that sits detached for days from burning a CPU percent the whole time.
+const IDLE_LABEL_INTERVAL: Duration = Duration::from_secs(5);
+
 /// A message funneled to the single-writer main loop from a connection thread.
 enum Incoming {
     /// A one-shot control request + its reply channel.
@@ -188,6 +210,18 @@ pub fn try_acquire_lock() -> Option<File> {
 /// Run the server to completion (exits when its last shell exits, on `kill-server`,
 /// or if another server already owns the lock).
 pub fn run() -> io::Result<()> {
+    // Before anything opens a descriptor: lift the soft fd limit. A server inherits it
+    // from whatever spawned it, and macOS still defaults to 256 — which at ~5
+    // descriptors per pane wedges the server at ~48 panes, every later new-tab /
+    // new-session / split failing to spawn its shell. Best-effort by design: a kernel
+    // that refuses the raise still runs, just with fewer panes.
+    match crate::fdlimit::raise() {
+        Ok((before, after)) if after > before => {
+            eprintln!("comux: raised fd limit {before} -> {after}");
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("comux: could not raise fd limit: {e}"),
+    }
     let (sock, lock_path) = prepare_paths()?;
     // Atomic ownership: only the flock holder may touch the socket file.
     let _lock = match acquire_lock(&lock_path) {
@@ -279,9 +313,19 @@ pub fn run() -> io::Result<()> {
     // Idle-skip: only compose+diff a frame when something that affects it changed since
     // the last render (tmx-style). Start dirty so the first frame is always drawn.
     let mut dirty = true;
+    // Whether a client was attached on the previous iteration, so the detached -> attached
+    // edge can force a label sweep (see IDLE_LABEL_INTERVAL).
+    let mut was_attached = false;
 
     loop {
-        match rx.recv_timeout(FRAME_INTERVAL) {
+        // Detached (no clients) → idle cadence; anything that needs prompt handling
+        // still arrives as a message and interrupts the wait.
+        let tick = if clients.is_empty() {
+            IDLE_INTERVAL
+        } else {
+            FRAME_INTERVAL
+        };
+        match rx.recv_timeout(tick) {
             Ok(msg) => {
                 dirty |= handle_incoming(msg, &mut app, &mut clients, &mut kill);
                 // Bound the drain so a key/ctl flood can't starve rendering, PTY
@@ -310,7 +354,21 @@ pub fn run() -> io::Result<()> {
         dirty |= reaped; // a reaped pane changed the layout
         dirty |= app.reconcile_popup();
         dirty |= app.reconcile_center();
-        dirty |= app.maybe_refresh_labels(); // sidebar/status data actually changed
+        // A client just attached after a detached stretch: the sweep has been running on
+        // the wide idle interval, so force one now instead of letting the first frame
+        // show tab labels and agent statuses that are seconds stale.
+        let attached = !clients.is_empty();
+        if attached && !was_attached {
+            app.invalidate_labels();
+        }
+        was_attached = attached;
+        // Sidebar/status data actually changed. Swept far less often while detached —
+        // see IDLE_LABEL_INTERVAL.
+        dirty |= app.maybe_refresh_labels(if clients.is_empty() {
+            IDLE_LABEL_INTERVAL
+        } else {
+            LABEL_INTERVAL
+        });
         dirty |= app.maybe_auto_roll_usage(); // usage carousel auto-advance (usage_rotate_secs)
         let pane_dirty = app.drain_pane_dirty(); // any pane's screen advanced (PTY output)
         dirty |= pane_dirty;

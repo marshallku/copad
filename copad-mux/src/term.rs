@@ -182,6 +182,39 @@ pub struct PaneTerm {
     spawn_cwd: Option<PathBuf>,
 }
 
+/// Turn a pane-spawn I/O error into a message worth showing a user.
+///
+/// Descriptor exhaustion gets its own wording because it is the one failure that is
+/// both self-inflicted and fixable: the raw `EMFILE` text ("too many open files")
+/// reads like a system problem, when the actual answer is that this server's soft
+/// limit is too low for the number of panes it hosts. Pointing at `comux health`
+/// turns a dead keypress into a diagnosis.
+fn describe_spawn_failure(stage: &str, err: &std::io::Error) -> String {
+    let budget = crate::fdlimit::snapshot().ok();
+    // EMFILE = this process is out of descriptors; ENFILE = the system-wide table is.
+    // Detected primarily from our OWN budget rather than the error: the PTY layer
+    // formats the errno into a message string, so `raw_os_error` is routinely `None`
+    // by the time the failure reaches us. A spawn that failed with less than a pane's
+    // worth of descriptors left is exhaustion whatever the text says — and the errno
+    // check still catches the case where the budget is unreadable.
+    let no_room = budget
+        .and_then(|b| b.panes_remaining())
+        .is_some_and(|room| room < 2);
+    let exhausted =
+        no_room || matches!(err.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE));
+    if exhausted {
+        let detail = budget
+            .map(|b| format!(" ({} of {} in use)", b.open.unwrap_or(0), b.soft))
+            .unwrap_or_default();
+        format!(
+            "out of file descriptors{detail} — this server cannot host more panes; \
+             `comux health` shows the budget, `comux server restart` from a shell re-raises it"
+        )
+    } else {
+        format!("{stage}: {err}")
+    }
+}
+
 impl PaneTerm {
     /// Spawn a shell in a PTY sized `cols`×`rows`. `shell` defaults to `$SHELL`
     /// (then the system default); `cwd` to the process cwd.
@@ -190,20 +223,27 @@ impl PaneTerm {
         rows: u16,
         shell: Option<String>,
         cwd: Option<PathBuf>,
-    ) -> Option<Self> {
+    ) -> Result<Self, String> {
         Self::spawn_with_env(cols, rows, shell, cwd, &[])
     }
 
     /// Like [`spawn`](Self::spawn) but injects extra environment variables into
     /// the child shell (e.g. `COPAD_MUX_SOCK` so a shell inside a pane can drive
     /// its own mux via `copad-mux ctl`).
+    ///
+    /// Returns the failure REASON rather than a bare `None`: the callers that create
+    /// panes on a keypress (new tab / new session / split) roll the just-created
+    /// tab or session back when the shell can't spawn, so without a reason the whole
+    /// failure is invisible — the key simply appears to do nothing. Descriptor
+    /// exhaustion in particular (see [`crate::fdlimit`]) is undiagnosable from the
+    /// UI without it.
     pub fn spawn_with_env(
         cols: u16,
         rows: u16,
         shell: Option<String>,
         cwd: Option<PathBuf>,
         env: &[(String, String)],
-    ) -> Option<Self> {
+    ) -> Result<Self, String> {
         let cols = cols.max(1);
         let rows = rows.max(1);
 
@@ -226,7 +266,7 @@ impl PaneTerm {
             cell_width: 1,
             cell_height: 1,
         };
-        let pty = tty::new(&opts, window, 0).ok()?;
+        let pty = tty::new(&opts, window, 0).map_err(|e| describe_spawn_failure("pty", &e))?;
         // Capture the child pid + a dup of the master fd before the Pty is moved
         // into the EventLoop (the dup lets us query the foreground pgrp later).
         let child_pid = Some(pty.child().id());
@@ -251,13 +291,13 @@ impl PaneTerm {
         let term = Term::new(config, &term_size, listener.clone());
         let term = Arc::new(FairMutex::new(term));
 
-        let event_loop =
-            EventLoop::new(Arc::clone(&term), listener.clone(), pty, false, false).ok()?;
+        let event_loop = EventLoop::new(Arc::clone(&term), listener.clone(), pty, false, false)
+            .map_err(|e| describe_spawn_failure("pty event loop", &e))?;
         let sender = event_loop.channel();
         listener.set_sender(sender.clone());
         let io_thread = event_loop.spawn();
 
-        Some(Self {
+        Ok(Self {
             term,
             sender,
             listener,

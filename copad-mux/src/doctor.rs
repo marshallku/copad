@@ -84,6 +84,12 @@ struct Section {
 /// `copad_core::config` — kept as a small explicit list rather than reflecting
 /// the schema because the whole point is to catch a value the *macOS* parser
 /// rejects, which the Rust schema itself would happily coerce and hide.
+/// Pane headroom below which `doctor` warns about the descriptor budget. Chosen so
+/// the warning arrives while the user can still act on it: a single busy session is
+/// a handful of panes, so fewer than this means the next few keypresses are the ones
+/// that will start failing.
+const LOW_FD_PANES: usize = 8;
+
 const FLOAT_FIELDS: &[(&str, &str)] = &[
     ("background", "tint"),
     ("background", "opacity"),
@@ -304,6 +310,28 @@ fn check_server() -> Section {
                          tab names/agent list may lag. Please report this with the count.",
                     )
                 });
+                // Descriptor headroom. Worth a WARN well before it hits zero: at zero
+                // the symptom is already "new tab / new session does nothing", and the
+                // only cure is a server restart, which costs the user their scrollback.
+                if let (Some(soft), Some(open), Some(room)) =
+                    (h.fd_soft, h.fd_open, h.panes_remaining())
+                {
+                    findings.push(if room >= LOW_FD_PANES {
+                        Finding::new(
+                            Level::Ok,
+                            format!("fds: {open}/{soft} — room for {room} more panes"),
+                        )
+                    } else {
+                        Finding::new(
+                            Level::Warn,
+                            format!("fds: {open}/{soft} — room for only {room} more panes"),
+                        )
+                        .with_hint(
+                            "new tabs/sessions/splits will start failing to spawn a shell; \
+                             `comux server restart` from a shell re-raises the limit",
+                        )
+                    });
+                }
             }
             None => findings.push(
                 Finding::new(Level::Note, "health counters unavailable").with_hint(
