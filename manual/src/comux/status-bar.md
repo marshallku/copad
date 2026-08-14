@@ -2,9 +2,19 @@
 
 comux draws an always-on bottom status bar (Catppuccin Mocha colors, matching the owner's tmux). Left to right it carries:
 
-**session pill · tab chips · `⚑N` attention count · `● N` agent count · scroll flag · usage/limits readout · `⬆ x.y.z` update hint · clock · host**
+**session pill · tab chips · `^b` prefix flag · `⚑N` attention count · `● N` agent count · scroll flag · usage/limits readout · `⬆ x.y.z` update hint · clock · host**
 
 Tabs live here (there is no top bar). Tab chips are windowed around the active tab with `‹`/`›` overflow markers so they stay visible even with many tabs; agent tabs are yellow with a `● ` marker.
+
+---
+
+## The prefix flag
+
+Press `Ctrl-b` and a red **`^b`** pill appears at the left edge of the right-hand cluster: the prefix is armed and comux is waiting for the second key of the chord. It disappears the moment the chord resolves — whether the key was bound to something or not.
+
+It shows the prefix you actually configured, so `prefix = "C-a"` in `mux.toml` renders `^a`.
+
+> With several clients attached to one session, the flag shows when **any** of them is mid-chord. The prefix itself stays per-client — a `Ctrl-b` on one client can never be completed by another's keypress — but the rendered frame is shared, the same way an open context menu or a drag selection is visible to everyone attached.
 
 ---
 

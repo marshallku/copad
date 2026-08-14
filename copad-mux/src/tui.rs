@@ -422,6 +422,13 @@ pub struct App {
     /// Which carousel page the usage readout shows (`usage_layout = paged`). Advanced
     /// by a wheel/click over the readout; clamped to the live page count at render.
     usage_page: usize,
+    /// Whether SOME attached client currently has the prefix armed — drives the `^b`
+    /// mode indicator in the status bar. The prefix itself stays strictly per-client
+    /// (a `Ctrl-b` on one client must not be completable by another's key); this is a
+    /// render-only summary the server recomputes each frame, because the composed frame
+    /// is shared by every client. Same precedent as an open context menu or a drag
+    /// selection: client-OWNED, but visible in everyone's view.
+    prefix_armed: bool,
     /// When the carousel last advanced — a manual page OR an auto-rotate tick resets
     /// it, so `usage_rotate_secs` counts from the last change, not a fixed cadence
     /// (a manual scroll never jumps again immediately after).
@@ -532,6 +539,7 @@ impl App {
             version_shown: None,
             usage_shown: None,
             usage_page: 0,
+            prefix_armed: false,
             usage_rolled_at: std::time::Instant::now(),
             alt_screen: HashMap::new(),
             selection: None,
@@ -1942,6 +1950,25 @@ impl App {
             return control::Resp::err(e);
         }
         control::finish_branch_delete(&repo, &entry, delete_branch, force)
+    }
+
+    /// Record whether any attached client has the prefix armed, for the status-bar
+    /// mode indicator. Called by the server each frame from the clients' own per-client
+    /// prefix flags — the render can't reach those, and the frame is shared anyway.
+    pub fn set_prefix_armed(&mut self, armed: bool) {
+        self.prefix_armed = armed;
+    }
+
+    /// What the last composed frame said about the prefix. The server compares this to a
+    /// freshly-pruned client list to notice that a frame it already sent is now a lie.
+    pub fn prefix_armed(&self) -> bool {
+        self.prefix_armed
+    }
+
+    /// The label the status bar shows while the prefix is armed (`^b`), from the
+    /// CONFIGURED prefix chord rather than a hardcoded `Ctrl-b`.
+    fn prefix_label(&self) -> String {
+        self.cfg.keymap.prefix_chord.label()
     }
 
     /// Route one key event through the mux (popup → prefix → direct-nav → shell).
@@ -4213,6 +4240,19 @@ impl App {
         // RIGHT cluster (attention · scroll · agents · clock · host) — built FIRST so the
         // tab chips know how much width they may use before it.
         let mut segs: Vec<(String, Style)> = Vec::new();
+        // Prefix armed (`Ctrl-b` pressed, waiting for the chord) — FIRST, so it sits at
+        // the left edge of the right cluster where the eye already goes for mode flags.
+        // Transient by nature: the very next key resolves the chord and clears it, which
+        // is also why it is fine for it to briefly shrink the tab-chip window.
+        if self.prefix_armed {
+            segs.push((
+                format!(" {} ", self.prefix_label()),
+                Style::default()
+                    .fg(CAT_BASE)
+                    .bg(CAT_RED)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         let attn = self.attention_count();
         if attn > 0 {
             segs.push((

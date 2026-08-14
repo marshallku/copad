@@ -2,7 +2,7 @@
 
 comux keybindings come in two kinds:
 
-- **Prefix bindings** — press the prefix (`Ctrl-b` by default), release, then the command key. Like tmux.
+- **Prefix bindings** — press the prefix (`Ctrl-b` by default), release, then the command key. Like tmux. While the prefix is armed, a red **`^b`** flag appears in the [status bar](./status-bar.md#the-prefix-flag) so you can tell it registered.
 - **Prefix-less (global) bindings** — a single chord, no prefix. Like tmux's `bind -n`.
 
 All of these are remappable in `mux.toml` — see [Customizing bindings](#customizing-bindings) and [Configuration](./configuration.md).

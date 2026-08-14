@@ -281,6 +281,53 @@ pub struct Chord {
     pub key: Key,
 }
 
+impl Chord {
+    /// A short label for showing the chord to the user: `C-b` → `^b`, `M-1` → `M-1`,
+    /// `C-S-Left` → `^S-Left`. Terminal caret convention rather than the config
+    /// spelling, because this is read at a glance in the status bar — and the prefix
+    /// indicator there must show the ACTUAL prefix, which `prefix = "C-a"` in
+    /// `mux.toml` can change.
+    pub fn label(&self) -> String {
+        let mut s = String::new();
+        if self.alt {
+            s.push_str("M-");
+        }
+        if self.ctrl {
+            s.push('^');
+        }
+        match self.key {
+            // An alphabetic key folds its shift into the letter's case (that is how
+            // `chord_of`/`parse_chord` canonicalize it), so `S-` would be redundant.
+            Key::Char(c) if c.is_ascii_alphabetic() => {
+                if self.shift {
+                    s.push(c.to_ascii_uppercase());
+                } else {
+                    s.push(c);
+                }
+            }
+            Key::Char(c) => s.push(c),
+            named => {
+                if self.shift {
+                    s.push_str("S-");
+                }
+                s.push_str(match named {
+                    Key::Left => "Left",
+                    Key::Right => "Right",
+                    Key::Up => "Up",
+                    Key::Down => "Down",
+                    Key::Enter => "Enter",
+                    Key::Tab => "Tab",
+                    Key::Space => "Space",
+                    Key::Esc => "Esc",
+                    Key::Backspace => "BSpace",
+                    Key::Char(_) => unreachable!("handled above"),
+                });
+            }
+        }
+        s
+    }
+}
+
 /// Which table a binding lives in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ctx {
@@ -1322,6 +1369,23 @@ mod tests {
             warns.iter().any(|w| w.contains("FocusRight")),
             "expected a focus-right collision warning: {warns:?}"
         );
+    }
+
+    #[test]
+    fn chord_labels_use_the_terminal_caret_convention() {
+        // What the status bar shows while the prefix is armed. The default prefix must
+        // read as `^b`; a user who set `prefix = "C-a"` must see THEIR key, not `^b`.
+        let label = |s: &str| parse_chord(s).unwrap().label();
+        assert_eq!(label("C-b"), "^b");
+        assert_eq!(label("C-a"), "^a");
+        assert_eq!(label("M-1"), "M-1");
+        assert_eq!(label("%"), "%");
+        // Shift on a letter lives in the letter's case (that is how both a live event and
+        // a config token canonicalize), so an `S-` prefix would double it up.
+        assert_eq!(label("C-S-h"), "^H");
+        // Named keys have no case to carry it, so they keep the explicit `S-`.
+        assert_eq!(label("C-S-Left"), "^S-Left");
+        assert_eq!(label("M-C-Space"), "M-^Space");
     }
 
     #[test]

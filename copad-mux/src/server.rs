@@ -848,6 +848,20 @@ fn prune_dead_clients(app: &mut App, clients: &mut Vec<Client>, dead: &[u64]) ->
         }
     }
     recompute_viewport(app, clients);
+    // A prune can turn a frame that was ALREADY SENT into a lie. The status bar's `^b` is
+    // composed from "some attached client is mid-chord", so pruning the client that held the
+    // prefix leaves every survivor painted with an indicator belonging to nobody — and both
+    // prune sites run at points where `dirty` has already been decided, so nothing would
+    // repaint it. `App::prefix_armed` is what the last composed frame said; when it no longer
+    // matches the pruned list, flag the survivors so the loop composes one more frame
+    // (`dirty |= clients.iter().any(|c| c.needs_full || c.pending)`). Terminating: each prune
+    // strictly shrinks `clients`. Centralized here rather than at the call sites so a future
+    // prune path cannot reintroduce the stuck indicator.
+    if app.prefix_armed() != clients.iter().any(|c| c.prefix) {
+        for c in clients.iter_mut() {
+            c.pending = true;
+        }
+    }
     true
 }
 
@@ -889,6 +903,13 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
     if clients.is_empty() {
         return;
     }
+    // The prefix is per-client state, but the composed frame is shared, so the status
+    // bar's `^b` indicator shows whether ANY client is mid-chord. Recomputed here rather
+    // than pushed from the key path because a client can also leave the prefix armed and
+    // then detach — reading the live client list each frame can't go stale.
+    let armed = clients.iter().any(|c| c.prefix);
+    app.set_prefix_armed(armed);
+
     let (cols, rows) = app.size();
     let area = RRect::new(0, 0, cols.max(1), rows.max(1));
     let mut buf = Buffer::empty(area);
@@ -947,6 +968,9 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
             Err(TrySendError::Disconnected(_)) => dead.push(c.id),
         }
     }
+    // Pruning here also re-checks the just-sent frame against the surviving clients: this
+    // loop only discovers a half-dead client DURING delivery, i.e. after composing from a
+    // list that still contained it. See `prune_dead_clients`.
     prune_dead_clients(app, clients, &dead);
 }
 
@@ -1057,6 +1081,123 @@ mod tests {
             Some("blocked copy")
         );
         drop(guard);
+    }
+
+    /// The rendered status bar (the frame's last row) as a plain string.
+    fn status_row(app: &App) -> String {
+        let (cols, rows) = app.size();
+        let mut buf = Buffer::empty(RRect::new(0, 0, cols, rows));
+        app.render_to(&mut buf);
+        let y = rows - 1;
+        (0..cols)
+            .filter_map(|x| buf.cell(ratatui::layout::Position::new(x, y)))
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn the_status_bar_flags_an_armed_prefix_and_clears_it_again() {
+        // The prefix is per-CLIENT state that the shared frame cannot see, so `push_frames`
+        // has to fold it into the App each tick. Without that the `^b` mode indicator would
+        // never appear — and, worse, could stick after the client that armed it went away.
+        let (mut cfg, _) = MuxConfig::load_from(std::path::Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false;
+        let mut app = App::new(80, 24, Vec::new(), Vec::new(), cfg).expect("app");
+
+        let (idle, _idle_guard) = test_client(1, 80, 24);
+        let (mut armed, _armed_guard) = test_client(2, 80, 24);
+        armed.prefix = true;
+        let mut clients = vec![idle, armed];
+
+        push_frames(&mut app, &mut clients);
+        assert!(
+            status_row(&app).contains("^b"),
+            "one client mid-chord must show the indicator: {:?}",
+            status_row(&app)
+        );
+
+        // The chord completed (or the key was not bound): the flag must go with it.
+        clients[1].prefix = false;
+        push_frames(&mut app, &mut clients);
+        assert!(
+            !status_row(&app).contains("^b"),
+            "a resolved chord must clear the indicator: {:?}",
+            status_row(&app)
+        );
+
+        // Armed again, then that client vanishes without ever resolving the chord — the
+        // indicator is recomputed from the live client list, so it cannot outlive them.
+        clients[1].prefix = true;
+        push_frames(&mut app, &mut clients);
+        assert!(status_row(&app).contains("^b"));
+        clients.pop();
+        push_frames(&mut app, &mut clients);
+        assert!(
+            !status_row(&app).contains("^b"),
+            "a departed client must not leave the prefix flag stuck: {:?}",
+            status_row(&app)
+        );
+    }
+
+    #[test]
+    fn pruning_the_client_that_held_the_prefix_reschedules_a_frame() {
+        // The nastier version of the same stuck-indicator risk: a client is only discovered
+        // to be half-dead (writer gone, no `Disconnect`) DURING delivery, which is after the
+        // frame was composed from a list that still contained it. If that client held the
+        // prefix, every survivor has just been painted a `^b` belonging to nobody — and with
+        // the loop about to clear `dirty`, nothing would ever repaint it.
+        let (mut cfg, _) = MuxConfig::load_from(std::path::Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false;
+        let mut app = App::new(80, 24, Vec::new(), Vec::new(), cfg).expect("app");
+
+        let (live, _live_guard) = test_client(1, 80, 24);
+        let (mut dying, dying_guard) = test_client(2, 80, 24);
+        dying.prefix = true;
+        drop(dying_guard); // its writer is gone — the send will report `Disconnected`
+        let mut clients = vec![live, dying];
+
+        push_frames(&mut app, &mut clients);
+        assert_eq!(clients.len(), 1, "the half-dead client is pruned");
+        assert!(
+            clients[0].pending,
+            "the survivor must be flagged for another frame — it was painted a `^b` that \
+             the prune just invalidated"
+        );
+
+        // That rescheduled frame is what actually clears it.
+        push_frames(&mut app, &mut clients);
+        assert!(
+            !status_row(&app).contains("^b"),
+            "the corrected frame must drop the indicator: {:?}",
+            status_row(&app)
+        );
+    }
+
+    #[test]
+    fn the_clipboard_delivery_path_also_unsticks_the_prefix() {
+        // `drain_pending_copies` is the OTHER place a half-dead client is discovered, and it
+        // runs AFTER the loop has already decided `dirty` — so pruning the prefix-holder
+        // there is just as capable of stranding a lit `^b` on the survivors. Hence the
+        // invalidation lives in `prune_dead_clients`, not at one call site.
+        let (mut cfg, _) = MuxConfig::load_from(std::path::Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false;
+        let mut app = App::new(80, 24, Vec::new(), Vec::new(), cfg).expect("app");
+        app.set_prefix_armed(true); // what the frame already on screen says
+
+        let (live, _live_guard) = test_client(1, 80, 24);
+        let (mut dying, dying_guard) = test_client(2, 80, 24);
+        dying.prefix = true;
+        super::queue_copy(&mut dying, 1, "a drag copy it will never receive");
+        drop(dying_guard);
+        let mut clients = vec![live, dying];
+
+        super::drain_pending_copies(&mut app, &mut clients);
+
+        assert_eq!(clients.len(), 1, "the half-dead client is pruned here too");
+        assert!(
+            clients[0].pending,
+            "the survivor must be flagged for a frame that drops the stale `^b`"
+        );
     }
 
     #[test]
