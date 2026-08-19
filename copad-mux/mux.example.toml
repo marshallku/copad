@@ -27,7 +27,15 @@ notify = true             # agent turn-completion desktop toasts (env COPAD_MUX_
 sidebar = true            # show the spaces+agents sidebar by default (Ctrl-b s toggles)
 sidebar_width = 24        # sidebar columns            (clamped to 8..80)
 sidebar_min_cols = 80     # hide the sidebar below this terminal width (>= width + 20)
-scroll_step = 3           # lines per mouse-wheel notch (1..50)
+sidebar_density = "comfortable"
+                          # rows per sidebar entry (a session, an agent):
+                          #   comfortable (default) — 2 rows: name + subtitle below it
+                          #   compact — 1 row: name with the subtitle trailing, right-
+                          #     aligned; fits twice as many entries
+                          #   auto — comfortable per half, dropping to compact only for a
+                          #     half that would otherwise overflow
+scroll_step = 3           # lines per mouse-wheel notch (1..50; the wheel over the SIDEBAR
+                          #   scrolls that half by one entry instead)
 sort_by = "created"       # session order in the sidebar / Ctrl-f switcher / )( cycle:
                           #   created (default) | alphabetical | recent | activity
 usage = "bar"             # status-bar Claude/Codex rate-limit readout:

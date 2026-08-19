@@ -1915,8 +1915,9 @@ impl App {
             Req::ReloadConfig => {
                 // Re-read mux.toml and swap the whole config (tmux `source-file`). Every
                 // live-read field takes effect on the next frame because rendering/input
-                // read straight off `self.cfg`: keymap, mouse, sidebar_width, all usage_*,
-                // tab_labels, notify, scroll_step, sort_by, worktree — and ALSO
+                // read straight off `self.cfg`: keymap, mouse, sidebar_width,
+                // sidebar_density, all usage_*, tab_labels, notify, scroll_step, sort_by,
+                // worktree — and ALSO
                 // restore_processes/restore_agent_sessions, which are read at SAVE time
                 // (see `snapshot_*` at ~3300), so a reloaded restore list governs the next
                 // autosave/shutdown-save. The genuinely frozen fields are the ones whose
@@ -4024,6 +4025,20 @@ impl App {
             .bg(panel_bg)
             .add_modifier(Modifier::BOLD);
         let sub_style = Style::default().fg(CAT_OVERLAY).bg(panel_bg);
+        // In compact mode a row's subtitle trails its name on the SAME line, right-aligned
+        // to the strip edge, and is dropped whole rather than truncated when the name
+        // already reaches it — a half-word of branch name is noise, not information.
+        let put_trailing = |buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style| {
+            if text.is_empty() {
+                return;
+            }
+            let w = UnicodeWidthStr::width(text) as u16;
+            let at = sidebar_w.saturating_sub(w + 1);
+            if at > x {
+                let mut tx = at;
+                put(buf, &mut tx, y, text, style);
+            }
+        };
         // The rule trailing an agents group header — darker than the muted text so the
         // header reads as a divider, not as an agent row with a missing status dot.
         let divider_style = Style::default().fg(CAT_SURFACE0).bg(panel_bg);
@@ -4041,15 +4056,36 @@ impl App {
             .iter()
             .filter(|r| r.status == "blocked")
             .collect();
-        // u32 accumulation so a pathological session/agent count can't overflow.
-        let want_spaces = 1 + 2 * sids.len() as u32; // header + 2 rows per session
         let want_band = if blocked.is_empty() {
             0
         } else {
             blocked.len() as u32 + 1 // 1 compact row each + the closing rule
         };
-        let want_agents = 1 + want_band + agent_items.iter().map(|i| i.rows() as u32).sum::<u32>();
-        let mid = split_sidebar(h, want_spaces, want_agents);
+        // u32 accumulation so a pathological session/agent count can't overflow.
+        // `ask` is a half's total row demand at a given rows-per-entry.
+        let ask_spaces = |e: u16| 1 + e as u32 * sids.len() as u32;
+        let ask_agents =
+            |e: u16| 1 + want_band + agent_items.iter().map(|i| i.rows(e) as u32).sum::<u32>();
+        // `auto` needs to know WHICH half overflows, and that only falls out of the split —
+        // which in turn depends on the entry heights. Break the cycle by splitting once at
+        // the comfortable size, reading off who overflowed, then splitting for real. One
+        // extra round of arithmetic, and the outcome is deterministic.
+        let probe = split_sidebar(h, ask_spaces(2), ask_agents(2), 2, 2);
+        let entry_sp = self
+            .cfg
+            .sidebar_density
+            .entry_rows(ask_spaces(2) > probe as u32);
+        let entry_ag = self
+            .cfg
+            .sidebar_density
+            .entry_rows(ask_agents(2) > h.saturating_sub(probe) as u32);
+        let mid = split_sidebar(
+            h,
+            ask_spaces(entry_sp),
+            ask_agents(entry_ag),
+            entry_sp,
+            entry_ag,
+        );
 
         // ---- spaces (top half) ----
         put(buf, &mut 0, 0, " spaces", header);
@@ -4065,7 +4101,7 @@ impl App {
         // a row for a "+N more" hint when truncated (the full list is in `Ctrl-f`). Only
         // window when there's room for at least a session + hint (≥2 slots); otherwise show
         // what fits with no fabricated/overlapping row.
-        let space_max = (mid.saturating_sub(1) / 2) as usize; // 2 rows per session
+        let space_max = (mid.saturating_sub(1) / entry_sp) as usize;
         let space_total = sids.len();
         let (space_start, space_vis, space_trunc) = if space_total <= space_max || space_max < 2 {
             (0, space_max.min(space_total), false)
@@ -4088,7 +4124,7 @@ impl App {
         };
         let mut y = 1u16;
         for (i, sid) in sids.iter().enumerate().skip(space_start).take(space_vis) {
-            if y + 1 >= mid {
+            if y + entry_sp > mid {
                 break; // safety: never spill into the agents half
             }
             let is_active = i == active_si;
@@ -4137,17 +4173,21 @@ impl App {
                 .get(sid)
                 .cloned()
                 .unwrap_or_else(|| self.session_focus_label(sid));
-            let mut sx = 4u16;
-            put(buf, &mut sx, y + 1, &sub, sub_style);
-            // Both rows (name + subtitle) click to switch to this session.
+            if entry_sp > 1 {
+                let mut sx = 4u16;
+                put(buf, &mut sx, y + 1, &sub, sub_style);
+            } else {
+                put_trailing(buf, x, y, &sub, sub_style);
+            }
+            // The whole entry clicks to switch to this session.
             self.click_zones.borrow_mut().push(ClickZone {
                 x0: 0,
                 x1: sidebar_w - 1,
                 y0: y,
-                y1: y + 1,
+                y1: y + entry_sp - 1,
                 target: ClickTarget::Session(sid.clone()),
             });
-            y += 2;
+            y += entry_sp;
         }
         if space_trunc {
             let hidden = space_total - space_vis;
@@ -4189,7 +4229,7 @@ impl App {
         // move rows out from under the pointer every time an agent changed state). They are
         // deliberately shown twice: the band is the shortcut, the list below is the map.
         let multi_space = agents_span_spaces(&agent_rows);
-        let band_n = band_rows(h.saturating_sub(mid + 1), blocked.len());
+        let band_n = band_rows(h.saturating_sub(mid + 1), blocked.len(), entry_ag);
         if band_n > 0 {
             for row in blocked.iter().take(band_n) {
                 let mut x = 1u16;
@@ -4275,7 +4315,7 @@ impl App {
             .and_then(|a| agent_rows.get(a))
             .map(|r| r.term.to_string())
             .or_else(|| Some(self.ws.to_string()));
-        let heights: Vec<u16> = agent_items.iter().map(AgentItem::rows).collect();
+        let heights: Vec<u16> = agent_items.iter().map(|i| i.rows(entry_ag)).collect();
         let avail = h.saturating_sub(y);
         let need: u32 = heights.iter().map(|&r| r as u32).sum();
         // Reserve a row for the "+M more" hint when the list can't fit; the full list is
@@ -4300,13 +4340,13 @@ impl App {
         };
         let mut shown = 0usize;
         for item in agent_items.iter().skip(start) {
-            if y + item.rows() > end_y {
+            if y + item.rows(entry_ag) > end_y {
                 break;
             }
             // A group header is ALWAYS followed by an agent entry (that is how
             // `agent_items` builds it), so on the last row it would render a heading with
             // nothing under it. Stop instead.
-            if matches!(item, AgentItem::Group(..)) && y + item.rows() + 2 > end_y {
+            if matches!(item, AgentItem::Group(..)) && y + item.rows(entry_ag) + entry_ag > end_y {
                 break;
             }
             let ai = match item {
@@ -4382,23 +4422,34 @@ impl App {
             };
             put(buf, &mut x, y, " ", name_style);
             put(buf, &mut x, y, &row.title, name_style);
-            let mut sx = 4u16;
             let waited = fmt_elapsed(row.for_secs);
-            let sub = if waited.is_empty() {
-                format!("{} · {}", row.status, row.tool)
+            if entry_ag > 1 {
+                let sub = if waited.is_empty() {
+                    format!("{} · {}", row.status, row.tool)
+                } else {
+                    format!("{} {} · {}", row.status, waited, row.tool)
+                };
+                let mut sx = 4u16;
+                put(buf, &mut sx, y + 1, &sub, sub_style);
             } else {
-                format!("{} {} · {}", row.status, waited, row.tool)
-            };
-            put(buf, &mut sx, y + 1, &sub, sub_style);
-            // Both rows click to jump to this agent's pane.
+                // One row: the tool name is the first thing to go — the tab chip already
+                // carries it, while the status and how long it has held are the point.
+                let sub = if waited.is_empty() {
+                    row.status.to_string()
+                } else {
+                    format!("{} {}", row.status, waited)
+                };
+                put_trailing(buf, x, y, &sub, sub_style);
+            }
+            // The whole entry clicks to jump to this agent's pane.
             self.click_zones.borrow_mut().push(ClickZone {
                 x0: 0,
                 x1: sidebar_w - 1,
                 y0: y,
-                y1: y + 1,
+                y1: y + entry_ag - 1,
                 target: ClickTarget::Agent(row.term.clone()),
             });
-            y += 2;
+            y += entry_ag;
         }
         if shown < agent_total && y < h {
             let hidden = agent_total - shown;
@@ -5800,10 +5851,12 @@ enum AgentItem {
 }
 
 impl AgentItem {
-    fn rows(&self) -> u16 {
+    /// `entry_h` is the configured rows-per-entry (`sidebar_density`); a group header is
+    /// always one row.
+    fn rows(&self, entry_h: u16) -> u16 {
         match self {
             AgentItem::Group(..) => 1,
-            AgentItem::Agent(_) => 2,
+            AgentItem::Agent(_) => entry_h,
         }
     }
 
@@ -5815,11 +5868,13 @@ impl AgentItem {
 
 /// How many rows the attention band may take out of `region` — the agents half below its
 /// header — given how many agents are `blocked`. A quarter of the region, floored at one
-/// row, but never at the cost of the list's own floor: one 2-row entry plus the band's
+/// row, but never at the cost of the list's own floor: one entry (`entry_h` rows, per
+/// `sidebar_density`) plus the band's
 /// closing rule. A strip too short for both drops the BAND, not the map, since the list is
 /// what carries the focused-agent anchor [codex S2/C1].
-fn band_rows(region: u16, blocked: usize) -> usize {
-    let cap = ((region / 4).max(1) as usize).min(region.saturating_sub(3) as usize);
+fn band_rows(region: u16, blocked: usize, entry_h: u16) -> usize {
+    let keep = 1 + entry_h; // the closing rule + one list entry
+    let cap = ((region / 4).max(1) as usize).min(region.saturating_sub(keep) as usize);
     blocked.min(cap)
 }
 
@@ -5855,8 +5910,11 @@ fn agent_items(rows: &[AgentRow]) -> Vec<AgentItem> {
 /// slack to the other — the old fixed 50/50 spent half the strip on a 2-session list
 /// while 12 agents truncated to 7, which is the many-agents case the panel exists for.
 /// Falls back to an even split only when both halves overflow.
-fn split_sidebar(h: u16, want_spaces: u32, want_agents: u32) -> u16 {
-    if h < 6 {
+fn split_sidebar(h: u16, want_spaces: u32, want_agents: u32, entry_sp: u16, entry_ag: u16) -> u16 {
+    // Each half's floor is its header plus one entry, so it scales with `sidebar_density`:
+    // a compact half needs 2 rows where a comfortable one needs 3.
+    let (floor_sp, floor_ag) = (1 + entry_sp, 1 + entry_ag);
+    if h < floor_sp + floor_ag {
         // Too short for either half to hold anything — keep the old split verbatim
         // rather than an approximation of it [codex R2/C1].
         return (h / 2).max(2);
@@ -5873,7 +5931,7 @@ fn split_sidebar(h: u16, want_spaces: u32, want_agents: u32) -> u16 {
         half // both overflow — split evenly
     };
     // Always leave each half a header + one entry's worth of rows.
-    (mid.min(h32) as u16).clamp(3, h - 3)
+    (mid.min(h32) as u16).clamp(floor_sp, h - floor_ag)
 }
 
 /// The furthest a variable-height window can scroll and still be FULL: the smallest start
@@ -6491,13 +6549,13 @@ mod tests {
     fn split_sidebar_gives_slack_to_the_crowded_half() {
         // 2 sessions (1 + 2*2 = 5 rows) vs 12 agents (1 + 24 = 25): 30 > 29, but the
         // spaces fit in their share, so they take 5 and agents get the other 24.
-        assert_eq!(split_sidebar(29, 5, 25), 5);
+        assert_eq!(split_sidebar(29, 5, 25, 2, 2), 5);
         // Mirror: 12 sessions vs 2 agents — agents keep their 5, spaces absorb 24.
-        assert_eq!(split_sidebar(29, 25, 5), 24);
+        assert_eq!(split_sidebar(29, 25, 5, 2, 2), 24);
         // Both overflow → even split (the old behaviour).
-        assert_eq!(split_sidebar(29, 25, 25), 14);
+        assert_eq!(split_sidebar(29, 25, 25, 2, 2), 14);
         // Everything fits with room to spare: spaces take theirs, agents get the rest.
-        assert_eq!(split_sidebar(49, 3, 41), 3);
+        assert_eq!(split_sidebar(49, 3, 41, 2, 2), 3);
     }
 
     #[test]
@@ -6505,12 +6563,12 @@ mod tests {
     /// reason about keeps the old even split.
     fn split_sidebar_reserves_a_minimum_for_both_halves() {
         // 1 session (3 rows) but only 6 rows total: agents keep 3.
-        assert_eq!(split_sidebar(6, 3, 99), 3);
+        assert_eq!(split_sidebar(6, 3, 99, 2, 2), 3);
         // A huge spaces list can't push the agents header off the bottom.
-        assert_eq!(split_sidebar(10, 99, 3), 7);
+        assert_eq!(split_sidebar(10, 99, 3, 2, 2), 7);
         // Below the floor, fall back to the pre-adaptive `(h / 2).max(2)` verbatim.
-        assert_eq!(split_sidebar(5, 3, 3), 2);
-        assert_eq!(split_sidebar(1, 3, 3), 2);
+        assert_eq!(split_sidebar(5, 3, 3, 2, 2), 2);
+        assert_eq!(split_sidebar(1, 3, 3, 2, 2), 2);
     }
 
     #[test]
@@ -6528,6 +6586,40 @@ mod tests {
         assert_eq!(window_start_var(&h, 4, 6), 2);
         assert_eq!(window_start_var(&[], 0, 6), 0);
         assert_eq!(window_start_var(&h, 99, 0), 0);
+    }
+
+    #[test]
+    /// A compact half's floor is a header + ONE row, so `split_sidebar` must not reserve
+    /// the comfortable 3 rows for it — that would waste a row exactly where space is
+    /// scarcest, which is the whole reason to go compact.
+    fn split_sidebar_floors_follow_the_entry_height() {
+        // Comfortable floors (3/3): 6 rows is the shortest strip that splits at all.
+        assert_eq!(split_sidebar(6, 3, 99, 2, 2), 3);
+        // Compact floors (2/2): the same strip gives the crowded half a row back.
+        assert_eq!(split_sidebar(6, 2, 99, 1, 1), 2);
+        assert_eq!(split_sidebar(10, 99, 2, 1, 1), 8);
+        // Below the combined floor, the legacy fallback.
+        assert_eq!(split_sidebar(3, 2, 2, 1, 1), 2);
+    }
+
+    #[test]
+    /// Compact entries halve what the agents list asks for, which is the point.
+    fn agent_item_rows_track_the_entry_height() {
+        let two = [arow("copad", "a"), arow("bots", "b")];
+        let items = agent_items(&two); // header, a, header, b
+        assert_eq!(items.iter().map(|i| i.rows(2)).sum::<u16>(), 6);
+        assert_eq!(items.iter().map(|i| i.rows(1)).sum::<u16>(), 4); // headers stay 1 row
+    }
+
+    #[test]
+    /// The band's reserve for the list shrinks with the entry it has to protect.
+    fn band_rows_reserve_tracks_the_entry_height() {
+        // Comfortable: band + rule + a 2-row entry needs 4 rows.
+        assert_eq!(band_rows(3, 5, 2), 0);
+        assert_eq!(band_rows(4, 5, 2), 1);
+        // Compact: the same reserve is one row cheaper.
+        assert_eq!(band_rows(3, 5, 1), 1);
+        assert_eq!(band_rows(2, 5, 1), 0);
     }
 
     #[test]
@@ -6609,14 +6701,14 @@ mod tests {
     /// the one-entry floor stage 1 guarantees, so a short strip drops the band instead.
     fn band_rows_never_squeezes_the_list_below_one_entry() {
         // Roomy: a quarter of the region, bounded by how many are actually blocked.
-        assert_eq!(band_rows(28, 12), 7);
-        assert_eq!(band_rows(28, 3), 3);
-        assert_eq!(band_rows(28, 0), 0);
+        assert_eq!(band_rows(28, 12, 2), 7);
+        assert_eq!(band_rows(28, 3, 2), 3);
+        assert_eq!(band_rows(28, 0, 2), 0);
         // Tight: band + rule + one 2-row entry is exactly 4 rows.
-        assert_eq!(band_rows(4, 5), 1);
+        assert_eq!(band_rows(4, 5, 2), 1);
         // Too tight for all three — the list wins.
-        assert_eq!(band_rows(3, 5), 0);
-        assert_eq!(band_rows(0, 5), 0);
+        assert_eq!(band_rows(3, 5, 2), 0);
+        assert_eq!(band_rows(0, 5, 2), 0);
     }
 
     #[test]
@@ -6652,7 +6744,7 @@ mod tests {
         assert!(matches!(&items[3], AgentItem::Group(s, _) if s == "bots"));
         assert!(items[4].is_agent(2));
         // Rows: 1 + 2 + 2 + 1 + 2
-        assert_eq!(items.iter().map(|i| i.rows()).sum::<u16>(), 8);
+        assert_eq!(items.iter().map(|i| i.rows(2)).sum::<u16>(), 8);
     }
 
     #[test]

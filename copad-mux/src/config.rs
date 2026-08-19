@@ -106,6 +106,45 @@ pub enum SortBy {
     Activity,
 }
 
+/// How many rows one sidebar entry (a session, an agent) occupies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Density {
+    /// Two rows: name + subtitle. The original layout.
+    Comfortable,
+    /// One row: name with its subtitle trailing, right-aligned. Doubles how many entries
+    /// fit, which past a certain count beats reading the subtitle of each.
+    Compact,
+    /// Comfortable per half, dropping to compact only for a half that would overflow —
+    /// so a workspace pays the density cost exactly where it has too much to show.
+    Auto,
+}
+
+impl Density {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "comfortable" | "comfy" | "normal" => Density::Comfortable,
+            "compact" | "dense" => Density::Compact,
+            "auto" => Density::Auto,
+            _ => return None,
+        })
+    }
+
+    /// Rows per entry, given whether this half would overflow at the comfortable size.
+    pub fn entry_rows(self, would_overflow: bool) -> u16 {
+        match self {
+            Density::Comfortable => 2,
+            Density::Compact => 1,
+            Density::Auto => {
+                if would_overflow {
+                    1
+                } else {
+                    2
+                }
+            }
+        }
+    }
+}
+
 impl SortBy {
     fn parse(s: &str) -> Option<Self> {
         Some(match s.trim().to_ascii_lowercase().as_str() {
@@ -642,6 +681,8 @@ pub struct MuxConfig {
     pub restore_agent_sessions: bool,
     /// Session ordering in the sidebar / switcher / cycle.
     pub sort_by: SortBy,
+    /// Rows per sidebar entry (`comfortable` | `compact` | `auto`).
+    pub sidebar_density: Density,
     /// How the status-bar usage/limits readout is rendered (off/text/bar).
     pub usage: UsageStyle,
     /// Which rate-limit windows the readout shows (config `usage_windows`); a window
@@ -689,6 +730,7 @@ struct RawConfig {
     restore_processes: Option<Vec<String>>,
     restore_agent_sessions: Option<bool>,
     sort_by: Option<String>,
+    sidebar_density: Option<String>,
     usage: Option<String>,
     usage_windows: Option<Vec<String>>,
     usage_bar_width: Option<i64>,
@@ -781,6 +823,7 @@ impl MuxConfig {
             restore_processes: default_restore_processes(),
             restore_agent_sessions: true,
             sort_by: SortBy::Created,
+            sidebar_density: Density::Comfortable,
             usage: UsageStyle::Bar,
             usage_windows: crate::usagepoll::UsageWindows::all(),
             usage_bar_width: DEFAULT_USAGE_BAR_WIDTH,
@@ -885,6 +928,16 @@ impl MuxConfig {
                     .restore_processes
                     .unwrap_or_else(default_restore_processes),
                 restore_agent_sessions: raw.restore_agent_sessions.unwrap_or(true),
+                sidebar_density: match raw.sidebar_density.as_deref() {
+                    None => Density::Comfortable,
+                    Some(s) => Density::parse(s).unwrap_or_else(|| {
+                        warnings.push(format!(
+                            "sidebar_density '{s}' unknown (comfortable|compact|auto) — \
+                             using comfortable"
+                        ));
+                        Density::Comfortable
+                    }),
+                },
                 sort_by: match raw.sort_by.as_deref() {
                     None => SortBy::Created,
                     Some(s) => SortBy::parse(s).unwrap_or_else(|| {
@@ -1524,6 +1577,32 @@ mod tests {
                 .0
                 .restore_agent_sessions
         );
+    }
+
+    #[test]
+    fn sidebar_density_parses_and_defaults() {
+        assert_eq!(MuxConfig::default().sidebar_density, Density::Comfortable);
+        assert_eq!(
+            load_str("sidebar_density = \"compact\"").0.sidebar_density,
+            Density::Compact
+        );
+        assert_eq!(
+            load_str("sidebar_density = \"auto\"").0.sidebar_density,
+            Density::Auto
+        );
+        // Unknown values warn and fall back rather than breaking the mux.
+        let (cfg, warns) = load_str("sidebar_density = \"tiny\"");
+        assert_eq!(cfg.sidebar_density, Density::Comfortable);
+        assert!(warns.iter().any(|w| w.contains("sidebar_density")));
+    }
+
+    #[test]
+    /// `auto` is the only mode that consults the overflow flag; the other two are fixed.
+    fn density_entry_rows_only_varies_for_auto() {
+        assert_eq!(Density::Comfortable.entry_rows(true), 2);
+        assert_eq!(Density::Compact.entry_rows(false), 1);
+        assert_eq!(Density::Auto.entry_rows(false), 2);
+        assert_eq!(Density::Auto.entry_rows(true), 1);
     }
 
     #[test]
