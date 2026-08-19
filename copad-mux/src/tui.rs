@@ -10,7 +10,7 @@
 //! and the thin [`crate::client`] renders + forwards input, so the same App serves
 //! local and detached/reattached sessions.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -111,6 +111,34 @@ enum PromptKind {
     /// switch (this client or a concurrent one) while the prompt is up can't retarget
     /// or silently drop it.
     RenameTab(WorkspaceId, TabId),
+}
+
+/// A sidebar half scrolled BY HAND (wheel), plus the auto-anchor that was in effect at the
+/// time. When the anchor moves on its own — you switch session, or the focused agent
+/// changes — the override is ignored and the half snaps back to following the focus; a
+/// panel that silently stopped tracking you would be worse than one that never scrolled.
+#[derive(Debug, Clone)]
+struct SidebarScroll {
+    /// Index the half was scrolled to (a session index for `spaces`, an item index for
+    /// `agents` — the two halves index different lists).
+    start: usize,
+    anchor: Option<String>,
+}
+
+/// What the last composed frame actually did with a sidebar half. A wheel event needs the
+/// current start and how far it may go, and neither is derivable outside the render pass:
+/// both depend on the MEASURED split (decision #94) and, for the agents half, on mixed row
+/// heights. Written by `render_sidebar`, read by `scroll_sidebar`.
+#[derive(Debug, Clone, Default)]
+struct HalfView {
+    start: usize,
+    /// Highest start that still fills the window (0 when everything fits — nothing to scroll).
+    max_start: usize,
+    /// Stable IDENTITY of the row the window auto-anchors on — a `WorkspaceId` for `spaces`,
+    /// a `TerminalId` for `agents` — and NOT its index. Under `sort_by = recent` the active
+    /// session sits at display index 0 permanently, so an index-keyed pin would compare
+    /// equal after every switch and never expire [codex S3a/C1].
+    anchor: Option<String>,
 }
 
 /// An agent pane's rolled-up status plus WHEN it entered it. The stamp is what lets the
@@ -422,6 +450,18 @@ pub struct App {
     confirm: Option<Confirm>,
     /// When `Some`, a right-click context menu (tmux `display-menu`) is open.
     menu: Option<Menu>,
+    /// Per-half manual scroll (wheel over the sidebar), each dropped as soon as its
+    /// auto-anchor moves. `None` = follow the focus, which is the default behaviour.
+    spaces_scroll: Option<SidebarScroll>,
+    agents_scroll: Option<SidebarScroll>,
+    /// What the last composed frame did with each half, so a wheel event can pick up from
+    /// where the render left off. Interior mutability for the same reason `click_zones` has
+    /// it: rendering takes `&self`.
+    spaces_view: RefCell<HalfView>,
+    agents_view: RefCell<HalfView>,
+    /// Row at which the `agents` half started in the last composed frame — how a wheel
+    /// event tells which half the pointer is over.
+    sidebar_mid: Cell<u16>,
     /// When `Some`, the sidebar has keyboard focus (`Ctrl-b e`) for in-place navigation.
     sidebar_focus: Option<SidebarFocus>,
     /// The effective user config (keybindings + options), loaded once at server start.
@@ -552,6 +592,11 @@ impl App {
             prompt: None,
             confirm: None,
             menu: None,
+            spaces_scroll: None,
+            agents_scroll: None,
+            spaces_view: RefCell::new(HalfView::default()),
+            agents_view: RefCell::new(HalfView::default()),
+            sidebar_mid: Cell::new(0),
             sidebar_focus: None,
             cfg,
             click_zones: RefCell::new(Vec::new()),
@@ -2338,6 +2383,14 @@ impl App {
                     self.page_usage(if up { -1 } else { 1 });
                     return None;
                 }
+                // A wheel over the sidebar scrolls THAT half rather than falling through
+                // to the focused pane's scrollback, which is what it used to do — the
+                // pointer was nowhere near that pane. `content_x` is the first column
+                // right of the strip's border, so `x < content_x` is "inside the sidebar".
+                if self.sidebar_visible() && x < self.content_x() && y < self.content_rows() {
+                    self.scroll_sidebar(y >= self.sidebar_mid.get(), if up { -1 } else { 1 });
+                    return None;
+                }
                 // The pane under the cursor, else the focused one (tmux forwards to the
                 // pane the pointer is over).
                 let rect = target.clone().or_else(|| {
@@ -2721,6 +2774,31 @@ impl App {
 
     /// Toggle the neovim-style left panel (honored only when wide enough). The
     /// pane content area shrinks/grows, so resize the PTYs to match.
+    /// Scroll one sidebar half by `delta` ITEMS (a session row, or an agent entry/group
+    /// header). Picks up from what the last frame actually rendered — the window start and
+    /// its ceiling both depend on the measured split, so only the render pass knows them.
+    /// A no-op when the half already fits, so a wheel there is not silently swallowed.
+    fn scroll_sidebar(&mut self, agents_half: bool, delta: i32) {
+        let view = if agents_half {
+            self.agents_view.borrow().clone()
+        } else {
+            self.spaces_view.borrow().clone()
+        };
+        if view.max_start == 0 {
+            return; // everything fits — nothing to scroll
+        }
+        let next = (view.start as i32 + delta).clamp(0, view.max_start as i32) as usize;
+        let pinned = Some(SidebarScroll {
+            start: next,
+            anchor: view.anchor,
+        });
+        if agents_half {
+            self.agents_scroll = pinned;
+        } else {
+            self.spaces_scroll = pinned;
+        }
+    }
+
     fn toggle_sidebar(&mut self) {
         self.sidebar = !self.sidebar;
         // The content width changes → re-derive the viewport, not just PTY sizes.
@@ -3995,6 +4073,19 @@ impl App {
             let vis = space_max - 1; // reserve one row for the "+N more" hint
             (list_window_start(space_total, space_center, vis), vis, true)
         };
+        // A wheel over this half pins the window; the pin is dropped the moment the
+        // auto-anchor moves on its own, so switching session re-centres as before.
+        let space_max_start = space_total.saturating_sub(space_vis);
+        let space_anchor = sids.get(space_center).map(|w| w.to_string());
+        let space_start = match &self.spaces_scroll {
+            Some(sc) if sc.anchor == space_anchor => sc.start.min(space_max_start),
+            _ => space_start,
+        };
+        *self.spaces_view.borrow_mut() = HalfView {
+            start: space_start,
+            max_start: space_max_start,
+            anchor: space_anchor,
+        };
         let mut y = 1u16;
         for (i, sid) in sids.iter().enumerate().skip(space_start).take(space_vis) {
             if y + 1 >= mid {
@@ -4071,6 +4162,7 @@ impl App {
         }
 
         // ---- agents (bottom half) ----
+        self.sidebar_mid.set(mid);
         let mut y = mid;
         put(buf, &mut 0, y, " agents", header);
         // `⚑N` on the header counts EVERY blocked agent, including any the band below had
@@ -4167,13 +4259,22 @@ impl App {
         // Anchor the window on the keyboard-focused row, else on the agent whose pane is
         // FOCUSED — parity with the spaces half centering on the active session. It used
         // to pin at index 0, so the agent you were looking at could be off-window.
-        let anchor = agent_focus
-            .or_else(|| {
-                let t = active_agent_term.as_ref()?;
-                agent_rows.iter().position(|r| &r.term == t)
-            })
+        let anchor_agent = agent_focus.or_else(|| {
+            let t = active_agent_term.as_ref()?;
+            agent_rows.iter().position(|r| &r.term == t)
+        });
+        let anchor = anchor_agent
             .and_then(|a| agent_items.iter().position(|i| i.is_agent(a)))
             .unwrap_or(0);
+        // Identity, not index: the pin below expires when the anchor MOVES, and a bare
+        // index can stay equal while pointing at a different agent. The anchor is TOTAL —
+        // with no agent focused it falls back to the active SESSION rather than `None`, or
+        // two different sessions whose focused panes are both shells would compare equal
+        // and carry a stale pin across the switch [codex S3a/C2].
+        let anchor_id = anchor_agent
+            .and_then(|a| agent_rows.get(a))
+            .map(|r| r.term.to_string())
+            .or_else(|| Some(self.ws.to_string()));
         let heights: Vec<u16> = agent_items.iter().map(AgentItem::rows).collect();
         let avail = h.saturating_sub(y);
         let need: u32 = heights.iter().map(|&r| r as u32).sum();
@@ -4187,7 +4288,16 @@ impl App {
             avail - 1
         };
         let end_y = y.saturating_add(budget);
-        let start = window_start_var(&heights, anchor, budget);
+        let agent_max_start = window_max_start(&heights, budget);
+        let start = match &self.agents_scroll {
+            Some(sc) if sc.anchor == anchor_id => sc.start.min(agent_max_start),
+            _ => window_start_var(&heights, anchor, budget),
+        };
+        *self.agents_view.borrow_mut() = HalfView {
+            start,
+            max_start: agent_max_start,
+            anchor: anchor_id,
+        };
         let mut shown = 0usize;
         for item in agent_items.iter().skip(start) {
             if y + item.rows() > end_y {
@@ -5766,6 +5876,22 @@ fn split_sidebar(h: u16, want_spaces: u32, want_agents: u32) -> u16 {
     (mid.min(h32) as u16).clamp(3, h - 3)
 }
 
+/// The furthest a variable-height window can scroll and still be FULL: the smallest start
+/// whose tail fits in `avail`. The uniform-height equivalent is `total - visible`.
+fn window_max_start(heights: &[u16], avail: u16) -> usize {
+    let mut used = 0u16;
+    let mut i = heights.len();
+    while i > 0 {
+        let h = heights[i - 1];
+        if used.saturating_add(h) > avail {
+            break;
+        }
+        used += h;
+        i -= 1;
+    }
+    i
+}
+
 /// Start index into a VARIABLE-height item list such that `anchor` is visible within
 /// `avail` rows, keeping it roughly centered. Mirrors [`list_window_start`] for lists
 /// whose items are not all the same height (the agents half's group headers).
@@ -5996,7 +6122,7 @@ mod tests {
         detect_alt_screen_transition, extract_selection, filter_env, fmt_elapsed,
         list_window_start, menu_origin, merge_env, merge_labels, reload_note, sel_bounds, sel_cols,
         shell_quote, split_sidebar, status_since, tab_window, usage_should_roll,
-        usage_threshold_color, window_start_var, wrap_page,
+        usage_threshold_color, window_max_start, window_start_var, wrap_page,
     };
     use crate::model::{TerminalId, WorkspaceId};
     use crate::procinfo::{Kind, Label};
@@ -6402,6 +6528,21 @@ mod tests {
         assert_eq!(window_start_var(&h, 4, 6), 2);
         assert_eq!(window_start_var(&[], 0, 6), 0);
         assert_eq!(window_start_var(&h, 99, 0), 0);
+    }
+
+    #[test]
+    /// The scroll ceiling: past it the window would trail blank rows instead of content.
+    fn window_max_start_stops_where_the_tail_stops_filling() {
+        let h = [1u16, 2, 2, 1, 2, 2, 2]; // 12 rows over 7 items
+        assert_eq!(window_max_start(&h, 12), 0); // everything fits — nothing to scroll
+        assert_eq!(window_max_start(&h, 99), 0);
+        // 6 rows of tail = items 4,5,6 (2+2+2); item 3 would make 7.
+        assert_eq!(window_max_start(&h, 6), 4);
+        // 2 rows = the last item alone.
+        assert_eq!(window_max_start(&h, 2), 6);
+        // Not even one item fits — clamp to the end rather than underflow.
+        assert_eq!(window_max_start(&h, 1), 7);
+        assert_eq!(window_max_start(&[], 6), 0);
     }
 
     #[test]
