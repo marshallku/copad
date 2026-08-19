@@ -121,6 +121,9 @@ struct AgentRow {
     /// The session (space) name — kept alongside `title` so the switcher can filter on
     /// it and show it even when a tab name overrides the title.
     space: String,
+    /// The session the agent lives in, so a sidebar space GROUP HEADER can click through
+    /// to it (the name alone is ambiguous — two sessions may share one).
+    space_id: WorkspaceId,
     /// The agent's foreground command (e.g. `claude` / `codex`).
     tool: String,
     /// Rolled-up status: `working` / `ready` / `blocked` / `idle`.
@@ -3812,9 +3815,13 @@ impl App {
                 continue;
             };
             let space = w.name.clone().unwrap_or_else(|| wid.to_string());
-            for t in &w.tabs {
+            for (ti, t) in w.tabs.iter().enumerate() {
                 // The tab's custom name titles its agent rows, so several agents in ONE
-                // space stay distinguishable (the reason tab rename exists).
+                // space stay distinguishable (the reason tab rename exists). Unnamed
+                // tabs fall back to their 1-based INDEX rather than the space name: the
+                // sidebar already groups by space, so repeating it would render every
+                // agent in a space as the same untellable row — the index at least says
+                // which `Ctrl-b <n>` jumps there.
                 let tab_name = t.name.as_deref().map(str::trim).filter(|n| !n.is_empty());
                 for p in t.layout.panes() {
                     if let Some(tid) = t.layout.terminal_of(&p)
@@ -3822,8 +3829,11 @@ impl App {
                         && label.kind == procinfo::Kind::Agent
                     {
                         out.push(AgentRow {
-                            title: tab_name.unwrap_or(&space).to_string(),
+                            title: tab_name
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!("tab {}", ti + 1)),
                             space: space.clone(),
+                            space_id: wid.clone(),
                             tool: label.text.clone(),
                             status: self.agent_status(tid),
                             term: tid.clone(),
@@ -3892,11 +3902,24 @@ impl App {
             .bg(panel_bg)
             .add_modifier(Modifier::BOLD);
         let sub_style = Style::default().fg(CAT_OVERLAY).bg(panel_bg);
+        // The rule trailing an agents group header — darker than the muted text so the
+        // header reads as a divider, not as an agent row with a missing status dot.
+        let divider_style = Style::default().fg(CAT_SURFACE0).bg(panel_bg);
+
+        // ---- split the strip between the two halves ----
+        // Both halves are measured first so a half that needs less than its share hands
+        // the slack to the other (a fixed 50/50 wasted the spaces half on a 2-session /
+        // 12-agent setup, which is exactly the many-agents case the panel is for).
+        let sids = self.sorted_session_ids();
+        let agent_rows = self.agent_rows();
+        let agent_items = agent_items(&agent_rows);
+        // u32 accumulation so a pathological session/agent count can't overflow.
+        let want_spaces = 1 + 2 * sids.len() as u32; // header + 2 rows per session
+        let want_agents = 1 + agent_items.iter().map(|i| i.rows() as u32).sum::<u32>();
+        let mid = split_sidebar(h, want_spaces, want_agents);
 
         // ---- spaces (top half) ----
-        let mid = (h / 2).max(2);
         put(buf, &mut 0, 0, " spaces", header);
-        let sids = self.sorted_session_ids();
         let active_si = self.active_session_index();
         // When the sidebar has keyboard focus on Sessions, center the window on the FOCUSED
         // row (and highlight it) instead of the active session.
@@ -4000,30 +4023,75 @@ impl App {
         // it can be highlighted like the active `spaces` row — bright/bold name vs the
         // dimmed siblings — instead of every agent looking identical.
         let active_agent_term = self.focused_terminal();
-        // Window agents (around the keyboard-focused row when focusing Agents, else the
-        // top) with a "+M more" hint; the full list is in Ctrl-f.
-        let agent_rows = self.agent_rows();
-        let agent_max = (h.saturating_sub(mid + 1) / 2) as usize;
         let agent_total = agent_rows.len();
         let agent_focus = match &self.sidebar_focus {
             Some(f) if f.tab == PopupTab::Agents => Some(f.sel.min(agent_total.saturating_sub(1))),
             _ => None,
         };
-        let (agent_vis, agent_trunc) = if agent_total <= agent_max || agent_max < 2 {
-            (agent_max.min(agent_total), false)
+        // Anchor the window on the keyboard-focused row, else on the agent whose pane is
+        // FOCUSED — parity with the spaces half centering on the active session. It used
+        // to pin at index 0, so the agent you were looking at could be off-window.
+        let anchor = agent_focus
+            .or_else(|| {
+                let t = active_agent_term.as_ref()?;
+                agent_rows.iter().position(|r| &r.term == t)
+            })
+            .and_then(|a| agent_items.iter().position(|i| i.is_agent(a)))
+            .unwrap_or(0);
+        let heights: Vec<u16> = agent_items.iter().map(AgentItem::rows).collect();
+        let avail = h.saturating_sub(mid + 1);
+        let need: u32 = heights.iter().map(|&r| r as u32).sum();
+        // Reserve a row for the "+M more" hint when the list can't fit; the full list is
+        // in Ctrl-f. Never at the cost of the last ENTRY, though — on a strip short enough
+        // that the half is down to its floor (header + one 2-row entry), reserving the
+        // hint row would leave the hint and no agent at all [codex C1].
+        let budget = if need <= avail as u32 || avail < 3 {
+            avail
         } else {
-            (agent_max - 1, true) // reserve one row for the "+M more" hint
+            avail - 1
         };
-        let agent_start = list_window_start(agent_total, agent_focus.unwrap_or(0), agent_vis);
-        for (ai, row) in agent_rows
-            .into_iter()
-            .enumerate()
-            .skip(agent_start)
-            .take(agent_vis)
-        {
-            if y + 1 >= h {
+        let end_y = (mid + 1).saturating_add(budget);
+        let start = window_start_var(&heights, anchor, budget);
+        let mut shown = 0usize;
+        for item in agent_items.iter().skip(start) {
+            if y + item.rows() > end_y {
                 break;
             }
+            // A group header is ALWAYS followed by an agent entry (that is how
+            // `agent_items` builds it), so on the last row it would render a heading with
+            // nothing under it. Stop instead.
+            if matches!(item, AgentItem::Group(..)) && y + item.rows() + 2 > end_y {
+                break;
+            }
+            let ai = match item {
+                AgentItem::Group(space, wid) => {
+                    // Dim space name + a rule to the edge: with agents from several
+                    // sessions in one flat list there was no way to tell which was which.
+                    let mut gx = 1u16;
+                    put(buf, &mut gx, y, space, sub_style);
+                    put(buf, &mut gx, y, " ", sub_style);
+                    while gx < sidebar_w {
+                        let before = gx;
+                        put(buf, &mut gx, y, "─", divider_style);
+                        if gx == before {
+                            break; // no room left — never spin
+                        }
+                    }
+                    // The header clicks through to its session, like a `spaces` row.
+                    self.click_zones.borrow_mut().push(ClickZone {
+                        x0: 0,
+                        x1: sidebar_w - 1,
+                        y0: y,
+                        y1: y,
+                        target: ClickTarget::Session(wid.clone()),
+                    });
+                    y += 1;
+                    continue;
+                }
+                AgentItem::Agent(ai) => *ai,
+            };
+            let row = &agent_rows[ai];
+            shown += 1;
             let is_focused = agent_focus == Some(ai);
             // The active pane's agent — highlighted like the active `spaces` row.
             let is_active = active_agent_term.as_ref() == Some(&row.term);
@@ -4086,8 +4154,8 @@ impl App {
             });
             y += 2;
         }
-        if agent_trunc && y < h {
-            let hidden = agent_total - agent_vis;
+        if shown < agent_total && y < h {
+            let hidden = agent_total - shown;
             let mut hx = 1u16;
             put(
                 buf,
@@ -5475,6 +5543,105 @@ fn extract_selection(snap: &crate::term::Snapshot, anchor: (u16, u16), head: (u1
     out
 }
 
+/// One row-group in the sidebar's `agents` half: a space header (1 row) or an agent
+/// entry (2 rows — name + `status · tool`). The two heights are why the agents half
+/// windows with [`window_start_var`] rather than the uniform [`list_window_start`].
+enum AgentItem {
+    /// Space name + its session, emitted only when the agents span MORE than one space.
+    Group(String, WorkspaceId),
+    /// Index into the `agent_rows()` vec.
+    Agent(usize),
+}
+
+impl AgentItem {
+    fn rows(&self) -> u16 {
+        match self {
+            AgentItem::Group(..) => 1,
+            AgentItem::Agent(_) => 2,
+        }
+    }
+
+    /// Is this the entry for agent index `i`? (For locating the window anchor.)
+    fn is_agent(&self, i: usize) -> bool {
+        matches!(self, AgentItem::Agent(a) if *a == i)
+    }
+}
+
+/// Interleave space group headers into the agent list. `agent_rows()` already yields
+/// agents grouped by space (it walks workspaces in order), so a header goes wherever the
+/// space CHANGES. Skipped entirely for a single space — the header would be pure noise
+/// and it costs a row that the agents themselves want.
+fn agent_items(rows: &[AgentRow]) -> Vec<AgentItem> {
+    let multi_space = rows.windows(2).any(|w| w[0].space_id != w[1].space_id);
+    let mut out = Vec::with_capacity(rows.len());
+    let mut cur: Option<&WorkspaceId> = None;
+    for (i, r) in rows.iter().enumerate() {
+        if multi_space && cur != Some(&r.space_id) {
+            out.push(AgentItem::Group(r.space.clone(), r.space_id.clone()));
+            cur = Some(&r.space_id);
+        }
+        out.push(AgentItem::Agent(i));
+    }
+    out
+}
+
+/// The row at which the sidebar's `agents` half starts, given what each half WANTS
+/// (its header + all its entries). A half that needs less than its share hands the
+/// slack to the other — the old fixed 50/50 spent half the strip on a 2-session list
+/// while 12 agents truncated to 7, which is the many-agents case the panel exists for.
+/// Falls back to an even split only when both halves overflow.
+fn split_sidebar(h: u16, want_spaces: u32, want_agents: u32) -> u16 {
+    if h < 6 {
+        // Too short for either half to hold anything — keep the old split verbatim
+        // rather than an approximation of it [codex R2/C1].
+        return (h / 2).max(2);
+    }
+    let (h32, half) = (h as u32, (h / 2) as u32);
+    let mid = if want_spaces <= half || want_spaces + want_agents <= h32 {
+        // Spaces fit within their share (or everything fits): give them exactly what
+        // they need and let the agents have the whole remainder.
+        want_spaces
+    } else if want_agents <= h32 - half {
+        // Mirror: a short agents list keeps its size, spaces absorb the slack.
+        h32 - want_agents
+    } else {
+        half // both overflow — split evenly
+    };
+    // Always leave each half a header + one entry's worth of rows.
+    (mid.min(h32) as u16).clamp(3, h - 3)
+}
+
+/// Start index into a VARIABLE-height item list such that `anchor` is visible within
+/// `avail` rows, keeping it roughly centered. Mirrors [`list_window_start`] for lists
+/// whose items are not all the same height (the agents half's group headers).
+fn window_start_var(heights: &[u16], anchor: usize, avail: u16) -> usize {
+    if heights.is_empty() || avail == 0 {
+        return 0;
+    }
+    let anchor = anchor.min(heights.len() - 1);
+    // Spend at most half the budget on items ABOVE the anchor — and never so much that the
+    // anchor itself no longer fits. Without the second cap a 2-row entry under a 1-row
+    // group header could be pushed out of a 2-row window by its own header, which is the
+    // opposite of what anchoring is for [codex C1].
+    let cap = (avail / 2).min(avail.saturating_sub(heights[anchor]));
+    let mut start = anchor;
+    let mut above = 0u16;
+    while start > 0 && above + heights[start - 1] <= cap {
+        start -= 1;
+        above += heights[start];
+    }
+    // If the tail from `start` leaves slack (anchor near the end of the list), pull the
+    // window further back so it stays full instead of trailing blank rows.
+    let mut total: u16 = heights[start..]
+        .iter()
+        .fold(0u16, |a, &b| a.saturating_add(b));
+    while start > 0 && total.saturating_add(heights[start - 1]) <= avail {
+        start -= 1;
+        total = total.saturating_add(heights[start]);
+    }
+    start
+}
+
 fn list_window_start(total: usize, active: usize, visible: usize) -> usize {
     if visible == 0 || total <= visible {
         return 0;
@@ -5637,12 +5804,13 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CAT_GREEN, CAT_RED, CAT_YELLOW, Menu, MenuAction, build_command_line,
-        detect_alt_screen_transition, extract_selection, filter_env, list_window_start,
-        menu_origin, merge_env, merge_labels, reload_note, sel_bounds, sel_cols, shell_quote,
-        tab_window, usage_should_roll, usage_threshold_color, wrap_page,
+        AgentItem, AgentRow, CAT_GREEN, CAT_RED, CAT_YELLOW, Menu, MenuAction, agent_items,
+        build_command_line, detect_alt_screen_transition, extract_selection, filter_env,
+        list_window_start, menu_origin, merge_env, merge_labels, reload_note, sel_bounds, sel_cols,
+        shell_quote, split_sidebar, tab_window, usage_should_roll, usage_threshold_color,
+        window_start_var, wrap_page,
     };
-    use crate::model::TerminalId;
+    use crate::model::{TerminalId, WorkspaceId};
     use crate::procinfo::{Kind, Label};
     use crate::term::{CellColor, CellSnap, Snapshot};
     use std::collections::HashMap;
@@ -6000,6 +6168,99 @@ mod tests {
         assert!(ml, "tabs before the window → left marker");
         // active is near the end, so nothing hidden on the right
         assert!(!mr || end < 10);
+    }
+
+    #[test]
+    /// The spaces half gets exactly what it needs when it fits, handing the whole
+    /// remainder to the agents — the case the old fixed 50/50 split wasted (a 29-row
+    /// strip with 2 sessions + 12 agents showed only 7 agents; now it shows 11).
+    fn split_sidebar_gives_slack_to_the_crowded_half() {
+        // 2 sessions (1 + 2*2 = 5 rows) vs 12 agents (1 + 24 = 25): 30 > 29, but the
+        // spaces fit in their share, so they take 5 and agents get the other 24.
+        assert_eq!(split_sidebar(29, 5, 25), 5);
+        // Mirror: 12 sessions vs 2 agents — agents keep their 5, spaces absorb 24.
+        assert_eq!(split_sidebar(29, 25, 5), 24);
+        // Both overflow → even split (the old behaviour).
+        assert_eq!(split_sidebar(29, 25, 25), 14);
+        // Everything fits with room to spare: spaces take theirs, agents get the rest.
+        assert_eq!(split_sidebar(49, 3, 41), 3);
+    }
+
+    #[test]
+    /// Neither half may be starved below a header + one entry, and a strip too short to
+    /// reason about keeps the old even split.
+    fn split_sidebar_reserves_a_minimum_for_both_halves() {
+        // 1 session (3 rows) but only 6 rows total: agents keep 3.
+        assert_eq!(split_sidebar(6, 3, 99), 3);
+        // A huge spaces list can't push the agents header off the bottom.
+        assert_eq!(split_sidebar(10, 99, 3), 7);
+        // Below the floor, fall back to the pre-adaptive `(h / 2).max(2)` verbatim.
+        assert_eq!(split_sidebar(5, 3, 3), 2);
+        assert_eq!(split_sidebar(1, 3, 3), 2);
+    }
+
+    #[test]
+    /// Variable-height windowing keeps the anchor visible and the window full — the
+    /// agents half mixes 1-row group headers with 2-row agent entries.
+    fn window_start_var_centers_anchor_and_fills_the_window() {
+        let h = [1u16, 2, 2, 1, 2, 2, 2]; // 2 groups + 5 agents = 12 rows
+        assert_eq!(window_start_var(&h, 0, 12), 0); // everything fits
+        assert_eq!(window_start_var(&h, 0, 6), 0); // anchor at the top
+        // Anchor at the end → clamp so the window stays full (items 3..7 = 7 rows > 6,
+        // so it starts at 4: rows 2+2+2 = 6).
+        assert_eq!(window_start_var(&h, 6, 6), 4);
+        // Anchor in the middle: at most half the budget (3 rows) goes above it, so the
+        // window opens at item 2 (2 + 1 rows above the anchor) and the anchor still fits.
+        assert_eq!(window_start_var(&h, 4, 6), 2);
+        assert_eq!(window_start_var(&[], 0, 6), 0);
+        assert_eq!(window_start_var(&h, 99, 0), 0);
+    }
+
+    #[test]
+    /// On a window barely big enough for one entry, the anchor still renders — its own
+    /// group header must not push it out (the half's floor is header + one entry).
+    fn window_start_var_never_spends_the_anchors_own_rows_on_a_header() {
+        let h = [1u16, 2, 1, 2];
+        // 2 rows: only the anchor entry fits, so the window opens ON it.
+        assert_eq!(window_start_var(&h, 1, 2), 1);
+        assert_eq!(window_start_var(&h, 3, 2), 3);
+        // 3 rows: room for the header above it too.
+        assert_eq!(window_start_var(&h, 3, 3), 2);
+        // An anchor taller than the whole window can't fit either way — don't hang.
+        assert_eq!(window_start_var(&h, 1, 1), 1);
+    }
+
+    fn arow(space: &str, title: &str) -> AgentRow {
+        AgentRow {
+            title: title.to_string(),
+            space: space.to_string(),
+            space_id: WorkspaceId::new(space),
+            tool: "claude".to_string(),
+            status: "ready",
+            term: tid(title),
+        }
+    }
+
+    #[test]
+    /// Group headers appear where the space changes — but only when the agents actually
+    /// span more than one space, since a lone header just costs an agent its row.
+    fn agent_items_groups_only_when_agents_span_spaces() {
+        let one = [arow("copad", "a"), arow("copad", "b")];
+        let items = agent_items(&one);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().all(|i| matches!(i, AgentItem::Agent(_))));
+
+        let two = [arow("copad", "a"), arow("copad", "b"), arow("bots", "c")];
+        let items = agent_items(&two);
+        // header, a, b, header, c
+        assert_eq!(items.len(), 5);
+        assert!(matches!(&items[0], AgentItem::Group(s, _) if s == "copad"));
+        assert!(items[1].is_agent(0));
+        assert!(items[2].is_agent(1));
+        assert!(matches!(&items[3], AgentItem::Group(s, _) if s == "bots"));
+        assert!(items[4].is_agent(2));
+        // Rows: 1 + 2 + 2 + 1 + 2
+        assert_eq!(items.iter().map(|i| i.rows()).sum::<u16>(), 8);
     }
 
     #[test]
