@@ -113,6 +113,19 @@ enum PromptKind {
     RenameTab(WorkspaceId, TabId),
 }
 
+/// An agent pane's rolled-up status plus WHEN it entered it. The stamp is what lets the
+/// sidebar say `blocked 4m` rather than `blocked` — the difference between "needs me" and
+/// "has been waiting on me for a while", which is the whole reason to scan the list.
+///
+/// comux tracks the transition ITSELF rather than reading Claude's `statusUpdatedAt`, so
+/// Codex and anything else resolved by the screen-text fallback get the same readout.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AgentState {
+    status: agentstate::AgentStatus,
+    /// Monotonic instant the pane entered `status`; carried across refreshes while it holds.
+    since: std::time::Instant,
+}
+
 /// One sidebar/switcher agent row: where the agent pane lives + what it runs.
 struct AgentRow {
     /// Display title: the pane's TAB custom name when set (so multiple agents in one
@@ -128,6 +141,8 @@ struct AgentRow {
     tool: String,
     /// Rolled-up status: `working` / `ready` / `blocked` / `idle`.
     status: &'static str,
+    /// Whole seconds the agent has held `status` — rendered as `blocked 4m`.
+    for_secs: u64,
     /// The pane's terminal, so the row is clickable (jump to its pane).
     term: TerminalId,
 }
@@ -383,9 +398,13 @@ pub struct App {
     /// Cumulative count of process sweeps that failed outright (see
     /// [`Self::label_sweeps_failed`]). Diagnostic only — never resets.
     label_sweeps_failed: u64,
-    /// Per-agent rolled-up status (working/ready/blocked/idle), refreshed at the
-    /// label cadence from Claude's session file + a screen-text fallback (`agentstate`).
-    agent_statuses: HashMap<TerminalId, agentstate::AgentStatus>,
+    /// Per-agent rolled-up status (working/ready/blocked/idle) + when it was entered,
+    /// refreshed at the label cadence from Claude's session file + a screen-text fallback
+    /// (`agentstate`).
+    agent_statuses: HashMap<TerminalId, AgentState>,
+    /// The whole-minute bucket of each agent's time-in-status as last REPORTED to the
+    /// render loop, so a roll can be turned into a repaint (see `refresh_agent_statuses`).
+    agent_minutes: HashMap<TerminalId, u64>,
     /// Per-session git branch (its focused pane's cwd) for the `spaces` subtitle,
     /// refreshed at the label cadence.
     branches: HashMap<WorkspaceId, String>,
@@ -525,6 +544,7 @@ impl App {
                 .unwrap_or_else(std::time::Instant::now),
             label_sweeps_failed: 0,
             agent_statuses: HashMap::new(),
+            agent_minutes: HashMap::new(),
             branches: HashMap::new(),
             next_session,
             session_activity: HashMap::new(),
@@ -671,7 +691,7 @@ impl App {
                     .and_then(|tid| self.agent_statuses.get(tid))
                     .map(|s| {
                         matches!(
-                            s,
+                            s.status,
                             agentstate::AgentStatus::Working | agentstate::AgentStatus::Blocked
                         )
                     })
@@ -1458,7 +1478,7 @@ impl App {
         let mut blocked: Vec<TerminalId> = self
             .agent_statuses
             .iter()
-            .filter(|(_, s)| **s == agentstate::AgentStatus::Blocked)
+            .filter(|(_, s)| s.status == agentstate::AgentStatus::Blocked)
             .map(|(tid, _)| tid.clone())
             .collect();
         if blocked.is_empty() {
@@ -1550,7 +1570,7 @@ impl App {
                             "other"
                         };
                         let status = match (is_agent, term.as_ref()) {
-                            (true, Some(tid)) => self.agent_status(tid).to_string(),
+                            (true, Some(tid)) => self.agent_status(tid).0.to_string(),
                             _ => String::new(),
                         };
                         PaneInfo {
@@ -3653,7 +3673,8 @@ impl App {
                 continue;
             }
             let status = agentstate::resolve(Some(label.pid), &pane.snapshot());
-            let body = match (self.agent_statuses.get(tid).copied(), status) {
+            let prev = self.agent_statuses.get(tid).copied();
+            let body = match (prev.map(|p| p.status), status) {
                 // turn just finished (was running, now parked at the prompt)
                 (Some(AgentStatus::Working), AgentStatus::Ready) => Some("turn finished"),
                 // just started blocking — only a real transition (require a KNOWN old
@@ -3666,9 +3687,29 @@ impl App {
             if let Some(body) = body {
                 events.push((tid.clone(), label.text.clone(), body));
             }
-            next.insert(tid.clone(), status);
+            // Carry the stamp forward while the status HOLDS — rebuilding the map each
+            // pass must not reset "how long has this been blocked" twice a second. This
+            // is also what keeps `changed` honest: an unchanged pass reproduces the map
+            // exactly, so the equality check below still means "a status moved" and the
+            // render loop's idle-skip survives.
+            let since = status_since(prev, status, std::time::Instant::now());
+            next.insert(tid.clone(), AgentState { status, since });
         }
-        let changed = next != self.agent_statuses;
+        // The sidebar renders time-in-status bucketed to whole minutes, and a BLOCKED
+        // agent — the one the attention band exists for — emits nothing, so no pane-dirty
+        // signal will ever fire when its bucket rolls. The loop's HH:MM tick does not
+        // cover it either: that fires on wall-clock minutes, not on the minute each
+        // agent's status began, so a row could sit a full bucket behind its neighbours.
+        // Report a roll as a change.
+        let mut minutes = HashMap::with_capacity(next.len());
+        let mut rolled = false;
+        for (tid, st) in &next {
+            let m = st.since.elapsed().as_secs() / 60;
+            rolled |= self.agent_minutes.get(tid) != Some(&m);
+            minutes.insert(tid.clone(), m);
+        }
+        self.agent_minutes = minutes;
+        let changed = next != self.agent_statuses || rolled;
         self.agent_statuses = next;
 
         // Fire desktop toasts (best-effort, non-blocking) — the server does this, so
@@ -3714,16 +3755,17 @@ impl App {
     fn attention_count(&self) -> usize {
         self.agent_statuses
             .values()
-            .filter(|s| **s == agentstate::AgentStatus::Blocked)
+            .filter(|s| s.status == agentstate::AgentStatus::Blocked)
             .count()
     }
 
-    /// An agent pane's rolled-up status label for the sidebar (`idle` if unknown).
-    fn agent_status(&self, tid: &TerminalId) -> &'static str {
+    /// An agent pane's rolled-up status label for the sidebar (`idle` if unknown), plus
+    /// how many whole seconds it has held that status (0 when unknown).
+    fn agent_status(&self, tid: &TerminalId) -> (&'static str, u64) {
         self.agent_statuses
             .get(tid)
-            .map(|s| s.label())
-            .unwrap_or("idle")
+            .map(|s| (s.status.label(), s.since.elapsed().as_secs()))
+            .unwrap_or(("idle", 0))
     }
 
     /// A one-line label for a pane row (index + short cwd basename if available).
@@ -3828,6 +3870,7 @@ impl App {
                         && let Some(label) = self.labels.get(tid)
                         && label.kind == procinfo::Kind::Agent
                     {
+                        let (status, for_secs) = self.agent_status(tid);
                         out.push(AgentRow {
                             title: tab_name
                                 .map(str::to_string)
@@ -3835,7 +3878,8 @@ impl App {
                             space: space.clone(),
                             space_id: wid.clone(),
                             tool: label.text.clone(),
-                            status: self.agent_status(tid),
+                            status,
+                            for_secs,
                             term: tid.clone(),
                         });
                     }
@@ -3913,9 +3957,20 @@ impl App {
         let sids = self.sorted_session_ids();
         let agent_rows = self.agent_rows();
         let agent_items = agent_items(&agent_rows);
+        // Agents awaiting input, pinned in a band above the list (see below). Counted
+        // into the agents half's ask so the band can't be paid for out of the list.
+        let blocked: Vec<&AgentRow> = agent_rows
+            .iter()
+            .filter(|r| r.status == "blocked")
+            .collect();
         // u32 accumulation so a pathological session/agent count can't overflow.
         let want_spaces = 1 + 2 * sids.len() as u32; // header + 2 rows per session
-        let want_agents = 1 + agent_items.iter().map(|i| i.rows() as u32).sum::<u32>();
+        let want_band = if blocked.is_empty() {
+            0
+        } else {
+            blocked.len() as u32 + 1 // 1 compact row each + the closing rule
+        };
+        let want_agents = 1 + want_band + agent_items.iter().map(|i| i.rows() as u32).sum::<u32>();
         let mid = split_sidebar(h, want_spaces, want_agents);
 
         // ---- spaces (top half) ----
@@ -4018,7 +4073,88 @@ impl App {
         // ---- agents (bottom half) ----
         let mut y = mid;
         put(buf, &mut 0, y, " agents", header);
+        // `⚑N` on the header counts EVERY blocked agent, including any the band below had
+        // no room for, so a capped band never under-reports what is waiting.
+        if !blocked.is_empty() {
+            let flag = format!("⚑{} ", blocked.len());
+            let mut fx = sidebar_w.saturating_sub(UnicodeWidthStr::width(flag.as_str()) as u16);
+            put(
+                buf,
+                &mut fx,
+                y,
+                &flag,
+                Style::default()
+                    .fg(CAT_YELLOW)
+                    .bg(panel_bg)
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
         y += 1;
+        // ---- attention band ----
+        // Blocked agents are the ones that need a human RIGHT NOW, and in a long list they
+        // can sit anywhere. Pinning them in a compact 1-row band at the top makes them
+        // always visible WITHOUT reordering the list underneath (sorting by status would
+        // move rows out from under the pointer every time an agent changed state). They are
+        // deliberately shown twice: the band is the shortcut, the list below is the map.
+        let multi_space = agents_span_spaces(&agent_rows);
+        let band_n = band_rows(h.saturating_sub(mid + 1), blocked.len());
+        if band_n > 0 {
+            for row in blocked.iter().take(band_n) {
+                let mut x = 1u16;
+                put(
+                    buf,
+                    &mut x,
+                    y,
+                    "▲ ",
+                    Style::default()
+                        .fg(CAT_YELLOW)
+                        .bg(panel_bg)
+                        .add_modifier(Modifier::BOLD),
+                );
+                let who = if multi_space {
+                    format!("{}/{}", row.space, row.title)
+                } else {
+                    row.title.clone()
+                };
+                put(
+                    buf,
+                    &mut x,
+                    y,
+                    &who,
+                    Style::default().fg(CAT_TEXT).bg(panel_bg),
+                );
+                // Right-align "how long it has been waiting" — the band is scanned down
+                // its right edge to find the one that has been blocked longest.
+                let waited = fmt_elapsed(row.for_secs);
+                if !waited.is_empty() {
+                    let at = sidebar_w
+                        .saturating_sub(UnicodeWidthStr::width(waited.as_str()) as u16 + 1);
+                    if at > x {
+                        x = at;
+                        put(buf, &mut x, y, &waited, sub_style);
+                    }
+                }
+                self.click_zones.borrow_mut().push(ClickZone {
+                    x0: 0,
+                    x1: sidebar_w - 1,
+                    y0: y,
+                    y1: y,
+                    target: ClickTarget::Agent(row.term.clone()),
+                });
+                y += 1;
+            }
+            // Rule closing the band off from the list (the list's own first group header
+            // is not guaranteed — a single-space workspace has none).
+            let mut rx = 1u16;
+            while rx < sidebar_w {
+                let before = rx;
+                put(buf, &mut rx, y, "─", divider_style);
+                if rx == before {
+                    break;
+                }
+            }
+            y += 1;
+        }
         // The agent whose pane is currently in focus (active session's focused pane), so
         // it can be highlighted like the active `spaces` row — bright/bold name vs the
         // dimmed siblings — instead of every agent looking identical.
@@ -4039,7 +4175,7 @@ impl App {
             .and_then(|a| agent_items.iter().position(|i| i.is_agent(a)))
             .unwrap_or(0);
         let heights: Vec<u16> = agent_items.iter().map(AgentItem::rows).collect();
-        let avail = h.saturating_sub(mid + 1);
+        let avail = h.saturating_sub(y);
         let need: u32 = heights.iter().map(|&r| r as u32).sum();
         // Reserve a row for the "+M more" hint when the list can't fit; the full list is
         // in Ctrl-f. Never at the cost of the last ENTRY, though — on a strip short enough
@@ -4050,7 +4186,7 @@ impl App {
         } else {
             avail - 1
         };
-        let end_y = (mid + 1).saturating_add(budget);
+        let end_y = y.saturating_add(budget);
         let start = window_start_var(&heights, anchor, budget);
         let mut shown = 0usize;
         for item in agent_items.iter().skip(start) {
@@ -4137,13 +4273,13 @@ impl App {
             put(buf, &mut x, y, " ", name_style);
             put(buf, &mut x, y, &row.title, name_style);
             let mut sx = 4u16;
-            put(
-                buf,
-                &mut sx,
-                y + 1,
-                &format!("{} · {}", row.status, row.tool),
-                sub_style,
-            );
+            let waited = fmt_elapsed(row.for_secs);
+            let sub = if waited.is_empty() {
+                format!("{} · {}", row.status, row.tool)
+            } else {
+                format!("{} {} · {}", row.status, waited, row.tool)
+            };
+            put(buf, &mut sx, y + 1, &sub, sub_style);
             // Both rows click to jump to this agent's pane.
             self.click_zones.borrow_mut().push(ClickZone {
                 x0: 0,
@@ -5567,12 +5703,31 @@ impl AgentItem {
     }
 }
 
+/// How many rows the attention band may take out of `region` — the agents half below its
+/// header — given how many agents are `blocked`. A quarter of the region, floored at one
+/// row, but never at the cost of the list's own floor: one 2-row entry plus the band's
+/// closing rule. A strip too short for both drops the BAND, not the map, since the list is
+/// what carries the focused-agent anchor [codex S2/C1].
+fn band_rows(region: u16, blocked: usize) -> usize {
+    let cap = ((region / 4).max(1) as usize).min(region.saturating_sub(3) as usize);
+    blocked.min(cap)
+}
+
+/// Do the agents live in more than one space? Decides both whether the list gets group
+/// headers and whether an attention-band row needs a `space/` prefix — the band is flat,
+/// so without it four `tab 2` rows from four sessions read identically.
+///
+/// `agent_rows()` yields agents grouped by space, so comparing neighbours is enough.
+fn agents_span_spaces(rows: &[AgentRow]) -> bool {
+    rows.windows(2).any(|w| w[0].space_id != w[1].space_id)
+}
+
 /// Interleave space group headers into the agent list. `agent_rows()` already yields
 /// agents grouped by space (it walks workspaces in order), so a header goes wherever the
 /// space CHANGES. Skipped entirely for a single space — the header would be pure noise
 /// and it costs a row that the agents themselves want.
 fn agent_items(rows: &[AgentRow]) -> Vec<AgentItem> {
-    let multi_space = rows.windows(2).any(|w| w[0].space_id != w[1].space_id);
+    let multi_space = agents_span_spaces(rows);
     let mut out = Vec::with_capacity(rows.len());
     let mut cur: Option<&WorkspaceId> = None;
     for (i, r) in rows.iter().enumerate() {
@@ -5640,6 +5795,38 @@ fn window_start_var(heights: &[u16], anchor: usize, avail: u16) -> usize {
         total = total.saturating_add(heights[start]);
     }
     start
+}
+
+/// The instant an agent has held `status` since: the previous stamp while the status
+/// HOLDS, else `now`. Extracted so the carry-forward is pinned by a test — the status map
+/// is rebuilt from scratch twice a second, and resetting the stamp on every pass would peg
+/// every readout at `0s` while looking perfectly correct.
+fn status_since(
+    prev: Option<AgentState>,
+    status: agentstate::AgentStatus,
+    now: std::time::Instant,
+) -> std::time::Instant {
+    match prev {
+        Some(p) if p.status == status => p.since,
+        _ => now,
+    }
+}
+
+/// Coarse "how long in this status" for a sidebar row: empty under a minute, then whole
+/// minutes, then hours. MINUTE granularity on purpose — a seconds-precise readout would
+/// recompose the frame (and re-diff it to every attached client) once a second forever,
+/// while the render loop's existing HH:MM rollover already guarantees a repaint at that
+/// cadence. The cost is that a bucket can be shown up to a minute late, which is invisible
+/// at this resolution.
+fn fmt_elapsed(secs: u64) -> String {
+    match secs {
+        0..60 => String::new(),
+        60..3600 => format!("{}m", secs / 60),
+        _ => match ((secs / 3600), (secs % 3600) / 60) {
+            (h, 0) => format!("{h}h"),
+            (h, m) => format!("{h}h{m}m"),
+        },
+    }
 }
 
 fn list_window_start(total: usize, active: usize, visible: usize) -> usize {
@@ -5804,11 +5991,12 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentItem, AgentRow, CAT_GREEN, CAT_RED, CAT_YELLOW, Menu, MenuAction, agent_items,
-        build_command_line, detect_alt_screen_transition, extract_selection, filter_env,
+        AgentItem, AgentRow, AgentState, CAT_GREEN, CAT_RED, CAT_YELLOW, Menu, MenuAction,
+        agent_items, agents_span_spaces, band_rows, build_command_line,
+        detect_alt_screen_transition, extract_selection, filter_env, fmt_elapsed,
         list_window_start, menu_origin, merge_env, merge_labels, reload_note, sel_bounds, sel_cols,
-        shell_quote, split_sidebar, tab_window, usage_should_roll, usage_threshold_color,
-        window_start_var, wrap_page,
+        shell_quote, split_sidebar, status_since, tab_window, usage_should_roll,
+        usage_threshold_color, window_start_var, wrap_page,
     };
     use crate::model::{TerminalId, WorkspaceId};
     use crate::procinfo::{Kind, Label};
@@ -6233,12 +6421,75 @@ mod tests {
     fn arow(space: &str, title: &str) -> AgentRow {
         AgentRow {
             title: title.to_string(),
+            for_secs: 0,
             space: space.to_string(),
             space_id: WorkspaceId::new(space),
             tool: "claude".to_string(),
             status: "ready",
             term: tid(title),
         }
+    }
+
+    #[test]
+    /// Minute buckets, so the composed frame changes at most once a minute per agent
+    /// instead of once a second.
+    fn fmt_elapsed_is_bucketed_to_minutes() {
+        assert_eq!(fmt_elapsed(0), "");
+        assert_eq!(fmt_elapsed(59), ""); // under a minute says nothing
+        assert_eq!(fmt_elapsed(60), "1m");
+        assert_eq!(fmt_elapsed(119), "1m");
+        assert_eq!(fmt_elapsed(3599), "59m");
+        assert_eq!(fmt_elapsed(3600), "1h");
+        assert_eq!(fmt_elapsed(3660), "1h1m");
+        assert_eq!(fmt_elapsed(86_400), "24h");
+    }
+
+    #[test]
+    /// The status map is rebuilt every refresh, so the stamp must be CARRIED while the
+    /// status holds — resetting it would peg every `blocked Nm` readout at nothing.
+    fn status_since_carries_forward_until_the_status_moves() {
+        use crate::agentstate::AgentStatus;
+        let then = std::time::Instant::now();
+        let now = then + std::time::Duration::from_secs(300);
+        let prev = AgentState {
+            status: AgentStatus::Blocked,
+            since: then,
+        };
+        // Same status → keep the original stamp (still "blocked for 5 minutes").
+        assert_eq!(status_since(Some(prev), AgentStatus::Blocked, now), then);
+        // Moved → restart the clock.
+        assert_eq!(status_since(Some(prev), AgentStatus::Ready, now), now);
+        // First sighting → start now.
+        assert_eq!(status_since(None, AgentStatus::Working, now), now);
+    }
+
+    #[test]
+    /// The band is a shortcut layered over the list; it may never squeeze the list below
+    /// the one-entry floor stage 1 guarantees, so a short strip drops the band instead.
+    fn band_rows_never_squeezes_the_list_below_one_entry() {
+        // Roomy: a quarter of the region, bounded by how many are actually blocked.
+        assert_eq!(band_rows(28, 12), 7);
+        assert_eq!(band_rows(28, 3), 3);
+        assert_eq!(band_rows(28, 0), 0);
+        // Tight: band + rule + one 2-row entry is exactly 4 rows.
+        assert_eq!(band_rows(4, 5), 1);
+        // Too tight for all three — the list wins.
+        assert_eq!(band_rows(3, 5), 0);
+        assert_eq!(band_rows(0, 5), 0);
+    }
+
+    #[test]
+    /// The same predicate gates BOTH the list's group headers and the attention band's
+    /// `space/` prefix — a flat band of `tab 2` rows from four sessions is unreadable,
+    /// but prefixing a single-space workspace is pure noise.
+    fn agents_span_spaces_only_when_more_than_one_is_involved() {
+        assert!(!agents_span_spaces(&[]));
+        assert!(!agents_span_spaces(&[arow("copad", "a")]));
+        assert!(!agents_span_spaces(&[
+            arow("copad", "a"),
+            arow("copad", "b")
+        ]));
+        assert!(agents_span_spaces(&[arow("copad", "a"), arow("bots", "b")]));
     }
 
     #[test]
