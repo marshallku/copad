@@ -14,7 +14,7 @@ comux reload          # re-read mux.toml on the live server (alias: comux source
 
 `reload` re-reads the file, swaps the config in place, and prints the config path plus any parse warnings — it never breaks the running mux. Keybindings, mouse, `osc52`, `sidebar_width`, all `usage_*`, `tab_labels`, `notify`, and worktree settings apply on the next frame.
 
-**Three settings are fixed at server boot** and need `comux server restart` instead: `persist`, `autosave_secs`, and `update_environment`. (`restore_processes` / `restore_agent_sessions` are read at save time, so `reload` does update them for the next save.)
+**Four settings are fixed at server boot** and need `comux server restart` instead: `persist`, `autosave_secs`, `update_environment`, and `never_inherit`. (`restore_processes` / `restore_agent_sessions` are read at save time, so `reload` does update them for the next save.)
 
 ---
 
@@ -38,6 +38,7 @@ comux reload          # re-read mux.toml on the live server (alias: comux source
 | `restore_processes` | AI agents (see below) | list of basenames; `[]` = bare shells | Programs re-run on restore |
 | `restore_agent_sessions` | `true` | bool | Resume agent conversations on restore |
 | `update_environment` | volatile session vars (see below) | list of var names; `[]` disables | Vars refreshed into new panes from the attaching client *(boot-fixed)* |
+| `never_inherit` | agent session markers (see below) | list of var names; **added** to the default | Vars scrubbed from the daemon and never given to a pane *(boot-fixed)* |
 
 `restore_processes` default:
 
@@ -55,7 +56,16 @@ update_environment = ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_SESSION_T
                       "WINDOWID", "KRB5CCNAME", "TERM_PROGRAM"]
 ```
 
-Load-bearing names (`PATH`, `HOME`, `SHELL`, `USER`, `TERM`, `PWD`, `COPAD_MUX`, …) are refused if you add them.
+`never_inherit` built-in list (see [Never inherited](./environment.md#never-inherited-agent-session-markers) for why) — the opposite rule to `update_environment`: scrubbed at boot, kept out of the boot pane, and never refreshed from a client:
+
+```toml
+never_inherit = ["CLAUDE_CODE_CHILD_SESSION", "CLAUDECODE", "CLAUDE_CODE_SESSION_ID",
+                 "CLAUDE_CODE_BRIDGE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT"]
+```
+
+Unlike every other list option, yours is **added** to that default instead of replacing it — replacing would let `never_inherit = ["MY_MARKER"]` silently drop `CLAUDE_CODE_CHILD_SESSION` and bring back the lost-transcript bug. A name in both lists is dropped from `update_environment` with a warning (`never_inherit` wins, otherwise the next attach would refresh it right back).
+
+Load-bearing names (`PATH`, `HOME`, `SHELL`, `USER`, `TERM`, `PWD`, `COPAD_MUX`, …) are refused in either list if you add them.
 
 ---
 

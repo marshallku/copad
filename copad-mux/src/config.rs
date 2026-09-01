@@ -74,6 +74,41 @@ pub fn default_update_environment() -> Vec<String> {
     .collect()
 }
 
+/// The built-in `never_inherit` denylist — agent session markers that a long-lived server
+/// must NEVER hand to a pane, whether from its own birth environment or from an attaching
+/// client. Distinct from [`default_update_environment`] on purpose: those names are
+/// scrubbed AND re-injected from the latest client, which for a session marker would just
+/// reintroduce the leak the moment you attach from inside an agent session.
+///
+/// `CLAUDE_CODE_CHILD_SESSION=1` marks a subprocess Claude Code launched; an interactive
+/// `claude` carrying it is classified as a nested session, so its transcript is never
+/// written and it never appears in `--resume` (upstream issue #3 — a server born inside
+/// Claude Code silently ate every conversation started in its panes). The rest are
+/// per-session identity for that same dead session; a pane inheriting them reports a
+/// session that no longer exists. Deliberately limited to Claude Code's own namespaced
+/// session variables: third-party markers stay untouched, and externally-enforced
+/// sandbox variables (`CODEX_SANDBOX*`) are NOT scrubbed — hiding a sandbox from the
+/// process inside it would make it misjudge what it is allowed to do.
+///
+/// Always applied; a configured `never_inherit` list ADDS to this (see
+/// [`build_never_inherit`]) rather than replacing it, so adding one marker of your own
+/// can't silently re-enable the leak.
+const NEVER_INHERIT_DEFAULTS: &[&str] = &[
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDECODE",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_BRIDGE_SESSION_ID",
+    "CLAUDE_CODE_ENTRYPOINT",
+];
+
+/// [`NEVER_INHERIT_DEFAULTS`] as owned strings (the built-in denylist with no user additions).
+pub fn default_never_inherit() -> Vec<String> {
+    NEVER_INHERIT_DEFAULTS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Names refused in `update_environment`: load-bearing shell/process variables whose
 /// removal (daemon scrub) or client-driven override would break PATH lookup, the login
 /// shell, the home dir, or comux's own pane markers. A configured entry matching this
@@ -711,6 +746,11 @@ pub struct MuxConfig {
     /// never inherits the session the server was born in; re-injected per-pane from
     /// the latest client. Empty list = no refresh (panes inherit the daemon env as-is).
     pub update_environment: Vec<String>,
+    /// Environment variables scrubbed from the daemon at startup and NEVER re-injected
+    /// into a pane — not from the birth environment (unlike `update_environment`, these
+    /// don't seed the boot pane either) and not from an attaching client. Agent session
+    /// markers ([`NEVER_INHERIT_DEFAULTS`]) plus anything the user adds.
+    pub never_inherit: Vec<String>,
     /// `comux worktree create` naming + post-create hooks.
     pub worktree: WorktreeConfig,
 }
@@ -741,6 +781,7 @@ struct RawConfig {
     tab_labels: Option<String>,
     update_check: Option<bool>,
     update_environment: Option<Vec<String>>,
+    never_inherit: Option<Vec<String>>,
     keys: Option<HashMap<String, ChordSpec>>,
     global: Option<HashMap<String, ChordSpec>>,
     worktree: Option<RawWorktree>,
@@ -834,6 +875,7 @@ impl MuxConfig {
             tab_labels: TabLabels::Number,
             update_check: true,
             update_environment: default_update_environment(),
+            never_inherit: default_never_inherit(),
             worktree: WorktreeConfig {
                 naming: crate::worktree::DEFAULT_NAMING.to_string(),
                 scripts: HashMap::new(),
@@ -910,7 +952,13 @@ impl MuxConfig {
         };
 
         let worktree = build_worktree(raw.worktree, &mut warnings);
+        let never_inherit = build_never_inherit(raw.never_inherit, &mut warnings);
         let update_environment = build_update_environment(raw.update_environment, &mut warnings);
+        // The two lists must stay DISJOINT, and `never_inherit` wins: `update_environment`
+        // is the whitelist the attach handshake refreshes from the client, so a name left in
+        // both would be scrubbed at boot and then handed straight back by the next client.
+        let update_environment =
+            subtract_never_inherit(update_environment, &never_inherit, &mut warnings);
 
         (
             MuxConfig {
@@ -1010,6 +1058,7 @@ impl MuxConfig {
                 },
                 update_check: raw.update_check.unwrap_or(true),
                 update_environment,
+                never_inherit,
                 worktree,
             },
             warnings,
@@ -1060,32 +1109,81 @@ fn build_update_environment(raw: Option<Vec<String>>, warnings: &mut Vec<String>
     };
     let mut out: Vec<String> = Vec::with_capacity(list.len());
     for name in list {
-        let name = name.trim().to_string();
-        if name.is_empty() {
-            continue;
-        }
-        // A name with `=` or a NUL byte would panic `std::env::remove_var` when the server
-        // scrubs it at startup — reject it here so a config typo can never crash the daemon.
-        if name.contains('=') || name.contains('\0') {
-            warnings.push(format!(
-                "update_environment: '{name}' is not a valid variable name — ignoring"
-            ));
-            continue;
-        }
-        if ENV_UPDATE_BLOCKLIST
-            .iter()
-            .any(|b| b.eq_ignore_ascii_case(&name))
+        if let Some(name) = check_env_name(&name, "update_environment", warnings)
+            && !out.iter().any(|e| e == &name)
         {
-            warnings.push(format!(
-                "update_environment: '{name}' is load-bearing and cannot be refreshed — ignoring"
-            ));
-            continue;
-        }
-        if !out.iter().any(|e| e == &name) {
             out.push(name);
         }
     }
     out
+}
+
+/// Resolve `never_inherit`: the built-in agent-marker denylist ([`default_never_inherit`])
+/// plus any configured additions, validated like `update_environment`. ADDITIVE on purpose —
+/// with replace semantics, `never_inherit = ["MY_MARKER"]` would quietly drop
+/// `CLAUDE_CODE_CHILD_SESSION` and bring the transcript-eating leak back. A pane that
+/// genuinely wants one of these values can re-export it from its shell rc.
+fn build_never_inherit(raw: Option<Vec<String>>, warnings: &mut Vec<String>) -> Vec<String> {
+    let mut out = default_never_inherit();
+    for name in raw.unwrap_or_default() {
+        if let Some(name) = check_env_name(&name, "never_inherit", warnings)
+            && !out.iter().any(|e| e == &name)
+        {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// `update_environment` with every [`build_never_inherit`] name removed (warning on each).
+/// Keeps the invariant the attach handshake depends on: a name the server scrubs for good
+/// is never in the whitelist it asks clients to refresh.
+fn subtract_never_inherit(
+    update_environment: Vec<String>,
+    never_inherit: &[String],
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    update_environment
+        .into_iter()
+        .filter(|name| {
+            let denied = never_inherit.iter().any(|n| n == name);
+            if denied {
+                warnings.push(format!(
+                    "update_environment: '{name}' is in never_inherit and can never be \
+                     refreshed from a client — ignoring"
+                ));
+            }
+            !denied
+        })
+        .collect()
+}
+
+/// Validate one configured environment-variable name for [`build_update_environment`] /
+/// [`build_never_inherit`]. Returns the trimmed name, or `None` (with a `field`-tagged
+/// warning) for a blank, malformed, or load-bearing entry.
+fn check_env_name(name: &str, field: &str, warnings: &mut Vec<String>) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    // A name with `=` or a NUL byte would panic `std::env::remove_var` when the server
+    // scrubs it at startup — reject it here so a config typo can never crash the daemon.
+    if name.contains('=') || name.contains('\0') {
+        warnings.push(format!(
+            "{field}: '{name}' is not a valid variable name — ignoring"
+        ));
+        return None;
+    }
+    if ENV_UPDATE_BLOCKLIST
+        .iter()
+        .any(|b| b.eq_ignore_ascii_case(name))
+    {
+        warnings.push(format!(
+            "{field}: '{name}' is load-bearing and cannot be scrubbed — ignoring"
+        ));
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// Build the `[worktree]` config: naming (empty → default) and per-repo hooks whose
@@ -1630,6 +1728,86 @@ mod tests {
         // Empty list disables program re-execution.
         let (off, _) = load_str("restore_processes = []");
         assert!(off.restore_processes.is_empty());
+    }
+
+    /// The transcript-eating leak from upstream issue #3: a server born inside a Claude Code
+    /// session used to hand `CLAUDE_CODE_CHILD_SESSION=1` to every pane, so every `claude`
+    /// started there was classified as a nested child — no transcript, no `--resume` entry.
+    #[test]
+    fn never_inherit_defaults_are_always_present_and_additive() {
+        let (def, _) = load_str("");
+        assert!(
+            def.never_inherit
+                .iter()
+                .any(|v| v == "CLAUDE_CODE_CHILD_SESSION")
+        );
+        assert!(def.never_inherit.iter().any(|v| v == "CLAUDECODE"));
+        // Externally-enforced sandbox markers are NOT scrubbed (the process inside a sandbox
+        // must be able to see it).
+        assert!(!def.never_inherit.iter().any(|v| v.starts_with("CODEX_")));
+
+        // A user list ADDS to the defaults — replace semantics would let `["MY_MARKER"]`
+        // silently drop the confirmed trigger and bring the leak back.
+        let (cfg, _) = load_str(r#"never_inherit = ["MY_MARKER", "MY_MARKER"]"#);
+        assert!(
+            cfg.never_inherit
+                .iter()
+                .any(|v| v == "CLAUDE_CODE_CHILD_SESSION")
+        );
+        assert_eq!(
+            cfg.never_inherit
+                .iter()
+                .filter(|v| *v == "MY_MARKER")
+                .count(),
+            1
+        );
+        // …and an empty list adds nothing rather than disabling the defaults.
+        let (empty, _) = load_str("never_inherit = []");
+        assert_eq!(empty.never_inherit, default_never_inherit());
+    }
+
+    #[test]
+    fn never_inherit_rejects_load_bearing_and_malformed_names() {
+        let (cfg, warns) = load_str(r#"never_inherit = ["PATH", "BAD=NAME", "OK"]"#);
+        assert!(cfg.never_inherit.iter().any(|v| v == "OK"));
+        assert!(!cfg.never_inherit.iter().any(|v| v == "PATH"));
+        assert!(!cfg.never_inherit.iter().any(|v| v.contains('=')));
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.contains("never_inherit") && w.contains("PATH"))
+        );
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.contains("never_inherit") && w.contains("BAD=NAME"))
+        );
+    }
+
+    /// `update_environment` is the whitelist an attaching client refreshes, so a name in both
+    /// lists would be scrubbed at boot and handed straight back by the next attach.
+    #[test]
+    fn never_inherit_wins_over_update_environment() {
+        let (cfg, warns) = load_str(
+            r#"
+            update_environment = ["DISPLAY", "CLAUDE_CODE_CHILD_SESSION"]
+            never_inherit = ["MY_MARKER"]
+            "#,
+        );
+        assert_eq!(cfg.update_environment, vec!["DISPLAY"]);
+        assert!(
+            warns
+                .iter()
+                .any(|w| w.contains("never_inherit") && w.contains("CLAUDE_CODE_CHILD_SESSION"))
+        );
+        // A user-added marker is subtracted too, not just the built-in ones.
+        let (user, _) = load_str(
+            r#"
+            update_environment = ["DISPLAY", "MY_MARKER"]
+            never_inherit = ["MY_MARKER"]
+            "#,
+        );
+        assert_eq!(user.update_environment, vec!["DISPLAY"]);
     }
 
     #[test]

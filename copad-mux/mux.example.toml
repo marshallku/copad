@@ -9,9 +9,9 @@
 # the running server WITHOUT a restart (tmux `source-file`) — keybindings, mouse, sidebar
 # width, the usage/tab-label display, notify, worktree config, and the restore lists
 # (`restore_processes`/`restore_agent_sessions`, applied on the next save) take effect
-# without a restart, and any parse warnings are printed. Only `update_environment` and the
-# persistence toggle/cadence (`persist`, `autosave_secs`) are fixed at server start; changing
-# those still needs `comux server restart`.
+# without a restart, and any parse warnings are printed. Only `update_environment`,
+# `never_inherit`, and the persistence toggle/cadence (`persist`, `autosave_secs`) are fixed at
+# server start; changing those still needs `comux server restart`.
 #
 # Chord syntax (tmux-like): `C-` = Ctrl, `M-` = Alt/Meta (Option on macOS), `S-` = Shift.
 #   examples: "C-b", "M-1", "C-S-h", "%", "Left", "Enter", "X"
@@ -105,6 +105,25 @@ restore_agent_sessions = true
 # update_environment = ["DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_SESSION_TYPE",
 #   "DBUS_SESSION_BUS_ADDRESS", "SSH_ASKPASS", "SSH_AUTH_SOCK", "SSH_AGENT_PID",
 #   "SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY", "WINDOWID", "KRB5CCNAME", "TERM_PROGRAM"]
+
+# ---- never inherited (agent session markers) ----
+# The other half of the same problem, with the opposite rule: these names are scrubbed from
+# the server at startup and NEVER put back — not from the server's birth env (so the boot pane
+# doesn't keep them either) and never from an attaching client. That distinction matters:
+# `CLAUDE_CODE_CHILD_SESSION=1` marks a process Claude Code launched, and an interactive
+# `claude` carrying it is treated as a nested session — its transcript is never written and it
+# never shows up in `claude --resume`. So a comux server first started from inside Claude Code
+# used to silently eat every conversation held in its panes. Putting these in
+# `update_environment` would NOT fix it: attaching from inside Claude Code would refresh the
+# marker straight back into new panes.
+# Your list is ADDED to the built-in one (below) rather than replacing it, so adding a marker
+# of your own can't re-enable the leak. Load-bearing names (PATH, HOME, SHELL, …) are refused.
+# Sandbox markers (CODEX_SANDBOX*) are deliberately NOT scrubbed — a process inside a sandbox
+# needs to be able to see it. A pane that genuinely wants one of these can export it from its
+# shell rc.
+# built-in: ["CLAUDE_CODE_CHILD_SESSION", "CLAUDECODE", "CLAUDE_CODE_SESSION_ID",
+#   "CLAUDE_CODE_BRIDGE_SESSION_ID", "CLAUDE_CODE_ENTRYPOINT"]
+# never_inherit = ["MY_AGENT_SESSION_ID"]
 
 # ---- git worktrees (`comux worktree create|list|rm`, tmx `twt`-style) ----
 # `comux worktree create <branch>` runs `git worktree add -b <branch>` placing the new

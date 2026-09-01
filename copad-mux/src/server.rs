@@ -279,6 +279,24 @@ pub fn run() -> io::Result<()> {
             }
         }
     }
+    // Second scrub, different contract: `never_inherit` names are agent SESSION markers
+    // (`CLAUDE_CODE_CHILD_SESSION` & co). They are removed from the daemon env and NOT
+    // recorded into `boot_env`, so unlike `update_environment` they don't seed the first /
+    // restored pane either — a server born inside a Claude Code session would otherwise mark
+    // every `claude` in every pane as a nested child, and Claude Code silently drops those
+    // transcripts (no `--resume` entry). Nothing re-injects them: `config::from_raw` keeps
+    // them out of `update_environment`, which is the only list a client can refresh.
+    // This is the AUTHORITATIVE scrub — it covers every launch path (auto-spawned server and
+    // a hand-run `comux server` alike) and runs before anything is spawned, so `spawn_server`
+    // deliberately does not filter its own child env.
+    for name in &cfg.never_inherit {
+        if std::env::var_os(name).is_some() {
+            // SAFETY: single-threaded at this point — same ordering guarantee as above.
+            unsafe {
+                std::env::remove_var(name);
+            }
+        }
+    }
     // Session persistence (continuum-style): a background writer autosaves the layout so a
     // reboot/crash can restore it (App::new already restored on boot). Disabled when
     // `persist = false` or `autosave_secs = 0`.

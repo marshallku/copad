@@ -30,3 +30,34 @@ To fix this, comux **scrubs the volatile session variables** (the `update_enviro
 - Customize the scrub list via `update_environment` in `mux.toml`. It's read only at boot — changing it needs `comux server restart`.
 - Load-bearing names (`PATH`, `HOME`, `SHELL`, …) are refused.
 - **Local-only privileges** (polkit `shutdown`, macOS GUI-app access) follow the server's kernel session and can only be fixed by birthing the server locally — so comux warns when you spawn a server from an SSH session. Silence that warning with `COPAD_MUX_QUIET_SSH=1`.
+
+---
+
+## Never inherited: agent session markers
+
+Environment refresh solves one half of the frozen-environment problem. The other half needs the opposite rule — some variables must be scrubbed and **never put back**.
+
+`CLAUDE_CODE_CHILD_SESSION=1` marks a process that Claude Code itself launched. An interactive `claude` that carries it is classified as a nested child session: its transcript is never written to `~/.claude/projects/…`, and it never appears in `claude --resume`. Start a comux server from inside a Claude Code session and — before this was fixed — the marker froze into the daemon and reached every pane, so every conversation held in comux was silently discarded. Other artifacts (`tool-results/`, `file-history/`) still got written, which is what made it hard to notice until you tried to resume.
+
+`update_environment` cannot fix this: it re-injects from the attaching client, so attaching from inside Claude Code would just hand the marker back. So these names live in a separate list, `never_inherit`:
+
+- scrubbed from the daemon at startup, on **every** launch path (auto-spawned or a hand-run `comux server`);
+- **not** carried into the boot pane either — unlike `update_environment`, no birth value is kept;
+- never accepted from an attaching client (they're kept out of the refresh whitelist, so a client is never even asked for them).
+
+Built-in list — Claude Code's own session-scoped variables:
+
+```
+CLAUDE_CODE_CHILD_SESSION   CLAUDECODE   CLAUDE_CODE_SESSION_ID
+CLAUDE_CODE_BRIDGE_SESSION_ID   CLAUDE_CODE_ENTRYPOINT
+```
+
+Your own `never_inherit` in `mux.toml` is **added** to that list rather than replacing it, so adding a marker of your own can't quietly re-enable the leak:
+
+```toml
+never_inherit = ["MY_AGENT_SESSION_ID"]
+```
+
+Sandbox markers (`CODEX_SANDBOX*`) are deliberately **not** scrubbed — a process running inside a sandbox has to be able to see that it is. Load-bearing names (`PATH`, `HOME`, `SHELL`, …) are refused, as with `update_environment`. Like `update_environment`, the list is read at boot: changing it needs `comux server restart`. A pane that genuinely wants one of these values can export it from its shell rc.
+
+> **Already affected?** Any server started before this fix still holds the marker. `comux server restart` clears it (the scrub runs on the restarted server regardless of the shell you restart from — you don't need a "clean" terminal). On an unfixed version, restart from a shell outside Claude Code, or `unset CLAUDE_CODE_CHILD_SESSION` in the pane before launching `claude`. Conversations already lost were never written to disk and cannot be recovered.

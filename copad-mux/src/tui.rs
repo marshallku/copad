@@ -523,7 +523,16 @@ impl App {
         let mut panes = HashMap::new();
         let client = ClientId(0);
 
-        let env_update = cfg.update_environment.clone();
+        // The whitelist a client may refresh. `config::from_raw` already keeps
+        // `never_inherit` out of `update_environment`, but this is the list that decides what
+        // a client can push back INTO a pane, so re-subtract here rather than let a future
+        // refactor of the config quietly turn a scrubbed session marker into a refreshed one.
+        let env_update: Vec<String> = cfg
+            .update_environment
+            .iter()
+            .filter(|n| !cfg.never_inherit.iter().any(|d| d == *n))
+            .cloned()
+            .collect();
         // The boot seed (daemon's pre-scrub values) is filtered to the whitelist, then merged
         // over sock_env so the initial/restored panes inherit exactly the daemon's birth
         // environment — the daemon env itself is scrubbed by `server::run` before this call.
@@ -5477,8 +5486,9 @@ fn reload_note(path: &std::path::Path, warnings: &[String]) -> String {
         }
     }
     msg.push_str(
-        "\n  note: environment refresh and the persistence toggle/cadence (persist, \
-         autosave_secs) are fixed at server start — run `comux server restart` to change those",
+        "\n  note: environment refresh/never_inherit and the persistence toggle/cadence \
+         (persist, autosave_secs) are fixed at server start — run `comux server restart` to \
+         change those",
     );
     msg
 }
