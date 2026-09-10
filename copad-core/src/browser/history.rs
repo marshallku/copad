@@ -226,7 +226,12 @@ pub fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     }
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    // `as_chunks::<2>()` rather than `chunks_exact(2)`: same split, but the chunk size is in
+    // the type, so `pair[0]`/`pair[1]` are compile-time-checked array indices instead of
+    // bounds-checked slice ones (clippy::chunks_exact_to_as_chunks). The odd-length guard
+    // above means the remainder is always empty, so it is discarded.
+    let (pairs, _) = bytes.as_chunks::<2>();
+    for pair in pairs {
         let hi = hex_val(pair[0])?;
         let lo = hex_val(pair[1])?;
         out.push((hi << 4) | lo);
