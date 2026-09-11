@@ -2986,43 +2986,112 @@ mod list_agents_proto_tests {
 mod skill_tests {
     use super::*;
 
+    /// Quoted string literals in `s`. Dispatch arms contain no escaped quotes, so a plain
+    /// scan is enough and avoids a regex dependency for one test.
+    fn quoted(s: &str) -> Vec<String> {
+        let b = s.as_bytes();
+        let (mut out, mut i) = (Vec::new(), 0);
+        while i < b.len() {
+            if b[i] == b'"' {
+                let start = i + 1;
+                let mut j = start;
+                while j < b.len() && b[j] != b'"' {
+                    j += 1;
+                }
+                if j < b.len() {
+                    out.push(s[start..j].to_string());
+                }
+                i = j + 1;
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// A top-level `match` arm: indented EXACTLY one level inside the match body (8 spaces)
+    /// and carrying a `=>`. The indentation is what excludes nested matches inside an arm's
+    /// BODY — `Some("-v") | Some("down") => "down"` lives in the `split` handler, and a
+    /// substring oracle happily accepts `comux down` because of it.
+    fn is_top_arm(line: &str) -> bool {
+        line.starts_with("        ") && !line.starts_with("         ") && line.contains("=>")
+    }
+
+    /// Every verb `comux` actually accepts, read out of the real dispatch in both files.
+    ///
+    /// Derived, never hand-listed: a maintained list is a superset the moment someone
+    /// deletes a verb and forgets it — which is the drift this exists to catch, so the list
+    /// cannot be the oracle. Nor is "the string appears somewhere in the dispatch" an oracle;
+    /// that accepts `comux down`, `comux right` and `comux done`, whose names occur as
+    /// argument VALUES inside arm bodies.
+    fn dispatch_verbs() -> std::collections::BTreeSet<String> {
+        const CTL: &str = include_str!("control.rs");
+        const BIN: &str = include_str!("bin/comux.rs");
+
+        let fail = "dispatch marker moved — fix this test, do not delete it";
+        let fn_start = CTL.find("pub fn run_client").expect(fail);
+        let arm_start = CTL[fn_start..]
+            .find("    let req = match cmd {")
+            .expect(fail)
+            + fn_start;
+        let arm_end = CTL[arm_start..]
+            .find(r#"eprintln!("comux: unknown command"#)
+            .expect(fail)
+            + arm_start;
+
+        let mut out = std::collections::BTreeSet::new();
+        // Verbs short-circuited before the match (`skill`, the waits, `worktree`).
+        for line in CTL[fn_start..arm_start].lines() {
+            if line.contains("cmd == \"") || line.contains("== Some(\"") {
+                out.extend(quoted(line));
+            }
+        }
+        // The match arms themselves.
+        for line in CTL[arm_start..arm_end].lines().filter(|l| is_top_arm(l)) {
+            out.extend(quoted(line.split("=>").next().unwrap_or("")));
+        }
+        // Verbs the BINARY routes before ever reaching the control client.
+        let bin_start = BIN.find("match args.first()").expect(fail);
+        for line in BIN[bin_start..].lines().filter(|l| is_top_arm(l)) {
+            out.extend(quoted(line.split("=>").next().unwrap_or("")));
+        }
+
+        // A refactor that breaks the slicing would otherwise leave an empty oracle that
+        // accepts nothing — or, worse, a tiny one that accepts almost nothing while still
+        // passing because the skill happens to name only common verbs.
+        assert!(
+            out.len() > 25,
+            "the dispatch oracle found only {} verbs ({out:?}) — the extraction has drifted",
+            out.len()
+        );
+        for expected in [
+            "list",
+            "send",
+            "capture-pane",
+            "wait-output",
+            "skill",
+            "worktree",
+        ] {
+            assert!(
+                out.contains(expected),
+                "the oracle missed `{expected}`, which is definitely a verb — extraction is wrong"
+            );
+        }
+        out
+    }
+
     /// Every `comux <verb>` the skill tells an agent to run must be a real verb.
     ///
     /// This is the test that matters for a document the model FOLLOWS: a skill naming a verb
     /// that was renamed or removed sends the agent down a path that fails at runtime, and
     /// nothing else in the build would notice.
-    ///
-    /// The accepted verbs are read out of THIS FILE's own dispatch rather than a
-    /// hand-maintained list. A hand list is a superset the moment someone deletes a verb and
-    /// forgets to update it — which is the exact drift this test exists to catch, so the list
-    /// cannot be the oracle.
     #[test]
     fn every_verb_the_skill_names_exists() {
-        const SRC: &str = include_str!("control.rs");
+        let accepted = dispatch_verbs();
 
-        // The dispatch region: the short-circuit verbs handled before the match, plus the
-        // match itself. Both bounds are asserted so a refactor that moves them fails loudly
-        // instead of quietly turning this test into a no-op.
-        let pre_start = SRC
-            .find("let Some(cmd) = rest.first()")
-            .expect("dispatch preamble marker moved — fix this test, do not delete it");
-        let arm_start = SRC
-            .find("    let req = match cmd {")
-            .expect("dispatch match marker moved — fix this test, do not delete it");
-        let arm_end = SRC
-            .find(r#"eprintln!("comux: unknown command"#)
-            .expect("dispatch fallthrough marker moved — fix this test, do not delete it");
-        assert!(
-            pre_start < arm_start && arm_start < arm_end,
-            "dispatch markers are out of order; the region slice is wrong"
-        );
-        let dispatch = &SRC[pre_start..arm_end];
-
-        // Verbs routed by the BINARY rather than the control dispatch (bin/comux.rs).
-        const BIN_VERBS: &[&str] = &["attach", "server", "doctor", "ctl"];
-
-        // Only fenced code blocks: prose says "comux is a terminal multiplexer", which is not
-        // a command.
+        // Only fenced code blocks, and only the code half of a line: prose says "comux is a
+        // terminal multiplexer" and a trailing `# … comux focuses it …` is explanation, not
+        // an instruction to run.
         let mut named = Vec::new();
         let mut in_code = false;
         for line in SKILL_MD.lines() {
@@ -3033,8 +3102,6 @@ mod skill_tests {
             if !in_code {
                 continue;
             }
-            // Strip the shell comment: an explanatory `# … comux focuses it …` is prose that
-            // happens to sit inside a fence, not an instruction to run.
             let code = match line.find(" #") {
                 Some(at) => &line[..at],
                 None => line,
@@ -3057,9 +3124,8 @@ mod skill_tests {
              formatting and is no longer checking anything"
         );
         for verb in &named {
-            let quoted = format!("\"{verb}\"");
             assert!(
-                dispatch.contains(&quoted) || BIN_VERBS.contains(&verb.as_str()),
+                accepted.contains(verb),
                 "the skill tells an agent to run `comux {verb}`, which no dispatch arm accepts"
             );
         }
@@ -3093,12 +3159,66 @@ mod skill_tests {
             "the recipe assembles the marker inside the sent command the shell echoes"
         );
         assert!(
-            SKILL_MD.contains(r"send 0 $'\n'"),
+            SKILL_MD.contains(r"$'\n'"),
             "the recipe never submits the command"
         );
         assert!(
             SKILL_MD.contains("124"),
             "the skill must tell the agent a timeout is not a match"
+        );
+    }
+
+    /// Indexes address panes of the SERVER's active tab, which the user can change while the
+    /// agent runs. A hard-coded index is therefore never safe — and on a single-pane tab,
+    /// index 0 is the AGENT ITSELF, so the recipe would have the agent type into its own
+    /// session instead of running the build.
+    #[test]
+    fn the_skill_never_hard_codes_a_pane_index() {
+        for bad in ["comux send 0 ", "comux send 1 ", "--index 0", "--index 1"] {
+            assert!(
+                !SKILL_MD.contains(bad),
+                "the skill hard-codes a pane index (`{bad}`); indexes are active-tab-relative \
+                 and index 0 can be the agent's own pane"
+            );
+        }
+    }
+
+    /// Identifying the pane you just created by `panes[focused]` is racy: the user can move
+    /// focus between the `split` and the `list`, and then every downstream check still passes
+    /// — their pane is live and in the active tab — while the agent types into their shell.
+    /// The skill must teach set-difference on tokens instead.
+    #[test]
+    fn the_skill_identifies_a_new_pane_by_difference_not_focus() {
+        assert!(
+            SKILL_MD.contains("Do not take `panes[focused]`"),
+            "the skill must warn against identifying the new pane by focus"
+        );
+        assert!(
+            SKILL_MD.contains("was **not** in the first"),
+            "the skill must teach identifying the sibling by set difference"
+        );
+        assert!(
+            SKILL_MD.contains("If none or several are, stop"),
+            "the skill must say what to do when the new pane is ambiguous"
+        );
+    }
+
+    /// The one safety check that makes an index-addressed `send` defensible: the agent must
+    /// confirm the active listing is the tab it is actually in, immediately before sending.
+    #[test]
+    fn the_skill_requires_verifying_the_active_tab_before_sending() {
+        assert!(
+            SKILL_MD.contains("$COPAD_MUX_PANE` appears in it")
+                || SKILL_MD.contains("own token is in that listing"),
+            "the skill must tell the agent to confirm its own pane is in the active listing"
+        );
+        assert!(
+            SKILL_MD.contains("cannot make an index-addressed send safe"),
+            "the skill must admit an index-addressed send cannot be made race-free"
+        );
+        assert!(
+            SKILL_MD.contains("cannot type into a pane by token"),
+            "the skill must state that `send` has no token form"
         );
     }
 }

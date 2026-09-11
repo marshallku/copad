@@ -38,33 +38,71 @@ Add `--json` to any of them when you need to parse rather than read.
 - **By token** — the `token` field, which is that pane's own `$COPAD_MUX_PANE`. Resolves
   anywhere in the mux and stays valid. `capture-pane`, `wait-output`, `wait-agent`, `jump`
   and `notify` all take one.
-- **By index** — the position printed by `comux list`. **Only within the ACTIVE tab**, and
-  the numbering shifts when panes open or close. `send`, `focus`, `close` and `resize` take
-  ONLY an index.
+- **By index** — the position printed by `comux list`. `send`, `focus`, `close` and `resize`
+  take ONLY an index.
 
-That asymmetry matters: **you cannot type into a pane by token.** If the pane you want is
-not in the active tab, you must switch to it first, which changes what the user is looking
-at. Prefer driving panes in your own tab.
+**An index is not a stable address.** It numbers the panes of whatever tab the SERVER
+considers active — which is the tab the *user* is looking at, not "yours". You keep running
+when they switch tabs, so between one command and the next, index 2 can become a pane in a
+completely different tab. Nothing warns you.
+
+So there are two things you cannot do, and pretending otherwise types into someone's live
+shell:
+
+- You **cannot type into a pane by token**. There is no token-addressed `send`.
+- You **cannot make an index-addressed send safe** against the user switching tabs. You can
+  only narrow the window.
+
+### The check to run before any `send`
+
+```bash
+comux list --json
+```
+
+Two things must hold in that listing, and you must re-check them immediately before each
+send — not once at the start:
+
+1. **Your own `$COPAD_MUX_PANE` appears in it.** If it does not, the active tab is not the
+   one you are in, every index refers to panes you know nothing about, and you must stop.
+2. **`panes[<index>].token` is still the token you recorded** for your target — and is not
+   your own.
+
+If either fails, do not send. Re-list, or tell the user what you were about to do.
 
 ## Run something in another pane
 
 ```bash
-comux split                  # new pane beside the focused one (-v for below)
-comux list --json            # the new pane is now the FOCUSED one (comux focuses it, like tmux)
+comux list --json
 ```
 
-Take the `focused` index from that listing, and take its `token` from `panes[focused]` for
-every later read. Then:
+Confirm your own token is in that listing (check 1 above), and **keep every
+`panes[].token` from it**. Then:
 
 ```bash
-comux send <index> "make build"   # type into it
-comux send <index> $'\n'          # submit — `send` does NOT append Enter
+comux split
+comux list --json
 ```
 
-`send` writes raw bytes: it does not escape anything and it does not press Enter for you.
+Your sibling is the token in the second listing that was **not** in the first. If exactly
+one token is new, that is yours. If none or several are, stop and say so — something else
+changed the tab and you can no longer tell which pane you created.
 
-**Before you send, check the target is not you.** `panes[<index>].token` must differ from
-`$COPAD_MUX_PANE`, or you are typing into your own session.
+**Do not take `panes[focused]`.** comux does focus the pane it just created, but the user
+can move focus between your `split` and your `list`, and then "focused" is one of THEIR
+panes. Nothing downstream catches it: their pane is genuinely live and in the active tab, so
+your own-token check passes and your target-token check passes, and you type into their
+shell.
+
+Record your sibling's `index` for `send` and its `token` for every read and wait. Only the
+token survives a tab change.
+
+```bash
+comux send <sibling-index> "make build"
+comux send <sibling-index> $'\n'
+```
+
+Re-run the pre-send check immediately before each of those. `send` writes raw bytes: it does
+not escape anything and it does not press Enter for you.
 
 ## Read a pane back
 
@@ -94,14 +132,24 @@ Both waits are **level-triggered and best-effort**: they return as soon as the c
 CURRENTLY true, including when it was already true before you called. That makes them
 race-free only if you give them something that cannot have been true before.
 
-So for "run a command and wait for it to finish":
+So for "run a command and wait for it to finish", using the sibling you created above —
+never a hard-coded index, which on a single-pane tab is YOU:
 
 ```bash
-id=$(date +%s%N)                                   # fresh every time
-comux send 0 "make build; printf 'DONE-%s\n' '$id'"  # the literal DONE-<id> is NOT in this
-comux send 0 $'\n'
-comux wait-output --index 0 "DONE-$id" --timeout 600
+comux list --json
 ```
+
+Re-check that `panes[<sibling-index>].token` is still your sibling's, then:
+
+```bash
+id=$(date +%s%N)
+comux send <sibling-index> "make build; printf 'DONE-%s\n' '$id'"
+comux send <sibling-index> $'\n'
+comux wait-output <sibling-token> "DONE-$id" --timeout 600
+```
+
+The sends take the index; the wait takes the token, so a tab change cannot make the wait
+watch the wrong pane.
 
 Two traps this recipe exists to dodge, both of which make a wait return instantly and
 wrongly:
