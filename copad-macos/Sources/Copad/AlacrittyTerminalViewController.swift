@@ -697,10 +697,10 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         windowOpacity < 1.0 || (transparentDefaultBg && imageBackgroundActive)
     }
 
-    /// OSC 52 policy from config. `.deny` (default) drops the request
-    /// with a stderr warning; `.allow` writes to NSPasteboard.general.
-    /// `var` so config hot-reload can flip it without re-creating the
-    /// pane — matches `TerminalViewController.applyOSC52Policy`.
+    /// OSC 52 policy from config. `.allow` (default) writes to
+    /// NSPasteboard.general; `.deny` drops the request with a stderr
+    /// warning. `var` so config hot-reload can flip it without
+    /// re-creating the pane — matches `applyOSC52Policy`.
     private var osc52Policy: OSC52Policy
 
     /// Setter for the controller to forward `applyConfig` updates.
@@ -1574,10 +1574,12 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     }
 
     /// Apply the user's OSC 52 policy to any pending clipboard write
-    /// request. `.allow` writes through to NSPasteboard.general;
-    /// `.deny` (the secure default) drops with a stderr warning so a
-    /// rogue program in the terminal can't silently overwrite the
-    /// user's clipboard. Matches the SwiftTerm path's behavior.
+    /// request. `.allow` (the default) writes through to
+    /// NSPasteboard.general; `.deny` drops it with a stderr warning, so a
+    /// user who does not want a program in a pane silently overwriting
+    /// their clipboard can opt back into the hardened behavior. Reads are
+    /// never served under either policy — `copad_term_take_clipboard_request`
+    /// only ever surfaces STORE requests, so there is no path back out.
     private func drainClipboardRequests(_ handle: CopadTermFFI.Handle) {
         guard let text = handle.takeClipboardRequest() else { return }
         switch osc52Policy {

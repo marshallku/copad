@@ -5,9 +5,19 @@ import TOMLKit
 ///
 /// Background: SwiftTerm's `LocalProcessTerminalView` writes to `NSPasteboard.general`
 /// unconditionally on OSC 52. That lets any program in the terminal silently overwrite
-/// the user's clipboard. We intercept by replacing `terminalDelegate` with a proxy
-/// that consults this policy. Default is `deny`; matches VTE's hardened default on
-/// Linux (VTE has OSC 52 disabled unless explicitly opted in).
+/// the user's clipboard. We intercept (now on the alacritty path, via
+/// `drainClipboardRequests`) so the write goes through this policy instead.
+///
+/// Default is `allow`, matching every terminal copad is actually used next to
+/// (ghostty/kitty/wezterm/alacritty all write-by-default; iTerm2 has an opt-in). The
+/// original `deny` default took VTE as the reference, but VTE is a widget library, not
+/// a terminal a user picks — and deny silently breaks the whole class of tools that
+/// copy BY emitting OSC 52: comux's drag-to-copy, nvim's osc52 provider, tmux
+/// `set-clipboard`, any `yank`-over-SSH helper. Those failures are invisible (the
+/// warning goes to a stderr a Finder-launched .app has nowhere to print), so the
+/// hardened default cost more than it bought. `deny` remains one line away for anyone
+/// who wants it. Clipboard READS are never answered under either policy — that is the
+/// exfiltration path, and it stays shut.
 enum OSC52Policy: String, Decodable {
     case deny
     case allow
@@ -351,7 +361,7 @@ struct CopadConfig {
             backgroundTint: 0.6,
             backgroundOpacity: 1.0,
             rotateInterval: 0,
-            osc52: .deny,
+            osc52: .allow,
             transparentDefaultBg: false,
             rendererGPU: true,
             windowOpacity: 1.0,

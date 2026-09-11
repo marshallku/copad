@@ -37,6 +37,7 @@ use alacritty_terminal::index::Side;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::selection::{Selection, SelectionRange, SelectionType};
 use alacritty_terminal::sync::FairMutex;
+use alacritty_terminal::term::ClipboardType;
 use alacritty_terminal::term::TermMode;
 use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::term::test::TermSize;
@@ -246,7 +247,13 @@ impl CopadListener {
 impl EventListener for CopadListener {
     fn send_event(&self, event: Event) {
         match event {
-            Event::ClipboardStore(_kind, text) => {
+            // CLIPBOARD (OSC 52 `c`) only. PRIMARY (`p`) is a separate,
+            // low-consequence X11 buffer with no macOS equivalent, so aliasing
+            // it onto NSPasteboard would let a program clobber the real
+            // clipboard through a selector that means something else. Ignored
+            // rather than aliased — same call comux makes in `term.rs`.
+            Event::ClipboardStore(ClipboardType::Selection, _) => {}
+            Event::ClipboardStore(ClipboardType::Clipboard, text) => {
                 // Drop the previous pending request if any (last write
                 // wins). The renderer takes it on the next tick via
                 // `copad_term_take_clipboard_request`.
@@ -3090,5 +3097,115 @@ mod search_match_projection_tests {
             out.end_col, 79,
             "clipped end row should extend through last col"
         );
+    }
+}
+
+#[cfg(test)]
+mod clipboard_policy_tests {
+    use super::*;
+
+    /// OSC 52 `c` — the real clipboard — is stashed for the renderer to pick up.
+    #[test]
+    fn clipboard_store_is_pending_for_the_renderer() {
+        let l = CopadListener::new();
+        l.send_event(Event::ClipboardStore(
+            ClipboardType::Clipboard,
+            "copied".into(),
+        ));
+        assert_eq!(
+            l.pending_clipboard.lock().unwrap().take(),
+            Some("copied".to_string())
+        );
+    }
+
+    /// OSC 52 `p` — PRIMARY — is DROPPED, not aliased onto the pasteboard. macOS has no
+    /// PRIMARY, so honoring `p` would let a program clobber the real clipboard through a
+    /// selector that means something much weaker (decisions #101; comux does the same).
+    #[test]
+    fn primary_selection_is_dropped_not_aliased() {
+        let l = CopadListener::new();
+        l.send_event(Event::ClipboardStore(
+            ClipboardType::Selection,
+            "primary".into(),
+        ));
+        assert_eq!(*l.pending_clipboard.lock().unwrap(), None);
+    }
+
+    /// Last write wins — the renderer drains at most one per tick, so a burst must not
+    /// queue up stale payloads ahead of the newest one.
+    #[test]
+    fn later_clipboard_store_replaces_the_pending_one() {
+        let l = CopadListener::new();
+        l.send_event(Event::ClipboardStore(
+            ClipboardType::Clipboard,
+            "old".into(),
+        ));
+        l.send_event(Event::ClipboardStore(
+            ClipboardType::Clipboard,
+            "new".into(),
+        ));
+        assert_eq!(
+            l.pending_clipboard.lock().unwrap().take(),
+            Some("new".to_string())
+        );
+    }
+
+    /// A PRIMARY write must not clear a CLIPBOARD write that is still waiting to be drained.
+    #[test]
+    fn primary_does_not_evict_a_pending_clipboard_store() {
+        let l = CopadListener::new();
+        l.send_event(Event::ClipboardStore(
+            ClipboardType::Clipboard,
+            "keep".into(),
+        ));
+        l.send_event(Event::ClipboardStore(
+            ClipboardType::Selection,
+            "primary".into(),
+        ));
+        assert_eq!(
+            l.pending_clipboard.lock().unwrap().take(),
+            Some("keep".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod osc52_parse_tests {
+    use super::*;
+    use alacritty_terminal::term::test::TermSize;
+    use alacritty_terminal::vte::ansi::Processor;
+
+    fn term_with(listener: CopadListener) -> Term<CopadListener> {
+        Term::new(Config::default(), &TermSize::new(20, 5), listener)
+    }
+
+    /// End-to-end through the ANSI parser, not just `send_event`: the bytes a shell's
+    /// `printf '\033]52;c;<b64>\a'` puts on the PTY must land in `pending_clipboard`,
+    /// which is what the renderer's display-link drains into the policy gate.
+    #[test]
+    fn osc52_clipboard_escape_reaches_pending_clipboard() {
+        let listener = CopadListener::new();
+        let mut term = term_with(listener.clone());
+        let mut parser = Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::default();
+        // base64("copad") = "Y29wYWQ="
+        for b in b"\x1b]52;c;Y29wYWQ=\x07" {
+            parser.advance(&mut term, &[*b]);
+        }
+        assert_eq!(
+            listener.pending_clipboard.lock().unwrap().take(),
+            Some("copad".to_string())
+        );
+    }
+
+    /// Same escape targeting PRIMARY (`p`) is parsed and then dropped by the listener.
+    #[test]
+    fn osc52_primary_escape_is_dropped() {
+        let listener = CopadListener::new();
+        let mut term = term_with(listener.clone());
+        let mut parser = Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::default();
+        for b in b"\x1b]52;p;Y29wYWQ=\x07" {
+            parser.advance(&mut term, &[*b]);
+        }
+        assert_eq!(*listener.pending_clipboard.lock().unwrap(), None);
     }
 }
