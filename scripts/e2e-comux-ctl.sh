@@ -24,6 +24,7 @@
 #   9. capture-pane reads a pane's output back (by default/token/index) + refusals
 #  10. wait-output matches a fresh marker, times out at 124, refuses bad input
 #  11. list-agents (empty vs populated) + wait-agent level-match / deadline / refusals
+#  12. `comux skill` emits the embedded agent guide, and the recipe it teaches works
 
 set -euo pipefail
 
@@ -350,7 +351,36 @@ set -e
 t 10 "$COMUX" send 0 $'\x03' >/dev/null
 ok "empty listing is []; fixture classified; level-match, deadline, and refusals honored"
 
-echo "12. the server is still responsive and shuts down cleanly"
+echo "12. the embedded agent skill, and the recipe it teaches"
+t 10 "$COMUX" skill >"$WORK/skill.md" || fail "comux skill failed"
+[[ "$(head -1 "$WORK/skill.md")" == "---" ]] || fail "the skill has no YAML frontmatter"
+grep -q 'COPAD_MUX' "$WORK/skill.md" || fail "the skill lost its inside-comux gate"
+(( $(wc -l <"$WORK/skill.md") > 50 )) || fail "the skill looks truncated"
+# Run the recipe the SKILL teaches, as it teaches it. A skill is a document the model
+# FOLLOWS, so the only honest check is that following it works.
+id=$(date +%s%N)
+t 10 "$COMUX" send 0 "printf 'DONE-%s\n' '$id'" >/dev/null
+t 10 "$COMUX" send 0 $'\n' >/dev/null
+t 30 "$COMUX" wait-output --index 0 "DONE-$id" --timeout 20 --interval 100 >/dev/null \
+    || fail "the recipe the skill teaches does not work"
+# The skill claims a split leaves the NEW pane focused and that `panes[focused].token` is how
+# you address it. An agent follows that literally, so verify it rather than trusting the prose.
+t 10 "$COMUX" split >/dev/null || fail "split failed"
+t 10 "$COMUX" list --json >"$WORK/json"
+newtok="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["panes"][d["focused"]]["token"])' <"$WORK/json")"
+[[ -n "$newtok" && "$newtok" != "$tok" ]] \
+    || fail "the skill says a split focuses the NEW pane; focused token was '$newtok'"
+# And that the token addresses it for reads.
+sid=$(date +%s%N)
+fidx="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["focused"])' <"$WORK/json")"
+t 10 "$COMUX" send "$fidx" "printf 'SPLIT-%s\n' '$sid'" >/dev/null
+t 10 "$COMUX" send "$fidx" $'\n' >/dev/null
+t 30 "$COMUX" wait-output "$newtok" "SPLIT-$sid" --timeout 20 --interval 100 >/dev/null \
+    || fail "the token from panes[focused] does not address the new pane"
+t 10 "$COMUX" close "$fidx" >/dev/null || fail "could not clean up the split"
+ok "skill emitted with frontmatter + gate; its recipe runs; its addressing claims hold"
+
+echo "13. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

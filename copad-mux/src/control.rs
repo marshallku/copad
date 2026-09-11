@@ -543,6 +543,13 @@ pub fn run_client(args: &[String]) -> i32 {
     // `wait-output` owns its own exit codes (124 on deadline) and issues MANY requests,
     // so it short-circuits the one-request-one-response path below rather than producing a
     // `Req` for it.
+    if cmd == "skill" {
+        // EMBEDDED, not read from disk: the skill has to be available from an installed
+        // binary with no repo checkout, and it must describe THIS build's verbs rather than
+        // whatever a stale file next to it says.
+        println!("{SKILL_MD}");
+        return 0;
+    }
     if cmd == "wait-agent" {
         return match parse_wait_agent_args(&rest) {
             Ok(args) => run_wait_agent(args),
@@ -863,6 +870,11 @@ fn maybe_raise(resp: &Resp) {
         crate::winfocus::raise(pid, &[]);
     }
 }
+
+/// The agent-facing operating guide, embedded so `comux skill` works from an installed
+/// binary. Install it where your agent looks for skills, e.g.
+/// `comux skill > ~/.claude/skills/comux/SKILL.md`.
+const SKILL_MD: &str = include_str!("../SKILL.md");
 
 /// Exit code for "the user cancelled the picker" — fzf's (and SIGINT's) convention, so a
 /// shell wrapper can tell a deliberate abort apart from a real failure.
@@ -2967,5 +2979,126 @@ mod list_agents_proto_tests {
         let line = serde_json::to_string(&Resp::agents(vec![info("blocked")])).unwrap();
         let back: Resp = serde_json::from_str(&line).unwrap();
         assert_eq!(back.agents, Some(vec![info("blocked")]));
+    }
+}
+
+#[cfg(test)]
+mod skill_tests {
+    use super::*;
+
+    /// Every `comux <verb>` the skill tells an agent to run must be a real verb.
+    ///
+    /// This is the test that matters for a document the model FOLLOWS: a skill naming a verb
+    /// that was renamed or removed sends the agent down a path that fails at runtime, and
+    /// nothing else in the build would notice.
+    ///
+    /// The accepted verbs are read out of THIS FILE's own dispatch rather than a
+    /// hand-maintained list. A hand list is a superset the moment someone deletes a verb and
+    /// forgets to update it — which is the exact drift this test exists to catch, so the list
+    /// cannot be the oracle.
+    #[test]
+    fn every_verb_the_skill_names_exists() {
+        const SRC: &str = include_str!("control.rs");
+
+        // The dispatch region: the short-circuit verbs handled before the match, plus the
+        // match itself. Both bounds are asserted so a refactor that moves them fails loudly
+        // instead of quietly turning this test into a no-op.
+        let pre_start = SRC
+            .find("let Some(cmd) = rest.first()")
+            .expect("dispatch preamble marker moved — fix this test, do not delete it");
+        let arm_start = SRC
+            .find("    let req = match cmd {")
+            .expect("dispatch match marker moved — fix this test, do not delete it");
+        let arm_end = SRC
+            .find(r#"eprintln!("comux: unknown command"#)
+            .expect("dispatch fallthrough marker moved — fix this test, do not delete it");
+        assert!(
+            pre_start < arm_start && arm_start < arm_end,
+            "dispatch markers are out of order; the region slice is wrong"
+        );
+        let dispatch = &SRC[pre_start..arm_end];
+
+        // Verbs routed by the BINARY rather than the control dispatch (bin/comux.rs).
+        const BIN_VERBS: &[&str] = &["attach", "server", "doctor", "ctl"];
+
+        // Only fenced code blocks: prose says "comux is a terminal multiplexer", which is not
+        // a command.
+        let mut named = Vec::new();
+        let mut in_code = false;
+        for line in SKILL_MD.lines() {
+            if line.trim_start().starts_with("```") {
+                in_code = !in_code;
+                continue;
+            }
+            if !in_code {
+                continue;
+            }
+            // Strip the shell comment: an explanatory `# … comux focuses it …` is prose that
+            // happens to sit inside a fence, not an instruction to run.
+            let code = match line.find(" #") {
+                Some(at) => &line[..at],
+                None => line,
+            };
+            let mut rest = code;
+            while let Some(at) = rest.find("comux ") {
+                rest = &rest[at + "comux ".len()..];
+                let verb: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .collect();
+                if !verb.is_empty() {
+                    named.push(verb);
+                }
+            }
+        }
+        assert!(
+            named.len() > 10,
+            "the extractor found almost nothing ({named:?}) — it has drifted from the skill's \
+             formatting and is no longer checking anything"
+        );
+        for verb in &named {
+            let quoted = format!("\"{verb}\"");
+            assert!(
+                dispatch.contains(&quoted) || BIN_VERBS.contains(&verb.as_str()),
+                "the skill tells an agent to run `comux {verb}`, which no dispatch arm accepts"
+            );
+        }
+    }
+
+    /// The safety gate is the whole reason the skill can be handed to an agent at all: without
+    /// `$COPAD_MUX` it would drive the user's real server. Keep it, and keep it near the top.
+    #[test]
+    fn the_skill_gates_on_being_inside_comux() {
+        assert!(SKILL_MD.contains("$COPAD_MUX"), "the env gate is missing");
+        let gate = SKILL_MD
+            .find("If `$COPAD_MUX` is unset")
+            .expect("the skill must say what to do when the gate fails");
+        assert!(
+            gate < SKILL_MD.len() / 3,
+            "the gate must come before the commands it guards"
+        );
+        assert!(
+            SKILL_MD.contains("frontmatter marker") || SKILL_MD.starts_with("---\n"),
+            "a skill needs YAML frontmatter to be discoverable"
+        );
+    }
+
+    /// The marker recipe is the one piece of the skill that is easy to get subtly wrong and
+    /// impossible to notice — it fails by SUCCEEDING instantly.
+    #[test]
+    fn the_skill_teaches_the_fresh_fragmented_marker() {
+        assert!(SKILL_MD.contains("DONE-%s"), "the marker is not fragmented");
+        assert!(
+            !SKILL_MD.contains("printf 'DONE-$id"),
+            "the recipe assembles the marker inside the sent command the shell echoes"
+        );
+        assert!(
+            SKILL_MD.contains(r"send 0 $'\n'"),
+            "the recipe never submits the command"
+        );
+        assert!(
+            SKILL_MD.contains("124"),
+            "the skill must tell the agent a timeout is not a match"
+        );
     }
 }
