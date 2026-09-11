@@ -133,6 +133,11 @@ at once. Its statuses are cached and inferred (Claude's from its session file, e
 else from screen text, refreshed every 500ms attached / 5s detached), so `blocked` can be a
 false reading from ordinary output. Treat it as a hint, and confirm with `capture-pane`.
 
+`idle` means comux recognised no agent UI at all — "no reading", not a state — which is why
+it is not waitable. A pane running a tool whose UI comux does not know stays `idle` forever,
+so never block on one; poll it with `capture-pane`, or have it signal you with
+`comux notify`.
+
 ## Coordinate with another agent
 
 ```bash

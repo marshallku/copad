@@ -26,6 +26,7 @@
 #  11. list-agents (empty vs populated) + wait-agent level-match / deadline / refusals
 #  12. `comux skill` emits the embedded agent guide, and the recipe it teaches works
 #  13. bell + title: an unfocused pane's BEL and OSC 0 title reach `list --json`
+#  14. a codex pane reads ready/blocked, not the `idle` it used to fall through to
 
 set -euo pipefail
 
@@ -451,7 +452,53 @@ bi="$(BP="$bell_pane" python3 -c 'import json,sys,os; print(next(p["index"] for 
 t 10 "$COMUX" close "$bi" >/dev/null || fail "could not clean up the bell pane"
 ok "an unfocused pane's BEL is reported; its OSC 0 title is exposed without displacing the label"
 
-echo "14. the server is still responsive and shuts down cleanly"
+echo "14. a codex pane is classified, not left at 'idle'"
+# Regression guard for the bug this step exists for: comux read an agent pane's status with
+# markers that only knew Claude's UI, so a codex pane reported `idle` BOTH when parked at its
+# composer and when blocked on an approval — and `idle` is deliberately not waitable, so
+# codex was invisible to `wait-agent`, the attention count and the blocked toast alike.
+#
+# The fixture RENDERS codex's real screen text (captured verbatim from codex-cli 0.154.0)
+# rather than running codex: a real agent needs credentials, costs quota and is not
+# deterministic. This checks the wiring end to end — process name -> classification ->
+# marker resolution -> the wire -> wait-agent — which the unit tests cannot reach.
+#
+# The screens are written to FILES here and `cat`-ed in the pane. Typing them as a `printf`
+# argument made the test pass for the wrong reason: the shell ECHOES the command line, so the
+# marker was on screen whether or not the command ever ran — the same trap `wait-output
+# --help` warns callers about, hit by its own harness.
+mkdir -p "$WORK/bin"
+ln -sf /bin/sleep "$WORK/bin/codex" || fail "could not build the codex fixture"
+printf '\xe2\x80\xba Ask Codex to do anything\n  Luna Reserve medium \xc2\xb7 /private/tmp\n' \
+    >"$WORK/codex-ready.txt"
+printf 'Would you like to run the following command?\n\xe2\x80\xba 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\nPress enter to confirm or esc to cancel\n' \
+    >"$WORK/codex-blocked.txt"
+cx="$(t 10 "$COMUX" split --from "$tok")" || fail "split for the codex fixture failed"
+[[ -n "$cx" ]] || fail "split did not name the codex pane"
+
+# Parked at its composer: the cursor glyph is codex's U+203A, not Claude's U+276F.
+t 10 "$COMUX" send "$cx" "clear; cat $WORK/codex-ready.txt; $WORK/bin/codex 600" >/dev/null
+t 10 "$COMUX" send "$cx" $'\n' >/dev/null
+t 40 "$COMUX" wait-agent "$cx" --status ready --timeout 25 --interval 200 >"$WORK/out" \
+    || { t 10 "$COMUX" capture-pane "$cx" -S 20 >&2 || true
+         fail "a codex pane parked at its composer was not reported ready (the pre-fix bug: idle)"; }
+grep -q ready "$WORK/out" || fail "wait-agent printed no status line for the codex fixture"
+
+# Blocked on an approval: the dialog replaces the composer, and its prose is what promotes the
+# pane past "not ready" to a positive "blocked".
+t 10 "$COMUX" send "$cx" $'\x03' >/dev/null
+t 10 "$COMUX" send "$cx" "clear; cat $WORK/codex-blocked.txt; $WORK/bin/codex 600" >/dev/null
+t 10 "$COMUX" send "$cx" $'\n' >/dev/null
+t 40 "$COMUX" wait-agent "$cx" --status blocked --timeout 25 --interval 200 >/dev/null \
+    || { t 10 "$COMUX" capture-pane "$cx" -S 20 >&2 || true
+         fail "a codex pane on an approval prompt was not reported blocked (the pre-fix bug: idle)"; }
+t 10 "$COMUX" send "$cx" $'\x03' >/dev/null
+t 10 "$COMUX" list --json >"$WORK/json"
+cxi="$(CX="$cx" python3 -c 'import json,sys,os; print(next(p["index"] for p in json.load(sys.stdin)["panes"] if p["token"]==os.environ["CX"]))' <"$WORK/json")"
+t 10 "$COMUX" close "$cxi" >/dev/null || fail "could not clean up the codex pane"
+ok "codex reads ready at its composer and blocked on an approval, not idle"
+
+echo "15. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"
