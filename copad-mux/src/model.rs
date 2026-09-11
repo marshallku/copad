@@ -467,6 +467,121 @@ impl SplitTree {
             },
         }
     }
+
+    /// Place every branch's DIVIDER, mirroring [`Self::derive_layout`] so the two agree
+    /// cell-for-cell. A branch too small to show a divider (`split3` gives it 0 cells)
+    /// contributes nothing — there is no gap to grab.
+    pub fn derive_dividers(
+        &self,
+        x: u16,
+        y: u16,
+        cols: u16,
+        rows: u16,
+        path: &mut Vec<bool>,
+        out: &mut Vec<DividerRect>,
+    ) {
+        let SplitTree::Branch {
+            dir,
+            ratio,
+            first,
+            second,
+        } = self
+        else {
+            return;
+        };
+        match dir {
+            Dir::Right => {
+                let (a, b, div) = Self::split3(cols, *ratio);
+                if div > 0 {
+                    out.push(DividerRect {
+                        path: path.clone(),
+                        dir: *dir,
+                        x: x + a,
+                        y,
+                        cols: div,
+                        rows,
+                        origin: x,
+                        extent: cols,
+                    });
+                }
+                path.push(false);
+                first.derive_dividers(x, y, a, rows, path, out);
+                path.pop();
+                path.push(true);
+                second.derive_dividers(x + a + div, y, b, rows, path, out);
+                path.pop();
+            }
+            Dir::Down => {
+                let (a, b, div) = Self::split3(rows, *ratio);
+                if div > 0 {
+                    out.push(DividerRect {
+                        path: path.clone(),
+                        dir: *dir,
+                        x,
+                        y: y + a,
+                        cols,
+                        rows: div,
+                        origin: y,
+                        extent: rows,
+                    });
+                }
+                path.push(false);
+                first.derive_dividers(x, y, cols, a, path, out);
+                path.pop();
+                path.push(true);
+                second.derive_dividers(x, y + a + div, cols, b, path, out);
+                path.pop();
+            }
+        }
+    }
+
+    /// Set the ratio of the branch at `path` directly. Returns whether it CHANGED, so a drag
+    /// that lands on the same cell does not churn the revision and repaint.
+    ///
+    /// Clamped to the same `[0.05, 0.95]` as the keyboard nudge, so geometry still conserves
+    /// (G2) and a drag cannot collapse a pane to nothing and strand its shell.
+    pub fn set_ratio_at(&mut self, path: &[bool], want: f32) -> bool {
+        let SplitTree::Branch {
+            ratio,
+            first,
+            second,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        if let Some((&step, rest)) = path.split_first() {
+            return if step { second } else { first }.set_ratio_at(rest, want);
+        }
+        let new = want.clamp(0.05, 0.95);
+        if (new - *ratio).abs() <= f32::EPSILON {
+            return false;
+        }
+        *ratio = new;
+        true
+    }
+}
+
+/// Where a branch's divider is on screen, and everything needed to drag it.
+///
+/// Emitted alongside the pane rects by [`SplitTree::derive_dividers`]. The `path` addresses
+/// the branch EXACTLY — `false` = descend into `first`, `true` = into `second`. Addressing it
+/// by an adjacent pane instead would be ambiguous: `SplitTree::resize` resolves deepest-first,
+/// so a pane inside an outer branch's `first` child may also sit inside a NESTED branch on the
+/// same axis, and dragging the outer divider would silently move the inner one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DividerRect {
+    pub path: Vec<bool>,
+    /// Which way the branch splits: `Right` = a vertical divider you drag horizontally.
+    pub dir: Dir,
+    pub x: u16,
+    pub y: u16,
+    pub cols: u16,
+    pub rows: u16,
+    /// First cell of the BRANCH along `dir` — the origin a pointer position is measured from.
+    pub origin: u16,
+    /// The branch's full extent along `dir`, so a pointer maps to a ratio.
+    pub extent: u16,
 }
 
 /// A tab: one BSP layout + a focused pane.
@@ -535,6 +650,112 @@ mod tests {
         assert_eq!((b.y, b.rows), (0, 24));
         assert_eq!(b.x, a.cols + 1, "second pane sits after the 1-cell divider");
         assert_eq!(a.cols + 1 + b.cols, 80, "widths + divider tile the area");
+    }
+
+    #[test]
+    fn dividers_sit_exactly_in_the_gaps_the_layout_leaves() {
+        // Two vertical splits nested in the left half, so there are two dividers at
+        // DIFFERENT depths on the same axis — the case that makes path addressing necessary.
+        let tree = SplitTree::Branch {
+            dir: Dir::Right,
+            ratio: 0.5,
+            first: Box::new(SplitTree::Branch {
+                dir: Dir::Right,
+                ratio: 0.5,
+                first: Box::new(leaf("p0", "t0")),
+                second: Box::new(leaf("p1", "t1")),
+            }),
+            second: Box::new(leaf("p2", "t2")),
+        };
+        let (cols, rows) = (80u16, 24u16);
+        let mut panes = Vec::new();
+        tree.derive_layout(0, 0, cols, rows, &mut panes);
+        let mut divs = Vec::new();
+        tree.derive_dividers(0, 0, cols, rows, &mut Vec::new(), &mut divs);
+        assert_eq!(divs.len(), 2, "one divider per branch");
+
+        // No divider may overlap a pane, and together they must fill the row exactly —
+        // the same conservation `split3` gives the layout.
+        for d in &divs {
+            for p in &panes {
+                let overlap = d.x < p.x + p.cols && p.x < d.x + d.cols;
+                assert!(!overlap, "divider {d:?} overlaps pane at x={}", p.x);
+            }
+        }
+        let covered: u16 =
+            panes.iter().map(|p| p.cols).sum::<u16>() + divs.iter().map(|d| d.cols).sum::<u16>();
+        assert_eq!(
+            covered, cols,
+            "panes + dividers must tile the width exactly"
+        );
+
+        // The OUTER divider spans the whole area; the inner one only its half.
+        let outer = divs.iter().find(|d| d.path.is_empty()).unwrap();
+        let inner = divs.iter().find(|d| d.path == vec![false]).unwrap();
+        assert_eq!((outer.origin, outer.extent), (0, cols));
+        assert_eq!(inner.origin, 0);
+        assert!(
+            inner.extent < cols,
+            "the nested branch spans less than the area"
+        );
+    }
+
+    #[test]
+    fn a_path_addresses_one_branch_and_only_that_branch() {
+        let mut tree = SplitTree::Branch {
+            dir: Dir::Right,
+            ratio: 0.5,
+            first: Box::new(SplitTree::Branch {
+                dir: Dir::Right,
+                ratio: 0.5,
+                first: Box::new(leaf("p0", "t0")),
+                second: Box::new(leaf("p1", "t1")),
+            }),
+            second: Box::new(leaf("p2", "t2")),
+        };
+        // The outer branch, NOT the nested one that shares its axis and contains p0. This is
+        // the ambiguity that rules out addressing a divider by an adjacent pane.
+        assert!(tree.set_ratio_at(&[], 0.7));
+        let SplitTree::Branch { ratio, first, .. } = &tree else {
+            panic!()
+        };
+        assert!((*ratio - 0.7).abs() < 1e-4, "the outer ratio moved");
+        let SplitTree::Branch { ratio: inner, .. } = &**first else {
+            panic!()
+        };
+        assert!((*inner - 0.5).abs() < 1e-4, "the nested ratio did NOT move");
+
+        assert!(tree.set_ratio_at(&[false], 0.2));
+        let SplitTree::Branch { first, .. } = &tree else {
+            panic!()
+        };
+        let SplitTree::Branch { ratio: inner, .. } = &**first else {
+            panic!()
+        };
+        assert!((*inner - 0.2).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_drag_cannot_collapse_a_pane_or_churn_the_revision() {
+        let mut tree = SplitTree::Branch {
+            dir: Dir::Right,
+            ratio: 0.5,
+            first: Box::new(leaf("p0", "t0")),
+            second: Box::new(leaf("p1", "t1")),
+        };
+        // Dragged past the edge: clamped to the same bound the keyboard nudge uses, so a
+        // pane never reaches zero cells and strands its shell.
+        assert!(tree.set_ratio_at(&[], 5.0));
+        let SplitTree::Branch { ratio, .. } = &tree else {
+            panic!()
+        };
+        assert!((*ratio - 0.95).abs() < 1e-4);
+        // Already there: no change reported, so a drag that stays on one cell does not
+        // repaint on every mouse event.
+        assert!(!tree.set_ratio_at(&[], 5.0));
+        assert!(!tree.set_ratio_at(&[], 0.95));
+        // A path that runs off a leaf is refused rather than panicking.
+        assert!(!tree.set_ratio_at(&[false, true], 0.5));
     }
 
     #[test]

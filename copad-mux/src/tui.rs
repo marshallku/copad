@@ -168,6 +168,31 @@ pub fn host_parts(m: &hostmetrics::HostMetrics) -> Vec<HostPart> {
     out
 }
 
+/// A divider being dragged: which branch, and by whom.
+///
+/// The branch is held by PATH rather than by an adjacent pane, because `SplitTree::resize`
+/// resolves deepest-first and a pane in an outer branch's `first` child can also sit inside a
+/// nested branch on the same axis — dragging the outer divider would move the inner one.
+#[derive(Debug, Clone)]
+struct ResizeDrag {
+    path: Vec<bool>,
+    dir: Dir,
+    owner: ClientId,
+}
+
+/// Where a pointer sits inside a branch, as a 0..1 share of its extent.
+///
+/// The divider itself occupies a cell, so the usable span is `extent - 1`; dividing by the
+/// full extent would make the pane always a hair narrower than where the pointer is, and the
+/// error grows as panes get small.
+fn drag_ratio(pos: u16, origin: u16, extent: u16) -> Option<f32> {
+    let span = extent.checked_sub(1)?;
+    if span == 0 {
+        return None;
+    }
+    Some(pos.saturating_sub(origin) as f32 / span as f32)
+}
+
 /// Max notifications retained in the center.
 const NOTIFY_LOG_CAP: usize = 100;
 
@@ -697,6 +722,10 @@ pub struct App {
     /// The in-progress mouse drag-selection, if any (tmux-style copy). `None` except between
     /// a button-down and its button-up; the highlight only shows during the drag.
     selection: Option<Sel>,
+    /// An in-progress divider drag. Client-OWNED like `selection`, and for the same reason:
+    /// input is multi-client, so only the client that grabbed a divider may move or release
+    /// it. At most one at a time — two clients dragging the same divider would fight.
+    resize_drag: Option<ResizeDrag>,
     /// Highest clipboard sequence already relayed out of a pane (OSC 52 passthrough). Guards
     /// against a write that reached its pane's slot late being broadcast after a newer one.
     /// `0` = nothing relayed yet; sequences are 1-based (see `term::CLIPBOARD_SEQ`).
@@ -830,6 +859,7 @@ impl App {
             usage_rolled_at: std::time::Instant::now(),
             alt_screen: HashMap::new(),
             selection: None,
+            resize_drag: None,
             last_clipboard_seq: 0,
         };
         app.reflow();
@@ -1060,6 +1090,70 @@ impl App {
             );
         }
         out
+    }
+
+    /// The active tab's dividers in screen coordinates — the grab targets for a resize drag.
+    fn dividers(&self) -> Vec<crate::model::DividerRect> {
+        let mut out = Vec::new();
+        if let Some(w) = self.state.workspace(&self.ws)
+            && let Some(tab) = w.tab(&w.active_tab)
+        {
+            tab.layout.derive_dividers(
+                self.content_x(),
+                self.content_y(),
+                self.content_cols(),
+                self.content_rows(),
+                &mut Vec::new(),
+                &mut out,
+            );
+        }
+        out
+    }
+
+    /// The divider under `(x, y)`, if any. Innermost first: nested dividers are emitted after
+    /// their ancestor and can only ever be BESIDE it, never on top, so order is not load-
+    /// bearing — but taking the last match keeps it deterministic if that ever changes.
+    fn divider_at(&self, x: u16, y: u16) -> Option<crate::model::DividerRect> {
+        self.dividers()
+            .into_iter()
+            .rfind(|d| x >= d.x && x < d.x + d.cols && y >= d.y && y < d.y + d.rows)
+    }
+
+    /// Move the dragged divider so it lands under the pointer. Returns whether anything
+    /// changed, so a drag that stays within one cell does not churn the revision.
+    fn drag_divider(&mut self, x: u16, y: u16) -> bool {
+        let Some(drag) = self.resize_drag.clone() else {
+            return false;
+        };
+        // Re-derive from the CURRENT layout: the branch's origin and extent move when the
+        // window is resized or another client splits mid-drag.
+        let Some(d) = self
+            .dividers()
+            .into_iter()
+            .find(|d| d.path == drag.path && d.dir == drag.dir)
+        else {
+            self.resize_drag = None; // the branch is gone — drop the drag, don't guess
+            return false;
+        };
+        let pos = if drag.dir == Dir::Right { x } else { y };
+        let Some(want) = drag_ratio(pos, d.origin, d.extent) else {
+            return false;
+        };
+        // Through the state machine, not into the tree: mutations are authorized, revved and
+        // re-derived in one place (single-writer, spec §1).
+        let changed = self
+            .state
+            .apply(Command::SetSplitRatio {
+                origin: Origin::Client(self.client),
+                workspace: self.ws.clone(),
+                path: drag.path,
+                ratio: want,
+            })
+            .is_ok_and(|evs| !evs.is_empty());
+        if changed {
+            self.sync_sizes();
+        }
+        changed
     }
 
     fn focused_pane(&self) -> Option<PaneId> {
@@ -3174,10 +3268,26 @@ impl App {
                     }
                 } else if !other_dragging {
                     self.selection = None; // clicked chrome gap / letterbox
+                    // A divider lives in the 1-cell gap BETWEEN panes, so it is never inside
+                    // a pane rect and only reachable here. Grabbing one starts a resize drag
+                    // instead of a text selection — the two cannot overlap.
+                    if let Some(d) = self.divider_at(x, y) {
+                        self.resize_drag = Some(ResizeDrag {
+                            path: d.path,
+                            dir: d.dir,
+                            owner: client,
+                        });
+                    }
                 }
                 None
             }
             MouseKind::Drag => {
+                // A divider drag takes precedence: if this client grabbed one, every Drag is
+                // a resize until it releases.
+                if self.resize_drag.as_ref().map(|d| d.owner) == Some(client) {
+                    self.drag_divider(x, y);
+                    return None;
+                }
                 // Only the owning client extends its own selection.
                 let owner = self.selection.as_ref().map(|s| s.owner);
                 if owner != Some(client) {
@@ -3201,6 +3311,14 @@ impl App {
                 None
             }
             MouseKind::Up => {
+                // Release the divider first: a resize drag never produced a selection, so the
+                // clause below would return early and leave the drag armed — the next click
+                // anywhere would then move the divider to it.
+                if self.resize_drag.as_ref().map(|d| d.owner) == Some(client) {
+                    self.drag_divider(x, y);
+                    self.resize_drag = None;
+                    return None;
+                }
                 // Only the owner finishes its selection; a non-owner release is ignored.
                 if self.selection.as_ref().map(|s| s.owner) != Some(client) {
                     return None;
@@ -3227,10 +3345,18 @@ impl App {
         self.selection = None;
     }
 
-    /// Drop the selection if it belongs to `client` (its owner detached).
+    /// Drop the selection — and any divider drag — belonging to `client` (its owner
+    /// detached).
+    ///
+    /// The drag matters as much as the selection: client ids are reused, so a drag left armed
+    /// by a client that vanished mid-gesture would be INHERITED by whoever next takes that id,
+    /// and their first click would yank a divider to it.
     pub fn clear_selection_of(&mut self, client: ClientId) {
         if self.selection.as_ref().is_some_and(|s| s.owner == client) {
             self.selection = None;
+        }
+        if self.resize_drag.as_ref().is_some_and(|d| d.owner == client) {
+            self.resize_drag = None;
         }
     }
 
@@ -4341,12 +4467,21 @@ impl App {
             }
         }
         let content_x = self.content_x();
+        let content_y = self.content_y();
         let content_rows = self.content_rows();
         for yy in 0..area.height {
             for xx in 0..area.width {
                 // The sidebar owns the left strip and the status bar owns the bottom
                 // row; don't paint dividers over either.
-                if yy >= content_rows || xx < content_x || covered[yy as usize][xx as usize] {
+                // Skip anything outside the pane grid: the top bar's rows, the sidebar's
+                // strip, the status bar. `yy < content_y` matters only because the grid no
+                // longer starts at row 0 — the top bar repaints over it today, so this is a
+                // correctness fix for TOP_H > 1 rather than a visible one.
+                if yy < content_y
+                    || yy >= content_y + content_rows
+                    || xx < content_x
+                    || covered[yy as usize][xx as usize]
+                {
                     continue;
                 }
                 let left = xx > 0 && covered[yy as usize][(xx - 1) as usize];

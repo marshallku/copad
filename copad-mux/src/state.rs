@@ -107,6 +107,16 @@ pub enum Command {
         axis: Dir,
         grow: bool,
     },
+    /// Set one branch's split ratio outright, addressing it by PATH in the active tab's tree
+    /// (`false` = descend into `first`). The absolute form of [`Command::ResizePane`], for a
+    /// pointer drag: a nudge cannot follow a pointer, and a pane adjacent to the divider
+    /// would be ambiguous (see `model::DividerRect`). Controller/API only.
+    SetSplitRatio {
+        origin: Origin,
+        workspace: WorkspaceId,
+        path: Vec<bool>,
+        ratio: f32,
+    },
 }
 
 /// A terminal's derived geometry + its new revision, carried in `Resized` so a
@@ -529,6 +539,12 @@ impl State {
                 axis,
                 grow,
             } => self.resize_pane(origin, workspace, pane, axis, grow),
+            Command::SetSplitRatio {
+                origin,
+                workspace,
+                path,
+                ratio,
+            } => self.set_split_ratio(origin, workspace, path, ratio),
         }
     }
 
@@ -1086,6 +1102,42 @@ impl State {
             });
         }
         Ok(evs)
+    }
+
+    /// Set the ratio of the branch at `path` in the ACTIVE tab. Shares `resize_pane`'s
+    /// bookkeeping — authorize, bump both revs, recompute sizes — so a dragged divider and a
+    /// nudged one produce identical events; the only difference is how the ratio is chosen.
+    fn set_split_ratio(
+        &mut self,
+        origin: Origin,
+        workspace: WorkspaceId,
+        path: Vec<bool>,
+        ratio: f32,
+    ) -> Result<Vec<Event>, MuxError> {
+        self.authorize_mutation(&origin, &workspace)?;
+        let idx = self.ws_index(&workspace)?;
+        let tab_id = self.workspaces[idx].active_tab.clone();
+        let tab = self.workspaces[idx]
+            .tab_mut(&tab_id)
+            .ok_or(MuxError::NoSuchTab)?;
+        if !tab.layout.set_ratio_at(&path, ratio) {
+            // No such branch, or the ratio did not move. A pointer drag fires on every mouse
+            // event, so reporting "nothing changed" is what keeps it from bumping the rev and
+            // repainting sixty times a second while the pointer sits on one cell.
+            return Ok(vec![]);
+        }
+        tab.rev += 1;
+        self.workspaces[idx].rev += 1;
+        let ws_rev = self.workspaces[idx].rev;
+        let terms = self.recompute_sizes(idx);
+        let vp = self.workspaces[idx].viewport;
+        Ok(vec![Event::Resized {
+            workspace,
+            cols: vp.cols,
+            rows: vp.rows,
+            terminals: terms,
+            workspace_rev: ws_rev,
+        }])
     }
 
     fn require_controller_of_attached(&self, client: ClientId) -> Result<WorkspaceId, MuxError> {

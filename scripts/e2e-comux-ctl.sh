@@ -30,6 +30,7 @@
 #  15. an agent's DOING line is read from its own structured log (agentpoll)
 #  16. `comux host` publishes CPU/memory/GPU/load, omitting what it could not read
 #  17. the top bar: off by default, and it moves the sidebar AND its click zones
+#  18. dragging a split divider moves the branch it is on, and only that one
 
 set -euo pipefail
 
@@ -744,7 +745,121 @@ rm -f "$XDG_CONFIG_HOME/copad/mux.toml"
 t 10 "$COMUX" reload >/dev/null
 ok "off by default; drawn and reloadable; the sidebar and its click zones moved with it; suppressed when short"
 
-echo "18. the server is still responsive and shuts down cleanly"
+echo "18. dragging a split divider"
+# The keyboard nudge (`Ctrl-b H/J/K/L`) moves a ratio by a fixed step; a POINTER has to land
+# the divider under itself, which is a different operation (absolute, not relative) and is only
+# checkable by actually dragging. The helper from step 17 already drives a real client, so this
+# reuses it with motion events.
+#
+# The branch is addressed by PATH, not by an adjacent pane: `SplitTree::resize` resolves
+# deepest-first, so a pane inside an outer branch's `first` child can also sit inside a NESTED
+# branch on the same axis, and dragging the outer divider would move the inner one. The nested
+# case below is what pins that.
+pane_cols () {
+    t 10 "$COMUX" list --json | python3 -c 'import json,sys
+print(" ".join(str(p["cols"]) for p in json.load(sys.stdin)["panes"]))'
+}
+pane_rows () {
+    t 10 "$COMUX" list --json | python3 -c 'import json,sys
+print(" ".join(str(p["rows"]) for p in json.load(sys.stdin)["panes"]))'
+}
+drag () { # drag <from> <to> <fixed-other-axis> <vertical?>
+    FROM="$1" TO="$2" FIX="$3" VERT="$4" CMX="$COMUX" python3 - <<'PYEOF' >/dev/null 2>&1
+import os, pty, time, select, fcntl, termios, struct
+rows, cols = 24, 100
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm-256color"
+    os.execvp(os.environ["CMX"], [os.environ["CMX"]])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+def drain(s):
+    end = time.time() + s
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if r:
+            try:
+                if not os.read(fd, 65536): break
+            except OSError: break
+drain(6)
+a, b, fix = int(os.environ["FROM"]), int(os.environ["TO"]), int(os.environ["FIX"])
+vert = os.environ["VERT"] == "1"
+def at(v):
+    return (fix, v) if vert else (v, fix)
+c, r = at(a)
+os.write(fd, f"\x1b[<0;{c};{r}M".encode()); time.sleep(0.2)
+step = 1 if b > a else -1
+for v in range(a + step, b + step, step):
+    c, r = at(v)
+    os.write(fd, f"\x1b[<32;{c};{r}M".encode()); time.sleep(0.04)
+c, r = at(b)
+os.write(fd, f"\x1b[<0;{c};{r}m".encode())
+drain(2)
+os.write(fd, b"\x02d"); time.sleep(0.8)
+try: os.close(fd)
+except OSError: pass
+try: os.waitpid(pid, 0)
+except ChildProcessError: pass
+PYEOF
+}
+
+first_tok="$(t 10 "$COMUX" list --json | python3 -c 'import json,sys
+print(json.load(sys.stdin)["panes"][0]["token"])')"
+t 10 "$COMUX" split --from "$first_tok" >/dev/null || fail "could not split for the drag test"
+sleep 1
+before_cols="$(pane_cols)"
+# Find the vertical divider on screen rather than computing it, so the test also proves the
+# rendered gap and the grab target are the same cell.
+python3 "$WORK/ptydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+dcol="$(python3 - "$WORK/frame" <<'PYEOF'
+import sys
+rows = open(sys.argv[1]).read().splitlines()
+# The sidebar's own border is the LEFTmost such column; the pane divider is the next one.
+cands = {}
+for line in rows[2:20]:
+    for i, ch in enumerate(line):
+        if ch == "│":
+            cands[i] = cands.get(i, 0) + 1
+tall = sorted(c for c, n in cands.items() if n > 8)
+print(tall[1] + 1 if len(tall) > 1 else 0)
+PYEOF
+)"
+[[ "$dcol" != "0" ]] || { cat "$WORK/frame" >&2; fail "no pane divider was drawn to grab"; }
+drag "$dcol" $((dcol + 18)) 3 0
+sleep 1
+after_cols="$(pane_cols)"
+[[ "$before_cols" != "$after_cols" ]] \
+    || fail "dragging the divider changed nothing ($before_cols)"
+python3 - "$before_cols" "$after_cols" <<'PYEOF' || fail "the drag did not move the divider the way it was dragged"
+import sys
+b = [int(x) for x in sys.argv[1].split()]
+a = [int(x) for x in sys.argv[2].split()]
+assert a[0] > b[0], f"the left pane should have GROWN: {b} -> {a}"
+assert a[1] < b[1], f"the right pane should have shrunk: {b} -> {a}"
+assert sum(a) == sum(b), f"cells must be conserved: {b} -> {a}"
+PYEOF
+
+# A NESTED branch on the other axis: dragging its divider must move IT, not the outer one.
+t 10 "$COMUX" split -v --from "$first_tok" >/dev/null || fail "could not nest a split"
+sleep 1
+outer_before="$(pane_cols)"
+rows_before="$(pane_rows)"
+drag 12 18 $((dcol / 2)) 1
+sleep 1
+[[ "$(pane_rows)" != "$rows_before" ]] \
+    || fail "dragging the nested horizontal divider changed no heights ($rows_before)"
+[[ "$(pane_cols)" == "$outer_before" ]] \
+    || fail "dragging the NESTED divider also moved the outer one ($outer_before -> $(pane_cols))"
+
+# Dragged past the edge, a pane must not collapse to nothing and strand its shell.
+drag 18 23 $((dcol / 2)) 1
+sleep 1
+python3 - "$(pane_rows)" <<'PYEOF' || fail "a divider drag collapsed a pane"
+import sys
+assert all(int(v) > 0 for v in sys.argv[1].split()), sys.argv[1]
+PYEOF
+ok "a dragged divider lands under the pointer, conserves cells, addresses the right branch, and clamps"
+
+echo "19. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"
