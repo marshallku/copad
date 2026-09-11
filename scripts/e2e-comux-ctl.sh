@@ -32,6 +32,7 @@
 #  17. the top bar: off by default, and it moves the sidebar AND its click zones
 #  18. dragging a split divider moves the branch it is on, and only that one
 #  19. a notification jump focuses the exact copad TAB, and degrades when it cannot
+#  20. the SSH fleet: an unreachable machine is reported with a reason, never dropped
 
 set -euo pipefail
 
@@ -962,7 +963,88 @@ assert "copad_host" not in r, r' <"$WORK/out" \
     || fail "a detached client left its copad tab behind: $(cat "$WORK/out")"
 ok "the jump names the copad tab, dials it, falls back when refused or dead, and forgets it on detach"
 
-echo "20. the server is still responsive and shuts down cleanly"
+echo "20. the SSH fleet readout"
+# One comux server per machine, reached by running `comux list-agents --json` there over
+# ordinary ssh. Driven against a FAKE `ssh` on PATH, which covers everything except OpenSSH
+# itself: config parsing, the remote command line, concurrency, and — the point of the whole
+# feature — that a machine which does NOT answer is reported rather than dropped.
+mkdir -p "$WORK/fleetbin"
+cat >"$WORK/fleetbin/ssh" <<'SSHEOF'
+#!/usr/bin/env bash
+dest="${@: -2:1}"
+cmd="${@: -1}"
+echo "$dest :: $cmd" >> "$FAKE_SSH_LOG"
+case "$dest" in
+  me@build.local)
+    echo '{"ok":true,"agents":[{"space":"api","tool":"claude","status":"blocked","for_secs":240,"detail":"Bash: run the tests","token":"t1"}]}' ;;
+  gpu-box)
+    echo "ssh: connect to host gpu-box port 22: Operation timed out" >&2; exit 255 ;;
+  quiet-box)
+    echo '{"ok":true,"agents":[]}' ;;
+  *) echo '{"ok":false,"error":"no server running"}' ;;
+esac
+SSHEOF
+chmod +x "$WORK/fleetbin/ssh"
+cat >"$XDG_CONFIG_HOME/copad/mux.toml" <<'TOMLEOF'
+[machines.build]
+ssh = "me@build.local"
+[machines.gpu]
+ssh = "gpu-box"
+socket = "/tmp/alt sock"
+[machines.quiet]
+ssh = "quiet-box"
+[machines.broken]
+TOMLEOF
+export FAKE_SSH_LOG="$WORK/ssh.log"
+: >"$FAKE_SSH_LOG"
+FLEET_PATH="$WORK/fleetbin:$PATH"
+
+# `machines` must work with NO server involved — that is exactly when you want to ask where
+# your agents are.
+PATH="$FLEET_PATH" t 10 "$COMUX" machines >"$WORK/out" 2>"$WORK/err" || fail "comux machines failed"
+grep -q 'me@build.local' "$WORK/out" || fail "machines did not list the fleet: $(cat "$WORK/out")"
+# A machine with no ssh destination is DROPPED WITH A WARNING, never silently defaulted to its
+# own name — a silent default would query the wrong host.
+grep -q "broken" "$WORK/err" || fail "an unusable machine was dropped silently: $(cat "$WORK/err")"
+grep -q "broken" "$WORK/out" && fail "an unusable machine must not be listed as usable"
+
+set +e
+PATH="$FLEET_PATH" t 30 "$COMUX" list-agents --fleet >"$WORK/out" 2>"$WORK/err"; code=$?
+set -e
+# A partial fleet is a partial answer: the reachable machines are still reported, and the exit
+# code says the picture is incomplete so a script need not re-parse the text to find out.
+[[ "$code" == "1" ]] || fail "an unreachable machine must make the fleet readout exit 1, got $code"
+grep -q 'Bash: run the tests' "$WORK/out" || fail "the reachable machine's agent was not shown: $(cat "$WORK/out")"
+grep -q 'UNREACHABLE' "$WORK/out" || fail "the unreachable machine was DROPPED instead of reported: $(cat "$WORK/out")"
+grep -q 'Operation timed out' "$WORK/out" || fail "the unreachable machine gave no reason: $(cat "$WORK/out")"
+# "no agents" and "could not reach" must be visibly different rows.
+grep -q 'no agents' "$WORK/out" || fail "an idle machine must say so, not vanish: $(cat "$WORK/out")"
+
+# The remote command line: a socket path with a SPACE must survive the remote login shell.
+grep -q "COPAD_MUX_SOCK='/tmp/alt sock' comux list-agents --json" "$WORK/ssh.log" \
+    || fail "the remote command did not quote the socket path: $(cat "$WORK/ssh.log")"
+[[ "$(grep -c '::' "$WORK/ssh.log")" == "3" ]] \
+    || fail "expected exactly 3 machines queried, got: $(cat "$WORK/ssh.log")"
+
+set +e
+PATH="$FLEET_PATH" t 30 "$COMUX" list-agents --fleet --json >"$WORK/out" 2>/dev/null; code=$?
+set -e
+python3 -c 'import json,sys
+d = json.load(sys.stdin)
+assert d["ok"] is False, d
+ms = d["machines"]
+assert ms["build"]["agents"][0]["status"] == "blocked", ms
+assert ms["quiet"]["agents"] == [], ms
+# Unreachable is its OWN key, not an empty agent list — a consumer must not be able to read a
+# failure as an idle machine.
+assert "unreachable" in ms["gpu"] and "agents" not in ms["gpu"], ms' <"$WORK/out" \
+    || fail "the json fleet readout conflates unreachable with idle: $(cat "$WORK/out")"
+
+rm -f "$XDG_CONFIG_HOME/copad/mux.toml"
+unset FAKE_SSH_LOG
+ok "the fleet is queried in parallel; an unreachable machine is reported with a reason, never dropped"
+
+echo "21. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

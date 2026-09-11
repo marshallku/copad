@@ -776,6 +776,12 @@ pub struct MuxConfig {
     pub never_inherit: Vec<String>,
     /// `comux worktree create` naming + post-create hooks.
     pub worktree: WorktreeConfig,
+    /// `[machines.<name>]` — the SSH fleet, in configured (alphabetical) order.
+    ///
+    /// DECLARATIVE, like `~/.ssh/config`: there is deliberately no `comux machine add` that
+    /// edits this file. comux has never written to `mux.toml`, and a rewriter would have to
+    /// either preserve the user's comments and ordering or silently destroy them.
+    pub machines: Vec<crate::fleet::Machine>,
 }
 
 #[derive(Deserialize, Default)]
@@ -810,6 +816,13 @@ struct RawConfig {
     keys: Option<HashMap<String, ChordSpec>>,
     global: Option<HashMap<String, ChordSpec>>,
     worktree: Option<RawWorktree>,
+    machines: Option<std::collections::BTreeMap<String, RawMachine>>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawMachine {
+    ssh: Option<String>,
+    socket: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -907,6 +920,7 @@ impl MuxConfig {
                 naming: crate::worktree::DEFAULT_NAMING.to_string(),
                 scripts: HashMap::new(),
             },
+            machines: Vec::new(),
         }
     }
 
@@ -979,6 +993,7 @@ impl MuxConfig {
         };
 
         let worktree = build_worktree(raw.worktree, &mut warnings);
+        let machines = build_machines(raw.machines, &mut warnings);
         let never_inherit = build_never_inherit(raw.never_inherit, &mut warnings);
         let update_environment = build_update_environment(raw.update_environment, &mut warnings);
         // The two lists must stay DISJOINT, and `never_inherit` wins: `update_environment`
@@ -1089,6 +1104,7 @@ impl MuxConfig {
                 update_environment,
                 never_inherit,
                 worktree,
+                machines,
             },
             warnings,
         )
@@ -1218,6 +1234,38 @@ fn check_env_name(name: &str, field: &str, warnings: &mut Vec<String>) -> Option
 /// Build the `[worktree]` config: naming (empty → default) and per-repo hooks whose
 /// path keys are `~`-expanded then canonicalized (so a linked-worktree caller matches
 /// the same repo hook). Duplicate canonical keys are last-wins with a warning.
+/// `[machines.<name>]` → the fleet, dropping entries that cannot be used and SAYING so.
+///
+/// A machine with no `ssh` destination is skipped with a warning rather than defaulting to its
+/// own name: a silent default would query the wrong host, and a fleet readout that quietly
+/// omits a machine is exactly the failure this feature exists to prevent.
+fn build_machines(
+    raw: Option<std::collections::BTreeMap<String, RawMachine>>,
+    warnings: &mut Vec<String>,
+) -> Vec<crate::fleet::Machine> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (name, m) in raw {
+        let ssh = m
+            .ssh
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        match ssh {
+            Some(ssh) => out.push(crate::fleet::Machine {
+                name,
+                ssh,
+                socket: m.socket.filter(|s| !s.is_empty()),
+            }),
+            None => warnings.push(format!(
+                "machine '{name}' has no `ssh` destination — skipped"
+            )),
+        }
+    }
+    out
+}
+
 fn build_worktree(raw: Option<RawWorktree>, warnings: &mut Vec<String>) -> WorktreeConfig {
     let raw = raw.unwrap_or_default();
     let naming = match raw.naming {

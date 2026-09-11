@@ -189,3 +189,29 @@ restore_agent_sessions = true
 # focus-down = ["C-S-j", "C-S-Down"]
 # focus-up = ["C-S-k", "C-S-Up"]
 # focus-right = ["C-S-l", "C-S-Right"]
+
+
+# ---------------------------------------------------------------------------
+# SSH fleet — one comux server per machine, reached over ordinary OpenSSH.
+#
+# comux stores NO credentials: an entry is just a name and an `ssh` destination, so keys,
+# jump hosts, ports and multiplexing are whatever your ~/.ssh/config already says. The
+# destination is anything `ssh` accepts — `host`, `user@host`, or a Host alias.
+#
+# Declarative on purpose: there is no `comux machine add`. comux has never written to this
+# file, and a rewriter would have to either preserve your comments and ordering or quietly
+# destroy them.
+#
+#   comux machines                 # what is configured
+#   comux list-agents --fleet      # every machine's agents, side by side
+#
+# A machine that does not answer is REPORTED with a reason and sets exit status 1 — it is
+# never dropped from the list, because "no agents on build" and "could not reach build" are
+# not the same thing. See decision #116.
+# ---------------------------------------------------------------------------
+# [machines.build]
+# ssh = "me@build.local"
+#
+# [machines.gpu]
+# ssh = "gpu-box"            # a Host alias from ~/.ssh/config works too
+# socket = "/run/user/1000/comux.sock"   # only when that server is not at the default path

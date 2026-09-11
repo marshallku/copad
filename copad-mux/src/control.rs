@@ -612,6 +612,13 @@ pub fn run_client(args: &[String]) -> i32 {
     if args.first().map(|s| s.as_str()) == Some("worktree") {
         return run_worktree_client(&args[1..]);
     }
+    // Fleet verbs are answered ENTIRELY client-side: they read the local config and run `ssh`,
+    // and never touch this machine's server. Handled before a request is built so
+    // `comux machines` works with no server running at all — which is exactly when you want to
+    // ask where your agents are.
+    if let Some(code) = fleet_verb(args) {
+        return code;
+    }
 
     let mut json_out = false;
     let mut rest: Vec<&String> = Vec::new();
@@ -3651,4 +3658,122 @@ mod split_exit_tests {
                 .is_empty()
         );
     }
+}
+
+/// `comux machines` / `comux list-agents --fleet`, or `None` when this is not a fleet verb.
+/// Returns an exit code the caller passes straight back.
+fn fleet_verb(args: &[String]) -> Option<i32> {
+    let verb = args.first().map(|s| s.as_str())?;
+    let fleet_flag = args.iter().any(|a| a == "--fleet");
+    let json = args.iter().any(|a| a == "--json");
+    match verb {
+        "machines" => Some(print_machines(json)),
+        "list-agents" | "agents" if fleet_flag => Some(print_fleet_agents(json)),
+        _ => None,
+    }
+}
+
+/// The configured fleet plus any config warnings, which are printed rather than swallowed: a
+/// machine dropped for a bad entry must not just be missing from the list.
+fn load_machines() -> (Vec<crate::fleet::Machine>, Vec<String>) {
+    let (cfg, warnings) = crate::config::MuxConfig::load();
+    (cfg.machines, warnings)
+}
+
+fn print_machines(json: bool) -> i32 {
+    let (machines, warnings) = load_machines();
+    for w in &warnings {
+        eprintln!("comux: {w}");
+    }
+    if json {
+        let rows: Vec<serde_json::Value> = machines
+            .iter()
+            .map(|m| serde_json::json!({ "name": m.name, "ssh": m.ssh, "socket": m.socket }))
+            .collect();
+        println!("{}", serde_json::json!({ "ok": true, "machines": rows }));
+        return 0;
+    }
+    if machines.is_empty() {
+        // Not an error: one machine is the normal case. Say where they would go.
+        println!("(no machines configured — add a [machines.<name>] table to mux.toml)");
+        return 0;
+    }
+    println!("{:<16} {:<28} SOCKET", "NAME", "SSH");
+    for m in &machines {
+        println!(
+            "{:<16} {:<28} {}",
+            m.name,
+            m.ssh,
+            m.socket.as_deref().unwrap_or("")
+        );
+    }
+    0
+}
+
+fn print_fleet_agents(json: bool) -> i32 {
+    use crate::fleet::Reply;
+    let (machines, warnings) = load_machines();
+    for w in &warnings {
+        eprintln!("comux: {w}");
+    }
+    if machines.is_empty() {
+        eprintln!("comux: no machines configured — add a [machines.<name>] table to mux.toml");
+        return 2;
+    }
+    let replies = crate::fleet::query_all(&machines, "list-agents", crate::fleet::DEFAULT_TIMEOUT);
+    // An unreachable machine sets the exit code, so a script can branch on "the fleet answered
+    // in full" without re-parsing output. The reachable machines are still REPORTED: a partial
+    // answer beats none, as long as the gap is visible.
+    let mut incomplete = false;
+    if json {
+        let mut rows = serde_json::Map::new();
+        for (name, r) in &replies {
+            rows.insert(
+                name.clone(),
+                match r {
+                    Reply::Agents(a) => serde_json::json!({ "agents": a }),
+                    Reply::Unreachable(why) => {
+                        incomplete = true;
+                        serde_json::json!({ "unreachable": why })
+                    }
+                },
+            );
+        }
+        println!(
+            "{}",
+            serde_json::json!({ "ok": !incomplete, "machines": rows })
+        );
+        return i32::from(incomplete);
+    }
+    println!(
+        "{:<12} {:<12} {:<10} {:<9} {:<6} DOING",
+        "MACHINE", "SPACE", "TOOL", "STATUS", "FOR"
+    );
+    for (name, r) in &replies {
+        match r {
+            Reply::Agents(agents) if agents.is_empty() => println!("{name:<12} (no agents)"),
+            Reply::Agents(agents) => {
+                for a in agents {
+                    let g = |k: &str| a.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let secs = a.get("for_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+                    println!(
+                        "{:<12} {:<12} {:<10} {:<9} {:<6} {}",
+                        name,
+                        g("space"),
+                        g("tool"),
+                        g("status"),
+                        format!("{secs}s"),
+                        g("detail")
+                    );
+                }
+            }
+            Reply::Unreachable(why) => {
+                incomplete = true;
+                // Reported, never omitted: "no agents on build" and "could not reach build"
+                // look identical in a list that drops failures, and only one needs acting on.
+                println!("{name:<12} UNREACHABLE  {why}");
+            }
+        }
+    }
+    i32::from(incomplete)
 }

@@ -19,6 +19,7 @@ pub mod control;
 pub mod copadlink;
 pub mod doctor;
 pub mod fdlimit;
+pub mod fleet;
 pub mod gitinfo;
 pub mod hostmetrics;
 pub mod model;
