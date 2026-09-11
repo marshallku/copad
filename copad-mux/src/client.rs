@@ -311,7 +311,14 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
     )?;
 
     let mut wr = stream.try_clone()?;
-    send(&mut wr, &ClientMsg::Attach { cols, rows })?;
+    send(
+        &mut wr,
+        &ClientMsg::Attach {
+            cols,
+            rows,
+            pid: Some(std::process::id()),
+        },
+    )?;
 
     // The server's `Hello` is always its first message. Consume it SYNCHRONOUSLY here —
     // before the input loop starts — and reply with our `Env` so a fast pane-creation

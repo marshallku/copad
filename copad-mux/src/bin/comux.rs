@@ -11,8 +11,8 @@
 //!
 //! Control commands: list | split | resize | focus | close | send | list-tabs | new-tab |
 //! select-tab | close-tab | rename-tab | list-sessions | new-session [name] |
-//! rename-session | select-session | kill-session | worktree <create|list|rm> | reload |
-//! health | kill-server.
+//! rename-session | select-session | kill-session | jump | notify |
+//! worktree <create|list|rm> | reload | health | kill-server.
 //!
 //! The server holds the shells; the client renders + forwards input and can detach
 //! (`Ctrl-b d`) / reattach, so a session survives the terminal that launched it.
@@ -37,6 +37,8 @@ fn print_usage() {
          \x20 comux rename-tab [i] <name> rename the active tab (or by index; \"\" clears)\n\
          \x20 comux close-tab [i]         close a tab (no index → picker)\n\
          \x20 comux split -h|-v           split the focused pane\n\
+         \x20 comux jump <pane>           switch to a pane anywhere (by $COPAD_MUX_PANE token)\n\
+         \x20 comux notify <body...>      raise an agent toast for this pane (--kind done|blocked)\n\
          \x20 comux worktree create <br>  git worktree + a session in it (also list|rm)\n\
          \x20 comux reload                re-read mux.toml on the live server (tmux source-file)\n\
          \x20 comux doctor [--json]       diagnose config problems (mux.toml + config.toml)\n\

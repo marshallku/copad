@@ -28,6 +28,40 @@ The server watches each agent's status **transitions** and fires a native deskto
 
 Disable toasts with `notify = false` in `mux.toml`, or `COPAD_MUX_NOTIFY=0` (the env var wins).
 
+### Clicking a toast
+
+The toast carries a **click action**: clicking it switches to the pane that raised it — its session, its tab, that pane — and brings the terminal window to the front. This works on Linux (dunst / libnotify actions) and macOS (`terminal-notifier`), and from any session, not just the one you're looking at.
+
+The click runs `comux jump <pane-token>`, which you can also run yourself:
+
+```bash
+comux jump "$COPAD_MUX_PANE"   # from inside a pane
+comux list --json              # prints every pane's token
+comux jump <token> --no-raise  # switch, but don't touch window focus
+```
+
+Two caveats, both deliberate:
+
+- **Tokens don't survive a server restart.** They're qualified by server incarnation, so clicking a toast left over from a previous server says `unknown pane` instead of jumping to whatever pane inherited that slot.
+- **Raising is application-level.** A pid identifies your terminal emulator, not which of its windows or native tabs holds the client — with several windows open, the one your WM considers current comes forward.
+
+On macOS the first click may ask for Automation permission (the raise is a `System Events` call).
+
+### Raising one from an agent hook
+
+An agent's own hooks know the exact moment a turn ended and the real message; comux's sweep can only infer a transition at ~2 Hz. A hook running inside a pane can push directly:
+
+```bash
+comux notify --pane "$COPAD_MUX_PANE" --kind blocked "waiting on a permission prompt"
+comux notify --kind done "turn finished"        # --pane defaults to $COPAD_MUX_PANE
+```
+
+`--kind` is `done` or `blocked`. Once a pane's agent has pushed a kind, the status sweep stops toasting that kind for it, so the two don't double-fire. Ownership is per `(pane, agent pid, kind)`: a hook that only reports `done` still gets sweep-detected `blocked` toasts, and a new agent in the same pane starts fresh rather than inheriting its predecessor's silence. The one case that can still double is the very first event of an agent's life, if the sweep notices the transition before the hook's push arrives.
+
+If neither `--pane` nor `$COPAD_MUX_PANE` is set, `comux notify` is a usage error — it never guesses the active pane, because a misattributed toast sends its click somewhere misleading.
+
+> After upgrading the comux binary, run `comux server restart` before these verbs work: the *running* server is what handles them.
+
 ---
 
 ## The usage / limits readout

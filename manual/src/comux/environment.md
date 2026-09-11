@@ -12,6 +12,7 @@ comux reads a handful of `COPAD_MUX_*` environment variables. Most duplicate a `
 | `COPAD_MUX_REDRAW_MS` | Set to a millisecond value to re-enable the periodic self-healing full repaint. **Default off** (the periodic repaint flashes a blank frame each tick, so it's kept as an escape hatch for outer-emulator drift only). |
 | `COPAD_MUX_QUIET_SSH` | `COPAD_MUX_QUIET_SSH=1` silences the "you're on SSH" advisory printed when `SSH_CONNECTION` is set. |
 | `COPAD_MUX` | Set to `1` by the server inside every pane. Marks a shell as already inside a comux pane (so `worktree create` from within comux doesn't spawn a nested client). Load-bearing — do not set or add it to `update_environment`. |
+| `COPAD_MUX_PANE` | Set by the server inside every pane to that pane's own identity (the `$TMUX_PANE` analogue), e.g. `ea196aa39dce-0`. Pass it to `comux jump` / `comux notify --pane` to address the pane from a script or an agent hook. Qualified by server incarnation, so a token from a previous server deliberately no longer resolves. Load-bearing — do not set it yourself. |
 
 Related non-`COPAD_MUX_*` variables comux consults: `XDG_RUNTIME_DIR` / `TMPDIR` / `USER` (runtime dir), `XDG_CONFIG_HOME` / `HOME` (config), `XDG_STATE_HOME` / `HOME` (state), `SHELL` (pane shell), and `SSH_CONNECTION` (SSH advisory).
 

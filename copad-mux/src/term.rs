@@ -7,8 +7,8 @@
 
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
 use alacritty_terminal::event::{Event, EventListener, WindowSize};
@@ -167,6 +167,32 @@ impl EventListener for MuxListener {
 }
 
 /// A hosted terminal pane.
+/// The environment variable naming a pane's identity inside its own shell — the
+/// `$TMUX_PANE` analogue. A hook running inside a pane reads it to tell comux WHICH
+/// pane raised a notification (`comux notify --pane "$COPAD_MUX_PANE"`).
+pub const PANE_TOKEN_ENV: &str = "COPAD_MUX_PANE";
+
+/// Mint a fresh pane token, unique across this server's lifetime AND across restarts.
+///
+/// The cross-restart part is why this is not just a counter: `TerminalId`s (and any
+/// naive counter) restart at zero with the server, so a toast left on screen from a
+/// previous incarnation would resolve against a DIFFERENT pane and jump somewhere
+/// wrong. Qualifying every token with a per-process nonce (pid + boot second) makes a
+/// stale click resolve to nothing, which reports "unknown pane" instead.
+pub fn next_pane_token() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    static NONCE: OnceLock<String> = OnceLock::new();
+    let nonce = NONCE.get_or_init(|| {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        format!("{:x}{:x}", std::process::id(), secs)
+    });
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{nonce}-{n}")
+}
+
 pub struct PaneTerm {
     term: Arc<FairMutex<Term<MuxListener>>>,
     sender: EventLoopSender,
@@ -183,6 +209,10 @@ pub struct PaneTerm {
     /// (e.g. worktree-removal safety) when the live `process_cwd` is momentarily
     /// unreadable — a pane never spawns "below" its initial cwd without our knowing.
     spawn_cwd: Option<PathBuf>,
+    /// The pane identity handed to the shell as `COPAD_MUX_PANE` (see
+    /// [`next_pane_token`]) — read back out of the spawn env rather than passed
+    /// separately, so every spawn path that builds a pane env gets it for free.
+    pane_token: Option<String>,
 }
 
 /// Turn a pane-spawn I/O error into a message worth showing a user.
@@ -259,7 +289,11 @@ impl PaneTerm {
         if let Some(dir) = cwd {
             opts.working_directory = Some(dir);
         }
+        let mut pane_token = None;
         for (k, v) in env {
+            if k == PANE_TOKEN_ENV {
+                pane_token = Some(v.clone());
+            }
             opts.env.insert(k.clone(), v.clone());
         }
 
@@ -308,12 +342,19 @@ impl PaneTerm {
             child_pid,
             fg_fd,
             spawn_cwd,
+            pane_token,
         })
     }
 
     /// The child shell's pid (fallback label when no foreground group is set).
     pub fn pid(&self) -> Option<u32> {
         self.child_pid
+    }
+
+    /// This pane's `COPAD_MUX_PANE` identity, if its spawn env carried one. What a
+    /// notification's click action and `comux notify --pane` address.
+    pub fn pane_token(&self) -> Option<&str> {
+        self.pane_token.as_deref()
     }
 
     /// The directory the shell was spawned in (liveness fallback when the live
@@ -646,6 +687,26 @@ fn ansi_to_cell(color: AnsiColor) -> CellColor {
             NamedColor::BrightWhite => CellColor::Indexed(15),
             _ => CellColor::Default,
         },
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::next_pane_token;
+
+    /// Tokens must be unique within a run AND carry a per-incarnation prefix, so a token
+    /// minted by a PREVIOUS server (a toast that outlived a restart) cannot resolve here.
+    #[test]
+    fn tokens_are_unique_and_incarnation_qualified() {
+        let a = next_pane_token();
+        let b = next_pane_token();
+        assert_ne!(a, b);
+        let (na, ia) = a.rsplit_once('-').expect("token is <nonce>-<counter>");
+        let (nb, ib) = b.rsplit_once('-').expect("token is <nonce>-<counter>");
+        assert_eq!(na, nb, "same server incarnation shares the nonce");
+        assert!(!na.is_empty(), "nonce must not be empty");
+        assert_ne!(ia, ib);
+        assert!(ia.parse::<u64>().is_ok() && ib.parse::<u64>().is_ok());
     }
 }
 

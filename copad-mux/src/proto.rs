@@ -108,7 +108,17 @@ pub enum MouseKind {
 pub enum ClientMsg {
     /// Open a streaming session at the client's terminal size (must be the first
     /// line on the connection).
-    Attach { cols: u16, rows: u16 },
+    ///
+    /// `pid` is the client process's own pid, used only to find the terminal emulator
+    /// hosting it so a notification jump can raise that window. `#[serde(default)]`
+    /// keeps a client built before this field compatible with a newer server — it just
+    /// means no window gets raised.
+    Attach {
+        cols: u16,
+        rows: u16,
+        #[serde(default)]
+        pid: Option<u32>,
+    },
     /// The client's values for the variables the server advertised in
     /// [`ServerMsg::Hello::update_environment`] (only those the client actually has,
     /// valid UTF-8). Sent immediately after `Hello`, before any input, so new panes
@@ -129,6 +139,21 @@ pub enum ClientMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `attach` line from a client built before the pid field must still open a
+    /// session — the field only decides whether a window gets raised, and refusing the
+    /// attach would break every running client the moment the server is upgraded.
+    #[test]
+    fn attach_without_pid_still_parses() {
+        let old = r#"{"t":"attach","cols":80,"rows":24}"#;
+        match serde_json::from_str::<ClientMsg>(old).expect("old attach must parse") {
+            ClientMsg::Attach { cols, rows, pid } => {
+                assert_eq!((cols, rows), (80, 24));
+                assert_eq!(pid, None);
+            }
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
 
     /// `ClientMsg::Env` MUST be a struct variant: an internally-tagged enum can't tag a
     /// newtype variant carrying a sequence, so `Env(Vec<…>)` would fail to serialize and

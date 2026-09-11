@@ -72,6 +72,29 @@ pub enum Req {
     },
     /// Make the session at `index` (as printed by `list-sessions`) active.
     SelectSession { index: usize },
+    /// Jump to a pane ANYWHERE in the mux by identity rather than by position: switch to
+    /// its session, select its tab, focus it. `target` is a pane token (the
+    /// `$COPAD_MUX_PANE` a pane's own shell carries) or a raw terminal id.
+    ///
+    /// This is what a desktop notification's click action runs. The response carries the
+    /// pid of the terminal emulator hosting an attached client (`raise_pid`), which the
+    /// CLI — not the server — then activates: the server's environment has been scrubbed
+    /// of the session variables a GUI command needs, and a long-lived daemon is the wrong
+    /// process to attribute macOS automation permission to.
+    Jump { target: String },
+    /// Raise an agent notification on behalf of a pane: a desktop toast whose click jumps
+    /// back to it, plus an entry in the in-app notification center. The entry point for
+    /// agent hooks (Claude `Stop`/`Notification`, Codex turn-complete), which know the
+    /// exact moment and message the server's ~2 Hz status sweep can only infer.
+    Notify {
+        /// Pane token / terminal id to attribute it to. Never defaulted to the active
+        /// pane — a misattributed jump is worse than a rejected notification.
+        target: String,
+        /// `done` (turn finished) or `blocked` (awaiting input).
+        kind: String,
+        /// Toast body. The title is composed server-side from the agent + session.
+        body: String,
+    },
     /// Kill the session at `index` (as printed by `list-sessions`): drop its tabs and
     /// reap every shell in them, switching to a survivor when it was the active one.
     /// Refused when it is the LAST session (the mux keeps ≥1). Unlike the TUI's
@@ -160,6 +183,10 @@ impl HealthInfo {
 pub struct PaneInfo {
     pub index: usize,
     pub id: String,
+    /// The pane's `$COPAD_MUX_PANE` identity — what `comux jump` / `comux notify --pane`
+    /// address. Empty for a pane spawned before the identity existed.
+    #[serde(default)]
+    pub token: String,
     pub focused: bool,
     pub cols: u16,
     pub rows: u16,
@@ -250,6 +277,15 @@ pub struct Resp {
     pub active_session: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<HealthInfo>,
+    /// `jump`: the pid of the terminal emulator hosting an attached client, for the CLI
+    /// to activate. Absent when nothing is attached (the jump still happened — the next
+    /// attach lands on the right pane).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raise_pid: Option<u32>,
+    /// `jump`: that pid's process name, so the CLI can re-check the pid still belongs to
+    /// the same program before activating it (pids get recycled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raise_comm: Option<String>,
 }
 
 impl Resp {
@@ -266,6 +302,21 @@ impl Resp {
             sessions: None,
             active_session: None,
             health: None,
+            raise_pid: None,
+            raise_comm: None,
+        }
+    }
+
+    /// A `jump` response: optionally naming a terminal-emulator process to activate.
+    pub fn jump(raise: Option<(u32, String)>) -> Self {
+        let (pid, comm) = match raise {
+            Some((p, c)) => (Some(p), Some(c)),
+            None => (None, None),
+        };
+        Self {
+            raise_pid: pid,
+            raise_comm: comm,
+            ..Self::ok()
         }
     }
 
@@ -473,6 +524,61 @@ pub fn run_client(args: &[String]) -> i32 {
                 Req::Close { index: idx }
             }
         }
+        "jump" => {
+            // Addressed by identity, not position, so there is no index listing to fuzzy-pick
+            // from when it is omitted (unlike `focus`/`select-tab`): `comux list --json`
+            // prints each pane's token, and a pane's own shell carries `$COPAD_MUX_PANE`.
+            let Some(target) = rest.get(1).filter(|t| !t.starts_with('-')) else {
+                eprintln!(
+                    "usage: comux jump <pane-token|terminal-id> [--no-raise]\n\
+                     hint:  a pane's own shell has it in $COPAD_MUX_PANE; \
+                     `comux list --json` prints the rest"
+                );
+                return 2;
+            };
+            Req::Jump {
+                target: target.to_string(),
+            }
+        }
+        "notify" => {
+            let mut target = std::env::var("COPAD_MUX_PANE").unwrap_or_default();
+            let mut kind = "done".to_string();
+            let mut body = Vec::new();
+            let mut it = rest.iter().skip(1);
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--pane" => match it.next() {
+                        Some(v) => target = (*v).clone(),
+                        None => {
+                            eprintln!("comux notify: --pane needs a value");
+                            return 2;
+                        }
+                    },
+                    "--kind" => match it.next() {
+                        Some(v) => kind = (*v).clone(),
+                        None => {
+                            eprintln!("comux notify: --kind needs a value");
+                            return 2;
+                        }
+                    },
+                    other => body.push(other.to_string()),
+                }
+            }
+            if target.is_empty() {
+                // Never fall back to the active pane: a notification attributed to the
+                // wrong pane sends its click somewhere misleading.
+                eprintln!(
+                    "usage: comux notify [--pane <token>] [--kind done|blocked] <body...>\n\
+                     comux: no pane given and $COPAD_MUX_PANE is unset (not inside a comux pane?)"
+                );
+                return 2;
+            }
+            Req::Notify {
+                target,
+                kind,
+                body: body.join(" "),
+            }
+        }
         "resize" => {
             let idx = rest.get(1).and_then(|s| s.parse::<usize>().ok());
             let dir = rest.get(2).map(|s| s.as_str());
@@ -536,12 +642,39 @@ pub fn run_client(args: &[String]) -> i32 {
         return 1;
     }
 
+    // A jump exists to put the pane in front of the user, which a state switch alone
+    // does not do when the terminal is behind another window. The RAISE runs here, in
+    // this short-lived process, rather than in the server: the daemon's environment was
+    // scrubbed of the session vars a GUI command needs, and it is the wrong process for
+    // macOS to attribute automation permission to. Opt out with `--no-raise`.
+    if matches!(req, Req::Jump { .. }) && resp.ok && !args.iter().any(|a| a == "--no-raise") {
+        maybe_raise(&resp);
+    }
+
     if json_out {
         println!("{}", serde_json::to_string(&resp).unwrap_or_default());
     } else {
         print_human(&req, &resp);
     }
     if resp.ok { 0 } else { 1 }
+}
+
+/// Activate the terminal window a `jump` response named, after re-checking the pid still
+/// belongs to the same program.
+///
+/// The recheck is not ceremony: the pid was sampled by the server a moment ago, and pids
+/// are recycled — without it, a terminal that exited between the response and the click
+/// could hand its number to an unrelated process, which we would then bring to the front.
+fn maybe_raise(resp: &Resp) {
+    let (Some(pid), Some(comm)) = (resp.raise_pid, resp.raise_comm.as_deref()) else {
+        return;
+    };
+    let still_there = crate::procinfo::ProcTree::snapshot()
+        .and_then(|t| t.parent_of(pid))
+        .is_some_and(|(_, live)| live == comm);
+    if still_there {
+        crate::winfocus::raise(pid, &[]);
+    }
 }
 
 /// Exit code for "the user cancelled the picker" — fzf's (and SIGINT's) convention, so a

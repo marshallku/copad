@@ -485,6 +485,13 @@ impl ProcTree {
         (!procs.is_empty()).then_some(Self { procs })
     }
 
+    /// This pid's `(ppid, comm-basename)`, or `None` when it is not in the snapshot.
+    /// The primitive behind the window-raise ancestor walk (`winfocus`), kept here so
+    /// `ProcRec` stays private.
+    pub fn parent_of(&self, pid: u32) -> Option<(u32, String)> {
+        self.procs.get(&pid).map(|r| (r.ppid, r.comm.clone()))
+    }
+
     /// The classified label of the terminal's foreground PROCESS GROUP (from
     /// `tcgetpgrp`). The pgid is NOT necessarily a live pid — in a pipeline like
     /// `true | sleep 300` the group leader (`true`) can exit while `sleep` runs —

@@ -30,6 +30,7 @@ pub mod term;
 pub mod tui;
 pub mod usagepoll;
 pub mod versionpoll;
+pub mod winfocus;
 pub mod worktree;
 
 pub use model::{

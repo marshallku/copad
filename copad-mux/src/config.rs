@@ -68,6 +68,9 @@ pub fn default_update_environment() -> Vec<String> {
         "WINDOWID",
         "KRB5CCNAME",
         "TERM_PROGRAM",
+        // The compositor instance a window-raise (notification jump) talks to. A server
+        // that outlives a Hyprland session would otherwise keep addressing the dead one.
+        "HYPRLAND_INSTANCE_SIGNATURE",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -126,6 +129,9 @@ const ENV_UPDATE_BLOCKLIST: &[&str] = &[
     "_",
     "COPAD_MUX",
     "COPAD_MUX_SOCK",
+    // Per-pane identity, minted at spawn: a client-supplied value would make two panes
+    // answer to the same token and send a notification jump to the wrong one.
+    "COPAD_MUX_PANE",
 ];
 
 /// How sessions are ordered in the sidebar + `Ctrl-f` switcher + `)`/`(` cycling.

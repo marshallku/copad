@@ -89,7 +89,7 @@ It only opens when it can: with `--json`, or when stderr isn't a terminal (a pip
 ## What makes comux different from tmux
 
 - **Agent awareness.** comux reads each agent pane's real status (Claude via `~/.claude/sessions/<pid>.json`, Codex/others via screen-text) and shows `working` / `ready` / `blocked` in the sidebar and status bar.
-- **Turn notifications.** A native desktop toast fires when an agent finishes a turn or starts waiting for input — even while you're detached. `Ctrl-b !` jumps to a blocked agent; `Ctrl-b a` opens a notification center.
+- **Turn notifications you can click.** A native desktop toast fires when an agent finishes a turn or starts waiting for input — even while you're detached — and **clicking it switches to that pane** (and raises the terminal window), wherever in the mux it lives. `Ctrl-b !` jumps to a blocked agent; `Ctrl-b a` opens a notification center. An agent's own hooks can raise one directly with `comux notify` (see [Environment](./environment.md)).
 - **Agents resume mid-conversation.** On restart, a restored agent pane doesn't start a fresh chat — it reconnects to its live session (`claude --resume <id>` / `codex resume <id>`). See [Persistence & Agent Resume](./persistence.md).
 - **Git worktrees as a first-class verb.** `comux worktree create <branch>` makes a sibling worktree, runs a per-repo hook, and drops you into a session there. See [Git Worktrees](./worktrees.md).
 - **A rich, always-on status bar** with a usage/limits carousel, agent counts, and an attention indicator. See [The Status Bar](./status-bar.md).

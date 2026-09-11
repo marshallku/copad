@@ -71,6 +71,9 @@ enum Incoming {
         id: u64,
         cols: u16,
         rows: u16,
+        /// The client process's pid, when it advertised one — the start of the walk to
+        /// the terminal emulator a notification jump should raise.
+        pid: Option<u32>,
         out: SyncSender<ServerMsg>,
         /// A clone of the connection, so the main loop can `shutdown` it to force a
         /// detach even when the bounded frame queue can't take a `Bye`.
@@ -110,6 +113,9 @@ struct Client {
     epoch: u64,
     cols: u16,
     rows: u16,
+    /// This client process's pid, when advertised at attach — the walk-up start for
+    /// raising its terminal window after a notification jump.
+    pid: Option<u32>,
     /// This client's refreshed session vars (tmux `update-environment`), sent right after
     /// attach via [`ClientMsg::Env`]. Adopted as the pane-spawn env source when this client's
     /// input is dispatched, so a pane it creates inherits ITS live SSH/display session.
@@ -124,6 +130,16 @@ struct Client {
     /// pane that writes the clipboard every tick would overwrite — and with backpressure, starve
     /// — an undelivered drag copy that happened later.
     pending_copy: Option<(u64, String)>,
+}
+
+/// What a client's `attach` line said about itself: its id (server-minted), the terminal
+/// size to open at, and its own pid (for window raising). Grouped so the per-connection
+/// thread takes one parameter for the connection's identity rather than four.
+struct AttachInfo {
+    id: u64,
+    cols: u16,
+    rows: u16,
+    pid: Option<u32>,
 }
 
 /// Per-connection handshake config threaded from [`run`] to each attaching client: the
@@ -524,8 +540,21 @@ fn handle_conn(stream: UnixStream, id: u64, tx: Sender<Incoming>, cfg: AttachCfg
     // A `{"cmd":…}` line is a control request; a `{"t":"attach",…}` opens a stream.
     if let Ok(req) = serde_json::from_str::<control::Req>(&first) {
         serve_ctl(Some(req), reader, stream, tx);
-    } else if let Ok(ClientMsg::Attach { cols, rows }) = serde_json::from_str::<ClientMsg>(&first) {
-        serve_client(id, cols, rows, reader, stream, tx, cfg);
+    } else if let Ok(ClientMsg::Attach { cols, rows, pid }) =
+        serde_json::from_str::<ClientMsg>(&first)
+    {
+        serve_client(
+            AttachInfo {
+                id,
+                cols,
+                rows,
+                pid,
+            },
+            reader,
+            stream,
+            tx,
+            cfg,
+        );
     } else {
         let mut w = stream;
         let _ = writeln!(
@@ -591,14 +620,18 @@ fn serve_ctl(
 /// Streaming client session: register, spawn a writer thread draining frames to the
 /// socket, and forward every subsequent `ClientMsg` to the main loop.
 fn serve_client(
-    id: u64,
-    cols: u16,
-    rows: u16,
+    info: AttachInfo,
     mut reader: BufReader<UnixStream>,
     mut writer: UnixStream,
     tx: Sender<Incoming>,
     cfg: AttachCfg,
 ) {
+    let AttachInfo {
+        id,
+        cols,
+        rows,
+        pid,
+    } = info;
     // A clone the main loop can shut down to force-detach this client reliably.
     let Ok(conn) = writer.try_clone() else { return };
     // Server-authoritative handshake FIRST (before any frame): tell the client whether
@@ -619,6 +652,7 @@ fn serve_client(
             id,
             cols,
             rows,
+            pid,
             out: out_tx,
             conn,
         })
@@ -662,6 +696,19 @@ fn serve_client(
     }
     let _ = tx.send(Incoming::Disconnect { id });
     let _ = writer_handle.join();
+}
+
+/// Drop a departing client's pid from the window-raise candidates.
+///
+/// Called on EVERY removal path (key detach, explicit detach, disconnect, dead-client
+/// prune) — not just disconnect. A client removed by one of the other paths never reaches
+/// the `Disconnect` arm's bookkeeping (its late `Disconnect` finds no client and no-ops),
+/// so its exited pid would otherwise stay the newest candidate forever and shadow the
+/// client that is still attached.
+fn forget_client(app: &mut App, c: &Client) {
+    if let Some(p) = c.pid {
+        app.forget_client_pid(p);
+    }
 }
 
 /// Detach a client for good: send `Bye` (best effort, may not fit the bounded queue)
@@ -708,6 +755,7 @@ fn handle_incoming(
             id,
             cols,
             rows,
+            pid,
             out,
             conn,
         } => {
@@ -724,9 +772,13 @@ fn handle_incoming(
                 epoch: 0,
                 cols,
                 rows,
+                pid,
                 env: Vec::new(),
                 pending_copy: None,
             });
+            if let Some(p) = pid {
+                app.set_client_pid(p);
+            }
             recompute_viewport(app, clients);
             true // a new client needs a (full) frame
         }
@@ -764,7 +816,9 @@ fn handle_incoming(
                     match action {
                         KeyAction::Detach => {
                             if let Some(pos) = clients.iter().position(|c| c.id == id) {
-                                detach_client(clients.remove(pos));
+                                let gone = clients.remove(pos);
+                                forget_client(app, &gone);
+                                detach_client(gone);
                                 // Reap the departing client's owned overlays (a menu it
                                 // opened must not linger capturing others' input).
                                 app.clear_selection_of(ClientId(id));
@@ -807,7 +861,9 @@ fn handle_incoming(
                 }
                 ClientMsg::Detach => {
                     if let Some(pos) = clients.iter().position(|c| c.id == id) {
-                        detach_client(clients.remove(pos));
+                        let gone = clients.remove(pos);
+                        forget_client(app, &gone);
+                        detach_client(gone);
                         // Same overlay reaping as the key-detach / disconnect paths.
                         app.clear_selection_of(ClientId(id));
                         app.close_menu_of(ClientId(id));
@@ -821,7 +877,8 @@ fn handle_incoming(
         Incoming::Disconnect { id } => {
             // The socket is already gone — drop the client WITHOUT another shutdown.
             if let Some(pos) = clients.iter().position(|c| c.id == id) {
-                clients.remove(pos);
+                let gone = clients.remove(pos);
+                forget_client(app, &gone);
                 // Drop a drag-selection / context menu the departing client owned (no
                 // live owner to finish them).
                 app.clear_selection_of(ClientId(id));
@@ -858,6 +915,7 @@ fn prune_dead_clients(app: &mut App, clients: &mut Vec<Client>, dead: &[u64]) ->
     while i < clients.len() {
         if dead.contains(&clients[i].id) {
             let c = clients.remove(i);
+            forget_client(app, &c);
             // Drop any drag-selection / context menu the departing client owned.
             app.clear_selection_of(ClientId(c.id));
             app.close_menu_of(ClientId(c.id));
@@ -1031,6 +1089,7 @@ mod tests {
             epoch: 0,
             cols,
             rows,
+            pid: None,
             env: Vec::new(),
             pending_copy: None,
         };
@@ -1155,6 +1214,34 @@ mod tests {
             !status_row(&app).contains("^b"),
             "a departed client must not leave the prefix flag stuck: {:?}",
             status_row(&app)
+        );
+    }
+
+    /// A client removed by the dead-client PRUNE never reaches the `Disconnect` arm (its
+    /// late `Disconnect` finds no client and no-ops), so if the prune didn't clear its pid
+    /// the exited terminal would stay the newest raise candidate and shadow the client that
+    /// is still attached — notification clicks would stop raising anything.
+    #[test]
+    fn pruning_a_dead_client_drops_its_raise_candidate() {
+        let (mut cfg, _) = MuxConfig::load_from(std::path::Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false;
+        let mut app = App::new(80, 24, Vec::new(), Vec::new(), cfg).expect("app");
+
+        let (mut live, _live_guard) = test_client(1, 80, 24);
+        let (mut dying, dying_guard) = test_client(2, 80, 24);
+        live.pid = Some(1111);
+        dying.pid = Some(2222);
+        app.set_client_pid(1111);
+        app.set_client_pid(2222);
+        drop(dying_guard); // writer gone — discovered half-dead during delivery
+        let mut clients = vec![live, dying];
+
+        push_frames(&mut app, &mut clients);
+        assert_eq!(clients.len(), 1, "the half-dead client is pruned");
+        assert_eq!(
+            app.raise_candidates(),
+            &[1111],
+            "the pruned client's pid must not outlive it"
         );
     }
 

@@ -19,7 +19,8 @@
 #   4. new-session → kill-session <i> reaps it
 #   5. kill-session on the LAST session is refused
 #   6. a pane whose shell IGNORES SIGHUP is killed without wedging the server
-#   7. a bad index is refused; `--json` with no index is a usage error (exit 2)
+#   7. pane identity (`$COPAD_MUX_PANE`) + `notify` + cross-session `jump` by token
+#   8. a bad index is refused; `--json` with no index is a usage error (exit 2)
 
 set -euo pipefail
 
@@ -146,7 +147,45 @@ kill -0 "$DEAF_PID" 2>/dev/null && fail "the SIGHUP-deaf shell (pid $DEAF_PID) l
 DEAF_PID=""
 ok "reaped off the loop, escalated to SIGKILL; the server stayed responsive"
 
-echo "7. bad index / missing index"
+echo "7. pane identity, notify, and jump by token"
+t 10 "$COMUX" list --json >"$WORK/json"
+token0="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["panes"][0]["token"])' <"$WORK/json")"
+[[ -n "$token0" ]] || fail "pane 0 has no \$COPAD_MUX_PANE token"
+# Incarnation-qualified (`<nonce>-<n>`), so a token from a previous server can't resolve.
+[[ "$token0" == *-* ]] || fail "token '$token0' is not <nonce>-<counter>"
+t 10 "$COMUX" notify --pane "$token0" --kind blocked "e2e says hello" >/dev/null \
+    || fail "notify on a live pane failed"
+if t 10 "$COMUX" notify --pane "no-such-pane" --kind done body >"$WORK/out" 2>&1; then
+    fail "notify on an unknown pane should have failed: $(cat "$WORK/out")"
+fi
+grep -q "unknown pane" "$WORK/out" || fail "expected 'unknown pane', got: $(cat "$WORK/out")"
+if t 10 "$COMUX" notify --pane "$token0" --kind sideways body >"$WORK/out" 2>&1; then
+    fail "notify with a bogus kind should have failed: $(cat "$WORK/out")"
+fi
+grep -q "unknown kind" "$WORK/out" || fail "expected 'unknown kind', got: $(cat "$WORK/out")"
+# No pane given and no $COPAD_MUX_PANE in the environment: a usage error, NEVER a
+# notification silently attributed to whichever pane happens to be active.
+set +e
+(unset COPAD_MUX_PANE; t 10 "$COMUX" notify "orphan" >/dev/null 2>&1); code=$?
+set -e
+[[ "$code" == "2" ]] || fail "expected usage exit 2 for a pane-less notify, got $code"
+# Jump crosses sessions by identity: switch away, then jump back by the token.
+t 10 "$COMUX" new-session e2e-jump >/dev/null
+t 10 "$COMUX" list-sessions --json >"$WORK/json"
+active="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["active_session"])' <"$WORK/json")"
+[[ "$active" == "1" ]] || fail "expected the new session to be active, got index $active"
+t 10 "$COMUX" jump "$token0" >/dev/null || fail "jump to a live pane failed"
+t 10 "$COMUX" list-sessions --json >"$WORK/json"
+active="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["active_session"])' <"$WORK/json")"
+[[ "$active" == "0" ]] || fail "jump did not switch back to session 0 (active=$active)"
+if t 10 "$COMUX" jump "deadbeef-99" >"$WORK/out" 2>&1; then
+    fail "jump to a stale token should have failed: $(cat "$WORK/out")"
+fi
+grep -q "unknown pane" "$WORK/out" || fail "expected 'unknown pane', got: $(cat "$WORK/out")"
+t 10 "$COMUX" kill-session 1 >/dev/null || fail "could not clean up the jump session"
+ok "token minted per pane; notify validated; jump switched sessions by identity"
+
+echo "8. bad index / missing index"
 t 10 "$COMUX" close-tab 99 >/dev/null 2>&1 && fail "close-tab 99 should have failed"
 t 10 "$COMUX" kill-session 99 >/dev/null 2>&1 && fail "kill-session 99 should have failed"
 # `--json` suppresses the fuzzy picker, so an omitted index stays a usage error (2).
@@ -156,10 +195,10 @@ set -e
 [[ "$code" == "2" ]] || fail "expected usage exit 2 for a picker-less close-tab, got $code"
 ok "out-of-range refused; --json with no index is exit 2"
 
-echo "8. the server is still responsive and shuts down cleanly"
+echo "9. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"
 
 echo
-echo "PASS — comux close-tab / kill-session verified end to end"
+echo "PASS — comux close-tab / kill-session / notify / jump verified end to end"

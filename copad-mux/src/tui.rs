@@ -11,7 +11,7 @@
 //! local and detached/reattached sessions.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -39,7 +39,7 @@ use crate::picker::fuzzy_match;
 use crate::procinfo;
 use crate::proto::MouseKind;
 use crate::state::{Command, Event, MuxError, Origin, RestoredTab, State};
-use crate::term::{CellColor, PaneTerm};
+use crate::term::{self, CellColor, PaneTerm};
 use crate::usagepoll::{self, UsagePart, UsageSnapshot};
 use crate::versionpoll::{self, VersionStatus};
 
@@ -61,13 +61,20 @@ struct Notification {
     kind: &'static str,
     tool: String,
     space: String,
-    body: &'static str,
+    body: String,
     /// The pane it came from — `Enter` in the center jumps here.
     terminal: TerminalId,
 }
 
 /// Max notifications retained in the center.
 const NOTIFY_LOG_CAP: usize = 100;
+
+/// Max hook-ownership records kept before pruning to live panes (see
+/// [`App::claim_hook_kind`]).
+const HOOK_OWNED_CAP: usize = 512;
+
+/// Max attached-client pids remembered for window raising.
+const MAX_CLIENT_PIDS: usize = 16;
 
 /// What a click on a piece of chrome should do. Recorded per rendered chip/row so
 /// [`App::mouse_at`] can turn a click on the status bar or sidebar into navigation.
@@ -437,8 +444,15 @@ pub struct App {
     /// terminal it was entered on, so a focus change (click / another client) can't
     /// strand that pane scrolled-up. Keys scroll it; exit bottoms it. Shared state.
     scroll_pane: Option<TerminalId>,
+    /// Pids of currently attached clients, oldest first — the walk-up start point for
+    /// raising the right terminal window after a notification jump.
+    client_pids: Vec<u32>,
     /// The logged agent-turn notifications (newest first), shown in the center.
     notifications: VecDeque<Notification>,
+    /// `(pane, agent pid, kind)` triples whose notifications the agent's own hooks push
+    /// (`comux notify`), so the status sweep must not toast them a second time. Keyed by
+    /// pid, not pane alone: a later agent in the same pane is a different owner.
+    hook_owned: HashSet<(TerminalId, u32, &'static str)>,
     /// When `Some(sel)`, the notification center (`Ctrl-b a`) is open at row `sel`.
     center: Option<usize>,
     /// When `Some`, the resume picker (`Ctrl-b R`) is open.
@@ -611,8 +625,14 @@ impl App {
                 let ws = WorkspaceId::new("local");
                 let (_tab, _pane, term0) =
                     state.create_workspace(ws.clone(), None, Rect { cols, rows });
-                let pt = PaneTerm::spawn_with_env(cols.max(1), rows.max(1), None, None, &boot_env)
-                    .map_err(|e| io::Error::other(format!("failed to spawn shell PTY: {e}")))?;
+                let pt = PaneTerm::spawn_with_env(
+                    cols.max(1),
+                    rows.max(1),
+                    None,
+                    None,
+                    &with_pane_token(boot_env.clone()),
+                )
+                .map_err(|e| io::Error::other(format!("failed to spawn shell PTY: {e}")))?;
                 panes.insert(term0, pt);
                 (ws, 1)
             }
@@ -637,7 +657,9 @@ impl App {
             sidebar: cfg.sidebar,
             popup: None,
             scroll_pane: None,
+            client_pids: Vec::new(),
             notifications: VecDeque::new(),
+            hook_owned: HashSet::new(),
             center: None,
             resume: None,
             sessions: agentsessions::idle(),
@@ -694,7 +716,32 @@ impl App {
     /// own env was scrubbed of these names at startup, so this is the sole source of a
     /// pane's SSH/display session.
     fn pane_env(&self) -> Vec<(String, String)> {
-        merge_env(&self.sock_env, &self.client_env)
+        with_pane_token(merge_env(&self.sock_env, &self.client_env))
+    }
+
+    /// The session variables to hand any desktop command we spawn (notifier, and the
+    /// click action it carries). The server scrubbed these out of its OWN environment at
+    /// startup, so without this overlay a `notify-send` from a long-lived daemon has no
+    /// `DBUS_SESSION_BUS_ADDRESS` to publish to and the toast silently never appears.
+    fn desktop_env(&self) -> Vec<(String, String)> {
+        let mut env = self.client_env.clone();
+        // The click action re-enters through the CLI, which must find THIS server.
+        if let Some((k, v)) = self.sock_env.iter().find(|(k, _)| k == "COPAD_MUX_SOCK") {
+            env.push((k.clone(), v.clone()));
+        }
+        env
+    }
+
+    /// The shell command a toast click should run to land in `term`'s pane, or `None`
+    /// when the pane has no token (it predates the feature) or our own path is unknown.
+    fn jump_action(&self, term: &TerminalId) -> Option<String> {
+        let token = self.panes.get(term)?.pane_token()?;
+        let exe = std::env::current_exe().ok()?;
+        Some(notify::action_command(
+            &exe.to_string_lossy(),
+            token,
+            &self.desktop_env(),
+        ))
     }
 
     /// Adopt an attaching/initiating client's environment as the source for future panes,
@@ -1266,7 +1313,12 @@ impl App {
     fn report_spawn_failure(&mut self, what: &str, reason: &str) {
         self.last_spawn_error = Some(reason.to_string());
         if notify::env_override().unwrap_or(true) {
-            notify::desktop(&format!("comux: {what} failed"), reason);
+            notify::desktop(
+                &format!("comux: {what} failed"),
+                reason,
+                None,
+                &self.desktop_env(),
+            );
         }
     }
 
@@ -1276,7 +1328,7 @@ impl App {
     /// still hard-disables every toast.
     fn report_note(&self, title: &str, body: &str) {
         if notify::env_override().unwrap_or(true) {
-            notify::desktop(title, body);
+            notify::desktop(title, body, None, &self.desktop_env());
         }
     }
 
@@ -1592,7 +1644,7 @@ impl App {
                 if let Some(msg) = note
                     && notify::env_override().unwrap_or(true)
                 {
-                    notify::desktop("comux worktree", &msg);
+                    notify::desktop("comux worktree", &msg, None, &self.desktop_env());
                 }
             }
             PromptKind::RenameSession(ws) => self.rename_session(&ws, name),
@@ -1666,6 +1718,63 @@ impl App {
         None
     }
 
+    /// Resolve a pane addressed by identity (not position): a `$COPAD_MUX_PANE` token
+    /// first, then a raw terminal id.
+    ///
+    /// Tokens are qualified by server incarnation, so one minted by a PREVIOUS server —
+    /// e.g. sitting in a toast that survived a restart — resolves to nothing here and the
+    /// caller reports "unknown pane". That is the point: terminal ids restart at `term0`
+    /// with the server, so accepting a bare id from a stale notification would jump
+    /// confidently to an unrelated pane.
+    fn resolve_pane_target(&self, target: &str) -> Option<TerminalId> {
+        if let Some((tid, _)) = self
+            .panes
+            .iter()
+            .find(|(_, p)| p.pane_token() == Some(target))
+        {
+            return Some(tid.clone());
+        }
+        let id = TerminalId::new(target);
+        self.panes.contains_key(&id).then_some(id)
+    }
+
+    /// The terminal-emulator process an attached client is running inside, for the CLI to
+    /// activate after a jump. Best-effort and app-level only: a pid identifies the
+    /// emulator, never which of its windows or native tabs holds the client.
+    ///
+    /// The most recently attached client wins — with several attached, that is the one the
+    /// user is most likely sitting at. A pid that no longer resolves to a terminal (it
+    /// exited, or its client was removed by a path that skipped bookkeeping) is skipped
+    /// rather than returned as `None`: the raise must not go dark because a stale entry
+    /// happens to sit on top.
+    fn raise_target(&self) -> Option<(u32, String)> {
+        self.client_pids
+            .iter()
+            .rev()
+            .find_map(|pid| crate::winfocus::terminal_ancestor_live(*pid))
+    }
+
+    /// Record an attaching client's pid (most recent last) so [`Self::raise_target`] can
+    /// find its terminal. Called by the server on attach.
+    pub fn set_client_pid(&mut self, pid: u32) {
+        self.client_pids.retain(|p| *p != pid);
+        self.client_pids.push(pid);
+        if self.client_pids.len() > MAX_CLIENT_PIDS {
+            self.client_pids.remove(0);
+        }
+    }
+
+    /// Forget a client's pid on detach — a departed client's terminal must not be raised.
+    pub fn forget_client_pid(&mut self, pid: u32) {
+        self.client_pids.retain(|p| *p != pid);
+    }
+
+    /// The attached-client pids currently considered for a window raise, oldest first.
+    /// Observability for the detach paths (a stale entry here shadows the live client).
+    pub fn raise_candidates(&self) -> &[u32] {
+        &self.client_pids
+    }
+
     // --- control API (spec §3): applied on the main loop (single writer) ---
 
     /// Handle one control request, mutating state as the sole writer. Returns the
@@ -1716,9 +1825,16 @@ impl App {
                             (true, Some(tid)) => self.agent_status(tid).0.to_string(),
                             _ => String::new(),
                         };
+                        let token = term
+                            .as_ref()
+                            .and_then(|tid| self.panes.get(tid))
+                            .and_then(|pt| pt.pane_token())
+                            .unwrap_or_default()
+                            .to_string();
                         PaneInfo {
                             index,
                             id: p.to_string(),
+                            token,
                             focused: focused.as_ref() == Some(p),
                             cols,
                             rows,
@@ -1993,6 +2109,41 @@ impl App {
                 } else {
                     Resp::err(format!("no session at index {index}"))
                 }
+            }
+            Req::Jump { target } => match self.resolve_pane_target(target) {
+                Some(term) => {
+                    self.jump_to_terminal(&term);
+                    Resp::jump(self.raise_target())
+                }
+                None => Resp::err(format!("unknown pane: {target}")),
+            },
+            Req::Notify { target, kind, body } => {
+                let kind = match kind.as_str() {
+                    "done" => "done",
+                    "blocked" => "blocked",
+                    other => return Resp::err(format!("unknown kind: {other} (done|blocked)")),
+                };
+                let Some(term) = self.resolve_pane_target(target) else {
+                    return Resp::err(format!("unknown pane: {target}"));
+                };
+                // Claim FIRST: it re-sweeps the process table, so the label read below
+                // names the agent that is actually running rather than a stale one.
+                self.claim_hook_kind(&term, kind);
+                let tool = self
+                    .labels
+                    .get(&term)
+                    .map(|l| l.text.clone())
+                    .unwrap_or_else(|| "agent".to_string());
+                let body = if body.trim().is_empty() {
+                    match kind {
+                        "blocked" => "awaiting input".to_string(),
+                        _ => "turn finished".to_string(),
+                    }
+                } else {
+                    body.clone()
+                };
+                self.raise_notification(term, tool, kind, body);
+                Resp::ok()
             }
             Req::KillSession { index } => {
                 let Some(wid) = self.session_ids().get(*index).cloned() else {
@@ -4265,39 +4416,102 @@ impl App {
         // Fire desktop toasts (best-effort, non-blocking) — the server does this, so
         // they arrive even while detached. Replaces the retired `~/.claude` notify hooks.
         for (tid, tool, body) in events {
-            let space = self
-                .locate_terminal(&tid)
-                .map(|(w, _, _)| {
-                    self.state
-                        .workspace(&w)
-                        .and_then(|ws| ws.name.clone())
-                        .unwrap_or_else(|| w.to_string())
-                })
-                .unwrap_or_default();
-            // Desktop toast: env override wins, else the config `notify` flag. The
-            // in-app center below is logged regardless (it's not a desktop toast).
-            if notify::env_override().unwrap_or(self.cfg.notify) {
-                notify::desktop(&format!("{tool} · {space}"), body);
-            }
-            // Also log it in the notification center (Ctrl-b a).
             let kind = if body == "awaiting input" {
                 "blocked"
             } else {
                 "done"
             };
-            self.notifications.push_front(Notification {
-                when: local_hhmm(),
-                kind,
-                tool,
-                space,
-                body,
-                terminal: tid,
-            });
+            // An agent whose own hooks push this event kind (`comux notify`) owns it: the
+            // hook knows the real moment, the sweep only infers it ~2 Hz later, and both
+            // firing would double every toast. Ownership is per (pane, agent pid, kind), so
+            // a Codex pane that only ever pushes `done` still gets sweep-detected `blocked`,
+            // and a NEW agent in the same pane starts unowned rather than silently muted.
+            if self.hook_owns(&tid, kind) {
+                continue;
+            }
+            self.raise_notification(tid, tool, kind, body.to_string());
         }
+        changed
+    }
+
+    /// Is this (pane, live agent pid, kind) already served by the agent's own hook?
+    fn hook_owns(&self, term: &TerminalId, kind: &'static str) -> bool {
+        let pid = self.labels.get(term).map(|l| l.pid).unwrap_or(0);
+        self.hook_owned.contains(&(term.clone(), pid, kind))
+    }
+
+    /// Record that the agent in `term` reports `kind` through its own hooks, so the
+    /// status sweep stops toasting that kind for it (see [`Self::hook_owns`]).
+    ///
+    /// Sweeps the process table FIRST. The claim is keyed by the agent's pid, and the
+    /// cached label is up to 500ms (attached) or 5s (detached) old — long enough that an
+    /// agent's first turn can be claimed under the pid of the shell that launched it. The
+    /// sweep would then look up the real agent pid, miss, and toast the event a second
+    /// time, which is exactly what ownership exists to prevent. A hook push is a
+    /// human-paced, rare event, so paying for one sweep here is cheap.
+    fn claim_hook_kind(&mut self, term: &TerminalId, kind: &'static str) {
+        self.refresh_labels();
+        let pid = self.labels.get(term).map(|l| l.pid).unwrap_or(0);
+        self.hook_owned.insert((term.clone(), pid, kind));
+        // Bound the set: it grows with (pane × agent invocation × kind). Pruning keeps only
+        // entries naming a live pane's CURRENT agent — a pane that has restarted its agent
+        // fifty times holds fifty dead pids otherwise, and a dead pid's claim can never be
+        // consulted again.
+        if self.hook_owned.len() > HOOK_OWNED_CAP {
+            let live: HashMap<TerminalId, u32> = self
+                .panes
+                .keys()
+                .map(|t| {
+                    let pid = self.labels.get(t).map(|l| l.pid).unwrap_or(0);
+                    (t.clone(), pid)
+                })
+                .collect();
+            self.hook_owned
+                .retain(|(t, pid, _)| live.get(t) == Some(pid));
+        }
+    }
+
+    /// Raise one agent notification: a desktop toast whose click jumps to the pane, plus
+    /// an entry in the in-app center (`Ctrl-b a`). Shared by the status sweep and the
+    /// `comux notify` push so both produce identical, jumpable notifications.
+    fn raise_notification(
+        &mut self,
+        term: TerminalId,
+        tool: String,
+        kind: &'static str,
+        body: String,
+    ) {
+        let space = self
+            .locate_terminal(&term)
+            .map(|(w, _, _)| {
+                self.state
+                    .workspace(&w)
+                    .and_then(|ws| ws.name.clone())
+                    .unwrap_or_else(|| w.to_string())
+            })
+            .unwrap_or_default();
+        // Desktop toast: env override wins, else the config `notify` flag. The in-app
+        // center below is logged regardless (it's not a desktop toast).
+        if notify::env_override().unwrap_or(self.cfg.notify) {
+            let action = self.jump_action(&term);
+            notify::desktop(
+                &format!("{tool} · {space}"),
+                &body,
+                action.as_deref(),
+                &self.desktop_env(),
+            );
+        }
+        self.notifications.push_front(Notification {
+            when: local_hhmm(),
+            kind,
+            tool,
+            space,
+            body,
+            terminal: term,
+        });
         while self.notifications.len() > NOTIFY_LOG_CAP {
             self.notifications.pop_back();
         }
-        changed
     }
 
     /// Number of agent panes currently BLOCKED (awaiting input) — the status-bar
@@ -6295,6 +6509,16 @@ fn merge_env(base: &[(String, String)], over: &[(String, String)]) -> Vec<(Strin
     out
 }
 
+/// `env` plus a freshly minted `COPAD_MUX_PANE` identity — the `$TMUX_PANE` analogue a
+/// pane's own shell (and any hook running in it) uses to name itself back to comux. Every
+/// spawn path funnels through here so no pane is born anonymous; the restore path needs it
+/// most, since restored agent panes are exactly the ones that raise notifications.
+fn with_pane_token(mut env: Vec<(String, String)>) -> Vec<(String, String)> {
+    env.retain(|(k, _)| k != term::PANE_TOKEN_ENV);
+    env.push((term::PANE_TOKEN_ENV.to_string(), term::next_pane_token()));
+    env
+}
+
 /// Restore saved sessions into `state`/`panes` (continuum-style). Returns the active
 /// workspace + the `next_session` counter (so freshly created sessions can't collide with
 /// restored `sN` ids), or `None` if nothing valid could be restored. Transactional per
@@ -6391,8 +6615,14 @@ fn spawn_layout(
             // drops failures rather than materializing a dead pane); the reason is not
             // actionable per-pane here, and `health` reports the budget if it was fd
             // exhaustion that pruned them.
-            let pt =
-                PaneTerm::spawn_with_env(cols.max(1), rows.max(1), None, dir, sock_env).ok()?;
+            let pt = PaneTerm::spawn_with_env(
+                cols.max(1),
+                rows.max(1),
+                None,
+                dir,
+                &with_pane_token(sock_env.to_vec()),
+            )
+            .ok()?;
             *budget -= 1;
             // Re-run a whitelisted program (agent): shell-quote each argv element and
             // inject the line into the fresh shell. Quoting preserves argument boundaries
@@ -6906,11 +7136,12 @@ mod tests {
         detect_alt_screen_transition, extract_selection, filter_env, fmt_elapsed, home_short_in,
         list_window_start, menu_origin, merge_env, merge_labels, reload_note, resume_line,
         resume_rank, sel_bounds, sel_cols, shell_quote, split_sidebar, status_since, tab_window,
-        usage_should_roll, usage_threshold_color, window_max_start, window_start_var, wrap_page,
+        usage_should_roll, usage_threshold_color, window_max_start, window_start_var,
+        with_pane_token, wrap_page,
     };
     use crate::model::{TerminalId, WorkspaceId};
     use crate::procinfo::{Kind, Label};
-    use crate::term::{CellColor, CellSnap, Snapshot};
+    use crate::term::{self, CellColor, CellSnap, Snapshot};
     use std::collections::HashMap;
 
     fn tid(s: &str) -> TerminalId {
@@ -7230,6 +7461,37 @@ mod tests {
                 ("SSH_CONNECTION", "1.2.3.4"),
             ])
         );
+    }
+
+    #[test]
+    fn every_pane_env_carries_exactly_one_fresh_token() {
+        let a = with_pane_token(kv(&[("COPAD_MUX", "1")]));
+        let b = with_pane_token(kv(&[("COPAD_MUX", "1")]));
+        let tok = |e: &[(String, String)]| {
+            let found: Vec<_> = e
+                .iter()
+                .filter(|(k, _)| k == term::PANE_TOKEN_ENV)
+                .map(|(_, v)| v.clone())
+                .collect();
+            assert_eq!(found.len(), 1, "exactly one token per pane env");
+            found[0].clone()
+        };
+        assert_ne!(tok(&a), tok(&b), "each pane gets its own identity");
+        assert!(a.iter().any(|(k, v)| k == "COPAD_MUX" && v == "1"));
+    }
+
+    /// A server born inside a comux pane would otherwise hand its OWN `COPAD_MUX_PANE`
+    /// down to every pane it spawns, so two panes would answer to the same token and a
+    /// notification would jump to whichever matched first.
+    #[test]
+    fn an_inherited_token_is_replaced_not_kept() {
+        let env = with_pane_token(kv(&[(term::PANE_TOKEN_ENV, "stale-from-parent")]));
+        let tokens: Vec<_> = env
+            .iter()
+            .filter(|(k, _)| k == term::PANE_TOKEN_ENV)
+            .collect();
+        assert_eq!(tokens.len(), 1);
+        assert_ne!(tokens[0].1, "stale-from-parent");
     }
 
     #[test]
