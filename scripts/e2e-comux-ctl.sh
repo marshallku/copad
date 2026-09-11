@@ -359,40 +359,54 @@ grep -q 'COPAD_MUX' "$WORK/skill.md" || fail "the skill lost its inside-comux ga
 # Run the recipe the SKILL teaches, as it teaches it. A skill is a document the model
 # FOLLOWS, so the only honest check is that following it works.
 #
-# Deliberately NOT against pane 0. The first version of this step used a disposable pane 0
-# and so could not have caught the recipe's real defect — a hard-coded index, which on a
-# one-pane tab is the AGENT'S OWN pane. Drive the SIBLING the skill tells you to create, and
-# assert the sibling is not the pane we started from.
-# Identify the sibling the way the skill says: the token that is NEW between the two
-# listings. Deliberately NOT `panes[focused]` — the user can move focus between the split
-# and the listing, and then every downstream check still passes while the agent types into
-# one of THEIR panes.
-t 10 "$COMUX" list --json >"$WORK/before.json"
-t 10 "$COMUX" split >/dev/null || fail "split failed"
-t 10 "$COMUX" list --json >"$WORK/json"
-read -r sib_i sib_t <<<"$(python3 - "$WORK/before.json" "$WORK/json" <<'PYEOF'
-import json, sys
-before = {p["token"] for p in json.load(open(sys.argv[1]))["panes"] if p["token"]}
-after = json.load(open(sys.argv[2]))["panes"]
-new = [p for p in after if p["token"] and p["token"] not in before]
-if len(new) != 1:
-    sys.exit(f"expected exactly one new pane, got {len(new)}")
-print(new[0]["index"], new[0]["token"])
-PYEOF
-)" || fail "could not identify the pane the split created"
-[[ -n "$sib_t" && "$sib_t" != "$tok" ]] || fail "the new token is missing or is the original pane"
+# Deliberately NOT against pane 0: the first version used a disposable pane 0 and so could
+# not have caught the recipe's real defect — a hard-coded index, which on a one-pane tab is
+# the AGENT'S OWN pane. The split names the pane it created, so nothing is inferred.
+sib="$(t 10 "$COMUX" split --from "$tok")" || fail "split --from failed"
+[[ -n "$sib" && "$sib" != "$tok" ]] || fail "split did not name a NEW pane (got '$sib')"
 id=$(date +%s%N)
-t 10 "$COMUX" send "$sib_i" "printf 'DONE-%s\n' '$id'" >/dev/null
-t 10 "$COMUX" send "$sib_i" $'\n' >/dev/null
-# The wait takes the TOKEN, as the skill says, so it cannot be retargeted by a tab change.
-t 30 "$COMUX" wait-output "$sib_t" "DONE-$id" --timeout 20 --interval 100 >/dev/null \
+t 10 "$COMUX" send "$sib" "printf 'DONE-%s\n' '$id'" >/dev/null
+t 10 "$COMUX" send "$sib" $'\n' >/dev/null
+t 30 "$COMUX" wait-output "$sib" "DONE-$id" --timeout 20 --interval 100 >/dev/null \
     || fail "the recipe the skill teaches does not work"
-# The original pane must NOT have received the build command — that is the C1 defect.
+# The pane we split FROM must not have received it — the defect a disposable pane 0 hid.
 t 10 "$COMUX" capture-pane "$tok" -S 60 >"$WORK/orig"
-grep -q "DONE-$id" "$WORK/orig" \
-    && fail "the recipe typed into the starting pane instead of the sibling"
+grep -q "DONE-$id" "$WORK/orig" && fail "the recipe typed into the source pane, not the new one"
+# `split --from` must refuse an identity it cannot resolve, and refuse a raw terminal id
+# (recycled across restarts) rather than splitting something arbitrary.
+t 10 "$COMUX" split --from no-such-pane >/dev/null 2>&1 && fail "split --from should refuse an unknown pane"
+ok_split_panes="$(panes_now)"
+# A token-addressed send crosses sessions WITHOUT moving the user's view — that is the whole
+# point of the addressing change, and the property most likely to regress silently.
+t 10 "$COMUX" new-session e2e-send >/dev/null
+t 10 "$COMUX" list-sessions --json >"$WORK/json"
+act_before="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["active_session"])' <"$WORK/json")"
+xid=$(date +%s%N)
+t 10 "$COMUX" send "$sib" "printf 'XS-%s\n' '$xid'" >/dev/null
+t 10 "$COMUX" send "$sib" $'\n' >/dev/null
+t 30 "$COMUX" wait-output "$sib" "XS-$xid" --timeout 20 --interval 100 >/dev/null \
+    || fail "a token-addressed send did not reach a pane in another session"
+t 10 "$COMUX" list-sessions --json >"$WORK/json"
+act_after="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["active_session"])' <"$WORK/json")"
+[[ "$act_before" == "$act_after" ]] \
+    || fail "a cross-session send moved the active session ($act_before -> $act_after)"
+t 10 "$COMUX" kill-session "$act_after" >/dev/null || fail "could not clean up the send session"
+# Refusals: a terminal id is not an address for a WRITE; no target at all is a usage error.
+t 10 "$COMUX" send term0 "x" >/dev/null 2>&1 && fail "send should refuse a raw terminal id"
+set +e
+t 10 "$COMUX" send >/dev/null 2>&1; c=$?
+set -e
+[[ "$c" == "2" ]] || fail "a target-less send should be usage exit 2, got $c"
+# Index addressing must still work exactly as before.
+t 10 "$COMUX" list --json >"$WORK/json"
+sib_i="$(SIB="$sib" python3 -c 'import json,sys,os; d=json.load(sys.stdin); print(next(p["index"] for p in d["panes"] if p["token"]==os.environ["SIB"]))' <"$WORK/json")"
+iid=$(date +%s%N)
+t 10 "$COMUX" send "$sib_i" "printf 'IDX-%s\n' '$iid'" >/dev/null
+t 10 "$COMUX" send "$sib_i" $'\n' >/dev/null
+t 30 "$COMUX" wait-output "$sib" "IDX-$iid" --timeout 20 --interval 100 >/dev/null \
+    || fail "index-addressed send regressed"
 t 10 "$COMUX" close "$sib_i" >/dev/null || fail "could not clean up the split"
-ok "skill emitted with frontmatter + gate; its recipe runs against a sibling, not pane 0"
+ok "skill recipe runs on a server-named pane; token send crosses sessions without moving the view; index send unchanged"
 
 echo "13. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"

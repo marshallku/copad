@@ -33,76 +33,46 @@ comux list-agents             # agent panes across EVERY session, with status an
 
 Add `--json` to any of them when you need to parse rather than read.
 
-### How panes are addressed — read this before sending anything
+### How panes are addressed
 
-- **By token** — the `token` field, which is that pane's own `$COPAD_MUX_PANE`. Resolves
-  anywhere in the mux and stays valid. `capture-pane`, `wait-output`, `wait-agent`, `jump`
-  and `notify` all take one.
-- **By index** — the position printed by `comux list`. `send`, `focus`, `close` and `resize`
-  take ONLY an index.
+- **By token** — the `token` field from `comux list --json`, which is that pane's own
+  `$COPAD_MUX_PANE`. It names exactly one pane, anywhere in the mux, for as long as the
+  server lives. Every verb you need takes one: `send`, `capture-pane`, `wait-output`,
+  `wait-agent`, `split --from`, `jump`, `notify`.
+- **By index** — a position in whatever tab the SERVER considers active, i.e. the tab the
+  *user* is looking at. `send` still accepts one, and `focus`/`close`/`resize` take only one.
 
-**An index is not a stable address.** It numbers the panes of whatever tab the SERVER
-considers active — which is the tab the *user* is looking at, not "yours". You keep running
-when they switch tabs, so between one command and the next, index 2 can become a pane in a
-completely different tab. Nothing warns you.
+**Use tokens. Always.** An index is not a stable address: you keep running when the user
+switches tabs, so between one command and the next, index 2 can become a pane in a
+completely different tab, and nothing warns you. There is no way to make an index-addressed
+write race-free — only to narrow the window.
 
-So there are two things you cannot do, and pretending otherwise types into someone's live
-shell:
+Do not record a pane's `id` (`term0`, `term1`, …) instead of its token. Those restart from
+zero every time the server does, so a saved one can address an unrelated pane later. `send`
+rejects them for that reason.
 
-- You **cannot type into a pane by token**. There is no token-addressed `send`.
-- You **cannot make an index-addressed send safe** against the user switching tabs. You can
-  only narrow the window.
-
-### The check to run before any `send`
-
-```bash
-comux list --json
-```
-
-Two things must hold in that listing, and you must re-check them immediately before each
-send — not once at the start:
-
-1. **Your own `$COPAD_MUX_PANE` appears in it.** If it does not, the active tab is not the
-   one you are in, every index refers to panes you know nothing about, and you must stop.
-2. **`panes[<index>].token` is still the token you recorded** for your target — and is not
-   your own.
-
-If either fails, do not send. Re-list, or tell the user what you were about to do.
+And never send to your own pane, `$COPAD_MUX_PANE` — you would be typing into yourself.
 
 ## Run something in another pane
 
 ```bash
-comux list --json
+comux split --from "$COPAD_MUX_PANE"
 ```
 
-Confirm your own token is in that listing (check 1 above), and **keep every
-`panes[].token` from it**. Then:
+That splits **your** pane — not "the focused one", which the user can change at any moment —
+and prints the new pane's token. `--json` gives you the same thing as `.pane`. If it fails,
+or the token comes back empty, stop: do not guess which pane appeared by diffing listings,
+because a concurrent focus or tab change defeats that.
+
+The new pane inherits the cwd of the pane it was split from, which is why splitting *your*
+pane matters: split something else and the command runs in a directory you did not choose.
 
 ```bash
-comux split
-comux list --json
+comux send <new-token> "make build"
+comux send <new-token> $'\n'
 ```
 
-Your sibling is the token in the second listing that was **not** in the first. If exactly
-one token is new, that is yours. If none or several are, stop and say so — something else
-changed the tab and you can no longer tell which pane you created.
-
-**Do not take `panes[focused]`.** comux does focus the pane it just created, but the user
-can move focus between your `split` and your `list`, and then "focused" is one of THEIR
-panes. Nothing downstream catches it: their pane is genuinely live and in the active tab, so
-your own-token check passes and your target-token check passes, and you type into their
-shell.
-
-Record your sibling's `index` for `send` and its `token` for every read and wait. Only the
-token survives a tab change.
-
-```bash
-comux send <sibling-index> "make build"
-comux send <sibling-index> $'\n'
-```
-
-Re-run the pre-send check immediately before each of those. `send` writes raw bytes: it does
-not escape anything and it does not press Enter for you.
+`send` writes raw bytes: it does not escape anything and it does not press Enter for you.
 
 ## Read a pane back
 
@@ -132,24 +102,17 @@ Both waits are **level-triggered and best-effort**: they return as soon as the c
 CURRENTLY true, including when it was already true before you called. That makes them
 race-free only if you give them something that cannot have been true before.
 
-So for "run a command and wait for it to finish", using the sibling you created above —
-never a hard-coded index, which on a single-pane tab is YOU:
+So for "run a command and wait for it to finish":
 
 ```bash
-comux list --json
-```
-
-Re-check that `panes[<sibling-index>].token` is still your sibling's, then:
-
-```bash
+pane=$(comux split --from "$COPAD_MUX_PANE")
 id=$(date +%s%N)
-comux send <sibling-index> "make build; printf 'DONE-%s\n' '$id'"
-comux send <sibling-index> $'\n'
-comux wait-output <sibling-token> "DONE-$id" --timeout 600
+comux send "$pane" "make build; printf 'DONE-%s\n' '$id'"
+comux send "$pane" $'\n'
+comux wait-output "$pane" "DONE-$id" --timeout 600
 ```
 
-The sends take the index; the wait takes the token, so a tab change cannot make the wait
-watch the wrong pane.
+Everything addresses the same token, so nothing the user does to their tabs can retarget it.
 
 Two traps this recipe exists to dodge, both of which make a wait return instantly and
 wrongly:
@@ -172,26 +135,17 @@ false reading from ordinary output. Treat it as a hint, and confirm with `captur
 
 ## Coordinate with another agent
 
-Observing another agent works from anywhere, because reads take a token:
-
 ```bash
 comux list-agents --json                   # token, tool, status, for_secs — across all sessions
 comux wait-agent <token> --status blocked  # it is probably asking something
 comux capture-pane <token> -S 80           # read what it asked
+comux send <token> "use the schema in ./docs"
+comux send <token> $'\n'
 ```
 
-**Prompting one is different.** `send` is index-only and indexes are active-tab-only, so you
-can only type into an agent that shares your tab:
-
-```bash
-comux list --json                          # is that token in THIS tab?
-comux send <index> "review the diff in ~/work"
-comux send <index> $'\n'
-```
-
-If it is not in your tab, the only way to reach it is `comux jump <token>`, which switches
-the user's session, tab and focus and raises their window. **That is a visible change to
-their workspace — ask first.** Otherwise, report what you observed and let the user act.
+All of it is token-addressed, so it reaches an agent in any session without switching the
+user's view. **That also means the user may not see it happen** — if what you are sending is
+consequential, tell them rather than assuming they are watching that pane.
 
 `wait-agent` addresses a **pane**, not a specific agent run: if the agent exits and another
 starts in that pane, they are indistinguishable.
@@ -213,8 +167,8 @@ notification sends the user's click somewhere misleading.
 - **Do not `send` to your own pane** (`$COPAD_MUX_PANE`).
 - **Do not `kill-session`, `close`, `close-tab` or `kill-server`** unless the user asked in
   this conversation. They destroy panes you did not create and cannot be undone.
-- **Do not `jump`, `select-session` or `select-tab`** to get at a pane without asking. They
-  move what the user is looking at.
+- **Do not `jump`, `select-session` or `select-tab`** without asking. They move what the
+  user is looking at, and token addressing means you almost never need to.
 - **Do not poll in a shell loop.** `wait-output` / `wait-agent` already poll, under one
   deadline, with a floor on the interval.
 - **Do not treat a `124` as success.** Report the timeout.

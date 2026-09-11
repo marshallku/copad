@@ -1355,6 +1355,7 @@ mod tests {
         assert!(!ctl_mutates(&Req::ListSessions));
         assert!(ctl_mutates(&Req::NewTab));
         assert!(ctl_mutates(&Req::Split {
+            from: None,
             dir: "right".into()
         }));
         assert!(ctl_mutates(&Req::Focus { index: 0 }));

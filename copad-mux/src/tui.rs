@@ -1738,6 +1738,19 @@ impl App {
         self.panes.contains_key(&id).then_some(id)
     }
 
+    /// Resolve a pane by its `$COPAD_MUX_PANE` TOKEN only — never a raw terminal id.
+    ///
+    /// Terminal ids restart at `term0` on every server incarnation, so a recorded one can
+    /// address a completely different pane after a restart. A read that lands on the wrong
+    /// pane returns a wrong answer; a WRITE types into someone's live shell. Writes therefore
+    /// use this, and only the incarnation-qualified token resolves.
+    fn resolve_pane_token(&self, token: &str) -> Option<TerminalId> {
+        self.panes
+            .iter()
+            .find(|(_, p)| p.pane_token() == Some(token))
+            .map(|(tid, _)| tid.clone())
+    }
+
     /// The terminal-emulator process an attached client is running inside, for the CLI to
     /// activate after a jump. Best-effort and app-level only: a pid identifies the
     /// emulator, never which of its windows or native tabs holds the client.
@@ -1849,20 +1862,59 @@ impl App {
                     .unwrap_or(0);
                 Resp::list(panes, fi)
             }
-            Req::Split { dir } => {
+            Req::Split { dir, from } => {
                 let d = match dir.as_str() {
                     "down" => Dir::Down,
                     "right" => Dir::Right,
                     other => return Resp::err(format!("bad dir '{other}' (right|down)")),
                 };
-                let before = self.pane_order().len();
+                // `from` pins the split SOURCE by identity. Without it the focused pane is
+                // split, and focus is mutable: a script that lists, then splits, can have the
+                // pane created somewhere else entirely — and since a new pane inherits the
+                // source's cwd, the command it then runs executes in the wrong directory.
+                if let Some(t) = from {
+                    let Some(tid) = self.resolve_pane_token(t) else {
+                        return Resp::err(format!("unknown pane '{t}'"));
+                    };
+                    // Splitting reaches into the active tab's layout, so a source outside it
+                    // is refused rather than silently splitting something else.
+                    let Some(pane) = self.pane_of_terminal(&tid) else {
+                        return Resp::err(format!(
+                            "pane '{t}' is not in the active tab — select its tab first"
+                        ));
+                    };
+                    // `App::split` splits whatever is focused, so pin focus to the named
+                    // source first. This is the only mutation `from` performs.
+                    if self.focused_pane().as_ref() != Some(&pane) {
+                        let _ = self.state.apply(Command::FocusPane {
+                            client: self.client,
+                            pane,
+                        });
+                    }
+                }
+                let before: Vec<PaneId> = self.pane_order();
                 self.clear_spawn_error();
                 self.split(d);
-                if self.pane_order().len() > before {
-                    Resp::ok()
-                } else {
-                    Resp::err(self.take_spawn_error("split"))
+                let after = self.pane_order();
+                if after.len() <= before.len() {
+                    return Resp::err(self.take_spawn_error("split"));
                 }
+                // Name the pane we created, so no caller ever has to infer it by diffing
+                // listings (which a concurrent focus or tab change can defeat).
+                let token = after
+                    .iter()
+                    .find(|p| !before.contains(p))
+                    .and_then(|p| {
+                        self.state
+                            .workspace(&self.ws)
+                            .and_then(|w| w.tab(&w.active_tab))
+                            .and_then(|t| t.layout.terminal_of(p).cloned())
+                    })
+                    .and_then(|tid| self.panes.get(&tid))
+                    .and_then(|pt| pt.pane_token())
+                    .unwrap_or_default()
+                    .to_string();
+                Resp::split(token)
             }
             Req::ResizePane { index, dir } => {
                 let (axis, grow) = match dir.as_str() {
@@ -1904,17 +1956,39 @@ impl App {
                 },
                 None => Resp::err(format!("no pane at index {index}")),
             },
-            Req::SendKeys { index, text } => {
-                let order = self.pane_order();
-                let Some(pane) = order.get(*index) else {
-                    return Resp::err(format!("no pane at index {index}"));
+            Req::SendKeys {
+                target,
+                index,
+                text,
+            } => {
+                let tid = match (target, index) {
+                    (Some(_), Some(_)) => {
+                        return Resp::err("give a pane token or an index, not both");
+                    }
+                    // A write never defaults to the focused pane: focus is mutable, and
+                    // typing into the wrong pane cannot be undone.
+                    (None, None) => return Resp::err("no pane given"),
+                    (Some(t), None) => match self.resolve_pane_token(t) {
+                        Some(tid) => tid,
+                        None => return Resp::err(format!("unknown pane '{t}'")),
+                    },
+                    (None, Some(i)) => {
+                        let order = self.pane_order();
+                        let Some(pane) = order.get(*i) else {
+                            return Resp::err(format!("no pane at index {i}"));
+                        };
+                        match self
+                            .state
+                            .workspace(&self.ws)
+                            .and_then(|w| w.tab(&w.active_tab))
+                            .and_then(|t| t.layout.terminal_of(pane).cloned())
+                        {
+                            Some(tid) => tid,
+                            None => return Resp::err("pane has no live terminal"),
+                        }
+                    }
                 };
-                let term = self
-                    .state
-                    .workspace(&self.ws)
-                    .and_then(|w| w.tab(&w.active_tab))
-                    .and_then(|t| t.layout.terminal_of(pane).cloned());
-                match term.and_then(|tid| self.panes.get(&tid)) {
+                match self.panes.get(&tid) {
                     Some(pt) => {
                         pt.input(text.as_bytes());
                         Resp::ok()

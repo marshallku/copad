@@ -20,8 +20,21 @@ use crate::picker;
 pub enum Req {
     /// List panes of the active tab.
     List,
-    /// Split the focused pane. `dir` = `"right"` (side by side) | `"down"` (stacked).
-    Split { dir: String },
+    /// Split a pane. `dir` = `"right"` (side by side) | `"down"` (stacked).
+    ///
+    /// `from` names the pane to split, by TOKEN, and must be in the active tab. Without it
+    /// the FOCUSED pane is split — fine for a human pressing a key, a race for a script:
+    /// focus is mutable, and the new pane also inherits the split source's cwd, so a focus
+    /// change between listing and splitting silently puts the pane in the wrong directory.
+    /// An agent should always pass `from`.
+    ///
+    /// The response carries the created pane's token in `Resp.pane`, so a caller never has
+    /// to infer which pane appeared.
+    Split {
+        dir: String,
+        #[serde(default)]
+        from: Option<String>,
+    },
     /// Grow the pane at `index` toward `dir` (`left`/`right`/`up`/`down`) by nudging
     /// its split divider.
     ResizePane { index: usize, dir: String },
@@ -29,8 +42,25 @@ pub enum Req {
     Focus { index: usize },
     /// Close the pane at `index`.
     Close { index: usize },
-    /// Inject `text` as input bytes into the pane at `index` (like `tmux send-keys`).
-    SendKeys { index: usize, text: String },
+    /// Inject `text` as input bytes into a pane (like `tmux send-keys`).
+    ///
+    /// `target` is a pane TOKEN and resolves anywhere in the mux; `index` is a position in
+    /// the ACTIVE TAB. Exactly one must be given — a write must never default to the focused
+    /// pane, and an index silently retargets when the user switches tabs.
+    ///
+    /// Deliberately token-only, unlike the read verbs which also accept a raw terminal id:
+    /// terminal ids restart at `term0` every server incarnation, so a recorded one can
+    /// address an unrelated pane after a restart. Tolerable for a read, not for a write.
+    ///
+    /// `index` keeps its old wire shape (`{"cmd":"send-keys","index":0,"text":"…"}`), so a
+    /// request from an older client still parses and behaves identically.
+    SendKeys {
+        #[serde(default)]
+        target: Option<String>,
+        #[serde(default)]
+        index: Option<usize>,
+        text: String,
+    },
     /// List the workspace's tabs.
     ListTabs,
     /// Create a new tab and make it active.
@@ -410,6 +440,14 @@ impl Resp {
         }
     }
 
+    /// A `split` response, naming the pane it created.
+    pub fn split(pane: String) -> Self {
+        Self {
+            pane: Some(pane),
+            ..Self::ok()
+        }
+    }
+
     /// A `capture-pane` response.
     pub fn capture(cap: crate::term::Capture, pane: String) -> Self {
         Self {
@@ -639,11 +677,36 @@ pub fn run_client(args: &[String]) -> i32 {
         }
         "split" => {
             // -h/--horizontal → side by side (right); -v/--vertical → stacked (down).
-            let dir = match rest.get(1).map(|s| s.as_str()) {
-                Some("-v") | Some("--vertical") | Some("down") => "down",
-                _ => "right",
-            };
+            let mut dir = "right";
+            let mut from: Option<String> = None;
+            let mut i = 1;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "-v" | "--vertical" | "down" => dir = "down",
+                    "-h" | "--horizontal" | "right" => dir = "right",
+                    "--from" => match rest.get(i + 1) {
+                        Some(v) => {
+                            from = Some((*v).to_string());
+                            i += 1;
+                        }
+                        None => {
+                            eprintln!("comux split: --from needs a pane token");
+                            return 2;
+                        }
+                    },
+                    "--json" => {}
+                    other => {
+                        eprintln!(
+                            "comux split: unexpected argument '{other}'\n\
+                             usage: comux split [-v|-h] [--from <pane-token>] [--json]"
+                        );
+                        return 2;
+                    }
+                }
+                i += 1;
+            }
             Req::Split {
+                from,
                 dir: dir.to_string(),
             }
         }
@@ -786,9 +849,17 @@ pub fn run_client(args: &[String]) -> i32 {
             }
         }
         "send" | "send-keys" => {
-            let Some(idx) = rest.get(1).and_then(|s| s.parse::<usize>().ok()) else {
-                eprintln!("usage: comux send <index> <text...>");
+            let Some(first) = rest.get(1) else {
+                eprintln!("{SEND_USAGE}");
                 return 2;
+            };
+            let (target, index) = match classify_pane_arg(first) {
+                Some(PaneArg::Index(i)) => (None, Some(i)),
+                Some(PaneArg::Token(t)) => (Some(t), None),
+                None => {
+                    eprintln!("comux send: '{first}' is neither a pane index nor a pane token");
+                    return 2;
+                }
             };
             let text = rest
                 .iter()
@@ -796,7 +867,11 @@ pub fn run_client(args: &[String]) -> i32 {
                 .map(|s| s.as_str())
                 .collect::<Vec<_>>()
                 .join(" ");
-            Req::SendKeys { index: idx, text }
+            Req::SendKeys {
+                target,
+                index,
+                text,
+            }
         }
         other => {
             eprintln!("comux: unknown command '{other}'");
@@ -850,6 +925,17 @@ pub fn run_client(args: &[String]) -> i32 {
     } else {
         print_human(&req, &resp);
     }
+    // A `split` whose response carries no pane token is NOT a success a script can use: the
+    // documented recipe is `pane=$(comux split --from …)`, and an empty capture with exit 0
+    // reads as "it worked" right up until the token is used to address a pane. An older
+    // server (before decision #107) answers exactly that way, and `--json` would otherwise
+    // not even print the warning.
+    if matches!(req, Req::Split { .. })
+        && resp.ok
+        && resp.pane.as_deref().unwrap_or_default().is_empty()
+    {
+        return 1;
+    }
     if resp.ok { 0 } else { 1 }
 }
 
@@ -875,6 +961,40 @@ fn maybe_raise(resp: &Resp) {
 /// binary. Install it where your agent looks for skills, e.g.
 /// `comux skill > ~/.claude/skills/comux/SKILL.md`.
 const SKILL_MD: &str = include_str!("../SKILL.md");
+
+/// How a positional pane argument was understood.
+enum PaneArg {
+    Index(usize),
+    Token(String),
+}
+
+/// Classify `send`'s first positional as an index or a pane token.
+///
+/// A `usize` parse comes FIRST so every invocation that works today keeps working
+/// identically, including the leading-`+` form Rust accepts. Only when that fails is the
+/// argument considered a token, and a token must contain `-`: the mint is
+/// `{pid:x}{secs:x}-{n}` ([`crate::term::next_pane_token`]), so a token always has one and a
+/// plain index never does. A numeric string too large for `usize` is therefore REJECTED
+/// rather than quietly falling through to token resolution and reporting "unknown pane".
+fn classify_pane_arg(arg: &str) -> Option<PaneArg> {
+    if let Ok(i) = arg.parse::<usize>() {
+        return Some(PaneArg::Index(i));
+    }
+    let numeric_ish = arg
+        .strip_prefix(['+', '-'])
+        .unwrap_or(arg)
+        .chars()
+        .all(|c| c.is_ascii_digit());
+    if numeric_ish || !arg.contains('-') {
+        return None;
+    }
+    Some(PaneArg::Token(arg.to_string()))
+}
+
+const SEND_USAGE: &str = "usage: comux send <pane-token|index> <text...>\n\
+     \x20      a TOKEN (from `comux list --json`, or a pane's own $COPAD_MUX_PANE) names one\n\
+     \x20      pane anywhere in the mux; an INDEX is a position in the ACTIVE tab and\n\
+     \x20      retargets when the user switches tabs. `send` does not append Enter.";
 
 /// Exit code for "the user cancelled the picker" — fzf's (and SIGINT's) convention, so a
 /// shell wrapper can tell a deliberate abort apart from a real failure.
@@ -1266,6 +1386,20 @@ fn print_human(req: &Req, resp: &Resp) {
             // The number that actually answers "why won't a new tab open?".
             if let Some(room) = h.panes_remaining() {
                 println!("panes headroom  {room}");
+            }
+        }
+        Req::Split { .. } => {
+            // Print the created pane's token in plain mode too, not only under `--json`:
+            // it is the whole point of the response, and a caller that cannot see it falls
+            // back to guessing which pane appeared.
+            match resp.pane.as_deref().filter(|t| !t.is_empty()) {
+                Some(t) => println!("{t}"),
+                // An older server answers `split` without a token. Say so rather than
+                // printing nothing and letting a script read an empty string as success.
+                None => eprintln!(
+                    "comux split: this server did not report the new pane's token \
+                     (older build — `comux server restart` after upgrading)"
+                ),
             }
         }
         Req::ListAgents { .. } => {
@@ -3183,42 +3317,216 @@ mod skill_tests {
         }
     }
 
-    /// Identifying the pane you just created by `panes[focused]` is racy: the user can move
-    /// focus between the `split` and the `list`, and then every downstream check still passes
-    /// — their pane is live and in the active tab — while the agent types into their shell.
-    /// The skill must teach set-difference on tokens instead.
+    /// The pane you just created must come from the SPLIT RESPONSE, not from inference.
+    ///
+    /// Two earlier versions of this guide got it wrong: `panes[focused]` is racy (the user
+    /// can move focus between the split and the listing), and so is set-difference on
+    /// listings (a concurrent tab switch can make exactly one unfamiliar token appear).
+    /// Both failures pass every downstream check, because the pane they name really is live
+    /// and really is in the active tab.
     #[test]
-    fn the_skill_identifies_a_new_pane_by_difference_not_focus() {
+    fn the_skill_takes_the_new_pane_from_the_split_response() {
         assert!(
-            SKILL_MD.contains("Do not take `panes[focused]`"),
-            "the skill must warn against identifying the new pane by focus"
+            SKILL_MD.contains("comux split --from"),
+            "the skill must pin the split SOURCE by identity, or the new pane inherits the \
+             wrong cwd when focus moves"
         );
         assert!(
-            SKILL_MD.contains("was **not** in the first"),
-            "the skill must teach identifying the sibling by set difference"
+            !SKILL_MD.contains("panes[focused]") && !SKILL_MD.contains("set difference"),
+            "the skill has gone back to inferring which pane was created"
         );
         assert!(
-            SKILL_MD.contains("If none or several are, stop"),
-            "the skill must say what to do when the new pane is ambiguous"
+            SKILL_MD.contains("do not guess which pane appeared"),
+            "the skill must say what to do when the split reports no token"
         );
     }
 
-    /// The one safety check that makes an index-addressed `send` defensible: the agent must
-    /// confirm the active listing is the tab it is actually in, immediately before sending.
+    /// Writes must be addressed by token. An index is a position in the SERVER's active tab,
+    /// which the user can change mid-run, and a raw terminal id is recycled across server
+    /// restarts — both retarget silently.
     #[test]
-    fn the_skill_requires_verifying_the_active_tab_before_sending() {
+    fn the_skill_addresses_writes_by_token() {
         assert!(
-            SKILL_MD.contains("$COPAD_MUX_PANE` appears in it")
-                || SKILL_MD.contains("own token is in that listing"),
-            "the skill must tell the agent to confirm its own pane is in the active listing"
+            SKILL_MD.contains("**Use tokens. Always.**"),
+            "the skill must state the preference outright"
+        );
+        // Matched on fragments that cannot straddle a line wrap — the prose is hard-wrapped,
+        // so a longer literal silently stops matching the moment the paragraph reflows.
+        assert!(
+            SKILL_MD.contains("no way to make an index-addressed")
+                && SKILL_MD.contains("race-free"),
+            "the skill must admit the index race cannot be closed, only narrowed"
         );
         assert!(
-            SKILL_MD.contains("cannot make an index-addressed send safe"),
-            "the skill must admit an index-addressed send cannot be made race-free"
+            SKILL_MD.contains("Those restart from")
+                && SKILL_MD.contains("address an unrelated pane later"),
+            "the skill must warn that terminal ids are recycled"
         );
         assert!(
-            SKILL_MD.contains("cannot type into a pane by token"),
-            "the skill must state that `send` has no token form"
+            SKILL_MD.contains("never send to your own pane"),
+            "the skill must keep the self-send prohibition"
+        );
+        // Token addressing reaches panes the user is not looking at — say so.
+        assert!(
+            SKILL_MD.contains("the user may not see it happen"),
+            "the skill must note that a token-addressed write is invisible to the user"
+        );
+    }
+}
+
+#[cfg(test)]
+mod pane_arg_tests {
+    use super::*;
+
+    #[test]
+    fn plain_integers_stay_indexes() {
+        // Every invocation that works today must keep working identically — including the
+        // leading `+` that Rust's usize parser accepts.
+        for (arg, want) in [("0", 0usize), ("12", 12), ("+0", 0)] {
+            match classify_pane_arg(arg) {
+                Some(PaneArg::Index(i)) => assert_eq!(i, want, "{arg}"),
+                other => panic!("{arg} should be an index, got {:?}", other.is_some()),
+            }
+        }
+    }
+
+    #[test]
+    fn tokens_are_recognized() {
+        match classify_pane_arg("1a2b3c-7") {
+            Some(PaneArg::Token(t)) => assert_eq!(t, "1a2b3c-7"),
+            _ => panic!("a minted-shape token should classify as a token"),
+        }
+    }
+
+    /// A numeric string too large for `usize` must be an ERROR, not a silent fall-through to
+    /// token resolution — which would report "unknown pane" and send the caller hunting for a
+    /// pane that was never the problem.
+    #[test]
+    fn an_overflowing_index_is_refused_not_treated_as_a_token() {
+        assert!(classify_pane_arg("99999999999999999999999999").is_none());
+        assert!(classify_pane_arg("-1").is_none());
+        assert!(classify_pane_arg("+9999999999999999999999").is_none());
+    }
+
+    /// A raw terminal id has no `-`, so it cannot be mistaken for a token — which is what
+    /// keeps `send` from accepting an identity that gets recycled across server restarts.
+    #[test]
+    fn a_terminal_id_is_not_accepted_as_a_token() {
+        assert!(classify_pane_arg("term0").is_none());
+        assert!(classify_pane_arg("").is_none());
+    }
+
+    /// The classification rests on the mint's shape. If `next_pane_token` ever stops putting
+    /// a `-` in, or starts producing something that parses as a `usize`, `send` would silently
+    /// route tokens to the index path.
+    #[test]
+    fn the_mint_still_matches_what_classification_assumes() {
+        let t = crate::term::next_pane_token();
+        assert!(t.contains('-'), "token mint lost its separator: {t}");
+        assert!(
+            t.parse::<usize>().is_err(),
+            "a token must never parse as an index: {t}"
+        );
+        match classify_pane_arg(&t) {
+            Some(PaneArg::Token(got)) => assert_eq!(got, t),
+            _ => panic!("a freshly minted token must classify as a token: {t}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod send_split_proto_tests {
+    use super::*;
+
+    /// The old wire shape must still parse: a running older client keeps sending it the
+    /// moment the server is upgraded, and refusing it would break every one of them.
+    #[test]
+    fn the_old_send_shape_still_parses() {
+        let old = r#"{"cmd":"send-keys","index":0,"text":"ls"}"#;
+        match serde_json::from_str::<Req>(old).expect("old send must parse") {
+            Req::SendKeys {
+                target,
+                index,
+                text,
+            } => {
+                assert_eq!(target, None);
+                assert_eq!(index, Some(0));
+                assert_eq!(text, "ls");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_token_send_shape_round_trips() {
+        let req = Req::SendKeys {
+            target: Some("ab12-3".into()),
+            index: None,
+            text: "make\n".into(),
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        match serde_json::from_str::<Req>(&line).unwrap() {
+            Req::SendKeys { target, index, .. } => {
+                assert_eq!(target.as_deref(), Some("ab12-3"));
+                assert_eq!(index, None);
+            }
+            other => panic!("wrong round-trip: {other:?}"),
+        }
+    }
+
+    /// `from` is optional on the wire so an older client's `{"cmd":"split","dir":"right"}`
+    /// still means "split the focused pane".
+    #[test]
+    fn the_old_split_shape_still_parses() {
+        match serde_json::from_str::<Req>(r#"{"cmd":"split","dir":"right"}"#).unwrap() {
+            Req::Split { dir, from } => {
+                assert_eq!(dir, "right");
+                assert_eq!(from, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_split_response_carries_the_new_pane() {
+        let line = serde_json::to_string(&Resp::split("ab12-4".into())).unwrap();
+        let back: Resp = serde_json::from_str(&line).unwrap();
+        assert!(back.ok);
+        assert_eq!(back.pane.as_deref(), Some("ab12-4"));
+    }
+}
+
+#[cfg(test)]
+mod split_exit_tests {
+    use super::*;
+
+    /// The documented recipe is `pane=$(comux split --from "$COPAD_MUX_PANE")`. An older
+    /// server answers `split` with `ok` and no token, so without this the shell captures an
+    /// empty string and a `||` guard never fires — the script proceeds to address a pane
+    /// that does not exist.
+    #[test]
+    fn a_split_response_without_a_token_is_not_a_usable_success() {
+        for missing in [None, Some(String::new())] {
+            let resp = Resp {
+                pane: missing.clone(),
+                ..Resp::ok()
+            };
+            assert!(
+                resp.ok,
+                "the server still reports success — the CLI is what must refuse it"
+            );
+            assert!(
+                resp.pane.as_deref().unwrap_or_default().is_empty(),
+                "fixture is wrong: {missing:?}"
+            );
+        }
+        // And a real one is usable.
+        assert!(
+            !Resp::split("ab12-4".into())
+                .pane
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
         );
     }
 }
