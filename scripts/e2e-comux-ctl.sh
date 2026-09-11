@@ -21,6 +21,7 @@
 #   6. a pane whose shell IGNORES SIGHUP is killed without wedging the server
 #   7. pane identity (`$COPAD_MUX_PANE`) + `notify` + cross-session `jump` by token
 #   8. a bad index is refused; `--json` with no index is a usage error (exit 2)
+#   9. capture-pane reads a pane's output back (by default/token/index) + refusals
 
 set -euo pipefail
 
@@ -195,10 +196,45 @@ set -e
 [[ "$code" == "2" ]] || fail "expected usage exit 2 for a picker-less close-tab, got $code"
 ok "out-of-range refused; --json with no index is exit 2"
 
-echo "9. the server is still responsive and shuts down cleanly"
+echo "9. capture-pane reads a pane back"
+# The marker must NOT appear literally in the command we send, or capture would match
+# the shell's echo of the input line instead of the command's OUTPUT.
+t 10 "$COMUX" send 0 "printf 'CAP%s_OK\n' TURE" >/dev/null
+t 10 "$COMUX" send 0 $'\n' >/dev/null
+found=""
+for _ in $(seq 1 50); do
+    t 10 "$COMUX" capture-pane >"$WORK/cap" 2>/dev/null || true
+    if grep -q "CAPTURE_OK" "$WORK/cap"; then found=1; break; fi
+    sleep 0.2
+done
+[[ -n "$found" ]] || fail "capture-pane never saw the marker: $(tail -3 "$WORK/cap")"
+# Addressing by token and by index must agree once output has gone quiet.
+t 10 "$COMUX" list --json >"$WORK/json"
+tok="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["panes"][0]["token"])' <"$WORK/json")"
+sleep 0.5
+t 10 "$COMUX" capture-pane "$tok" >"$WORK/by-token"
+t 10 "$COMUX" capture-pane --index 0 >"$WORK/by-index"
+diff -q "$WORK/by-token" "$WORK/by-index" >/dev/null \
+    || fail "capture by token and by index disagree"
+# The resolved pane is echoed, so a defaulted target is auditable.
+t 10 "$COMUX" capture-pane --json >"$WORK/json"
+echoed="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+[[ "$echoed" == "$tok" ]] || fail "capture-pane echoed pane '$echoed', expected '$tok'"
+# A deep request must be answered by the budget, not by hanging.
+t 10 "$COMUX" capture-pane -S 999999 >/dev/null || fail "an over-long capture failed"
+# Refusals.
+t 10 "$COMUX" capture-pane no-such-pane >/dev/null 2>&1 && fail "unknown target should fail"
+t 10 "$COMUX" capture-pane -S 0 >/dev/null 2>&1 && fail "--lines 0 should fail"
+set +e
+t 10 "$COMUX" capture-pane "$tok" --index 0 >/dev/null 2>&1; code=$?
+set -e
+[[ "$code" == "2" ]] || fail "target + --index should be usage exit 2, got $code"
+ok "marker read back; token/index agree; resolved pane echoed; refusals honored"
+
+echo "10. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"
 
 echo
-echo "PASS — comux close-tab / kill-session / notify / jump verified end to end"
+echo "PASS — comux close-tab / kill-session / notify / jump / capture-pane verified end to end"

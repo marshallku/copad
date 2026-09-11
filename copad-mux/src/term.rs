@@ -471,6 +471,24 @@ impl PaneTerm {
     pub fn snapshot(&self) -> Snapshot {
         snapshot_grid(&self.term.lock())
     }
+
+    /// Capture this pane's text for read-back (`comux capture-pane`).
+    ///
+    /// `want_rows` counts PHYSICAL grid rows ending at the live screen bottom, reaching
+    /// back into scrollback; `None` means the visible screen's worth. See [`capture_rows`]
+    /// for why this does not reuse the render snapshot and why it ignores the scroll
+    /// position.
+    ///
+    /// The lock is scoped to the harvest so the concatenation — which touches every
+    /// retained byte — cannot starve the PTY reader thread.
+    pub fn capture(&self, want_rows: Option<usize>) -> Capture {
+        let harvest = {
+            let term = self.term.lock();
+            let rows = want_rows.unwrap_or_else(|| term.screen_lines());
+            capture_rows(&term, rows)
+        };
+        assemble_capture(harvest)
+    }
 }
 
 /// Snapshot the visible viewport of any `Term` into renderer-ready [`Snapshot`]. Split
@@ -552,6 +570,160 @@ fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
         wrapped,
         cursor: (cursor_col, cursor_row),
     }
+}
+
+/// Server-owned traversal budgets for [`capture_text`]. These bound the WORK, not merely
+/// the output: the walk runs on the single-writer main loop while holding the pane's
+/// `term` lock, so a caller must not be able to make it traverse an unbounded grid.
+///
+/// Why three of them, none redundant:
+/// - `CAPTURE_MAX_ROWS` — the same order as the configured scrollback, so `--lines`
+///   cannot ask for more history than exists to begin with.
+/// - `CAPTURE_MAX_BYTES` — same order as [`MAX_CLIPBOARD_BYTES`]; caps the retained text.
+/// - `CAPTURE_MAX_CELLS` — neither of the other two bounds a history of BLANK rows: those
+///   trim to nothing, so the byte budget never trips while the walk still visits
+///   `rows × cols` cells. Zero-width combining marks are charged against it too, because
+///   alacritty stores them in an UNCAPPED `Vec<char>` per cell — without that, a single
+///   cell could blow the byte budget on its own and be copied in full before anyone noticed.
+pub const CAPTURE_MAX_ROWS: usize = 10_000;
+pub const CAPTURE_MAX_BYTES: usize = 1 << 20; // 1 MiB of retained text
+pub const CAPTURE_MAX_CELLS: usize = 2_000_000;
+
+/// The text of a pane's grid, newest-last. See [`capture_text`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct Capture {
+    /// The captured text. Rows are joined with `\n` except at a soft-wrap seam; there is
+    /// no trailing newline (matching the drag-copy extractor).
+    pub text: String,
+    /// Physical grid rows actually included.
+    pub rows: usize,
+    /// Older output exists that this capture could NOT include — a budget cut the walk
+    /// short, or the request was clamped to [`CAPTURE_MAX_ROWS`]. Deliberately NOT set
+    /// when the caller simply asked for fewer rows than exist and got exactly that:
+    /// "I hit a limit" and "you are missing output" are different claims, and only the
+    /// second is worth waking a caller up about.
+    pub truncated: bool,
+}
+
+/// Rows harvested bottom-up by [`capture_rows`], before assembly. `wanted` is how many
+/// rows the caller could legitimately have received, so the truncation verdict can be
+/// formed without re-reading the grid (and therefore without re-taking the lock).
+struct CaptureRows {
+    /// `(row text, does this row soft-wrap into the one below it)`, BOTTOM-UP.
+    rows: Vec<(String, bool)>,
+    wanted: usize,
+}
+
+/// Harvest up to `want_rows` physical grid rows ending at the **live screen bottom**,
+/// walking backward into scrollback history.
+///
+/// Deliberately NOT built on [`snapshot_grid`]: that path coerces each grapheme's
+/// unicode-width to the column span alacritty allotted it, which drops VS16/ZWJ marks and
+/// blanks unrepresentable graphemes (`❤️` → `❤`). That is the right trade for rendering —
+/// it is the root fix for wide-glyph ghosting — and it is silent corruption for read-back.
+/// This walker emits the stored scalars verbatim.
+///
+/// Anchored at the LIVE bottom rather than the displayed viewport, so a human scrolling in
+/// copy-mode cannot change what a scripted reader sees.
+///
+/// `want_rows` counts PHYSICAL grid rows, not logical lines — a soft-wrapped logical line
+/// spans several rows. In the alternate screen there is no history, so at most the alt
+/// screen itself is available.
+fn capture_rows<L: EventListener>(term: &Term<L>, want_rows: usize) -> CaptureRows {
+    let cols = term.columns();
+    let screen = term.screen_lines();
+    let grid = term.grid();
+    // Never index past the top of history: `Line(-n)` for n > history_size panics.
+    let available = screen + grid.history_size();
+    let wanted = want_rows.min(available);
+    let walk = wanted.min(CAPTURE_MAX_ROWS);
+
+    let mut rows: Vec<(String, bool)> = Vec::new();
+    // Bytes already committed, charging each row the `\n` it may need (a history of blank
+    // rows still costs one separator byte each — that is the whole byte budget otherwise).
+    let mut retained = 0usize;
+    let mut cells = 0usize;
+    'walk: for k in 0..walk {
+        let line = Line(screen as i32 - 1 - k as i32);
+        let mut text = String::new();
+        for c in 0..cols {
+            cells += 1;
+            if cells > CAPTURE_MAX_CELLS {
+                break 'walk; // discard this incomplete row rather than emit a partial one
+            }
+            let cell = &grid[Point::new(line, Column(c))];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                continue; // wide-glyph right half: the grapheme lives on the leading cell
+            }
+            if retained + text.len() + cell.c.len_utf8() + 1 > CAPTURE_MAX_BYTES {
+                break 'walk;
+            }
+            text.push(cell.c);
+            if let Some(zw) = cell.zerowidth() {
+                for ch in zw {
+                    cells += 1;
+                    if cells > CAPTURE_MAX_CELLS {
+                        break 'walk;
+                    }
+                    if retained + text.len() + ch.len_utf8() + 1 > CAPTURE_MAX_BYTES {
+                        break 'walk;
+                    }
+                    text.push(*ch);
+                }
+            }
+        }
+        // alacritty marks the LAST cell of a soft-wrapped row `WRAPLINE`: the row continues
+        // onto the next one, so the seam must not become a newline.
+        let wraps = cols > 0
+            && grid[Point::new(line, Column(cols - 1))]
+                .flags
+                .contains(Flags::WRAPLINE);
+        retained += text.len() + 1;
+        rows.push((text, wraps));
+    }
+    CaptureRows { rows, wanted }
+}
+
+/// Join harvested rows top-down. Split from [`capture_rows`] so the concatenation — which
+/// touches every retained byte — runs with the pane's `term` lock RELEASED, keeping the
+/// PTY reader thread unblocked.
+fn assemble_capture(harvest: CaptureRows) -> Capture {
+    let CaptureRows { mut rows, wanted } = harvest;
+    rows.reverse();
+    let mut text = String::new();
+    for (i, (row, wraps)) in rows.iter().enumerate() {
+        let last = i + 1 == rows.len();
+        if *wraps && !last {
+            // Soft-wrap seam: the same logical line continues, so keep the trailing spaces
+            // (trimming would fuse "word " + "next" into "wordnext") and emit no newline.
+            text.push_str(row);
+        } else {
+            // Trim ONLY the ASCII space a terminal pads empty cells with. `trim_end()`
+            // would also strip Unicode whitespace the program actually WROTE — a trailing
+            // U+00A0 is content, not padding — and read-back has to be lossless or the
+            // caller acts on text that never existed.
+            text.push_str(row.trim_end_matches(' '));
+            if !last {
+                text.push('\n');
+            }
+        }
+    }
+    Capture {
+        rows: rows.len(),
+        truncated: rows.len() < wanted,
+        text,
+    }
+}
+
+/// Capture pane text from a bare `Term` — the composition of [`capture_rows`] and
+/// [`assemble_capture`]. Used by tests (no PTY, no shell, deterministic); production goes
+/// through [`PaneTerm::capture`], which scopes the lock to the harvest.
+#[cfg(test)]
+fn capture_text<L: EventListener>(term: &Term<L>, want_rows: usize) -> Capture {
+    assemble_capture(capture_rows(term, want_rows))
 }
 
 /// How long a closed pane's shell gets to honour its `SIGHUP` before it is killed.
@@ -1531,6 +1703,231 @@ mod render_repro {
                 "\x1b[H┌──────┐\x1b[2;1H│      │\x1b[3;1H└──────┘".as_bytes(),
                 "\x1b[2;2Hhello".as_bytes(),
             ],
+        );
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    //! Read-back (`comux capture-pane`) driven against a bare `Term` through the VTE
+    //! parser — no PTY, no shell, deterministic.
+    use super::*;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::term::test::TermSize;
+    use alacritty_terminal::term::{Config, Term};
+    use alacritty_terminal::vte::ansi::Processor;
+
+    fn term(cols: usize, rows: usize) -> (Term<VoidListener>, Processor) {
+        let size = TermSize::new(cols, rows);
+        (
+            Term::new(Config::default(), &size, VoidListener),
+            Processor::new(),
+        )
+    }
+
+    fn feed(t: &mut Term<VoidListener>, p: &mut Processor, s: &str) {
+        p.advance(t, s.as_bytes());
+    }
+
+    #[test]
+    fn captures_the_visible_screen() {
+        let (mut t, mut p) = term(20, 4);
+        feed(&mut t, &mut p, "alpha\r\nbeta\r\ngamma");
+        let cap = capture_text(&t, 4);
+        assert_eq!(cap.text, "alpha\nbeta\ngamma\n");
+        assert_eq!(cap.rows, 4);
+        // Everything available was returned, so this is NOT truncation.
+        assert!(!cap.truncated);
+    }
+
+    #[test]
+    fn reaches_back_into_scrollback() {
+        let (mut t, mut p) = term(20, 3);
+        // 6 lines through a 3-row screen: the first three scroll into history.
+        for i in 1..=6 {
+            feed(&mut t, &mut p, &format!("line{i}\r\n"));
+        }
+        // The visible screen alone cannot see line1.
+        assert!(!capture_text(&t, 3).text.contains("line1"));
+        let deep = capture_text(&t, 9);
+        assert!(
+            deep.text.contains("line1") && deep.text.contains("line6"),
+            "scrollback capture missed rows: {:?}",
+            deep.text
+        );
+        // Order is oldest-first, newest-last.
+        let first = deep.text.find("line1").unwrap();
+        let last = deep.text.find("line6").unwrap();
+        assert!(first < last, "capture is not in display order");
+    }
+
+    #[test]
+    fn clamps_past_the_top_of_history() {
+        // Indexing `Line(-n)` past `history_size` panics in alacritty, so an over-long
+        // request must clamp rather than reach.
+        let (mut t, mut p) = term(20, 3);
+        feed(&mut t, &mut p, "only\r\n");
+        let cap = capture_text(&t, 50_000);
+        assert!(cap.text.contains("only"));
+        // Nothing older exists, so asking for more is not "missing output".
+        assert!(!cap.truncated);
+    }
+
+    #[test]
+    fn zero_rows_is_empty_not_a_panic() {
+        // The server refuses `--lines 0` at the boundary; the walker must still be safe,
+        // because a clamp/index slip here is an out-of-bounds panic on the main loop.
+        let (mut t, mut p) = term(20, 3);
+        feed(&mut t, &mut p, "x");
+        let cap = capture_text(&t, 0);
+        assert_eq!(cap.text, "");
+        assert_eq!(cap.rows, 0);
+        assert!(!cap.truncated);
+    }
+
+    #[test]
+    fn joins_a_softwrap_seam_without_a_newline() {
+        // 6 columns: "abcdefgh" soft-wraps, and the seam is the SAME logical line.
+        let (mut t, mut p) = term(6, 3);
+        feed(&mut t, &mut p, "abcdefgh");
+        let cap = capture_text(&t, 3);
+        assert!(
+            cap.text.starts_with("abcdefgh"),
+            "soft-wrap seam became a line break: {:?}",
+            cap.text
+        );
+    }
+
+    #[test]
+    fn a_hard_line_break_stays_a_newline() {
+        // Capture counts rows UP from the live bottom, so a 3-row screen needs all 3 to
+        // reach "one" — asking for 2 legitimately starts at "two".
+        let (mut t, mut p) = term(20, 3);
+        feed(&mut t, &mut p, "one\r\ntwo");
+        assert!(capture_text(&t, 3).text.starts_with("one\ntwo"));
+        assert!(capture_text(&t, 2).text.starts_with("two"));
+    }
+
+    #[test]
+    fn a_wide_glyph_is_captured_once() {
+        // The trailing spacer cell must be skipped, or every CJK glyph doubles.
+        let (mut t, mut p) = term(10, 1);
+        feed(&mut t, &mut p, "가나");
+        assert_eq!(capture_text(&t, 1).text, "가나");
+    }
+
+    #[test]
+    fn preserves_vs16_that_the_render_snapshot_drops() {
+        // THE regression test for the reason this walker exists. `snapshot_grid` coerces a
+        // grapheme's unicode-width to alacritty's column span, which turns ❤️ into ❤ (see
+        // `snapshot_coerces_grapheme_width_to_alacritty_span`). That is right for rendering
+        // and silent corruption for read-back, so capture must NOT go through it.
+        let (mut t, mut p) = term(10, 1);
+        feed(&mut t, &mut p, "❤\u{fe0f}");
+        let captured = capture_text(&t, 1).text;
+        assert_eq!(captured, "❤\u{fe0f}", "capture lost the VS16 selector");
+        assert_ne!(
+            captured,
+            snapshot_grid(&t).cells[0][0].sym,
+            "capture must not reproduce the render path's lossy coercion"
+        );
+    }
+
+    #[test]
+    fn keeps_unicode_whitespace_the_program_wrote() {
+        // Read-back must be lossless, which makes the trailing-trim rule load-bearing. A
+        // trailing U+00A0 is CONTENT, not padding: `trim_end()` (Unicode White_Space) would
+        // delete it and still report `truncated: false` — a lie the caller cannot detect.
+        // Only the ASCII space the grid pads empty cells with is safe to strip.
+        let (mut t, mut p) = term(10, 1);
+        feed(&mut t, &mut p, "x\u{00A0}");
+        assert_eq!(capture_text(&t, 1).text, "x\u{00A0}");
+    }
+
+    #[test]
+    fn trailing_whitespace_is_trimmed_per_row() {
+        let (mut t, mut p) = term(20, 2);
+        feed(&mut t, &mut p, "padded   \r\n");
+        assert!(capture_text(&t, 2).text.starts_with("padded\n"));
+    }
+
+    #[test]
+    fn row_budget_keeps_the_newest_and_flags_truncation() {
+        // alacritty's default history is 10_000 rows, so a full screen plus full history
+        // exceeds CAPTURE_MAX_ROWS and the clamp becomes real missing output.
+        let (mut t, mut p) = term(20, 5);
+        for i in 0..10_200 {
+            feed(&mut t, &mut p, &format!("r{i}\r\n"));
+        }
+        let available = 5 + t.grid().history_size();
+        assert!(
+            available > CAPTURE_MAX_ROWS,
+            "test needs more history than the row cap ({available})"
+        );
+        let cap = capture_text(&t, available);
+        assert_eq!(cap.rows, CAPTURE_MAX_ROWS);
+        assert!(cap.truncated, "a clamped request IS missing output");
+        // The newest rows are the ones kept.
+        assert!(cap.text.contains("r10199"));
+    }
+
+    #[test]
+    fn byte_budget_keeps_the_newest_and_flags_truncation() {
+        // Wide rows so the byte budget trips before the row budget does.
+        let (mut t, mut p) = term(200, 5);
+        let wide = "x".repeat(199);
+        for i in 0..8_000 {
+            feed(&mut t, &mut p, &format!("{i:06}{wide}\r\n"));
+        }
+        let cap = capture_text(&t, 20_000);
+        assert!(cap.truncated, "1 MiB of text should have tripped the cap");
+        assert!(
+            cap.text.len() <= CAPTURE_MAX_BYTES,
+            "retained {} bytes, cap is {}",
+            cap.text.len(),
+            CAPTURE_MAX_BYTES
+        );
+        // Newest suffix, cut on a row boundary — the last line must be the last written.
+        let last = cap.text.lines().next_back().unwrap_or_default();
+        assert!(
+            last.starts_with("007999"),
+            "byte budget dropped the NEWEST rows instead of the oldest: {last:.20}"
+        );
+    }
+
+    #[test]
+    fn is_unaffected_by_the_scroll_position() {
+        // Capture anchors at the LIVE screen bottom, so a human scrolling in copy-mode
+        // cannot change what a scripted reader sees.
+        let (mut t, mut p) = term(20, 3);
+        for i in 1..=9 {
+            feed(&mut t, &mut p, &format!("row{i}\r\n"));
+        }
+        let live = capture_text(&t, 3).text;
+        t.scroll_display(Scroll::Delta(4));
+        assert!(
+            t.grid().display_offset() > 0,
+            "test did not actually scroll"
+        );
+        assert_eq!(capture_text(&t, 3).text, live);
+    }
+
+    #[test]
+    fn alt_screen_has_no_history_to_reach_into() {
+        // Documented contract: in the alternate screen a deep request returns at most the
+        // alt screen itself — and must not index past it.
+        let (mut t, mut p) = term(20, 3);
+        for i in 1..=9 {
+            feed(&mut t, &mut p, &format!("scroll{i}\r\n"));
+        }
+        feed(&mut t, &mut p, "\x1b[?1049h"); // enter alt screen
+        feed(&mut t, &mut p, "alt-only");
+        let cap = capture_text(&t, 500);
+        assert!(cap.text.contains("alt-only"));
+        assert!(
+            !cap.text.contains("scroll1"),
+            "alt-screen capture leaked the primary screen's scrollback: {:?}",
+            cap.text
         );
     }
 }

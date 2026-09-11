@@ -2235,6 +2235,56 @@ impl App {
             }
             // Intercepted by the server before it reaches here; answered ok for a
             // (hypothetical) direct call so the match stays exhaustive.
+            Req::CapturePane {
+                target,
+                index,
+                lines,
+            } => {
+                if target.is_some() && index.is_some() {
+                    return Resp::err("give a target or --index, not both");
+                }
+                if *lines == Some(0) {
+                    return Resp::err("--lines must be at least 1");
+                }
+                // Precedence: explicit target (anywhere in the mux) > index (active tab) >
+                // focused pane. Resolved to a TerminalId either way, because that is what
+                // owns the grid.
+                let tid = match target {
+                    Some(t) => match self.resolve_pane_target(t) {
+                        Some(tid) => tid,
+                        None => return Resp::err(format!("unknown pane '{t}'")),
+                    },
+                    None => {
+                        let order = self.pane_order();
+                        let pane = match index {
+                            Some(i) => match order.get(*i) {
+                                Some(p) => p.clone(),
+                                None => return Resp::err(format!("no pane at index {i}")),
+                            },
+                            None => match self.focused_pane() {
+                                Some(p) => p,
+                                None => return Resp::err("no focused pane"),
+                            },
+                        };
+                        match self
+                            .state
+                            .workspace(&self.ws)
+                            .and_then(|w| w.tab(&w.active_tab))
+                            .and_then(|t| t.layout.terminal_of(&pane).cloned())
+                        {
+                            Some(tid) => tid,
+                            None => return Resp::err("pane has no live terminal"),
+                        }
+                    }
+                };
+                match self.panes.get(&tid) {
+                    Some(pt) => {
+                        let token = pt.pane_token().unwrap_or_default().to_string();
+                        Resp::capture(pt.capture(*lines), token)
+                    }
+                    None => Resp::err("pane has no live terminal"),
+                }
+            }
             Req::KillServer => Resp::ok(),
         }
     }
@@ -6785,7 +6835,9 @@ fn extract_selection(snap: &crate::term::Snapshot, anchor: (u16, u16), head: (u1
             if soft {
                 out.push_str(&line);
             } else {
-                out.push_str(line.trim_end());
+                // ASCII space only — the grid's padding. `trim_end()` would also eat a
+                // trailing U+00A0 the program wrote, silently altering what gets copied.
+                out.push_str(line.trim_end_matches(' '));
                 if row < end.1 {
                     out.push('\n');
                 }

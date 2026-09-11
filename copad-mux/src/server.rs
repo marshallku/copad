@@ -728,6 +728,10 @@ fn ctl_mutates(req: &control::Req) -> bool {
             | control::Req::ListTabs
             | control::Req::ListSessions
             | control::Req::Health
+            // Read-only, and the one verb callers POLL. Treating it as a mutation would
+            // mark the render dirty on every poll and defeat the loop's idle skip — the
+            // detached-CPU throttle exists precisely to stop that kind of busy-work.
+            | control::Req::CapturePane { .. }
     )
 }
 

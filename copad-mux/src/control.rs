@@ -128,6 +128,28 @@ pub enum Req {
         #[serde(default)]
         cwd: Option<String>,
     },
+    /// Read a pane's text back (`comux capture-pane`) — the counterpart to
+    /// [`Req::SendKeys`], and the primitive an agent needs to observe a sibling pane.
+    ///
+    /// Addressing precedence: `target` (a pane token / terminal id, resolvable ANYWHERE in
+    /// the mux) > `index` (into the active tab, as printed by `list`) > the focused pane.
+    /// Supplying both `target` and `index` is a usage error rather than a silent
+    /// precedence win — a capture of the wrong pane is a wrong ANSWER, and answers get
+    /// acted on.
+    ///
+    /// `lines` counts PHYSICAL grid rows ending at the LIVE screen bottom (not the
+    /// displayed viewport, so a human scrolling in copy-mode cannot change what a script
+    /// reads), reaching back into scrollback. `None` = the visible screen's worth. `0` is
+    /// refused. Read-only: it must stay out of `ctl_mutates`, since this is a verb callers
+    /// poll.
+    CapturePane {
+        #[serde(default)]
+        target: Option<String>,
+        #[serde(default)]
+        index: Option<usize>,
+        #[serde(default)]
+        lines: Option<usize>,
+    },
     /// Re-read `mux.toml` and apply the live-reloadable settings to the running server
     /// WITHOUT restarting it — like tmux `source-file`. Keybindings, mouse, sidebar
     /// width, usage/tab-label display, notify, and worktree config take effect on the
@@ -286,6 +308,21 @@ pub struct Resp {
     /// the same program before activating it (pids get recycled).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raise_comm: Option<String>,
+    /// `capture-pane`: the pane's text, newest-last.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// `capture-pane`: physical grid rows the text spans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_rows: Option<usize>,
+    /// `capture-pane`: older output exists that the capture could not include.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    /// `capture-pane`: the token of the pane actually read. Echoed so a caller that let
+    /// the target default to the focused pane can tell WHICH pane answered — focus is a
+    /// mutable UI choice, and a silently-retargeted read is indistinguishable from a
+    /// correct one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pane: Option<String>,
 }
 
 impl Resp {
@@ -304,6 +341,21 @@ impl Resp {
             health: None,
             raise_pid: None,
             raise_comm: None,
+            text: None,
+            capture_rows: None,
+            truncated: None,
+            pane: None,
+        }
+    }
+
+    /// A `capture-pane` response.
+    pub fn capture(cap: crate::term::Capture, pane: String) -> Self {
+        Self {
+            text: Some(cap.text),
+            capture_rows: Some(cap.rows),
+            truncated: Some(cap.truncated),
+            pane: Some(pane),
+            ..Self::ok()
         }
     }
 
@@ -417,7 +469,7 @@ pub fn run_client(args: &[String]) -> i32 {
     }
     let Some(cmd) = rest.first().map(|s| s.as_str()) else {
         eprintln!(
-            "usage: comux <list|split|resize|focus|close|send|list-tabs|new-tab|select-tab|\
+            "usage: comux <list|split|resize|focus|close|send|capture-pane|list-tabs|new-tab|select-tab|\
              close-tab|rename-tab [index] <name>|list-sessions|new-session [name]|\
              rename-session [index] <name>|select-session|kill-session|\
              worktree <create|list|rm>|reload|health|kill-server> [args]"
@@ -522,6 +574,61 @@ pub fn run_client(args: &[String]) -> i32 {
                 Req::Focus { index: idx }
             } else {
                 Req::Close { index: idx }
+            }
+        }
+        "capture-pane" | "capture" => {
+            // Addressed by identity like `jump`/`notify` rather than by picker: this verb
+            // exists for scripts and agents, and an interactive picker in the middle of a
+            // pipeline is the wrong affordance. A bare `comux capture-pane` still works —
+            // it reads the focused pane.
+            let mut target: Option<String> = None;
+            let mut index: Option<usize> = None;
+            let mut lines: Option<usize> = None;
+            let mut it = rest.iter().skip(1);
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--json" => {}
+                    "-S" | "--lines" => match it.next().map(|v| v.parse::<usize>()) {
+                        Some(Ok(n)) => lines = Some(n),
+                        _ => {
+                            eprintln!("comux capture-pane: -S/--lines needs a number");
+                            return 2;
+                        }
+                    },
+                    "--index" => match it.next().map(|v| v.parse::<usize>()) {
+                        Some(Ok(n)) => index = Some(n),
+                        _ => {
+                            eprintln!("comux capture-pane: --index needs a number");
+                            return 2;
+                        }
+                    },
+                    "-h" | "--help" => {
+                        eprintln!("{CAPTURE_USAGE}");
+                        return 2;
+                    }
+                    other if other.starts_with('-') => {
+                        eprintln!("comux capture-pane: unknown flag {other}\n{CAPTURE_USAGE}");
+                        return 2;
+                    }
+                    other => {
+                        if target.is_some() {
+                            eprintln!(
+                                "comux capture-pane: give at most one target\n{CAPTURE_USAGE}"
+                            );
+                            return 2;
+                        }
+                        target = Some(other.to_string());
+                    }
+                }
+            }
+            if target.is_some() && index.is_some() {
+                eprintln!("comux capture-pane: give a target or --index, not both");
+                return 2;
+            }
+            Req::CapturePane {
+                target,
+                index,
+                lines,
             }
         }
         "jump" => {
@@ -679,6 +786,11 @@ fn maybe_raise(resp: &Resp) {
 
 /// Exit code for "the user cancelled the picker" — fzf's (and SIGINT's) convention, so a
 /// shell wrapper can tell a deliberate abort apart from a real failure.
+/// Usage for `capture-pane`. A const because three argument-error paths print it.
+const CAPTURE_USAGE: &str = "usage: comux capture-pane [<pane-token|terminal-id>] [--index N] [-S|--lines N] [--json]\n\
+     \x20      no target = the focused pane; -S counts PHYSICAL grid rows back from the\n\
+     \x20      live screen bottom (not the scrolled view), reaching into scrollback";
+
 const EXIT_CANCELLED: i32 = 130;
 
 /// Which live listing an omitted argument should be fuzzy-picked from.
@@ -1062,6 +1174,19 @@ fn print_human(req: &Req, resp: &Resp) {
             // The number that actually answers "why won't a new tab open?".
             if let Some(room) = h.panes_remaining() {
                 println!("panes headroom  {room}");
+            }
+        }
+        Req::CapturePane { .. } => {
+            // Text to STDOUT, notices to STDERR: `comux capture-pane | grep` must stay
+            // machine-readable even when the capture was cut short.
+            if let Some(t) = resp.text.as_deref() {
+                println!("{t}");
+            }
+            if resp.truncated == Some(true) {
+                eprintln!(
+                    "comux capture-pane: truncated — older output omitted ({} rows returned)",
+                    resp.capture_rows.unwrap_or(0)
+                );
             }
         }
         Req::List => {
@@ -1664,5 +1789,90 @@ mod server_admin_tests {
             new,
             Req::RenameTab { index: None, ref name } if name == "build"
         ));
+    }
+}
+
+#[cfg(test)]
+mod capture_proto_tests {
+    use super::*;
+
+    /// `capture-pane`'s three arguments are all optional, so the minimal request a script
+    /// writes by hand (`{"cmd":"capture-pane"}`) must parse as "focused pane, visible
+    /// screen" rather than failing.
+    #[test]
+    fn minimal_request_parses() {
+        let r: Req = serde_json::from_str(r#"{"cmd":"capture-pane"}"#).expect("must parse");
+        match r {
+            Req::CapturePane {
+                target,
+                index,
+                lines,
+            } => {
+                assert_eq!(target, None);
+                assert_eq!(index, None);
+                assert_eq!(lines, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn full_request_round_trips() {
+        let req = Req::CapturePane {
+            target: Some("ab12-3".into()),
+            index: None,
+            lines: Some(500),
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(
+            line.contains(r#""cmd":"capture-pane""#),
+            "wire form: {line}"
+        );
+        match serde_json::from_str::<Req>(&line).unwrap() {
+            Req::CapturePane { target, lines, .. } => {
+                assert_eq!(target.as_deref(), Some("ab12-3"));
+                assert_eq!(lines, Some(500));
+            }
+            other => panic!("wrong round-trip: {other:?}"),
+        }
+    }
+
+    /// The response carries the RESOLVED pane token, so a caller that let the target
+    /// default to the focused pane can tell which pane actually answered.
+    #[test]
+    fn response_carries_text_rows_and_resolved_pane() {
+        let resp = Resp::capture(
+            crate::term::Capture {
+                text: "hello".into(),
+                rows: 2,
+                truncated: true,
+            },
+            "ab12-3".into(),
+        );
+        let line = serde_json::to_string(&resp).unwrap();
+        let back: Resp = serde_json::from_str(&line).unwrap();
+        assert!(back.ok);
+        assert_eq!(back.text.as_deref(), Some("hello"));
+        assert_eq!(back.capture_rows, Some(2));
+        assert_eq!(back.truncated, Some(true));
+        assert_eq!(back.pane.as_deref(), Some("ab12-3"));
+    }
+
+    /// The capture fields are skipped when absent, so every OTHER verb's response is
+    /// unchanged on the wire and an older client parsing it sees exactly what it did before.
+    #[test]
+    fn non_capture_responses_carry_no_capture_fields() {
+        let line = serde_json::to_string(&Resp::ok()).unwrap();
+        for field in ["text", "capture_rows", "truncated", "pane"] {
+            assert!(!line.contains(field), "{field} leaked into: {line}");
+        }
+    }
+
+    /// An OLDER server does not know the verb. There is no graceful degradation to
+    /// arrange — it answers with a parse error — so the contract is simply that the
+    /// failure is explicit rather than a silent empty capture.
+    #[test]
+    fn an_unknown_verb_is_a_parse_error_not_a_default() {
+        assert!(serde_json::from_str::<Req>(r#"{"cmd":"capture-pane-v2"}"#).is_err());
     }
 }
