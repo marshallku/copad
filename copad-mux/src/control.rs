@@ -434,6 +434,11 @@ pub struct Resp {
     /// the same program before activating it (pids get recycled).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raise_comm: Option<String>,
+    /// `jump`: `(COPAD_SOCKET, COPAD_PANEL_ID)` when an attached client runs inside a copad
+    /// tab. The CLI asks copad to focus that exact tab, which application-level activation
+    /// cannot express; it falls back to `raise_pid` when this is absent or the call fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copad_host: Option<(String, String)>,
     /// `capture-pane`: the pane's text, newest-last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
@@ -472,6 +477,7 @@ impl Resp {
             health: None,
             raise_pid: None,
             raise_comm: None,
+            copad_host: None,
             text: None,
             capture_rows: None,
             truncated: None,
@@ -508,7 +514,7 @@ impl Resp {
     }
 
     /// A `jump` response: optionally naming a terminal-emulator process to activate.
-    pub fn jump(raise: Option<(u32, String)>) -> Self {
+    pub fn jump(raise: Option<(u32, String)>, copad_host: Option<(String, String)>) -> Self {
         let (pid, comm) = match raise {
             Some((p, c)) => (Some(p), Some(c)),
             None => (None, None),
@@ -516,6 +522,7 @@ impl Resp {
         Self {
             raise_pid: pid,
             raise_comm: comm,
+            copad_host,
             ..Self::ok()
         }
     }
@@ -995,6 +1002,16 @@ pub fn run_client(args: &[String]) -> i32 {
 /// are recycled — without it, a terminal that exited between the response and the click
 /// could hand its number to an unrelated process, which we would then bring to the front.
 fn maybe_raise(resp: &Resp) {
+    // Copad first, when the client is inside one. It is the only host that can be asked for
+    // the exact TAB — a pid names the emulator, not one of its tabs — so activating the
+    // application instead would land the user on whichever tab happened to be active.
+    let copad_focused = match resp.copad_host.as_ref() {
+        Some((sock, panel)) => crate::copadlink::focus_panel(sock, panel),
+        None => false,
+    };
+    if !fall_back_after_copad(copad_focused) {
+        return;
+    }
     let (Some(pid), Some(comm)) = (resp.raise_pid, resp.raise_comm.as_deref()) else {
         return;
     };
@@ -1004,6 +1021,16 @@ fn maybe_raise(resp: &Resp) {
     if still_there {
         crate::winfocus::raise(pid, &[]);
     }
+}
+
+/// Whether the generic application-level raise should still run after the copad attempt.
+///
+/// One line, extracted only so it can be TESTED: an end-to-end harness can watch comux dial
+/// copad, but it cannot watch a window come forward, so the fall-through is exactly the piece
+/// no e2e can pin. Treating a refusal as success — the plausible mistake — leaves the user
+/// looking at whatever was already frontmost, with nothing anywhere reporting a problem.
+fn fall_back_after_copad(copad_focused: bool) -> bool {
+    !copad_focused
 }
 
 /// The agent-facing operating guide, embedded so `comux skill` works from an installed
@@ -3202,6 +3229,17 @@ mod list_agents_proto_tests {
 
 #[cfg(test)]
 mod skill_tests {
+
+    #[test]
+    fn a_copad_that_did_not_focus_must_not_suppress_the_generic_raise() {
+        // The bug this guards: treating ANY reply from copad as "handled". A copad that does
+        // not own the panel answers `focused: false` — a successful call that found nothing —
+        // and the click must still fall through to activating the application.
+        assert!(super::fall_back_after_copad(false));
+        assert!(!super::fall_back_after_copad(true));
+        // No copad at all is the same as a copad that did not focus.
+        assert!(super::fall_back_after_copad(false));
+    }
     use super::*;
 
     /// Quoted string literals in `s`. Dispatch arms contain no escaped quotes, so a plain

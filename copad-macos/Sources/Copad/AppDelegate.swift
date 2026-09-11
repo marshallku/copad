@@ -1327,6 +1327,31 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             vc.switchTab(to: index)
             completion(["ok": true])
 
+        // Focus one pane from anywhere and bring the app forward with it. Exists for the
+        // notification jump path: a toast raised by an agent inside a comux pane knows the
+        // `COPAD_PANEL_ID` of the copad tab hosting that comux, and activating the
+        // APPLICATION alone would land the user on whichever tab happened to be active.
+        // One call rather than `tab.list` + index arithmetic, because the tab list can
+        // change between the two.
+        case "panel.focus":
+            guard let panelID = params["panel_id"] as? String, !panelID.isEmpty else {
+                completion(RPCError(
+                    code: "invalid_params",
+                    message: "panel.focus requires a non-empty `panel_id` string"))
+                return
+            }
+            let focused = vc.activatePanel(id: panelID)
+            if focused {
+                // Order matters: activate the app first, then raise the window, or the
+                // window comes forward behind whatever was already frontmost.
+                NSApp.activate(ignoringOtherApps: true)
+                vc.view.window?.makeKeyAndOrderFront(nil)
+            }
+            // `focused: false` is reported as a SUCCESSFUL call that found nothing, not an
+            // error: the caller's panel id may simply belong to another copad instance, and
+            // it needs to tell that apart from a broken request so it can fall back.
+            completion(["ok": true, "focused": focused])
+
         case "tab.list":
             completion(vc.tabList())
 

@@ -585,6 +585,8 @@ pub struct App {
     /// Pids of currently attached clients, oldest first — the walk-up start point for
     /// raising the right terminal window after a notification jump.
     client_pids: Vec<u32>,
+    /// `(client pid, COPAD_SOCKET, COPAD_PANEL_ID)` for clients running inside a copad tab.
+    client_copad: Vec<(u32, String, String)>,
     /// Bells this server has ACKNOWLEDGED per pane, against `PaneTerm::bell_count`.
     /// Unacknowledged = `count > seen`. See `MuxListener::bells` for why both sides count
     /// rather than flag.
@@ -809,6 +811,7 @@ impl App {
             popup: None,
             scroll_pane: None,
             client_pids: Vec::new(),
+            client_copad: Vec::new(),
             notifications: VecDeque::new(),
             hook_owned: HashSet::new(),
             center: None,
@@ -2001,6 +2004,33 @@ impl App {
             .find_map(|pid| crate::winfocus::terminal_ancestor_live(*pid))
     }
 
+    /// Record that the client with `pid` is running inside a copad tab, and which one.
+    ///
+    /// This is what makes the notification jump land on the right TAB rather than merely
+    /// bringing copad forward. Keyed by client pid so it is dropped by the same
+    /// `forget_client_pid` that drops the raise target — a departed client must not leave a
+    /// panel id behind for a later jump to focus.
+    pub fn set_client_copad(&mut self, pid: u32, sock: String, panel: String) {
+        self.client_copad.retain(|(p, _, _)| *p != pid);
+        self.client_copad.push((pid, sock, panel));
+        if self.client_copad.len() > MAX_CLIENT_PIDS {
+            self.client_copad.remove(0);
+        }
+    }
+
+    /// The copad tab hosting the most recently attached client, if any.
+    ///
+    /// Most-recent-first, matching [`Self::raise_target`]: with several clients attached the
+    /// one you just used is the one you meant.
+    fn copad_target(&self) -> Option<(String, String)> {
+        let live: Vec<&(u32, String, String)> = self
+            .client_copad
+            .iter()
+            .filter(|(p, _, _)| self.client_pids.contains(p))
+            .collect();
+        live.last().map(|(_, s, panel)| (s.clone(), panel.clone()))
+    }
+
     /// Record an attaching client's pid (most recent last) so [`Self::raise_target`] can
     /// find its terminal. Called by the server on attach.
     pub fn set_client_pid(&mut self, pid: u32) {
@@ -2014,6 +2044,7 @@ impl App {
     /// Forget a client's pid on detach — a departed client's terminal must not be raised.
     pub fn forget_client_pid(&mut self, pid: u32) {
         self.client_pids.retain(|p| *p != pid);
+        self.client_copad.retain(|(p, _, _)| *p != pid);
     }
 
     /// The attached-client pids currently considered for a window raise, oldest first.
@@ -2448,7 +2479,7 @@ impl App {
             Req::Jump { target } => match self.resolve_pane_target(target) {
                 Some(term) => {
                     self.jump_to_terminal(&term);
-                    Resp::jump(self.raise_target())
+                    Resp::jump(self.raise_target(), self.copad_target())
                 }
                 None => Resp::err(format!("unknown pane: {target}")),
             },

@@ -31,6 +31,7 @@
 #  16. `comux host` publishes CPU/memory/GPU/load, omitting what it could not read
 #  17. the top bar: off by default, and it moves the sidebar AND its click zones
 #  18. dragging a split divider moves the branch it is on, and only that one
+#  19. a notification jump focuses the exact copad TAB, and degrades when it cannot
 
 set -euo pipefail
 
@@ -859,7 +860,109 @@ assert all(int(v) > 0 for v in sys.argv[1].split()), sys.argv[1]
 PYEOF
 ok "a dragged divider lands under the pointer, conserves cells, addresses the right branch, and clamps"
 
-echo "19. the server is still responsive and shuts down cleanly"
+echo "19. a jump into a copad tab"
+# `winfocus` can only activate an APPLICATION — a pid names the emulator, not one of its tabs
+# — so a toast click lands on whichever copad tab happened to be active. Copad exports
+# `COPAD_SOCKET` and `COPAD_PANEL_ID` into every tab's shell, so a client running inside one
+# can name its exact tab; comux asks copad to focus it.
+#
+# Driven against a FAKE copad speaking the same line-JSON protocol. That covers comux's whole
+# half — the client handshake, the server bookkeeping, the response, the dial and the reply
+# parse. It does NOT cover copad's `panel.focus` handler, which is compile-verified only; see
+# decision #115.
+cat >"$WORK/fakecopad.py" <<'PYEOF'
+import json, os, socket, sys, threading, time
+path, log, focused = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+try: os.unlink(path)
+except FileNotFoundError: pass
+srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+srv.bind(path); srv.listen(4)
+def serve():
+    while True:
+        c, _ = srv.accept()
+        f = c.makefile("rwb")
+        try: req = json.loads(f.readline())
+        except Exception: req = {}
+        with open(log, "a") as fh: fh.write(json.dumps(req) + "\n")
+        f.write((json.dumps({"id": req.get("id"), "ok": True,
+                             "result": {"ok": True, "focused": focused}}) + "\n").encode())
+        f.flush(); c.close()
+threading.Thread(target=serve, daemon=True).start()
+time.sleep(120)
+PYEOF
+cat >"$WORK/attach.py" <<'PYEOF'
+import os, pty, time, select, fcntl, termios, struct, sys
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm-256color"
+    os.execvp(sys.argv[1], ["comux"])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+end = time.time() + float(sys.argv[2])
+while time.time() < end:
+    r, _, _ = select.select([fd], [], [], 0.2)
+    if r:
+        try:
+            if not os.read(fd, 65536): break
+        except OSError: break
+PYEOF
+
+start_copad () { # start_copad <focused?>
+    rm -f "$WORK/gui.sock" "$WORK/copadcalls.log"
+    python3 "$WORK/fakecopad.py" "$WORK/gui.sock" "$WORK/copadcalls.log" "$1" >/dev/null 2>&1 &
+    COPAD_FAKE_PID=$!
+    sleep 1
+}
+attach_as_copad_tab () {
+    COPAD_SOCKET="$WORK/gui.sock" COPAD_PANEL_ID="e2e-panel" \
+        python3 "$WORK/attach.py" "$COMUX" 25 >/dev/null 2>&1 &
+    COPAD_CLIENT_PID=$!
+    sleep 5
+}
+
+start_copad 1
+attach_as_copad_tab
+# The response must NAME the tab. Without this the CLI has nothing to dial and silently
+# degrades to application activation — which looks identical until you have two copad tabs.
+t 10 "$COMUX" jump "$tok" --json >"$WORK/out" || fail "jump failed while attached"
+python3 -c 'import json,sys
+r = json.load(sys.stdin)
+h = r.get("copad_host")
+assert h and h[1] == "e2e-panel", r' <"$WORK/out" \
+    || fail "the jump response did not name the copad tab: $(cat "$WORK/out")"
+t 10 "$COMUX" jump "$tok" >/dev/null || fail "plain jump failed"
+sleep 1
+python3 -c 'import json,sys
+line = open(sys.argv[1]).readline()
+req = json.loads(line)
+assert req.get("method") == "panel.focus", req
+assert req.get("params", {}).get("panel_id") == "e2e-panel", req' "$WORK/copadcalls.log" \
+    || fail "comux did not ask copad to focus its panel: $(cat "$WORK/copadcalls.log" 2>/dev/null)"
+
+# A copad that does not own the panel answers `focused: false`. That is a SUCCESSFUL call
+# that found nothing, and the CLI must fall through to the generic raise rather than treat it
+# as done — otherwise the user is left looking at the wrong window.
+kill "$COPAD_FAKE_PID" 2>/dev/null || true
+start_copad 0
+t 10 "$COMUX" jump "$tok" >/dev/null || fail "jump failed against a copad that refused focus"
+[[ -s "$WORK/copadcalls.log" ]] || fail "the refusing copad was never called"
+
+# A dead copad must not fail the jump, hang it, or print anything: the pane switch already
+# happened server-side, and raising a window is best-effort by construction.
+kill "$COPAD_FAKE_PID" 2>/dev/null || true
+rm -f "$WORK/gui.sock"
+t 10 "$COMUX" jump "$tok" >"$WORK/out" 2>&1 || fail "a dead copad must not fail the jump"
+kill "$COPAD_CLIENT_PID" 2>/dev/null || true
+sleep 1
+# Once that client detaches, the panel id must be FORGOTten — a departed client's tab must
+# not be focused by a later jump.
+t 10 "$COMUX" jump "$tok" --json >"$WORK/out" || fail "jump failed after the client left"
+python3 -c 'import json,sys
+r = json.load(sys.stdin)
+assert "copad_host" not in r, r' <"$WORK/out" \
+    || fail "a detached client left its copad tab behind: $(cat "$WORK/out")"
+ok "the jump names the copad tab, dials it, falls back when refused or dead, and forgets it on detach"
+
+echo "20. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

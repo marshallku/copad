@@ -125,7 +125,21 @@ pub enum ClientMsg {
     /// this client spawns inherit its live SSH/display session (tmux `update-environment`).
     /// A struct variant (named `vars`) — an internally-tagged enum (`tag = "t"`) cannot
     /// serialize a newtype variant whose payload is a sequence, so this must NOT be `Env(Vec<…>)`.
-    Env { vars: Vec<(String, String)> },
+    Env {
+        vars: Vec<(String, String)>,
+        /// The COPAD terminal this client is running inside, when it is one:
+        /// `(COPAD_SOCKET, COPAD_PANEL_ID)`. Copad exports both into every tab's shell, so a
+        /// client hosted by it can say exactly WHICH tab it occupies — which app-level window
+        /// activation cannot express, and which nothing else can infer without guessing.
+        ///
+        /// Kept OUT of `vars`: that list is the tmux `update-environment` scrub set, and its
+        /// members are re-injected into every pane comux spawns. A pane inheriting
+        /// `COPAD_PANEL_ID` would make each of them claim to be the copad panel.
+        ///
+        /// `serde(default)` so a client built before this field still parses.
+        #[serde(default)]
+        copad_host: Option<(String, String)>,
+    },
     /// A forwarded key event (interpreted server-side: prefix/nav/tabs/input).
     Key(KeyEvent),
     /// A forwarded mouse action at frame cell `(x, y)`.
@@ -165,13 +179,18 @@ mod tests {
                 ("DISPLAY".to_string(), ":0".to_string()),
                 ("SSH_CONNECTION".to_string(), "1.2.3.4 5 6".to_string()),
             ],
+            copad_host: Some(("/run/copad/gui-9.sock".into(), "panel-7".into())),
         };
         let line = serde_json::to_string(&msg).expect("Env must serialize");
         assert!(line.contains("\"t\":\"env\""));
         match serde_json::from_str::<ClientMsg>(&line).expect("Env must deserialize") {
-            ClientMsg::Env { vars } => {
+            ClientMsg::Env { vars, copad_host } => {
                 assert_eq!(vars.len(), 2);
                 assert_eq!(vars[0], ("DISPLAY".to_string(), ":0".to_string()));
+                assert_eq!(
+                    copad_host,
+                    Some(("/run/copad/gui-9.sock".into(), "panel-7".into()))
+                );
             }
             other => panic!("wrong variant: {other:?}"),
         }

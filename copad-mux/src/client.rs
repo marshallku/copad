@@ -359,7 +359,21 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                                 .map(|v| (name, v))
                         })
                         .collect();
-                    let _ = send(&mut wr, &ClientMsg::Env { vars: env });
+                    // Copad exports both of these into every tab's shell, so a client
+                    // hosted by it can name the exact tab it occupies. Read here, in the
+                    // CLIENT, for the same reason the env above is: the server froze its own
+                    // environment at birth and may not even be running under a GUI.
+                    let copad_host = std::env::var("COPAD_SOCKET")
+                        .ok()
+                        .zip(std::env::var("COPAD_PANEL_ID").ok())
+                        .filter(|(s, p)| !s.is_empty() && !p.is_empty());
+                    let _ = send(
+                        &mut wr,
+                        &ClientMsg::Env {
+                            vars: env,
+                            copad_host,
+                        },
+                    );
                     break;
                 }
                 Ok(ServerMsg::Bye) => return Ok(()),

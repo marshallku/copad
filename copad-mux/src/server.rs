@@ -805,13 +805,19 @@ fn handle_incoming(
                 app.ack_focused_bell();
             }
             match msg {
-                ClientMsg::Env { vars } => {
+                ClientMsg::Env { vars, copad_host } => {
                     // tmux update-environment: store this client's session vars and adopt
                     // them now, so the next pane it spawns inherits its live SSH/display env.
+                    let pid = clients.iter().find(|c| c.id == id).and_then(|c| c.pid);
                     if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
                         c.env = vars.clone();
                     }
                     app.set_client_env(vars);
+                    // Keyed by the CLIENT's pid, the same key `raise_target` picks a terminal
+                    // by, so the two can never disagree about which client is being raised.
+                    if let (Some(pid), Some((sock, panel))) = (pid, copad_host) {
+                        app.set_client_copad(pid, sock, panel);
+                    }
                     false
                 }
                 ClientMsg::Key(k) => {
