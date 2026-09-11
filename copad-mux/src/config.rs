@@ -709,6 +709,12 @@ pub struct MuxConfig {
     /// READS are never answered regardless (see `term.rs`).
     pub osc52: bool,
     pub notify: bool,
+    /// Show a marker when a pane rings the bell (tab chip, sidebar space row, and a
+    /// mux-wide `! N` count in the status bar). PRESENTATION ONLY: `comux list --json`
+    /// reports `bell` either way, so a script's behaviour never depends on a display
+    /// preference. There is deliberately no desktop toast — shells ring for ambiguous
+    /// tab-completion, end of history and end of pager, which would bury the agent toasts.
+    pub bell: bool,
     pub sidebar: bool,
     pub sidebar_width: u16,
     pub sidebar_min_cols: u16,
@@ -772,6 +778,7 @@ struct RawConfig {
     mouse: Option<bool>,
     osc52: Option<bool>,
     notify: Option<bool>,
+    bell: Option<bool>,
     sidebar: Option<bool>,
     sidebar_width: Option<i64>,
     sidebar_min_cols: Option<i64>,
@@ -866,6 +873,7 @@ impl MuxConfig {
             mouse: true,
             osc52: true,
             notify: true,
+            bell: true,
             sidebar: true,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_min_cols: DEFAULT_SIDEBAR_MIN_COLS,
@@ -977,6 +985,7 @@ impl MuxConfig {
                 mouse: raw.mouse.unwrap_or(true),
                 osc52: raw.osc52.unwrap_or(true),
                 notify: raw.notify.unwrap_or(true),
+                bell: raw.bell.unwrap_or(true),
                 sidebar: raw.sidebar.unwrap_or(true),
                 sidebar_width,
                 sidebar_min_cols,

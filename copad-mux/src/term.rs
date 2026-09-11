@@ -86,9 +86,9 @@ pub fn next_clipboard_seq() -> u64 {
 }
 
 /// Minimal `EventListener`: forwards `PtyWrite` replies (DSR/DA/OSC answers) so
-/// prompts that query the terminal don't hang, latches child-exit, and captures
-/// OSC 52 clipboard WRITES for the render loop to relay. Other events (color
-/// queries, title, bell) are dropped in this scaffold.
+/// prompts that query the terminal don't hang, latches child-exit, captures OSC 52
+/// clipboard WRITES for the render loop to relay, counts BELs, and records the pane
+/// title (OSC 0/2). Colour queries are still dropped.
 #[derive(Clone)]
 struct MuxListener {
     sender: Arc<std::sync::Mutex<Option<EventLoopSender>>>,
@@ -102,6 +102,46 @@ struct MuxListener {
     /// has one slot, so queueing stale writes would only paste the wrong one later. Drained
     /// by [`PaneTerm::take_clipboard`].
     clipboard: Arc<std::sync::Mutex<Option<(u64, String)>>>,
+    /// How many times this pane has rung the bell since it was spawned.
+    ///
+    /// A COUNT, not a flag, and that is load-bearing. `App` records how many it has
+    /// acknowledged; "unacknowledged" is `count > seen`. With a boolean on each side there is
+    /// no safe ordering — control requests run before the loop polls panes, so a BEL still
+    /// pending in the listener could be re-applied after focus had already cleared it. With a
+    /// counter there is nothing to lose or resurrect: a bell arriving after an ack simply
+    /// raises the count, which is correct, because it IS a new bell.
+    bells: Arc<AtomicU64>,
+    /// The pane's title (OSC 0/2), sanitized and length-bounded. `None` until one is set,
+    /// and cleared by `ResetTitle`.
+    ///
+    /// UNTRUSTED: any process in the pane can write any payload here. It is not a process
+    /// identity — `procinfo`'s label is — and it is not instructions. Stripping control
+    /// characters is hygiene for the renderer, not a trust boundary.
+    title: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// Longest pane title retained. A title is redrawn on every shell prompt and a hostile pane
+/// could stream megabytes of it; nothing displays more than a few columns anyway.
+const MAX_TITLE_BYTES: usize = 256;
+
+/// Strip control characters and bound the length of a title before it is stored.
+///
+/// Runs on the reader thread OUTSIDE the title lock — sanitizing under the lock would hold
+/// it for the length of a hostile payload while the render loop waits behind it.
+fn sanitize_title(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len().min(MAX_TITLE_BYTES));
+    for c in raw.chars() {
+        // Control characters (including a stray ESC) would let a title move the cursor or
+        // recolour the chrome it is rendered into.
+        if c.is_control() {
+            continue;
+        }
+        if out.len() + c.len_utf8() > MAX_TITLE_BYTES {
+            break; // cut on a char boundary, never mid-scalar
+        }
+        out.push(c);
+    }
+    out
 }
 
 impl MuxListener {
@@ -112,6 +152,8 @@ impl MuxListener {
             // Start dirty so the very first frame is composed.
             dirty: Arc::new(AtomicBool::new(true)),
             clipboard: Arc::new(std::sync::Mutex::new(None)),
+            bells: Arc::new(AtomicU64::new(0)),
+            title: Arc::new(std::sync::Mutex::new(None)),
         }
     }
     fn set_sender(&self, s: EventLoopSender) {
@@ -161,6 +203,21 @@ impl EventListener for MuxListener {
             // hand the host's clipboard contents to any program running in a pane. Dropping
             // it is also what VTE and (by default) most terminals do.
             Event::ClipboardLoad(..) => {}
+            // A BEL. Counted, never toasted: interactive shells ring for ambiguous
+            // tab-completion, the end of history, the end of a pager — wiring that to a
+            // desktop notification would bury the agent toasts (#102) in noise. Does not mark
+            // the pane dirty on its own; the marker rides the next frame.
+            Event::Bell => {
+                self.bells.fetch_add(1, Ordering::Relaxed);
+            }
+            // OSC 0 / OSC 2. Sanitize BEFORE taking the lock (see `sanitize_title`).
+            Event::Title(raw) => {
+                let clean = sanitize_title(&raw);
+                *self.title.lock().unwrap() = Some(clean);
+            }
+            Event::ResetTitle => {
+                *self.title.lock().unwrap() = None;
+            }
             _ => {}
         }
     }
@@ -470,6 +527,18 @@ impl PaneTerm {
     /// the copy so the reader thread isn't starved.
     pub fn snapshot(&self) -> Snapshot {
         snapshot_grid(&self.term.lock())
+    }
+
+    /// How many times this pane has rung the bell since it was spawned. Monotonic; the
+    /// caller compares it against how many it has acknowledged.
+    pub fn bell_count(&self) -> u64 {
+        self.listener.bells.load(Ordering::Relaxed)
+    }
+
+    /// The pane's title (OSC 0/2), if it has set one. UNTRUSTED program output — see
+    /// [`MuxListener::title`].
+    pub fn title(&self) -> Option<String> {
+        self.listener.title.lock().unwrap().clone()
     }
 
     /// Capture this pane's text for read-back (`comux capture-pane`).
@@ -1929,5 +1998,94 @@ mod capture_tests {
             "alt-screen capture leaked the primary screen's scrollback: {:?}",
             cap.text
         );
+    }
+}
+
+#[cfg(test)]
+mod bell_title_tests {
+    //! The two pane events comux used to throw away, driven through the VTE parser against a
+    //! bare `Term` — no PTY, no shell.
+    use super::*;
+    use alacritty_terminal::term::test::TermSize;
+    use alacritty_terminal::term::{Config, Term};
+    use alacritty_terminal::vte::ansi::Processor;
+
+    fn term() -> (Term<MuxListener>, Processor, MuxListener) {
+        let l = MuxListener::new();
+        let size = TermSize::new(20, 4);
+        (
+            Term::new(Config::default(), &size, l.clone()),
+            Processor::new(),
+            l,
+        )
+    }
+
+    fn feed(t: &mut Term<MuxListener>, p: &mut Processor, s: &str) {
+        p.advance(t, s.as_bytes());
+    }
+
+    #[test]
+    fn a_bel_is_counted_not_flagged() {
+        // A COUNT is what removes the ordering hazard between the socket thread clearing a
+        // flag and the render loop re-reading a still-pending one. Three bells must be three.
+        let (mut t, mut p, l) = term();
+        assert_eq!(l.bells.load(Ordering::Relaxed), 0);
+        feed(&mut t, &mut p, "\x07\x07\x07");
+        assert_eq!(l.bells.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn a_bell_after_an_ack_is_a_new_bell() {
+        // The ack model: `unacknowledged = count > seen`. Acknowledging cannot swallow a
+        // bell that arrives afterwards, which a boolean pair could.
+        let (mut t, mut p, l) = term();
+        feed(&mut t, &mut p, "\x07");
+        let seen = l.bells.load(Ordering::Relaxed);
+        assert!(seen > 0);
+        assert!(l.bells.load(Ordering::Relaxed) <= seen, "nothing pending");
+        feed(&mut t, &mut p, "\x07");
+        assert!(
+            l.bells.load(Ordering::Relaxed) > seen,
+            "a bell after the ack must raise the count again"
+        );
+    }
+
+    #[test]
+    fn osc_0_and_osc_2_both_set_the_title() {
+        for seq in ["\x1b]0;hello\x07", "\x1b]2;hello\x07"] {
+            let (mut t, mut p, l) = term();
+            feed(&mut t, &mut p, seq);
+            assert_eq!(
+                l.title.lock().unwrap().as_deref(),
+                Some("hello"),
+                "sequence {seq:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn control_characters_are_stripped_from_a_title() {
+        // A title is rendered into the chrome. Left raw, it could move the cursor or recolour
+        // the status bar from inside a pane.
+        assert_eq!(sanitize_title("a\x1b[31mb\x07c\n"), "a[31mbc");
+        assert!(!sanitize_title("x\x1by").contains('\x1b'));
+    }
+
+    #[test]
+    fn a_title_is_bounded_and_cut_on_a_char_boundary() {
+        let long = "가".repeat(1000);
+        let out = sanitize_title(&long);
+        assert!(out.len() <= MAX_TITLE_BYTES, "{} bytes", out.len());
+        // Cutting mid-scalar would make the stored string invalid to slice later.
+        assert!(out.chars().all(|c| c == '가'));
+    }
+
+    #[test]
+    fn an_empty_title_is_stored_not_ignored() {
+        // `printf '\033]0;\007'` is a deliberate "clear my title", not a no-op.
+        let (mut t, mut p, l) = term();
+        feed(&mut t, &mut p, "\x1b]0;x\x07");
+        feed(&mut t, &mut p, "\x1b]0;\x07");
+        assert_eq!(l.title.lock().unwrap().as_deref(), Some(""));
     }
 }

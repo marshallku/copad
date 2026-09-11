@@ -447,6 +447,10 @@ pub struct App {
     /// Pids of currently attached clients, oldest first — the walk-up start point for
     /// raising the right terminal window after a notification jump.
     client_pids: Vec<u32>,
+    /// Bells this server has ACKNOWLEDGED per pane, against `PaneTerm::bell_count`.
+    /// Unacknowledged = `count > seen`. See `MuxListener::bells` for why both sides count
+    /// rather than flag.
+    bell_seen: HashMap<TerminalId, u64>,
     /// The logged agent-turn notifications (newest first), shown in the center.
     notifications: VecDeque<Notification>,
     /// `(pane, agent pid, kind)` triples whose notifications the agent's own hooks push
@@ -702,6 +706,7 @@ impl App {
             usage_shown: None,
             usage_page: 0,
             prefix_armed: false,
+            bell_seen: HashMap::new(),
             usage_rolled_at: std::time::Instant::now(),
             alt_screen: HashMap::new(),
             selection: None,
@@ -1844,6 +1849,18 @@ impl App {
                             .and_then(|pt| pt.pane_token())
                             .unwrap_or_default()
                             .to_string();
+                        let (title, bell) = term
+                            .as_ref()
+                            .map(|tid| {
+                                (
+                                    self.panes
+                                        .get(tid)
+                                        .and_then(|pt| pt.title())
+                                        .unwrap_or_default(),
+                                    self.bell(tid),
+                                )
+                            })
+                            .unwrap_or_default();
                         PaneInfo {
                             index,
                             id: p.to_string(),
@@ -1854,6 +1871,8 @@ impl App {
                             label: self.pane_label(index),
                             kind: kind.to_string(),
                             status,
+                            title,
+                            bell,
                         }
                     })
                     .collect();
@@ -2482,6 +2501,53 @@ impl App {
     /// Record whether any attached client has the prefix armed, for the status-bar
     /// mode indicator. Called by the server each frame from the clients' own per-client
     /// prefix flags — the render can't reach those, and the frame is shared anyway.
+    /// Has this pane rung the bell since it was last acknowledged?
+    pub fn bell(&self, tid: &TerminalId) -> bool {
+        self.panes
+            .get(tid)
+            .is_some_and(|p| p.bell_count() > self.bell_seen.get(tid).copied().unwrap_or(0))
+    }
+
+    /// Acknowledge the focused pane's bells — the user just acted on this view.
+    ///
+    /// The evidence is a CLIENT ACTION (a key or a mouse event), not a frame we hope arrived.
+    /// That distinction is the whole design: earlier drafts tried to acknowledge when a frame
+    /// was composed, then when it was queued, then when a writer thread had flushed it, and
+    /// each boundary had a window where a bell could be cleared without anyone seeing it —
+    /// because "the server emitted a frame" is simply not evidence that a human looked. A
+    /// keypress is. It also gives the behaviour people expect: a bell clears when you go to
+    /// the pane, and one rung while you were away is still there when you come back.
+    ///
+    /// A pane that rings while you are typing in it (ambiguous tab-completion, which is most
+    /// bells) clears on your next keystroke, which is immediate in practice.
+    pub fn ack_focused_bell(&mut self) {
+        let Some(tid) = self.focused_pane().and_then(|p| {
+            self.state
+                .workspace(&self.ws)
+                .and_then(|w| w.tab(&w.active_tab))
+                .and_then(|t| t.layout.terminal_of(&p).cloned())
+        }) else {
+            return;
+        };
+        if let Some(count) = self.panes.get(&tid).map(|p| p.bell_count()) {
+            self.bell_seen.insert(tid, count);
+        }
+        // Pane ids are never reused, so a stale entry is pure growth on a server that lives
+        // for weeks. Pruned only when it can actually have grown.
+        if self.bell_seen.len() > self.panes.len() {
+            self.bell_seen.retain(|tid, _| self.panes.contains_key(tid));
+        }
+    }
+
+    /// How many panes anywhere in the mux have an unacknowledged bell.
+    ///
+    /// Rendered in the status bar because the per-tab and per-session markers cannot be a
+    /// guarantee: the ringing session's sidebar row can be outside the visible window, and
+    /// the sidebar can be hidden entirely on a narrow terminal. Same reasoning as `⚑N`.
+    pub fn bell_count(&self) -> usize {
+        self.panes.keys().filter(|tid| self.bell(tid)).count()
+    }
+
     pub fn set_prefix_armed(&mut self, armed: bool) {
         self.prefix_armed = armed;
     }
@@ -5010,6 +5076,20 @@ impl App {
             );
             put(buf, &mut x, y, " ", name_style);
             put(buf, &mut x, y, &name, name_style);
+            // A bell anywhere in this space. Placed after the name so it does not shift the
+            // names out of alignment when one space rings and the others do not.
+            if self.cfg.bell && self.session_has_bell(sid) {
+                put(
+                    buf,
+                    &mut x,
+                    y,
+                    " !",
+                    Style::default()
+                        .fg(CAT_YELLOW)
+                        .bg(panel_bg)
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
             // subtitle: git branch (herdr-style), falling back to the focused command
             // when the cwd isn't a git repo.
             let sub = self
@@ -5333,6 +5413,24 @@ impl App {
     }
 
     /// Does any pane in `tab_id` currently run a classified AI agent?
+    /// Any pane in this tab with an unacknowledged bell.
+    fn tab_has_bell(&self, id: &TabId) -> bool {
+        self.state
+            .workspace(&self.ws)
+            .and_then(|w| w.tab(id))
+            .is_some_and(|t| t.layout.terminals().into_iter().any(|tid| self.bell(tid)))
+    }
+
+    /// Any pane anywhere in this SESSION with an unacknowledged bell — the sidebar `spaces`
+    /// row marker, so a bell outside the current session is not invisible.
+    fn session_has_bell(&self, wid: &WorkspaceId) -> bool {
+        self.state.workspace(wid).is_some_and(|w| {
+            w.tabs
+                .iter()
+                .any(|t| t.layout.terminals().into_iter().any(|tid| self.bell(tid)))
+        })
+    }
+
     fn tab_has_agent(&self, tab_id: &TabId) -> bool {
         let Some(w) = self.state.workspace(&self.ws) else {
             return false;
@@ -5469,6 +5567,20 @@ impl App {
                 Style::default()
                     .fg(CAT_BASE)
                     .bg(CAT_PEACH)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        // Bells, mux-wide. The per-tab chip and per-session sidebar markers cannot be the
+        // guarantee — the ringing session's row can be outside the sidebar's visible window,
+        // and the sidebar can be hidden entirely on a narrow terminal. `!` is tmux's bell
+        // convention, and it reads as distinct from `⚑` (attention) and `●` (agents).
+        let bells = self.bell_count();
+        if bells > 0 && self.cfg.bell {
+            segs.push((
+                format!(" ! {bells} "),
+                Style::default()
+                    .fg(CAT_BASE)
+                    .bg(CAT_YELLOW)
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -5640,6 +5752,13 @@ impl App {
             .enumerate()
             .map(|(i, id)| {
                 let agent = self.tab_has_agent(id);
+                // `!` is tmux's bell convention. It precedes the agent dot so the two read
+                // as separate facts rather than one glyph blob.
+                let bell = if self.cfg.bell && self.tab_has_bell(id) {
+                    "! "
+                } else {
+                    ""
+                };
                 let dot = if agent { "● " } else { "" };
                 let n = i + 1;
                 // `tab_labels` picks number / process name / both. A CUSTOM name (`Ctrl-b ,`
@@ -5663,7 +5782,7 @@ impl App {
                         None => n.to_string(),
                     },
                 };
-                (format!(" {dot}{inner} "), agent)
+                (format!(" {bell}{dot}{inner} "), agent)
             })
             .collect();
         let widths: Vec<u16> = chips.iter().map(|(s, _)| s.width() as u16).collect();

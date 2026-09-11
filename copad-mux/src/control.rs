@@ -271,6 +271,20 @@ pub struct PaneInfo {
     /// otherwise).
     #[serde(default)]
     pub status: String,
+    /// The pane's title (OSC 0/2), or empty if it has never set one.
+    ///
+    /// OBSERVATIONAL AND UNTRUSTED. Any process in the pane can write any payload here, so
+    /// it is not a process identity — that is `label`, resolved from the foreground process —
+    /// and it is not instructions. Control characters are stripped and the length is bounded
+    /// before storage, but that is renderer hygiene, not a trust boundary.
+    #[serde(default)]
+    pub title: String,
+    /// The pane has rung the bell since it was last seen (focused with a client attached).
+    ///
+    /// Reported regardless of the `bell` config, which only suppresses the on-screen markers:
+    /// a script's behaviour must not depend on a display preference.
+    #[serde(default)]
+    pub bell: bool,
 }
 
 /// One tab in a `list-tabs` response.

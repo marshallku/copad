@@ -25,6 +25,7 @@
 #  10. wait-output matches a fresh marker, times out at 124, refuses bad input
 #  11. list-agents (empty vs populated) + wait-agent level-match / deadline / refusals
 #  12. `comux skill` emits the embedded agent guide, and the recipe it teaches works
+#  13. bell + title: an unfocused pane's BEL and OSC 0 title reach `list --json`
 
 set -euo pipefail
 
@@ -408,7 +409,49 @@ t 30 "$COMUX" wait-output "$sib" "IDX-$iid" --timeout 20 --interval 100 >/dev/nu
 t 10 "$COMUX" close "$sib_i" >/dev/null || fail "could not clean up the split"
 ok "skill recipe runs on a server-named pane; token send crosses sessions without moving the view; index send unchanged"
 
-echo "13. the server is still responsive and shuts down cleanly"
+echo "13. bell and title, the two pane events comux used to drop"
+# Must be an UNFOCUSED pane. The focused one is acknowledged on the next frame (that is the
+# rule — a bell you are looking at is a bell you saw), so testing it would assert nothing.
+# This headless server has NO client attached, so nothing is acknowledged at all here, which
+# is itself the detached half of the contract.
+bell_pane="$(t 10 "$COMUX" split --from "$tok")" || fail "split --from failed"
+t 10 "$COMUX" focus 0 >/dev/null || fail "could not focus away from the bell pane"
+t 10 "$COMUX" send "$bell_pane" "printf '\a'" >/dev/null
+t 10 "$COMUX" send "$bell_pane" $'\n' >/dev/null
+rang=""
+for _ in $(seq 1 40); do
+    t 10 "$COMUX" list --json >"$WORK/json"
+    if BP="$bell_pane" python3 -c 'import json,sys,os; print(any(p["bell"] for p in json.load(sys.stdin)["panes"] if p["token"]==os.environ["BP"]))' <"$WORK/json" | grep -q True; then
+        rang=1; break
+    fi
+    sleep 0.2
+done
+[[ -n "$rang" ]] || fail "a BEL in an unfocused pane was not reported"
+# A title set via OSC 0 must show up WITHOUT displacing the process label — the label comes
+# from the foreground process sweep, which is the more trustworthy of the two.
+# `; sleep 8` matters: the shell rewrites the title on every PROMPT (zsh/bash commonly set
+# it to the cwd), so a title set by a command that then returns is overwritten before the
+# poll can see it. That is exactly why titles are NOT used as pane labels — the process
+# sweep is the more trustworthy source — and the test has to hold the shell to observe one.
+t 10 "$COMUX" send "$bell_pane" "printf '\033]0;e2e-title\a'; sleep 8" >/dev/null
+t 10 "$COMUX" send "$bell_pane" $'\n' >/dev/null
+titled=""
+for _ in $(seq 1 40); do
+    t 10 "$COMUX" list --json >"$WORK/json"
+    if BP="$bell_pane" python3 -c 'import json,sys,os
+d=json.load(sys.stdin)
+p=next(p for p in d["panes"] if p["token"]==os.environ["BP"])
+print(p["title"]=="e2e-title" and p["label"]!="e2e-title")' <"$WORK/json" | grep -q True; then
+        titled=1; break
+    fi
+    sleep 0.2
+done
+[[ -n "$titled" ]] || fail "the pane title was not reported, or it displaced the process label"
+bi="$(BP="$bell_pane" python3 -c 'import json,sys,os; print(next(p["index"] for p in json.load(sys.stdin)["panes"] if p["token"]==os.environ["BP"]))' <"$WORK/json")"
+t 10 "$COMUX" close "$bi" >/dev/null || fail "could not clean up the bell pane"
+ok "an unfocused pane's BEL is reported; its OSC 0 title is exposed without displacing the label"
+
+echo "14. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

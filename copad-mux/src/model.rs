@@ -157,6 +157,27 @@ impl SplitTree {
         }
     }
 
+    /// DFS pre-order terminal ids.
+    ///
+    /// The counterpart to [`SplitTree::panes`]. Walking panes and then calling
+    /// [`SplitTree::terminal_of`] for each is O(N²) — `terminal_of` re-descends the tree per
+    /// pane — which matters for anything asked every frame.
+    pub fn terminals(&self) -> Vec<&TerminalId> {
+        let mut out = Vec::new();
+        self.collect_terminals(&mut out);
+        out
+    }
+
+    fn collect_terminals<'a>(&'a self, out: &mut Vec<&'a TerminalId>) {
+        match self {
+            SplitTree::Leaf { terminal, .. } => out.push(terminal),
+            SplitTree::Branch { first, second, .. } => {
+                first.collect_terminals(out);
+                second.collect_terminals(out);
+            }
+        }
+    }
+
     /// Find the terminal id for a pane, if present.
     pub fn terminal_of(&self, target: &PaneId) -> Option<&TerminalId> {
         match self {
@@ -577,5 +598,36 @@ mod tests {
                 "layout size == derived size"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod terminal_walk_tests {
+    use super::*;
+
+    /// `terminals()` must agree with walking `panes()` and resolving each — it exists purely
+    /// so per-frame callers stop paying O(N²) for that walk, and a divergence would make a
+    /// bell marker disagree with the pane list.
+    #[test]
+    fn terminals_match_panes_resolved_one_by_one() {
+        let mut tree = SplitTree::Leaf {
+            pane: PaneId::new("p0"),
+            terminal: TerminalId::new("t0"),
+        };
+        for (i, dir) in [(1, Dir::Right), (2, Dir::Down), (3, Dir::Right)] {
+            assert!(tree.split_leaf(
+                &PaneId::new(format!("p{}", i - 1)),
+                dir,
+                PaneId::new(format!("p{i}")),
+                TerminalId::new(format!("t{i}")),
+            ));
+        }
+        let via_panes: Vec<&TerminalId> = tree
+            .panes()
+            .iter()
+            .map(|p| tree.terminal_of(p).expect("every pane has a terminal"))
+            .collect();
+        assert_eq!(tree.terminals(), via_panes);
+        assert_eq!(tree.terminals().len(), 4);
     }
 }

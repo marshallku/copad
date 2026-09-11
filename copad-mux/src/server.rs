@@ -794,6 +794,13 @@ fn handle_incoming(
             if !clients.iter().any(|c| c.id == id) {
                 return false;
             }
+            // A key or a mouse event is a human acting on the CURRENT view, which is the only
+            // honest evidence that the focused pane has been seen. Bells are acknowledged
+            // here rather than anywhere in the frame path: composing, queueing, or even
+            // flushing a frame all say the server emitted something, not that anyone looked.
+            if matches!(msg, ClientMsg::Key(_) | ClientMsg::Mouse { .. }) {
+                app.ack_focused_bell();
+            }
             match msg {
                 ClientMsg::Env { vars } => {
                     // tmux update-environment: store this client's session vars and adopt
