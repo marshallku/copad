@@ -732,6 +732,9 @@ fn ctl_mutates(req: &control::Req) -> bool {
             // mark the render dirty on every poll and defeat the loop's idle skip — the
             // detached-CPU throttle exists precisely to stop that kind of busy-work.
             | control::Req::CapturePane { .. }
+            // Also read-only and also polled (by `wait-agent`); it reads CACHED labels and
+            // statuses, so it neither sweeps processes nor touches a PTY.
+            | control::Req::ListAgents { .. }
     )
 }
 

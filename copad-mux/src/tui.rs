@@ -2285,6 +2285,41 @@ impl App {
                     None => Resp::err("pane has no live terminal"),
                 }
             }
+            Req::ListAgents { target } => {
+                // Resolve the target on EVERY request, not once: the pane can close during
+                // a wait, and "gone" must be distinguishable from "not an agent yet".
+                let want = match target {
+                    Some(t) => match self.resolve_pane_target(t) {
+                        Some(tid) => Some(tid),
+                        // The pane does not exist. Distinct from an existing pane that the
+                        // cached classification has not caught up with — which answers with
+                        // an empty listing so a caller can keep waiting through the sweep
+                        // interval (500ms attached, 5s detached).
+                        None => return Resp::err(format!("unknown pane '{t}'")),
+                    },
+                    None => None,
+                };
+                let agents = self
+                    .agent_rows()
+                    .into_iter()
+                    .filter(|r| want.as_ref().is_none_or(|w| &r.term == w))
+                    .map(|r| control::AgentInfo {
+                        token: self
+                            .panes
+                            .get(&r.term)
+                            .and_then(|p| p.pane_token())
+                            .unwrap_or_default()
+                            .to_string(),
+                        terminal: r.term.to_string(),
+                        space: r.space,
+                        title: r.title,
+                        tool: r.tool,
+                        status: r.status.to_string(),
+                        for_secs: r.for_secs,
+                    })
+                    .collect();
+                Resp::agents(agents)
+            }
             Req::KillServer => Resp::ok(),
         }
     }

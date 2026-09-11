@@ -23,6 +23,7 @@
 #   8. a bad index is refused; `--json` with no index is a usage error (exit 2)
 #   9. capture-pane reads a pane's output back (by default/token/index) + refusals
 #  10. wait-output matches a fresh marker, times out at 124, refuses bad input
+#  11. list-agents (empty vs populated) + wait-agent level-match / deadline / refusals
 
 set -euo pipefail
 
@@ -274,18 +275,85 @@ set -e
 # literal backslash-n, so the command was never submitted) — a test that only reads the
 # source cannot catch that.
 id=$(date +%s%N)
-t 10 "$COMUX" send 0 "printf 'MARK-%s
-' '$id'" >/dev/null
+t 10 "$COMUX" send 0 "printf 'MARK-%s\n' '$id'" >/dev/null
 t 10 "$COMUX" send 0 $'
 ' >/dev/null
 t 30 "$COMUX" wait-output --index 0 --timeout 20 --interval 100 "MARK-$id" >/dev/null     || fail "the recipe printed by --help does not work as written"
 ok "matched a pane-assembled fresh marker; timed out at 124; overflow + refusals honored; \
 documented recipe runs"
 
-echo "11. the server is still responsive and shuts down cleanly"
+echo "11. list-agents / wait-agent"
+# With no agent running, a listing is an EMPTY LIST, not an error — `wait-agent` branches on
+# exactly that distinction (empty = "not classified as an agent yet", keep waiting).
+t 10 "$COMUX" list-agents --json >"$WORK/json"
+[[ "$(count agents)" == "0" ]] || fail "expected no agents on a fresh server"
+python3 -c 'import json,sys; a=json.load(sys.stdin)["agents"]; sys.exit(0 if a==[] else 1)' <"$WORK/json" \
+    || fail "an empty listing must be [] (not null) so it differs from a non-listing response"
+# A pane is classified as an agent purely by its foreground process NAME, so the fixture has
+# to be a real executable that reports `claude` — a shell script would report the
+# INTERPRETER's name instead. It is a SYMLINK rather than a copy: macOS kills a copied
+# Apple-signed binary on exec (the copy's signature no longer validates), while a symlink
+# executes the original and still reports the LINK's name. This proves the classification +
+# listing + polling plumbing; it says nothing about real-agent status accuracy, which no
+# hermetic harness can check.
+mkdir -p "$WORK/bin"
+ln -sf /bin/sleep "$WORK/bin/claude" || fail "could not build the agent fixture"
+# Give the pane a status the heuristic can actually read. A bare `sleep` shows no agent UI,
+# so it resolves to `idle` — which is deliberately NOT waitable (it also means "no reading").
+# Printing "esc to interrupt" first is, incidentally, a live demonstration of the caveat the
+# --help states: ordinary output can be read as an agent status.
+t 10 "$COMUX" send 0 "printf 'esc to interrupt\n'; $WORK/bin/claude 600" >/dev/null
+t 10 "$COMUX" send 0 $'\n' >/dev/null
+seen=""
+for _ in $(seq 1 40); do
+    t 10 "$COMUX" list-agents --json >"$WORK/json"
+    [[ "$(count agents)" != "0" ]] && { seen=1; break; }
+    sleep 0.25
+done
+if [[ -z "$seen" ]]; then
+    echo "--- diagnostics ---" >&2
+    t 10 "$COMUX" list >&2 || true
+    t 10 "$COMUX" capture-pane -S 40 >&2 || true
+    fail "the fixture pane was never classified as an agent"
+fi
+atok="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["agents"][0]["token"])' <"$WORK/json")"
+astat="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["agents"][0]["status"])' <"$WORK/json")"
+[[ "$atok" == "$tok" ]] || fail "list-agents reported token '$atok', expected '$tok'"
+[[ "$astat" == "working" ]] || fail "expected the fixture to read as 'working', got '$astat'"
+# Waiting for the status it IS in returns at once (level-triggered, as documented).
+t 15 "$COMUX" wait-agent "$tok" --status working --timeout 10 >"$WORK/out" \
+    || fail "wait-agent did not match the agent's current status"
+grep -q working "$WORK/out" || fail "wait-agent printed no status line"
+# Waiting for a status it is NOT in must reach the deadline, not hang and not fail early.
+start=$(date +%s)
+set +e
+t 20 "$COMUX" wait-agent "$tok" --status blocked --timeout 2 --interval 100 >/dev/null 2>&1; code=$?
+set -e
+elapsed=$(( $(date +%s) - start ))
+[[ "$code" == "124" ]] || fail "wait-agent on a non-matching status should time out (124), got $code"
+(( elapsed <= 8 )) || fail "wait-agent did not honor its deadline (${elapsed}s)"
+# Refusals: an absent pane fails fast; unwaitable/unknown statuses and a missing target are usage errors.
+set +e
+start=$(date +%s)
+t 15 "$COMUX" wait-agent no-such-pane --status ready --timeout 10 >/dev/null 2>&1; c1=$?
+elapsed=$(( $(date +%s) - start ))
+t 10 "$COMUX" wait-agent "$tok" --status idle >/dev/null 2>&1; c2=$?
+t 10 "$COMUX" wait-agent "$tok" --status done >/dev/null 2>&1; c3=$?
+t 10 "$COMUX" wait-agent --status ready >/dev/null 2>&1; c4=$?
+set -e
+[[ "$c1" == "1" ]] || fail "an absent pane should fail with 1, got $c1"
+(( elapsed <= 5 )) || fail "an absent pane was waited out instead of refused (${elapsed}s)"
+[[ "$c2" == "2" ]] || fail "--status idle should be usage exit 2, got $c2"
+[[ "$c3" == "2" ]] || fail "an unknown --status should be usage exit 2, got $c3"
+[[ "$c4" == "2" ]] || fail "a missing target should be usage exit 2, got $c4"
+# Put the pane back to a shell so the shutdown step is not reaping a 600s sleep.
+t 10 "$COMUX" send 0 $'\x03' >/dev/null
+ok "empty listing is []; fixture classified; level-match, deadline, and refusals honored"
+
+echo "12. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"
 
 echo
-echo "PASS — comux close-tab / kill-session / notify / jump / capture-pane / wait-output verified end to end"
+echo "PASS — comux close-tab / kill-session / notify / jump / capture-pane / wait-output / agents verified end to end"

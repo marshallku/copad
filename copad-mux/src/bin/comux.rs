@@ -10,7 +10,7 @@
 //!                            `comux new-session work` == `comux ctl new-session work`
 //!
 //! Control commands: list | split | resize | focus | close | send | capture-pane | wait-output |
-//! list-tabs | new-tab |
+//! list-agents | wait-agent | list-tabs | new-tab |
 //! select-tab | close-tab | rename-tab | list-sessions | new-session [name] |
 //! rename-session | select-session | kill-session | jump | notify |
 //! worktree <create|list|rm> | reload | health | kill-server.
@@ -40,6 +40,8 @@ fn print_usage() {
          \x20 comux split -h|-v           split the focused pane\n\
          \x20 comux capture-pane [pane]   read a pane's text back (-S N rows of scrollback)\n\
          \x20 comux wait-output <pat>     block until a pane's text matches (best-effort; exit 124 on timeout)\n\
+         \x20 comux list-agents           agent panes across every session, with status\n\
+         \x20 comux wait-agent <pane>     block until that agent's status matches (--status working|ready|blocked)\n\
          \x20 comux jump <pane>           switch to a pane anywhere (by $COPAD_MUX_PANE token)\n\
          \x20 comux notify <body...>      raise an agent toast for this pane (--kind done|blocked)\n\
          \x20 comux worktree create <br>  git worktree + a session in it (also list|rm)\n\

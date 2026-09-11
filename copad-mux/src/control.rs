@@ -150,6 +150,25 @@ pub enum Req {
         #[serde(default)]
         lines: Option<usize>,
     },
+    /// List AI-agent panes across every session (what the sidebar's `agents` half and the
+    /// `Ctrl-f` switcher already show), optionally narrowed to one pane.
+    ///
+    /// `target` is what makes `wait-agent` implementable: a parameterless listing cannot
+    /// tell a pane that does NOT EXIST from a pane that exists but is not classified as an
+    /// agent yet, and those need opposite handling (fail vs keep waiting — classification is
+    /// cached and refreshed only every 500ms attached / 5s detached). With a target the
+    /// server resolves it against the live pane set on EVERY request — so a pane closing
+    /// mid-wait is caught — and answers:
+    /// - unknown pane -> `ok = false`
+    /// - pane present, not an agent -> `agents = Some([])`
+    /// - pane present and an agent -> `agents = Some([info])`
+    ///
+    /// Read-only, and reads CACHED state only (no process sweep, no PTY snapshot), so it is
+    /// safe to poll and must stay out of `ctl_mutates`.
+    ListAgents {
+        #[serde(default)]
+        target: Option<String>,
+    },
     /// Re-read `mux.toml` and apply the live-reloadable settings to the running server
     /// WITHOUT restarting it — like tmux `source-file`. Keybindings, mouse, sidebar
     /// width, usage/tab-label display, notify, and worktree config take effect on the
@@ -257,6 +276,36 @@ pub struct SessionInfo {
     pub agents: usize,
 }
 
+/// One AI-agent pane in a `list-agents` response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentInfo {
+    /// The pane's `$COPAD_MUX_PANE` identity — what `jump` / `capture-pane` / `wait-agent`
+    /// address. EMPTY for a pane spawned before pane tokens existed, which is why
+    /// `terminal` is kept as an addressable fallback.
+    #[serde(default)]
+    pub token: String,
+    /// The pane's terminal id.
+    pub terminal: String,
+    /// The session (space) the agent lives in.
+    #[serde(default)]
+    pub space: String,
+    /// The tab's custom name, else `tab <n>` — what the sidebar titles the row with.
+    #[serde(default)]
+    pub title: String,
+    /// The agent's foreground command (`claude`, `codex`, …).
+    #[serde(default)]
+    pub tool: String,
+    /// Rolled-up status: `working` / `ready` / `blocked` / `idle`.
+    ///
+    /// CACHED AND INFERRED. Claude's comes from `~/.claude/sessions/<pid>.json`; everything
+    /// else falls back to matching substrings on the pane's screen, so ordinary output that
+    /// happens to contain a prompt-like phrase can read as `blocked`. `idle` additionally
+    /// means "no recognized UI", which is also what an unresolved reading looks like.
+    pub status: String,
+    /// Whole seconds the agent has held `status`.
+    pub for_secs: u64,
+}
+
 /// One git worktree in a `worktree list` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeInfo {
@@ -317,6 +366,10 @@ pub struct Resp {
     /// `capture-pane`: older output exists that the capture could not include.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
+    /// `list-agents`: the agent panes. `Some([])` is a real empty listing (no agents, or a
+    /// targeted pane that is not an agent); `None` means this response is not a listing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agents: Option<Vec<AgentInfo>>,
     /// `capture-pane`: the token of the pane actually read. Echoed so a caller that let
     /// the target default to the focused pane can tell WHICH pane answered — focus is a
     /// mutable UI choice, and a silently-retargeted read is indistinguishable from a
@@ -345,6 +398,15 @@ impl Resp {
             capture_rows: None,
             truncated: None,
             pane: None,
+            agents: None,
+        }
+    }
+
+    /// A `list-agents` response.
+    pub fn agents(agents: Vec<AgentInfo>) -> Self {
+        Self {
+            agents: Some(agents),
+            ..Self::ok()
         }
     }
 
@@ -469,7 +531,8 @@ pub fn run_client(args: &[String]) -> i32 {
     }
     let Some(cmd) = rest.first().map(|s| s.as_str()) else {
         eprintln!(
-            "usage: comux <list|split|resize|focus|close|send|capture-pane|wait-output|list-tabs|new-tab|select-tab|\
+            "usage: comux <list|split|resize|focus|close|send|capture-pane|wait-output|list-agents|wait-agent|\
+             list-tabs|new-tab|select-tab|\
              close-tab|rename-tab [index] <name>|list-sessions|new-session [name]|\
              rename-session [index] <name>|select-session|kill-session|\
              worktree <create|list|rm>|reload|health|kill-server> [args]"
@@ -480,6 +543,12 @@ pub fn run_client(args: &[String]) -> i32 {
     // `wait-output` owns its own exit codes (124 on deadline) and issues MANY requests,
     // so it short-circuits the one-request-one-response path below rather than producing a
     // `Req` for it.
+    if cmd == "wait-agent" {
+        return match parse_wait_agent_args(&rest) {
+            Ok(args) => run_wait_agent(args),
+            Err(code) => code,
+        };
+    }
     if cmd == "wait-output" || cmd == "wait" {
         return match parse_wait_args(&rest) {
             Ok(args) => run_wait_output(args),
@@ -495,6 +564,7 @@ pub fn run_client(args: &[String]) -> i32 {
         "list-tabs" | "tabs" => Req::ListTabs,
         "new-tab" => Req::NewTab,
         "list-sessions" | "sessions" => Req::ListSessions,
+        "list-agents" | "agents" => Req::ListAgents { target: None },
         "new-session" => {
             // Optional name: everything after the verb, space-joined (tmux `new -s`).
             let name = rest
@@ -1184,6 +1254,28 @@ fn print_human(req: &Req, resp: &Resp) {
             // The number that actually answers "why won't a new tab open?".
             if let Some(room) = h.panes_remaining() {
                 println!("panes headroom  {room}");
+            }
+        }
+        Req::ListAgents { .. } => {
+            let agents = resp.agents.clone().unwrap_or_default();
+            if agents.is_empty() {
+                println!("(no agent panes)");
+                return;
+            }
+            println!(
+                "{:<12} {:<12} {:<10} {:<9} {:<6} PANE",
+                "SPACE", "TAB", "TOOL", "STATUS", "FOR"
+            );
+            for a in &agents {
+                println!(
+                    "{:<12} {:<12} {:<10} {:<9} {:<6} {}",
+                    a.space,
+                    a.title,
+                    a.tool,
+                    a.status,
+                    format!("{}s", a.for_secs),
+                    a.token
+                );
             }
         }
         Req::CapturePane { .. } => {
@@ -2509,5 +2601,371 @@ mod wait_bounds_tests {
             WAIT_USAGE.contains("BEST-EFFORT"),
             "help hides the limitation"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `wait-agent` — block until an agent pane reaches a status (WU3, decision #105).
+// ---------------------------------------------------------------------------
+
+/// Statuses a WAIT may ask for. `idle` is deliberately absent: per `agentstate.rs` it means
+/// "no recognized UI", which is also what an unresolved reading looks like — waiting on it
+/// is waiting on an ambiguity. It still APPEARS in `list-agents`, with that meaning.
+const WAITABLE_STATUSES: &[&str] = &["working", "ready", "blocked"];
+
+const WAIT_AGENT_USAGE: &str = "usage: comux wait-agent <pane-token|terminal-id> \
+     --status working|ready|blocked [--timeout S] [--interval MS]\n\
+     \n\
+     BEST-EFFORT CURRENT-STATE wait, NOT turn-completion detection. It returns as soon as\n\
+     the agent is IN that status, including a status it was already in before the call —\n\
+     so right after sending a prompt, `--status ready` can match the PREVIOUS turn.\n\
+     \n\
+     The status is CACHED and INFERRED: Claude's comes from ~/.claude/sessions/<pid>.json,\n\
+     everything else from matching substrings on the pane's screen, so ordinary output can\n\
+     read as `blocked`. It refreshes every 500ms while a client is attached and every 5s\n\
+     while detached, so a shorter --interval cannot recover a transition that happened\n\
+     between sweeps.\n\
+     \n\
+     The target is a PANE, not an agent invocation: an agent that exits and is replaced in\n\
+     the same pane is indistinguishable. A pane that does not exist fails at once; a pane\n\
+     that exists but is not classified as an agent YET is waited on, since classification\n\
+     lags a launch by up to one sweep.\n\
+     \n\
+     For real turn completion, have the agent's own hook run `comux notify`, or print a\n\
+     fresh marker and use `comux wait-output`.";
+
+/// Everything `wait-agent` parsed off the command line.
+#[derive(Debug, PartialEq)]
+struct WaitAgentArgs {
+    target: String,
+    status: String,
+    timeout: Option<Duration>,
+    interval: Duration,
+}
+
+/// Parse `wait-agent`'s arguments. `Err(code)` is the process exit code.
+fn parse_wait_agent_args(rest: &[&String]) -> Result<WaitAgentArgs, i32> {
+    let mut target: Option<String> = None;
+    let mut status: Option<String> = None;
+    let mut timeout_secs: u64 = 300;
+    let mut interval_ms: u64 = 250;
+    let mut i = 1;
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        let mut takes_value = true;
+        match a {
+            "--status" => match rest.get(i + 1) {
+                Some(v) => status = Some((*v).to_string()),
+                None => {
+                    eprintln!("comux wait-agent: --status needs a value");
+                    return Err(2);
+                }
+            },
+            "--timeout" | "--interval" => {
+                let n = match rest.get(i + 1).map(|v| v.parse::<u64>()) {
+                    Some(Ok(n)) => n,
+                    _ => {
+                        eprintln!("comux wait-agent: {a} needs a number");
+                        return Err(2);
+                    }
+                };
+                if a == "--timeout" {
+                    timeout_secs = n;
+                } else {
+                    interval_ms = n;
+                }
+            }
+            _ => {
+                takes_value = false;
+                match a {
+                    "--json" => {}
+                    "-h" | "--help" => {
+                        eprintln!("{WAIT_AGENT_USAGE}");
+                        return Err(2);
+                    }
+                    other if other.starts_with('-') => {
+                        eprintln!("comux wait-agent: unknown flag {other}\n{WAIT_AGENT_USAGE}");
+                        return Err(2);
+                    }
+                    other if target.is_none() => target = Some(other.to_string()),
+                    _ => {
+                        eprintln!("comux wait-agent: give exactly one target\n{WAIT_AGENT_USAGE}");
+                        return Err(2);
+                    }
+                }
+            }
+        }
+        i += if takes_value { 2 } else { 1 };
+    }
+    // No focused-pane default, unlike `wait-output`: there is usually more than one agent,
+    // and silently waiting on whichever pane happens to be focused is a wrong answer that
+    // looks like a right one.
+    let Some(target) = target else {
+        eprintln!("{WAIT_AGENT_USAGE}");
+        return Err(2);
+    };
+    let Some(status) = status else {
+        eprintln!("comux wait-agent: --status is required\n{WAIT_AGENT_USAGE}");
+        return Err(2);
+    };
+    if !WAITABLE_STATUSES.contains(&status.as_str()) {
+        // Failing loudly beats waiting out the whole timeout for a value that can never
+        // appear — which is what `--status done` or `--status idle` would otherwise do.
+        eprintln!(
+            "comux wait-agent: cannot wait for '{status}' (try {})",
+            WAITABLE_STATUSES.join(", ")
+        );
+        return Err(2);
+    }
+    let interval = Duration::from_millis(interval_ms);
+    if interval < MIN_INTERVAL {
+        eprintln!(
+            "comux wait-agent: --interval must be at least {}ms",
+            MIN_INTERVAL.as_millis()
+        );
+        return Err(2);
+    }
+    let timeout = match timeout_secs {
+        0 => None,
+        n => {
+            let d = Duration::from_secs(n);
+            if Instant::now().checked_add(d).is_none() {
+                eprintln!("comux wait-agent: --timeout {n} is too large to represent");
+                return Err(2);
+            }
+            Some(d)
+        }
+    };
+    Ok(WaitAgentArgs {
+        target,
+        status,
+        timeout,
+        interval,
+    })
+}
+
+/// Run `wait-agent`. Shares [`WaitConn`] and the deadline machinery with `wait-output`.
+fn run_wait_agent(args: WaitAgentArgs) -> i32 {
+    let deadline = args.timeout.map(|t| Instant::now() + t);
+    let expired = |d: Option<Instant>| d.is_some_and(|d| Instant::now() >= d);
+    let mut conn = match WaitConn::connect(deadline) {
+        Ok(c) => c,
+        Err(WaitErr::TimedOut) => return EXIT_TIMEOUT,
+        Err(WaitErr::Failed(e)) => {
+            eprintln!("comux wait-agent: {e}");
+            return 1;
+        }
+    };
+    let req = Req::ListAgents {
+        target: Some(args.target.clone()),
+    };
+    loop {
+        if expired(deadline) {
+            return EXIT_TIMEOUT;
+        }
+        let resp = match conn.request(&req, deadline) {
+            Ok(r) => r,
+            Err(WaitErr::TimedOut) => return EXIT_TIMEOUT,
+            Err(WaitErr::Failed(e)) => {
+                eprintln!("comux wait-agent: {e}");
+                return 1;
+            }
+        };
+        if !resp.ok {
+            // The pane is GONE — the server resolves the target every request, so this also
+            // catches a pane that closed mid-wait.
+            eprintln!(
+                "comux wait-agent: {}",
+                resp.error.as_deref().unwrap_or("(unspecified)")
+            );
+            return 1;
+        }
+        // An empty listing means the pane exists but is not classified as an agent yet (or
+        // any more). Keep waiting: classification lags a launch by up to one sweep.
+        if let Some(hit) = resp
+            .agents
+            .unwrap_or_default()
+            .into_iter()
+            .find(|a| a.status == args.status)
+        {
+            if expired(deadline) {
+                return EXIT_TIMEOUT;
+            }
+            println!("{} {} {}s", hit.status, hit.tool, hit.for_secs);
+            return 0;
+        }
+        let nap = match deadline {
+            Some(d) => args
+                .interval
+                .min(d.saturating_duration_since(Instant::now())),
+            None => args.interval,
+        };
+        if nap.is_zero() {
+            return EXIT_TIMEOUT;
+        }
+        std::thread::sleep(nap);
+    }
+}
+
+#[cfg(test)]
+mod wait_agent_tests {
+    use super::*;
+
+    fn parse(v: &[&str]) -> Result<WaitAgentArgs, i32> {
+        let owned: Vec<String> = v.iter().map(|s| s.to_string()).collect();
+        let refs: Vec<&String> = owned.iter().collect();
+        parse_wait_agent_args(&refs)
+    }
+
+    #[test]
+    fn requires_a_target_and_a_status() {
+        // No focused-pane default here, unlike `wait-output`: with several agents running,
+        // waiting on whichever pane happens to be focused is a wrong answer that looks right.
+        assert_eq!(parse(&["wait-agent", "--status", "ready"]), Err(2));
+        assert_eq!(parse(&["wait-agent", "ab12-3"]), Err(2));
+        assert!(parse(&["wait-agent", "ab12-3", "--status", "ready"]).is_ok());
+    }
+
+    #[test]
+    fn refuses_a_status_that_can_never_arrive() {
+        // Waiting out a 300s timeout for a value the server will never report is the
+        // failure this check exists to prevent.
+        assert_eq!(parse(&["wait-agent", "p", "--status", "done"]), Err(2));
+        assert_eq!(parse(&["wait-agent", "p", "--status", "Ready"]), Err(2));
+    }
+
+    /// `idle` means "no recognized UI" (agentstate.rs), which is also what an unresolved
+    /// reading looks like — so it is listable but not waitable.
+    #[test]
+    fn idle_is_listable_but_not_waitable() {
+        assert_eq!(parse(&["wait-agent", "p", "--status", "idle"]), Err(2));
+        assert!(!WAITABLE_STATUSES.contains(&"idle"));
+    }
+
+    #[test]
+    fn rejects_a_second_target() {
+        assert_eq!(
+            parse(&["wait-agent", "a", "b", "--status", "ready"]),
+            Err(2)
+        );
+    }
+
+    #[test]
+    fn shares_the_interval_floor_and_timeout_bounds() {
+        assert_eq!(
+            parse(&["wait-agent", "p", "--status", "ready", "--interval", "10"]),
+            Err(2)
+        );
+        assert_eq!(
+            parse(&[
+                "wait-agent",
+                "p",
+                "--status",
+                "ready",
+                "--timeout",
+                "18446744073709551615"
+            ]),
+            Err(2)
+        );
+        let a = parse(&["wait-agent", "p", "--status", "blocked", "--timeout", "5"]).unwrap();
+        assert_eq!(a.timeout, Some(Duration::from_secs(5)));
+        assert_eq!(a.target, "p");
+        assert_eq!(a.status, "blocked");
+    }
+
+    #[test]
+    fn flag_values_are_not_mistaken_for_the_target() {
+        let a = parse(&[
+            "wait-agent",
+            "--timeout",
+            "9",
+            "--status",
+            "ready",
+            "pane-1",
+        ])
+        .unwrap();
+        assert_eq!(a.target, "pane-1");
+        assert_eq!(a.timeout, Some(Duration::from_secs(9)));
+    }
+
+    /// The help must not sell turn-completion detection, which this verb cannot do, and
+    /// must name the inference the status rests on.
+    #[test]
+    fn the_help_states_what_it_cannot_do() {
+        assert!(WAIT_AGENT_USAGE.contains("NOT turn-completion detection"));
+        assert!(WAIT_AGENT_USAGE.contains("CACHED and INFERRED"));
+        assert!(
+            WAIT_AGENT_USAGE.contains("5s"),
+            "detached sweep rate missing"
+        );
+        assert!(
+            WAIT_AGENT_USAGE.contains("comux notify")
+                && WAIT_AGENT_USAGE.contains("comux wait-output"),
+            "help should point at what DOES detect completion"
+        );
+    }
+}
+
+#[cfg(test)]
+mod list_agents_proto_tests {
+    use super::*;
+
+    fn info(status: &str) -> AgentInfo {
+        AgentInfo {
+            token: "ab12-3".into(),
+            terminal: "t1".into(),
+            space: "work".into(),
+            title: "tab 1".into(),
+            tool: "claude".into(),
+            status: status.into(),
+            for_secs: 42,
+        }
+    }
+
+    #[test]
+    fn minimal_request_parses_without_a_target() {
+        match serde_json::from_str::<Req>(r#"{"cmd":"list-agents"}"#).expect("must parse") {
+            Req::ListAgents { target } => assert_eq!(target, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_targeted_request_round_trips() {
+        let req = Req::ListAgents {
+            target: Some("ab12-3".into()),
+        };
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(line.contains(r#""cmd":"list-agents""#), "wire form: {line}");
+        match serde_json::from_str::<Req>(&line).unwrap() {
+            Req::ListAgents { target } => assert_eq!(target.as_deref(), Some("ab12-3")),
+            other => panic!("wrong round-trip: {other:?}"),
+        }
+    }
+
+    /// `Some([])` and `None` mean different things — "no agents" versus "this response is
+    /// not a listing" — and `wait-agent` branches on exactly that, so the distinction has to
+    /// survive the wire.
+    #[test]
+    fn an_empty_listing_is_not_a_missing_listing() {
+        let empty = serde_json::to_string(&Resp::agents(vec![])).unwrap();
+        assert!(empty.contains(r#""agents":[]"#), "wire form: {empty}");
+        let back: Resp = serde_json::from_str(&empty).unwrap();
+        assert_eq!(back.agents, Some(vec![]));
+
+        let other = serde_json::to_string(&Resp::ok()).unwrap();
+        assert!(!other.contains("agents"), "agents leaked into: {other}");
+        assert_eq!(
+            serde_json::from_str::<Resp>(&other).unwrap().agents,
+            None,
+            "a non-listing response must not look like an empty listing"
+        );
+    }
+
+    #[test]
+    fn agent_info_round_trips() {
+        let line = serde_json::to_string(&Resp::agents(vec![info("blocked")])).unwrap();
+        let back: Resp = serde_json::from_str(&line).unwrap();
+        assert_eq!(back.agents, Some(vec![info("blocked")]));
     }
 }
