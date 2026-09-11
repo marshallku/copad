@@ -36,6 +36,7 @@ use crate::persist::{self, MAX_LEAVES_PER_TAB, MAX_TOTAL_PANES, PLayout};
 // same query narrows both lists identically.
 use crate::agentpoll;
 use crate::agentsessions;
+use crate::hostmetrics;
 use crate::picker::fuzzy_match;
 use crate::procinfo;
 use crate::proto::MouseKind;
@@ -616,6 +617,8 @@ pub struct App {
     /// Shared "what is each agent doing" readings, written by the `agentpoll` thread and
     /// read (never blocked on) when building agent rows.
     agent_poll: agentpoll::Shared,
+    /// Shared host CPU/memory/GPU/load reading, written by the `hostmetrics` poller.
+    host_poll: hostmetrics::Shared,
     /// Shared "update available" hint, written by the `versionpoll` thread
     /// (server-only); read into `version_shown` at the label cadence.
     version_poll: versionpoll::Shared,
@@ -771,6 +774,7 @@ impl App {
             // App without a server never spawn the poller thread.
             usage_poll: usagepoll::idle(),
             agent_poll: agentpoll::idle(),
+            host_poll: hostmetrics::idle(),
             version_poll: versionpoll::idle(),
             version_shown: None,
             usage_shown: None,
@@ -1870,6 +1874,19 @@ impl App {
     pub fn handle_control(&mut self, req: &control::Req) -> control::Resp {
         use control::{PaneInfo, Req, Resp};
         match req {
+            Req::Host => {
+                let m = hostmetrics::read(&self.host_poll);
+                Resp {
+                    host: Some(control::HostInfo {
+                        cpu: m.cpu,
+                        mem_used: m.mem_used,
+                        mem_total: m.mem_total,
+                        gpu: m.gpu,
+                        load1: m.load1,
+                    }),
+                    ..Resp::ok()
+                }
+            }
             Req::Health => {
                 let fd = crate::fdlimit::snapshot().ok();
                 Resp::health(control::HealthInfo {
@@ -4613,6 +4630,11 @@ impl App {
             return;
         }
         self.usage_poll = usagepoll::spawn();
+    }
+
+    /// Start the background host-metrics poller (server-only; see `hostmetrics`).
+    pub fn start_host_poll(&mut self) {
+        self.host_poll = hostmetrics::spawn();
     }
 
     /// Start the background agent-activity poller (server-only; see `agentpoll`).

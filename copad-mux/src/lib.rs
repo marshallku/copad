@@ -19,6 +19,7 @@ pub mod control;
 pub mod doctor;
 pub mod fdlimit;
 pub mod gitinfo;
+pub mod hostmetrics;
 pub mod model;
 pub mod notify;
 pub mod persist;

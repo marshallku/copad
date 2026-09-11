@@ -332,6 +332,7 @@ pub fn run() -> io::Result<()> {
     // hint). Detached thread; `COPAD_MUX_UPDATE_CHECK=0` / `update_check = false`
     // disables it.
     app.start_agent_poll();
+    app.start_host_poll();
     app.start_version_poll();
 
     let (tx, rx) = mpsc::channel::<Incoming>();
@@ -729,6 +730,7 @@ fn ctl_mutates(req: &control::Req) -> bool {
             | control::Req::ListTabs
             | control::Req::ListSessions
             | control::Req::Health
+            | control::Req::Host
             // Read-only, and the one verb callers POLL. Treating it as a mutation would
             // mark the render dirty on every poll and defeat the loop's idle skip — the
             // detached-CPU throttle exists precisely to stop that kind of busy-work.

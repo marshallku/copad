@@ -28,6 +28,7 @@
 #  13. bell + title: an unfocused pane's BEL and OSC 0 title reach `list --json`
 #  14. a codex pane reads ready/blocked, not the `idle` it used to fall through to
 #  15. an agent's DOING line is read from its own structured log (agentpoll)
+#  16. `comux host` publishes CPU/memory/GPU/load, omitting what it could not read
 
 set -euo pipefail
 
@@ -565,7 +566,43 @@ dxi="$(DX="$dx" python3 -c 'import json,sys,os; print(next(p["index"] for p in j
 t 10 "$COMUX" close "$dxi" >/dev/null || fail "could not clean up the activity pane"
 ok "the newest rollout item became the agent's DOING line; a pane with no log omits it"
 
-echo "16. the server is still responsive and shuts down cleanly"
+echo "16. the host readout"
+# `comux host` is served from the poller's last reading, so it must answer immediately and
+# must never invent a value. The CPU percentage is a RATE between two samples, so it is the
+# one field that is legitimately absent right after boot — hence the retry rather than a
+# single assertion.
+t 10 "$COMUX" host --json >"$WORK/json" || fail "comux host failed"
+python3 -c 'import json,sys; h=json.load(sys.stdin)["host"]; sys.exit(0 if isinstance(h,dict) else 1)' \
+    <"$WORK/json" || fail "comux host returned no host object"
+got=""
+for _ in $(seq 1 20); do
+    t 10 "$COMUX" host --json >"$WORK/json"
+    if python3 -c 'import json,sys
+h=json.load(sys.stdin)["host"]
+ok=[k for k in ("cpu","mem_used","load1") if k in h]
+sys.exit(0 if ok else 1)' <"$WORK/json"; then
+        got=1; break
+    fi
+    sleep 0.5
+done
+[[ -n "$got" ]] || fail "the host poller never published a reading: $(cat "$WORK/json")"
+# Ranges, because a bad probe is far likelier to produce a nonsense number than an error.
+python3 -c 'import json,sys
+h=json.load(sys.stdin)["host"]
+for k in ("cpu","gpu"):
+    if k in h and not (0.0 <= h[k] <= 100.0):
+        print(f"{k} out of range: {h[k]}"); sys.exit(1)
+if "mem_used" in h and "mem_total" in h and not (0 < h["mem_used"] <= h["mem_total"]):
+    print("memory is not a share of the machine:", h); sys.exit(1)
+if "load1" in h and h["load1"] < 0:
+    print("negative load:", h); sys.exit(1)' <"$WORK/json" || fail "implausible host reading"
+# Absence is absence: a field that could not be read is OMITTED, so the plain readout has no
+# line for it at all rather than a zero or a dash.
+t 10 "$COMUX" host >"$WORK/out" || fail "plain host readout failed"
+grep -qE '^(cpu|mem|gpu|load1) ' "$WORK/out" || fail "plain host readout printed nothing usable"
+ok "host metrics are published, in range, and omit what could not be read"
+
+echo "17. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

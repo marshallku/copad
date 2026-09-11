@@ -209,6 +209,9 @@ pub enum Req {
     /// Runtime counters of the RUNNING server (pane/label coverage + process-sweep
     /// failures), for `comux doctor`. Read-only; safe to poll.
     Health,
+    /// The host machine's CPU / memory / GPU / load, as the status surfaces see them.
+    /// Read-only; served from the poller's last reading, so it never blocks the loop.
+    Host,
     /// Shut the persistent server down (drops every shell). The only key-free way to
     /// stop a detached server short of exiting its last shell.
     KillServer,
@@ -358,6 +361,24 @@ pub struct AgentInfo {
     pub detail: Option<String>,
 }
 
+/// The host machine, as `comux host` reports it.
+///
+/// Every field is optional and ABSENT means "could not read", never zero — a readout that
+/// prints `cpu 0%` when the probe failed is making a claim about the machine.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+pub struct HostInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_used: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load1: Option<f64>,
+}
+
 /// One git worktree in a `worktree list` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeInfo {
@@ -400,6 +421,10 @@ pub struct Resp {
     pub active_session: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<HealthInfo>,
+    /// `host`: the machine's last metrics reading. Every field inside is itself optional —
+    /// absent means the probe failed, NEVER zero (see `hostmetrics`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<HostInfo>,
     /// `jump`: the pid of the terminal emulator hosting an attached client, for the CLI
     /// to activate. Absent when nothing is attached (the jump still happened — the next
     /// attach lands on the right pane).
@@ -443,6 +468,7 @@ impl Resp {
             active_tab: None,
             sessions: None,
             active_session: None,
+            host: None,
             health: None,
             raise_pid: None,
             raise_comm: None,
@@ -626,6 +652,7 @@ pub fn run_client(args: &[String]) -> i32 {
     let req = match cmd {
         "list" => Req::List,
         "health" => Req::Health,
+        "host" => Req::Host,
         "reload" | "source-file" => Req::ReloadConfig,
         "kill-server" => Req::KillServer,
         "list-tabs" | "tabs" => Req::ListTabs,
@@ -1408,6 +1435,37 @@ fn print_human(req: &Req, resp: &Resp) {
             // The number that actually answers "why won't a new tab open?".
             if let Some(room) = h.panes_remaining() {
                 println!("panes headroom  {room}");
+            }
+        }
+        Req::Host => {
+            let Some(h) = resp.host.as_ref() else {
+                return;
+            };
+            // A field that could not be read prints nothing at all rather than a dash or a
+            // zero, so `comux host | grep cpu` is empty exactly when there is no reading.
+            let pct = |label: &str, v: Option<f64>| {
+                if let Some(v) = v {
+                    println!("{label:<7} {v:.0}%");
+                }
+            };
+            pct("cpu", h.cpu);
+            if let (Some(used), Some(total)) = (h.mem_used, h.mem_total) {
+                let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
+                let share = if total > 0 {
+                    used as f64 * 100.0 / total as f64
+                } else {
+                    0.0
+                };
+                println!(
+                    "mem     {:.0}%  ({:.1}/{:.1} GiB)",
+                    share,
+                    gib(used),
+                    gib(total)
+                );
+            }
+            pct("gpu", h.gpu);
+            if let Some(l) = h.load1 {
+                println!("load1   {l:.2}");
             }
         }
         Req::Split { .. } => {
