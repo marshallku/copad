@@ -159,8 +159,23 @@ token0="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["panes"][0]["t
 [[ -n "$token0" ]] || fail "pane 0 has no \$COPAD_MUX_PANE token"
 # Incarnation-qualified (`<nonce>-<n>`), so a token from a previous server can't resolve.
 [[ "$token0" == *-* ]] || fail "token '$token0' is not <nonce>-<counter>"
-t 10 "$COMUX" notify --pane "$token0" --kind blocked "e2e says hello" >/dev/null \
+t 10 "$COMUX" notify --pane "$token0" --kind blocked "e2e says hello" >"$WORK/out" \
     || fail "notify on a live pane failed"
+# The response echoes WHERE the notification was attributed (`tool · space/tab`). A pushing
+# hook has no other way to tell a mis-addressed pane from a correctly addressed one — the
+# toast is the only other evidence and it is transient. The tab half is the point: a space
+# can hold many agents, so the space name alone does not answer "which one is asking me".
+grep -q '/' "$WORK/out" || fail "notify did not report which tab it was attributed to: $(cat "$WORK/out")"
+t 10 "$COMUX" rename-tab "e2e-tab" >/dev/null || fail "rename-tab failed"
+t 10 "$COMUX" notify --pane "$token0" --kind done "named" >"$WORK/out" \
+    || fail "notify after rename-tab failed"
+grep -q '/e2e-tab$' "$WORK/out" || fail "a named tab must title the notification: $(cat "$WORK/out")"
+# Clearing the name falls back to the 1-based index — the `Ctrl-b <n>` that jumps there,
+# which is more useful than repeating the space name on every row.
+t 10 "$COMUX" rename-tab "" >/dev/null || fail "clearing the tab name failed"
+t 10 "$COMUX" notify --pane "$token0" --kind done "unnamed" >"$WORK/out" \
+    || fail "notify after clearing the tab name failed"
+grep -qE '/tab [0-9]+$' "$WORK/out" || fail "an unnamed tab must fall back to its index: $(cat "$WORK/out")"
 if t 10 "$COMUX" notify --pane "no-such-pane" --kind done body >"$WORK/out" 2>&1; then
     fail "notify on an unknown pane should have failed: $(cat "$WORK/out")"
 fi
@@ -189,7 +204,7 @@ if t 10 "$COMUX" jump "deadbeef-99" >"$WORK/out" 2>&1; then
 fi
 grep -q "unknown pane" "$WORK/out" || fail "expected 'unknown pane', got: $(cat "$WORK/out")"
 t 10 "$COMUX" kill-session 1 >/dev/null || fail "could not clean up the jump session"
-ok "token minted per pane; notify validated; jump switched sessions by identity"
+ok "token minted per pane; notify validated + reports its space/tab attribution; jump switched sessions by identity"
 
 echo "8. bad index / missing index"
 t 10 "$COMUX" close-tab 99 >/dev/null 2>&1 && fail "close-tab 99 should have failed"

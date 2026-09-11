@@ -61,9 +61,45 @@ struct Notification {
     kind: &'static str,
     tool: String,
     space: String,
+    /// The TAB it came from, titled by the same rule the sidebar uses
+    /// ([`tab_display_title`]). A space can hold many agents, so the space name alone does
+    /// not answer "which one is asking me" — the question a notification exists to raise.
+    tab: String,
     body: String,
     /// The pane it came from — `Enter` in the center jumps here.
     terminal: TerminalId,
+}
+
+/// A tab's display title: its custom name when it has a meaningful one, else its 1-based
+/// INDEX (`tab 2` — the `Ctrl-b <n>` that jumps there).
+///
+/// One rule, one place. The sidebar's agent rows and the notifications now both title a tab
+/// with it; two copies would drift, and a toast that names a tab differently from the row
+/// you then go looking for is worse than a toast that names no tab at all.
+fn tab_display_title(name: Option<&str>, index: usize) -> String {
+    name.map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("tab {}", index + 1))
+}
+
+/// Where a notification came from: `tool · space/tab`.
+///
+/// Each part is dropped when it is unknown rather than rendered as an empty segment — a
+/// pane that could not be located must not produce a title ending in a bare `/`, which
+/// reads as a real but nameless tab.
+fn notify_title(tool: &str, space: &str, tab: &str) -> String {
+    let place = match (space.is_empty(), tab.is_empty()) {
+        (false, false) => format!("{space}/{tab}"),
+        (false, true) => space.to_string(),
+        (true, false) => tab.to_string(),
+        (true, true) => String::new(),
+    };
+    if place.is_empty() {
+        tool.to_string()
+    } else {
+        format!("{tool} · {place}")
+    }
 }
 
 /// Max notifications retained in the center.
@@ -2235,8 +2271,10 @@ impl App {
                 } else {
                     body.clone()
                 };
-                self.raise_notification(term, tool, kind, body);
-                Resp::ok()
+                // Echo the attribution: a pushing hook otherwise has no way to tell a
+                // mis-addressed pane from a correctly addressed one, since the toast is
+                // the only other evidence and it is transient.
+                Resp::message(self.raise_notification(term, tool, kind, body))
             }
             Req::KillSession { index } => {
                 let Some(wid) = self.session_ids().get(*index).cloned() else {
@@ -4699,44 +4737,51 @@ impl App {
     /// Raise one agent notification: a desktop toast whose click jumps to the pane, plus
     /// an entry in the in-app center (`Ctrl-b a`). Shared by the status sweep and the
     /// `comux notify` push so both produce identical, jumpable notifications.
+    /// Returns the `tool · space/tab` attribution it used, so a caller can SEE where its
+    /// notification landed. A pushing hook (`comux notify`) has no other way to tell a
+    /// mis-addressed pane from a correctly addressed one — the toast is the only other
+    /// evidence and it is transient.
     fn raise_notification(
         &mut self,
         term: TerminalId,
         tool: String,
         kind: &'static str,
         body: String,
-    ) {
-        let space = self
+    ) -> String {
+        let (space, tab) = self
             .locate_terminal(&term)
-            .map(|(w, _, _)| {
-                self.state
-                    .workspace(&w)
+            .map(|(w, t, _)| {
+                let ws = self.state.workspace(&w);
+                let space = ws
                     .and_then(|ws| ws.name.clone())
-                    .unwrap_or_else(|| w.to_string())
+                    .unwrap_or_else(|| w.to_string());
+                let tab = ws
+                    .and_then(|ws| ws.tabs.iter().position(|x| x.id == t).map(|i| (ws, i)))
+                    .map(|(ws, i)| tab_display_title(ws.tabs[i].name.as_deref(), i))
+                    .unwrap_or_default();
+                (space, tab)
             })
             .unwrap_or_default();
         // Desktop toast: env override wins, else the config `notify` flag. The in-app
         // center below is logged regardless (it's not a desktop toast).
+        let title = notify_title(&tool, &space, &tab);
         if notify::env_override().unwrap_or(self.cfg.notify) {
             let action = self.jump_action(&term);
-            notify::desktop(
-                &format!("{tool} · {space}"),
-                &body,
-                action.as_deref(),
-                &self.desktop_env(),
-            );
+            notify::desktop(&title, &body, action.as_deref(), &self.desktop_env());
         }
         self.notifications.push_front(Notification {
             when: local_hhmm(),
             kind,
             tool,
             space,
+            tab,
             body,
             terminal: term,
         });
         while self.notifications.len() > NOTIFY_LOG_CAP {
             self.notifications.pop_back();
         }
+        title
     }
 
     /// Number of agent panes currently BLOCKED (awaiting input) — the status-bar
@@ -4853,7 +4898,7 @@ impl App {
                 // sidebar already groups by space, so repeating it would render every
                 // agent in a space as the same untellable row — the index at least says
                 // which `Ctrl-b <n>` jumps there.
-                let tab_name = t.name.as_deref().map(str::trim).filter(|n| !n.is_empty());
+                let tab_title = tab_display_title(t.name.as_deref(), ti);
                 for p in t.layout.panes() {
                     if let Some(tid) = t.layout.terminal_of(&p)
                         && let Some(label) = self.labels.get(tid)
@@ -4861,9 +4906,7 @@ impl App {
                     {
                         let (status, for_secs) = self.agent_status(tid);
                         out.push(AgentRow {
-                            title: tab_name
-                                .map(str::to_string)
-                                .unwrap_or_else(|| format!("tab {}", ti + 1)),
+                            title: tab_title.clone(),
                             space: space.clone(),
                             space_id: wid.clone(),
                             tool: label.text.clone(),
@@ -6542,12 +6585,11 @@ impl App {
             let selected = i == sel;
             let glyph = if note.kind == "blocked" { "▲" } else { "✓" };
             let row = format!(
-                "{} {} {} {} · {}  {}",
+                "{} {} {} {}  {}",
                 if selected { "▸" } else { " " },
                 note.when,
                 glyph,
-                note.tool,
-                note.space,
+                notify_title(&note.tool, &note.space, &note.tab),
                 note.body
             );
             let st = if selected {
@@ -7414,10 +7456,10 @@ mod tests {
         AgentItem, AgentRow, AgentState, CAT_GREEN, CAT_RED, CAT_YELLOW, Menu, MenuAction,
         agent_items, agents_span_spaces, band_rows, build_command_line, clip_width, cwd_affinity,
         detect_alt_screen_transition, extract_selection, filter_env, fmt_elapsed, home_short_in,
-        list_window_start, menu_origin, merge_env, merge_labels, reload_note, resume_line,
-        resume_rank, sel_bounds, sel_cols, shell_quote, split_sidebar, status_since, tab_window,
-        usage_should_roll, usage_threshold_color, window_max_start, window_start_var,
-        with_pane_token, wrap_page,
+        list_window_start, menu_origin, merge_env, merge_labels, notify_title, reload_note,
+        resume_line, resume_rank, sel_bounds, sel_cols, shell_quote, split_sidebar, status_since,
+        tab_display_title, tab_window, usage_should_roll, usage_threshold_color, window_max_start,
+        window_start_var, with_pane_token, wrap_page,
     };
     use crate::model::{TerminalId, WorkspaceId};
     use crate::procinfo::{Kind, Label};
@@ -8024,6 +8066,36 @@ mod tests {
     #[test]
     /// The status map is rebuilt every refresh, so the stamp must be CARRIED while the
     /// status holds — resetting it would peg every `blocked Nm` readout at nothing.
+    fn a_tab_title_falls_back_to_the_key_that_jumps_to_it() {
+        assert_eq!(tab_display_title(Some("build"), 0), "build");
+        assert_eq!(tab_display_title(Some("  build  "), 3), "build");
+        // No name, an empty name and a whitespace-only name all mean "unnamed": show the
+        // 1-based index, which is the `Ctrl-b <n>` that jumps there.
+        assert_eq!(tab_display_title(None, 0), "tab 1");
+        assert_eq!(tab_display_title(Some(""), 1), "tab 2");
+        assert_eq!(tab_display_title(Some("   "), 8), "tab 9");
+    }
+
+    #[test]
+    fn a_notification_title_names_the_tab_and_omits_what_it_does_not_know() {
+        assert_eq!(
+            notify_title("claude", "copad", "tab 2"),
+            "claude · copad/tab 2"
+        );
+        assert_eq!(
+            notify_title("codex", "copad", "review"),
+            "codex · copad/review"
+        );
+        // A pane that could not be located must not yield a trailing or leading bare `/`,
+        // which would read as a real but nameless tab.
+        assert_eq!(notify_title("claude", "copad", ""), "claude · copad");
+        assert_eq!(notify_title("claude", "", "tab 2"), "claude · tab 2");
+        assert_eq!(notify_title("claude", "", ""), "claude");
+        assert!(!notify_title("claude", "copad", "").contains('/'));
+        assert!(!notify_title("claude", "", "").contains('·'));
+    }
+
+    #[test]
     fn status_since_carries_forward_until_the_status_moves() {
         use crate::agentstate::AgentStatus;
         let then = std::time::Instant::now();

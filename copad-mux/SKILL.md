@@ -166,6 +166,9 @@ This raises a desktop toast whose click jumps back to your pane — it works whi
 detached, which is the point. Always pass your own `$COPAD_MUX_PANE`; a misattributed
 notification sends the user's click somewhere misleading.
 
+It prints where the notification was attributed (`claude · backend/review` — tool, space and
+tab). Check it: that line is the only non-transient evidence you addressed the right pane.
+
 ## Do not
 
 - **Do not run any of this when `$COPAD_MUX` is unset.** See the top.
