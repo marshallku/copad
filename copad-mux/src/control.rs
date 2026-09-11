@@ -348,6 +348,14 @@ pub struct AgentInfo {
     pub status: String,
     /// Whole seconds the agent has held `status`.
     pub for_secs: u64,
+    /// What the agent was last seen DOING (`Bash: run the tests`, `running: cargo test`),
+    /// read from the tool's own structured log.
+    ///
+    /// ABSENT means "no reading", never "doing nothing" — the agent may be a tool whose log
+    /// we cannot read, one that has run no tools yet, or one whose log format has moved. Do
+    /// not branch on its absence; it is a hint for a human scanning a list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// One git worktree in a `worktree list` response.
@@ -1423,18 +1431,21 @@ fn print_human(req: &Req, resp: &Resp) {
                 return;
             }
             println!(
-                "{:<12} {:<12} {:<10} {:<9} {:<6} PANE",
-                "SPACE", "TAB", "TOOL", "STATUS", "FOR"
+                "{:<12} {:<12} {:<10} {:<9} {:<6} {:<18} DOING",
+                "SPACE", "TAB", "TOOL", "STATUS", "FOR", "PANE"
             );
             for a in &agents {
+                // `DOING` goes LAST because it is free text containing spaces; every column
+                // before it stays splittable by whitespace.
                 println!(
-                    "{:<12} {:<12} {:<10} {:<9} {:<6} {}",
+                    "{:<12} {:<12} {:<10} {:<9} {:<6} {:<18} {}",
                     a.space,
                     a.title,
                     a.tool,
                     a.status,
                     format!("{}s", a.for_secs),
-                    a.token
+                    a.token,
+                    a.detail.as_deref().unwrap_or("")
                 );
             }
         }
@@ -3079,6 +3090,7 @@ mod list_agents_proto_tests {
             tool: "claude".into(),
             status: status.into(),
             for_secs: 42,
+            detail: None,
         }
     }
 

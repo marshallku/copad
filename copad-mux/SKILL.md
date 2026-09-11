@@ -133,6 +133,11 @@ at once. Its statuses are cached and inferred (Claude's from its session file, e
 else from screen text, refreshed every 500ms attached / 5s detached), so `blocked` can be a
 false reading from ordinary output. Treat it as a hint, and confirm with `capture-pane`.
 
+`detail` is what the agent was last seen DOING (`Bash: run the tests`), read from the tool's
+own log. It is ABSENT, not empty, when there is no reading — a tool whose log comux cannot
+read, one that has run no tools yet, or a format that has moved. Never branch on its absence;
+it is a hint for a human scanning a list.
+
 `idle` means comux recognised no agent UI at all — "no reading", not a state — which is why
 it is not waitable. A pane running a tool whose UI comux does not know stays `idle` forever,
 so never block on one; poll it with `capture-pane`, or have it signal you with
@@ -141,7 +146,7 @@ so never block on one; poll it with `capture-pane`, or have it signal you with
 ## Coordinate with another agent
 
 ```bash
-comux list-agents --json                   # token, tool, status, for_secs — across all sessions
+comux list-agents --json                   # token, tool, status, for_secs, detail — all sessions
 comux wait-agent <token> --status blocked  # it is probably asking something
 comux capture-pane <token> -S 80           # read what it asked
 comux send <token> "use the schema in ./docs"

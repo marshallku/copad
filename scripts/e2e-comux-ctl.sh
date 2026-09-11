@@ -27,6 +27,7 @@
 #  12. `comux skill` emits the embedded agent guide, and the recipe it teaches works
 #  13. bell + title: an unfocused pane's BEL and OSC 0 title reach `list --json`
 #  14. a codex pane reads ready/blocked, not the `idle` it used to fall through to
+#  15. an agent's DOING line is read from its own structured log (agentpoll)
 
 set -euo pipefail
 
@@ -513,7 +514,58 @@ cxi="$(CX="$cx" python3 -c 'import json,sys,os; print(next(p["index"] for p in j
 t 10 "$COMUX" close "$cxi" >/dev/null || fail "could not clean up the codex pane"
 ok "codex reads ready at its composer and blocked on an approval, not idle"
 
-echo "15. the server is still responsive and shuts down cleanly"
+echo "15. an agent's activity line is read from its own log"
+# End-to-end for the `agentpoll` thread: pane label -> the wanted-set handed to the poller ->
+# source-file resolution (which forks `lsof` on macOS, off the render loop) -> bounded tail
+# read -> parse -> the wire. None of that is reachable from a unit test.
+#
+# The CODEX path is the one that can be faked honestly: it locates the log by finding a
+# rollout file the agent process holds OPEN, so a fixture that is named `codex` and holds one
+# open exercises the real resolution. (Claude's path derives its transcript from
+# `~/.claude/sessions/<pid>.json`, a file the harness does not own, so it is covered by unit
+# tests plus an ignored live oracle — `cargo test -p copad-mux -- --ignored live_`.)
+mkdir -p "$WORK/bin2" "$WORK/sessions"
+ln -sf /bin/sh "$WORK/bin2/codex" || fail "could not build the rollout-holding fixture"
+roll="$WORK/sessions/rollout-2026-09-12T00-00-00-01a09154-4f7e-76a1-81e0-daae1f6d49b3.jsonl"
+# A real codex `CommandExecution`: `command` is an ARRAY and codex pre-parses it into
+# `parsed_cmd`. Reading `command` as a string is a bug a hand-written fixture hid once.
+cat >"$roll" <<'ROLLEOF'
+{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"Reasoning"}}}
+{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":["/bin/zsh","-lc","cargo test --all"],"parsed_cmd":[{"type":"unknown","cmd":"cargo test --all"}]}}}
+ROLLEOF
+dx="$(t 10 "$COMUX" split --from "$tok")" || fail "split for the activity fixture failed"
+# NOT `exec`: the pane's shell has to survive the Ctrl-C below, or the pane closes itself and
+# the cleanup has nothing to address.
+t 10 "$COMUX" send "$dx" "$WORK/bin2/codex -c 'exec 9< $roll; sleep 600'" >/dev/null
+t 10 "$COMUX" send "$dx" $'\n' >/dev/null
+seen=""
+for _ in $(seq 1 60); do
+    t 10 "$COMUX" list-agents --json >"$WORK/json"
+    if DX="$dx" python3 -c 'import json,sys,os
+a=[x for x in json.load(sys.stdin)["agents"] if x["token"]==os.environ["DX"]]
+sys.exit(0 if a and a[0].get("detail") else 1)' <"$WORK/json"; then
+        seen=1; break
+    fi
+    sleep 0.5
+done
+[[ -n "$seen" ]] || { t 10 "$COMUX" list-agents >&2 || true
+                      fail "no activity was ever read from the fixture's rollout"; }
+det="$(DX="$dx" python3 -c 'import json,sys,os; print(next(x["detail"] for x in json.load(sys.stdin)["agents"] if x["token"]==os.environ["DX"]))' <"$WORK/json")"
+[[ "$det" == "running: cargo test --all" ]] \
+    || fail "expected the NEWEST rollout item, got '$det'"
+# Absence must stay absent: a pane with no readable log carries no `detail` key at all, so a
+# caller can tell "no reading" from "doing nothing" (the same contract as #105's [] vs null).
+if python3 -c 'import json,sys
+sys.exit(0 if any("detail" in x for x in json.load(sys.stdin)["agents"] if x["tool"]!="codex") else 1)' <"$WORK/json"; then
+    fail "a pane with no readable log must omit detail entirely, not send an empty one"
+fi
+t 10 "$COMUX" send "$dx" $'\x03' >/dev/null
+t 10 "$COMUX" list --json >"$WORK/json"
+dxi="$(DX="$dx" python3 -c 'import json,sys,os; print(next(p["index"] for p in json.load(sys.stdin)["panes"] if p["token"]==os.environ["DX"]))' <"$WORK/json")"
+t 10 "$COMUX" close "$dxi" >/dev/null || fail "could not clean up the activity pane"
+ok "the newest rollout item became the agent's DOING line; a pane with no log omits it"
+
+echo "16. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

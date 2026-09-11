@@ -34,6 +34,7 @@ use crate::notify;
 use crate::persist::{self, MAX_LEAVES_PER_TAB, MAX_TOTAL_PANES, PLayout};
 // The `Ctrl-f` switcher and the CLI's fuzzy picker share one filter, so typing the
 // same query narrows both lists identically.
+use crate::agentpoll;
 use crate::agentsessions;
 use crate::picker::fuzzy_match;
 use crate::procinfo;
@@ -99,6 +100,31 @@ fn notify_title(tool: &str, space: &str, tab: &str) -> String {
         tool.to_string()
     } else {
         format!("{tool} · {place}")
+    }
+}
+
+/// One `Ctrl-f` agent row: `codex · working 4m — running: cargo test  (space · tab 2)`.
+///
+/// The detail is what the switcher is opened for — "working" does not distinguish an agent
+/// compiling for 40 seconds from one stuck in a retry loop. It is omitted entirely when there
+/// is no reading, so a row never carries a placeholder standing in for information we do not
+/// have.
+fn agent_popup_text(
+    tool: &str,
+    status: &str,
+    for_secs: u64,
+    detail: Option<&str>,
+    place: &str,
+) -> String {
+    let age = fmt_elapsed(for_secs);
+    let head = if age.is_empty() {
+        format!("{tool} · {status}")
+    } else {
+        format!("{tool} · {status} {age}")
+    };
+    match detail {
+        Some(d) if !d.is_empty() => format!("{head} — {d}  ({place})"),
+        _ => format!("{head}  ({place})"),
     }
 }
 
@@ -206,6 +232,10 @@ struct AgentRow {
     /// The session (space) name — kept alongside `title` so the switcher can filter on
     /// it and show it even when a tab name overrides the title.
     space: String,
+    /// What the agent was last seen DOING (`Bash: run the tests`), from `agentpoll`.
+    /// `None` means "no reading" — the row then looks exactly as it did before the poller
+    /// existed, rather than showing a placeholder or a stale value.
+    detail: Option<String>,
     /// The session the agent lives in, so a sidebar space GROUP HEADER can click through
     /// to it (the name alone is ambiguous — two sessions may share one).
     space_id: WorkspaceId,
@@ -583,6 +613,9 @@ pub struct App {
     /// Shared usage/limits readout (`coctl usage --limits`), written by a background
     /// poller thread (`usagepoll`), read into `usage_shown` at the label cadence.
     usage_poll: usagepoll::Shared,
+    /// Shared "what is each agent doing" readings, written by the `agentpoll` thread and
+    /// read (never blocked on) when building agent rows.
+    agent_poll: agentpoll::Shared,
     /// Shared "update available" hint, written by the `versionpoll` thread
     /// (server-only); read into `version_shown` at the label cadence.
     version_poll: versionpoll::Shared,
@@ -737,6 +770,7 @@ impl App {
             // Idle until `start_usage_poll` (called by the server); tests that build an
             // App without a server never spawn the poller thread.
             usage_poll: usagepoll::idle(),
+            agent_poll: agentpoll::idle(),
             version_poll: versionpoll::idle(),
             version_shown: None,
             usage_shown: None,
@@ -2447,6 +2481,7 @@ impl App {
                         tool: r.tool,
                         status: r.status.to_string(),
                         for_secs: r.for_secs,
+                        detail: r.detail,
                     })
                     .collect();
                 Resp::agents(agents)
@@ -3453,15 +3488,31 @@ impl App {
                     } else {
                         format!("{} · {}", row.space, row.title)
                     };
+                    // The detail is part of the haystack: "which pane is running webpack"
+                    // is the question the switcher is opened to answer, and the tool name
+                    // and status alone cannot answer it.
                     if fuzzy_match(
                         filter,
-                        &format!("{} {} {} {}", row.space, row.title, row.tool, row.status),
+                        &format!(
+                            "{} {} {} {} {}",
+                            row.space,
+                            row.title,
+                            row.tool,
+                            row.status,
+                            row.detail.as_deref().unwrap_or("")
+                        ),
                     ) {
                         rows.push(PopupRow {
                             target: PopupTarget::Agent(row.term),
                             glyph,
                             color,
-                            text: format!("{} · {}  ({place})", row.tool, row.status),
+                            text: agent_popup_text(
+                                &row.tool,
+                                row.status,
+                                row.for_secs,
+                                row.detail.as_deref(),
+                                &place,
+                            ),
                         });
                     }
                 }
@@ -4564,6 +4615,13 @@ impl App {
         self.usage_poll = usagepoll::spawn();
     }
 
+    /// Start the background agent-activity poller (server-only; see `agentpoll`).
+    /// Unconditional: unlike the usage and update pollers it does no network I/O and stays
+    /// entirely idle — no wake work at all — until an agent pane exists to track.
+    pub fn start_agent_poll(&mut self) {
+        self.agent_poll = agentpoll::spawn();
+    }
+
     /// Start the background GitHub-release update checker (server-only; see
     /// `versionpoll`). Skipped when `update_check = false` so a disabled check
     /// costs no network polling (matching `COPAD_MUX_UPDATE_CHECK=0`).
@@ -4629,6 +4687,10 @@ impl App {
         let mut next = HashMap::new();
         // Meaningful status TRANSITIONS to notify on (fired after the borrow ends).
         let mut events: Vec<(TerminalId, String, &'static str)> = Vec::new();
+        // The activity poller is told which agents exist from HERE rather than sweeping the
+        // process table itself: this loop already walks exactly the agent panes and holds
+        // their labels, so `procinfo` keeps a single writer (#88).
+        let mut wanted: Vec<(u32, String)> = Vec::new();
         for (tid, pane) in &self.panes {
             let Some(label) = self.labels.get(tid) else {
                 continue;
@@ -4636,6 +4698,7 @@ impl App {
             if label.kind != procinfo::Kind::Agent {
                 continue;
             }
+            wanted.push((label.pid, label.text.clone()));
             let status = agentstate::resolve(Some(label.pid), &pane.snapshot());
             let prev = self.agent_statuses.get(tid).copied();
             let body = match (prev.map(|p| p.status), status) {
@@ -4665,6 +4728,7 @@ impl App {
         // cover it either: that fires on wall-clock minutes, not on the minute each
         // agent's status began, so a row could sit a full bucket behind its neighbours.
         // Report a roll as a change.
+        agentpoll::set_wanted(&self.agent_poll, wanted);
         let mut minutes = HashMap::with_capacity(next.len());
         let mut rolled = false;
         for (tid, st) in &next {
@@ -4907,6 +4971,8 @@ impl App {
                         let (status, for_secs) = self.agent_status(tid);
                         out.push(AgentRow {
                             title: tab_title.clone(),
+                            detail: agentpoll::activity(&self.agent_poll, label.pid)
+                                .map(|a| a.detail),
                             space: space.clone(),
                             space_id: wid.clone(),
                             tool: label.text.clone(),
@@ -7454,12 +7520,12 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
 mod tests {
     use super::{
         AgentItem, AgentRow, AgentState, CAT_GREEN, CAT_RED, CAT_YELLOW, Menu, MenuAction,
-        agent_items, agents_span_spaces, band_rows, build_command_line, clip_width, cwd_affinity,
-        detect_alt_screen_transition, extract_selection, filter_env, fmt_elapsed, home_short_in,
-        list_window_start, menu_origin, merge_env, merge_labels, notify_title, reload_note,
-        resume_line, resume_rank, sel_bounds, sel_cols, shell_quote, split_sidebar, status_since,
-        tab_display_title, tab_window, usage_should_roll, usage_threshold_color, window_max_start,
-        window_start_var, with_pane_token, wrap_page,
+        agent_items, agent_popup_text, agents_span_spaces, band_rows, build_command_line,
+        clip_width, cwd_affinity, detect_alt_screen_transition, extract_selection, filter_env,
+        fmt_elapsed, home_short_in, list_window_start, menu_origin, merge_env, merge_labels,
+        notify_title, reload_note, resume_line, resume_rank, sel_bounds, sel_cols, shell_quote,
+        split_sidebar, status_since, tab_display_title, tab_window, usage_should_roll,
+        usage_threshold_color, window_max_start, window_start_var, with_pane_token, wrap_page,
     };
     use crate::model::{TerminalId, WorkspaceId};
     use crate::procinfo::{Kind, Label};
@@ -8039,6 +8105,7 @@ mod tests {
 
     fn arow(space: &str, title: &str) -> AgentRow {
         AgentRow {
+            detail: None,
             title: title.to_string(),
             for_secs: 0,
             space: space.to_string(),
@@ -8064,8 +8131,40 @@ mod tests {
     }
 
     #[test]
-    /// The status map is rebuilt every refresh, so the stamp must be CARRIED while the
-    /// status holds — resetting it would peg every `blocked Nm` readout at nothing.
+    fn an_agent_switcher_row_omits_what_it_has_no_reading_for() {
+        assert_eq!(
+            agent_popup_text(
+                "codex",
+                "working",
+                260,
+                Some("running: cargo test"),
+                "copad · tab 2"
+            ),
+            "codex · working 4m — running: cargo test  (copad · tab 2)"
+        );
+        // No detail: the row must look exactly as it did before the poller existed, with no
+        // placeholder standing in for information we do not have.
+        assert_eq!(
+            agent_popup_text("claude", "ready", 260, None, "copad · tab 1"),
+            "claude · ready 4m  (copad · tab 1)"
+        );
+        assert_eq!(
+            agent_popup_text("claude", "ready", 260, Some(""), "copad · tab 1"),
+            "claude · ready 4m  (copad · tab 1)"
+        );
+        // Under a minute `fmt_elapsed` is empty, and the row must not grow a stray space or
+        // a dangling separator because of it.
+        assert_eq!(
+            agent_popup_text("codex", "blocked", 3, None, "copad · tab 2"),
+            "codex · blocked  (copad · tab 2)"
+        );
+        assert_eq!(
+            agent_popup_text("codex", "blocked", 3, Some("thinking"), "p"),
+            "codex · blocked — thinking  (p)"
+        );
+    }
+
+    #[test]
     fn a_tab_title_falls_back_to_the_key_that_jumps_to_it() {
         assert_eq!(tab_display_title(Some("build"), 0), "build");
         assert_eq!(tab_display_title(Some("  build  "), 3), "build");
@@ -8096,6 +8195,8 @@ mod tests {
     }
 
     #[test]
+    /// The status map is rebuilt every refresh, so the stamp must be CARRIED while the
+    /// status holds — resetting it would peg every `blocked Nm` readout at nothing.
     fn status_since_carries_forward_until_the_status_moves() {
         use crate::agentstate::AgentStatus;
         let then = std::time::Instant::now();

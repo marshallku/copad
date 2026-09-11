@@ -331,6 +331,7 @@ pub fn run() -> io::Result<()> {
     // And the background GitHub-release update checker (status-bar `⬆ x.y.z`
     // hint). Detached thread; `COPAD_MUX_UPDATE_CHECK=0` / `update_check = false`
     // disables it.
+    app.start_agent_poll();
     app.start_version_poll();
 
     let (tx, rx) = mpsc::channel::<Incoming>();

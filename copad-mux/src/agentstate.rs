@@ -438,6 +438,10 @@ pub fn codex_session_id(pid: u32) -> Option<String> {
 /// Extract the UUID from a Codex rollout path `…/sessions/…/rollout-<ts>-<uuid>.jsonl`. The
 /// timestamp segment also contains dashes, so the id is the trailing five hex groups. `None`
 /// unless the path is under a `sessions` dir and ends in a valid rollout filename.
+pub fn is_rollout_path(path: &std::path::Path) -> bool {
+    rollout_session_id(path).is_some()
+}
+
 fn rollout_session_id(path: &std::path::Path) -> Option<String> {
     if !path.components().any(|c| c.as_os_str() == "sessions") {
         return None;
