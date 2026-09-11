@@ -129,6 +129,45 @@ fn agent_popup_text(
     }
 }
 
+/// One labelled reading on the top bar.
+pub struct HostPart {
+    pub label: String,
+    pub value: String,
+    pub color: Color,
+}
+
+/// The host readout, as label/value pairs. A field with no reading produces NO part — the bar
+/// then shows less, rather than showing a zero that claims something about the machine.
+///
+/// Split out of the renderer so the composition is testable: `App` cannot be constructed in a
+/// unit test, and "does an unreadable GPU disappear" is exactly the kind of thing that would
+/// otherwise only be checked by looking at it.
+pub fn host_parts(m: &hostmetrics::HostMetrics) -> Vec<HostPart> {
+    let mut out = Vec::new();
+    let mut pct = |label: &str, v: Option<f64>| {
+        if let Some(v) = v {
+            out.push(HostPart {
+                label: label.to_string(),
+                value: format!("{v:.0}%"),
+                color: usage_threshold_color(v),
+            });
+        }
+    };
+    pct("cpu ", m.cpu);
+    pct("mem ", m.mem_pct());
+    pct("gpu ", m.gpu);
+    if let Some(l) = m.load1 {
+        // Load is NOT thresholded: what counts as high depends on the core count, and a
+        // colour implying otherwise would be worse than no colour.
+        out.push(HostPart {
+            label: "load ".to_string(),
+            value: format!("{l:.2}"),
+            color: CAT_TEXT,
+        });
+    }
+    out
+}
+
 /// Max notifications retained in the center.
 const NOTIFY_LOG_CAP: usize = 100;
 
@@ -436,6 +475,13 @@ pub enum KeyAction {
 
 /// Height of the always-on bottom status bar (tmux-style).
 const STATUS_H: u16 = 1;
+
+/// Rows the optional top bar occupies.
+const TOP_H: u16 = 1;
+
+/// Below this many rows the top bar is suppressed whatever the config says — see
+/// [`App::top_h`].
+const MIN_ROWS_FOR_TOP: u16 = 8;
 
 /// How long a completed transcript scan is reused before the resume picker asks for a new
 /// one. Long enough that flipping the `Ctrl-a` scope or reopening the picker right away is
@@ -975,12 +1021,27 @@ impl App {
     /// Top y-offset of the pane grid. Tabs live in the bottom status bar now, so
     /// there is no top bar — the grid starts at row 0.
     fn content_y(&self) -> u16 {
-        0
+        self.top_h()
     }
 
-    /// Height available to the pane grid, above the always-on bottom status bar.
+    /// Rows the top bar occupies: `TOP_H` when it is enabled AND the terminal can spare them.
+    ///
+    /// The floor is not cosmetic. Every chrome row comes out of the pane grid, and at three
+    /// rows total a top bar plus the status bar would leave one row for the shell — so a
+    /// short terminal silently keeps its panes instead of honouring the config.
+    fn top_h(&self) -> u16 {
+        if self.cfg.top_bar && self.rows >= MIN_ROWS_FOR_TOP {
+            TOP_H
+        } else {
+            0
+        }
+    }
+
+    /// Height available to the pane grid, between the top bar and the bottom status bar.
     fn content_rows(&self) -> u16 {
-        self.rows.saturating_sub(STATUS_H)
+        self.rows
+            .saturating_sub(STATUS_H)
+            .saturating_sub(self.top_h())
     }
 
     /// Placed rects for the active tab, tiling the content area (right of the
@@ -3024,7 +3085,11 @@ impl App {
                 // to the focused pane's scrollback, which is what it used to do — the
                 // pointer was nowhere near that pane. `content_x` is the first column
                 // right of the strip's border, so `x < content_x` is "inside the sidebar".
-                if self.sidebar_visible() && x < self.content_x() && y < self.content_rows() {
+                if self.sidebar_visible()
+                    && x < self.content_x()
+                    && y >= self.content_y()
+                    && y < self.content_y() + self.content_rows()
+                {
                     self.scroll_sidebar(y >= self.sidebar_mid.get(), if up { -1 } else { 1 });
                     return None;
                 }
@@ -4304,10 +4369,15 @@ impl App {
             self.render_sidebar(buf);
         }
 
-        // 4) the always-on bottom status bar (session · tabs · scroll/agents/clock/host).
+        // 4) the optional top bar (host machine readout), over the reserved top row.
+        if self.top_h() > 0 {
+            self.render_top_bar(buf);
+        }
+
+        // 5) the always-on bottom status bar (session · tabs · scroll/agents/clock/host).
         self.render_status_bar(buf);
 
-        // 5) the Ctrl-f switcher popup / notification center, over everything.
+        // 6) the Ctrl-f switcher popup / notification center, over everything.
         if self.popup.is_some() {
             self.render_popup(buf);
         }
@@ -5012,14 +5082,19 @@ impl App {
     /// The herdr-style left panel: `spaces` (sessions, top half) + `agents` (agent
     /// panes with status·tool, bottom half). Always on when wide enough.
     fn render_sidebar(&self, buf: &mut Buffer) {
-        let h = self.content_rows(); // above the bottom status bar
+        let h = self.content_rows(); // between the top bar and the bottom status bar
+        // The strip starts below the top bar when there is one. Every write below goes
+        // through `put`/`put_trailing` or the fill loop, and every click zone is pushed with
+        // `y0 +`, so the body keeps using 0-based rows and there is exactly one place the
+        // offset can be forgotten.
+        let y0 = self.content_y();
         // Transparent fill (default terminal bg) so a configured background image shows
         // through the sidebar — the right-border `│` column is the only visual separator.
         let panel_bg = Color::Reset;
         let sidebar_w = self.sidebar_w();
 
         // Fill the strip + the right border column (down to the status bar).
-        for y in 0..h {
+        for y in y0..y0 + h {
             for x in 0..sidebar_w {
                 if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
                     bc.set_symbol(" ");
@@ -5037,6 +5112,7 @@ impl App {
         // Display-width-aware writer that ADVANCES `x` (so a colored dot and the name
         // after it don't overwrite each other). Clipped to the strip.
         let put = |buf: &mut Buffer, x: &mut u16, y: u16, s: &str, style: Style| {
+            let y = y0 + y; // rows below are 0-based within the strip
             for ch in s.chars() {
                 let cw = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
                 if cw == 0 {
@@ -5070,6 +5146,8 @@ impl App {
         // to the strip edge, and is dropped whole rather than truncated when the name
         // already reaches it — a half-word of branch name is noise, not information.
         let put_trailing = |buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style| {
+            // NOT offset here: it delegates to `put`, which already applies `y0`. Offsetting
+            // in both would push every compact subtitle one row down.
             if text.is_empty() {
                 return;
             }
@@ -5238,8 +5316,8 @@ impl App {
             self.click_zones.borrow_mut().push(ClickZone {
                 x0: 0,
                 x1: sidebar_w - 1,
-                y0: y,
-                y1: y + entry_sp - 1,
+                y0: y0 + y,
+                y1: y0 + y + entry_sp - 1,
                 target: ClickTarget::Session(sid.clone()),
             });
             y += entry_sp;
@@ -5257,7 +5335,9 @@ impl App {
         }
 
         // ---- agents (bottom half) ----
-        self.sidebar_mid.set(mid);
+        // ABSOLUTE screen row: it is compared against a raw mouse `y` to decide which half
+        // the wheel is over.
+        self.sidebar_mid.set(y0 + mid);
         let mut y = mid;
         put(buf, &mut 0, y, " agents", header);
         // `⚑N` on the header counts EVERY blocked agent, including any the band below had
@@ -5324,8 +5404,8 @@ impl App {
                 self.click_zones.borrow_mut().push(ClickZone {
                     x0: 0,
                     x1: sidebar_w - 1,
-                    y0: y,
-                    y1: y,
+                    y0: y0 + y,
+                    y1: y0 + y,
                     target: ClickTarget::Agent(row.term.clone()),
                 });
                 y += 1;
@@ -5422,8 +5502,8 @@ impl App {
                     self.click_zones.borrow_mut().push(ClickZone {
                         x0: 0,
                         x1: sidebar_w - 1,
-                        y0: y,
-                        y1: y,
+                        y0: y0 + y,
+                        y1: y0 + y,
                         target: ClickTarget::Session(wid.clone()),
                     });
                     y += 1;
@@ -5500,8 +5580,8 @@ impl App {
             self.click_zones.borrow_mut().push(ClickZone {
                 x0: 0,
                 x1: sidebar_w - 1,
-                y0: y,
-                y1: y + entry_ag - 1,
+                y0: y0 + y,
+                y1: y0 + y + entry_ag - 1,
                 target: ClickTarget::Agent(row.term.clone()),
             });
             y += entry_ag;
@@ -5603,6 +5683,68 @@ impl App {
     /// The always-on bottom status bar (Catppuccin Mocha, matching the owner's tmux):
     /// LEFT = session pill + tab chips (active highlighted, agent `●`); RIGHT =
     /// scroll flag · agent count · clock · host.
+    /// The optional top bar: how the HOST is doing (`cpu 12%  mem 59%  gpu 2%  load 2.36`).
+    ///
+    /// Deliberately a different question from the bottom bar, which is about the MUX (session,
+    /// tabs, agents, subscription limits). Splitting them is the reason to have a second bar
+    /// at all; duplicating the bottom bar's content up here would just cost a row.
+    ///
+    /// A reading that is absent is OMITTED, never drawn as `0%` or `--`: see `hostmetrics`.
+    /// When nothing at all is readable the bar is still drawn — it was asked for, and an
+    /// empty strip is a visible, diagnosable "no readings" rather than a layout that silently
+    /// changes height.
+    fn render_top_bar(&self, buf: &mut Buffer) {
+        let w = buf.area.width;
+        let y = 0u16;
+        for x in 0..w {
+            if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
+                bc.set_symbol(" ");
+                bc.set_skip(false);
+                bc.set_style(Style::default().bg(CAT_BASE));
+            }
+        }
+        let put = |buf: &mut Buffer, x: &mut u16, s: &str, st: Style| {
+            for ch in s.chars() {
+                let cw = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+                if cw == 0 {
+                    continue;
+                }
+                if *x + cw > w {
+                    break;
+                }
+                if let Some(bc) = buf.cell_mut(Position::new(*x, y)) {
+                    let mut sb = [0u8; 4];
+                    bc.set_symbol(ch.encode_utf8(&mut sb));
+                    bc.set_skip(false);
+                    bc.set_style(st);
+                }
+                if cw == 2
+                    && let Some(bc) = buf.cell_mut(Position::new(*x + 1, y))
+                {
+                    bc.set_symbol(" ");
+                    bc.set_skip(true);
+                    bc.set_style(st);
+                }
+                *x += cw;
+            }
+        };
+        let label = Style::default().fg(CAT_OVERLAY).bg(CAT_BASE);
+        let mut x = 1u16;
+        for part in host_parts(&hostmetrics::read(&self.host_poll)) {
+            put(buf, &mut x, &part.label, label);
+            put(
+                buf,
+                &mut x,
+                &part.value,
+                Style::default()
+                    .fg(part.color)
+                    .bg(CAT_BASE)
+                    .add_modifier(Modifier::BOLD),
+            );
+            put(buf, &mut x, "  ", label);
+        }
+    }
+
     fn render_status_bar(&self, buf: &mut Buffer) {
         let area = buf.area;
         let w = area.width;
@@ -7541,13 +7683,14 @@ fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AgentItem, AgentRow, AgentState, CAT_GREEN, CAT_RED, CAT_YELLOW, Menu, MenuAction,
-        agent_items, agent_popup_text, agents_span_spaces, band_rows, build_command_line,
-        clip_width, cwd_affinity, detect_alt_screen_transition, extract_selection, filter_env,
-        fmt_elapsed, home_short_in, list_window_start, menu_origin, merge_env, merge_labels,
-        notify_title, reload_note, resume_line, resume_rank, sel_bounds, sel_cols, shell_quote,
-        split_sidebar, status_since, tab_display_title, tab_window, usage_should_roll,
-        usage_threshold_color, window_max_start, window_start_var, with_pane_token, wrap_page,
+        AgentItem, AgentRow, AgentState, CAT_GREEN, CAT_RED, CAT_TEXT, CAT_YELLOW, Menu,
+        MenuAction, agent_items, agent_popup_text, agents_span_spaces, band_rows,
+        build_command_line, clip_width, cwd_affinity, detect_alt_screen_transition,
+        extract_selection, filter_env, fmt_elapsed, home_short_in, host_parts, list_window_start,
+        menu_origin, merge_env, merge_labels, notify_title, reload_note, resume_line, resume_rank,
+        sel_bounds, sel_cols, shell_quote, split_sidebar, status_since, tab_display_title,
+        tab_window, usage_should_roll, usage_threshold_color, window_max_start, window_start_var,
+        with_pane_token, wrap_page,
     };
     use crate::model::{TerminalId, WorkspaceId};
     use crate::procinfo::{Kind, Label};
@@ -8150,6 +8293,54 @@ mod tests {
         assert_eq!(fmt_elapsed(3600), "1h");
         assert_eq!(fmt_elapsed(3660), "1h1m");
         assert_eq!(fmt_elapsed(86_400), "24h");
+    }
+
+    #[test]
+    fn the_top_bar_omits_readings_it_does_not_have() {
+        use crate::hostmetrics::HostMetrics;
+        // Nothing readable at all: no parts. The bar is still DRAWN (the height must not
+        // depend on the reading), it is simply empty.
+        assert!(host_parts(&HostMetrics::default()).is_empty());
+
+        let m = HostMetrics {
+            cpu: Some(12.4),
+            mem_used: Some(30),
+            mem_total: Some(100),
+            gpu: None,
+            load1: Some(2.357),
+        };
+        let parts = host_parts(&m);
+        let rendered: Vec<String> = parts
+            .iter()
+            .map(|p| format!("{}{}", p.label, p.value))
+            .collect();
+        assert_eq!(rendered, vec!["cpu 12%", "mem 30%", "load 2.36"]);
+        // The GPU had no reading, so it contributes NOTHING — not `gpu 0%`, which would be a
+        // claim about the machine, and not `gpu --`, which still spends a column on absence.
+        assert!(!rendered.iter().any(|r| r.starts_with("gpu")));
+
+        // A zero reading is a reading and must still appear.
+        let idle = HostMetrics {
+            gpu: Some(0.0),
+            ..HostMetrics::default()
+        };
+        assert_eq!(host_parts(&idle).len(), 1);
+        assert_eq!(host_parts(&idle)[0].value, "0%");
+    }
+
+    #[test]
+    fn only_the_percentages_are_threshold_coloured() {
+        use crate::hostmetrics::HostMetrics;
+        let hot = HostMetrics {
+            cpu: Some(95.0),
+            load1: Some(99.0),
+            ..HostMetrics::default()
+        };
+        let parts = host_parts(&hot);
+        assert_eq!(parts[0].color, usage_threshold_color(95.0));
+        // Load average is not a percentage: what counts as high depends on the core count,
+        // so colouring it would imply a judgement we cannot make.
+        assert_eq!(parts[1].color, CAT_TEXT);
     }
 
     #[test]

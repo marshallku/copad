@@ -24,6 +24,13 @@ mouse = true              # mouse: wheel-scroll, click-to-focus, click chrome to
 osc52 = true              # let a pane's program set the clipboard via OSC 52 (tmux set-clipboard).
                           # false stops a background pane clobbering it; reads are never answered.
 notify = true             # agent turn-completion desktop toasts (env COPAD_MUX_NOTIFY wins)
+# A one-row bar along the TOP of the mux showing how the HOST machine is doing:
+#   cpu 12%  mem 59%  gpu 2%  load 2.36
+# Deliberately a different question from the bottom status bar, which is about the MUX
+# (session, tabs, agents, subscription limits). Off by default because it costs a row of the
+# pane grid; also suppressed outright on a terminal under 8 rows tall, whatever this says.
+# A reading the host cannot supply is omitted rather than shown as 0% — see decision #112.
+top_bar = false
 sidebar = true            # show the spaces+agents sidebar by default (Ctrl-b s toggles)
 sidebar_width = 24        # sidebar columns            (clamped to 8..80)
 sidebar_min_cols = 80     # hide the sidebar below this terminal width (>= width + 20)

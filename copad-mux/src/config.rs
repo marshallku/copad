@@ -715,6 +715,12 @@ pub struct MuxConfig {
     /// preference. There is deliberately no desktop toast — shells ring for ambiguous
     /// tab-completion, end of history and end of pager, which would bury the agent toasts.
     pub bell: bool,
+    /// Show a one-row bar along the TOP of the mux (host CPU/memory/GPU/load).
+    ///
+    /// Off by default: it costs a row of the pane grid, and an existing user's layout should
+    /// not shrink because they upgraded. It is also suppressed outright on a terminal too
+    /// short to spare the row — see `App::top_h`.
+    pub top_bar: bool,
     pub sidebar: bool,
     pub sidebar_width: u16,
     pub sidebar_min_cols: u16,
@@ -779,6 +785,7 @@ struct RawConfig {
     osc52: Option<bool>,
     notify: Option<bool>,
     bell: Option<bool>,
+    top_bar: Option<bool>,
     sidebar: Option<bool>,
     sidebar_width: Option<i64>,
     sidebar_min_cols: Option<i64>,
@@ -874,6 +881,7 @@ impl MuxConfig {
             osc52: true,
             notify: true,
             bell: true,
+            top_bar: false,
             sidebar: true,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_min_cols: DEFAULT_SIDEBAR_MIN_COLS,
@@ -986,6 +994,7 @@ impl MuxConfig {
                 osc52: raw.osc52.unwrap_or(true),
                 notify: raw.notify.unwrap_or(true),
                 bell: raw.bell.unwrap_or(true),
+                top_bar: raw.top_bar.unwrap_or(false),
                 sidebar: raw.sidebar.unwrap_or(true),
                 sidebar_width,
                 sidebar_min_cols,

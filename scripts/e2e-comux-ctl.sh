@@ -29,6 +29,7 @@
 #  14. a codex pane reads ready/blocked, not the `idle` it used to fall through to
 #  15. an agent's DOING line is read from its own structured log (agentpoll)
 #  16. `comux host` publishes CPU/memory/GPU/load, omitting what it could not read
+#  17. the top bar: off by default, and it moves the sidebar AND its click zones
 
 set -euo pipefail
 
@@ -44,6 +45,13 @@ export COPAD_MUX_NOTIFY=0
 export COPAD_MUX_USAGE=0
 export COPAD_MUX_UPDATE_CHECK=0
 export COPAD_MUX_QUIET_SSH=1
+# Config isolation. Without this the throwaway server reads the DEVELOPER's real
+# `~/.config/copad/mux.toml`, so every assertion below silently depends on their personal
+# settings — a custom prefix, `sidebar = false`, a different `sidebar_density`. Point
+# `XDG_CONFIG_HOME` at the work dir so the run starts from documented defaults, and so a step
+# that needs a setting can write one without touching anything the user owns.
+export XDG_CONFIG_HOME="$WORK/cfg"
+mkdir -p "$WORK/cfg/copad"
 
 SERVER_PID=""
 DEAF_PID=""
@@ -602,7 +610,141 @@ t 10 "$COMUX" host >"$WORK/out" || fail "plain host readout failed"
 grep -qE '^(cpu|mem|gpu|load1) ' "$WORK/out" || fail "plain host readout printed nothing usable"
 ok "host metrics are published, in range, and omit what could not be read"
 
-echo "17. the server is still responsive and shuts down cleanly"
+echo "17. the top bar, and what it does to every coordinate below it"
+# The top bar is a LAYOUT change: it pushes the pane grid, the sidebar and every sidebar click
+# zone down a row. The rendering is only checkable by looking at a real frame, and the click
+# zones only by clicking — so this step drives a real client over a pty.
+#
+# The offsets are easy to half-apply: the first version of this change moved the sidebar's
+# DRAWING but only two of its four click zones, which reads perfectly and sends clicks to the
+# wrong session.
+# NOT named `pty.py`: a script with that name SHADOWS the standard-library `pty` module it
+# imports, and the failure is `module 'pty' has no attribute 'fork'` from inside its own
+# import line.
+cat >"$WORK/ptydrive.py" <<'PYEOF'
+import os, pty, sys, time, select, re, fcntl, termios, struct
+# capture:  pty.py cap  -- cmd...        -> prints the final frame
+# click:    pty.py <row> <col> -- cmd... -> clicks (1-based screen coords), then detaches
+mode = sys.argv[1]
+rows, cols = 24, 100
+cmd = sys.argv[sys.argv.index("--") + 1:]
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm-256color"
+    os.execvp(cmd[0], cmd)
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+def drain(sec):
+    out = b""; end = time.time() + sec
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if r:
+            try: c = os.read(fd, 65536)
+            except OSError: break
+            if not c: break
+            out += c
+    return out
+buf = drain(6)
+if mode != "cap":
+    row, col = int(sys.argv[1]), int(sys.argv[2])
+    os.write(fd, f"\x1b[<0;{col};{row}M".encode()); time.sleep(0.2)
+    os.write(fd, f"\x1b[<0;{col};{row}m".encode())
+    drain(3)
+os.write(fd, b"\x02d")
+time.sleep(0.8)
+try: os.close(fd)
+except OSError: pass
+try: os.waitpid(pid, 0)
+except ChildProcessError: pass
+if mode != "cap":
+    sys.exit(0)
+grid = [[" "] * cols for _ in range(rows)]
+cy = cx = 0
+text = buf.decode("utf-8", "replace"); i = 0
+while i < len(text):
+    ch = text[i]
+    if ch == "\x1b":
+        m = re.match(r"\x1b\[([0-9;?]*)([A-Za-z])", text[i:])
+        if m:
+            params, fin = m.group(1), m.group(2)
+            if fin == "H":
+                p = [int(x) for x in params.split(";") if x.isdigit()] or [1, 1]
+                cy = p[0] - 1 if p else 0
+                cx = p[1] - 1 if len(p) > 1 else 0
+            elif fin == "J" and params in ("2", ""):
+                grid = [[" "] * cols for _ in range(rows)]
+            i += m.end(); continue
+        m2 = re.match(r"\x1b\][^\x07\x1b]*(\x07|\x1b\\)", text[i:])
+        if m2:
+            i += m2.end(); continue
+        i += 1; continue
+    if ch == "\r": cx = 0; i += 1; continue
+    if ch == "\n": cy += 1; cx = 0; i += 1; continue
+    if 0 <= cy < rows and 0 <= cx < cols: grid[cy][cx] = ch
+    cx += 1; i += 1
+for r in grid:
+    print("".join(r).rstrip())
+PYEOF
+
+active_session () { t 10 "$COMUX" list-sessions | awk '/active/{print $3}'; }
+
+# Baseline: OFF by default, so an existing layout does not shrink on upgrade.
+python3 "$WORK/ptydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+# NOTE `grep -q … && fail …` cannot be used here: when grep does not match — the SUCCESS
+# case — the expression returns 1 and `set -e` kills the run with no message at all.
+if head -1 "$WORK/frame" | grep -qE '^ *(cpu|mem|gpu|load) '; then
+    fail "the top bar must be OFF by default, but row 0 carries a host readout"
+fi
+
+echo "top_bar = true" >"$XDG_CONFIG_HOME/copad/mux.toml"
+t 10 "$COMUX" reload >/dev/null || fail "reload failed"
+sleep 1
+python3 "$WORK/ptydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+head -1 "$WORK/frame" | grep -qE '(cpu|mem|gpu|load) ' \
+    || fail "no host readout on row 0 after enabling it: $(head -1 "$WORK/frame")"
+# It must not simply OVERWRITE the first content row — the sidebar has to have moved down.
+sed -n '2p' "$WORK/frame" | grep -q 'spaces' \
+    || fail "the sidebar did not move below the top bar: $(sed -n '2p' "$WORK/frame")"
+
+# Now the part rendering cannot show: the sidebar's CLICK ZONES have to have moved too.
+# Two sessions, and the click lands on the SECOND one's subtitle row — deliberately not its
+# title row, which sits on a zone boundary where an off-by-one still resolves correctly and
+# the test would pass against the bug.
+t 10 "$COMUX" new-session e2etop >/dev/null || fail "could not create the second session"
+t 10 "$COMUX" select-session 0 >/dev/null
+python3 "$WORK/ptydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+row="$(python3 - "$WORK/frame" <<'PYEOF'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+for i, l in enumerate(lines):
+    if "e2etop" in l:
+        print(i + 2)  # 1-based, and the row AFTER the title is its branch subtitle
+        break
+else:
+    print(0)
+PYEOF
+)"
+[[ "$row" != "0" ]] || { cat "$WORK/frame" >&2; fail "could not find the second session in the sidebar"; }
+before="$(active_session)"
+python3 "$WORK/ptydrive.py" "$row" 5 -- "$COMUX" >/dev/null 2>&1
+sleep 1
+after="$(active_session)"
+[[ "$before" != "$after" ]] \
+    || { cat "$WORK/frame" >&2
+         fail "clicking the second session's row (screen row $row) did not switch to it"; }
+
+# A terminal too short to spare the row keeps its panes whatever the config says.
+sed -i.bak 's/rows, cols = 24, 100/rows, cols = 6, 100/' "$WORK/ptydrive.py"
+python3 "$WORK/ptydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+if head -1 "$WORK/frame" | grep -qE '^ *(cpu|mem|gpu|load) '; then
+    fail "the top bar must be suppressed on a terminal too short for it"
+fi
+sed -i.bak 's/rows, cols = 6, 100/rows, cols = 24, 100/' "$WORK/ptydrive.py"
+
+rm -f "$XDG_CONFIG_HOME/copad/mux.toml"
+t 10 "$COMUX" reload >/dev/null
+ok "off by default; drawn and reloadable; the sidebar and its click zones moved with it; suppressed when short"
+
+echo "18. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"
