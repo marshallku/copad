@@ -469,13 +469,23 @@ pub fn run_client(args: &[String]) -> i32 {
     }
     let Some(cmd) = rest.first().map(|s| s.as_str()) else {
         eprintln!(
-            "usage: comux <list|split|resize|focus|close|send|capture-pane|list-tabs|new-tab|select-tab|\
+            "usage: comux <list|split|resize|focus|close|send|capture-pane|wait-output|list-tabs|new-tab|select-tab|\
              close-tab|rename-tab [index] <name>|list-sessions|new-session [name]|\
              rename-session [index] <name>|select-session|kill-session|\
              worktree <create|list|rm>|reload|health|kill-server> [args]"
         );
         return 2;
     };
+
+    // `wait-output` owns its own exit codes (124 on deadline) and issues MANY requests,
+    // so it short-circuits the one-request-one-response path below rather than producing a
+    // `Req` for it.
+    if cmd == "wait-output" || cmd == "wait" {
+        return match parse_wait_args(&rest) {
+            Ok(args) => run_wait_output(args),
+            Err(code) => code,
+        };
+    }
 
     let req = match cmd {
         "list" => Req::List,
@@ -1874,5 +1884,630 @@ mod capture_proto_tests {
     #[test]
     fn an_unknown_verb_is_a_parse_error_not_a_default() {
         assert!(serde_json::from_str::<Req>(r#"{"cmd":"capture-pane-v2"}"#).is_err());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `wait-output` — block until a pane's text matches (WU2, decision #104).
+// ---------------------------------------------------------------------------
+
+/// Exit code for "the wait timed out". `timeout(1)`'s convention, so a shell can tell a
+/// deadline from a real failure. Distinct from [`EXIT_CANCELLED`] (130).
+const EXIT_TIMEOUT: i32 = 124;
+
+/// Smallest poll interval accepted. A caller must not be able to turn the wait into a
+/// busy-loop: every poll wakes the single-writer loop and takes a pane's terminal lock.
+const MIN_INTERVAL: Duration = Duration::from_millis(50);
+
+const WAIT_USAGE: &str = "usage: comux wait-output [<pane-token|terminal-id>] <pattern>\n\
+     \x20      [--index N] [--timeout S] [--lines N] [--interval MS]\n\
+     \n\
+     BEST-EFFORT. It matches the pane's CURRENT text — including text that was already\n\
+     there before the call — and a match can be ERASED between polls by a \\r overwrite,\n\
+     a line-erase, or an alt-screen redraw. It is not proof that nothing was missed.\n\
+     \n\
+     Two traps the verb cannot detect for you: the shell ECHOES the command you send, so a\n\
+     marker visible in that command satisfies the wait immediately; and a marker left over\n\
+     from a previous run satisfies the next wait. So build the marker from fragments the\n\
+     sent command never contains as a whole, and make it fresh each call. `send` does not\n\
+     append Enter, so submit the line yourself.\n\
+     \n\
+     \x20 id=$(date +%s%N)\n\
+     \x20 comux send 0 \"make build; printf 'MARK-%s\\n' '$id'\"\n\
+     \x20 comux send 0 $'\\n'\n\
+     \x20 comux wait-output --index 0 \"MARK-$id\"";
+
+/// Everything `wait-output` parsed off the command line.
+#[derive(Debug, PartialEq)]
+struct WaitArgs {
+    target: Option<String>,
+    index: Option<usize>,
+    pattern: String,
+    /// `None` = wait forever (`--timeout 0`).
+    timeout: Option<Duration>,
+    lines: usize,
+    interval: Duration,
+}
+
+/// The last line of `text` containing `pattern`.
+///
+/// Per LOGICAL line: `capture-pane` already joins soft-wrapped rows, so splitting on `\n`
+/// yields logical lines. "Last" means last **in the captured text**, not necessarily newest
+/// in wall-clock terms — cursor movement can rewrite an earlier row after a later one — and
+/// the first line may be PARTIAL when a capture budget cut a soft-wrapped line in half.
+fn last_match<'a>(text: &'a str, pattern: &str) -> Option<&'a str> {
+    text.lines().rfind(|l| l.contains(pattern))
+}
+
+/// Parse `wait-output`'s arguments. `Err(code)` is the process exit code to use.
+fn parse_wait_args(rest: &[&String]) -> Result<WaitArgs, i32> {
+    let mut target: Option<String> = None;
+    let mut index: Option<usize> = None;
+    let mut positional: Vec<String> = Vec::new();
+    let mut timeout_secs: u64 = 300;
+    let mut lines: usize = 200;
+    let mut interval_ms: u64 = 250;
+
+    // Index-based rather than an iterator: each flag consumes the NEXT argument, and a
+    // borrowed iterator cannot be handed to a helper closure without naming its type.
+    let mut i = 1;
+    let num = |what: &str, v: Option<&&String>| -> Result<u64, i32> {
+        match v.map(|v| v.parse::<u64>()) {
+            Some(Ok(n)) => Ok(n),
+            _ => {
+                eprintln!("comux wait-output: {what} needs a number");
+                Err(2)
+            }
+        }
+    };
+    while i < rest.len() {
+        let a = rest[i].as_str();
+        let mut takes_value = true;
+        match a {
+            "--timeout" => timeout_secs = num(a, rest.get(i + 1))?,
+            "--lines" | "-S" => lines = num(a, rest.get(i + 1))? as usize,
+            "--interval" => interval_ms = num(a, rest.get(i + 1))?,
+            "--index" => index = Some(num(a, rest.get(i + 1))? as usize),
+            _ => {
+                takes_value = false;
+                match a {
+                    "--json" => {}
+                    "-h" | "--help" => {
+                        eprintln!("{WAIT_USAGE}");
+                        return Err(2);
+                    }
+                    other if other.starts_with('-') => {
+                        eprintln!("comux wait-output: unknown flag {other}\n{WAIT_USAGE}");
+                        return Err(2);
+                    }
+                    other => positional.push(other.to_string()),
+                }
+            }
+        }
+        i += if takes_value { 2 } else { 1 };
+    }
+
+    // `<target> <pattern>`, or just `<pattern>`.
+    let pattern = match positional.len() {
+        1 => positional.remove(0),
+        2 => {
+            target = Some(positional.remove(0));
+            positional.remove(0)
+        }
+        _ => {
+            eprintln!("{WAIT_USAGE}");
+            return Err(2);
+        }
+    };
+    if pattern.is_empty() {
+        eprintln!("comux wait-output: the pattern must not be empty");
+        return Err(2);
+    }
+    // Matching is per logical line, so a newline in the pattern could never match.
+    if pattern.contains('\n') {
+        eprintln!(
+            "comux wait-output: the pattern must not contain a newline (matching is per line)"
+        );
+        return Err(2);
+    }
+    if target.is_some() && index.is_some() {
+        eprintln!("comux wait-output: give a target or --index, not both");
+        return Err(2);
+    }
+    if lines == 0 {
+        eprintln!("comux wait-output: --lines must be at least 1");
+        return Err(2);
+    }
+    let interval = Duration::from_millis(interval_ms);
+    if interval < MIN_INTERVAL {
+        eprintln!(
+            "comux wait-output: --interval must be at least {}ms",
+            MIN_INTERVAL.as_millis()
+        );
+        return Err(2);
+    }
+    // `Instant + Duration` PANICS on overflow, so a huge `--timeout` would abort with 101
+    // instead of a usage error. Reject anything the clock cannot represent.
+    let timeout = match timeout_secs {
+        0 => None, // explicit "wait forever"
+        n => {
+            let d = Duration::from_secs(n);
+            if Instant::now().checked_add(d).is_none() {
+                eprintln!("comux wait-output: --timeout {n} is too large to represent");
+                return Err(2);
+            }
+            Some(d)
+        }
+    };
+    Ok(WaitArgs {
+        target,
+        index,
+        pattern,
+        timeout,
+        lines,
+        interval,
+    })
+}
+
+/// Run `wait-output`: poll `capture-pane` until the pattern shows up, the deadline passes,
+/// or the pane goes away.
+///
+/// **Best-effort by construction.** It matches the pane's CURRENT text; it is not a
+/// guarantee that no matching output was missed. `\r` overwrites, `\x1b[2K` line erasure
+/// and alternate-screen redraws can all remove a match without producing a single new row,
+/// and the alternate screen has no scrollback to fall back on. Raising `--lines` does not
+/// change that. A caller needing a guarantee must write a durable marker somewhere the
+/// caller itself can check.
+///
+/// The pane is PINNED to the token the first response echoes. A default / `--index` target
+/// re-resolves against the live focus and active tab on every request, so without pinning a
+/// user switching panes mid-wait could make the wait succeed on an unrelated pane.
+fn run_wait_output(args: WaitArgs) -> i32 {
+    let deadline = args.timeout.map(|t| Instant::now() + t);
+    let expired = |d: Option<Instant>| d.is_some_and(|d| Instant::now() >= d);
+
+    let mut conn = match WaitConn::connect(deadline) {
+        Ok(c) => c,
+        Err(WaitErr::TimedOut) => return EXIT_TIMEOUT,
+        Err(WaitErr::Failed(e)) => {
+            eprintln!("comux wait-output: {e}");
+            return 1;
+        }
+    };
+
+    // Pinned after the FIRST response, whatever the caller passed. Pinning a defaulted
+    // target stops a mid-wait focus change retargeting the wait; pinning an EXPLICIT one
+    // matters too, because a raw terminal id can be reused by a different pane across a
+    // server restart while a pane token is incarnation-qualified.
+    let mut pinned: Option<String> = None;
+    loop {
+        if expired(deadline) {
+            return EXIT_TIMEOUT;
+        }
+        let req = Req::CapturePane {
+            target: pinned.clone().or_else(|| args.target.clone()),
+            index: pinned.is_none().then_some(args.index).flatten(),
+            lines: Some(args.lines),
+        };
+        let resp = match conn.request(&req, deadline) {
+            Ok(r) => r,
+            Err(WaitErr::TimedOut) => return EXIT_TIMEOUT,
+            Err(WaitErr::Failed(e)) => {
+                eprintln!("comux wait-output: {e}");
+                return 1;
+            }
+        };
+        if !resp.ok {
+            eprintln!(
+                "comux wait-output: {}",
+                resp.error.as_deref().unwrap_or("(unspecified)")
+            );
+            return 1;
+        }
+        if pinned.is_none() {
+            // A pane with no token cannot be re-addressed, so the wait would silently
+            // follow the focus — refuse rather than guess.
+            match resp.pane.as_deref().filter(|t| !t.is_empty()) {
+                Some(t) => pinned = Some(t.to_string()),
+                None => {
+                    eprintln!(
+                        "comux wait-output: the pane has no identity to pin to \
+                         (spawned before pane tokens existed); pass an explicit target"
+                    );
+                    return 1;
+                }
+            }
+        }
+        if let Some(line) = last_match(resp.text.as_deref().unwrap_or(""), &args.pattern) {
+            // Re-check before ACCEPTING: a match read after the budget ran out is a late
+            // answer, and the caller has already given up on it.
+            if expired(deadline) {
+                return EXIT_TIMEOUT;
+            }
+            println!("{line}");
+            return 0;
+        }
+        // The sleep draws from the same budget, so the deadline can't be overshot by a
+        // whole interval at the very end.
+        let nap = match deadline {
+            Some(d) => args
+                .interval
+                .min(d.saturating_duration_since(Instant::now())),
+            None => args.interval,
+        };
+        if nap.is_zero() {
+            return EXIT_TIMEOUT;
+        }
+        std::thread::sleep(nap);
+    }
+}
+
+/// Why a deadline-bounded exchange gave up.
+enum WaitErr {
+    TimedOut,
+    Failed(String),
+}
+
+/// The remaining budget, or [`WaitErr::TimedOut`] if it is already gone. `None` = no
+/// deadline at all (`--timeout 0`).
+fn remaining(deadline: Option<Instant>) -> Result<Option<Duration>, WaitErr> {
+    match deadline {
+        None => Ok(None),
+        Some(d) => {
+            let left = d.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                Err(WaitErr::TimedOut)
+            } else {
+                Ok(Some(left))
+            }
+        }
+    }
+}
+
+/// ONE control connection, held open across every poll of a wait.
+///
+/// `server.rs::serve_ctl` reads request lines in a loop, so a single connection carries
+/// arbitrarily many requests. Reusing it is not just cheaper — it means the unbounded part
+/// of the exchange (`UnixStream::connect`, which has no timeout knob) happens **once**
+/// instead of once per poll.
+struct WaitConn {
+    stream: UnixStream,
+    /// Bytes read from the socket but not yet consumed as a complete line. A chunked read
+    /// can overshoot the newline, and the remainder belongs to the NEXT response.
+    buf: Vec<u8>,
+}
+
+impl WaitConn {
+    /// Connect under the deadline.
+    ///
+    /// `UnixStream::connect` blocks and cannot be interrupted — on Linux it genuinely waits
+    /// when the listener's backlog is full, so checking the clock on either side of it
+    /// would be theatre. The connect therefore runs on a throwaway thread and the deadline
+    /// bounds the *wait for it*. A thread left behind by a timeout dies with this
+    /// short-lived process.
+    fn connect(deadline: Option<Instant>) -> Result<Self, WaitErr> {
+        let left = remaining(deadline)?;
+        let path = socket_path();
+        let display = path.display().to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(UnixStream::connect(&path).map_err(|e| e.to_string()));
+        });
+        let outcome = match left {
+            Some(l) => match rx.recv_timeout(l) {
+                Ok(r) => r,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Err(WaitErr::TimedOut),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(WaitErr::Failed("connect thread died".into()));
+                }
+            },
+            None => rx
+                .recv()
+                .map_err(|_| WaitErr::Failed("connect thread died".into()))?,
+        };
+        let stream = outcome.map_err(|e| {
+            WaitErr::Failed(format!(
+                "no running comux at {display} ({e}). Start one, or set COPAD_MUX_SOCK."
+            ))
+        })?;
+        Ok(Self {
+            stream,
+            buf: Vec::new(),
+        })
+    }
+
+    /// Send one request and read its response, all within `deadline`.
+    fn request(&mut self, req: &Req, deadline: Option<Instant>) -> Result<Resp, WaitErr> {
+        let line = serde_json::to_string(req).map_err(|e| WaitErr::Failed(e.to_string()))?;
+        self.write_all_by(format!("{line}\n").as_bytes(), deadline)?;
+        self.stream.flush().ok();
+        let text = self.read_line_by(deadline)?;
+        if text.trim().is_empty() {
+            return Err(WaitErr::Failed("empty response from comux".into()));
+        }
+        serde_json::from_str(text.trim()).map_err(|e| WaitErr::Failed(format!("bad response: {e}")))
+    }
+
+    /// Write every byte under the deadline.
+    ///
+    /// NOT `write_all`: that loops over partial writes internally, and each underlying
+    /// `write` would get the ORIGINAL socket timeout rather than what is left of the
+    /// budget — a peer draining the socket slowly could outlast `--timeout`. A timeout
+    /// here is also a DEADLINE, so it must surface as `TimedOut` (exit 124) and not as a
+    /// generic failure (exit 1).
+    fn write_all_by(&mut self, mut data: &[u8], deadline: Option<Instant>) -> Result<(), WaitErr> {
+        while !data.is_empty() {
+            self.stream
+                .set_write_timeout(remaining(deadline)?)
+                .map_err(|e| WaitErr::Failed(e.to_string()))?;
+            match std::io::Write::write(&mut self.stream, data) {
+                Ok(0) => return Err(WaitErr::Failed("comux closed the connection".into())),
+                Ok(n) => data = &data[n..],
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(WaitErr::TimedOut);
+                }
+                Err(e) => return Err(WaitErr::Failed(e.to_string())),
+            }
+        }
+        Ok(())
+    }
+
+    /// Read one newline-terminated line under the deadline.
+    ///
+    /// The socket timeout is re-armed from the REMAINING budget before every chunk read,
+    /// because `set_read_timeout` bounds a single read syscall and not a whole line: a peer
+    /// trickling bytes would otherwise keep a line-oriented read alive indefinitely.
+    /// Chunked rather than byte-at-a-time because a capture response can reach 1 MiB, and a
+    /// syscall per byte would cost seconds.
+    fn read_line_by(&mut self, deadline: Option<Instant>) -> Result<String, WaitErr> {
+        loop {
+            if let Some(pos) = self.buf.iter().position(|b| *b == b'\n') {
+                let line: Vec<u8> = self.buf.drain(..=pos).collect();
+                return Ok(String::from_utf8_lossy(&line[..line.len() - 1]).into_owned());
+            }
+            if self.buf.len() > MAX_RESP_BYTES {
+                return Err(WaitErr::Failed("response too large".into()));
+            }
+            self.stream
+                .set_read_timeout(remaining(deadline)?)
+                .map_err(|e| WaitErr::Failed(e.to_string()))?;
+            let mut chunk = [0u8; 8192];
+            match std::io::Read::read(&mut self.stream, &mut chunk) {
+                Ok(0) => return Err(WaitErr::Failed("comux closed the connection".into())),
+                Ok(n) => self.buf.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(WaitErr::TimedOut);
+                }
+                Err(e) => return Err(WaitErr::Failed(e.to_string())),
+            }
+        }
+    }
+}
+
+/// Hard ceiling on a single control response the wait path will buffer. `capture-pane`
+/// already caps its text server-side; this guards the client against a hostile or broken
+/// peer streaming forever instead of sending a newline.
+const MAX_RESP_BYTES: usize = 8 << 20; // 8 MiB
+
+#[cfg(test)]
+mod wait_output_tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+    fn parse(v: &[&str]) -> Result<WaitArgs, i32> {
+        let owned = args(v);
+        let refs: Vec<&String> = owned.iter().collect();
+        parse_wait_args(&refs)
+    }
+
+    #[test]
+    fn picks_the_last_matching_logical_line() {
+        // "Last" = last in the CAPTURED TEXT. Not necessarily newest in wall-clock terms
+        // (cursor movement can rewrite an earlier row after a later one), which is why the
+        // contract is worded that way rather than "most recent".
+        let text = "build DONE\nnoise\nrerun DONE now\ntail";
+        assert_eq!(last_match(text, "DONE"), Some("rerun DONE now"));
+    }
+
+    #[test]
+    fn no_match_is_none() {
+        assert_eq!(last_match("alpha\nbeta", "gamma"), None);
+    }
+
+    #[test]
+    fn matches_inside_a_joined_softwrap_line() {
+        // `capture-pane` joins soft-wrapped rows, so a marker split across the terminal's
+        // right edge arrives as ONE logical line and must still match.
+        assert_eq!(last_match("aaaMARKERbbb", "MARKER"), Some("aaaMARKERbbb"));
+    }
+
+    #[test]
+    fn bare_pattern_defaults_to_the_focused_pane() {
+        let a = parse(&["wait-output", "READY"]).expect("should parse");
+        assert_eq!(a.pattern, "READY");
+        assert_eq!(a.target, None);
+        assert_eq!(a.index, None);
+    }
+
+    #[test]
+    fn a_leading_positional_is_the_target() {
+        let a = parse(&["wait-output", "ab12-3", "READY"]).expect("should parse");
+        assert_eq!(a.target.as_deref(), Some("ab12-3"));
+        assert_eq!(a.pattern, "READY");
+    }
+
+    #[test]
+    fn flags_do_not_get_eaten_as_positionals() {
+        // The parser consumes a flag AND its value; a regression here would silently turn
+        // "250" into the pattern and wait for a string that never appears.
+        let a =
+            parse(&["wait-output", "--timeout", "5", "--lines", "10", "OK"]).expect("should parse");
+        assert_eq!(a.pattern, "OK");
+        assert_eq!(a.timeout, Some(Duration::from_secs(5)));
+        assert_eq!(a.lines, 10);
+    }
+
+    #[test]
+    fn timeout_zero_means_wait_forever() {
+        assert_eq!(
+            parse(&["wait-output", "--timeout", "0", "X"])
+                .unwrap()
+                .timeout,
+            None
+        );
+    }
+
+    #[test]
+    fn defaults_are_bounded() {
+        // The DEFAULT must be a bounded wait: an agent blocking forever on a pattern that
+        // will never appear is the failure mode this verb would otherwise introduce.
+        let a = parse(&["wait-output", "X"]).unwrap();
+        assert_eq!(a.timeout, Some(Duration::from_secs(300)));
+        assert_eq!(a.interval, Duration::from_millis(250));
+        assert_eq!(a.lines, 200);
+    }
+
+    #[test]
+    fn rejects_a_busy_loop_interval() {
+        assert_eq!(parse(&["wait-output", "--interval", "0", "X"]), Err(2));
+        assert_eq!(parse(&["wait-output", "--interval", "10", "X"]), Err(2));
+        assert!(parse(&["wait-output", "--interval", "50", "X"]).is_ok());
+    }
+
+    #[test]
+    fn rejects_a_newline_in_the_pattern() {
+        // Matching is per logical line, so such a pattern could never match — failing loudly
+        // beats waiting out the full timeout for a reason the caller cannot see.
+        assert_eq!(parse(&["wait-output", "a\nb"]), Err(2));
+    }
+
+    #[test]
+    fn rejects_empty_pattern_and_missing_pattern() {
+        assert_eq!(parse(&["wait-output", ""]), Err(2));
+        assert_eq!(parse(&["wait-output"]), Err(2));
+        assert_eq!(parse(&["wait-output", "a", "b", "c"]), Err(2));
+    }
+
+    #[test]
+    fn rejects_target_and_index_together() {
+        assert_eq!(
+            parse(&["wait-output", "ab12-3", "X", "--index", "0"]),
+            Err(2)
+        );
+    }
+
+    #[test]
+    fn rejects_zero_lines() {
+        assert_eq!(parse(&["wait-output", "--lines", "0", "X"]), Err(2));
+    }
+
+    /// 124 is `timeout(1)`'s code and must stay distinct from the picker's cancellation
+    /// code, or a shell wrapper cannot tell a deadline from a deliberate abort.
+    #[test]
+    fn timeout_and_cancel_codes_do_not_collide() {
+        assert_ne!(EXIT_TIMEOUT, EXIT_CANCELLED);
+    }
+}
+
+#[cfg(test)]
+mod wait_bounds_tests {
+    use super::*;
+
+    /// A `--timeout` too large for `Instant + Duration` must be a USAGE error. Before this
+    /// check it panicked (exit 101): `Instant::add` overflows rather than saturating.
+    #[test]
+    fn an_unrepresentable_timeout_is_refused_not_a_panic() {
+        let owned: Vec<String> = ["wait-output", "--timeout", &u64::MAX.to_string(), "X"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let refs: Vec<&String> = owned.iter().collect();
+        assert_eq!(parse_wait_args(&refs), Err(2));
+    }
+
+    /// A timeout a user might plausibly type must still be accepted.
+    #[test]
+    fn a_long_but_representable_timeout_is_accepted() {
+        let owned: Vec<String> = ["wait-output", "--timeout", "86400", "X"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let refs: Vec<&String> = owned.iter().collect();
+        assert_eq!(
+            parse_wait_args(&refs).unwrap().timeout,
+            Some(Duration::from_secs(86_400))
+        );
+    }
+
+    /// The recipe is printed for a human to PASTE, so it must survive Rust's string
+    /// escaping. An earlier version rendered `$'\\n'` (a literal backslash-n, which never
+    /// submits the line) and `[\"panes\"]` (a Python SyntaxError). Assert the RENDERED
+    /// text, not the source — that is where the bug lived.
+    #[test]
+    fn the_help_recipe_renders_as_runnable_shell() {
+        assert!(
+            !WAIT_USAGE.contains(r"\\"),
+            "a double backslash survived into the rendered help — it will not run as printed"
+        );
+        assert!(
+            !WAIT_USAGE.contains("\\\""),
+            "an escaped quote survived into the rendered help"
+        );
+        // `send` does not append Enter, so the recipe must submit with a real newline
+        // inside a $'...' word.
+        assert!(
+            WAIT_USAGE.contains(r"comux send 0 $'\n'"),
+            "recipe never submits the command"
+        );
+        // The wait must address the SAME pane the recipe sent to.
+        assert!(
+            WAIT_USAGE.contains("comux send 0 ") && WAIT_USAGE.contains("wait-output --index 0"),
+            "recipe sends to one pane and waits on another"
+        );
+    }
+
+    /// `remaining` is what every read/write arms its socket timeout from, so an expired
+    /// deadline must report TimedOut instead of handing back a zero timeout — a zero
+    /// `set_read_timeout` means "block forever" to the OS, which is the opposite.
+    #[test]
+    fn an_expired_deadline_never_yields_a_zero_timeout() {
+        let past = Instant::now() - Duration::from_secs(1);
+        assert!(matches!(remaining(Some(past)), Err(WaitErr::TimedOut)));
+        match remaining(Some(Instant::now() + Duration::from_secs(5))) {
+            Ok(Some(d)) => assert!(!d.is_zero()),
+            other => panic!("expected a live budget, got {:?}", other.is_ok()),
+        }
+        assert!(matches!(remaining(None), Ok(None)));
+    }
+
+    /// The documented recipe must not contain the assembled marker: the whole point is that
+    /// the shell's echo of the command cannot satisfy the wait.
+    #[test]
+    fn the_help_recipe_does_not_leak_the_assembled_marker() {
+        assert!(
+            WAIT_USAGE.contains("MARK-%s"),
+            "recipe lost its fragment form"
+        );
+        assert!(
+            !WAIT_USAGE.contains("printf 'MARK-$id"),
+            "the recipe assembles the marker inside the sent command"
+        );
+        assert!(
+            WAIT_USAGE.contains("BEST-EFFORT"),
+            "help hides the limitation"
+        );
     }
 }

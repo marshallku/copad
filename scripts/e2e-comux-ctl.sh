@@ -22,6 +22,7 @@
 #   7. pane identity (`$COPAD_MUX_PANE`) + `notify` + cross-session `jump` by token
 #   8. a bad index is refused; `--json` with no index is a usage error (exit 2)
 #   9. capture-pane reads a pane's output back (by default/token/index) + refusals
+#  10. wait-output matches a fresh marker, times out at 124, refuses bad input
 
 set -euo pipefail
 
@@ -231,10 +232,60 @@ set -e
 [[ "$code" == "2" ]] || fail "target + --index should be usage exit 2, got $code"
 ok "marker read back; token/index agree; resolved pane echoed; refusals honored"
 
-echo "10. the server is still responsive and shuts down cleanly"
+echo "10. wait-output blocks until a pane's text matches"
+# The marker is ASSEMBLED IN THE PANE from fragments: the sent command contains "MARK-%s"
+# and the id separately, never "MARK-<id>" as a literal. Otherwise the shell's echo of the
+# command satisfies the wait before the command has run, and this step would pass while
+# testing nothing. The id is fresh per run so a leftover match can't satisfy it either.
+ID="$$-$RANDOM-$(date +%s)"
+t 10 "$COMUX" send 0 "sleep 1; printf 'MARK-%s\n' '$ID'" >/dev/null
+t 10 "$COMUX" send 0 $'\n' >/dev/null
+# Wait on the pane EXPLICITLY (the same one we sent to), not on whatever is focused.
+t 30 "$COMUX" wait-output "$tok" --timeout 20 --interval 100 "MARK-$ID" >"$WORK/wait" \
+    || fail "wait-output did not see MARK-$ID: $(cat "$WORK/wait")"
+grep -q "MARK-$ID" "$WORK/wait" || fail "wait-output printed no matching line"
+# A pattern that never appears must hit the deadline (124), not hang the harness.
+start=$(date +%s)
+set +e
+t 20 "$COMUX" wait-output --timeout 2 --interval 100 "NEVER_APPEARS_$ID" >/dev/null 2>&1; code=$?
+set -e
+elapsed=$(( $(date +%s) - start ))
+[[ "$code" == "124" ]] || fail "expected timeout exit 124, got $code"
+(( elapsed <= 8 )) || fail "the deadline did not fire promptly (${elapsed}s)"
+# Usage refusals, including the --timeout overflow that used to panic with exit 101.
+set +e
+t 10 "$COMUX" wait-output --interval 0 X >/dev/null 2>&1; c1=$?
+t 10 "$COMUX" wait-output >/dev/null 2>&1; c2=$?
+t 10 "$COMUX" wait-output --timeout 18446744073709551615 X >/dev/null 2>&1; c3=$?
+set -e
+[[ "$c1" == "2" ]] || fail "--interval 0 should be usage exit 2, got $c1"
+[[ "$c2" == "2" ]] || fail "a missing pattern should be usage exit 2, got $c2"
+[[ "$c3" == "2" ]] || fail "an overflowing --timeout should be usage exit 2, got $c3 (101 = panic)"
+# An unknown pane fails rather than waiting out the clock.
+set +e
+start=$(date +%s)
+t 15 "$COMUX" wait-output no-such-pane X --timeout 10 >/dev/null 2>&1; c4=$?
+elapsed=$(( $(date +%s) - start ))
+set -e
+[[ "$c4" == "1" ]] || fail "an unknown pane should fail with 1, got $c4"
+(( elapsed <= 5 )) || fail "an unknown pane was waited out instead of refused (${elapsed}s)"
+# Run the recipe `comux wait-output --help` PRINTS, verbatim. The help is there to be
+# pasted, and it has already shipped broken once (Rust string escaping turned $'\n' into a
+# literal backslash-n, so the command was never submitted) — a test that only reads the
+# source cannot catch that.
+id=$(date +%s%N)
+t 10 "$COMUX" send 0 "printf 'MARK-%s
+' '$id'" >/dev/null
+t 10 "$COMUX" send 0 $'
+' >/dev/null
+t 30 "$COMUX" wait-output --index 0 --timeout 20 --interval 100 "MARK-$id" >/dev/null     || fail "the recipe printed by --help does not work as written"
+ok "matched a pane-assembled fresh marker; timed out at 124; overflow + refusals honored; \
+documented recipe runs"
+
+echo "11. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"
 
 echo
-echo "PASS — comux close-tab / kill-session / notify / jump / capture-pane verified end to end"
+echo "PASS — comux close-tab / kill-session / notify / jump / capture-pane / wait-output verified end to end"
