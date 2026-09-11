@@ -2089,3 +2089,121 @@ mod bell_title_tests {
         assert_eq!(l.title.lock().unwrap().as_deref(), Some(""));
     }
 }
+
+/// Capability probe for the desktop-notification OSC sequences (`OSC 9`, `OSC 777`, `OSC 99`).
+///
+/// comux does NOT capture these, and this module exists to say so with evidence rather than in
+/// a comment, and to notice the day that changes.
+///
+/// **Why not.** The bytes reach `vte::ansi::Processor`, which owns the OSC dispatch table. In
+/// vte 0.15 that table handles `0`, `2`, `4`, `8`, `10`–`12`, `22`, `50`, `52`, `104`, `110`–
+/// `112`; everything else — including all three notification codes — falls to its private
+/// `unhandled()` and is logged at debug level and dropped. There is no `Handler` method for an
+/// unrecognised OSC, so `Term` never learns about it and neither does our `EventListener`.
+///
+/// **What capturing them would cost.** Only two options, both structural:
+/// 1. Fork or patch `vte` to add an unknown-OSC hook. Owning a fork of the parser under the
+///    terminal we do not otherwise touch is a large, permanent maintenance surface.
+/// 2. Run our own PTY read loop so the bytes can be tee'd into a second `vte::Parser` before
+///    alacritty's sees them. `alacritty_terminal::tty::{EventedPty, EventedReadWrite}` are both
+///    public, but `EventedReadWrite::reader()` hands back `&mut Self::Reader` — a wrapper would
+///    have to OWN the inner reader, and `tty::Pty` exposes no way to take it. So this means
+///    reimplementing the tty module (openpty, child spawn, poll registration, race-free exit),
+///    which is exactly the "own read loop" the competitive analysis predicted.
+///
+/// Neither is worth it for a feature comux already covers by a better route: `comux notify
+/// --pane` is a PUSH that carries the pane identity, and a pushed notification is jumpable
+/// (#102, #115) where an OSC one would not be — an OSC 9 says only "something happened", and
+/// the pane it came from would still have to be inferred.
+///
+/// These tests pin the current behaviour in both directions. If a future vte routes any of
+/// these codes to a `Handler` method, the "nothing observable happens" assertions here are what
+/// will notice.
+#[cfg(test)]
+mod osc_notification_probe {
+    use super::*;
+    use alacritty_terminal::term::test::TermSize;
+    use alacritty_terminal::term::{Config, Term};
+    use alacritty_terminal::vte::ansi::Processor;
+
+    /// Every desktop-notification OSC in the wild, as a program would emit it.
+    const SEQUENCES: &[(&str, &str)] = &[
+        // iTerm2 / ConEmu growl notification.
+        ("OSC 9", "\x1b]9;build finished\x07"),
+        // rxvt-unicode extension, also supported by wezterm/foot: title + body.
+        ("OSC 777", "\x1b]777;notify;comux;build finished\x07"),
+        // kitty's desktop notification protocol (chunked; this is a whole one-shot message).
+        ("OSC 99", "\x1b]99;i=1:d=0;build finished\x1b\\"),
+        // String-terminator forms, in case the bell terminator is what is being ignored.
+        ("OSC 9 (ST)", "\x1b]9;build finished\x1b\\"),
+        ("OSC 777 (ST)", "\x1b]777;notify;comux;build finished\x1b\\"),
+    ];
+
+    fn term() -> (Term<MuxListener>, Processor, MuxListener) {
+        let l = MuxListener::new();
+        let size = TermSize::new(40, 4);
+        (
+            Term::new(Config::default(), &size, l.clone()),
+            Processor::new(),
+            l,
+        )
+    }
+
+    #[test]
+    fn a_notification_osc_is_swallowed_whole() {
+        for (name, seq) in SEQUENCES {
+            let (mut t, mut p, l) = term();
+            p.advance(&mut t, seq.as_bytes());
+
+            // Nothing is drawn. This is the half that matters for `capture-pane` and the
+            // status heuristics: the sequence must not leak into the grid as text either.
+            let text: String = t
+                .grid()
+                .display_iter()
+                .map(|c| c.c)
+                .collect::<String>()
+                .replace(' ', "");
+            assert!(
+                text.is_empty(),
+                "{name} leaked into the grid as {text:?} — the parser did not consume it"
+            );
+
+            // And nothing reaches us. `set_title` is checked explicitly because OSC 9 differs
+            // from OSC 0/2 by one character, and a parser that lumped them together would
+            // silently rename the pane on every notification.
+            assert_eq!(
+                l.title.lock().unwrap().clone(),
+                None,
+                "{name} was mistaken for a title"
+            );
+            assert_eq!(
+                l.bells.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "{name} rang the bell"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bell_terminator_of_a_notification_is_not_a_bell() {
+        // `\x07` ends an OSC string; it must be consumed as the terminator, not delivered as
+        // BEL. If it were, every notification would light the `!` marker (#108) — a
+        // plausible-looking wrong behaviour, since the marker WOULD appear.
+        let (mut t, mut p, l) = term();
+        let bells = || l.bells.load(std::sync::atomic::Ordering::Relaxed);
+        p.advance(&mut t, b"\x1b]9;hello\x07");
+        assert_eq!(bells(), 0);
+        // A real BEL still counts, so the assertion above is not vacuous.
+        p.advance(&mut t, b"\x07");
+        assert_eq!(bells(), 1);
+    }
+
+    #[test]
+    fn osc_0_still_sets_the_title_beside_them() {
+        // Guards the probe itself: if the listener stopped observing titles, every assertion
+        // above would pass for the wrong reason.
+        let (mut t, mut p, l) = term();
+        p.advance(&mut t, b"\x1b]0;real title\x07");
+        assert_eq!(l.title.lock().unwrap().as_deref(), Some("real title"));
+    }
+}
