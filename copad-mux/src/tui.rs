@@ -647,6 +647,23 @@ pub struct App {
     /// The whole-minute bucket of each agent's time-in-status as last REPORTED to the
     /// render loop, so a roll can be turned into a repaint (see `refresh_agent_statuses`).
     agent_minutes: HashMap<TerminalId, u64>,
+    /// What `agentpoll` last reported each agent pane was DOING, as last reported to the
+    /// render loop. Compared — not just rendered — because `agent_rows` reads the poller
+    /// live: a hidden agent that changes tool while staying `Working` moves no other
+    /// compared value, so without this its sidebar detail would freeze once
+    /// `drain_pane_dirty` stopped repainting for hidden panes.
+    agent_details: HashMap<TerminalId, String>,
+    /// Panes with an UNACKNOWLEDGED bell, as last reported to the render loop. Same reason
+    /// as `agent_details`: `bell()` / `bell_count()` are live reads that drive the `!`
+    /// markers and the mux-wide `! N`, and a bell rung in a hidden pane is precisely the
+    /// case that used to repaint only because that pane dirtied the frame.
+    bells_reported: std::collections::HashSet<TerminalId>,
+    /// The top bar's rendered host readings, as last reported to the render loop. Compared
+    /// as what is DRAWN rather than raw floats, so a change below the printed precision does
+    /// not cost a repaint — but the threshold COLOUR is part of that, not just the text:
+    /// 69.8% and 70.2% both print `70%` while crossing green→yellow, and comparing the
+    /// strings alone would leave that severity stale.
+    host_reported: Vec<(String, String, Color)>,
     /// Per-session git branch (its focused pane's cwd) for the `spaces` subtitle,
     /// refreshed at the label cadence.
     branches: HashMap<WorkspaceId, String>,
@@ -833,6 +850,9 @@ impl App {
             label_sweeps_failed: 0,
             agent_statuses: HashMap::new(),
             agent_minutes: HashMap::new(),
+            agent_details: HashMap::new(),
+            bells_reported: std::collections::HashSet::new(),
+            host_reported: Vec::new(),
             branches: HashMap::new(),
             next_session,
             session_activity: HashMap::new(),
@@ -4621,10 +4641,31 @@ impl App {
         self.cfg.osc52.then_some((seq, text))
     }
 
+    /// Clear every pane's dirty flag, and report whether a VISIBLE one had advanced.
+    ///
+    /// The flag must be taken from every pane — a hidden pane that kept its flag would
+    /// report stale output the moment it was revealed — but only a pane in `self.layout()`
+    /// is on screen, and only those can justify recomposing the frame. This used to be
+    /// "any pane anywhere", which on a mux with dozens of panes meant a single background
+    /// agent's spinner drove the visible screen to recompose (new `Buffer`, per-client
+    /// diff, clone) at the full frame rate, forever.
+    ///
+    /// `layout()` is the visibility source of truth — `take_alt_screen_transition` uses
+    /// exactly it — and revealing a hidden pane goes through a mutation that dirties the
+    /// frame on its own, so nothing is lost on the switch.
+    ///
+    /// This is only sound because every VISIBLE value that is a live function of a hidden
+    /// pane is compared on the label cadence instead: agent status and detail
+    /// (`refresh_agent_statuses`), bells (`refresh_bells`), host metrics
+    /// (`refresh_host_metrics`), labels, branches, usage and version. Adding a new live
+    /// read of `self.panes` to a render path means adding its comparison there too.
     pub fn drain_pane_dirty(&self) -> bool {
+        let visible: std::collections::HashSet<TerminalId> =
+            self.layout().into_iter().map(|r| r.terminal).collect();
         let mut dirty = false;
-        for pt in self.panes.values() {
-            if pt.take_dirty() {
+        for (tid, pt) in &self.panes {
+            // No short-circuit: every flag has to be taken, visible or not.
+            if pt.take_dirty() && visible.contains(tid) {
                 dirty = true;
             }
         }
@@ -4793,10 +4834,59 @@ impl App {
             let c = self.refresh_branches();
             let d = self.refresh_usage();
             let e = self.refresh_version();
-            a || b || c || d || e
+            let f = self.refresh_bells();
+            let g = self.refresh_host_metrics();
+            a || b || c || d || e || f || g
         } else {
             false
         }
+    }
+
+    /// Report whether the set of panes with an unacknowledged bell has moved.
+    ///
+    /// `bell()` and `bell_count()` are live reads off each `PaneTerm`'s atomic counter, so
+    /// nothing else on this cadence would notice a bell. It used to repaint anyway —
+    /// ringing produces PTY output, and `drain_pane_dirty` treated ANY pane's output as a
+    /// reason to recompose. Now that only visible panes do that, a bell rung in a hidden
+    /// pane needs its own comparison to reach the `!` markers and the mux-wide `! N`.
+    ///
+    /// The comparison is the per-pane SET, not the count: one pane ringing while another is
+    /// acknowledged in the same window leaves the total unchanged while both markers move.
+    fn refresh_bells(&mut self) -> bool {
+        let next: std::collections::HashSet<TerminalId> = self
+            .panes
+            .keys()
+            .filter(|tid| self.bell(tid))
+            .cloned()
+            .collect();
+        let changed = next != self.bells_reported;
+        self.bells_reported = next;
+        changed
+    }
+
+    /// Report whether the top bar's host readings have moved.
+    ///
+    /// `render_top_bar` reads `hostmetrics::read` live off the poller thread, which is
+    /// another value that only ever repainted because some pane somewhere dirtied the frame.
+    /// Compared as what is actually DRAWN — text AND threshold colour — so a drift below the
+    /// printed precision costs nothing while a severity change still repaints.
+    fn refresh_host_metrics(&mut self) -> bool {
+        // Nothing renders these when the bar is not on screen, so don't manufacture repaints
+        // for them. `top_h()` rather than `cfg.top_bar`: the bar is also suppressed on a
+        // terminal below `MIN_ROWS_FOR_TOP`, and a config check would still repaint there.
+        if self.top_h() == 0 {
+            if !self.host_reported.is_empty() {
+                self.host_reported.clear();
+            }
+            return false;
+        }
+        let next: Vec<(String, String, Color)> = host_parts(&hostmetrics::read(&self.host_poll))
+            .into_iter()
+            .map(|p| (p.label, p.value, p.color))
+            .collect();
+        let changed = next != self.host_reported;
+        self.host_reported = next;
+        changed
     }
 
     /// Number of carousel pages the usage readout currently has (0 when hidden,
@@ -4949,6 +5039,9 @@ impl App {
         // process table itself: this loop already walks exactly the agent panes and holds
         // their labels, so `procinfo` keeps a single writer (#88).
         let mut wanted: Vec<(u32, String)> = Vec::new();
+        // What each agent is DOING. Read here rather than only at render time so a change
+        // reports `changed` — see `App::agent_details`.
+        let mut details: HashMap<TerminalId, String> = HashMap::new();
         for (tid, pane) in &self.panes {
             let Some(label) = self.labels.get(tid) else {
                 continue;
@@ -4957,7 +5050,10 @@ impl App {
                 continue;
             }
             wanted.push((label.pid, label.text.clone()));
-            let status = agentstate::resolve(Some(label.pid), &pane.snapshot());
+            if let Some(a) = agentpoll::activity(&self.agent_poll, label.pid) {
+                details.insert(tid.clone(), a.detail);
+            }
+            let status = agentstate::resolve_with(Some(label.pid), || pane.snapshot());
             let prev = self.agent_statuses.get(tid).copied();
             let body = match (prev.map(|p| p.status), status) {
                 // turn just finished (was running, now parked at the prompt)
@@ -4995,8 +5091,9 @@ impl App {
             minutes.insert(tid.clone(), m);
         }
         self.agent_minutes = minutes;
-        let changed = next != self.agent_statuses || rolled;
+        let changed = next != self.agent_statuses || rolled || details != self.agent_details;
         self.agent_statuses = next;
+        self.agent_details = details;
 
         // Fire desktop toasts (best-effort, non-blocking) — the server does this, so
         // they arrive even while detached. Replaces the retired `~/.claude` notify hooks.

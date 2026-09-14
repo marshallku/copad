@@ -33,6 +33,7 @@
 #  18. dragging a split divider moves the branch it is on, and only that one
 #  19. a notification jump focuses the exact copad TAB, and degrades when it cannot
 #  20. the SSH fleet: an unreachable machine is reported with a reason, never dropped
+#  21. a bell rung in a HIDDEN tab still reaches the rendered status bar
 
 set -euo pipefail
 
@@ -1044,7 +1045,39 @@ rm -f "$XDG_CONFIG_HOME/copad/mux.toml"
 unset FAKE_SSH_LOG
 ok "the fleet is queried in parallel; an unreachable machine is reported with a reason, never dropped"
 
-echo "21. the server is still responsive and shuts down cleanly"
+echo "21. a HIDDEN pane's bell still reaches the rendered status bar"
+# Only a VISIBLE pane's output recomposes the frame now (`App::drain_pane_dirty`): with dozens
+# of panes, one background agent's spinner used to drive the whole visible screen to recompose
+# at the frame rate. That filter is only sound because every visible value that is a live
+# function of a HIDDEN pane gained its own comparison on the label cadence — and a bell is one
+# of them (`App::refresh_bells`), since `bell()`/`bell_count()` read each pane's atomic counter
+# at render time.
+#
+# So this asserts the exact combination: ring a bell in a pane on another TAB (truly off
+# screen, unlike step 13's same-tab split, and unlike step 13 this reads a REAL rendered frame
+# rather than `list --json`) and require the tab chip's `!` to appear. Without `refresh_bells`
+# the bell has no way to reach the frame at all once hidden panes stop dirtying it.
+#
+# The bell has to ring while a client is ALREADY ATTACHED, and with no control traffic of its
+# own. Both attaching and any mutating `ctl` verb dirty the frame by themselves, so a bell rung
+# before the client connects — or delivered by a `send` — would repaint for reasons that have
+# nothing to do with this fix, and the check would pass with `refresh_bells` deleted. Hence the
+# self-timed bell: arm it in the pane, hide the pane, then attach and wait it out.
+hidden_tok="$(t 10 "$COMUX" split -h)" || fail "could not create the pane that will ring"
+t 10 "$COMUX" send "$hidden_tok" "(sleep 3; printf '\a') &" >/dev/null
+t 10 "$COMUX" send "$hidden_tok" $'\n' >/dev/null
+# Move it out of sight: a new tab becomes the active one, so everything on the old tab is
+# hidden from the composed frame.
+t 10 "$COMUX" new-tab >/dev/null || fail "new-tab failed"
+# `cap` attaches, drains for 6s, then detaches — so the bell lands mid-drain and the label
+# cadence has seconds to turn it into a repaint.
+python3 "$WORK/ptydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+if ! tail -1 "$WORK/frame" | grep -q '!'; then
+    fail "a bell rung in a hidden tab never reached the status bar: $(tail -1 "$WORK/frame")"
+fi
+ok "a hidden tab's bell still repaints the chrome, without its output driving the frame"
+
+echo "22. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

@@ -37,12 +37,23 @@ impl AgentStatus {
 /// Resolve an agent pane's status: Claude session file first (accurate, pid-keyed),
 /// else the screen-text fallback.
 pub fn resolve(pid: Option<u32>, snap: &Snapshot) -> AgentStatus {
-    if let Some(pid) = pid
-        && let Some(s) = claude_session_status(pid)
-    {
-        return s;
-    }
-    screen_status(snap)
+    session_first(pid).unwrap_or_else(|| screen_status(snap))
+}
+
+/// [`resolve`], but the screen snapshot is only taken IF the fallback is reached.
+///
+/// The session file answers for every Claude pane, and `PaneTerm::snapshot` copies the whole
+/// viewport — a `String` allocated per cell, under the terminal lock — so passing one eagerly
+/// meant building and discarding a screen copy per agent per sweep (2 Hz attached, every
+/// agent in every session). The closure defers that to the panes that actually need it:
+/// codex, and anything with no session file.
+pub fn resolve_with(pid: Option<u32>, snap: impl FnOnce() -> Snapshot) -> AgentStatus {
+    session_first(pid).unwrap_or_else(|| screen_status(&snap()))
+}
+
+/// The PRIMARY signal, shared by both resolvers so the policy cannot drift between them.
+fn session_first(pid: Option<u32>) -> Option<AgentStatus> {
+    claude_session_status(pid?)
 }
 
 /// Path of Claude's per-process status file, `~/.claude/sessions/<pid>.json`.

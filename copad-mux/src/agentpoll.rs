@@ -99,6 +99,15 @@ struct Entry {
     path: Option<PathBuf>,
     /// `(mtime, len)` at the last read, so an unchanged file costs one `stat`.
     stamp: Option<(SystemTime, u64)>,
+    /// The reading `stamp` was taken from, so an unchanged file costs the `stat` and
+    /// NOTHING ELSE. Without this the stamp was computed and then ignored: every tick
+    /// re-tailed 256 KiB per Claude agent, lossy-decoded it and parsed JSON, only to
+    /// publish the same string again. At 30 agents that is ~7.7 MB/s of pure waste.
+    ///
+    /// `None` means "read fine, nothing parseable in the tail" — which is exactly what
+    /// gets republished, so the distinction from a FAILED read matters and is why
+    /// [`read_detail`] returns a nested `Option`.
+    last: Option<Activity>,
     /// When resolution last failed, for [`RESOLVE_RETRY`].
     failed_at: Option<Instant>,
 }
@@ -146,12 +155,17 @@ fn sweep(wanted: &[(u32, String)], cache: &mut HashMap<u32, Entry>) -> HashMap<u
             tool: tool.clone(),
             path: None,
             stamp: None,
+            last: None,
             failed_at: None,
         });
         // Re-resolve when we have no path, or when the one we had has vanished (a codex
         // `/new` rotates to a fresh rollout).
         if e.path.as_ref().is_none_or(|p| !p.exists()) {
             e.path = None;
+            // The cached reading belongs to the OLD source. A codex `/new` rotates to a
+            // fresh rollout, and republishing across that boundary would attribute the
+            // previous conversation's activity to the new one.
+            e.last = None;
             let due = e.failed_at.is_none_or(|t| t.elapsed() >= RESOLVE_RETRY);
             if budget > 0 && due {
                 budget -= 1;
@@ -166,14 +180,26 @@ fn sweep(wanted: &[(u32, String)], cache: &mut HashMap<u32, Entry>) -> HashMap<u
             .and_then(|m| Some((m.modified().ok()?, m.len())));
         if now.is_some() && now == e.stamp {
             // Unchanged: republish the last reading rather than dropping it, so an idle agent
-            // does not flicker between a detail and nothing.
-            if let Some(a) = read_detail(&path, tool) {
+            // does not flicker between a detail and nothing. This is the whole point of
+            // `stamp` — see [`Entry::last`] for what it used to cost.
+            if let Some(a) = e.last.clone() {
                 out.insert(*pid, a);
             }
             continue;
         }
-        e.stamp = now;
-        if let Some(a) = read_detail(&path, tool) {
+        // A read that SUCCEEDED commits both the stamp and the reading, whether or not the
+        // tail held anything parseable — an inner `None` legitimately blanks the row.
+        //
+        // A read that FAILED falls through, leaving `stamp` uncommitted so the very next tick
+        // retries. Committing it would suppress the pid permanently: a file restored to
+        // readability without its mtime or length changing would never re-stamp. What we
+        // already had is republished below rather than blanking the row over a transient
+        // failure.
+        if let Some(detail) = read_detail(&path, tool) {
+            e.stamp = now;
+            e.last = detail;
+        }
+        if let Some(a) = e.last.clone() {
             out.insert(*pid, a);
         }
     }
@@ -236,23 +262,32 @@ fn project_slug(cwd: &str) -> String {
 }
 
 /// Read the newest activity out of `path`'s tail.
-fn read_detail(path: &Path, tool: &str) -> Option<Activity> {
+///
+/// The nested `Option` separates two outcomes the caller must NOT conflate:
+/// * `None` — could not read (unknown tool, open/seek/read failed). The caller leaves its
+///   stamp uncommitted so the next tick retries; caching this would suppress the pid
+///   forever once the file became readable again without its mtime/len changing.
+/// * `Some(None)` — read fine, but the tail held nothing parseable. A real, cacheable
+///   reading of "no activity".
+fn read_detail(path: &Path, tool: &str) -> Option<Option<Activity>> {
     let (budget, parse): (u64, fn(&str) -> Option<String>) = match tool {
         "claude" => (CLAUDE_TAIL, claude_line_detail),
         "codex" => (CODEX_TAIL, codex_line_detail),
         _ => return None,
     };
     let text = tail(path, budget)?;
-    let detail = text.lines().rev().find_map(parse)?;
-    Some(Activity {
+    Some(text.lines().rev().find_map(parse).map(|detail| Activity {
         detail: truncate(&detail, MAX_DETAIL),
-    })
+    }))
 }
 
 /// The last `budget` bytes of `path` as UTF-8, with a leading PARTIAL line discarded.
 ///
 /// The partial line is dropped rather than parsed: a JSON record cut mid-way is not merely
 /// unparseable, it can be a valid prefix that parses to something else.
+///
+/// `None` means the file could not be READ, and nothing else — see the caller in
+/// [`read_detail`] for why a successful read with no usable content must not share it.
 fn tail(path: &Path, budget: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path).ok()?;
@@ -265,8 +300,15 @@ fn tail(path: &Path, budget: u64) -> Option<String> {
     if from == 0 {
         return Some(text);
     }
-    // Not at the start of the file, so the first line is a fragment.
-    text.find('\n').map(|i| text[i + 1..].to_string())
+    // Not at the start of the file, so the first line is a fragment. NO newline at all means
+    // the budget landed entirely inside one record — there is nothing complete to parse, but
+    // the read still SUCCEEDED. That distinction is load-bearing now that the caller uses
+    // `None` to mean "could not read, retry next tick": reporting a failure here would make an
+    // oversized record re-read its file on every single tick, forever.
+    Some(
+        text.find('\n')
+            .map_or(String::new(), |i| text[i + 1..].to_string()),
+    )
 }
 
 /// One Claude transcript line → `"Bash: commit the fix"`, or `None` when it names no tool use.
@@ -355,6 +397,129 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transcript line that parses to `"Bash: <what>"`.
+    fn tool_use_line(what: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","message":{{"content":[{{"type":"tool_use","name":"Bash","input":{{"description":"{what}"}}}}]}}}}"#
+        )
+    }
+
+    fn entry_for(path: &std::path::Path) -> Entry {
+        Entry {
+            tool: "claude".into(),
+            path: Some(path.to_path_buf()),
+            stamp: None,
+            last: None,
+            failed_at: None,
+        }
+    }
+
+    /// The bug this module's `stamp` was always supposed to prevent: an unchanged transcript
+    /// was re-tailed, lossy-decoded and JSON-parsed on EVERY tick.
+    ///
+    /// Proving a read did NOT happen needs the read to be observable, so the second pass runs
+    /// against a file whose CONTENT has been swapped while its length and mtime are restored.
+    /// Anything that re-reads publishes the new content; only the cache publishes the old.
+    #[test]
+    fn an_unchanged_transcript_is_not_re_read() {
+        let dir = std::env::temp_dir().join(format!("agentpoll-unchanged-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+
+        std::fs::write(&path, tool_use_line("first") + "\n").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let (mtime, len) = (meta.modified().unwrap(), meta.len());
+
+        let mut cache = HashMap::from([(1u32, entry_for(&path))]);
+        let wanted = vec![(1u32, "claude".to_string())];
+        let first = sweep(&wanted, &mut cache);
+        assert_eq!(first[&1].detail, "Bash: first");
+
+        // Same length ("first" and "wrong" are both 5 bytes), same mtime → same stamp.
+        std::fs::write(&path, tool_use_line("wrong") + "\n").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(mtime))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            len,
+            "stamp must match"
+        );
+
+        let second = sweep(&wanted, &mut cache);
+        assert_eq!(
+            second[&1].detail, "Bash: first",
+            "an unchanged stamp must republish the cached reading, not re-read the file"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A transient read failure must not be cached as "no activity": the stamp stays
+    /// uncommitted so the next tick retries. Caching it would suppress the pid until the
+    /// file's mtime or length happened to change again.
+    #[test]
+    #[cfg(unix)]
+    fn a_failed_read_is_retried_and_never_poisons_the_cache() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("agentpoll-failed-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        let wanted = vec![(1u32, "claude".to_string())];
+
+        std::fs::write(&path, tool_use_line("first") + "\n").unwrap();
+        let mut cache = HashMap::from([(1u32, entry_for(&path))]);
+        assert_eq!(sweep(&wanted, &mut cache)[&1].detail, "Bash: first");
+
+        // Content AND length change (so the stamp differs), but the file cannot be read.
+        std::fs::write(&path, tool_use_line("second reading") + "\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = sweep(&wanted, &mut cache);
+        assert_eq!(
+            blocked[&1].detail, "Bash: first",
+            "a transient failure republishes the last good reading rather than blanking the row"
+        );
+
+        // Readable again, with mtime and length untouched since the failed pass. Only an
+        // UNCOMMITTED stamp can notice.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let recovered = sweep(&wanted, &mut cache);
+        assert_eq!(
+            recovered[&1].detail, "Bash: second reading",
+            "the failed read must have left the stamp uncommitted so this tick retries"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A codex `/new` rotates to a fresh rollout. The previous conversation's activity must
+    /// not be attributed to the new one while the new path is still unresolved.
+    #[test]
+    fn a_vanished_transcript_drops_its_cached_reading() {
+        let dir = std::env::temp_dir().join(format!("agentpoll-rotate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.jsonl");
+        let wanted = vec![(1u32, "claude".to_string())];
+
+        std::fs::write(&path, tool_use_line("old conversation") + "\n").unwrap();
+        let mut cache = HashMap::from([(1u32, entry_for(&path))]);
+        assert_eq!(
+            sweep(&wanted, &mut cache)[&1].detail,
+            "Bash: old conversation"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            !sweep(&wanted, &mut cache).contains_key(&1),
+            "a reading must never outlive the source it was read from"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_claude_tool_use_becomes_a_named_detail() {
@@ -453,6 +618,18 @@ mod tests {
         assert_eq!(tail(&f, 12).as_deref(), Some("BBBB\nCCCC\n"));
         // A budget covering the file keeps everything.
         assert_eq!(tail(&f, 999).as_deref(), Some("AAAA\nBBBB\nCCCC\n"));
+
+        // A single record LARGER than the budget leaves no complete line — but the read
+        // succeeded, so this must be an empty tail, NOT the `None` that means "could not
+        // read". `sweep` leaves its stamp uncommitted on `None`, so conflating the two would
+        // make an oversized record re-read its file on every tick forever: exactly the bug
+        // the stamp exists to prevent.
+        let big = dir.join("big.jsonl");
+        std::fs::write(&big, "x".repeat(4096)).unwrap();
+        assert_eq!(tail(&big, 64).as_deref(), Some(""));
+
+        // And `None` still means unreadable.
+        assert_eq!(tail(&dir.join("absent.jsonl"), 64), None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -499,7 +676,9 @@ mod live_tests {
         };
         let d = read_detail(&f, "claude");
         assert!(
-            d.is_some(),
+            // `Some(None)` = read fine but nothing parseable, which is the failure this
+            // test exists to catch. Only a nested `Some` means the format still matches.
+            matches!(d, Some(Some(_))),
             "no tool_use found in the tail of {f:?} — Claude's transcript format may have moved"
         );
         println!("claude: {:?} -> {:?}", f.file_name().unwrap(), d);
@@ -542,7 +721,7 @@ mod live_tests {
         let d = read_detail(&f, "codex");
         println!("codex: {:?} -> {:?}", f.file_name().unwrap(), d);
         assert!(
-            d.is_some_and(|a| !a.detail.is_empty()),
+            d.flatten().is_some_and(|a| !a.detail.is_empty()),
             "a rollout containing CommandExecution yielded no detail — codex's rollout \
              format may have moved ({f:?})"
         );

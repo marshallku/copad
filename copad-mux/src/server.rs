@@ -407,7 +407,7 @@ pub fn run() -> io::Result<()> {
         });
         dirty |= app.maybe_auto_roll_usage(); // usage carousel auto-advance (usage_rotate_secs)
         dirty |= app.poll_agent_sessions(); // resume-picker scan landed (Ctrl-b R)
-        let pane_dirty = app.drain_pane_dirty(); // any pane's screen advanced (PTY output)
+        let pane_dirty = app.drain_pane_dirty(); // a VISIBLE pane's screen advanced (PTY output)
         dirty |= pane_dirty;
         // A full-screen app (nvim/less/htop/…) just ENTERED or LEFT the alternate screen:
         // force a full repaint for every client so both the app's first screen and the

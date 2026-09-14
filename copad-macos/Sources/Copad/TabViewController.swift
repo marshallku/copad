@@ -497,6 +497,15 @@ final class TabViewController: NSViewController {
             ) { [weak self] _ in
                 Task { @MainActor in self?.scheduleSessionSave() }
             },
+            // The background is decoded at the size the CURRENT screens need (see
+            // `decodeBackground`), so a display being attached, detached or rescaled is the
+            // one event that can invalidate it.
+            NotificationCenter.default.addObserver(
+                forName: NSApplication.didChangeScreenParametersNotification,
+                object: nil, queue: .main,
+            ) { [weak self] _ in
+                Task { @MainActor in self?.reapplyBackgroundForScreenChange() }
+            },
         ]
     }
 
@@ -824,27 +833,19 @@ final class TabViewController: NSViewController {
         ensureBackgroundViews()
         backgroundLoadToken &+= 1
         let token = backgroundLoadToken
+        // Read the screen geometry HERE: AppKit is main-thread-only, and the decode below
+        // runs on a background queue.
+        let envelope = Self.backingPixelEnvelope()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let image = NSImage(contentsOfFile: path)
+            let cgImage = Self.decodeBackground(path: path, envelope: envelope)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 // Stale: newer applyBackground / clearBackground won
                 // the race; drop this decode.
                 guard token == backgroundLoadToken else { return }
-                guard let image else { return }
-                // NSImage → CGImage so the layer can render it under
-                // its `contentsGravity` rule. `forProposedRect: nil`
-                // asks for the image's natural representation; aspect-
-                // fill scaling happens in CoreAnimation, not in the
-                // bitmap, so passing the original-size CGImage is
-                // correct (and cheaper than pre-rasterizing at view
-                // size). Skip the assignment if conversion fails —
-                // we don't want to wipe a previously-good image.
-                guard let cgImage = image.cgImage(
-                    forProposedRect: nil,
-                    context: nil,
-                    hints: nil,
-                ) else { return }
+                // Skip the assignment if the decode failed — we don't want to wipe a
+                // previously-good image.
+                guard let cgImage else { return }
                 let windowOpacity = currentWindowOpacity()
                 backgroundView?.layer?.contents = cgImage
                 backgroundView?.alphaValue = CGFloat(opacity * windowOpacity)
@@ -857,6 +858,101 @@ final class TabViewController: NSViewController {
                 fanSetImageBackgroundActive(true)
             }
         }
+    }
+
+    /// The largest backing-pixel size any screen could ask this window's background to fill.
+    ///
+    /// Derived from the SCREENS rather than the view: `.resizeAspectFill` means a bitmap sized
+    /// to today's window is upscaled (and visibly softens) the moment the window grows or
+    /// moves to a denser display, and a view-derived cap would force a fresh decode on every
+    /// resize. A screen-derived envelope is stable, so the decode happens once per image.
+    private static func backingPixelEnvelope() -> [CGSize] {
+        let screens = NSScreen.screens.map { screen -> CGSize in
+            let scale = screen.backingScaleFactor
+            return CGSize(
+                width: screen.frame.width * scale,
+                height: screen.frame.height * scale,
+            )
+        }
+        // No screens at all (headless/locked) — fall back to something sane rather than
+        // deciding the image may be one pixel wide.
+        return screens.isEmpty ? [CGSize(width: 3840, height: 2160)] : screens
+    }
+
+    /// Decode `path` at the smallest size that still fully covers `envelope` under
+    /// `.resizeAspectFill`.
+    ///
+    /// The old path was `NSImage(contentsOfFile:)` + `cgImage(forProposedRect: nil)`, which
+    /// hands CoreAnimation the image at its NATURAL size and lets the layer scale it. That is
+    /// correct, and it is also why a wallpaper directory of 6000x4000 camera JPEGs cost ~96 MB
+    /// of RGBA each once resident — the dominant term in this process's memory. Nothing leaked
+    /// (one `backgroundView` per window, and replacing `contents` releases the old image); the
+    /// bitmap was simply far larger than any screen could show.
+    ///
+    /// Sizing is aspect-fill-aware, NOT a plain longest-side cap. Capping the long side of a
+    /// 4000x6000 portrait at a 3440-wide screen yields 2293x3440, and filling a 3440x1440 view
+    /// with that upscales it — despite the source having pixels to spare. So the scale is
+    /// computed the way the layer will actually use it (`max(W/Iw, H/Ih)`, clamped to 1 so a
+    /// small image is never enlarged) and only then turned back into a longest-side bound.
+    private static func decodeBackground(path: String, envelope: [CGSize]) -> CGImage? {
+        let url = URL(fileURLWithPath: path)
+        guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              let rawW = (props[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
+              let rawH = (props[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue,
+              rawW > 0, rawH > 0
+        else { return fallbackDecode(path: path) }
+
+        // EXIF orientations 5-8 mean the stored pixel dimensions are transposed relative to
+        // how the image is DISPLAYED. Sizing against the stored ones would compute the scale
+        // for a sideways image. This only affects the arithmetic — ImageIO applies the
+        // rotation itself, once, via `kCGImageSourceCreateThumbnailWithTransform` below.
+        let orientation = (props[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1
+        let sourceW = (5...8).contains(orientation) ? rawH : rawW
+        let sourceH = (5...8).contains(orientation) ? rawW : rawH
+
+        let scale = envelope.reduce(0.0) { best, target in
+            max(best, min(1.0, max(target.width / sourceW, target.height / sourceH)))
+        }
+        let bound = Int(ceil(scale * max(sourceW, sourceH)))
+        guard bound > 0 else { return fallbackDecode(path: path) }
+
+        let options: [CFString: Any] = [
+            // Scale the real image. Without this a file carrying a small embedded EXIF
+            // thumbnail would hand us THAT, and the wallpaper would render as mush.
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            // Apply EXIF orientation. `NSImage` used to do this for us; dropping it would
+            // silently rotate every photo shot in portrait.
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            // Decode HERE, on the background queue, rather than lazily on the main thread at
+            // first draw.
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: bound,
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary)
+        else { return fallbackDecode(path: path) }
+        return image
+    }
+
+    /// The original full-size path, kept as a fallback so a format ImageIO will open but not
+    /// thumbnail can still show a background rather than none at all.
+    private static func fallbackDecode(path: String) -> CGImage? {
+        NSImage(contentsOfFile: path)?.cgImage(forProposedRect: nil, context: nil, hints: nil)
+    }
+
+    /// Re-decode the current background after a display change.
+    ///
+    /// The size envelope above is only stable while the screen configuration is: plugging in a
+    /// larger or denser display raises what aspect-fill needs, and the bitmap already resident
+    /// would be upscaled from then on.
+    private func reapplyBackgroundForScreenChange() {
+        guard let path = currentBackgroundPath else { return }
+        applyBackground(
+            path: path,
+            tint: currentBackgroundTint,
+            opacity: currentBackgroundOpacity,
+            fromList: currentBackgroundFromList,
+        )
     }
 
     func clearBackground() {
