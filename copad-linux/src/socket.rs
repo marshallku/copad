@@ -533,6 +533,45 @@ pub fn dispatch(
             cmd.reply_with_completion(event_bus, resp);
         }
 
+        // Focus one specific pane by id and bring the window forward — the comux
+        // notification-jump path (decision #115). `activate_panel` is the same
+        // call a cockpit row click makes, so the two cannot drift.
+        "panel.focus" => {
+            let resp = match req.params.get("panel_id").and_then(|v| v.as_str()) {
+                Some(panel_id) if !panel_id.is_empty() => {
+                    let focused = mgr.activate_panel(panel_id);
+                    if focused {
+                        // Only on a hit. Raising after a miss would bring forward
+                        // an instance that did NOT satisfy the request, right as
+                        // the caller falls back to activating the owner.
+                        //
+                        // `raised: false` regardless, and it is not pessimism: a
+                        // Wayland client holding no activation token has its
+                        // `present()` accepted and IGNORED (measured on Hyprland),
+                        // and X11 focus-stealing prevention can refuse it too. So
+                        // this asks, and reports that it cannot promise — the
+                        // caller then runs the compositor-level raise, which works
+                        // precisely because it is not the GUI asking for itself.
+                        window.present();
+                    }
+                    // `focused: false` is a SUCCESSFUL call that found nothing,
+                    // not an error: the id may belong to another copad instance,
+                    // and comux branches on exactly this to decide whether to
+                    // fall back (`copad-mux/src/copadlink.rs`).
+                    Response::success(
+                        req.id.clone(),
+                        json!({ "ok": true, "focused": focused, "raised": false }),
+                    )
+                }
+                _ => Response::error(
+                    req.id.clone(),
+                    "invalid_params",
+                    "panel.focus requires a non-empty `panel_id` string",
+                ),
+            };
+            cmd.reply_with_completion(event_bus, resp);
+        }
+
         // Pane focus movement. Already keybound (Ctrl+Shift+N / Left); exposing
         // it so an agent can drive what a human could already do.
         "pane.focus_next" => {

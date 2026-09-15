@@ -1350,7 +1350,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // `focused: false` is reported as a SUCCESSFUL call that found nothing, not an
             // error: the caller's panel id may simply belong to another copad instance, and
             // it needs to tell that apart from a broken request so it can fall back.
-            completion(["ok": true, "focused": focused])
+            //
+            // `raised` is a SEPARATE outcome from `focused` because on Linux the two come
+            // apart — GTK under Wayland switches the tab but cannot bring its own window
+            // forward. AppKit can, so it is reported here, and the caller skips its
+            // compositor-level raise. Sending it explicitly rather than leaning on the
+            // reader's back-compat default keeps the default from becoming load-bearing.
+            completion(["ok": true, "focused": focused, "raised": focused])
 
         case "tab.list":
             completion(vc.tabList())

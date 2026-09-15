@@ -77,9 +77,10 @@ pub fn method_capability(method: &str) -> Option<&'static str> {
         // Focus movement rides the pane-geometry capability rather than a new
         // `pane` one: both are pane-scoped, and `split` is already in the GUI's
         // advertised CAPABILITIES, so this needs no handshake change.
-        "split.horizontal" | "split.vertical" | "pane.focus_next" | "pane.focus_prev" => {
-            Some("split")
-        }
+        // `panel.focus` joins them: it is the same act addressed by id instead of
+        // by direction.
+        "split.horizontal" | "split.vertical" | "pane.focus_next" | "pane.focus_prev"
+        | "panel.focus" => Some("split"),
         "terminal.read" | "terminal.state" | "terminal.exec" | "terminal.feed"
         | "terminal.history" | "terminal.context" => Some("terminal"),
         m if m.starts_with("webview.") => Some("webview"),
@@ -516,6 +517,11 @@ mod tests {
         assert_eq!(method_capability("tab.switch"), Some("tab"));
         assert_eq!(method_capability("pane.focus_next"), Some("split"));
         assert_eq!(method_capability("pane.focus_prev"), Some("split"));
+        // The notification-jump target (#115). Without a capability the daemon
+        // treats it as daemon-owned by omission, so a daemon-routed call answers
+        // `unknown_method` for a method BOTH GUIs implement — and nothing
+        // reserves the name against a plugin's `provides[]`.
+        assert_eq!(method_capability("panel.focus"), Some("split"));
         assert_eq!(method_capability("webview.state"), Some("webview"));
         assert_eq!(method_capability("system.ping"), None);
         assert_eq!(method_capability("kb.search"), None);

@@ -1012,11 +1012,14 @@ fn maybe_raise(resp: &Resp) {
     // Copad first, when the client is inside one. It is the only host that can be asked for
     // the exact TAB — a pid names the emulator, not one of its tabs — so activating the
     // application instead would land the user on whichever tab happened to be active.
-    let copad_focused = match resp.copad_host.as_ref() {
+    let copad = match resp.copad_host.as_ref() {
         Some((sock, panel)) => crate::copadlink::focus_panel(sock, panel),
-        None => false,
+        None => crate::copadlink::FocusOutcome {
+            focused: false,
+            raised: false,
+        },
     };
-    if !fall_back_after_copad(copad_focused) {
+    if !fall_back_after_copad(copad) {
         return;
     }
     let (Some(pid), Some(comm)) = (resp.raise_pid, resp.raise_comm.as_deref()) else {
@@ -1036,8 +1039,12 @@ fn maybe_raise(resp: &Resp) {
 /// copad, but it cannot watch a window come forward, so the fall-through is exactly the piece
 /// no e2e can pin. Treating a refusal as success — the plausible mistake — leaves the user
 /// looking at whatever was already frontmost, with nothing anywhere reporting a problem.
-fn fall_back_after_copad(copad_focused: bool) -> bool {
-    !copad_focused
+fn fall_back_after_copad(copad: crate::copadlink::FocusOutcome) -> bool {
+    // Focusing the tab is not the same as being LOOKED at. GTK under Wayland does the first and
+    // cannot do the second, so a copad that switched the tab but could not raise itself still
+    // needs the generic application raise — which on Linux is `hyprctl`/`wmctrl`, a path that
+    // works precisely because it is not the GUI asking on its own behalf.
+    !copad.focused || !copad.raised
 }
 
 /// The agent-facing operating guide, embedded so `comux skill` works from an installed
@@ -3237,15 +3244,39 @@ mod list_agents_proto_tests {
 #[cfg(test)]
 mod skill_tests {
 
+    use crate::copadlink::FocusOutcome;
+
     #[test]
     fn a_copad_that_did_not_focus_must_not_suppress_the_generic_raise() {
         // The bug this guards: treating ANY reply from copad as "handled". A copad that does
         // not own the panel answers `focused: false` — a successful call that found nothing —
         // and the click must still fall through to activating the application.
-        assert!(super::fall_back_after_copad(false));
-        assert!(!super::fall_back_after_copad(true));
+        let miss = FocusOutcome {
+            focused: false,
+            raised: false,
+        };
+        assert!(super::fall_back_after_copad(miss));
         // No copad at all is the same as a copad that did not focus.
-        assert!(super::fall_back_after_copad(false));
+        assert!(super::fall_back_after_copad(FocusOutcome {
+            focused: false,
+            raised: true
+        }));
+        assert!(!super::fall_back_after_copad(FocusOutcome {
+            focused: true,
+            raised: true
+        }));
+    }
+
+    #[test]
+    fn a_copad_that_focused_but_could_not_raise_still_needs_the_generic_raise() {
+        // GTK under Wayland: the tab is right, the window is still behind whatever was
+        // frontmost. Suppressing the fallback here would trade the old bug (right window,
+        // wrong tab) for a new one (right tab, invisible) — the click would look like it did
+        // nothing at all.
+        assert!(super::fall_back_after_copad(FocusOutcome {
+            focused: true,
+            raised: false
+        }));
     }
     use super::*;
 

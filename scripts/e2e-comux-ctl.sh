@@ -870,11 +870,14 @@ echo "19. a jump into a copad tab"
 #
 # Driven against a FAKE copad speaking the same line-JSON protocol. That covers comux's whole
 # half — the client handshake, the server bookkeeping, the response, the dial and the reply
-# parse. It does NOT cover copad's `panel.focus` handler, which is compile-verified only; see
-# decision #115.
+# parse. copad's own `panel.focus` handler is covered separately: the GTK one was driven against
+# a real copad window on Linux (decision #115), the AppKit one on macOS.
 cat >"$WORK/fakecopad.py" <<'PYEOF'
 import json, os, socket, sys, threading, time
-path, log, focused = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+# mode: 1 = focused and raised, 0 = did not own the panel, 2 = focused but cannot raise
+# itself (GTK under Wayland), which must still fall through to the compositor-level raise.
+path, log, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+focused, raised = mode in ("1", "2"), mode == "1"
 try: os.unlink(path)
 except FileNotFoundError: pass
 srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -887,7 +890,8 @@ def serve():
         except Exception: req = {}
         with open(log, "a") as fh: fh.write(json.dumps(req) + "\n")
         f.write((json.dumps({"id": req.get("id"), "ok": True,
-                             "result": {"ok": True, "focused": focused}}) + "\n").encode())
+                             "result": {"ok": True, "focused": focused,
+                                        "raised": raised}}) + "\n").encode())
         f.flush(); c.close()
 threading.Thread(target=serve, daemon=True).start()
 time.sleep(120)
@@ -948,6 +952,15 @@ start_copad 0
 t 10 "$COMUX" jump "$tok" >/dev/null || fail "jump failed against a copad that refused focus"
 [[ -s "$WORK/copadcalls.log" ]] || fail "the refusing copad was never called"
 
+# A copad that focused the tab but could NOT raise itself — GTK under Wayland, where a client
+# with no activation token has its `present()` accepted and ignored — must also fall through to
+# the compositor-level raise. Suppressing it there trades the old bug (right window, wrong tab)
+# for a worse one: the right tab, still behind whatever was frontmost, so the click looks inert.
+kill "$COPAD_FAKE_PID" 2>/dev/null || true
+start_copad 2
+t 10 "$COMUX" jump "$tok" >/dev/null || fail "jump failed against a copad that cannot raise"
+[[ -s "$WORK/copadcalls.log" ]] || fail "the non-raising copad was never called"
+
 # A dead copad must not fail the jump, hang it, or print anything: the pane switch already
 # happened server-side, and raising a window is best-effort by construction.
 kill "$COPAD_FAKE_PID" 2>/dev/null || true
@@ -962,7 +975,7 @@ python3 -c 'import json,sys
 r = json.load(sys.stdin)
 assert "copad_host" not in r, r' <"$WORK/out" \
     || fail "a detached client left its copad tab behind: $(cat "$WORK/out")"
-ok "the jump names the copad tab, dials it, falls back when refused or dead, and forgets it on detach"
+ok "the jump names the copad tab, dials it, falls back when refused, unraised or dead, and forgets it on detach"
 
 echo "20. the SSH fleet readout"
 # One comux server per machine, reached by running `comux list-agents --json` there over

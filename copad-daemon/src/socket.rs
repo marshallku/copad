@@ -110,6 +110,7 @@ pub const LEGACY_DISPATCH_METHODS: &[&str] = &[
     "split.vertical",
     "pane.focus_next",
     "pane.focus_prev",
+    "panel.focus",
     "session.list",
     "session.info",
     "webview.open",
