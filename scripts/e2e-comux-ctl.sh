@@ -39,6 +39,15 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMUX="$REPO/target/debug/comux"
+# BUILD, rather than merely checking the binary exists. Testing a stale binary is the worst
+# outcome this script has: it reports a failure that is not in the tree (or, worse, a pass for
+# a fix that is not in the binary), and the message points at the code under test. It cost a
+# real session — a rebase pulled in a fleet fix, the binary was 20 minutes older, and step 20
+# reported the deadlock that commit had just removed. `COMUX_E2E_NO_BUILD=1` opts out for the
+# rare deliberate case of running against a binary you built some other way.
+if [[ "${COMUX_E2E_NO_BUILD:-0}" != 1 ]]; then
+    (cd "$REPO" && cargo build -q -p copad-mux) || { echo "build failed"; exit 2; }
+fi
 [[ -x "$COMUX" ]] || { echo "build first: cargo build -p copad-mux"; exit 2; }
 
 WORK="$(mktemp -d -t comux-e2e.XXXXXX)"
@@ -538,7 +547,7 @@ echo "15. an agent's activity line is read from its own log"
 # `~/.claude/sessions/<pid>.json`, a file the harness does not own, so it is covered by unit
 # tests plus an ignored live oracle — `cargo test -p copad-mux -- --ignored live_`.)
 mkdir -p "$WORK/bin2" "$WORK/sessions"
-ln -sf /bin/sh "$WORK/bin2/codex" || fail "could not build the rollout-holding fixture"
+ln -sf /bin/sleep "$WORK/bin2/codex" || fail "could not build the rollout-holding fixture"
 roll="$WORK/sessions/rollout-2026-09-12T00-00-00-01a09154-4f7e-76a1-81e0-daae1f6d49b3.jsonl"
 # A real codex `CommandExecution`: `command` is an ARRAY and codex pre-parses it into
 # `parsed_cmd`. Reading `command` as a string is a bug a hand-written fixture hid once.
@@ -547,9 +556,20 @@ cat >"$roll" <<'ROLLEOF'
 {"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":["/bin/zsh","-lc","cargo test --all"],"parsed_cmd":[{"type":"unknown","cmd":"cargo test --all"}]}}}
 ROLLEOF
 dx="$(t 10 "$COMUX" split --from "$tok")" || fail "split for the activity fixture failed"
-# NOT `exec`: the pane's shell has to survive the Ctrl-C below, or the pane closes itself and
-# the cleanup has nothing to address.
-t 10 "$COMUX" send "$dx" "$WORK/bin2/codex -c 'exec 9< $roll; sleep 600'" >/dev/null
+# The PANE'S shell opens the rollout, and the `codex`-named child inherits the descriptor. Two
+# things that looks like it is working around, and is not:
+#   * NOT `exec`-ing the fixture: the pane's shell has to survive the Ctrl-C below, or the pane
+#     closes itself and the cleanup has nothing to address.
+#   * NOT `codex -c 'exec 9< …; sleep 600'` with `codex` a symlink to `/bin/sh`. That was the
+#     first shape and it only held on macOS, whose `/bin/sh` is bash 3.2. Where `/bin/sh` is a
+#     modern bash or dash, the shell EXEC-OPTIMISES the last command of a `-c` list, so the
+#     process replaces itself with `sleep` and its `comm` stops being `codex` — the fd survives,
+#     the IDENTITY does not, and the sweep never classifies the pane as an agent at all. The
+#     failure reads as "no activity was ever read", which points at the poller rather than at
+#     the fixture.
+# Holding the descriptor from the shell and letting the agent inherit it is also closer to the
+# real thing: codex holds its own rollout open, it does not run one inside a `sh -c`.
+t 10 "$COMUX" send "$dx" "exec 9< $roll; $WORK/bin2/codex 600" >/dev/null
 t 10 "$COMUX" send "$dx" $'\n' >/dev/null
 seen=""
 for _ in $(seq 1 60); do
