@@ -18,11 +18,17 @@
 
 use std::collections::BTreeMap;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 /// Per-machine wall-clock budget. A stalled machine must not hold up the rest, so every query
 /// runs on its own thread under this deadline (herdr's independent-reconnect property).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Most bytes accepted from one machine's reply. A fleet readout must not be a way for a
+/// remote host — or a misconfigured one echoing a login script forever — to exhaust memory
+/// here. Generous next to any real `list-agents` payload.
+const MAX_REPLY_BYTES: u64 = 4 * 1024 * 1024;
 
 /// One configured machine. Deliberately just a name and an SSH destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,27 +161,127 @@ fn query_one(m: &Machine, verb: &str, timeout: Duration) -> Reply {
         Ok(c) => c,
         Err(e) => return Reply::Unreachable(clip(&format!("could not run ssh: {e}"))),
     };
+    // BOTH pipes must be drained WHILE we wait, on their own threads.
+    //
+    // The first version polled `try_wait()` and only called `wait_with_output()` afterwards.
+    // A pipe holds ~64 KiB; once the child fills one it blocks in `write` and can never exit,
+    // so `try_wait` never reports it done, and at the deadline we killed a perfectly reachable
+    // machine and reported "timed out". It failed exactly where the feature earns its keep:
+    // the more agents a machine has, the bigger its reply and the surer the deadlock.
+    // BOTH pipes are drained WHILE we wait, on their own threads, and collected over a CHANNEL
+    // rather than by joining.
+    //
+    // Joining is not safe here, and "we killed the child so the readers see EOF" is wrong:
+    // killing `ssh` does not close a pipe write end that its DESCENDANTS inherited. An ordinary
+    // `ProxyCommand` keeps stderr open, so the reader stays blocked after the child is reaped —
+    // measured at 2.8s against `ProxyCommand=sleep 3`, and unbounded against a proxy that never
+    // exits. A join there would hold up the whole fleet, defeating the one property this module
+    // promises.
+    let mut out = child.stdout.take();
+    let mut err = child.stderr.take();
+    // Each reader appends into a SHARED buffer as bytes arrive and signals completion on the
+    // channel. Two different needs, hence two mechanisms:
+    //
+    // * the channel is how the normal path knows both pipes reached EOF;
+    // * the shared buffer is how the TIMEOUT path still gets what the machine managed to say.
+    //   Sending only the finished buffer would strand it: a proxy that prints
+    //   "Permission denied" and then hangs holds stderr open, so the reader never completes and
+    //   the reason dies inside an abandoned thread while we report a bare deadline.
+    let so = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let se = Arc::new(Mutex::new(Vec::<u8>::new()));
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let (o_pipe, o_sink, o_tx) = (out.take(), so.clone(), tx.clone());
+    std::thread::spawn(move || {
+        if let Some(p) = o_pipe {
+            read_into(p, &o_sink);
+        }
+        let _ = o_tx.send(());
+    });
+    let (e_pipe, e_sink) = (err.take(), se.clone());
+    std::thread::spawn(move || {
+        if let Some(p) = e_pipe {
+            read_into(p, &e_sink);
+        }
+        let _ = tx.send(());
+    });
+
     let deadline = std::time::Instant::now() + timeout;
-    loop {
+    let timed_out = loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(_)) => break false,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Reply::Unreachable(format!("timed out after {}s", timeout.as_secs()));
+                    break true;
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Reply::Unreachable(clip(&format!("ssh failed: {e}"))),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Reply::Unreachable(clip(&format!("ssh failed: {e}")));
+            }
+        }
+    };
+    // Wait for both readers within the REMAINING budget. One still blocked on a pipe its
+    // descendant inherited is abandoned, not waited on — it holds an fd in a CLI process that
+    // is about to exit. (If `fleet` ever moves into the long-lived server, this is the line
+    // that has to become a process-group teardown.)
+    for _ in 0..2 {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if rx
+            .recv_timeout(left.max(Duration::from_millis(50)))
+            .is_err()
+        {
+            break;
         }
     }
-    match child.wait_with_output() {
-        Ok(out) => parse_agents(
-            &String::from_utf8_lossy(&out.stdout),
-            &String::from_utf8_lossy(&out.stderr),
-        ),
-        Err(e) => Reply::Unreachable(clip(&format!("ssh failed: {e}"))),
+    // Decode ONCE, over the whole snapshot. Decoding each 8 KiB read on its own would mangle
+    // any multibyte character that happened to straddle a read boundary — `é` arriving as
+    // `C3` then `A9` becomes `??`, and the JSON still parses, so a corrupted agent detail would
+    // sail through silently. Agent details here are routinely non-ASCII.
+    let take = |b: &Arc<Mutex<Vec<u8>>>| {
+        b.lock()
+            .map(|g| String::from_utf8_lossy(&g).into_owned())
+            .unwrap_or_default()
+    };
+    let stdout = take(&so);
+    let stderr = take(&se);
+    if timed_out {
+        // Report the timeout, but keep whatever the machine managed to say: a truncated stderr
+        // ("Permission denied", a banner) is usually the actual reason, and it is more useful
+        // than the deadline we happened to pick.
+        let why = stderr
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|l| format!("timed out after {}s: {l}", timeout.as_secs()))
+            .unwrap_or_else(|| format!("timed out after {}s", timeout.as_secs()));
+        return Reply::Unreachable(clip(&why));
+    }
+    parse_agents(&stdout, &stderr)
+}
+
+/// Read a child pipe to EOF, appending RAW BYTES into `sink` as they arrive so a caller that
+/// gives up at its deadline still sees what was said. Bytes, not text: decoding per read would
+/// corrupt any multibyte character split across a read boundary. Bounded by
+/// [`MAX_REPLY_BYTES`], so a machine that floods us — or echoes a login script forever — cannot
+/// exhaust memory here.
+fn read_into(mut r: impl std::io::Read, sink: &Arc<Mutex<Vec<u8>>>) {
+    let mut buf = [0u8; 8192];
+    let mut total: u64 = 0;
+    while total < MAX_REPLY_BYTES {
+        match r.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                total += n as u64;
+                if let Ok(mut g) = sink.lock() {
+                    g.extend_from_slice(&buf[..n]);
+                }
+            }
+        }
     }
 }
 
@@ -270,6 +376,51 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_multibyte_reply_survives_being_split_across_reads() {
+        // `read_into` fills an 8 KiB buffer, so a character can straddle two reads. Decoding
+        // each read on its own turns a split `한` into replacement characters — and the JSON
+        // still parses, so a corrupted agent detail would sail through silently. Agent details
+        // here are routinely non-ASCII.
+        //
+        // Driven through a real pipe with a writer that pauses MID-CHARACTER, because the bug
+        // is invisible to any fixture that hands the reader whole strings.
+        use std::io::Write;
+        let detail = "테스트를 실행하는 중".repeat(400); // comfortably over one read
+        let payload = serde_json::json!({
+            "ok": true,
+            "agents": [{ "tool": "codex", "status": "working", "detail": detail }],
+        })
+        .to_string();
+
+        let (r, mut w) = std::io::pipe().expect("pipe");
+        let bytes = payload.clone().into_bytes();
+        let writer = std::thread::spawn(move || {
+            // Split at a byte offset that lands inside a multibyte character.
+            let cut = bytes
+                .iter()
+                .position(|b| *b >= 0x80)
+                .map(|i| i + 1)
+                .unwrap_or(1);
+            let _ = w.write_all(&bytes[..cut]);
+            let _ = w.flush();
+            std::thread::sleep(Duration::from_millis(40));
+            let _ = w.write_all(&bytes[cut..]);
+        });
+        let sink = Arc::new(Mutex::new(Vec::<u8>::new()));
+        read_into(r, &sink); // the REAL reader, so a regression in it fails here
+        writer.join().unwrap();
+        let text = String::from_utf8_lossy(&sink.lock().unwrap()).into_owned();
+        assert!(
+            !text.contains('\u{FFFD}'),
+            "a character split across reads was replaced"
+        );
+        let Reply::Agents(a) = parse_agents(&text, "") else {
+            panic!("expected agents from {}", &text[..60.min(text.len())])
+        };
+        assert_eq!(a[0]["detail"].as_str().unwrap(), detail);
     }
 
     #[test]

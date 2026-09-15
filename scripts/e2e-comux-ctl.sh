@@ -982,6 +982,21 @@ case "$dest" in
     echo "ssh: connect to host gpu-box port 22: Operation timed out" >&2; exit 255 ;;
   quiet-box)
     echo '{"ok":true,"agents":[]}' ;;
+  big-box)
+    # A reply far larger than a pipe buffer (~64 KiB). The first version of `query_one` left
+    # both pipes undrained until the child exited, so ssh blocked in `write`, never exited,
+    # and a perfectly reachable machine was killed at the deadline and reported as timed out —
+    # failing precisely where the feature earns its keep, since the more agents a machine has
+    # the bigger its reply.
+    python3 - <<'PYBIG'
+import json
+pad = "x" * 300
+print(json.dumps({"ok": True, "agents": [
+    {"space": "s%d" % i, "tool": "claude", "status": "ready",
+     "for_secs": i, "detail": pad, "token": "t%d" % i}
+    for i in range(1200)]}))
+PYBIG
+    ;;
   *) echo '{"ok":false,"error":"no server running"}' ;;
 esac
 SSHEOF
@@ -994,6 +1009,8 @@ ssh = "gpu-box"
 socket = "/tmp/alt sock"
 [machines.quiet]
 ssh = "quiet-box"
+[machines.big]
+ssh = "big-box"
 [machines.broken]
 TOMLEOF
 export FAKE_SSH_LOG="$WORK/ssh.log"
@@ -1024,8 +1041,13 @@ grep -q 'no agents' "$WORK/out" || fail "an idle machine must say so, not vanish
 # The remote command line: a socket path with a SPACE must survive the remote login shell.
 grep -q "COPAD_MUX_SOCK='/tmp/alt sock' comux list-agents --json" "$WORK/ssh.log" \
     || fail "the remote command did not quote the socket path: $(cat "$WORK/ssh.log")"
-[[ "$(grep -c '::' "$WORK/ssh.log")" == "3" ]] \
-    || fail "expected exactly 3 machines queried, got: $(cat "$WORK/ssh.log")"
+[[ "$(grep -c '::' "$WORK/ssh.log")" == "4" ]] \
+    || fail "expected exactly 4 machines queried, got: $(cat "$WORK/ssh.log")"
+# A reply bigger than a pipe buffer must ARRIVE, not deadlock into a bogus timeout.
+grep -q 'big .*claude' "$WORK/out" \
+    || fail "a large reply was not read back — the pipes are not drained while waiting: $(grep big "$WORK/out")"
+grep -qE 'big +UNREACHABLE' "$WORK/out" \
+    && fail "a large reply was reported unreachable — the pipe deadlock is back"
 
 set +e
 PATH="$FLEET_PATH" t 30 "$COMUX" list-agents --fleet --json >"$WORK/out" 2>/dev/null; code=$?
@@ -1036,14 +1058,59 @@ assert d["ok"] is False, d
 ms = d["machines"]
 assert ms["build"]["agents"][0]["status"] == "blocked", ms
 assert ms["quiet"]["agents"] == [], ms
+assert len(ms["big"]["agents"]) == 1200, len(ms["big"].get("agents", []))
 # Unreachable is its OWN key, not an empty agent list — a consumer must not be able to read a
 # failure as an idle machine.
 assert "unreachable" in ms["gpu"] and "agents" not in ms["gpu"], ms' <"$WORK/out" \
     || fail "the json fleet readout conflates unreachable with idle: $(cat "$WORK/out")"
 
+# A machine whose ssh DESCENDANT holds the pipes open must still be abandoned at the deadline.
+# Killing ssh does not close a write end its `ProxyCommand` inherited, so collecting the
+# readers by joining them waits for the PROXY, not for our deadline: measured 60.8s against a
+# 60s proxy where the budget was 10s. Uses the real ssh, with a proxy that never connects.
+cat >"$XDG_CONFIG_HOME/copad/mux.toml" <<'TOMLEOF'
+[machines.stuck]
+ssh = "stuck-host"
+TOMLEOF
+cat >"$WORK/fleetbin/ssh" <<'SSHEOF'
+#!/usr/bin/env bash
+exec /usr/bin/ssh -F /dev/null -o BatchMode=yes -o "ProxyCommand=sleep 45" "$@"
+SSHEOF
+chmod +x "$WORK/fleetbin/ssh"
+start=$(date +%s)
+set +e
+PATH="$FLEET_PATH" t 60 "$COMUX" list-agents --fleet >"$WORK/out" 2>/dev/null
+set -e
+elapsed=$(( $(date +%s) - start ))
+grep -q 'timed out' "$WORK/out" || fail "a stalled proxy should time out: $(cat "$WORK/out")"
+# The budget is 10s. Anything near the proxy's 45s means the readers are being waited on.
+(( elapsed <= 20 )) \
+    || fail "a descendant holding the pipes held the whole fleet for ${elapsed}s — the readers are not deadline-bounded"
+
+# A machine that prints its REASON and then hangs holding the pipe open must still report the
+# reason, not a bare deadline. The readers therefore publish as bytes arrive rather than only
+# on EOF — otherwise "Permission denied" dies inside the abandoned reader thread and the user
+# is told only that something timed out.
+cat >"$XDG_CONFIG_HOME/copad/mux.toml" <<'TOMLEOF'
+[machines.noisy]
+ssh = "noisy-host"
+TOMLEOF
+cat >"$WORK/fleetbin/ssh" <<'SSHEOF'
+#!/usr/bin/env bash
+echo "Permission denied (publickey)." >&2
+sleep 45
+SSHEOF
+chmod +x "$WORK/fleetbin/ssh"
+set +e
+PATH="$FLEET_PATH" t 60 "$COMUX" list-agents --fleet >"$WORK/out" 2>/dev/null
+set -e
+grep -q 'Permission denied' "$WORK/out" \
+    || fail "a timeout threw away the reason the machine gave: $(cat "$WORK/out")"
+grep -q 'timed out' "$WORK/out" || fail "the timeout itself went unreported: $(cat "$WORK/out")"
+
 rm -f "$XDG_CONFIG_HOME/copad/mux.toml"
 unset FAKE_SSH_LOG
-ok "the fleet is queried in parallel; an unreachable machine is reported with a reason, never dropped"
+ok "the fleet is queried in parallel; an unreachable machine is reported with a reason, never dropped; a stalled descendant cannot hold up the deadline"
 
 echo "21. a HIDDEN pane's bell still reaches the rendered status bar"
 # Only a VISIBLE pane's output recomposes the frame now (`App::drain_pane_dirty`): with dozens

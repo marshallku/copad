@@ -107,16 +107,31 @@ mod imp {
     /// `[natural_t; CPU_STATE_MAX]` that `libc` declares for us — there is no nested union to
     /// transcribe, which is what makes this safe to do by hand where other mach info calls
     /// are not.
-    // `libc::mach_host_self` is deprecated in favour of the `mach2` crate. Kept rather than
-    // taking a new dependency for two call sites: if libc ever removes it the build fails
-    // loudly, which is the right failure for a migration that is a one-line swap.
+    /// The host port, acquired ONCE.
+    ///
+    /// `mach_host_self()` returns a send RIGHT, and every call adds a reference that must be
+    /// balanced with `mach_port_deallocate`. Calling it per sample leaked one reference every
+    /// two seconds — measured growing 2 → 3 → 4 on successive calls — which on a server that
+    /// runs for weeks is tens of thousands of references against a port that is never released.
+    ///
+    /// Holding one for the process's life is the standard fix and needs no deallocation: the
+    /// port dies with the process, and the poller is the only caller.
+    ///
+    /// `libc::mach_host_self` is deprecated in favour of the `mach2` crate. Kept rather than
+    /// taking a new dependency: if libc ever removes it the build fails loudly, which is the
+    /// right failure for a migration that is a one-line swap.
     #[allow(deprecated)]
+    pub(super) fn host_port() -> libc::mach_port_t {
+        static PORT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *PORT.get_or_init(|| unsafe { libc::mach_host_self() })
+    }
+
     fn cpu(prev: &mut CpuTicks) -> Option<f64> {
         let now = unsafe {
             let mut info: libc::host_cpu_load_info = zeroed();
             let mut count = libc::HOST_CPU_LOAD_INFO_COUNT;
             let r = libc::host_statistics(
-                libc::mach_host_self(),
+                host_port(),
                 libc::HOST_CPU_LOAD_INFO,
                 &mut info as *mut _ as *mut libc::integer_t,
                 &mut count,
@@ -141,7 +156,6 @@ mod imp {
     /// `(used, total)` bytes. "Used" is active + wired + compressed, which is what Activity
     /// Monitor calls Memory Used. Deliberately NOT `top`'s figure, which folds in the file
     /// cache and so reads near-full on any machine that has been up a while.
-    #[allow(deprecated)]
     fn memory() -> Option<(u64, u64)> {
         unsafe {
             let mut total: u64 = 0;
@@ -160,7 +174,7 @@ mod imp {
             let mut count =
                 (size_of::<libc::vm_statistics64>() / size_of::<libc::integer_t>()) as u32;
             if libc::host_statistics64(
-                libc::mach_host_self(),
+                host_port(),
                 libc::HOST_VM_INFO64,
                 &mut vm as *mut _ as *mut libc::integer_t,
                 &mut count,
@@ -300,9 +314,21 @@ pub fn parse_ioreg_utilization(text: &str) -> Option<f64> {
 
 /// The aggregate `cpu` line of `/proc/stat` → tick counters.
 ///
-/// Fields after the first four are optional across kernel versions, so everything present is
-/// summed into `total` and only user/nice/system count as `busy`. `iowait` is idle time, not
-/// work — counting it as busy is the classic way to report a disk-bound box as CPU-pegged.
+/// Field order is fixed by the kernel:
+/// `user nice system idle iowait irq softirq steal guest guest_nice`.
+///
+/// Two accounting rules that are easy to get wrong, and the first version got both:
+/// * **`iowait` is idle time, not work.** Counting it as busy is the classic way to report a
+///   disk-bound box as CPU-pegged.
+/// * **`irq` and `softirq` ARE work.** Excluding them while leaving them in the denominator
+///   undercounts: an interval spent entirely servicing interrupts reported ~0%.
+/// * **`guest` and `guest_nice` are already included in `user`/`nice`** by the kernel, so
+///   summing every field double-counts them. An interval spent wholly in a guest reported 50%.
+///
+/// Trailing fields are optional across kernel versions, so anything present is used and
+/// anything absent is simply zero.
+///
+/// See `kernel/sched/cputime.c`.
 pub fn parse_proc_stat(text: &str) -> Option<CpuTicks> {
     let line = text.lines().find(|l| l.starts_with("cpu "))?;
     let vals: Vec<u64> = line
@@ -313,10 +339,18 @@ pub fn parse_proc_stat(text: &str) -> Option<CpuTicks> {
     if vals.len() < 4 {
         return None;
     }
-    let busy = vals[0] + vals[1] + vals[2];
+    let at = |i: usize| vals.get(i).copied().unwrap_or(0);
+    let (user, nice, system, idle, iowait) = (at(0), at(1), at(2), at(3), at(4));
+    let (irq, softirq, steal) = (at(5), at(6), at(7));
+    let (guest, guest_nice) = (at(8), at(9));
+    // `user`/`nice` already contain the guest ticks; subtract them so they are not counted
+    // twice, saturating because a truncated or synthetic line may not be self-consistent.
+    let user = user.saturating_sub(guest);
+    let nice = nice.saturating_sub(guest_nice);
+    let busy = user + nice + system + irq + softirq + steal + guest + guest_nice;
     Some(CpuTicks {
         busy,
-        total: vals.iter().sum(),
+        total: busy + idle + iowait,
     })
 }
 
@@ -455,6 +489,46 @@ pub fn spawn() -> Shared {
 mod tests {
     use super::*;
 
+    /// The host port must be acquired ONCE however many samples are taken.
+    ///
+    /// `mach_host_self()` hands back a send right and every call adds a reference that is
+    /// never balanced; the first version called it twice per sample, so a server running for
+    /// weeks accumulated tens of thousands of references on a port it never released. Measured
+    /// on this machine: three naive calls moved the count 2 → 5.
+    ///
+    /// Asserts on the REAL port refcount rather than on "we called a cached function", because
+    /// the bug was invisible at the Rust level — the code looked perfectly ordinary.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn sampling_does_not_leak_a_mach_port_reference() {
+        unsafe extern "C" {
+            fn mach_task_self() -> libc::mach_port_t;
+            fn mach_port_get_refs(
+                task: libc::mach_port_t,
+                name: libc::mach_port_t,
+                right: u32,
+                refs: *mut u32,
+            ) -> libc::kern_return_t;
+        }
+        const MACH_PORT_RIGHT_SEND: u32 = 0;
+        let port = imp::host_port();
+        let refs = || unsafe {
+            let mut n: u32 = 0;
+            mach_port_get_refs(mach_task_self(), port, MACH_PORT_RIGHT_SEND, &mut n);
+            n
+        };
+        let before = refs();
+        let mut ticks = CpuTicks::default();
+        for _ in 0..20 {
+            let _ = sample(&mut ticks, false);
+        }
+        assert_eq!(
+            refs(),
+            before,
+            "20 samples moved the host port's send-right count — it is being re-acquired"
+        );
+    }
+
     #[test]
     fn a_cpu_percentage_needs_two_points() {
         // The first sample has nothing to diff against: reporting it would publish the
@@ -488,14 +562,38 @@ mod tests {
     }
 
     #[test]
-    fn proc_stat_counts_iowait_as_idle_not_as_work() {
+    fn proc_stat_counts_interrupt_work_but_not_iowait() {
         // user nice system idle iowait irq softirq steal
         let s = "cpu  100 20 30 1000 500 1 2 3\ncpu0 1 1 1 1\n";
         let t = parse_proc_stat(s).unwrap();
-        assert_eq!(t.busy, 150, "busy is user+nice+system only");
-        assert_eq!(t.total, 1656, "every present field counts toward total");
-        // Counting iowait as busy is the classic way to report a disk-bound box as pegged.
+        // irq + softirq + steal are WORK. The first version of this function excluded them
+        // while leaving them in the denominator, and THIS TEST asserted 150 — it pinned the
+        // bug rather than the behaviour, which is how it survived review-by-testing.
+        assert_eq!(t.busy, 156, "user+nice+system+irq+softirq+steal");
+        // iowait is idle: counting it as busy reports a disk-bound box as pegged.
+        assert_eq!(t.total, 1656, "busy + idle + iowait");
         assert!(t.busy < 650);
+    }
+
+    #[test]
+    fn guest_ticks_are_not_counted_twice() {
+        // The kernel already folds guest into user and guest_nice into nice. Summing every
+        // field double-counts them: this line is 100% guest, and the naive version called it
+        // 50% busy.
+        // user nice system idle iowait irq softirq steal guest guest_nice
+        let s = "cpu  100 10 0 0 0 0 0 0 100 10\n";
+        let t = parse_proc_stat(s).unwrap();
+        assert_eq!(t.busy, 110, "guest is inside user; it must be counted once");
+        assert_eq!(t.total, 110);
+        assert_eq!(cpu_percent(CpuTicks::default(), t), Some(100.0));
+    }
+
+    #[test]
+    fn a_kernel_without_the_trailing_fields_still_parses() {
+        // `steal`/`guest`/`guest_nice` arrived over successive kernel versions; absent is 0,
+        // not a refusal.
+        let t = parse_proc_stat("cpu  10 0 5 85\n").unwrap();
+        assert_eq!((t.busy, t.total), (15, 100));
     }
 
     #[test]
