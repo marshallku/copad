@@ -14,8 +14,10 @@
 //!   `host_statistics64`), whose structs the `libc` crate already declares, so nothing is
 //!   hand-transcribed. GPU comes from `ioreg`, the one subprocess, kept off the render loop
 //!   and polled at a slower cadence than the rest.
-//! * **Linux** — implemented from `/proc` and `sysfs` (plain file reads), but **not yet run on
-//!   Linux**: this workspace's only host is macOS. Treat it as untested until it is.
+//! * **Linux** — implemented and verified on hardware. CPU and memory are plain `/proc` reads;
+//!   GPU comes from `sysfs` where amdgpu/i915 expose it, and otherwise from `nvidia-smi`, the
+//!   one subprocess, gated on the NVIDIA module existing and killed on a deadline so a wedged
+//!   driver cannot freeze the readings that share its thread.
 //! * **Anything else** — every field `None`, which every surface already handles.
 
 /// One reading of the host. All fields optional; see the module note on absence.
@@ -222,20 +224,46 @@ mod imp {
         super::parse_meminfo(&text)
     }
 
-    /// AMD and Intel expose a busy percentage in sysfs. NVIDIA does not — it needs
-    /// `nvidia-smi`, a subprocess, which is deliberately NOT added here until someone can
-    /// run it: an untested fork in a long-lived server is worse than an absent reading.
+    /// How long `nvidia-smi` gets before it is killed. It reads in ~25 ms here; a wedged
+    /// driver makes it hang indefinitely, and this thread also carries CPU, memory and load.
+    const NVIDIA_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
+    /// AMD and Intel expose a busy percentage in sysfs; NVIDIA exposes it nowhere under
+    /// `/proc` or `/sys` and needs `nvidia-smi`. Sysfs goes first because it costs no fork.
     fn gpu() -> Option<f64> {
-        let dir = std::fs::read_dir("/sys/class/drm").ok()?;
-        for e in dir.flatten() {
-            let p = e.path().join("device/gpu_busy_percent");
-            if let Ok(t) = std::fs::read_to_string(&p)
-                && let Ok(v) = t.trim().parse::<f64>()
-            {
-                return Some(v.clamp(0.0, 100.0));
-            }
+        sysfs_gpu().or_else(nvidia_gpu)
+    }
+
+    /// The BUSIEST card, not the first one that answers: a machine with integrated plus
+    /// discrete graphics lists both, and enumeration order is arbitrary — reading the first
+    /// reports the idle iGPU while the dGPU is pinned. Connector entries (`card1-DP-1`) share
+    /// their card's `device`, so a card can be seen several times; a max does not care.
+    fn sysfs_gpu() -> Option<f64> {
+        std::fs::read_dir("/sys/class/drm")
+            .ok()?
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.path().join("device/gpu_busy_percent")).ok())
+            .filter_map(|t| t.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 100.0))
+            .reduce(f64::max)
+    }
+
+    /// Gated on the NVIDIA kernel module being loaded, which is a `stat` rather than a fork:
+    /// a host with neither an amdgpu/i915 sysfs reading nor an NVIDIA card must not spawn a
+    /// process every GPU tick forever just to fail.
+    fn nvidia_gpu() -> Option<f64> {
+        if !std::path::Path::new("/proc/driver/nvidia/gpus").exists() {
+            return None;
         }
-        None
+        let out = super::run_with_deadline(
+            std::process::Command::new("nvidia-smi").args([
+                "--query-gpu=utilization.gpu",
+                "--format=csv,noheader,nounits",
+            ]),
+            NVIDIA_DEADLINE,
+        )?;
+        super::parse_nvidia_smi(&out)
     }
 }
 
@@ -290,6 +318,65 @@ pub fn parse_proc_stat(text: &str) -> Option<CpuTicks> {
         busy,
         total: vals.iter().sum(),
     })
+}
+
+/// `nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits` → the busiest card.
+///
+/// One line per GPU, so this takes the max rather than the first line, for the same reason the
+/// sysfs walk does. `[N/A]` — what nvidia-smi prints for a card that does not report
+/// utilization — must yield nothing rather than 0: a 0 is a claim that the GPU is idle.
+pub fn parse_nvidia_smi(text: &str) -> Option<f64> {
+    text.lines()
+        .filter_map(|l| l.trim().parse::<f64>().ok())
+        // `"inf"` and `"nan"` parse as f64, and `clamp` on a NaN returns NaN rather than a
+        // bound, so a junk line would otherwise poison the whole reading.
+        .filter(|v| v.is_finite())
+        .map(|v| v.clamp(0.0, 100.0))
+        .reduce(f64::max)
+}
+
+/// Run a command and return its stdout, killing it if it outstays `deadline`.
+///
+/// A probe must not be able to hang the poller: that one thread also carries CPU, memory and
+/// load, so a single wedged subprocess would freeze every reading — permanently, since nothing
+/// else ever times it out. `std::process` has no timed wait and this is the only call site, so
+/// the loop is cheaper than a dependency.
+///
+/// **Only for commands whose output fits the pipe buffer.** Nothing drains stdout until the
+/// child exits, so a chatty command would block writing and then be killed at the deadline.
+/// That is why macOS's `ioreg` probe, whose dump runs to tens of kilobytes, keeps using
+/// `output()` and is NOT routed through here.
+#[cfg(target_os = "linux")]
+fn run_with_deadline(cmd: &mut std::process::Command, deadline: Duration) -> Option<String> {
+    use std::io::Read;
+    use std::process::Stdio;
+
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if start.elapsed() >= deadline => {
+                // Reaping matters on the timeout path too: an un-`wait`ed child keeps its pid
+                // reserved and its end of the pipe open.
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            // Output is a few bytes, so it sits in the pipe buffer and leaving it undrained
+            // until the child exits cannot deadlock.
+            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            Err(_) => return None,
+        }
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    Some(out)
 }
 
 /// `/proc/meminfo` → `(used, total)` bytes, using `MemAvailable` (the kernel's own estimate of
@@ -458,6 +545,68 @@ mod tests {
     }
 
     #[test]
+    fn nvidia_smi_reports_the_busiest_card() {
+        assert_eq!(parse_nvidia_smi("24\n"), Some(24.0));
+        // One line per GPU. Reading the first would report whichever card the driver happens
+        // to enumerate first, which is the same bug the sysfs walk had.
+        assert_eq!(parse_nvidia_smi("3\n91\n17\n"), Some(91.0));
+        assert_eq!(
+            parse_nvidia_smi(" 42 \n"),
+            Some(42.0),
+            "whitespace is trimmed"
+        );
+    }
+
+    #[test]
+    fn an_unsupported_card_is_absent_not_idle() {
+        // nvidia-smi prints `[N/A]` for a card that does not report utilization. Parsing that
+        // as 0 would claim an idle GPU where in fact we read none.
+        assert_eq!(parse_nvidia_smi("[N/A]\n"), None);
+        assert_eq!(parse_nvidia_smi(""), None);
+        assert_eq!(parse_nvidia_smi("Failed to initialize NVML\n"), None);
+        // A readable card alongside an unreadable one still answers — the N/A must not poison
+        // the reading, and `inf`/`nan` (which do parse as f64) must not either.
+        assert_eq!(parse_nvidia_smi("[N/A]\n55\n"), Some(55.0));
+        assert_eq!(parse_nvidia_smi("nan\ninf\n7\n"), Some(7.0));
+        // Out of range is a bad reading, not a bad machine.
+        assert_eq!(parse_nvidia_smi("250\n"), Some(100.0));
+        assert_eq!(parse_nvidia_smi("-5\n"), Some(0.0));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_wedged_probe_is_killed_rather_than_left_to_freeze_the_poller() {
+        let mut ok = std::process::Command::new("echo");
+        ok.arg("41");
+        assert_eq!(
+            run_with_deadline(&mut ok, Duration::from_secs(5)).as_deref(),
+            Some("41\n")
+        );
+
+        // The reason the deadline exists: this thread also carries CPU, memory and load, so a
+        // probe allowed to hang would freeze every reading forever.
+        let start = std::time::Instant::now();
+        let mut hang = std::process::Command::new("sleep");
+        hang.arg("30");
+        assert_eq!(
+            run_with_deadline(&mut hang, Duration::from_millis(200)),
+            None
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the deadline did not fire: {:?}",
+            start.elapsed()
+        );
+
+        // A command that is not installed is an absent reading, not a panic.
+        let mut missing = std::process::Command::new("copad-no-such-binary-exists");
+        assert_eq!(
+            run_with_deadline(&mut missing, Duration::from_secs(1)),
+            None
+        );
+    }
+
+    #[test]
     fn an_empty_reading_is_distinguishable_from_a_zero_one() {
         assert!(HostMetrics::default().is_empty());
         let zeroed = HostMetrics {
@@ -488,6 +637,22 @@ mod tests {
         }
         if let Some(p) = m.mem_pct() {
             assert!((0.0..=100.0).contains(&p), "mem out of range: {p}");
+        }
+        // A host that ADVERTISES a readable GPU must yield one. Conditioned on the host rather
+        // than asserted outright, so the same test is meaningful on a machine with no GPU
+        // probe at all instead of encoding whichever workstation last ran it.
+        #[cfg(target_os = "linux")]
+        if std::path::Path::new("/proc/driver/nvidia/gpus").exists()
+            || std::fs::read_dir("/sys/class/drm")
+                .into_iter()
+                .flatten()
+                .flatten()
+                .any(|e| e.path().join("device/gpu_busy_percent").exists())
+        {
+            let gpu = m
+                .gpu
+                .expect("this host advertises a GPU probe but none was read");
+            assert!((0.0..=100.0).contains(&gpu), "gpu out of range: {gpu}");
         }
     }
 }
