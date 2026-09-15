@@ -547,7 +547,6 @@ echo "15. an agent's activity line is read from its own log"
 # `~/.claude/sessions/<pid>.json`, a file the harness does not own, so it is covered by unit
 # tests plus an ignored live oracle — `cargo test -p copad-mux -- --ignored live_`.)
 mkdir -p "$WORK/bin2" "$WORK/sessions"
-ln -sf /bin/sleep "$WORK/bin2/codex" || fail "could not build the rollout-holding fixture"
 roll="$WORK/sessions/rollout-2026-09-12T00-00-00-01a09154-4f7e-76a1-81e0-daae1f6d49b3.jsonl"
 # A real codex `CommandExecution`: `command` is an ARRAY and codex pre-parses it into
 # `parsed_cmd`. Reading `command` as a string is a bug a hand-written fixture hid once.
@@ -555,21 +554,44 @@ cat >"$roll" <<'ROLLEOF'
 {"type":"event_msg","payload":{"type":"item_completed","item":{"type":"Reasoning"}}}
 {"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":["/bin/zsh","-lc","cargo test --all"],"parsed_cmd":[{"type":"unknown","cmd":"cargo test --all"}]}}}
 ROLLEOF
+# The SECOND conversation, written up front: the fixture must be ONE process that rotates its
+# own rollout, not two processes. Killing the fixture and starting another changes the agent
+# PID, which retires the cache entry and resolves from scratch — a rotation test built that way
+# passes with the fix reverted, which is exactly what the first draft of this step did.
+roll2="$WORK/sessions/rollout-2026-09-12T01-00-00-01a09154-4f7e-76a1-81e0-daae1f6d49b4.jsonl"
+cat >"$roll2" <<'ROLLEOF'
+{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":["/bin/zsh","-lc","git bisect run"],"parsed_cmd":[{"type":"unknown","cmd":"git bisect run"}]}}}
+ROLLEOF
 dx="$(t 10 "$COMUX" split --from "$tok")" || fail "split for the activity fixture failed"
-# The PANE'S shell opens the rollout, and the `codex`-named child inherits the descriptor. Two
-# things that looks like it is working around, and is not:
-#   * NOT `exec`-ing the fixture: the pane's shell has to survive the Ctrl-C below, or the pane
-#     closes itself and the cleanup has nothing to address.
-#   * NOT `codex -c 'exec 9< …; sleep 600'` with `codex` a symlink to `/bin/sh`. That was the
-#     first shape and it only held on macOS, whose `/bin/sh` is bash 3.2. Where `/bin/sh` is a
-#     modern bash or dash, the shell EXEC-OPTIMISES the last command of a `-c` list, so the
-#     process replaces itself with `sleep` and its `comm` stops being `codex` — the fd survives,
-#     the IDENTITY does not, and the sweep never classifies the pane as an agent at all. The
-#     failure reads as "no activity was ever read", which points at the poller rather than at
-#     the fixture.
-# Holding the descriptor from the shell and letting the agent inherit it is also closer to the
-# real thing: codex holds its own rollout open, it does not run one inside a `sh -c`.
-t 10 "$COMUX" send "$dx" "exec 9< $roll; $WORK/bin2/codex 600" >/dev/null
+# The fixture is `codex` symlinked to PYTHON, holding its own rollout open and rotating it on
+# cue. Three shapes this went through, each ruled out by something real:
+#   * NOT `exec`-ing it: the pane's shell has to survive the Ctrl-C below, or the pane closes
+#     itself and the cleanup has nothing to address.
+#   * NOT `codex -c 'exec 9< …; sleep 600'` with `codex` a symlink to `/bin/sh`. That only held
+#     on macOS, whose `/bin/sh` is bash 3.2. Where `/bin/sh` is a modern bash or dash, the shell
+#     EXEC-OPTIMISES the last command of a `-c` list, so the process replaces itself with
+#     `sleep` and its `comm` stops being `codex` — the fd survives, the IDENTITY does not, and
+#     the sweep never classifies the pane as an agent at all.
+#   * NOT the pane's shell holding the descriptor and a `sleep`-symlink inheriting it. That is
+#     fine for reading ONE conversation, but an inherited fd is a copy: the agent process can
+#     never rotate it, and rotating by killing and restarting the fixture changes the agent PID
+#     — which retires the cache entry and resolves from scratch, so the test passes with the fix
+#     reverted. (It did. That draft is why this comment exists.)
+# Python holds its own rollout, swaps it in place, and optimises nothing away — which is also
+# what real codex does.
+cat >"$WORK/rotate.py" <<'PYEOF'
+import os, sys, time
+live = open(sys.argv[1])
+while not os.path.exists(sys.argv[3]):
+    time.sleep(0.25)
+# Exactly what `codex /new` and `claude /clear` do: close the old log, open a new one, and
+# leave the old one sitting on disk.
+live.close()
+live = open(sys.argv[2])
+time.sleep(600)
+PYEOF
+ln -sf "$(command -v python3)" "$WORK/bin2/codex" || fail "could not build the rotating fixture"
+t 10 "$COMUX" send "$dx" "$WORK/bin2/codex $WORK/rotate.py $roll $roll2 $WORK/switch" >/dev/null
 t 10 "$COMUX" send "$dx" $'\n' >/dev/null
 seen=""
 for _ in $(seq 1 60); do
@@ -592,11 +614,30 @@ if python3 -c 'import json,sys
 sys.exit(0 if any("detail" in x for x in json.load(sys.stdin)["agents"] if x["tool"]!="codex") else 1)' <"$WORK/json"; then
     fail "a pane with no readable log must omit detail entirely, not send an empty one"
 fi
+# The conversation can change INSIDE the same pid — `codex /new` rotates to a fresh rollout,
+# `claude /clear` mints a new sessionId — and in both cases the PREVIOUS log stays on disk. A
+# resolver that re-resolves only when its cached file has VANISHED therefore never fires, and
+# republishes the old conversation forever.
+touch "$WORK/switch"
+# Deliberately longer than SOURCE_RECHECK (30s): resolving a codex source forks `lsof`, which
+# decision #88 bars from the sweep cadence, so the rotation is picked up on a timer rather than
+# at once. Waiting it out is also the assertion that the timer is a DELAY and not a ceiling.
+rotated=""
+for _ in $(seq 1 100); do
+    t 10 "$COMUX" list-agents --json >"$WORK/json"
+    det="$(DX="$dx" python3 -c 'import json,sys,os
+a=[x for x in json.load(sys.stdin)["agents"] if x["token"]==os.environ["DX"]]
+print(a[0].get("detail","") if a else "")' <"$WORK/json")"
+    [[ "$det" == "running: git bisect run" ]] && { rotated=1; break; }
+    sleep 0.5
+done
+[[ -f "$roll" ]] || fail "the first rollout must survive the rotation, or this proves nothing"
+[[ -n "$rotated" ]] || fail "the activity line never followed the new conversation: '$det'"
 t 10 "$COMUX" send "$dx" $'\x03' >/dev/null
 t 10 "$COMUX" list --json >"$WORK/json"
 dxi="$(DX="$dx" python3 -c 'import json,sys,os; print(next(p["index"] for p in json.load(sys.stdin)["panes"] if p["token"]==os.environ["DX"]))' <"$WORK/json")"
 t 10 "$COMUX" close "$dxi" >/dev/null || fail "could not clean up the activity pane"
-ok "the newest rollout item became the agent's DOING line; a pane with no log omits it"
+ok "the newest rollout item became the DOING line, followed a new conversation in the same pane, and a pane with no log omits it"
 
 echo "16. the host readout"
 # `comux host` is served from the poller's last reading, so it must answer immediately and

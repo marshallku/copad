@@ -144,43 +144,60 @@ pub fn process_command(_pid: u32) -> Option<Vec<String>> {
 
 /// The regular files a process holds open, used to resolve an agent's live session file
 /// (e.g. the Codex rollout `…/rollout-<ts>-<uuid>.jsonl` an interactive TUI keeps open).
-/// Linux reads the `/proc/<pid>/fd` symlinks; macOS shells out to `lsof -p <pid> -Fn`. Empty
-/// on failure (the caller then falls back to a fresh restart, never a wrong session).
+/// Linux reads the `/proc/<pid>/fd` symlinks; macOS shells out to `lsof -p <pid> -Fn`.
+///
+/// `None` means the open files COULD NOT BE ENUMERATED; `Some(v)` means they were, and `v` may
+/// legitimately be empty. Collapsing those two into an empty `Vec` — which this returned until
+/// #121 — makes "we cannot see" indistinguishable from "we looked, there is nothing", and a
+/// caller that caches a source then has no way to tell a transient `lsof` failure from an
+/// agent that has genuinely closed its log. Decision #88 forced the same distinction on
+/// [`ProcTree::snapshot`] for the same reason.
 #[cfg(target_os = "linux")]
-pub fn open_files(pid: u32) -> Vec<PathBuf> {
+pub fn open_files(pid: u32) -> Option<Vec<PathBuf>> {
+    let rd = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
     let mut out = Vec::new();
-    if let Ok(rd) = std::fs::read_dir(format!("/proc/{pid}/fd")) {
-        for entry in rd.flatten() {
-            if let Ok(target) = std::fs::read_link(entry.path()) {
-                out.push(target);
-            }
+    for entry in rd {
+        // An error mid-walk is an enumeration we did not finish, so the list we would return
+        // is INCOMPLETE — and an incomplete `Some` reads as "we looked, it is not there".
+        let entry = entry.ok()?;
+        match std::fs::read_link(entry.path()) {
+            Ok(target) => out.push(target),
+            // The descriptor was closed while we walked: genuinely gone, and skipping it
+            // leaves the list honest.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Anything else (EACCES on a process we do not own) is us being unable to look.
+            Err(_) => return None,
         }
     }
-    out
+    Some(out)
 }
 
 #[cfg(target_os = "macos")]
-pub fn open_files(pid: u32) -> Vec<PathBuf> {
+pub fn open_files(pid: u32) -> Option<Vec<PathBuf>> {
     // `lsof -Fn` emits one field per line prefixed by its type letter; `n` = the file name.
-    let Ok(output) = Command::new("lsof")
+    let output = Command::new("lsof")
         .args(["-p", &pid.to_string(), "-Fn"])
         .output()
-    else {
-        return Vec::new();
-    };
+        .ok()?;
+    // A nonzero exit is a FAILED enumeration, not an empty one: `lsof` exits 1 both when the
+    // pid is gone and when it could not read the process, and we cannot tell those apart.
     if !output.status.success() {
-        return Vec::new();
+        return None;
     }
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|l| l.strip_prefix('n'))
-        .map(PathBuf::from)
-        .collect()
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|l| l.strip_prefix('n'))
+            .map(PathBuf::from)
+            .collect(),
+    )
 }
 
+/// `None`, not `Some(vec![])`: on a platform with no enumeration we genuinely cannot see, and
+/// claiming "this process holds nothing open" would make every caller drop a working source.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-pub fn open_files(_pid: u32) -> Vec<PathBuf> {
-    Vec::new()
+pub fn open_files(_pid: u32) -> Option<Vec<PathBuf>> {
+    None
 }
 
 /// What a pane is running, for styling the sidebar/popup row.
@@ -637,5 +654,23 @@ mod tests {
         assert_eq!(tree.command_of_pgroup(600).unwrap().text, "claude");
         // Empty group → None.
         assert!(tree.command_of_pgroup(9999).is_none());
+    }
+
+    /// The distinction `open_files` exists to carry: `None` means we could not look, not that
+    /// the process holds nothing open. Conflating the two lets a caller that caches a resolved
+    /// path (`agentpoll`) drop a working source the moment an enumeration hiccups.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn enumeration_failure_is_not_reported_as_an_empty_set() {
+        let mine = open_files(std::process::id());
+        assert!(
+            mine.as_ref().is_some_and(|v| !v.is_empty()),
+            "this process holds files open; enumerating itself must succeed: {mine:?}"
+        );
+        assert_eq!(
+            open_files(u32::MAX),
+            None,
+            "a pid that cannot be inspected must be None, never an empty list"
+        );
     }
 }

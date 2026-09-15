@@ -426,24 +426,57 @@ fn carry_flags(tail: &[String], bool_flags: &[&str], value_flags: &[&str]) -> Ve
     out
 }
 
-/// Read Codex's live conversation id from the rollout file the process holds open
-/// (`~/.codex/sessions/**/rollout-<ts>-<uuid>.jsonl`). An interactive Codex TUI keeps exactly
-/// its one session file open; if several are open (broker/subsessions), the most-recently
-/// modified one is the live session. `None` if no rollout is open (→ fresh start on restore).
-pub fn codex_session_id(pid: u32) -> Option<String> {
-    let mut best: Option<(std::time::SystemTime, String)> = None;
-    for path in crate::procinfo::open_files(pid) {
-        let Some(id) = rollout_session_id(&path) else {
+/// The rollout file a Codex process holds open (`~/.codex/sessions/**/rollout-<ts>-<uuid>.jsonl`).
+/// An interactive Codex TUI keeps exactly its one session file open; if several are open
+/// (broker/subsessions), the most-recently modified one is the live session.
+///
+/// The nested `Option` carries the distinction [`crate::procinfo::open_files`] now makes:
+/// `None` = could not enumerate the pid's open files, `Some(None)` = enumerated, and it holds
+/// no rollout. A caller caching the path needs both — the first must keep what it has, the
+/// second must drop it.
+///
+/// Ties are broken on `(mtime, path)` rather than on enumeration order, so the answer does not
+/// depend on how `lsof` happened to sort its output. Rollout filenames embed their timestamp,
+/// so the greater path is also the newer session.
+///
+/// This is the ONE place that decides which rollout is live; [`codex_session_id`] and
+/// `agentpoll`'s resolver both go through it. They used to disagree — this picked newest-mtime,
+/// the poller picked whichever `lsof` listed first.
+pub fn codex_rollout_path(pid: u32) -> Option<Option<std::path::PathBuf>> {
+    newest_rollout(crate::procinfo::open_files(pid)?)
+}
+
+/// The newest rollout among `open`, split out so the ranking is testable without a live pid.
+///
+/// A candidate we cannot `stat` returns `None` for the WHOLE lookup rather than being ranked at
+/// `UNIX_EPOCH`: defaulting it would silently demote the live session below an older sibling
+/// and hand the caller a different conversation, which is worse than no answer. Only a
+/// candidate that has since gone (`NotFound` — closed and unlinked between the enumeration and
+/// the `stat`) is skipped, since dropping it leaves the ranking honest.
+fn newest_rollout(open: Vec<std::path::PathBuf>) -> Option<Option<std::path::PathBuf>> {
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for path in open {
+        if !is_rollout_path(&path) {
             continue;
+        }
+        let mtime = match std::fs::metadata(&path).and_then(|m| m.modified()) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return None,
         };
-        let mtime = std::fs::metadata(&path)
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::UNIX_EPOCH);
-        if best.as_ref().is_none_or(|(bm, _)| mtime >= *bm) {
-            best = Some((mtime, id));
+        if best.as_ref().is_none_or(|b| (mtime, &path) > (b.0, &b.1)) {
+            best = Some((mtime, path));
         }
     }
-    best.map(|(_, id)| id)
+    Some(best.map(|(_, p)| p))
+}
+
+/// Read Codex's live conversation id from the rollout file the process holds open. `None` if
+/// no rollout is open OR it could not be observed — the caller (restore) treats both as
+/// "fresh start", which is the safe answer for either.
+pub fn codex_session_id(pid: u32) -> Option<String> {
+    let path = codex_rollout_path(pid).flatten()?;
+    rollout_session_id(&path)
 }
 
 /// Extract the UUID from a Codex rollout path `…/sessions/…/rollout-<ts>-<uuid>.jsonl`. The
@@ -473,6 +506,45 @@ fn rollout_session_id(path: &std::path::Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Ranking candidates we cannot `stat` at `UNIX_EPOCH` would silently demote the LIVE
+    /// rollout below an older sibling and hand the caller a different conversation. A lookup
+    /// that cannot be completed says so instead.
+    #[test]
+    #[cfg(unix)]
+    fn a_rollout_we_cannot_stat_fails_the_lookup_instead_of_ranking_last() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rollout-rank-{}", std::process::id()));
+        let inner = dir.join("sessions");
+        std::fs::create_dir_all(&inner).unwrap();
+        let mk = |n: &str| {
+            let p = inner.join(format!(
+                "rollout-2026-09-12T0{n}-00-00-01a09154-4f7e-76a1-81e0-daae1f6d49b{n}.jsonl"
+            ));
+            std::fs::write(&p, "{}\n").unwrap();
+            p
+        };
+        let (old, new) = (mk("1"), mk("2"));
+        assert_eq!(
+            newest_rollout(vec![old.clone(), new.clone()]),
+            Some(Some(new.clone())),
+            "the newest open rollout is the live session"
+        );
+
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = std::fs::metadata(&new).is_err();
+        let got = newest_rollout(vec![old, new]);
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if !blocked {
+            return; // running as root: the premise does not hold
+        }
+        assert_eq!(
+            got, None,
+            "an unrankable candidate must fail the lookup, not let an older one win"
+        );
+    }
     use crate::term::{CellColor, CellSnap, Snapshot};
 
     fn snap_from(lines: &[&str]) -> Snapshot {

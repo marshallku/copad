@@ -37,9 +37,20 @@ const TICK: Duration = Duration::from_secs(1);
 /// growing unbounded I/O for.
 const MAX_TRACKED: usize = 64;
 
-/// Source-file resolutions attempted per tick. Bounds the fork burst when several codex panes
-/// appear at once.
+/// Source-file resolutions attempted per tick, for the tools whose resolution costs a FORK.
+/// Bounds the burst when several codex panes appear at once. It deliberately does NOT gate
+/// Claude, whose resolution is one small read: capping a fork-free path at 4/tick would defeat
+/// the every-tick revalidation below as soon as there were five Claude agents.
 const RESOLVE_BUDGET: usize = 4;
+
+/// How long between re-checks of a source that costs a fork to resolve.
+///
+/// A conversation can change inside the SAME pid — Claude `/clear` mints a new `sessionId`,
+/// codex `/new` rotates to a fresh rollout — and in both cases the previous log stays on disk,
+/// so "the file is still there" is not evidence that it is still the right file. Claude has a
+/// cheap identity oracle and is re-checked every tick; codex has none (the check IS the
+/// `lsof`), and decision #88 forbids forking on the sweep cadence, so it waits this out.
+const SOURCE_RECHECK: Duration = Duration::from_secs(30);
 
 /// How long before retrying a resolution that failed. Without this a non-interactive `codex
 /// exec` (which holds no rollout open) would make us fork every single tick, forever.
@@ -108,8 +119,33 @@ struct Entry {
     /// gets republished, so the distinction from a FAILED read matters and is why
     /// [`read_detail`] returns a nested `Option`.
     last: Option<Activity>,
-    /// When resolution last failed, for [`RESOLVE_RETRY`].
+    /// When resolution last produced no path, for [`RESOLVE_RETRY`].
     failed_at: Option<Instant>,
+    /// When a source that costs a FORK to resolve was last re-resolved, for
+    /// [`SOURCE_RECHECK`]. `None` = never attempted, so the first resolve is immediate.
+    checked_at: Option<Instant>,
+}
+
+/// What the CHEAP re-check can say about the source we hold.
+///
+/// Only Claude has one. Its `~/.claude/sessions/<pid>.json` names the conversation the pid is
+/// CURRENTLY in, and the transcript path's file stem is that same id, so comparing them is one
+/// ~520-byte read and no path work at all.
+#[derive(Debug, PartialEq, Eq)]
+enum Source {
+    /// No usable signal — KEEP what we have. The session file is rewritten in place constantly
+    /// (`updatedAt`), so a read landing mid-write must not blow away a working source.
+    Unknown,
+    /// Still the conversation we are reading.
+    Same,
+    /// A DIFFERENT conversation, positively identified.
+    Changed,
+}
+
+/// Whether resolving this tool's source costs a fork. See [`RESOLVE_BUDGET`] and
+/// [`SOURCE_RECHECK`], which both branch on it.
+fn forks(tool: &str) -> bool {
+    tool == "codex"
 }
 
 pub fn spawn() -> Shared {
@@ -118,7 +154,14 @@ pub fn spawn() -> Shared {
     let _ = std::thread::Builder::new()
         .name("agent-poll".into())
         .spawn(move || {
+            // Read `HOME` ONCE, here, and pass it down. Everything below then takes it as a
+            // parameter, which is what makes the resolver testable: `std::env::set_var` is
+            // `unsafe` in edition 2024 and races the other test threads. An absent `HOME`
+            // leaves an empty path, whose reads fail, which this module already reports as
+            // "no detail" rather than a wrong one.
+            let home = std::env::var_os("HOME").map_or_else(PathBuf::new, PathBuf::from);
             let mut cache: HashMap<u32, Entry> = HashMap::new();
+            let mut cursor = 0usize;
             loop {
                 // Copy the request out and RELEASE the lock before any I/O: the render loop
                 // takes the same lock to publish `wanted` and to read results, and must never
@@ -128,7 +171,7 @@ pub fn spawn() -> Shared {
                     Err(_) => Vec::new(),
                 };
                 if !wanted.is_empty() {
-                    let seen = sweep(&wanted, &mut cache);
+                    let seen = sweep(&wanted, &mut cache, &home, &mut cursor);
                     if let Ok(mut g) = out.lock() {
                         g.seen = seen;
                     }
@@ -146,32 +189,95 @@ pub fn spawn() -> Shared {
 
 /// One pass over the tracked pids. Pure except for the filesystem, so it is testable with a
 /// hand-built cache.
-fn sweep(wanted: &[(u32, String)], cache: &mut HashMap<u32, Entry>) -> HashMap<u32, Activity> {
+///
+/// `cursor` rotates the visit order by one each tick. `wanted` is otherwise walked in a fixed
+/// order, so with more unresolvable entries than [`RESOLVE_BUDGET`] the ones at the front eat
+/// every tick's budget and an entry behind them never re-checks — it would keep publishing a
+/// conversation that had already ended. Rotating makes every position the head within
+/// `wanted.len()` ticks. The result is a `HashMap`, so visit order is not otherwise observable.
+fn sweep(
+    wanted: &[(u32, String)],
+    cache: &mut HashMap<u32, Entry>,
+    home: &Path,
+    cursor: &mut usize,
+) -> HashMap<u32, Activity> {
     cache.retain(|pid, e| wanted.iter().any(|(p, tool)| p == pid && tool == &e.tool));
     let mut budget = RESOLVE_BUDGET;
     let mut out = HashMap::new();
-    for (pid, tool) in wanted {
+    let n = wanted.len();
+    let start = *cursor % n.max(1);
+    *cursor = cursor.wrapping_add(1);
+    for k in 0..n {
+        let (pid, tool) = &wanted[(start + k) % n];
         let e = cache.entry(*pid).or_insert_with(|| Entry {
             tool: tool.clone(),
             path: None,
             stamp: None,
             last: None,
             failed_at: None,
+            checked_at: None,
         });
-        // Re-resolve when we have no path, or when the one we had has vanished (a codex
-        // `/new` rotates to a fresh rollout).
-        if e.path.as_ref().is_none_or(|p| !p.exists()) {
+        // The file we were reading was DELETED. Distinct from the checks below, which ask
+        // whether a file that still exists is still the right one.
+        //
+        // NOT `Path::exists()`: it collapses every `stat` error into `false`, so a permission
+        // or I/O hiccup would read as "deleted" and throw away a source that is fine — and for
+        // codex the 30s timer would then leave the row blank until the next recheck. Only a
+        // confirmed `NotFound` counts.
+        let vanished = e.path.as_ref().is_some_and(|p| {
+            matches!(std::fs::metadata(p), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
+        });
+        if vanished {
             e.path = None;
-            // The cached reading belongs to the OLD source. A codex `/new` rotates to a
-            // fresh rollout, and republishing across that boundary would attribute the
-            // previous conversation's activity to the new one.
+            e.stamp = None;
             e.last = None;
-            let due = e.failed_at.is_none_or(|t| t.elapsed() >= RESOLVE_RETRY);
-            if budget > 0 && due {
+        }
+        // The cheap oracle, for the tool that has one. codex has none, so it is the timer in
+        // `want` that decides for it and this stays `false`.
+        let changed = !forks(tool)
+            && match claude_source(home, *pid, e.path.as_deref()) {
+                Source::Unknown | Source::Same => false,
+                Source::Changed => {
+                    // A positively different conversation invalidates the reading AT ONCE —
+                    // before, and independently of, whether the new transcript can be resolved
+                    // yet. Claude writes the session-file entry before the first transcript
+                    // record exists, so "B named, B not yet on disk" is a real window, and
+                    // republishing A across it is the exact bug being fixed.
+                    e.path = None;
+                    e.stamp = None;
+                    e.last = None;
+                    true
+                }
+            };
+        let due = e.failed_at.is_none_or(|t| t.elapsed() >= RESOLVE_RETRY);
+        // What makes a re-resolve WANTED differs by tool, and for a forking tool it must not
+        // include "we have no path": an observed absence clears the path, so keying off that
+        // would fork `lsof` every single tick for a codex pane that simply has no rollout open.
+        // For codex the timer is the only gate; `checked_at == None` means never attempted, so
+        // the first resolve is still immediate.
+        let want = if forks(tool) {
+            e.checked_at.is_none_or(|t| t.elapsed() >= SOURCE_RECHECK)
+        } else {
+            e.path.is_none() || changed
+        };
+        if want && due && (!forks(tool) || budget > 0) {
+            if forks(tool) {
                 budget -= 1;
-                e.path = resolve_log(*pid, tool);
-                e.failed_at = e.path.is_none().then(Instant::now);
-                e.stamp = None;
+            }
+            e.checked_at = Some(Instant::now());
+            match resolve_log(home, *pid, tool) {
+                // Could not observe: keep whatever we hold, and back off so a hard failure
+                // does not retry every tick.
+                None => e.failed_at = Some(Instant::now()),
+                Some(found) => {
+                    e.failed_at = found.is_none().then(Instant::now);
+                    if found.as_ref() != e.path.as_ref() {
+                        // The cached reading belongs to the OLD source.
+                        e.path = found;
+                        e.stamp = None;
+                        e.last = None;
+                    }
+                }
             }
         }
         let Some(path) = e.path.clone() else { continue };
@@ -206,27 +312,44 @@ fn sweep(wanted: &[(u32, String)], cache: &mut HashMap<u32, Entry>) -> HashMap<u
     out
 }
 
-/// Locate the log for an agent pid. `None` when there is none to read (a headless run, a
-/// tool we do not know), which the caller treats as "no reading".
-fn resolve_log(pid: u32, tool: &str) -> Option<PathBuf> {
+/// Locate the log for an agent pid.
+///
+/// The nested `Option` is the same convention [`read_detail`] uses, one level up, and the two
+/// negatives must NOT be conflated:
+/// * `None` — could not OBSERVE (session file unreadable, `lsof`/`/proc` enumeration failed,
+///   or the tool has no log we know how to find). The caller keeps whatever it holds.
+/// * `Some(None)` — observed, and there is no log for this pid. The caller DROPS what it holds.
+///
+/// Codex closes its old rollout before opening the new one, so a re-check landing in that
+/// window sees a successful enumeration with no rollout in it. Reading that as "could not
+/// observe" would pin the previous conversation forever.
+fn resolve_log(home: &Path, pid: u32, tool: &str) -> Option<Option<PathBuf>> {
     match tool {
-        "claude" => claude_transcript(pid),
-        "codex" => crate::procinfo::open_files(pid)
-            .into_iter()
-            .find(|p| crate::agentstate::is_rollout_path(p)),
+        "claude" => claude_transcript(home, pid),
+        "codex" => crate::agentstate::codex_rollout_path(pid),
         _ => None,
     }
 }
 
-/// Claude's transcript for `pid`: guess the project slug from the session file's `cwd`, and
-/// fall back to scanning `~/.claude/projects/*` for `<sessionId>.jsonl`.
+/// Whether the transcript we hold is still the conversation `pid` is in.
 ///
-/// The slug is another program's private encoding. Deriving it and trusting the result fails
-/// SILENTLY — a missing file is indistinguishable from an agent that has run no tools — so the
-/// guess is only ever used when it actually exists. `agentsessions.rs`, the other reader of
-/// these files, enumerates for the same reason.
-fn claude_transcript(pid: u32) -> Option<PathBuf> {
-    let home = PathBuf::from(std::env::var_os("HOME")?);
+/// The cached path's file stem IS the `sessionId`, so this is a string compare against one
+/// small read — no path work, and in particular never the `read_dir` scan in
+/// [`claude_transcript`]. Only a genuinely changed id pays for a resolve.
+fn claude_source(home: &Path, pid: u32, path: Option<&Path>) -> Source {
+    let Some(id) = claude_session_id(home, pid) else {
+        return Source::Unknown;
+    };
+    match path.and_then(|p| p.file_stem()).and_then(|s| s.to_str()) {
+        Some(stem) if stem == id => Source::Same,
+        _ => Source::Changed,
+    }
+}
+
+/// `(sessionId, cwd)` out of `~/.claude/sessions/<pid>.json`, the file Claude keeps current for
+/// the conversation a pid is in. `None` when it cannot be read or does not name a valid id —
+/// which callers treat as "cannot observe", never as "no session".
+fn claude_session(home: &Path, pid: u32) -> Option<(String, Option<String>)> {
     let json = std::fs::read_to_string(
         home.join(".claude")
             .join("sessions")
@@ -238,21 +361,52 @@ fn claude_transcript(pid: u32) -> Option<PathBuf> {
     if !crate::agentstate::is_session_uuid(id) {
         return None;
     }
+    let cwd = v.get("cwd").and_then(|c| c.as_str()).map(str::to_string);
+    Some((id.to_string(), cwd))
+}
+
+fn claude_session_id(home: &Path, pid: u32) -> Option<String> {
+    claude_session(home, pid).map(|(id, _)| id)
+}
+
+/// Claude's transcript for `pid`: guess the project slug from the session file's `cwd`, and
+/// fall back to scanning `~/.claude/projects/*` for `<sessionId>.jsonl`.
+///
+/// The slug is another program's private encoding. Deriving it and trusting the result fails
+/// SILENTLY — a missing file is indistinguishable from an agent that has run no tools — so the
+/// guess is only ever used when it actually exists. `agentsessions.rs`, the other reader of
+/// these files, enumerates for the same reason.
+///
+/// `Some(None)` means the session file named a conversation whose transcript is not on disk:
+/// a real, observed absence (Claude creates the session entry before the first record), and
+/// the caller must drop the previous conversation's transcript rather than keep reading it.
+fn claude_transcript(home: &Path, pid: u32) -> Option<Option<PathBuf>> {
+    let (id, cwd) = claude_session(home, pid)?;
     let projects = home.join(".claude").join("projects");
-    if let Some(cwd) = v.get("cwd").and_then(|c| c.as_str()) {
-        let guess = projects.join(project_slug(cwd)).join(format!("{id}.jsonl"));
+    let want = format!("{id}.jsonl");
+    if let Some(cwd) = cwd {
+        let guess = projects.join(project_slug(&cwd)).join(&want);
         if guess.is_file() {
-            return Some(guess);
+            return Some(Some(guess));
         }
     }
     // The guess was wrong (or there was no cwd): find it. Bounded by the directory listing,
-    // and only reached on a cache MISS.
-    let want = format!("{id}.jsonl");
-    std::fs::read_dir(&projects)
-        .ok()?
-        .flatten()
-        .map(|e| e.path().join(&want))
-        .find(|p| p.is_file())
+    // and only reached when the conversation actually changed.
+    //
+    // Neither `flatten()` nor `is_file()` is used to walk it: both turn an error into "not this
+    // one", so one unreadable entry would make an INCOMPLETE listing look like a confirmed
+    // absence — and `Some(None)` is exactly what tells the caller to drop the source it holds.
+    let rd = std::fs::read_dir(&projects).ok()?;
+    for entry in rd {
+        let candidate = entry.ok()?.path().join(&want);
+        match std::fs::metadata(&candidate) {
+            Ok(m) if m.is_file() => return Some(Some(candidate)),
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+    }
+    Some(None)
 }
 
 /// Claude's project-directory encoding for a cwd, as observed: path separators become `-`.
@@ -412,7 +566,23 @@ mod tests {
             stamp: None,
             last: None,
             failed_at: None,
+            checked_at: None,
         }
+    }
+
+    /// A home with no `sessions/` in it, so the cheap oracle returns [`Source::Unknown`] and a
+    /// hand-built path stands. That is what the tests below mean by "this pane reads this
+    /// file"; the conversation-change tests build a real home instead.
+    fn no_home() -> &'static Path {
+        Path::new("/nonexistent/agentpoll-test-home")
+    }
+
+    fn sweep_once(
+        wanted: &[(u32, String)],
+        cache: &mut HashMap<u32, Entry>,
+    ) -> HashMap<u32, Activity> {
+        let mut cursor = 0usize;
+        sweep(wanted, cache, no_home(), &mut cursor)
     }
 
     /// The bug this module's `stamp` was always supposed to prevent: an unchanged transcript
@@ -433,7 +603,7 @@ mod tests {
 
         let mut cache = HashMap::from([(1u32, entry_for(&path))]);
         let wanted = vec![(1u32, "claude".to_string())];
-        let first = sweep(&wanted, &mut cache);
+        let first = sweep_once(&wanted, &mut cache);
         assert_eq!(first[&1].detail, "Bash: first");
 
         // Same length ("first" and "wrong" are both 5 bytes), same mtime → same stamp.
@@ -450,13 +620,277 @@ mod tests {
             "stamp must match"
         );
 
-        let second = sweep(&wanted, &mut cache);
+        let second = sweep_once(&wanted, &mut cache);
         assert_eq!(
             second[&1].detail, "Bash: first",
             "an unchanged stamp must republish the cached reading, not re-read the file"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Build a fake `$HOME` holding Claude's two files: the per-pid session record naming a
+    /// conversation, and that conversation's transcript.
+    struct FakeHome {
+        dir: PathBuf,
+    }
+
+    impl FakeHome {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "agentpoll-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join(".claude").join("sessions")).unwrap();
+            std::fs::create_dir_all(dir.join(".claude").join("projects").join("-w")).unwrap();
+            Self { dir }
+        }
+
+        /// Point `pid`'s session record at conversation `id`, as Claude does on `/clear`.
+        fn in_conversation(&self, pid: u32, id: &str) {
+            std::fs::write(
+                self.dir
+                    .join(".claude")
+                    .join("sessions")
+                    .join(format!("{pid}.json")),
+                format!(r#"{{"pid":{pid},"sessionId":"{id}","cwd":"/w"}}"#),
+            )
+            .unwrap();
+        }
+
+        /// Write a transcript for `id` whose newest tool use says `what`.
+        fn transcript(&self, id: &str, what: &str) -> PathBuf {
+            let path = self
+                .dir
+                .join(".claude")
+                .join("projects")
+                .join("-w")
+                .join(format!("{id}.jsonl"));
+            std::fs::write(&path, tool_use_line(what) + "\n").unwrap();
+            path
+        }
+
+        fn sweep(&self, cache: &mut HashMap<u32, Entry>) -> HashMap<u32, Activity> {
+            let mut cursor = 0usize;
+            sweep(
+                &[(1u32, "claude".to_string())],
+                cache,
+                &self.dir,
+                &mut cursor,
+            )
+        }
+    }
+
+    impl Drop for FakeHome {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    const A: &str = "aaaaaaaa-1111-2222-3333-444444444444";
+    const B: &str = "bbbbbbbb-1111-2222-3333-444444444444";
+
+    /// The bug: a conversation can change inside the SAME pid — Claude `/clear` mints a new
+    /// `sessionId` — and the previous transcript stays on disk. Re-resolving only when the
+    /// cached path has VANISHED therefore never fires, and the old conversation's activity is
+    /// republished indefinitely.
+    #[test]
+    fn a_new_conversation_in_the_same_pid_stops_republishing_the_old_one() {
+        let home = FakeHome::new("cleared");
+        let old = home.transcript(A, "first");
+        home.in_conversation(1, A);
+        home.transcript(B, "second");
+
+        let mut cache = HashMap::from([(1u32, entry_for(&old))]);
+        assert_eq!(home.sweep(&mut cache)[&1].detail, "Bash: first");
+
+        // `/clear`: same pid, new conversation, and A is STILL THERE.
+        home.in_conversation(1, B);
+        assert!(
+            old.is_file(),
+            "the old transcript must survive, or this proves nothing"
+        );
+        assert_eq!(
+            home.sweep(&mut cache)[&1].detail,
+            "Bash: second",
+            "a changed sessionId must re-resolve the transcript, not keep reading the old one"
+        );
+    }
+
+    /// The window the plan review caught: Claude writes the session record naming B before B's
+    /// transcript exists. Publishing A's activity across that gap is the same bug wearing a
+    /// hat — absence is what this module reports when it does not know.
+    #[test]
+    fn a_named_conversation_with_no_transcript_yet_publishes_nothing() {
+        let home = FakeHome::new("nascent");
+        let old = home.transcript(A, "first");
+        home.in_conversation(1, A);
+
+        let mut cache = HashMap::from([(1u32, entry_for(&old))]);
+        assert_eq!(home.sweep(&mut cache)[&1].detail, "Bash: first");
+
+        home.in_conversation(1, B); // B has no transcript on disk yet
+        assert!(
+            !home.sweep(&mut cache).contains_key(&1),
+            "a conversation we cannot read yet must publish nothing, not the previous one"
+        );
+    }
+
+    /// The other side of the same coin, and why the cheap oracle is TRI-state: the session file
+    /// is rewritten in place on every status change, so a read landing mid-write yields nothing
+    /// — which must not be mistaken for "the conversation changed".
+    #[test]
+    fn an_unreadable_session_file_keeps_the_source_we_have() {
+        let home = FakeHome::new("unreadable");
+        let path = home.transcript(A, "first");
+        home.in_conversation(1, A);
+
+        let mut cache = HashMap::from([(1u32, entry_for(&path))]);
+        assert_eq!(home.sweep(&mut cache)[&1].detail, "Bash: first");
+
+        std::fs::write(
+            home.dir.join(".claude").join("sessions").join("1.json"),
+            "{ truncated",
+        )
+        .unwrap();
+        assert_eq!(
+            home.sweep(&mut cache)[&1].detail,
+            "Bash: first",
+            "an unobservable identity must keep the source, not drop it"
+        );
+        assert_eq!(cache[&1].path.as_deref(), Some(path.as_path()));
+    }
+
+    /// `Path::exists()` answers `false` for "it is not there" AND for "I could not look", and
+    /// the second must not discard a working source — for codex it would then be blank until
+    /// the 30s recheck. Made observable by putting the transcript behind a directory the test
+    /// process cannot traverse, which fails `stat` with `EACCES` rather than `ENOENT`.
+    #[test]
+    #[cfg(unix)]
+    fn a_source_we_cannot_stat_is_not_treated_as_deleted() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("agentpoll-nostat-{}", std::process::id()));
+        let inner = dir.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let path = inner.join("t.jsonl");
+        std::fs::write(&path, tool_use_line("first") + "\n").unwrap();
+
+        let wanted = vec![(1u32, "claude".to_string())];
+        let mut cache = HashMap::from([(1u32, entry_for(&path))]);
+        assert_eq!(sweep_once(&wanted, &mut cache)[&1].detail, "Bash: first");
+
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = std::fs::metadata(&path).is_err();
+        let got = sweep_once(&wanted, &mut cache);
+        std::fs::set_permissions(&inner, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        if !blocked {
+            return; // running as root: the premise does not hold, so assert nothing
+        }
+        assert_eq!(
+            got.get(&1).map(|a| a.detail.as_str()),
+            Some("Bash: first"),
+            "a source we merely could not stat must be kept, not treated as deleted"
+        );
+    }
+
+    fn codex_entry(path: Option<PathBuf>, checked_at: Option<Instant>) -> Entry {
+        Entry {
+            tool: "codex".into(),
+            path,
+            stamp: None,
+            last: None,
+            // Old enough that [`RESOLVE_RETRY`] never gates these tests: the point is to
+            // isolate the SOURCE_RECHECK timer.
+            failed_at: Instant::now().checked_sub(Duration::from_secs(3600)),
+            checked_at,
+        }
+    }
+
+    fn ago(secs: u64) -> Option<Instant> {
+        Instant::now().checked_sub(Duration::from_secs(secs))
+    }
+
+    /// Codex's source can only be re-checked by forking `lsof`, which decision #88 forbids on
+    /// the sweep cadence — so unlike Claude's it waits out [`SOURCE_RECHECK`].
+    #[test]
+    fn a_forking_source_is_not_re_resolved_every_tick() {
+        let dir = std::env::temp_dir().join(format!("agentpoll-timer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("rollout.jsonl");
+        std::fs::write(&path, "{}\n").unwrap();
+        let wanted = vec![(7u32, "codex".to_string())];
+
+        let fresh = ago(1);
+        let mut cache = HashMap::from([(7u32, codex_entry(Some(path.clone()), fresh))]);
+        sweep_once(&wanted, &mut cache);
+        assert_eq!(
+            cache[&7].checked_at, fresh,
+            "a fresh check must not fork again"
+        );
+
+        let stale = ago(SOURCE_RECHECK.as_secs() + 1);
+        cache.get_mut(&7).unwrap().checked_at = stale;
+        sweep_once(&wanted, &mut cache);
+        assert_ne!(cache[&7].checked_at, stale, "a stale check must re-resolve");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A codex pane with no rollout open at all (`codex exec`, or the moment between closing
+    /// one and opening the next) resolves to an OBSERVED ABSENCE, which clears the cached path.
+    /// Keying the re-resolve off "we have no path" would then fork `lsof` every single tick,
+    /// forever — the exact cadence the timer exists to prevent.
+    #[test]
+    fn a_codex_pane_with_no_rollout_does_not_fork_every_tick() {
+        let wanted = vec![(7u32, "codex".to_string())];
+        let fresh = ago(1);
+        let mut cache = HashMap::from([(7u32, codex_entry(None, fresh))]);
+        sweep_once(&wanted, &mut cache);
+        assert_eq!(
+            cache[&7].checked_at, fresh,
+            "an observed absence must wait out the timer like a cached path does"
+        );
+    }
+
+    /// `wanted` is walked in a fixed order, so the entries at the front get first claim on
+    /// [`RESOLVE_BUDGET`] every tick. Under today's gates that cannot actually starve anyone —
+    /// each codex entry wants a resolve at most once per [`SOURCE_RECHECK`], so the queue
+    /// drains — but the bias is one gate change away from mattering, and rotating the head
+    /// costs three lines. This test forces the pathological case (every entry wanting a resolve
+    /// on every tick) to exercise the mechanism, since nothing reachable does.
+    #[test]
+    fn the_resolve_budget_rotates_so_the_tail_is_not_starved() {
+        let n = RESOLVE_BUDGET + 2;
+        let wanted: Vec<(u32, String)> = (0..n as u32).map(|i| (i, "codex".to_string())).collect();
+        let mut cache: HashMap<u32, Entry> = wanted
+            .iter()
+            .map(|(p, _)| (*p, codex_entry(None, None)))
+            .collect();
+        let mut cursor = 0usize;
+        let mut served: Vec<u32> = Vec::new();
+        let home = no_home();
+
+        // Rotating by one means every position becomes the head within `n` ticks.
+        for _ in 0..n {
+            sweep(&wanted, &mut cache, home, &mut cursor);
+            for (pid, e) in cache.iter_mut() {
+                if e.checked_at.take().is_some() {
+                    served.push(*pid);
+                }
+                e.failed_at = Instant::now().checked_sub(Duration::from_secs(3600));
+            }
+        }
+        served.sort_unstable();
+        served.dedup();
+        assert_eq!(
+            served.len(),
+            n,
+            "every tracked pid must get a turn at the budget; served {served:?}"
+        );
     }
 
     /// A transient read failure must not be cached as "no activity": the stamp stays
@@ -473,12 +907,12 @@ mod tests {
 
         std::fs::write(&path, tool_use_line("first") + "\n").unwrap();
         let mut cache = HashMap::from([(1u32, entry_for(&path))]);
-        assert_eq!(sweep(&wanted, &mut cache)[&1].detail, "Bash: first");
+        assert_eq!(sweep_once(&wanted, &mut cache)[&1].detail, "Bash: first");
 
         // Content AND length change (so the stamp differs), but the file cannot be read.
         std::fs::write(&path, tool_use_line("second reading") + "\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let blocked = sweep(&wanted, &mut cache);
+        let blocked = sweep_once(&wanted, &mut cache);
         assert_eq!(
             blocked[&1].detail, "Bash: first",
             "a transient failure republishes the last good reading rather than blanking the row"
@@ -487,7 +921,7 @@ mod tests {
         // Readable again, with mtime and length untouched since the failed pass. Only an
         // UNCOMMITTED stamp can notice.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let recovered = sweep(&wanted, &mut cache);
+        let recovered = sweep_once(&wanted, &mut cache);
         assert_eq!(
             recovered[&1].detail, "Bash: second reading",
             "the failed read must have left the stamp uncommitted so this tick retries"
@@ -508,13 +942,13 @@ mod tests {
         std::fs::write(&path, tool_use_line("old conversation") + "\n").unwrap();
         let mut cache = HashMap::from([(1u32, entry_for(&path))]);
         assert_eq!(
-            sweep(&wanted, &mut cache)[&1].detail,
+            sweep_once(&wanted, &mut cache)[&1].detail,
             "Bash: old conversation"
         );
 
         std::fs::remove_file(&path).unwrap();
         assert!(
-            !sweep(&wanted, &mut cache).contains_key(&1),
+            !sweep_once(&wanted, &mut cache).contains_key(&1),
             "a reading must never outlive the source it was read from"
         );
 
