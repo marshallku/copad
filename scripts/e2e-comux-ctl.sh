@@ -860,7 +860,94 @@ python3 - "$(pane_rows)" <<'PYEOF' || fail "a divider drag collapsed a pane"
 import sys
 assert all(int(v) > 0 for v in sys.argv[1].split()), sys.argv[1]
 PYEOF
-ok "a dragged divider lands under the pointer, conserves cells, addresses the right branch, and clamps"
+# A drag must not survive the view moving under it. Input is SHARED, so the active tab can
+# change while a client holds a divider — and a ROUND TRIP is the case that defeats every
+# "are we still on the tab we grabbed in" check, because it restores each field while the
+# pointer has moved somewhere unrelated.
+#
+# Two round trips, run SEPARATELY because each masks the other: selecting a tab away and back,
+# and creating a tab (which activates it) then closing it (which promotes a neighbour). The
+# first version ran them together and the trailing `select-tab` bumped the generation for both,
+# so the create/close path passed with its cancellation removed.
+cat >"$WORK/dragdisturb.py" <<'PYEOF'
+import os, pty, time, select, fcntl, termios, struct, subprocess, sys
+rows, cols = 24, 100
+a, b = int(os.environ["DRAG_FROM"]), int(os.environ["DRAG_TO"])
+disturb = [x.split(",") for x in os.environ["DISTURB"].split(";") if x]
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm-256color"
+    os.execvp(os.environ["CMX"], [os.environ["CMX"]])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+def drain(s):
+    end = time.time() + s
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if r:
+            try:
+                if not os.read(fd, 65536): break
+            except OSError: break
+drain(6)
+os.write(fd, f"\x1b[<0;{a};3M".encode()); time.sleep(0.3)
+for argv in disturb:                       # another client moves the view, button still DOWN
+    r = subprocess.run([os.environ["CMX"]] + argv, capture_output=True)
+    if r.returncode != 0:
+        print(f"disturb {argv} failed: {r.stderr!r}", file=sys.stderr)
+        sys.exit(3)
+    time.sleep(0.4)
+drain(1)
+os.write(fd, f"\x1b[<32;{b};3M".encode()); time.sleep(0.2)
+os.write(fd, f"\x1b[<0;{b};3m".encode())
+drain(2)
+os.write(fd, b"\x02d"); time.sleep(0.8)
+try: os.close(fd)
+except OSError: pass
+try: os.waitpid(pid, 0)
+except ChildProcessError: pass
+PYEOF
+
+find_divider () {
+    python3 "$WORK/ptydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+    python3 - "$WORK/frame" <<'PYEOF'
+import sys
+rows = open(sys.argv[1]).read().splitlines()
+cands = {}
+for line in rows[2:20]:
+    for i, ch in enumerate(line):
+        if ch == "│":
+            cands[i] = cands.get(i, 0) + 1
+tall = sorted(c for c, n in cands.items() if n > 8)
+print(tall[1] + 1 if len(tall) > 1 else 0)
+PYEOF
+}
+
+# Each case re-locates the divider: the drags above MOVED it, and clicking empty space starts
+# no drag at all — which is how an earlier version of this test passed against the bug.
+check_view_moved () { # check_view_moved <label> <disturb-spec>
+    local d; d="$(find_divider)"
+    [[ "$d" != "0" ]] || { cat "$WORK/frame" >&2; fail "no divider to grab for: $1"; }
+    local rb cb; rb="$(pane_rows)"; cb="$(pane_cols)"
+    DRAG_FROM="$d" DRAG_TO=$((d - 15)) DISTURB="$2" CMX="$COMUX" \
+        python3 "$WORK/dragdisturb.py" >/dev/null 2>&1 \
+        || fail "the disturbance itself failed for: $1"
+    sleep 1
+    [[ "$(pane_cols)" == "$cb" && "$(pane_rows)" == "$rb" ]] \
+        || fail "a drag survived $1: $cb/$rb -> $(pane_cols)/$(pane_rows)"
+}
+
+# (a) create + close, with ONE tab, so closing promotes us back without a `select-tab` that
+#     would bump the generation on its own and mask this path entirely.
+# `close-tab` with no index opens an interactive picker, so the index is explicit: the tab
+# `new-tab` just created is the last one, index 1 while only tab 0 existed.
+check_view_moved "a tab being created and closed" "new-tab;close-tab,1"
+
+# (b) select away and back, which needs a second tab to exist.
+t 10 "$COMUX" new-tab >/dev/null || fail "could not create a second tab"
+t 10 "$COMUX" select-tab 0 >/dev/null || fail "could not return to the first tab"
+sleep 1
+check_view_moved "the tab being selected away and back" "select-tab,1;select-tab,0"
+
+ok "a dragged divider lands under the pointer, conserves cells, addresses the right branch, clamps, and dies when the view moves"
 
 echo "19. a jump into a copad tab"
 # `winfocus` can only activate an APPLICATION — a pid names the emulator, not one of its tabs

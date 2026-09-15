@@ -175,8 +175,18 @@ pub fn host_parts(m: &hostmetrics::HostMetrics) -> Vec<HostPart> {
 /// nested branch on the same axis — dragging the outer divider would move the inner one.
 #[derive(Debug, Clone)]
 struct ResizeDrag {
+    /// Where the branch lives. A drag applied to whatever tab happens to be active is how a
+    /// gesture started in one tab silently resized another.
+    ws: WorkspaceId,
+    tab: TabId,
     path: Vec<bool>,
     dir: Dir,
+    /// The branch's identity at grab time (see `DividerRect::ends`); the path alone is only a
+    /// position, and a tree edit can leave a different branch at it.
+    ends: (TerminalId, TerminalId),
+    /// The view generation when it was grabbed. Compared, not the view itself: another client
+    /// cycling A → B → A restores every view field while the pointer has moved elsewhere.
+    view_gen: u64,
     owner: ClientId,
 }
 
@@ -587,6 +597,10 @@ pub struct App {
     client_pids: Vec<u32>,
     /// `(client pid, COPAD_SOCKET, COPAD_PANEL_ID)` for clients running inside a copad tab.
     client_copad: Vec<(u32, String, String)>,
+    /// Bumped by [`Self::note_view_moved`] on every active-view transition. A divider drag
+    /// records it at grab time and dies if it moves — see that method for why a counter and
+    /// not a comparison.
+    view_gen: u64,
     /// Bells this server has ACKNOWLEDGED per pane, against `PaneTerm::bell_count`.
     /// Unacknowledged = `count > seen`. See `MuxListener::bells` for why both sides count
     /// rather than flag.
@@ -829,6 +843,7 @@ impl App {
             scroll_pane: None,
             client_pids: Vec::new(),
             client_copad: Vec::new(),
+            view_gen: 0,
             notifications: VecDeque::new(),
             hook_owned: HashSet::new(),
             center: None,
@@ -1148,14 +1163,27 @@ impl App {
         let Some(drag) = self.resize_drag.clone() else {
             return false;
         };
+        // Everything below cancels rather than guesses. A drag that can no longer be proved to
+        // address the branch it grabbed must do NOTHING — the failure it replaces is moving a
+        // divider the user cannot see.
+        let same_view = drag.view_gen == self.view_gen
+            && drag.ws == self.ws
+            && self
+                .state
+                .workspace(&self.ws)
+                .is_some_and(|w| w.active_tab == drag.tab);
+        if !same_view {
+            self.resize_drag = None;
+            return false;
+        }
         // Re-derive from the CURRENT layout: the branch's origin and extent move when the
         // window is resized or another client splits mid-drag.
         let Some(d) = self
             .dividers()
             .into_iter()
-            .find(|d| d.path == drag.path && d.dir == drag.dir)
+            .find(|d| d.path == drag.path && d.dir == drag.dir && d.ends == drag.ends)
         else {
-            self.resize_drag = None; // the branch is gone — drop the drag, don't guess
+            self.resize_drag = None; // gone, or a different branch now sits at that path
             return false;
         };
         let pos = if drag.dir == Dir::Right { x } else { y };
@@ -1163,12 +1191,13 @@ impl App {
             return false;
         };
         // Through the state machine, not into the tree: mutations are authorized, revved and
-        // re-derived in one place (single-writer, spec §1).
+        // re-derived in one place (single-writer, spec §1). Addressed with the drag's OWN
+        // workspace, so the target is what the gesture started on by construction.
         let changed = self
             .state
             .apply(Command::SetSplitRatio {
                 origin: Origin::Client(self.client),
-                workspace: self.ws.clone(),
+                workspace: drag.ws,
                 path: drag.path,
                 ratio: want,
             })
@@ -1393,6 +1422,10 @@ impl App {
     /// so a caller targeting another space switches to it first. Rolls the tab back and
     /// toasts if the PTY can't spawn, so state never holds a tab with no live terminal.
     fn new_tab_in(&mut self, ws: &WorkspaceId, cwd: Option<PathBuf>) -> Option<TerminalId> {
+        // Creating a tab makes it active, so it is a view transition like any other. Missing
+        // it left a hole that survived a round trip: create a tab and close it again while a
+        // divider is held, and every identity check passes on the way back.
+        self.note_view_moved();
         let events = match self.state.apply(Command::NewTab {
             origin: Origin::Client(self.client),
             workspace: ws.clone(),
@@ -1438,24 +1471,48 @@ impl App {
         };
         let cur = ids.iter().position(|t| t == &active).unwrap_or(0);
         let next = ids[(cur as i32 + delta).rem_euclid(ids.len() as i32) as usize].clone();
-        let _ = self.state.apply(Command::SelectTab {
-            origin: Origin::Client(self.client),
-            workspace: self.ws.clone(),
-            tab: next,
-        });
+        let ws = self.ws.clone();
+        self.select_tab(ws, next);
         self.sync_sizes();
     }
 
     /// Switch to the tab at 0-based `index` (the tab bar shows 1-based labels, so
+    /// Make `tab` active in `ws`. THE one place a tab selection happens.
+    ///
+    /// Every caller funnels here so `note_view_moved` cannot be forgotten: the eager
+    /// cancellation of a divider drag has to cover EVERY successful view transition, and the
+    /// four sites that used to apply `SelectTab` by hand were exactly how a `cycle_tab` slipped
+    /// past it.
+    fn select_tab(&mut self, ws: WorkspaceId, tab: TabId) {
+        let _ = self.state.apply(Command::SelectTab {
+            origin: Origin::Client(self.client),
+            workspace: ws,
+            tab,
+        });
+        self.note_view_moved();
+    }
+
+    /// Record that what the user is looking at has changed.
+    ///
+    /// A MONOTONIC counter, not a comparison of the current view: another client can cycle
+    /// A → B → A while you hold a divider, and every "are we still on the tab we grabbed in"
+    /// check passes on the way back — while your pointer has moved somewhere unrelated, so a
+    /// release would snap the divider to it.
+    /// EVERY path that changes which tab or session is on screen must call this: selecting a
+    /// tab, switching session, creating a tab (which activates it) and closing one (which
+    /// promotes a neighbour). Adding a fifth without calling it reopens the round-trip hole.
+    fn note_view_moved(&mut self) {
+        self.view_gen = self.view_gen.wrapping_add(1);
+        // A drag-selection is already invalidated by a view change; a divider drag now is too.
+        self.selection = None;
+        self.resize_drag = None;
+    }
+
     /// `Ctrl-b 1` → index 0). Out-of-range is ignored.
     fn select_tab_index(&mut self, index: usize) {
         if let Some(tab) = self.tab_ids().get(index).cloned() {
-            self.selection = None; // switching tabs invalidates a drag-selection
-            let _ = self.state.apply(Command::SelectTab {
-                origin: Origin::Client(self.client),
-                workspace: self.ws.clone(),
-                tab,
-            });
+            let ws = self.ws.clone();
+            self.select_tab(ws, tab);
             self.sync_sizes();
         }
     }
@@ -1473,6 +1530,10 @@ impl App {
     /// discard that `Err` (nothing to say), while the control API turns it into the
     /// response's error string.
     fn close_tab(&mut self, ws: &WorkspaceId, tab: TabId) -> Result<(), MuxError> {
+        // Closing the active tab promotes a neighbour — another view transition. Bumped BEFORE
+        // the apply so a refusal (the last tab) still cancels: over-cancelling a drag is a
+        // shrug, moving the wrong divider is not.
+        self.note_view_moved();
         // `?` on the last-tab refusal: the tab is kept and the caller decides whether
         // that is worth reporting.
         let events = self.state.apply(Command::CloseTab {
@@ -1500,6 +1561,7 @@ impl App {
         if self.ws == wid || self.state.workspace(&wid).is_none() {
             return;
         }
+        self.note_view_moved();
         // Record recency for `sort_by = recent`.
         self.activity_clock += 1;
         self.session_activity
@@ -3322,10 +3384,23 @@ impl App {
                     // A divider lives in the 1-cell gap BETWEEN panes, so it is never inside
                     // a pane rect and only reachable here. Grabbing one starts a resize drag
                     // instead of a text selection — the two cannot overlap.
-                    if let Some(d) = self.divider_at(x, y) {
+                    // Never take a divider another client is already holding: input is
+                    // shared, and `other_dragging` above only guards the text selection, so
+                    // without this a second click re-owned and re-targeted a live gesture.
+                    let held_by_other =
+                        self.resize_drag.as_ref().is_some_and(|d| d.owner != client);
+                    if !held_by_other
+                        && let Some(d) = self.divider_at(x, y)
+                        && let Some(tab) =
+                            self.state.workspace(&self.ws).map(|w| w.active_tab.clone())
+                    {
                         self.resize_drag = Some(ResizeDrag {
+                            ws: self.ws.clone(),
+                            tab,
                             path: d.path,
                             dir: d.dir,
+                            ends: d.ends,
+                            view_gen: self.view_gen,
                             owner: client,
                         });
                     }
@@ -3426,11 +3501,7 @@ impl App {
     fn jump_to_terminal(&mut self, term: &TerminalId) {
         if let Some((wid, tab, pane)) = self.locate_terminal(term) {
             self.switch_session(wid.clone());
-            let _ = self.state.apply(Command::SelectTab {
-                origin: Origin::Client(self.client),
-                workspace: wid,
-                tab,
-            });
+            self.select_tab(wid, tab);
             let _ = self.state.apply(Command::FocusPane {
                 client: self.client,
                 pane,
@@ -4288,11 +4359,7 @@ impl App {
             self.center = None;
             if let Some((wid, tab, pane)) = self.locate_terminal(&note.terminal) {
                 self.switch_session(wid.clone());
-                let _ = self.state.apply(Command::SelectTab {
-                    origin: Origin::Client(self.client),
-                    workspace: wid,
-                    tab,
-                });
+                self.select_tab(wid, tab);
                 let _ = self.state.apply(Command::FocusPane {
                     client: self.client,
                     pane,

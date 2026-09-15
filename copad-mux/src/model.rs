@@ -162,6 +162,20 @@ impl SplitTree {
     /// The counterpart to [`SplitTree::panes`]. Walking panes and then calling
     /// [`SplitTree::terminal_of`] for each is O(N²) — `terminal_of` re-descends the tree per
     /// pane — which matters for anything asked every frame.
+    /// The first terminal in depth-first order, WITHOUT collecting the subtree.
+    ///
+    /// `terminals()` allocates and walks everything below it; used per divider per mouse event
+    /// that is O(N log N) on a balanced tree and O(N²) on a skewed one, paid as input latency
+    /// on every pointer move during a drag.
+    pub fn first_terminal(&self) -> Option<&TerminalId> {
+        match self {
+            SplitTree::Leaf { terminal, .. } => Some(terminal),
+            SplitTree::Branch { first, second, .. } => {
+                first.first_terminal().or_else(|| second.first_terminal())
+            }
+        }
+    }
+
     pub fn terminals(&self) -> Vec<&TerminalId> {
         let mut out = Vec::new();
         self.collect_terminals(&mut out);
@@ -471,6 +485,9 @@ impl SplitTree {
     /// Place every branch's DIVIDER, mirroring [`Self::derive_layout`] so the two agree
     /// cell-for-cell. A branch too small to show a divider (`split3` gives it 0 cells)
     /// contributes nothing — there is no gap to grab.
+    /// Returns this subtree's FIRST terminal, so a parent gets its children's identities from
+    /// the traversal it is already doing. Re-descending with `first_terminal` per divider is
+    /// O(N²) on a tree skewed through `first`; this is one pass.
     pub fn derive_dividers(
         &self,
         x: u16,
@@ -479,7 +496,7 @@ impl SplitTree {
         rows: u16,
         path: &mut Vec<bool>,
         out: &mut Vec<DividerRect>,
-    ) {
+    ) -> Option<TerminalId> {
         let SplitTree::Branch {
             dir,
             ratio,
@@ -487,52 +504,51 @@ impl SplitTree {
             second,
         } = self
         else {
-            return;
+            let SplitTree::Leaf { terminal, .. } = self else {
+                return None;
+            };
+            return Some(terminal.clone());
         };
-        match dir {
+        // Recurse FIRST: each child hands back its own first terminal, which is this
+        // branch's identity, so nothing has to descend a second time.
+        let (a, b, div, fx, fy, sx, sy, fc, fr, sc, sr) = match dir {
             Dir::Right => {
                 let (a, b, div) = Self::split3(cols, *ratio);
-                if div > 0 {
-                    out.push(DividerRect {
-                        path: path.clone(),
-                        dir: *dir,
-                        x: x + a,
-                        y,
-                        cols: div,
-                        rows,
-                        origin: x,
-                        extent: cols,
-                    });
-                }
-                path.push(false);
-                first.derive_dividers(x, y, a, rows, path, out);
-                path.pop();
-                path.push(true);
-                second.derive_dividers(x + a + div, y, b, rows, path, out);
-                path.pop();
+                (a, b, div, x, y, x + a + div, y, a, rows, b, rows)
             }
             Dir::Down => {
                 let (a, b, div) = Self::split3(rows, *ratio);
-                if div > 0 {
-                    out.push(DividerRect {
-                        path: path.clone(),
-                        dir: *dir,
-                        x,
-                        y: y + a,
-                        cols,
-                        rows: div,
-                        origin: y,
-                        extent: rows,
-                    });
-                }
-                path.push(false);
-                first.derive_dividers(x, y, cols, a, path, out);
-                path.pop();
-                path.push(true);
-                second.derive_dividers(x, y + a + div, cols, b, path, out);
-                path.pop();
+                (a, b, div, x, y, x, y + a + div, cols, a, cols, b)
             }
+        };
+        path.push(false);
+        let t0 = first.derive_dividers(fx, fy, fc, fr, path, out);
+        path.pop();
+        path.push(true);
+        let t1 = second.derive_dividers(sx, sy, sc, sr, path, out);
+        path.pop();
+        let _ = b;
+
+        if div > 0
+            && let (Some(e0), Some(e1)) = (t0.as_ref(), t1.as_ref())
+        {
+            let (dx, dy, dc, dr, origin, extent) = match dir {
+                Dir::Right => (x + a, y, div, rows, x, cols),
+                Dir::Down => (x, y + a, cols, div, y, rows),
+            };
+            out.push(DividerRect {
+                path: path.clone(),
+                ends: (e0.clone(), e1.clone()),
+                dir: *dir,
+                x: dx,
+                y: dy,
+                cols: dc,
+                rows: dr,
+                origin,
+                extent,
+            });
         }
+        t0.or(t1)
     }
 
     /// Set the ratio of the branch at `path` directly. Returns whether it CHANGED, so a drag
@@ -572,6 +588,11 @@ impl SplitTree {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DividerRect {
     pub path: Vec<bool>,
+    /// The first terminal under each side. A path is a POSITION — a tree edit can leave a
+    /// DIFFERENT branch at the same one — so a drag compares these to know it is still moving
+    /// the divider it grabbed. The pair identifies the branch because it is their lowest common
+    /// ancestor; an edit deeper on either side leaves it, and the drag rightly survives.
+    pub ends: (TerminalId, TerminalId),
     /// Which way the branch splits: `Right` = a vertical divider you drag horizontally.
     pub dir: Dir,
     pub x: u16,
@@ -697,6 +718,62 @@ mod tests {
         assert!(
             inner.extent < cols,
             "the nested branch spans less than the area"
+        );
+    }
+
+    #[test]
+    fn a_divider_carries_the_identity_of_the_branch_it_belongs_to() {
+        // Two trees with the SAME shape: the path `[]` exists in both and means a different
+        // branch. Only the end terminals tell them apart, which is what a drag needs after
+        // another client edits the tree under it.
+        let a = SplitTree::Branch {
+            dir: Dir::Right,
+            ratio: 0.5,
+            first: Box::new(leaf("p0", "t0")),
+            second: Box::new(leaf("p1", "t1")),
+        };
+        let b = SplitTree::Branch {
+            dir: Dir::Right,
+            ratio: 0.5,
+            first: Box::new(leaf("p8", "t8")),
+            second: Box::new(leaf("p9", "t9")),
+        };
+        let ends = |t: &SplitTree| {
+            let mut v = Vec::new();
+            t.derive_dividers(0, 0, 80, 24, &mut Vec::new(), &mut v);
+            v[0].ends.clone()
+        };
+        assert_eq!(
+            ends(&a),
+            (TerminalId::new("t0"), TerminalId::new("t1")),
+            "the ends are the first terminal under each side"
+        );
+        assert_ne!(ends(&a), ends(&b), "same path, same dir, different branch");
+    }
+
+    #[test]
+    fn first_terminal_descends_without_collecting_the_subtree() {
+        // Used per divider per POINTER MOVE, so it must not walk everything below it.
+        let deep = SplitTree::Branch {
+            dir: Dir::Down,
+            ratio: 0.5,
+            first: Box::new(SplitTree::Branch {
+                dir: Dir::Right,
+                ratio: 0.5,
+                first: Box::new(leaf("p0", "t0")),
+                second: Box::new(leaf("p1", "t1")),
+            }),
+            second: Box::new(leaf("p2", "t2")),
+        };
+        assert_eq!(deep.first_terminal(), Some(&TerminalId::new("t0")));
+        assert_eq!(
+            deep.first_terminal(),
+            deep.terminals().first().copied(),
+            "it must agree with the collecting version it replaces"
+        );
+        assert_eq!(
+            leaf("p5", "t5").first_terminal(),
+            Some(&TerminalId::new("t5"))
         );
     }
 
