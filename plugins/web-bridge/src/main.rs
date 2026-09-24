@@ -24,6 +24,7 @@
 
 mod agents;
 mod cockpit;
+mod comux;
 mod daemon_client;
 mod font;
 mod push;
@@ -248,6 +249,13 @@ struct AppState {
     /// shell-outs per click; once the snapshot is built we serve it
     /// from memory until the TTL expires.
     tmux_cache: Arc<tokio::sync::Mutex<Option<TmuxCacheEntry>>>,
+    /// In-process TTL cache for `/api/board`, and — unlike `tmux_cache` — the plugin's
+    /// single-flight guard for comux reads. The board handler holds this lock ACROSS the
+    /// fetch, so however many phones are polling there is at most one `comux` child alive at
+    /// a time — the handler's two reads are awaited sequentially for the same reason. That
+    /// bound is the point: comux's client reads its socket with no deadline, so a wedged
+    /// server turns every concurrent poll into another stuck child.
+    board_cache: Arc<tokio::sync::Mutex<Option<TmuxCacheEntry>>>,
     /// VAPID config from env. `None` disables the push endpoints (501).
     push_config: Arc<Option<push::PushConfig>>,
     /// Loaded subscription list — serialised through this Mutex on
@@ -342,6 +350,7 @@ async fn run_server(
         font,
         allow_tailscale_header,
         tmux_cache: Arc::new(tokio::sync::Mutex::new(None)),
+        board_cache: Arc::new(tokio::sync::Mutex::new(None)),
         push_config: Arc::new(push_config),
         push_subs: Arc::new(tokio::sync::Mutex::new(push::load_subscriptions())),
         default_subscribe_patterns: Arc::new(vec![
@@ -373,6 +382,7 @@ async fn run_server(
         .route("/api/pilot/goals/:id/answer", post(handle_pilot_answer))
         .route("/api/pilot/goals/:id/approve", post(handle_pilot_approve))
         .route("/api/pilot/goals/:id/cancel", post(handle_pilot_cancel))
+        .route("/api/board", get(handle_board))
         .route("/ws/tmux/overview", get(handle_ws_tmux_overview))
         .route("/ws/tmux/attach/:pane_id", get(handle_ws_tmux_attach))
         .route("/ws/events", get(handle_ws_events))
@@ -1264,6 +1274,71 @@ async fn handle_pilot_cancel(
         .rpc("pilot.cancel", json!({ "id": id }))
         .await?;
     Ok(axum::Json(v))
+}
+
+/// `GET /api/board` — the mobile board's fleet read: every comux session and every agent
+/// pane across all of them.
+///
+/// This is the endpoint that exists because `/api/tmux/panes` answers `{"panes":[]}` on a
+/// machine running 10 comux sessions and 27 agents.
+///
+/// **Partial failure is representable on purpose.** `sessions` and `agents` are two separate
+/// `comux` invocations, so one can fail while the other succeeds. A collection is `null` when
+/// it could not be READ and `[]` when it was read and was empty — collapsing those would
+/// render "we could not look" as "your fleet is gone". Whatever succeeded is still returned,
+/// and every failure is named in `errors`.
+///
+/// **The counts can disagree.** The two calls are sampled at slightly different instants, so
+/// a session's `agents` count need not match how many rows `agents` carries for it during a
+/// change. `fetched_at_ms` is when the composition finished; it says nothing about how fresh
+/// comux's own cached classification is, which is why `status_is_inferred` is always set.
+async fn handle_board(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> Result<axum::Json<Value>, AppError> {
+    const TTL: std::time::Duration = std::time::Duration::from_secs(2);
+    // Held across the fetch — see `AppState::board_cache`.
+    let mut cache = state.board_cache.lock().await;
+    if let Some(entry) = cache.as_ref()
+        && entry.at.elapsed() < TTL
+    {
+        return Ok(axum::Json(entry.value.clone()));
+    }
+
+    // SEQUENTIAL, not `join!`. Running the two reads concurrently would put two children in
+    // flight, and against a wedged comux server both sit there until their deadlines — which
+    // would make the single-flight guard above a half-truth. Both results are still kept, so
+    // partial failure is unaffected; the only cost is two serial socket round trips.
+    let sessions = comux::list_sessions().await;
+    let agents = comux::list_agents().await;
+    let mut errors = Vec::new();
+    let mut take = |what: &str, r: Result<Value, comux::ComuxError>| match r {
+        Ok(v) => v,
+        Err(e) => {
+            errors.push(json!({ "what": what, "code": e.code(), "message": e.to_string() }));
+            Value::Null
+        }
+    };
+    let sessions = take("sessions", sessions.map(|v| json!(v)));
+    let agents = take("agents", agents.map(|v| json!(v)));
+
+    let snapshot = json!({
+        "fetched_at_ms": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0),
+        "sessions": sessions,
+        "agents": agents,
+        // A flag, not a nicety: comux infers `status` from screen text for everything that
+        // is not Claude, `idle` doubles as "unresolved", and `for_secs` is time holding that
+        // inferred label — not task duration. A UI that prints these as fact is lying.
+        "status_is_inferred": true,
+        "errors": errors,
+    });
+    *cache = Some(TmuxCacheEntry {
+        at: std::time::Instant::now(),
+        value: snapshot.clone(),
+    });
+    Ok(axum::Json(snapshot))
 }
 
 /// Sync helper used inside `spawn_blocking`. Builds the overview JSON

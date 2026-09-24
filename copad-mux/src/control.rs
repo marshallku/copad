@@ -333,9 +333,17 @@ pub struct AgentInfo {
     pub token: String,
     /// The pane's terminal id.
     pub terminal: String,
-    /// The session (space) the agent lives in.
+    /// The session (space) the agent lives in — its DISPLAY name, which is what the sidebar
+    /// shows and what a rename changes.
     #[serde(default)]
     pub space: String,
+    /// The session's STABLE id (`WorkspaceId`), which a rename does not change.
+    ///
+    /// `space` alone cannot key a join: a caller that lists sessions and agents in two round
+    /// trips can have a rename land between them, and two sessions may legitimately carry the
+    /// same display name. This is the field to group agents by; `space` is for showing.
+    #[serde(default)]
+    pub space_id: String,
     /// The tab's custom name, else `tab <n>` — what the sidebar titles the row with.
     #[serde(default)]
     pub title: String,
@@ -3185,6 +3193,7 @@ mod list_agents_proto_tests {
             token: "ab12-3".into(),
             terminal: "t1".into(),
             space: "work".into(),
+            space_id: "s1".into(),
             title: "tab 1".into(),
             tool: "claude".into(),
             status: status.into(),

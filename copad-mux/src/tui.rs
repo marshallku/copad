@@ -2762,6 +2762,7 @@ impl App {
                             .to_string(),
                         terminal: r.term.to_string(),
                         space: r.space,
+                        space_id: r.space_id.to_string(),
                         title: r.title,
                         tool: r.tool,
                         status: r.status.to_string(),

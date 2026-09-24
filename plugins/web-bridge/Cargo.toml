@@ -22,6 +22,10 @@ tokio = { version = "1", features = [
     "net",
     "io-util",
     "time",
+    # `tokio::process` — the comux CLI shell-out needs a child it can KILL on a
+    # deadline. `std::process::Command::output()` has no timeout, so a wedged
+    # comux server would park a blocking task and leak a child per poll (codex C1).
+    "process",
 ] }
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["set-header"] }
