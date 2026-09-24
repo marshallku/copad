@@ -24,6 +24,7 @@ fn print_usage() {
          \n\
          usage:\n\
          \x20 comux                       attach (spawns the server if needed)\n\
+         \x20 comux attach --no-spawn     attach, but fail if no server is running\n\
          \x20 comux server                run the headless server in the foreground\n\
          \x20 comux server <sub>          manage the server: start|stop|restart|status\n\
          \x20 comux <cmd> [args]          run a control command (shorthand for `comux ctl <cmd>`)\n\
@@ -67,7 +68,12 @@ fn main() {
             None => copad_mux::server::run(),
             Some(sub) => std::process::exit(copad_mux::control::run_server_admin(sub)),
         },
-        Some("attach") | Some("run") | None => copad_mux::client::run(),
+        Some("attach") | Some("run") | None => {
+            // `--no-spawn` is accepted on the attach verbs only. It exists for supervised
+            // callers (web-bridge's mobile attach); see `client::AttachOpts::no_spawn`.
+            let no_spawn = args.iter().any(|a| a == "--no-spawn");
+            copad_mux::client::run_with(copad_mux::client::AttachOpts { no_spawn })
+        }
         // `doctor` is a local diagnostic — it must run without (and report on) the
         // server, so it's dispatched here rather than through the control client.
         Some("doctor") => std::process::exit(copad_mux::doctor::run(&args[1..])),

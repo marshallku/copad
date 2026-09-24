@@ -181,6 +181,26 @@ impl Drop for TermGuard {
 /// Connect to the running server, spawning a detached one if none answers, then run
 /// the attach loop until detach / server exit.
 pub fn run() -> io::Result<()> {
+    run_with(AttachOpts::default())
+}
+
+/// How [`run_with`] should behave when nothing is listening on the socket.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AttachOpts {
+    /// Refuse to birth a server; fail instead.
+    ///
+    /// Bare `comux` is connect-or-spawn, which is right for a human at a terminal and wrong
+    /// for anything supervised. A server BIRTHED by a daemon inherits that daemon's kernel
+    /// session and environment — and a long-lived supervisor has deliberately scrubbed the
+    /// volatile session vars out of its own (see `update_environment`), so such a server
+    /// would then own every pane the user ever opens with no desktop session behind it.
+    /// Nothing about that is visible after the fact; it can only be undone by killing the
+    /// server. A caller that cannot guarantee it is a human at a console sets this.
+    pub no_spawn: bool,
+}
+
+/// [`run`], with explicit control over the connect-or-spawn decision.
+pub fn run_with(opts: AttachOpts) -> io::Result<()> {
     // Print any config warnings NOW, before raw/alt-screen — an auto-spawned server's
     // stderr is /dev/null, so this is the user's reliable view of config diagnostics.
     // (The effective mouse setting is the SERVER's, delivered in its `Hello`; the client
@@ -190,8 +210,29 @@ pub fn run() -> io::Result<()> {
         eprintln!("comux config: {w}");
     }
     let sock = socket_path();
-    let stream = connect_or_spawn(&sock)?;
+    let stream = if opts.no_spawn {
+        connect_only(&sock)?
+    } else {
+        connect_or_spawn(&sock)?
+    };
     run_attached(stream)
+}
+
+/// Connect to `sock` and fail if nothing answers, rather than starting a server.
+///
+/// Deliberately ONE attempt with no retry: the caller asked not to create a server, so there
+/// is nothing that could appear by waiting. The message names the socket because the usual
+/// cause is a caller resolving a different one than the server bound.
+fn connect_only(sock: &Path) -> io::Result<UnixStream> {
+    UnixStream::connect(sock).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!(
+                "no running comux at {} ({e}), and --no-spawn was given so none was started",
+                sock.display()
+            ),
+        )
+    })
 }
 
 /// Connect to `sock`; if nothing is listening, spawn a server and retry with backoff.
@@ -658,7 +699,9 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PROBE_CORNER, PROBE_MAX, base64, size_from_clamped_cursor};
+    use super::{
+        AttachOpts, PROBE_CORNER, PROBE_MAX, base64, connect_only, io, size_from_clamped_cursor,
+    };
 
     #[test]
     fn size_from_clamped_cursor_converts_and_guards() {
@@ -691,5 +734,48 @@ mod tests {
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
         // Non-ASCII payload (a drag-copy can contain UTF-8) encodes its bytes.
         assert_eq!(base64("가".as_bytes()), "6rCA");
+    }
+
+    /// The guarantee `--no-spawn` exists for: a supervised caller must never be the process
+    /// that BIRTHS a server, because such a server inherits the supervisor's kernel session
+    /// and scrubbed environment and then owns every pane the user opens afterwards.
+    #[test]
+    fn connect_only_refuses_instead_of_creating_a_server() {
+        let dir = std::env::temp_dir().join(format!("cmx-ns-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("s");
+        let _ = std::fs::remove_file(&sock);
+
+        let err = connect_only(&sock).expect_err("must not connect");
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        // The socket is the observable proof: a spawn would have bound it.
+        assert!(!sock.exists(), "connect_only must not create {sock:?}");
+        // The message names the socket, because the usual cause is a caller resolving a
+        // different path than the server bound.
+        assert!(
+            err.to_string().contains(&sock.display().to_string()),
+            "message must name the socket, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn connect_only_connects_when_a_server_is_listening() {
+        let dir = std::env::temp_dir().join(format!("cmx-ok-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("s");
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
+
+        connect_only(&sock).expect("must connect to a listening socket");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn attach_opts_default_still_spawns() {
+        // `run()` must keep the connect-or-spawn behaviour a human at a terminal relies on.
+        assert!(!AttachOpts::default().no_spawn);
     }
 }
