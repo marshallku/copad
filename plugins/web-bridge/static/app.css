@@ -1,0 +1,145 @@
+    :root {
+      color-scheme: dark;
+      --bg: #1e1e2e;
+      --bg-2: #181825;
+      --bg-3: #11111b;
+      --fg: #cdd6f4;
+      --fg-dim: #a6adc8;
+      --accent: #89b4fa;
+      --accent-warn: #fab387;
+      --accent-err: #f38ba8;
+      --accent-ok: #a6e3a1;
+      --border: #313244;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: ui-monospace, "JetBrains Mono", "SF Mono", monospace; }
+    /* --app-h tracks the VISUAL viewport (see setAppHeight in JS). 100vh/100dvh
+       are the LAYOUT viewport: neither shrinks when the on-screen keyboard opens,
+       so a vh-based terminal stays full height behind the keyboard. The fallback
+       only applies before the first JS measurement, or on browsers without
+       visualViewport. */
+    /* The workstation's terminal font, served at runtime from whatever it has
+       installed (GET /font/terminal). Without this a phone has no Nerd Font and
+       every powerline/devicon glyph renders as tofu. No format() — the server
+       decides the bytes (ttf/otf/woff2 depending on what's installed) and declares
+       the type, so a hardcoded hint here could contradict them and get the face
+       rejected. font-display: swap so text shows in the fallback immediately
+       instead of an invisible terminal while ~2 MB downloads over cellular.
+       404 (font not resolved) simply leaves the fallback stack in place. */
+    @font-face {
+      font-family: "CopadTerminal";
+      src: url("/font/terminal");
+      font-display: swap;
+    }
+    :root { --app-h: 100vh; }
+    body { background: var(--bg); color: var(--fg); padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); min-height: var(--app-h); overflow: hidden; }
+    header { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; padding: 0.6rem 0.9rem; border-bottom: 1px solid var(--border); background: var(--bg-2); position: sticky; top: 0; z-index: 10; }
+    header h1 { font-size: 0.95rem; font-weight: 500; }
+    header h1 .dim { color: var(--fg-dim); }
+    .chip { padding: 0.3rem 0.65rem; border-radius: 0.5rem; border: 1px solid var(--border); cursor: pointer; background: var(--bg); color: var(--fg); font-size: 0.78rem; line-height: 1; }
+    .chip.active { background: var(--accent); color: var(--bg-3); border-color: var(--accent); }
+    .chip.warn { color: var(--accent-warn); border-color: var(--accent-warn); }
+    .chip.ok { color: var(--accent-ok); border-color: var(--accent-ok); }
+    .chip[disabled] { opacity: 0.45; cursor: not-allowed; }
+
+    /* ==== overview mode ==== */
+    main.overview { display: flex; flex-direction: column; gap: 0.6rem; padding: 0.6rem; max-width: 800px; margin: 0 auto; height: calc(var(--app-h) - 50px); overflow-y: auto; overflow-x: hidden; }
+    .section-title { font-size: 0.72rem; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.08em; padding: 0 0.2rem; margin-top: 0.25rem; display: flex; justify-content: space-between; align-items: center; }
+    /* min-width: 0 on the grid + items lets nowrap+ellipsis actually
+       shrink the cell instead of pushing the grid wider than the
+       viewport (default min-width: auto = min-content). */
+    .cards { display: grid; grid-template-columns: 1fr; gap: 0.5rem; min-width: 0; }
+    @media (min-width: 600px) { .cards { grid-template-columns: 1fr 1fr; } }
+    .card { background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.65rem; padding: 0.7rem 0.85rem; cursor: pointer; display: flex; flex-direction: column; gap: 0.35rem; min-width: 0; }
+    .card:hover { border-color: var(--accent); }
+    .card.active-pane { border-color: var(--accent-ok); }
+    .card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 0.5rem; }
+    .card-name { font-size: 0.85rem; color: var(--fg); font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .card-meta { font-size: 0.7rem; color: var(--fg-dim); white-space: nowrap; }
+    .card-cwd { font-size: 0.72rem; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    /* Status row sits between the head and the preview; small inline
+       chips for agent state + freshness. The colors track the chip
+       palette: busy/working → warn (mid-turn, draw eye), idle/ready →
+       ok (parked at prompt, calm), waiting → err (user blocked). */
+    .card-status { display: flex; gap: 0.3rem; flex-wrap: wrap; align-items: center; }
+    .card-status .pill { font-size: 0.65rem; padding: 0.12rem 0.4rem; border-radius: 0.35rem; border: 1px solid var(--border); color: var(--fg-dim); white-space: nowrap; line-height: 1.3; }
+    .card-status .pill.busy { color: var(--accent-warn); border-color: var(--accent-warn); }
+    .card-status .pill.idle { color: var(--accent-ok); border-color: var(--accent-ok); }
+    .card-status .pill.waiting { color: var(--accent-err); border-color: var(--accent-err); }
+    .card-status .pill.age { color: var(--fg-dim); }
+    .card-preview { font-size: 0.72rem; color: var(--fg); background: var(--bg-3); padding: 0.4rem 0.55rem; border-radius: 0.4rem; line-height: 1.35; max-height: 5.5em; overflow: hidden; white-space: pre-wrap; word-break: break-all; }
+    /* Attention strip — same chassis as events strip but kind-color
+       coded. notification = accent (info), stop = ok (done), codex* =
+       warn (response ready / awaits user). Hidden via JS when empty. */
+    /* Rows are interactive — tapping routes to the originating pane.
+       Hover hint + cursor pointer signals the affordance. Rows without
+       a resolvable target still render but the click is a no-op. */
+    /* Push toggle in header — same chip chassis as presence.
+       Push settings expand below cards when subscribed. */
+    .push-settings { background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.65rem; padding: 0.55rem 0.85rem; font-size: 0.75rem; color: var(--fg-dim); display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
+    .push-settings label { display: inline-flex; gap: 0.3rem; align-items: center; color: var(--fg); cursor: pointer; }
+    .push-settings input[type="checkbox"] { accent-color: var(--accent); }
+    .push-settings .err { color: var(--accent-err); }
+    .empty { padding: 1.2rem; color: var(--fg-dim); text-align: center; font-size: 0.85rem; border: 1px dashed var(--border); border-radius: 0.55rem; }
+    .events-strip { background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.65rem; overflow: hidden; }
+    .event-row { padding: 0.4rem 0.85rem; border-bottom: 1px solid var(--border); font-size: 0.74rem; color: var(--fg); display: flex; gap: 0.5rem; align-items: baseline; }
+    .event-row:last-child { border-bottom: none; }
+    .event-kind { color: var(--accent); flex-shrink: 0; }
+    .event-row[data-kind^="claude.commit_blocked"] .event-kind { color: var(--accent-err); }
+    .event-row[data-kind^="claude.review_approved"] .event-kind { color: var(--accent-ok); }
+    .banner { background: var(--accent-warn); color: var(--bg-3); padding: 0.4rem 0.85rem; font-size: 0.78rem; border-radius: 0.5rem; text-align: center; }
+    /* Phase 24.6 pilot cockpit */
+    .pilot-strip { display: flex; flex-direction: column; gap: 0.35rem; }
+    .pilot-goal { background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.55rem; padding: 0.45rem 0.55rem; }
+    .pilot-goal.active { border-color: var(--accent); }
+    .pilot-goal-head { display: flex; align-items: center; gap: 0.45rem; }
+    .pilot-goal-head .pill { font-size: 0.65rem; padding: 0.12rem 0.4rem; border-radius: 0.35rem; border: 1px solid var(--border); color: var(--fg-dim); white-space: nowrap; }
+    .pilot-goal-head .pill.busy { color: var(--accent-warn); border-color: var(--accent-warn); }
+    .pilot-goal-head .pill.ok { color: var(--accent-ok); border-color: var(--accent-ok); }
+    .pilot-goal-head .pill.err { color: var(--accent-err); border-color: var(--accent-err); }
+    .pilot-goal-id { font-size: 0.7rem; color: var(--fg-dim); font-family: monospace; }
+    .pilot-goal-instr { flex: 1; font-size: 0.78rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pilot-gate { margin-top: 0.4rem; padding: 0.4rem; background: var(--bg-3); border-radius: 0.45rem; display: flex; flex-direction: column; gap: 0.35rem; }
+    .pilot-gate .pill { align-self: flex-start; font-size: 0.65rem; padding: 0.12rem 0.4rem; border-radius: 0.35rem; border: 1px solid var(--accent-warn); color: var(--accent-warn); }
+    .pilot-gate-prompt { font-size: 0.76rem; white-space: pre-wrap; word-break: break-word; max-height: 8em; overflow-y: auto; }
+    .pilot-gate-controls { display: flex; gap: 0.35rem; }
+    .pilot-gate-controls input, .pilot-add input, .pilot-add textarea, .pilot-add select { flex: 1; background: var(--bg-3); color: var(--fg); border: 1px solid var(--border); border-radius: 0.4rem; padding: 0.35rem 0.45rem; font: inherit; font-size: 0.78rem; }
+    .pilot-add { display: flex; flex-direction: column; gap: 0.35rem; margin-top: 0.4rem; }
+    .pilot-add textarea { min-height: 3em; resize: vertical; }
+    .pilot-add-row { display: flex; gap: 0.35rem; }
+    .pilot-sidecar-err { font-size: 0.68rem; color: var(--fg-dim); padding: 0.1rem 0.2rem; }
+    .chip.ok { color: var(--accent-ok); border-color: var(--accent-ok); }
+
+    /* ==== attach mode ==== */
+    main.attach { display: flex; flex-direction: column; height: calc(var(--app-h) - 50px); }
+    .attach-bar { display: flex; gap: 0.4rem; padding: 0.4rem 0.6rem; background: var(--bg-2); border-bottom: 1px solid var(--border); align-items: center; }
+    .attach-bar .back { padding: 0.3rem 0.55rem; }
+    .attach-bar .title { flex: 1; font-size: 0.8rem; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #term-host { flex: 1; background: var(--bg-3); padding: 0.3rem; overflow: hidden; }
+    #term-host .xterm { height: 100%; }
+    /* The comux view floors the grid at 80 columns, which is wider than a phone. Without a
+       scrollable host the extra columns are simply clipped — the promised "scroll instead of
+       shrinking the desktop" only exists if the overflow is reachable. `touch` keeps the
+       momentum scroll iOS otherwise drops on a nested scroller. */
+    #term-host.mux { overflow: auto; -webkit-overflow-scrolling: touch; }
+    #term-host.mux .xterm { height: 100%; width: max-content; }
+    /* mobile keyboard toolbar */
+    .agent-list { display: flex; flex-direction: column; gap: 0.2rem; margin: 0 0.6rem 0.5rem; }
+    .agent-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.45rem 0.5rem; background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.35rem; cursor: pointer; }
+    .agent-row .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .agent-row .age { color: var(--fg-dim); font-size: 0.78rem; white-space: nowrap; }
+    .group-head { cursor: pointer; user-select: none; }
+    .kbd-bar { display: flex; flex-wrap: wrap; gap: 0.3rem; padding: 0.4rem; background: var(--bg-2); border-top: 1px solid var(--border); }
+    /* touch-action: manipulation suppresses double-tap zoom; user-select
+       prevents long-press text selection on iOS. Combined with the
+       mousedown/touchstart preventDefault below, this keeps focus on
+       xterm's hidden textarea so the toolbar Ctrl+key combo works
+       without re-tapping the terminal between keys. */
+    .kbd-bar button { flex: 1 0 auto; min-width: 2.5rem; padding: 0.5rem 0.5rem; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 0.35rem; font-size: 0.78rem; cursor: pointer; touch-action: manipulation; -webkit-user-select: none; user-select: none; }
+    .kbd-bar button.sticky { background: var(--accent); color: var(--bg-3); }
+    .kbd-bar button:active { background: var(--accent); color: var(--bg-3); }
+
+    /* ==== setup ==== */
+    .setup { max-width: 380px; margin: 3rem auto 0; padding: 1.5rem; background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.75rem; }
+    .setup p { font-size: 0.82rem; color: var(--fg-dim); margin-bottom: 0.5rem; }
+    .setup input { display: block; width: 100%; padding: 0.55rem 0.75rem; margin: 0.5rem 0; background: var(--bg-3); color: var(--fg); border: 1px solid var(--border); border-radius: 0.45rem; font-size: 0.9rem; }
+    .setup button { padding: 0.55rem 1rem; background: var(--accent); color: var(--bg-3); border: none; border-radius: 0.45rem; cursor: pointer; font-weight: 500; }

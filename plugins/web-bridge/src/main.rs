@@ -399,6 +399,8 @@ async fn run_server(
         .route("/manifest.webmanifest", get(handle_manifest))
         .route("/sw.js", get(handle_service_worker))
         .route("/icon.svg", get(handle_icon))
+        .route("/app.js", get(handle_app_js))
+        .route("/app.css", get(handle_app_css))
         .route("/font/terminal", get(handle_font))
         .layer(axum::middleware::from_fn(
             move |req: axum::extract::Request, next: Next| {
@@ -419,6 +421,11 @@ async fn run_server(
                         || path == "/manifest.webmanifest"
                         || path == "/sw.js"
                         || path == "/icon.svg"
+                        // The shell's script + stylesheet. A `<script src>` / `<link>` fetch
+                        // sends no Authorization header, so authing these would 401 and leave
+                        // a blank page; neither carries a secret.
+                        || path == "/app.js"
+                        || path == "/app.css"
                         // A CSS @font-face fetch sends no Authorization header, so an
                         // authed font URL would 401 and leave the glyphs broken — the
                         // very bug it exists to fix. Public is therefore forced, which
@@ -784,14 +791,85 @@ fn urlenc(s: &str) -> String {
     out
 }
 
-async fn handle_index() -> axum::response::Response {
-    use axum::http::header;
+/// Serve one of the three compile-time files that make up the PWA shell.
+///
+/// **Caching.** `no-cache` + a strong content ETag, the same shape `/font/terminal` uses and
+/// for the same reason: the page, its script and its stylesheet are separate requests at
+/// stable URLs with no build hash (the HTML is `include_str!`'d and cannot carry one), so
+/// anything with a lifetime could pin a stale `app.js` against a new `index.html` — a mismatch
+/// whose only symptom is a broken page. `no-cache` stores the body but always revalidates, and
+/// the ETag is what makes that revalidation cost a 304 instead of re-sending ~70 KB to a phone
+/// on cellular every single load. Without a validator `no-cache` is just "download it again".
+///
+/// Not `private`: these bytes are identical for every viewer and carry nothing user-specific.
+///
+/// The ETag is content-derived, so it changes exactly when the asset does — there is no build
+/// step here to supply a version, and mtime/size would not survive `include_str!` at all.
+fn shell_asset(
+    headers: &axum::http::HeaderMap,
+    content_type: &'static str,
+    body: &'static str,
+) -> axum::response::Response {
+    use axum::http::{StatusCode, header};
     use axum::response::IntoResponse;
+
+    use sha2::Digest;
+    let etag = format!("\"{:x}\"", sha2::Sha256::digest(body.as_bytes()));
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|t| t.trim() == etag))
+    {
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, "no-cache".to_string()),
+            ],
+        )
+            .into_response();
+    }
     (
-        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-        include_str!("../static/index.html"),
+        [
+            (header::CONTENT_TYPE, content_type.to_string()),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, "no-cache".to_string()),
+        ],
+        body,
     )
         .into_response()
+}
+
+async fn handle_index(headers: axum::http::HeaderMap) -> axum::response::Response {
+    shell_asset(
+        &headers,
+        "text/html; charset=utf-8",
+        include_str!("../static/index.html"),
+    )
+}
+
+/// `GET /app.js` — the PWA's script, loaded as a module.
+///
+/// Public, like `/sw.js` and `/icon.svg`: a `<script src>` sends no Authorization header, so an
+/// authed URL would 401 and leave a blank page — the same reason `/font/terminal` is public.
+/// It carries no secrets; the bearer token is typed by the user and lives in `sessionStorage`.
+/// The MIME type is load-bearing for a module script: a browser refuses to execute one served
+/// as anything but JavaScript, and it does so silently apart from a console line.
+async fn handle_app_js(headers: axum::http::HeaderMap) -> axum::response::Response {
+    shell_asset(
+        &headers,
+        "text/javascript; charset=utf-8",
+        include_str!("../static/app.js"),
+    )
+}
+
+/// `GET /app.css` — the PWA's stylesheet. Public for the same reason as `/app.js`.
+async fn handle_app_css(headers: axum::http::HeaderMap) -> axum::response::Response {
+    shell_asset(
+        &headers,
+        "text/css; charset=utf-8",
+        include_str!("../static/app.css"),
+    )
 }
 
 async fn handle_healthz() -> &'static str {
