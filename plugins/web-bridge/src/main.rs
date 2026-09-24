@@ -237,12 +237,6 @@ struct AppState {
     /// endpoint then 404s and the PWA keeps its fallback stack, which is exactly
     /// today's behaviour, so a missing font degrades rather than breaks.
     font: Option<Arc<font::Font>>,
-    /// True only when the HTTP listener is bound to a loopback
-    /// address. Header-based Tailscale auth (`Tailscale-User-Login`)
-    /// is unsafe on non-loopback binds because any reachable caller
-    /// could forge the header — so we disable that path entirely
-    /// when bound to a routable interface and require bearer auth.
-    allow_tailscale_header: bool,
     default_subscribe_patterns: Arc<Vec<String>>,
     /// In-process 2 s TTL cache for `/api/tmux/panes`. Multiple
     /// dashboard tabs hitting refresh shouldn't fan out as N tmux
@@ -272,9 +266,13 @@ struct TmuxCacheEntry {
 }
 
 /// True when `bind` resolves to a loopback address (`127.0.0.0/8`
-/// for IPv4 or `::1` for IPv6). Header-based Tailscale auth is only
-/// safe under that invariant — see `AppState::allow_tailscale_header`.
+/// for IPv4 or `::1` for IPv6).
 /// Returns false for unparseable bind strings (fail-closed).
+///
+/// This used to gate the Tailscale identity-header auth path, which no longer exists. It now
+/// drives a startup warning: on a loopback bind the only way to this service is from this
+/// machine or through a proxy the operator put there, while on a routable one the bearer token
+/// is the single thing between the LAN and a terminal.
 fn bind_is_loopback(bind: &str) -> bool {
     use std::net::SocketAddr;
     let parsed: Option<SocketAddr> = bind.parse().ok();
@@ -302,12 +300,6 @@ async fn run_server(
     if push_config.is_none() {
         eprintln!(
             "[web-bridge] COPAD_WEB_BRIDGE_VAPID_PRIVATE/PUBLIC not set — push notifications disabled"
-        );
-    }
-    let allow_tailscale_header = bind_is_loopback(bind);
-    if !allow_tailscale_header {
-        eprintln!(
-            "[web-bridge] bind={bind} is not loopback; disabling Tailscale-User-Login header auth (bearer token required)"
         );
     }
     // Resolve the terminal font once, at startup, from the SAME config the desktop
@@ -348,7 +340,6 @@ async fn run_server(
         daemon: DaemonClient::new(socket_path),
         token: Arc::new(token.to_string()),
         font,
-        allow_tailscale_header,
         tmux_cache: Arc::new(tokio::sync::Mutex::new(None)),
         board_cache: Arc::new(tokio::sync::Mutex::new(None)),
         push_config: Arc::new(push_config),
@@ -362,7 +353,6 @@ async fn run_server(
     };
 
     let auth_state = state.clone();
-    let allow_ts_header = state.allow_tailscale_header;
     let app = Router::new()
         .route("/", get(handle_index))
         .route("/healthz", get(handle_healthz))
@@ -436,25 +426,18 @@ async fn run_server(
                     if public {
                         return next.run(req).await;
                     }
-                    // Tailscale serve injects `Tailscale-User-Login`
-                    // (and `-User-Name`) on every request that came
-                    // through it. Our plugin only binds 127.0.0.1, so
-                    // any external attacker would need to be in the
-                    // tailnet AND going through serve to reach us —
-                    // trust the header. Anyone with raw localhost
-                    // access already has the bearer token in env / on
-                    // disk, so per-process header forgery is a
-                    // theoretical not a real attack here.
-                    let ts_authed = allow_ts_header
-                        && req
-                            .headers()
-                            .get("tailscale-user-login")
-                            .and_then(|h| h.to_str().ok())
-                            .map(|s| !s.is_empty())
-                            .unwrap_or(false);
-                    if ts_authed {
-                        return next.run(req).await;
-                    }
+                    // There is deliberately NO identity-header auth path here.
+                    //
+                    // `tailscale serve` attaches `Tailscale-User-Login` to every request it
+                    // forwards, and trusting it let a browser on any admitted device reach this
+                    // service with no token. WebSocket upgrades are not subject to CORS and send
+                    // no preflight, so ANY page that device visited could have opened
+                    // `/ws/board/attach` — a terminal that accepts raw keystrokes — and had
+                    // serve supply the identity for it. The bearer path has no equivalent hole:
+                    // a cross-site page cannot produce `Sec-WebSocket-Protocol: bearer.<token>`
+                    // without the token. Closing the gap would have meant an origin policy on
+                    // top of an allowlist, two competing auth decisions, to save typing a token
+                    // once per session. See docs/mobile-access.md.
                     if upgrades {
                         // WS auth via Sec-WebSocket-Protocol: bearer.<token>
                         if !ws_subprotocol_ok(req.headers(), &token) {
@@ -483,6 +466,13 @@ async fn run_server(
     }
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
+    if !bind_is_loopback(bind) {
+        eprintln!(
+            "[web-bridge] WARNING: bound to {bind}, which is not loopback — the bearer token is \
+             the only thing protecting a terminal from anyone who can reach this address. The \
+             supported setup is a loopback bind behind `tailscale serve`."
+        );
+    }
     eprintln!("[web-bridge] listening on {bind}");
     axum::serve(listener, app).await?;
     Ok(())
@@ -882,22 +872,13 @@ async fn handle_healthz() -> &'static str {
 /// serve injects `Tailscale-User-Login` on every proxied request;
 /// bearer-token requests show that fallback. Anything else gets 401
 /// from the middleware before reaching here.
-async fn handle_whoami(headers: axum::http::HeaderMap) -> axum::Json<Value> {
-    let login = headers
-        .get("tailscale-user-login")
-        .and_then(|h| h.to_str().ok())
-        .filter(|s| !s.is_empty());
-    let name = headers
-        .get("tailscale-user-name")
-        .and_then(|h| h.to_str().ok())
-        .filter(|s| !s.is_empty());
-    if let Some(login) = login {
-        return axum::Json(json!({
-            "auth": "tailscale",
-            "login": login,
-            "name": name,
-        }));
-    }
+/// `GET /api/whoami` — how this request authenticated.
+///
+/// Always `bearer`, because that is now the only way to get here: the route is behind the
+/// auth middleware, so reaching this function already proves a valid token. It must NOT infer
+/// a mode from `Tailscale-User-Login`; reporting an identity the middleware did not act on is
+/// how a client ends up believing it is authenticated by a header that authenticates nothing.
+async fn handle_whoami() -> axum::Json<Value> {
     axum::Json(json!({ "auth": "bearer" }))
 }
 

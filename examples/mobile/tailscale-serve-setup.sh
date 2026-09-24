@@ -12,7 +12,10 @@
 # Why tailscale serve (not a raw bind): it gives HTTPS + a *.ts.net host = the
 # secure context iOS/Android require before a PWA may use a service worker or Web
 # Push, and it injects the Tailscale-User-Login identity header so the phone skips
-# the token page. See docs/mobile-access.md § tailscale serve.
+# HTTPS + a secure context, which the PWA needs for its service worker and Web Push.
+# It does NOT remove the bearer token: the identity-header auth path was removed because it
+# let any page a browser on an admitted device visited open a terminal. See
+# docs/mobile-access.md § Auth model.
 
 set -euo pipefail
 
@@ -60,7 +63,9 @@ echo
 echo "3) Front it with HTTPS over your tailnet (keeps the bind on loopback):"
 echo "     sudo tailscale serve --bg --https=443 http://127.0.0.1:$PORT"
 echo "     tailscale serve status      # your https://<host>.<tailnet>.ts.net URL"
-echo "   Open that URL on the phone → PWA installs, push works, no token page."
+echo "   Open that URL on the phone -> PWA installs and push works."
+echo "   You will be asked for the bearer token once per session:"
+echo "     cat ~/.config/copad/secrets.env"
 echo "   NOTE: writing a serve config needs root — without it you get"
 echo "         'Access denied: serve config denied'. Either prefix with sudo, or"
 echo "         grant your user the operator role once:"

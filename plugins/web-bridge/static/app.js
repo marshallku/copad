@@ -5,15 +5,17 @@
     // skips the token setup page entirely + omits the Authorization
     // header from /api/* calls + the bearer.<token> subprotocol from
     // /ws/* upgrades (the middleware trusts Tailscale-User-Login).
-    let authMode = "bearer";  // "bearer" | "tailscale"
-    let tsIdentity = null;     // { login, name } when authMode === "tailscale"
+    // Bearer is the only auth mode. The Tailscale identity-header path was removed: serve
+    // attaches that header to every request it forwards, WebSocket upgrades are not subject to
+    // CORS, and `/ws/board/attach` hands back a terminal — so any page visited on an admitted
+    // device could have driven it with no token. See docs/mobile-access.md.
 
     function api(path, opts = {}) {
       opts.headers = Object.assign({}, opts.headers || {});
       // Only send the Bearer header in bearer mode — in tailscale
       // mode we have no token and the server would 401 on an empty
       // bearer anyway.
-      if (authMode === "bearer" && token) {
+      if (token) {
         opts.headers["Authorization"] = "Bearer " + token;
       }
       if (opts.body && !opts.headers["Content-Type"]) opts.headers["Content-Type"] = "application/json";
@@ -24,7 +26,7 @@
           // the header — surface it as a generic error rather than
           // dropping the user back to a setup page that doesn't
           // apply to them.
-          if (authMode === "bearer") {
+          {
             token = ""; sessionStorage.removeItem("copad.token");
             stopBoardPolling();   // no longer authenticated; do not keep hammering 401s
             render();
@@ -99,7 +101,7 @@
     // header (injected on the upgrade request like any HTTP request)
     // satisfy the middleware.
     function wsProtocols() {
-      return (authMode === "bearer" && token) ? [`bearer.${token}`] : undefined;
+      return token ? [`bearer.${token}`] : undefined;
     }
     // True when the SPA still has a way to authenticate the next
     // reconnect attempt — tailscale mode is always-eligible since
@@ -107,7 +109,7 @@
     // cached token. Used by overview/events WS onclose handlers so
     // tailscale sessions don't silently stop reconnecting.
     function canReconnect() {
-      return authMode === "tailscale" || !!token;
+      return !!token;
     }
 
     function escapeHtml(s) {
@@ -349,7 +351,7 @@
     // the token and re-renders — wiping the field the user is in the middle of pasting into,
     // every five seconds.
     function isAuthed() {
-      return authMode === "tailscale" || !!token;
+      return !!token;
     }
 
     function startBoardPolling() {
@@ -395,13 +397,9 @@
         if (state.push.status === "on") return `<button class="chip ok" id="push-toggle">push: on</button>`;
         return `<button class="chip" id="push-toggle">push: off</button>`;
       })();
-      const authChip = authMode === "tailscale"
-        ? `<span class="chip ok" title="Authenticated via Tailscale serve">ts: ${escapeHtml((tsIdentity && (tsIdentity.login || tsIdentity.name)) || "ok")}</span>`
-        : "";
       root.innerHTML = `
         <header>
           <h1>copad <span class="dim">— remote bridge</span></h1>
-          ${authChip}
           ${pushChip}
           <button class="chip" id="open-mux">terminal</button>
           <button class="chip ${state.presence === "away" ? "warn" : "ok"}" id="presence-toggle">${state.presence || "…"}</button>
@@ -668,7 +666,7 @@
     function render() {
       // Tailscale mode never needs a token — go straight to the app.
       // Bearer mode needs one; otherwise show the setup prompt.
-      if (authMode !== "tailscale" && !token) { renderSetup(); return; }
+      if (!token) { renderSetup(); return; }
       if (state.mode === "mux") { renderMux(); return; }
       if (state.mode === "attach") { renderAttach(); return; }
       renderOverview();
@@ -1401,26 +1399,12 @@
       }
     }
 
-    // Boot order:
-    //   1. ask /api/whoami WITHOUT any auth header — if Tailscale
-    //      serve injected its identity header, the middleware lets
-    //      us through and the SPA skips the bearer setup page.
-    //   2. otherwise fall back to the cached bearer token (sessionStorage)
-    //      or render the setup page.
-    (async () => {
-      try {
-        const r = await fetch("/api/whoami");
-        if (r.ok) {
-          const w = await r.json();
-          if (w.auth === "tailscale") {
-            authMode = "tailscale";
-            tsIdentity = { login: w.login || "", name: w.name || "" };
-          }
-        }
-      } catch {}
-      if (authMode === "tailscale") {
-        bootFromHash(); bootstrap();
-      } else if (token) {
+    // Bearer only: with a cached token, boot; without one, show the setup page. The
+    // unauthenticated /api/whoami probe that used to precede this is gone with the identity
+    // header path it existed to detect — it now always answers `bearer`, and it is behind the
+    // auth middleware anyway, so an unauthenticated call can only 401.
+    (() => {
+      if (token) {
         bootFromHash(); bootstrap();
       } else {
         render();
