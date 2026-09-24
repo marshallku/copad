@@ -82,19 +82,9 @@
     /* Attention strip — same chassis as events strip but kind-color
        coded. notification = accent (info), stop = ok (done), codex* =
        warn (response ready / awaits user). Hidden via JS when empty. */
-    .attention-strip { background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.65rem; overflow: hidden; }
     /* Rows are interactive — tapping routes to the originating pane.
        Hover hint + cursor pointer signals the affordance. Rows without
        a resolvable target still render but the click is a no-op. */
-    .attention-row { padding: 0.45rem 0.85rem; border-bottom: 1px solid var(--border); font-size: 0.74rem; color: var(--fg); display: flex; gap: 0.5rem; align-items: baseline; cursor: pointer; }
-    .attention-row:hover { background: var(--bg-3); }
-    .attention-row:last-child { border-bottom: none; }
-    .attention-row .kind { flex-shrink: 0; font-size: 0.65rem; padding: 0.1rem 0.35rem; border-radius: 0.3rem; border: 1px solid var(--border); color: var(--fg-dim); }
-    .attention-row[data-kind="notification"] .kind { color: var(--accent); border-color: var(--accent); }
-    .attention-row[data-kind="stop"] .kind { color: var(--accent-ok); border-color: var(--accent-ok); }
-    .attention-row[data-kind^="codex"] .kind { color: var(--accent-warn); border-color: var(--accent-warn); }
-    .attention-row .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .attention-row .age { color: var(--fg-dim); font-size: 0.7rem; flex-shrink: 0; }
     /* Push toggle in header — same chip chassis as presence.
        Push settings expand below cards when subscribed. */
     .push-settings { background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.65rem; padding: 0.55rem 0.85rem; font-size: 0.75rem; color: var(--fg-dim); display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; }
@@ -145,6 +135,11 @@
     #term-host.mux { overflow: auto; -webkit-overflow-scrolling: touch; }
     #term-host.mux .xterm { height: 100%; width: max-content; }
     /* mobile keyboard toolbar */
+    .agent-list { display: flex; flex-direction: column; gap: 0.2rem; margin: 0 0.6rem 0.5rem; }
+    .agent-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.45rem 0.5rem; background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.35rem; cursor: pointer; }
+    .agent-row .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .agent-row .age { color: var(--fg-dim); font-size: 0.78rem; white-space: nowrap; }
+    .group-head { cursor: pointer; user-select: none; }
     .kbd-bar { display: flex; flex-wrap: wrap; gap: 0.3rem; padding: 0.4rem; background: var(--bg-2); border-top: 1px solid var(--border); }
     /* touch-action: manipulation suppresses double-tap zoom; user-select
        prevents long-press text selection on iOS. Combined with the
@@ -199,6 +194,7 @@
           // apply to them.
           if (authMode === "bearer") {
             token = ""; sessionStorage.removeItem("copad.token");
+            stopBoardPolling();   // no longer authenticated; do not keep hammering 401s
             render();
           }
           throw new Error("unauthorized");
@@ -215,14 +211,18 @@
     const state = {
       mode: "overview",         // "overview" | "attach" | "mux"
       muxError: "",             // why the comux terminal could not open (from the preflight)
+      board: null,              // GET /api/board result; null = never loaded
+      boardStale: false,        // a fetch failed — what is shown is the LAST good read
+      boardOpen: {},            // session key -> true; expansion survives re-renders
+      boardTimer: null,
+      boardEpoch: 0,
+      boardLoop: 0,
+      boardInFlight: false,
       muxChecking: false,       // a preflight is in flight (drives the banner)
       muxEpoch: 0,              // bumped on every entry/teardown; stale preflights are dropped
       muxResizeOff: null,       // detaches the mux resize listeners on leave
       presence: null,
       tmuxPanes: [],
-      attention: [],
-      codexJobs: [],
-      copadPanels: [],
       events: [],
       noGui: false,
       pilot: null,              // /api/pilot/status result: {pilot:{goals,active,gate,counts}, csd, tmx, errors}
@@ -372,48 +372,191 @@
       return panes.slice().sort((a, b) => paneSortRank(a) - paneSortRank(b));
     }
 
+    /* ==== the comux fleet board ====
+     *
+     * This replaces the tmx-fed `attention` strip and `codex jobs` cards that used to sit in
+     * the overview. Their only producer was the /ws/tmux/overview stream, which this build no
+     * longer opens, so they could only ever render empty here; the board answers the same
+     * question (which agent needs me) from comux, which is what actually runs on this machine.
+     */
+
+    // Status comes from comux and is CACHED AND INFERRED: only Claude's is read from a session
+    // file, everything else is matched against screen text, and `idle` doubles as "no
+    // recognized UI" — i.e. an unresolved reading. So the partition below must be EXHAUSTIVE
+    // and must preserve the raw label. An earlier draft listed blocked/working/idle only,
+    // which would have hidden `ready` — 26 of the 27 agents on this machine.
+    const BOARD_ATTENTION = new Set(["blocked"]);
+    const BOARD_ACTIVE = new Set(["working"]);
+
+    // Group key. `space_id` is the stable session id, but an older comux does not send it, and
+    // two sessions may legitimately share a display name — so a name-based key is NAMESPACED
+    // and marked ambiguous rather than silently merged with an id-based one.
+    function boardGroupKey(a) {
+      return a.space_id ? `id:${a.space_id}` : `name:${a.space || "?"}`;
+    }
+
+    function boardRow(a) {
+      const cls = BOARD_ATTENTION.has(a.status) ? "warn" : BOARD_ACTIVE.has(a.status) ? "busy" : "";
+      return `
+        <div class="agent-row" data-token="${escapeHtml(a.token || a.terminal || "")}">
+          <span class="pill ${cls}">${escapeHtml(a.status || "?")}</span>
+          <span class="title">${escapeHtml(a.space || "?")} / ${escapeHtml(a.title || "?")}</span>
+          <span class="age">${escapeHtml(a.tool || "")} · ${escapeHtml(humanSecs(a.for_secs))}</span>
+        </div>`;
+    }
+
+    function humanSecs(n) {
+      if (typeof n !== "number" || n < 0) return "";
+      if (n < 90) return `${n}s`;
+      if (n < 5400) return `${Math.round(n / 60)}m`;
+      if (n < 172800) return `${Math.round(n / 3600)}h`;
+      return `${Math.round(n / 86400)}d`;
+    }
+
+    function renderBoard() {
+      const b = state.board;
+      if (!b) {
+        // Never loaded. "loading…" forever would be a lie once the first attempt has already
+        // failed, so the stale flag decides which of the two this is.
+        return `<div class="section-title">fleet</div><div class="empty">${
+          state.boardStale ? "could not reach the bridge — retrying" : "loading…"}</div>`;
+      }
+
+      const errs = (b.errors || []).map(e =>
+        `<div class="banner">fleet: ${escapeHtml(e.what)} — ${escapeHtml(e.message || e.code)}</div>`).join("");
+      // null means "could not read"; [] means "read, and empty". Rendering them the same would
+      // report a failed read as an empty fleet — and the agents list is the whole board, so
+      // substituting [] for it would print a confident "idle 0" that is simply false. The
+      // error banner does not make that count true.
+      // Computed BEFORE the early return: without it, a transport failure on top of an
+      // already-partial response would present the retained session count as current.
+      const stale = state.boardStale
+        ? `<div class="banner">showing the last good read — the bridge did not answer</div>` : "";
+
+      if (b.agents === null) {
+        return `<div class="section-title">fleet</div>${errs}${stale}
+                <div class="empty">could not read the agent list${
+                  b.sessions ? ` — ${b.sessions.length} sessions were up at the last read` : ""}</div>`;
+      }
+      const agents = b.agents;
+      const attention = agents.filter(a => BOARD_ATTENTION.has(a.status));
+      const active = agents.filter(a => BOARD_ACTIVE.has(a.status));
+      const rest = agents.filter(a => !BOARD_ATTENTION.has(a.status) && !BOARD_ACTIVE.has(a.status));
+
+      const groups = new Map();
+      for (const a of rest) {
+        const k = boardGroupKey(a);
+        if (!groups.has(k)) groups.set(k, { name: a.space || "?", ambiguous: !a.space_id, rows: [] });
+        groups.get(k).rows.push(a);
+      }
+
+      const section = (title, rows, n) => rows.length === 0 ? "" : `
+        <div class="section-title">${title} <span style="text-transform:none; color:var(--fg-dim);">${n}</span></div>
+        <div class="agent-list">${rows.map(boardRow).join("")}</div>`;
+
+      const groupBlocks = [...groups.entries()].map(([k, g]) => {
+        const open = !!state.boardOpen[k];
+        return `
+          <div class="section-title group-head" data-group="${escapeHtml(k)}">
+            ${open ? "▾" : "▸"} ${escapeHtml(g.name)}${g.ambiguous ? ' <span class="dim">(by name)</span>' : ""}
+            <span style="text-transform:none; color:var(--fg-dim);">${g.rows.length}</span>
+          </div>
+          ${open ? `<div class="agent-list">${g.rows.map(boardRow).join("")}</div>` : ""}`;
+      }).join("");
+
+      // The status legend is not decoration: comux documents that a screen-text match can read
+      // as `blocked`, so the board must not present these as fact.
+      return `${errs}${stale}
+        ${section("needs you", attention, attention.length)}
+        ${section("working", active, active.length)}
+        <div class="section-title">idle <span style="text-transform:none; color:var(--fg-dim);">${rest.length}</span></div>
+        ${groupBlocks || `<div class="empty">no idle agents</div>`}
+        <div class="push-settings"><span style="color:var(--fg-dim);">status is inferred by comux; the time is how long it has held that status, not how long a task has run.</span></div>`;
+    }
+
+    // One outstanding request at a time, the next scheduled only after the previous completes,
+    // and stale responses dropped by epoch. A fixed interval would stack requests whenever the
+    // bridge is slow — and /api/board can spend two sequential subprocess deadlines.
+    async function loadBoard() {
+      // One request at a time, not one per caller. `startBoardPolling` is invoked on return
+      // from the terminal AND on every foreground, so without this a phone waking up could put
+      // several fetches in flight at once — and each /api/board can spend two sequential
+      // subprocess deadlines server-side.
+      if (state.boardInFlight) return;
+      state.boardInFlight = true;
+      const epoch = ++state.boardEpoch;
+      let deadline = null;
+      try {
+        // `api()` has no timeout of its own. A request that never settles — a phone that lost
+        // signal mid-flight is the ordinary case — would otherwise leave `boardInFlight` set
+        // forever, silently skipping every later refresh while the board showed data that was
+        // never marked stale. The fetch is ABORTED rather than merely raced: abandoning it
+        // would leave the old request outstanding while the next poll started another, which
+        // is the overlap the single-flight guard exists to prevent.
+        const ctl = new AbortController();
+        deadline = setTimeout(() => ctl.abort(), 15000);
+        const b = await api("/api/board", { signal: ctl.signal });
+        if (state.boardEpoch !== epoch) return;
+        state.board = b;
+        state.boardStale = false;
+      } catch {
+        if (state.boardEpoch !== epoch) return;
+        // A request that never returns is invisible to the API's own `errors[]`, so transport
+        // failure marks what is on screen as stale rather than blanking it.
+        state.boardStale = true;
+      } finally {
+        if (deadline) clearTimeout(deadline);
+        state.boardInFlight = false;
+      }
+      if (state.mode === "overview") render();
+    }
+
+    // The same condition `render()` uses to decide between the app and the token page. Polling
+    // must respect it: on the setup screen `state.mode` is still "overview", so a foreground
+    // event would start the loop, every /api/board would 401, and `api()`'s 401 handler clears
+    // the token and re-renders — wiping the field the user is in the middle of pasting into,
+    // every five seconds.
+    function isAuthed() {
+      return authMode === "tailscale" || !!token;
+    }
+
+    function startBoardPolling() {
+      if (!isAuthed()) { stopBoardPolling(); return; }
+      // Only the TIMER is reset here, deliberately not the request epoch. `startBoardPolling`
+      // runs on every foreground and on every return from the terminal, and invalidating an
+      // in-flight request there would throw away a good response that is about to land and
+      // then wait a full interval for its replacement. Invalidation belongs to leaving
+      // (`stopBoardPolling`).
+      clearBoardTimer();
+      // Each loop carries a generation, and only the CURRENT generation may schedule. Without
+      // it a restart during an in-flight request forks the loop: the new tick returns early on
+      // the single-flight guard and schedules, then the original tick completes and schedules
+      // too — two chains from then on, each polling.
+      const loop = ++state.boardLoop;
+      const tick = async () => {
+        if (!isAuthed() || state.mode !== "overview" || state.boardLoop !== loop) return;
+        await loadBoard();
+        if (!isAuthed() || state.mode !== "overview" || state.boardLoop !== loop) return;
+        state.boardTimer = setTimeout(tick, 5000);
+      };
+      tick();
+    }
+
+    function clearBoardTimer() {
+      if (state.boardTimer) { clearTimeout(state.boardTimer); state.boardTimer = null; }
+    }
+
+    function stopBoardPolling() {
+      clearBoardTimer();
+      state.boardLoop++;    // no existing tick may schedule again
+      state.boardEpoch++;   // leaving: drop any in-flight response
+    }
+
     function renderOverview() {
-      const sortedPanes = paneSorted(state.tmuxPanes);
-      const tmuxBlock = sortedPanes.length === 0
-        ? `<div class="empty">no tmux panes. start a tmux session (or use the non-tmux fallback below).</div>`
-        : `<div class="cards">${sortedPanes.map(p => {
-            const a = p.agent;
-            // Skip the status row entirely for shell/other panes — no
-            // signal to show beyond cwd + preview. Only claude / codex
-            // (or anything with explicit flags) gets pills.
-            const isAgentKind = a && (a.kind === "claude" || a.kind === "codex");
-            const statusPill = isAgentKind
-              ? `<span class="pill ${escapeHtml(statusToPillClass(a.status))}">${escapeHtml(a.kind)}: ${escapeHtml(a.status)}</span>`
-              : "";
-            const flagPills = a && a.flags ? [
-              a.flags.blocked ? `<span class="pill waiting">blocked</span>` : "",
-              a.flags.has_intent ? `<span class="pill">intent</span>` : "",
-              a.flags.reviewed_fresh ? `<span class="pill idle">reviewed</span>` : "",
-            ].join("") : "";
-            const statusRow = (statusPill || flagPills)
-              ? `<div class="card-status">${statusPill}${flagPills}</div>`
-              : "";
-            return `
-            <div class="card${p.pane_active ? " active-pane" : ""}" data-pane="${escapeHtml(p.pane_id)}">
-              <div class="card-head">
-                <div class="card-name">${escapeHtml(p.session)} : ${escapeHtml(p.window_name || p.window_index)} (${escapeHtml(p.pane_id)})</div>
-                <div class="card-meta">${p.pane_active ? "● active" : ""}</div>
-              </div>
-              <div class="card-cwd">${escapeHtml(p.cwd || "")}</div>
-              ${statusRow}
-              <div class="card-preview">${escapeHtml(stripAnsi((p.last_lines || []).join("\n")).trim() || "(empty)")}</div>
-            </div>`;
-          }).join("")}</div>`;
-      const copadBlock = state.copadPanels.length === 0
-        ? `<div class="empty">no copad panels${state.noGui ? " — copad GUI not running" : ""}</div>`
-        : `<div class="cards">${state.copadPanels.map(p => `
-            <div class="card" data-copad-pane="${escapeHtml(p.id)}">
-              <div class="card-head">
-                <div class="card-name">${escapeHtml(p.title || p.id)}</div>
-                <div class="card-meta">${escapeHtml(p.type || "?")}</div>
-              </div>
-              <div class="card-cwd">interactive UI deferred to Slice 3.2 — see Slice 3.0 endpoints</div>
-            </div>`).join("")}</div>`;
+      // The tmux-pane cards and copad-panel cards that used to be built here are gone with
+      // the tmux data model; `renderBoard()` below is the overview's content now. Their
+      // computation was removed rather than left unrendered — it walked state that nothing
+      // populates any more and ran on every poll.
       const pushChip = (() => {
         if (state.push.status === "unsupported") return `<button class="chip" id="push-toggle" disabled>push: n/a</button>`;
         if (state.push.status === "denied") return `<button class="chip warn" id="push-toggle">push: denied</button>`;
@@ -431,7 +574,7 @@
           <button class="chip" id="open-mux">terminal</button>
           <button class="chip ${state.presence === "away" ? "warn" : "ok"}" id="presence-toggle">${state.presence || "…"}</button>
         </header>
-        ${state.noGui ? `<div class="banner" style="margin: 0.5rem 0.6rem;">copad GUI not running — only tmux + presence + events work</div>` : ""}
+        ${state.noGui ? `<div class="banner" style="margin: 0.5rem 0.6rem;">copad GUI not running — the fleet board, terminal, presence and events still work</div>` : ""}
         <main class="overview">
           ${state.push.status === "on" ? `
             <div class="push-settings">
@@ -443,45 +586,8 @@
             </div>
           ` : ""}
           ${state.push.error ? `<div class="push-settings"><span class="err">push: ${escapeHtml(state.push.error)}</span></div>` : ""}
-          ${state.attention.length === 0 ? "" : `
-            <div class="section-title">attention <span style="text-transform:none; color:var(--fg-dim);">${state.attention.length}</span></div>
-            <div class="attention-strip">${state.attention.slice(0, 5).map(a => `
-              <div class="attention-row" data-kind="${escapeHtml(a.kind || "?")}" data-target="${escapeHtml(a.tmux_target || "")}" data-session="${escapeHtml(a.tmux_session || "")}">
-                <span class="kind">${escapeHtml(a.kind || "?")}</span>
-                <span class="title">${escapeHtml(a.title || a.body || "")}</span>
-                <span class="age">${escapeHtml(a.tmux_session || "")} ${escapeHtml(humanAgeFromEpochSec(a.ts))}</span>
-              </div>`).join("")}</div>
-          `}
           ${renderPilot()}
-          ${state.codexJobs.length === 0 ? "" : `
-            <div class="section-title">codex jobs <span style="text-transform:none; color:var(--fg-dim);">${state.codexJobs.length}</span></div>
-            <div class="cards">${state.codexJobs.map(j => {
-              const wsName = (j.workspace_root || "").split("/").filter(Boolean).pop() || "";
-              // Only `running` gets a colored pill (warn/orange via the
-              // existing `busy` style). Every other status — queued,
-              // unknown, etc — uses the bare neutral pill class so we
-              // don't accidentally pick up `.idle`/`.waiting` colors
-              // when the raw status string happens to match those names.
-              const statusPill = j.status === "running"
-                ? `<span class="pill busy">${escapeHtml(j.status)}</span>`
-                : `<span class="pill">${escapeHtml(j.status || "?")}</span>`;
-              const agePill = j.updated_at_ms ? `<span class="pill age">${escapeHtml(humanAgeMs(j.updated_at_ms))} ago</span>` : "";
-              const pidPart = j.pid ? `pid ${j.pid}` : "";
-              return `
-                <div class="card">
-                  <div class="card-head">
-                    <div class="card-name">${escapeHtml(j.title || j.id)}</div>
-                    <div class="card-meta">${escapeHtml(pidPart)}</div>
-                  </div>
-                  <div class="card-cwd">${escapeHtml(wsName)}${j.kind_label ? " · " + escapeHtml(j.kind_label) : ""}</div>
-                  <div class="card-status">${statusPill}${agePill}</div>
-                </div>`;
-            }).join("")}</div>
-          `}
-          <div class="section-title">tmux panes <span style="text-transform:none; color:var(--fg-dim);">${state.tmuxPanes.length}</span></div>
-          ${tmuxBlock}
-          <div class="section-title">copad panels <span style="text-transform:none; color:var(--fg-dim);">${state.copadPanels.length}</span></div>
-          ${copadBlock}
+          ${renderBoard()}
           <div class="section-title">recent events</div>
           <div class="events-strip">${
             state.events.length === 0
@@ -502,14 +608,22 @@
       document.querySelectorAll(".push-settings input[data-push-kind]").forEach(el => {
         el.addEventListener("change", () => updatePushKinds(el.dataset.pushKind, el.checked));
       });
+      document.querySelectorAll(".group-head[data-group]").forEach(el => {
+        el.addEventListener("click", () => {
+          const k = el.dataset.group;
+          state.boardOpen[k] = !state.boardOpen[k];
+          render();
+        });
+      });
+      // Opening the terminal is the only action a row can offer today: comux's v1 transport
+      // composes ONE frame for all clients, so the phone cannot show a single pane, and
+      // `jump` would move the desktop user's view. Targeted open waits on the per-pane
+      // protocol (decisions #65/#66).
+      document.querySelectorAll(".agent-row").forEach(el => {
+        el.addEventListener("click", () => enterMux(true));
+      });
       document.querySelectorAll(".card[data-pane]").forEach(el => {
         el.addEventListener("click", () => enterAttach(el.dataset.pane));
-      });
-      document.querySelectorAll(".attention-row").forEach(el => {
-        el.addEventListener("click", () => {
-          const pid = resolveAttentionTargetPane(el.dataset.target, el.dataset.session);
-          if (pid) enterAttach(pid);
-        });
       });
       wirePilot();
     }
@@ -519,26 +633,6 @@
     // active pane in the exact window → first pane in the window → any
     // pane in the session. Null when nothing matches (stale entry whose
     // session has since died).
-    function resolveAttentionTargetPane(target, session) {
-      const panes = state.tmuxPanes || [];
-      if (target) {
-        const [sess, widx] = target.split(":");
-        const widxNum = Number.parseInt(widx, 10);
-        if (sess && !Number.isNaN(widxNum)) {
-          const inWindow = panes.filter(p => p.session === sess && p.window_index === widxNum);
-          const active = inWindow.find(p => p.pane_active);
-          if (active) return active.pane_id;
-          if (inWindow.length > 0) return inWindow[0].pane_id;
-        }
-      }
-      if (session) {
-        const inSession = panes.filter(p => p.session === session);
-        const active = inSession.find(p => p.pane_active);
-        if (active) return active.pane_id;
-        if (inSession.length > 0) return inSession[0].pane_id;
-      }
-      return null;
-    }
 
     function renderAttach() {
       const pane = state.tmuxPanes.find(p => p.pane_id === state.activePane);
@@ -850,6 +944,7 @@
       state.muxChecking = false;
       state.mode = "overview";
       state.muxError = "";
+      startBoardPolling();      // refresh immediately on return, then resume the cadence
     }
 
     function leaveMux() {
@@ -893,6 +988,7 @@
         // transitions, so the platform back gesture leaves the terminal, not the page.
         history.pushState({ mode: "mux" }, "", "#mux");
       }
+      stopBoardPolling();
       render();                 // shell + "checking" banner; no socket opened yet
       const err = await muxPreflight();
       if (state.muxEpoch !== epoch) return;   // superseded by a later entry or a teardown
@@ -1098,30 +1194,6 @@
     }
 
     /* ==== overview WS ==== */
-    function openOverviewStream() {
-      if (state.ws.overview) { try { state.ws.overview.close(); } catch {} }
-      const proto = location.protocol === "https:" ? "wss" : "ws";
-      const ws = new WebSocket(`${proto}://${location.host}/ws/tmux/overview`, wsProtocols());
-      state.ws.overview = ws;
-      ws.onmessage = (msg) => {
-        try {
-          const snap = JSON.parse(msg.data);
-          // New shape is {panes, attention}; tolerate the old plain-
-          // array shape so a stale cached page transient doesn't blank
-          // the dashboard during the deploy window.
-          if (Array.isArray(snap)) {
-            state.tmuxPanes = snap;
-          } else {
-            state.tmuxPanes = snap.panes || [];
-            state.attention = snap.attention || [];
-            state.codexJobs = snap.codex_jobs || [];
-          }
-          if (state.mode === "overview") render();
-        } catch {}
-      };
-      ws.onclose = () => { state.ws.overview = null; if (canReconnect()) setTimeout(openOverviewStream, 2000); };
-      ws.onerror = () => { try { ws.close(); } catch {} };
-    }
 
     function openEventStream() {
       if (state.ws.events) { try { state.ws.events.close(); } catch {} }
@@ -1352,15 +1424,20 @@
         state.presence = "?";
       }
       try {
-        state.copadPanels = await api("/api/panes");
+        // Called for its failure mode, not its payload: a `no_gui` rejection is how the page
+        // learns the copad GUI is not running. The pane list itself is no longer rendered.
+        await api("/api/panes");
       } catch (e) {
         if (e && e.code === "no_gui") state.noGui = true;
-        state.copadPanels = [];
       }
       await initPush();
       render();
       openEventStream();
-      openOverviewStream();
+      // `/ws/tmux/overview` is deliberately NOT opened any more. It shells out to tmux
+      // server-side every 5 s and pushes a snapshot that triggers a render — pure cost on a
+      // machine whose multiplexer is comux, where every one of those snapshots is empty. The
+      // endpoint itself is left in place for installs that still run tmux.
+      startBoardPolling();
       // Pilot cockpit: initial load + a slow poll as a backstop (pilot.*
       // bus events on the event stream drive the responsive refresh; this
       // catches state the events miss and the first paint).
@@ -1419,6 +1496,10 @@
       if (state._removeResize) { state._removeResize(); state._removeResize = null; }
       state.activePane = null;
       state.mode = "overview";
+      // The board's poll loop exits whenever the mode is not `overview`, and a `#pane/<id>`
+      // deep link puts the page straight into attach at boot — so without this the fleet would
+      // sit on "loading…" until something else happened to restart it.
+      startBoardPolling();
     }
 
     function leaveAttach() {
@@ -1440,6 +1521,14 @@
       if (state.mode === "attach") teardownAttach();
       else if (state.mode === "mux") teardownMux();
     }
+
+    // Mobile browsers freeze timers in a backgrounded tab, so the cadence alone cannot keep the
+    // board honest — refresh when the page comes back instead.
+    document.addEventListener("visibilitychange", () => {
+      if (document.visibilityState === "visible" && state.mode === "overview" && isAuthed()) {
+        startBoardPolling();
+      }
+    });
 
     window.addEventListener("popstate", (e) => {
       const target = (e.state && e.state.mode) || "overview";
