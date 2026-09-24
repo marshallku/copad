@@ -130,10 +130,20 @@ pub fn load(path: &Path) -> Result<Font, String> {
 /// `None` → the endpoint 404s and the PWA keeps its existing fallback stack, i.e.
 /// today's behaviour. Every failure logs once so it's diagnosable.
 pub fn resolve(family: &str) -> Option<PathBuf> {
-    if let Ok(p) = std::env::var("COPAD_WEB_BRIDGE_FONT") {
+    resolve_with_override(family, "COPAD_WEB_BRIDGE_FONT")
+}
+
+/// Resolve `family`, honouring a path override from `override_var`.
+///
+/// The override variable is a PARAMETER because the terminal font and the symbol font must not
+/// share one. `COPAD_WEB_BRIDGE_FONT` is a supported escape hatch that pins an exact file; if
+/// symbol resolution read it too, anyone using it would be served the same glyph-incomplete
+/// file from both endpoints and the icons would stay broken with no indication why.
+pub fn resolve_with_override(family: &str, override_var: &str) -> Option<PathBuf> {
+    if let Ok(p) = std::env::var(override_var) {
         let path = PathBuf::from(&p);
         if !path.is_absolute() {
-            eprintln!("[web-bridge] COPAD_WEB_BRIDGE_FONT must be absolute: {p}");
+            eprintln!("[web-bridge] {override_var} must be absolute: {p}");
             return None;
         }
         return Some(path);
@@ -174,6 +184,29 @@ fn fc_match(family: &str) -> Option<PathBuf> {
 }
 
 /// macOS has no fc-match by default. Best-effort filename match.
+/// How much we want a given file, given the family we asked for. LOWER is better.
+///
+/// A family like `Jetendard` has a dozen files on disk and `read_dir` hands them back in
+/// whatever order the filesystem likes. Taking the first match served
+/// `Jetendard-SemiBoldItalic` to the phone — every glyph in semibold italic — which is how this
+/// was found. Rank instead, so the weight the user actually configured wins regardless of
+/// directory order.
+pub fn variant_rank(stem: &str, want: &str) -> u8 {
+    let rest = norm(stem)
+        .strip_prefix(want)
+        .map(str::to_string)
+        .unwrap_or_default();
+    match rest.as_str() {
+        // "Jetendard" itself, or a single-file family.
+        "" => 0,
+        "regular" => 1,
+        // Anything else is a named variant. Italic is worse than a plain weight, because a
+        // whole terminal in italic is worse than a whole terminal in the wrong weight.
+        r if r.contains("italic") => 3,
+        _ => 2,
+    }
+}
+
 fn macos_scan(family: &str) -> Option<PathBuf> {
     if !cfg!(target_os = "macos") {
         return None;
@@ -185,24 +218,63 @@ fn macos_scan(family: &str) -> Option<PathBuf> {
         PathBuf::from("/Library/Fonts"),
         PathBuf::from("/System/Library/Fonts"),
     ];
+    let mut best: Option<(u8, PathBuf)> = None;
     for dir in dirs {
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
         };
         for e in rd.flatten() {
             let p = e.path();
-            let stem = p.file_stem()?.to_string_lossy().to_string();
-            if norm(&stem).starts_with(&want) {
-                return Some(p);
+            // NOT `?`: a single stem-less entry used to abort the entire scan, taking every
+            // later directory with it.
+            let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string()) else {
+                continue;
+            };
+            if !norm(&stem).starts_with(&want) {
+                continue;
+            }
+            let rank = variant_rank(&stem, &want);
+            if best.as_ref().is_none_or(|(b, _)| rank < *b) {
+                best = Some((rank, p));
+            }
+            if rank == 0 {
+                break;
             }
         }
     }
-    None
+    best.map(|(_, p)| p)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bug this encodes: `read_dir` order decided the variant, and it picked
+    /// `Jetendard-SemiBoldItalic` — so the phone rendered every glyph in semibold italic.
+    #[test]
+    fn regular_beats_every_other_variant_regardless_of_directory_order() {
+        let want = norm("Jetendard");
+        let mut ranked = [
+            "Jetendard-SemiBoldItalic",
+            "Jetendard-Bold",
+            "Jetendard-Regular",
+            "Jetendard-Light",
+        ];
+        ranked.sort_by_key(|s| variant_rank(s, &want));
+        assert_eq!(ranked[0], "Jetendard-Regular");
+        // Italic ranks below a plain weight: a whole terminal in italic is worse than one in
+        // the wrong weight.
+        assert!(
+            variant_rank("Jetendard-Bold", &want) < variant_rank("Jetendard-BoldItalic", &want)
+        );
+    }
+
+    #[test]
+    fn a_single_file_family_with_no_suffix_wins_outright() {
+        let want = norm("Monaco");
+        assert_eq!(variant_rank("Monaco", &want), 0);
+        assert!(variant_rank("Monaco", &want) < variant_rank("MonacoBold", &want));
+    }
 
     #[test]
     fn sniff_accepts_real_font_magic() {

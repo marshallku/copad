@@ -674,18 +674,29 @@
 
     /* ==== comux terminal (the mobile terminal) ==== */
 
-    // The comux client renders ONE composed frame sized to the smallest attached client, so a
-    // phone attaching at its natural ~40 columns reflows the user's desktop terminal to 40
-    // columns for as long as the phone is connected. The floor bounds that: the grid is never
-    // narrower than this, and the phone scrolls its viewport instead of dragging the desktop
-    // below a usable size.
+    // The grid is whatever the phone actually fits. There is deliberately NO column floor.
     //
-    // It has to be the BROWSER's logical grid, not just the PTY size — comux probes the
-    // terminal for its true size on focus and sends what it gets back, so a PTY-only clamp
-    // would be overwritten, and an 80-column PTY rendered into a 40-column xterm wraps wrong
-    // rather than scrolling. Real fix is the per-pane semantic grid (decisions #65/#66).
-    const MUX_MIN_COLS = 80;
-    const MUX_MIN_ROWS = 24;
+    // An earlier build floored it at 80 to stop the phone reflowing the desktop, since comux
+    // composes one frame sized to the smallest attached client. That was the wrong trade twice
+    // over. A phone fits roughly 40 columns, so an 80-column grid meant horizontal scrolling
+    // through content that did not fit — and 80 is exactly comux's `sidebar_min_cols` default,
+    // the one value at which its sidebar stays VISIBLE, so 24 of those 80 columns went to a
+    // sidebar the phone does not need. The result on a real device was a screen with nothing
+    // readable on it.
+    //
+    // Fitting the viewport hides that sidebar for free — comux checks `cols >= sidebar_min_cols`
+    // itself — without touching `Ctrl-b s`, which is shared state and would hide it on the
+    // desktop too. The fleet board is the phone's sidebar.
+    //
+    // The cost is real and larger than "while attached": the composed frame and the PTYs follow
+    // the narrowest client, and if the phone is the LAST one to detach the geometry stays
+    // narrow until something attaches again. Accepted — the premise of this product is that
+    // nobody is at the desktop. The fix is the per-pane semantic grid (decisions #65/#66).
+    //
+    // The sizing must be the BROWSER's logical grid, not just the PTY: comux probes the terminal
+    // for its true size on focus and sends back what it gets, so a PTY-only clamp is overwritten.
+    const MUX_MIN_COLS = 20;   // not a layout choice — just never send a degenerate size
+    const MUX_MIN_ROWS = 8;
 
     function muxGrid(fit, term) {
       if (fit) fit.fit();
@@ -832,7 +843,7 @@
       const host = document.getElementById("term-host");
       const term = new window.Terminal({
         fontSize: 13,
-        fontFamily: '"CopadTerminal", ui-monospace, "JetBrains Mono", "SF Mono", monospace',
+        fontFamily: '"CopadTerminal", "CopadSymbols", ui-monospace, "JetBrains Mono", "SF Mono", monospace',
         cursorBlink: true,
         scrollback: 5000,
         convertEol: false,
@@ -849,6 +860,9 @@
       // push the grid below the floor and leave xterm and the PTY disagreeing. Re-apply the
       // floor and send the corrected size instead.
       whenFontReady(term.options.fontSize, () => { repairFontMetrics({ sendResize: false }); sendMuxResize(); });
+      // The symbol font lands independently and changes no metrics (xterm measures the FIRST
+      // family), but the glyphs it carries only appear once it has. Nudge a repaint.
+      whenFontReady(term.options.fontSize, () => term.refresh(0, term.rows - 1), "CopadSymbols");
 
       const proto = location.protocol === "https:" ? "wss" : "ws";
       const ws = new WebSocket(`${proto}://${location.host}/ws/board/attach`, wsProtocols());
@@ -898,7 +912,7 @@
       const host = document.getElementById("term-host");
       const term = new window.Terminal({
         fontSize: 13,
-        fontFamily: '"CopadTerminal", ui-monospace, "JetBrains Mono", "SF Mono", monospace',
+        fontFamily: '"CopadTerminal", "CopadSymbols", ui-monospace, "JetBrains Mono", "SF Mono", monospace',
         cursorBlink: true,
         scrollback: 5000,
         convertEol: false,
@@ -1177,9 +1191,9 @@
     /// Run `cb` once the terminal webfont is actually usable. Never runs it if the
     /// font can't load (e.g. /font/terminal 404s because the workstation has no such
     /// font installed) — the fallback stack is then simply what you get, as before.
-    function whenFontReady(px, cb) {
+    function whenFontReady(px, cb, family = "CopadTerminal") {
       if (!document.fonts?.load) return;
-      const spec = `${px || 13}px "CopadTerminal"`;
+      const spec = `${px || 13}px "${family}"`;
       document.fonts
         .load(spec)
         .then(() => {

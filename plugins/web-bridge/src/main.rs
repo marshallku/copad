@@ -237,6 +237,13 @@ struct AppState {
     /// endpoint then 404s and the PWA keeps its fallback stack, which is exactly
     /// today's behaviour, so a missing font degrades rather than breaks.
     font: Option<Arc<font::Font>>,
+    /// A font carrying the icon glyphs the terminal font lacks.
+    ///
+    /// The desktop renders devicons and powerline separators because the configured family does
+    /// not have them and the SYSTEM falls back to a Nerd Font. A phone has no such chain — it
+    /// gets exactly the files this server sends — so serving only the terminal font rendered
+    /// every one of those codepoints as tofu.
+    symbol_font: Option<Arc<font::Font>>,
     default_subscribe_patterns: Arc<Vec<String>>,
     /// In-process 2 s TTL cache for `/api/tmux/panes`. Multiple
     /// dashboard tabs hitting refresh shouldn't fan out as N tmux
@@ -305,6 +312,40 @@ async fn run_server(
     // Resolve the terminal font once, at startup, from the SAME config the desktop
     // terminal uses — so the phone renders in the user's font rather than a guess.
     // Failure is non-fatal: the PWA just keeps its fallback stack (today's behaviour).
+    // The glyphs the terminal font does not have. Family is configurable; the default is the
+    // Nerd Font the desktop already falls back to. Its own override var, deliberately not
+    // `COPAD_WEB_BRIDGE_FONT` — that pins one exact file, and sharing it would serve the same
+    // glyph-incomplete font from both endpoints.
+    let symbol_font = (|| {
+        let family = std::env::var("COPAD_WEB_BRIDGE_SYMBOL_FAMILY")
+            .unwrap_or_else(|_| "JetBrainsMonoNerdFont".to_string());
+        if family.is_empty() {
+            return None;
+        }
+        let path = font::resolve_with_override(&family, "COPAD_WEB_BRIDGE_SYMBOL_FONT")?;
+        match font::load(&path) {
+            Ok(f) => {
+                eprintln!(
+                    "[web-bridge] symbol font: {} ({} KB, {})",
+                    f.path.display(),
+                    f.bytes.len() / 1024,
+                    f.content_type
+                );
+                Some(Arc::new(f))
+            }
+            Err(e) => {
+                eprintln!("[web-bridge] symbol font rejected: {e}");
+                None
+            }
+        }
+    })();
+    if symbol_font.is_none() {
+        eprintln!(
+            "[web-bridge] no symbol font resolved — icon glyphs will render as tofu on the \
+             phone. Set COPAD_WEB_BRIDGE_SYMBOL_FAMILY to a Nerd Font you have installed."
+        );
+    }
+
     let font = (|| {
         let family = copad_core::config::CopadConfig::load()
             .map(|c| c.terminal.font_family)
@@ -340,6 +381,7 @@ async fn run_server(
         daemon: DaemonClient::new(socket_path),
         token: Arc::new(token.to_string()),
         font,
+        symbol_font,
         tmux_cache: Arc::new(tokio::sync::Mutex::new(None)),
         board_cache: Arc::new(tokio::sync::Mutex::new(None)),
         push_config: Arc::new(push_config),
@@ -392,6 +434,7 @@ async fn run_server(
         .route("/app.js", get(handle_app_js))
         .route("/app.css", get(handle_app_css))
         .route("/font/terminal", get(handle_font))
+        .route("/font/symbols", get(handle_symbol_font))
         .layer(axum::middleware::from_fn(
             move |req: axum::extract::Request, next: Next| {
                 let token = auth_state.token.clone();
@@ -421,7 +464,9 @@ async fn run_server(
                         // very bug it exists to fix. Public is therefore forced, which
                         // is why font::load() validates magic + size + regular-file
                         // before a byte is served.
-                        || path == "/font/terminal";
+                        || path == "/font/terminal"
+                        // Same reason: a CSS @font-face fetch carries no Authorization header.
+                        || path == "/font/symbols";
                     let upgrades = path.starts_with("/ws/");
                     if public {
                         return next.run(req).await;
@@ -930,11 +975,28 @@ async fn handle_font(
     axum::extract::State(state): axum::extract::State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
+    serve_font(state.font.clone(), "terminal", &headers)
+}
+
+/// `GET /font/symbols` — the icon glyphs the terminal font lacks. Public, same as
+/// `/font/terminal` and for the same reason.
+async fn handle_symbol_font(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    serve_font(state.symbol_font.clone(), "symbol", &headers)
+}
+
+fn serve_font(
+    font: Option<Arc<font::Font>>,
+    what: &str,
+    headers: &axum::http::HeaderMap,
+) -> axum::response::Response {
     use axum::http::{StatusCode, header};
     use axum::response::IntoResponse;
 
-    let Some(font) = state.font.clone() else {
-        return (StatusCode::NOT_FOUND, "no terminal font resolved\n").into_response();
+    let Some(font) = font else {
+        return (StatusCode::NOT_FOUND, format!("no {what} font resolved\n")).into_response();
     };
 
     if headers

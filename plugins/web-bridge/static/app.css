@@ -30,6 +30,17 @@
       src: url("/font/terminal");
       font-display: swap;
     }
+    /* The icon glyphs the terminal font does not have. The desktop gets these from a system
+       fallback to a Nerd Font; a phone only has what this server sends, so without this every
+       devicon and powerline separator renders as tofu. Listed AFTER CopadTerminal in the
+       terminal's font stack, so it is consulted per-glyph rather than replacing anything —
+       xterm's DOM renderer leaves that fallback to the browser. 404 (no Nerd Font resolved on
+       the workstation) just leaves the tofu, same as before. */
+    @font-face {
+      font-family: "CopadSymbols";
+      src: url("/font/symbols");
+      font-display: swap;
+    }
     :root { --app-h: 100vh; }
     body { background: var(--bg); color: var(--fg); padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); min-height: var(--app-h); overflow: hidden; }
     header { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; padding: 0.6rem 0.9rem; border-bottom: 1px solid var(--border); background: var(--bg-2); position: sticky; top: 0; z-index: 10; }
