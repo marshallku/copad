@@ -121,8 +121,27 @@ impl ComuxError {
     }
 }
 
+/// Whether a non-zero exit means the command failed.
+///
+/// Most control verbs use the exit code the obvious way. `doctor` does not: it exits
+/// `errors > 0 || warnings > 0`, so a server that is up and perfectly usable reports failure
+/// merely because `mux.toml` carries a tolerated value or a process sweep once failed. Reading
+/// its exit code as failure would make the phone refuse to open a terminal against a healthy
+/// machine — so for `doctor` the JSON body IS the result, and the exit code is a diagnostic.
+#[derive(Clone, Copy, PartialEq)]
+enum ExitPolicy {
+    /// Non-zero exit means the call failed.
+    Strict,
+    /// Non-zero exit is a diagnostic; trust the payload when there is one.
+    PayloadWins,
+}
+
 /// Run one `comux <args> --json` under [`DEADLINE`], returning its stdout.
 async fn run_json(args: &[&str]) -> Result<String, ComuxError> {
+    run_json_with(args, ExitPolicy::Strict).await
+}
+
+async fn run_json_with(args: &[&str], policy: ExitPolicy) -> Result<String, ComuxError> {
     let mut cmd = tokio::process::Command::new("comux");
     cmd.args(args)
         .arg("--json")
@@ -138,10 +157,15 @@ async fn run_json(args: &[&str]) -> Result<String, ComuxError> {
         Ok(Err(e)) => return Err(ComuxError::Failed(format!("spawn comux: {e}"))),
         Ok(Ok(o)) => o,
     };
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     if !out.status.success() {
-        return Err(classify_failure(&String::from_utf8_lossy(&out.stderr)));
+        // Under `PayloadWins` a non-zero exit with a body is still an answer; an EMPTY body is
+        // not, and must not be smuggled through as a parse failure later.
+        if policy == ExitPolicy::Strict || stdout.trim().is_empty() {
+            return Err(classify_failure(&String::from_utf8_lossy(&out.stderr)));
+        }
     }
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    Ok(stdout)
 }
 
 /// Turn a failed `comux` invocation's stderr into an error kind.
@@ -286,6 +310,114 @@ mod tests {
     #[test]
     fn non_json_output_is_malformed() {
         let err = parse_envelope::<Session>("comux: usage ...", "sessions")
+            .expect_err("must not succeed");
+        assert!(matches!(err, ComuxError::Malformed(_)), "got {err:?}");
+    }
+}
+
+/// What `comux doctor --json` says about the server: where its socket is, and whether it is up.
+///
+/// This is the ONE place the socket path comes from. Resolving it independently here would
+/// duplicate `copad-mux/src/control.rs::socket_path`, which reads `COPAD_MUX_SOCK` else a
+/// runtime dir derived from `XDG_RUNTIME_DIR`/`TMPDIR`/`USER` — so a divergence in any of
+/// those between this process and the client it spawns would silently point the two at
+/// different servers. Asking comux removes that class of bug, and the answer is then passed
+/// explicitly to the client so both are pinned to the same socket.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ServerInfo {
+    pub socket: String,
+    pub running: bool,
+}
+
+/// Parse the `server` section out of a `comux doctor --json` document.
+pub fn parse_doctor(stdout: &str) -> Result<ServerInfo, ComuxError> {
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| ComuxError::Malformed(format!("doctor is not JSON: {e}")))?;
+    let section = v
+        .get("sections")
+        .and_then(|s| s.as_array())
+        .and_then(|a| {
+            a.iter()
+                .find(|s| s.get("title").and_then(|t| t.as_str()) == Some("server"))
+        })
+        .ok_or_else(|| ComuxError::Malformed("doctor has no `server` section".into()))?;
+    let socket = section
+        .get("path")
+        .and_then(|p| p.as_str())
+        .ok_or_else(|| ComuxError::Malformed("the `server` section has no `path`".into()))?
+        .to_string();
+    // doctor reports the server as a finding, not a boolean. "running" is the only message
+    // that means up; anything else (`not running`, a bind error) is down. Matching the
+    // message keeps this honest about being a contract with another binary's prose — the
+    // same coupling `classify_failure` carries, and pinned by a test the same way.
+    let running = section
+        .get("findings")
+        .and_then(|f| f.as_array())
+        .is_some_and(|fs| {
+            fs.iter()
+                .any(|f| f.get("message").and_then(|m| m.as_str()) == Some("running"))
+        });
+    Ok(ServerInfo { socket, running })
+}
+
+/// `comux doctor --json` — where the server's socket is and whether it is up.
+pub async fn server_info() -> Result<ServerInfo, ComuxError> {
+    parse_doctor(&run_json_with(&["doctor"], ExitPolicy::PayloadWins).await?)
+}
+
+#[cfg(test)]
+mod doctor_tests {
+    use super::*;
+
+    /// Captured from `comux doctor --json` on this machine (comux 1.2.0).
+    const DOCTOR: &str = r#"{"errors":0,"warnings":0,"sections":[
+        {"title":"config.toml","path":"/Users/u/.config/copad/config.toml",
+         "findings":[{"level":"ok","message":"parses"}]},
+        {"title":"server","path":"/var/folders/T/copad-mux-u/sock",
+         "findings":[{"level":"ok","message":"running"},
+                     {"level":"note","message":"56 panes, 56 labeled"}]}]}"#;
+
+    #[test]
+    fn the_socket_path_and_running_state_come_from_the_server_section() {
+        let got = parse_doctor(DOCTOR).expect("must parse");
+        assert_eq!(got.socket, "/var/folders/T/copad-mux-u/sock");
+        assert!(got.running);
+    }
+
+    /// A down server still reports its path — that is what makes the path usable for a
+    /// diagnostic message rather than only for a successful attach.
+    #[test]
+    fn a_server_that_is_not_running_is_reported_as_down_with_its_path() {
+        let down = DOCTOR.replace(
+            r#"{"level":"ok","message":"running"}"#,
+            r#"{"level":"warn","message":"not running"}"#,
+        );
+        let got = parse_doctor(&down).expect("must parse");
+        assert_eq!(got.socket, "/var/folders/T/copad-mux-u/sock");
+        assert!(!got.running, "only the literal `running` finding means up");
+    }
+
+    /// The defect this guards: `comux doctor` exits 1 for any WARNING, so a running server on a
+    /// machine with one tolerated config value would have made the phone refuse to open a
+    /// terminal. The payload, not the exit code, is the answer.
+    #[test]
+    fn a_warning_only_doctor_still_reports_a_running_server() {
+        let warned = DOCTOR
+            .replace(r#""warnings":0"#, r#""warnings":1"#)
+            .replace(
+                r#"{"level":"ok","message":"parses"}"#,
+                r#"{"level":"warn","message":"unknown key `nope`"}"#,
+            );
+        let got = parse_doctor(&warned).expect("must parse");
+        assert!(
+            got.running,
+            "a config warning must not read as a down server"
+        );
+    }
+
+    #[test]
+    fn a_doctor_without_a_server_section_is_malformed() {
+        let err = parse_doctor(r#"{"sections":[{"title":"mux.toml","path":"/x"}]}"#)
             .expect_err("must not succeed");
         assert!(matches!(err, ComuxError::Malformed(_)), "got {err:?}");
     }

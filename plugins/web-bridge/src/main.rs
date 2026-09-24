@@ -383,6 +383,8 @@ async fn run_server(
         .route("/api/pilot/goals/:id/approve", post(handle_pilot_approve))
         .route("/api/pilot/goals/:id/cancel", post(handle_pilot_cancel))
         .route("/api/board", get(handle_board))
+        .route("/api/board/attach-preflight", get(handle_board_preflight))
+        .route("/ws/board/attach", get(handle_ws_board_attach))
         .route("/ws/tmux/overview", get(handle_ws_tmux_overview))
         .route("/ws/tmux/attach/:pane_id", get(handle_ws_tmux_attach))
         .route("/ws/events", get(handle_ws_events))
@@ -1341,6 +1343,85 @@ async fn handle_board(
     Ok(axum::Json(snapshot))
 }
 
+/// `GET /api/board/attach-preflight` — can the phone open a terminal right now?
+///
+/// This exists because a WebSocket upgrade cannot report WHY it failed: a browser that gets a
+/// 503 on `/ws/board/attach` sees only a closed socket, and the UI can say nothing better than
+/// "disconnected". So the client asks over plain HTTP first and gets an answer it can show.
+async fn handle_board_preflight(
+    axum::extract::State(_state): axum::extract::State<AppState>,
+) -> axum::Json<Value> {
+    match comux::server_info().await {
+        Ok(info) if info.running => axum::Json(json!({ "ok": true, "socket": info.socket })),
+        Ok(info) => axum::Json(json!({
+            "ok": false,
+            "code": "no_server",
+            "message": format!("no comux server is running at {}", info.socket),
+        })),
+        Err(e) => axum::Json(json!({ "ok": false, "code": e.code(), "message": e.to_string() })),
+    }
+}
+
+/// `WS /ws/board/attach` — a real terminal on the phone: the comux CLIENT itself, run inside a
+/// PTY and pumped to xterm.js.
+///
+/// Running the actual client rather than reimplementing its rendering means the phone sees
+/// exactly what the desktop sees — same sidebar, status bar, keybindings — and there is no
+/// second renderer to keep in sync.
+///
+/// Two things are load-bearing:
+///
+/// * **`--no-spawn`.** Bare `comux` is connect-or-spawn, so with no server running this would
+///   birth one parented to copadd, whose environment is scrubbed of the volatile session vars
+///   and whose kernel session is a daemon's. That server would then own every pane the user
+///   opens afterwards. The flag makes comux refuse instead.
+/// * **An explicit socket.** The path comes from `comux doctor` and is passed back in as
+///   `COPAD_MUX_SOCK`, so the preflight and the client cannot resolve different servers.
+///
+/// Known limitation: comux adopts the ATTACHING client's session vars for panes that client
+/// creates. copadd's environment has those scrubbed, so a pane created FROM THE PHONE gets no
+/// `DISPLAY`/`DBUS_SESSION_BUS_ADDRESS` injected. The desktop client re-applies its own on its
+/// next action, so nothing it creates is affected.
+async fn handle_ws_board_attach(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    ws: axum::extract::WebSocketUpgrade,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let info = match comux::server_info().await {
+        Ok(i) if i.running => i,
+        Ok(i) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("no comux server is running at {}\n", i.socket),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (StatusCode::BAD_GATEWAY, format!("comux: {e}\n")).into_response();
+        }
+    };
+    let proto = format!("bearer.{}", state.token);
+    ws.protocols([proto])
+        .on_upgrade(move |socket| async move {
+            let mut cmd = portable_pty::CommandBuilder::new("comux");
+            cmd.args(["attach", "--no-spawn"]);
+            // NOT cleared: portable-pty seeds the builder from this process's environment,
+            // which is where PATH/LANG/TMPDIR come from. Only the socket is pinned.
+            cmd.env("COPAD_MUX_SOCK", &info.socket);
+            if std::env::var("LANG").is_err() && std::env::var("LC_ALL").is_err() {
+                cmd.env("LANG", "C.UTF-8");
+            }
+            if std::env::var("TERM").is_err() {
+                cmd.env("TERM", "xterm-256color");
+            }
+            if let Err(e) = run_pty_attach(socket, cmd).await {
+                eprintln!("[web-bridge] board attach ended: {e}");
+            }
+        })
+        .into_response()
+}
+
 /// Sync helper used inside `spawn_blocking`. Builds the overview JSON
 /// `{panes, attention, codex_jobs}` by joining our `tmux list-panes`
 /// rows against `tmx agents --json`. tmx owns the agent classification,
@@ -1522,19 +1603,7 @@ async fn run_attach(
     socket: axum::extract::ws::WebSocket,
     pane: tmux::TmuxPane,
 ) -> Result<(), String> {
-    use axum::extract::ws::Message;
-    use futures_util::{SinkExt, StreamExt};
-    use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-
-    let pty_system = native_pty_system();
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .map_err(|e| format!("openpty: {e}"))?;
+    use portable_pty::CommandBuilder;
 
     // `tmux attach-session -t <session>` then `select-pane` via a
     // chained command. tmux supports `\;` as a command separator, but
@@ -1576,40 +1645,56 @@ async fn run_attach(
     // in panes whose programs (vim, less, fzf) trust tmux's notion of
     // UTF-8 support over their own locale.
     cmd.args(["-u", "attach-session", "-t", pane.session.as_str()]);
-    // CommandBuilder starts with an EMPTY env. Forward the variables
-    // that tmux + its child shells need for UTF-8 + path resolution +
-    // sensible behaviour. Without LANG/LC_CTYPE the child shell falls
-    // back to C locale and mangles every multibyte character; without
-    // PATH it can't find non-builtin binaries.
-    for var in [
-        "LANG",
-        "LC_ALL",
-        "LC_CTYPE",
-        "PATH",
-        "HOME",
-        "USER",
-        "SHELL",
-        "COLORTERM",
-    ] {
-        if let Ok(v) = std::env::var(var) {
-            cmd.env(var, v);
-        }
-    }
     // Fallback locale if the parent env had none — guarantees UTF-8.
     if std::env::var("LANG").is_err() && std::env::var("LC_ALL").is_err() {
         cmd.env("LANG", "C.UTF-8");
     }
-    if let Ok(term) = std::env::var("TERM") {
-        cmd.env("TERM", term);
-    } else {
+    if std::env::var("TERM").is_err() {
         cmd.env("TERM", "xterm-256color");
     }
+    run_pty_attach(socket, cmd).await
+}
+
+/// Own one PTY-backed attach WebSocket: spawn `cmd` on a PTY, pump it both ways, and tear the
+/// child down when either side goes.
+///
+/// Extracted from the tmux attach so the comux one can reuse it — the pump never cared which
+/// program it was carrying, only that it speaks a terminal.
+///
+/// Protocol: PTY output goes out as WS Binary; WS Binary comes back in as keystrokes; a WS Text
+/// frame is JSON control, currently only `{type:"resize",rows,cols}`.
+async fn run_pty_attach(
+    socket: axum::extract::ws::WebSocket,
+    cmd: portable_pty::CommandBuilder,
+) -> Result<(), String> {
+    use axum::extract::ws::Message;
+    use futures_util::{SinkExt, StreamExt};
+    use portable_pty::{PtySize, native_pty_system};
+
+    /// How long one WebSocket send may take before the attach is considered dead.
+    ///
+    /// A phone that sleeps or loses signal mid-frame leaves the send pending forever. Without
+    /// a bound the whole attach parks: the PTY child stays alive and, because comux sizes its
+    /// composed frame to the SMALLEST attached client, the user's desktop terminal stays
+    /// clamped to that phone's grid until the TCP stack eventually gives up. Dropping the
+    /// attach on a stalled send is what releases both.
+    const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("openpty: {e}"))?;
+
     let mut child = pair
         .slave
         .spawn_command(cmd)
-        .map_err(|e| format!("spawn tmux attach: {e}"))?;
+        .map_err(|e| format!("spawn attach child: {e}"))?;
     drop(pair.slave);
-
     let mut reader = pair
         .master
         .try_clone_reader()
@@ -1667,7 +1752,13 @@ async fn run_attach(
             chunk = rx.recv() => {
                 match chunk {
                     Some(bytes) => {
-                        if sink.send(Message::Binary(bytes)).await.is_err() { break; }
+                        // Bounded: an unbounded send against a slept phone parks the whole
+                        // attach and keeps the desktop clamped to that phone's grid.
+                        match tokio::time::timeout(SEND_TIMEOUT, sink.send(Message::Binary(bytes))).await {
+                            Err(_) => break,          // stalled peer — drop the attach
+                            Ok(Err(_)) => break,      // socket closed
+                            Ok(Ok(())) => {}
+                        }
                     }
                     None => break, // reader task ended (PTY closed)
                 }
@@ -1703,8 +1794,8 @@ async fn run_attach(
             }
         }
     }
-    // Tear down: kill the tmux attach child (detaches the client from
-    // the session — multi-attach model preserves the session itself).
+    // Tear down: kill the child (for tmux this detaches the client and leaves the session;
+    // for comux the same — the server and its panes outlive any client).
     let _ = child.kill();
     let _ = child.wait();
     drop(resize_tx); // signals resize task to exit

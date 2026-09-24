@@ -138,6 +138,12 @@
     .attach-bar .title { flex: 1; font-size: 0.8rem; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     #term-host { flex: 1; background: var(--bg-3); padding: 0.3rem; overflow: hidden; }
     #term-host .xterm { height: 100%; }
+    /* The comux view floors the grid at 80 columns, which is wider than a phone. Without a
+       scrollable host the extra columns are simply clipped — the promised "scroll instead of
+       shrinking the desktop" only exists if the overflow is reachable. `touch` keeps the
+       momentum scroll iOS otherwise drops on a nested scroller. */
+    #term-host.mux { overflow: auto; -webkit-overflow-scrolling: touch; }
+    #term-host.mux .xterm { height: 100%; width: max-content; }
     /* mobile keyboard toolbar */
     .kbd-bar { display: flex; flex-wrap: wrap; gap: 0.3rem; padding: 0.4rem; background: var(--bg-2); border-top: 1px solid var(--border); }
     /* touch-action: manipulation suppresses double-tap zoom; user-select
@@ -207,7 +213,11 @@
     }
 
     const state = {
-      mode: "overview",         // "overview" | "attach"
+      mode: "overview",         // "overview" | "attach" | "mux"
+      muxError: "",             // why the comux terminal could not open (from the preflight)
+      muxChecking: false,       // a preflight is in flight (drives the banner)
+      muxEpoch: 0,              // bumped on every entry/teardown; stale preflights are dropped
+      muxResizeOff: null,       // detaches the mux resize listeners on leave
       presence: null,
       tmuxPanes: [],
       attention: [],
@@ -418,6 +428,7 @@
           <h1>copad <span class="dim">— remote bridge</span></h1>
           ${authChip}
           ${pushChip}
+          <button class="chip" id="open-mux">terminal</button>
           <button class="chip ${state.presence === "away" ? "warn" : "ok"}" id="presence-toggle">${state.presence || "…"}</button>
         </header>
         ${state.noGui ? `<div class="banner" style="margin: 0.5rem 0.6rem;">copad GUI not running — only tmux + presence + events work</div>` : ""}
@@ -484,6 +495,7 @@
           }</div>
         </main>
       `;
+      document.getElementById("open-mux").addEventListener("click", () => enterMux(true));
       document.getElementById("presence-toggle").addEventListener("click", togglePresence);
       const pushBtn = document.getElementById("push-toggle");
       if (pushBtn && !pushBtn.disabled) pushBtn.addEventListener("click", togglePush);
@@ -565,6 +577,14 @@
       // instead of "Ctrl, letter". After the click fires we still
       // call term.focus() as a belt-and-braces refocus in case any
       // platform quirk drained the textarea.
+      wireKbdBar();
+      openTerminal();
+    }
+
+    // Shared by both terminal views. The preventDefault on mousedown/touchstart is what keeps
+    // focus in xterm's textarea, so the on-screen keyboard never closes mid-chord and a Ctrl
+    // press reads as "Ctrl+letter" rather than "Ctrl, letter".
+    function wireKbdBar() {
       const refocus = () => { try { state.term && state.term.focus(); } catch {} };
       document.querySelectorAll(".kbd-bar button").forEach(btn => {
         btn.addEventListener("mousedown", e => e.preventDefault());
@@ -573,12 +593,11 @@
       document.querySelectorAll(".kbd-bar button[data-bytes]").forEach(btn => {
         btn.addEventListener("click", () => { sendKbdBytes(btn.dataset.bytes); refocus(); });
       });
-      document.getElementById("ctrl").addEventListener("click", () => {
+      document.getElementById("ctrl")?.addEventListener("click", () => {
         state.ctrlSticky = !state.ctrlSticky;
         document.getElementById("ctrl").classList.toggle("sticky", state.ctrlSticky);
         refocus();
       });
-      openTerminal();
     }
 
     // --- Phase 24.6 pilot orchestration cockpit ---
@@ -724,8 +743,223 @@
       // Tailscale mode never needs a token — go straight to the app.
       // Bearer mode needs one; otherwise show the setup prompt.
       if (authMode !== "tailscale" && !token) { renderSetup(); return; }
+      if (state.mode === "mux") { renderMux(); return; }
       if (state.mode === "attach") { renderAttach(); return; }
       renderOverview();
+    }
+
+    /* ==== comux terminal (the mobile terminal) ==== */
+
+    // The comux client renders ONE composed frame sized to the smallest attached client, so a
+    // phone attaching at its natural ~40 columns reflows the user's desktop terminal to 40
+    // columns for as long as the phone is connected. The floor bounds that: the grid is never
+    // narrower than this, and the phone scrolls its viewport instead of dragging the desktop
+    // below a usable size.
+    //
+    // It has to be the BROWSER's logical grid, not just the PTY size — comux probes the
+    // terminal for its true size on focus and sends what it gets back, so a PTY-only clamp
+    // would be overwritten, and an 80-column PTY rendered into a 40-column xterm wraps wrong
+    // rather than scrolling. Real fix is the per-pane semantic grid (decisions #65/#66).
+    const MUX_MIN_COLS = 80;
+    const MUX_MIN_ROWS = 24;
+
+    function muxGrid(fit, term) {
+      if (fit) fit.fit();
+      const cols = Math.max(term.cols, MUX_MIN_COLS);
+      const rows = Math.max(term.rows, MUX_MIN_ROWS);
+      if (cols !== term.cols || rows !== term.rows) term.resize(cols, rows);
+      return { cols, rows };
+    }
+
+    // Apply the floor and tell the PTY the SAME grid the browser is drawing. Every path that
+    // can change the size goes through here, so xterm and the PTY cannot drift apart.
+    function sendMuxResize() {
+      if (!state.term) return;
+      const { cols, rows } = muxGrid(state.fit, state.term);
+      const ws = state.ws.attach;
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "resize", rows, cols }));
+      }
+    }
+
+    // Replace the view's chrome while KEEPING a live terminal's DOM.
+    //
+    // Any async handler that finishes while mux is open calls `render()` — the push
+    // subscribe/unsubscribe completions do, and so would anything added later. A plain
+    // `root.innerHTML = …` throws away xterm's host element, and `openMuxTerminal` then
+    // returns early on its idempotence guard because the Terminal and socket objects still
+    // exist: a blank screen whose toolbar still types into an invisible terminal. Detaching
+    // the live host first and putting it back into the freshly rendered slot preserves the
+    // terminal, its scrollback and its socket, so no caller has to know mux is open.
+    function renderPreservingTerminal(html) {
+      const live = state.term ? document.getElementById("term-host") : null;
+      if (live) live.remove();
+      root.innerHTML = html;
+      if (live) document.getElementById("term-host")?.replaceWith(live);
+    }
+
+    function renderMux() {
+      renderPreservingTerminal(`
+        <header>
+          <button class="chip back" id="back">&larr; overview</button>
+          <div class="card-meta" style="flex:1; text-align:center;">comux</div>
+          <button class="chip ${state.presence === "away" ? "warn" : "ok"}" id="presence-toggle">${state.presence || "\u2026"}</button>
+        </header>
+        <main class="attach">
+          ${state.muxChecking ? `<div class="banner">checking comux\u2026</div>` : ""}
+          ${state.muxError ? `<div class="banner">${escapeHtml(state.muxError)}</div>` : ""}
+          <div id="term-host" class="mux"></div>
+          <div class="kbd-bar">
+            <button data-bytes="\\x02">Ctrl-b</button>
+            <button data-bytes="\\x1b">Esc</button>
+            <button data-bytes="\\t">Tab</button>
+            <button id="ctrl">Ctrl</button>
+            <button data-bytes="\\x1b[A">&uarr;</button>
+            <button data-bytes="\\x1b[B">&darr;</button>
+            <button data-bytes="\\x1b[D">&larr;</button>
+            <button data-bytes="\\x1b[C">&rarr;</button>
+            <button data-bytes="\\x0d">Enter</button>
+          </div>
+        </main>`);
+      document.getElementById("back").addEventListener("click", leaveMux);
+      document.getElementById("presence-toggle").addEventListener("click", togglePresence);
+      wireKbdBar();
+      // Only once the preflight has answered, and only if it said yes.
+      if (!state.muxChecking && !state.muxError) openMuxTerminal();
+    }
+
+    // Drop the terminal + socket + listeners WITHOUT changing the mode. Split out because
+    // re-entering mux must also do this: `render()` replaces the host element, and
+    // `openMuxTerminal` would then no-op on its idempotence guard, leaving a blank screen
+    // whose toolbar still types into the old socket.
+    function disposeMuxTerminal() {
+      try { state.muxResizeOff?.(); } catch {}
+      state.muxResizeOff = null;
+      if (state.ws.attach) { try { state.ws.attach.close(); } catch {} state.ws.attach = null; }
+      if (state.term) { try { state.term.dispose(); } catch {} state.term = null; }
+      state.fit = null;
+    }
+
+    // Tear down mux WITHOUT touching history — the mirror of `teardownAttach`, so popstate
+    // owns the transition and neither path double-pops. Bumping the epoch is what lets a
+    // Back-then-Forward while a preflight is still in flight open a fresh one instead of
+    // being swallowed by a guard the old request never released.
+    function teardownMux() {
+      disposeMuxTerminal();
+      state.muxEpoch++;
+      state.muxChecking = false;
+      state.mode = "overview";
+      state.muxError = "";
+    }
+
+    function leaveMux() {
+      if (history.state && history.state.mode === "mux") {
+        history.back();
+      } else {
+        teardownMux();
+        render();
+      }
+    }
+
+    // A WebSocket upgrade cannot tell the page WHY it failed — a refused attach looks exactly
+    // like a dropped connection. So ask over HTTP first and show the real reason.
+    // A WebSocket upgrade cannot tell the page WHY it failed — a refused attach looks exactly
+    // like a dropped connection. So ask over HTTP first and show the real reason.
+    async function muxPreflight() {
+      try {
+        const j = await api("/api/board/attach-preflight");
+        return j.ok ? "" : (j.message || j.code || "comux is unavailable");
+      } catch (e) {
+        return `could not reach the bridge: ${e}`;
+      }
+    }
+
+    // The ONE way into mux, used by the button and by history navigation alike. Entering
+    // through popstate has to preflight too: otherwise Back-then-Forward with comux stopped
+    // would skip straight to the socket and show a bare "[disconnected]", which is precisely
+    // the diagnostic the preflight exists to replace.
+    async function enterMux(pushHistory) {
+      // Identity, not a boolean: a second entry (double tap, or Back-then-Forward while the
+      // first request is still out) supersedes the earlier one, and only the CURRENT epoch's
+      // response is allowed to land. A boolean guard could be left set by a teardown that
+      // happened mid-flight, which silently swallowed the next entry.
+      disposeMuxTerminal();
+      const epoch = ++state.muxEpoch;
+      state.muxError = "";
+      state.muxChecking = true;
+      state.mode = "mux";
+      if (pushHistory) {
+        // Same contract as attach: popstate is the single source of truth for terminal-mode
+        // transitions, so the platform back gesture leaves the terminal, not the page.
+        history.pushState({ mode: "mux" }, "", "#mux");
+      }
+      render();                 // shell + "checking" banner; no socket opened yet
+      const err = await muxPreflight();
+      if (state.muxEpoch !== epoch) return;   // superseded by a later entry or a teardown
+      state.muxChecking = false;
+      state.muxError = err;
+      if (state.mode === "mux") render();
+    }
+
+    function openMuxTerminal() {
+      if (state.term || state.ws.attach) return;
+      const host = document.getElementById("term-host");
+      const term = new window.Terminal({
+        fontSize: 13,
+        fontFamily: '"CopadTerminal", ui-monospace, "JetBrains Mono", "SF Mono", monospace',
+        cursorBlink: true,
+        scrollback: 5000,
+        convertEol: false,
+        theme: { background: "#11111b", foreground: "#cdd6f4" },
+      });
+      const FitAddon = window.FitAddon?.FitAddon;
+      const fit = FitAddon ? new FitAddon() : null;
+      if (fit) term.loadAddon(fit);
+      term.open(host);
+      state.term = term;
+      state.fit = fit;
+      muxGrid(fit, term);
+      // repairFontMetrics refits to the raw viewport and sends THAT to the PTY, which would
+      // push the grid below the floor and leave xterm and the PTY disagreeing. Re-apply the
+      // floor and send the corrected size instead.
+      whenFontReady(term.options.fontSize, () => { repairFontMetrics({ sendResize: false }); sendMuxResize(); });
+
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      const ws = new WebSocket(`${proto}://${location.host}/ws/board/attach`, wsProtocols());
+      ws.binaryType = "arraybuffer";
+      state.ws.attach = ws;
+
+      ws.onopen = () => sendMuxResize();
+      ws.onmessage = (msg) => {
+        if (msg.data instanceof ArrayBuffer) term.write(new Uint8Array(msg.data));
+        else term.write(String(msg.data));
+      };
+      ws.onclose = () => {
+        if (state.mode === "mux") term.writeln("\r\n\x1b[33m[disconnected]\x1b[0m");
+      };
+      ws.onerror = () => { try { ws.close(); } catch {} };
+
+      term.onData((data) => {
+        if (state.ctrlSticky && data.length === 1 && data >= " " && data <= "~") {
+          data = String.fromCharCode(data.charCodeAt(0) & 0x1f);
+          state.ctrlSticky = false;
+          document.getElementById("ctrl")?.classList.remove("sticky");
+        }
+        if (ws.readyState === WebSocket.OPEN) ws.send(new TextEncoder().encode(data));
+      });
+
+      const onResize = () => {
+        if (state.mode !== "mux") return;
+        sendMuxResize();
+      };
+      window.addEventListener("resize", onResize);
+      window.visualViewport?.addEventListener("resize", onResize);
+      // Without this every visit leaves another live listener behind, and each one refits the
+      // CURRENT terminal and sends its own duplicate resize.
+      state.muxResizeOff = () => {
+        window.removeEventListener("resize", onResize);
+        window.visualViewport?.removeEventListener("resize", onResize);
+      };
     }
 
     /* ==== xterm.js attach mode ==== */
@@ -1060,7 +1294,8 @@
     /// without it the grid keeps the fallback's cell size and the columns stay
     /// misaligned even though the right glyphs are now available. Then refit and tell
     /// the PTY, since the cell size (and therefore rows/cols) just changed.
-    function repairFontMetrics() {
+    function repairFontMetrics(opts = {}) {
+      const { sendResize = true } = opts;
       const term = state.term;
       if (!term) return;
       try {
@@ -1073,7 +1308,7 @@
         term.options.fontFamily = ff;
         state.fit?.fit();
         const ws = state.ws.attach;
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        if (sendResize && ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: "resize", rows: term.rows, cols: term.cols }));
         }
       } catch {}
@@ -1145,7 +1380,10 @@
         // even with its idempotent guard, would needlessly thrash the
         // xterm host element. Overview mode goes through render() as
         // normal so the chip + downstream UI stay consistent.
-        if (state.mode === "attach") {
+        // Both terminal views patch in place: a full render() tears out xterm's host element,
+        // and openTerminal/openMuxTerminal then no-op on their idempotence guard because
+        // `state.term` still exists — leaving a live socket attached to a terminal with no DOM.
+        if (state.mode === "attach" || state.mode === "mux") {
           const el = document.getElementById("presence-toggle");
           if (el) {
             el.textContent = state.presence;
@@ -1195,22 +1433,33 @@
       }
     }
 
+    // Leave whichever terminal mode is live. Both own an xterm + socket, and `render()` drops
+    // the host element, so switching between them without tearing down first leaves a blank
+    // screen whose toolbar still types into the old socket.
+    function teardownAnyTerminal() {
+      if (state.mode === "attach") teardownAttach();
+      else if (state.mode === "mux") teardownMux();
+    }
+
     window.addEventListener("popstate", (e) => {
       const target = (e.state && e.state.mode) || "overview";
       if (target === "attach" && e.state.pane) {
         // Forward navigation back into an attach URL — only act if
         // we're not already attached to the same pane.
         if (state.mode !== "attach" || state.activePane !== e.state.pane) {
-          if (state.mode === "attach") teardownAttach();
+          teardownAnyTerminal();
           state.activePane = e.state.pane;
           state.mode = "attach";
           render();
         }
-      } else {
-        if (state.mode === "attach") {
-          teardownAttach();
-          render();
+      } else if (target === "mux") {
+        if (state.mode !== "mux") {
+          teardownAnyTerminal();
+          enterMux(false);
         }
+      } else if (state.mode !== "overview") {
+        teardownAnyTerminal();
+        render();
       }
     });
 
