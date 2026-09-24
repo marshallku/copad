@@ -139,6 +139,15 @@
     .agent-row .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .agent-row .age { color: var(--fg-dim); font-size: 0.78rem; white-space: nowrap; }
     .group-head { cursor: pointer; user-select: none; }
+    .compose-wrap { display: flex; align-items: flex-end; gap: 0.4rem; padding: 0.4rem; background: var(--bg-2); border-top: 1px solid var(--border); }
+    .compose-wrap textarea {
+      flex: 1; resize: none; min-height: 2.1rem; max-height: 6rem; padding: 0.5rem 0.6rem;
+      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+      border-radius: 0.4rem; font: inherit; font-size: 0.95rem; line-height: 1.3;
+    }
+    .compose-wrap textarea:focus { outline: none; border-color: var(--accent); }
+    .compose-wrap .chip { flex-shrink: 0; padding: 0.55rem 0.8rem; }
+    .compose-note { flex-basis: 100%; color: var(--accent-warn); font-size: 0.72rem; padding: 0.1rem 0.2rem 0; }
     .kbd-bar { display: flex; flex-wrap: wrap; gap: 0.3rem; padding: 0.4rem; background: var(--bg-2); border-top: 1px solid var(--border); }
     /* touch-action: manipulation suppresses double-tap zoom; user-select
        prevents long-press text selection on iOS. Combined with the

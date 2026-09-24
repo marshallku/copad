@@ -52,6 +52,8 @@
       boardEpoch: 0,
       boardLoop: 0,
       boardInFlight: false,
+      rawInput: false,          // keystrokes go straight to the PTY (no IME composition)
+      composeNote: "",          // why a send did not go out; the draft is kept
       muxChecking: false,       // a preflight is in flight (drives the banner)
       muxEpoch: 0,              // bumped on every entry/teardown; stale preflights are dropped
       muxResizeOff: null,       // detaches the mux resize listeners on leave
@@ -509,7 +511,16 @@
     // focus in xterm's textarea, so the on-screen keyboard never closes mid-chord and a Ctrl
     // press reads as "Ctrl+letter" rather than "Ctrl, letter".
     function wireKbdBar() {
-      const refocus = () => { try { state.term && state.term.focus(); } catch {} };
+      // Mode-aware: in compose mode this MUST go back to the compose bar. Sending it to
+      // xterm's textarea — which is what every keybar tap used to do, including the new Ctrl-C
+      // — hands the iOS keyboard back to xterm and the next Korean word decomposes again. The
+      // toggle would still read 조합 while the bug was back.
+      const refocus = () => {
+        try {
+          if (state.mode === "mux" && !state.rawInput) composeEl()?.focus();
+          else state.term?.focus();
+        } catch {}
+      };
       document.querySelectorAll(".kbd-bar button").forEach(btn => {
         btn.addEventListener("mousedown", e => e.preventDefault());
         btn.addEventListener("touchstart", e => e.preventDefault(), { passive: false });
@@ -727,25 +738,50 @@
     // the live host first and putting it back into the freshly rendered slot preserves the
     // terminal, its scrollback and its socket, so no caller has to know mux is open.
     function renderPreservingTerminal(html) {
-      const live = state.term ? document.getElementById("term-host") : null;
-      if (live) live.remove();
+      // The compose bar is preserved for a second reason beyond the terminal's: it may be in
+      // the middle of a native IME composition, and a composition lives in the ELEMENT. Copying
+      // its string value into a fresh element would drop the half-built syllable and leave the
+      // keyboard in a state the page cannot see.
+      const keep = ["term-host", "compose-wrap"]
+        .map((id) => document.getElementById(id))
+        .filter(Boolean);
+      for (const el of keep) el.remove();
       root.innerHTML = html;
-      if (live) document.getElementById("term-host")?.replaceWith(live);
+      for (const el of keep) document.getElementById(el.id)?.replaceWith(el);
     }
 
+    // The mux view is BUILT ONCE and patched thereafter — it is never re-rendered.
+    //
+    // Preserving the compose element across a re-render is not enough, and that was the bug:
+    // `el.remove()` disconnects a focused textarea, which resets focus and ends the native IME
+    // composition. Re-inserting the same node and calling `.focus()` cannot resurrect a
+    // half-built syllable. So nothing removes it: later renders only patch the chrome. This
+    // also stops the event listeners accumulating, one set per render, on the preserved nodes.
     function renderMux() {
+      if (document.getElementById("mux-shell")) {
+        patchMuxChrome();
+        return;
+      }
       renderPreservingTerminal(`
+        <div id="mux-shell">
         <header>
           <button class="chip back" id="back">&larr; overview</button>
           <div class="card-meta" style="flex:1; text-align:center;">comux</div>
-          <button class="chip ${state.presence === "away" ? "warn" : "ok"}" id="presence-toggle">${state.presence || "\u2026"}</button>
+          <button class="chip" id="raw-toggle"></button>
+          <button class="chip" id="presence-toggle"></button>
         </header>
         <main class="attach">
-          ${state.muxChecking ? `<div class="banner">checking comux\u2026</div>` : ""}
-          ${state.muxError ? `<div class="banner">${escapeHtml(state.muxError)}</div>` : ""}
+          <div id="mux-banner"></div>
           <div id="term-host" class="mux"></div>
+          <div id="compose-wrap" class="compose-wrap">
+            <textarea id="compose" rows="1" enterkeyhint="send" autocapitalize="off"
+                      autocorrect="off" spellcheck="false"
+                      placeholder="한글 입력 · Enter 전송"></textarea>
+            <button id="compose-send" class="chip ok">보내기</button>
+          </div>
           <div class="kbd-bar">
             <button data-bytes="\\x02">Ctrl-b</button>
+            <button data-bytes="\\x03">Ctrl-C</button>
             <button data-bytes="\\x1b">Esc</button>
             <button data-bytes="\\t">Tab</button>
             <button id="ctrl">Ctrl</button>
@@ -755,10 +791,35 @@
             <button data-bytes="\\x1b[C">&rarr;</button>
             <button data-bytes="\\x0d">Enter</button>
           </div>
-        </main>`);
+        </main>
+        </div>`);
       document.getElementById("back").addEventListener("click", leaveMux);
       document.getElementById("presence-toggle").addEventListener("click", togglePresence);
+      document.getElementById("raw-toggle").addEventListener("click", toggleRawInput);
       wireKbdBar();
+      wireCompose();
+      patchMuxChrome();
+    }
+
+    /// Update everything about the mux view that can change, WITHOUT touching the DOM the
+    /// terminal and the IME live in.
+    function patchMuxChrome() {
+      const raw = document.getElementById("raw-toggle");
+      if (raw) {
+        raw.textContent = state.rawInput ? "직접" : "조합";
+        raw.classList.toggle("active", state.rawInput);
+      }
+      const pres = document.getElementById("presence-toggle");
+      if (pres) {
+        pres.textContent = state.presence || "\u2026";
+        pres.className = "chip " + (state.presence === "away" ? "warn" : "ok");
+      }
+      const banner = document.getElementById("mux-banner");
+      if (banner) {
+        const msg = state.muxChecking ? "checking comux\u2026" : state.muxError;
+        banner.innerHTML = msg ? `<div class="banner">${escapeHtml(msg)}</div>` : "";
+      }
+      renderComposeNote();
       // Only once the preflight has answered, and only if it said yes.
       if (!state.muxChecking && !state.muxError) openMuxTerminal();
     }
@@ -786,6 +847,171 @@
       state.mode = "overview";
       state.muxError = "";
       startBoardPolling();      // refresh immediately on return, then resume the cadence
+    }
+
+    /* ==== composed text input ====
+     *
+     * Typing Korean straight into xterm produces DECOMPOSED jamo on iOS — `잘 접근되는데`
+     * arrives as `ㅈㅏㄹ ㅈㅓㅂㄱㅡㄴㄷㅗㅣㄴㅡㄴㄷㅔ`. Reported from the device. On a desktop
+     * the OS composes a syllable before the terminal ever sees it, which is why nothing I ran
+     * locally could catch it.
+     *
+     * The mechanism is attributed to WebKit not driving composition inside the hidden textarea
+     * xterm owns and keeps moving, but I have NOT verified that claim at the source — what is
+     * verified is the symptom and that composing outside xterm fixes it. So: a real textarea
+     * the IME owns, and only finished text reaches the PTY.
+     *
+     * A textarea, not an `<input>`: an input silently strips newlines, so a pasted two-line
+     * command would become a different single-line command with nothing to see.
+     */
+
+    // Enter is ambiguous during Korean input: WebKit fires `compositionend` BEFORE the keydown
+    // of the Enter that CONFIRMED the candidate, so `isComposing` is already false by then and
+    // submitting on it would swallow that Enter and send a syllable early. Treat an Enter that
+    // lands immediately after a composition ended as the confirming one.
+    const COMPOSE_CONFIRM_GRACE_MS = 50;
+    let lastCompositionEnd = 0;
+
+    // Should this keydown send the draft?
+    //
+    // Pulled out as a pure function because it is the whole correctness of Korean input and it
+    // is otherwise unreachable from a test. Three separate ways an Enter is NOT a submission:
+    //   * Shift+Enter — the user is inserting a newline.
+    //   * `isComposing` / keyCode 229 — the IME is mid-syllable.
+    //   * an Enter that arrives within the grace window after `compositionend` — WebKit fires
+    //     compositionend BEFORE the keydown of the Enter that CONFIRMED the candidate, so
+    //     `isComposing` is already false and this is the only thing separating "confirm the
+    //     syllable" from "send the line".
+    function shouldSubmitOnEnter(e, now, lastEnd) {
+      if (e.key !== "Enter" || e.shiftKey) return false;
+      if (e.isComposing || e.keyCode === 229) return false;
+      return now - lastEnd >= COMPOSE_CONFIRM_GRACE_MS;
+    }
+
+    function composeEl() {
+      return document.getElementById("compose");
+    }
+
+    function focusForMode() {
+      if (state.rawInput) {
+        try { state.term?.focus(); } catch {}
+      } else {
+        composeEl()?.focus();
+      }
+    }
+
+    function toggleRawInput() {
+      // Never flushes the draft — switching modes is navigation, not submission.
+      state.rawInput = !state.rawInput;
+      render();
+      focusForMode();
+    }
+
+    function submitCompose() {
+      const el = composeEl();
+      if (!el) return;
+      const text = el.value;
+      if (!text) return;
+      const ws = state.ws.attach;
+      // Keep the draft on any failure. `sendKbdBytes` silently returns when the socket is not
+      // open, which is fine for one keystroke and would be a lost prompt here.
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        state.composeNote = "연결되지 않음 — 입력은 유지됩니다";
+        renderComposeNote();
+        return;
+      }
+      try {
+        // Literally what typing would do: the text, then Enter. Newlines inside the text are
+        // Enter presses at the remote too — a two-line paste submits twice. The socket has no
+        // application ack, so a send that leaves here is QUEUED, not delivered; nothing is
+        // replayed automatically, because replaying an ambiguous send could run a command twice.
+        ws.send(new TextEncoder().encode(text + "\r"));
+      } catch {
+        state.composeNote = "전송 실패 — 입력은 유지됩니다";
+        renderComposeNote();
+        return;
+      }
+      el.value = "";
+      autoGrow(el);
+      state.composeNote = "";
+      renderComposeNote();
+      el.focus();
+    }
+
+    function renderComposeNote() {
+      const wrap = document.getElementById("compose-wrap");
+      if (!wrap) return;
+      let note = wrap.querySelector(".compose-note");
+      if (!state.composeNote) { note?.remove(); return; }
+      if (!note) {
+        note = document.createElement("div");
+        note.className = "compose-note";
+        wrap.appendChild(note);
+      }
+      note.textContent = state.composeNote;
+    }
+
+    /// Resize the draft box to its content, and tell the terminal when that moved it.
+    ///
+    /// The compose bar and the terminal share the column: growing the draft shrinks the
+    /// terminal's box. Nothing else notices — the resize listeners watch the window and the
+    /// visual viewport, neither of which fires for a textarea growing — so without this the
+    /// grid keeps its old row count and its bottom lines sit outside the visible area.
+    function autoGrow(el) {
+      const before = el.style.height;
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, 96)}px`;
+      if (el.style.height !== before) sendMuxResize();
+    }
+
+    function wireCompose() {
+      const el = composeEl();
+      if (!el) return;
+      el.addEventListener("compositionend", () => { lastCompositionEnd = Date.now(); });
+      el.addEventListener("input", () => autoGrow(el));
+      el.addEventListener("keydown", (e) => {
+        if (!shouldSubmitOnEnter(e, Date.now(), lastCompositionEnd)) return;
+        e.preventDefault();
+        submitCompose();
+      });
+      document.getElementById("compose-send")?.addEventListener("click", (e) => {
+        e.preventDefault();
+        submitCompose();
+      });
+      // xterm grabs focus whenever the terminal body is touched, and once its textarea has it
+      // the iOS keyboard belongs to xterm again and Korean stops composing. In compose mode the
+      // terminal is for READING.
+      //
+      // CAPTURE phase AND `stopPropagation`, both load-bearing.
+      //
+      // Capture, because xterm's handler is on a DESCENDANT: a bubbling listener would run
+      // after it had already focused the textarea, interrupting the IME session even though
+      // focus is handed straight back. And `preventDefault` alone is not enough either —
+      // xterm 5.5's mousedown handler calls `focus()` unconditionally and never looks at
+      // `defaultPrevented` — so the event must not reach it at all.
+      //
+      // The cost, accepted: with the event stopped, xterm's own drag-selection does not run in
+      // compose mode. Switch to 직접 to select terminal text with the pointer.
+      //
+      // Deliberately NOT touchstart: stopping that would kill scrolling the output, and iOS
+      // synthesises the mousedown for a tap anyway.
+      const host = document.getElementById("term-host");
+      const keepFocus = (ev) => {
+        if (state.rawInput) return;
+        ev.stopPropagation();
+        ev.preventDefault();
+        el.focus();
+      };
+      host?.addEventListener("mousedown", keepFocus, true);
+      host?.addEventListener("contextmenu", keepFocus, true);
+      // Backstop for any focus path not enumerated above: if anything inside the terminal takes
+      // focus while composing, bounce it straight back.
+      host?.addEventListener("focusin", (ev) => {
+        if (state.rawInput || ev.target === el) return;
+        el.focus();
+      }, true);
+      renderComposeNote();
+      focusForMode();
     }
 
     function leaveMux() {
