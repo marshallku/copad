@@ -134,11 +134,72 @@
     #term-host.mux { overflow: auto; -webkit-overflow-scrolling: touch; }
     #term-host.mux .xterm { height: 100%; width: max-content; }
     /* mobile keyboard toolbar */
-    .agent-list { display: flex; flex-direction: column; gap: 0.2rem; margin: 0 0.6rem 0.5rem; }
-    .agent-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.45rem 0.5rem; background: var(--bg-2); border: 1px solid var(--border); border-radius: 0.35rem; cursor: pointer; }
-    .agent-row .title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .agent-row .age { color: var(--fg-dim); font-size: 0.78rem; white-space: nowrap; }
-    .group-head { cursor: pointer; user-select: none; }
+    /* ==== fleet board ====
+       Scanning, not reading: the eye should land on a status colour and a name, and everything
+       else should stay out of the way until looked at. Groups are always open — a phone answer
+       you have to unfold one session at a time is not an answer. */
+    .board-summary { display: flex; flex-wrap: wrap; gap: 0.4rem; padding: 0.7rem 0.9rem 0.3rem; }
+    .board-summary .sum {
+      display: inline-flex; align-items: baseline; gap: 0.3rem; padding: 0.3rem 0.6rem;
+      border: 1px solid var(--border); border-radius: 999px; font-size: 0.78rem; color: var(--fg-dim);
+    }
+    .board-summary .sum b { font-size: 0.95rem; font-weight: 600; color: var(--fg); }
+    .board-summary .s-attn b { color: var(--accent-warn); }
+    .board-summary .s-work b { color: var(--accent); }
+    .board-summary .sum-quiet { opacity: 0.6; }
+
+    .band { margin: 0 0 0.2rem; }
+    /* Each session is its own sticky containing block. Without it every group head shares the
+       whole idle band, so a head stays pinned long after its rows have scrolled away and sits
+       on top of the next session's. */
+    .group { position: relative; }
+    .band-head, .group-head {
+      display: flex; align-items: center; gap: 0.5rem;
+      margin: 0; padding: 0.5rem 0.9rem 0.3rem;
+      font-size: 0.7rem; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase;
+      color: var(--fg-dim);
+      /* Sticky so the session you are looking at is always named, however far you scroll. */
+      position: sticky; z-index: 2; background: var(--bg);
+    }
+    .band-head { top: 0; }
+    .group-head {
+      top: 1.75rem; text-transform: none; letter-spacing: 0; font-size: 0.82rem; color: var(--fg);
+      background: var(--bg-2); border-top: 1px solid var(--border);
+      padding-top: 0.4rem; padding-bottom: 0.4rem;
+    }
+    .group-head em { font-style: normal; font-size: 0.66rem; color: var(--fg-dim); border: 1px solid var(--border); border-radius: 0.3rem; padding: 0 0.3rem; }
+    .band-head .count, .group-head .count { margin-left: auto; color: var(--fg-dim); font-weight: 400; }
+    .band.attention .band-head { color: var(--accent-warn); }
+    .band.working   .band-head { color: var(--accent); }
+
+    .agent-row {
+      display: flex; align-items: center; gap: 0.6rem;
+      padding: 0.45rem 0.9rem; min-height: 2.6rem;   /* touchable, without wasting the screen */
+      border-top: 1px solid var(--border);
+      cursor: pointer;
+    }
+    .agent-row:active { background: var(--bg-2); }
+    .agent-row .dot { flex-shrink: 0; width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--fg-dim); }
+    .agent-row .dot.s-work { background: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 25%, transparent); }
+    .agent-row .dot.s-attn { background: var(--accent-warn); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-warn) 30%, transparent); }
+    .agent-row .dot.s-idle { background: var(--border); }
+    .row-main { flex: 1; min-width: 0; }
+    .row-title { display: flex; align-items: baseline; gap: 0.35rem; }
+    .row-space { color: var(--fg-dim); font-size: 0.82rem; }
+    .row-space::after { content: "/"; margin-left: 0.35rem; opacity: 0.5; }
+    .row-name { font-size: 0.92rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .row-detail { margin-top: 0.15rem; font-size: 0.74rem; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .row-tool { flex-shrink: 0; font-size: 0.7rem; color: var(--fg-dim); }
+    /* Only shown for statuses the layout does NOT encode positionally — so it appearing at all
+       means "this reading is not one of the three we understand". */
+    .row-status { flex-shrink: 0; font-size: 0.66rem; color: var(--accent-warn);
+                  border: 1px solid var(--accent-warn); border-radius: 0.3rem; padding: 0 0.3rem; }
+    .row-age { flex-shrink: 0; font-style: normal; font-size: 0.72rem; color: var(--fg-dim);
+               font-variant-numeric: tabular-nums; min-width: 2.4rem; text-align: right; }
+
+    .board-empty { padding: 2rem 0.9rem; text-align: center; color: var(--fg-dim); }
+    .board-note { padding: 0.9rem; margin: 0; font-size: 0.7rem; color: var(--fg-dim); line-height: 1.5; }
+
     .compose-wrap { display: flex; align-items: flex-end; gap: 0.4rem; padding: 0.4rem; background: var(--bg-2); border-top: 1px solid var(--border); }
     .compose-wrap textarea {
       flex: 1; resize: none; min-height: 2.1rem; max-height: 6rem; padding: 0.5rem 0.6rem;

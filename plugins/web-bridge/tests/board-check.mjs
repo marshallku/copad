@@ -7,53 +7,65 @@ const src = [
   grab(/    const BOARD_ATTENTION = new Set\(\[[^\]]*\]\);/),
   grab(/    const BOARD_ACTIVE = new Set\(\[[^\]]*\]\);/),
   grab(/    function boardGroupKey\(a\) \{[\s\S]*?\n    \}/),
-  grab(/    function boardRow\(a\) \{[\s\S]*?\n    \}/),
+  grab(/    function dominantTool\(agents\) \{[\s\S]*?\n    \}/),
+  grab(/    function boardRow\(a, withSpace, hideTool\) \{[\s\S]*?\n    \}/),
   grab(/    function humanSecs\(n\) \{[\s\S]*?\n    \}/),
   grab(/    function renderBoard\(\) \{[\s\S]*?\n    \}/),
 ].join("\n");
 const board = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
-const state = { board, boardStale: false, boardOpen: {} };
+const state = { board, boardStale: false };
 const escapeHtml = (x) => String(x ?? "");
 const renderBoard = new Function("state", "escapeHtml", src + "; return renderBoard;")(state, escapeHtml);
 
 const out = renderBoard();
 const agents = board.agents || [];
+// Groups are always expanded now — there is no toggle — so a single render must already
+// contain every agent. That IS the regression this guards: the partition once hid 26 of 27.
 const rendered = [...out.matchAll(/data-token="([^"]*)"/g)].map(m => m[1]);
-// Idle groups start collapsed, so expand them all and re-render to count every agent.
-for (const a of agents) state.boardOpen[a.space_id ? `id:${a.space_id}` : `name:${a.space || "?"}`] = true;
-const outOpen = renderBoard();
-const renderedOpen = new Set([...outOpen.matchAll(/data-token="([^"]*)"/g)].map(m => m[1]));
+const renderedOpen = new Set(rendered);
 
 const byStatus = {};
 for (const a of agents) byStatus[a.status] = (byStatus[a.status] || 0) + 1;
 console.log("payload:", agents.length, "agents", JSON.stringify(byStatus));
-console.log("rendered while collapsed:", rendered.length);
-console.log("rendered with groups open:", renderedOpen.size);
+console.log("rendered in one pass:", rendered.length);
+console.log("distinct tokens:", renderedOpen.size);
 const missing = agents.filter(a => !renderedOpen.has(a.token || a.terminal || ""));
 console.log("agents never rendered:", missing.length, missing.map(a => `${a.space}/${a.title}:${a.status}`).slice(0,5));
 const counts = out.match(/idle <span[^>]*>(\d+)</);
+// `idle` and an unknown status must not render identically to `ready`: comux documents `idle`
+// as also meaning "no recognized UI", so collapsing them hides an unresolved reading.
+const one = (st) => { state.board = { sessions: [], agents: [{ token: "t", terminal: "x",
+  space: "s", title: "tab 1", tool: "claude", status: st, for_secs: 1 }], errors: [] };
+  return renderBoard(); };
+const rReady = one("ready"), rIdle = one("idle"), rHuh = one("something-new");
+console.log("ready vs idle differ:", rReady !== rIdle);
+console.log("ready vs unknown differ:", rReady !== rHuh);
+const statusesDistinct = rReady !== rIdle && rReady !== rHuh
+  && rIdle.includes("idle") && rHuh.includes("something-new");
+state.board = board; state.boardStale = false;
+
 // Partial failure: agents unreadable while sessions succeeded must NOT print a confident
 // "idle 0" — that count would simply be false.
 state.board = { sessions: board.sessions, agents: null, errors: [{ what: "agents", code: "timeout", message: "x" }] };
 const partial = renderBoard();
-const liesAboutIdle = /idle <span[^>]*>0</.test(partial) || partial.includes("no idle agents");
+const liesAboutIdle = /대기<span[^>]*>0</.test(partial);
 console.log("partial failure (agents null, sessions ok):");
 console.log("  claims an empty fleet:", liesAboutIdle);
-console.log("  says it could not read:", partial.includes("could not read the agent list"));
+console.log("  says it could not read:", partial.includes("읽지 못했습니다"));
 
 // ...and a transport failure on top of a partial response must still say the data is stale.
 state.boardStale = true;
 const partialStale = renderBoard();
-console.log("  partial + stale shows the stale banner:", partialStale.includes("last good read"));
+console.log("  partial + stale shows the stale banner:", partialStale.includes("응답하지 않음"));
 state.boardStale = false;
 
 // Both null.
 state.board = { sessions: null, agents: null, errors: [] };
 const both = renderBoard();
-console.log("both null -> could not read:", both.includes("could not read the agent list"));
+console.log("both null -> could not read:", both.includes("읽지 못했습니다"));
 
-const ok = partialStale.includes("last good read") && missing.length === 0 && renderedOpen.size === agents.length
-  && !liesAboutIdle && partial.includes("could not read the agent list")
-  && both.includes("could not read the agent list");
+const ok = statusesDistinct && partialStale.includes("응답하지 않음") && missing.length === 0 && renderedOpen.size === agents.length
+  && !liesAboutIdle && partial.includes("읽지 못했습니다")
+  && both.includes("읽지 못했습니다");
 console.log(ok ? "PASS — exhaustive partition, and an unreadable list never reads as empty" : "FAIL");
 process.exit(ok ? 0 : 1);

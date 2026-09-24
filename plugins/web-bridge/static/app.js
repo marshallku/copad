@@ -47,7 +47,6 @@
       muxError: "",             // why the comux terminal could not open (from the preflight)
       board: null,              // GET /api/board result; null = never loaded
       boardStale: false,        // a fetch failed — what is shown is the LAST good read
-      boardOpen: {},            // session key -> true; expansion survives re-renders
       boardTimer: null,
       boardEpoch: 0,
       boardLoop: 0,
@@ -231,13 +230,47 @@
       return a.space_id ? `id:${a.space_id}` : `name:${a.space || "?"}`;
     }
 
-    function boardRow(a) {
-      const cls = BOARD_ATTENTION.has(a.status) ? "warn" : BOARD_ACTIVE.has(a.status) ? "busy" : "";
+    /// The tool worth naming is the one that is NOT what everything else is.
+    ///
+    /// Every agent here is `claude`, so printing it on all 27 rows is 27 repetitions of one
+    /// fact and it costs a column on a phone. Name the tool only where it differs from the
+    /// fleet's dominant one — then seeing `codex` on a row actually means something.
+    function dominantTool(agents) {
+      const c = new Map();
+      for (const a of agents) c.set(a.tool, (c.get(a.tool) || 0) + 1);
+      let best = null, n = 0;
+      for (const [t, k] of c) if (k > n) { best = t; n = k; }
+      return c.size <= 1 ? best : null;
+    }
+
+    function boardRow(a, withSpace, hideTool) {
+      const cls = BOARD_ATTENTION.has(a.status) ? "s-attn"
+                : BOARD_ACTIVE.has(a.status) ? "s-work" : "s-idle";
+      const where = withSpace
+        ? `<span class="row-space">${escapeHtml(a.space || "?")}</span>`
+        : "";
+      // `detail` is what the agent was last seen DOING, straight from its own log. Absent means
+      // "no reading", never "doing nothing" — an older comux does not send it at all — so it is
+      // rendered when present and simply left out otherwise, never as a placeholder.
+      const detail = a.detail
+        ? `<div class="row-detail">${escapeHtml(a.detail)}</div>` : "";
+      const tool = hideTool ? "" : `<span class="row-tool">${escapeHtml(a.tool || "")}</span>`;
+      // The layout encodes three statuses positionally: `blocked` is the attention band,
+      // `working` is the working band, `ready` is a plain dot in the idle list. Anything else
+      // gets its raw label printed, because collapsing it into the same grey dot would hide a
+      // real distinction — comux documents `idle` as ALSO meaning "no recognized UI", i.e. an
+      // unresolved reading, and an unknown status must not silently read as ready.
+      const encoded = BOARD_ATTENTION.has(a.status) || BOARD_ACTIVE.has(a.status)
+        || a.status === "ready";
+      const status = encoded ? "" : `<span class="row-status">${escapeHtml(a.status || "?")}</span>`;
       return `
         <div class="agent-row" data-token="${escapeHtml(a.token || a.terminal || "")}">
-          <span class="pill ${cls}">${escapeHtml(a.status || "?")}</span>
-          <span class="title">${escapeHtml(a.space || "?")} / ${escapeHtml(a.title || "?")}</span>
-          <span class="age">${escapeHtml(a.tool || "")} · ${escapeHtml(humanSecs(a.for_secs))}</span>
+          <span class="dot ${cls}"></span>
+          <div class="row-main">
+            <div class="row-title">${where}<span class="row-name">${escapeHtml(a.title || "?")}</span></div>
+            ${detail}
+          </div>
+          ${status}${tool}<i class="row-age">${escapeHtml(humanSecs(a.for_secs))}</i>
         </div>`;
     }
 
@@ -252,33 +285,32 @@
     function renderBoard() {
       const b = state.board;
       if (!b) {
-        // Never loaded. "loading…" forever would be a lie once the first attempt has already
-        // failed, so the stale flag decides which of the two this is.
-        return `<div class="section-title">fleet</div><div class="empty">${
-          state.boardStale ? "could not reach the bridge — retrying" : "loading…"}</div>`;
+        return `<div class="board-empty">${
+          state.boardStale ? "브리지에 연결할 수 없음 — 재시도 중" : "불러오는 중\u2026"}</div>`;
       }
 
       const errs = (b.errors || []).map(e =>
         `<div class="banner">fleet: ${escapeHtml(e.what)} — ${escapeHtml(e.message || e.code)}</div>`).join("");
-      // null means "could not read"; [] means "read, and empty". Rendering them the same would
-      // report a failed read as an empty fleet — and the agents list is the whole board, so
-      // substituting [] for it would print a confident "idle 0" that is simply false. The
-      // error banner does not make that count true.
       // Computed BEFORE the early return: without it, a transport failure on top of an
       // already-partial response would present the retained session count as current.
       const stale = state.boardStale
-        ? `<div class="banner">showing the last good read — the bridge did not answer</div>` : "";
+        ? `<div class="banner">마지막으로 읽은 내용 — 브리지가 응답하지 않음</div>` : "";
 
+      // null means "could not read"; [] means "read, and empty". Rendering them the same would
+      // report a failed read as an empty fleet — and the agents list IS the board, so
+      // substituting [] would print a confident "idle 0" that is simply false.
       if (b.agents === null) {
-        return `<div class="section-title">fleet</div>${errs}${stale}
-                <div class="empty">could not read the agent list${
-                  b.sessions ? ` — ${b.sessions.length} sessions were up at the last read` : ""}</div>`;
+        return `${errs}${stale}<div class="board-empty">에이전트 목록을 읽지 못했습니다${
+          b.sessions ? ` — 마지막 읽기 기준 세션 ${b.sessions.length}개` : ""}</div>`;
       }
       const agents = b.agents;
+      const only = dominantTool(agents);   // null when the fleet is mixed
       const attention = agents.filter(a => BOARD_ATTENTION.has(a.status));
       const active = agents.filter(a => BOARD_ACTIVE.has(a.status));
       const rest = agents.filter(a => !BOARD_ATTENTION.has(a.status) && !BOARD_ACTIVE.has(a.status));
 
+      // Groups are ALWAYS expanded. There is no toggle: on a phone the question is "what is
+      // going on", and an answer you have to unfold one session at a time is not an answer.
       const groups = new Map();
       for (const a of rest) {
         const k = boardGroupKey(a);
@@ -286,28 +318,46 @@
         groups.get(k).rows.push(a);
       }
 
-      const section = (title, rows, n) => rows.length === 0 ? "" : `
-        <div class="section-title">${title} <span style="text-transform:none; color:var(--fg-dim);">${n}</span></div>
-        <div class="agent-list">${rows.map(boardRow).join("")}</div>`;
+      const band = (title, rows, cls) => rows.length === 0 ? "" : `
+        <section class="band ${cls}">
+          <h2 class="band-head">${title}<span class="count">${rows.length}</span></h2>
+          ${rows.map(a => boardRow(a, true, !!only)).join("")}
+        </section>`;
 
-      const groupBlocks = [...groups.entries()].map(([k, g]) => {
-        const open = !!state.boardOpen[k];
-        return `
-          <div class="section-title group-head" data-group="${escapeHtml(k)}">
-            ${open ? "▾" : "▸"} ${escapeHtml(g.name)}${g.ambiguous ? ' <span class="dim">(by name)</span>' : ""}
-            <span style="text-transform:none; color:var(--fg-dim);">${g.rows.length}</span>
-          </div>
-          ${open ? `<div class="agent-list">${g.rows.map(boardRow).join("")}</div>` : ""}`;
-      }).join("");
+      // Ambiguous grouping is a property of the SERVER, not of one session: an older comux
+      // sends no session id at all, so marking every group "by name" would repeat one global
+      // fact ten times. Per-group only when some groups are keyed by id and some are not.
+      const someById = [...groups.values()].some(g => !g.ambiguous);
+      const allByName = groups.size > 0 && [...groups.values()].every(g => g.ambiguous);
+      const idle = rest.length === 0 ? "" : `
+        <section class="band idle">
+          <h2 class="band-head">대기<span class="count">${rest.length}</span></h2>
+          ${[...groups.values()].map(g => `
+            <div class="group">
+              <h3 class="group-head">${escapeHtml(g.name)}${
+                g.ambiguous && someById ? '<em title="이 세션은 id가 없어 이름으로 묶었습니다">이름 기준</em>' : ""
+              }<span class="count">${g.rows.length}</span></h3>
+              ${g.rows.map(a => boardRow(a, false, !!only)).join("")}
+            </div>`).join("")}
+        </section>`;
 
-      // The status legend is not decoration: comux documents that a screen-text match can read
-      // as `blocked`, so the board must not present these as fact.
-      return `${errs}${stale}
-        ${section("needs you", attention, attention.length)}
-        ${section("working", active, active.length)}
-        <div class="section-title">idle <span style="text-transform:none; color:var(--fg-dim);">${rest.length}</span></div>
-        ${groupBlocks || `<div class="empty">no idle agents</div>`}
-        <div class="push-settings"><span style="color:var(--fg-dim);">status is inferred by comux; the time is how long it has held that status, not how long a task has run.</span></div>`;
+      const sessions = b.sessions ? b.sessions.length : null;
+      const summary = `
+        <div class="board-summary">
+          ${attention.length ? `<span class="sum s-attn"><b>${attention.length}</b>대기 중</span>` : ""}
+          <span class="sum s-work"><b>${active.length}</b>작업 중</span>
+          <span class="sum s-idle"><b>${rest.length}</b>유휴</span>
+          ${sessions === null ? "" : `<span class="sum"><b>${sessions}</b>세션</span>`}
+          ${only ? `<span class="sum sum-quiet">${escapeHtml(only)}</span>` : ""}
+        </div>`;
+
+      return `${errs}${stale}${summary}
+        ${band("응답 필요", attention, "attention")}
+        ${band("작업 중", active, "working")}
+        ${idle}
+        <p class="board-note">상태는 comux의 추론값이고, 시간은 그 상태를 유지한 기간입니다.${
+          allByName ? " 이 comux는 세션 id를 보내지 않아 이름으로 묶었습니다 — <code>comux server restart</code> 후 정확해집니다." : ""
+        }</p>`;
     }
 
     // One outstanding request at a time, the next scheduled only after the previous completes,
@@ -439,13 +489,6 @@
       if (pushBtn && !pushBtn.disabled) pushBtn.addEventListener("click", togglePush);
       document.querySelectorAll(".push-settings input[data-push-kind]").forEach(el => {
         el.addEventListener("change", () => updatePushKinds(el.dataset.pushKind, el.checked));
-      });
-      document.querySelectorAll(".group-head[data-group]").forEach(el => {
-        el.addEventListener("click", () => {
-          const k = el.dataset.group;
-          state.boardOpen[k] = !state.boardOpen[k];
-          render();
-        });
       });
       // Opening the terminal is the only action a row can offer today: comux's v1 transport
       // composes ONE frame for all clients, so the phone cannot show a single pane, and
