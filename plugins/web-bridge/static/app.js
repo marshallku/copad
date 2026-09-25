@@ -51,8 +51,8 @@
       boardEpoch: 0,
       boardLoop: 0,
       boardInFlight: false,
-      rawInput: false,          // keystrokes go straight to the PTY (no IME composition)
-      composeNote: "",          // why a send did not go out; the draft is kept
+      muxNote: "",              // transient input-layer note, shown under the IME strip
+      muxDown: false,           // the attach socket closed; the banner offers a reconnect
       muxChecking: false,       // a preflight is in flight (drives the banner)
       muxEpoch: 0,              // bumped on every entry/teardown; stale preflights are dropped
       muxResizeOff: null,       // detaches the mux resize listeners on leave
@@ -550,17 +550,15 @@
       openTerminal();
     }
 
-    // Shared by both terminal views. The preventDefault on mousedown/touchstart is what keeps
-    // focus in xterm's textarea, so the on-screen keyboard never closes mid-chord and a Ctrl
-    // press reads as "Ctrl+letter" rather than "Ctrl, letter".
+    // Shared by both terminal views. The preventDefault on mousedown/touchstart is what keeps the
+    // keyboard up and the focus where it was, so the on-screen keyboard never closes mid-chord and
+    // a sticky Ctrl press reads as "Ctrl+letter" rather than "Ctrl, letter".
     function wireKbdBar() {
-      // Mode-aware: in compose mode this MUST go back to the compose bar. Sending it to
-      // xterm's textarea — which is what every keybar tap used to do, including the new Ctrl-C
-      // — hands the iOS keyboard back to xterm and the next Korean word decomposes again. The
-      // toggle would still read 조합 while the bug was back.
+      // Mode-aware because the two views own input differently: mux has the IME strip, and the
+      // legacy attach view still lets xterm read its own keyboard.
       const refocus = () => {
         try {
-          if (state.mode === "mux" && !state.rawInput) composeEl()?.focus();
+          if (state.mode === "mux") imeEl()?.focus({ preventScroll: true });
           else state.term?.focus();
         } catch {}
       };
@@ -785,7 +783,7 @@
       // the middle of a native IME composition, and a composition lives in the ELEMENT. Copying
       // its string value into a fresh element would drop the half-built syllable and leave the
       // keyboard in a state the page cannot see.
-      const keep = ["term-host", "compose-wrap"]
+      const keep = ["term-host", "ime-wrap"]
         .map((id) => document.getElementById(id))
         .filter(Boolean);
       for (const el of keep) el.remove();
@@ -810,17 +808,15 @@
         <header>
           <button class="chip back" id="back">&larr; overview</button>
           <div class="card-meta" style="flex:1; text-align:center;">comux</div>
-          <button class="chip" id="raw-toggle"></button>
           <button class="chip" id="presence-toggle"></button>
         </header>
         <main class="attach">
           <div id="mux-banner"></div>
           <div id="term-host" class="mux"></div>
-          <div id="compose-wrap" class="compose-wrap">
-            <textarea id="compose" rows="1" enterkeyhint="send" autocapitalize="off"
-                      autocorrect="off" spellcheck="false"
-                      placeholder="한글 입력 · Enter 전송"></textarea>
-            <button id="compose-send" class="chip ok">보내기</button>
+          <div id="ime-wrap" class="ime-wrap">
+            <textarea id="ime" rows="1" enterkeyhint="enter" autocapitalize="off" autocomplete="off"
+                      autocorrect="off" spellcheck="false" aria-label="입력"
+                      placeholder="한글 조합 영역 · 그 외 키는 바로 전송"></textarea>
           </div>
           <div class="kbd-bar">
             <button data-bytes="\\x02">Ctrl-b</button>
@@ -834,24 +830,31 @@
             <button data-bytes="\\x1b[C">&rarr;</button>
             <button data-bytes="\\x0d">Enter</button>
           </div>
+          <!-- comux chords. The prefix and the key travel as ONE payload, so a soft keyboard is
+               never asked to hold a modifier across two taps — which is what made these
+               unreachable before. Kept to the verbs worth a chip on a phone. -->
+          <div class="kbd-bar chords">
+            <button data-bytes="\\x02c">탭+</button>
+            <button data-bytes="\\x02p">&lsaquo;탭</button>
+            <button data-bytes="\\x02n">탭&rsaquo;</button>
+            <button data-bytes="\\x02s">사이드바</button>
+            <button data-bytes="\\x02!">&#9873;막힌곳</button>
+            <button data-bytes="\\x06">찾기</button>
+            <button data-bytes="\\x02[">스크롤</button>
+            <button data-bytes="\\x02d">분리</button>
+          </div>
         </main>
         </div>`);
       document.getElementById("back").addEventListener("click", leaveMux);
       document.getElementById("presence-toggle").addEventListener("click", togglePresence);
-      document.getElementById("raw-toggle").addEventListener("click", toggleRawInput);
       wireKbdBar();
-      wireCompose();
+      wireIme();
       patchMuxChrome();
     }
 
     /// Update everything about the mux view that can change, WITHOUT touching the DOM the
     /// terminal and the IME live in.
     function patchMuxChrome() {
-      const raw = document.getElementById("raw-toggle");
-      if (raw) {
-        raw.textContent = state.rawInput ? "직접" : "조합";
-        raw.classList.toggle("active", state.rawInput);
-      }
       const pres = document.getElementById("presence-toggle");
       if (pres) {
         pres.textContent = state.presence || "\u2026";
@@ -859,10 +862,14 @@
       }
       const banner = document.getElementById("mux-banner");
       if (banner) {
-        const msg = state.muxChecking ? "checking comux\u2026" : state.muxError;
-        banner.innerHTML = msg ? `<div class="banner">${escapeHtml(msg)}</div>` : "";
+        const msg = state.muxChecking ? "checking comux\u2026"
+                  : state.muxError || (state.muxDown ? "연결이 끊겼습니다" : "");
+        const again = state.muxDown && !state.muxChecking
+          ? ` <button class="chip ok" id="mux-reconnect">재연결</button>` : "";
+        banner.innerHTML = msg ? `<div class="banner">${escapeHtml(msg)}${again}</div>` : "";
+        document.getElementById("mux-reconnect")?.addEventListener("click", () => enterMux(false));
       }
-      renderComposeNote();
+      renderImeNote();
       // Only once the preflight has answered, and only if it said yes.
       if (!state.muxChecking && !state.muxError) openMuxTerminal();
     }
@@ -872,6 +879,12 @@
     // `openMuxTerminal` would then no-op on its idempotence guard, leaving a blank screen
     // whose toolbar still types into the old socket.
     function disposeMuxTerminal() {
+      // Invalidate the input layer FIRST: a settle timer or a queued chord closes over
+      // `state.ws.attach`, which the next entry replaces, so a late drain would type into a
+      // different socket than the one the user was looking at.
+      resetIme();
+      state.muxDown = false;
+      state.muxNote = "";
       try { state.muxResizeOff?.(); } catch {}
       state.muxResizeOff = null;
       if (state.ws.attach) { try { state.ws.attach.close(); } catch {} state.ws.attach = null; }
@@ -892,169 +905,455 @@
       startBoardPolling();      // refresh immediately on return, then resume the cadence
     }
 
-    /* ==== composed text input ====
+    /* ==== direct input ====
      *
-     * Typing Korean straight into xterm produces DECOMPOSED jamo on iOS — `잘 접근되는데`
-     * arrives as `ㅈㅏㄹ ㅈㅓㅂㄱㅡㄴㄷㅗㅣㄴㅡㄴㄷㅔ`. Reported from the device. On a desktop
-     * the OS composes a syllable before the terminal ever sees it, which is why nothing I ran
-     * locally could catch it.
+     * The comux view is a TERMINAL, not a form: a key reaches the PTY the moment it is pressed,
+     * so `Ctrl-b` then `c` is a comux chord and not two characters in a draft. That is the whole
+     * point — the previous design made every keystroke a line you had to submit, which is why
+     * no comux command could be typed at all.
      *
-     * The mechanism is attributed to WebKit not driving composition inside the hidden textarea
-     * xterm owns and keeps moving, but I have NOT verified that claim at the source — what is
-     * verified is the symptom and that composing outside xterm fixes it. So: a real textarea
-     * the IME owns, and only finished text reaches the PTY.
+     * The ONE thing that cannot work that way is an IME composition. Korean typed into xterm's
+     * own helper textarea arrives DECOMPOSED on iOS — `잘 접근되는데` came off the device as
+     * `ㅈㅏㄹ ㅈㅓㅂㄱㅡㄴㄷㅗㅣㄴㅡㄴㄷㅔ`. That textarea is `opacity: 0; z-index: -5` and xterm moves
+     * it under the cursor on every render; an editing host with no visible layout is the
+     * suspected reason WebKit will not hold marked text there, and I have NOT proved it. What IS
+     * proved on the device: a normal, visible, sized textarea composes Korean correctly.
      *
-     * A textarea, not an `<input>`: an input silently strips newlines, so a pasted two-line
-     * command would become a different single-line command with nothing to see.
+     * So there is exactly one focusable element — a one-row strip under the terminal — and it is
+     * almost always EMPTY. Printable text, Enter, Backspace, arrows, Ctrl chords and pastes are
+     * intercepted and written straight to the PTY; only the syllable the IME is still building
+     * lives in the strip, and it is written the instant the IME commits. No mode toggle, no send
+     * button, no Enter-means-submit.
+     *
+     * ORDERING is the hard part and `withOrder` is its single owner. Nothing may reach the PTY
+     * ahead of text the IME has already shown the user, and nothing that can RETARGET the input
+     * — a comux chord, a tap on another pane — may run before that text lands, or the syllable
+     * is typed into the wrong pane. A native terminal gets this from the OS, which commits marked
+     * text to the old input context before it delivers the click. Three states, one queue:
+     *
+     *   idle       nothing pending: flush the strip, then act.
+     *   composing  the IME owns the strip: queue the action and ask the IME to commit NOW
+     *              (blur+refocus — the only synchronous commit the DOM offers).
+     *   settling   the IME says it finished but the DOM has not settled, so reading the strip
+     *              here is the early read xterm itself defers. A BARRIER: the action queues and
+     *              drains after the read, in arrival order.
      */
 
-    // Enter is ambiguous during Korean input: WebKit fires `compositionend` BEFORE the keydown
-    // of the Enter that CONFIRMED the candidate, so `isComposing` is already false by then and
-    // submitting on it would swallow that Enter and send a syllable early. Treat an Enter that
-    // lands immediately after a composition ended as the confirming one.
-    const COMPOSE_CONFIRM_GRACE_MS = 50;
-    let lastCompositionEnd = 0;
+    const IME_COMMIT_MS = 200;      // how long a forced commit is given before we give up on it
+    const IME_MAX_H = 72;           // the strip grows to ~3 rows, then scrolls
 
-    // Should this keydown send the draft?
-    //
-    // Pulled out as a pure function because it is the whole correctness of Korean input and it
-    // is otherwise unreachable from a test. Three separate ways an Enter is NOT a submission:
-    //   * Shift+Enter — the user is inserting a newline.
-    //   * `isComposing` / keyCode 229 — the IME is mid-syllable.
-    //   * an Enter that arrives within the grace window after `compositionend` — WebKit fires
-    //     compositionend BEFORE the keydown of the Enter that CONFIRMED the candidate, so
-    //     `isComposing` is already false and this is the only thing separating "confirm the
-    //     syllable" from "send the line".
-    function shouldSubmitOnEnter(e, now, lastEnd) {
-      if (e.key !== "Enter" || e.shiftKey) return false;
-      if (e.isComposing || e.keyCode === 229) return false;
-      return now - lastEnd >= COMPOSE_CONFIRM_GRACE_MS;
+    let imeState = "idle";          // "idle" | "composing" | "settling"
+    let imeComp = 0;                // bumped per composition; the watchdog checks it
+    let imeQueue = [];              // {run, text} deferred behind a composition, in arrival order
+    let imeGen = 0;                 // bumped on dispose; a stale timer checks it and returns
+    let imeTimer = null;
+    let imeInAction = false;        // re-entrancy: data produced BY a drained action is not requeued
+    let imeWriteFailed = false;     // a write failed inside the action currently running
+
+    function imeEl() { return document.getElementById("ime"); }
+
+    /// The only ws.send for input. Returns false rather than dropping the keystroke in silence:
+    /// on a phone this socket dies every time the screen sleeps, and a terminal that quietly
+    /// swallows what you type is worse than one that says it is disconnected.
+    function write(s) {
+      if (!s) return true;
+      return writeBytes(new TextEncoder().encode(s));
     }
 
-    function composeEl() {
-      return document.getElementById("compose");
-    }
-
-    function focusForMode() {
-      if (state.rawInput) {
-        try { state.term?.focus(); } catch {}
-      } else {
-        composeEl()?.focus();
-      }
-    }
-
-    function toggleRawInput() {
-      // Never flushes the draft — switching modes is navigation, not submission.
-      state.rawInput = !state.rawInput;
-      render();
-      focusForMode();
-    }
-
-    function submitCompose() {
-      const el = composeEl();
-      if (!el) return;
-      const text = el.value;
-      if (!text) return;
+    function writeBytes(bytes) {
       const ws = state.ws.attach;
-      // Keep the draft on any failure. `sendKbdBytes` silently returns when the socket is not
-      // open, which is fine for one keystroke and would be a lost prompt here.
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        state.composeNote = "연결되지 않음 — 입력은 유지됩니다";
-        renderComposeNote();
-        return;
-      }
-      try {
-        // Literally what typing would do: the text, then Enter. Newlines inside the text are
-        // Enter presses at the remote too — a two-line paste submits twice. The socket has no
-        // application ack, so a send that leaves here is QUEUED, not delivered; nothing is
-        // replayed automatically, because replaying an ambiguous send could run a command twice.
-        ws.send(new TextEncoder().encode(text + "\r"));
-      } catch {
-        state.composeNote = "전송 실패 — 입력은 유지됩니다";
-        renderComposeNote();
-        return;
-      }
-      el.value = "";
-      autoGrow(el);
-      state.composeNote = "";
-      renderComposeNote();
-      el.focus();
+      const fail = () => { imeWriteFailed = true; showDisconnected(); return false; };
+      if (!ws || ws.readyState !== WebSocket.OPEN) return fail();
+      try { ws.send(bytes); } catch { return fail(); }
+      return true;
     }
 
-    function renderComposeNote() {
-      const wrap = document.getElementById("compose-wrap");
+    /// Staged text → PTY. Cleared only after a write that SUCCEEDED, on the next line,
+    /// synchronously. A deferred clear is what forced the earlier design to carry a
+    /// consumed-length cursor so a racing flush would not send the same syllable twice.
+    function flush() {
+      const el = imeEl();
+      if (!el || !el.value) return true;
+      if (!write(el.value)) return false;
+      el.value = "";
+      autoGrowIme(el);
+      return true;
+    }
+
+    /// `text` is the printable payload an action would have written, if it has one. It is what
+    /// lets a DROPPED action still not lose what the user typed: the control part of the action is
+    /// discarded, the characters go back into the strip.
+    function withOrder(action, text) {
+      if (imeInAction) { action(); return; }      // already inside an ordered drain
+      if (imeState !== "idle") {
+        imeQueue.push({ run: action, text });
+        if (imeState === "composing") forceCommit();
+        return;
+      }
+      // A failed send cancels what came after it — but never the CHARACTERS. Older queued text
+      // goes back first, then this action's own, so the strip reads in the order it was typed.
+      if (!flush()) { dropQueue(); if (text) stageText(text); return; }
+      runAction(action);
+    }
+
+    /// Run one action and report whether its writes got out. An action returns `false` when it
+    /// could not send — that is the ONLY way a failure inside `term.paste()` (which writes through
+    /// `onData` and reports nothing back) reaches the code that decides what to keep.
+    function runAction(action) {
+      imeInAction = true;
+      imeWriteFailed = false;
+      try {
+        const ok = action();
+        return ok !== false && !imeWriteFailed;
+      } finally {
+        imeInAction = false;
+      }
+    }
+
+    const emit = (bytes) => withOrder(() => write(bytes));
+
+    /// Throw the queue away, keeping only the characters. A chord or a mouse report is discarded
+    /// on purpose — replayed later it would act on a screen that has moved on — but text is text,
+    /// and it goes back where unsent text lives, in the strip, in arrival order.
+    function dropQueue() {
+      const q = imeQueue;
+      imeQueue = [];
+      const kept = q.map((a) => a.text || "").join("");
+      if (kept) stageText(kept);
+    }
+
+    /// Ask the IME to commit right now. `blur()` is the only synchronous commit the DOM offers,
+    /// and Chrome and WebKit both raise `compositionend` inside the call; the refocus is
+    /// immediate so the phone keyboard never drops.
+    ///
+    /// If an engine defers it anyway, the watchdog DISCARDS the queued action instead of running
+    /// it late — a chord or a tap that fires after an unknown delay acts on a different screen
+    /// than the one the user was looking at, which is worse than not firing. The staged text is
+    /// kept (nothing typed is lost) and the next boundary writes it.
+    function forceCommit() {
+      const el = imeEl();
+      if (!el) return;
+      el.blur();
+      el.focus({ preventScroll: true });
+      const gen = imeGen;
+      const comp = imeComp;
+      // Armed ONCE per pending queue, never restarted: re-arming on every queued action is how a
+      // 200 ms promise turns into "200 ms after you stop tapping", and the first action in the
+      // queue is the one whose screen goes stale.
+      if (imeTimer) return;
+      imeTimer = setTimeout(() => {
+        imeTimer = null;
+        if (gen !== imeGen || !imeQueue.length) return;
+        dropQueue();
+        showImeNote("조합이 끝나지 않아 키를 보내지 못했습니다");
+        // Only take the state back if nothing newer took over. A composition that started after
+        // this deadline was armed owns the strip now, and is entitled to settle normally — but it
+        // does NOT inherit this queue, which is exactly the hole a composition-owned timer left:
+        // clearing the timer on `compositionstart` let a chord that missed its deadline fire
+        // minutes later, whenever some unrelated syllable happened to commit.
+        if (comp === imeComp) imeState = "idle";
+      }, IME_COMMIT_MS);
+    }
+
+    /// One task after `compositionend`, when the DOM has settled. Idempotent.
+    ///
+    /// Known limit: if a NEWER composition both starts and commits before this runs, the queue
+    /// drains after that second syllable — the strip is flushed whole, so `한` + a queued `x` + a
+    /// commit of `글` would reach the PTY as `한글x`. Separating them again needs the consumed-range
+    /// bookkeeping this design deliberately does not carry, and reaching it needs two keystrokes
+    /// inside ONE task: a human types each key in its own, so the settle timer always runs between
+    /// them.
+    function settle(gen) {
+      if (gen !== imeGen) return;                // torn down: this strip and socket are gone
+      if (imeState === "composing") return;      // a newer composition owns the strip; it settles
+      clearTimeout(imeTimer);
+      imeTimer = null;
+      imeState = "idle";
+      // A queued action is replayed ONCE, and dropped if the socket died meanwhile: unsent TEXT
+      // is worth keeping, a chord or a mouse report is not — replaying it after a reconnect would
+      // act on whatever is on screen by then.
+      if (!flush()) { dropQueue(); return; }
+      const q = imeQueue;
+      imeQueue = [];
+      // Stop at the first failure: everything behind it was typed later, so sending it would
+      // reorder the user's input around the part that did not get through. Its characters go back
+      // to the strip instead, still in order (the action that failed kept its own).
+      for (let i = 0; i < q.length; i++) {
+        if (runAction(q[i].run)) continue;
+        const rest = q.slice(i + 1).map((a) => a.text || "").join("");
+        if (rest) stageText(rest);
+        return;
+      }
+    }
+
+    /// Tear the input layer down — on dispose, and therefore on the 재연결 button too. Queued
+    /// CHARACTERS are put back in the strip rather than thrown away with the queue: reconnecting
+    /// is the user trying to recover their typing, which is the worst possible moment to drop it.
+    function resetIme() {
+      imeGen++;
+      clearTimeout(imeTimer);
+      imeTimer = null;
+      dropQueue();
+      imeState = "idle";
+      imeInAction = false;
+    }
+
+    /// A keydown → the bytes a terminal would send, or null when it is not ours (a ⌘ shortcut
+    /// belongs to the OS; a dead key belongs to the IME).
+    ///
+    /// A plain printable character IS translated here, and preventing that keydown suppresses the
+    /// `beforeinput` that would otherwise follow — so the two paths cannot both fire and there is
+    /// nothing to de-duplicate. Handling it in keydown alone is what a keyboard that reports keys
+    /// but no input events needs: the e2e found exactly that, a Space that arrived as a keydown
+    /// with no text and vanished when only `beforeinput` could deliver a character.
+    function keyBytes(e) {
+      if (e.metaKey) return null;
+      switch (e.key) {
+        case "Tab": return "\t";
+        case "Escape": return "\x1b";
+        case "Backspace": return "\x7f";
+        case "Delete": return "\x1b[3~";
+        case "ArrowUp": return "\x1b[A";
+        case "ArrowDown": return "\x1b[B";
+        case "ArrowRight": return "\x1b[C";
+        case "ArrowLeft": return "\x1b[D";
+        case "Home": return "\x1b[H";
+        case "End": return "\x1b[F";
+        case "PageUp": return "\x1b[5~";
+        case "PageDown": return "\x1b[6~";
+      }
+      if (typeof e.key !== "string" || e.key.length !== 1) return null;   // F-keys, modifiers, Dead
+      if (e.ctrlKey) {
+        const c = e.key.toUpperCase().charCodeAt(0);
+        if (c === 63) return "\x7f";                                      // Ctrl-? = DEL
+        if (c === 32 || (c >= 64 && c <= 95)) return String.fromCharCode(c & 0x1f);
+        return null;
+      }
+      if (e.altKey) return "\x1b" + e.key;                                // Meta = ESC prefix
+      return e.key;                                                       // printable
+    }
+
+    /// Anything the IME might still be composing stays in the strip until a boundary. This is the
+    /// fallback for a WebKit that inserts syllables without ever raising a composition event: a
+    /// real textarea composes them correctly, and they go out in order at the next boundary.
+    /// Deliberately every non-ASCII insertion, not just Hangul — the same is true of any IME.
+    const NON_ASCII = /[^\x20-\x7e]/;
+
+    function clearSticky() {
+      state.ctrlSticky = false;
+      document.getElementById("ctrl")?.classList.remove("sticky");
+    }
+
+    /// The keyboard's exit. The sticky-Ctrl fold lives HERE and not in `write`, so a mouse report
+    /// or a bracketed-paste byte can never be folded into a control character.
+    ///
+    /// A printable character that cannot be sent is KEPT, in the strip, where unsent text already
+    /// lives — the user gets it back when the socket returns instead of watching their typing
+    /// disappear. A control byte is not kept: a stray Enter or arrow replayed after a reconnect
+    /// would act on a screen that has moved on.
+    function sendKey(text) {
+      if (state.ctrlSticky && text.length === 1 && text >= " " && text <= "~") {
+        text = String.fromCharCode(text.charCodeAt(0) & 0x1f);
+        clearSticky();
+      }
+      // Length is not the test: dictation and autocorrect deliver whole words, and losing
+      // "hello" to a sleeping phone is the same defect as losing "h".
+      if (!isPrintable(text)) { emit(text); return; }
+      // Even with the socket already gone this goes through `withOrder` rather than staging
+      // directly: a character typed while a syllable is still pending belongs AFTER that syllable,
+      // and a direct stage would put it in front of the text it was typed behind.
+      withOrder(() => {
+        if (write(text)) return true;
+        stageText(text);
+        return false;
+      }, text);
+    }
+
+    const isPrintable = (t) => t.length > 0 && !/[\x00-\x1f\x7f]/.test(t);
+
+    function socketOpen() {
+      const ws = state.ws.attach;
+      return !!ws && ws.readyState === WebSocket.OPEN;
+    }
+
+    /// Put text back into the strip, so nothing typed is lost to a socket that went away.
+    function stageText(text) {
+      const el = imeEl();
+      if (!el) return;
+      el.value += text;
+      autoGrowIme(el);
+    }
+
+    function onImeKeyDown(e) {
+      if (state.muxNote) showImeNote("");
+      // Enter first, and always prevented. While the IME owns the key we cannot let the default
+      // run (it would leave a newline in the strip to be flushed later), and preventing it is
+      // also what guarantees no `insertLineBreak` follows — which is why the beforeinput branch
+      // below needs no de-duplication.
+      if (e.key === "Enter") {
+        e.preventDefault();
+        emit("\r");
+        return;
+      }
+      if (e.isComposing || e.keyCode === 229) return;      // the IME owns this key
+      const el = imeEl();
+      // With a syllable staged, Backspace edits it — deleting the composing jamo is the IME's job.
+      if ((e.key === "Backspace" || e.key === "Delete") && el && el.value) return;
+      const bytes = keyBytes(e);
+      if (bytes == null) return;                           // not ours: beforeinput may still own it
+      e.preventDefault();
+      sendKey(bytes);
+    }
+
+    function onImeBeforeInput(e) {
+      if (e.isComposing || e.inputType === "insertCompositionText") return;   // the IME owns it
+      if (state.muxNote) showImeNote("");
+      const el = imeEl();
+      switch (e.inputType) {
+        case "insertText":
+        case "insertReplacementText": {
+          // Only reachable when the keydown path did not already send this text (it prevents its
+          // own default, which suppresses this event): dictation, an autocorrect replacement, an
+          // emoji picked from the keyboard, or a soft keyboard that reports no usable keydown.
+          const data = e.data || "";
+          if (!data) return;
+          if (NON_ASCII.test(data)) return;                // let it stage; a boundary writes it
+          e.preventDefault();
+          sendKey(data);
+          return;
+        }
+        case "insertFromPaste": {
+          // A plain textarea hands the pasted text over on `e.data` and leaves `dataTransfer`
+          // null; a contenteditable does the opposite. Reading only the latter swallowed every
+          // paste. If NEITHER carries it, do not cancel the insertion — letting the text land in
+          // the strip and go out at the next boundary loses the bracketing, not the paste.
+          const text = e.data || e.dataTransfer?.getData("text") || "";
+          if (!text) return;
+          e.preventDefault();
+          // term.paste, not write: it is what adds the bracketed-paste delimiters when the app
+          // asked for them, so a pasted multi-line command is EDITABLE instead of running itself
+          // line by line. It reports nothing back, so the socket is checked BEFORE handing over —
+          // and `text` rides along as the retention payload, so every drop path keeps it like any
+          // other typing. What is lost on that path is the bracketing, not the paste.
+          withOrder(() => {
+            if (socketOpen()) {
+              try { state.term?.paste(text); } catch { imeWriteFailed = true; }
+              // `imeWriteFailed` is what a write inside `onData` sets; `runAction` reads it.
+              if (!imeWriteFailed) return true;
+            } else {
+              showDisconnected();
+            }
+            stageText(text);
+            return false;
+          }, text);
+          return;
+        }
+        case "insertLineBreak":
+        case "insertParagraph":
+          // Only reachable when no keydown was delivered for that Return — the keydown path
+          // prevents every Enter, which suppresses this event — so there is nothing to
+          // de-duplicate against and the CR is unambiguously ours to send.
+          e.preventDefault();
+          emit("\r");
+          return;
+        case "deleteContentBackward":
+          if (el && el.value) return;                      // editing the staged syllable
+          e.preventDefault();
+          emit("\x7f");
+          return;
+        case "deleteWordBackward":
+          if (el && el.value) return;
+          e.preventDefault();
+          emit("\x17");
+          return;
+        default:
+          return;
+      }
+    }
+
+    /// xterm decides whether to draw a live cursor purely from focus/blur events on its own
+    /// textarea, which will never get focus again. Mirror ours so the cursor still blinks where
+    /// the user is typing. A coupling to 5.5.0's handler (index.html pins the version); its only
+    /// other effect is the `ESC [I` focus report an app has to ask for, which is honest here —
+    /// the user really did just focus the terminal.
+    function mirrorXtermFocus(type) {
+      const ta = state.term?.textarea;
+      if (!ta) return;
+      try { ta.dispatchEvent(new FocusEvent(type)); } catch {}
+    }
+
+    /// Grow the strip to its content. The regrid that has to follow is driven by the observer in
+    /// `wireIme` rather than from here, because the strip's height is not the only thing that
+    /// moves the terminal's floor — a note appearing does too, and the e2e caught exactly that:
+    /// comux's status bar slid under the fold and stayed there.
+    function autoGrowIme(el) {
+      el.style.height = "auto";
+      el.style.height = `${Math.min(el.scrollHeight, IME_MAX_H)}px`;
+      if (!window.ResizeObserver) sendMuxResize();
+    }
+
+    function showImeNote(msg) {
+      state.muxNote = msg;
+      renderImeNote();
+    }
+
+    function renderImeNote() {
+      const wrap = document.getElementById("ime-wrap");
       if (!wrap) return;
-      let note = wrap.querySelector(".compose-note");
-      if (!state.composeNote) { note?.remove(); return; }
+      let note = wrap.querySelector(".ime-note");
+      if (!state.muxNote) { note?.remove(); return; }
       if (!note) {
         note = document.createElement("div");
-        note.className = "compose-note";
+        note.className = "ime-note";
         wrap.appendChild(note);
       }
-      note.textContent = state.composeNote;
+      note.textContent = state.muxNote;
     }
 
-    /// Resize the draft box to its content, and tell the terminal when that moved it.
-    ///
-    /// The compose bar and the terminal share the column: growing the draft shrinks the
-    /// terminal's box. Nothing else notices — the resize listeners watch the window and the
-    /// visual viewport, neither of which fires for a textarea growing — so without this the
-    /// grid keeps its old row count and its bottom lines sit outside the visible area.
-    function autoGrow(el) {
-      const before = el.style.height;
-      el.style.height = "auto";
-      el.style.height = `${Math.min(el.scrollHeight, 96)}px`;
-      if (el.style.height !== before) sendMuxResize();
+    /// The socket is gone. Surfaced in the banner WITH a way out, because the `[disconnected]`
+    /// line xterm prints scrolls away and leaves a terminal that looks alive and types into
+    /// nothing — the exact failure a sleeping phone causes several times a day.
+    function showDisconnected() {
+      if (state.muxDown) return;
+      state.muxDown = true;
+      patchMuxChrome();
     }
 
-    function wireCompose() {
-      const el = composeEl();
+    function wireIme() {
+      const el = imeEl();
       if (!el) return;
-      el.addEventListener("compositionend", () => { lastCompositionEnd = Date.now(); });
-      el.addEventListener("input", () => autoGrow(el));
-      el.addEventListener("keydown", (e) => {
-        if (!shouldSubmitOnEnter(e, Date.now(), lastCompositionEnd)) return;
-        e.preventDefault();
-        submitCompose();
+      el.addEventListener("keydown", onImeKeyDown);
+      el.addEventListener("beforeinput", onImeBeforeInput);
+      el.addEventListener("compositionstart", () => {
+        imeComp++;
+        imeState = "composing";
       });
-      document.getElementById("compose-send")?.addEventListener("click", (e) => {
-        e.preventDefault();
-        submitCompose();
+      el.addEventListener("compositionend", () => {
+        imeState = "settling";
+        const gen = imeGen;
+        setTimeout(() => settle(gen), 0);
       });
-      // xterm grabs focus whenever the terminal body is touched, and once its textarea has it
-      // the iOS keyboard belongs to xterm again and Korean stops composing. In compose mode the
-      // terminal is for READING.
-      //
-      // CAPTURE phase AND `stopPropagation`, both load-bearing.
-      //
-      // Capture, because xterm's handler is on a DESCENDANT: a bubbling listener would run
-      // after it had already focused the textarea, interrupting the IME session even though
-      // focus is handed straight back. And `preventDefault` alone is not enough either —
-      // xterm 5.5's mousedown handler calls `focus()` unconditionally and never looks at
-      // `defaultPrevented` — so the event must not reach it at all.
-      //
-      // The cost, accepted: with the event stopped, xterm's own drag-selection does not run in
-      // compose mode. Switch to 직접 to select terminal text with the pointer.
-      //
-      // Deliberately NOT touchstart: stopping that would kill scrolling the output, and iOS
-      // synthesises the mousedown for a tap anyway.
+      el.addEventListener("input", () => autoGrowIme(el));
+      // The strip shares the column with the terminal, so anything that changes its height takes
+      // rows away from the grid — and nothing else notices: the resize listeners watch the window
+      // and the visual viewport, neither of which fires for the box next door.
+      if (window.ResizeObserver) {
+        const wrap = document.getElementById("ime-wrap");
+        if (wrap) new ResizeObserver(() => sendMuxResize()).observe(wrap);
+      }
+      el.addEventListener("focus", () => mirrorXtermFocus("focus"));
+      el.addEventListener("blur", () => mirrorXtermFocus("blur"));
+      // A focus that lands anywhere inside the terminal comes back to the strip. Capture phase so
+      // it runs first, but deliberately WITHOUT stopPropagation/preventDefault: the version that
+      // stopped the event is why the terminal could not be tapped at all — no focus, no
+      // selection, and no mouse report, so comux's own clickable chrome (status-bar tab chips,
+      // sidebar rows, pane bodies) was dead on the phone.
       const host = document.getElementById("term-host");
-      const keepFocus = (ev) => {
-        if (state.rawInput) return;
-        ev.stopPropagation();
-        ev.preventDefault();
-        el.focus();
-      };
-      host?.addEventListener("mousedown", keepFocus, true);
-      host?.addEventListener("contextmenu", keepFocus, true);
-      // Backstop for any focus path not enumerated above: if anything inside the terminal takes
-      // focus while composing, bounce it straight back.
       host?.addEventListener("focusin", (ev) => {
-        if (state.rawInput || ev.target === el) return;
-        el.focus();
+        if (ev.target === el) return;
+        el.focus({ preventScroll: true });
       }, true);
-      renderComposeNote();
-      focusForMode();
+      renderImeNote();
     }
 
     function leaveMux() {
@@ -1091,6 +1390,7 @@
       disposeMuxTerminal();
       const epoch = ++state.muxEpoch;
       state.muxError = "";
+      state.muxDown = false;
       state.muxChecking = true;
       state.mode = "mux";
       if (pushHistory) {
@@ -1124,6 +1424,15 @@
       term.open(host);
       state.term = term;
       state.fit = fit;
+      // Own the keyboard without fighting for it. xterm's own mousedown handler calls
+      // `this.textarea.focus()` unconditionally; redirect that and a tap on the terminal opens the
+      // keyboard for OUR strip, inside the same user gesture, while the very same mousedown still
+      // produces a mouse report. Nothing ever focuses xterm's textarea, so none of its
+      // key/input/composition handlers can run. The primary boundary, not a complete one — the
+      // `focusin` bounce in `wireIme` is the backstop for paths that also call `select()`.
+      if (term.textarea) {
+        term.textarea.focus = () => imeEl()?.focus({ preventScroll: true });
+      }
       muxGrid(fit, term);
       // repairFontMetrics refits to the raw viewport and sends THAT to the PTY, which would
       // push the grid below the floor and leave xterm and the PTY disagreeing. Re-apply the
@@ -1138,23 +1447,35 @@
       ws.binaryType = "arraybuffer";
       state.ws.attach = ws;
 
-      ws.onopen = () => sendMuxResize();
+      ws.onopen = () => {
+        state.muxDown = false;
+        patchMuxChrome();
+        sendMuxResize();
+      };
       ws.onmessage = (msg) => {
         if (msg.data instanceof ArrayBuffer) term.write(new Uint8Array(msg.data));
         else term.write(String(msg.data));
       };
       ws.onclose = () => {
-        if (state.mode === "mux") term.writeln("\r\n\x1b[33m[disconnected]\x1b[0m");
+        if (state.mode !== "mux") return;
+        term.writeln("\r\n\x1b[33m[disconnected]\x1b[0m");
+        showDisconnected();
       };
       ws.onerror = () => { try { ws.close(); } catch {} };
 
-      term.onData((data) => {
-        if (state.ctrlSticky && data.length === 1 && data >= " " && data <= "~") {
-          data = String.fromCharCode(data.charCodeAt(0) & 0x1f);
-          state.ctrlSticky = false;
-          document.getElementById("ctrl")?.classList.remove("sticky");
-        }
-        if (ws.readyState === WebSocket.OPEN) ws.send(new TextEncoder().encode(data));
+      // `onData` is not the keyboard any more — it carries MOUSE reports, the paste we ask for,
+      // and protocol REPLIES (DA/DSR, focus reports). Only a mouse report can change which pane
+      // the next keystroke lands in, so only that is ordered behind a pending composition;
+      // holding a reply back could make comux's own terminal probe time out.
+      term.onData((d) => {
+        if (isMouseReport(d)) withOrder(() => write(d));
+        else write(d);
+      });
+      // A DEFAULT-encoding (non-SGR) mouse report goes out on this channel instead, one byte per
+      // char. Never through TextEncoder, which would expand a report byte above 0x7f into two.
+      term.onBinary((d) => {
+        const bytes = Uint8Array.from(d, (c) => c.charCodeAt(0) & 0xff);
+        withOrder(() => writeBytes(bytes));
       });
 
       const onResize = () => {
@@ -1292,6 +1613,8 @@
       // unescape sequences typed in the data-bytes attribute
       let bytes = escape.replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
                         .replace(/\\t/g, "\t");
+      // A tap mid-syllable must not overtake the syllable: in mux the payload goes through the
+      // ordering owner, so `Ctrl-b n` can never switch panes ahead of the text the IME is holding.
       // Sticky-Ctrl path: if toolbar Ctrl is armed and the next
       // toolbar tap is a single printable byte, fold it via the
       // 0x1f mask (Ctrl-A = 0x01, Ctrl-/ = 0x1f, etc.). Without
@@ -1299,11 +1622,18 @@
       // sticky-modifier contract is broken on the toolbar path.
       if (state.ctrlSticky && bytes.length === 1 && bytes >= " " && bytes <= "~") {
         bytes = String.fromCharCode(bytes.charCodeAt(0) & 0x1f);
-        state.ctrlSticky = false;
-        const el = document.getElementById("ctrl");
-        if (el) el.classList.remove("sticky");
+        clearSticky();
       }
-      ws.send(new TextEncoder().encode(bytes));
+      if (state.mode === "mux") emit(bytes);
+      else ws.send(new TextEncoder().encode(bytes));
+    }
+
+    /// Which `onData` payloads can retarget the input. SGR reports are `ESC [ < …M/m` and the
+    /// DEFAULT encoding's are `ESC [ M …`; neither prefix can collide with an application reply
+    /// (a device attribute answers `ESC [ ? …c`, a cursor report `ESC [ …R`). xterm 5.5 exposes no
+    /// provenance on that channel, so this classifier is version-specific by necessity.
+    function isMouseReport(d) {
+      return typeof d === "string" && (d.startsWith("\x1b[<") || d.startsWith("\x1b[M"));
     }
 
     /* ==== overview WS ==== */

@@ -11,7 +11,13 @@ const evaluated = new Function("state", "escapeHtml", "return `" + m[1] + "`;")(
 const decode = (e) => e.replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
                        .replace(/\\t/g, "\t");
 const want = { "Ctrl-b": "\x02", "Ctrl-C": "\x03", "Esc": "\x1b", "Tab": "\t", "&uarr;": "\x1b[A",
-               "&darr;": "\x1b[B", "&larr;": "\x1b[D", "&rarr;": "\x1b[C", "Enter": "\r" };
+               "&darr;": "\x1b[B", "&larr;": "\x1b[D", "&rarr;": "\x1b[C", "Enter": "\r",
+               // The comux chord row: prefix + key in ONE payload, because a soft keyboard cannot
+               // hold Ctrl-b across two taps — which is why none of these were reachable before.
+               "탭+": "\x02c", "&lsaquo;탭": "\x02p", "탭&rsaquo;": "\x02n",
+               "사이드바": "\x02s", "&#9873;막힌곳": "\x02!",
+               "찾기": "\x06", "스크롤": "\x02[", "분리": "\x02d" };
+const WANT_N = Object.keys(want).length;
 let ok = true, n = 0;
 for (const r of evaluated.matchAll(/data-bytes="([^"]*)"[^>]*>([^<]*)</g)) {
   // innerHTML normalizes CR (and CRLF) to LF inside attribute values — emulate it, because
@@ -23,5 +29,5 @@ for (const r of evaluated.matchAll(/data-bytes="([^"]*)"[^>]*>([^<]*)</g)) {
   ok = ok && pass; n++;
   console.log(`${pass ? "ok  " : "FAIL"} ${r[2].padEnd(7)} attr=${JSON.stringify(attr)} -> ${JSON.stringify(got)}`);
 }
-console.log(ok && n === 9 ? `PASS — all ${n} keybar buttons emit the intended bytes` : "FAIL");
-process.exit(ok && n === 9 ? 0 : 1);
+console.log(ok && n === WANT_N ? `PASS — all ${n} keybar buttons emit the intended bytes` : "FAIL");
+process.exit(ok && n === WANT_N ? 0 : 1);

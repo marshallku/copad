@@ -22,15 +22,21 @@ const history = { state: null, pushState(s) { this.state = s; }, back() {} };
 let polls = { start: 0, stop: 0 };
 const startBoardPolling = () => { polls.start++; };
 const stopBoardPolling = () => { polls.stop++; };
+// The input layer's own teardown. Counted rather than stubbed away: every dispose MUST invalidate
+// it, or a queued chord from the previous attach drains into the replacement socket.
+let resets = 0;
+const resetIme = () => { resets++; };
 const fn = new Function("state", "api", "render", "history", "startBoardPolling", "stopBoardPolling",
-  src + "; return { enterMux, teardownMux };");
-const { enterMux, teardownMux } = fn(state, api, render, history, startBoardPolling, stopBoardPolling);
+  "resetIme", src + "; return { enterMux, teardownMux };");
+const { enterMux, teardownMux } = fn(state, api, render, history, startBoardPolling, stopBoardPolling,
+  resetIme);
 
 (async () => {
   console.log("1. click terminal (preflight goes out, stays pending)");
   const p1 = enterMux(true);
   console.log(`   mode=${state.mode} checking=${state.muxChecking} epoch=${state.muxEpoch}`);
 
+  if (resets < 1) { console.log("FAIL: entering mux did not reset the input layer"); process.exit(1); }
   console.log("2. Back while it is still pending");
   teardownMux();
   console.log(`   mode=${state.mode} checking=${state.muxChecking} epoch=${state.muxEpoch}`);

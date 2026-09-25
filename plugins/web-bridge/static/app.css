@@ -127,10 +127,10 @@
     .attach-bar .title { flex: 1; font-size: 0.8rem; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     #term-host { flex: 1; background: var(--bg-3); padding: 0.3rem; overflow: hidden; }
     #term-host .xterm { height: 100%; }
-    /* The comux view floors the grid at 80 columns, which is wider than a phone. Without a
-       scrollable host the extra columns are simply clipped — the promised "scroll instead of
-       shrinking the desktop" only exists if the overflow is reachable. `touch` keeps the
-       momentum scroll iOS otherwise drops on a nested scroller. */
+    /* The grid is fitted to the phone, so there is normally nothing to scroll here. The
+       scrollable host stays because the floor (`MUX_MIN_COLS`) can still exceed a narrow
+       viewport, and clipped columns would be unreachable otherwise. `touch` keeps the momentum
+       scroll iOS drops on a nested scroller. */
     #term-host.mux { overflow: auto; -webkit-overflow-scrolling: touch; }
     #term-host.mux .xterm { height: 100%; width: max-content; }
     /* mobile keyboard toolbar */
@@ -200,22 +200,44 @@
     .board-empty { padding: 2rem 0.9rem; text-align: center; color: var(--fg-dim); }
     .board-note { padding: 0.9rem; margin: 0; font-size: 0.7rem; color: var(--fg-dim); line-height: 1.5; }
 
-    .compose-wrap { display: flex; align-items: flex-end; gap: 0.4rem; padding: 0.4rem; background: var(--bg-2); border-top: 1px solid var(--border); }
-    .compose-wrap textarea {
-      flex: 1; resize: none; min-height: 2.1rem; max-height: 6rem; padding: 0.5rem 0.6rem;
-      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
-      border-radius: 0.4rem; font: inherit; font-size: 0.95rem; line-height: 1.3;
+    /* ==== IME strip ====
+       One row under the terminal, normally EMPTY: it holds only the syllable an IME is still
+       building, and it is the page's single focus target. Styled as a continuation of the
+       terminal rather than a form field — it is not a draft box, and nothing is "submitted" from
+       it. It cannot be hidden or made transparent: a visible, laid-out editing host is the only
+       configuration in which WebKit composes Korean on the device. */
+    .ime-wrap {
+      display: flex; flex-wrap: wrap; align-items: flex-end;
+      background: var(--bg-3); border-top: 1px solid var(--border); padding: 0.15rem 0.5rem;
     }
-    .compose-wrap textarea:focus { outline: none; border-color: var(--accent); }
-    .compose-wrap .chip { flex-shrink: 0; padding: 0.55rem 0.8rem; }
-    .compose-note { flex-basis: 100%; color: var(--accent-warn); font-size: 0.72rem; padding: 0.1rem 0.2rem 0; }
-    .kbd-bar { display: flex; flex-wrap: wrap; gap: 0.3rem; padding: 0.4rem; background: var(--bg-2); border-top: 1px solid var(--border); }
+    .ime-wrap::before {
+      content: "\203a"; color: var(--fg-dim); opacity: 0.5; font-size: 0.85rem;
+      line-height: 1.7; padding-right: 0.35rem;
+    }
+    #ime {
+      flex: 1; resize: none; min-height: 1.6rem; max-height: 72px; padding: 0.1rem 0;
+      background: transparent; color: var(--fg); border: 0; outline: none;
+      font-family: "CopadTerminal", ui-monospace, "SF Mono", monospace;
+      font-size: 0.9rem; line-height: 1.5;
+    }
+    #ime::placeholder { color: var(--fg-dim); opacity: 0.45; font-size: 0.78rem; }
+    .ime-note { flex-basis: 100%; color: var(--accent-warn); font-size: 0.72rem; padding: 0 0 0.15rem 0.85rem; }
+    /* Each bar is ONE scrollable row, never wrapped: two bars that reflow to four steal a third of
+       a phone screen from the terminal. */
+    .kbd-bar {
+      display: flex; flex-wrap: nowrap; gap: 0.3rem; padding: 0.35rem 0.4rem; background: var(--bg-2);
+      border-top: 1px solid var(--border); overflow-x: auto; scrollbar-width: none;
+      -webkit-overflow-scrolling: touch;
+    }
+    .kbd-bar::-webkit-scrollbar { display: none; }
+    .kbd-bar.chords { border-top-color: transparent; padding-top: 0; }
+    .kbd-bar.chords button { color: var(--fg-dim); }
     /* touch-action: manipulation suppresses double-tap zoom; user-select
        prevents long-press text selection on iOS. Combined with the
        mousedown/touchstart preventDefault below, this keeps focus on
        xterm's hidden textarea so the toolbar Ctrl+key combo works
        without re-tapping the terminal between keys. */
-    .kbd-bar button { flex: 1 0 auto; min-width: 2.5rem; padding: 0.5rem 0.5rem; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 0.35rem; font-size: 0.78rem; cursor: pointer; touch-action: manipulation; -webkit-user-select: none; user-select: none; }
+    .kbd-bar button { flex: 0 0 auto; min-width: 2.5rem; padding: 0.45rem 0.55rem; background: var(--bg); color: var(--fg); border: 1px solid var(--border); border-radius: 0.35rem; font-size: 0.78rem; cursor: pointer; touch-action: manipulation; -webkit-user-select: none; user-select: none; }
     .kbd-bar button.sticky { background: var(--accent); color: var(--bg-3); }
     .kbd-bar button:active { background: var(--accent); color: var(--bg-3); }
 
