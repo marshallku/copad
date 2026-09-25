@@ -224,9 +224,84 @@ pub async fn list_agents() -> Result<Vec<Agent>, ComuxError> {
     parse_envelope(&run_json(&["list-agents"]).await?, "agents")
 }
 
+/// A pane token, as it may arrive from a browser.
+///
+/// Two separate jobs. The first is that `comux jump` takes its target positionally and skips any
+/// argument starting with `-`, so a token of `--help` would silently become a usage error rather
+/// than a jump. The second is that this string comes from a request body: the process is spawned
+/// without a shell, so there is nothing to inject into, but a token is a `<nonce>-<counter>` or a
+/// `termN`, and anything that is not one is a bug or an attack and gets a clean refusal either way.
+pub fn is_pane_token(t: &str) -> bool {
+    !t.is_empty()
+        && t.len() <= 64
+        && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !t.starts_with('-')
+}
+
+/// `comux jump <token> --no-raise --json` — move the mux's focus to that pane.
+///
+/// `--no-raise` is not optional here. The raise runs in the spawned CLI, which under the bridge is
+/// a child of copadd: an environment with `DISPLAY`/`DBUS_SESSION_BUS_ADDRESS` scrubbed (#77), and
+/// the wrong process for macOS to hang Automation permission on. There is also nothing to raise —
+/// the person asking is holding a phone.
+///
+/// `PayloadWins`, because the interesting failure is a STRUCTURED one: an expired token answers
+/// `{"ok":false,"error":"unknown pane: …"}` on stdout and then exits 1, and `Strict` would throw
+/// that body away and report whatever stderr happened to hold. Pane tokens are qualified by server
+/// incarnation, so "unknown pane" is the normal answer after `comux server restart` — the one case
+/// where the phone MUST be told rather than quietly shown someone else's session.
+pub async fn jump(token: &str) -> Result<(), ComuxError> {
+    if !is_pane_token(token) {
+        return Err(ComuxError::Failed(format!("not a pane token: {token:?}")));
+    }
+    let out = run_json_with(&["jump", token, "--no-raise"], ExitPolicy::PayloadWins).await?;
+    parse_ok(&out)
+}
+
+/// Read a bare `{"ok": …}` control response — the shape a verb that returns no list answers with.
+pub fn parse_ok(stdout: &str) -> Result<(), ComuxError> {
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|e| ComuxError::Malformed(format!("not JSON: {e}")))?;
+    if v.get("ok").and_then(|b| b.as_bool()) == Some(true) {
+        return Ok(());
+    }
+    Err(ComuxError::Failed(
+        v.get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("ok was not true")
+            .to_string(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stale_token_keeps_its_reason() {
+        // comux prints this on STDOUT and then exits 1. Strict policy would drop the body and
+        // report stderr, which is empty — the phone would be told nothing at all.
+        let err = parse_ok(r#"{"ok":false,"error":"unknown pane: 17bca6ab617c6-4"}"#).unwrap_err();
+        assert!(
+            matches!(&err, ComuxError::Failed(m) if m.contains("unknown pane")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_successful_jump_needs_no_payload() {
+        assert!(parse_ok(r#"{"ok":true}"#).is_ok());
+    }
+
+    #[test]
+    fn a_token_that_would_be_read_as_a_flag_is_refused() {
+        assert!(is_pane_token("17bca6ab617c6-4"));
+        assert!(is_pane_token("term4"));
+        assert!(!is_pane_token("--no-raise"));
+        assert!(!is_pane_token(""));
+        assert!(!is_pane_token("a b"));
+        assert!(!is_pane_token(&"a".repeat(65)));
+    }
 
     const SESSIONS: &str = r#"{"ok":true,"sessions":[
         {"index":0,"id":"local","name":"blog","active":false,"tabs":4,"panes":4,"agents":0},

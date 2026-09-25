@@ -2,8 +2,8 @@
 # Browser-side regression tests for the mobile bridge.
 #
 # They are here rather than in `cargo test` because what they cover lives in `static/app.js`:
-# IME submission, focus ownership, the board's status partition, the polling lifecycle and the
-# keybar's byte encoding. Each one pulls the REAL function out of app.js and runs it — none of
+# input ordering, focus ownership, the touch paths, the board's status partition + row targeting,
+# the polling lifecycle and the keybar's byte encoding. Each one pulls the REAL function out of app.js and runs it — none of
 # them re-implement the logic they check, so a behaviour change fails the test rather than
 # quietly diverging from it.
 #
@@ -18,7 +18,7 @@ board_json="${1:-${BOARD_JSON:-}}"
 token="${COPAD_WEB_BRIDGE_TOKEN:-}"
 fail=0
 
-for t in ime-check focus-check poll-check keybar-check nav-check preserve-check; do
+for t in ime-check focus-check touch-check poll-check keybar-check jump-check nav-check preserve-check; do
     printf '  %-16s ' "$t"
     if timeout 60 node "$t.mjs" >/dev/null 2>&1; then echo PASS; else echo FAIL; fail=1; fi
 done

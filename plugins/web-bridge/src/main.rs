@@ -416,6 +416,7 @@ async fn run_server(
         .route("/api/pilot/goals/:id/cancel", post(handle_pilot_cancel))
         .route("/api/board", get(handle_board))
         .route("/api/board/attach-preflight", get(handle_board_preflight))
+        .route("/api/board/jump", post(handle_board_jump))
         .route("/ws/board/attach", get(handle_ws_board_attach))
         .route("/ws/tmux/overview", get(handle_ws_tmux_overview))
         .route("/ws/tmux/attach/:pane_id", get(handle_ws_tmux_attach))
@@ -1483,6 +1484,41 @@ async fn handle_board_preflight(
     }
 }
 
+#[derive(Deserialize)]
+struct BoardJump {
+    token: String,
+}
+
+/// `POST /api/board/jump` — move the mux's focus to one pane, addressed by its token.
+///
+/// This is what makes a board row a destination rather than a link to "whatever comux happens to
+/// be showing". It MOVES THE DESKTOP'S VIEW as well, because comux composes one frame for every
+/// attached client — and that is the intended behaviour, not a leak: the person tapping the phone
+/// is the person sitting at the desk. The alternative (a per-client view) is the per-pane semantic
+/// grid, decisions #65/#66.
+///
+/// A refusal is reported rather than smoothed over. Pane tokens are qualified by server
+/// incarnation, so every token the phone is holding goes stale on `comux server restart`; showing
+/// the focused session instead of saying so would reproduce exactly the bug this endpoint fixes.
+async fn handle_board_jump(
+    axum::extract::State(_state): axum::extract::State<AppState>,
+    axum::Json(body): axum::Json<BoardJump>,
+) -> Result<axum::Json<Value>, AppError> {
+    if !comux::is_pane_token(&body.token) {
+        return Err(AppError::custom("bad_token", "not a pane token"));
+    }
+    match comux::jump(&body.token).await {
+        Ok(()) => Ok(axum::Json(json!({ "ok": true, "token": body.token }))),
+        // A pane that is not there is the CLIENT's problem — a token it has been holding since
+        // before the last `comux server restart` — not a server fault, and logging it as a 500
+        // would bury the one failure this endpoint expects to see.
+        Err(e) if e.to_string().contains("unknown pane") => {
+            Err(AppError::custom("unknown_pane", &e.to_string()))
+        }
+        Err(e) => Err(AppError::custom(e.code(), &e.to_string())),
+    }
+}
+
 /// `WS /ws/board/attach` — a real terminal on the phone: the comux CLIENT itself, run inside a
 /// PTY and pumped to xterm.js.
 ///
@@ -2053,6 +2089,12 @@ impl axum::response::IntoResponse for AppError {
                     StatusCode::BAD_GATEWAY
                 } else if code == "push_disabled" {
                     StatusCode::SERVICE_UNAVAILABLE
+                } else if code == "bad_token" {
+                    StatusCode::BAD_REQUEST
+                } else if code == "unknown_pane" {
+                    // Gone, not missing: the pane existed and the id the client holds is from a
+                    // previous server incarnation.
+                    StatusCode::GONE
                 } else {
                     StatusCode::INTERNAL_SERVER_ERROR
                 };

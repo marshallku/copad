@@ -200,6 +200,10 @@
     .board-empty { padding: 2rem 0.9rem; text-align: center; color: var(--fg-dim); }
     .board-note { padding: 0.9rem; margin: 0; font-size: 0.7rem; color: var(--fg-dim); line-height: 1.5; }
 
+    /* A row that has been tapped and is waiting on the jump. Set on the element, not through a
+       re-render, so a board poll landing mid-jump cannot wipe the only feedback there is. */
+    .agent-row.pending { opacity: 0.55; }
+
     /* ==== IME strip ====
        One row under the terminal, normally EMPTY: it holds only the syllable an IME is still
        building, and it is the page's single focus target. Styled as a continuation of the

@@ -51,6 +51,8 @@
       boardEpoch: 0,
       boardLoop: 0,
       boardInFlight: false,
+      boardNote: "",            // why a row could not be opened (stale token, no server)
+      jumpBusy: null,           // a jump is in flight; a second row tap would race it
       muxNote: "",              // transient input-layer note, shown under the IME strip
       muxDown: false,           // the attach socket closed; the banner offers a reconnect
       muxChecking: false,       // a preflight is in flight (drives the banner)
@@ -264,7 +266,7 @@
         || a.status === "ready";
       const status = encoded ? "" : `<span class="row-status">${escapeHtml(a.status || "?")}</span>`;
       return `
-        <div class="agent-row" data-token="${escapeHtml(a.token || a.terminal || "")}">
+        <div class="agent-row" data-token="${escapeHtml(a.token || "")}">
           <span class="dot ${cls}"></span>
           <div class="row-main">
             <div class="row-title">${where}<span class="row-name">${escapeHtml(a.title || "?")}</span></div>
@@ -290,7 +292,8 @@
       }
 
       const errs = (b.errors || []).map(e =>
-        `<div class="banner">fleet: ${escapeHtml(e.what)} — ${escapeHtml(e.message || e.code)}</div>`).join("");
+        `<div class="banner">fleet: ${escapeHtml(e.what)} — ${escapeHtml(e.message || e.code)}</div>`).join("")
+        + (state.boardNote ? `<div class="banner">${escapeHtml(state.boardNote)}</div>` : "");
       // Computed BEFORE the early return: without it, a transport failure on top of an
       // already-partial response would present the retained session count as current.
       const stale = state.boardStale
@@ -490,12 +493,8 @@
       document.querySelectorAll(".push-settings input[data-push-kind]").forEach(el => {
         el.addEventListener("change", () => updatePushKinds(el.dataset.pushKind, el.checked));
       });
-      // Opening the terminal is the only action a row can offer today: comux's v1 transport
-      // composes ONE frame for all clients, so the phone cannot show a single pane, and
-      // `jump` would move the desktop user's view. Targeted open waits on the per-pane
-      // protocol (decisions #65/#66).
       document.querySelectorAll(".agent-row").forEach(el => {
-        el.addEventListener("click", () => enterMux(true));
+        el.addEventListener("click", () => openAgent(el, el.dataset.token || ""));
       });
       document.querySelectorAll(".card[data-pane]").forEach(el => {
         el.addEventListener("click", () => enterAttach(el.dataset.pane));
@@ -550,9 +549,89 @@
       openTerminal();
     }
 
-    // Shared by both terminal views. The preventDefault on mousedown/touchstart is what keeps the
-    // keyboard up and the focus where it was, so the on-screen keyboard never closes mid-chord and
-    // a sticky Ctrl press reads as "Ctrl+letter" rather than "Ctrl, letter".
+    /* ==== the key bar ====
+     *
+     * Every button in both bars was DEAD on the phone, and had been since the bar was written:
+     * the handlers were `mousedown`+`touchstart` → `preventDefault()` (to stop the tap blurring
+     * the input and dropping the keyboard mid-chord) with the action on `click`. On iOS,
+     * preventing the default of `touchstart` suppresses the synthesized mouse events — mousedown,
+     * mouseup AND click — so the action never ran. A desktop mouse still produces a real click,
+     * which is why every test and every e2e passed.
+     *
+     * So the touch path is explicit now: the action fires on `touchend`, and only for a touch that
+     * stayed put (each bar is one horizontally scrollable row, and dragging it must scroll rather
+     * than type). `preventDefault` there is what keeps the focus, and it also cancels the
+     * synthesized click — but a device that emits one anyway is covered by the suppression window.
+     */
+
+    const TAP_SLOP_PX = 10;        // a touch that moves further than this is a scroll, not a tap
+    const TAP_CLICK_SUPPRESS_MS = 700;
+
+    /// "Did this touch stay still enough to be a tap" as a small machine, so the bookkeeping is
+    /// testable without a browser — which is the only reason the original was wrong twice.
+    ///
+    /// A gesture is OWNED by the identifier it started with. It dies the moment a second finger
+    /// joins (checked on every move, because that finger may land on a different element and this
+    /// listener would never hear its `touchstart`) or the moment it travels past the slop —
+    /// DURING the move, not at the end: a finger that wanders 80px down the bar and comes back
+    /// was scrolling, and comparing only start to end would type a key for it.
+    function tapGesture(slop) {
+      let id = null, sx = 0, sy = 0, moved = false;
+      return {
+        start(t, count) {
+          if (count !== 1) { id = null; return; }
+          id = t.identifier; sx = t.clientX; sy = t.clientY; moved = false;
+        },
+        move(t, count) {
+          if (id === null) return;
+          if (count !== 1) { id = null; return; }
+          if (t.identifier !== id) return;
+          if (Math.abs(t.clientX - sx) > slop || Math.abs(t.clientY - sy) > slop) moved = true;
+        },
+        /// `remaining` is how many fingers are still down; a clean tap leaves none.
+        end(t, remaining) {
+          const fire = id !== null && !moved && remaining === 0 && !!t && t.identifier === id;
+          id = null;
+          return fire;
+        },
+        cancel() { id = null; },
+      };
+    }
+
+    /// Should a `click` run, given the last touch-driven fire? Both events reaching us would send
+    /// the byte twice — an `Esc` that fires twice is a second Escape the app acts on.
+    function shouldFireClick(now, lastTouch) {
+      return now - lastTouch >= TAP_CLICK_SUPPRESS_MS;
+    }
+
+    /// Bind one activation to an element across both input models.
+    function onActivate(el, run) {
+      if (!el) return;
+      // A synthesized mousedown's default IS the focus change, and preventing it does NOT cancel
+      // the click — unlike touchstart. That asymmetry is the whole fix.
+      el.addEventListener("mousedown", (e) => e.preventDefault());
+      // Per element, not shared: a hybrid device (iPad + trackpad) tapping one key and then
+      // clicking another within the window would otherwise swallow the second.
+      // Per element, not shared: a hybrid device (iPad + trackpad) tapping one key and then
+      // clicking another within the window would otherwise swallow the second.
+      let lastTouchFire = 0;
+      const tap = tapGesture(TAP_SLOP_PX);
+      el.addEventListener("touchstart", (e) => tap.start(e.touches[0], e.touches.length), { passive: true });
+      el.addEventListener("touchmove", (e) => tap.move(e.touches[0], e.touches.length), { passive: true });
+      el.addEventListener("touchend", (e) => {
+        if (!tap.end(e.changedTouches[0], e.touches.length)) return;
+        e.preventDefault();
+        lastTouchFire = Date.now();
+        run();
+      }, { passive: false });
+      el.addEventListener("touchcancel", () => tap.cancel());
+      el.addEventListener("click", () => {
+        if (!shouldFireClick(Date.now(), lastTouchFire)) return;
+        run();
+      });
+    }
+
+    // Shared by both terminal views.
     function wireKbdBar() {
       // Mode-aware because the two views own input differently: mux has the IME strip, and the
       // legacy attach view still lets xterm read its own keyboard.
@@ -562,16 +641,13 @@
           else state.term?.focus();
         } catch {}
       };
-      document.querySelectorAll(".kbd-bar button").forEach(btn => {
-        btn.addEventListener("mousedown", e => e.preventDefault());
-        btn.addEventListener("touchstart", e => e.preventDefault(), { passive: false });
-      });
       document.querySelectorAll(".kbd-bar button[data-bytes]").forEach(btn => {
-        btn.addEventListener("click", () => { sendKbdBytes(btn.dataset.bytes); refocus(); });
+        onActivate(btn, () => { sendKbdBytes(btn.dataset.bytes); refocus(); });
       });
-      document.getElementById("ctrl")?.addEventListener("click", () => {
+      // Sticky Ctrl goes through the same activation, or it would be the one dead button left.
+      onActivate(document.getElementById("ctrl"), () => {
         state.ctrlSticky = !state.ctrlSticky;
-        document.getElementById("ctrl").classList.toggle("sticky", state.ctrlSticky);
+        document.getElementById("ctrl")?.classList.toggle("sticky", state.ctrlSticky);
         refocus();
       });
     }
@@ -1319,6 +1395,95 @@
       patchMuxChrome();
     }
 
+    /* ==== touch scrolling ====
+     *
+     * There is nothing on this page for iOS to scroll. comux paints the whole screen with cursor
+     * addressing, so xterm's own scrollback stays EMPTY and `#term-host` only ever overflows
+     * sideways. Scrolling is comux's job — it forwards a wheel to a mouse-aware pane app (Claude
+     * Code, nvim) and scrolls its own scrollback for a plain shell — and comux hears about a wheel
+     * and nothing else. A one-finger drag produces no wheel event on any touch device, so the
+     * terminal simply could not be scrolled.
+     *
+     * So a vertical drag is translated into wheel events and dispatched at the touch point, and
+     * xterm encodes them with whatever protocol the app negotiated. Encoding SGR here by hand
+     * would duplicate that negotiation AND bypass the classifier that keeps a mouse report ordered
+     * behind a pending composition.
+     */
+
+    const TOUCH_AXIS_SLOP_PX = 8;   // movement before the gesture commits to an axis
+    const TOUCH_LINE_FALLBACK = 17; // px per line when the grid cannot be measured yet
+
+    /// One row's height in CSS pixels, measured off what xterm actually rendered.
+    function rowHeightPx() {
+      const rows = document.querySelector("#term-host .xterm-rows");
+      const h = rows?.firstElementChild?.getBoundingClientRect().height;
+      return h && h > 1 ? h : TOUCH_LINE_FALLBACK;
+    }
+
+    /// How many whole lines a drag of `dy` pixels is worth, and what is left over. Pulled out
+    /// because it is the only arithmetic here and the rest is event bookkeeping.
+    function wheelSteps(dy, rowH) {
+      const steps = Math.trunc(dy / rowH);
+      return { steps, rest: dy - steps * rowH };
+    }
+
+    /// The drag → lines machine. Same ownership rules as `tapGesture`, plus an axis that latches
+    /// ONCE past the slop: a drag that curves must not switch between scrolling and panning
+    /// mid-gesture. `move` returns the whole-line steps this move is worth, `null` when the move
+    /// is not ours to act on (wrong finger, second finger, still under the slop, horizontal).
+    function scrollGesture(slop) {
+      let id = null, sx = 0, sy = 0, lastY = 0, rest = 0, axis = "";
+      return {
+        start(t, count) {
+          if (count !== 1) { id = null; return; }
+          id = t.identifier; sx = t.clientX; sy = t.clientY; lastY = t.clientY;
+          rest = 0; axis = "";
+        },
+        move(t, count, rowH) {
+          if (id === null || !t || t.identifier !== id) return null;
+          if (count !== 1) { id = null; return null; }
+          if (!axis) {
+            const dx = Math.abs(t.clientX - sx), dy = Math.abs(t.clientY - sy);
+            if (Math.max(dx, dy) < slop) return null;
+            axis = dy > dx ? "y" : "x";
+            // `lastY` is deliberately NOT reset here. The movement that latched the axis is real
+            // movement; discarding it made a gesture delivered as one big `touchmove` — which is
+            // what a fast drag or a busy main thread produces — scroll nothing at all.
+          }
+          if (axis !== "y") return null;
+          const { steps, rest: left } = wheelSteps(t.clientY - lastY + rest, rowH);
+          rest = left; lastY = t.clientY;
+          return { steps };
+        },
+        end() { id = null; axis = ""; rest = 0; },
+      };
+    }
+
+    function wireTouchScroll(host) {
+      if (!host) return;
+      const drag = scrollGesture(TOUCH_AXIS_SLOP_PX);
+      host.addEventListener("touchstart", (e) => drag.start(e.touches[0], e.touches.length), { passive: true });
+      host.addEventListener("touchmove", (e) => {
+        const r = drag.move(e.touches[0], e.touches.length, rowHeightPx());
+        if (!r) return;
+        e.preventDefault();                                  // ours: stop iOS rubber-banding
+        if (!r.steps) return;
+        const t = e.touches[0];
+        // Dragging DOWN scrolls BACK, as content does under a finger everywhere else.
+        const target = document.elementFromPoint(t.clientX, t.clientY) || host;
+        for (let i = 0; i < Math.abs(r.steps); i++) {
+          target.dispatchEvent(new WheelEvent("wheel", {
+            deltaY: r.steps > 0 ? -1 : 1,
+            deltaMode: 1,                                    // DOM_DELTA_LINE: exactly one row
+            clientX: t.clientX, clientY: t.clientY,
+            bubbles: true, cancelable: true,
+          }));
+        }
+      }, { passive: false });
+      host.addEventListener("touchend", () => drag.end());
+      host.addEventListener("touchcancel", () => drag.end());
+    }
+
     function wireIme() {
       const el = imeEl();
       if (!el) return;
@@ -1353,6 +1518,7 @@
         if (ev.target === el) return;
         el.focus({ preventScroll: true });
       }, true);
+      wireTouchScroll(host);
       renderImeNote();
     }
 
@@ -1405,6 +1571,52 @@
       state.muxChecking = false;
       state.muxError = err;
       if (state.mode === "mux") render();
+    }
+
+    /// Open the terminal ON the agent that was tapped.
+    ///
+    /// Every row used to call `enterMux()` with no target, so all 27 of them landed on whatever
+    /// comux last focused: the board looked like a switcher and behaved like a single link. The
+    /// jump MOVES THE DESKTOP'S VIEW as well — comux composes one frame for every attached client
+    /// — and that is what "go to this agent" means here, since the person tapping the phone is the
+    /// person sitting at the desk. A per-client view is the per-pane semantic grid (#65/#66).
+    ///
+    /// ONE jump at a time. Two taps would be two independent server-side mutations, and the first
+    /// can land last: the terminal would open on a pane the second tap already moved away from,
+    /// and no response-ordering guard can undo a jump that already happened.
+    async function openAgent(el, token) {
+      // A pane from before pane tokens existed has nothing stable to address — `terminal` ids
+      // restart at `term0` each incarnation, so jumping by one risks landing somewhere else
+      // entirely. Open the terminal without moving anything, which is what every row did before.
+      if (!token) { enterMux(true); return; }
+      if (state.jumpBusy) return;
+      state.jumpBusy = token;
+      el?.classList.add("pending");
+      // Navigation can happen under an in-flight jump — open the terminal from the header, come
+      // back — and a response landing after that must not reopen it and push a second history
+      // entry. `muxEpoch` is already bumped by every entry and every teardown, so it is the
+      // generation to compare against.
+      const epoch = state.muxEpoch;
+      const superseded = () => state.muxEpoch !== epoch || state.mode !== "overview";
+      try {
+        await api("/api/board/jump", { method: "POST", body: JSON.stringify({ token }) });
+        state.boardNote = "";
+      } catch (e) {
+        // A token goes stale on `comux server restart`, and "unknown pane" is exactly the case
+        // where opening the focused session anyway would look like the bug this replaced.
+        state.jumpBusy = null;
+        el?.classList.remove("pending");
+        if (superseded()) return;
+        state.boardNote = e && e.message
+          ? `그 pane으로 이동하지 못했습니다 — ${e.message}`
+          : "그 pane으로 이동하지 못했습니다";
+        render();
+        return;
+      }
+      state.jumpBusy = null;
+      el?.classList.remove("pending");
+      if (superseded()) return;
+      enterMux(true);
     }
 
     function openMuxTerminal() {
