@@ -473,6 +473,20 @@ impl PaneTerm {
         self.listener.clipboard.lock().unwrap().take()
     }
 
+    /// Feed raw bytes straight into this pane's terminal, bypassing the PTY — the injection
+    /// point for the render-fidelity harness, which needs to put *chosen* content on a pane's
+    /// grid without depending on a shell to echo it. The caller owns the VTE `Processor` so
+    /// escape sequences can be split across calls exactly as a real read would split them.
+    #[cfg(test)]
+    pub(crate) fn feed_test_bytes(
+        &self,
+        parser: &mut alacritty_terminal::vte::ansi::Processor,
+        bytes: &[u8],
+    ) {
+        parser.advance(&mut *self.term.lock(), bytes);
+        self.mark_dirty();
+    }
+
     /// Force this pane dirty (e.g. after a resize/scroll that changes what's visible but
     /// may not emit a `Wakeup`).
     pub fn mark_dirty(&self) {
@@ -562,8 +576,9 @@ impl PaneTerm {
 
 /// Snapshot the visible viewport of any `Term` into renderer-ready [`Snapshot`]. Split
 /// out of [`PaneTerm::snapshot`] so tests can drive a bare `Term` (via the VTE parser)
-/// deterministically — no PTY, no shell, no timing.
-fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
+/// deterministically — no PTY, no shell, no timing. `pub(crate)` so the render-fidelity
+/// harness in `tui.rs` can read a REFERENCE emulator's screen too.
+pub(crate) fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
     let cols = term.columns();
     let rows = term.screen_lines();
     let grid = term.grid();
@@ -574,11 +589,51 @@ fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
     for r in 0..rows as i32 {
         let line = Line(r - display_offset);
         let mut row = Vec::with_capacity(cols);
+        // Does the cell we just emitted occupy TWO columns? This single carry is what makes the
+        // spacer marking and the emitted grapheme widths consistent BY CONSTRUCTION — see below.
+        let mut prev_spans_two = false;
         for c in 0..cols {
             let cell = &grid[Point::new(line, Column(c))];
             let flags = cell.flags;
-            let spacer =
-                flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+
+            // THE INVARIANT: a cell is a render spacer exactly when the cell before it occupies
+            // two columns. Nothing else. The client's `fix_wide_spacers` rebuilds spacer
+            // structure with literally this predicate ("is the previous symbol two columns
+            // wide?"), because the wire delta cannot carry a `skip` cell — `Buffer::diff` drops
+            // them. Deriving it here the same way is what stops the two from ever disagreeing.
+            //
+            // Reading alacritty's flags directly instead is what caused two distinct residue
+            // bugs, because a `*_SPACER` flag does NOT imply a covering wide glyph:
+            //
+            //  * `LEADING_WIDE_CHAR_SPACER` is the filler alacritty leaves in the LAST column
+            //    when a wide glyph did not fit and wrapped to the next row. Nothing precedes it
+            //    and nothing covers it — alacritty's own renderer paints it as a blank.
+            //  * `WIDE_CHAR_SPACER` can also appear with NO `WIDE_CHAR` cell before it (a ZWJ
+            //    sequence collapsing into the preceding cell will do it).
+            //
+            // In both cases the server composed a `skip` cell, the delta therefore never shipped
+            // that position, and the client — correctly seeing no wide glyph before it — cleared
+            // `skip` and emitted whatever stale glyph and background the cell still held. The
+            // server's baseline had already recorded the position as delivered, so no later delta
+            // could correct it: a coloured blank or a leftover glyph frozen into a pane's edge
+            // until something happened to overwrite it. Both were found by
+            // `tui::app_render_fidelity` and are guarded by `a_spacer_always_follows_a_wide_cell`.
+            let spacer = prev_spans_two;
+
+            // How many columns does THIS cell occupy? The authoritative signal is that alacritty
+            // RESERVED the next column for it, not the `WIDE_CHAR` flag on its own (see above).
+            let span = if !spacer
+                && flags.contains(Flags::WIDE_CHAR)
+                && c + 1 < cols
+                && grid[Point::new(line, Column(c + 1))]
+                    .flags
+                    .contains(Flags::WIDE_CHAR_SPACER)
+            {
+                2
+            } else {
+                1
+            };
+
             // Grapheme = base char + any zero-width combining marks.
             let mut sym = String::new();
             sym.push(cell.c);
@@ -592,22 +647,22 @@ fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
             // alacritty gives 1 column but unicode-width calls 2, or a ZWJ sequence — the client
             // desyncs from the server's grid and a cell the diff wrongly deems unchanged is never
             // re-sent → residue. Force the emitted grapheme's unicode-width to equal the number of
-            // columns alacritty allotted it (`span`: 2 for a WIDE_CHAR leading cell, else 1), so
-            // every stage agrees. Width-inflating marks (VS/ZWJ) are dropped to the base scalar;
-            // ordinary zero-width combining marks (accents) don't change width and are kept.
-            if !spacer {
-                let span = if flags.contains(Flags::WIDE_CHAR) {
-                    2
+            // columns alacritty allotted it, so every stage agrees. Width-inflating marks (VS/ZWJ)
+            // are dropped to the base scalar; ordinary zero-width combining marks (accents) don't
+            // change width and are kept. Together with `span` above this is what the invariant
+            // rests on: a cell with `span == 2` always emits a symbol `unicode-width` calls 2.
+            if spacer {
+                // Never painted (the glyph before it covers this column), so its symbol is
+                // unobservable — but it must still MEASURE one column, or the client would read
+                // it as a wide cell and mark the NEXT position a spacer the server didn't. The
+                // invariant has to hold in both directions.
+                sym = " ".to_string();
+            } else if UnicodeWidthStr::width(sym.as_str()) != span {
+                sym = if UnicodeWidthChar::width(cell.c).unwrap_or(0) == span {
+                    cell.c.to_string()
                 } else {
-                    1
+                    " ".repeat(span) // unrepresentable at this width — blank the leading cell
                 };
-                if UnicodeWidthStr::width(sym.as_str()) != span {
-                    sym = if UnicodeWidthChar::width(cell.c).unwrap_or(0) == span {
-                        cell.c.to_string()
-                    } else {
-                        " ".repeat(span) // unrepresentable at this width — blank the leading cell
-                    };
-                }
             }
             row.push(CellSnap {
                 sym,
@@ -617,6 +672,7 @@ fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
                 bold: flags.contains(Flags::BOLD),
                 reverse: flags.contains(Flags::INVERSE),
             });
+            prev_spans_two = span == 2;
         }
         // alacritty marks the LAST cell of a soft-wrapped row with `WRAPLINE` (the row
         // continues onto the next). Used by drag-copy to avoid a spurious newline at the seam.
@@ -1162,10 +1218,12 @@ mod render_repro {
         }
         let changed = last.diff(server);
         for (x, y, cell) in &changed {
-            if let Some(bc) = client.cell_mut(Position::new(*x, *y)) {
-                bc.set_symbol(cell.symbol());
-                bc.set_style(cell.style());
-                bc.set_skip(cell.skip);
+            // Through the real wire type, NOT `set_style`: a `Style` read back off a cell has an
+            // empty `sub_modifier`, so `set_style` only ever ADDS modifier bits and would make
+            // BOLD/DIM/REVERSED stick forever — a harness bug that flatters the pipeline.
+            let wire = crate::proto::WireCell::of(*x, *y, cell);
+            if let Some(bc) = client.cell_mut(Position::new(wire.x, wire.y)) {
+                wire.apply_to(bc);
             }
         }
         *last = server.clone();
@@ -1360,10 +1418,10 @@ mod render_repro {
             // `push_frames`: diff the raw compose against the raw baseline, ship changed cells.
             let changed = server_last.diff(&server);
             for (x, y, cell) in &changed {
-                if let Some(bc) = client.cell_mut(Position::new(*x, *y)) {
-                    bc.set_symbol(cell.symbol());
-                    bc.set_style(cell.style());
-                    bc.set_skip(cell.skip);
+                // See `roundtrip`: the wire type, never `set_style`.
+                let wire = crate::proto::WireCell::of(*x, *y, cell);
+                if let Some(bc) = client.cell_mut(Position::new(wire.x, wire.y)) {
+                    wire.apply_to(bc);
                 }
             }
             server_last = server.clone(); // advance the RAW baseline (production semantics)
@@ -1400,6 +1458,89 @@ mod render_repro {
             snap_text(&ref_snap),
             snap_text(&src_snap),
         );
+    }
+
+    #[test]
+    fn a_spacer_always_follows_a_wide_cell() {
+        // THE invariant the whole wide-glyph path rests on, asserted directly: a cell is marked
+        // a spacer exactly when the cell before it emits a two-column symbol. The client's
+        // `fix_wide_spacers` rebuilds spacer structure from that same predicate and CANNOT check
+        // it — the wire delta never carries a `skip` cell — so if the two ever disagree the
+        // client paints a stale cell the server believes it delivered, which no later delta can
+        // correct. Both directions matter: a spacer with no wide cell before it (alacritty's
+        // line-end filler, and a `WIDE_CHAR_SPACER` orphaned by a ZWJ sequence), and a wide
+        // symbol whose following cell is NOT marked.
+        //
+        // Widths 8..11 × three paddings put a wide glyph at both column parities and straddling
+        // the right edge, which is where alacritty leaves the line-end filler.
+        for cols in [8usize, 9, 10, 11] {
+            for pad in 0..3 {
+                let (mut t, mut p) = term(cols, 4);
+                let mut input = "x".repeat(pad);
+                input.push_str(&"가".repeat(cols));
+                // A ZWJ sequence and a VS16 emoji too: both make alacritty's flags and
+                // unicode-width disagree, which is how the orphaned spacer arises.
+                input.push_str("👨\u{200d}👩\u{200d}👧❤\u{fe0f}가");
+                feed(&mut t, &mut p, input.as_bytes());
+                let snap = snapshot_grid(&t);
+                for (y, row) in snap.cells.iter().enumerate() {
+                    for (x, cell) in row.iter().enumerate() {
+                        let covered = x > 0
+                            && !row[x - 1].spacer
+                            && UnicodeWidthStr::width(row[x - 1].sym.as_str()) == 2;
+                        assert_eq!(
+                            cell.spacer,
+                            covered,
+                            "cols={cols} pad={pad} cell ({x},{y}): spacer={} but the cell before \
+                             it is {:?} (covered={covered}). Row: {:?}",
+                            cell.spacer,
+                            x.checked_sub(1)
+                                .and_then(|i| row.get(i))
+                                .map(|c| (&c.sym, c.spacer)),
+                            row.iter().map(|c| (&c.sym, c.spacer)).collect::<Vec<_>>(),
+                        );
+                        // And every non-spacer symbol measures 1 or 2 columns — never 0, which
+                        // would desync the client's left-to-right walk.
+                        if !cell.spacer {
+                            let w = UnicodeWidthStr::width(cell.sym.as_str());
+                            assert!(
+                                w == 1 || w == 2,
+                                "cols={cols} pad={pad} ({x},{y}) width {w} for {:?}",
+                                cell.sym
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_line_end_wide_char_filler_is_a_blank_not_a_spacer() {
+        // The concrete case behind the invariant above: a wide glyph that does not fit in the
+        // last column makes alacritty leave a `LEADING_WIDE_CHAR_SPACER` filler there and wrap
+        // the glyph to the next row. Nothing covers that filler, so it must be composed as an
+        // ordinary blank — marking it `skip` froze whatever the cell previously held into the
+        // pane's last column, because a `skip` cell is never shipped.
+        let (mut t, mut p) = term(5, 3);
+        // Odd offset so the 5th column can only hold half of a wide glyph.
+        feed(&mut t, &mut p, "ab가가".as_bytes());
+        let snap = snapshot_grid(&t);
+        let row0 = &snap.cells[0];
+        assert_eq!((&row0[0].sym, row0[0].spacer), (&"a".to_string(), false));
+        assert_eq!((&row0[1].sym, row0[1].spacer), (&"b".to_string(), false));
+        assert_eq!((&row0[2].sym, row0[2].spacer), (&"가".to_string(), false));
+        assert!(
+            row0[3].spacer,
+            "col 3 is the wide glyph's real trailing half"
+        );
+        assert!(
+            !row0[4].spacer,
+            "col 4 is the line-end filler — a blank, NOT a spacer: {:?}",
+            row0.iter().map(|c| (&c.sym, c.spacer)).collect::<Vec<_>>()
+        );
+        // And the glyph that did not fit wrapped to the next row.
+        assert_eq!(&snap.cells[1][0].sym, "가");
     }
 
     #[test]
@@ -1672,10 +1813,10 @@ mod render_repro {
             client.clone()
         };
         for (x, y, cell) in base.diff(frame) {
-            if let Some(bc) = client.cell_mut(Position::new(x, y)) {
-                bc.set_symbol(cell.symbol());
-                bc.set_style(cell.style());
-                bc.set_skip(cell.skip);
+            // See `roundtrip`: the wire type, never `set_style`.
+            let wire = crate::proto::WireCell::of(x, y, cell);
+            if let Some(bc) = client.cell_mut(Position::new(wire.x, wire.y)) {
+                wire.apply_to(bc);
             }
         }
     }

@@ -72,6 +72,18 @@ usage_reset = "relative"  # how the carousel shows a window's reset time:
 usage_rotate_secs = 0     # auto-advance the carousel every N seconds (0 = off,
                           #   manual wheel/click only). A manual page resets the
                           #   timer. (clamped to 0..3600)
+reconcile_secs = 3        # how often the server has each attached client SILENTLY repaint
+                          #   its whole screen — re-emit every cell it already holds, no
+                          #   clear, so nothing flickers. 0 disables it. (clamped to 0..3600)
+                          #
+                          #   This is the self-heal for render residue: the client paints
+                          #   through ratatui's incremental diff, whose cached buffer can
+                          #   drift from what your terminal actually shows (an outer
+                          #   emulator with its own damage tracking, a lossy link). Once
+                          #   drifted, the stale cell counts as "unchanged" forever and only
+                          #   a full repaint clears it — which used to mean noticing and
+                          #   pressing Ctrl-b r. This is the worst-case time you look at
+                          #   residue before it clears itself.
 tab_labels = "number"     # what each status-bar tab chip shows:
                           #   number (default) — the 1-based index: ` 1 ` ` 2 `
                           #   name  — the tab's focused-pane process: ` claude ` ` nvim `

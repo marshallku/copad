@@ -10,8 +10,8 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, TryRecvError};
 use std::time::{Duration, Instant};
 
-use ratatui::backend::CrosstermBackend;
-use ratatui::buffer::Buffer;
+use ratatui::backend::{Backend, CrosstermBackend};
+use ratatui::buffer::{Buffer, Cell};
 use ratatui::crossterm::cursor::{self, MoveTo, RestorePosition, SavePosition};
 use ratatui::crossterm::event::{
     self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
@@ -52,6 +52,94 @@ pub(crate) fn fix_wide_spacers(buf: &mut ratatui::buffer::Buffer) {
             }
         }
     }
+}
+
+/// Map the server's frame onto a viewport-sized ratatui buffer: the frame's cells at the
+/// top-left, blanks in the letterbox margin, and a blank in place of any glyph that would spill
+/// past the right edge.
+///
+/// The frame is composed at the SMALLEST attached client's size (tmux-style shared view), so it is
+/// routinely a different size from this terminal, in either direction:
+///
+///  * SMALLER — the ordinary case. The remainder is letterbox margin and must be blanked, or a
+///    margin cell the terminal lost would never come back.
+///  * BIGGER — the window after this terminal shrinks, since ratatui is resized at once while the
+///    server's frame catches up a tick later. Emitting the frame would address columns and rows
+///    past the edge.
+///
+/// And in that second window a TWO-COLUMN glyph can sit in the viewport's LAST column with its
+/// spacer outside, so printing it sends its second half off the edge — which the terminal answers
+/// by wrapping, and on the bottom row by scrolling the whole screen. Checking the glyph's starting
+/// coordinate is not enough; its WIDTH has to fit. The composition never does this to itself (a
+/// pane's last column can only hold a one-column symbol — see `term.rs::snapshot_grid`), which is
+/// why it only shows up across a resize.
+///
+/// The single definition of that mapping, shared by the client's draw and its silent repaint so
+/// the two cannot disagree, and used by the render-fidelity harness for the same reason.
+pub(crate) fn blit_view(src: &Buffer, out: &mut Buffer) {
+    let area = out.area;
+    for y in 0..area.height {
+        for x in 0..area.width {
+            let Some(d) = out.cell_mut(Position::new(x, y)) else {
+                continue;
+            };
+            match src.cell(Position::new(x, y)) {
+                Some(sc) if x + 1 < area.width || UnicodeWidthStr::width(sc.symbol()) < 2 => {
+                    *d = sc.clone();
+                }
+                // Letterbox margin, or a glyph with nowhere to put its second column.
+                _ => {
+                    d.reset();
+                }
+            }
+        }
+    }
+}
+
+/// Re-emit every cell of `src` straight to the terminal, bypassing ratatui's incremental
+/// diff — the silent full repaint behind [`crate::proto::FrameMsg::repaint`].
+///
+/// Deliberately NOT `Terminal::clear` + draw. Clearing first flashes a blank frame, and that
+/// flicker — not its cost — is the whole reason the periodic self-heal had to ship disabled.
+/// Overwriting every cell with the content ratatui already believes is on screen is invisible,
+/// and it is precisely what heals a divergence between that belief and the real terminal: an
+/// outer emulator with its own damage tracking, a lossy link, or ratatui's wide-glyph
+/// suppression leaking across a row/pane boundary in its flat buffer. Once ratatui's cached
+/// buffer has drifted, the stale cell is "unchanged" forever and no delta will ever repaint it.
+///
+/// `skip` cells are left out, the same rule `Buffer::diff` applies: they are the trailing half
+/// of a wide glyph, already covered by printing the leading cell, and printing over one splits
+/// the glyph. ratatui's cached buffers are deliberately untouched — the content did not change,
+/// so its belief stays accurate and the next delta is still correct.
+pub(crate) fn repaint_all<W: Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    src: &Buffer,
+    view: (u16, u16),
+    cursor: Option<(u16, u16)>,
+) -> io::Result<()> {
+    // Re-emit the VIEWPORT, built by the same `blit_view` the draw path uses — so a repaint can
+    // never paint something the draw would not have.
+    let (vw, vh) = view;
+    let mut frame = Buffer::empty(RRect::new(0, 0, vw, vh));
+    blit_view(src, &mut frame);
+    let cells: Vec<(u16, u16, &Cell)> = (0..vh)
+        .flat_map(|y| (0..vw).map(move |x| (x, y)))
+        .filter_map(|(x, y)| frame.cell(Position::new(x, y)).map(|c| (x, y, c)))
+        .filter(|(_, _, c)| !c.skip)
+        .collect();
+    let backend = terminal.backend_mut();
+    backend.draw(cells.into_iter())?;
+    // `Backend::draw` leaves the cursor wherever it printed last; put it back where the frame
+    // wants it or the next keystroke echoes in the wrong place. Clamped to the viewport for the
+    // same reason the cells are.
+    if let Some((cx, cy)) = cursor
+        && cx < vw
+        && cy < vh
+    {
+        backend.set_cursor_position(Position::new(cx, cy))?;
+    }
+    // Disambiguated: `CrosstermBackend` implements both `Backend::flush` and `io::Write::flush`.
+    Backend::flush(backend)
 }
 
 /// Standard base64 (RFC 4648, `+`/`/`, `=` padding) of arbitrary bytes — for the OSC 52
@@ -467,13 +555,18 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
     // is wiped and EVERY cell is re-emitted — otherwise a cell the real terminal lost
     // (nested emulator, resize, alt-screen transition) lingers as a ghost.
     let mut force_clear = false;
-    // Optional self-healing full repaint, DEFAULT OFF. The wide-char spacer desync that used to
-    // force this is now root-fixed (see `fix_wide_spacers`), so the periodic clear+repaint —
-    // whose `Clear(All)` flashes a blank frame each tick (visible flicker) — is no longer worth
-    // its cost by default. Kept as an opt-in escape hatch for any residual OUTER-emulator drift
-    // (e.g. copad-term GPU damage tracking): set `COPAD_MUX_REDRAW_MS=<ms>` to re-enable. The
-    // manual `Ctrl-b r` redraw covers the occasional case without the steady flicker.
-    let self_heal = std::env::var("COPAD_MUX_REDRAW_MS")
+    // A SILENT full repaint is due: re-emit every cell without clearing (see `repaint_all`).
+    // Set by the server's periodic `FrameMsg::repaint` (`reconcile_secs`) and by the
+    // client-local timer below.
+    let mut force_repaint = false;
+    // Client-local silent-repaint period, DEFAULT OFF — additive to the cadence the server
+    // drives, so a client whose OUTER emulator drifts faster than the rest can heal itself
+    // without changing `reconcile_secs` for every attached client.
+    //
+    // This is the old `COPAD_MUX_REDRAW_MS` self-heal, which had to default OFF because it
+    // did `Clear(All)` first and flashed a blank frame every tick. It no longer clears, so
+    // setting it now costs a repaint's worth of escapes and nothing visible.
+    let local_repaint = std::env::var("COPAD_MUX_REDRAW_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map_or(Duration::ZERO, Duration::from_millis);
@@ -619,11 +712,7 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     }
                     for c in &f.cells {
                         if let Some(cell) = buf.cell_mut(Position::new(c.x, c.y)) {
-                            cell.set_symbol(&c.sym);
-                            cell.fg = c.fg;
-                            cell.bg = c.bg;
-                            cell.modifier = c.mods;
-                            cell.set_skip(c.skip);
+                            c.apply_to(cell);
                         }
                     }
                     // Rebuild wide-char spacer structure so the client buffer EXACTLY matches
@@ -636,6 +725,10 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     cursor = f.cursor;
                     have_frame = true;
                     dirty = true;
+                    // The server asked for a silent full repaint (self-heal). Sticky until the
+                    // draw below honours it, so a repaint frame coalesced with later deltas in
+                    // one drain is still acted on.
+                    force_repaint |= f.repaint;
                 }
                 // A drag-selection copy: set the SYSTEM clipboard via OSC 52 through this
                 // client's own terminal (works over SSH). A one-shot, non-rendering control —
@@ -654,38 +747,29 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
 
         // 3) draw — blit the server frame into this terminal's top-left, blanking the
         // letterbox margin when our terminal is bigger than the shared (min) frame.
+        // Client-local silent repaint due (see `local_repaint`)? Drive a draw for it, so it
+        // still fires on a screen so idle that no frame is arriving at all.
+        if !local_repaint.is_zero() && last_repaint.elapsed() >= local_repaint {
+            force_repaint = true;
+            need_redraw = true;
+        }
+
         if (dirty || need_redraw) && have_frame {
-            // Force a full repaint on a `full` frame OR when the self-heal interval has
-            // elapsed since the last one (drift correction — see `self_heal` above).
-            if !force_clear && !self_heal.is_zero() && last_repaint.elapsed() >= self_heal {
-                force_clear = true;
-            }
-            // A `full` frame / self-heal resets the diff baseline: clear the screen + ratatui's
-            // cached previous-buffer so the upcoming draw re-emits every cell (no lingering ghost).
-            if force_clear {
+            // A `full` frame resets the diff baseline: clear the screen + ratatui's cached
+            // previous-buffer so the upcoming draw re-emits every cell (no lingering ghost).
+            // This is the ONLY path that clears — its cells were applied over an EMPTY buffer,
+            // so whatever the clear does not wipe would linger. The self-heal repaint below
+            // never clears (that flash is what kept it disabled for a year).
+            let cleared = force_clear;
+            if cleared {
                 terminal.clear()?;
                 force_clear = false;
-                last_repaint = Instant::now();
             }
             let src = buf.clone();
             let cur = cursor;
             terminal.draw(|frame| {
                 let area = frame.area();
-                let out = frame.buffer_mut();
-                for y in 0..area.height {
-                    for x in 0..area.width {
-                        let Some(dst) = out.cell_mut(Position::new(x, y)) else {
-                            continue;
-                        };
-                        if x < src.area.width && y < src.area.height {
-                            if let Some(s) = src.cell(Position::new(x, y)) {
-                                *dst = s.clone();
-                            }
-                        } else {
-                            dst.reset(); // letterbox margin
-                        }
-                    }
-                }
+                blit_view(&src, frame.buffer_mut());
                 if let Some((cx, cy)) = cur
                     && cx < area.width
                     && cy < area.height
@@ -693,6 +777,15 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     frame.set_cursor_position(Position::new(cx, cy));
                 }
             })?;
+            // Self-heal: re-emit every cell over what is already there. Redundant behind a
+            // clear+draw, which just painted the whole screen from an empty baseline.
+            if force_repaint && !cleared {
+                repaint_all(&mut terminal, &src, (cols, rows), cur)?;
+            }
+            if force_repaint || cleared {
+                last_repaint = Instant::now();
+            }
+            force_repaint = false;
         }
     }
 }
@@ -700,8 +793,164 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachOpts, PROBE_CORNER, PROBE_MAX, base64, connect_only, io, size_from_clamped_cursor,
+        AttachOpts, PROBE_CORNER, PROBE_MAX, base64, connect_only, io, repaint_all,
+        size_from_clamped_cursor,
     };
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::{Position, Rect};
+    use ratatui::style::{Color, Style};
+    use ratatui::{Terminal, TerminalOptions, Viewport};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// A `Write` sink we can read back, to assert on the exact escape bytes emitted.
+    #[derive(Clone)]
+    struct Sink(Rc<RefCell<Vec<u8>>>);
+    impl io::Write for Sink {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_silent_repaint_paints_the_viewport_not_the_server_frame() {
+        // The two sizes are routinely different and writing the wrong one corrupts the screen in
+        // BOTH directions, so the repaint clips exactly like the draw closure it follows.
+        let paint = |view: Rect, src: &Buffer, cursor| {
+            let sink = Sink(Rc::new(RefCell::new(Vec::new())));
+            let mut term = Terminal::with_options(
+                CrosstermBackend::new(sink.clone()),
+                TerminalOptions {
+                    viewport: Viewport::Fixed(view),
+                },
+            )
+            .expect("terminal");
+            repaint_all(&mut term, src, (view.width, view.height), cursor).expect("repaint");
+            String::from_utf8(sink.0.borrow().clone()).expect("utf8")
+        };
+
+        // (1) The frame is BIGGER than the viewport — the window right after this terminal
+        // shrinks, when ratatui has been resized but the server's frame has not caught up.
+        // Emitting the frame would write past the edge and wrap.
+        let mut big = Buffer::empty(Rect::new(0, 0, 6, 3));
+        big.set_string(4, 2, "Z", Style::default());
+        let out = paint(Rect::new(0, 0, 4, 2), &big, Some((5, 2)));
+        assert!(
+            !out.contains('Z'),
+            "a cell outside the viewport must not be emitted: {out:?}"
+        );
+        assert!(
+            !out.contains("\u{1b}[3;"),
+            "nothing may be addressed below the viewport's last row: {out:?}"
+        );
+
+        // (1b) And a TWO-COLUMN glyph STARTING on the viewport's last column is just as bad,
+        // which checking only its starting coordinate misses: its second half goes off the edge,
+        // the terminal wraps, and on the bottom row it scrolls the whole screen. The composition
+        // never produces this; a retained frame across a shrink does.
+        let mut wide = Buffer::empty(Rect::new(0, 0, 6, 2));
+        wide.set_string(0, 0, "가", Style::default()); // fully inside — must survive
+        wide.set_string(3, 1, "가", Style::default()); // starts on the last viewport column
+        let out = paint(Rect::new(0, 0, 4, 2), &wide, None);
+        assert_eq!(
+            out.matches('가').count(),
+            1,
+            "the glyph that fits is emitted and the one that would spill is not: {out:?}"
+        );
+
+        // (2) The frame is SMALLER than the viewport — the ordinary letterbox, because the
+        // composition is sized to the SMALLEST attached client. The margin must be blanked, or a
+        // margin cell the terminal lost would never come back.
+        let mut small = Buffer::empty(Rect::new(0, 0, 2, 1));
+        small.set_string(0, 0, "ab", Style::default());
+        let out = paint(Rect::new(0, 0, 4, 3), &small, None);
+        assert!(
+            out.contains("\u{1b}[3;1H"),
+            "the margin rows are painted: {out:?}"
+        );
+        assert_eq!(
+            out.matches('a').count(),
+            1,
+            "and the frame's own content is still emitted once: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_silent_repaint_re_emits_every_cell_and_never_clears() {
+        // The two properties that let this run on a timer by default. (1) It re-emits
+        // EVERYTHING, including cells ratatui's diff believes are already correct — that
+        // belief is exactly what has gone stale. (2) It never clears: `Clear(All)` flashes a
+        // blank frame, and that flicker is the only reason the old periodic self-heal had to
+        // ship disabled.
+        let area = Rect::new(0, 0, 6, 2);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "ab", Style::default().fg(Color::Red));
+        buf.set_string(0, 1, "가X", Style::default());
+
+        let sink = Sink(Rc::new(RefCell::new(Vec::new())));
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(sink.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .expect("terminal");
+
+        // Draw it once so ratatui's cached buffer matches — the state in which its own diff
+        // would emit NOTHING on a second draw. The repaint must still emit everything.
+        let src = buf.clone();
+        term.draw(|f| {
+            let out = f.buffer_mut();
+            for y in 0..area.height {
+                for x in 0..area.width {
+                    if let (Some(a), Some(b)) = (
+                        src.cell(Position::new(x, y)),
+                        out.cell_mut(Position::new(x, y)),
+                    ) {
+                        *b = a.clone();
+                    }
+                }
+            }
+        })
+        .expect("draw");
+        sink.0.borrow_mut().clear();
+
+        repaint_all(&mut term, &buf, (area.width, area.height), Some((3, 1))).expect("repaint");
+        let out = String::from_utf8(sink.0.borrow().clone()).expect("utf8");
+
+        assert!(
+            out.contains('a') && out.contains('b'),
+            "plain cells re-emitted: {out:?}"
+        );
+        assert!(out.contains('가'), "the wide glyph re-emitted: {out:?}");
+        assert!(
+            out.contains('X'),
+            "the cell after the wide glyph re-emitted: {out:?}"
+        );
+        // The trailing half of `가` must NOT be printed over — that splits the glyph.
+        assert_eq!(
+            out.matches('가').count(),
+            1,
+            "the wide glyph is emitted once, its spacer skipped: {out:?}"
+        );
+        // No clear of any flavour: `2J` (all), `1J`/`0J` (partial), `3J` (scrollback).
+        for clear in ["[2J", "[1J", "[0J", "[3J", "[J"] {
+            assert!(
+                !out.contains(clear),
+                "a silent repaint must not clear (found {clear}): {out:?}"
+            );
+        }
+        // And the cursor is put back where the frame wants it, not left after the last cell.
+        assert!(
+            out.contains("\u{1b}[2;4H"),
+            "cursor restored to the frame position (1-based row 2, col 4): {out:?}"
+        );
+    }
 
     #[test]
     fn size_from_clamped_cursor_converts_and_guards() {

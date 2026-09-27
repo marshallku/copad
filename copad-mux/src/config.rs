@@ -33,6 +33,11 @@ pub const DEFAULT_SCROLL_STEP: i32 = 3;
 pub const DEFAULT_AUTOSAVE_SECS: u32 = 15;
 /// Default cells per progress bar for `usage = "bar"`.
 pub const DEFAULT_USAGE_BAR_WIDTH: u16 = 8;
+/// Default period (seconds) of the silent full repaint that heals render residue
+/// (`MuxConfig::reconcile_secs`). Three seconds is short enough that residue reads as a
+/// flicker of staleness rather than something you have to fix by hand, and — because the
+/// repaint ships no cells, only a flag — costs the wire nothing at any cadence.
+pub const DEFAULT_RECONCILE_SECS: u32 = 3;
 /// Minimum pane-content width kept to the right of the sidebar; `sidebar_min_cols`
 /// is forced to at least `sidebar_width + this` so a visible sidebar can never eat
 /// the whole viewport.
@@ -758,6 +763,23 @@ pub struct MuxConfig {
     /// Auto-advance the carousel every N seconds (0 = off, manual paging only). A
     /// manual wheel/click resets the timer so it doesn't jump right after you page.
     pub usage_rotate_secs: u32,
+    /// How often (seconds) the server tells each attached client to SILENTLY repaint its
+    /// whole screen — re-emit every cell it already holds, with no `Clear`, so nothing
+    /// flickers. `0` disables it.
+    ///
+    /// This is the self-heal for render residue that no amount of correctness in the delta
+    /// pipeline can prevent: the client paints through ratatui's incremental diff, and that
+    /// diff's cached previous-buffer can drift from what the terminal actually shows — an
+    /// outer emulator with its own damage tracking, a lossy link, or ratatui's own
+    /// wide-glyph suppression leaking across a row/pane boundary in its flat buffer. Once
+    /// drifted, the stale cell is deemed "unchanged" forever and only a full repaint clears
+    /// it (`Ctrl-b r`, by hand, after the user notices). At this cadence it clears itself.
+    ///
+    /// Its predecessor (`COPAD_MUX_REDRAW_MS`, default OFF) did the same thing with a
+    /// `Clear(All)` first, which flashed a blank frame every tick — that flicker, not the
+    /// cost, is why it could not be left on. Dropping the clear makes it invisible, so it is
+    /// on by default. The cadence is the worst-case time a user stares at residue.
+    pub reconcile_secs: u32,
     /// What each status-bar tab chip shows (number / process name / both).
     pub tab_labels: TabLabels,
     /// Check GitHub releases in the background and show a `⬆ x.y.z` hint in the
@@ -809,6 +831,7 @@ struct RawConfig {
     usage_page_unit: Option<String>,
     usage_reset: Option<String>,
     usage_rotate_secs: Option<i64>,
+    reconcile_secs: Option<i64>,
     tab_labels: Option<String>,
     update_check: Option<bool>,
     update_environment: Option<Vec<String>>,
@@ -912,6 +935,7 @@ impl MuxConfig {
             usage_page_unit: crate::usagepoll::PageUnit::Window,
             usage_reset: crate::usagepoll::ResetStyle::Relative,
             usage_rotate_secs: 0,
+            reconcile_secs: DEFAULT_RECONCILE_SECS,
             tab_labels: TabLabels::Number,
             update_check: true,
             update_environment: default_update_environment(),
@@ -1089,6 +1113,14 @@ impl MuxConfig {
                     0,
                     3600,
                     "usage_rotate_secs",
+                    &mut warnings,
+                ) as u32,
+                reconcile_secs: clamp_field(
+                    raw.reconcile_secs,
+                    DEFAULT_RECONCILE_SECS as i64,
+                    0,
+                    3600,
+                    "reconcile_secs",
                     &mut warnings,
                 ) as u32,
                 tab_labels: match raw.tab_labels.as_deref() {

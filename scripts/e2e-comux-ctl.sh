@@ -34,6 +34,7 @@
 #  19. a notification jump focuses the exact copad TAB, and degrades when it cannot
 #  20. the SSH fleet: an unreachable machine is reported with a reason, never dropped
 #  21. a bell rung in a HIDDEN tab still reaches the rendered status bar
+#  22. an idle client silently repaints itself on a timer, and never clears to do it
 
 set -euo pipefail
 
@@ -931,7 +932,7 @@ PYEOF
 # first version ran them together and the trailing `select-tab` bumped the generation for both,
 # so the create/close path passed with its cancellation removed.
 cat >"$WORK/dragdisturb.py" <<'PYEOF'
-import os, pty, time, select, fcntl, termios, struct, subprocess, sys
+import os, pty, time, select, fcntl, termios, struct, subprocess, sys, threading
 rows, cols = 24, 100
 a, b = int(os.environ["DRAG_FROM"]), int(os.environ["DRAG_TO"])
 disturb = [x.split(",") for x in os.environ["DISTURB"].split(";") if x]
@@ -940,14 +941,30 @@ if pid == 0:
     os.environ["TERM"] = "xterm-256color"
     os.execvp(os.environ["CMX"], [os.environ["CMX"]])
 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
-def drain(s):
-    end = time.time() + s
-    while time.time() < end:
-        r, _, _ = select.select([fd], [], [], 0.2)
-        if r:
-            try:
-                if not os.read(fd, 65536): break
-            except OSError: break
+# Drain CONTINUOUSLY, on its own thread, for the whole life of the client.
+#
+# Draining only BETWEEN writes is what this did first, and it made the test measure the wrong
+# thing. The client writes to its terminal synchronously, so an undrained pty fills and blocks
+# it mid-write — and a client blocked in `write` is not reading our input either. The mouse-DOWN
+# then reaches the server AFTER the disturbance instead of before it, a fresh drag is started
+# against the new view, and the release moves the divider: the test reports "a drag survived the
+# view moving" when what actually happened is that the drag began afterwards. A real terminal
+# always drains, so a reader thread models production rather than starving it. This surfaced
+# when `reconcile_secs` started sending a periodic silent repaint — i.e. simply more output, so
+# any future change that emits more would have broken it the same way.
+alive = True
+def reader():
+    while alive:
+        try:
+            r, _, _ = select.select([fd], [], [], 0.1)
+            if r and not os.read(fd, 65536):
+                return
+        except OSError:
+            return
+rt = threading.Thread(target=reader, daemon=True)
+rt.start()
+def drain(s):   # nothing to pump any more: the reader thread owns the fd. Just let time pass.
+    time.sleep(s)
 drain(6)
 os.write(fd, f"\x1b[<0;{a};3M".encode()); time.sleep(0.3)
 for argv in disturb:                       # another client moves the view, button still DOWN
@@ -961,6 +978,8 @@ os.write(fd, f"\x1b[<32;{b};3M".encode()); time.sleep(0.2)
 os.write(fd, f"\x1b[<0;{b};3m".encode())
 drain(2)
 os.write(fd, b"\x02d"); time.sleep(0.8)
+alive = False
+rt.join(timeout=1)
 try: os.close(fd)
 except OSError: pass
 try: os.waitpid(pid, 0)
@@ -1305,7 +1324,79 @@ if ! tail -1 "$WORK/frame" | grep -q '!'; then
 fi
 ok "a hidden tab's bell still repaints the chrome, without its output driving the frame"
 
-echo "22. the server is still responsive and shuts down cleanly"
+echo "22. an idle client silently repaints itself, and never clears to do it"
+# The render self-heal (`reconcile_secs`), verified where it has to work: a REAL client on a pty.
+#
+# Residue lives BELOW the client's buffer — ratatui's incremental diff believes a cell is already
+# correct while the terminal shows something else — so no delta can ever repair it and the user
+# ends up pressing `Ctrl-b r`. The fix is to re-emit the whole screen periodically. Nothing here
+# can corrupt a real terminal's memory from outside, so what is asserted is the contract that
+# makes the fix work: while NOTHING is happening the client keeps re-emitting the screen, and it
+# does so WITHOUT a clear. The missing clear is the whole reason this can ship on by default —
+# `COPAD_MUX_REDRAW_MS` did the same job for a year with `Clear(All)` in front of it and had to
+# stay off because it flashed a blank frame every tick.
+cat >"$WORK/idlewatch.py" <<'PYEOF'
+import os, pty, sys, time, select, fcntl, termios, struct
+# Settle, then watch an IDLE client for `window` seconds and report what it emitted.
+window = float(sys.argv[1])
+rows, cols = 24, 100
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm-256color"
+    os.execvp(os.environ["CMX"], [os.environ["CMX"]])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+def read_for(sec):
+    out = b""; end = time.time() + sec
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r:
+            try: c = os.read(fd, 65536)
+            except OSError: break
+            if not c: break
+            out += c
+    return out
+read_for(6)                      # attach, first full frame, agent sweep — all the startup churn
+watched = read_for(window)       # nothing is touching this session now
+os.write(fd, b"\x02d"); time.sleep(0.8)
+try: os.close(fd)
+except OSError: pass
+try: os.waitpid(pid, 0)
+except ChildProcessError: pass
+txt = watched.decode("utf-8", "replace")
+# `local` is the session name, drawn in the status-bar pill and the sidebar: a repaint re-emits
+# the whole screen, so it comes back around every time.
+clears = sum(txt.count(c) for c in ("\x1b[2J", "\x1b[3J", "\x1b[1J", "\x1b[0J", "\x1b[J"))
+print(f"bytes={len(watched)} marker={txt.count('local')} clears={clears}")
+PYEOF
+
+echo "reconcile_secs = 1" >"$XDG_CONFIG_HOME/copad/mux.toml"
+t 10 "$COMUX" reload >/dev/null || fail "could not turn the self-heal on"
+on="$(CMX="$COMUX" t 40 python3 "$WORK/idlewatch.py" 4)" || fail "idlewatch failed with the self-heal on"
+echo "reconcile_secs = 0" >"$XDG_CONFIG_HOME/copad/mux.toml"
+t 10 "$COMUX" reload >/dev/null || fail "could not turn the self-heal off"
+off="$(CMX="$COMUX" t 40 python3 "$WORK/idlewatch.py" 4)" || fail "idlewatch failed with the self-heal off"
+rm -f "$XDG_CONFIG_HOME/copad/mux.toml"
+t 10 "$COMUX" reload >/dev/null || fail "could not restore the default config"
+
+python3 - "$on" "$off" <<'PYEOF' || fail "the idle self-heal did not behave: on=[$on] off=[$off]"
+import sys
+def parse(s):
+    return {k: int(v) for k, v in (p.split("=") for p in s.split())}
+on, off = parse(sys.argv[1]), parse(sys.argv[2])
+# ON: the screen comes back repeatedly while nothing at all is happening.
+assert on["marker"] >= 2, f"an idle client should keep re-emitting the screen: {on}"
+# ...and never by clearing it first. This is the flicker-free property, not a detail.
+assert on["clears"] == 0, f"a silent repaint must not clear the screen: {on}"
+# OFF: nothing repaints, so the same idle window is near-silent. Compared as a ratio rather
+# than against zero because a status-bar HH:MM rollover can legitimately land in the window.
+assert off["marker"] == 0 or off["bytes"] * 4 < on["bytes"], (
+    f"with reconcile_secs = 0 an idle client should stay quiet: on={on} off={off}"
+)
+print(f"on={on} off={off}")
+PYEOF
+ok "an idle client re-emits its screen on a timer, with no clear; reconcile_secs = 0 keeps it silent"
+
+echo "23. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

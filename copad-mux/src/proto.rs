@@ -13,6 +13,7 @@
 //! composition to one client, which is fine while at most one client attaches at a
 //! time; multi-client composition is a later unit (see decisions.md).
 
+use ratatui::buffer::Cell;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::style::{Color, Modifier};
 use serde::{Deserialize, Serialize};
@@ -36,6 +37,37 @@ pub struct WireCell {
     pub skip: bool,
 }
 
+impl WireCell {
+    /// The wire form of one composed cell at `(x, y)` — what [`crate::server`] ships.
+    pub fn of(x: u16, y: u16, cell: &Cell) -> Self {
+        Self {
+            x,
+            y,
+            sym: cell.symbol().to_string(),
+            fg: cell.fg,
+            bg: cell.bg,
+            mods: cell.modifier,
+            skip: cell.skip,
+        }
+    }
+
+    /// Apply this cell onto the client's mirror of the screen.
+    ///
+    /// The ONE definition of what a frame does to a client buffer, so the render-fidelity
+    /// harnesses model production instead of approximating it. The approximation that matters:
+    /// `Cell::set_style` takes a `Style`, whose `sub_modifier` is empty for a style read back
+    /// off a cell, and it therefore only ever ADDS modifier bits — using it here would make
+    /// BOLD/DIM/REVERSED stick forever instead of following the frame. These are plain
+    /// assignments for that reason; keep them that way.
+    pub fn apply_to(&self, dst: &mut Cell) {
+        dst.set_symbol(&self.sym);
+        dst.fg = self.fg;
+        dst.bg = self.bg;
+        dst.modifier = self.mods;
+        dst.set_skip(self.skip);
+    }
+}
+
 /// A render frame: the cells that changed since the client's previous frame, plus
 /// the cursor. `full` marks a baseline repaint (diff against an empty buffer) that
 /// the client must apply after clearing — emitted on attach, resize, and takeover.
@@ -50,6 +82,22 @@ pub struct FrameMsg {
     pub full: bool,
     pub cells: Vec<WireCell>,
     pub cursor: Option<(u16, u16)>,
+    /// **Silent full repaint.** Re-emit every cell of the client's buffer to the terminal
+    /// after applying this frame, WITHOUT clearing it first — the self-healing counterpart
+    /// to `full`, which the client honours with a `Clear(All)` that flashes a blank frame.
+    ///
+    /// This is the recovery for a divergence BELOW the client's buffer: the client renders
+    /// through ratatui's incremental diff, whose cached previous-buffer can drift from what
+    /// the real terminal shows (its wide-glyph suppression is computed over a FLAT buffer, so
+    /// it crosses row and pane/sidebar boundaries; and an outer emulator or a lossy link can
+    /// simply drop a cell). Once drifted, ratatui deems the stale cell "unchanged" and never
+    /// repaints it — residue that only a full repaint clears. Overwriting every cell with the
+    /// content already believed correct costs no `Clear`, so it is invisible.
+    ///
+    /// Cheap on the wire (it carries no extra cells — the client re-emits what it already
+    /// holds), so the server sets it often. See `reconcile_secs`.
+    #[serde(default)]
+    pub repaint: bool,
 }
 
 /// Server → client messages.

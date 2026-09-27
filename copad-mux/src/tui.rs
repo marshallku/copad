@@ -4650,6 +4650,8 @@ impl App {
         if self.menu.is_some() {
             self.render_menu(buf);
         }
+        // Last, over everything every widget wrote: no cell may carry DIM and BOLD at once.
+        resolve_dim_bold(buf);
 
         // The shell cursor shows only when nothing modal is capturing input.
         if self.popup.is_none()
@@ -4992,6 +4994,18 @@ impl App {
         }
         self.usage_page = wrap_page(self.usage_page, delta, n);
         self.usage_rolled_at = std::time::Instant::now();
+    }
+
+    /// How often each attached client should be told to silently repaint its whole screen
+    /// (`reconcile_secs`), or `None` when the self-heal is switched off.
+    ///
+    /// Read live off `self.cfg` rather than cached in the server loop, so `comux reload`
+    /// changes the cadence on the RUNNING server like every other render-affecting setting.
+    pub fn repaint_period(&self) -> Option<Duration> {
+        match self.cfg.reconcile_secs {
+            0 => None,
+            n => Some(Duration::from_secs(n as u64)),
+        }
     }
 
     /// Auto-rotate hook, called every render tick (~30 fps) by the server loop.
@@ -7322,6 +7336,37 @@ fn wrap_page(cur: usize, delta: i32, n: usize) -> usize {
     (cur + delta).rem_euclid(n as i32) as usize
 }
 
+/// Drop `BOLD` from every composed cell that also carries `DIM`, so the two are never set
+/// together. DIM wins: an inactive pane is dimmed precisely to de-emphasise it, and a faint-bold
+/// cell is a combination terminals render inconsistently anyway.
+///
+/// This is not cosmetic — it dodges an asymmetry in ratatui's crossterm emit that otherwise
+/// produces permanent residue. `ModifierDiff` writes `NormalIntensity` (`ESC [ 22 m`) to remove
+/// DIM, and that sequence cancels BOLD as well; the mirror case is handled (removing BOLD while
+/// keeping DIM re-emits `Dim`) but removing DIM while KEEPING BOLD is not, so BOLD is silently
+/// dropped on the wire while ratatui's cached buffer still believes it is set — and a belief that
+/// does not match the screen is never repainted by an incremental diff. comux hits the transition
+/// constantly: `render_to` dims every inactive pane, so any row crossing from an inactive pane
+/// into a divider or the focused pane is exactly `DIM|BOLD -> BOLD`.
+///
+/// With the sets kept disjoint, `to` containing BOLD means BOLD lands in `added` and is re-emitted
+/// after the `NormalIntensity`, which is correct. A whole-buffer sweep rather than a fix at each
+/// call site because DIM is written by the pane loop, the sidebar's group headers and the status
+/// bar's muted labels, and the invariant has to hold no matter which of them ran.
+/// Guarded by `dim_and_bold_are_never_set_together`.
+fn resolve_dim_bold(buf: &mut Buffer) {
+    let (w, h) = (buf.area.width, buf.area.height);
+    for y in 0..h {
+        for x in 0..w {
+            if let Some(c) = buf.cell_mut(Position::new(x, y))
+                && c.modifier.contains(Modifier::DIM)
+            {
+                c.modifier.remove(Modifier::BOLD);
+            }
+        }
+    }
+}
+
 /// Current Unix time in seconds (0 on a clock before the epoch — informational only).
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -8875,5 +8920,610 @@ mod tests {
         assert_eq!(m.item_at(10, 19), None, "left border column");
         assert_eq!(m.item_at(23, 19), None, "right border column");
         assert_eq!(m.item_at(30, 19), None, "outside");
+    }
+}
+
+/// END-TO-END RENDER FIDELITY OF THE REAL COMPOSED SCREEN.
+///
+/// `term.rs`'s `render_repro` harness already drives compose → wire delta → client buffer →
+/// real ratatui emit → a reference emulator, and it is production-accurate. What it has never
+/// seen is the screen a user actually looks at: it composes ONE full-screen pane. The real
+/// [`App::render_to`] lays a sidebar, a split pane grid, divider columns and a status bar into
+/// a single buffer — and `ratatui::buffer::Buffer::diff`, which decides what gets shipped,
+/// carries its wide-glyph suppression state (`to_skip` / `invalidated`) across a FLAT buffer.
+/// That state therefore walks straight through every region boundary and every row boundary in
+/// the composed screen, which is precisely where a withheld cell would go unnoticed.
+///
+/// The invariant asserted here: **what the terminal ends up showing after the incremental
+/// relay must equal what it would show if the composed buffer were painted onto it from
+/// scratch.** Anything less is residue — a stale cell no later delta will ever correct, which
+/// is the failure mode this module exists to hunt.
+#[cfg(test)]
+mod app_render_fidelity {
+    use super::*;
+    use crate::term::{CellColor, Snapshot, snapshot_grid};
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::term::test::TermSize;
+    use alacritty_terminal::term::{Config as AlacConfig, Term};
+    use alacritty_terminal::vte::ansi::Processor;
+    use ratatui::backend::CrosstermBackend;
+    use ratatui::layout::Rect as RRect;
+    use ratatui::{Terminal, TerminalOptions, Viewport};
+    use std::rc::Rc;
+
+    /// A `Write` sink shared with the caller, so the exact escape bytes ratatui emits can be
+    /// read back and replayed into a reference emulator (`writer_mut` is feature-gated).
+    #[derive(Clone)]
+    struct Sink(Rc<RefCell<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn ref_term(cols: u16, rows: u16) -> (Term<VoidListener>, Processor) {
+        let size = TermSize::new(cols as usize, rows as usize);
+        (
+            Term::new(AlacConfig::default(), &size, VoidListener),
+            Processor::new(),
+        )
+    }
+
+    fn sink_terminal(cols: u16, rows: u16) -> (Sink, Terminal<CrosstermBackend<Sink>>) {
+        let sink = Sink(Rc::new(RefCell::new(Vec::new())));
+        let term = Terminal::with_options(
+            CrosstermBackend::new(sink.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(RRect::new(0, 0, cols, rows)),
+            },
+        )
+        .expect("terminal");
+        (sink, term)
+    }
+
+    /// A comparable view of a screen: glyph + fg/bg + bold/reverse, with the trailing half of a
+    /// wide glyph collapsed to a sentinel (its own colour is unobservable — the glyph in the
+    /// preceding cell covers both columns and nothing is ever printed there).
+    type Row = Vec<(String, CellColor, CellColor, bool, bool)>;
+    fn norm(s: &Snapshot) -> Vec<Row> {
+        s.cells
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|c| {
+                        if c.spacer {
+                            (
+                                String::new(),
+                                CellColor::Default,
+                                CellColor::Default,
+                                false,
+                                false,
+                            )
+                        } else {
+                            (c.sym.clone(), c.fg, c.bg, c.bold, c.reverse)
+                        }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn text(s: &Snapshot) -> Vec<String> {
+        s.cells
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|c| if c.spacer { "" } else { c.sym.as_str() })
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Blit `src` into a ratatui frame at the top-left, blanking the letterbox margin — byte
+    /// for byte what `client::run_attached` does in its draw closure.
+    fn blit(term: &mut Terminal<CrosstermBackend<Sink>>, src: &Buffer, cursor: Option<(u16, u16)>) {
+        term.draw(|frame| {
+            let area = frame.area();
+            // The production mapping, not a copy of it — see `client::blit_view`.
+            crate::client::blit_view(src, frame.buffer_mut());
+            if let Some((cx, cy)) = cursor
+                && cx < area.width
+                && cy < area.height
+            {
+                frame.set_cursor_position(Position::new(cx, cy));
+            }
+        })
+        .expect("draw");
+    }
+
+    /// GROUND TRUTH: what a terminal shows when `buf` is painted onto it from scratch.
+    ///
+    /// Deliberately another alacritty screen rather than a direct read of the buffer, so BOTH
+    /// sides of the assertion pass through ONE width/style oracle. A direct read would compare
+    /// ratatui's model against alacritty's and fail on their known disagreements, which are not
+    /// the bug being hunted.
+    fn painted_fresh(buf: &Buffer) -> Snapshot {
+        let (cols, rows) = (buf.area.width, buf.area.height);
+        let (mut t, mut p) = ref_term(cols, rows);
+        let (sink, mut term) = sink_terminal(cols, rows);
+        term.clear().expect("clear");
+        blit(&mut term, buf, None);
+        let bytes = std::mem::take(&mut *sink.0.borrow_mut());
+        p.advance(&mut t, &bytes);
+        snapshot_grid(&t)
+    }
+
+    /// The production relay: `server::push_frames` → wire → `client::run_attached` → a
+    /// reference emulator standing in for the user's terminal.
+    struct Relay {
+        area: RRect,
+        sink: Sink,
+        cterm: Terminal<CrosstermBackend<Sink>>,
+        ref_t: Term<VoidListener>,
+        ref_p: Processor,
+        /// The server's `c.last` — the RAW composed buffer, never the client's normalized one.
+        /// Keeping it independent is what exposes a baseline that disagrees with what the
+        /// client actually holds.
+        server_last: Buffer,
+        /// The client's mirror of the screen.
+        client: Buffer,
+        first: bool,
+    }
+
+    impl Relay {
+        fn new(cols: u16, rows: u16) -> Self {
+            let area = RRect::new(0, 0, cols, rows);
+            let (sink, cterm) = sink_terminal(cols, rows);
+            let (ref_t, ref_p) = ref_term(cols, rows);
+            Self {
+                area,
+                sink,
+                cterm,
+                ref_t,
+                ref_p,
+                server_last: Buffer::empty(area),
+                client: Buffer::empty(area),
+                first: true,
+            }
+        }
+
+        /// One server tick. Returns the composed buffer — the thing the client must end up
+        /// showing.
+        fn tick(&mut self, app: &App) -> Buffer {
+            let mut buf = Buffer::empty(self.area);
+            let cursor = app.render_to(&mut buf).map(|p| (p.x, p.y));
+            assert_no_dim_bold(&buf);
+
+            let full = self.first;
+            if full {
+                self.server_last = Buffer::empty(self.area);
+                self.client = Buffer::empty(self.area);
+            }
+            // `push_frames`: ship the changed cells, then advance the baseline to the RAW
+            // compose (NOT to what the client ends up holding — that asymmetry is the point).
+            // Each cell goes through the real wire type AND a serde round-trip, so a style that
+            // does not survive ndjson is caught here rather than on someone's screen.
+            let changed = self.server_last.diff(&buf);
+            for (x, y, cell) in &changed {
+                let wire = crate::proto::WireCell::of(*x, *y, cell);
+                let line = serde_json::to_string(&wire).expect("encode");
+                let wire: crate::proto::WireCell = serde_json::from_str(&line).expect("decode");
+                if let Some(c) = self.client.cell_mut(Position::new(wire.x, wire.y)) {
+                    wire.apply_to(c);
+                }
+            }
+            self.server_last = buf.clone();
+            // `run_attached`: rebuild spacer structure, clear only on a `full` frame, emit.
+            crate::client::fix_wide_spacers(&mut self.client);
+            if full {
+                self.cterm.clear().expect("clear");
+            }
+            let src = self.client.clone();
+            blit(&mut self.cterm, &src, cursor);
+            let bytes = std::mem::take(&mut *self.sink.0.borrow_mut());
+            self.ref_p.advance(&mut self.ref_t, &bytes);
+            self.first = false;
+            buf
+        }
+
+        /// Apply the silent full repaint (`FrameMsg::repaint`) — the self-heal. After it, the
+        /// screen must match the composed buffer even if it had drifted.
+        fn repaint(&mut self, cursor: Option<(u16, u16)>) {
+            let src = self.client.clone();
+            let view = (self.area.width, self.area.height);
+            crate::client::repaint_all(&mut self.cterm, &src, view, cursor).expect("repaint");
+            let bytes = std::mem::take(&mut *self.sink.0.borrow_mut());
+            self.ref_p.advance(&mut self.ref_t, &bytes);
+        }
+
+        /// Describe one position across every layer, so a failure says WHICH layer lost it:
+        /// the server's composed buffer, the baseline it believes the client holds, and the
+        /// client's own mirror. If composed == client, the delta pipeline is fine and the emit
+        /// path drifted; if they differ, the delta withheld a cell.
+        fn layers_at(&self, composed: &Buffer, x: u16, y: u16) -> String {
+            let show = |b: &Buffer| match b.cell(Position::new(x, y)) {
+                Some(c) => format!(
+                    "{:?} fg={:?} bg={:?} mods={:?} skip={}",
+                    c.symbol(),
+                    c.fg,
+                    c.bg,
+                    c.modifier,
+                    c.skip
+                ),
+                None => "(out of area)".to_string(),
+            };
+            format!(
+                "  composed     {}\n  server c.last {}\n  client buf   {}",
+                show(composed),
+                show(&self.server_last),
+                show(&self.client)
+            )
+        }
+
+        /// The cells LEADING UP TO `(x, y)` in each layer. Whether a position is a wide-glyph
+        /// spacer is decided by its predecessors, so a divergence there is almost always
+        /// explained by a neighbour rather than by the cell itself.
+        fn neighbourhood(&self, composed: &Buffer, x: u16, y: u16) -> String {
+            let lo = x.saturating_sub(3);
+            let row = |b: &Buffer| {
+                (lo..=x)
+                    .map(|i| match b.cell(Position::new(i, y)) {
+                        Some(c) => {
+                            format!("{i}:{:?}{}", c.symbol(), if c.skip { "/skip" } else { "" })
+                        }
+                        None => format!("{i}:-"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            format!(
+                "  row {y} composed  {}\n  row {y} client    {}",
+                row(composed),
+                row(&self.client)
+            )
+        }
+
+        /// Write `ch` at `(x, y)` straight into the terminal, BEHIND comux's back — what an
+        /// outer emulator with its own damage tracking, or a lossy link, effectively does.
+        fn corrupt(&mut self, x: u16, y: u16, ch: char) {
+            let seq = format!("\u{1b}[0m\u{1b}[{};{}H{ch}", y + 1, x + 1);
+            let bytes = seq.into_bytes();
+            self.ref_p.advance(&mut self.ref_t, &bytes);
+        }
+
+        /// The glyph the terminal is actually showing at `(x, y)`.
+        fn screen_sym(&self, x: u16, y: u16) -> String {
+            let snap = snapshot_grid(&self.ref_t);
+            snap.cells[y as usize][x as usize].sym.clone()
+        }
+
+        fn assert_shows(&self, composed: &Buffer, ctx: &str) {
+            let got = snapshot_grid(&self.ref_t);
+            let want = painted_fresh(composed);
+            let (gn, wn) = (norm(&got), norm(&want));
+            if gn != wn {
+                // Name the first differing CELL, with both styles — a style-only divergence
+                // (a lost colour or attribute on the right glyph) is just as much residue as a
+                // wrong glyph, and reporting rows alone cannot see it.
+                let mut cell = "(none)".to_string();
+                'find: for (y, (gr, wr)) in gn.iter().zip(wn.iter()).enumerate() {
+                    for (x, (gc, wc)) in gr.iter().zip(wr.iter()).enumerate() {
+                        if gc != wc {
+                            cell = format!(
+                                "cell ({x},{y})\n  screen got  {gc:?}\n  screen want {wc:?}\n{}\n{}",
+                                self.layers_at(composed, x as u16, y as u16),
+                                self.neighbourhood(composed, x as u16, y as u16)
+                            );
+                            break 'find;
+                        }
+                    }
+                }
+                let (g, w) = (text(&got), text(&want));
+                let row = g
+                    .iter()
+                    .zip(w.iter())
+                    .position(|(a, b)| a != b)
+                    .map(|i| {
+                        format!(
+                            "\nfirst differing row {i}:\n  got  {:?}\n  want {:?}",
+                            g[i], w[i]
+                        )
+                    })
+                    .unwrap_or_else(|| "\n(glyphs all match — style only)".to_string());
+                panic!(
+                    "\n{ctx}\nthe relayed screen diverged from a fresh paint of the composed \
+                     buffer — this is residue no later delta will correct.\n{cell}{row}\n"
+                );
+            }
+        }
+    }
+
+    /// No composed cell may carry DIM and BOLD together — see [`resolve_dim_bold`]. Checked on
+    /// every tick of the fuzz rather than once, because any widget could reintroduce it.
+    fn assert_no_dim_bold(buf: &Buffer) {
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if let Some(c) = buf.cell(Position::new(x, y)) {
+                    assert!(
+                        !(c.modifier.contains(Modifier::DIM)
+                            && c.modifier.contains(Modifier::BOLD)),
+                        "cell ({x},{y}) {:?} carries DIM and BOLD; ratatui's emit drops the BOLD \
+                         permanently (see resolve_dim_bold)",
+                        c.symbol()
+                    );
+                }
+            }
+        }
+    }
+
+    /// xorshift64*, so the fuzz is reproducible from its seed without a dev-dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Self(seed | 1) // 0 is the degenerate state
+        }
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            if n == 0 {
+                0
+            } else {
+                (self.next() % n as u64) as usize
+            }
+        }
+    }
+
+    /// Byte sequences chosen to stress the seams: graphemes the two width models disagree about
+    /// (VS16 / ZWJ), genuinely wide CJK, erase-in-line (the "should become blank" case the
+    /// reported symptom is about), absolute cursor moves, colour/attribute runs, and
+    /// alt-screen + synchronized-update toggles.
+    fn vocabulary() -> Vec<String> {
+        let mut v: Vec<String> = [
+            "hello ",
+            "x",
+            "0123456789",
+            " ",
+            "|",
+            "\r\n",
+            "\n",
+            "\r",
+            "\x1b[2K",
+            "\x1b[K",
+            "\x1b[J",
+            "\x1b[1J",
+            "\x1b[H",
+            "\x1b[3;5H",
+            "\x1b[9;1H",
+            "\x1b[1m",
+            "\x1b[7m",
+            "\x1b[2m",
+            "\x1b[0m",
+            "\x1b[38;2;203;166;247m",
+            "\x1b[48;5;236m",
+            "\x1b[?1049h",
+            "\x1b[?1049l",
+            "\x1b[?2026h",
+            "\x1b[?2026l",
+            "\x1b[2J\x1b[H",
+            "가나다",
+            "漢字テスト",
+            "❤\u{fe0f}",
+            "👨\u{200d}👩\u{200d}👧",
+            "🎉",
+            "→",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // Wide-glyph runs at BOTH column parities and long enough to wrap a pane: the way to
+        // land a leading wide cell on a pane's last column, which is the position ratatui's
+        // flat diff suppresses the FOLLOWING cell for — in a composed screen, the next region's
+        // first column.
+        for pad in 0..3 {
+            v.push(format!("{}{}", "x".repeat(pad), "가".repeat(40)));
+            v.push(format!("{}{}", "y".repeat(pad), "❤\u{fe0f}".repeat(40)));
+            v.push(format!("{}{}", "z".repeat(pad), "漢".repeat(40)));
+        }
+        v
+    }
+
+    /// One screen shape to fuzz. Varying these is the whole point: the sidebar strip, the
+    /// divider column and the status bar are what put a region boundary in the MIDDLE of a row.
+    struct Shape {
+        name: &'static str,
+        cols: u16,
+        rows: u16,
+        splits: &'static [&'static str],
+        sidebar: bool,
+        top_bar: bool,
+    }
+
+    const SHAPES: &[Shape] = &[
+        Shape {
+            name: "single pane",
+            cols: 100,
+            rows: 30,
+            splits: &[],
+            sidebar: false,
+            top_bar: false,
+        },
+        Shape {
+            name: "sidebar + status bar",
+            cols: 100,
+            rows: 30,
+            splits: &[],
+            sidebar: true,
+            top_bar: false,
+        },
+        Shape {
+            name: "vertical split + sidebar",
+            cols: 100,
+            rows: 30,
+            splits: &["right"],
+            sidebar: true,
+            top_bar: false,
+        },
+        Shape {
+            name: "nested splits + sidebar + top bar",
+            cols: 110,
+            rows: 32,
+            splits: &["right", "down"],
+            sidebar: true,
+            top_bar: true,
+        },
+        // An odd width matters: it decides whether a pane's content columns end on an even or
+        // odd boundary, and therefore whether a wide glyph can straddle the pane's edge.
+        Shape {
+            name: "odd width, split, sidebar",
+            cols: 101,
+            rows: 29,
+            splits: &["right"],
+            sidebar: true,
+            top_bar: false,
+        },
+    ];
+
+    fn build(shape: &Shape) -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        cfg.sidebar = shape.sidebar;
+        cfg.top_bar = shape.top_bar;
+        // A quiet shell keeps the pane content mostly the harness's own, so a failure is easy
+        // to read. Its prompt arriving anyway is harmless — the assertion compares the relay
+        // against the buffer composed on the SAME tick, so extra churn only adds coverage.
+        let env = vec![("PS1".to_string(), String::new())];
+        let mut app = App::new(shape.cols, shape.rows, env, Vec::new(), cfg).expect("app");
+        for dir in shape.splits {
+            app.handle_control(&crate::control::Req::Split {
+                dir: (*dir).to_string(),
+                from: None,
+            });
+        }
+        app.resize(shape.cols, shape.rows);
+        app
+    }
+
+    #[test]
+    fn a_silent_repaint_heals_a_screen_the_delta_pipeline_cannot() {
+        // What `reconcile_secs` buys, stated as a property. Corrupt the terminal behind comux's
+        // back and no number of further deltas repairs it — every buffer in the chain still
+        // agrees about that cell, so nothing is ever re-sent for it. That is precisely the
+        // residue a user ends up clearing by hand with `Ctrl-b r`. One silent repaint fixes it,
+        // and unlike `Ctrl-b r` it needs no `Clear` and therefore no visible flash.
+        let app = build(&SHAPES[0]); // single pane: no clock or agent row to churn under us
+        let mut relay = Relay::new(SHAPES[0].cols, SHAPES[0].rows);
+        let composed = relay.tick(&app);
+        relay.assert_shows(&composed, "baseline");
+
+        // A cell the composition keeps blank, well away from the shell's prompt.
+        let (x, y) = (40u16, 15u16);
+        assert_eq!(
+            composed.cell(Position::new(x, y)).map(|c| c.symbol()),
+            Some(" "),
+            "the test needs a blank cell at ({x},{y})"
+        );
+
+        relay.corrupt(x, y, 'Z');
+        assert_eq!(relay.screen_sym(x, y), "Z", "the corruption landed");
+
+        let composed = relay.tick(&app);
+        assert_eq!(
+            relay.screen_sym(x, y),
+            "Z",
+            "an incremental delta cannot see the corruption — this is the bug, not a flaw in \
+             the test"
+        );
+
+        relay.repaint(None);
+        assert_eq!(relay.screen_sym(x, y), " ", "the silent repaint healed it");
+        relay.assert_shows(&composed, "after the silent repaint");
+    }
+
+    #[test]
+    fn dim_and_bold_are_never_set_together() {
+        // DIM wins, and the sweep runs over the WHOLE buffer — the reason it is a sweep rather
+        // than a fix at each call site is that DIM is written by the pane loop, the sidebar's
+        // group headers and the status bar's muted labels alike.
+        let mut buf = Buffer::empty(RRect::new(0, 0, 4, 1));
+        let styles = [
+            Style::default().add_modifier(Modifier::DIM | Modifier::BOLD),
+            Style::default().add_modifier(Modifier::BOLD),
+            Style::default().add_modifier(Modifier::DIM),
+            Style::default().add_modifier(Modifier::DIM | Modifier::BOLD | Modifier::REVERSED),
+        ];
+        for (x, st) in styles.iter().enumerate() {
+            buf.cell_mut(Position::new(x as u16, 0))
+                .expect("cell")
+                .set_style(*st);
+        }
+        super::resolve_dim_bold(&mut buf);
+        let m = |x: u16| buf.cell(Position::new(x, 0)).expect("cell").modifier;
+        assert_eq!(m(0), Modifier::DIM, "DIM wins over BOLD");
+        assert_eq!(m(1), Modifier::BOLD, "BOLD alone is untouched");
+        assert_eq!(m(2), Modifier::DIM, "DIM alone is untouched");
+        assert_eq!(
+            m(3),
+            Modifier::DIM | Modifier::REVERSED,
+            "only BOLD is dropped — other attributes survive"
+        );
+    }
+
+    #[test]
+    fn the_composed_screen_relays_without_residue() {
+        let vocab = vocabulary();
+        // Enough seeds to be a real gate without dominating the suite; crank it up to hunt
+        // (`COPAD_MUX_FUZZ_SEEDS=400 cargo test --release app_render_fidelity`). Seeds are
+        // derived from a counter so raising the number only ADDS cases — it never renumbers the
+        // ones a past failure was reported against.
+        let seeds: u64 = std::env::var("COPAD_MUX_FUZZ_SEEDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12);
+        for shape in SHAPES {
+            for seed in (1..=seeds).map(|i| i.wrapping_mul(0x9E37_79B9_7F4A_7C15)) {
+                let app = build(shape);
+                let mut rng = Rng::new(seed);
+                let mut relay = Relay::new(shape.cols, shape.rows);
+                // SORTED: `panes` is a `HashMap`, so unsorted iteration would hand the same
+                // seed's token streams to different panes on every run and a reported failure
+                // could not be reproduced from its seed.
+                let mut ids: Vec<TerminalId> = app.panes.keys().cloned().collect();
+                ids.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut parsers: HashMap<TerminalId, Processor> =
+                    ids.iter().map(|i| (i.clone(), Processor::new())).collect();
+
+                for tick in 0..24 {
+                    for id in &ids {
+                        let n = 1 + rng.below(4);
+                        for _ in 0..n {
+                            let tok = vocab[rng.below(vocab.len())].clone();
+                            let parser = parsers.get_mut(id).expect("parser");
+                            app.panes
+                                .get(id)
+                                .expect("pane")
+                                .feed_test_bytes(parser, tok.as_bytes());
+                        }
+                    }
+                    let composed = relay.tick(&app);
+                    relay.assert_shows(
+                        &composed,
+                        &format!(
+                            "shape {:?} (cols={} rows={}), seed {seed:#x}, tick {tick}",
+                            shape.name, shape.cols, shape.rows
+                        ),
+                    );
+                }
+            }
+        }
     }
 }

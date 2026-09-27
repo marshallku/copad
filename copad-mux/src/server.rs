@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender, SyncSender, TrySendError};
 use std::time::{Duration, Instant};
 
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect as RRect;
+use ratatui::buffer::{Buffer, Cell};
+use ratatui::layout::{Position, Rect as RRect};
 
 use crate::control::{self, runtime_dir, socket_path};
 use crate::model::ClientId;
@@ -58,6 +58,21 @@ const LABEL_INTERVAL: Duration = Duration::from_millis(500);
 /// extra latency on a desktop toast is imperceptible. This is what keeps a server
 /// that sits detached for days from burning a CPU percent the whole time.
 const IDLE_LABEL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a full **baseline resync** pass takes: the walk that re-establishes, band by
+/// band, what the server believes each client holds. Far slower than the silent repaint
+/// (`reconcile_secs`) because the two cost wildly different amounts. A repaint ships a flag
+/// and the client re-emits cells it already has; a resync band ships every cell in those rows
+/// as ndjson with full per-cell style — tens of kilobytes for a large screen. So the cheap
+/// signal runs on the user-visible cadence and the expensive one trickles.
+///
+/// It exists because the two failure modes live on opposite sides of the client's buffer: a
+/// repaint fixes a buffer-vs-screen divergence but would faithfully re-emit a buffer that is
+/// itself wrong, which is what a resync fixes.
+const RESYNC_PASS: Duration = Duration::from_secs(60);
+
+/// Bands a [`RESYNC_PASS`] is split into, so no single frame carries a whole screen.
+const RESYNC_BANDS: u16 = 8;
 
 /// A message funneled to the single-writer main loop from a connection thread.
 enum Incoming {
@@ -113,6 +128,14 @@ struct Client {
     epoch: u64,
     cols: u16,
     rows: u16,
+    /// When this client is next due a silent full repaint (`reconcile_secs`). Set forward
+    /// on every repaint AND on every baseline reset, so a `full` frame — which already puts
+    /// every cell on screen — doesn't get a redundant repaint right behind it.
+    repaint_at: Instant,
+    /// When this client's next baseline-resync band is due (see [`RESYNC_PASS`]).
+    resync_at: Instant,
+    /// Which band the resync walk is on; wraps at the bottom of the screen.
+    resync_band: u16,
     /// This client process's pid, when advertised at attach — the walk-up start for
     /// raising its terminal window after a notification jump.
     pid: Option<u32>,
@@ -429,6 +452,10 @@ pub fn run() -> io::Result<()> {
         // A frame dropped under backpressure (or a fresh attach) leaves the client
         // behind; reschedule a render to catch it up.
         dirty |= clients.iter().any(|c| c.needs_full || c.pending);
+        // A self-heal signal is due (silent repaint / resync band). This is the one dirty
+        // source that fires with nothing on screen having changed — deliberately, since
+        // residue is only visible when nothing is changing.
+        dirty |= reconcile_due(&app, &clients);
         // Deliver any pending drag-selection clipboard copies (OSC 52) BEFORE frames, so a
         // one-shot copy takes priority for the cap-1 channel slot and can't be perpetually
         // starved by sustained frame output. Non-blocking (a suspended client can't stall us):
@@ -780,6 +807,12 @@ fn handle_incoming(
                 last_cursor: None,
                 prefix: false,
                 epoch: 0,
+                // The attach frame is `full` — every cell, applied over a cleared screen — so
+                // both self-heal walks start one interval OUT rather than firing immediately
+                // behind it. (When the self-heal is off these are never read.)
+                repaint_at: Instant::now() + app.repaint_period().unwrap_or(RESYNC_PASS),
+                resync_at: Instant::now() + RESYNC_PASS / u32::from(RESYNC_BANDS),
+                resync_band: 0,
                 cols,
                 rows,
                 pid,
@@ -995,6 +1028,60 @@ fn queue_copy(c: &mut Client, seq: u64, text: &str) {
     }
 }
 
+/// A cell value no compose path can produce, used to mark part of a client's baseline
+/// "unknown" so the next diff re-sends every cell there — **including the blanks**.
+///
+/// Wiping the band to `Buffer::empty` instead would defeat the whole point: an empty cell
+/// equals the blank a compose produces, so the diff would skip exactly the position whose
+/// stale glyph we are trying to clear — and "a cell that should be blank keeps showing its
+/// old glyph" is the reported symptom. A NUL symbol can't collide with real content:
+/// `snapshot_grid` coerces pane graphemes and the chrome writes printable text.
+fn unknown_cell() -> Cell {
+    let mut c = Cell::EMPTY;
+    c.set_symbol("\u{0}");
+    c
+}
+
+/// The rows covered by resync band `i` of a `rows`-tall screen, or `None` once `i` is past
+/// the bottom (the caller wraps to band 0). Bands are ceil-sized so the last one is the short
+/// remainder rather than the walk overrunning the screen.
+fn resync_band_rows(rows: u16, i: u16) -> Option<(u16, u16)> {
+    if rows == 0 {
+        return None;
+    }
+    let h = rows.div_ceil(RESYNC_BANDS).max(1);
+    let y0 = i.checked_mul(h)?;
+    if y0 >= rows {
+        return None;
+    }
+    Some((y0, h.min(rows - y0)))
+}
+
+/// Mark `h` rows of `last` unknown from `y0` down (see [`unknown_cell`]).
+fn invalidate_band(last: &mut Buffer, y0: u16, h: u16) {
+    for y in y0..y0.saturating_add(h) {
+        for x in 0..last.area.width {
+            if let Some(cell) = last.cell_mut(Position::new(x, y)) {
+                *cell = unknown_cell();
+            }
+        }
+    }
+}
+
+/// Whether any attached client is due a self-heal signal — a silent repaint or the next
+/// baseline-resync band — so the main loop composes a frame even with nothing else dirty.
+/// Always false when the self-heal is off, so it can never keep a detached-but-idle server
+/// (or one with `reconcile_secs = 0`) spinning.
+fn reconcile_due(app: &App, clients: &[Client]) -> bool {
+    if app.repaint_period().is_none() {
+        return false;
+    }
+    let now = Instant::now();
+    clients
+        .iter()
+        .any(|c| now >= c.repaint_at || now >= c.resync_at)
+}
+
 /// Render the app ONCE and broadcast the changed cells (or a full baseline) to every
 /// attached client — each diffed against its OWN last-sent buffer, so a freshly
 /// attached client gets a full frame while up-to-date ones get small deltas. No-op
@@ -1010,6 +1097,10 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
     let armed = clients.iter().any(|c| c.prefix);
     app.set_prefix_armed(armed);
 
+    // Self-heal cadence, read live so `comux reload` changes it on the running server.
+    let period = app.repaint_period();
+    let now = Instant::now();
+
     let (cols, rows) = app.size();
     let area = RRect::new(0, 0, cols.max(1), rows.max(1));
     let mut buf = Buffer::empty(area);
@@ -1021,22 +1112,65 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
             c.last = Buffer::empty(area);
             c.needs_full = true;
         }
+        // `comux reload` can shorten `reconcile_secs` under a client already waiting on a
+        // deadline computed from the OLD value, so cap it: going from an hour to 3s must not
+        // leave every attached client waiting out the hour. Growing the period just lets one
+        // already-due repaint fire early, after which the new cadence applies.
+        if let Some(p) = period {
+            let cap = now + p;
+            if c.repaint_at > cap {
+                c.repaint_at = cap;
+            }
+        }
+        // Baseline resync: forget what this client is believed to hold for one band of rows,
+        // so the diff below re-ships every cell in them. Skipped when a `full` frame is
+        // already pending — that re-ships the entire screen anyway.
+        if period.is_some() && !c.needs_full && !c.pending && now >= c.resync_at {
+            let (band, next) = match resync_band_rows(rows, c.resync_band) {
+                Some(b) => (b, c.resync_band.saturating_add(1)),
+                // Past the bottom: wrap and take band 0 on this same tick, so the walk never
+                // spends an interval doing nothing.
+                None => (resync_band_rows(rows, 0).unwrap_or((0, 0)), 1),
+            };
+            invalidate_band(&mut c.last, band.0, band.1);
+            c.resync_band = next;
+            c.resync_at = now + RESYNC_PASS / u32::from(RESYNC_BANDS);
+        }
         let changed = c.last.diff(&buf);
-        // Send when cells changed, a baseline is due, OR the cursor moved.
-        if changed.is_empty() && !c.needs_full && cursor == c.last_cursor {
+        // Silent full repaint due? Three gates, each removing a case where it is pointless or
+        // harmful:
+        //   * behind a `full` frame, which already repaints everything;
+        //   * to a client that did not get the LAST frame (`pending`) — it is already behind, and
+        //     a self-heal is a luxury, never something to pile onto a struggling client;
+        //   * on a frame that carries changed cells at all. A repaint exists for residue you are
+        //     LOOKING at, and while content is flowing the delta is already overwriting cells. It
+        //     also keeps a screenful of escapes out of a busy stream: the client writes to its
+        //     terminal synchronously, so padding an active stream is how one on a slow link ends
+        //     up blocked in `write` and late to forward the user's input.
+        // An idle attached screen has an empty delta most ticks, so this still heals within a
+        // second of anything pausing.
+        let repaint = period.is_some()
+            && !c.needs_full
+            && !c.pending
+            && changed.is_empty()
+            && now >= c.repaint_at;
+        // Send when cells changed, a baseline is due, a repaint is due, OR the cursor moved.
+        // A repaint alone is a ~60-byte line carrying no cells, which is the point: it asks
+        // the client to re-emit what it already holds.
+        if changed.is_empty() && !c.needs_full && !repaint && cursor == c.last_cursor {
+            // Nothing to say — and that also settles a client marked `pending`. `pending` means
+            // it did not receive the LAST frame, but `c.last` was never advanced for that frame,
+            // so an empty diff against it proves the client's content is already current: the
+            // dropped frame was superseded. Leaving the flag set would be a live-lock, because
+            // `dirty |= any(pending)` keeps the loop composing every tick while the repaint and
+            // resync gates (both `!c.pending`) guarantee nothing is ever sent to clear it. A
+            // dropped EMPTY repaint frame is exactly that case.
+            c.pending = false;
             continue;
         }
         let cells: Vec<WireCell> = changed
             .iter()
-            .map(|(x, y, cell)| WireCell {
-                x: *x,
-                y: *y,
-                sym: cell.symbol().to_string(),
-                fg: cell.fg,
-                bg: cell.bg,
-                mods: cell.modifier,
-                skip: cell.skip,
-            })
+            .map(|(x, y, cell)| WireCell::of(*x, *y, cell))
             .collect();
         let frame = FrameMsg {
             epoch: c.epoch,
@@ -1045,11 +1179,19 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
             full: c.needs_full,
             cells,
             cursor,
+            repaint,
         };
         match c.out.try_send(ServerMsg::Frame(frame)) {
             // Advance this client's baseline only once it actually has the frame.
             Ok(()) => {
                 c.last = buf.clone();
+                // Anything that put every cell on this client's screen restarts the repaint
+                // clock — a `full` frame no less than a `repaint` one.
+                if let Some(p) = period
+                    && (c.needs_full || repaint)
+                {
+                    c.repaint_at = now + p;
+                }
                 c.needs_full = false;
                 c.pending = false;
                 c.last_cursor = cursor;
@@ -1061,6 +1203,13 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
             // the client's buffer.
             Err(TrySendError::Full(_)) => {
                 c.pending = true;
+                // A self-heal is best-effort: charge a failed repaint to the clock so a client
+                // whose queue stays full is retried next INTERVAL rather than every tick.
+                if let Some(p) = period
+                    && repaint
+                {
+                    c.repaint_at = now + p;
+                }
             }
             // The writer thread is gone: the socket died with writes failing while the
             // reader thread stayed blocked (no `Disconnect` will arrive). Prune it below so
@@ -1085,6 +1234,7 @@ mod tests {
     use ratatui::layout::Rect as RRect;
     use std::os::unix::net::UnixStream;
     use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     /// Keeps the peer ends of a test client's channel + socket alive: while held the frame
     /// sender stays connected, so a client is "live"; dropping the guard closes the receiver
@@ -1110,6 +1260,9 @@ mod tests {
             last_cursor: None,
             prefix: false,
             epoch: 0,
+            repaint_at: Instant::now() + Duration::from_secs(3600),
+            resync_at: Instant::now() + Duration::from_secs(3600),
+            resync_band: 0,
             cols,
             rows,
             pid: None,
@@ -1379,5 +1532,214 @@ mod tests {
             name: None,
             cwd: None
         }));
+    }
+
+    /// Build an app whose self-heal cadence is `secs` (0 = off), with persistence disabled so
+    /// the test never restores (or saves over) the user's real sessions.
+    fn test_app(secs: u32) -> App {
+        let (mut cfg, _) = MuxConfig::load_from(std::path::Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false;
+        cfg.reconcile_secs = secs;
+        App::new(80, 24, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    /// Drain whatever `push_frames` enqueued for a client, newest last.
+    fn drain(rx: &mpsc::Receiver<ServerMsg>) -> Vec<crate::proto::FrameMsg> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            if let ServerMsg::Frame(f) = m {
+                out.push(f);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn resync_bands_tile_the_screen_exactly_and_then_wrap() {
+        // Every row must belong to exactly one band, or the walk would leave a stripe it never
+        // resyncs — the one place a permanently-wrong baseline could hide from the self-heal.
+        for rows in [1u16, 7, 8, 9, 24, 50, 200] {
+            let mut covered = vec![0u32; rows as usize];
+            let mut i = 0u16;
+            while let Some((y0, h)) = super::resync_band_rows(rows, i) {
+                assert!(h >= 1, "rows={rows} band={i} is empty");
+                for y in y0..y0 + h {
+                    covered[y as usize] += 1;
+                }
+                i += 1;
+            }
+            assert!(
+                covered.iter().all(|n| *n == 1),
+                "rows={rows} not tiled exactly once: {covered:?}"
+            );
+            assert!(i <= super::RESYNC_BANDS, "rows={rows} used {i} bands");
+            // Past the last band the walk reports exhaustion so the caller wraps to 0.
+            assert!(super::resync_band_rows(rows, i).is_none());
+        }
+        assert_eq!(
+            super::resync_band_rows(0, 0),
+            None,
+            "a 0-row screen has no bands"
+        );
+    }
+
+    #[test]
+    fn a_resync_band_resends_cells_that_are_blank() {
+        // THE point of the sentinel. The reported symptom is a stale glyph sitting where the
+        // truth is a BLANK, so a resync that only re-sends non-blank cells would walk right
+        // past it. Wiping the band to `Buffer::empty` instead of `unknown_cell` does exactly
+        // that, because an empty cell equals the blank the compose produces.
+        let area = RRect::new(0, 0, 4, 2);
+        let blank = Buffer::empty(area); // what the server composed: all blanks
+        let mut baseline = blank.clone(); // what the client is believed to hold: same
+
+        assert!(
+            baseline.diff(&blank).is_empty(),
+            "precondition: an up-to-date baseline ships nothing"
+        );
+
+        super::invalidate_band(&mut baseline, 0, 1);
+        let changed = baseline.diff(&blank);
+        assert_eq!(
+            changed.len(),
+            4,
+            "every cell of the invalidated row re-ships, blanks included"
+        );
+        assert!(
+            changed.iter().all(|(_, y, _)| *y == 0),
+            "only the invalidated band ships: {:?}",
+            changed.iter().map(|(x, y, _)| (*x, *y)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn an_idle_client_gets_a_repaint_frame_carrying_no_cells() {
+        // The silent repaint's whole economy: it asks the client to re-emit what it already
+        // holds, so it must cost a flag and not a screenful of cells. If this ever starts
+        // shipping cells, the cadence stops being free.
+        let mut app = test_app(3);
+        let (mut c, guard) = test_client(1, 80, 24);
+        c.needs_full = false;
+        c.last = Buffer::empty(RRect::new(0, 0, 80, 24));
+        let mut clients = vec![c];
+
+        // Bring the client fully up to date first (its baseline is empty, the app is not).
+        push_frames(&mut app, &mut clients);
+        let _ = drain(&guard._rx);
+        assert!(!clients[0].needs_full, "the catch-up frame landed");
+
+        // Nothing changed, but the repaint clock is due.
+        clients[0].repaint_at = Instant::now() - Duration::from_secs(1);
+        push_frames(&mut app, &mut clients);
+        let frames = drain(&guard._rx);
+        assert_eq!(
+            frames.len(),
+            1,
+            "a due repaint sends a frame even with no delta"
+        );
+        assert!(frames[0].repaint, "and it is flagged as a repaint");
+        assert!(!frames[0].full, "a repaint is not a clearing full frame");
+        assert!(
+            frames[0].cells.is_empty(),
+            "a repaint ships no cells, got {}",
+            frames[0].cells.len()
+        );
+        assert!(
+            clients[0].repaint_at > Instant::now(),
+            "the clock restarts, so it does not fire every tick"
+        );
+    }
+
+    #[test]
+    fn a_full_frame_is_not_also_flagged_repaint_and_restarts_the_clock() {
+        // A `full` frame already paints every cell over a cleared screen. Flagging it
+        // `repaint` too would make the client emit the entire screen a second time.
+        let mut app = test_app(3);
+        let (mut c, guard) = test_client(1, 80, 24);
+        c.repaint_at = Instant::now() - Duration::from_secs(1); // due
+        assert!(c.needs_full, "a fresh client starts needing a baseline");
+        let mut clients = vec![c];
+
+        push_frames(&mut app, &mut clients);
+        let frames = drain(&guard._rx);
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].full);
+        assert!(
+            !frames[0].repaint,
+            "the baseline repaint is not doubled up with a silent one"
+        );
+        assert!(
+            clients[0].repaint_at > Instant::now(),
+            "a full frame restarts the repaint clock too — it painted everything"
+        );
+    }
+
+    #[test]
+    fn a_dropped_repaint_does_not_live_lock_the_render_loop() {
+        // `pending` means the client missed the LAST frame, and `dirty |= any(pending)` keeps the
+        // loop composing until it is cleared. But the repaint and resync gates are both
+        // `!c.pending`, and an up-to-date client's diff is empty — so nothing would ever be sent
+        // to clear it and the server would recompose at the frame rate forever. A dropped EMPTY
+        // repaint frame walks straight into that, which is why the nothing-to-say path settles
+        // the flag: an empty diff against an un-advanced baseline PROVES the client is current.
+        let mut app = test_app(3);
+        let (mut c, guard) = test_client(1, 80, 24);
+        c.needs_full = false;
+        c.last = Buffer::empty(RRect::new(0, 0, 80, 24));
+        let mut clients = vec![c];
+        push_frames(&mut app, &mut clients); // catch the client up
+        let _ = drain(&guard._rx);
+
+        // A repaint comes due while the client's cap-1 queue is already occupied.
+        clients[0].repaint_at = Instant::now() - Duration::from_secs(1);
+        clients[0]
+            .out
+            .try_send(ServerMsg::Bye)
+            .expect("occupy the queue");
+        push_frames(&mut app, &mut clients);
+        assert!(clients[0].pending, "the repaint frame was dropped");
+        assert!(
+            clients[0].repaint_at > Instant::now(),
+            "a failed repaint is charged to the clock, so a stuck client is retried next              interval rather than every tick"
+        );
+
+        // The queue drains; nothing on screen changed.
+        let _ = drain(&guard._rx);
+        push_frames(&mut app, &mut clients);
+        assert!(
+            !clients[0].pending,
+            "an empty diff settles `pending` — otherwise the loop never goes idle again"
+        );
+        assert!(
+            !super::reconcile_due(&app, &clients),
+            "and with the flag settled and the clock charged, the loop has nothing left to do"
+        );
+    }
+
+    #[test]
+    fn the_self_heal_never_ticks_when_it_is_switched_off_or_nobody_is_watching() {
+        // `reconcile_due` is the only dirty source that fires with the screen unchanged, so it
+        // is also the only one that could keep an idle server composing forever. Both guards
+        // matter: `reconcile_secs = 0` (user opted out) and no clients (detached, which the
+        // CPU throttle depends on).
+        let off = test_app(0);
+        let (mut c, _g) = test_client(1, 80, 24);
+        c.repaint_at = Instant::now() - Duration::from_secs(60);
+        c.resync_at = Instant::now() - Duration::from_secs(60);
+        let clients = vec![c];
+        assert!(
+            !super::reconcile_due(&off, &clients),
+            "reconcile_secs = 0 must never mark the frame dirty"
+        );
+
+        let on = test_app(3);
+        assert!(
+            !super::reconcile_due(&on, &[]),
+            "a detached server has no client to heal"
+        );
+        assert!(
+            super::reconcile_due(&on, &clients),
+            "an attached client past its due time is the case this exists for"
+        );
     }
 }

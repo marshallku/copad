@@ -12,7 +12,7 @@ Most settings apply on the running server without a restart:
 comux reload          # re-read mux.toml on the live server (alias: comux source-file)
 ```
 
-`reload` re-reads the file, swaps the config in place, and prints the config path plus any parse warnings — it never breaks the running mux. Keybindings, mouse, `osc52`, `sidebar_width`, all `usage_*`, `tab_labels`, `notify`, and worktree settings apply on the next frame.
+`reload` re-reads the file, swaps the config in place, and prints the config path plus any parse warnings — it never breaks the running mux. Keybindings, mouse, `osc52`, `sidebar_width`, all `usage_*`, `tab_labels`, `notify`, `reconcile_secs`, and worktree settings apply on the next frame.
 
 **Four settings are fixed at server boot** and need `comux server restart` instead: `persist`, `autosave_secs`, `update_environment`, and `never_inherit`. (`restore_processes` / `restore_agent_sessions` are read at save time, so `reload` does update them for the next save.)
 
@@ -32,6 +32,7 @@ comux reload          # re-read mux.toml on the live server (alias: comux source
 | `scroll_step` | `3` | `1`–`50` | Lines per mouse-wheel notch |
 | `sort_by` | `"created"` | `created` / `alphabetical` / `recent` / `activity` | Session order in sidebar, switcher, and `)(`/cycle |
 | `tab_labels` | `"number"` | `number` / `name` / `both` | What each status-bar tab chip shows |
+| `reconcile_secs` | `3` | `0`–`3600` (`0` disables) | How often each client silently repaints its whole screen — the render-residue self-heal (see below) |
 | `update_check` | `true` | bool | GitHub-release check + `⬆ x.y.z` hint (`COPAD_MUX_UPDATE_CHECK=0` disables) |
 | `persist` | `true` | bool | Restore the saved layout on server start *(boot-fixed)* |
 | `autosave_secs` | `15` | `0` disables; else `5`–`3600` | Periodic save interval *(boot-fixed)* |
@@ -68,6 +69,25 @@ Unlike every other list option, yours is **added** to that default instead of re
 Load-bearing names (`PATH`, `HOME`, `SHELL`, `USER`, `TERM`, `PWD`, `COPAD_MUX`, …) are refused in either list if you add them.
 
 ---
+
+### `reconcile_secs` — the render-residue self-heal
+
+comux ships the screen to a client as a **cell delta**, and the client paints it through
+ratatui's own incremental diff. Both layers assume the layer below them applied everything they
+sent. When that assumption breaks even once — an outer terminal with its own damage tracking, a
+lossy SSH link — the stale cell is deemed "unchanged" from then on and **no later delta ever
+repaints it**. What you see is a leftover glyph or a coloured blank that sits there until
+something happens to overwrite it, and the only cure is a full repaint.
+
+`reconcile_secs` is that full repaint, on a timer: every N seconds the server tells each client
+to re-emit every cell it already holds. It ships **no extra cells** (just a flag), and it does
+**not** clear the screen first — overwriting a cell with what is already believed to be there is
+invisible, so this can simply be left on. `Ctrl-b r` is still there for an instant repaint, and
+still does clear, which is what you want when you suspect the layout itself is wrong.
+
+Set `reconcile_secs = 0` to switch it off. `COPAD_MUX_REDRAW_MS=<ms>` adds a *client-local*
+repaint on top of the server's cadence, for one machine whose terminal drifts faster than the
+rest — it no longer clears either, so setting it costs nothing visible.
 
 ## Usage / limits options
 
@@ -142,6 +162,7 @@ sort_by          = "activity"
 # ---- status bar ----
 notify            = true
 tab_labels        = "both"
+reconcile_secs    = 3
 usage             = "bar"
 usage_layout      = "paged"
 usage_page_unit   = "provider"
