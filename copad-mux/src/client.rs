@@ -122,13 +122,52 @@ pub(crate) fn repaint_all<W: Write>(
     let (vw, vh) = view;
     let mut frame = Buffer::empty(RRect::new(0, 0, vw, vh));
     blit_view(src, &mut frame);
-    let cells: Vec<(u16, u16, &Cell)> = (0..vh)
-        .flat_map(|y| (0..vw).map(move |x| (x, y)))
-        .filter_map(|(x, y)| frame.cell(Position::new(x, y)).map(|c| (x, y, c)))
-        .filter(|(_, _, c)| !c.skip)
-        .collect();
+    // Emit in SEGMENTS, cutting after any cell whose glyph is not plain ASCII.
+    //
+    // `CrosstermBackend::draw` omits the `MoveTo` between cells it believes are adjacent, so a run
+    // is positioned entirely by the terminal's OWN cursor advance — it trusts that the terminal
+    // measured every glyph the way `unicode-width` did. That is tolerable for the incremental
+    // path, whose runs are short and re-anchored constantly by the next diff. It is not tolerable
+    // here: a full repaint makes each row ONE run, so a single glyph the outer terminal measures
+    // differently shifts everything after it in that row — and because this repaint repeats on a
+    // timer, it would re-apply that shift every few seconds instead of being overwritten by the
+    // next delta. Turning a one-cell artefact into a permanently skewed row is the opposite of a
+    // self-heal.
+    //
+    // The everyday case is a Nerd Font / Powerline icon in a shell prompt: Private Use Area, one
+    // column by `unicode-width`, two in plenty of fonts. comux cannot see that disagreement — it
+    // lives in the outer terminal's font, not in any table we can read, which is also why the
+    // `app_render_fidelity` fuzz cannot catch it (its reference emulator shares alacritty's width
+    // table). So do not try to predict it: re-anchor after every glyph that could carry it.
+    // Starting a new `draw` call resets its cursor tracking, so each segment opens with a
+    // `MoveTo` — the damage is bounded to the one cell, and the next repaint CORRECTS the drift
+    // instead of entrenching it. ASCII needs no anchor; every terminal agrees it is one column.
+    let mut segments: Vec<Vec<(u16, u16, &Cell)>> = Vec::new();
+    let mut seg: Vec<(u16, u16, &Cell)> = Vec::new();
+    for y in 0..vh {
+        for x in 0..vw {
+            let Some(c) = frame.cell(Position::new(x, y)) else {
+                continue;
+            };
+            if c.skip {
+                continue;
+            }
+            let plain_ascii = c.symbol().len() == 1 && c.symbol().is_ascii();
+            seg.push((x, y, c));
+            if !plain_ascii {
+                segments.push(std::mem::take(&mut seg));
+            }
+        }
+        // A row boundary is already a re-anchor (`draw` emits `MoveTo` when the position is not
+        // the next column of the same row), so rows need no cut of their own.
+    }
+    if !seg.is_empty() {
+        segments.push(seg);
+    }
     let backend = terminal.backend_mut();
-    backend.draw(cells.into_iter())?;
+    for seg in segments {
+        backend.draw(seg.into_iter())?;
+    }
     // `Backend::draw` leaves the cursor wherever it printed last; put it back where the frame
     // wants it or the next keystroke echoes in the wrong place. Clamped to the viewport for the
     // same reason the cells are.
@@ -815,6 +854,48 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_silent_repaint_re_anchors_after_a_glyph_the_terminal_may_measure_differently() {
+        // The repaint must never let ONE glyph skew the rest of a row.
+        //
+        // `CrosstermBackend::draw` positions a run of adjacent cells by the terminal's own cursor
+        // advance, emitting no `MoveTo` between them — it trusts the terminal to have measured
+        // every glyph exactly as `unicode-width` did. A full repaint makes each row one such run,
+        // so a Nerd Font / Powerline icon (Private Use Area: one column here, two in plenty of
+        // fonts) would shift everything after it — every few seconds, forever, because this
+        // repaint repeats. comux cannot read the outer terminal's font, so the only safe move is
+        // to re-anchor after any glyph that could carry the disagreement.
+        let area = Rect::new(0, 0, 6, 1);
+        let mut buf = Buffer::empty(area);
+        buf.set_string(0, 0, "ab\u{e0b0}cd", Style::default()); // U+E0B0 = the Powerline separator
+
+        let sink = Sink(Rc::new(RefCell::new(Vec::new())));
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(sink.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .expect("terminal");
+        repaint_all(&mut term, &buf, (area.width, area.height), None).expect("repaint");
+        let out = String::from_utf8(sink.0.borrow().clone()).expect("utf8");
+
+        // The cell AFTER the icon is addressed explicitly (1-based row 1, column 4) instead of
+        // being left to wherever the terminal's cursor ended up.
+        assert!(
+            out.contains("\u{1b}[1;4H"),
+            "the cell after a non-ASCII glyph must be re-anchored: {out:?}"
+        );
+        // ...and the plain-ASCII run before it is still emitted as one run, so the anchoring
+        // costs nothing on ordinary text.
+        let first = out.find("\u{1b}[1;1H").expect("row start");
+        let icon = out.find('\u{e0b0}').expect("icon emitted");
+        assert!(
+            !out[first..icon].contains("\u{1b}[1;2H"),
+            "ASCII needs no anchor — every terminal agrees it is one column: {out:?}"
+        );
     }
 
     #[test]
