@@ -9025,19 +9025,17 @@ mod app_render_fidelity {
 
     /// Blit `src` into a ratatui frame at the top-left, blanking the letterbox margin — byte
     /// for byte what `client::run_attached` does in its draw closure.
-    fn blit(term: &mut Terminal<CrosstermBackend<Sink>>, src: &Buffer, cursor: Option<(u16, u16)>) {
-        term.draw(|frame| {
-            let area = frame.area();
-            // The production mapping, not a copy of it — see `client::blit_view`.
-            crate::client::blit_view(src, frame.buffer_mut());
-            if let Some((cx, cy)) = cursor
-                && cx < area.width
-                && cy < area.height
-            {
-                frame.set_cursor_position(Position::new(cx, cy));
-            }
-        })
-        .expect("draw");
+    fn blit(
+        term: &mut Terminal<CrosstermBackend<Sink>>,
+        prev: Option<&Buffer>,
+        src: &Buffer,
+        area: RRect,
+        cursor: Option<(u16, u16)>,
+    ) -> Buffer {
+        let mut next = Buffer::empty(area);
+        crate::client::blit_view(src, &mut next);
+        crate::client::emit_view(term, prev, &next, cursor).expect("emit");
+        next
     }
 
     /// GROUND TRUTH: what a terminal shows when `buf` is painted onto it from scratch.
@@ -9051,7 +9049,7 @@ mod app_render_fidelity {
         let (mut t, mut p) = ref_term(cols, rows);
         let (sink, mut term) = sink_terminal(cols, rows);
         term.clear().expect("clear");
-        blit(&mut term, buf, None);
+        blit(&mut term, None, buf, RRect::new(0, 0, cols, rows), None);
         let bytes = std::mem::take(&mut *sink.0.borrow_mut());
         p.advance(&mut t, &bytes);
         snapshot_grid(&t)
@@ -9071,6 +9069,9 @@ mod app_render_fidelity {
         server_last: Buffer,
         /// The client's mirror of the screen.
         client: Buffer,
+        /// What the client believes is ON the terminal — its emit baseline, exactly as
+        /// `run_attached` keeps it now that the second diff is gone.
+        painted: Buffer,
         first: bool,
     }
 
@@ -9087,6 +9088,7 @@ mod app_render_fidelity {
                 ref_p,
                 server_last: Buffer::empty(area),
                 client: Buffer::empty(area),
+                painted: Buffer::empty(area),
                 first: true,
             }
         }
@@ -9121,9 +9123,11 @@ mod app_render_fidelity {
             crate::client::fix_wide_spacers(&mut self.client);
             if full {
                 self.cterm.clear().expect("clear");
+                self.painted = Buffer::empty(self.area);
             }
             let src = self.client.clone();
-            blit(&mut self.cterm, &src, cursor);
+            let prev = (!full).then(|| self.painted.clone());
+            self.painted = blit(&mut self.cterm, prev.as_ref(), &src, self.area, cursor);
             let bytes = std::mem::take(&mut *self.sink.0.borrow_mut());
             self.ref_p.advance(&mut self.ref_t, &bytes);
             self.first = false;

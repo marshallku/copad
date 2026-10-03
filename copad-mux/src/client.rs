@@ -54,6 +54,41 @@ pub(crate) fn fix_wide_spacers(buf: &mut ratatui::buffer::Buffer) {
     }
 }
 
+/// A blank carrying `c`'s colours — used to erase a cell before writing a glyph that might not
+/// fit it. Keeps fg/bg/attributes so erasing does not flash the default background through a
+/// coloured region.
+fn blank_like(c: &Cell) -> Cell {
+    let mut b = Cell::EMPTY;
+    b.set_symbol(" ");
+    b.fg = c.fg;
+    b.bg = c.bg;
+    b.modifier = c.modifier;
+    b
+}
+
+/// Must this frame state the cursor's visibility, given what we last set it to (`None` = we have
+/// never set it) and what it should be?
+///
+/// Only on a change — except that "never set" counts as a change, because the alternate screen
+/// INHERITS whatever visibility the shell left behind. Treating unknown as shown is how a cursor
+/// hidden before comux started stays hidden for the whole session.
+fn cursor_visibility_needs_stating(shown: Option<bool>, want: bool) -> bool {
+    shown != Some(want)
+}
+
+/// Must the paint baseline be thrown away this frame?
+///
+/// `painted` is only a useful diff baseline while it describes what is actually ON the terminal.
+/// Three things invalidate it, and the middle one is easy to miss: a `full` frame clears the
+/// screen; a RESIZE clears it too (`Terminal::resize` does), even when the size ends up back
+/// where it started — a queued burst of resize events can read A -> B -> A within one input
+/// drain, and comparing the final size against `painted.area` sees no change while the screen
+/// has been blanked; and a view of a different size obviously cannot be compared cell for cell.
+/// Miss any of them and the next delta skips cells the terminal no longer has.
+fn baseline_is_stale(cleared: bool, resized: bool, painted: RRect, view: RRect) -> bool {
+    cleared || resized || painted != view
+}
+
 /// Map the server's frame onto a viewport-sized ratatui buffer: the frame's cells at the
 /// top-left, blanks in the letterbox margin, and a blank in place of any glyph that would spill
 /// past the right edge.
@@ -111,17 +146,55 @@ pub(crate) fn blit_view(src: &Buffer, out: &mut Buffer) {
 /// of a wide glyph, already covered by printing the leading cell, and printing over one splits
 /// the glyph. ratatui's cached buffers are deliberately untouched — the content did not change,
 /// so its belief stays accurate and the next delta is still correct.
+/// Blit a server frame into `view` and emit every cell of it — what the paint path does when it
+/// has no trustworthy baseline (after a clear, or for the self-heal repaint).
+///
+/// Production reaches this by passing `None` to [`emit_view`] directly; this is the composition
+/// of the two production functions, kept for the tests and the render-fidelity harness so they
+/// exercise the real `blit_view` + `emit_view` rather than a restatement of them. Both prior
+/// harness bugs in this area came from modelling the client instead of calling it.
+#[cfg(test)]
 pub(crate) fn repaint_all<W: Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
     src: &Buffer,
     view: (u16, u16),
     cursor: Option<(u16, u16)>,
 ) -> io::Result<()> {
-    // Re-emit the VIEWPORT, built by the same `blit_view` the draw path uses — so a repaint can
-    // never paint something the draw would not have.
     let (vw, vh) = view;
     let mut frame = Buffer::empty(RRect::new(0, 0, vw, vh));
     blit_view(src, &mut frame);
+    emit_view(terminal, None, &frame, cursor)
+}
+
+/// Emit `cur` to the terminal — every cell when `prev` is `None` (the silent full repaint), or
+/// just the cells that differ from `prev` (an ordinary frame).
+///
+/// This is the client's whole paint path, replacing `Terminal::draw`. comux used to stack TWO
+/// incremental diffs: the server shipped `c.last.diff(&composed)`, and the client applied that to
+/// its mirror and then let ratatui diff AGAIN to decide what to write. Collapsing them was
+/// deferred in decisions #124 until a divergence showed up. One did, and it is visible: the two
+/// paths POSITION cells differently.
+///
+/// `CrosstermBackend::draw` omits the `MoveTo` between cells it believes are adjacent, so a run
+/// is placed by the terminal's own cursor advance — it trusts the terminal to have measured every
+/// glyph exactly as `unicode-width` did. The repaint has to re-anchor (one Nerd Font icon would
+/// otherwise skew a whole row, and the repaint would re-apply that skew on every tick). While the
+/// incremental path did not, the two disagreed about where the same text goes — so output landed
+/// in one place and the next repaint SNAPPED it somewhere else. Text appearing and then jumping
+/// sideways is not a cosmetic artefact of the self-heal; it is two renderers arguing.
+///
+/// Now there is one renderer. Diffing here also drops ratatui's `Buffer::diff`, whose wide-glyph
+/// suppression runs over a FLAT buffer and therefore leaks across row and pane boundaries in a
+/// composed screen — the hazard `term.rs::snapshot_grid`'s spacer invariant had to work around.
+/// This diff is per-cell and row-bounded, and it ships a wide glyph's leading cell (which covers
+/// both columns) while never printing over a spacer.
+pub(crate) fn emit_view<W: Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    prev: Option<&Buffer>,
+    cur: &Buffer,
+    cursor: Option<(u16, u16)>,
+) -> io::Result<()> {
+    let (vw, vh) = (cur.area.width, cur.area.height);
     // Emit in SEGMENTS, cutting after any cell whose glyph is not plain ASCII.
     //
     // `CrosstermBackend::draw` omits the `MoveTo` between cells it believes are adjacent, so a run
@@ -142,31 +215,70 @@ pub(crate) fn repaint_all<W: Write>(
     // Starting a new `draw` call resets its cursor tracking, so each segment opens with a
     // `MoveTo` — the damage is bounded to the one cell, and the next repaint CORRECTS the drift
     // instead of entrenching it. ASCII needs no anchor; every terminal agrees it is one column.
-    let mut segments: Vec<Vec<(u16, u16, &Cell)>> = Vec::new();
-    let mut seg: Vec<(u16, u16, &Cell)> = Vec::new();
+    // Owned cells, because the last-column guard below has to emit a blank that exists in no
+    // buffer. One small clone per EMITTED cell; a delta emits few, and the full repaint that
+    // emits many already allocates its frame.
+    let mut segments: Vec<Vec<(u16, u16, Cell)>> = Vec::new();
+    let mut seg: Vec<(u16, u16, Cell)> = Vec::new();
     for y in 0..vh {
+        // Set after emitting a glyph that could occupy MORE columns than we think, so the next
+        // cell we would otherwise have skipped is repainted. Scoped to the row because the client
+        // runs with autowrap OFF (see `TermGuard::enter`): an overflow at the last column is
+        // clamped, not wrapped into the next row, so the damage stays inside its row.
+        let mut repair_next = false;
         for x in 0..vw {
-            let Some(c) = frame.cell(Position::new(x, y)) else {
+            let Some(c) = cur.cell(Position::new(x, y)) else {
                 continue;
             };
+            // Never print over a wide glyph's trailing half — the glyph before it already covers
+            // that column. (Skipping it also means `repair_next` survives to the first column we
+            // believe the glyph does NOT cover, which is the one that can have been clobbered.)
             if c.skip {
                 continue;
             }
+            // An unchanged cell is not re-sent on an ordinary frame. `prev` is what we believe is
+            // ON THE TERMINAL, not what the server believes we hold, so this cannot inherit the
+            // server's baseline drifting away from reality.
+            let unchanged = prev.is_some_and(|p| p.cell(Position::new(x, y)) == Some(c));
+            if unchanged && !repair_next {
+                continue;
+            }
+            repair_next = false;
             let plain_ascii = c.symbol().len() == 1 && c.symbol().is_ascii();
-            seg.push((x, y, c));
+            // The LAST column cannot be repaired after the fact. With autowrap off a terminal
+            // that measures this glyph as two columns does not clamp it — it declines to write
+            // it at all (alacritty's `Handler::input` returns early), so whatever was there
+            // stays. `painted` would then record the glyph we never managed to draw and skip the
+            // cell forever, and a repaint could not remove it either. Erasing first makes the
+            // outcome independent of what was on screen: either the glyph lands, or the column
+            // is blank — the same thing a fresh paint would show, which is the property this
+            // whole emitter exists to guarantee.
+            if !plain_ascii && x + 1 == vw {
+                segments.push(vec![(x, y, blank_like(c))]);
+            }
+            seg.push((x, y, c.clone()));
             if !plain_ascii {
+                // Cut the run, so the NEXT cell is addressed with a `MoveTo` instead of being
+                // placed by the terminal's own cursor advance...
                 segments.push(std::mem::take(&mut seg));
+                // ...and repaint that cell even if it did not change. Anchoring only fixes where
+                // the next emitted cell GOES; it does not undo what this glyph overwrote getting
+                // there. A one-column cell that becomes a Nerd Font icon the outer terminal draws
+                // two columns wide clobbers its neighbour, and if the neighbour is unchanged the
+                // delta would leave it clobbered until the next self-heal repaint restored it —
+                // which is precisely the "text lands, then jumps" the single emitter exists to
+                // remove. Repainting it here keeps the delta and the repaint showing the same
+                // screen.
+                repair_next = true;
             }
         }
-        // A row boundary is already a re-anchor (`draw` emits `MoveTo` when the position is not
-        // the next column of the same row), so rows need no cut of their own.
     }
     if !seg.is_empty() {
         segments.push(seg);
     }
     let backend = terminal.backend_mut();
-    for seg in segments {
-        backend.draw(seg.into_iter())?;
+    for seg in &segments {
+        backend.draw(seg.iter().map(|(x, y, c)| (*x, *y, c)))?;
     }
     // `Backend::draw` leaves the cursor wherever it printed last; put it back where the frame
     // wants it or the next keystroke echoes in the wrong place. Clamped to the viewport for the
@@ -280,6 +392,18 @@ impl TermGuard {
         // (e.g. after the display woke from sleep) — the sanctioned recovery for a stale OS
         // winsize. Harmless on terminals that ignore it.
         execute!(io::stdout(), EnterAlternateScreen, EnableFocusChange)?;
+        // Autowrap OFF (DECAWM, `ESC [ ? 7 l`) for the life of the alt screen.
+        //
+        // comux positions every cell itself and never relies on the terminal wrapping for it, so
+        // wrapping can only do damage. A glyph the outer terminal draws WIDER than we measured it
+        // — a Nerd Font icon in a prompt is the everyday case — would otherwise overflow the last
+        // column, and a wrapping terminal moves the WHOLE glyph to the next row, clobbering two
+        // cells there; in the bottom-right corner it scrolls the entire screen, which no amount
+        // of repainting cells can undo. With wrapping off the terminal clamps instead, so the
+        // worst a mismeasured glyph can do is cover its own row's neighbour — which `emit_view`
+        // repairs. Restored on the way out.
+        write!(io::stdout(), "\u{1b}[?7l")?;
+        io::stdout().flush()?;
         Ok(Self { mouse: false })
     }
 
@@ -301,6 +425,7 @@ impl Drop for TermGuard {
         if self.mouse {
             let _ = execute!(io::stdout(), DisableMouseCapture);
         }
+        let _ = write!(io::stdout(), "\u{1b}[?7h"); // restore autowrap (see `enter`)
         let _ = execute!(io::stdout(), DisableFocusChange, LeaveAlternateScreen);
     }
 }
@@ -459,6 +584,7 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
+        let _ = write!(io::stdout(), "\u{1b}[?7h"); // restore autowrap (see `TermGuard::enter`)
         let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
         default_hook(info);
     }));
@@ -598,6 +724,20 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
     // Set by the server's periodic `FrameMsg::repaint` (`reconcile_secs`) and by the
     // client-local timer below.
     let mut force_repaint = false;
+    // Our own record of what the terminal is showing — the single diff baseline now that the
+    // client no longer paints through `Terminal::draw` (see `emit_view`).
+    let mut painted = Buffer::empty(RRect::new(0, 0, 1, 1));
+    // Whether the cursor is currently shown, so show/hide is emitted on the edge only.
+    //
+    // `None` = UNKNOWN, which is the honest starting state and not an implementation detail:
+    // entering the alternate screen does not reset cursor visibility, so a shell that hid it
+    // (`printf '\033[?25l'; comux`) hands us an invisible cursor. Assuming "shown" there means
+    // the first frame matches, nothing is emitted, and the cursor never comes back — a
+    // regression against `Terminal::draw`, which asserted visibility on every frame that had a
+    // cursor. Unknown forces the first frame to state it either way.
+    let mut cursor_shown: Option<bool> = None;
+    // A resize has cleared the screen since the last paint (see `baseline_is_stale`).
+    let mut resized = false;
     // Client-local silent-repaint period, DEFAULT OFF — additive to the cadence the server
     // drives, so a client whose OUTER emulator drifts faster than the rest can heal itself
     // without changing `reconcile_secs` for every attached client.
@@ -733,6 +873,9 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
         // Drive ratatui + the server ONCE for whatever moved the size this iteration.
         if size_changed {
             apply_size(&mut terminal, &mut wr, cols, rows);
+            // `Terminal::resize` clears the screen, so the paint baseline is gone — whether or
+            // not the size ended up different from the one it already had.
+            resized = true;
             need_redraw = true;
         }
 
@@ -804,22 +947,36 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                 terminal.clear()?;
                 force_clear = false;
             }
-            let src = buf.clone();
-            let cur = cursor;
-            terminal.draw(|frame| {
-                let area = frame.area();
-                blit_view(&src, frame.buffer_mut());
-                if let Some((cx, cy)) = cur
-                    && cx < area.width
-                    && cy < area.height
-                {
-                    frame.set_cursor_position(Position::new(cx, cy));
+            // What we believe is ON THE TERMINAL. Reset wherever the screen was blanked under
+            // us — a `full` frame's clear, and a resize (`Terminal::resize` clears too) — so the
+            // next emit repaints from a baseline that matches reality rather than one that
+            // merely matches the last frame.
+            let view = RRect::new(0, 0, cols, rows);
+            if baseline_is_stale(cleared, resized, painted.area, view) {
+                painted = Buffer::empty(view);
+            }
+            resized = false;
+            let mut next = Buffer::empty(painted.area);
+            blit_view(&buf, &mut next);
+            // One renderer: every cell after a clear or a self-heal repaint, otherwise just what
+            // changed — through the SAME emitter either way, so the two can never disagree about
+            // where a glyph goes. Showing the cursor only when the frame has one mirrors what
+            // `Terminal::draw` did.
+            let baseline = if cleared || force_repaint {
+                None
+            } else {
+                Some(&painted)
+            };
+            emit_view(&mut terminal, baseline, &next, cursor)?;
+            painted = next;
+            let want_cursor = cursor.is_some_and(|(cx, cy)| cx < cols && cy < rows);
+            if cursor_visibility_needs_stating(cursor_shown, want_cursor) {
+                if want_cursor {
+                    terminal.show_cursor()?;
+                } else {
+                    terminal.hide_cursor()?;
                 }
-            })?;
-            // Self-heal: re-emit every cell over what is already there. Redundant behind a
-            // clear+draw, which just painted the whole screen from an empty baseline.
-            if force_repaint && !cleared {
-                repaint_all(&mut terminal, &src, (cols, rows), cur)?;
+                cursor_shown = Some(want_cursor);
             }
             if force_repaint || cleared {
                 last_repaint = Instant::now();
@@ -832,7 +989,7 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachOpts, PROBE_CORNER, PROBE_MAX, base64, connect_only, io, repaint_all,
+        AttachOpts, PROBE_CORNER, PROBE_MAX, base64, connect_only, emit_view, io, repaint_all,
         size_from_clamped_cursor,
     };
     use ratatui::backend::CrosstermBackend;
@@ -854,6 +1011,236 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_delta_repaints_the_neighbour_an_over_wide_glyph_can_clobber() {
+        // Anchoring fixes where the NEXT emitted cell goes; it does not undo what the glyph
+        // overwrote getting there. A one-column cell that becomes a Nerd Font icon the outer
+        // terminal draws two columns wide clobbers its neighbour — and if that neighbour did not
+        // change, a pure diff leaves it clobbered until the next self-heal repaint restores it.
+        // That restore IS the "text lands, then jumps" this emitter exists to remove, so the
+        // delta has to repaint the neighbour itself.
+        let area = Rect::new(0, 0, 5, 1);
+        let mut prev = Buffer::empty(area);
+        prev.set_string(0, 0, "aXbcd", Style::default());
+        let mut cur = Buffer::empty(area);
+        cur.set_string(0, 0, "a\u{e0b0}bcd", Style::default()); // only column 1 changed
+
+        let sink = Sink(Rc::new(RefCell::new(Vec::new())));
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(sink.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .expect("terminal");
+        emit_view(&mut term, Some(&prev), &cur, None).expect("emit");
+        let out = String::from_utf8(sink.0.borrow().clone()).expect("utf8");
+
+        assert!(
+            out.contains('\u{e0b0}'),
+            "the changed cell is emitted: {out:?}"
+        );
+        assert!(
+            out.contains("\u{1b}[1;3Hb"),
+            "the unchanged neighbour is repainted, anchored, because the icon may have covered              its column: {out:?}"
+        );
+        // Only the neighbour, though — the rest of the unchanged row is left alone.
+        assert!(
+            !out.contains('c') && !out.contains('d'),
+            "a delta must not turn into a full repaint: {out:?}"
+        );
+    }
+
+    #[test]
+    fn the_last_column_is_erased_before_a_glyph_that_might_not_fit_it() {
+        // The one cell with no neighbour to repair. With autowrap off, a terminal that measures
+        // this glyph as two columns declines to write it at all rather than clamping — so the
+        // previous contents would survive, `painted` would record the glyph we never drew, and
+        // neither a later delta nor a repaint would ever touch the cell again. Erasing first
+        // makes the result the same whatever was there before.
+        let area = Rect::new(0, 0, 3, 1);
+        let mut prev = Buffer::empty(area);
+        prev.set_string(0, 0, "abX", Style::default());
+        let mut cur = Buffer::empty(area);
+        cur.set_string(0, 0, "ab\u{e0b0}", Style::default()); // only the last column changed
+
+        let sink = Sink(Rc::new(RefCell::new(Vec::new())));
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(sink.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .expect("terminal");
+        emit_view(&mut term, Some(&prev), &cur, None).expect("emit");
+        let out = String::from_utf8(sink.0.borrow().clone()).expect("utf8");
+
+        let erase = out
+            .find("\u{1b}[1;3H ")
+            .unwrap_or_else(|| panic!("last column erased first: {out:?}"));
+        let glyph = out.find('\u{e0b0}').expect("the glyph is still emitted");
+        assert!(erase < glyph, "the erase comes BEFORE the glyph: {out:?}");
+        // A mid-row glyph needs no erase — it has a neighbour that gets repaired instead.
+        let mut mid = Buffer::empty(area);
+        mid.set_string(0, 0, "a\u{e0b0}X", Style::default());
+        let sink2 = Sink(Rc::new(RefCell::new(Vec::new())));
+        let mut term2 = Terminal::with_options(
+            CrosstermBackend::new(sink2.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .expect("terminal");
+        emit_view(&mut term2, Some(&prev), &mid, None).expect("emit");
+        let out2 = String::from_utf8(sink2.0.borrow().clone()).expect("utf8");
+        assert!(
+            !out2.contains("\u{1b}[1;2H "),
+            "a mid-row glyph is not preceded by an erase: {out2:?}"
+        );
+    }
+
+    #[test]
+    fn a_repair_never_crosses_a_row_boundary() {
+        // With autowrap off (see `TermGuard::enter`) a glyph that overflows the last column is
+        // clamped, not wrapped — so the damage stays inside its row and the first cell of the
+        // NEXT row needs no repair. Carrying the repair across the boundary would repaint a cell
+        // on every row for nothing, and would also be a half-measure for a hazard that is
+        // prevented rather than mitigated: a wrapping terminal moves the WHOLE glyph down, which
+        // costs two cells, and in the bottom-right corner scrolls the screen.
+        let area = Rect::new(0, 0, 3, 2);
+        let mut prev = Buffer::empty(area);
+        prev.set_string(0, 0, "abX", Style::default());
+        prev.set_string(0, 1, "cde", Style::default());
+        let mut cur = Buffer::empty(area);
+        cur.set_string(0, 0, "ab\u{e0b0}", Style::default()); // only the LAST cell of row 0 changed
+        cur.set_string(0, 1, "cde", Style::default()); // row 1 untouched
+
+        let sink = Sink(Rc::new(RefCell::new(Vec::new())));
+        let mut term = Terminal::with_options(
+            CrosstermBackend::new(sink.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .expect("terminal");
+        emit_view(&mut term, Some(&prev), &cur, None).expect("emit");
+        let out = String::from_utf8(sink.0.borrow().clone()).expect("utf8");
+
+        assert!(
+            out.contains('\u{e0b0}'),
+            "the changed cell is emitted: {out:?}"
+        );
+        assert!(
+            !out.contains('c'),
+            "the next row's first cell is not dragged into the delta: {out:?}"
+        );
+    }
+
+    #[test]
+    fn the_first_frame_states_the_cursor_even_if_it_already_looks_right() {
+        use super::cursor_visibility_needs_stating;
+        // Entering the alternate screen does not reset cursor visibility, so `printf
+        // '\033[?25l'; comux` hands us an invisible one. "Never set" therefore cannot be
+        // optimised away as "already correct" — that is how the cursor stays gone all session.
+        assert!(cursor_visibility_needs_stating(None, true));
+        assert!(cursor_visibility_needs_stating(None, false));
+        // Afterwards it is edge-triggered, so an idle screen does not re-emit it every frame.
+        assert!(!cursor_visibility_needs_stating(Some(true), true));
+        assert!(!cursor_visibility_needs_stating(Some(false), false));
+        assert!(cursor_visibility_needs_stating(Some(false), true));
+        assert!(cursor_visibility_needs_stating(Some(true), false));
+    }
+
+    #[test]
+    fn the_paint_baseline_is_thrown_away_whenever_the_screen_was_blanked() {
+        use super::baseline_is_stale;
+        let view = Rect::new(0, 0, 80, 24);
+        // Steady state: keep the baseline, or every frame becomes a full repaint.
+        assert!(!baseline_is_stale(false, false, view, view));
+        // A `full` frame cleared the screen.
+        assert!(baseline_is_stale(true, false, view, view));
+        // A different view size cannot be compared cell for cell.
+        assert!(baseline_is_stale(
+            false,
+            false,
+            Rect::new(0, 0, 80, 23),
+            view
+        ));
+        // THE easy one to miss: a queued burst of resize events can read A -> B -> A inside one
+        // input drain. The size ends up unchanged, so an area comparison sees nothing — but
+        // `Terminal::resize` ran and blanked the screen, so the baseline is a lie.
+        assert!(
+            baseline_is_stale(false, true, view, view),
+            "a same-size resize still clears the screen"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_frame_anchors_exactly_like_a_repaint_does() {
+        // This is the property whose absence the owner could SEE: `ls` output landing in one
+        // place and then jumping sideways a moment later.
+        //
+        // The incremental path used to paint through `Terminal::draw` — one unanchored run per
+        // row — while the self-heal repaint re-anchored after every non-ASCII glyph (it has to,
+        // or one Nerd Font icon skews a whole row on every tick). Two renderers that position
+        // the same text differently produce exactly that jump. There is one emitter now, so the
+        // anchoring is identical whether a frame is a delta or a full repaint.
+        let area = Rect::new(0, 0, 6, 1);
+        let prev = Buffer::empty(area);
+        let mut cur = Buffer::empty(area);
+        // Fills the row exactly, so every cell differs from the empty baseline — otherwise the
+        // delta legitimately omits the trailing blank and the two cannot be compared byte for
+        // byte.
+        cur.set_string(0, 0, "ab\u{e0b0}cde", Style::default());
+
+        let emit = |baseline: Option<&Buffer>| {
+            let sink = Sink(Rc::new(RefCell::new(Vec::new())));
+            let mut term = Terminal::with_options(
+                CrosstermBackend::new(sink.clone()),
+                TerminalOptions {
+                    viewport: Viewport::Fixed(area),
+                },
+            )
+            .expect("terminal");
+            emit_view(&mut term, baseline, &cur, None).expect("emit");
+            String::from_utf8(sink.0.borrow().clone()).expect("utf8")
+        };
+
+        let delta = emit(Some(&prev));
+        let repaint = emit(None);
+        // Same anchors either way — the cell after the icon is addressed explicitly in BOTH.
+        for (what, out) in [("delta", &delta), ("repaint", &repaint)] {
+            assert!(
+                out.contains("\u{1b}[1;4H"),
+                "{what} must re-anchor after a non-ASCII glyph: {out:?}"
+            );
+        }
+        // Here every cell changed, so the two agree byte for byte. That equality is the point:
+        // it is what guarantees nothing moves when the repaint lands on top of a delta.
+        assert_eq!(
+            delta, repaint,
+            "a delta covering every cell must paint them exactly as a repaint would"
+        );
+
+        // And it really is a diff — an unchanged cell is not re-sent.
+        let quiet = {
+            let sink = Sink(Rc::new(RefCell::new(Vec::new())));
+            let mut term = Terminal::with_options(
+                CrosstermBackend::new(sink.clone()),
+                TerminalOptions {
+                    viewport: Viewport::Fixed(area),
+                },
+            )
+            .expect("terminal");
+            emit_view(&mut term, Some(&cur), &cur, None).expect("emit");
+            String::from_utf8(sink.0.borrow().clone()).expect("utf8")
+        };
+        assert!(
+            !quiet.contains('a') && !quiet.contains('\u{e0b0}'),
+            "an unchanged screen emits no cells: {quiet:?}"
+        );
     }
 
     #[test]
