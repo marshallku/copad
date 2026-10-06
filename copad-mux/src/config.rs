@@ -43,10 +43,19 @@ pub const DEFAULT_RECONCILE_SECS: u32 = 3;
 /// the whole viewport.
 const MIN_CONTENT_COLS: u16 = 20;
 
-/// The default `restore_processes` whitelist: the built-in AI-agent basenames.
+/// Non-agent programs re-run on restore by default — tmux-resurrect's default list. Each is
+/// safe to re-execute from its argv: editors, pagers and monitors only read, and an editor
+/// re-opened on a file with unsaved changes offers its own swap-file recovery.
+const RESTORE_PROGRAMS: &[&str] = &[
+    "vi", "vim", "nvim", "emacs", "man", "less", "more", "tail", "top", "htop", "irssi", "weechat",
+    "mutt",
+];
+
+/// The default `restore_processes` whitelist: the built-in AI agents plus [`RESTORE_PROGRAMS`].
 fn default_restore_processes() -> Vec<String> {
     crate::procinfo::agent_basenames()
         .iter()
+        .chain(RESTORE_PROGRAMS)
         .map(|s| s.to_string())
         .collect()
 }
@@ -735,7 +744,8 @@ pub struct MuxConfig {
     /// Periodic autosave interval in seconds; `0` disables periodic saves.
     pub autosave_secs: u32,
     /// Process basenames whose running command is saved and RE-RUN on restore (tmux
-    /// -resurrect's process whitelist). Default = the built-in AI agents; an empty list
+    /// -resurrect's process whitelist). Default = the built-in AI agents + resurrect's
+    /// editors/pagers/monitors (`vim`, `nvim`, `less`, `htop`, …); an empty list
     /// disables program re-execution (panes restore as bare shells).
     pub restore_processes: Vec<String>,
     /// When re-running a restored agent (`restore_processes`), resume its live conversation
@@ -1777,6 +1787,13 @@ mod tests {
         assert_eq!(cfg.autosave_secs, DEFAULT_AUTOSAVE_SECS);
         // restore_processes defaults to the built-in agents (claude et al.).
         assert!(cfg.restore_processes.iter().any(|p| p == "claude"));
+        // ...plus tmux-resurrect's editors/pagers, but nothing with side effects.
+        assert!(cfg.restore_processes.iter().any(|p| p == "nvim"));
+        assert!(
+            !cfg.restore_processes
+                .iter()
+                .any(|p| p == "cargo" || p == "zsh")
+        );
         // Resuming the live agent conversation on restore is on by default.
         assert!(cfg.restore_agent_sessions);
         assert!(

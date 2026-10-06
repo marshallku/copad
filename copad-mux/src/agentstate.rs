@@ -471,12 +471,15 @@ fn newest_rollout(open: Vec<std::path::PathBuf>) -> Option<Option<std::path::Pat
     Some(best.map(|(_, p)| p))
 }
 
-/// Read Codex's live conversation id from the rollout file the process holds open. `None` if
-/// no rollout is open OR it could not be observed — the caller (restore) treats both as
-/// "fresh start", which is the safe answer for either.
+/// Read Codex's live conversation id from the rollout file the process holds open, else — a
+/// TUI attached to the shared app-server daemon holds none — from the daemon's (see
+/// [`crate::codexdaemon`]). `None` if neither resolves — the caller (restore) treats that as
+/// "fresh start", which is the safe answer.
 pub fn codex_session_id(pid: u32) -> Option<String> {
-    let path = codex_rollout_path(pid).flatten()?;
-    rollout_session_id(&path)
+    codex_rollout_path(pid)
+        .flatten()
+        .and_then(|path| rollout_session_id(&path))
+        .or_else(|| crate::codexdaemon::session_id(pid))
 }
 
 /// Extract the UUID from a Codex rollout path `…/sessions/…/rollout-<ts>-<uuid>.jsonl`. The

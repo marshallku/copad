@@ -14,6 +14,7 @@ pub mod agentpoll;
 pub mod agentsessions;
 pub mod agentstate;
 pub mod client;
+pub mod codexdaemon;
 pub mod config;
 pub mod control;
 pub mod copadlink;

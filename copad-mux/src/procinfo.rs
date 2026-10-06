@@ -61,6 +61,64 @@ pub fn process_cwd(_pid: u32) -> Option<PathBuf> {
     None
 }
 
+/// When `pid` started (macOS `PROC_PIDTBSDINFO`, Linux `/proc/<pid>/stat` field 22 + the
+/// boot time). Also serves as a pid's incarnation stamp: a recycled pid has a different one.
+#[cfg(target_os = "macos")]
+pub fn process_start_time(pid: u32) -> Option<std::time::SystemTime> {
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    // SAFETY: `info` is a zeroed, correctly-sized out-param for this flavor.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if read != size {
+        return None;
+    }
+    Some(
+        std::time::UNIX_EPOCH
+            + std::time::Duration::new(info.pbi_start_tvsec, info.pbi_start_tvusec as u32 * 1000),
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub fn process_start_time(pid: u32) -> Option<std::time::SystemTime> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // `comm` (field 2) is parenthesised and may contain spaces, so count from the LAST `)`:
+    // field 3 is the first one after it, which puts `starttime` (22) at index 19.
+    let ticks: u64 = stat
+        .rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()?;
+    let boot: u64 = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("btime "))?
+        .trim()
+        .parse()
+        .ok()?;
+    // SAFETY: sysconf has no preconditions.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if hz <= 0 {
+        return None;
+    }
+    let since_boot = std::time::Duration::from_millis(ticks * 1000 / hz as u64);
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(boot) + since_boot)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_start_time(_pid: u32) -> Option<std::time::SystemTime> {
+    None
+}
+
 /// The argv (structural, NOT space-joined) of `pid`, for restoring a whitelisted program
 /// (agent) on session restore. Structural so argument boundaries + quoting survive
 /// (`claude "a; b"` stays ONE arg, re-quoted on restore — never re-split into two shell
@@ -505,6 +563,15 @@ impl ProcTree {
     /// This pid's `(ppid, comm-basename)`, or `None` when it is not in the snapshot.
     /// The primitive behind the window-raise ancestor walk (`winfocus`), kept here so
     /// `ProcRec` stays private.
+    /// Every pid whose comm basename satisfies `pred`.
+    pub fn pids_where(&self, pred: impl Fn(&str) -> bool) -> Vec<u32> {
+        self.procs
+            .iter()
+            .filter(|(_, r)| pred(&r.comm))
+            .map(|(&pid, _)| pid)
+            .collect()
+    }
+
     pub fn parent_of(&self, pid: u32) -> Option<(u32, String)> {
         self.procs.get(&pid).map(|r| (r.ppid, r.comm.clone()))
     }

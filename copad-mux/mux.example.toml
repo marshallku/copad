@@ -95,7 +95,7 @@ update_check = true       # check GitHub releases in the background and show a
 # ---- session persistence (tmux-resurrect / continuum style) ----
 # The layout (sessions, tabs, splits, per-pane cwd) is autosaved and restored when the
 # server next starts, so a reboot/crash brings your workspace back. Shells restart fresh
-# in their saved directory (running programs are NOT re-launched).
+# in their saved directory; only the `restore_processes` programs below are re-launched.
 persist = true            # restore the saved layout on server start (delete the state
                           #   file, or set false, for a fresh start)
 autosave_secs = 15        # periodic save interval; 0 disables (clamped to 5..3600)
@@ -103,14 +103,19 @@ autosave_secs = 15        # periodic save interval; 0 disables (clamped to 5..36
 # Re-run these programs on restore (by their command basename), tmux-resurrect style: if a
 # pane's foreground command matches, its full command line is saved and re-run in the fresh
 # shell. Default = the built-in AI agents (claude, codex, aider, cursor, gemini, opencode,
-# droid, copilot, qwen, crush). Set [] to restore bare shells only; add your own (e.g.
-# "nvim") to extend. (Restored panes start at the scrollback bottom — history isn't saved.)
-# restore_processes = ["claude", "codex", "nvim"]
+# droid, copilot, qwen, crush) plus tmux-resurrect's defaults (vi, vim, nvim, emacs, man,
+# less, more, tail, top, htop, irssi, weechat, mutt). Setting the list REPLACES the default;
+# [] restores bare shells only. (Restored panes start at the scrollback bottom — history isn't
+# saved.)
+# restore_processes = ["claude", "codex", "nvim", "less"]
 # When re-running a restored agent, RESUME its live conversation rather than starting fresh:
 # claude → `claude --resume <id>`, codex → `codex resume <id>`, using the session the process
 # was actually in (Claude's session id comes from ~/.claude/sessions/<pid>.json; Codex's from
 # the rollout file it holds open). Safe runtime flags (e.g. --dangerously-skip-permissions,
-# --model) carry over; the prompt and one-shot `-p` runs don't. Set false to always restart clean.
+# --model) carry over; the prompt and one-shot `-p` runs don't. A Codex TUI attached to the
+# shared app-server daemon (the default since 0.160) is matched to the daemon-held conversation
+# by cwd + activity since launch; two such TUIs in one directory that can't be told apart
+# restart fresh. Set false to always restart clean.
 restore_agent_sessions = true
 
 # ---- environment refresh (tmux `update-environment`) ----

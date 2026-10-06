@@ -112,7 +112,7 @@ const MAX_VISITS: usize = 200_000;
 const CLAUDE_HEADLESS: &[&str] = &["sdk-cli", "sdk-ts", "sdk-py", "print"];
 /// Non-interactive Codex `originator` values: `codex_exec` is `codex exec`, and
 /// `Claude Code` is Codex driven by a Claude Code integration.
-const CODEX_HEADLESS: &[&str] = &["codex_exec", "Claude Code"];
+pub(crate) const CODEX_HEADLESS: &[&str] = &["codex_exec", "Claude Code"];
 
 /// The handle the picker reads. `None` = no scan has completed yet ("scanning…").
 pub type Shared = Arc<Mutex<Option<Scan>>>;
