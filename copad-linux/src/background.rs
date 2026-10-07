@@ -642,10 +642,24 @@ impl BackgroundLayer {
     /// separate layer painted on top with its own `background.opacity`, so the
     /// base stays put underneath it. Re-run when `window_opacity` or the theme
     /// color changes.
+    ///
+    /// GTK 4.24 attaches an `ext_background_effect_v1` object to every toplevel
+    /// and, without a blur region, that tells the compositor "no blur" — so
+    /// Hyprland's `decoration:blur` stops applying. A window `backdrop-filter`
+    /// makes GTK send the region; GTK only offloads radii >= 10px (below that it
+    /// sends nothing), and the protocol carries no radius, so the strength still
+    /// comes from the compositor.
     fn refresh_window_backdrop(&self) {
+        let opacity = self.window_opacity.get();
+        let backdrop_filter = if opacity < 1.0 && gtk4::minor_version() >= 24 {
+            " backdrop-filter: blur(10px);"
+        } else {
+            ""
+        };
         self.window_css.load_from_string(&format!(
-            "window {{ background-color: {}; }}",
-            rgba_css(&self.theme_bg.borrow(), self.window_opacity.get())
+            "window {{ background-color: {};{} }}",
+            rgba_css(&self.theme_bg.borrow(), opacity),
+            backdrop_filter,
         ));
     }
 
