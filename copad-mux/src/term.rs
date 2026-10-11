@@ -1269,8 +1269,110 @@ mod render_repro {
             .collect()
     }
 
+    /// Rewrite an emitted byte stream so the reference terminal measures one glyph DIFFERENTLY
+    /// than the emitter did: every `U+E0B0` (a Powerline separator — Private Use Area, one column
+    /// by `unicode-width`) becomes `가`, which every terminal agrees is two.
+    ///
+    /// This models the one failure comux cannot see from the inside. A Nerd Font icon's width
+    /// lives in the OUTER terminal's font, not in any table we can read, so the fidelity fuzz
+    /// cannot catch it — its reference emulator shares alacritty's width table and therefore
+    /// agrees with us by construction. Substituting in the byte stream makes the reference
+    /// advance two columns where the emitter assumed one, which is exactly what the owner sees.
+    fn widen_sentinel(bytes: &[u8]) -> Vec<u8> {
+        String::from_utf8_lossy(bytes)
+            .replace('\u{e0b0}', "가")
+            .into_bytes()
+    }
+
+    /// Paint `cur` over `prev` through the PRODUCTION emitter and report what a width-disagreeing
+    /// terminal ends up showing.
+    fn paint_into_widening_terminal(
+        t: &mut Term<VoidListener>,
+        p: &mut Processor,
+        prev: Option<&Buffer>,
+        cur: &Buffer,
+        cols: usize,
+        rows: usize,
+    ) {
+        let sink = SharedBytes(Rc::new(RefCell::new(Vec::new())));
+        let area = Rect::new(0, 0, cols as u16, rows as u16);
+        let mut cterm = Terminal::with_options(
+            CrosstermBackend::new(sink.clone()),
+            TerminalOptions {
+                viewport: Viewport::Fixed(area),
+            },
+        )
+        .unwrap();
+        crate::client::emit_view(&mut cterm, prev, cur, None).unwrap();
+        let bytes = std::mem::take(&mut *sink.0.borrow_mut());
+        feed(t, p, &widen_sentinel(&bytes));
+    }
+
+    #[test]
+    fn a_glyph_the_terminal_measures_wider_does_not_skew_its_row_or_jump_on_repaint() {
+        // THE reported symptom, reproduced: "ls나 git status를 하면 글자가 떴다가 확 오른쪽으로
+        // 움직여". Output lands, then the self-heal repaint snaps it sideways.
+        //
+        // The cause is a glyph the outer terminal draws wider than `unicode-width` says. Before
+        // the emitter re-anchored, a row went out as ONE run positioned entirely by the
+        // terminal's own cursor advance, so that one glyph pushed everything after it right —
+        // and the repaint, which did anchor, put it back. Two renderers, one visible jump.
+        //
+        // Asserted here: the cells after the wide-measured glyph land on their true columns, and
+        // a full repaint over the result changes NOTHING. Convergence is the property; the glyph
+        // itself is collateral (printing its neighbour overwrites its second half, which
+        // alacritty answers by blanking the pair) and that is the bounded damage by design.
+        let (cols, rows) = (8usize, 1usize);
+        let (mut t, mut p) = term(cols, rows);
+        let area = Rect::new(0, 0, cols as u16, rows as u16);
+
+        let mut frame = Buffer::empty(area);
+        frame.set_string(0, 0, "ab\u{e0b0}cdef", ratatui::style::Style::default());
+        let mut cur = Buffer::empty(area);
+        crate::client::blit_view(&frame, &mut cur);
+
+        // One ordinary delta from a blank screen.
+        let empty = Buffer::empty(area);
+        paint_into_widening_terminal(&mut t, &mut p, Some(&empty), &cur, cols, rows);
+        let after_delta = snap_text(&snapshot_grid(&t));
+
+        // Everything after the mismeasured glyph is on its TRUE COLUMN — no skew.
+        //
+        // Asserted per column off the grid, never off `snap_text`: that collapses a wide glyph's
+        // spacer to an empty string, so a row shifted one column right still reads `ab가cdef`
+        // and the skew — the whole bug — hides inside the text.
+        let cells = &snapshot_grid(&t).cells[0];
+        let at = |x: usize| -> String {
+            if cells[x].spacer {
+                "<spacer>".to_string()
+            } else {
+                cells[x].sym.clone()
+            }
+        };
+        let row: Vec<String> = (0..cols).map(at).collect();
+        assert_eq!(at(0), "a", "row: {row:?}");
+        assert_eq!(at(1), "b", "row: {row:?}");
+        for (i, want) in ["c", "d", "e", "f"].iter().enumerate() {
+            assert_eq!(
+                at(3 + i),
+                *want,
+                "column {} must still hold {want:?}; anything else is the reported skew: {row:?}",
+                3 + i
+            );
+        }
+
+        // Now the self-heal repaint, over the same content. It must change NOTHING — that
+        // equality is the absence of the jump.
+        paint_into_widening_terminal(&mut t, &mut p, None, &cur, cols, rows);
+        let after_repaint = snap_text(&snapshot_grid(&t));
+        assert_eq!(
+            after_repaint, after_delta,
+            "a repaint moved the screen — that movement IS what the owner sees"
+        );
+    }
+
     /// The heart of it: after feeding a SEQUENCE of byte-batches (each = one server
-    /// render tick), the client's on-screen text must equal the final snapshot's text.
+    /// render tick), the client's on-screen text must equal the final snapshot's text."""
     fn assert_pipeline(cols: usize, rows: usize, batches: &[&[u8]]) {
         let (mut t, mut p) = term(cols, rows);
         let backend = TestBackend::new(cols as u16, rows as u16);
