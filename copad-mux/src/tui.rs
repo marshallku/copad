@@ -2518,6 +2518,8 @@ impl App {
                 target,
                 index,
                 text,
+                paste,
+                enter,
             } => {
                 let tid = match (target, index) {
                     (Some(_), Some(_)) => {
@@ -2551,7 +2553,15 @@ impl App {
                 };
                 match self.panes.get(&tid) {
                     Some(pt) => {
-                        pt.input(text.as_bytes());
+                        let mut bytes = if *paste {
+                            crate::term::paste_bytes(text, pt.bracketed_paste())
+                        } else {
+                            text.as_bytes().to_vec()
+                        };
+                        if *enter {
+                            bytes.push(b'\r');
+                        }
+                        pt.input(&bytes);
                         Resp::ok()
                     }
                     None => Resp::err("pane has no live terminal"),

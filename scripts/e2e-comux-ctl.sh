@@ -40,6 +40,7 @@
 #  25. sessions/tabs addressed by id/name (ambiguous = exit 2); create verbs return their ids
 #  26. list-tree shows every session/tab/pane; list-agents says which tab and pane an agent is in
 #  27. wait-agent --after-seq only matches a NEWER status change; wait verbs answer in JSON
+#  28. send --enter / --paste (bracketed only when the program asked) / --file
 
 set -euo pipefail
 
@@ -1606,7 +1607,40 @@ sid="$(python3 -c 'import json,sys; print([x["id"] for x in json.load(sys.stdin)
 t 12 "$COMUX" kill-session "$sid" >/dev/null || fail "seq cleanup failed"
 ok "a status already seen is not an edge; a newer one is; waits and transport errors answer in JSON"
 
-echo "28. the server is still responsive and shuts down cleanly"
+echo "28. send --enter, --paste and --file"
+t 10 "$COMUX" new-session sendtest --json >"$WORK/json" || fail "could not create the send session"
+P="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+sleep 1 # let the shell reach its prompt
+# --enter submits; the marker is assembled by the shell so the echoed command can't match.
+t 10 "$COMUX" send "$P" --enter -- 'echo SENT-$((40+2))' >/dev/null || fail "send --enter failed"
+t 15 "$COMUX" wait-output "$P" "SENT-42" --timeout 10 >/dev/null || fail "send --enter did not submit the line"
+# A program that enables bracketed paste sees the delimiters; `cat -v` makes ESC visible as ^[.
+t 10 "$COMUX" send "$P" --enter -- "printf '\\033[?2004h'; cat -v" >/dev/null
+sleep 0.5
+t 10 "$COMUX" send "$P" --paste --enter -- $'one\x1b[201~two' >/dev/null || fail "send --paste failed"
+t 15 "$COMUX" wait-output "$P" '^[[200~onetwo^[[201~' --timeout 10 >/dev/null \
+    || fail "a bracketed paste was not wrapped (or the embedded delimiter survived): $(t 10 "$COMUX" capture-pane "$P")"
+t 10 "$COMUX" send "$P" $'\x03' >/dev/null # Ctrl-C out of cat
+sleep 0.3
+# With bracketed paste OFF there is nothing to wrap in.
+t 10 "$COMUX" send "$P" --enter -- "printf '\\033[?2004l'; cat -v" >/dev/null
+sleep 0.5
+t 10 "$COMUX" send "$P" --paste --enter -- "plain-paste" >/dev/null
+t 15 "$COMUX" wait-output "$P" 'plain-paste' --timeout 10 >/dev/null || fail "an unbracketed paste did not arrive"
+t 10 "$COMUX" capture-pane "$P" >"$WORK/out"
+tail -3 "$WORK/out" | grep -q '200~plain' && fail "a paste was bracketed for a program that did not ask: $(cat "$WORK/out")"
+t 10 "$COMUX" send "$P" $'\x03' >/dev/null
+sleep 0.3
+# --file sends the file's contents.
+printf 'echo FROMFILE-$((1+1))' >"$WORK/send.txt"
+t 10 "$COMUX" send "$P" --file "$WORK/send.txt" --enter >/dev/null || fail "send --file failed"
+t 15 "$COMUX" wait-output "$P" "FROMFILE-2" --timeout 10 >/dev/null || fail "send --file did not send the file"
+t 10 "$COMUX" list-sessions --json >"$WORK/json"
+sid="$(python3 -c 'import json,sys; print([x["id"] for x in json.load(sys.stdin)["sessions"] if x["name"]=="sendtest"][0])' <"$WORK/json")"
+t 12 "$COMUX" kill-session "$sid" >/dev/null || fail "send cleanup failed"
+ok "--enter submits; --paste brackets only for a program that enabled it, with embedded delimiters stripped; --file sends the file"
+
+echo "29. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

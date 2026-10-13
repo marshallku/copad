@@ -61,6 +61,13 @@ pub enum Req {
         #[serde(default)]
         index: Option<usize>,
         text: String,
+        /// Send `text` the way a terminal PASTES it (bracketed when the program asked for
+        /// it, delimiters inside the text stripped) rather than as typed bytes.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        paste: bool,
+        /// Press Enter after the text.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        enter: bool,
     },
     /// List a session's tabs — the active one, or `session` (a selector).
     ListTabs {
@@ -306,8 +313,20 @@ pub const CAP_SELECTORS: &str = "selectors";
 /// Capability: `list-tree` exists.
 pub const CAP_LIST_TREE: &str = "list-tree";
 
+/// Capability: `send` honors `paste` and `enter`.
+pub const CAP_SEND_FLAGS: &str = "send-flags";
+
 /// Every capability this build's server implements (reported by `health`).
-pub const SERVER_CAPS: &[&str] = &[CAP_RENAME_CALLER, CAP_SELECTORS, CAP_LIST_TREE];
+pub const SERVER_CAPS: &[&str] = &[
+    CAP_RENAME_CALLER,
+    CAP_SELECTORS,
+    CAP_LIST_TREE,
+    CAP_SEND_FLAGS,
+];
+
+/// The most `send --file` reads. A paste larger than this is a mistake (a binary, a log),
+/// not something to type into a shell.
+const SEND_FILE_CAP: u64 = 1024 * 1024;
 
 /// A session or tab a mutating verb created or acted on: its stable id and display name.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1180,10 +1199,34 @@ pub fn run_client(args: &[String]) -> i32 {
                     );
                 }
             };
+            let text = match p.value("--file") {
+                Some(_) if p.positionals.len() > 1 => {
+                    return usage_error(
+                        json_out,
+                        "comux send: give --file or text, not both",
+                        SEND_USAGE,
+                    );
+                }
+                Some(path) => match read_send_file(path) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        return usage_error(json_out, &format!("comux send: {e}"), SEND_USAGE);
+                    }
+                },
+                None => p.positionals[1..].join(" "),
+            };
+            let (paste, enter) = (p.has("--paste"), p.has("--enter"));
+            if (paste || enter)
+                && let Err(code) = require_cap(CAP_SEND_FLAGS, cmd, json_out)
+            {
+                return code;
+            }
             Req::SendKeys {
                 target,
                 index,
-                text: p.positionals[1..].join(" "),
+                text,
+                paste,
+                enter,
             }
         }
         other => {
@@ -1300,6 +1343,31 @@ fn usage_error(json: bool, msg: &str, usage: &str) -> i32 {
     }
     eprintln!("{msg}\n{usage}");
     2
+}
+
+/// `send --file`: the file (or stdin for `-`), bounded by reading at most one byte past the
+/// cap — a size check before an unbounded read would not hold for a growing file or a pipe.
+fn read_send_file(path: &str) -> Result<String, String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let read = if path == "-" {
+        std::io::stdin()
+            .take(SEND_FILE_CAP + 1)
+            .read_to_end(&mut buf)
+    } else {
+        std::fs::File::open(path)
+            .map_err(|e| format!("cannot open {path}: {e}"))?
+            .take(SEND_FILE_CAP + 1)
+            .read_to_end(&mut buf)
+    };
+    read.map_err(|e| format!("cannot read {path}: {e}"))?;
+    if buf.len() as u64 > SEND_FILE_CAP {
+        return Err(format!(
+            "{path} is larger than {} KiB",
+            SEND_FILE_CAP / 1024
+        ));
+    }
+    String::from_utf8(buf).map_err(|_| format!("{path} is not UTF-8 text"))
 }
 
 /// `-h`/`--help` before any `--`, for the verbs with their own parsers.
@@ -1517,7 +1585,7 @@ const RESIZE_SPEC: Spec = Spec {
 
 const SEND_SPEC: Spec = Spec {
     usage: SEND_USAGE,
-    flags: &[],
+    flags: &[flag(&["--enter"]), flag(&["--paste"]), opt(&["--file"])],
     positionals: Positionals::Any,
 };
 
@@ -1600,10 +1668,17 @@ fn classify_pane_arg(arg: &str) -> Option<PaneArg> {
     Some(PaneArg::Token(arg.to_string()))
 }
 
-const SEND_USAGE: &str = "usage: comux send <pane-token|index> <text...>\n\
+const SEND_USAGE: &str = "usage: comux send <pane-token|index> [--enter] [--paste] [--file PATH|-] [--] [text...]\n\
      \x20      a TOKEN (from `comux list --json`, or a pane's own $COPAD_MUX_PANE) names one\n\
      \x20      pane anywhere in the mux; an INDEX is a position in the ACTIVE tab and\n\
-     \x20      retargets when the user switches tabs. `send` does not append Enter.";
+     \x20      retargets when the user switches tabs.\n\
+     \x20      --enter   press Enter after the text (without it, nothing is submitted)\n\
+     \x20      --paste   send it as a PASTE: bracketed when the program enabled that, so a\n\
+     \x20                multi-line prompt arrives as one input. A program that did NOT enable\n\
+     \x20                it receives each line as a submitted line, as with any terminal paste\n\
+     \x20      --file    the text is this file's contents (`-` = stdin; at most 1 MiB, UTF-8),\n\
+     \x20                instead of the arguments\n\
+     \x20      text starting with `-` goes after `--`";
 
 /// Exit code for "the user cancelled the picker" — fzf's (and SIGINT's) convention, so a
 /// shell wrapper can tell a deliberate abort apart from a real failure.
@@ -2723,6 +2798,20 @@ mod verb_args_tests {
         assert_eq!(rename_args(&p), Some((Some(2), "plan".to_string())));
         let p = cliargs::parse(&RENAME_TAB_SPEC, &["-t", "s1:t0"]).unwrap();
         assert_eq!(rename_args(&p), None);
+    }
+
+    #[test]
+    fn send_file_and_text_are_exclusive_and_the_file_is_bounded() {
+        assert_eq!(exit(&["send", "a1-1", "--file", "/etc/hosts", "extra"]), 2);
+        assert_eq!(exit(&["send", "a1-1", "--file", "/no/such/file"]), 2);
+        let big = std::env::temp_dir().join(format!("comux-send-big-{}", std::process::id()));
+        std::fs::write(&big, vec![b'a'; SEND_FILE_CAP as usize + 1]).unwrap();
+        assert!(read_send_file(big.to_str().unwrap()).is_err());
+        std::fs::write(&big, b"hi\n").unwrap();
+        assert_eq!(read_send_file(big.to_str().unwrap()).as_deref(), Ok("hi\n"));
+        std::fs::write(&big, [0xff, 0xfe]).unwrap();
+        assert!(read_send_file(big.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_file(&big);
     }
 
     #[test]
@@ -4481,10 +4570,16 @@ mod send_split_proto_tests {
                 target,
                 index,
                 text,
+                paste,
+                enter,
             } => {
                 assert_eq!(target, None);
                 assert_eq!(index, Some(0));
                 assert_eq!(text, "ls");
+                assert!(
+                    !paste && !enter,
+                    "an old request is neither a paste nor submitted"
+                );
             }
             other => panic!("wrong variant: {other:?}"),
         }
@@ -4496,8 +4591,12 @@ mod send_split_proto_tests {
             target: Some("ab12-3".into()),
             index: None,
             text: "make\n".into(),
+            paste: false,
+            enter: false,
         };
         let line = serde_json::to_string(&req).unwrap();
+        // Unset flags stay off the wire, so an older server sees exactly the shape it knows.
+        assert!(!line.contains("paste") && !line.contains("enter"), "{line}");
         match serde_json::from_str::<Req>(&line).unwrap() {
             Req::SendKeys { target, index, .. } => {
                 assert_eq!(target.as_deref(), Some("ab12-3"));

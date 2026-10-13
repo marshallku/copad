@@ -529,6 +529,11 @@ impl PaneTerm {
         wheel_bytes_for_mode(*self.term.lock().mode(), up, col, row)
     }
 
+    /// Whether the pane's program asked for bracketed paste (`?2004h`).
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
     /// Whether the pane is currently on the ALTERNATE screen (`?1049h`) — i.e. a
     /// full-screen app (nvim, less, htop, …) is running. The render loop polls this to
     /// notice when such an app EXITS (alt → primary), so it can force a full repaint and
@@ -2448,5 +2453,92 @@ mod osc_notification_probe {
         let (mut t, mut p, l) = term();
         p.advance(&mut t, b"\x1b]0;real title\x07");
         assert_eq!(l.title.lock().unwrap().as_deref(), Some("real title"));
+    }
+}
+
+/// The bytes a PASTE of `text` sends, the way a terminal pastes: wrapped in `ESC[200~` /
+/// `ESC[201~` when the program enabled bracketed paste, so a multi-line paste is taken as
+/// text instead of being executed line by line.
+///
+/// Any paste delimiter already inside `text` is removed first — in both the 7-bit (`ESC [`)
+/// and the 8-bit C1 (`U+009B`) CSI spellings, repeatedly, since removing one can splice two
+/// halves into another — or the text could close the bracket early and run what follows.
+/// Line breaks become `\r`, which is what Enter sends.
+///
+/// Without bracketed paste there is nothing to wrap in, and every line break in the text
+/// still submits a line: that is what a paste into such a program does too.
+pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    const MARKERS: [&str; 4] = ["\x1b[200~", "\x1b[201~", "\u{9b}200~", "\u{9b}201~"];
+    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+    // One pass, as a stack: after each char, drop a marker the output now ENDS with. Removing
+    // one exposes what came before it, and the chars still to come can complete another with
+    // it — exactly the splice a repeated `replace` would need a pass per layer for (quadratic
+    // on a crafted 1 MiB paste, and this runs on the server's single-writer loop).
+    let mut clean = String::with_capacity(normalized.len());
+    for ch in normalized.chars() {
+        clean.push(ch);
+        if ch == '~'
+            && let Some(m) = MARKERS.iter().find(|m| clean.ends_with(*m))
+        {
+            clean.truncate(clean.len() - m.len());
+        }
+    }
+    if !bracketed {
+        return clean.into_bytes();
+    }
+    let mut out = Vec::with_capacity(clean.len() + 12);
+    out.extend_from_slice(b"\x1b[200~");
+    out.extend_from_slice(clean.as_bytes());
+    out.extend_from_slice(b"\x1b[201~");
+    out
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::paste_bytes;
+
+    #[test]
+    fn a_bracketed_paste_is_wrapped_and_lines_become_cr() {
+        assert_eq!(paste_bytes("a\nb\r\nc", true), b"\x1b[200~a\rb\rc\x1b[201~");
+    }
+
+    #[test]
+    fn nested_markers_are_stripped_in_linear_time() {
+        let n = 200_000;
+        let evil = format!("{}{}", "\x1b[201".repeat(n), "~".repeat(n));
+        let start = std::time::Instant::now();
+        let out = paste_bytes(&evil, false);
+        assert!(out.is_empty(), "every layer is a marker");
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn without_bracketed_paste_the_text_goes_as_is() {
+        assert_eq!(paste_bytes("ls\n", false), b"ls\r");
+    }
+
+    #[test]
+    fn embedded_delimiters_cannot_close_the_bracket() {
+        for evil in [
+            "x\x1b[201~rm -rf ~\n",
+            "x\u{9b}201~rm -rf ~\n",
+            "x\x1b[20\x1b[201~1~rm -rf ~\n",
+            "x\x1b[200~y",
+            "x\x1b[2\x1b[20\x1b[201~1~0~1~z",
+        ] {
+            let out = paste_bytes(evil, true);
+            let body = &out[6..out.len() - 6];
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            assert!(
+                !body.contains("\x1b[201~")
+                    && !body.contains("\u{9b}201~")
+                    && !body.contains("\x1b[200~"),
+                "{evil:?} -> {body:?}"
+            );
+        }
     }
 }
