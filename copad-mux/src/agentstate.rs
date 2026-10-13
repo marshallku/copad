@@ -489,7 +489,7 @@ pub fn is_rollout_path(path: &std::path::Path) -> bool {
     rollout_session_id(path).is_some()
 }
 
-fn rollout_session_id(path: &std::path::Path) -> Option<String> {
+pub(crate) fn rollout_session_id(path: &std::path::Path) -> Option<String> {
     if !path.components().any(|c| c.as_os_str() == "sessions") {
         return None;
     }

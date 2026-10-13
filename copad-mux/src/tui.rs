@@ -3022,8 +3022,14 @@ impl App {
                     .agent_rows()
                     .into_iter()
                     .filter(|r| want.as_ref().is_none_or(|w| &r.term == w))
-                    .map(|r| (self.tab_location(&r.term), r))
-                    .map(|(loc, r)| control::AgentInfo {
+                    .map(|r| {
+                        let conv = self
+                            .labels
+                            .get(&r.term)
+                            .and_then(|l| agentpoll::conversation(&self.agent_poll, l.pid));
+                        (self.tab_location(&r.term), conv, r)
+                    })
+                    .map(|(loc, conv, r)| control::AgentInfo {
                         token: self
                             .panes
                             .get(&r.term)
@@ -3043,6 +3049,8 @@ impl App {
                         tab_name: loc.as_ref().map(|l| l.1.clone()).unwrap_or_default(),
                         tab_index: loc.as_ref().map_or(0, |l| l.2),
                         pane_index: loc.as_ref().map_or(0, |l| l.3),
+                        agent_session_id: conv.as_ref().map(|c| c.0.clone()),
+                        transcript_path: conv.as_ref().map(|c| c.1.display().to_string()),
                     })
                     .collect();
                 Resp::agents(agents)

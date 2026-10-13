@@ -173,6 +173,11 @@ own log. It is ABSENT, not empty, when there is no reading — a tool whose log 
 read, one that has run no tools yet, or a format that has moved. Never branch on its absence;
 it is a hint for a human scanning a list.
 
+`transcript_path` (with `agent_session_id`) is the file the agent logs its conversation to —
+Claude's `~/.claude/projects/…/<id>.jsonl`, Codex's rollout. Reading it is a better way to follow
+another agent's progress than `capture-pane`, whose bottom rows are the agent's own input box
+and status line. Absent until comux has resolved it; a Codex pane can lag a `/new` by ~30s.
+
 `idle` means comux recognised no agent UI at all — "no reading", not a state — which is why
 it is not waitable. A pane running a tool whose UI comux does not know stays `idle` forever,
 so never block on one; poll it with `capture-pane`, or have it signal you with

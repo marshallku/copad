@@ -81,6 +81,9 @@ pub struct Inner {
     wanted: Vec<(u32, String)>,
     /// Published readings, keyed by agent pid.
     seen: HashMap<u32, Activity>,
+    /// The log each pid was resolved to, published whether or not it has yielded a detail
+    /// yet — a fresh conversation that has run no tool still HAS a conversation.
+    sources: HashMap<u32, PathBuf>,
 }
 
 pub type Shared = Arc<Mutex<Inner>>;
@@ -96,6 +99,19 @@ pub fn set_wanted(shared: &Shared, wanted: Vec<(u32, String)>) {
     if let Ok(mut g) = shared.lock() {
         g.wanted = wanted;
     }
+}
+
+/// The conversation `pid` is in, as `(id, transcript path)`, when its log has been resolved.
+///
+/// As fresh as the poller's resolution: Claude's is re-checked against its session file every
+/// tick, Codex's every [`SOURCE_RECHECK`], so a Codex pane that just switched conversation can
+/// report the previous one for that long. A Codex TUI attached to the shared app-server daemon
+/// holds no rollout of its own and reports nothing here.
+pub fn conversation(shared: &Shared, pid: u32) -> Option<(String, PathBuf)> {
+    let path = shared.lock().ok()?.sources.get(&pid).cloned()?;
+    let id = crate::agentstate::rollout_session_id(&path)
+        .or_else(|| path.file_stem()?.to_str().map(str::to_string))?;
+    Some((id, path))
 }
 
 /// The activity last read for `pid`, if any.
@@ -172,13 +188,19 @@ pub fn spawn() -> Shared {
                 };
                 if !wanted.is_empty() {
                     let seen = sweep(&wanted, &mut cache, &home, &mut cursor);
+                    let sources = cache
+                        .iter()
+                        .filter_map(|(pid, e)| Some((*pid, e.path.clone()?)))
+                        .collect();
                     if let Ok(mut g) = out.lock() {
                         g.seen = seen;
+                        g.sources = sources;
                     }
                 } else if !cache.is_empty() {
                     cache.clear();
                     if let Ok(mut g) = out.lock() {
                         g.seen.clear();
+                        g.sources.clear();
                     }
                 }
                 std::thread::sleep(TICK);
@@ -551,6 +573,35 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_conversation_is_published_with_its_id_whether_or_not_it_has_a_detail() {
+        let shared = idle();
+        let claude =
+            PathBuf::from("/h/.claude/projects/-x/4f1c2a9e-0000-4000-8000-000000000001.jsonl");
+        let codex = PathBuf::from(
+            "/h/.codex/sessions/2026/07/24/rollout-2026-07-24T09-59-48-36213526-fd15-4fc9-b146-842f71382088.jsonl",
+        );
+        {
+            let mut g = shared.lock().unwrap();
+            g.sources.insert(1, claude.clone());
+            g.sources.insert(2, codex.clone());
+        }
+        assert_eq!(
+            conversation(&shared, 1),
+            Some(("4f1c2a9e-0000-4000-8000-000000000001".to_string(), claude))
+        );
+        assert_eq!(
+            conversation(&shared, 2),
+            Some(("36213526-fd15-4fc9-b146-842f71382088".to_string(), codex))
+        );
+        assert_eq!(conversation(&shared, 3), None);
+        assert_eq!(
+            activity(&shared, 1),
+            None,
+            "no detail is not no conversation"
+        );
+    }
 
     /// A transcript line that parses to `"Bash: <what>"`.
     fn tool_use_line(what: &str) -> String {

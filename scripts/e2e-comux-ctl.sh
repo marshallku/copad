@@ -619,6 +619,12 @@ done
 det="$(DX="$dx" python3 -c 'import json,sys,os; print(next(x["detail"] for x in json.load(sys.stdin)["agents"] if x["token"]==os.environ["DX"]))' <"$WORK/json")"
 [[ "$det" == "running: cargo test --all" ]] \
     || fail "expected the NEWEST rollout item, got '$det'"
+# The conversation itself is exposed too: its id and the file it is logged to.
+DX="$dx" ROLL="$roll" python3 -c 'import json,sys,os
+a=next(x for x in json.load(sys.stdin)["agents"] if x["token"]==os.environ["DX"])
+assert os.path.realpath(a["transcript_path"])==os.path.realpath(os.environ["ROLL"]), a
+assert a["agent_session_id"]=="01a09154-4f7e-76a1-81e0-daae1f6d49b3", a' <"$WORK/json" \
+    || fail "list-agents did not expose the conversation id + transcript: $(cat "$WORK/json")"
 # Absence must stay absent: a pane with no readable log carries no `detail` key at all, so a
 # caller can tell "no reading" from "doing nothing" (the same contract as #105's [] vs null).
 if python3 -c 'import json,sys
@@ -644,6 +650,10 @@ print(a[0].get("detail","") if a else "")' <"$WORK/json")"
 done
 [[ -f "$roll" ]] || fail "the first rollout must survive the rotation, or this proves nothing"
 [[ -n "$rotated" ]] || fail "the activity line never followed the new conversation: '$det'"
+DX="$dx" python3 -c 'import json,sys,os
+a=next(x for x in json.load(sys.stdin)["agents"] if x["token"]==os.environ["DX"])
+assert a["agent_session_id"]=="01a09154-4f7e-76a1-81e0-daae1f6d49b4", a' <"$WORK/json" \
+    || fail "the conversation id did not follow the rotation: $(cat "$WORK/json")"
 t 10 "$COMUX" send "$dx" $'\x03' >/dev/null
 t 10 "$COMUX" list --json >"$WORK/json"
 dxi="$(DX="$dx" python3 -c 'import json,sys,os; print(next(p["index"] for p in json.load(sys.stdin)["panes"] if p["token"]==os.environ["DX"]))' <"$WORK/json")"

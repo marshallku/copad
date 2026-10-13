@@ -476,6 +476,15 @@ pub struct AgentInfo {
     /// The pane's index within its tab, in `list` order.
     #[serde(default)]
     pub pane_index: usize,
+    /// The agent's OWN conversation id (Claude's session uuid, Codex's rollout uuid) — not a
+    /// comux session. Absent when its log has not been resolved (see `agentpoll::conversation`
+    /// for how stale it can be).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_session_id: Option<String>,
+    /// The file that conversation is logged to, for reading its progress directly instead of
+    /// scraping the pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
 }
 
 /// One session in a `list-tree` response, with its tabs and their panes.
@@ -4130,6 +4139,8 @@ mod list_agents_proto_tests {
             tab_name: String::new(),
             tab_index: 0,
             pane_index: 0,
+            agent_session_id: None,
+            transcript_path: None,
         }
     }
 
