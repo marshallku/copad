@@ -73,6 +73,9 @@ comux send <new-token> $'\n'
 ```
 
 `send` writes raw bytes: it does not escape anything and it does not press Enter for you.
+Text that starts with `-` goes after `--` (`comux send <token> -- --verbose`): every verb
+rejects an unknown flag (exit 2) rather than guessing, and `--help` (exit 0) never reaches the
+server.
 
 ## Read a pane back
 

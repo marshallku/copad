@@ -35,6 +35,7 @@
 #  20. the SSH fleet: an unreachable machine is reported with a reason, never dropped
 #  21. a bell rung in a HIDDEN tab still reaches the rendered status bar
 #  22. an idle client silently repaints itself on a timer, and never clears to do it
+#  23. every verb answers --help (0) / rejects unknown flags (2) without touching state
 
 set -euo pipefail
 
@@ -59,6 +60,10 @@ export COPAD_MUX_NOTIFY=0
 export COPAD_MUX_USAGE=0
 export COPAD_MUX_UPDATE_CHECK=0
 export COPAD_MUX_QUIET_SSH=1
+# This script usually runs INSIDE a comux pane. Its pane identity names a pane on the user's
+# real server, and verbs that default to "the caller's pane" would read it — a step that wants
+# a caller pane sets one explicitly from the throwaway server.
+unset COPAD_MUX_PANE COPAD_MUX
 # Config isolation. Without this the throwaway server reads the DEVELOPER's real
 # `~/.config/copad/mux.toml`, so every assertion below silently depends on their personal
 # settings — a custom prefix, `sidebar = false`, a different `sidebar_density`. Point
@@ -1396,7 +1401,37 @@ print(f"on={on} off={off}")
 PYEOF
 ok "an idle client re-emits its screen on a timer, with no clear; reconcile_secs = 0 keeps it silent"
 
-echo "23. the server is still responsive and shuts down cleanly"
+echo "23. --help / unknown flags / extra arguments never reach the server"
+s_before="$(sessions_now)"
+t 10 "$COMUX" new-session --help >"$WORK/out" || fail "new-session --help should exit 0"
+grep -q "usage: comux new-session" "$WORK/out" || fail "new-session --help printed no usage: $(cat "$WORK/out")"
+[[ "$(sessions_now)" == "$s_before" ]] || fail "new-session --help created a session"
+rc=0; t 10 "$COMUX" new-session --bogus >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 2 ]] || fail "new-session --bogus: expected exit 2, got $rc"
+[[ "$(sessions_now)" == "$s_before" ]] || fail "new-session --bogus created a session"
+t 10 "$COMUX" list-tabs --json >"$WORK/tabs-before"
+t 10 "$COMUX" rename-tab --help >/dev/null || fail "rename-tab --help should exit 0"
+t 10 "$COMUX" list-tabs --json >"$WORK/tabs-after"
+cmp -s "$WORK/tabs-before" "$WORK/tabs-after" || fail "rename-tab --help renamed a tab"
+for args in "list --bogus" "list-sessions --bogus" "list-agents --owner x" "list extra" "health extra"; do
+    rc=0; t 10 "$COMUX" $args >/dev/null 2>&1 || rc=$?
+    [[ "$rc" == 2 ]] || fail "comux $args: expected exit 2, got $rc"
+done
+# `--json` under a usage error still answers in JSON on stdout.
+rc=0; t 10 "$COMUX" list --bogus --json >"$WORK/out" 2>/dev/null || rc=$?
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is False and d["code"]=="usage", d' \
+    <"$WORK/out" || fail "a --json usage error did not print a JSON error: $(cat "$WORK/out")"
+# A body after `--` is literal, including the global `--json` switch.
+t 10 "$COMUX" list --json >"$WORK/json"
+tok="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["panes"][0]["token"])' <"$WORK/json")"
+t 10 "$COMUX" send "$tok" -- --json-literal-e2e >/dev/null || fail "send -- --json-literal-e2e failed"
+sleep 0.5
+t 10 "$COMUX" capture-pane "$tok" >"$WORK/out"
+grep -q -- "--json-literal-e2e" "$WORK/out" || fail "the text after -- was not sent verbatim"
+t 10 "$COMUX" send "$tok" $'\x15' >/dev/null # clear the line again (Ctrl-U)
+ok "help exits 0 and creates nothing; bad flags exit 2 (JSON under --json); -- passes text through"
+
+echo "24. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

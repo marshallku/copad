@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
+use crate::cliargs::{self, Positionals, Spec, flag, opt};
 use crate::picker;
 
 /// A control request. Wire form: one JSON object per line, tagged by `cmd`
@@ -609,6 +610,12 @@ pub fn socket_path() -> PathBuf {
     if let Ok(p) = std::env::var("COPAD_MUX_SOCK") {
         return PathBuf::from(p);
     }
+    // A unit test must never reach the user's LIVE server: the env var is process-global, so
+    // one test clearing it while another runs `run_client` once sent a real `split` to the
+    // owner's session. Test builds fall back to a path nothing listens on.
+    if cfg!(test) {
+        return std::env::temp_dir().join("copad-mux-unit-tests-no-listener.sock");
+    }
     runtime_dir().join("sock")
 }
 
@@ -618,7 +625,11 @@ pub fn run_client(args: &[String]) -> i32 {
     // `worktree` has its own nested grammar (subcommands + `--from`/`--plain`/`-d`), so it
     // is parsed BEFORE the flat `--json`-stripping path below could reinterpret its flags.
     if args.first().map(|s| s.as_str()) == Some("worktree") {
-        return run_worktree_client(&args[1..]);
+        let json = args
+            .iter()
+            .take_while(|a| *a != "--")
+            .any(|a| a == "--json");
+        return json_usage(json, "worktree", run_worktree_client(&args[1..]));
     }
     // Fleet verbs are answered ENTIRELY client-side: they read the local config and run `ssh`,
     // and never touch this machine's server. Handled before a request is built so
@@ -628,15 +639,8 @@ pub fn run_client(args: &[String]) -> i32 {
         return code;
     }
 
-    let mut json_out = false;
-    let mut rest: Vec<&String> = Vec::new();
-    for a in args {
-        if a == "--json" {
-            json_out = true;
-        } else {
-            rest.push(a);
-        }
-    }
+    let (json_out, owned) = cliargs::take_json(args);
+    let rest: Vec<&String> = owned.iter().collect();
     let Some(cmd) = rest.first().map(|s| s.as_str()) else {
         eprintln!(
             "usage: comux <list|split|resize|focus|close|send|capture-pane|wait-output|list-agents|wait-agent|\
@@ -647,11 +651,25 @@ pub fn run_client(args: &[String]) -> i32 {
         );
         return 2;
     };
+    // Every verb below parses through `verb_args`, which answers `--help` (exit 0) and
+    // rejects unknown flags / extra arguments (exit 2) BEFORE a request is built — so a
+    // malformed invocation can never reach the server and mutate something.
+    macro_rules! parsed {
+        ($spec:expr) => {
+            match verb_args(&$spec, &rest, json_out) {
+                Ok(p) => p,
+                Err(code) => return code,
+            }
+        };
+    }
 
     // `wait-output` owns its own exit codes (124 on deadline) and issues MANY requests,
     // so it short-circuits the one-request-one-response path below rather than producing a
     // `Req` for it.
     if cmd == "skill" {
+        parsed!(cliargs::bare(
+            "usage: comux skill   (prints the agent-facing SKILL.md)"
+        ));
         // EMBEDDED, not read from disk: the skill has to be available from an installed
         // binary with no repo checkout, and it must describe THIS build's verbs rather than
         // whatever a stale file next to it says.
@@ -661,34 +679,57 @@ pub fn run_client(args: &[String]) -> i32 {
     if cmd == "wait-agent" {
         return match parse_wait_agent_args(&rest) {
             Ok(args) => run_wait_agent(args),
-            Err(code) => code,
+            Err(code) => json_usage(json_out, cmd, code),
         };
     }
     if cmd == "wait-output" || cmd == "wait" {
         return match parse_wait_args(&rest) {
             Ok(args) => run_wait_output(args),
-            Err(code) => code,
+            Err(code) => json_usage(json_out, cmd, code),
         };
     }
 
     let req = match cmd {
-        "list" => Req::List,
-        "health" => Req::Health,
-        "host" => Req::Host,
-        "reload" | "source-file" => Req::ReloadConfig,
-        "kill-server" => Req::KillServer,
-        "list-tabs" | "tabs" => Req::ListTabs,
-        "new-tab" => Req::NewTab,
-        "list-sessions" | "sessions" => Req::ListSessions,
-        "list-agents" | "agents" => Req::ListAgents { target: None },
+        "list" => {
+            parsed!(cliargs::bare("usage: comux list [--json]"));
+            Req::List
+        }
+        "health" => {
+            parsed!(cliargs::bare("usage: comux health [--json]"));
+            Req::Health
+        }
+        "host" => {
+            parsed!(cliargs::bare("usage: comux host [--json]"));
+            Req::Host
+        }
+        "reload" | "source-file" => {
+            parsed!(cliargs::bare("usage: comux reload [--json]"));
+            Req::ReloadConfig
+        }
+        "kill-server" => {
+            parsed!(cliargs::bare("usage: comux kill-server"));
+            Req::KillServer
+        }
+        "list-tabs" | "tabs" => {
+            parsed!(cliargs::bare("usage: comux list-tabs [--json]"));
+            Req::ListTabs
+        }
+        "new-tab" => {
+            parsed!(cliargs::bare("usage: comux new-tab [--json]"));
+            Req::NewTab
+        }
+        "list-sessions" | "sessions" => {
+            parsed!(cliargs::bare("usage: comux list-sessions [--json]"));
+            Req::ListSessions
+        }
+        "list-agents" | "agents" => {
+            parsed!(cliargs::bare("usage: comux list-agents [--fleet] [--json]"));
+            Req::ListAgents { target: None }
+        }
         "new-session" => {
-            // Optional name: everything after the verb, space-joined (tmux `new -s`).
-            let name = rest
-                .iter()
-                .skip(1)
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
+            let p = parsed!(NAME_SPEC_NEW_SESSION);
+            // Optional name: every positional, space-joined (tmux `new -s`).
+            let name = p.positionals.join(" ");
             Req::NewSession {
                 name: (!name.trim().is_empty()).then(|| name.trim().to_string()),
                 // Start the session's shell where the CLI was invoked (like `tmx $name`).
@@ -698,16 +739,24 @@ pub fn run_client(args: &[String]) -> i32 {
             }
         }
         "rename-session" | "rename" => {
-            let Some((index, name)) = parse_rename(&rest) else {
-                eprintln!("usage: comux rename-session [index] <name...>   (no index = active)");
-                return 2;
+            let p = parsed!(RENAME_SESSION_SPEC);
+            let Some((index, name)) = parse_rename(&p.positionals) else {
+                return usage_error(
+                    json_out,
+                    "comux rename-session: a name is required",
+                    RENAME_SESSION_SPEC.usage,
+                );
             };
             Req::RenameSession { index, name }
         }
         "rename-tab" => {
-            let Some((index, name)) = parse_rename(&rest) else {
-                eprintln!("usage: comux rename-tab [index] <name...>   (no index = active)");
-                return 2;
+            let p = parsed!(RENAME_TAB_SPEC);
+            let Some((index, name)) = parse_rename(&p.positionals) else {
+                return usage_error(
+                    json_out,
+                    "comux rename-tab: a name is required",
+                    RENAME_TAB_SPEC.usage,
+                );
             };
             Req::RenameTab { index, name }
         }
@@ -715,14 +764,14 @@ pub fn run_client(args: &[String]) -> i32 {
         // picker over a live listing instead of failing with a usage line (see
         // `pick_index`), while a MALFORMED index still fails — the user meant something.
         "select-session" => {
-            let idx = match pick_index(rest.get(1), json_out, Target::Session) {
+            let idx = match pick_verb(&rest, json_out, Target::Session) {
                 Ok(i) => i,
                 Err(code) => return code,
             };
             Req::SelectSession { index: idx }
         }
         "select-tab" => {
-            let idx = match pick_index(rest.get(1), json_out, Target::Tab) {
+            let idx = match pick_verb(&rest, json_out, Target::Tab) {
                 Ok(i) => i,
                 Err(code) => return code,
             };
@@ -733,51 +782,45 @@ pub fn run_client(args: &[String]) -> i32 {
         // session the way `rename-*` does: an explicit pick is what makes a bare
         // `comux close-tab` safe to type.
         "close-tab" | "kill-tab" => {
-            let idx = match pick_index(rest.get(1), json_out, Target::TabClose) {
+            let idx = match pick_verb(&rest, json_out, Target::TabClose) {
                 Ok(i) => i,
                 Err(code) => return code,
             };
             Req::CloseTab { index: idx }
         }
         "kill-session" => {
-            let idx = match pick_index(rest.get(1), json_out, Target::SessionKill) {
+            let idx = match pick_verb(&rest, json_out, Target::SessionKill) {
                 Ok(i) => i,
                 Err(code) => return code,
             };
             Req::KillSession { index: idx }
         }
         "split" => {
-            // -h/--horizontal → side by side (right); -v/--vertical → stacked (down).
+            // -h/--horizontal → side by side (right); -v/--vertical → stacked (down). The
+            // verb owns `-h`, so only `--help` asks for help here.
+            let p = parsed!(SPLIT_SPEC);
             let mut dir = "right";
-            let mut from: Option<String> = None;
-            let mut i = 1;
-            while i < rest.len() {
-                match rest[i].as_str() {
-                    "-v" | "--vertical" | "down" => dir = "down",
-                    "-h" | "--horizontal" | "right" => dir = "right",
-                    "--from" => match rest.get(i + 1) {
-                        Some(v) => {
-                            from = Some((*v).to_string());
-                            i += 1;
-                        }
-                        None => {
-                            eprintln!("comux split: --from needs a pane token");
-                            return 2;
-                        }
-                    },
-                    "--json" => {}
-                    other => {
-                        eprintln!(
-                            "comux split: unexpected argument '{other}'\n\
-                             usage: comux split [-v|-h] [--from <pane-token>] [--json]"
-                        );
-                        return 2;
-                    }
+            for (f, _) in &p.flags {
+                match *f {
+                    "-v" => dir = "down",
+                    "-h" => dir = "right",
+                    _ => {}
                 }
-                i += 1;
+            }
+            match p.positionals.first().map(|s| s.as_str()) {
+                None => {}
+                Some("down") => dir = "down",
+                Some("right") => dir = "right",
+                Some(other) => {
+                    return usage_error(
+                        json_out,
+                        &format!("comux split: unexpected argument '{other}'"),
+                        SPLIT_SPEC.usage,
+                    );
+                }
             }
             Req::Split {
-                from,
+                from: p.value("--from").map(str::to_string),
                 dir: dir.to_string(),
             }
         }
@@ -787,7 +830,7 @@ pub fn run_client(args: &[String]) -> i32 {
             } else {
                 Target::PaneClose
             };
-            let idx = match pick_index(rest.get(1), json_out, target) {
+            let idx = match pick_verb(&rest, json_out, target) {
                 Ok(i) => i,
                 Err(code) => return code,
             };
@@ -802,49 +845,34 @@ pub fn run_client(args: &[String]) -> i32 {
             // exists for scripts and agents, and an interactive picker in the middle of a
             // pipeline is the wrong affordance. A bare `comux capture-pane` still works —
             // it reads the focused pane.
-            let mut target: Option<String> = None;
-            let mut index: Option<usize> = None;
-            let mut lines: Option<usize> = None;
-            let mut it = rest.iter().skip(1);
-            while let Some(a) = it.next() {
-                match a.as_str() {
-                    "--json" => {}
-                    "-S" | "--lines" => match it.next().map(|v| v.parse::<usize>()) {
-                        Some(Ok(n)) => lines = Some(n),
-                        _ => {
-                            eprintln!("comux capture-pane: -S/--lines needs a number");
-                            return 2;
-                        }
-                    },
-                    "--index" => match it.next().map(|v| v.parse::<usize>()) {
-                        Some(Ok(n)) => index = Some(n),
-                        _ => {
-                            eprintln!("comux capture-pane: --index needs a number");
-                            return 2;
-                        }
-                    },
-                    "-h" | "--help" => {
-                        eprintln!("{CAPTURE_USAGE}");
-                        return 2;
-                    }
-                    other if other.starts_with('-') => {
-                        eprintln!("comux capture-pane: unknown flag {other}\n{CAPTURE_USAGE}");
-                        return 2;
-                    }
-                    other => {
-                        if target.is_some() {
-                            eprintln!(
-                                "comux capture-pane: give at most one target\n{CAPTURE_USAGE}"
-                            );
-                            return 2;
-                        }
-                        target = Some(other.to_string());
-                    }
+            let p = parsed!(CAPTURE_SPEC);
+            let num = |flag: &str| -> Result<Option<usize>, i32> {
+                match p.value(flag) {
+                    None => Ok(None),
+                    Some(v) => v.parse::<usize>().map(Some).map_err(|_| {
+                        usage_error(
+                            json_out,
+                            &format!("comux capture-pane: {flag} needs a number"),
+                            CAPTURE_USAGE,
+                        )
+                    }),
                 }
-            }
+            };
+            let lines = match num("-S") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            let index = match num("--index") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            let target = p.positionals.first().cloned();
             if target.is_some() && index.is_some() {
-                eprintln!("comux capture-pane: give a target or --index, not both");
-                return 2;
+                return usage_error(
+                    json_out,
+                    "comux capture-pane: give a target or --index, not both",
+                    CAPTURE_USAGE,
+                );
             }
             Req::CapturePane {
                 target,
@@ -856,92 +884,71 @@ pub fn run_client(args: &[String]) -> i32 {
             // Addressed by identity, not position, so there is no index listing to fuzzy-pick
             // from when it is omitted (unlike `focus`/`select-tab`): `comux list --json`
             // prints each pane's token, and a pane's own shell carries `$COPAD_MUX_PANE`.
-            let Some(target) = rest.get(1).filter(|t| !t.starts_with('-')) else {
-                eprintln!(
-                    "usage: comux jump <pane-token|terminal-id> [--no-raise]\n\
-                     hint:  a pane's own shell has it in $COPAD_MUX_PANE; \
-                     `comux list --json` prints the rest"
-                );
-                return 2;
+            let p = parsed!(JUMP_SPEC);
+            let Some(target) = p.positionals.first() else {
+                return usage_error(json_out, "comux jump: a pane is required", JUMP_SPEC.usage);
             };
             Req::Jump {
-                target: target.to_string(),
+                target: target.clone(),
             }
         }
         "notify" => {
-            let mut target = std::env::var("COPAD_MUX_PANE").unwrap_or_default();
-            let mut kind = "done".to_string();
-            let mut body = Vec::new();
-            let mut it = rest.iter().skip(1);
-            while let Some(a) = it.next() {
-                match a.as_str() {
-                    "--pane" => match it.next() {
-                        Some(v) => target = (*v).clone(),
-                        None => {
-                            eprintln!("comux notify: --pane needs a value");
-                            return 2;
-                        }
-                    },
-                    "--kind" => match it.next() {
-                        Some(v) => kind = (*v).clone(),
-                        None => {
-                            eprintln!("comux notify: --kind needs a value");
-                            return 2;
-                        }
-                    },
-                    other => body.push(other.to_string()),
-                }
-            }
+            let p = parsed!(NOTIFY_SPEC);
+            let target = p
+                .value("--pane")
+                .map(str::to_string)
+                .unwrap_or_else(|| std::env::var("COPAD_MUX_PANE").unwrap_or_default());
             if target.is_empty() {
                 // Never fall back to the active pane: a notification attributed to the
                 // wrong pane sends its click somewhere misleading.
-                eprintln!(
-                    "usage: comux notify [--pane <token>] [--kind done|blocked] <body...>\n\
-                     comux: no pane given and $COPAD_MUX_PANE is unset (not inside a comux pane?)"
+                return usage_error(
+                    json_out,
+                    "comux: no pane given and $COPAD_MUX_PANE is unset (not inside a comux pane?)",
+                    NOTIFY_SPEC.usage,
                 );
-                return 2;
             }
             Req::Notify {
                 target,
-                kind,
-                body: body.join(" "),
+                kind: p.value("--kind").unwrap_or("done").to_string(),
+                body: p.positionals.join(" "),
             }
         }
         "resize" => {
-            let idx = rest.get(1).and_then(|s| s.parse::<usize>().ok());
-            let dir = rest.get(2).map(|s| s.as_str());
+            let p = parsed!(RESIZE_SPEC);
+            let idx = p.positionals.first().and_then(|s| s.parse::<usize>().ok());
+            let dir = p.positionals.get(1);
             let (Some(idx), Some(dir)) = (idx, dir) else {
-                eprintln!("usage: comux resize <index> <left|right|up|down>");
-                return 2;
+                return usage_error(
+                    json_out,
+                    "comux resize: an index and a direction are required",
+                    RESIZE_SPEC.usage,
+                );
             };
             Req::ResizePane {
                 index: idx,
-                dir: dir.to_string(),
+                dir: dir.clone(),
             }
         }
         "send" | "send-keys" => {
-            let Some(first) = rest.get(1) else {
-                eprintln!("{SEND_USAGE}");
-                return 2;
+            let p = parsed!(SEND_SPEC);
+            let Some(first) = p.positionals.first() else {
+                return usage_error(json_out, "comux send: a pane is required", SEND_USAGE);
             };
             let (target, index) = match classify_pane_arg(first) {
                 Some(PaneArg::Index(i)) => (None, Some(i)),
                 Some(PaneArg::Token(t)) => (Some(t), None),
                 None => {
-                    eprintln!("comux send: '{first}' is neither a pane index nor a pane token");
-                    return 2;
+                    return usage_error(
+                        json_out,
+                        &format!("comux send: '{first}' is neither a pane index nor a pane token"),
+                        SEND_USAGE,
+                    );
                 }
             };
-            let text = rest
-                .iter()
-                .skip(2)
-                .map(|s| s.as_str())
-                .collect::<Vec<_>>()
-                .join(" ");
             Req::SendKeys {
                 target,
                 index,
-                text,
+                text: p.positionals[1..].join(" "),
             }
         }
         other => {
@@ -1009,6 +1016,127 @@ pub fn run_client(args: &[String]) -> i32 {
     }
     if resp.ok { 0 } else { 1 }
 }
+
+/// Parse a verb's arguments (`rest[0]` is the verb) against its grammar. `Err` is the exit
+/// code to return: 0 after printing `--help`, 2 after a usage error.
+fn verb_args(spec: &Spec, rest: &[&String], json: bool) -> Result<cliargs::Parsed, i32> {
+    let verb = rest.first().map(|s| s.as_str()).unwrap_or("");
+    let args: Vec<&str> = rest.iter().skip(1).map(|s| s.as_str()).collect();
+    match cliargs::parse(spec, &args) {
+        Ok(p) => Ok(p),
+        Err(cliargs::Stop::Help) => {
+            println!("{}", spec.usage);
+            Err(0)
+        }
+        Err(cliargs::Stop::Usage(msg)) => Err(usage_error(
+            json,
+            &format!("comux {verb}: {msg}"),
+            spec.usage,
+        )),
+    }
+}
+
+/// Report a malformed invocation and return exit code 2. Under `--json` the error also goes
+/// to stdout as `{"ok":false,"code":"usage",...}`, so a caller parsing stdout sees a JSON
+/// answer for EVERY outcome rather than an empty string.
+fn usage_error(json: bool, msg: &str, usage: &str) -> i32 {
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "ok": false, "code": "usage", "error": msg })
+        );
+    }
+    eprintln!("{msg}\n{usage}");
+    2
+}
+
+/// For a verb with its own parser that already printed its usage error to stderr: under
+/// `--json`, also answer on stdout, so every usage error has the same JSON shape.
+fn json_usage(json: bool, verb: &str, code: i32) -> i32 {
+    if json && code == 2 {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": false,
+                "code": "usage",
+                "error": format!("comux {verb}: invalid arguments (see stderr)"),
+            })
+        );
+    }
+    code
+}
+
+/// The argument of a picker-backed index verb: at most one positional, and when it is
+/// absent the fuzzy picker opens (see [`pick_index`]).
+fn pick_verb(rest: &[&String], json: bool, target: Target) -> Result<usize, i32> {
+    let spec = Spec {
+        usage: target.usage(),
+        flags: &[],
+        positionals: Positionals::AtMost(1),
+    };
+    let p = verb_args(&spec, rest, json)?;
+    pick_index(p.positionals.first().map(|s| s.as_str()), json, target)
+}
+
+const NAME_SPEC_NEW_SESSION: Spec = Spec {
+    usage: "usage: comux new-session [name...] [--json]   (use `--` before a name starting with '-')",
+    flags: &[],
+    positionals: Positionals::Any,
+};
+
+const RENAME_SESSION_SPEC: Spec = Spec {
+    usage: "usage: comux rename-session [index] <name...>   (no index = active)",
+    flags: &[],
+    positionals: Positionals::Any,
+};
+
+const RENAME_TAB_SPEC: Spec = Spec {
+    usage: "usage: comux rename-tab [index] <name...>   (no index = active)",
+    flags: &[],
+    positionals: Positionals::Any,
+};
+
+const SPLIT_SPEC: Spec = Spec {
+    usage: "usage: comux split [-v|-h] [--from <pane-token>] [--json]",
+    flags: &[
+        flag(&["-v", "--vertical"]),
+        flag(&["-h", "--horizontal"]),
+        opt(&["--from"]),
+    ],
+    positionals: Positionals::AtMost(1),
+};
+
+const CAPTURE_SPEC: Spec = Spec {
+    usage: CAPTURE_USAGE,
+    flags: &[opt(&["-S", "--lines"]), opt(&["--index"])],
+    positionals: Positionals::AtMost(1),
+};
+
+const JUMP_SPEC: Spec = Spec {
+    usage: "usage: comux jump <pane-token|terminal-id> [--no-raise]\n\
+            hint:  a pane's own shell has it in $COPAD_MUX_PANE; \
+            `comux list --json` prints the rest",
+    flags: &[flag(&["--no-raise"])],
+    positionals: Positionals::AtMost(1),
+};
+
+const NOTIFY_SPEC: Spec = Spec {
+    usage: "usage: comux notify [--pane <token>] [--kind done|blocked] [--] <body...>",
+    flags: &[opt(&["--pane"]), opt(&["--kind"])],
+    positionals: Positionals::Any,
+};
+
+const RESIZE_SPEC: Spec = Spec {
+    usage: "usage: comux resize <index> <left|right|up|down>",
+    flags: &[],
+    positionals: Positionals::AtMost(2),
+};
+
+const SEND_SPEC: Spec = Spec {
+    usage: SEND_USAGE,
+    flags: &[],
+    positionals: Positionals::Any,
+};
 
 /// Activate the terminal window a `jump` response named, after re-checking the pid still
 /// belongs to the same program.
@@ -1238,11 +1366,14 @@ impl Target {
 /// Resolve an index argument: parse it when one was given, otherwise fuzzy-pick from
 /// the server's live listing. `Err` carries the process exit code (2 usage · 1 failure ·
 /// [`EXIT_CANCELLED`] when the user aborted the picker).
-fn pick_index(arg: Option<&&String>, json: bool, target: Target) -> Result<usize, i32> {
+fn pick_index(arg: Option<&str>, json: bool, target: Target) -> Result<usize, i32> {
     if let Some(a) = arg {
         return a.parse::<usize>().map_err(|_| {
-            eprintln!("usage: {}", target.usage());
-            2
+            usage_error(
+                json,
+                &format!("comux: '{a}' is not an index"),
+                &format!("usage: {}", target.usage()),
+            )
         });
     }
     prompt_ok(json, target.usage())?;
@@ -1639,12 +1770,11 @@ fn print_human(req: &Req, resp: &Resp) {
 }
 
 /// `rename-*` CLI argument shape, shared by tabs and sessions: `rename-x <name...>`
-/// targets the ACTIVE one; `rename-x <index> <name...>` targets by list index. `rest`
-/// includes the verb at `[0]`. A leading integer is read as an index only when a name
+/// targets the ACTIVE one; `rename-x <index> <name...>` targets by list index. `args` are
+/// the verb's positionals. A leading integer is read as an index only when a name
 /// follows it, so `rename-tab 2` names the active tab "2" rather than erroring on a
 /// missing name. An explicit empty name (`rename-tab ""`) clears back to the default.
-fn parse_rename(rest: &[&String]) -> Option<(Option<usize>, String)> {
-    let args = &rest[1..];
+fn parse_rename(args: &[String]) -> Option<(Option<usize>, String)> {
     let (index, name_args) = match args.first().and_then(|s| s.parse::<usize>().ok()) {
         Some(idx) if args.len() > 1 => (Some(idx), &args[1..]),
         _ => (None, args),
@@ -1673,15 +1803,15 @@ fn server_running() -> bool {
 }
 
 fn print_worktree_usage() {
-    eprintln!(
-        "usage:\n\
+    eprintln!("{WORKTREE_USAGE}");
+}
+
+const WORKTREE_USAGE: &str = "usage:\n\
          \x20 comux worktree create <branch> [--from <ref>] [--no-attach] [--json]\n\
          \x20 comux worktree list [--plain|--json]\n\
          \x20 comux worktree rm [<path|branch>] [-f|--force] [-d|--delete-branch] [--json]\n\
          \n\
-         omitting the `rm` target opens a fuzzy picker over the repo's worktrees."
-    );
-}
+         omitting the `rm` target opens a fuzzy picker over the repo's worktrees.";
 
 /// `comux worktree <sub> …` — a nested grammar parsed independently of the flat client.
 fn run_worktree_client(args: &[String]) -> i32 {
@@ -1690,12 +1820,22 @@ fn run_worktree_client(args: &[String]) -> i32 {
         return 2;
     };
     let rest = &args[1..];
+    // `--help` anywhere before a `--` answers with the usage and touches nothing — the
+    // subcommand parsers below would otherwise reject it as an unknown flag (exit 2).
+    if rest
+        .iter()
+        .take_while(|a| *a != "--")
+        .any(|a| a == "-h" || a == "--help")
+    {
+        println!("{WORKTREE_USAGE}");
+        return 0;
+    }
     match sub {
         "create" | "new" | "add" => worktree_create_client(rest),
         "list" | "ls" => worktree_list_client(rest),
         "rm" | "remove" => worktree_rm_client(rest),
         "help" | "-h" | "--help" => {
-            print_worktree_usage();
+            println!("{WORKTREE_USAGE}");
             0
         }
         other => {
@@ -2059,6 +2199,125 @@ fn print_worktrees(infos: &[WorktreeInfo], json: bool, plain: bool) {
 }
 
 #[cfg(test)]
+mod verb_args_tests {
+    use super::*;
+
+    /// Run `comux <args>` against a socket with NO listener. A help/usage path returns 0/2
+    /// before any request is built; an invocation that wrongly got PAST parsing tries the
+    /// dead socket and returns 1 — so the exit code alone says whether a request was sent.
+    ///
+    /// No env juggling here: a test build's [`socket_path`] already falls back to a path with
+    /// no listener, and setting the process-global variable would race other tests.
+    fn exit(args: &[&str]) -> i32 {
+        let argv: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        run_client(&argv)
+    }
+
+    /// Every verb that reaches the request path. `new-session` is deliberately absent: it
+    /// starts a server when parsing lets it through, so a regression there would spawn a
+    /// stray server — the e2e script covers it against an isolated one instead.
+    const VERBS: &[&str] = &[
+        "list",
+        "health",
+        "host",
+        "reload",
+        "kill-server",
+        "list-tabs",
+        "new-tab",
+        "list-sessions",
+        "list-agents",
+        "rename-session",
+        "rename-tab",
+        "select-session",
+        "select-tab",
+        "close-tab",
+        "kill-session",
+        "split",
+        "focus",
+        "close",
+        "capture-pane",
+        "jump",
+        "notify",
+        "resize",
+        "send",
+        "skill",
+        "wait-output",
+        "wait-agent",
+    ];
+
+    #[test]
+    fn help_exits_zero_without_a_request() {
+        for v in VERBS {
+            assert_eq!(exit(&[v, "--help"]), 0, "{v} --help");
+        }
+        assert_eq!(exit(&["worktree", "rm", "--help"]), 0);
+    }
+
+    #[test]
+    fn unknown_flags_exit_two_without_a_request() {
+        for v in VERBS {
+            assert_eq!(exit(&[v, "--bogus"]), 2, "{v} --bogus");
+        }
+    }
+
+    #[test]
+    fn verbs_that_take_nothing_refuse_an_argument() {
+        for v in [
+            "list",
+            "health",
+            "host",
+            "reload",
+            "kill-server",
+            "list-tabs",
+            "new-tab",
+            "list-sessions",
+            "list-agents",
+            "skill",
+        ] {
+            assert_eq!(exit(&[v, "extra"]), 2, "{v} extra");
+        }
+        for v in ["select-session", "close-tab", "focus", "jump"] {
+            assert_eq!(exit(&[v, "1", "2"]), 2, "{v} 1 2");
+        }
+    }
+
+    #[test]
+    fn fleet_verbs_parse_before_any_sweep() {
+        // Help and bad flags must answer without reading config or running ssh.
+        assert_eq!(exit(&["machines", "--help"]), 0);
+        assert_eq!(exit(&["machines", "--bogus"]), 2);
+        assert_eq!(exit(&["machines", "extra"]), 2);
+        assert_eq!(exit(&["list-agents", "--fleet", "--help"]), 0);
+        assert_eq!(exit(&["list-agents", "--fleet", "extra"]), 2);
+    }
+
+    #[test]
+    fn a_value_flag_does_not_eat_help() {
+        assert_eq!(exit(&["split", "--from", "--help"]), 0);
+        // `split` owns `-h`, so there it is a missing value, not help.
+        assert_eq!(exit(&["split", "--from", "-h"]), 2);
+        assert_eq!(
+            exit(&["notify", "--pane", "a-1", "--kind", "--bogus", "x"]),
+            2
+        );
+    }
+
+    #[test]
+    fn split_keeps_dash_h_as_horizontal() {
+        // Parses (then fails on the dead socket) — `-h` is the split direction, not help.
+        assert_eq!(exit(&["split", "-h"]), 1);
+        assert_eq!(exit(&["split", "--help"]), 0);
+    }
+
+    #[test]
+    fn a_body_after_the_separator_may_start_with_a_dash() {
+        // Parses, so it reaches (and fails on) the dead socket.
+        assert_eq!(exit(&["send", "a1-1", "--", "--json"]), 1);
+        assert_eq!(exit(&["send", "a1-1", "--json-ish"]), 2);
+    }
+}
+
+#[cfg(test)]
 mod server_admin_tests {
     use super::*;
 
@@ -2095,7 +2354,7 @@ mod server_admin_tests {
         with_dead_socket(|| assert_eq!(run_server_admin("frobnicate"), 2));
     }
 
-    /// Build the `&[&String]` shape `run_client` passes to `parse_rename`.
+    /// Build the positional shape `run_client` passes to `parse_rename`.
     fn rename_args(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
     }
@@ -2103,10 +2362,9 @@ mod server_admin_tests {
     #[test]
     fn parse_rename_targets_active_or_index() {
         let check = |args: &[&str], want: Option<(Option<usize>, &str)>| {
-            let owned = rename_args(args);
-            let refs: Vec<&String> = owned.iter().collect();
+            let owned = rename_args(&args[1..]);
             assert_eq!(
-                parse_rename(&refs),
+                parse_rename(&owned),
                 want.map(|(i, n)| (i, n.to_string())),
                 "args: {args:?}"
             );
@@ -2332,6 +2590,11 @@ fn parse_wait_args(rest: &[&String]) -> Result<WaitArgs, i32> {
     };
     while i < rest.len() {
         let a = rest[i].as_str();
+        // `--` ends flag parsing, so a pattern that starts with `-` can be waited on.
+        if a == "--" {
+            positional.extend(rest[i + 1..].iter().map(|s| s.to_string()));
+            break;
+        }
         let mut takes_value = true;
         match a {
             "--timeout" => timeout_secs = num(a, rest.get(i + 1))?,
@@ -2343,8 +2606,8 @@ fn parse_wait_args(rest: &[&String]) -> Result<WaitArgs, i32> {
                 match a {
                     "--json" => {}
                     "-h" | "--help" => {
-                        eprintln!("{WAIT_USAGE}");
-                        return Err(2);
+                        println!("{WAIT_USAGE}");
+                        return Err(0);
                     }
                     other if other.starts_with('-') => {
                         eprintln!("comux wait-output: unknown flag {other}\n{WAIT_USAGE}");
@@ -2930,6 +3193,16 @@ fn parse_wait_agent_args(rest: &[&String]) -> Result<WaitAgentArgs, i32> {
     let mut i = 1;
     while i < rest.len() {
         let a = rest[i].as_str();
+        // `--` ends flag parsing: what follows is the target.
+        if a == "--" {
+            for t in &rest[i + 1..] {
+                if target.replace(t.to_string()).is_some() {
+                    eprintln!("comux wait-agent: give exactly one target\n{WAIT_AGENT_USAGE}");
+                    return Err(2);
+                }
+            }
+            break;
+        }
         let mut takes_value = true;
         match a {
             "--status" => match rest.get(i + 1) {
@@ -2958,8 +3231,8 @@ fn parse_wait_agent_args(rest: &[&String]) -> Result<WaitAgentArgs, i32> {
                 match a {
                     "--json" => {}
                     "-h" | "--help" => {
-                        eprintln!("{WAIT_AGENT_USAGE}");
-                        return Err(2);
+                        println!("{WAIT_AGENT_USAGE}");
+                        return Err(0);
                     }
                     other if other.starts_with('-') => {
                         eprintln!("comux wait-agent: unknown flag {other}\n{WAIT_AGENT_USAGE}");
@@ -3703,13 +3976,32 @@ mod split_exit_tests {
 /// `comux machines` / `comux list-agents --fleet`, or `None` when this is not a fleet verb.
 /// Returns an exit code the caller passes straight back.
 fn fleet_verb(args: &[String]) -> Option<i32> {
-    let verb = args.first().map(|s| s.as_str())?;
-    let fleet_flag = args.iter().any(|a| a == "--fleet");
-    let json = args.iter().any(|a| a == "--json");
-    match verb {
-        "machines" => Some(print_machines(json)),
-        "list-agents" | "agents" if fleet_flag => Some(print_fleet_agents(json)),
-        _ => None,
+    const MACHINES: Spec = cliargs::bare("usage: comux machines [--json]");
+    const AGENTS: Spec = Spec {
+        usage: "usage: comux list-agents [--fleet] [--json]",
+        flags: &[flag(&["--fleet"])],
+        positionals: Positionals::AtMost(0),
+    };
+    let (json, owned) = cliargs::take_json(args);
+    let rest: Vec<&String> = owned.iter().collect();
+    let machines = match rest.first().map(|s| s.as_str())? {
+        "machines" => true,
+        "list-agents" | "agents" => false,
+        _ => return None,
+    };
+    let spec = if machines { &MACHINES } else { &AGENTS };
+    // Parsed HERE, not only by the flat client: a fleet verb never reaches it, and `--help`
+    // must not run an SSH sweep.
+    let p = match verb_args(spec, &rest, json) {
+        Ok(p) => p,
+        Err(code) => return Some(code),
+    };
+    if machines {
+        Some(print_machines(json))
+    } else if p.has("--fleet") {
+        Some(print_fleet_agents(json))
+    } else {
+        None
     }
 }
 

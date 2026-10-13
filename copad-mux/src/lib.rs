@@ -13,6 +13,7 @@
 pub mod agentpoll;
 pub mod agentsessions;
 pub mod agentstate;
+pub mod cliargs;
 pub mod client;
 pub mod codexdaemon;
 pub mod config;
