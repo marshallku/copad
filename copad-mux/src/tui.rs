@@ -2057,6 +2057,17 @@ impl App {
         self.panes.contains_key(&id).then_some(id)
     }
 
+    /// Where the caller's pane lives, for a verb that defaults to "the caller's tab/session".
+    /// Token-only, like every write: a raw terminal id can name an unrelated pane after a
+    /// server restart.
+    fn caller_location(&self, token: &str) -> Result<(WorkspaceId, TabId, PaneId), String> {
+        self.resolve_pane_token(token)
+            .and_then(|tid| self.locate_terminal(&tid))
+            .ok_or_else(|| {
+                format!("unknown pane '{token}' (the calling pane is not on this server)")
+            })
+    }
+
     /// Resolve a pane by its `$COPAD_MUX_PANE` TOKEN only — never a raw terminal id.
     ///
     /// Terminal ids restart at `term0` on every server incarnation, so a recorded one can
@@ -2163,6 +2174,7 @@ impl App {
                     label_sweeps_failed: self.label_sweeps_failed,
                     fd_soft: fd.map(|b| b.soft),
                     fd_open: fd.and_then(|b| b.open),
+                    caps: control::SERVER_CAPS.iter().map(|c| c.to_string()).collect(),
                 })
             }
             Req::List => {
@@ -2448,16 +2460,27 @@ impl App {
                     Err(e) => Resp::err(e.to_string()),
                 }
             }
-            Req::RenameTab { index, name } => {
-                // No index → the ACTIVE tab (so a pane's shell can rename its own tab).
-                let tab = match index {
-                    Some(i) => self.tab_ids().get(*i).cloned(),
-                    None => self.active_tab_id(),
+            Req::RenameTab { index, pane, name } => {
+                // An index addresses the active session's tabs. With no index, `pane` (the
+                // caller's own pane) names the tab — in whatever session it lives, so an agent
+                // renaming its own tab never touches the one the user is looking at. Neither
+                // (an older client) keeps the legacy "active tab" meaning.
+                let target = match (index, pane) {
+                    (Some(i), _) => self
+                        .tab_ids()
+                        .get(*i)
+                        .cloned()
+                        .map(|t| (self.ws.clone(), t)),
+                    (None, Some(p)) => match self.caller_location(p) {
+                        Ok((ws, tab, _)) => Some((ws, tab)),
+                        Err(e) => return Resp::err(e),
+                    },
+                    (None, None) => self.active_tab_id().map(|t| (self.ws.clone(), t)),
                 };
-                match tab {
-                    Some(tab) => {
+                match target {
+                    Some((ws, tab)) => {
                         let new = (!name.trim().is_empty()).then(|| name.trim().to_string());
-                        self.rename_tab(&self.ws.clone(), &tab, new);
+                        self.rename_tab(&ws, &tab, new);
                         Resp::ok()
                     }
                     None => Resp::err(match index {
@@ -2532,11 +2555,16 @@ impl App {
                     Resp::err(self.take_spawn_error("new-session"))
                 }
             }
-            Req::RenameSession { index, name } => {
-                // No index → the ACTIVE session (mirrors `rename-tab`).
-                let wid = match index {
-                    Some(i) => self.session_ids().get(*i).cloned(),
-                    None => Some(self.ws.clone()),
+            Req::RenameSession { index, pane, name } => {
+                // Same addressing as `rename-tab`: index, else the caller's session, else
+                // (an older client) the active one.
+                let wid = match (index, pane) {
+                    (Some(i), _) => self.session_ids().get(*i).cloned(),
+                    (None, Some(p)) => match self.caller_location(p) {
+                        Ok((ws, _, _)) => Some(ws),
+                        Err(e) => return Resp::err(e),
+                    },
+                    (None, None) => Some(self.ws.clone()),
                 };
                 match wid {
                     Some(wid) => {

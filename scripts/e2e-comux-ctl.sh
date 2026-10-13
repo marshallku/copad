@@ -36,6 +36,7 @@
 #  21. a bell rung in a HIDDEN tab still reaches the rendered status bar
 #  22. an idle client silently repaints itself on a timer, and never clears to do it
 #  23. every verb answers --help (0) / rejects unknown flags (2) without touching state
+#  24. an index-less rename renames the CALLER's tab/session, not the one the user is viewing
 
 set -euo pipefail
 
@@ -195,13 +196,13 @@ t 10 "$COMUX" notify --pane "$token0" --kind blocked "e2e says hello" >"$WORK/ou
 # toast is the only other evidence and it is transient. The tab half is the point: a space
 # can hold many agents, so the space name alone does not answer "which one is asking me".
 grep -q '/' "$WORK/out" || fail "notify did not report which tab it was attributed to: $(cat "$WORK/out")"
-t 10 "$COMUX" rename-tab "e2e-tab" >/dev/null || fail "rename-tab failed"
+COPAD_MUX_PANE="$token0" t 10 "$COMUX" rename-tab "e2e-tab" >/dev/null || fail "rename-tab failed"
 t 10 "$COMUX" notify --pane "$token0" --kind done "named" >"$WORK/out" \
     || fail "notify after rename-tab failed"
 grep -q '/e2e-tab$' "$WORK/out" || fail "a named tab must title the notification: $(cat "$WORK/out")"
 # Clearing the name falls back to the 1-based index — the `Ctrl-b <n>` that jumps there,
 # which is more useful than repeating the space name on every row.
-t 10 "$COMUX" rename-tab "" >/dev/null || fail "clearing the tab name failed"
+COPAD_MUX_PANE="$token0" t 10 "$COMUX" rename-tab "" >/dev/null || fail "clearing the tab name failed"
 t 10 "$COMUX" notify --pane "$token0" --kind done "unnamed" >"$WORK/out" \
     || fail "notify after clearing the tab name failed"
 grep -qE '/tab [0-9]+$' "$WORK/out" || fail "an unnamed tab must fall back to its index: $(cat "$WORK/out")"
@@ -1431,7 +1432,42 @@ grep -q -- "--json-literal-e2e" "$WORK/out" || fail "the text after -- was not s
 t 10 "$COMUX" send "$tok" $'\x15' >/dev/null # clear the line again (Ctrl-U)
 ok "help exits 0 and creates nothing; bad flags exit 2 (JSON under --json); -- passes text through"
 
-echo "24. the server is still responsive and shuts down cleanly"
+echo "24. an index-less rename targets the caller's tab and session"
+t 10 "$COMUX" list --json >"$WORK/json"
+tokA="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["panes"][0]["token"])' <"$WORK/json")"
+t 10 "$COMUX" new-session wu2-viewed >/dev/null || fail "could not create the viewed session"
+# The user now looks at `wu2-viewed`; the caller's pane lives in the other session.
+COPAD_MUX_PANE="$tokA" t 10 "$COMUX" rename-tab callers-tab >/dev/null || fail "caller rename-tab failed"
+COPAD_MUX_PANE="$tokA" t 10 "$COMUX" rename-session callers-space >/dev/null || fail "caller rename-session failed"
+t 10 "$COMUX" list-tabs --json >"$WORK/json"
+python3 -c 'import json,sys; t=json.load(sys.stdin)["tabs"]; assert all(x["name"]=="" for x in t), t' <"$WORK/json" \
+    || fail "the VIEWED session's tab was renamed: $(cat "$WORK/json")"
+t 10 "$COMUX" list-sessions --json >"$WORK/json"
+python3 - "$WORK/json" <<'PYEOF' || fail "rename-session hit the wrong session: $(cat "$WORK/json")"
+import json, sys
+s = json.load(open(sys.argv[1]))["sessions"]
+names = {x["name"]: x["active"] for x in s}
+assert names.get("callers-space") is False, s   # renamed, and NOT the one being viewed
+assert names.get("wu2-viewed") is True, s       # the viewed session kept its name
+PYEOF
+t 10 "$COMUX" agents --json >/dev/null # (smoke) the server still answers
+t 10 "$COMUX" list-sessions --json >"$WORK/json"
+ia="$(python3 -c 'import json,sys; print([x["index"] for x in json.load(sys.stdin)["sessions"] if x["name"]=="callers-space"][0])' <"$WORK/json")"
+t 10 "$COMUX" select-session "$ia" >/dev/null
+t 10 "$COMUX" list-tabs --json >"$WORK/json"
+grep -q '"name":"callers-tab"' "$WORK/json" || fail "the caller's tab was not renamed: $(cat "$WORK/json")"
+rc=0; t 10 "$COMUX" rename-tab nowhere >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 2 ]] || fail "rename-tab outside a pane should exit 2, got $rc"
+rc=0; COPAD_MUX_PANE="deadbeef-999" t 10 "$COMUX" rename-tab ghost >"$WORK/out" 2>&1 || rc=$?
+[[ "$rc" == 1 ]] || fail "rename-tab from an unknown pane should fail (1), got $rc: $(cat "$WORK/out")"
+t 10 "$COMUX" list-sessions --json >"$WORK/json"
+iv="$(python3 -c 'import json,sys; print([x["index"] for x in json.load(sys.stdin)["sessions"] if x["name"]=="wu2-viewed"][0])' <"$WORK/json")"
+t 10 "$COMUX" kill-session "$iv" >/dev/null || fail "cleanup kill-session failed"
+COPAD_MUX_PANE="$tokA" t 10 "$COMUX" rename-session "" >/dev/null
+COPAD_MUX_PANE="$tokA" t 10 "$COMUX" rename-tab "" >/dev/null
+ok "the caller's tab and session were renamed while another was viewed; outside a pane exits 2"
+
+echo "25. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

@@ -79,6 +79,11 @@ pub enum Req {
     RenameTab {
         #[serde(default)]
         index: Option<usize>,
+        /// The CALLER's pane token (`$COPAD_MUX_PANE`): with no `index`, the tab holding that
+        /// pane is renamed — wherever it is — rather than whatever tab the user is looking at.
+        /// An older client sends neither, and keeps the legacy "active tab" meaning.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<String>,
         name: String,
     },
     /// List the sessions (workspaces).
@@ -99,6 +104,9 @@ pub enum Req {
     RenameSession {
         #[serde(default)]
         index: Option<usize>,
+        /// The caller's pane token; see [`Req::RenameTab::pane`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane: Option<String>,
         name: String,
     },
     /// Make the session at `index` (as printed by `list-sessions`) active.
@@ -243,7 +251,18 @@ pub struct HealthInfo {
     /// Descriptors the server currently holds open, when countable.
     #[serde(default)]
     pub fd_open: Option<usize>,
+    /// Request semantics this server implements beyond the original wire, so a newer CLI
+    /// can REFUSE an operation an older server would silently misread (it ignores unknown
+    /// fields, so e.g. a caller-targeted rename would rename the user's active tab instead).
+    #[serde(default)]
+    pub caps: Vec<String>,
 }
+
+/// Capability: `rename-tab`/`rename-session` honor `pane` (the caller's pane).
+pub const CAP_RENAME_CALLER: &str = "rename-caller";
+
+/// Every capability this build's server implements (reported by `health`).
+pub const SERVER_CAPS: &[&str] = &[CAP_RENAME_CALLER];
 
 impl HealthInfo {
     /// Panes that still fit in the descriptor budget, when both numbers are known.
@@ -747,7 +766,11 @@ pub fn run_client(args: &[String]) -> i32 {
                     RENAME_SESSION_SPEC.usage,
                 );
             };
-            Req::RenameSession { index, name }
+            let pane = match caller_pane_for(index, cmd, json_out, RENAME_SESSION_SPEC.usage) {
+                Ok(p) => p,
+                Err(code) => return code,
+            };
+            Req::RenameSession { index, pane, name }
         }
         "rename-tab" => {
             let p = parsed!(RENAME_TAB_SPEC);
@@ -758,7 +781,11 @@ pub fn run_client(args: &[String]) -> i32 {
                     RENAME_TAB_SPEC.usage,
                 );
             };
-            Req::RenameTab { index, name }
+            let pane = match caller_pane_for(index, cmd, json_out, RENAME_TAB_SPEC.usage) {
+                Ok(p) => p,
+                Err(code) => return code,
+            };
+            Req::RenameTab { index, pane, name }
         }
         // The index-taking verbs below share one shape: an omitted index opens the fuzzy
         // picker over a live listing instead of failing with a usage line (see
@@ -1066,6 +1093,64 @@ fn json_usage(json: bool, verb: &str, code: i32) -> i32 {
     code
 }
 
+/// The caller's own pane for an index-less `rename-*`, so it renames the tab/session the
+/// CALLER is in rather than the one the user happens to be looking at. `Ok(None)` when an
+/// index was given. Refuses (exit 2) outside a comux pane — there is no "caller" to default
+/// to — and (exit 1) against a server too old to honor the field, which would otherwise
+/// ignore it and rename the user's active tab.
+fn caller_pane_for(
+    index: Option<usize>,
+    verb: &str,
+    json: bool,
+    usage: &str,
+) -> Result<Option<String>, i32> {
+    if index.is_some() {
+        return Ok(None);
+    }
+    let Some(pane) = std::env::var("COPAD_MUX_PANE")
+        .ok()
+        .filter(|p| !p.is_empty())
+    else {
+        return Err(usage_error(
+            json,
+            &format!(
+                "comux {verb}: not inside a comux pane ($COPAD_MUX_PANE is unset) — give an index"
+            ),
+            usage,
+        ));
+    };
+    require_cap(CAP_RENAME_CALLER, verb, json)?;
+    Ok(Some(pane))
+}
+
+/// Refuse (exit 1) unless the running server reports `cap`. One extra `health` round trip,
+/// paid only by the operations whose new meaning an older server would silently misread.
+fn require_cap(cap: &str, verb: &str, json: bool) -> Result<(), i32> {
+    let resp = match round_trip(&Req::Health) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("comux: {e}");
+            return Err(1);
+        }
+    };
+    let caps = resp.health.map(|h| h.caps).unwrap_or_default();
+    if caps.iter().any(|c| c == cap) {
+        return Ok(());
+    }
+    let msg = format!(
+        "comux {verb}: the running server predates this operation ({cap}) — \
+         `comux server restart` after upgrading"
+    );
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "ok": false, "code": "unsupported", "error": msg })
+        );
+    }
+    eprintln!("{msg}");
+    Err(1)
+}
+
 /// The argument of a picker-backed index verb: at most one positional, and when it is
 /// absent the fuzzy picker opens (see [`pick_index`]).
 fn pick_verb(rest: &[&String], json: bool, target: Target) -> Result<usize, i32> {
@@ -1085,13 +1170,13 @@ const NAME_SPEC_NEW_SESSION: Spec = Spec {
 };
 
 const RENAME_SESSION_SPEC: Spec = Spec {
-    usage: "usage: comux rename-session [index] <name...>   (no index = active)",
+    usage: "usage: comux rename-session [index] <name...>   (no index = the session of the calling pane)",
     flags: &[],
     positionals: Positionals::Any,
 };
 
 const RENAME_TAB_SPEC: Spec = Spec {
-    usage: "usage: comux rename-tab [index] <name...>   (no index = active)",
+    usage: "usage: comux rename-tab [index] <name...>   (no index = the tab of the calling pane)",
     flags: &[],
     positionals: Positionals::Any,
 };
@@ -2419,13 +2504,13 @@ mod server_admin_tests {
             .expect("indexed form must parse");
         assert!(matches!(
             old,
-            Req::RenameSession { index: Some(1), ref name } if name == "api"
+            Req::RenameSession { index: Some(1), pane: None, ref name } if name == "api"
         ));
         let new: Req = serde_json::from_str(r#"{"cmd":"rename-tab","name":"build"}"#)
             .expect("index-less form must parse");
         assert!(matches!(
             new,
-            Req::RenameTab { index: None, ref name } if name == "build"
+            Req::RenameTab { index: None, pane: None, ref name } if name == "build"
         ));
     }
 }
