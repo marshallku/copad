@@ -298,6 +298,12 @@ struct AgentState {
     status: agentstate::AgentStatus,
     /// Monotonic instant the pane entered `status`; carried across refreshes while it holds.
     since: std::time::Instant,
+    /// The mux-wide change counter ([`App::agent_seq`]) at the moment `status` was entered;
+    /// carried forward with `since`. What `wait-agent --after-seq` compares against.
+    seq: u64,
+    /// The agent process the reading is for. A different pid in the same pane is a different
+    /// agent, so it is a change even when the status happens to match.
+    pid: u32,
 }
 
 /// One sidebar/switcher agent row: where the agent pane lives + what it runs.
@@ -659,6 +665,9 @@ pub struct App {
     /// refreshed at the label cadence from Claude's session file + a screen-text fallback
     /// (`agentstate`).
     agent_statuses: HashMap<TerminalId, AgentState>,
+    /// Mux-wide count of observed agent status changes; stamps each [`AgentState::seq`].
+    /// Monotonic for the server's life, so a reading never repeats.
+    agent_seq: u64,
     /// The whole-minute bucket of each agent's time-in-status as last REPORTED to the
     /// render loop, so a roll can be turned into a repaint (see `refresh_agent_statuses`).
     agent_minutes: HashMap<TerminalId, u64>,
@@ -865,6 +874,7 @@ impl App {
                 .unwrap_or_else(std::time::Instant::now),
             label_sweeps_failed: 0,
             agent_statuses: HashMap::new(),
+            agent_seq: 0,
             agent_minutes: HashMap::new(),
             agent_details: HashMap::new(),
             bells_reported: std::collections::HashSet::new(),
@@ -2408,7 +2418,12 @@ impl App {
                 let d = match dir.as_str() {
                     "down" => Dir::Down,
                     "right" => Dir::Right,
-                    other => return Resp::err(format!("bad dir '{other}' (right|down)")),
+                    other => {
+                        return Resp::err_code(
+                            "invalid",
+                            format!("bad dir '{other}' (right|down)"),
+                        );
+                    }
                 };
                 // `from` pins the split SOURCE by identity. Without it the focused pane is
                 // split, and focus is mutable: a script that lists, then splits, can have the
@@ -2416,7 +2431,7 @@ impl App {
                 // source's cwd, the command it then runs executes in the wrong directory.
                 if let Some(t) = from {
                     let Some(tid) = self.resolve_pane_token(t) else {
-                        return Resp::err(format!("unknown pane '{t}'"));
+                        return Resp::err_code("not_found", format!("unknown pane '{t}'"));
                     };
                     // Splitting reaches into the active tab's layout, so a source outside it
                     // is refused rather than silently splitting something else.
@@ -2460,7 +2475,12 @@ impl App {
                     "left" => (Dir::Right, false),
                     "down" => (Dir::Down, true),
                     "up" => (Dir::Down, false),
-                    other => return Resp::err(format!("bad dir '{other}' (left|right|up|down)")),
+                    other => {
+                        return Resp::err_code(
+                            "invalid",
+                            format!("bad dir '{other}' (left|right|up|down)"),
+                        );
+                    }
                 };
                 match self.pane_order().get(*index).cloned() {
                     Some(pane) => {
@@ -2474,7 +2494,7 @@ impl App {
                         self.sync_sizes();
                         Resp::ok()
                     }
-                    None => Resp::err(format!("no pane at index {index}")),
+                    None => Resp::err_code("not_found", format!("no pane at index {index}")),
                 }
             }
             Req::Focus { index } => match self.pane_order().get(*index).cloned() {
@@ -2485,14 +2505,14 @@ impl App {
                     });
                     Resp::ok()
                 }
-                None => Resp::err(format!("no pane at index {index}")),
+                None => Resp::err_code("not_found", format!("no pane at index {index}")),
             },
             Req::Close { index } => match self.pane_order().get(*index).cloned() {
                 Some(pane) => match self.close_pane(pane) {
                     Ok(()) => Resp::ok(),
                     Err(e) => Resp::err(e.to_string()),
                 },
-                None => Resp::err(format!("no pane at index {index}")),
+                None => Resp::err_code("not_found", format!("no pane at index {index}")),
             },
             Req::SendKeys {
                 target,
@@ -2501,19 +2521,22 @@ impl App {
             } => {
                 let tid = match (target, index) {
                     (Some(_), Some(_)) => {
-                        return Resp::err("give a pane token or an index, not both");
+                        return Resp::err_code(
+                            "invalid",
+                            "give a pane token or an index, not both",
+                        );
                     }
                     // A write never defaults to the focused pane: focus is mutable, and
                     // typing into the wrong pane cannot be undone.
-                    (None, None) => return Resp::err("no pane given"),
+                    (None, None) => return Resp::err_code("invalid", "no pane given"),
                     (Some(t), None) => match self.resolve_pane_token(t) {
                         Some(tid) => tid,
-                        None => return Resp::err(format!("unknown pane '{t}'")),
+                        None => return Resp::err_code("not_found", format!("unknown pane '{t}'")),
                     },
                     (None, Some(i)) => {
                         let order = self.pane_order();
                         let Some(pane) = order.get(*i) else {
-                            return Resp::err(format!("no pane at index {i}"));
+                            return Resp::err_code("not_found", format!("no pane at index {i}"));
                         };
                         match self
                             .state
@@ -2780,16 +2803,21 @@ impl App {
                     self.jump_to_terminal(&term);
                     Resp::jump(self.raise_target(), self.copad_target())
                 }
-                None => Resp::err(format!("unknown pane: {target}")),
+                None => Resp::err_code("not_found", format!("unknown pane: {target}")),
             },
             Req::Notify { target, kind, body } => {
                 let kind = match kind.as_str() {
                     "done" => "done",
                     "blocked" => "blocked",
-                    other => return Resp::err(format!("unknown kind: {other} (done|blocked)")),
+                    other => {
+                        return Resp::err_code(
+                            "invalid",
+                            format!("unknown kind: {other} (done|blocked)"),
+                        );
+                    }
                 };
                 let Some(term) = self.resolve_pane_target(target) else {
-                    return Resp::err(format!("unknown pane: {target}"));
+                    return Resp::err_code("not_found", format!("unknown pane: {target}"));
                 };
                 // Claim FIRST: it re-sweeps the process table, so the label read below
                 // names the agent that is actually running rather than a stale one.
@@ -2917,10 +2945,10 @@ impl App {
                 lines,
             } => {
                 if target.is_some() && index.is_some() {
-                    return Resp::err("give a target or --index, not both");
+                    return Resp::err_code("invalid", "give a target or --index, not both");
                 }
                 if *lines == Some(0) {
-                    return Resp::err("--lines must be at least 1");
+                    return Resp::err_code("invalid", "--lines must be at least 1");
                 }
                 // Precedence: explicit target (anywhere in the mux) > index (active tab) >
                 // focused pane. Resolved to a TerminalId either way, because that is what
@@ -2928,14 +2956,19 @@ impl App {
                 let tid = match target {
                     Some(t) => match self.resolve_pane_target(t) {
                         Some(tid) => tid,
-                        None => return Resp::err(format!("unknown pane '{t}'")),
+                        None => return Resp::err_code("not_found", format!("unknown pane '{t}'")),
                     },
                     None => {
                         let order = self.pane_order();
                         let pane = match index {
                             Some(i) => match order.get(*i) {
                                 Some(p) => p.clone(),
-                                None => return Resp::err(format!("no pane at index {i}")),
+                                None => {
+                                    return Resp::err_code(
+                                        "not_found",
+                                        format!("no pane at index {i}"),
+                                    );
+                                }
                             },
                             None => match self.focused_pane() {
                                 Some(p) => p,
@@ -2971,7 +3004,7 @@ impl App {
                         // cached classification has not caught up with — which answers with
                         // an empty listing so a caller can keep waiting through the sweep
                         // interval (500ms attached, 5s detached).
-                        None => return Resp::err(format!("unknown pane '{t}'")),
+                        None => return Resp::err_code("not_found", format!("unknown pane '{t}'")),
                     },
                     None => None,
                 };
@@ -2994,6 +3027,7 @@ impl App {
                         tool: r.tool,
                         status: r.status.to_string(),
                         for_secs: r.for_secs,
+                        seq: self.agent_statuses.get(&r.term).map_or(0, |s| s.seq),
                         detail: r.detail,
                         tab_id: loc.as_ref().map(|l| l.0.to_string()).unwrap_or_default(),
                         tab_name: loc.as_ref().map(|l| l.1.clone()).unwrap_or_default(),
@@ -5370,6 +5404,7 @@ impl App {
         // What each agent is DOING. Read here rather than only at render time so a change
         // reports `changed` — see `App::agent_details`.
         let mut details: HashMap<TerminalId, String> = HashMap::new();
+        let mut seq_counter = self.agent_seq;
         for (tid, pane) in &self.panes {
             let Some(label) = self.labels.get(tid) else {
                 continue;
@@ -5402,7 +5437,18 @@ impl App {
             // exactly, so the equality check below still means "a status moved" and the
             // render loop's idle-skip survives.
             let since = status_since(prev, status, std::time::Instant::now());
-            next.insert(tid.clone(), AgentState { status, since });
+            // A NEW status — including the first one seen for this pane, so an agent that
+            // reappears after losing its classification is a change — takes the next number.
+            let seq = status_seq(prev, label.pid, status, &mut seq_counter);
+            next.insert(
+                tid.clone(),
+                AgentState {
+                    status,
+                    since,
+                    seq,
+                    pid: label.pid,
+                },
+            );
         }
         // The sidebar renders time-in-status bucketed to whole minutes, and a BLOCKED
         // agent — the one the attention band exists for — emits nothing, so no pane-dirty
@@ -5410,6 +5456,7 @@ impl App {
         // cover it either: that fires on wall-clock minutes, not on the minute each
         // agent's status began, so a row could sit a full bucket behind its neighbours.
         // Report a roll as a change.
+        self.agent_seq = seq_counter;
         agentpoll::set_wanted(&self.agent_poll, wanted);
         let mut minutes = HashMap::with_capacity(next.len());
         let mut rolled = false;
@@ -8150,6 +8197,25 @@ fn status_since(
     }
 }
 
+/// The change number for `status`: the previous one while the status HOLDS, else the next
+/// value of the mux-wide `counter`. A pane seen for the first time (`prev = None`) is a change
+/// too, so an agent that loses its classification and comes back is never mistaken for the
+/// reading a `wait-agent --after-seq` already saw.
+fn status_seq(
+    prev: Option<AgentState>,
+    pid: u32,
+    status: agentstate::AgentStatus,
+    counter: &mut u64,
+) -> u64 {
+    match prev {
+        Some(p) if p.status == status && p.pid == pid => p.seq,
+        _ => {
+            *counter += 1;
+            *counter
+        }
+    }
+}
+
 /// Coarse "how long in this status" for a sidebar row: empty under a minute, then whole
 /// minutes, then hours. MINUTE granularity on purpose — a seconds-precise readout would
 /// recompose the frame (and re-diff it to every attached client) once a second forever,
@@ -8334,9 +8400,9 @@ mod tests {
         build_command_line, clip_width, cwd_affinity, detect_alt_screen_transition,
         extract_selection, filter_env, fmt_elapsed, home_short_in, host_parts, list_window_start,
         menu_origin, merge_env, merge_labels, notify_title, reload_note, resume_line, resume_rank,
-        sel_bounds, sel_cols, shell_quote, split_sidebar, status_since, tab_display_title,
-        tab_window, usage_should_roll, usage_threshold_color, window_max_start, window_start_var,
-        with_pane_token, wrap_page,
+        sel_bounds, sel_cols, shell_quote, split_sidebar, status_seq, status_since,
+        tab_display_title, tab_window, usage_should_roll, usage_threshold_color, window_max_start,
+        window_start_var, with_pane_token, wrap_page,
     };
     use crate::model::{TerminalId, WorkspaceId};
     use crate::procinfo::{Kind, Label};
@@ -9056,6 +9122,46 @@ mod tests {
     #[test]
     /// The status map is rebuilt every refresh, so the stamp must be CARRIED while the
     /// status holds — resetting it would peg every `blocked Nm` readout at nothing.
+    fn status_seq_moves_only_on_a_change_and_never_repeats() {
+        use crate::agentstate::AgentStatus;
+        let now = std::time::Instant::now();
+        let st = |status, seq| AgentState {
+            status,
+            since: now,
+            seq,
+            pid: 100,
+        };
+        let mut c = 5;
+        // Holding: same number, counter untouched.
+        let held = status_seq(
+            Some(st(AgentStatus::Working, 5)),
+            100,
+            AgentStatus::Working,
+            &mut c,
+        );
+        assert_eq!((held, c), (5, 5));
+        // A change takes the next number.
+        let moved = status_seq(
+            Some(st(AgentStatus::Working, 5)),
+            100,
+            AgentStatus::Ready,
+            &mut c,
+        );
+        assert_eq!(moved, 6);
+        // A REPLACEMENT agent (new pid) in the same status is a change too.
+        let replaced = status_seq(
+            Some(st(AgentStatus::Ready, 6)),
+            200,
+            AgentStatus::Ready,
+            &mut c,
+        );
+        assert_eq!(replaced, 7);
+        // A first sighting is a change as well, and numbers are never reused.
+        assert_eq!(status_seq(None, 100, AgentStatus::Ready, &mut c), 8);
+        assert_eq!(status_seq(None, 100, AgentStatus::Ready, &mut c), 9);
+    }
+
+    #[test]
     fn status_since_carries_forward_until_the_status_moves() {
         use crate::agentstate::AgentStatus;
         let then = std::time::Instant::now();
@@ -9063,6 +9169,8 @@ mod tests {
         let prev = AgentState {
             status: AgentStatus::Blocked,
             since: then,
+            seq: 1,
+            pid: 1,
         };
         // Same status → keep the original stamp (still "blocked for 5 minutes").
         assert_eq!(status_since(Some(prev), AgentStatus::Blocked, now), then);

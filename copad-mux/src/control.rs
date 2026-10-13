@@ -433,6 +433,11 @@ pub struct AgentInfo {
     pub status: String,
     /// Whole seconds the agent has held `status`.
     pub for_secs: u64,
+    /// Bumped on every observed status change, mux-wide and never reused within a server's
+    /// life: `wait-agent --after-seq <seq>` waits for a change NEWER than this reading. Only
+    /// comparable on the server that issued it (see `wait-agent --help`).
+    #[serde(default)]
+    pub seq: u64,
     /// What the agent was last seen DOING (`Bash: run the tests`, `running: cargo test`),
     /// read from the tool's own structured log.
     ///
@@ -791,6 +796,9 @@ pub fn run_client(args: &[String]) -> i32 {
             .iter()
             .take_while(|a| *a != "--")
             .any(|a| a == "--json");
+        if json && wants_help(&args[1..]) {
+            return json_help(WORKTREE_USAGE);
+        }
         return json_usage(json, "worktree", run_worktree_client(&args[1..]));
     }
     // Fleet verbs are answered ENTIRELY client-side: they read the local config and run `ssh`,
@@ -804,6 +812,12 @@ pub fn run_client(args: &[String]) -> i32 {
     let (json_out, owned) = cliargs::take_json(args);
     let rest: Vec<&String> = owned.iter().collect();
     let Some(cmd) = rest.first().map(|s| s.as_str()) else {
+        if json_out {
+            println!(
+                "{}",
+                serde_json::json!({ "ok": false, "code": "usage", "error": "comux: no command given" })
+            );
+        }
         eprintln!(
             "usage: comux <list|split|resize|focus|close|send|capture-pane|wait-output|list-agents|wait-agent|\
              list-tabs|new-tab|select-tab|\
@@ -835,18 +849,32 @@ pub fn run_client(args: &[String]) -> i32 {
         // EMBEDDED, not read from disk: the skill has to be available from an installed
         // binary with no repo checkout, and it must describe THIS build's verbs rather than
         // whatever a stale file next to it says.
-        println!("{SKILL_MD}");
+        if json_out {
+            println!("{}", serde_json::json!({ "ok": true, "skill": SKILL_MD }));
+        } else {
+            println!("{SKILL_MD}");
+        }
         return 0;
+    }
+    if json_out
+        && (cmd == "wait-agent" || cmd == "wait-output" || cmd == "wait")
+        && wants_help(&owned[1..])
+    {
+        return json_help(if cmd == "wait-agent" {
+            WAIT_AGENT_USAGE
+        } else {
+            WAIT_USAGE
+        });
     }
     if cmd == "wait-agent" {
         return match parse_wait_agent_args(&rest) {
-            Ok(args) => run_wait_agent(args),
+            Ok(args) => run_wait_agent(args, json_out),
             Err(code) => json_usage(json_out, cmd, code),
         };
     }
     if cmd == "wait-output" || cmd == "wait" {
         return match parse_wait_args(&rest) {
-            Ok(args) => run_wait_output(args),
+            Ok(args) => run_wait_output(args, json_out),
             Err(code) => json_usage(json_out, cmd, code),
         };
     }
@@ -1176,6 +1204,12 @@ pub fn run_client(args: &[String]) -> i32 {
     let resp = match round_trip(&req) {
         Ok(r) => r,
         Err(e) => {
+            if json_out {
+                println!(
+                    "{}",
+                    serde_json::json!({ "ok": false, "code": "unavailable", "error": e })
+                );
+            }
             eprintln!("comux: {e}");
             return 1;
         }
@@ -1239,7 +1273,11 @@ fn verb_args(spec: &Spec, rest: &[&String], json: bool) -> Result<cliargs::Parse
     match cliargs::parse(spec, &args) {
         Ok(p) => Ok(p),
         Err(cliargs::Stop::Help) => {
-            println!("{}", spec.usage);
+            if json {
+                println!("{}", serde_json::json!({ "ok": true, "usage": spec.usage }));
+            } else {
+                println!("{}", spec.usage);
+            }
             Err(0)
         }
         Err(cliargs::Stop::Usage(msg)) => Err(usage_error(
@@ -1262,6 +1300,19 @@ fn usage_error(json: bool, msg: &str, usage: &str) -> i32 {
     }
     eprintln!("{msg}\n{usage}");
     2
+}
+
+/// `-h`/`--help` before any `--`, for the verbs with their own parsers.
+fn wants_help(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|a| *a != "--")
+        .any(|a| a == "-h" || a == "--help")
+}
+
+/// `--help` under `--json`: the usage as a JSON answer, exit 0.
+fn json_help(usage: &str) -> i32 {
+    println!("{}", serde_json::json!({ "ok": true, "usage": usage }));
+    0
 }
 
 /// For a verb with its own parser that already printed its usage error to stderr: under
@@ -3081,17 +3132,82 @@ fn parse_wait_args(rest: &[&String]) -> Result<WaitArgs, i32> {
 /// The pane is PINNED to the token the first response echoes. A default / `--index` target
 /// re-resolves against the live focus and active tab on every request, so without pinning a
 /// user switching panes mid-wait could make the wait succeed on an unrelated pane.
-fn run_wait_output(args: WaitArgs) -> i32 {
+/// How a wait ended. Printed ONCE by [`WaitOutcome::finish`], as text or — under `--json` —
+/// as one JSON object, so a caller parsing stdout gets an answer for every ending, timeouts
+/// included.
+enum WaitOutcome {
+    Matched {
+        human: String,
+        json: serde_json::Value,
+    },
+    TimedOut,
+    Failed {
+        code: String,
+        msg: String,
+    },
+}
+
+impl WaitOutcome {
+    fn failed(code: &str, msg: impl Into<String>) -> Self {
+        WaitOutcome::Failed {
+            code: code.to_string(),
+            msg: msg.into(),
+        }
+    }
+
+    fn from_resp(resp: &Resp) -> Self {
+        Self::failed(
+            resp.code.as_deref().unwrap_or("error"),
+            resp.error.as_deref().unwrap_or("(unspecified)"),
+        )
+    }
+
+    /// Print and return the exit code: 0 matched, [`EXIT_TIMEOUT`] timed out, 1 failed.
+    fn finish(self, verb: &str, json: bool) -> i32 {
+        match self {
+            WaitOutcome::Matched { human, json: j } => {
+                if json {
+                    println!("{j}");
+                } else {
+                    println!("{human}");
+                }
+                0
+            }
+            WaitOutcome::TimedOut => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "ok": false, "code": "timeout", "error": "timed out" })
+                    );
+                }
+                EXIT_TIMEOUT
+            }
+            WaitOutcome::Failed { code, msg } => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({ "ok": false, "code": code, "error": msg })
+                    );
+                }
+                eprintln!("comux {verb}: {msg}");
+                1
+            }
+        }
+    }
+}
+
+fn run_wait_output(args: WaitArgs, json: bool) -> i32 {
+    wait_output(args).finish("wait-output", json)
+}
+
+fn wait_output(args: WaitArgs) -> WaitOutcome {
     let deadline = args.timeout.map(|t| Instant::now() + t);
     let expired = |d: Option<Instant>| d.is_some_and(|d| Instant::now() >= d);
 
     let mut conn = match WaitConn::connect(deadline) {
         Ok(c) => c,
-        Err(WaitErr::TimedOut) => return EXIT_TIMEOUT,
-        Err(WaitErr::Failed(e)) => {
-            eprintln!("comux wait-output: {e}");
-            return 1;
-        }
+        Err(WaitErr::TimedOut) => return WaitOutcome::TimedOut,
+        Err(WaitErr::Failed(e)) => return WaitOutcome::failed("unavailable", e),
     };
 
     // Pinned after the FIRST response, whatever the caller passed. Pinning a defaulted
@@ -3101,7 +3217,7 @@ fn run_wait_output(args: WaitArgs) -> i32 {
     let mut pinned: Option<String> = None;
     loop {
         if expired(deadline) {
-            return EXIT_TIMEOUT;
+            return WaitOutcome::TimedOut;
         }
         let req = Req::CapturePane {
             target: pinned.clone().or_else(|| args.target.clone()),
@@ -3110,18 +3226,11 @@ fn run_wait_output(args: WaitArgs) -> i32 {
         };
         let resp = match conn.request(&req, deadline) {
             Ok(r) => r,
-            Err(WaitErr::TimedOut) => return EXIT_TIMEOUT,
-            Err(WaitErr::Failed(e)) => {
-                eprintln!("comux wait-output: {e}");
-                return 1;
-            }
+            Err(WaitErr::TimedOut) => return WaitOutcome::TimedOut,
+            Err(WaitErr::Failed(e)) => return WaitOutcome::failed("unavailable", e),
         };
         if !resp.ok {
-            eprintln!(
-                "comux wait-output: {}",
-                resp.error.as_deref().unwrap_or("(unspecified)")
-            );
-            return 1;
+            return WaitOutcome::from_resp(&resp);
         }
         if pinned.is_none() {
             // A pane with no token cannot be re-addressed, so the wait would silently
@@ -3129,11 +3238,11 @@ fn run_wait_output(args: WaitArgs) -> i32 {
             match resp.pane.as_deref().filter(|t| !t.is_empty()) {
                 Some(t) => pinned = Some(t.to_string()),
                 None => {
-                    eprintln!(
-                        "comux wait-output: the pane has no identity to pin to \
-                         (spawned before pane tokens existed); pass an explicit target"
+                    return WaitOutcome::failed(
+                        "invalid",
+                        "the pane has no identity to pin to \
+                         (spawned before pane tokens existed); pass an explicit target",
                     );
-                    return 1;
                 }
             }
         }
@@ -3141,10 +3250,16 @@ fn run_wait_output(args: WaitArgs) -> i32 {
             // Re-check before ACCEPTING: a match read after the budget ran out is a late
             // answer, and the caller has already given up on it.
             if expired(deadline) {
-                return EXIT_TIMEOUT;
+                return WaitOutcome::TimedOut;
             }
-            println!("{line}");
-            return 0;
+            return WaitOutcome::Matched {
+                human: line.to_string(),
+                json: serde_json::json!({
+                    "ok": true,
+                    "pane": pinned,
+                    "line": line,
+                }),
+            };
         }
         // The sleep draws from the same budget, so the deadline can't be overshot by a
         // whole interval at the very end.
@@ -3155,7 +3270,7 @@ fn run_wait_output(args: WaitArgs) -> i32 {
             None => args.interval,
         };
         if nap.is_zero() {
-            return EXIT_TIMEOUT;
+            return WaitOutcome::TimedOut;
         }
         std::thread::sleep(nap);
     }
@@ -3541,11 +3656,24 @@ mod wait_bounds_tests {
 const WAITABLE_STATUSES: &[&str] = &["working", "ready", "blocked"];
 
 const WAIT_AGENT_USAGE: &str = "usage: comux wait-agent <pane-token|terminal-id> \
-     --status working|ready|blocked [--timeout S] [--interval MS]\n\
+     --status working|ready|blocked [--after-seq N] [--timeout S] [--interval MS] [--json]\n\
      \n\
-     BEST-EFFORT CURRENT-STATE wait, NOT turn-completion detection. It returns as soon as\n\
-     the agent is IN that status, including a status it was already in before the call —\n\
-     so right after sending a prompt, `--status ready` can match the PREVIOUS turn.\n\
+     Without --after-seq this is a CURRENT-STATE wait: it returns as soon as the agent is IN\n\
+     that status, including one it was already in before the call — so right after sending a\n\
+     prompt, `--status ready` can match the PREVIOUS turn.\n\
+     \n\
+     EDGE-TRIGGERED with --after-seq: every observed status change gets a new `seq` (shown\n\
+     by `list-agents --json` and by every wait result). Read it BEFORE you send the prompt,\n\
+     then `--after-seq <that>` only matches a status reached by a LATER change:\n\
+     \n\
+     \x20 seq=$(comux list-agents --json | jq --arg p \"$pane\" '.agents[]|select(.token==$p).seq')\n\
+     \x20 comux send \"$pane\" \"run the tests\" && comux send \"$pane\" $'\\n'\n\
+     \x20 comux wait-agent \"$pane\" --status ready --after-seq \"$seq\"\n\
+     \n\
+     Even so it is NOT turn-completion detection: a change that starts AND ends between two\n\
+     sweeps is never observed, so a turn shorter than the sweep can be missed (the wait then\n\
+     times out; it never matches the old turn). An agent replaced in the same pane counts as\n\
+     a change. --after-seq needs a pane TOKEN.\n\
      \n\
      The status is CACHED and INFERRED: Claude's comes from ~/.claude/sessions/<pid>.json,\n\
      everything else from matching substrings on the pane's screen, so ordinary output can\n\
@@ -3568,6 +3696,8 @@ struct WaitAgentArgs {
     status: String,
     timeout: Option<Duration>,
     interval: Duration,
+    /// `--after-seq N`: match only a status reached by a transition NEWER than `N`.
+    after_seq: Option<u64>,
 }
 
 /// Parse `wait-agent`'s arguments. `Err(code)` is the process exit code.
@@ -3576,6 +3706,7 @@ fn parse_wait_agent_args(rest: &[&String]) -> Result<WaitAgentArgs, i32> {
     let mut status: Option<String> = None;
     let mut timeout_secs: u64 = 300;
     let mut interval_ms: u64 = 250;
+    let mut after_seq: Option<u64> = None;
     let mut i = 1;
     while i < rest.len() {
         let a = rest[i].as_str();
@@ -3598,7 +3729,7 @@ fn parse_wait_agent_args(rest: &[&String]) -> Result<WaitAgentArgs, i32> {
                     return Err(2);
                 }
             },
-            "--timeout" | "--interval" => {
+            "--timeout" | "--interval" | "--after-seq" => {
                 let n = match rest.get(i + 1).map(|v| v.parse::<u64>()) {
                     Some(Ok(n)) => n,
                     _ => {
@@ -3606,10 +3737,10 @@ fn parse_wait_agent_args(rest: &[&String]) -> Result<WaitAgentArgs, i32> {
                         return Err(2);
                     }
                 };
-                if a == "--timeout" {
-                    timeout_secs = n;
-                } else {
-                    interval_ms = n;
+                match a {
+                    "--timeout" => timeout_secs = n,
+                    "--interval" => interval_ms = n,
+                    _ => after_seq = Some(n),
                 }
             }
             _ => {
@@ -3654,6 +3785,16 @@ fn parse_wait_agent_args(rest: &[&String]) -> Result<WaitAgentArgs, i32> {
         );
         return Err(2);
     }
+    // A sequence number is only meaningful on the server that issued it. A pane TOKEN is
+    // incarnation-qualified, so after a restart it stops resolving and the wait fails; a raw
+    // terminal id would resolve to whatever pane now holds it and wait forever on a counter
+    // that restarted from zero.
+    if after_seq.is_some() && !matches!(classify_pane_arg(&target), Some(PaneArg::Token(_))) {
+        eprintln!(
+            "comux wait-agent: --after-seq needs a pane TOKEN target, not an index or terminal id"
+        );
+        return Err(2);
+    }
     let interval = Duration::from_millis(interval_ms);
     if interval < MIN_INTERVAL {
         eprintln!(
@@ -3678,44 +3819,39 @@ fn parse_wait_agent_args(rest: &[&String]) -> Result<WaitAgentArgs, i32> {
         status,
         timeout,
         interval,
+        after_seq,
     })
 }
 
 /// Run `wait-agent`. Shares [`WaitConn`] and the deadline machinery with `wait-output`.
-fn run_wait_agent(args: WaitAgentArgs) -> i32 {
+fn run_wait_agent(args: WaitAgentArgs, json: bool) -> i32 {
+    wait_agent(args).finish("wait-agent", json)
+}
+
+fn wait_agent(args: WaitAgentArgs) -> WaitOutcome {
     let deadline = args.timeout.map(|t| Instant::now() + t);
     let expired = |d: Option<Instant>| d.is_some_and(|d| Instant::now() >= d);
     let mut conn = match WaitConn::connect(deadline) {
         Ok(c) => c,
-        Err(WaitErr::TimedOut) => return EXIT_TIMEOUT,
-        Err(WaitErr::Failed(e)) => {
-            eprintln!("comux wait-agent: {e}");
-            return 1;
-        }
+        Err(WaitErr::TimedOut) => return WaitOutcome::TimedOut,
+        Err(WaitErr::Failed(e)) => return WaitOutcome::failed("unavailable", e),
     };
     let req = Req::ListAgents {
         target: Some(args.target.clone()),
     };
     loop {
         if expired(deadline) {
-            return EXIT_TIMEOUT;
+            return WaitOutcome::TimedOut;
         }
         let resp = match conn.request(&req, deadline) {
             Ok(r) => r,
-            Err(WaitErr::TimedOut) => return EXIT_TIMEOUT,
-            Err(WaitErr::Failed(e)) => {
-                eprintln!("comux wait-agent: {e}");
-                return 1;
-            }
+            Err(WaitErr::TimedOut) => return WaitOutcome::TimedOut,
+            Err(WaitErr::Failed(e)) => return WaitOutcome::failed("unavailable", e),
         };
         if !resp.ok {
             // The pane is GONE — the server resolves the target every request, so this also
             // catches a pane that closed mid-wait.
-            eprintln!(
-                "comux wait-agent: {}",
-                resp.error.as_deref().unwrap_or("(unspecified)")
-            );
-            return 1;
+            return WaitOutcome::from_resp(&resp);
         }
         // An empty listing means the pane exists but is not classified as an agent yet (or
         // any more). Keep waiting: classification lags a launch by up to one sweep.
@@ -3723,13 +3859,18 @@ fn run_wait_agent(args: WaitAgentArgs) -> i32 {
             .agents
             .unwrap_or_default()
             .into_iter()
-            .find(|a| a.status == args.status)
+            .find(|a| a.status == args.status && args.after_seq.is_none_or(|n| a.seq > n))
         {
             if expired(deadline) {
-                return EXIT_TIMEOUT;
+                return WaitOutcome::TimedOut;
             }
-            println!("{} {} {}s", hit.status, hit.tool, hit.for_secs);
-            return 0;
+            return WaitOutcome::Matched {
+                human: format!(
+                    "{} {} {}s seq={}",
+                    hit.status, hit.tool, hit.for_secs, hit.seq
+                ),
+                json: serde_json::json!({ "ok": true, "agent": hit }),
+            };
         }
         let nap = match deadline {
             Some(d) => args
@@ -3738,7 +3879,7 @@ fn run_wait_agent(args: WaitAgentArgs) -> i32 {
             None => args.interval,
         };
         if nap.is_zero() {
-            return EXIT_TIMEOUT;
+            return WaitOutcome::TimedOut;
         }
         std::thread::sleep(nap);
     }
@@ -3752,6 +3893,43 @@ mod wait_agent_tests {
         let owned: Vec<String> = v.iter().map(|s| s.to_string()).collect();
         let refs: Vec<&String> = owned.iter().collect();
         parse_wait_agent_args(&refs)
+    }
+
+    #[test]
+    fn after_seq_is_parsed_and_needs_a_token() {
+        let a = parse(&[
+            "wait-agent",
+            "ab12-3",
+            "--status",
+            "ready",
+            "--after-seq",
+            "9",
+        ])
+        .unwrap();
+        assert_eq!(a.after_seq, Some(9));
+        assert_eq!(
+            parse(&[
+                "wait-agent",
+                "term3",
+                "--status",
+                "ready",
+                "--after-seq",
+                "9"
+            ]),
+            Err(2),
+            "a terminal id can outlive the server that numbered the change"
+        );
+        assert_eq!(
+            parse(&[
+                "wait-agent",
+                "ab12-3",
+                "--status",
+                "ready",
+                "--after-seq",
+                "x"
+            ]),
+            Err(2)
+        );
     }
 
     #[test]
@@ -3857,6 +4035,7 @@ mod list_agents_proto_tests {
             tool: "claude".into(),
             status: status.into(),
             for_secs: 42,
+            seq: 7,
             detail: None,
             tab_id: "s1:t0".into(),
             tab_name: String::new(),

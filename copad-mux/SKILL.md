@@ -152,6 +152,20 @@ at once. Its statuses are cached and inferred (Claude's from its session file, e
 else from screen text, refreshed every 500ms attached / 5s detached), so `blocked` can be a
 false reading from ordinary output. Treat it as a hint, and confirm with `capture-pane`.
 
+To wait for the status the agent reaches AFTER your prompt, take its `seq` first and pass
+`--after-seq`, which ignores every change it has already seen:
+
+```bash
+seq=$(comux list-agents --json | jq --arg p "$pane" '.agents[] | select(.token == $p) | .seq')
+comux send "$pane" "use the schema in ./docs"
+comux send "$pane" $'\n'
+comux wait-agent "$pane" --status ready --after-seq "$seq" --timeout 900
+```
+
+That is still not proof the turn finished: a turn shorter than the sweep is never observed
+(the wait times out rather than matching the old turn), and the status is still inferred.
+`--json` makes every wait print one JSON object — `{"ok":false,"code":"timeout"}` included.
+
 `detail` is what the agent was last seen DOING (`Bash: run the tests`), read from the tool's
 own log. It is ABSENT, not empty, when there is no reading — a tool whose log comux cannot
 read, one that has run no tools yet, or a format that has moved. Never branch on its absence;

@@ -39,6 +39,7 @@
 #  24. an index-less rename renames the CALLER's tab/session, not the one the user is viewing
 #  25. sessions/tabs addressed by id/name (ambiguous = exit 2); create verbs return their ids
 #  26. list-tree shows every session/tab/pane; list-agents says which tab and pane an agent is in
+#  27. wait-agent --after-seq only matches a NEWER status change; wait verbs answer in JSON
 
 set -euo pipefail
 
@@ -1557,7 +1558,55 @@ print(f"{len(agents)} agent row(s) checked")
 PYEOF
 ok "the tree matches the listings; agent rows name their tab and pane"
 
-echo "27. the server is still responsive and shuts down cleanly"
+echo "27. edge-triggered wait-agent, and JSON from the wait verbs"
+t 10 "$COMUX" new-session seqtest --json >"$WORK/json" || fail "could not create the seq session"
+P="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+t 10 "$COMUX" send "$P" "printf 'esc to interrupt\n'; $WORK/bin/claude 600" >/dev/null
+t 10 "$COMUX" send "$P" $'\n' >/dev/null
+S=""
+for _ in $(seq 1 60); do
+    t 10 "$COMUX" list-agents --json >"$WORK/json"
+    S="$(python3 -c 'import json,sys; a=[x for x in json.load(sys.stdin)["agents"] if x["token"]=="'"$P"'" and x["status"]=="working"]; print(a[0]["seq"] if a else "")' <"$WORK/json")"
+    [[ -n "$S" ]] && break
+    sleep 0.25
+done
+[[ -n "$S" && "$S" -gt 0 ]] || fail "the seq fixture never read as working with a seq: $(cat "$WORK/json")"
+# Level-triggered without --after-seq: the CURRENT status matches, and says its seq.
+t 15 "$COMUX" wait-agent "$P" --status working --timeout 10 --json >"$WORK/out" || fail "level wait failed"
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] and d["agent"]["seq"]=='"$S"', d' <"$WORK/out" \
+    || fail "wait-agent --json did not report the agent and its seq: $(cat "$WORK/out")"
+# Edge-triggered: the status it is ALREADY in, reached at seq S, does not count.
+rc=0; t 15 "$COMUX" wait-agent "$P" --status working --after-seq "$S" --timeout 2 --interval 100 --json >"$WORK/out" 2>/dev/null || rc=$?
+[[ "$rc" == 124 ]] || fail "--after-seq matched a change it had already seen (exit $rc): $(cat "$WORK/out")"
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert d=={"ok":False,"code":"timeout","error":"timed out"}, d' <"$WORK/out" \
+    || fail "a --json timeout should print a timeout object: $(cat "$WORK/out")"
+# ...and a LATER change does. The prompt text echoes onto the screen while the fixture runs,
+# which the screen heuristic reads as blocked.
+"$COMUX" wait-agent "$P" --status blocked --after-seq "$S" --timeout 20 --json >"$WORK/edge" 2>&1 &
+EDGE_PID=$!
+sleep 0.5
+t 10 "$COMUX" send "$P" "Do you want to proceed" >/dev/null
+rc=0; wait "$EDGE_PID" || rc=$?
+[[ "$rc" == 0 ]] || fail "--after-seq missed the newer change (exit $rc): $(cat "$WORK/edge")"
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["agent"]["status"]=="blocked" and d["agent"]["seq"]>'"$S"', d' <"$WORK/edge" \
+    || fail "the edge wait should report the newer seq: $(cat "$WORK/edge")"
+# wait-output answers in JSON too, success and failure alike.
+t 15 "$COMUX" wait-output "$P" "Do you want" --timeout 5 --json >"$WORK/out" || fail "wait-output --json failed"
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] and d["pane"]=="'"$P"'" and "Do you want" in d["line"], d' <"$WORK/out" \
+    || fail "wait-output --json shape: $(cat "$WORK/out")"
+rc=0; t 15 "$COMUX" wait-output no-such-pane x --timeout 3 --json >"$WORK/out" 2>/dev/null || rc=$?
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["ok"] is False and d["code"]=="not_found", d' <"$WORK/out" \
+    || fail "a failed wait-output --json should print an error object: $(cat "$WORK/out")"
+# A plain verb against a dead socket still answers in JSON.
+rc=0; COPAD_MUX_SOCK="$WORK/no-such-sock" t 10 "$COMUX" list --json >"$WORK/out" 2>/dev/null || rc=$?
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["code"]=="unavailable", d' <"$WORK/out" \
+    || fail "an unreachable server should be a JSON error under --json: $(cat "$WORK/out")"
+t 10 "$COMUX" list-sessions --json >"$WORK/json"
+sid="$(python3 -c 'import json,sys; print([x["id"] for x in json.load(sys.stdin)["sessions"] if x["name"]=="seqtest"][0])' <"$WORK/json")"
+t 12 "$COMUX" kill-session "$sid" >/dev/null || fail "seq cleanup failed"
+ok "a status already seen is not an edge; a newer one is; waits and transport errors answer in JSON"
+
+echo "28. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"
