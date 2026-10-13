@@ -241,6 +241,12 @@ pub enum Req {
         #[serde(default)]
         target: Option<String>,
     },
+    /// The whole mux as one tree — sessions, their tabs, their panes — or one `session`
+    /// (a selector). Read-only.
+    ListTree {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+    },
     /// Re-read `mux.toml` and apply the live-reloadable settings to the running server
     /// WITHOUT restarting it — like tmux `source-file`. Keybindings, mouse, sidebar
     /// width, usage/tab-label display, notify, and worktree config take effect on the
@@ -297,8 +303,11 @@ pub const CAP_RENAME_CALLER: &str = "rename-caller";
 /// Capability: session/tab verbs honor `target` selectors, and `list-tabs` honors `session`.
 pub const CAP_SELECTORS: &str = "selectors";
 
+/// Capability: `list-tree` exists.
+pub const CAP_LIST_TREE: &str = "list-tree";
+
 /// Every capability this build's server implements (reported by `health`).
-pub const SERVER_CAPS: &[&str] = &[CAP_RENAME_CALLER, CAP_SELECTORS];
+pub const SERVER_CAPS: &[&str] = &[CAP_RENAME_CALLER, CAP_SELECTORS, CAP_LIST_TREE];
 
 /// A session or tab a mutating verb created or acted on: its stable id and display name.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -432,6 +441,61 @@ pub struct AgentInfo {
     /// not branch on its absence; it is a hint for a human scanning a list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The tab the agent lives in: its STABLE id (`s4:t13`, a tab selector), its custom name
+    /// (empty when unnamed — `title` then shows `tab <n>`), and its index in the session.
+    #[serde(default)]
+    pub tab_id: String,
+    #[serde(default)]
+    pub tab_name: String,
+    #[serde(default)]
+    pub tab_index: usize,
+    /// The pane's index within its tab, in `list` order.
+    #[serde(default)]
+    pub pane_index: usize,
+}
+
+/// One session in a `list-tree` response, with its tabs and their panes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeSession {
+    pub index: usize,
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    /// The session the user is looking at.
+    pub active: bool,
+    pub tabs: Vec<TreeTab>,
+}
+
+/// One tab in a `list-tree` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreeTab {
+    pub index: usize,
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    /// Its session's active tab.
+    pub active: bool,
+    pub panes: Vec<TreePane>,
+}
+
+/// One pane in a `list-tree` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TreePane {
+    pub index: usize,
+    /// The `$COPAD_MUX_PANE` identity — the address to use.
+    #[serde(default)]
+    pub token: String,
+    pub terminal: String,
+    /// Its tab's focused pane.
+    pub focused: bool,
+    #[serde(default)]
+    pub label: String,
+    /// `agent` / `shell` / `other`, as in `list`.
+    #[serde(default)]
+    pub kind: String,
+    /// Agents only: `working` / `ready` / `blocked` / `idle`.
+    #[serde(default)]
+    pub status: String,
 }
 
 /// The host machine, as `comux host` reports it.
@@ -536,6 +600,9 @@ pub struct Resp {
     /// targeted pane that is not an agent); `None` means this response is not a listing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents: Option<Vec<AgentInfo>>,
+    /// `list-tree`: sessions → tabs → panes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<Vec<TreeSession>>,
     /// `capture-pane`: the token of the pane actually read. Echoed so a caller that let
     /// the target default to the focused pane can tell WHICH pane answered — focus is a
     /// mutable UI choice, and a silently-retargeted read is indistinguishable from a
@@ -570,6 +637,7 @@ impl Resp {
             truncated: None,
             pane: None,
             agents: None,
+            tree: None,
         }
     }
 
@@ -821,6 +889,12 @@ pub fn run_client(args: &[String]) -> i32 {
         "list-sessions" | "sessions" => {
             parsed!(cliargs::bare("usage: comux list-sessions [--json]"));
             Req::ListSessions
+        }
+        "list-tree" | "tree" => {
+            let p = parsed!(LIST_TREE_SPEC);
+            Req::ListTree {
+                session: p.value("--session").map(str::to_string),
+            }
         }
         "list-agents" | "agents" => {
             parsed!(cliargs::bare("usage: comux list-agents [--fleet] [--json]"));
@@ -1321,6 +1395,12 @@ fn rename_target(
         _ => caller_pane_for(index, verb, json, usage),
     }
 }
+
+const LIST_TREE_SPEC: Spec = Spec {
+    usage: "usage: comux list-tree [--session <s1|name:hub|index>] [--json]",
+    flags: &[opt(&["--session", "-s"])],
+    positionals: Positionals::AtMost(0),
+};
 
 const LIST_TABS_SPEC: Spec = Spec {
     usage: "usage: comux list-tabs [--session <s1|name:hub|index>] [--json]",
@@ -1919,6 +1999,29 @@ fn print_human(req: &Req, resp: &Resp) {
                     "comux split: this server did not report the new pane's token \
                      (older build — `comux server restart` after upgrading)"
                 ),
+            }
+        }
+        Req::ListTree { .. } => {
+            for s in resp.tree.as_deref().unwrap_or_default() {
+                let name = if s.name.is_empty() { "-" } else { &s.name };
+                let mark = if s.active { "  *active" } else { "" };
+                println!("{} {}{mark}", s.id, name);
+                for t in &s.tabs {
+                    let name = if t.name.is_empty() { "-" } else { &t.name };
+                    let mark = if t.active { "  *active" } else { "" };
+                    println!("  {} {}{mark}", t.id, name);
+                    for p in &t.panes {
+                        println!(
+                            "    {:<2} {:<18} {:<8} {:<14} {:<8}{}",
+                            p.index,
+                            p.token,
+                            p.kind,
+                            p.label,
+                            p.status,
+                            if p.focused { " *focused" } else { "" }
+                        );
+                    }
+                }
             }
         }
         Req::ListAgents { .. } => {
@@ -3755,7 +3858,33 @@ mod list_agents_proto_tests {
             status: status.into(),
             for_secs: 42,
             detail: None,
+            tab_id: "s1:t0".into(),
+            tab_name: String::new(),
+            tab_index: 0,
+            pane_index: 0,
         }
+    }
+
+    #[test]
+    fn list_tree_parses_with_and_without_a_session() {
+        assert!(matches!(
+            serde_json::from_str::<Req>(r#"{"cmd":"list-tree"}"#).unwrap(),
+            Req::ListTree { session: None }
+        ));
+        assert_eq!(
+            serde_json::to_string(&Req::ListTree {
+                session: Some("name:hub".into())
+            })
+            .unwrap(),
+            r#"{"cmd":"list-tree","session":"name:hub"}"#
+        );
+    }
+
+    #[test]
+    fn an_old_agent_listing_without_location_still_parses() {
+        let old = r#"{"token":"a-1","terminal":"t1","status":"ready","for_secs":3}"#;
+        let a: AgentInfo = serde_json::from_str(old).unwrap();
+        assert_eq!((a.tab_id.as_str(), a.pane_index), ("", 0));
     }
 
     #[test]

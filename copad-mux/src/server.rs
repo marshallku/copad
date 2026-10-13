@@ -765,6 +765,7 @@ fn ctl_mutates(req: &control::Req) -> bool {
             // Also read-only and also polled (by `wait-agent`); it reads CACHED labels and
             // statuses, so it neither sweeps processes nor touches a PTY.
             | control::Req::ListAgents { .. }
+            | control::Req::ListTree { .. }
     )
 }
 

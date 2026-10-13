@@ -2052,6 +2052,79 @@ impl App {
         self.panes.contains_key(&id).then_some(id)
     }
 
+    /// Where a terminal sits, for listings: `(tab id, tab name, tab index, pane index)`.
+    fn tab_location(&self, term: &TerminalId) -> Option<(TabId, String, usize, usize)> {
+        let (ws, tab, pane) = self.locate_terminal(term)?;
+        let w = self.state.workspace(&ws)?;
+        let ti = w.tabs.iter().position(|t| t.id == tab)?;
+        let t = &w.tabs[ti];
+        let pi = t.layout.panes().iter().position(|p| *p == pane)?;
+        Some((tab, t.name.clone().unwrap_or_default(), ti, pi))
+    }
+
+    /// Sessions → tabs → panes, for `list-tree`. `only` narrows it to one session.
+    fn tree(&self, only: Option<&WorkspaceId>) -> Vec<control::TreeSession> {
+        self.session_ids()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, wid)| only.is_none_or(|o| o == wid))
+            .filter_map(|(si, wid)| {
+                let w = self.state.workspace(&wid)?;
+                let tabs = w
+                    .tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(ti, t)| control::TreeTab {
+                        index: ti,
+                        id: t.id.to_string(),
+                        name: t.name.clone().unwrap_or_default(),
+                        active: t.id == w.active_tab,
+                        panes: t
+                            .layout
+                            .panes()
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(pi, p)| {
+                                let tid = t.layout.terminal_of(p)?;
+                                let label = self.labels.get(tid);
+                                let kind = match label.map(|l| l.kind) {
+                                    Some(procinfo::Kind::Agent) => "agent",
+                                    Some(procinfo::Kind::Shell) => "shell",
+                                    _ => "other",
+                                };
+                                Some(control::TreePane {
+                                    index: pi,
+                                    token: self
+                                        .panes
+                                        .get(tid)
+                                        .and_then(|pt| pt.pane_token())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    terminal: tid.to_string(),
+                                    focused: *p == t.focused,
+                                    label: label.map(|l| l.text.clone()).unwrap_or_default(),
+                                    kind: kind.to_string(),
+                                    status: if kind == "agent" {
+                                        self.agent_status(tid).0.to_string()
+                                    } else {
+                                        String::new()
+                                    },
+                                })
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                Some(control::TreeSession {
+                    index: si,
+                    id: wid.to_string(),
+                    name: w.name.clone().unwrap_or_default(),
+                    active: wid == self.ws,
+                    tabs,
+                })
+            })
+            .collect()
+    }
+
     /// The response for a create verb: where the new pane landed (session + tab, by id and
     /// name) and its token — so a script never has to find what it made by diffing listings.
     fn created(&self, term: &TerminalId) -> control::Resp {
@@ -2906,7 +2979,8 @@ impl App {
                     .agent_rows()
                     .into_iter()
                     .filter(|r| want.as_ref().is_none_or(|w| &r.term == w))
-                    .map(|r| control::AgentInfo {
+                    .map(|r| (self.tab_location(&r.term), r))
+                    .map(|(loc, r)| control::AgentInfo {
                         token: self
                             .panes
                             .get(&r.term)
@@ -2921,9 +2995,26 @@ impl App {
                         status: r.status.to_string(),
                         for_secs: r.for_secs,
                         detail: r.detail,
+                        tab_id: loc.as_ref().map(|l| l.0.to_string()).unwrap_or_default(),
+                        tab_name: loc.as_ref().map(|l| l.1.clone()).unwrap_or_default(),
+                        tab_index: loc.as_ref().map_or(0, |l| l.2),
+                        pane_index: loc.as_ref().map_or(0, |l| l.3),
                     })
                     .collect();
                 Resp::agents(agents)
+            }
+            Req::ListTree { session } => {
+                let only = match session {
+                    Some(sel) => match self.session_addr(None, Some(sel)) {
+                        Ok(ws) => Some(ws),
+                        Err((c, m)) => return Resp::err_code(c, &m),
+                    },
+                    None => None,
+                };
+                Resp {
+                    tree: Some(self.tree(only.as_ref())),
+                    ..Resp::ok()
+                }
             }
             Req::KillServer => Resp::ok(),
         }

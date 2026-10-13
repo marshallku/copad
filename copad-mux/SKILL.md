@@ -29,6 +29,7 @@ comux list-sessions           # every session (workspace)
 comux list-tabs               # tabs in the active session
 comux list                    # panes in the active tab: index, token, label, status
 comux list-agents             # agent panes across EVERY session, with status and age
+comux list-tree               # sessions → tabs → panes in one call (tokens included)
 ```
 
 Add `--json` to any of them when you need to parse rather than read.

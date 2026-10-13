@@ -38,6 +38,7 @@
 #  23. every verb answers --help (0) / rejects unknown flags (2) without touching state
 #  24. an index-less rename renames the CALLER's tab/session, not the one the user is viewing
 #  25. sessions/tabs addressed by id/name (ambiguous = exit 2); create verbs return their ids
+#  26. list-tree shows every session/tab/pane; list-agents says which tab and pane an agent is in
 
 set -euo pipefail
 
@@ -1521,7 +1522,42 @@ done
 [[ "$(sessions_now)" == "$s25" ]] || fail "selector cleanup left sessions behind: $(cat "$WORK/json")"
 ok "ids/names/paths resolve; ambiguous exits 2 with candidates; background tab closed by id; create verbs return ids"
 
-echo "26. the server is still responsive and shuts down cleanly"
+echo "26. list-tree, and where list-agents says an agent is"
+t 10 "$COMUX" list-tree --json >"$WORK/tree.json" || fail "list-tree --json failed"
+t 10 "$COMUX" list-sessions --json >"$WORK/sessions.json"
+python3 - "$WORK/tree.json" "$WORK/sessions.json" <<'PYEOF' || fail "list-tree disagrees with list-sessions: $(cat "$WORK/tree.json")"
+import json, sys
+tree = json.load(open(sys.argv[1]))["tree"]
+sessions = json.load(open(sys.argv[2]))["sessions"]
+assert [s["id"] for s in tree] == [s["id"] for s in sessions], (tree, sessions)
+for t, s in zip(tree, sessions):
+    assert len(t["tabs"]) == s["tabs"], (t, s)
+    assert sum(len(x["panes"]) for x in t["tabs"]) == s["panes"], (t, s)
+    for tab in t["tabs"]:
+        assert tab["id"].startswith(t["id"] + ":t"), tab
+        assert sum(p["focused"] for p in tab["panes"]) == 1, tab
+        assert all("-" in p["token"] for p in tab["panes"]), tab
+assert sum(s["active"] for s in tree) == 1, tree
+PYEOF
+first="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tree"][0]["id"])' <"$WORK/tree.json")"
+t 10 "$COMUX" list-tree --session "$first" --json >"$WORK/json"
+[[ "$(count tree)" == 1 ]] || fail "list-tree --session should return one session: $(cat "$WORK/json")"
+t 10 "$COMUX" list-tree >"$WORK/out" || fail "list-tree (human) failed"
+grep -q "$first:t" "$WORK/out" || fail "the human tree shows no tab ids: $(cat "$WORK/out")"
+# Every agent row's location must agree with the tree.
+t 10 "$COMUX" list-agents --json >"$WORK/agents.json"
+python3 - "$WORK/tree.json" "$WORK/agents.json" <<'PYEOF' || fail "list-agents' location fields disagree with list-tree"
+import json, sys
+tree = json.load(open(sys.argv[1]))["tree"]
+agents = json.load(open(sys.argv[2]))["agents"]
+where = {p["token"]: (t["id"], t["index"], p["index"]) for s in tree for t in s["tabs"] for p in t["panes"]}
+for a in agents:
+    assert where.get(a["token"]) == (a["tab_id"], a["tab_index"], a["pane_index"]), (a, where.get(a["token"]))
+print(f"{len(agents)} agent row(s) checked")
+PYEOF
+ok "the tree matches the listings; agent rows name their tab and pane"
+
+echo "27. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"
