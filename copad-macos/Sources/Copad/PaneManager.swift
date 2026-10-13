@@ -618,6 +618,7 @@ final class PaneManager {
             if let alac = pane as? AlacrittyTerminalViewController {
                 alac.applyTheme(newTheme)
                 alac.applyFont(family: newConfig.fontFamily, baseSize: CGFloat(newConfig.fontSize))
+                alac.applyFontThicken(newConfig.fontThicken)
                 alac.applyOSC52Policy(newConfig.osc52)
                 alac.applyWindowOpacity(newConfig.windowOpacity)
             }

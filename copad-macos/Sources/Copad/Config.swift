@@ -1,3 +1,4 @@
+import CopadCore
 import Foundation
 import TOMLKit
 
@@ -63,6 +64,8 @@ struct CopadConfig {
     let shell: String
     let fontFamily: String
     let fontSize: Int
+    /// `[terminal] font_thicken` — see [`FontThicken`].
+    let fontThicken: FontThicken
     /// macOS-only: when true, Option+key sends `ESC + key` to the PTY
     /// instead of routing through the system IME (which produces
     /// `¡™£¢`-style special chars on Option+1/2/3/4). Required for
@@ -241,6 +244,7 @@ struct CopadConfig {
             shell: tomlString(terminal, "shell") ?? d.shell,
             fontFamily: tomlString(terminal, "font_family") ?? d.fontFamily,
             fontSize: tomlInt(terminal, "font_size") ?? d.fontSize,
+            fontThicken: fontThicken(terminal) ?? d.fontThicken,
             optionAsAlt: tomlBool(terminal, "option_as_alt") ?? d.optionAsAlt,
             forceMetaKeys: tomlStringArray(terminal, "force_meta_keys") ?? d.forceMetaKeys,
             closeOnExit: tomlBool(terminal, "close_on_exit") ?? d.closeOnExit,
@@ -291,6 +295,17 @@ struct CopadConfig {
 
     private static func tomlString(_ table: TOMLTable?, _ key: String) -> String? {
         table?[key]?.string
+    }
+
+    /// `[terminal] font_thicken`, warning (once per load) on a value it
+    /// cannot read rather than silently treating it as the default.
+    private static func fontThicken(_ table: TOMLTable?) -> FontThicken? {
+        guard let raw = table?["font_thicken"] else { return nil }
+        if let parsed = FontThicken.parse(bool: raw.bool, string: raw.string) { return parsed }
+        FileHandle.standardError.write(
+            Data("[copad] [terminal] font_thicken must be true, false or \"auto\" — using the default (false)\n".utf8),
+        )
+        return nil
     }
 
     private static func tomlBool(_ table: TOMLTable?, _ key: String) -> Bool? {
@@ -353,6 +368,7 @@ struct CopadConfig {
             shell: ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh",
             fontFamily: "JetBrains Mono",
             fontSize: 14,
+            fontThicken: .off,
             optionAsAlt: true,
             forceMetaKeys: ["Return"],
             closeOnExit: true,

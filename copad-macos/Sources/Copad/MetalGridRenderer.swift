@@ -135,6 +135,9 @@ final class MetalGridRenderer {
         let cellHeight: CGFloat
         let ascent: CGFloat
         let scale: CGFloat
+        /// Rasterize glyphs with macOS font smoothing (`[terminal] font_thicken`,
+        /// already resolved against `scale`).
+        let smoothFonts: Bool
     }
 
     /// Theme-derived colors packed RGBA32 (the CopadCore convention).
@@ -233,7 +236,8 @@ final class MetalGridRenderer {
             return nil
         }
 
-        guard let atlas = GlyphAtlas(device: device, scale: metrics.scale) else { return nil }
+        guard let atlas = GlyphAtlas(device: device, scale: metrics.scale, smooth: metrics.smoothFonts)
+        else { return nil }
 
         self.device = device
         self.queue = queue
@@ -248,7 +252,7 @@ final class MetalGridRenderer {
     func setFonts(_ newFonts: Fonts, metrics newMetrics: Metrics) {
         fonts = newFonts
         metrics = newMetrics
-        atlas.flush(scale: newMetrics.scale)
+        atlas.flush(scale: newMetrics.scale, smooth: newMetrics.smoothFonts)
         shapeCache.removeAll(keepingCapacity: true)
         fallbackCache.removeAll(keepingCapacity: true)
     }
@@ -289,7 +293,7 @@ final class MetalGridRenderer {
             if buildFrame(snap: snap, theme: theme, state: state, into: &instances) {
                 break
             }
-            atlas.flush(scale: scale)
+            atlas.flush(scale: scale, smooth: metrics.smoothFonts)
             if attempt == 1 {
                 FileHandle.standardError.write(
                     Data("[copad] glyph atlas overflow persists after rebuild — frame may drop glyphs\n".utf8),
@@ -852,8 +856,11 @@ private final class GlyphAtlas {
     private var packer: AtlasShelfPacker
     private var entries: [Key: Entry] = [:]
     private var scale: CGFloat
+    /// Whether glyphs are rasterized with font smoothing. Part of every
+    /// cached bitmap, so changing it flushes the atlas like a scale change.
+    private var smooth: Bool
 
-    init?(device: MTLDevice, scale: CGFloat) {
+    init?(device: MTLDevice, scale: CGFloat, smooth: Bool) {
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba8Unorm,
             width: Self.size,
@@ -866,15 +873,17 @@ private final class GlyphAtlas {
         self.texture = texture
         packer = AtlasShelfPacker(width: Self.size, height: Self.size, padding: 1)
         self.scale = scale
+        self.smooth = smooth
     }
 
     /// Drop every entry and reset packing. Old texels stay in the
     /// texture (harmless — nothing references them) and get
     /// overwritten as new glyphs land.
-    func flush(scale newScale: CGFloat) {
+    func flush(scale newScale: CGFloat, smooth newSmooth: Bool) {
         entries.removeAll(keepingCapacity: true)
         packer.reset()
         scale = newScale
+        smooth = newSmooth
     }
 
     /// Look up or rasterize. Returns nil on atlas overflow — caller
@@ -930,16 +939,14 @@ private final class GlyphAtlas {
                 bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue,
             ) else { return false }
             ctx.scaleBy(x: scale, y: scale)
-            // Keep font smoothing ON to match the old CPU painter (which drew
-            // via CTLineDraw with the OS default) and, more importantly, to
-            // stay legible on 1x / non-Retina displays. macOS font smoothing
-            // is grayscale stem regularization — at 1x it is what keeps thin
-            // stems uniform instead of each glyph rounding to a random
-            // 1px-crisp / 2px-gray weight (the "random bold" jitter). At 2x
-            // the extra resolution hides the difference either way.
+            // Font smoothing per `[terminal] font_thicken` (see FontThicken):
+            // at 1x it keeps thin stems uniform instead of each glyph rounding
+            // to a random 1px-crisp / 2px-gray weight; on Retina it only
+            // thickens and blurs our white-on-transparent, alpha-recolored,
+            // non-gamma-blended glyphs, so `auto` turns it off there.
             ctx.setShouldAntialias(true)
-            ctx.setAllowsFontSmoothing(true)
-            ctx.setShouldSmoothFonts(true)
+            ctx.setAllowsFontSmoothing(smooth)
+            ctx.setShouldSmoothFonts(smooth)
             if !isColor {
                 ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
             }

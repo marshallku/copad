@@ -180,6 +180,7 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         let render = AlacrittyRenderView(
             theme: theme,
             font: resolveFont(family: config.fontFamily, size: CGFloat(config.fontSize)),
+            fontThicken: config.fontThicken,
             transparentDefaultBg: config.transparentDefaultBg,
             windowOpacity: config.windowOpacity,
             osc52Policy: config.osc52,
@@ -405,6 +406,10 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
     /// leaves `currentFontSize` alone if the user has an active zoom
     /// in flight — matches `TerminalViewController.applyFont` so a
     /// live Cmd++ doesn't get clobbered by saving config.toml.
+    func applyFontThicken(_ value: FontThicken) {
+        renderView?.setFontThicken(value)
+    }
+
     func applyFont(family: String, baseSize: CGFloat) {
         configFontSize = baseSize
         currentFontFamily = family
@@ -677,6 +682,13 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// applies or clears the background) AND-gates the actual behavior
     /// — no image, no transparency, regardless of the user pref.
     private let transparentDefaultBg: Bool
+    /// `[terminal] font_thicken`; resolved against the window's backing
+    /// scale on every use, so moving between a Retina and a 1x display
+    /// (which already re-runs `setFonts`) picks the right rasterization.
+    private var fontThicken: FontThicken
+    private var smoothFonts: Bool {
+        fontThicken.smooths(scale: window?.backingScaleFactor ?? 2)
+    }
     private var imageBackgroundActive = false
 
     /// `[window] opacity` — when < 1.0, the window is non-opaque and
@@ -854,6 +866,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     init(
         theme: CopadTheme,
         font: NSFont,
+        fontThicken: FontThicken,
         transparentDefaultBg: Bool,
         windowOpacity: Double,
         osc52Policy: OSC52Policy,
@@ -867,6 +880,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         italicFont = Self.deriveTrait(font, mask: .italicFontMask)
         boldItalicFont = Self.deriveTrait(font, mask: [.boldFontMask, .italicFontMask])
         paletteCache = Self.buildPalette(theme: theme)
+        self.fontThicken = fontThicken
         self.transparentDefaultBg = transparentDefaultBg
         self.windowOpacity = windowOpacity
         self.osc52Policy = osc52Policy
@@ -960,6 +974,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             cellHeight: cellHeight,
             ascent: ascent,
             scale: window?.backingScaleFactor ?? 2,
+            smoothFonts: smoothFonts,
         )
     }
 
@@ -1045,6 +1060,16 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// when the cell size actually changed so the caller can resize
     /// the term grid to match — without that, the PTY keeps sending
     /// content sized to the old grid.
+    /// Live config reload of `font_thicken`: re-rasterize every glyph.
+    func setFontThicken(_ value: FontThicken) {
+        guard value != fontThicken else { return }
+        fontThicken = value
+        flushCTLineCache()
+        metalRenderer?.setFonts(gpuFonts(), metrics: gpuMetrics())
+        needsDisplay = true
+        requestRepaint()
+    }
+
     @discardableResult
     func setFont(_ newFont: NSFont) -> Bool {
         font = newFont
@@ -1637,6 +1662,9 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         guard let snap = snapshotCache,
               let ctx = NSGraphicsContext.current?.cgContext
         else { return }
+        // Same `font_thicken` choice the Metal atlas rasterizes with.
+        ctx.setAllowsFontSmoothing(smoothFonts)
+        ctx.setShouldSmoothFonts(smoothFonts)
 
         // Perf harness: time the CoreText paint. Note this reflects
         // PARTIAL repaint (only `dirtyRect`'s rows) — full-screen
