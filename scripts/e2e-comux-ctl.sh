@@ -37,6 +37,7 @@
 #  22. an idle client silently repaints itself on a timer, and never clears to do it
 #  23. every verb answers --help (0) / rejects unknown flags (2) without touching state
 #  24. an index-less rename renames the CALLER's tab/session, not the one the user is viewing
+#  25. sessions/tabs addressed by id/name (ambiguous = exit 2); create verbs return their ids
 
 set -euo pipefail
 
@@ -1467,7 +1468,60 @@ COPAD_MUX_PANE="$tokA" t 10 "$COMUX" rename-session "" >/dev/null
 COPAD_MUX_PANE="$tokA" t 10 "$COMUX" rename-tab "" >/dev/null
 ok "the caller's tab and session were renamed while another was viewed; outside a pane exits 2"
 
-echo "25. the server is still responsive and shuts down cleanly"
+echo "25. session/tab selectors, and create verbs that say what they made"
+s25="$(sessions_now)"
+t 10 "$COMUX" new-session sel-a --json >"$WORK/json" || fail "new-session --json failed"
+python3 - "$WORK/json" <<'PYEOF' || fail "new-session --json did not name what it made: $(cat "$WORK/json")"
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d["ok"] and d["session"]["name"] == "sel-a" and d["session"]["id"].startswith("s"), d
+assert d["tab"]["id"].startswith(d["session"]["id"] + ":t"), d
+assert "-" in d["pane"], d
+PYEOF
+sa="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["session"]["id"])' <"$WORK/json")"
+t 10 "$COMUX" new-tab --json >"$WORK/json" || fail "new-tab --json failed"
+ta="$(python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["session"]["id"]=="'"$sa"'", d; print(d["tab"]["id"])' <"$WORK/json")" \
+    || fail "new-tab --json did not name its tab in the current session: $(cat "$WORK/json")"
+t 10 "$COMUX" rename-tab -t "$ta" picked >/dev/null || fail "rename-tab -t <tab id> failed"
+# Two sessions with ONE name: a name selector must refuse to guess.
+t 10 "$COMUX" new-session twin >/dev/null
+t 10 "$COMUX" new-session twin >/dev/null
+rc=0; t 10 "$COMUX" select-session name:twin >"$WORK/out" 2>&1 || rc=$?
+[[ "$rc" == 2 ]] || fail "an ambiguous session name should exit 2, got $rc: $(cat "$WORK/out")"
+grep -q "matches 2" "$WORK/out" || fail "the ambiguity error should list the candidates: $(cat "$WORK/out")"
+rc=0; t 10 "$COMUX" select-session --json name:twin >"$WORK/out" 2>/dev/null || rc=$?
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["code"]=="ambiguous", d' <"$WORK/out" \
+    || fail "--json ambiguity should carry code=ambiguous: $(cat "$WORK/out")"
+rc=0; t 10 "$COMUX" select-session name:nope >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 1 ]] || fail "an unknown session name should exit 1, got $rc"
+# By name and by path: the view follows, and the named tab is the active one.
+t 10 "$COMUX" select-session name:sel-a >/dev/null || fail "select-session name:sel-a failed"
+t 10 "$COMUX" list-sessions --json >"$WORK/json"
+python3 -c 'import json,sys; s=json.load(sys.stdin)["sessions"]; assert [x for x in s if x["active"]][0]["name"]=="sel-a", s' <"$WORK/json" \
+    || fail "select-session name: did not switch: $(cat "$WORK/json")"
+t 10 "$COMUX" select-tab "sel-a/picked" >/dev/null || fail "select-tab <session>/<tab name> failed"
+# list-tabs --session reads ANOTHER session without switching to it.
+t 10 "$COMUX" list-tabs --session "name:sel-a" --json >"$WORK/json"
+python3 -c 'import json,sys; t=json.load(sys.stdin)["tabs"]; assert [x for x in t if x["active"]][0]["name"]=="picked", t' <"$WORK/json" \
+    || fail "list-tabs --session did not show the selected tab: $(cat "$WORK/json")"
+t 10 "$COMUX" select-session 0 >/dev/null
+t 10 "$COMUX" list-tabs --session "$sa" --json >"$WORK/json"
+[[ "$(count tabs)" == 2 ]] || fail "list-tabs --session $sa should list 2 tabs: $(cat "$WORK/json")"
+# Close a tab of a BACKGROUND session by id; the viewed session is untouched.
+v_before="$(tabs_now)"
+t 10 "$COMUX" close-tab "$ta" >/dev/null || fail "close-tab <tab id> in a background session failed"
+[[ "$(tabs_now)" == "$v_before" ]] || fail "closing a background tab changed the viewed session"
+t 10 "$COMUX" list-tabs --session "$sa" --json >"$WORK/json"
+[[ "$(count tabs)" == 1 ]] || fail "the background tab was not closed: $(cat "$WORK/json")"
+for sel in "$sa" twin twin; do
+    t 10 "$COMUX" list-sessions --json >"$WORK/json"
+    id="$(python3 -c 'import json,sys; print([x["id"] for x in json.load(sys.stdin)["sessions"] if x["id"]=="'"$sel"'" or x["name"]=="'"$sel"'"][0])' <"$WORK/json")"
+    t 10 "$COMUX" kill-session "$id" >/dev/null || fail "kill-session $id (by id) failed"
+done
+[[ "$(sessions_now)" == "$s25" ]] || fail "selector cleanup left sessions behind: $(cat "$WORK/json")"
+ok "ids/names/paths resolve; ambiguous exits 2 with candidates; background tab closed by id; create verbs return ids"
+
+echo "26. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

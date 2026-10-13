@@ -32,6 +32,7 @@ use crate::model::{
 };
 use crate::notify;
 use crate::persist::{self, MAX_LEAVES_PER_TAB, MAX_TOTAL_PANES, PLayout};
+use crate::selector;
 // The `Ctrl-f` switcher and the CLI's fuzzy picker share one filter, so typing the
 // same query narrows both lists identically.
 use crate::agentpoll;
@@ -976,13 +977,6 @@ impl App {
 
     // --- tabs ---
 
-    fn tab_count(&self) -> usize {
-        self.state
-            .workspace(&self.ws)
-            .map(|w| w.tabs.len())
-            .unwrap_or(0)
-    }
-
     fn tab_ids(&self) -> Vec<TabId> {
         self.state
             .workspace(&self.ws)
@@ -1407,14 +1401,15 @@ impl App {
 
     /// Create a new tab (a fresh single-pane layout) and switch to it, spawning its
     /// shell. Rolls the tab back if the PTY can't spawn (never leave a blank tab).
-    fn new_tab(&mut self) {
+    fn new_tab(&mut self) -> Option<TerminalId> {
         // Inherit the current pane's cwd into the new tab's shell (tmux-style).
         let cwd = self.focused_cwd();
         let ws = self.ws.clone();
-        self.new_tab_in(&ws, cwd);
+        let term = self.new_tab_in(&ws, cwd);
         // A new tab may make the tab bar appear (1→2 tabs), shrinking the content
         // height → re-derive the viewport, not just PTY sizes.
         self.reflow();
+        term
     }
 
     /// Create a tab in `ws` whose shell starts in `cwd`, returning its terminal. `ws` must be
@@ -1536,8 +1531,15 @@ impl App {
         self.note_view_moved();
         // `?` on the last-tab refusal: the tab is kept and the caller decides whether
         // that is worth reporting.
+        // The lease only covers the attached session; a tab in a background session (a
+        // `close-tab s2:t1` from the CLI) is closed on the API's authority instead.
+        let origin = if *ws == self.ws {
+            Origin::Client(self.client)
+        } else {
+            Origin::Api
+        };
         let events = self.state.apply(Command::CloseTab {
-            origin: Origin::Client(self.client),
+            origin,
             workspace: ws.clone(),
             tab,
         })?;
@@ -2012,13 +2014,6 @@ impl App {
         self.jump_to_terminal(&target);
     }
 
-    /// Switch to the session at 0-based `index` (as listed by `list-sessions`).
-    fn select_session_index(&mut self, index: usize) {
-        if let Some(id) = self.session_ids().get(index).cloned() {
-            self.switch_session(id);
-        }
-    }
-
     /// Locate a terminal's `(workspace, tab, pane)` across ALL sessions and tabs (not
     /// just the active one), so a background session's/tab's exited shell is reaped.
     fn locate_terminal(&self, term: &TerminalId) -> Option<(WorkspaceId, TabId, PaneId)> {
@@ -2055,6 +2050,94 @@ impl App {
         }
         let id = TerminalId::new(target);
         self.panes.contains_key(&id).then_some(id)
+    }
+
+    /// The response for a create verb: where the new pane landed (session + tab, by id and
+    /// name) and its token — so a script never has to find what it made by diffing listings.
+    fn created(&self, term: &TerminalId) -> control::Resp {
+        let token = self
+            .panes
+            .get(term)
+            .and_then(|p| p.pane_token())
+            .unwrap_or_default()
+            .to_string();
+        let Some((ws, tab, _)) = self.locate_terminal(term) else {
+            return control::Resp::split(token);
+        };
+        let w = self.state.workspace(&ws);
+        let session = control::NodeRef {
+            id: ws.to_string(),
+            name: w.and_then(|w| w.name.clone()).unwrap_or_default(),
+        };
+        let tab = control::NodeRef {
+            name: w
+                .and_then(|w| w.tab(&tab))
+                .and_then(|t| t.name.clone())
+                .unwrap_or_default(),
+            id: tab.to_string(),
+        };
+        control::Resp::created(session, tab, token)
+    }
+
+    /// Every session and its tabs as the selector resolver sees them, in `session_ids` order.
+    fn selector_snapshot(&self) -> SelectorSnap {
+        self.session_ids()
+            .into_iter()
+            .filter_map(|wid| {
+                let w = self.state.workspace(&wid)?;
+                let tabs = w
+                    .tabs
+                    .iter()
+                    .map(|t| (t.id.clone(), t.name.clone()))
+                    .collect();
+                Some((wid.clone(), w.name.clone(), tabs))
+            })
+            .collect()
+    }
+
+    /// Resolve a session address: an index (creation order) or a selector. Both, or neither,
+    /// is `invalid`; a miss is `not_found`; a name matching several sessions is `ambiguous`.
+    fn session_addr(
+        &self,
+        index: Option<usize>,
+        target: Option<&str>,
+    ) -> Result<WorkspaceId, AddrErr> {
+        let snap = self.selector_snapshot();
+        match (index, target) {
+            (Some(_), Some(_)) => Err(addr_err("invalid", "give an index or a target, not both")),
+            (None, None) => Err(addr_err("invalid", "no session given")),
+            (Some(i), None) => snap
+                .get(i)
+                .map(|(w, _, _)| w.clone())
+                .ok_or_else(|| addr_err("not_found", format!("no session at index {i}"))),
+            (None, Some(sel)) => {
+                let views = selector_views(&snap);
+                selector::session(&views, sel)
+                    .map(|i| snap[i].0.clone())
+                    .map_err(|e| (e.code(), e.message().to_string()))
+            }
+        }
+    }
+
+    /// Resolve a tab address: an index into the ACTIVE session's tabs, or a selector (which
+    /// may name a tab in any session).
+    fn tab_addr(
+        &self,
+        index: Option<usize>,
+        target: Option<&str>,
+    ) -> Result<(WorkspaceId, TabId), AddrErr> {
+        let snap = self.selector_snapshot();
+        let active = snap.iter().position(|(w, _, _)| *w == self.ws).unwrap_or(0);
+        let pick = match (index, target) {
+            (Some(_), Some(_)) => {
+                return Err(addr_err("invalid", "give an index or a target, not both"));
+            }
+            (None, None) => return Err(addr_err("invalid", "no tab given")),
+            (Some(i), None) => selector::tab(&selector_views(&snap), active, &i.to_string()),
+            (None, Some(sel)) => selector::tab(&selector_views(&snap), active, sel),
+        };
+        pick.map(|(si, ti)| (snap[si].0.clone(), snap[si].2[ti].0.clone()))
+            .map_err(|e| (e.code(), e.message().to_string()))
     }
 
     /// Where the caller's pane lives, for a verb that defaults to "the caller's tab/session".
@@ -2283,24 +2366,20 @@ impl App {
                 self.split(d);
                 let after = self.pane_order();
                 if after.len() <= before.len() {
-                    return Resp::err(self.take_spawn_error("split"));
+                    return Resp::err_code("spawn_failed", self.take_spawn_error("split"));
                 }
                 // Name the pane we created, so no caller ever has to infer it by diffing
                 // listings (which a concurrent focus or tab change can defeat).
-                let token = after
-                    .iter()
-                    .find(|p| !before.contains(p))
-                    .and_then(|p| {
-                        self.state
-                            .workspace(&self.ws)
-                            .and_then(|w| w.tab(&w.active_tab))
-                            .and_then(|t| t.layout.terminal_of(p).cloned())
-                    })
-                    .and_then(|tid| self.panes.get(&tid))
-                    .and_then(|pt| pt.pane_token())
-                    .unwrap_or_default()
-                    .to_string();
-                Resp::split(token)
+                let term = after.iter().find(|p| !before.contains(p)).and_then(|p| {
+                    self.state
+                        .workspace(&self.ws)
+                        .and_then(|w| w.tab(&w.active_tab))
+                        .and_then(|t| t.layout.terminal_of(p).cloned())
+                });
+                match term {
+                    Some(term) => self.created(&term),
+                    None => Resp::split(String::new()),
+                }
             }
             Req::ResizePane { index, dir } => {
                 let (axis, grow) = match dir.as_str() {
@@ -2382,8 +2461,15 @@ impl App {
                     None => Resp::err("pane has no live terminal"),
                 }
             }
-            Req::ListTabs => {
-                let Some(w) = self.state.workspace(&self.ws) else {
+            Req::ListTabs { session } => {
+                let ws = match session {
+                    Some(sel) => match self.session_addr(None, Some(sel)) {
+                        Ok(ws) => ws,
+                        Err((c, m)) => return Resp::err_code(c, &m),
+                    },
+                    None => self.ws.clone(),
+                };
+                let Some(w) = self.state.workspace(&ws) else {
                     return Resp::err("no workspace");
                 };
                 let active_id = w.active_tab.clone();
@@ -2421,61 +2507,76 @@ impl App {
                 Resp::tab_list(infos, active_idx)
             }
             Req::NewTab => {
-                let before = self.tab_count();
                 self.clear_spawn_error();
-                self.new_tab();
-                if self.tab_count() > before {
-                    Resp::ok()
-                } else {
-                    Resp::err(self.take_spawn_error("new-tab"))
+                match self.new_tab() {
+                    Some(term) => self.created(&term),
+                    None => Resp::err_code("spawn_failed", self.take_spawn_error("new-tab")),
                 }
             }
-            Req::SelectTab { index } => {
-                if self.tab_ids().get(*index).is_some() {
-                    self.select_tab_index(*index);
-                    Resp::ok()
-                } else {
-                    Resp::err(format!("no tab at index {index}"))
-                }
+            Req::SelectTab { index, target } => {
+                let (ws, tab) = match self.tab_addr(*index, target.as_deref()) {
+                    Ok(a) => a,
+                    Err((c, m)) => return Resp::err_code(c, &m),
+                };
+                // A tab in another session is reached the way a jump reaches a pane: switch
+                // to its session, then select it.
+                self.switch_session(ws.clone());
+                self.select_tab(ws, tab);
+                self.sync_sizes();
+                Resp::ok()
             }
-            Req::CloseTab { index } => {
+            Req::CloseTab { index, target } => {
+                let (ws, id) = match self.tab_addr(*index, target.as_deref()) {
+                    Ok(a) => a,
+                    Err((c, m)) => return Resp::err_code(c, &m),
+                };
                 // Read the tab's identity + pane count BEFORE closing so the outcome
                 // message can name what went away (the tab is gone afterwards).
-                let Some(w) = self.state.workspace(&self.ws) else {
-                    return Resp::err("no workspace");
+                let Some((pos, tab)) = self
+                    .state
+                    .workspace(&ws)
+                    .and_then(|w| w.tabs.iter().enumerate().find(|(_, t)| t.id == id))
+                else {
+                    return Resp::err_code("not_found", format!("no tab '{id}'"));
                 };
-                let Some(tab) = w.tabs.get(*index) else {
-                    return Resp::err(format!("no tab at index {index}"));
-                };
-                let id = tab.id.clone();
                 let label = tab.name.clone().unwrap_or_else(|| id.to_string());
                 let panes = tab.layout.panes().len();
-                match self.close_tab(&self.ws.clone(), id) {
+                match self.close_tab(&ws, id) {
                     Ok(()) => Resp::message(format!(
-                        "closed tab {index} '{label}' ({panes} pane(s) reaped)"
+                        "closed tab {pos} '{label}' ({panes} pane(s) reaped)"
                     )),
-                    Err(MuxError::CannotCloseLastTab) => Resp::err(
+                    Err(MuxError::CannotCloseLastTab) => Resp::err_code(
+                        "refused",
                         "cannot close the last tab of a session — use `comux kill-session` instead",
                     ),
                     Err(e) => Resp::err(e.to_string()),
                 }
             }
-            Req::RenameTab { index, pane, name } => {
+            Req::RenameTab {
+                index,
+                pane,
+                target,
+                name,
+            } => {
                 // An index addresses the active session's tabs. With no index, `pane` (the
                 // caller's own pane) names the tab — in whatever session it lives, so an agent
                 // renaming its own tab never touches the one the user is looking at. Neither
                 // (an older client) keeps the legacy "active tab" meaning.
-                let target = match (index, pane) {
-                    (Some(i), _) => self
+                let target = match (index, target, pane) {
+                    (_, Some(sel), _) => match self.tab_addr(*index, Some(sel)) {
+                        Ok(a) => Some(a),
+                        Err((c, m)) => return Resp::err_code(c, &m),
+                    },
+                    (Some(i), None, _) => self
                         .tab_ids()
                         .get(*i)
                         .cloned()
                         .map(|t| (self.ws.clone(), t)),
-                    (None, Some(p)) => match self.caller_location(p) {
+                    (None, None, Some(p)) => match self.caller_location(p) {
                         Ok((ws, tab, _)) => Some((ws, tab)),
-                        Err(e) => return Resp::err(e),
+                        Err(e) => return Resp::err_code("not_found", e),
                     },
-                    (None, None) => self.active_tab_id().map(|t| (self.ws.clone(), t)),
+                    (None, None, None) => self.active_tab_id().map(|t| (self.ws.clone(), t)),
                 };
                 match target {
                     Some((ws, tab)) => {
@@ -2550,21 +2651,35 @@ impl App {
                 self.clear_spawn_error();
                 self.new_session(name.clone(), dir);
                 if self.session_count() > before {
-                    Resp::ok()
+                    // A successful `new_session` switched to it, so its one pane is the
+                    // focused one.
+                    match self.focused_terminal() {
+                        Some(term) => self.created(&term),
+                        None => Resp::ok(),
+                    }
                 } else {
-                    Resp::err(self.take_spawn_error("new-session"))
+                    Resp::err_code("spawn_failed", self.take_spawn_error("new-session"))
                 }
             }
-            Req::RenameSession { index, pane, name } => {
+            Req::RenameSession {
+                index,
+                pane,
+                target,
+                name,
+            } => {
                 // Same addressing as `rename-tab`: index, else the caller's session, else
                 // (an older client) the active one.
-                let wid = match (index, pane) {
-                    (Some(i), _) => self.session_ids().get(*i).cloned(),
-                    (None, Some(p)) => match self.caller_location(p) {
-                        Ok((ws, _, _)) => Some(ws),
-                        Err(e) => return Resp::err(e),
+                let wid = match (index, target, pane) {
+                    (_, Some(sel), _) => match self.session_addr(*index, Some(sel)) {
+                        Ok(ws) => Some(ws),
+                        Err((c, m)) => return Resp::err_code(c, &m),
                     },
-                    (None, None) => Some(self.ws.clone()),
+                    (Some(i), None, _) => self.session_ids().get(*i).cloned(),
+                    (None, None, Some(p)) => match self.caller_location(p) {
+                        Ok((ws, _, _)) => Some(ws),
+                        Err(e) => return Resp::err_code("not_found", e),
+                    },
+                    (None, None, None) => Some(self.ws.clone()),
                 };
                 match wid {
                     Some(wid) => {
@@ -2578,12 +2693,13 @@ impl App {
                     )),
                 }
             }
-            Req::SelectSession { index } => {
-                if self.session_ids().get(*index).is_some() {
-                    self.select_session_index(*index);
-                    Resp::ok()
-                } else {
-                    Resp::err(format!("no session at index {index}"))
+            Req::SelectSession { index, target } => {
+                match self.session_addr(*index, target.as_deref()) {
+                    Ok(ws) => {
+                        self.switch_session(ws);
+                        Resp::ok()
+                    }
+                    Err((c, m)) => Resp::err_code(c, &m),
                 }
             }
             Req::Jump { target } => match self.resolve_pane_target(target) {
@@ -2623,14 +2739,23 @@ impl App {
                 // the only other evidence and it is transient.
                 Resp::message(self.raise_notification(term, tool, kind, body))
             }
-            Req::KillSession { index } => {
-                let Some(wid) = self.session_ids().get(*index).cloned() else {
-                    return Resp::err(format!("no session at index {index}"));
+            Req::KillSession { index, target } => {
+                let wid = match self.session_addr(*index, target.as_deref()) {
+                    Ok(ws) => ws,
+                    Err((c, m)) => return Resp::err_code(c, &m),
                 };
+                let index = self
+                    .session_ids()
+                    .iter()
+                    .position(|w| w == &wid)
+                    .unwrap_or_default();
                 // Same floor the TUI's `Ctrl-b X` enforces — report it rather than
                 // no-op silently, which is what a script would otherwise see.
                 if self.state.workspace_count() <= 1 {
-                    return Resp::err("cannot kill the last session (the mux always keeps one)");
+                    return Resp::err_code(
+                        "refused",
+                        "cannot kill the last session (the mux always keeps one)",
+                    );
                 }
                 let (label, tabs, panes) = self
                     .state
@@ -3160,7 +3285,9 @@ impl App {
         match action {
             SplitRight => self.split(Dir::Right),
             SplitDown => self.split(Dir::Down),
-            NewTab => self.new_tab(),
+            NewTab => {
+                self.new_tab();
+            }
             NextTab => self.cycle_tab(1),
             PrevTab => self.cycle_tab(-1),
             CloseTab => self.close_active_tab(),
@@ -7891,6 +8018,30 @@ fn window_start_var(heights: &[u16], anchor: usize, avail: u16) -> usize {
         total = total.saturating_add(heights[start]);
     }
     start
+}
+
+/// Every session (id, name) and its tabs (id, name), for the selector resolver.
+type SelectorSnap = Vec<(WorkspaceId, Option<String>, Vec<(TabId, Option<String>)>)>;
+
+/// Why a session/tab address did not resolve: a [`control::Resp::code`] and a message.
+type AddrErr = (&'static str, String);
+
+fn addr_err(code: &'static str, msg: impl Into<String>) -> AddrErr {
+    (code, msg.into())
+}
+
+/// Borrow a [`App::selector_snapshot`] as the resolver's view.
+fn selector_views(snap: &SelectorSnap) -> Vec<selector::SessionView<'_>> {
+    snap.iter()
+        .map(|(w, name, tabs)| selector::SessionView {
+            id: &w.0,
+            name: name.as_deref(),
+            tabs: tabs
+                .iter()
+                .map(|(t, n)| (t.0.as_str(), n.as_deref()))
+                .collect(),
+        })
+        .collect()
 }
 
 /// The instant an agent has held `status` since: the previous stamp while the status

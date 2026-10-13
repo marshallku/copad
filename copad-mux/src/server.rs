@@ -754,7 +754,7 @@ fn ctl_mutates(req: &control::Req) -> bool {
     !matches!(
         req,
         control::Req::List
-            | control::Req::ListTabs
+            | control::Req::ListTabs { .. }
             | control::Req::ListSessions
             | control::Req::Health
             | control::Req::Host
@@ -1520,7 +1520,7 @@ mod tests {
         // Read-only queries must NOT dirty the frame (else `ctl list` polling defeats
         // idle-skip). Everything that changes state must.
         assert!(!ctl_mutates(&Req::List));
-        assert!(!ctl_mutates(&Req::ListTabs));
+        assert!(!ctl_mutates(&Req::ListTabs { session: None }));
         assert!(!ctl_mutates(&Req::ListSessions));
         assert!(ctl_mutates(&Req::NewTab));
         assert!(ctl_mutates(&Req::Split {

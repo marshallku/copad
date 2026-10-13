@@ -62,17 +62,32 @@ pub enum Req {
         index: Option<usize>,
         text: String,
     },
-    /// List the workspace's tabs.
-    ListTabs,
+    /// List a session's tabs — the active one, or `session` (a selector).
+    ListTabs {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+    },
     /// Create a new tab and make it active.
     NewTab,
     /// Make the tab at `index` (as printed by `list-tabs`) active.
-    SelectTab { index: usize },
+    SelectTab {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+        /// A selector (`s1:t0`, `hub/build`, …; see [`crate::selector`]) instead of `index`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+    },
     /// Close the tab at `index` (as printed by `list-tabs`) and reap its shells —
     /// the `Ctrl-b &` / context-menu "close tab" action, reachable from a script.
     /// Refused when it is the session's LAST tab (a session always keeps ≥1; kill the
     /// session instead). Unlike the TUI there is no confirm — tmux `kill-window` parity.
-    CloseTab { index: usize },
+    CloseTab {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+        /// A selector (`s1:t0`, `hub/build`, …; see [`crate::selector`]) instead of `index`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+    },
     /// Rename the tab at `index` (as printed by `list-tabs`), or the ACTIVE tab when
     /// `index` is `None` — so a shell inside a pane can rename its own tab without
     /// knowing its position. An empty `name` clears back to the process/index label.
@@ -84,6 +99,9 @@ pub enum Req {
         /// An older client sends neither, and keeps the legacy "active tab" meaning.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane: Option<String>,
+        /// A tab selector; beats `pane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
         name: String,
     },
     /// List the sessions (workspaces).
@@ -107,10 +125,19 @@ pub enum Req {
         /// The caller's pane token; see [`Req::RenameTab::pane`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane: Option<String>,
+        /// A session selector; beats `pane`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
         name: String,
     },
     /// Make the session at `index` (as printed by `list-sessions`) active.
-    SelectSession { index: usize },
+    SelectSession {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+        /// A selector (`s1:t0`, `hub/build`, …; see [`crate::selector`]) instead of `index`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+    },
     /// Jump to a pane ANYWHERE in the mux by identity rather than by position: switch to
     /// its session, select its tab, focus it. `target` is a pane token (the
     /// `$COPAD_MUX_PANE` a pane's own shell carries) or a raw terminal id.
@@ -138,7 +165,13 @@ pub enum Req {
     /// reap every shell in them, switching to a survivor when it was the active one.
     /// Refused when it is the LAST session (the mux keeps ≥1). Unlike the TUI's
     /// `Ctrl-b X` there is no y/n confirm — tmux `kill-session` parity.
-    KillSession { index: usize },
+    KillSession {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+        /// A selector (`s1:t0`, `hub/build`, …; see [`crate::selector`]) instead of `index`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+    },
     /// Create a git worktree for `branch` (sibling of the repo's MAIN worktree) and open
     /// a session in it, switching to it. `cwd` is the caller's dir (the repo is resolved
     /// from it); `from` is the base ref for the new branch (`None` → HEAD).
@@ -261,8 +294,20 @@ pub struct HealthInfo {
 /// Capability: `rename-tab`/`rename-session` honor `pane` (the caller's pane).
 pub const CAP_RENAME_CALLER: &str = "rename-caller";
 
+/// Capability: session/tab verbs honor `target` selectors, and `list-tabs` honors `session`.
+pub const CAP_SELECTORS: &str = "selectors";
+
 /// Every capability this build's server implements (reported by `health`).
-pub const SERVER_CAPS: &[&str] = &[CAP_RENAME_CALLER];
+pub const SERVER_CAPS: &[&str] = &[CAP_RENAME_CALLER, CAP_SELECTORS];
+
+/// A session or tab a mutating verb created or acted on: its stable id and display name.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NodeRef {
+    pub id: String,
+    /// Empty when unnamed.
+    #[serde(default)]
+    pub name: String,
+}
 
 impl HealthInfo {
     /// Panes that still fit in the descriptor budget, when both numbers are known.
@@ -430,6 +475,17 @@ pub struct Resp {
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Machine-readable reason for `ok = false`: `not_found`, `ambiguous`, `refused`,
+    /// `spawn_failed`, `invalid`, `unsupported`, or `error` when unclassified. (Usage errors
+    /// never reach the server; the CLI prints `usage` itself.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    /// `new-session` / `new-tab` / `split`: the session the result lives in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<NodeRef>,
+    /// `new-session` / `new-tab` / `split`: the tab the result lives in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab: Option<NodeRef>,
     /// Human-readable outcome for a mutating verb (e.g. the created worktree path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -493,6 +549,9 @@ impl Resp {
         Self {
             ok: true,
             error: None,
+            code: None,
+            session: None,
+            tab: None,
             message: None,
             worktrees: None,
             panes: None,
@@ -579,9 +638,25 @@ impl Resp {
         }
     }
     pub fn err(msg: impl Into<String>) -> Self {
+        Self::err_code("error", msg)
+    }
+
+    /// A failure with a machine-readable `code` (see [`Resp::code`]).
+    pub fn err_code(code: &str, msg: impl Into<String>) -> Self {
         Self {
             ok: false,
             error: Some(msg.into()),
+            code: Some(code.to_string()),
+            ..Self::ok()
+        }
+    }
+
+    /// A response naming what a create verb made: its session, tab, and pane token.
+    pub fn created(session: NodeRef, tab: NodeRef, pane: String) -> Self {
+        Self {
+            session: Some(session),
+            tab: Some(tab),
+            pane: Some(pane),
             ..Self::ok()
         }
     }
@@ -730,8 +805,14 @@ pub fn run_client(args: &[String]) -> i32 {
             Req::KillServer
         }
         "list-tabs" | "tabs" => {
-            parsed!(cliargs::bare("usage: comux list-tabs [--json]"));
-            Req::ListTabs
+            let p = parsed!(LIST_TABS_SPEC);
+            let session = p.value("--session").map(str::to_string);
+            if session.is_some()
+                && let Err(code) = require_cap(CAP_SELECTORS, cmd, json_out)
+            {
+                return code;
+            }
+            Req::ListTabs { session }
         }
         "new-tab" => {
             parsed!(cliargs::bare("usage: comux new-tab [--json]"));
@@ -759,68 +840,92 @@ pub fn run_client(args: &[String]) -> i32 {
         }
         "rename-session" | "rename" => {
             let p = parsed!(RENAME_SESSION_SPEC);
-            let Some((index, name)) = parse_rename(&p.positionals) else {
+            let Some((index, name)) = rename_args(&p) else {
                 return usage_error(
                     json_out,
                     "comux rename-session: a name is required",
                     RENAME_SESSION_SPEC.usage,
                 );
             };
-            let pane = match caller_pane_for(index, cmd, json_out, RENAME_SESSION_SPEC.usage) {
+            let target = p.value("--target").map(str::to_string);
+            let pane = match rename_target(
+                index,
+                target.as_deref(),
+                cmd,
+                json_out,
+                RENAME_SESSION_SPEC.usage,
+            ) {
                 Ok(p) => p,
                 Err(code) => return code,
             };
-            Req::RenameSession { index, pane, name }
+            Req::RenameSession {
+                index,
+                pane,
+                target,
+                name,
+            }
         }
         "rename-tab" => {
             let p = parsed!(RENAME_TAB_SPEC);
-            let Some((index, name)) = parse_rename(&p.positionals) else {
+            let Some((index, name)) = rename_args(&p) else {
                 return usage_error(
                     json_out,
                     "comux rename-tab: a name is required",
                     RENAME_TAB_SPEC.usage,
                 );
             };
-            let pane = match caller_pane_for(index, cmd, json_out, RENAME_TAB_SPEC.usage) {
+            let target = p.value("--target").map(str::to_string);
+            let pane = match rename_target(
+                index,
+                target.as_deref(),
+                cmd,
+                json_out,
+                RENAME_TAB_SPEC.usage,
+            ) {
                 Ok(p) => p,
                 Err(code) => return code,
             };
-            Req::RenameTab { index, pane, name }
+            Req::RenameTab {
+                index,
+                pane,
+                target,
+                name,
+            }
         }
         // The index-taking verbs below share one shape: an omitted index opens the fuzzy
         // picker over a live listing instead of failing with a usage line (see
         // `pick_index`), while a MALFORMED index still fails — the user meant something.
         "select-session" => {
-            let idx = match pick_verb(&rest, json_out, Target::Session) {
-                Ok(i) => i,
+            let (index, target) = match pick_verb(&rest, json_out, Target::Session) {
+                Ok(a) => a,
                 Err(code) => return code,
             };
-            Req::SelectSession { index: idx }
+            Req::SelectSession { index, target }
         }
         "select-tab" => {
-            let idx = match pick_verb(&rest, json_out, Target::Tab) {
-                Ok(i) => i,
+            let (index, target) = match pick_verb(&rest, json_out, Target::Tab) {
+                Ok(a) => a,
                 Err(code) => return code,
             };
-            Req::SelectTab { index: idx }
+            Req::SelectTab { index, target }
         }
         // The two destructive selection verbs. They picker on an omitted index like
         // their non-destructive siblings rather than defaulting to the ACTIVE tab /
         // session the way `rename-*` does: an explicit pick is what makes a bare
         // `comux close-tab` safe to type.
         "close-tab" | "kill-tab" => {
-            let idx = match pick_verb(&rest, json_out, Target::TabClose) {
-                Ok(i) => i,
+            let (index, target) = match pick_verb(&rest, json_out, Target::TabClose) {
+                Ok(a) => a,
                 Err(code) => return code,
             };
-            Req::CloseTab { index: idx }
+            Req::CloseTab { index, target }
         }
         "kill-session" => {
-            let idx = match pick_verb(&rest, json_out, Target::SessionKill) {
-                Ok(i) => i,
+            let (index, target) = match pick_verb(&rest, json_out, Target::SessionKill) {
+                Ok(a) => a,
                 Err(code) => return code,
             };
-            Req::KillSession { index: idx }
+            Req::KillSession { index, target }
         }
         "split" => {
             // -h/--horizontal → side by side (right); -v/--vertical → stacked (down). The
@@ -858,7 +963,8 @@ pub fn run_client(args: &[String]) -> i32 {
                 Target::PaneClose
             };
             let idx = match pick_verb(&rest, json_out, target) {
-                Ok(i) => i,
+                Ok((Some(i), _)) => i,
+                Ok((None, _)) => unreachable!("pane verbs take no selector"),
                 Err(code) => return code,
             };
             if cmd == "focus" {
@@ -1041,7 +1147,14 @@ pub fn run_client(args: &[String]) -> i32 {
     {
         return 1;
     }
-    if resp.ok { 0 } else { 1 }
+    if resp.ok {
+        0
+    } else if resp.code.as_deref() == Some("ambiguous") {
+        // An ambiguous NAME is the caller's to fix, like any other malformed argument.
+        2
+    } else {
+        1
+    }
 }
 
 /// Parse a verb's arguments (`rest[0]` is the verb) against its grammar. `Err` is the exit
@@ -1153,15 +1266,67 @@ fn require_cap(cap: &str, verb: &str, json: bool) -> Result<(), i32> {
 
 /// The argument of a picker-backed index verb: at most one positional, and when it is
 /// absent the fuzzy picker opens (see [`pick_index`]).
-fn pick_verb(rest: &[&String], json: bool, target: Target) -> Result<usize, i32> {
+///
+/// For a session/tab verb, a non-numeric argument is a SELECTOR (`s1`, `name:hub`, `s1:t0`,
+/// `hub/build`) and comes back as the target, after checking the server understands one.
+/// Pane verbs take only an index, so for them a non-number stays a usage error.
+fn pick_verb(
+    rest: &[&String],
+    json: bool,
+    target: Target,
+) -> Result<(Option<usize>, Option<String>), i32> {
     let spec = Spec {
         usage: target.usage(),
         flags: &[],
         positionals: Positionals::AtMost(1),
     };
     let p = verb_args(&spec, rest, json)?;
-    pick_index(p.positionals.first().map(|s| s.as_str()), json, target)
+    let verb = rest.first().map(|s| s.as_str()).unwrap_or("");
+    match p.positionals.first() {
+        Some(a) if a.parse::<usize>().is_err() && target.takes_selector() => {
+            require_cap(CAP_SELECTORS, verb, json)?;
+            Ok((None, Some(a.clone())))
+        }
+        a => pick_index(a.map(|s| s.as_str()), json, target).map(|i| (Some(i), None)),
+    }
 }
+
+/// `(index, name)` for a `rename-*`. With `--target` the target IS the address, so every
+/// positional is the name — `rename-tab -t s1:t0 2026 plan` names the tab "2026 plan" rather
+/// than reading `2026` as an index.
+fn rename_args(p: &cliargs::Parsed) -> Option<(Option<usize>, String)> {
+    if p.value("--target").is_some() {
+        return (!p.positionals.is_empty())
+            .then(|| (None, p.positionals.join(" ").trim().to_string()));
+    }
+    parse_rename(&p.positionals)
+}
+
+/// Where an index-less `rename-*` points: an explicit `--target` selector, else the caller's
+/// pane. Returns the `pane` field to send.
+fn rename_target(
+    index: Option<usize>,
+    target: Option<&str>,
+    verb: &str,
+    json: bool,
+    usage: &str,
+) -> Result<Option<String>, i32> {
+    match (index, target) {
+        (Some(_), Some(_)) => Err(usage_error(
+            json,
+            &format!("comux {verb}: give an index or --target, not both"),
+            usage,
+        )),
+        (None, Some(_)) => require_cap(CAP_SELECTORS, verb, json).map(|_| None),
+        _ => caller_pane_for(index, verb, json, usage),
+    }
+}
+
+const LIST_TABS_SPEC: Spec = Spec {
+    usage: "usage: comux list-tabs [--session <s1|name:hub|index>] [--json]",
+    flags: &[opt(&["--session", "-s"])],
+    positionals: Positionals::AtMost(0),
+};
 
 const NAME_SPEC_NEW_SESSION: Spec = Spec {
     usage: "usage: comux new-session [name...] [--json]   (use `--` before a name starting with '-')",
@@ -1170,14 +1335,16 @@ const NAME_SPEC_NEW_SESSION: Spec = Spec {
 };
 
 const RENAME_SESSION_SPEC: Spec = Spec {
-    usage: "usage: comux rename-session [index] <name...>   (no index = the session of the calling pane)",
-    flags: &[],
+    usage: "usage: comux rename-session [index | -t <s1|name:hub>] <name...>\n\
+            \x20      no index = the session of the calling pane",
+    flags: &[opt(&["--target", "-t"])],
     positionals: Positionals::Any,
 };
 
 const RENAME_TAB_SPEC: Spec = Spec {
-    usage: "usage: comux rename-tab [index] <name...>   (no index = the tab of the calling pane)",
-    flags: &[],
+    usage: "usage: comux rename-tab [index | -t <s1:t0|hub/build>] <name...>\n\
+            \x20      no index = the tab of the calling pane",
+    flags: &[opt(&["--target", "-t"])],
     positionals: Positionals::Any,
 };
 
@@ -1332,13 +1499,18 @@ impl Target {
     /// when an index WAS given but isn't a number.
     fn usage(self) -> &'static str {
         match self {
-            Target::Session => "comux select-session [index]   (no index → fuzzy picker)",
-            Target::SessionKill => "comux kill-session [index]   (no index → fuzzy picker)",
-            Target::Tab => "comux select-tab [index]   (no index → fuzzy picker)",
-            Target::TabClose => "comux close-tab [index]   (no index → fuzzy picker)",
+            Target::Session => "comux select-session [index|s1|name:hub]   (none → fuzzy picker)",
+            Target::SessionKill => "comux kill-session [index|s1|name:hub]   (none → fuzzy picker)",
+            Target::Tab => "comux select-tab [index|s1:t0|hub/build]   (none → fuzzy picker)",
+            Target::TabClose => "comux close-tab [index|s1:t0|hub/build]   (none → fuzzy picker)",
             Target::PaneFocus => "comux focus [index]   (no index → fuzzy picker)",
             Target::PaneClose => "comux close [index]   (no index → fuzzy picker)",
         }
+    }
+
+    /// Session/tab verbs also accept a selector; pane verbs take only an index.
+    fn takes_selector(self) -> bool {
+        !matches!(self, Target::PaneFocus | Target::PaneClose)
     }
 
     fn title(self) -> &'static str {
@@ -1397,7 +1569,9 @@ impl Target {
                     .collect())
             }
             Target::Tab | Target::TabClose => {
-                let tabs = query(&Req::ListTabs)?.tabs.unwrap_or_default();
+                let tabs = query(&Req::ListTabs { session: None })?
+                    .tabs
+                    .unwrap_or_default();
                 Ok(tabs
                     .iter()
                     .map(|t| {
@@ -1806,7 +1980,7 @@ fn print_human(req: &Req, resp: &Resp) {
                 );
             }
         }
-        Req::ListTabs => {
+        Req::ListTabs { .. } => {
             let tabs = resp.tabs.clone().unwrap_or_default();
             let active = resp.active_tab.unwrap_or(usize::MAX);
             println!(
@@ -2388,6 +2562,16 @@ mod verb_args_tests {
     }
 
     #[test]
+    fn a_targeted_rename_takes_every_word_as_the_name() {
+        let p = cliargs::parse(&RENAME_TAB_SPEC, &["-t", "s1:t0", "2026", "plan"]).unwrap();
+        assert_eq!(rename_args(&p), Some((None, "2026 plan".to_string())));
+        let p = cliargs::parse(&RENAME_TAB_SPEC, &["2", "plan"]).unwrap();
+        assert_eq!(rename_args(&p), Some((Some(2), "plan".to_string())));
+        let p = cliargs::parse(&RENAME_TAB_SPEC, &["-t", "s1:t0"]).unwrap();
+        assert_eq!(rename_args(&p), None);
+    }
+
+    #[test]
     fn split_keeps_dash_h_as_horizontal() {
         // Parses (then fails on the dead socket) — `-h` is the split direction, not help.
         assert_eq!(exit(&["split", "-h"]), 1);
@@ -2475,20 +2659,34 @@ mod server_admin_tests {
     #[test]
     fn close_tab_and_kill_session_round_trip() {
         assert_eq!(
-            serde_json::to_string(&Req::CloseTab { index: 1 }).unwrap(),
+            serde_json::to_string(&Req::CloseTab {
+                index: Some(1),
+                target: None
+            })
+            .unwrap(),
             r#"{"cmd":"close-tab","index":1}"#
         );
         assert_eq!(
-            serde_json::to_string(&Req::KillSession { index: 2 }).unwrap(),
+            serde_json::to_string(&Req::KillSession {
+                index: Some(2),
+                target: None
+            })
+            .unwrap(),
             r#"{"cmd":"kill-session","index":2}"#
         );
         assert!(matches!(
             serde_json::from_str::<Req>(r#"{"cmd":"close-tab","index":3}"#).unwrap(),
-            Req::CloseTab { index: 3 }
+            Req::CloseTab {
+                index: Some(3),
+                target: None
+            }
         ));
         assert!(matches!(
             serde_json::from_str::<Req>(r#"{"cmd":"kill-session","index":0}"#).unwrap(),
-            Req::KillSession { index: 0 }
+            Req::KillSession {
+                index: Some(0),
+                target: None
+            }
         ));
         assert!(matches!(
             serde_json::from_str::<Req>(r#"{"cmd":"kill-server"}"#).unwrap(),
@@ -2504,13 +2702,13 @@ mod server_admin_tests {
             .expect("indexed form must parse");
         assert!(matches!(
             old,
-            Req::RenameSession { index: Some(1), pane: None, ref name } if name == "api"
+            Req::RenameSession { index: Some(1), pane: None, target: None, ref name } if name == "api"
         ));
         let new: Req = serde_json::from_str(r#"{"cmd":"rename-tab","name":"build"}"#)
             .expect("index-less form must parse");
         assert!(matches!(
             new,
-            Req::RenameTab { index: None, pane: None, ref name } if name == "build"
+            Req::RenameTab { index: None, pane: None, target: None, ref name } if name == "build"
         ));
     }
 }

@@ -30,6 +30,7 @@ pub mod persist;
 pub mod picker;
 pub mod procinfo;
 pub mod proto;
+pub mod selector;
 pub mod server;
 pub mod state;
 pub mod term;

@@ -53,6 +53,21 @@ rejects them for that reason.
 
 And never send to your own pane, `$COPAD_MUX_PANE` — you would be typing into yourself.
 
+### How sessions and tabs are addressed
+
+The same rule holds one level up: name the thing, not its position. A session is `s4` (its
+`id`), `name:hub`, or a bare `hub`; a tab is `s4:t13` (its `id`, anywhere in the mux) or
+`hub/build` (session, then tab id/name/index). `select-session`, `kill-session`,
+`select-tab`, `close-tab` take one; `rename-tab`/`rename-session` take it as `-t <selector>`;
+`comux list-tabs --session <selector>` reads another session without switching to it. A name
+that matches two things exits 2 and lists their ids — pick by id.
+
+`new-session --json`, `new-tab --json` and `split --json` answer with what they made:
+`{"session":{"id","name"},"tab":{"id","name"},"pane":"<token>"}`. Keep those ids.
+
+`rename-tab <name>` with no index renames the tab YOUR pane is in, never the one the user
+is looking at.
+
 ## Run something in another pane
 
 ```bash
