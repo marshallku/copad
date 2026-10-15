@@ -66,6 +66,8 @@ struct CopadConfig {
     let fontSize: Int
     /// `[terminal] font_thicken` — see [`FontThicken`].
     let fontThicken: FontThicken
+    /// `[terminal] alpha_blending` — see [`AlphaBlending`].
+    let alphaBlending: AlphaBlending
     /// macOS-only: when true, Option+key sends `ESC + key` to the PTY
     /// instead of routing through the system IME (which produces
     /// `¡™£¢`-style special chars on Option+1/2/3/4). Required for
@@ -245,6 +247,7 @@ struct CopadConfig {
             fontFamily: tomlString(terminal, "font_family") ?? d.fontFamily,
             fontSize: tomlInt(terminal, "font_size") ?? d.fontSize,
             fontThicken: fontThicken(terminal) ?? d.fontThicken,
+            alphaBlending: alphaBlending(terminal) ?? d.alphaBlending,
             optionAsAlt: tomlBool(terminal, "option_as_alt") ?? d.optionAsAlt,
             forceMetaKeys: tomlStringArray(terminal, "force_meta_keys") ?? d.forceMetaKeys,
             closeOnExit: tomlBool(terminal, "close_on_exit") ?? d.closeOnExit,
@@ -304,6 +307,16 @@ struct CopadConfig {
         if let parsed = FontThicken.parse(bool: raw.bool, string: raw.string) { return parsed }
         FileHandle.standardError.write(
             Data("[copad] [terminal] font_thicken must be true, false or \"auto\" — using the default (false)\n".utf8),
+        )
+        return nil
+    }
+
+    /// `[terminal] alpha_blending`, warning (once per load) on a value it cannot read.
+    private static func alphaBlending(_ table: TOMLTable?) -> AlphaBlending? {
+        guard let raw = table?["alpha_blending"] else { return nil }
+        if let parsed = AlphaBlending.parse(raw.string) { return parsed }
+        FileHandle.standardError.write(
+            Data("[copad] [terminal] alpha_blending must be \"native\" or \"linear\" — using the default (native)\n".utf8),
         )
         return nil
     }
@@ -369,6 +382,7 @@ struct CopadConfig {
             fontFamily: "JetBrains Mono",
             fontSize: 14,
             fontThicken: .off,
+            alphaBlending: .native,
             optionAsAlt: true,
             forceMetaKeys: ["Return"],
             closeOnExit: true,

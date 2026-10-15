@@ -619,6 +619,7 @@ final class PaneManager {
                 alac.applyTheme(newTheme)
                 alac.applyFont(family: newConfig.fontFamily, baseSize: CGFloat(newConfig.fontSize))
                 alac.applyFontThicken(newConfig.fontThicken)
+                alac.applyAlphaBlending(newConfig.alphaBlending)
                 alac.applyOSC52Policy(newConfig.osc52)
                 alac.applyWindowOpacity(newConfig.windowOpacity)
             }

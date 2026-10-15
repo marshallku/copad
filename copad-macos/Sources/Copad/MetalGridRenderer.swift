@@ -68,26 +68,40 @@ final class MetalGridRenderer {
         return out;
     }
 
+    // Same curve as `AlphaBlending.linearize`.
+    float3 srgb_to_linear(float3 c) {
+        return select(pow((c + 0.055) / 1.055, 2.4), c / 12.92, c <= 0.04045);
+    }
+
     fragment float4 quad_fs(
         VSOut in [[stage_in]],
-        texture2d<float> atlas [[texture(0)]]
+        texture2d<float> atlas [[texture(0)]],
+        constant uint &linear [[buffer(0)]]
     ) {
         constexpr sampler s(mag_filter::nearest, min_filter::nearest,
                             address::clamp_to_edge);
+        // Instance colors are sRGB-encoded. Into an `_srgb` drawable
+        // (`alpha_blending = linear`) they go as linear light: the
+        // hardware blends linearly and re-encodes on store.
+        float3 rgb = linear != 0 ? srgb_to_linear(in.color.rgb) : in.color.rgb;
         // Output is premultiplied (pipeline blends one /
         // one-minus-source-alpha).
         switch (in.kind) {
         case 0:
-            return float4(in.color.rgb * in.color.a, in.color.a);
+            return float4(rgb * in.color.a, in.color.a);
         case 1: {
             float cov = atlas.sample(s, in.uv).a;
-            return float4(in.color.rgb * in.color.a * cov, in.color.a * cov);
+            return float4(rgb * in.color.a * cov, in.color.a * cov);
         }
         default: {
             // Color glyph (emoji): atlas texels are already
-            // premultiplied by the CGBitmapContext; tint is ignored,
-            // only the instance alpha scales.
-            return atlas.sample(s, in.uv) * in.color.a;
+            // premultiplied (sRGB-encoded) by the CGBitmapContext; tint
+            // is ignored, only the instance alpha scales.
+            float4 t = atlas.sample(s, in.uv);
+            if (linear != 0 && t.a > 0.0) {
+                t.rgb = srgb_to_linear(t.rgb / t.a) * t.a;
+            }
+            return t * in.color.a;
         }
         }
     }
@@ -162,6 +176,10 @@ final class MetalGridRenderer {
     let device: MTLDevice
     private let queue: MTLCommandQueue
     private let pipeline: MTLRenderPipelineState
+    /// The same pipeline for an `_srgb` drawable (`alpha_blending = linear`).
+    private let linearPipeline: MTLRenderPipelineState
+    /// `[terminal] alpha_blending`; applies from the next frame.
+    var alphaBlending: AlphaBlending = .native
     private weak var layer: CAMetalLayer?
 
     private var fonts: Fonts
@@ -217,20 +235,27 @@ final class MetalGridRenderer {
               let fs = library.makeFunction(name: "quad_fs")
         else { return nil }
 
-        let desc = MTLRenderPipelineDescriptor()
-        desc.vertexFunction = vs
-        desc.fragmentFunction = fs
-        let attachment = desc.colorAttachments[0]!
-        attachment.pixelFormat = .bgra8Unorm
-        attachment.isBlendingEnabled = true
-        // Premultiplied-alpha over: the fragment shader premultiplies.
-        attachment.sourceRGBBlendFactor = .one
-        attachment.sourceAlphaBlendFactor = .one
-        attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
-        attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+        // One pipeline per drawable format: `.bgra8Unorm` blends the stored
+        // sRGB values (`alpha_blending = native`), `.bgra8Unorm_srgb`
+        // blends in linear light.
+        func makePipeline(_ format: MTLPixelFormat) throws -> MTLRenderPipelineState {
+            let desc = MTLRenderPipelineDescriptor()
+            desc.vertexFunction = vs
+            desc.fragmentFunction = fs
+            let attachment = desc.colorAttachments[0]!
+            attachment.pixelFormat = format
+            attachment.isBlendingEnabled = true
+            // Premultiplied-alpha over: the fragment shader premultiplies.
+            attachment.sourceRGBBlendFactor = .one
+            attachment.sourceAlphaBlendFactor = .one
+            attachment.destinationRGBBlendFactor = .oneMinusSourceAlpha
+            attachment.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+            return try device.makeRenderPipelineState(descriptor: desc)
+        }
 
         do {
-            pipeline = try device.makeRenderPipelineState(descriptor: desc)
+            pipeline = try makePipeline(.bgra8Unorm)
+            linearPipeline = try makePipeline(.bgra8Unorm_srgb)
         } catch {
             FileHandle.standardError.write(Data("[copad] Metal pipeline create failed: \(error)\n".utf8))
             return nil
@@ -274,6 +299,13 @@ final class MetalGridRenderer {
             lastDrawableWaitNanos = 0
         }
         guard let layer else { return true }
+        let linear = alphaBlending.blendsLinearly(transparentBackground: state.transparentMode)
+        // The drawable format IS the blend space; it follows the setting and the
+        // transparency mode, and the next drawable comes in the new format.
+        let format: MTLPixelFormat = linear ? .bgra8Unorm_srgb : .bgra8Unorm
+        if layer.pixelFormat != format {
+            layer.pixelFormat = format
+        }
         let scale = metrics.scale
         let drawableSize = CGSize(
             width: max(1, state.viewSizePoints.width * scale),
@@ -316,7 +348,7 @@ final class MetalGridRenderer {
         attachment.texture = drawable.texture
         attachment.loadAction = .clear
         attachment.storeAction = .store
-        attachment.clearColor = clearColor(theme: theme, state: state)
+        attachment.clearColor = clearColor(theme: theme, state: state, linear: linear)
 
         guard let cmd = queue.makeCommandBuffer(),
               let encoder = cmd.makeRenderCommandEncoder(descriptor: pass)
@@ -330,7 +362,9 @@ final class MetalGridRenderer {
            )
         {
             var viewport = SIMD2<Float>(Float(drawableSize.width), Float(drawableSize.height))
-            encoder.setRenderPipelineState(pipeline)
+            var linearFlag: UInt32 = linear ? 1 : 0
+            encoder.setRenderPipelineState(linear ? linearPipeline : pipeline)
+            encoder.setFragmentBytes(&linearFlag, length: MemoryLayout<UInt32>.size, index: 0)
             encoder.setVertexBuffer(buffer, offset: 0, index: 0)
             encoder.setVertexBytes(&viewport, length: MemoryLayout<SIMD2<Float>>.size, index: 1)
             encoder.setFragmentTexture(atlas.texture, index: 0)
@@ -355,11 +389,21 @@ final class MetalGridRenderer {
     /// Transparent modes clear to alpha-0 so the layer background /
     /// wallpaper image view behind shows through — the GPU equivalent
     /// of the CPU painter skipping its opaque bounds fill.
-    private func clearColor(theme: ThemeColors, state: FrameState) -> MTLClearColor {
+    /// An `_srgb` drawable stores the clear color as linear light and
+    /// encodes it, so `linear` passes the decoded value.
+    private func clearColor(theme: ThemeColors, state: FrameState, linear: Bool) -> MTLClearColor {
         if state.transparentMode {
             return MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
         }
-        let bg = rgbaToFloat4(theme.defaultBg)
+        var bg = rgbaToFloat4(theme.defaultBg)
+        if linear {
+            bg = SIMD4(
+                AlphaBlending.linearize(bg.x),
+                AlphaBlending.linearize(bg.y),
+                AlphaBlending.linearize(bg.z),
+                bg.w,
+            )
+        }
         return MTLClearColor(red: Double(bg.x), green: Double(bg.y), blue: Double(bg.z), alpha: 1)
     }
 

@@ -181,6 +181,7 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
             theme: theme,
             font: resolveFont(family: config.fontFamily, size: CGFloat(config.fontSize)),
             fontThicken: config.fontThicken,
+            alphaBlending: config.alphaBlending,
             transparentDefaultBg: config.transparentDefaultBg,
             windowOpacity: config.windowOpacity,
             osc52Policy: config.osc52,
@@ -408,6 +409,10 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
     /// live Cmd++ doesn't get clobbered by saving config.toml.
     func applyFontThicken(_ value: FontThicken) {
         renderView?.setFontThicken(value)
+    }
+
+    func applyAlphaBlending(_ value: AlphaBlending) {
+        renderView?.setAlphaBlending(value)
     }
 
     func applyFont(family: String, baseSize: CGFloat) {
@@ -689,6 +694,9 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     private var smoothFonts: Bool {
         fontThicken.smooths(scale: window?.backingScaleFactor ?? 2)
     }
+    /// `[terminal] alpha_blending`. GPU painter only: the CoreText painter
+    /// always blends the way Core Graphics does.
+    private var alphaBlending: AlphaBlending
     private var imageBackgroundActive = false
 
     /// `[window] opacity` — when < 1.0, the window is non-opaque and
@@ -867,6 +875,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         theme: CopadTheme,
         font: NSFont,
         fontThicken: FontThicken,
+        alphaBlending: AlphaBlending,
         transparentDefaultBg: Bool,
         windowOpacity: Double,
         osc52Policy: OSC52Policy,
@@ -881,6 +890,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         boldItalicFont = Self.deriveTrait(font, mask: [.boldFontMask, .italicFontMask])
         paletteCache = Self.buildPalette(theme: theme)
         self.fontThicken = fontThicken
+        self.alphaBlending = alphaBlending
         self.transparentDefaultBg = transparentDefaultBg
         self.windowOpacity = windowOpacity
         self.osc52Policy = osc52Policy
@@ -934,6 +944,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
                metrics: gpuMetrics(),
            )
         {
+            renderer.alphaBlending = alphaBlending
             metalRenderer = renderer
             rebuildGPUTheme()
             let overlay = IMEPreeditOverlayView(theme: theme, font: font)
@@ -1060,6 +1071,15 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// when the cell size actually changed so the caller can resize
     /// the term grid to match — without that, the PTY keeps sending
     /// content sized to the old grid.
+    /// Live config reload of `alpha_blending`: nothing to re-rasterize, the
+    /// next frame blends in the new space.
+    func setAlphaBlending(_ value: AlphaBlending) {
+        guard value != alphaBlending else { return }
+        alphaBlending = value
+        metalRenderer?.alphaBlending = value
+        requestRepaint()
+    }
+
     /// Live config reload of `font_thicken`: re-rasterize every glyph.
     func setFontThicken(_ value: FontThicken) {
         guard value != fontThicken else { return }
