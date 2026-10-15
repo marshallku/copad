@@ -78,10 +78,12 @@ pub enum Command {
         pane: PaneId,
         if_rev: Option<u64>,
     },
-    /// Create a new single-pane tab and make it active. Controller/API only.
+    /// Create a new single-pane tab, making it active when `activate`. Controller/API only.
     NewTab {
         origin: Origin,
         workspace: WorkspaceId,
+        /// `false` adds the tab behind the active one — the session's view does not move.
+        activate: bool,
     },
     /// Make `tab` the active tab; its geometry is re-derived while non-active tabs
     /// keep their frozen sizes. Controller/API only.
@@ -521,7 +523,11 @@ impl State {
                 pane,
                 if_rev,
             } => self.close(origin, workspace, pane, if_rev),
-            Command::NewTab { origin, workspace } => self.new_tab(origin, workspace),
+            Command::NewTab {
+                origin,
+                workspace,
+                activate,
+            } => self.new_tab(origin, workspace, activate),
             Command::SelectTab {
                 origin,
                 workspace,
@@ -924,7 +930,12 @@ impl State {
 
     // --- tabs (spec §1: multiple layouts per workspace) ---
 
-    fn new_tab(&mut self, origin: Origin, workspace: WorkspaceId) -> Result<Vec<Event>, MuxError> {
+    fn new_tab(
+        &mut self,
+        origin: Origin,
+        workspace: WorkspaceId,
+        activate: bool,
+    ) -> Result<Vec<Event>, MuxError> {
         self.authorize_mutation(&origin, &workspace)?;
         let idx = self.ws_index(&workspace)?;
         let n = self.next_tab;
@@ -944,7 +955,9 @@ impl State {
             rev: 0,
         };
         self.workspaces[idx].tabs.push(tab);
-        self.workspaces[idx].active_tab = tab_id.clone();
+        if activate {
+            self.workspaces[idx].active_tab = tab_id.clone();
+        }
         self.workspaces[idx].rev += 1;
         let ws_rev = self.workspaces[idx].rev;
         let terms = self.recompute_sizes(idx);
@@ -1335,6 +1348,7 @@ mod tests {
         s.apply(Command::NewTab {
             origin: Origin::Api,
             workspace: ws.clone(),
+            activate: true,
         })
         .unwrap();
 
@@ -1904,6 +1918,7 @@ mod tests {
             .apply(Command::NewTab {
                 origin: Origin::Client(c),
                 workspace: ws.clone(),
+                activate: true,
             })
             .unwrap();
         let Event::TabCreated { tab, .. } = &ev[0] else {
@@ -1916,6 +1931,27 @@ mod tests {
             w.tab(tab).unwrap().layout.is_single_leaf(),
             "a fresh tab has exactly one pane"
         );
+        assert!(s.check_tree_consistency());
+    }
+
+    #[test]
+    fn a_background_tab_leaves_the_active_tab_alone() {
+        let (mut s, ws, _p) = seed();
+        let before = s.workspace(&ws).unwrap().active_tab.clone();
+        let ev = s
+            .apply(Command::NewTab {
+                origin: Origin::Api,
+                workspace: ws.clone(),
+                activate: false,
+            })
+            .unwrap();
+        let Event::TabCreated { tab, .. } = &ev[0] else {
+            panic!("first event must be TabCreated")
+        };
+        let w = s.workspace(&ws).unwrap();
+        assert_eq!(w.tabs.len(), 2);
+        assert_eq!(w.active_tab, before, "the view did not move");
+        assert_ne!(&w.active_tab, tab);
         assert!(s.check_tree_consistency());
     }
 
@@ -1936,6 +1972,7 @@ mod tests {
         s.apply(Command::NewTab {
             origin: Origin::Client(c),
             workspace: ws.clone(),
+            activate: true,
         })
         .unwrap();
         // switch back to the original tab
@@ -1978,6 +2015,7 @@ mod tests {
             .apply(Command::NewTab {
                 origin: Origin::Client(c),
                 workspace: ws.clone(),
+                activate: true,
             })
             .unwrap();
         let Event::TabCreated { tab, terminal, .. } = &ev[0] else {
@@ -2169,7 +2207,7 @@ mod proptests {
                         if r.is_ok() { prop_assert!(ctl_before, "I1: focus succeeded from a non-controller"); }
                     }
                     Op::NewTab => {
-                        let _ = s.apply(Command::NewTab { origin: Origin::Api, workspace: ws.clone() });
+                        let _ = s.apply(Command::NewTab { origin: Origin::Api, workspace: ws.clone(), activate: true });
                     }
                     Op::SelectTab(ti) => {
                         let tabs = tab_ids(&s, &ws);

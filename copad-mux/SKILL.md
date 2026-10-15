@@ -66,6 +66,18 @@ that matches two things exits 2 and lists their ids — pick by id.
 `new-session --json`, `new-tab --json` and `split --json` answer with what they made:
 `{"session":{"id","name"},"tab":{"id","name"},"pane":"<token>"}`. Keep those ids.
 
+A plain `new-tab` creates the tab in front of the user and switches to it. To make one without
+moving anyone's view, name where it goes, or say not to focus it:
+
+```bash
+comux new-tab --session s4 --name worker --json   # a tab in s4, behind its active tab
+comux new-tab --no-focus --json                   # a tab beside YOUR pane, not selected
+```
+
+Either way the shell starts in `--cwd DIR`, else in your pane's directory. `split --from
+<token>` splits that pane wherever it is — another tab, another session — and only moves focus
+when the pane is in the tab on screen (`--no-focus` stops even that).
+
 `rename-tab <name>` with no index renames the tab YOUR pane is in, never the one the user
 is looking at.
 
@@ -76,7 +88,8 @@ comux split --from "$COPAD_MUX_PANE"
 ```
 
 That splits **your** pane — not "the focused one", which the user can change at any moment —
-and prints the new pane's token. `--json` gives you the same thing as `.pane`. If it fails,
+and prints the new pane's token. If your pane is the one the user is looking at, focus moves
+to the new pane; add `--no-focus` to leave it on yours. `--json` gives you the same thing as `.pane`. If it fails,
 or the token comes back empty, stop: do not guess which pane appeared by diffing listings,
 because a concurrent focus or tab change defeats that.
 

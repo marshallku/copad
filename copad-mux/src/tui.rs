@@ -1305,59 +1305,96 @@ impl App {
         let Some(pane) = self.focused_pane() else {
             return;
         };
-        // Inherit the split source pane's cwd (tmux `-c '#{pane_current_path}'`).
-        let cwd = self.focused_cwd();
-        let events = match self.state.apply(Command::SplitPane {
-            origin: Origin::Client(self.client),
-            workspace: self.ws.clone(),
-            pane,
-            dir,
-            if_rev: None,
-        }) {
-            Ok(e) => e,
-            Err(_) => return,
-        };
-        let mut new_term = None;
-        let mut new_pane = None;
-        for e in &events {
-            if let Event::PaneSplit {
+        let ws = self.ws.clone();
+        self.split_at(&ws, pane, dir, true);
+    }
+
+    /// Split `pane` of `ws` (any tab, any session), spawning the new pane's shell in the
+    /// source's cwd (tmux `-c '#{pane_current_path}'`). `focus` moves focus to the new pane
+    /// — only ever in the tab on screen; a split elsewhere moves nothing anyone sees.
+    /// Returns the new pane's terminal, or `None` with the split rolled back.
+    fn split_at(
+        &mut self,
+        ws: &WorkspaceId,
+        pane: PaneId,
+        dir: Dir,
+        focus: bool,
+    ) -> Option<TerminalId> {
+        let cwd = self
+            .state
+            .workspace(ws)
+            .and_then(|w| w.tab_of_pane(&pane))
+            .and_then(|t| t.layout.terminal_of(&pane))
+            .and_then(|t| self.terminal_cwd(t));
+        let origin = self.origin_for(ws);
+        let events = self
+            .state
+            .apply(Command::SplitPane {
+                origin: origin.clone(),
+                workspace: ws.clone(),
+                pane,
+                dir,
+                if_rev: None,
+            })
+            .ok()?;
+        let (nt, np) = events.iter().find_map(|e| match e {
+            Event::PaneSplit {
                 new_terminal,
-                new_pane: np,
+                new_pane,
                 ..
-            } = e
-            {
-                new_term = Some(new_terminal.clone());
-                new_pane = Some(np.clone());
-            }
-        }
-        if let (Some(nt), Some(np)) = (new_term, new_pane) {
-            let pane_env = self.pane_env();
-            match PaneTerm::spawn_with_env(self.cols.max(1), self.rows.max(1), None, cwd, &pane_env)
-            {
-                Ok(pt) => {
-                    self.panes.insert(nt, pt);
-                    // tmux-style: focus the freshly created pane.
+            } => Some((new_terminal.clone(), new_pane.clone())),
+            _ => None,
+        })?;
+        let pane_env = self.pane_env();
+        let made = match PaneTerm::spawn_with_env(
+            self.cols.max(1),
+            self.rows.max(1),
+            None,
+            cwd,
+            &pane_env,
+        ) {
+            Ok(pt) => {
+                self.panes.insert(nt.clone(), pt);
+                // `sync_sizes` below only reaches the session on screen; a split in another
+                // session's active tab re-divides ITS geometry, which the PTYs must follow.
+                self.apply_resized_events(&events);
+                if focus {
+                    // tmux-style: focus the freshly created pane. Refused (and ignored) when
+                    // it is not in the tab on screen.
                     let _ = self.state.apply(Command::FocusPane {
                         client: self.client,
                         pane: np,
                     });
                 }
-                Err(reason) => {
-                    // PTY spawn failed — roll the split back so authoritative state
-                    // never holds a pane without a matching PaneTerm (which would
-                    // render blank + silently drop input). Closing `np` collapses the
-                    // branch and refocuses the original pane.
-                    let _ = self.state.apply(Command::ClosePane {
-                        origin: Origin::Client(self.client),
-                        workspace: self.ws.clone(),
-                        pane: np,
-                        if_rev: None,
-                    });
-                    self.report_spawn_failure("split", &reason);
-                }
+                Some(nt)
             }
-        }
+            Err(reason) => {
+                // PTY spawn failed — roll the split back so authoritative state
+                // never holds a pane without a matching PaneTerm (which would
+                // render blank + silently drop input). Closing `np` collapses the
+                // branch and refocuses the original pane.
+                let _ = self.state.apply(Command::ClosePane {
+                    origin,
+                    workspace: ws.clone(),
+                    pane: np,
+                    if_rev: None,
+                });
+                self.report_spawn_failure("split", &reason);
+                None
+            }
+        };
         self.sync_sizes();
+        made
+    }
+
+    /// The authority a mutation of `ws` runs under: this client's lease for the session it
+    /// is attached to, the API's for any other (a CLI verb reaching a background session).
+    fn origin_for(&self, ws: &WorkspaceId) -> Origin {
+        if *ws == self.ws {
+            Origin::Client(self.client)
+        } else {
+            Origin::Api
+        }
     }
 
     /// Grow/shrink the focused pane along an axis (`Right` = width, `Down` = height)
@@ -1415,25 +1452,31 @@ impl App {
         // Inherit the current pane's cwd into the new tab's shell (tmux-style).
         let cwd = self.focused_cwd();
         let ws = self.ws.clone();
-        let term = self.new_tab_in(&ws, cwd);
-        // A new tab may make the tab bar appear (1→2 tabs), shrinking the content
-        // height → re-derive the viewport, not just PTY sizes.
-        self.reflow();
-        term
+        self.new_tab_in(&ws, cwd, true)
     }
 
-    /// Create a tab in `ws` whose shell starts in `cwd`, returning its terminal. `ws` must be
-    /// the workspace this client is attached to (the lease only authorizes mutations there),
-    /// so a caller targeting another space switches to it first. Rolls the tab back and
-    /// toasts if the PTY can't spawn, so state never holds a tab with no live terminal.
-    fn new_tab_in(&mut self, ws: &WorkspaceId, cwd: Option<PathBuf>) -> Option<TerminalId> {
+    /// Create a tab in `ws` whose shell starts in `cwd`, returning its terminal. `activate`
+    /// makes it `ws`'s active tab; without it nothing anyone is looking at moves. A tab in
+    /// the attached session runs under this client's lease, one anywhere else under the
+    /// API's. Rolls the tab back and toasts if the PTY can't spawn, so state never holds a
+    /// tab with no live terminal.
+    fn new_tab_in(
+        &mut self,
+        ws: &WorkspaceId,
+        cwd: Option<PathBuf>,
+        activate: bool,
+    ) -> Option<TerminalId> {
         // Creating a tab makes it active, so it is a view transition like any other. Missing
         // it left a hole that survived a round trip: create a tab and close it again while a
         // divider is held, and every identity check passes on the way back.
-        self.note_view_moved();
+        if activate && *ws == self.ws {
+            self.note_view_moved();
+        }
+        let origin = self.origin_for(ws);
         let events = match self.state.apply(Command::NewTab {
-            origin: Origin::Client(self.client),
+            origin: origin.clone(),
             workspace: ws.clone(),
+            activate,
         }) {
             Ok(e) => e,
             Err(_) => return None,
@@ -1446,7 +1489,13 @@ impl App {
         }
         let (tab_id, term) = created?;
         let pane_env = self.pane_env();
-        match PaneTerm::spawn_with_env(self.cols.max(1), self.rows.max(1), None, cwd, &pane_env) {
+        let made = match PaneTerm::spawn_with_env(
+            self.cols.max(1),
+            self.rows.max(1),
+            None,
+            cwd,
+            &pane_env,
+        ) {
             Ok(pt) => {
                 self.panes.insert(term.clone(), pt);
                 Some(term)
@@ -1455,14 +1504,20 @@ impl App {
                 // Spawn failed — close the just-created tab so state never holds a
                 // tab whose pane has no live terminal (blank render + dropped input).
                 let _ = self.state.apply(Command::CloseTab {
-                    origin: Origin::Client(self.client),
+                    origin,
                     workspace: ws.clone(),
                     tab: tab_id,
                 });
                 self.report_spawn_failure("new tab", &reason);
                 None
             }
+        };
+        // A new tab in the attached session may make the tab bar appear (1→2 tabs),
+        // shrinking the content height → re-derive the viewport, not just PTY sizes.
+        if *ws == self.ws {
+            self.reflow();
         }
+        made
     }
 
     /// Switch the active tab by `delta` (wrapping): `+1` next, `-1` previous.
@@ -1595,8 +1650,13 @@ impl App {
     /// The working directory of the focused pane's shell, for inheriting into a new
     /// session/tab/split (tmux `-c '#{pane_current_path}'`). `None` if unreadable.
     fn focused_cwd(&self) -> Option<PathBuf> {
-        self.focused_terminal()
-            .and_then(|t| self.panes.get(&t))
+        self.focused_terminal().and_then(|t| self.terminal_cwd(&t))
+    }
+
+    /// The working directory of `term`'s shell. `None` if unreadable.
+    fn terminal_cwd(&self, term: &TerminalId) -> Option<PathBuf> {
+        self.panes
+            .get(term)
             .and_then(|p| p.pid())
             .and_then(procinfo::process_cwd)
     }
@@ -2414,7 +2474,11 @@ impl App {
                     .unwrap_or(0);
                 Resp::list(panes, fi)
             }
-            Req::Split { dir, from } => {
+            Req::Split {
+                dir,
+                from,
+                no_focus,
+            } => {
                 let d = match dir.as_str() {
                     "down" => Dir::Down,
                     "right" => Dir::Right,
@@ -2425,48 +2489,30 @@ impl App {
                         );
                     }
                 };
-                // `from` pins the split SOURCE by identity. Without it the focused pane is
-                // split, and focus is mutable: a script that lists, then splits, can have the
-                // pane created somewhere else entirely — and since a new pane inherits the
-                // source's cwd, the command it then runs executes in the wrong directory.
-                if let Some(t) = from {
-                    let Some(tid) = self.resolve_pane_token(t) else {
-                        return Resp::err_code("not_found", format!("unknown pane '{t}'"));
-                    };
-                    // Splitting reaches into the active tab's layout, so a source outside it
-                    // is refused rather than silently splitting something else.
-                    let Some(pane) = self.pane_of_terminal(&tid) else {
-                        return Resp::err(format!(
-                            "pane '{t}' is not in the active tab — select its tab first"
-                        ));
-                    };
-                    // `App::split` splits whatever is focused, so pin focus to the named
-                    // source first. This is the only mutation `from` performs.
-                    if self.focused_pane().as_ref() != Some(&pane) {
-                        let _ = self.state.apply(Command::FocusPane {
-                            client: self.client,
-                            pane,
-                        });
-                    }
-                }
-                let before: Vec<PaneId> = self.pane_order();
+                // `from` pins the split SOURCE by identity, in any tab of any session. Without
+                // it the focused pane is split, and focus is mutable: a script that lists, then
+                // splits, can have the pane created somewhere else entirely — and since a new
+                // pane inherits the source's cwd, the command it then runs executes in the
+                // wrong directory.
+                let (ws, pane) = match from {
+                    Some(t) => match self
+                        .resolve_pane_token(t)
+                        .and_then(|tid| self.locate_terminal(&tid))
+                    {
+                        Some((ws, _, pane)) => (ws, pane),
+                        None => return Resp::err_code("not_found", format!("unknown pane '{t}'")),
+                    },
+                    None => match self.focused_pane() {
+                        Some(p) => (self.ws.clone(), p),
+                        None => return Resp::err_code("not_found", "no focused pane"),
+                    },
+                };
                 self.clear_spawn_error();
-                self.split(d);
-                let after = self.pane_order();
-                if after.len() <= before.len() {
-                    return Resp::err_code("spawn_failed", self.take_spawn_error("split"));
-                }
                 // Name the pane we created, so no caller ever has to infer it by diffing
                 // listings (which a concurrent focus or tab change can defeat).
-                let term = after.iter().find(|p| !before.contains(p)).and_then(|p| {
-                    self.state
-                        .workspace(&self.ws)
-                        .and_then(|w| w.tab(&w.active_tab))
-                        .and_then(|t| t.layout.terminal_of(p).cloned())
-                });
-                match term {
+                match self.split_at(&ws, pane, d, !no_focus) {
                     Some(term) => self.created(&term),
-                    None => Resp::split(String::new()),
+                    None => Resp::err_code("spawn_failed", self.take_spawn_error("split")),
                 }
             }
             Req::ResizePane { index, dir } => {
@@ -2612,12 +2658,49 @@ impl App {
                     .collect();
                 Resp::tab_list(infos, active_idx)
             }
-            Req::NewTab => {
+            Req::NewTab {
+                session,
+                from,
+                cwd,
+                name,
+                no_focus,
+            } => {
+                let caller = from
+                    .as_deref()
+                    .and_then(|t| self.resolve_pane_token(t))
+                    .and_then(|tid| self.locate_terminal(&tid).map(|(ws, ..)| (ws, tid)));
+                // Placement. Naming a session, or asking for no focus, means nothing anyone is
+                // looking at moves (decision #134): the tab is created behind that session's
+                // active tab, and the user's view stays where it is.
+                let ws = match (session, no_focus, &caller) {
+                    (Some(sel), ..) => match self.session_addr(None, Some(sel)) {
+                        Ok(ws) => ws,
+                        Err((c, m)) => return Resp::err_code(c, &m),
+                    },
+                    (None, true, Some((ws, _))) => ws.clone(),
+                    _ => self.ws.clone(),
+                };
+                let activate = session.is_none() && !no_focus;
+                let cwd = match cwd {
+                    Some(c) if !Path::new(c).is_dir() => {
+                        return Resp::err_code("invalid", format!("not a directory: {c}"));
+                    }
+                    Some(c) => Some(PathBuf::from(c)),
+                    None => match &caller {
+                        Some((_, tid)) => self.terminal_cwd(tid),
+                        None => self.focused_cwd(),
+                    },
+                };
                 self.clear_spawn_error();
-                match self.new_tab() {
-                    Some(term) => self.created(&term),
-                    None => Resp::err_code("spawn_failed", self.take_spawn_error("new-tab")),
+                let Some(term) = self.new_tab_in(&ws, cwd, activate) else {
+                    return Resp::err_code("spawn_failed", self.take_spawn_error("new-tab"));
+                };
+                if let Some(n) = name.as_deref().map(str::trim).filter(|n| !n.is_empty())
+                    && let Some((ws, tab, _)) = self.locate_terminal(&term)
+                {
+                    self.rename_tab(&ws, &tab, Some(n.to_string()));
                 }
+                self.created(&term)
             }
             Req::SelectTab { index, target } => {
                 let (ws, tab) = match self.tab_addr(*index, target.as_deref()) {
@@ -4468,7 +4551,7 @@ impl App {
         let prev = self.ws.clone();
         let target = self.resume_target_space(cwd.as_deref());
         self.switch_session(target.clone());
-        match self.new_tab_in(&target, cwd.clone()) {
+        match self.new_tab_in(&target, cwd.clone(), true) {
             Some(term) => {
                 if let Some(pt) = self.panes.get(&term) {
                     pt.input(format!("{line}\n").as_bytes());
@@ -9807,6 +9890,7 @@ mod app_render_fidelity {
             app.handle_control(&crate::control::Req::Split {
                 dir: (*dir).to_string(),
                 from: None,
+                no_focus: false,
             });
         }
         app.resize(shape.cols, shape.rows);
@@ -9925,5 +10009,103 @@ mod app_render_fidelity {
                 }
             }
         }
+    }
+}
+
+/// Creating panes somewhere the user is not looking must not move what they ARE looking at.
+#[cfg(test)]
+mod placement {
+    use super::*;
+    use crate::control::Req;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    /// `(attached session, every session's (id, active tab, tab count))`.
+    fn view(app: &App) -> (WorkspaceId, Vec<(WorkspaceId, TabId, usize)>) {
+        let all = app
+            .session_ids()
+            .into_iter()
+            .filter_map(|id| {
+                let w = app.state.workspace(&id)?;
+                Some((id, w.active_tab.clone(), w.tabs.len()))
+            })
+            .collect();
+        (app.ws.clone(), all)
+    }
+
+    fn new_tab(session: Option<&str>, no_focus: bool) -> Req {
+        Req::NewTab {
+            session: session.map(str::to_string),
+            from: None,
+            cwd: None,
+            name: Some("bg".into()),
+            no_focus,
+        }
+    }
+
+    #[test]
+    fn a_tab_in_another_session_moves_nobody() {
+        let mut app = app();
+        assert!(
+            app.handle_control(&Req::NewSession {
+                name: Some("other".into()),
+                cwd: None,
+            })
+            .ok
+        );
+        assert!(
+            app.handle_control(&Req::SelectSession {
+                index: Some(0),
+                target: None,
+            })
+            .ok
+        );
+        let (ws0, before) = view(&app);
+
+        let r = app.handle_control(&new_tab(Some("name:other"), false));
+        assert!(r.ok, "{:?}", r.error);
+        let (ws1, after) = view(&app);
+        assert_eq!(ws0, ws1, "the user's session did not change");
+        assert_eq!(before[1].1, after[1].1, "nor did that session's active tab");
+        assert_eq!(after[1].2, before[1].2 + 1, "but it has one more tab");
+        let tab = r.tab.expect("the created tab is named in the response");
+        assert_eq!(tab.name, "bg");
+        assert_eq!(r.session.unwrap().id, after[1].0.to_string());
+
+        // Split the new background pane: still nothing visible moves.
+        let token = r.pane.expect("token");
+        let s = app.handle_control(&Req::Split {
+            dir: "right".into(),
+            from: Some(token),
+            no_focus: false,
+        });
+        assert!(s.ok, "{:?}", s.error);
+        assert_eq!(s.tab.unwrap().id, tab.id, "the split landed in that tab");
+        assert_eq!(view(&app), (ws1, after), "a background split moves nothing");
+    }
+
+    #[test]
+    fn no_focus_keeps_the_active_tab() {
+        let mut app = app();
+        let (ws, before) = view(&app);
+        assert!(app.handle_control(&new_tab(None, true)).ok);
+        let (ws_after, after) = view(&app);
+        assert_eq!(ws, ws_after);
+        assert_eq!(before[0].1, after[0].1);
+        assert_eq!(after[0].2, 2);
+        // The legacy shape still selects the new tab.
+        assert!(app.handle_control(&new_tab(None, false)).ok);
+        assert_ne!(view(&app).1[0].1, before[0].1);
+    }
+
+    #[test]
+    fn an_unknown_session_is_not_found() {
+        let mut app = app();
+        let r = app.handle_control(&new_tab(Some("nope"), false));
+        assert_eq!(r.code.as_deref(), Some("not_found"));
     }
 }

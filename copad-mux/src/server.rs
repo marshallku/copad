@@ -1523,10 +1523,17 @@ mod tests {
         assert!(!ctl_mutates(&Req::List));
         assert!(!ctl_mutates(&Req::ListTabs { session: None }));
         assert!(!ctl_mutates(&Req::ListSessions));
-        assert!(ctl_mutates(&Req::NewTab));
+        assert!(ctl_mutates(&Req::NewTab {
+            session: None,
+            from: None,
+            cwd: None,
+            name: None,
+            no_focus: false,
+        }));
         assert!(ctl_mutates(&Req::Split {
             from: None,
-            dir: "right".into()
+            dir: "right".into(),
+            no_focus: false,
         }));
         assert!(ctl_mutates(&Req::Focus { index: 0 }));
         assert!(ctl_mutates(&Req::NewSession {

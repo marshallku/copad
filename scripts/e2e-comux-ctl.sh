@@ -41,6 +41,7 @@
 #  26. list-tree shows every session/tab/pane; list-agents says which tab and pane an agent is in
 #  27. wait-agent --after-seq only matches a NEWER status change; wait verbs answer in JSON
 #  28. send --enter / --paste (bracketed only when the program asked) / --file
+#  29. new-tab --session / --no-focus and split --from a background pane move nobody's view
 
 set -euo pipefail
 
@@ -1650,7 +1651,43 @@ sid="$(python3 -c 'import json,sys; print([x["id"] for x in json.load(sys.stdin)
 t 12 "$COMUX" kill-session "$sid" >/dev/null || fail "send cleanup failed"
 ok "--enter submits; --paste brackets only for a program that enabled it, with embedded delimiters stripped; --file sends the file"
 
-echo "29. the server is still responsive and shuts down cleanly"
+echo "29. tabs and panes made where nobody is looking move nobody's view"
+t 10 "$COMUX" new-session placetest --json >"$WORK/json" || fail "could not create the placement session"
+sp="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["session"]["id"])' <"$WORK/json")"
+P0="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+t 10 "$COMUX" select-session 0 >/dev/null
+view() { t 10 "$COMUX" list-tree --json | python3 -c 'import json,sys; print([(s["id"],s["active"],[t["id"] for t in s["tabs"] if t["active"]]) for s in json.load(sys.stdin)["tree"]])'; }
+v0="$(view)"
+mkdir -p "$WORK/place dir"
+t 10 "$COMUX" new-tab --session "name:placetest" --name bg --cwd "$WORK/place dir" --json >"$WORK/json" \
+    || fail "new-tab --session failed: $(cat "$WORK/json")"
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["session"]["id"]=="'"$sp"'" and d["tab"]["name"]=="bg", d' <"$WORK/json" \
+    || fail "new-tab --session did not land where asked: $(cat "$WORK/json")"
+B="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+btab="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["tab"]["id"])' <"$WORK/json")"
+[[ "$(view)" == "$v0" ]] || fail "new-tab --session moved a view: $v0 -> $(view)"
+# The shell started in --cwd.
+t 10 "$COMUX" send "$B" --enter -- 'pwd; echo PWD-$((7*6))' >/dev/null
+t 15 "$COMUX" wait-output "$B" "PWD-42" --timeout 10 >/dev/null || fail "the background tab's shell never ran"
+t 10 "$COMUX" capture-pane "$B" | grep -qF "$WORK/place dir" || fail "new-tab --cwd was not honored: $(t 10 "$COMUX" capture-pane "$B")"
+# Split a pane in a BACKGROUND tab of a BACKGROUND session.
+t 10 "$COMUX" split --from "$B" --json >"$WORK/json" || fail "split --from a background pane failed: $(cat "$WORK/json")"
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["tab"]["id"]=="'"$btab"'", d' <"$WORK/json" \
+    || fail "the background split landed elsewhere: $(cat "$WORK/json")"
+[[ "$(view)" == "$v0" ]] || fail "a background split moved a view: $v0 -> $(view)"
+# --no-focus without --session lands beside the CALLER, wherever the user is.
+COPAD_MUX_PANE="$P0" t 10 "$COMUX" new-tab --no-focus --json >"$WORK/json" || fail "new-tab --no-focus failed"
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["session"]["id"]=="'"$sp"'", d' <"$WORK/json" \
+    || fail "new-tab --no-focus did not land in the caller's session: $(cat "$WORK/json")"
+[[ "$(view)" == "$v0" ]] || fail "new-tab --no-focus moved a view: $v0 -> $(view)"
+t 10 "$COMUX" list-tabs --session "$sp" --json >"$WORK/json"
+[[ "$(count tabs)" == 3 ]] || fail "placetest should have 3 tabs: $(cat "$WORK/json")"
+rc=0; t 10 "$COMUX" new-tab --cwd "$WORK/nope" >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 2 ]] || fail "new-tab --cwd <missing dir> should be a usage error, got $rc"
+t 12 "$COMUX" kill-session "$sp" >/dev/null || fail "placement cleanup failed"
+ok "new-tab --session/--no-focus and a background split leave every view alone; --cwd honored"
+
+echo "30. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

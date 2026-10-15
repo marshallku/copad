@@ -23,7 +23,7 @@ pub enum Req {
     List,
     /// Split a pane. `dir` = `"right"` (side by side) | `"down"` (stacked).
     ///
-    /// `from` names the pane to split, by TOKEN, and must be in the active tab. Without it
+    /// `from` names the pane to split, by TOKEN, in any tab of any session. Without it
     /// the FOCUSED pane is split — fine for a human pressing a key, a race for a script:
     /// focus is mutable, and the new pane also inherits the split source's cwd, so a focus
     /// change between listing and splitting silently puts the pane in the wrong directory.
@@ -35,6 +35,9 @@ pub enum Req {
         dir: String,
         #[serde(default)]
         from: Option<String>,
+        /// Leave focus where it is. A split in a tab nobody is looking at never moves focus.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_focus: bool,
     },
     /// Grow the pane at `index` toward `dir` (`left`/`right`/`up`/`down`) by nudging
     /// its split divider.
@@ -74,8 +77,28 @@ pub enum Req {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<String>,
     },
-    /// Create a new tab and make it active.
-    NewTab,
+    /// Create a new tab. With every field empty (an older client's shape) it is created in
+    /// the session on screen and made active — the `Ctrl-b c` behavior.
+    ///
+    /// `session` (a selector) creates it there instead, and `no_focus` creates it without
+    /// selecting it: either way NOTHING anyone is looking at moves — not the user's session,
+    /// not that session's active tab. A `no_focus` tab with no `session` lands in the
+    /// caller's (`from`'s) session, beside the pane that asked for it.
+    ///
+    /// The shell starts in `cwd`, else in the caller's (`from`, a pane token) directory, else
+    /// in the focused pane's. `name` names the tab.
+    NewTab {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_focus: bool,
+    },
     /// Make the tab at `index` (as printed by `list-tabs`) active.
     SelectTab {
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -316,12 +339,17 @@ pub const CAP_LIST_TREE: &str = "list-tree";
 /// Capability: `send` honors `paste` and `enter`.
 pub const CAP_SEND_FLAGS: &str = "send-flags";
 
+/// Capability: `new-tab` honors `session`/`cwd`/`name`/`no_focus`, and `split` honors
+/// `no_focus` and a `from` outside the active tab.
+pub const CAP_PLACEMENT: &str = "placement";
+
 /// Every capability this build's server implements (reported by `health`).
 pub const SERVER_CAPS: &[&str] = &[
     CAP_RENAME_CALLER,
     CAP_SELECTORS,
     CAP_LIST_TREE,
     CAP_SEND_FLAGS,
+    CAP_PLACEMENT,
 ];
 
 /// The most `send --file` reads. A paste larger than this is a mistake (a binary, a log),
@@ -939,8 +967,26 @@ pub fn run_client(args: &[String]) -> i32 {
             Req::ListTabs { session }
         }
         "new-tab" => {
-            parsed!(cliargs::bare("usage: comux new-tab [--json]"));
-            Req::NewTab
+            let p = parsed!(NEW_TAB_SPEC);
+            let cwd = match p.value("--cwd").map(absolute_dir).transpose() {
+                Ok(c) => c,
+                Err(e) => return usage_error(json_out, &e, NEW_TAB_SPEC.usage),
+            };
+            let req = Req::NewTab {
+                session: p.value("--session").map(str::to_string),
+                from: caller_pane(),
+                cwd,
+                name: p.value("--name").map(str::to_string),
+                no_focus: p.has("--no-focus"),
+            };
+            // An older server ignores every field, so it would create the tab in front of the
+            // user — exactly what these flags exist to prevent.
+            if !p.flags.is_empty()
+                && let Err(code) = require_cap(CAP_PLACEMENT, cmd, json_out)
+            {
+                return code;
+            }
+            req
         }
         "list-sessions" | "sessions" => {
             parsed!(cliargs::bare("usage: comux list-sessions [--json]"));
@@ -1081,9 +1127,14 @@ pub fn run_client(args: &[String]) -> i32 {
                     );
                 }
             }
+            let no_focus = p.has("--no-focus");
+            if no_focus && let Err(code) = require_cap(CAP_PLACEMENT, cmd, json_out) {
+                return code;
+            }
             Req::Split {
                 from: p.value("--from").map(str::to_string),
                 dir: dir.to_string(),
+                no_focus,
             }
         }
         "focus" | "close" => {
@@ -1408,6 +1459,27 @@ fn json_usage(json: bool, verb: &str, code: i32) -> i32 {
     code
 }
 
+/// The calling pane's token (`$COPAD_MUX_PANE`), when the CLI runs inside a comux pane.
+fn caller_pane() -> Option<String> {
+    std::env::var("COPAD_MUX_PANE")
+        .ok()
+        .filter(|p| !p.is_empty())
+}
+
+/// `dir` as an absolute path, resolved against the CLI's own cwd (the server's is
+/// unrelated), and refused unless it is a directory.
+fn absolute_dir(dir: &str) -> Result<String, String> {
+    let p = std::env::current_dir()
+        .map(|c| c.join(dir))
+        .unwrap_or_else(|_| PathBuf::from(dir));
+    if !p.is_dir() {
+        return Err(format!("not a directory: {dir}"));
+    }
+    p.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("not a UTF-8 path: {dir}"))
+}
+
 /// The caller's own pane for an index-less `rename-*`, so it renames the tab/session the
 /// CALLER is in rather than the one the user happens to be looking at. `Ok(None)` when an
 /// index was given. Refuses (exit 2) outside a comux pane — there is no "caller" to default
@@ -1422,10 +1494,7 @@ fn caller_pane_for(
     if index.is_some() {
         return Ok(None);
     }
-    let Some(pane) = std::env::var("COPAD_MUX_PANE")
-        .ok()
-        .filter(|p| !p.is_empty())
-    else {
+    let Some(pane) = caller_pane() else {
         return Err(usage_error(
             json,
             &format!(
@@ -1557,13 +1626,28 @@ const RENAME_TAB_SPEC: Spec = Spec {
 };
 
 const SPLIT_SPEC: Spec = Spec {
-    usage: "usage: comux split [-v|-h] [--from <pane-token>] [--json]",
+    usage: "usage: comux split [-v|-h] [--from <pane-token>] [--no-focus] [--json]\n\
+            \x20      --from splits that pane wherever it is; --no-focus leaves focus alone",
     flags: &[
         flag(&["-v", "--vertical"]),
         flag(&["-h", "--horizontal"]),
         opt(&["--from"]),
+        flag(&["--no-focus", "-d"]),
     ],
     positionals: Positionals::AtMost(1),
+};
+
+const NEW_TAB_SPEC: Spec = Spec {
+    usage: "usage: comux new-tab [--session <s1|name:hub>] [--cwd DIR] [--name N] [--no-focus] [--json]\n\
+            \x20      --session / --no-focus create it without moving anyone's view;\n\
+            \x20      the shell starts in --cwd, else the calling pane's directory",
+    flags: &[
+        opt(&["--session", "-s"]),
+        opt(&["--cwd", "-c"]),
+        opt(&["--name", "-n"]),
+        flag(&["--no-focus", "-d"]),
+    ],
+    positionals: Positionals::AtMost(0),
 };
 
 const CAPTURE_SPEC: Spec = Spec {
@@ -4622,7 +4706,7 @@ mod send_split_proto_tests {
     #[test]
     fn the_old_split_shape_still_parses() {
         match serde_json::from_str::<Req>(r#"{"cmd":"split","dir":"right"}"#).unwrap() {
-            Req::Split { dir, from } => {
+            Req::Split { dir, from, .. } => {
                 assert_eq!(dir, "right");
                 assert_eq!(from, None);
             }
