@@ -465,6 +465,12 @@ fn read_detail(path: &Path, tool: &str) -> Option<Option<Activity>> {
 /// `None` means the file could not be READ, and nothing else — see the caller in
 /// [`read_detail`] for why a successful read with no usable content must not share it.
 fn tail(path: &Path, budget: u64) -> Option<String> {
+    tail_from(path, budget).map(|(text, _)| text)
+}
+
+/// [`tail`], plus whether the read started past the beginning of the file — i.e. whether
+/// anything older was left unread.
+pub(crate) fn tail_from(path: &Path, budget: u64) -> Option<(String, bool)> {
     use std::io::{Read, Seek, SeekFrom};
     let mut f = std::fs::File::open(path).ok()?;
     let len = f.metadata().ok()?.len();
@@ -474,17 +480,18 @@ fn tail(path: &Path, budget: u64) -> Option<String> {
     f.take(budget).read_to_end(&mut buf).ok()?;
     let text = String::from_utf8_lossy(&buf).into_owned();
     if from == 0 {
-        return Some(text);
+        return Some((text, false));
     }
     // Not at the start of the file, so the first line is a fragment. NO newline at all means
     // the budget landed entirely inside one record — there is nothing complete to parse, but
     // the read still SUCCEEDED. That distinction is load-bearing now that the caller uses
     // `None` to mean "could not read, retry next tick": reporting a failure here would make an
     // oversized record re-read its file on every single tick, forever.
-    Some(
+    Some((
         text.find('\n')
             .map_or(String::new(), |i| text[i + 1..].to_string()),
-    )
+        true,
+    ))
 }
 
 /// One Claude transcript line → `"Bash: commit the fix"`, or `None` when it names no tool use.

@@ -45,6 +45,7 @@ fn print_usage() {
          \x20 comux skill                 print the agent operating guide (pipe into your agent's skills dir)\n\
          \x20 comux list-agents           agent panes across every session, with status\n\
          \x20 comux wait-agent <pane>     block until that agent's status matches (--status working|ready|blocked)\n\
+         \x20 comux agent-log <pane>      the last entries of that agent's own conversation log (--last N)\n\
          \x20 comux jump <pane>           switch to a pane anywhere (by $COPAD_MUX_PANE token)\n\
          \x20 comux notify <body...>      raise an agent toast for this pane (--kind done|blocked)\n\
          \x20 comux worktree create <br>  git worktree + a session in it (also list|rm)\n\

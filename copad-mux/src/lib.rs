@@ -10,6 +10,7 @@
 //! actor + `Command`/`Event` + invariant checks). No I/O, no PTYs — so the state
 //! machines are unit- and property-testable in isolation.
 
+pub mod agentlog;
 pub mod agentpoll;
 pub mod agentsessions;
 pub mod agentstate;

@@ -564,6 +564,9 @@ roll="$WORK/sessions/rollout-2026-09-12T00-00-00-01a09154-4f7e-76a1-81e0-daae1f6
 # A real codex `CommandExecution`: `command` is an ARRAY and codex pre-parses it into
 # `parsed_cmd`. Reading `command` as a string is a bug a hand-written fixture hid once.
 cat >"$roll" <<'ROLLEOF'
+{"type":"response_item","timestamp":"2026-09-12T00:00:01.000Z","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"run the tests"}]}}
+{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"cargo test --all\"}"}}
+{"type":"response_item","payload":{"type":"function_call_output","output":"tests ok \u001b]0;pwned\u0007 done"}}
 {"type":"event_msg","payload":{"type":"item_completed","item":{"type":"Reasoning"}}}
 {"type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","command":["/bin/zsh","-lc","cargo test --all"],"parsed_cmd":[{"type":"unknown","cmd":"cargo test --all"}]}}}
 ROLLEOF
@@ -627,6 +630,18 @@ a=next(x for x in json.load(sys.stdin)["agents"] if x["token"]==os.environ["DX"]
 assert os.path.realpath(a["transcript_path"])==os.path.realpath(os.environ["ROLL"]), a
 assert a["agent_session_id"]=="01a09154-4f7e-76a1-81e0-daae1f6d49b3", a' <"$WORK/json" \
     || fail "list-agents did not expose the conversation id + transcript: $(cat "$WORK/json")"
+# ...and `agent-log` reads that conversation back, normalized, oldest first.
+t 10 "$COMUX" agent-log "$dx" --last 2 --json >"$WORK/log.json" || fail "agent-log failed: $(cat "$WORK/log.json")"
+python3 -c 'import json,sys; d=json.load(sys.stdin); e=d["entries"]
+assert d["tool"]=="codex" and d["partial"] is False, d
+assert [(x["role"],x["kind"],x.get("name")) for x in e]==[("assistant","tool_use","exec_command"),("tool","tool_result",None)], e
+assert e[0]["text"]=="cargo test --all", e' <"$WORK/log.json" \
+    || fail "agent-log --json shape: $(cat "$WORK/log.json")"
+t 10 "$COMUX" agent-log "$dx" >"$WORK/log.txt" || fail "agent-log (human) failed"
+grep -q "user      text: run the tests" "$WORK/log.txt" || fail "agent-log (human) misses the prompt: $(cat "$WORK/log.txt")"
+LC_ALL=C grep -q $'\x1b' "$WORK/log.txt" && fail "agent-log printed a raw ESC from a tool result"
+rc=0; t 10 "$COMUX" agent-log "$tok" >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 1 ]] || fail "agent-log on a non-agent pane should exit 1, got $rc"
 # Absence must stay absent: a pane with no readable log carries no `detail` key at all, so a
 # caller can tell "no reading" from "doing nothing" (the same contract as #105's [] vs null).
 if python3 -c 'import json,sys

@@ -889,7 +889,7 @@ pub fn run_client(args: &[String]) -> i32 {
             );
         }
         eprintln!(
-            "usage: comux <list|split|resize|focus|close|send|capture-pane|wait-output|list-agents|wait-agent|\
+            "usage: comux <list|split|resize|focus|close|send|capture-pane|wait-output|list-agents|wait-agent|agent-log|\
              list-tabs|new-tab|spawn|select-tab|\
              close-tab|rename-tab [index] <name>|list-sessions|new-session [name]|\
              rename-session [index] <name>|select-session|kill-session|\
@@ -941,6 +941,30 @@ pub fn run_client(args: &[String]) -> i32 {
             Ok(args) => run_wait_agent(args, json_out),
             Err(code) => json_usage(json_out, cmd, code),
         };
+    }
+    // Like the waits, `agent-log` is answered here: one request for the agent's log path, then
+    // the file is read client-side (it is the caller's own user's file; the server never
+    // touches it).
+    if cmd == "agent-log" {
+        let p = parsed!(AGENT_LOG_SPEC);
+        let num = |flag: &str, default: usize| -> Result<usize, String> {
+            p.value(flag).map_or(Ok(default), |v| {
+                v.parse::<usize>()
+                    .map_err(|_| format!("comux agent-log: {flag} needs a number, got '{v}'"))
+            })
+        };
+        let (last, max_chars) = match (num("--last", 20), num("--max-chars", 400)) {
+            (Ok(l), Ok(m)) => (l, m),
+            (Err(e), _) | (_, Err(e)) => return usage_error(json_out, &e, AGENT_LOG_SPEC.usage),
+        };
+        let Some(pane) = p.positionals.first() else {
+            return usage_error(
+                json_out,
+                "comux agent-log: which pane? (a token from `comux list-agents`)",
+                AGENT_LOG_SPEC.usage,
+            );
+        };
+        return agent_log(pane, last, max_chars).finish("agent-log", json_out);
     }
     if cmd == "wait-output" || cmd == "wait" {
         return match parse_wait_args(&rest) {
@@ -1733,6 +1757,14 @@ const NEW_TAB_SPEC: Spec = Spec {
         flag(&["--no-focus", "-d"]),
     ],
     positionals: Positionals::AtMost(0),
+};
+
+const AGENT_LOG_SPEC: Spec = Spec {
+    usage: "usage: comux agent-log <pane-token> [--last N] [--max-chars C] [--json]\n\
+            \x20      the last N entries (default 20) of that agent's own conversation log, each cut\n\
+            \x20      to C chars (default 400; 0 = whole)",
+    flags: &[opt(&["--last", "-n"]), opt(&["--max-chars"])],
+    positionals: Positionals::AtMost(1),
 };
 
 const SPAWN_SPEC: Spec = Spec {
@@ -2909,6 +2941,7 @@ mod verb_args_tests {
         "list-tabs",
         "new-tab",
         "spawn",
+        "agent-log",
         "list-sessions",
         "list-agents",
         "rename-session",
@@ -2986,6 +3019,14 @@ mod verb_args_tests {
         );
         assert_eq!(exit(&["spawn", "--cwd", "/no/such/dir", "--", "true"]), 2);
         assert_eq!(exit(&["spawn", "--keep", "--help"]), 0);
+    }
+
+    #[test]
+    fn agent_log_refuses_bad_input_before_any_request() {
+        assert_eq!(exit(&["agent-log"]), 2, "no pane");
+        assert_eq!(exit(&["agent-log", "p", "--last", "many"]), 2);
+        assert_eq!(exit(&["agent-log", "p", "--max-chars", "-1"]), 2);
+        assert_eq!(exit(&["agent-log", "p", "q"]), 2);
     }
 
     #[test]
@@ -3507,6 +3548,51 @@ impl WaitOutcome {
                 1
             }
         }
+    }
+}
+
+/// `comux agent-log`: find the agent's transcript through the server, then read its tail here.
+fn agent_log(pane: &str, last: usize, max_chars: usize) -> WaitOutcome {
+    let resp = match round_trip(&Req::ListAgents {
+        target: Some(pane.to_string()),
+    }) {
+        Ok(r) => r,
+        Err(e) => return WaitOutcome::failed("unavailable", e),
+    };
+    if !resp.ok {
+        return WaitOutcome::from_resp(&resp);
+    }
+    let Some(agent) = resp.agents.unwrap_or_default().into_iter().next() else {
+        return WaitOutcome::failed("not_found", format!("no agent is running in pane '{pane}'"));
+    };
+    let Some(path) = agent.transcript_path.clone() else {
+        return WaitOutcome::failed(
+            "unavailable",
+            format!(
+                "comux has not found {}'s log yet (it can lag a launch by a sweep, a Codex                  `/new` by ~30s)",
+                agent.tool
+            ),
+        );
+    };
+    let log = match crate::agentlog::read(Path::new(&path), &agent.tool, last, max_chars) {
+        Ok(l) => l,
+        Err(e) => return WaitOutcome::failed("error", e),
+    };
+    let mut human: Vec<String> = log.entries.iter().map(crate::agentlog::render).collect();
+    if human.is_empty() {
+        human.push(format!("(nothing readable in the end of {path})"));
+    }
+    WaitOutcome::Matched {
+        human: human.join("\n"),
+        json: serde_json::json!({
+            "ok": true,
+            "pane": agent.token,
+            "tool": agent.tool,
+            "agent_session_id": agent.agent_session_id,
+            "transcript_path": path,
+            "partial": log.partial,
+            "entries": log.entries,
+        }),
     }
 }
 
