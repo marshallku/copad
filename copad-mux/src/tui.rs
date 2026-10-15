@@ -668,6 +668,12 @@ pub struct App {
     /// Mux-wide count of observed agent status changes; stamps each [`AgentState::seq`].
     /// Monotonic for the server's life, so a reading never repeats.
     agent_seq: u64,
+    /// Which pane made each tab (`new-tab`/`spawn --owner`), by its terminal. Saved with the
+    /// layout and re-attached on restore. An entry whose tab or owner pane is gone means
+    /// nothing; [`App::prune_mailboxes`] drops them.
+    tab_owner: HashMap<TabId, TerminalId>,
+    /// Each pane's inbox (`notify --to`). In memory only: a restart loses unread messages.
+    inboxes: HashMap<TerminalId, Mailbox>,
     /// The whole-minute bucket of each agent's time-in-status as last REPORTED to the
     /// render loop, so a roll can be turned into a repaint (see `refresh_agent_statuses`).
     agent_minutes: HashMap<TerminalId, u64>,
@@ -813,7 +819,7 @@ impl App {
         } else {
             None
         };
-        let (ws, next_session) = match restored {
+        let (ws, next_session, owners) = match restored {
             Some(r) => r,
             None => {
                 let ws = WorkspaceId::new("local");
@@ -828,7 +834,7 @@ impl App {
                 )
                 .map_err(|e| io::Error::other(format!("failed to spawn shell PTY: {e}")))?;
                 panes.insert(term0, pt);
-                (ws, 1)
+                (ws, 1, HashMap::new())
             }
         };
         let _ = state.apply(Command::Attach {
@@ -875,6 +881,8 @@ impl App {
             label_sweeps_failed: 0,
             agent_statuses: HashMap::new(),
             agent_seq: 0,
+            tab_owner: owners,
+            inboxes: HashMap::new(),
             agent_minutes: HashMap::new(),
             agent_details: HashMap::new(),
             bells_reported: std::collections::HashSet::new(),
@@ -2142,23 +2150,34 @@ impl App {
         Some((tab, t.name.clone().unwrap_or_default(), ti, pi))
     }
 
-    /// Sessions → tabs → panes, for `list-tree`. `only` narrows it to one session.
-    fn tree(&self, only: Option<&WorkspaceId>) -> Vec<control::TreeSession> {
+    /// Sessions → tabs → panes, for `list-tree`. `only` narrows it to one session, `owner` to
+    /// the tabs that pane owns (dropping sessions left with none).
+    fn tree(
+        &self,
+        only: Option<&WorkspaceId>,
+        owner: Option<&TerminalId>,
+    ) -> Vec<control::TreeSession> {
         self.session_ids()
             .into_iter()
             .enumerate()
             .filter(|(_, wid)| only.is_none_or(|o| o == wid))
             .filter_map(|(si, wid)| {
                 let w = self.state.workspace(&wid)?;
-                let tabs = w
+                let tabs: Vec<control::TreeTab> = w
                     .tabs
                     .iter()
                     .enumerate()
+                    .filter(|(_, t)| {
+                        owner.is_none_or(|o| {
+                            self.tab_owner.get(&t.id) == Some(o) && self.panes.contains_key(o)
+                        })
+                    })
                     .map(|(ti, t)| control::TreeTab {
                         index: ti,
                         id: t.id.to_string(),
                         name: t.name.clone().unwrap_or_default(),
                         active: t.id == w.active_tab,
+                        owner: self.owner_token(&t.id),
                         panes: t
                             .layout
                             .panes()
@@ -2194,6 +2213,9 @@ impl App {
                             .collect(),
                     })
                     .collect();
+                if owner.is_some() && tabs.is_empty() {
+                    return None;
+                }
                 Some(control::TreeSession {
                     index: si,
                     id: wid.to_string(),
@@ -2354,6 +2376,45 @@ impl App {
             .iter()
             .find(|(_, p)| p.pane_token() == Some(token))
             .map(|(tid, _)| tid.clone())
+    }
+
+    /// A live pane's token.
+    fn token_of(&self, term: &TerminalId) -> Option<String> {
+        self.panes
+            .get(term)
+            .and_then(|p| p.pane_token())
+            .map(str::to_string)
+    }
+
+    /// `(tab, owner terminal)` for every owned tab that still exists and whose owner pane is
+    /// still alive, in tab order.
+    fn live_owners(&self) -> Vec<(TabId, TerminalId)> {
+        self.state
+            .workspace_ids()
+            .iter()
+            .filter_map(|w| self.state.workspace(w))
+            .flat_map(|w| w.tabs.iter())
+            .filter_map(|t| {
+                let owner = self.tab_owner.get(&t.id)?;
+                self.panes
+                    .contains_key(owner)
+                    .then(|| (t.id.clone(), owner.clone()))
+            })
+            .collect()
+    }
+
+    /// The token of the pane that owns `tab`, while it lives.
+    fn owner_token(&self, tab: &TabId) -> Option<String> {
+        self.tab_owner.get(tab).and_then(|o| self.token_of(o))
+    }
+
+    /// Forget owners of closed tabs / dead panes, and the inboxes of dead panes. Lazy (on
+    /// every owner/inbox write) rather than on each teardown path, which are many.
+    fn prune_mailboxes(&mut self) {
+        let live: HashMap<TabId, TerminalId> = self.live_owners().into_iter().collect();
+        self.tab_owner = live;
+        let panes = &self.panes;
+        self.inboxes.retain(|tid, _| panes.contains_key(tid));
     }
 
     /// The terminal-emulator process an attached client is running inside, for the CLI to
@@ -2724,7 +2785,20 @@ impl App {
                 command,
                 env,
                 keep,
+                owner,
             } => {
+                let owner = match owner {
+                    Some(t) => match self.resolve_pane_token(t) {
+                        Some(tid) => Some(tid),
+                        None => {
+                            return Resp::err_code(
+                                "not_found",
+                                format!("unknown owner pane '{t}'"),
+                            );
+                        }
+                    },
+                    None => None,
+                };
                 // Validate a spawn before anything is created: a refusal must leave no tab.
                 let mut extra_env = Vec::with_capacity(env.len());
                 for kv in env {
@@ -2774,10 +2848,14 @@ impl App {
                 let Some(term) = self.new_tab_in(&ws, launch) else {
                     return Resp::err_code("spawn_failed", self.take_spawn_error("new-tab"));
                 };
-                if let Some(n) = name.as_deref().map(str::trim).filter(|n| !n.is_empty())
-                    && let Some((ws, tab, _)) = self.locate_terminal(&term)
-                {
-                    self.rename_tab(&ws, &tab, Some(n.to_string()));
+                if let Some((ws, tab, _)) = self.locate_terminal(&term) {
+                    if let Some(n) = name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                        self.rename_tab(&ws, &tab, Some(n.to_string()));
+                    }
+                    if let Some(o) = owner {
+                        self.prune_mailboxes();
+                        self.tab_owner.insert(tab, o);
+                    }
                 }
                 self.created(&term)
             }
@@ -3203,7 +3281,7 @@ impl App {
                     .collect();
                 Resp::agents(agents)
             }
-            Req::ListTree { session } => {
+            Req::ListTree { session, owner } => {
                 let only = match session {
                     Some(sel) => match self.session_addr(None, Some(sel)) {
                         Ok(ws) => Some(ws),
@@ -3211,8 +3289,217 @@ impl App {
                     },
                     None => None,
                 };
+                let owner = match owner {
+                    Some(t) => match self.resolve_pane_token(t) {
+                        Some(tid) => Some(tid),
+                        None => return Resp::err_code("not_found", format!("unknown pane '{t}'")),
+                    },
+                    None => None,
+                };
                 Resp {
-                    tree: Some(self.tree(only.as_ref())),
+                    tree: Some(self.tree(only.as_ref(), owner.as_ref())),
+                    ..Resp::ok()
+                }
+            }
+            Req::CloseOwned {
+                owner,
+                caller,
+                dry_run,
+            } => {
+                let Some(owner) = self.resolve_pane_token(owner) else {
+                    return Resp::err_code("not_found", format!("unknown pane '{owner}'"));
+                };
+                let targets: Vec<(WorkspaceId, TabId, control::NodeRef)> = self
+                    .live_owners()
+                    .into_iter()
+                    .filter(|(_, o)| *o == owner)
+                    .filter_map(|(tab, _)| {
+                        let ws = self.state.workspace_ids().into_iter().find(|w| {
+                            self.state
+                                .workspace(w)
+                                .is_some_and(|w| w.tab(&tab).is_some())
+                        })?;
+                        let name = self
+                            .state
+                            .workspace(&ws)
+                            .and_then(|w| w.tab(&tab))
+                            .and_then(|t| t.name.clone())
+                            .unwrap_or_default();
+                        let node = control::NodeRef {
+                            id: tab.to_string(),
+                            name,
+                        };
+                        Some((ws, tab, node))
+                    })
+                    .collect();
+                // A cleanup must never close the pane running it: it would kill its own CLI
+                // before the answer arrives.
+                if let Some(c) = caller.as_deref()
+                    && let Ok((_, tab, _)) = self.caller_location(c)
+                    && targets.iter().any(|(_, t, _)| *t == tab)
+                {
+                    return Resp::err_code(
+                        "refused",
+                        format!("tab {tab} is owned by that pane but holds the calling pane"),
+                    );
+                }
+                let mut closed = Vec::new();
+                let mut skipped = Vec::new();
+                // A dry run plays the same rule the close enforces (a session keeps its last
+                // tab), so the preview names exactly what `--yes` would do.
+                let mut left: HashMap<WorkspaceId, usize> = HashMap::new();
+                for (ws, tab, node) in targets {
+                    if *dry_run {
+                        let n = left.entry(ws.clone()).or_insert_with(|| {
+                            self.state.workspace(&ws).map_or(0, |w| w.tabs.len())
+                        });
+                        if *n > 1 {
+                            *n -= 1;
+                            closed.push(node);
+                        } else {
+                            skipped.push(node);
+                        }
+                        continue;
+                    }
+                    match self.close_tab(&ws, tab) {
+                        Ok(()) => closed.push(node),
+                        Err(_) => skipped.push(node),
+                    }
+                }
+                self.prune_mailboxes();
+                let verb = if *dry_run { "would close" } else { "closed" };
+                Resp {
+                    message: Some(format!(
+                        "{verb} {} tab(s){}",
+                        closed.len(),
+                        if skipped.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", kept {} (a session's last tab)", skipped.len())
+                        }
+                    )),
+                    closed: Some(closed),
+                    skipped: Some(skipped),
+                    ..Resp::ok()
+                }
+            }
+            Req::Deliver {
+                to,
+                from,
+                kind,
+                body,
+                result,
+            } => {
+                if !matches!(kind.as_str(), "done" | "blocked" | "failed") {
+                    return Resp::err_code(
+                        "invalid",
+                        format!("unknown kind: {kind} (done|blocked|failed)"),
+                    );
+                }
+                if body.len() > INBOX_BODY_MAX {
+                    return Resp::err_code(
+                        "invalid",
+                        format!(
+                            "the message is over {INBOX_BODY_MAX} bytes — pass a --result file"
+                        ),
+                    );
+                }
+                if let Some(r) = result
+                    && (r.len() > INBOX_RESULT_MAX || !Path::new(r).is_absolute())
+                {
+                    return Resp::err_code("invalid", "--result must be an absolute path");
+                }
+                let sender = match from {
+                    Some(t) => match self.resolve_pane_token(t) {
+                        Some(tid) => Some((t.clone(), tid)),
+                        None => return Resp::err_code("not_found", format!("unknown pane '{t}'")),
+                    },
+                    None => None,
+                };
+                let dest = if to == "owner" {
+                    let Some((_, tid)) = &sender else {
+                        return Resp::err_code("invalid", "--to owner needs the sending pane");
+                    };
+                    let owner = self
+                        .locate_terminal(tid)
+                        .and_then(|(_, tab, _)| self.tab_owner.get(&tab).cloned())
+                        .filter(|o| self.panes.contains_key(o));
+                    match owner {
+                        Some(o) => o,
+                        None => {
+                            return Resp::err_code(
+                                "not_found",
+                                "your tab has no owner (or its owner pane is gone)",
+                            );
+                        }
+                    }
+                } else {
+                    match self.resolve_pane_token(to) {
+                        Some(tid) => tid,
+                        None => return Resp::err_code("not_found", format!("unknown pane '{to}'")),
+                    }
+                };
+                self.prune_mailboxes();
+                let box_ = self.inboxes.entry(dest.clone()).or_default();
+                box_.next_seq += 1;
+                if box_.msgs.len() >= INBOX_CAP {
+                    box_.msgs.pop_front();
+                    box_.dropped += 1;
+                }
+                box_.msgs.push_back(control::InboxMsg {
+                    seq: box_.next_seq,
+                    ts: now_secs(),
+                    from: sender.map(|(t, _)| t),
+                    kind: kind.clone(),
+                    body: body.clone(),
+                    result: result.clone(),
+                });
+                let token = self.token_of(&dest).unwrap_or_default();
+                Resp {
+                    message: Some(format!("delivered to {token}")),
+                    pane: Some(token),
+                    ..Resp::ok()
+                }
+            }
+            Req::Inbox { pane, ack } => {
+                let Some(tid) = self.resolve_pane_token(pane) else {
+                    return Resp::err_code("not_found", format!("unknown pane '{pane}'"));
+                };
+                let (messages, dropped, more) = match self.inboxes.get_mut(&tid) {
+                    Some(b) => {
+                        if let Some(a) = ack {
+                            while b.msgs.front().is_some_and(|m| m.seq <= *a) {
+                                b.msgs.pop_front();
+                            }
+                            b.dropped = 0;
+                        }
+                        // One batch stays well under the client's response cap however the
+                        // bodies escape; the rest come on the next read, after this one's ack.
+                        let mut size = 0;
+                        let batch: Vec<control::InboxMsg> = b
+                            .msgs
+                            .iter()
+                            .take_while(|m| {
+                                size += serde_json::to_string(m).map_or(0, |j| j.len());
+                                size <= INBOX_BATCH_BYTES
+                            })
+                            .cloned()
+                            .collect();
+                        let batch = if batch.is_empty() {
+                            b.msgs.iter().take(1).cloned().collect()
+                        } else {
+                            batch
+                        };
+                        let more = batch.len() < b.msgs.len();
+                        (batch, b.dropped, more)
+                    }
+                    None => (Vec::new(), 0, false),
+                };
+                Resp {
+                    pane: Some(pane.clone()),
+                    messages: Some(messages),
+                    dropped: Some(dropped),
+                    truncated: more.then_some(true),
                     ..Resp::ok()
                 }
             }
@@ -5233,6 +5520,12 @@ impl App {
     /// Build the on-disk snapshot of the current session layout (names + tabs + BSP split
     /// trees + per-leaf cwd). Read-only — safe to call on the render loop for autosave.
     pub fn snapshot(&self) -> persist::PersistState {
+        // Owner panes get a snapshot-local ref their tabs point at (tokens die with the server).
+        let mut refs: HashMap<TerminalId, u32> = HashMap::new();
+        for (_, owner) in self.live_owners() {
+            let next = refs.len() as u32;
+            refs.entry(owner).or_insert(next);
+        }
         let mut sessions = Vec::new();
         let mut active_session = 0;
         for wid in self.state.workspace_ids() {
@@ -5250,7 +5543,8 @@ impl App {
                 }
                 tabs.push(persist::PTab {
                     name: t.name.clone(),
-                    layout: self.layout_to_persist(&t.layout),
+                    layout: self.layout_to_persist(&t.layout, &refs),
+                    owner: self.tab_owner.get(&t.id).and_then(|o| refs.get(o)).copied(),
                 });
             }
             sessions.push(persist::PSession {
@@ -5269,7 +5563,7 @@ impl App {
 
     /// Convert a live `SplitTree` to its persisted form, reading each leaf's shell cwd and
     /// (for a whitelisted foreground program, e.g. an agent) its command to re-run.
-    fn layout_to_persist(&self, tree: &SplitTree) -> PLayout {
+    fn layout_to_persist(&self, tree: &SplitTree, refs: &HashMap<TerminalId, u32>) -> PLayout {
         match tree {
             SplitTree::Leaf { terminal, .. } => {
                 // Non-UTF-8 cwd → None (that pane restores to $HOME); the save never fails.
@@ -5313,7 +5607,11 @@ impl App {
                     }
                     Some(argv)
                 });
-                PLayout::Leaf { cwd, command }
+                PLayout::Leaf {
+                    cwd,
+                    command,
+                    pane_ref: refs.get(terminal).copied(),
+                }
             }
             SplitTree::Branch {
                 dir,
@@ -5323,8 +5621,8 @@ impl App {
             } => PLayout::Branch {
                 dir: *dir,
                 ratio: *ratio,
-                first: Box::new(self.layout_to_persist(first)),
-                second: Box::new(self.layout_to_persist(second)),
+                first: Box::new(self.layout_to_persist(first, refs)),
+                second: Box::new(self.layout_to_persist(second, refs)),
             },
         }
     }
@@ -7899,8 +8197,12 @@ fn restore_sessions(
     cols: u16,
     rows: u16,
     sock_env: &[(String, String)],
-) -> Option<(WorkspaceId, u64)> {
+) -> Option<(WorkspaceId, u64, HashMap<TabId, TerminalId>)> {
     let viewport = Rect { cols, rows };
+    // Owner refs are snapshot-global (an owner can sit in another session), so they are
+    // resolved only once every session is installed.
+    let mut ref_terms: HashMap<u32, TerminalId> = HashMap::new();
+    let mut owned_tabs: Vec<(TabId, u32)> = Vec::new();
     let mut budget = MAX_TOTAL_PANES; // total panes across all sessions
     let mut installed: Vec<WorkspaceId> = Vec::new();
     let mut active_ws: Option<WorkspaceId> = None;
@@ -7908,7 +8210,9 @@ fn restore_sessions(
     for (si, ps) in snap.sessions.iter().enumerate() {
         // Phase 1: spawn+prune every tab OFF-STATE.
         let mut restored_tabs: Vec<RestoredTab> = Vec::new();
-        let mut tab_paneterms: Vec<Vec<PaneTerm>> = Vec::new();
+        let mut tab_paneterms: Vec<Vec<RestoredPane>> = Vec::new();
+        // Parallel to `restored_tabs`: a pruned tab must not shift its owner onto the next.
+        let mut tab_owner_refs: Vec<Option<u32>> = Vec::new();
         for (ti, pt) in ps.tabs.iter().enumerate() {
             // Reject a suspiciously large tab outright (untrusted file).
             if pt.layout.leaf_count() > MAX_LEAVES_PER_TAB {
@@ -7925,6 +8229,7 @@ fn restore_sessions(
                     active: ti == ps.active_tab,
                 });
                 tab_paneterms.push(pts);
+                tab_owner_refs.push(pt.owner);
             }
         }
         if restored_tabs.is_empty() {
@@ -7944,8 +8249,18 @@ fn restore_sessions(
         // Phase 3: attach the already-spawned PaneTerms by the ids State minted (DFS order
         // matches spawn order, since both walk the same pruned spec first-then-second).
         for (terms, pts) in per_tab_terms.into_iter().zip(tab_paneterms) {
-            for (tid, pane_term) in terms.into_iter().zip(pts) {
+            for (tid, (pane_term, pane_ref)) in terms.into_iter().zip(pts) {
+                if let Some(r) = pane_ref {
+                    ref_terms.entry(r).or_insert_with(|| tid.clone());
+                }
                 panes.insert(tid, pane_term);
+            }
+        }
+        if let Some(w) = state.workspace(&id) {
+            for (t, owner) in w.tabs.iter().zip(&tab_owner_refs) {
+                if let Some(r) = owner {
+                    owned_tabs.push((t.id.clone(), *r));
+                }
             }
         }
         if si == snap.active_session {
@@ -7958,12 +8273,21 @@ fn restore_sessions(
         return None;
     }
     let active = active_ws.unwrap_or_else(|| installed[0].clone());
+    // A ref whose leaf was pruned (or never existed — the file is untrusted) owns nothing.
+    let owners = owned_tabs
+        .into_iter()
+        .filter_map(|(tab, r)| ref_terms.get(&r).map(|tid| (tab, tid.clone())))
+        .collect();
     // Restored ids are `local, s1, .., s{n-1}`; next new session must be `s{n}`.
-    Some((active, installed.len() as u64))
+    Some((active, installed.len() as u64, owners))
 }
 
+/// A restored leaf's PTY and the owner `pane_ref` its leaf carried.
+type RestoredPane = (PaneTerm, Option<u32>);
+
 /// Spawn PTYs for a persisted layout, pruning any leaf whose shell can't spawn. Returns
-/// the pruned `LayoutSpec` (live leaves only) + the `PaneTerm`s in DFS pre-order, or `None`
+/// the pruned `LayoutSpec` (live leaves only) + the `PaneTerm`s in DFS pre-order, each with
+/// its leaf's owner `pane_ref`, or `None`
 /// if the whole subtree died. Enforces the depth cap and the shared pane `budget`.
 fn spawn_layout(
     node: &PLayout,
@@ -7972,9 +8296,13 @@ fn spawn_layout(
     depth: usize,
     budget: &mut usize,
     sock_env: &[(String, String)],
-) -> Option<(LayoutSpec, Vec<PaneTerm>)> {
+) -> Option<(LayoutSpec, Vec<RestoredPane>)> {
     match node {
-        PLayout::Leaf { cwd, command } => {
+        PLayout::Leaf {
+            cwd,
+            command,
+            pane_ref,
+        } => {
             if *budget == 0 {
                 return None;
             }
@@ -8001,7 +8329,7 @@ fn spawn_layout(
             {
                 pt.input(format!("{line}\n").as_bytes());
             }
-            Some((LayoutSpec::Leaf, vec![pt]))
+            Some((LayoutSpec::Leaf, vec![(pt, *pane_ref)]))
         }
         PLayout::Branch {
             dir,
@@ -8033,6 +8361,25 @@ fn spawn_layout(
             }
         }
     }
+}
+
+/// The most messages one inbox holds; a full inbox drops its oldest and counts it.
+const INBOX_CAP: usize = 256;
+/// The largest message body. Anything bigger belongs in a `--result` file.
+const INBOX_BODY_MAX: usize = 16 * 1024;
+/// The longest `--result` path.
+const INBOX_RESULT_MAX: usize = 4096;
+/// The most serialized message bytes one `inbox` response carries — far below the client's
+/// response cap even for one maximal message escaped to six bytes a character.
+const INBOX_BATCH_BYTES: usize = 1024 * 1024;
+
+/// One pane's inbox (`notify --to`). `seq` starts at 1 so `ack: 0` acknowledges nothing.
+#[derive(Default)]
+struct Mailbox {
+    next_seq: u64,
+    msgs: VecDeque<control::InboxMsg>,
+    /// Dropped since the reader last acknowledged.
+    dropped: u64,
 }
 
 /// What a new tab runs, and where. The default is a login shell in the server's cwd, created
@@ -10146,6 +10493,7 @@ mod placement {
             command: Vec::new(),
             env: Vec::new(),
             keep: false,
+            owner: None,
         }
     }
 
@@ -10217,6 +10565,7 @@ mod placement {
             command: command.iter().map(|s| s.to_string()).collect(),
             env: env.iter().map(|s| s.to_string()).collect(),
             keep: false,
+            owner: None,
         };
         let r = app.handle_control(&spawn(&["sleep", "30"], &["FOO=bar"]));
         assert!(r.ok, "{:?}", r.error);
@@ -10301,6 +10650,7 @@ mod caller_index {
             command: Vec::new(),
             env: Vec::new(),
             keep: false,
+            owner: None,
         });
         assert!(r.ok, "{:?}", r.error);
         let agent = r.pane.unwrap();
@@ -10406,5 +10756,374 @@ mod caller_index {
             caller: Some("nope-1".into()),
         });
         assert_eq!(r.code.as_deref(), Some("not_found"));
+    }
+}
+
+/// #8: tabs remember the pane that made them; children report into that pane's inbox.
+#[cfg(test)]
+mod owner_inbox {
+    use super::*;
+    use crate::control::Req;
+    use crate::persist::{PLayout, PSession, PTab, PersistState};
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn focused_token(app: &App) -> String {
+        let t = app.focused_terminal().unwrap();
+        app.token_of(&t).unwrap()
+    }
+
+    /// A background tab owned by `owner`; returns its pane token and tab id.
+    fn owned_tab(app: &mut App, owner: &str) -> (String, String) {
+        let r = app.handle_control(&Req::NewTab {
+            session: None,
+            from: None,
+            cwd: None,
+            name: Some("child".into()),
+            no_focus: true,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
+            owner: Some(owner.to_string()),
+        });
+        assert!(r.ok, "{:?}", r.error);
+        (r.pane.unwrap(), r.tab.unwrap().id)
+    }
+
+    fn deliver(to: &str, from: Option<&str>, body: &str) -> Req {
+        Req::Deliver {
+            to: to.into(),
+            from: from.map(str::to_string),
+            kind: "done".into(),
+            body: body.into(),
+            result: None,
+        }
+    }
+
+    fn inbox(app: &mut App, pane: &str, ack: Option<u64>) -> Vec<control::InboxMsg> {
+        let r = app.handle_control(&Req::Inbox {
+            pane: pane.into(),
+            ack,
+        });
+        assert!(r.ok, "{:?}", r.error);
+        r.messages.unwrap()
+    }
+
+    #[test]
+    fn an_owned_tab_lists_its_owner_and_filters_by_it() {
+        let mut app = app();
+        let parent = focused_token(&app);
+        let (_, tab) = owned_tab(&mut app, &parent);
+        let r = app.handle_control(&Req::ListTree {
+            session: None,
+            owner: Some(parent.clone()),
+        });
+        let tree = r.tree.unwrap();
+        let tabs: Vec<_> = tree.iter().flat_map(|s| &s.tabs).collect();
+        assert_eq!(tabs.len(), 1, "only the owned tab");
+        assert_eq!(tabs[0].id, tab);
+        assert_eq!(tabs[0].owner.as_deref(), Some(parent.as_str()));
+
+        // An unknown owner creates nothing.
+        let before = app.state.workspace(&app.ws).unwrap().tabs.len();
+        let r = app.handle_control(&Req::NewTab {
+            session: None,
+            from: None,
+            cwd: None,
+            name: None,
+            no_focus: true,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
+            owner: Some("nope-1".into()),
+        });
+        assert_eq!(r.code.as_deref(), Some("not_found"));
+        assert_eq!(app.state.workspace(&app.ws).unwrap().tabs.len(), before);
+    }
+
+    #[test]
+    fn a_child_reports_to_its_owner_and_the_message_stays_until_acknowledged() {
+        let mut app = app();
+        let parent = focused_token(&app);
+        let (child, _) = owned_tab(&mut app, &parent);
+        let r = app.handle_control(&deliver("owner", Some(&child), "tests passed"));
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.pane.as_deref(), Some(parent.as_str()));
+
+        let first = inbox(&mut app, &parent, None);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].from.as_deref(), Some(child.as_str()));
+        assert_eq!(first[0].body, "tests passed");
+        assert_eq!(
+            inbox(&mut app, &parent, None),
+            first,
+            "reading does not consume"
+        );
+        assert!(inbox(&mut app, &parent, Some(first[0].seq)).is_empty());
+
+        // A tab without an owner has nobody to report to.
+        let r = app.handle_control(&deliver("owner", Some(&parent), "x"));
+        assert_eq!(r.code.as_deref(), Some("not_found"));
+        // Bad input is refused before anything is queued.
+        let big = "x".repeat(INBOX_BODY_MAX + 1);
+        assert_eq!(
+            app.handle_control(&deliver(&parent, None, &big))
+                .code
+                .as_deref(),
+            Some("invalid")
+        );
+        let rel = Req::Deliver {
+            to: parent.clone(),
+            from: None,
+            kind: "done".into(),
+            body: String::new(),
+            result: Some("out.txt".into()),
+        };
+        assert_eq!(app.handle_control(&rel).code.as_deref(), Some("invalid"));
+        assert!(inbox(&mut app, &parent, None).is_empty());
+    }
+
+    #[test]
+    fn a_full_inbox_drops_its_oldest_and_says_so() {
+        let mut app = app();
+        let parent = focused_token(&app);
+        for i in 0..=INBOX_CAP {
+            assert!(
+                app.handle_control(&deliver(&parent, None, &i.to_string()))
+                    .ok
+            );
+        }
+        let r = app.handle_control(&Req::Inbox {
+            pane: parent.clone(),
+            ack: None,
+        });
+        let msgs = r.messages.unwrap();
+        assert_eq!(msgs.len(), INBOX_CAP);
+        assert_eq!(msgs[0].body, "1", "the oldest went");
+        assert_eq!(r.dropped, Some(1));
+    }
+
+    #[test]
+    fn a_huge_inbox_is_read_in_batches_that_fit_a_response() {
+        let mut app = app();
+        let parent = focused_token(&app);
+        // Backslashes double when JSON-escaped: the worst case for the response size.
+        let body = "\\".repeat(INBOX_BODY_MAX);
+        for _ in 0..INBOX_CAP {
+            assert!(app.handle_control(&deliver(&parent, None, &body)).ok);
+        }
+        let mut seen = 0;
+        let mut ack = None;
+        loop {
+            let r = app.handle_control(&Req::Inbox {
+                pane: parent.clone(),
+                ack,
+            });
+            let line = serde_json::to_string(&r).unwrap();
+            assert!(line.len() < 2 * INBOX_BATCH_BYTES, "{} bytes", line.len());
+            let msgs = r.messages.unwrap();
+            if msgs.is_empty() {
+                break;
+            }
+            seen += msgs.len();
+            ack = msgs.last().map(|m| m.seq);
+            assert_eq!(r.truncated == Some(true), seen < INBOX_CAP);
+        }
+        assert_eq!(seen, INBOX_CAP, "every message arrives, batch by batch");
+    }
+
+    #[test]
+    fn a_dry_run_keeps_a_sessions_last_tab_like_the_close_does() {
+        let mut app = app();
+        let ws = app.ws.clone();
+        let r = app.handle_control(&Req::NewSession {
+            name: Some("kids".into()),
+            cwd: None,
+        });
+        assert!(r.ok, "{:?}", r.error);
+        let first = r.pane.unwrap();
+        assert!(
+            app.handle_control(&Req::SelectSession {
+                index: Some(0),
+                target: None,
+            })
+            .ok
+        );
+        assert_eq!(app.ws, ws);
+        let parent = focused_token(&app);
+        // Own the new session's ONLY tab, plus one more there.
+        let kid_tab = app
+            .resolve_pane_token(&first)
+            .and_then(|t| app.locate_terminal(&t))
+            .map(|(_, tab, _)| tab)
+            .unwrap();
+        let parent_term = app.resolve_pane_token(&parent).unwrap();
+        app.tab_owner.insert(kid_tab, parent_term);
+        let r = app.handle_control(&Req::NewTab {
+            session: Some("name:kids".into()),
+            from: None,
+            cwd: None,
+            name: None,
+            no_focus: true,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
+            owner: Some(parent.clone()),
+        });
+        assert!(r.ok, "{:?}", r.error);
+        let close = |dry_run| Req::CloseOwned {
+            owner: parent.clone(),
+            caller: None,
+            dry_run,
+        };
+        let preview = app.handle_control(&close(true));
+        let real = app.handle_control(&close(false));
+        assert_eq!(preview.closed.as_ref().map(Vec::len), Some(1));
+        assert_eq!(preview.skipped.as_ref().map(Vec::len), Some(1));
+        assert_eq!(
+            preview.closed.unwrap()[0].id,
+            real.closed.unwrap()[0].id,
+            "the preview closes what the close does"
+        );
+        assert_eq!(real.skipped.map(|s| s.len()), Some(1));
+    }
+
+    #[test]
+    fn close_owned_never_closes_the_caller_and_dry_run_closes_nothing() {
+        let mut app = app();
+        let parent = focused_token(&app);
+        let (child, tab) = owned_tab(&mut app, &parent);
+        let tabs = |app: &App| app.state.workspace(&app.ws).unwrap().tabs.len();
+        let close = |dry_run, caller: Option<&str>| Req::CloseOwned {
+            owner: parent.clone(),
+            caller: caller.map(str::to_string),
+            dry_run,
+        };
+        let r = app.handle_control(&close(true, None));
+        assert_eq!(r.closed.unwrap()[0].id, tab);
+        assert_eq!(tabs(&app), 2, "a dry run closes nothing");
+        let r = app.handle_control(&close(false, Some(&child)));
+        assert_eq!(r.code.as_deref(), Some("refused"));
+        assert_eq!(tabs(&app), 2);
+        let r = app.handle_control(&close(false, Some(&parent)));
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.closed.unwrap().len(), 1);
+        assert_eq!(tabs(&app), 1);
+    }
+
+    #[test]
+    fn the_owner_survives_a_snapshot_round_trip() {
+        let mut app = app();
+        let parent = focused_token(&app);
+        let _ = owned_tab(&mut app, &parent);
+        let snap = app.snapshot();
+        let tabs = &snap.sessions[0].tabs;
+        assert_eq!(tabs[1].owner, Some(0));
+        assert!(matches!(
+            tabs[0].layout,
+            PLayout::Leaf {
+                pane_ref: Some(0),
+                ..
+            }
+        ));
+    }
+
+    fn leaf(pane_ref: Option<u32>) -> PLayout {
+        PLayout::Leaf {
+            cwd: None,
+            command: None,
+            pane_ref,
+        }
+    }
+
+    #[test]
+    fn restore_reattaches_owners_across_sessions_and_pruned_tabs() {
+        // A tab the restore rejects (too many leaves) sits BEFORE the owned one: its owner
+        // must not shift onto a neighbour.
+        let mut too_big = leaf(None);
+        for _ in 0..persist::MAX_LEAVES_PER_TAB {
+            too_big = PLayout::Branch {
+                dir: Dir::Right,
+                ratio: 0.5,
+                first: Box::new(leaf(None)),
+                second: Box::new(too_big),
+            };
+        }
+        let snap = PersistState {
+            version: persist::SCHEMA_VERSION,
+            saved_at: 0,
+            active_session: 0,
+            sessions: vec![
+                PSession {
+                    name: None,
+                    active_tab: 0,
+                    tabs: vec![
+                        PTab {
+                            name: Some("parent".into()),
+                            layout: leaf(Some(7)),
+                            owner: None,
+                        },
+                        PTab {
+                            name: Some("pruned".into()),
+                            layout: too_big,
+                            owner: Some(7),
+                        },
+                        PTab {
+                            name: Some("child".into()),
+                            layout: leaf(None),
+                            owner: Some(7),
+                        },
+                        PTab {
+                            name: Some("dangling".into()),
+                            layout: leaf(None),
+                            owner: Some(99),
+                        },
+                    ],
+                },
+                PSession {
+                    name: Some("other".into()),
+                    active_tab: 0,
+                    tabs: vec![PTab {
+                        name: Some("far child".into()),
+                        layout: leaf(None),
+                        owner: Some(7),
+                    }],
+                },
+            ],
+        };
+        let mut state = State::new();
+        let mut panes = HashMap::new();
+        let (_, _, owners) =
+            restore_sessions(&mut state, &mut panes, &snap, 80, 24, &[]).expect("restored");
+        let named = |name: &str| {
+            state
+                .workspace_ids()
+                .into_iter()
+                .filter_map(|w| state.workspace(&w).cloned())
+                .flat_map(|w| w.tabs.clone())
+                .find(|t| t.name.as_deref() == Some(name))
+                .map(|t| {
+                    (
+                        t.id.clone(),
+                        t.layout.terminal_of(&t.focused).cloned().unwrap(),
+                    )
+                })
+        };
+        let (_, parent_term) = named("parent").unwrap();
+        assert!(named("pruned").is_none());
+        let (child, _) = named("child").unwrap();
+        let (far, _) = named("far child").unwrap();
+        let (dangling, _) = named("dangling").unwrap();
+        assert_eq!(owners.get(&child), Some(&parent_term));
+        assert_eq!(owners.get(&far), Some(&parent_term), "across sessions");
+        assert!(
+            !owners.contains_key(&dangling),
+            "a ref to no leaf owns nothing"
+        );
+        assert_eq!(owners.len(), 2);
     }
 }

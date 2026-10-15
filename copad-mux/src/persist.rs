@@ -75,6 +75,11 @@ pub struct PTab {
     #[serde(default)]
     pub name: Option<String>,
     pub layout: PLayout,
+    /// The `pane_ref` of the leaf (in any tab of any session) whose pane owns this tab.
+    /// Pane tokens do not survive a restart, so the relation is saved by position and
+    /// re-attached to whatever pane that leaf restores as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<u32>,
 }
 
 /// A persisted split tree: a leaf (with its cwd) or a branch (dir + ratio + children).
@@ -91,6 +96,9 @@ pub enum PLayout {
         /// argument boundaries survive. `None`/missing = restore a bare shell.
         #[serde(default)]
         command: Option<Vec<String>>,
+        /// A snapshot-local id, set only on a leaf some tab's `owner` points at.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_ref: Option<u32>,
     },
     Branch {
         dir: Dir,
@@ -330,12 +338,15 @@ mod tests {
                             first: Box::new(PLayout::Leaf {
                                 cwd: Some("/tmp".into()),
                                 command: Some(vec!["claude".into(), "--resume".into()]),
+                                pane_ref: Some(0),
                             }),
                             second: Box::new(PLayout::Leaf {
                                 cwd: None,
                                 command: None,
+                                pane_ref: None,
                             }),
                         },
+                        owner: None,
                     }],
                 },
                 PSession {
@@ -347,14 +358,18 @@ mod tests {
                             layout: PLayout::Leaf {
                                 cwd: None,
                                 command: None,
+                                pane_ref: None,
                             },
+                            owner: None,
                         },
                         PTab {
                             name: Some("logs".into()),
                             layout: PLayout::Leaf {
                                 cwd: Some("/var".into()),
                                 command: None,
+                                pane_ref: None,
                             },
+                            owner: Some(0),
                         },
                     ],
                 },

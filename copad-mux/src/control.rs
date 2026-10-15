@@ -141,6 +141,10 @@ pub enum Req {
         env: Vec<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         keep: bool,
+        /// The pane (a TOKEN) that owns the new tab — what `close-tab --owned-by` and
+        /// `list-tree --owner` select on, and where `notify --to owner` delivers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
     },
     /// Make the tab at `index` (as printed by `list-tabs`) active.
     SelectTab {
@@ -324,6 +328,40 @@ pub enum Req {
     ListTree {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<String>,
+        /// Only the tabs this pane (a token) owns.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<String>,
+    },
+    /// Close every tab `owner` (a pane token) owns. `dry_run` only reports them. Refused as a
+    /// whole when one of them holds `caller`, so a cleanup can never close the pane running it.
+    CloseOwned {
+        owner: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
+    },
+    /// Leave a message in a pane's inbox — a child reporting to its parent. `to` is a pane
+    /// token, or `owner` for the owner of `from`'s tab. No toast: the reader is a program.
+    Deliver {
+        to: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        kind: String,
+        #[serde(default)]
+        body: String,
+        /// A file the sender left for the reader (an absolute path). A reference only: comux
+        /// never reads it, and keeping it until it is read is the sender's job.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result: Option<String>,
+    },
+    /// Read a pane's inbox. Non-destructive: messages stay until acknowledged, so a reader
+    /// that dies before printing them loses nothing. `ack` first drops every message with
+    /// `seq <= ack` — at-least-once delivery, deduplicated by `seq`.
+    Inbox {
+        pane: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ack: Option<u64>,
     },
     /// Re-read `mux.toml` and apply the live-reloadable settings to the running server
     /// WITHOUT restarting it — like tmux `source-file`. Keybindings, mouse, sidebar
@@ -397,6 +435,13 @@ pub const CAP_SPAWN: &str = "spawn";
 /// Capability: the index verbs honor `caller` — an index counts in the caller's tab.
 pub const CAP_CALLER_INDEX: &str = "caller-index";
 
+/// Capability: tabs carry an `owner` (`new-tab`/`spawn --owner`, `list-tree --owner`,
+/// `close-tab --owned-by`).
+pub const CAP_OWNER: &str = "owner";
+
+/// Capability: pane inboxes (`notify --to`, `inbox`).
+pub const CAP_INBOX: &str = "inbox";
+
 /// Every capability this build's server implements (reported by `health`).
 pub const SERVER_CAPS: &[&str] = &[
     CAP_RENAME_CALLER,
@@ -406,6 +451,8 @@ pub const SERVER_CAPS: &[&str] = &[
     CAP_PLACEMENT,
     CAP_SPAWN,
     CAP_CALLER_INDEX,
+    CAP_OWNER,
+    CAP_INBOX,
 ];
 
 /// The most `send --file` reads. A paste larger than this is a mistake (a binary, a log),
@@ -592,6 +639,9 @@ pub struct TreeTab {
     pub name: String,
     /// Its session's active tab.
     pub active: bool,
+    /// The token of the pane that owns this tab, while that pane is alive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     pub panes: Vec<TreePane>,
 }
 
@@ -726,6 +776,35 @@ pub struct Resp {
     /// correct one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<String>,
+    /// `inbox`: the messages waiting, oldest first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub messages: Option<Vec<InboxMsg>>,
+    /// `inbox`: messages dropped because the inbox was full, since it was last read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dropped: Option<u64>,
+    /// `close-tab --owned-by`: the tabs closed (or, dry-run, that would be).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed: Option<Vec<NodeRef>>,
+    /// `close-tab --owned-by`: the tabs that could not be closed (a session's last tab).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<Vec<NodeRef>>,
+}
+
+/// One inbox message. Everything but `seq`/`ts` came from the sender: data, not instructions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InboxMsg {
+    /// Increases per pane; acknowledge with it, deduplicate by it.
+    pub seq: u64,
+    /// Unix seconds when it arrived.
+    pub ts: u64,
+    /// The sender's pane token, when it sent from a pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    pub kind: String,
+    #[serde(default)]
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<String>,
 }
 
 impl Resp {
@@ -755,6 +834,10 @@ impl Resp {
             pane: None,
             agents: None,
             tree: None,
+            messages: None,
+            dropped: None,
+            closed: None,
+            skipped: None,
         }
     }
 
@@ -987,6 +1070,45 @@ pub fn run_client(args: &[String]) -> i32 {
     // Like the waits, `agent-log` is answered here: one request for the agent's log path, then
     // the file is read client-side (it is the caller's own user's file; the server never
     // touches it).
+    // `inbox` reads, prints, THEN acknowledges, over one connection: see [`run_inbox`].
+    if cmd == "inbox" {
+        let p = parsed!(INBOX_SPEC);
+        let Some(pane) = p.positionals.first().cloned().or_else(caller_pane) else {
+            return usage_error(
+                json_out,
+                "comux inbox: whose? (no pane given and $COPAD_MUX_PANE is unset)",
+                INBOX_SPEC.usage,
+            );
+        };
+        let timeout = match p.value("--timeout").map(str::parse::<u64>).transpose() {
+            Ok(t) => t.unwrap_or(300),
+            Err(_) => {
+                return usage_error(
+                    json_out,
+                    "comux inbox: --timeout needs a number",
+                    INBOX_SPEC.usage,
+                );
+            }
+        };
+        if p.value("--timeout").is_some() && !p.has("--wait") {
+            return usage_error(
+                json_out,
+                "comux inbox: --timeout goes with --wait",
+                INBOX_SPEC.usage,
+            );
+        }
+        // `--timeout 0` waits forever; anything the clock cannot represent is refused rather
+        // than left to panic in `Instant + Duration`.
+        let limit = (timeout > 0).then(|| Duration::from_secs(timeout));
+        if limit.is_some_and(|l| Instant::now().checked_add(l).is_none()) {
+            return usage_error(
+                json_out,
+                "comux inbox: --timeout is too large",
+                INBOX_SPEC.usage,
+            );
+        }
+        return run_inbox(&pane, p.has("--wait"), limit, p.has("--peek"), json_out);
+    }
     if cmd == "agent-log" {
         let p = parsed!(AGENT_LOG_SPEC);
         let num = |flag: &str, default: usize| -> Result<usize, String> {
@@ -1055,6 +1177,12 @@ pub fn run_client(args: &[String]) -> i32 {
                 Ok(c) => c,
                 Err(e) => return usage_error(json_out, &e, NEW_TAB_SPEC.usage),
             };
+            let owner = p.value("--owner").map(str::to_string);
+            if owner.is_some()
+                && let Err(code) = require_cap(CAP_OWNER, cmd, json_out)
+            {
+                return code;
+            }
             let req = Req::NewTab {
                 session: p.value("--session").map(str::to_string),
                 from: caller_pane(),
@@ -1064,6 +1192,7 @@ pub fn run_client(args: &[String]) -> i32 {
                 command: Vec::new(),
                 env: Vec::new(),
                 keep: false,
+                owner,
             };
             // An older server ignores every field, so it would create the tab in front of the
             // user — exactly what these flags exist to prevent.
@@ -1100,6 +1229,12 @@ pub fn run_client(args: &[String]) -> i32 {
             if let Err(code) = require_cap(CAP_SPAWN, cmd, json_out) {
                 return code;
             }
+            let owner = p.value("--owner").map(str::to_string);
+            if owner.is_some()
+                && let Err(code) = require_cap(CAP_OWNER, cmd, json_out)
+            {
+                return code;
+            }
             Req::NewTab {
                 session: p.value("--session").map(str::to_string),
                 from: caller_pane(),
@@ -1110,6 +1245,7 @@ pub fn run_client(args: &[String]) -> i32 {
                 command: p.positionals.clone(),
                 env,
                 keep: p.has("--keep"),
+                owner,
             }
         }
         "list-sessions" | "sessions" => {
@@ -1118,8 +1254,15 @@ pub fn run_client(args: &[String]) -> i32 {
         }
         "list-tree" | "tree" => {
             let p = parsed!(LIST_TREE_SPEC);
+            let owner = p.value("--owner").map(str::to_string);
+            if owner.is_some()
+                && let Err(code) = require_cap(CAP_OWNER, cmd, json_out)
+            {
+                return code;
+            }
             Req::ListTree {
                 session: p.value("--session").map(str::to_string),
+                owner,
             }
         }
         "list-agents" | "agents" => {
@@ -1213,6 +1356,32 @@ pub fn run_client(args: &[String]) -> i32 {
         // their non-destructive siblings rather than defaulting to the ACTIVE tab /
         // session the way `rename-*` does: an explicit pick is what makes a bare
         // `comux close-tab` safe to type.
+        "close-tab" | "kill-tab" if owned_by_form(&rest) => {
+            let p = parsed!(CLOSE_OWNED_SPEC);
+            let Some(owner) = p.value("--owned-by").map(str::to_string) else {
+                return usage_error(
+                    json_out,
+                    "comux close-tab: --owned-by needs a pane",
+                    CLOSE_OWNED_SPEC.usage,
+                );
+            };
+            let dry_run = p.has("--dry-run");
+            if dry_run == p.has("--yes") {
+                return usage_error(
+                    json_out,
+                    "comux close-tab --owned-by: pass --dry-run to list them or --yes to close them",
+                    CLOSE_OWNED_SPEC.usage,
+                );
+            }
+            if let Err(code) = require_cap(CAP_OWNER, cmd, json_out) {
+                return code;
+            }
+            Req::CloseOwned {
+                owner,
+                caller: caller_pane(),
+                dry_run,
+            }
+        }
         "close-tab" | "kill-tab" => {
             let (index, target) = match pick_verb(&rest, json_out, Target::TabClose) {
                 Ok(a) => a,
@@ -1355,23 +1524,61 @@ pub fn run_client(args: &[String]) -> i32 {
         }
         "notify" => {
             let p = parsed!(NOTIFY_SPEC);
-            let target = p
-                .value("--pane")
-                .map(str::to_string)
-                .unwrap_or_else(|| std::env::var("COPAD_MUX_PANE").unwrap_or_default());
-            if target.is_empty() {
-                // Never fall back to the active pane: a notification attributed to the
-                // wrong pane sends its click somewhere misleading.
-                return usage_error(
-                    json_out,
-                    "comux: no pane given and $COPAD_MUX_PANE is unset (not inside a comux pane?)",
-                    NOTIFY_SPEC.usage,
-                );
-            }
-            Req::Notify {
-                target,
-                kind: p.value("--kind").unwrap_or("done").to_string(),
-                body: p.positionals.join(" "),
+            if let Some(to) = p.value("--to") {
+                let from = p.value("--pane").map(str::to_string).or_else(caller_pane);
+                if to == "owner" && from.is_none() {
+                    return usage_error(
+                        json_out,
+                        "comux notify --to owner: no sending pane ($COPAD_MUX_PANE is unset; pass --pane)",
+                        NOTIFY_SPEC.usage,
+                    );
+                }
+                let result = match p.value("--result").map(result_path).transpose() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        return usage_error(
+                            json_out,
+                            &format!("comux notify: {e}"),
+                            NOTIFY_SPEC.usage,
+                        );
+                    }
+                };
+                if let Err(code) = require_cap(CAP_INBOX, cmd, json_out) {
+                    return code;
+                }
+                Req::Deliver {
+                    to: to.to_string(),
+                    from,
+                    kind: p.value("--kind").unwrap_or("done").to_string(),
+                    body: p.positionals.join(" "),
+                    result,
+                }
+            } else {
+                if p.value("--result").is_some() {
+                    return usage_error(
+                        json_out,
+                        "comux notify: --result goes with --to (a toast carries no file)",
+                        NOTIFY_SPEC.usage,
+                    );
+                }
+                let target = p
+                    .value("--pane")
+                    .map(str::to_string)
+                    .unwrap_or_else(|| std::env::var("COPAD_MUX_PANE").unwrap_or_default());
+                if target.is_empty() {
+                    // Never fall back to the active pane: a notification attributed to the
+                    // wrong pane sends its click somewhere misleading.
+                    return usage_error(
+                        json_out,
+                        "comux: no pane given and $COPAD_MUX_PANE is unset (not inside a comux pane?)",
+                        NOTIFY_SPEC.usage,
+                    );
+                }
+                Req::Notify {
+                    target,
+                    kind: p.value("--kind").unwrap_or("done").to_string(),
+                    body: p.positionals.join(" "),
+                }
             }
         }
         "resize" => {
@@ -1799,8 +2006,8 @@ fn rename_target(
 }
 
 const LIST_TREE_SPEC: Spec = Spec {
-    usage: "usage: comux list-tree [--session <s1|name:hub|index>] [--json]",
-    flags: &[opt(&["--session", "-s"])],
+    usage: "usage: comux list-tree [--session <s1|name:hub|index>] [--owner <pane-token>] [--json]",
+    flags: &[opt(&["--session", "-s"]), opt(&["--owner"])],
     positionals: Positionals::AtMost(0),
 };
 
@@ -1843,7 +2050,7 @@ const SPLIT_SPEC: Spec = Spec {
 };
 
 const NEW_TAB_SPEC: Spec = Spec {
-    usage: "usage: comux new-tab [--session <s1|name:hub>] [--cwd DIR] [--name N] [--no-focus] [--json]\n\
+    usage: "usage: comux new-tab [--session <s1|name:hub>] [--cwd DIR] [--name N] [--no-focus] [--owner TOKEN] [--json]\n\
             \x20      --session / --no-focus create it without moving anyone's view;\n\
             \x20      the shell starts in --cwd, else the calling pane's directory",
     flags: &[
@@ -1851,6 +2058,7 @@ const NEW_TAB_SPEC: Spec = Spec {
         opt(&["--cwd", "-c"]),
         opt(&["--name", "-n"]),
         flag(&["--no-focus", "-d"]),
+        opt(&["--owner"]),
     ],
     positionals: Positionals::AtMost(0),
 };
@@ -1864,7 +2072,7 @@ const AGENT_LOG_SPEC: Spec = Spec {
 };
 
 const SPAWN_SPEC: Spec = Spec {
-    usage: "usage: comux spawn [--session <s1|name:hub>] [--cwd DIR] [--name N] [--env K=V]... [--keep] [--json] -- <argv...>\n\
+    usage: "usage: comux spawn [--session <s1|name:hub>] [--cwd DIR] [--name N] [--env K=V]... [--keep] [--owner TOKEN] [--json] -- <argv...>\n\
             \x20      runs argv in a new tab without moving anyone's view (in --session, else beside\n\
             \x20      the calling pane); the tab closes when it exits unless --keep leaves a shell",
     flags: &[
@@ -1873,6 +2081,7 @@ const SPAWN_SPEC: Spec = Spec {
         opt(&["--name", "-n"]),
         opt(&["--env", "-e"]),
         flag(&["--keep", "-k"]),
+        opt(&["--owner"]),
     ],
     positionals: Positionals::Any,
 };
@@ -1896,10 +2105,62 @@ const JUMP_SPEC: Spec = Spec {
 };
 
 const NOTIFY_SPEC: Spec = Spec {
-    usage: "usage: comux notify [--pane <token>] [--kind done|blocked] [--] <body...>",
-    flags: &[opt(&["--pane"]), opt(&["--kind"])],
+    usage: "usage: comux notify [--pane <token>] [--kind done|blocked] [--] <body...>\n\
+            \x20      comux notify --to <pane-token|owner> [--kind done|blocked|failed] [--result FILE] [--] <body...>\n\
+            \x20      --to leaves the message in that pane's inbox (`comux inbox`) instead of raising a toast;\n\
+            \x20      `owner` is the pane that owns your tab",
+    flags: &[
+        opt(&["--pane"]),
+        opt(&["--kind"]),
+        opt(&["--to"]),
+        opt(&["--result"]),
+    ],
     positionals: Positionals::Any,
 };
+
+const CLOSE_OWNED_SPEC: Spec = Spec {
+    usage: "usage: comux close-tab --owned-by <pane-token> --dry-run|--yes [--json]\n\
+            \x20      closes every tab that pane owns (new-tab/spawn --owner); never the caller's own",
+    flags: &[
+        opt(&["--owned-by"]),
+        flag(&["--dry-run", "-n"]),
+        flag(&["--yes", "-y"]),
+    ],
+    positionals: Positionals::AtMost(0),
+};
+
+const INBOX_SPEC: Spec = Spec {
+    usage: "usage: comux inbox [<pane-token>] [--wait [--timeout S]] [--peek] [--json]\n\
+            \x20      reads the messages `notify --to` left for a pane (default: yours) and acknowledges\n\
+            \x20      them once printed; --peek leaves them. Exit 124 if --wait times out",
+    flags: &[
+        flag(&["--wait", "-w"]),
+        opt(&["--timeout"]),
+        flag(&["--peek"]),
+    ],
+    positionals: Positionals::AtMost(1),
+};
+
+/// `close-tab --owned-by …` is a different verb from `close-tab [index]` (no picker, no index).
+fn owned_by_form(rest: &[&String]) -> bool {
+    rest.iter()
+        .take_while(|a| a.as_str() != "--")
+        .any(|a| a.as_str() == "--owned-by" || a.starts_with("--owned-by="))
+}
+
+/// A `--result` file as an absolute path the reader can open from anywhere. It must exist
+/// now; keeping it until it is read is the sender's job.
+fn result_path(path: &str) -> Result<String, String> {
+    let p = std::env::current_dir()
+        .map(|c| c.join(path))
+        .unwrap_or_else(|_| PathBuf::from(path));
+    if !p.exists() {
+        return Err(format!("--result {path}: no such file"));
+    }
+    p.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("--result {path}: not a UTF-8 path"))
+}
 
 /// `--active`: count an index in the tab on screen rather than the caller's.
 const ACTIVE_FLAG: &[cliargs::Flag] = &[flag(&["--active"])];
@@ -2488,7 +2749,12 @@ fn print_human(req: &Req, resp: &Resp) {
                 for t in &s.tabs {
                     let name = if t.name.is_empty() { "-" } else { &t.name };
                     let mark = if t.active { "  *active" } else { "" };
-                    println!("  {} {}{mark}", t.id, name);
+                    let owner = t
+                        .owner
+                        .as_deref()
+                        .map(|o| format!("  owner {o}"))
+                        .unwrap_or_default();
+                    println!("  {} {}{mark}{owner}", t.id, name);
                     for p in &t.panes {
                         println!(
                             "    {:<2} {:<18} {:<8} {:<14} {:<8}{}",
@@ -2598,6 +2864,16 @@ fn print_human(req: &Req, resp: &Resp) {
                     s.tabs,
                     s.panes,
                     s.agents,
+                );
+            }
+        }
+        Req::CloseOwned { .. } => {
+            println!("{}", resp.message.as_deref().unwrap_or("ok"));
+            for t in resp.closed.as_deref().unwrap_or_default() {
+                println!(
+                    "  {} {}",
+                    t.id,
+                    if t.name.is_empty() { "-" } else { &t.name }
                 );
             }
         }
@@ -3067,6 +3343,7 @@ mod verb_args_tests {
         "new-tab",
         "spawn",
         "agent-log",
+        "inbox",
         "list-sessions",
         "list-agents",
         "rename-session",
@@ -3144,6 +3421,36 @@ mod verb_args_tests {
         );
         assert_eq!(exit(&["spawn", "--cwd", "/no/such/dir", "--", "true"]), 2);
         assert_eq!(exit(&["spawn", "--keep", "--help"]), 0);
+    }
+
+    #[test]
+    fn owner_and_inbox_refuse_bad_input_before_any_request() {
+        assert_eq!(exit(&["inbox", "p", "--timeout", "x", "--wait"]), 2);
+        assert_eq!(
+            exit(&["inbox", "p", "--timeout", "5"]),
+            2,
+            "--timeout needs --wait"
+        );
+        assert_eq!(exit(&["inbox", "p", "q"]), 2);
+        assert_eq!(
+            exit(&["close-tab", "--owned-by", "p"]),
+            2,
+            "neither --dry-run nor --yes"
+        );
+        assert_eq!(
+            exit(&["close-tab", "--owned-by", "p", "--dry-run", "--yes"]),
+            2
+        );
+        assert_eq!(
+            exit(&["notify", "--result", "/etc/hosts", "x"]),
+            2,
+            "--result needs --to"
+        );
+        assert_eq!(
+            exit(&["notify", "--to", "p", "--result", "/no/such/file", "x"]),
+            2
+        );
+        assert_eq!(exit(&["close-tab", "--owned-by", "p", "--help"]), 0);
     }
 
     #[test]
@@ -3684,6 +3991,127 @@ impl WaitOutcome {
             }
         }
     }
+}
+
+/// How long a plain (non-waiting) `inbox` gives the server.
+const INBOX_IO_BUDGET: Duration = Duration::from_secs(10);
+
+/// `comux inbox`: read a pane's messages, print them, and only then acknowledge them, so a
+/// reader that dies or times out before printing loses nothing (the server keeps every
+/// message until it is acknowledged). The cost is at-least-once delivery: a reader killed
+/// between printing and the ack sees the same messages again — `seq` deduplicates them.
+///
+/// `--wait` polls from here, never inside the server (a server-side wait would stall its
+/// single-writer loop), under one deadline that also bounds the capability check. With
+/// `--wait`, `timeout` `None` waits forever; without it the short I/O budget applies.
+fn run_inbox(pane: &str, wait: bool, timeout: Option<Duration>, peek: bool, json: bool) -> i32 {
+    let deadline = if wait {
+        timeout.map(|t| Instant::now() + t)
+    } else {
+        Some(Instant::now() + INBOX_IO_BUDGET)
+    };
+    let fail = |code: &str, msg: String| WaitOutcome::failed(code, msg).finish("inbox", json);
+    let mut conn = match WaitConn::connect(deadline) {
+        Ok(c) => c,
+        Err(WaitErr::TimedOut) => return WaitOutcome::TimedOut.finish("inbox", json),
+        Err(WaitErr::Failed(e)) => return fail("unavailable", e),
+    };
+    let caps = match conn.request(&Req::Health, deadline) {
+        Ok(r) => r.health.map(|h| h.caps).unwrap_or_default(),
+        Err(WaitErr::TimedOut) => return WaitOutcome::TimedOut.finish("inbox", json),
+        Err(WaitErr::Failed(e)) => return fail("unavailable", e),
+    };
+    if !caps.iter().any(|c| c == CAP_INBOX) {
+        return fail(
+            "unsupported",
+            format!(
+                "the running server predates this operation ({CAP_INBOX}) — \
+                 `comux server restart` after upgrading"
+            ),
+        );
+    }
+    let read = Req::Inbox {
+        pane: pane.to_string(),
+        ack: None,
+    };
+    let resp = loop {
+        let resp = match conn.request(&read, deadline) {
+            Ok(r) => r,
+            Err(WaitErr::TimedOut) => return WaitOutcome::TimedOut.finish("inbox", json),
+            Err(WaitErr::Failed(e)) => return fail("unavailable", e),
+        };
+        if !resp.ok {
+            return WaitOutcome::from_resp(&resp).finish("inbox", json);
+        }
+        if !wait || resp.messages.as_ref().is_some_and(|m| !m.is_empty()) {
+            break resp;
+        }
+        let nap = match deadline {
+            Some(d) => Duration::from_millis(250).min(d.saturating_duration_since(Instant::now())),
+            None => Duration::from_millis(250),
+        };
+        if nap.is_zero() {
+            return WaitOutcome::TimedOut.finish("inbox", json);
+        }
+        std::thread::sleep(nap);
+    };
+    let messages = resp.messages.unwrap_or_default();
+    let dropped = resp.dropped.unwrap_or(0);
+    // A response carries one size-bounded batch; the rest wait for the next read.
+    let more = resp.truncated == Some(true);
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "ok": true,
+                "pane": resp.pane,
+                "messages": messages,
+                "dropped": dropped,
+                "more": more,
+            })
+        );
+    } else {
+        if dropped > 0 {
+            println!("({dropped} older message(s) dropped: the inbox was full)");
+        }
+        for m in &messages {
+            println!("{}", render_inbox(m));
+        }
+        if more {
+            println!("(more messages waiting: run `comux inbox` again)");
+        }
+    }
+    // Acknowledge only what was printed — and only once it is out of our buffer.
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    if let Some(last) = messages.last().map(|m| m.seq).filter(|_| !peek) {
+        let ack = Req::Inbox {
+            pane: pane.to_string(),
+            ack: Some(last),
+        };
+        // A failed ack only means the same messages come back next time.
+        let _ = conn.request(&ack, Some(Instant::now() + INBOX_IO_BUDGET));
+    }
+    0
+}
+
+/// One inbox message for a human. Every field but `seq` is the sender's, so control
+/// characters are neutralized before they reach the terminal.
+fn render_inbox(m: &InboxMsg) -> String {
+    let from = m.from.as_deref().unwrap_or("-");
+    let mut line = format!(
+        "[{}] {} from {}: {}",
+        m.seq,
+        crate::agentlog::inert(&m.kind, false),
+        crate::agentlog::inert(from, false),
+        crate::agentlog::inert(&m.body, true)
+    );
+    if let Some(r) = &m.result {
+        line.push_str(&format!(
+            "\n    result: {}",
+            crate::agentlog::inert(r, false)
+        ));
+    }
+    line
 }
 
 /// `comux agent-log`: find the agent's transcript through the server, then read its tail here.
@@ -4607,11 +5035,15 @@ mod list_agents_proto_tests {
     fn list_tree_parses_with_and_without_a_session() {
         assert!(matches!(
             serde_json::from_str::<Req>(r#"{"cmd":"list-tree"}"#).unwrap(),
-            Req::ListTree { session: None }
+            Req::ListTree {
+                session: None,
+                owner: None
+            }
         ));
         assert_eq!(
             serde_json::to_string(&Req::ListTree {
-                session: Some("name:hub".into())
+                session: Some("name:hub".into()),
+                owner: None,
             })
             .unwrap(),
             r#"{"cmd":"list-tree","session":"name:hub"}"#
@@ -4933,21 +5365,25 @@ mod skill_tests {
         );
     }
 
-    /// Writes must be addressed by token. An index is a position in the SERVER's active tab,
-    /// which the user can change mid-run, and a raw terminal id is recycled across server
-    /// restarts — both retarget silently.
+    /// Writes should be addressed by token. An index is a position — in the caller's tab
+    /// (#137), but a pane closing or splitting there still shifts it — and a raw terminal id
+    /// is recycled across server restarts; both retarget silently.
     #[test]
     fn the_skill_addresses_writes_by_token() {
         assert!(
-            SKILL_MD.contains("**Use tokens. Always.**"),
+            SKILL_MD.contains("**Still prefer tokens.**"),
             "the skill must state the preference outright"
         );
         // Matched on fragments that cannot straddle a line wrap — the prose is hard-wrapped,
         // so a longer literal silently stops matching the moment the paragraph reflows.
         assert!(
-            SKILL_MD.contains("no way to make an index-addressed")
-                && SKILL_MD.contains("race-free"),
-            "the skill must admit the index race cannot be closed, only narrowed"
+            SKILL_MD.contains("An index is a position, not a name")
+                && SKILL_MD.contains("nothing warns you"),
+            "the skill must admit an index can shift under the caller"
+        );
+        assert!(
+            SKILL_MD.contains("a position in YOUR tab"),
+            "the skill must say which tab an index counts in"
         );
         assert!(
             SKILL_MD.contains("Those restart from")

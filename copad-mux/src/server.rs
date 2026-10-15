@@ -766,6 +766,9 @@ fn ctl_mutates(req: &control::Req) -> bool {
             // statuses, so it neither sweeps processes nor touches a PTY.
             | control::Req::ListAgents { .. }
             | control::Req::ListTree { .. }
+            // Inbox traffic is polled by `inbox --wait` and draws nothing.
+            | control::Req::Inbox { .. }
+            | control::Req::Deliver { .. }
     )
 }
 
@@ -1532,6 +1535,11 @@ mod tests {
             command: Vec::new(),
             env: Vec::new(),
             keep: false,
+            owner: None,
+        }));
+        assert!(!ctl_mutates(&Req::Inbox {
+            pane: "a-1".into(),
+            ack: None
         }));
         assert!(ctl_mutates(&Req::Split {
             from: None,

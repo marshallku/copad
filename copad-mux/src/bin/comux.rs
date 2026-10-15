@@ -48,6 +48,8 @@ fn print_usage() {
          \x20 comux agent-log <pane>      the last entries of that agent's own conversation log (--last N)\n\
          \x20 comux jump <pane>           switch to a pane anywhere (by $COPAD_MUX_PANE token)\n\
          \x20 comux notify <body...>      raise an agent toast for this pane (--kind done|blocked)\n\
+         \x20 comux notify --to owner ... leave a message in the inbox of the pane that owns your tab\n\
+         \x20 comux inbox [--wait]       read (and acknowledge) the messages left for your pane\n\
          \x20 comux worktree create <br>  git worktree + a session in it (also list|rm)\n\
          \x20 comux reload                re-read mux.toml on the live server (tmux source-file)\n\
          \x20 comux doctor [--json]       diagnose config problems (mux.toml + config.toml)\n\

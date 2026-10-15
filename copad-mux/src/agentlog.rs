@@ -84,7 +84,7 @@ pub fn render(e: &Entry) -> String {
 }
 
 /// `s` with every control character replaced — except newline and tab when `multiline`.
-fn inert(s: &str, multiline: bool) -> String {
+pub(crate) fn inert(s: &str, multiline: bool) -> String {
     s.chars()
         .map(|c| match c {
             '\n' | '\t' if multiline => c,

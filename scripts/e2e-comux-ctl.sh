@@ -43,6 +43,8 @@
 #  28. send --enter / --paste (bracketed only when the program asked) / --file
 #  29. new-tab --session / --no-focus and split --from a background pane move nobody's view
 #  30. spawn runs argv verbatim in a background tab; it closes on exit unless --keep
+#  31. inside a pane, list and the index verbs count in the caller's tab
+#  32. owned tabs, the inbox, and ownership across a server restart
 
 set -euo pipefail
 
@@ -1775,7 +1777,67 @@ rc=0; COPAD_MUX_PANE="nope-1" t 10 "$COMUX" list >/dev/null 2>&1 || rc=$?
 t 12 "$COMUX" kill-session "$sp" >/dev/null || fail "index cleanup failed"
 ok "list/send/capture/wait/focus/close agree on the caller's tab; --active is the tab on screen; no view moves"
 
-echo "32. the server is still responsive and shuts down cleanly"
+echo "32. owned tabs, the inbox, and ownership across a server restart"
+t 10 "$COMUX" new-session ownertest --json >"$WORK/json" || fail "could not create the owner session"
+sp="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["session"]["id"])' <"$WORK/json")"
+PARENT="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+t 10 "$COMUX" rename-tab -t "$sp/0" e2e-parent >/dev/null || fail "could not name the parent tab"
+t 10 "$COMUX" select-session 0 >/dev/null
+v0="$(view)"
+t 10 "$COMUX" spawn --session "$sp" --name e2e-child --owner "$PARENT" --keep --json -- sh -c 'sleep 600' >"$WORK/json" \
+    || fail "spawn --owner failed: $(cat "$WORK/json")"
+CHILD="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+owned() { t 10 "$COMUX" list-tree --owner "$1" --json | python3 -c 'import json,sys; print([t["name"] for s in json.load(sys.stdin)["tree"] for t in s["tabs"]])'; }
+[[ "$(owned "$PARENT")" == "['e2e-child']" ]] || fail "list-tree --owner should show the child tab: $(owned "$PARENT")"
+# The child reports to whoever owns its tab, without knowing that pane's token.
+echo "the report" >"$WORK/report.txt"
+(cd "$WORK" && COPAD_MUX_PANE="$CHILD" t 10 "$COMUX" notify --to owner --kind done --result report.txt -- "child done") >/dev/null \
+    || fail "notify --to owner failed"
+t 10 "$COMUX" inbox "$PARENT" --peek --json >"$WORK/json" || fail "inbox --peek failed"
+python3 -c '
+import json,os,sys
+m=json.load(sys.stdin)["messages"]
+assert len(m)==1 and m[0]["body"]=="child done" and m[0]["from"]=="'"$CHILD"'", m
+assert os.path.realpath(m[0]["result"])==os.path.realpath("'"$WORK"'/report.txt"), m' <"$WORK/json" \
+    || fail "the parent's inbox is wrong: $(cat "$WORK/json")"
+COPAD_MUX_PANE="$PARENT" t 15 "$COMUX" inbox --wait --timeout 5 >"$WORK/out" || fail "inbox --wait with a message waiting failed"
+grep -qF "child done" "$WORK/out" || fail "inbox did not print the message: $(cat "$WORK/out")"
+t 10 "$COMUX" inbox "$PARENT" --json | python3 -c 'import json,sys; assert json.load(sys.stdin)["messages"]==[]' \
+    || fail "a printed message should have been acknowledged"
+rc=0; t 10 "$COMUX" inbox "$PARENT" --wait --timeout 1 >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 124 ]] || fail "an empty inbox --wait should time out with 124, got $rc"
+# A message arriving DURING the wait is picked up.
+( sleep 1; COPAD_MUX_PANE="$CHILD" "$COMUX" notify --to owner --kind failed -- "late" >/dev/null ) &
+t 15 "$COMUX" inbox "$PARENT" --wait --timeout 10 >"$WORK/out" || fail "inbox --wait missed a message sent during the wait"
+grep -qF "late" "$WORK/out" || fail "inbox --wait printed the wrong thing: $(cat "$WORK/out")"
+[[ "$(view)" == "$v0" ]] || fail "owner/inbox traffic moved a view"
+# Cleanup is scoped to what the parent made, and never the caller's own tab.
+rc=0; COPAD_MUX_PANE="$CHILD" t 10 "$COMUX" close-tab --owned-by "$PARENT" --yes >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 1 ]] || fail "close-tab --owned-by from inside an owned tab should be refused, got $rc"
+t 10 "$COMUX" close-tab --owned-by "$PARENT" --dry-run --json >"$WORK/json" || fail "close-tab --dry-run failed"
+[[ "$(count closed)" == 1 && "$(owned "$PARENT")" == "['e2e-child']" ]] || fail "a dry run should list one tab and close none"
+# Ownership survives a restart even though every token changes.
+t 15 "$COMUX" kill-server >/dev/null || fail "kill-server before the restart failed"
+for _ in $(seq 1 100); do [[ -S "$COPAD_MUX_SOCK" ]] || break; sleep 0.1; done
+"$COMUX" server >>"$WORK/server.log" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 100); do t 5 "$COMUX" health >/dev/null 2>&1 && break; sleep 0.1; done
+t 10 "$COMUX" list-tree --json >"$WORK/json" || fail "the restarted server does not answer"
+read -r NEWPARENT OWNER <<<"$(python3 -c '
+import json,sys
+tabs=[t for s in json.load(sys.stdin)["tree"] for t in s["tabs"]]
+p=[t for t in tabs if t["name"]=="e2e-parent"][0]["panes"][0]["token"]
+c=[t for t in tabs if t["name"]=="e2e-child"][0].get("owner","")
+print(p, c)' <"$WORK/json")"
+[[ -n "$NEWPARENT" && "$NEWPARENT" != "$PARENT" ]] || fail "the parent pane should come back with a new token"
+[[ "$OWNER" == "$NEWPARENT" ]] || fail "the child tab's owner should be the restored parent ($NEWPARENT), got '$OWNER'"
+rc=0; t 10 "$COMUX" list-tree --owner "$PARENT" >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 1 ]] || fail "the pre-restart token must not resolve, got $rc"
+t 10 "$COMUX" close-tab --owned-by "$NEWPARENT" --yes --json >"$WORK/json" || fail "close-tab --owned-by --yes failed"
+[[ "$(count closed)" == 1 && "$(owned "$NEWPARENT")" == "[]" ]] || fail "the owned tab should be gone"
+ok "spawn --owner, notify --to owner -> inbox (read, then acked), scoped cleanup, owner restored with the new token"
+
+echo "33. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"
