@@ -1529,6 +1529,9 @@ mod tests {
             cwd: None,
             name: None,
             no_focus: false,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
         }));
         assert!(ctl_mutates(&Req::Split {
             from: None,

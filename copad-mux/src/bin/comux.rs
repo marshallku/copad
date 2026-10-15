@@ -36,6 +36,7 @@ fn print_usage() {
          \x20 comux select-session <i>    switch to a session\n\
          \x20 comux kill-session [i]      kill a session (no index → picker)\n\
          \x20 comux new-tab               create a tab\n\
+         \x20 comux spawn -- <argv...>   run a command in a new background tab (--keep keeps a shell)\n\
          \x20 comux rename-tab [i] <name> rename the active tab (or by index; \"\" clears)\n\
          \x20 comux close-tab [i]         close a tab (no index → picker)\n\
          \x20 comux split -h|-v           split the focused pane\n\

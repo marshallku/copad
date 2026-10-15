@@ -334,14 +334,47 @@ impl PaneTerm {
         cwd: Option<PathBuf>,
         env: &[(String, String)],
     ) -> Result<Self, String> {
+        // Login shell so PATH / profile are set up as in a normal terminal.
+        let program = shell
+            .or_else(|| std::env::var("SHELL").ok())
+            .map(|sh| Shell::new(sh, vec!["-l".to_string()]));
+        Self::spawn_program(cols, rows, program, cwd, env)
+    }
+
+    /// Spawn `argv` as the pane's process instead of a shell. The pane ends when it exits.
+    pub fn spawn_argv(
+        cols: u16,
+        rows: u16,
+        argv: &[String],
+        cwd: Option<PathBuf>,
+        env: &[(String, String)],
+    ) -> Result<Self, String> {
+        let (prog, args) = argv
+            .split_first()
+            .ok_or_else(|| "nothing to run".to_string())?;
+        Self::spawn_program(
+            cols,
+            rows,
+            Some(Shell::new(prog.clone(), args.to_vec())),
+            cwd,
+            env,
+        )
+    }
+
+    fn spawn_program(
+        cols: u16,
+        rows: u16,
+        program: Option<Shell>,
+        cwd: Option<PathBuf>,
+        env: &[(String, String)],
+    ) -> Result<Self, String> {
         let cols = cols.max(1);
         let rows = rows.max(1);
 
-        let mut opts = TtyOptions::default();
-        if let Some(sh) = shell.or_else(|| std::env::var("SHELL").ok()) {
-            // Login shell so PATH / profile are set up as in a normal terminal.
-            opts.shell = Some(Shell::new(sh, vec!["-l".to_string()]));
-        }
+        let mut opts = TtyOptions {
+            shell: program,
+            ..TtyOptions::default()
+        };
         let spawn_cwd = cwd.clone();
         if let Some(dir) = cwd {
             opts.working_directory = Some(dir);

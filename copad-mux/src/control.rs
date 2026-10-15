@@ -98,6 +98,16 @@ pub enum Req {
         name: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         no_focus: bool,
+        /// `comux spawn`: run this argv as the tab's program instead of a bare shell. It runs
+        /// under the user's login shell (so PATH and profile apply) without ever being typed
+        /// into one, and the pane closes when it exits — unless `keep`, which leaves a shell.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        command: Vec<String>,
+        /// `KEY=VALUE` pairs added to the new pane's environment.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        keep: bool,
     },
     /// Make the tab at `index` (as printed by `list-tabs`) active.
     SelectTab {
@@ -343,6 +353,9 @@ pub const CAP_SEND_FLAGS: &str = "send-flags";
 /// `no_focus` and a `from` outside the active tab.
 pub const CAP_PLACEMENT: &str = "placement";
 
+/// Capability: `new-tab` honors `command`/`env`/`keep` (`comux spawn`).
+pub const CAP_SPAWN: &str = "spawn";
+
 /// Every capability this build's server implements (reported by `health`).
 pub const SERVER_CAPS: &[&str] = &[
     CAP_RENAME_CALLER,
@@ -350,6 +363,7 @@ pub const SERVER_CAPS: &[&str] = &[
     CAP_LIST_TREE,
     CAP_SEND_FLAGS,
     CAP_PLACEMENT,
+    CAP_SPAWN,
 ];
 
 /// The most `send --file` reads. A paste larger than this is a mistake (a binary, a log),
@@ -876,7 +890,7 @@ pub fn run_client(args: &[String]) -> i32 {
         }
         eprintln!(
             "usage: comux <list|split|resize|focus|close|send|capture-pane|wait-output|list-agents|wait-agent|\
-             list-tabs|new-tab|select-tab|\
+             list-tabs|new-tab|spawn|select-tab|\
              close-tab|rename-tab [index] <name>|list-sessions|new-session [name]|\
              rename-session [index] <name>|select-session|kill-session|\
              worktree <create|list|rm>|reload|health|kill-server> [args]"
@@ -978,6 +992,9 @@ pub fn run_client(args: &[String]) -> i32 {
                 cwd,
                 name: p.value("--name").map(str::to_string),
                 no_focus: p.has("--no-focus"),
+                command: Vec::new(),
+                env: Vec::new(),
+                keep: false,
             };
             // An older server ignores every field, so it would create the tab in front of the
             // user — exactly what these flags exist to prevent.
@@ -987,6 +1004,44 @@ pub fn run_client(args: &[String]) -> i32 {
                 return code;
             }
             req
+        }
+        "spawn" => {
+            let p = parsed!(SPAWN_SPEC);
+            if p.positionals.is_empty() {
+                return usage_error(json_out, "comux spawn: nothing to run", SPAWN_SPEC.usage);
+            }
+            let cwd = match p.value("--cwd").map(absolute_dir).transpose() {
+                Ok(c) => c,
+                Err(e) => return usage_error(json_out, &e, SPAWN_SPEC.usage),
+            };
+            let env: Vec<String> = p
+                .flags
+                .iter()
+                .filter(|(f, _)| *f == "--env")
+                .filter_map(|(_, v)| v.clone())
+                .collect();
+            if let Some(e) = env.iter().find_map(|kv| env_pair(kv).err()) {
+                return usage_error(json_out, &format!("comux spawn: {e}"), SPAWN_SPEC.usage);
+            }
+            if let Some(e) = p.positionals.iter().find_map(|a| spawn_arg(a).err()) {
+                return usage_error(json_out, &format!("comux spawn: {e}"), SPAWN_SPEC.usage);
+            }
+            // An older server ignores `command`, so it would answer with an ordinary shell
+            // tab and `ok` — a command reported as started that never ran.
+            if let Err(code) = require_cap(CAP_SPAWN, cmd, json_out) {
+                return code;
+            }
+            Req::NewTab {
+                session: p.value("--session").map(str::to_string),
+                from: caller_pane(),
+                cwd,
+                name: p.value("--name").map(str::to_string),
+                // A spawned worker never moves anyone's view.
+                no_focus: true,
+                command: p.positionals.clone(),
+                env,
+                keep: p.has("--keep"),
+            }
         }
         "list-sessions" | "sessions" => {
             parsed!(cliargs::bare("usage: comux list-sessions [--json]"));
@@ -1466,6 +1521,36 @@ fn caller_pane() -> Option<String> {
         .filter(|p| !p.is_empty())
 }
 
+/// Split one `--env` value into `(KEY, VALUE)`. The key must be a portable variable name, and
+/// comux's own `COPAD_MUX*` markers are refused: overriding them would make the pane lie about
+/// which server and which pane it is.
+pub fn env_pair(kv: &str) -> Result<(&str, &str), String> {
+    let (k, v) = kv
+        .split_once('=')
+        .ok_or_else(|| format!("--env '{kv}' is not KEY=VALUE"))?;
+    let portable = !k.is_empty()
+        && !k.starts_with(|c: char| c.is_ascii_digit())
+        && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !portable {
+        return Err(format!("--env: '{k}' is not a variable name"));
+    }
+    if k.starts_with("COPAD_MUX") {
+        return Err(format!("--env: {k} is comux's own and cannot be set"));
+    }
+    if v.contains('\0') {
+        return Err(format!("--env: {k}'s value contains a NUL byte"));
+    }
+    Ok((k, v))
+}
+
+/// One `spawn` argument: anything but a NUL, which no argv can carry.
+pub fn spawn_arg(a: &str) -> Result<(), String> {
+    if a.contains('\0') {
+        return Err("an argument contains a NUL byte".to_string());
+    }
+    Ok(())
+}
+
 /// `dir` as an absolute path, resolved against the CLI's own cwd (the server's is
 /// unrelated), and refused unless it is a directory.
 fn absolute_dir(dir: &str) -> Result<String, String> {
@@ -1648,6 +1733,20 @@ const NEW_TAB_SPEC: Spec = Spec {
         flag(&["--no-focus", "-d"]),
     ],
     positionals: Positionals::AtMost(0),
+};
+
+const SPAWN_SPEC: Spec = Spec {
+    usage: "usage: comux spawn [--session <s1|name:hub>] [--cwd DIR] [--name N] [--env K=V]... [--keep] [--json] -- <argv...>\n\
+            \x20      runs argv in a new tab without moving anyone's view (in --session, else beside\n\
+            \x20      the calling pane); the tab closes when it exits unless --keep leaves a shell",
+    flags: &[
+        opt(&["--session", "-s"]),
+        opt(&["--cwd", "-c"]),
+        opt(&["--name", "-n"]),
+        opt(&["--env", "-e"]),
+        flag(&["--keep", "-k"]),
+    ],
+    positionals: Positionals::Any,
 };
 
 const CAPTURE_SPEC: Spec = Spec {
@@ -2219,6 +2318,10 @@ fn print_human(req: &Req, resp: &Resp) {
                      (older build — `comux server restart` after upgrading)"
                 ),
             }
+        }
+        // `spawn` prints its pane like `split` does: the token is what the caller came for.
+        Req::NewTab { command, .. } if !command.is_empty() => {
+            println!("{}", resp.pane.as_deref().unwrap_or_default());
         }
         Req::ListTree { .. } => {
             for s in resp.tree.as_deref().unwrap_or_default() {
@@ -2805,6 +2908,7 @@ mod verb_args_tests {
         "kill-server",
         "list-tabs",
         "new-tab",
+        "spawn",
         "list-sessions",
         "list-agents",
         "rename-session",
@@ -2870,6 +2974,34 @@ mod verb_args_tests {
         assert_eq!(exit(&["machines", "extra"]), 2);
         assert_eq!(exit(&["list-agents", "--fleet", "--help"]), 0);
         assert_eq!(exit(&["list-agents", "--fleet", "extra"]), 2);
+    }
+
+    #[test]
+    fn spawn_refuses_bad_input_before_any_request() {
+        assert_eq!(exit(&["spawn"]), 2, "nothing to run");
+        assert_eq!(exit(&["spawn", "--env", "NOEQ", "--", "true"]), 2);
+        assert_eq!(
+            exit(&["spawn", "--env", "COPAD_MUX_SOCK=x", "--", "true"]),
+            2
+        );
+        assert_eq!(exit(&["spawn", "--cwd", "/no/such/dir", "--", "true"]), 2);
+        assert_eq!(exit(&["spawn", "--keep", "--help"]), 0);
+    }
+
+    #[test]
+    fn env_pairs_are_portable_names_and_never_comux_markers() {
+        assert_eq!(env_pair("A_1=x=y"), Ok(("A_1", "x=y")));
+        assert_eq!(env_pair("EMPTY="), Ok(("EMPTY", "")));
+        for bad in [
+            "noequals",
+            "=v",
+            "1A=v",
+            "A-B=v",
+            "COPAD_MUX=1",
+            "COPAD_MUX_PANE=p",
+        ] {
+            assert!(env_pair(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

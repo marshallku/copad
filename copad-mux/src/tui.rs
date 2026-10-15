@@ -1452,20 +1452,27 @@ impl App {
         // Inherit the current pane's cwd into the new tab's shell (tmux-style).
         let cwd = self.focused_cwd();
         let ws = self.ws.clone();
-        self.new_tab_in(&ws, cwd, true)
+        self.new_tab_in(
+            &ws,
+            TabLaunch {
+                cwd,
+                activate: true,
+                ..TabLaunch::default()
+            },
+        )
     }
 
-    /// Create a tab in `ws` whose shell starts in `cwd`, returning its terminal. `activate`
-    /// makes it `ws`'s active tab; without it nothing anyone is looking at moves. A tab in
-    /// the attached session runs under this client's lease, one anywhere else under the
-    /// API's. Rolls the tab back and toasts if the PTY can't spawn, so state never holds a
-    /// tab with no live terminal.
-    fn new_tab_in(
-        &mut self,
-        ws: &WorkspaceId,
-        cwd: Option<PathBuf>,
-        activate: bool,
-    ) -> Option<TerminalId> {
+    /// Create a tab in `ws` running what `launch` says, returning its terminal. A tab in the
+    /// attached session runs under this client's lease, one anywhere else under the API's.
+    /// Rolls the tab back and toasts if the PTY can't spawn, so state never holds a tab with
+    /// no live terminal.
+    fn new_tab_in(&mut self, ws: &WorkspaceId, launch: TabLaunch) -> Option<TerminalId> {
+        let TabLaunch {
+            cwd,
+            activate,
+            argv,
+            env,
+        } = launch;
         // Creating a tab makes it active, so it is a view transition like any other. Missing
         // it left a hole that survived a round trip: create a tab and close it again while a
         // divider is held, and every identity check passes on the way back.
@@ -1488,14 +1495,14 @@ impl App {
             }
         }
         let (tab_id, term) = created?;
-        let pane_env = self.pane_env();
-        let made = match PaneTerm::spawn_with_env(
-            self.cols.max(1),
-            self.rows.max(1),
-            None,
-            cwd,
-            &pane_env,
-        ) {
+        let mut pane_env = self.pane_env();
+        pane_env.extend(env);
+        let (cols, rows) = (self.cols.max(1), self.rows.max(1));
+        let spawned = match &argv {
+            Some(argv) => PaneTerm::spawn_argv(cols, rows, argv, cwd, &pane_env),
+            None => PaneTerm::spawn_with_env(cols, rows, None, cwd, &pane_env),
+        };
+        let made = match spawned {
             Ok(pt) => {
                 self.panes.insert(term.clone(), pt);
                 Some(term)
@@ -2664,7 +2671,23 @@ impl App {
                 cwd,
                 name,
                 no_focus,
+                command,
+                env,
+                keep,
             } => {
+                // Validate a spawn before anything is created: a refusal must leave no tab.
+                let mut extra_env = Vec::with_capacity(env.len());
+                for kv in env {
+                    match control::env_pair(kv) {
+                        Ok((k, v)) => extra_env.push((k.to_string(), v.to_string())),
+                        Err(e) => return Resp::err_code("invalid", e),
+                    }
+                }
+                if let Some(e) = command.iter().find_map(|a| control::spawn_arg(a).err()) {
+                    return Resp::err_code("invalid", e);
+                }
+                let argv = (!command.is_empty())
+                    .then(|| spawn_argv(std::env::var("SHELL").ok().as_deref(), command, *keep));
                 let caller = from
                     .as_deref()
                     .and_then(|t| self.resolve_pane_token(t))
@@ -2692,7 +2715,13 @@ impl App {
                     },
                 };
                 self.clear_spawn_error();
-                let Some(term) = self.new_tab_in(&ws, cwd, activate) else {
+                let launch = TabLaunch {
+                    cwd,
+                    activate,
+                    argv,
+                    env: extra_env,
+                };
+                let Some(term) = self.new_tab_in(&ws, launch) else {
                     return Resp::err_code("spawn_failed", self.take_spawn_error("new-tab"));
                 };
                 if let Some(n) = name.as_deref().map(str::trim).filter(|n| !n.is_empty())
@@ -4551,7 +4580,12 @@ impl App {
         let prev = self.ws.clone();
         let target = self.resume_target_space(cwd.as_deref());
         self.switch_session(target.clone());
-        match self.new_tab_in(&target, cwd.clone(), true) {
+        let launch = TabLaunch {
+            cwd: cwd.clone(),
+            activate: true,
+            ..TabLaunch::default()
+        };
+        match self.new_tab_in(&target, launch) {
             Some(term) => {
                 if let Some(pt) = self.panes.get(&term) {
                     pt.input(format!("{line}\n").as_bytes());
@@ -7987,6 +8021,57 @@ fn spawn_layout(
     }
 }
 
+/// What a new tab runs, and where. The default is a login shell in the server's cwd, created
+/// behind the active tab.
+#[derive(Default)]
+struct TabLaunch {
+    cwd: Option<PathBuf>,
+    /// Make it its session's active tab.
+    activate: bool,
+    /// Run this argv as the pane's process instead of a login shell (see [`spawn_argv`]).
+    argv: Option<Vec<String>>,
+    /// Added to the pane's environment, after (so over) the usual pane variables.
+    env: Vec<(String, String)>,
+}
+
+/// The argv a `comux spawn` pane actually runs: `argv` handed to the user's login shell as
+/// POSITIONAL parameters — `$SHELL -l -i -c 'exec "$@"' comux-spawn <argv…>` — so PATH and
+/// profile apply exactly as in a normal pane, yet nothing is ever typed into a shell: no
+/// quoting, no line editor, no startup race that could eat or mangle the command.
+///
+/// `exec` makes the program the pane's process, so the pane ends when it does. `keep`
+/// instead runs it as a child and then becomes an interactive login shell, leaving the output
+/// (or the error) on screen. `-i` keeps an interrupted program from taking that shell down
+/// with it, and sources the same rc files a pane's shell does.
+///
+/// The `"$@"` script is POSIX; a shell that is not (fish, nu, …) is replaced by `/bin/sh` as
+/// the wrapper — the program still gets its argv verbatim, but that shell's own profile does
+/// not apply.
+fn spawn_argv(shell: Option<&str>, argv: &[String], keep: bool) -> Vec<String> {
+    const POSIX: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "mksh", "yash"];
+    let posix = shell.filter(|sh| {
+        Path::new(sh)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| POSIX.contains(&n))
+    });
+    let (wrapper, flags): (&str, &[&str]) = match posix {
+        Some(sh) => (sh, &["-l", "-i", "-c"]),
+        None => ("/bin/sh", &["-l", "-c"]),
+    };
+    let script = if keep {
+        r#""$@"; exec "${SHELL:-/bin/sh}" -l"#
+    } else {
+        r#"exec "$@""#
+    };
+    let mut out = vec![wrapper.to_string()];
+    out.extend(flags.iter().map(|f| f.to_string()));
+    out.push(script.to_string());
+    out.push("comux-spawn".to_string());
+    out.extend(argv.iter().cloned());
+    out
+}
+
 /// Build a shell command line from a saved argv by POSIX single-quoting each argument, so
 /// argument boundaries + any metacharacters/newlines are preserved literally (the shell
 /// runs exactly this argv, never re-splitting a quoted arg into extra commands). Returns
@@ -10044,6 +10129,9 @@ mod placement {
             cwd: None,
             name: Some("bg".into()),
             no_focus,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
         }
     }
 
@@ -10100,6 +10188,71 @@ mod placement {
         // The legacy shape still selects the new tab.
         assert!(app.handle_control(&new_tab(None, false)).ok);
         assert_ne!(view(&app).1[0].1, before[0].1);
+    }
+
+    #[test]
+    fn a_spawn_runs_in_the_background_and_a_bad_one_creates_nothing() {
+        let mut app = app();
+        let (ws, before) = view(&app);
+        let spawn = |command: &[&str], env: &[&str]| Req::NewTab {
+            session: None,
+            from: None,
+            cwd: None,
+            name: None,
+            no_focus: true,
+            command: command.iter().map(|s| s.to_string()).collect(),
+            env: env.iter().map(|s| s.to_string()).collect(),
+            keep: false,
+        };
+        let r = app.handle_control(&spawn(&["sleep", "30"], &["FOO=bar"]));
+        assert!(r.ok, "{:?}", r.error);
+        assert!(r.pane.is_some_and(|p| !p.is_empty()));
+        let (ws_after, after) = view(&app);
+        assert_eq!(
+            (ws.clone(), before[0].1.clone()),
+            (ws_after, after[0].1.clone())
+        );
+        assert_eq!(after[0].2, 2);
+
+        for bad in [
+            spawn(&["true"], &["COPAD_MUX_PANE=x"]),
+            spawn(&["true"], &["1X=y"]),
+            spawn(&["a\0b"], &[]),
+        ] {
+            assert_eq!(app.handle_control(&bad).code.as_deref(), Some("invalid"));
+        }
+        assert_eq!(view(&app).1[0].2, 2, "a refused spawn creates no tab");
+    }
+
+    #[test]
+    fn spawn_argv_hands_the_argv_to_a_login_shell_verbatim() {
+        let argv: Vec<String> = ["echo", "a b", "$HOME", "it's"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            spawn_argv(Some("/bin/zsh"), &argv, false),
+            [
+                "/bin/zsh",
+                "-l",
+                "-i",
+                "-c",
+                r#"exec "$@""#,
+                "comux-spawn",
+                "echo",
+                "a b",
+                "$HOME",
+                "it's"
+            ]
+        );
+        let keep = spawn_argv(Some("/usr/bin/fish"), &argv, true);
+        assert_eq!(
+            keep[..3],
+            ["/bin/sh", "-l", "-c"],
+            "a non-POSIX shell is not the wrapper"
+        );
+        assert!(keep[3].starts_with(r#""$@"; exec"#), "{keep:?}");
+        assert_eq!(spawn_argv(None, &argv, false)[0], "/bin/sh");
     }
 
     #[test]

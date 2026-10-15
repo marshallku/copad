@@ -42,6 +42,7 @@
 #  27. wait-agent --after-seq only matches a NEWER status change; wait verbs answer in JSON
 #  28. send --enter / --paste (bracketed only when the program asked) / --file
 #  29. new-tab --session / --no-focus and split --from a background pane move nobody's view
+#  30. spawn runs argv verbatim in a background tab; it closes on exit unless --keep
 
 set -euo pipefail
 
@@ -1687,7 +1688,45 @@ rc=0; t 10 "$COMUX" new-tab --cwd "$WORK/nope" >/dev/null 2>&1 || rc=$?
 t 12 "$COMUX" kill-session "$sp" >/dev/null || fail "placement cleanup failed"
 ok "new-tab --session/--no-focus and a background split leave every view alone; --cwd honored"
 
-echo "30. the server is still responsive and shuts down cleanly"
+echo "30. spawn: argv verbatim, in the background, gone on exit unless --keep"
+t 10 "$COMUX" new-session spawntest --json >"$WORK/json" || fail "could not create the spawn session"
+sp="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["session"]["id"])' <"$WORK/json")"
+P0="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+t 10 "$COMUX" select-session 0 >/dev/null
+v0="$(view)"
+tabs_in() { t 10 "$COMUX" list-tabs --session "$sp" --json | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["tabs"]))'; }
+# Arguments a shell would mangle if the command were ever typed into one.
+t 10 "$COMUX" spawn --session "$sp" --name worker --env SPAWN_FOO=bar --json -- \
+    sh -c 'printf "<%s>" "$@"; echo; echo "ENV-$SPAWN_FOO"; sleep 60' x 'a b' '$HOME' "it's" >"$WORK/json" \
+    || fail "spawn failed: $(cat "$WORK/json")"
+python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["session"]["id"]=="'"$sp"'" and d["tab"]["name"]=="worker", d' <"$WORK/json" \
+    || fail "spawn did not land where asked: $(cat "$WORK/json")"
+W="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+t 15 "$COMUX" wait-output "$W" "ENV-bar" --timeout 15 >/dev/null || fail "the spawned program never ran: $(t 10 "$COMUX" capture-pane "$W")"
+t 10 "$COMUX" capture-pane "$W" | grep -qF "<a b><\$HOME><it's>" \
+    || fail "spawn did not pass argv verbatim: $(t 10 "$COMUX" capture-pane "$W")"
+[[ "$(view)" == "$v0" ]] || fail "spawn moved a view: $v0 -> $(view)"
+[[ "$(tabs_in)" == 2 ]] || fail "spawntest should have 2 tabs"
+# Without --session it lands beside the caller; and a program that exits takes its tab along.
+COPAD_MUX_PANE="$P0" t 10 "$COMUX" spawn -- sh -c 'sleep 1' >"$WORK/out" || fail "spawn beside the caller failed"
+grep -q -- "-" "$WORK/out" || fail "plain spawn should print the pane token: $(cat "$WORK/out")"
+[[ "$(tabs_in)" == 3 ]] || fail "a caller-relative spawn did not land in the caller's session"
+for _ in $(seq 1 40); do [[ "$(tabs_in)" == 2 ]] && break; sleep 0.25; done
+[[ "$(tabs_in)" == 2 ]] || fail "a spawned program exited but its tab stayed"
+# --keep leaves a shell behind, which still takes input.
+t 10 "$COMUX" spawn --session "$sp" --keep --json -- sh -c 'echo KEPT-$((1+1))' >"$WORK/json" || fail "spawn --keep failed"
+K="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+t 15 "$COMUX" wait-output "$K" "KEPT-2" --timeout 15 >/dev/null || fail "the --keep program never ran"
+sleep 1
+t 10 "$COMUX" send "$K" --enter -- 'echo SHELL-$((2+3))' >/dev/null || fail "the --keep pane is gone"
+t 15 "$COMUX" wait-output "$K" "SHELL-5" --timeout 15 >/dev/null || fail "--keep left no working shell: $(t 10 "$COMUX" capture-pane "$K")"
+[[ "$(view)" == "$v0" ]] || fail "spawn --keep moved a view"
+rc=0; t 10 "$COMUX" spawn --env COPAD_MUX_PANE=x -- true >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 2 ]] || fail "spawn --env COPAD_MUX_PANE=… should be refused with 2, got $rc"
+t 12 "$COMUX" kill-session "$sp" >/dev/null || fail "spawn cleanup failed"
+ok "argv arrives verbatim with --env; no view moves; the tab closes on exit, or keeps a working shell with --keep"
+
+echo "31. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

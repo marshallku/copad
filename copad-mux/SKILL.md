@@ -101,6 +101,19 @@ comux send <new-token> "make build"
 comux send <new-token> $'\n'
 ```
 
+To run ONE program in its own tab rather than in a shell you type into, `spawn` it:
+
+```bash
+pane=$(comux spawn --name tests -- cargo test --workspace)
+comux spawn --keep --env RUST_LOG=debug -- ./run-server.sh   # keep a shell when it exits
+```
+
+The argv reaches the program exactly as given — nothing is typed into a shell, so there is
+nothing to quote — under your login shell's PATH. The tab goes in your own session (or
+`--session S`) and never moves the user's view. It CLOSES when the program exits, taking the
+output with it; pass `--keep` when you will want to read the result, or when a failure to
+start would otherwise vanish.
+
 `send` writes raw bytes: it does not escape anything and it does not press Enter for you.
 `--enter` presses it after the text; `--paste` sends a multi-line prompt as ONE paste (bracketed
 when the program enabled that, as agent TUIs do); `--file PATH` sends a file's contents.
