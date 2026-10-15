@@ -61,6 +61,14 @@ pub enum Command {
         client: ClientId,
         pane: PaneId,
     },
+    /// Focus `pane` within ITS OWN tab, in any tab of `workspace`, without changing which
+    /// tab is active — the control API's `focus` for a caller in a background tab. A mutation
+    /// like any other, so it is authorized like one rather than by the controller lease.
+    FocusPaneIn {
+        origin: Origin,
+        workspace: WorkspaceId,
+        pane: PaneId,
+    },
     /// Split a pane. Client origin must be the controller; `if_rev` (if set)
     /// must equal the target tab's rev or the split is rejected as stale (M2).
     SplitPane {
@@ -510,6 +518,11 @@ impl State {
                 Ok(vec![]) // accepted; bytes flow to the PTY outside the pure model
             }
             Command::FocusPane { client, pane } => self.focus(client, pane),
+            Command::FocusPaneIn {
+                origin,
+                workspace,
+                pane,
+            } => self.focus_in(origin, workspace, pane),
             Command::SplitPane {
                 origin,
                 workspace,
@@ -782,6 +795,33 @@ impl State {
         Ok(vec![Event::Focused {
             workspace: ws_id,
             tab: active,
+            pane,
+            tab_rev,
+        }])
+    }
+
+    fn focus_in(
+        &mut self,
+        origin: Origin,
+        workspace: WorkspaceId,
+        pane: PaneId,
+    ) -> Result<Vec<Event>, MuxError> {
+        self.authorize_mutation(&origin, &workspace)?;
+        let idx = self.ws_index(&workspace)?;
+        let tab_id = self.workspaces[idx]
+            .tab_of_pane(&pane)
+            .map(|t| t.id.clone())
+            .ok_or(MuxError::NoSuchPane)?;
+        let tab = self.workspaces[idx].tab_mut(&tab_id).unwrap();
+        if tab.focused == pane {
+            return Ok(vec![]);
+        }
+        tab.focused = pane.clone();
+        tab.rev += 1;
+        let tab_rev = tab.rev;
+        Ok(vec![Event::Focused {
+            workspace,
+            tab: tab_id,
             pane,
             tab_rev,
         }])
@@ -1952,6 +1992,67 @@ mod tests {
         assert_eq!(w.tabs.len(), 2);
         assert_eq!(w.active_tab, before, "the view did not move");
         assert_ne!(&w.active_tab, tab);
+        assert!(s.check_tree_consistency());
+    }
+
+    #[test]
+    fn focus_in_moves_a_background_tabs_focus_and_nothing_else() {
+        let (mut s, ws, p0) = seed();
+        let first = s.workspace(&ws).unwrap().active_tab.clone();
+        let ev = s
+            .apply(Command::NewTab {
+                origin: Origin::Api,
+                workspace: ws.clone(),
+                activate: false,
+            })
+            .unwrap();
+        let Event::TabCreated { tab, .. } = &ev[0] else {
+            panic!("first event must be TabCreated")
+        };
+        let bg = tab.clone();
+        let left = s.workspace(&ws).unwrap().tab(&bg).unwrap().focused.clone();
+        let ev = s
+            .apply(Command::SplitPane {
+                origin: Origin::Api,
+                workspace: ws.clone(),
+                pane: left.clone(),
+                dir: Dir::Right,
+                if_rev: None,
+            })
+            .unwrap();
+        let Some(Event::PaneSplit { new_pane, .. }) = ev.first() else {
+            panic!("first event must be PaneSplit")
+        };
+        let right = new_pane.clone();
+        s.apply(Command::FocusPaneIn {
+            origin: Origin::Api,
+            workspace: ws.clone(),
+            pane: left.clone(),
+        })
+        .unwrap();
+        let w = s.workspace(&ws).unwrap();
+        assert_eq!(w.tab(&bg).unwrap().focused, left);
+        assert_eq!(w.active_tab, first, "the view did not move");
+        assert_eq!(w.tab(&first).unwrap().focused, p0);
+        assert!(
+            s.apply(Command::FocusPaneIn {
+                origin: Origin::Api,
+                workspace: ws.clone(),
+                pane: left.clone(),
+            })
+            .unwrap()
+            .is_empty(),
+            "refocusing the focused pane is a no-op"
+        );
+        // An unattached client may not reach in.
+        assert!(
+            s.apply(Command::FocusPaneIn {
+                origin: Origin::Client(ClientId(9)),
+                workspace: ws.clone(),
+                pane: right,
+            })
+            .is_err()
+        );
         assert!(s.check_tree_consistency());
     }
 

@@ -19,8 +19,14 @@ use crate::picker;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum Req {
-    /// List panes of the active tab.
-    List,
+    /// List panes of the active tab, or of the caller's tab (see `caller`).
+    List {
+        /// The CALLER's pane token. An index then counts in the caller's tab, wherever it is,
+        /// instead of the tab on screen — so `list` and the index verbs agree for an agent in a
+        /// background tab. Absent = the active tab, as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<String>,
+    },
     /// Split a pane. `dir` = `"right"` (side by side) | `"down"` (stacked).
     ///
     /// `from` names the pane to split, by TOKEN, in any tab of any session. Without it
@@ -41,11 +47,33 @@ pub enum Req {
     },
     /// Grow the pane at `index` toward `dir` (`left`/`right`/`up`/`down`) by nudging
     /// its split divider.
-    ResizePane { index: usize, dir: String },
+    ResizePane {
+        index: usize,
+        dir: String,
+        /// The CALLER's pane token. An index then counts in the caller's tab, wherever it is,
+        /// instead of the tab on screen — so `list` and the index verbs agree for an agent in a
+        /// background tab. Absent = the active tab, as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<String>,
+    },
     /// Focus the pane at `index` (as printed by `list`).
-    Focus { index: usize },
+    Focus {
+        index: usize,
+        /// The CALLER's pane token. An index then counts in the caller's tab, wherever it is,
+        /// instead of the tab on screen — so `list` and the index verbs agree for an agent in a
+        /// background tab. Absent = the active tab, as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<String>,
+    },
     /// Close the pane at `index`.
-    Close { index: usize },
+    Close {
+        index: usize,
+        /// The CALLER's pane token. An index then counts in the caller's tab, wherever it is,
+        /// instead of the tab on screen — so `list` and the index verbs agree for an agent in a
+        /// background tab. Absent = the active tab, as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<String>,
+    },
     /// Inject `text` as input bytes into a pane (like `tmux send-keys`).
     ///
     /// `target` is a pane TOKEN and resolves anywhere in the mux; `index` is a position in
@@ -71,6 +99,11 @@ pub enum Req {
         /// Press Enter after the text.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         enter: bool,
+        /// The CALLER's pane token. An index then counts in the caller's tab, wherever it is,
+        /// instead of the tab on screen — so `list` and the index verbs agree for an agent in a
+        /// background tab. Absent = the active tab, as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<String>,
     },
     /// List a session's tabs — the active one, or `session` (a selector).
     ListTabs {
@@ -261,6 +294,11 @@ pub enum Req {
         index: Option<usize>,
         #[serde(default)]
         lines: Option<usize>,
+        /// The CALLER's pane token. An index then counts in the caller's tab, wherever it is,
+        /// instead of the tab on screen — so `list` and the index verbs agree for an agent in a
+        /// background tab. Absent = the active tab, as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<String>,
     },
     /// List AI-agent panes across every session (what the sidebar's `agents` half and the
     /// `Ctrl-f` switcher already show), optionally narrowed to one pane.
@@ -356,6 +394,9 @@ pub const CAP_PLACEMENT: &str = "placement";
 /// Capability: `new-tab` honors `command`/`env`/`keep` (`comux spawn`).
 pub const CAP_SPAWN: &str = "spawn";
 
+/// Capability: the index verbs honor `caller` — an index counts in the caller's tab.
+pub const CAP_CALLER_INDEX: &str = "caller-index";
+
 /// Every capability this build's server implements (reported by `health`).
 pub const SERVER_CAPS: &[&str] = &[
     CAP_RENAME_CALLER,
@@ -364,6 +405,7 @@ pub const SERVER_CAPS: &[&str] = &[
     CAP_SEND_FLAGS,
     CAP_PLACEMENT,
     CAP_SPAWN,
+    CAP_CALLER_INDEX,
 ];
 
 /// The most `send --file` reads. A paste larger than this is a mistake (a binary, a log),
@@ -975,8 +1017,11 @@ pub fn run_client(args: &[String]) -> i32 {
 
     let req = match cmd {
         "list" => {
-            parsed!(cliargs::bare("usage: comux list [--json]"));
-            Req::List
+            let p = parsed!(LIST_SPEC);
+            match index_caller(p.has("--active"), cmd, json_out) {
+                Ok(caller) => Req::List { caller },
+                Err(code) => return code,
+            }
         }
         "health" => {
             parsed!(cliargs::bare("usage: comux health [--json]"));
@@ -1222,15 +1267,29 @@ pub fn run_client(args: &[String]) -> i32 {
             } else {
                 Target::PaneClose
             };
-            let idx = match pick_verb(&rest, json_out, target) {
-                Ok((Some(i), _)) => i,
-                Ok((None, _)) => unreachable!("pane verbs take no selector"),
+            let spec = Spec {
+                usage: target.usage(),
+                flags: ACTIVE_FLAG,
+                positionals: Positionals::AtMost(1),
+            };
+            let p = parsed!(spec);
+            let caller = match index_caller(p.has("--active"), cmd, json_out) {
+                Ok(c) => c,
+                Err(code) => return code,
+            };
+            let index = match pick_index(
+                p.positionals.first().map(|s| s.as_str()),
+                json_out,
+                target,
+                caller.as_deref(),
+            ) {
+                Ok(i) => i,
                 Err(code) => return code,
             };
             if cmd == "focus" {
-                Req::Focus { index: idx }
+                Req::Focus { index, caller }
             } else {
-                Req::Close { index: idx }
+                Req::Close { index, caller }
             }
         }
         "capture-pane" | "capture" => {
@@ -1267,10 +1326,19 @@ pub fn run_client(args: &[String]) -> i32 {
                     CAPTURE_USAGE,
                 );
             }
+            // Only an index is counted in a tab; a target names its pane anywhere.
+            let caller = match index {
+                Some(_) => match index_caller(p.has("--active"), cmd, json_out) {
+                    Ok(c) => c,
+                    Err(code) => return code,
+                },
+                None => None,
+            };
             Req::CapturePane {
                 target,
                 index,
                 lines,
+                caller,
             }
         }
         "jump" => {
@@ -1317,9 +1385,14 @@ pub fn run_client(args: &[String]) -> i32 {
                     RESIZE_SPEC.usage,
                 );
             };
+            let caller = match index_caller(p.has("--active"), cmd, json_out) {
+                Ok(c) => c,
+                Err(code) => return code,
+            };
             Req::ResizePane {
                 index: idx,
                 dir: dir.clone(),
+                caller,
             }
         }
         "send" | "send-keys" => {
@@ -1360,12 +1433,20 @@ pub fn run_client(args: &[String]) -> i32 {
             {
                 return code;
             }
+            let caller = match index {
+                Some(_) => match index_caller(p.has("--active"), cmd, json_out) {
+                    Ok(c) => c,
+                    Err(code) => return code,
+                },
+                None => None,
+            };
             Req::SendKeys {
                 target,
                 index,
                 text,
                 paste,
                 enter,
+                caller,
             }
         }
         other => {
@@ -1545,6 +1626,21 @@ fn caller_pane() -> Option<String> {
         .filter(|p| !p.is_empty())
 }
 
+/// The pane an index is counted from: the one this command runs in, unless `--active` asks
+/// for the tab on screen. Outside a pane there is no caller and the active tab is used, as
+/// before. An older server would silently count in the active tab instead — a different
+/// pane than `list` showed — so the capability is checked first.
+fn index_caller(active: bool, verb: &str, json: bool) -> Result<Option<String>, i32> {
+    if active {
+        return Ok(None);
+    }
+    let Some(token) = caller_pane() else {
+        return Ok(None);
+    };
+    require_cap(CAP_CALLER_INDEX, verb, json)?;
+    Ok(Some(token))
+}
+
 /// Split one `--env` value into `(KEY, VALUE)`. The key must be a portable variable name, and
 /// comux's own `COPAD_MUX*` markers are refused: overriding them would make the pane lie about
 /// which server and which pane it is.
@@ -1667,7 +1763,7 @@ fn pick_verb(
             require_cap(CAP_SELECTORS, verb, json)?;
             Ok((None, Some(a.clone())))
         }
-        a => pick_index(a.map(|s| s.as_str()), json, target).map(|i| (Some(i), None)),
+        a => pick_index(a.map(|s| s.as_str()), json, target, None).map(|i| (Some(i), None)),
     }
 }
 
@@ -1783,7 +1879,11 @@ const SPAWN_SPEC: Spec = Spec {
 
 const CAPTURE_SPEC: Spec = Spec {
     usage: CAPTURE_USAGE,
-    flags: &[opt(&["-S", "--lines"]), opt(&["--index"])],
+    flags: &[
+        opt(&["-S", "--lines"]),
+        opt(&["--index"]),
+        flag(&["--active"]),
+    ],
     positionals: Positionals::AtMost(1),
 };
 
@@ -1801,15 +1901,30 @@ const NOTIFY_SPEC: Spec = Spec {
     positionals: Positionals::Any,
 };
 
+/// `--active`: count an index in the tab on screen rather than the caller's.
+const ACTIVE_FLAG: &[cliargs::Flag] = &[flag(&["--active"])];
+
+const LIST_SPEC: Spec = Spec {
+    usage: "usage: comux list [--active] [--json]\n\
+            inside a pane it lists YOUR tab; --active lists the tab on screen",
+    flags: &[flag(&["--active"])],
+    positionals: Positionals::AtMost(0),
+};
+
 const RESIZE_SPEC: Spec = Spec {
-    usage: "usage: comux resize <index> <left|right|up|down>",
-    flags: &[],
+    usage: "usage: comux resize <index> <left|right|up|down> [--active]",
+    flags: &[flag(&["--active"])],
     positionals: Positionals::AtMost(2),
 };
 
 const SEND_SPEC: Spec = Spec {
     usage: SEND_USAGE,
-    flags: &[flag(&["--enter"]), flag(&["--paste"]), opt(&["--file"])],
+    flags: &[
+        flag(&["--enter"]),
+        flag(&["--paste"]),
+        opt(&["--file"]),
+        flag(&["--active"]),
+    ],
     positionals: Positionals::Any,
 };
 
@@ -1933,8 +2048,8 @@ impl Target {
             Target::SessionKill => "comux kill-session [index|s1|name:hub]   (none → fuzzy picker)",
             Target::Tab => "comux select-tab [index|s1:t0|hub/build]   (none → fuzzy picker)",
             Target::TabClose => "comux close-tab [index|s1:t0|hub/build]   (none → fuzzy picker)",
-            Target::PaneFocus => "comux focus [index]   (no index → fuzzy picker)",
-            Target::PaneClose => "comux close [index]   (no index → fuzzy picker)",
+            Target::PaneFocus => "comux focus [index] [--active]   (no index → fuzzy picker)",
+            Target::PaneClose => "comux close [index] [--active]   (no index → fuzzy picker)",
         }
     }
 
@@ -1972,7 +2087,7 @@ impl Target {
     /// last tab, the last session) — unlike `pick_worktree`, where hiding still leaves
     /// candidates. Here the refusable row is typically the only one, so hiding it would
     /// report an empty picker in place of the server's error, which names the reason.
-    fn rows(self) -> Result<Vec<(picker::Item, usize)>, i32> {
+    fn rows(self, caller: Option<&str>) -> Result<Vec<(picker::Item, usize)>, i32> {
         match self {
             Target::Session | Target::SessionKill => {
                 let sessions = query(&Req::ListSessions)?.sessions.unwrap_or_default();
@@ -2025,7 +2140,11 @@ impl Target {
                     .collect())
             }
             Target::PaneFocus | Target::PaneClose => {
-                let panes = query(&Req::List)?.panes.unwrap_or_default();
+                let panes = query(&Req::List {
+                    caller: caller.map(str::to_string),
+                })?
+                .panes
+                .unwrap_or_default();
                 Ok(panes
                     .iter()
                     .map(|p| {
@@ -2055,7 +2174,13 @@ impl Target {
 /// Resolve an index argument: parse it when one was given, otherwise fuzzy-pick from
 /// the server's live listing. `Err` carries the process exit code (2 usage · 1 failure ·
 /// [`EXIT_CANCELLED`] when the user aborted the picker).
-fn pick_index(arg: Option<&str>, json: bool, target: Target) -> Result<usize, i32> {
+/// `caller` scopes a pane listing to the caller's tab, as the index it returns will be.
+fn pick_index(
+    arg: Option<&str>,
+    json: bool,
+    target: Target,
+    caller: Option<&str>,
+) -> Result<usize, i32> {
     if let Some(a) = arg {
         return a.parse::<usize>().map_err(|_| {
             usage_error(
@@ -2066,7 +2191,7 @@ fn pick_index(arg: Option<&str>, json: bool, target: Target) -> Result<usize, i3
         });
     }
     prompt_ok(json, target.usage())?;
-    let rows = target.rows()?;
+    let rows = target.rows(caller)?;
     choose(target.title(), target.empty(), rows)
 }
 
@@ -2416,7 +2541,7 @@ fn print_human(req: &Req, resp: &Resp) {
                 );
             }
         }
-        Req::List => {
+        Req::List { .. } => {
             let panes = resp.panes.clone().unwrap_or_default();
             let focused = resp.focused.unwrap_or(usize::MAX);
             println!(
@@ -3237,7 +3362,9 @@ mod capture_proto_tests {
                 target,
                 index,
                 lines,
+                caller,
             } => {
+                assert_eq!(caller, None);
                 assert_eq!(target, None);
                 assert_eq!(index, None);
                 assert_eq!(lines, None);
@@ -3252,6 +3379,7 @@ mod capture_proto_tests {
             target: Some("ab12-3".into()),
             index: None,
             lines: Some(500),
+            caller: None,
         };
         let line = serde_json::to_string(&req).unwrap();
         assert!(
@@ -3320,7 +3448,7 @@ const EXIT_TIMEOUT: i32 = 124;
 const MIN_INTERVAL: Duration = Duration::from_millis(50);
 
 const WAIT_USAGE: &str = "usage: comux wait-output [<pane-token|terminal-id>] <pattern>\n\
-     \x20      [--index N] [--timeout S] [--lines N] [--interval MS]\n\
+     \x20      [--index N [--active]] [--timeout S] [--lines N] [--interval MS]\n\
      \n\
      BEST-EFFORT. It matches the pane's CURRENT text — including text that was already\n\
      there before the call — and a match can be ERASED between polls by a \\r overwrite,\n\
@@ -3342,6 +3470,9 @@ const WAIT_USAGE: &str = "usage: comux wait-output [<pane-token|terminal-id>] <p
 struct WaitArgs {
     target: Option<String>,
     index: Option<usize>,
+    /// The pane `--index` counts from (see [`index_caller`]); checked against the server's
+    /// capabilities inside the wait's deadline, not before it.
+    caller: Option<String>,
     pattern: String,
     /// `None` = wait forever (`--timeout 0`).
     timeout: Option<Duration>,
@@ -3363,6 +3494,7 @@ fn last_match<'a>(text: &'a str, pattern: &str) -> Option<&'a str> {
 fn parse_wait_args(rest: &[&String]) -> Result<WaitArgs, i32> {
     let mut target: Option<String> = None;
     let mut index: Option<usize> = None;
+    let mut active = false;
     let mut positional: Vec<String> = Vec::new();
     let mut timeout_secs: u64 = 300;
     let mut lines: usize = 200;
@@ -3397,6 +3529,7 @@ fn parse_wait_args(rest: &[&String]) -> Result<WaitArgs, i32> {
                 takes_value = false;
                 match a {
                     "--json" => {}
+                    "--active" => active = true,
                     "-h" | "--help" => {
                         println!("{WAIT_USAGE}");
                         return Err(0);
@@ -3464,9 +3597,11 @@ fn parse_wait_args(rest: &[&String]) -> Result<WaitArgs, i32> {
             Some(d)
         }
     };
+    let caller = (index.is_some() && !active).then(caller_pane).flatten();
     Ok(WaitArgs {
         target,
         index,
+        caller,
         pattern,
         timeout,
         lines,
@@ -3614,15 +3749,37 @@ fn wait_output(args: WaitArgs) -> WaitOutcome {
     // target stops a mid-wait focus change retargeting the wait; pinning an EXPLICIT one
     // matters too, because a raw terminal id can be reused by a different pane across a
     // server restart while a pane token is incarnation-qualified.
+    // Checked on the wait's own connection so the deadline bounds it: an older server would
+    // count the index in the active tab, not the caller's.
+    if args.caller.is_some() {
+        let resp = match conn.request(&Req::Health, deadline) {
+            Ok(r) => r,
+            Err(WaitErr::TimedOut) => return WaitOutcome::TimedOut,
+            Err(WaitErr::Failed(e)) => return WaitOutcome::failed("unavailable", e),
+        };
+        let caps = resp.health.map(|h| h.caps).unwrap_or_default();
+        if !caps.iter().any(|c| c == CAP_CALLER_INDEX) {
+            return WaitOutcome::failed(
+                "unsupported",
+                format!(
+                    "the running server predates this operation ({CAP_CALLER_INDEX}) — \
+                     `comux server restart` after upgrading, or pass --active"
+                ),
+            );
+        }
+    }
+
     let mut pinned: Option<String> = None;
     loop {
         if expired(deadline) {
             return WaitOutcome::TimedOut;
         }
+        let first = pinned.is_none();
         let req = Req::CapturePane {
             target: pinned.clone().or_else(|| args.target.clone()),
-            index: pinned.is_none().then_some(args.index).flatten(),
+            index: first.then_some(args.index).flatten(),
             lines: Some(args.lines),
+            caller: first.then(|| args.caller.clone()).flatten(),
         };
         let resp = match conn.request(&req, deadline) {
             Ok(r) => r,
@@ -4885,7 +5042,9 @@ mod send_split_proto_tests {
                 text,
                 paste,
                 enter,
+                caller,
             } => {
+                assert_eq!(caller, None, "an old send counts in the active tab");
                 assert_eq!(target, None);
                 assert_eq!(index, Some(0));
                 assert_eq!(text, "ls");
@@ -4906,6 +5065,7 @@ mod send_split_proto_tests {
             text: "make\n".into(),
             paste: false,
             enter: false,
+            caller: None,
         };
         let line = serde_json::to_string(&req).unwrap();
         // Unset flags stay off the wire, so an older server sees exactly the shape it knows.

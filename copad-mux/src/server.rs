@@ -753,7 +753,7 @@ fn detach_client(c: Client) {
 fn ctl_mutates(req: &control::Req) -> bool {
     !matches!(
         req,
-        control::Req::List
+        control::Req::List { .. }
             | control::Req::ListTabs { .. }
             | control::Req::ListSessions
             | control::Req::Health
@@ -1520,7 +1520,7 @@ mod tests {
     fn read_only_ctl_requests_do_not_force_a_render() {
         // Read-only queries must NOT dirty the frame (else `ctl list` polling defeats
         // idle-skip). Everything that changes state must.
-        assert!(!ctl_mutates(&Req::List));
+        assert!(!ctl_mutates(&Req::List { caller: None }));
         assert!(!ctl_mutates(&Req::ListTabs { session: None }));
         assert!(!ctl_mutates(&Req::ListSessions));
         assert!(ctl_mutates(&Req::NewTab {
@@ -1538,7 +1538,10 @@ mod tests {
             dir: "right".into(),
             no_focus: false,
         }));
-        assert!(ctl_mutates(&Req::Focus { index: 0 }));
+        assert!(ctl_mutates(&Req::Focus {
+            index: 0,
+            caller: None
+        }));
         assert!(ctl_mutates(&Req::NewSession {
             name: None,
             cwd: None

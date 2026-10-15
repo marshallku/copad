@@ -1422,18 +1422,19 @@ impl App {
         if let Some(pane) = self.focused_pane() {
             // The `x` key ignores a rejected close (e.g. the last pane stays;
             // the shell-exit path handles quitting).
-            let _ = self.close_pane(pane);
+            let ws = self.ws.clone();
+            let _ = self.close_pane(&ws, pane);
         }
     }
 
-    /// Close a specific pane (used by the `x` key on the focused pane and by the
-    /// control API's `close <index>`).
-    fn close_pane(&mut self, pane: PaneId) -> Result<(), MuxError> {
+    /// Close a specific pane of `ws` (used by the `x` key on the focused pane and by the
+    /// control API's `close <index>`, which can reach a caller's background tab).
+    fn close_pane(&mut self, ws: &WorkspaceId, pane: PaneId) -> Result<(), MuxError> {
         // Propagate the actor's verdict (e.g. `CannotCloseLastPane`) so the
         // control API reports a real failure instead of a false `ok`.
         let events = self.state.apply(Command::ClosePane {
-            origin: Origin::Client(self.client),
-            workspace: self.ws.clone(),
+            origin: self.origin_for(ws),
+            workspace: ws.clone(),
             pane,
             if_rev: None,
         })?;
@@ -1442,6 +1443,8 @@ impl App {
                 self.panes.remove(terminal);
             }
         }
+        // `sync_sizes` only reaches the session on screen.
+        self.apply_resized_events(&events);
         self.sync_sizes();
         Ok(())
     }
@@ -2301,6 +2304,45 @@ impl App {
             })
     }
 
+    /// The tab an index counts in: the CALLER's (named by its pane token), wherever it is, else
+    /// the tab on screen. Counting in the caller's tab is what keeps `list` and `send N` /
+    /// `focus N` / `close N` pointing at the same pane for an agent in a background tab.
+    fn index_tab(&self, caller: Option<&str>) -> Result<(WorkspaceId, TabId), AddrErr> {
+        match caller {
+            Some(t) => self
+                .caller_location(t)
+                .map(|(ws, tab, _)| (ws, tab))
+                .map_err(|m| addr_err("not_found", m)),
+            None => self
+                .state
+                .workspace(&self.ws)
+                .map(|w| (self.ws.clone(), w.active_tab.clone()))
+                .ok_or_else(|| addr_err("error", "no workspace")),
+        }
+    }
+
+    /// The pane at `index` of [`Self::index_tab`]'s tab: `(workspace, pane, its terminal)`.
+    fn pane_at(
+        &self,
+        caller: Option<&str>,
+        index: usize,
+    ) -> Result<(WorkspaceId, PaneId, Option<TerminalId>), AddrErr> {
+        let (ws, tab) = self.index_tab(caller)?;
+        let t = self
+            .state
+            .workspace(&ws)
+            .and_then(|w| w.tab(&tab))
+            .ok_or_else(|| addr_err("not_found", "the tab is gone"))?;
+        let pane = t
+            .layout
+            .panes()
+            .get(index)
+            .cloned()
+            .ok_or_else(|| addr_err("not_found", format!("no pane at index {index}")))?;
+        let term = t.layout.terminal_of(&pane).cloned();
+        Ok((ws, pane, term))
+    }
+
     /// Resolve a pane by its `$COPAD_MUX_PANE` TOKEN only — never a raw terminal id.
     ///
     /// Terminal ids restart at `term0` on every server incarnation, so a recorded one can
@@ -2410,37 +2452,50 @@ impl App {
                     caps: control::SERVER_CAPS.iter().map(|c| c.to_string()).collect(),
                 })
             }
-            Req::List => {
-                let order = self.pane_order();
-                let focused = self.focused_pane();
-                let rects = self.layout();
+            Req::List { caller } => {
+                let (ws, tab) = match self.index_tab(caller.as_deref()) {
+                    Ok(v) => v,
+                    Err((c, m)) => return Resp::err_code(c, m),
+                };
+                let Some(t) = self.state.workspace(&ws).and_then(|w| w.tab(&tab)) else {
+                    return Resp::err_code("not_found", "the tab is gone");
+                };
+                let on_screen = ws == self.ws
+                    && self
+                        .state
+                        .workspace(&ws)
+                        .is_some_and(|w| w.active_tab == tab);
+                // On screen: the rect each pane is drawn in. Elsewhere: the size its terminal
+                // was last given — what its program sees — rather than a fresh derivation that
+                // a background tab's PTYs have not been resized to.
+                let rects = if on_screen { self.layout() } else { Vec::new() };
+                let order = t.layout.panes();
                 let panes = order
                     .iter()
                     .enumerate()
                     .map(|(index, p)| {
-                        let term = self
-                            .state
-                            .workspace(&self.ws)
-                            .and_then(|w| w.tab(&w.active_tab))
-                            .and_then(|t| t.layout.terminal_of(p).cloned());
+                        let term = t.layout.terminal_of(p).cloned();
                         let (cols, rows) = term
                             .as_ref()
-                            .and_then(|tid| rects.iter().find(|r| &r.terminal == tid))
-                            .map(|r| (r.cols, r.rows))
+                            .and_then(|tid| {
+                                if on_screen {
+                                    rects
+                                        .iter()
+                                        .find(|r| &r.terminal == tid)
+                                        .map(|r| (r.cols, r.rows))
+                                } else {
+                                    self.state.terminal(tid).map(|g| (g.cols, g.rows))
+                                }
+                            })
                             .unwrap_or((0, 0));
-                        let is_agent = self.pane_label_at(index).map(|l| l.kind)
-                            == Some(procinfo::Kind::Agent);
-                        let kind = if is_agent {
-                            "agent"
-                        } else if self.pane_label_at(index).map(|l| l.kind)
-                            == Some(procinfo::Kind::Shell)
-                        {
-                            "shell"
-                        } else {
-                            "other"
+                        let label = term.as_ref().and_then(|tid| self.labels.get(tid));
+                        let kind = match label.map(|l| l.kind) {
+                            Some(procinfo::Kind::Agent) => "agent",
+                            Some(procinfo::Kind::Shell) => "shell",
+                            _ => "other",
                         };
-                        let status = match (is_agent, term.as_ref()) {
-                            (true, Some(tid)) => self.agent_status(tid).0.to_string(),
+                        let status = match (kind, term.as_ref()) {
+                            ("agent", Some(tid)) => self.agent_status(tid).0.to_string(),
                             _ => String::new(),
                         };
                         let token = term
@@ -2465,10 +2520,12 @@ impl App {
                             index,
                             id: p.to_string(),
                             token,
-                            focused: focused.as_ref() == Some(p),
+                            focused: *p == t.focused,
                             cols,
                             rows,
-                            label: self.pane_label(index),
+                            label: label
+                                .map(|l| l.text.clone())
+                                .unwrap_or_else(|| format!("pane {index}")),
                             kind: kind.to_string(),
                             status,
                             title,
@@ -2476,9 +2533,7 @@ impl App {
                         }
                     })
                     .collect();
-                let fi = focused
-                    .and_then(|f| order.iter().position(|p| p == &f))
-                    .unwrap_or(0);
+                let fi = order.iter().position(|p| *p == t.focused).unwrap_or(0);
                 Resp::list(panes, fi)
             }
             Req::Split {
@@ -2522,7 +2577,7 @@ impl App {
                     None => Resp::err_code("spawn_failed", self.take_spawn_error("split")),
                 }
             }
-            Req::ResizePane { index, dir } => {
+            Req::ResizePane { index, dir, caller } => {
                 let (axis, grow) = match dir.as_str() {
                     "right" => (Dir::Right, true),
                     "left" => (Dir::Right, false),
@@ -2535,37 +2590,41 @@ impl App {
                         );
                     }
                 };
-                match self.pane_order().get(*index).cloned() {
-                    Some(pane) => {
-                        let _ = self.state.apply(Command::ResizePane {
-                            origin: Origin::Client(self.client),
-                            workspace: self.ws.clone(),
+                match self.pane_at(caller.as_deref(), *index) {
+                    Ok((ws, pane, _)) => {
+                        if let Ok(events) = self.state.apply(Command::ResizePane {
+                            origin: self.origin_for(&ws),
+                            workspace: ws,
                             pane,
                             axis,
                             grow,
-                        });
+                        }) {
+                            self.apply_resized_events(&events);
+                        }
                         self.sync_sizes();
                         Resp::ok()
                     }
-                    None => Resp::err_code("not_found", format!("no pane at index {index}")),
+                    Err((c, m)) => Resp::err_code(c, m),
                 }
             }
-            Req::Focus { index } => match self.pane_order().get(*index).cloned() {
-                Some(pane) => {
-                    let _ = self.state.apply(Command::FocusPane {
-                        client: self.client,
+            // In a background tab this focuses the pane within that tab; the view never moves.
+            Req::Focus { index, caller } => match self.pane_at(caller.as_deref(), *index) {
+                Ok((ws, pane, _)) => {
+                    let _ = self.state.apply(Command::FocusPaneIn {
+                        origin: self.origin_for(&ws),
+                        workspace: ws,
                         pane,
                     });
                     Resp::ok()
                 }
-                None => Resp::err_code("not_found", format!("no pane at index {index}")),
+                Err((c, m)) => Resp::err_code(c, m),
             },
-            Req::Close { index } => match self.pane_order().get(*index).cloned() {
-                Some(pane) => match self.close_pane(pane) {
+            Req::Close { index, caller } => match self.pane_at(caller.as_deref(), *index) {
+                Ok((ws, pane, _)) => match self.close_pane(&ws, pane) {
                     Ok(()) => Resp::ok(),
                     Err(e) => Resp::err(e.to_string()),
                 },
-                None => Resp::err_code("not_found", format!("no pane at index {index}")),
+                Err((c, m)) => Resp::err_code(c, m),
             },
             Req::SendKeys {
                 target,
@@ -2573,6 +2632,7 @@ impl App {
                 text,
                 paste,
                 enter,
+                caller,
             } => {
                 let tid = match (target, index) {
                     (Some(_), Some(_)) => {
@@ -2588,21 +2648,11 @@ impl App {
                         Some(tid) => tid,
                         None => return Resp::err_code("not_found", format!("unknown pane '{t}'")),
                     },
-                    (None, Some(i)) => {
-                        let order = self.pane_order();
-                        let Some(pane) = order.get(*i) else {
-                            return Resp::err_code("not_found", format!("no pane at index {i}"));
-                        };
-                        match self
-                            .state
-                            .workspace(&self.ws)
-                            .and_then(|w| w.tab(&w.active_tab))
-                            .and_then(|t| t.layout.terminal_of(pane).cloned())
-                        {
-                            Some(tid) => tid,
-                            None => return Resp::err("pane has no live terminal"),
-                        }
-                    }
+                    (None, Some(i)) => match self.pane_at(caller.as_deref(), *i) {
+                        Ok((_, _, Some(tid))) => tid,
+                        Ok((_, _, None)) => return Resp::err("pane has no live terminal"),
+                        Err((c, m)) => return Resp::err_code(c, m),
+                    },
                 };
                 match self.panes.get(&tid) {
                     Some(pt) => {
@@ -3065,6 +3115,7 @@ impl App {
                 target,
                 index,
                 lines,
+                caller,
             } => {
                 if target.is_some() && index.is_some() {
                     return Resp::err_code("invalid", "give a target or --index, not both");
@@ -3080,33 +3131,18 @@ impl App {
                         Some(tid) => tid,
                         None => return Resp::err_code("not_found", format!("unknown pane '{t}'")),
                     },
-                    None => {
-                        let order = self.pane_order();
-                        let pane = match index {
-                            Some(i) => match order.get(*i) {
-                                Some(p) => p.clone(),
-                                None => {
-                                    return Resp::err_code(
-                                        "not_found",
-                                        format!("no pane at index {i}"),
-                                    );
-                                }
-                            },
-                            None => match self.focused_pane() {
-                                Some(p) => p,
-                                None => return Resp::err("no focused pane"),
-                            },
-                        };
-                        match self
-                            .state
-                            .workspace(&self.ws)
-                            .and_then(|w| w.tab(&w.active_tab))
-                            .and_then(|t| t.layout.terminal_of(&pane).cloned())
-                        {
+                    // An index counts in the caller's tab when there is a caller.
+                    None => match index {
+                        Some(i) => match self.pane_at(caller.as_deref(), *i) {
+                            Ok((_, _, Some(tid))) => tid,
+                            Ok((_, _, None)) => return Resp::err("pane has no live terminal"),
+                            Err((c, m)) => return Resp::err_code(c, m),
+                        },
+                        None => match self.focused_terminal() {
                             Some(tid) => tid,
-                            None => return Resp::err("pane has no live terminal"),
-                        }
-                    }
+                            None => return Resp::err("no focused pane"),
+                        },
+                    },
                 };
                 match self.panes.get(&tid) {
                     Some(pt) => {
@@ -5771,28 +5807,6 @@ impl App {
     /// that used to be an unexplained "my tab names vanished" is observable.
     pub fn label_sweeps_failed(&self) -> u64 {
         self.label_sweeps_failed
-    }
-
-    /// The terminal id backing the pane at list index `idx`.
-    fn terminal_at(&self, idx: usize) -> Option<TerminalId> {
-        let pane = self.pane_order().get(idx)?.clone();
-        let w = self.state.workspace(&self.ws)?;
-        let tab = w.tab(&w.active_tab)?;
-        tab.layout.terminal_of(&pane).cloned()
-    }
-
-    /// The classified label for the pane at list index `idx`, if known.
-    fn pane_label_at(&self, idx: usize) -> Option<&procinfo::Label> {
-        let term = self.terminal_at(idx)?;
-        self.labels.get(&term)
-    }
-
-    /// Display text for the pane at list index `idx`: its foreground command
-    /// (agent / shell / program), or a fallback before the first label sweep.
-    fn pane_label(&self, idx: usize) -> String {
-        self.pane_label_at(idx)
-            .map(|l| l.text.clone())
-            .unwrap_or_else(|| format!("pane {idx}"))
     }
 
     /// The foreground command of a session's focused pane (its "what's happening"
@@ -10259,6 +10273,138 @@ mod placement {
     fn an_unknown_session_is_not_found() {
         let mut app = app();
         let r = app.handle_control(&new_tab(Some("nope"), false));
+        assert_eq!(r.code.as_deref(), Some("not_found"));
+    }
+}
+
+/// A-2: inside a pane, an index counts in the CALLER's tab, so `list` and every index verb
+/// agree for an agent in a tab the user is not looking at.
+#[cfg(test)]
+mod caller_index {
+    use super::*;
+    use crate::control::Req;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    /// A background tab holding two panes; returns the first pane's token (the "agent").
+    fn background_pair(app: &mut App) -> (String, String) {
+        let r = app.handle_control(&Req::NewTab {
+            session: None,
+            from: None,
+            cwd: None,
+            name: Some("bg".into()),
+            no_focus: true,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
+        });
+        assert!(r.ok, "{:?}", r.error);
+        let agent = r.pane.unwrap();
+        let s = app.handle_control(&Req::Split {
+            dir: "right".into(),
+            from: Some(agent.clone()),
+            no_focus: true,
+        });
+        assert!(s.ok, "{:?}", s.error);
+        (agent, s.pane.unwrap())
+    }
+
+    fn tokens(app: &mut App, caller: Option<&str>) -> Vec<String> {
+        let r = app.handle_control(&Req::List {
+            caller: caller.map(str::to_string),
+        });
+        assert!(r.ok, "{:?}", r.error);
+        r.panes.unwrap().into_iter().map(|p| p.token).collect()
+    }
+
+    fn view(app: &App) -> (WorkspaceId, TabId) {
+        (
+            app.ws.clone(),
+            app.state.workspace(&app.ws).unwrap().active_tab.clone(),
+        )
+    }
+
+    #[test]
+    fn list_and_the_index_verbs_count_in_the_callers_tab() {
+        let mut app = app();
+        let before = view(&app);
+        let (agent, sibling) = background_pair(&mut app);
+
+        assert_eq!(
+            tokens(&mut app, Some(&agent)),
+            vec![agent.clone(), sibling.clone()]
+        );
+        assert_eq!(
+            tokens(&mut app, None).len(),
+            1,
+            "no caller = the tab on screen"
+        );
+
+        // Index 1 is the sibling — for capture as for list.
+        let c = app.handle_control(&Req::CapturePane {
+            target: None,
+            index: Some(1),
+            lines: None,
+            caller: Some(agent.clone()),
+        });
+        assert!(c.ok, "{:?}", c.error);
+        assert_eq!(c.pane.as_deref(), Some(sibling.as_str()));
+        let s = app.handle_control(&Req::SendKeys {
+            target: None,
+            index: Some(1),
+            text: String::new(),
+            paste: false,
+            enter: false,
+            caller: Some(agent.clone()),
+        });
+        assert!(s.ok, "{:?}", s.error);
+
+        // Focus moves within the background tab only.
+        let f = app.handle_control(&Req::Focus {
+            index: 0,
+            caller: Some(agent.clone()),
+        });
+        assert!(f.ok, "{:?}", f.error);
+        let r = app.handle_control(&Req::List {
+            caller: Some(agent.clone()),
+        });
+        assert_eq!(r.focused, Some(0), "the caller's tab now focuses index 0");
+        assert_eq!(view(&app), before, "the view did not move");
+
+        let rz = app.handle_control(&Req::ResizePane {
+            index: 0,
+            dir: "right".into(),
+            caller: Some(agent.clone()),
+        });
+        assert!(rz.ok, "{:?}", rz.error);
+
+        // Close the sibling by index; the on-screen tab is untouched.
+        let x = app.handle_control(&Req::Close {
+            index: 1,
+            caller: Some(agent.clone()),
+        });
+        assert!(x.ok, "{:?}", x.error);
+        assert_eq!(tokens(&mut app, Some(&agent)), vec![agent.clone()]);
+        assert_eq!(tokens(&mut app, None).len(), 1);
+        assert_eq!(view(&app), before);
+    }
+
+    #[test]
+    fn an_out_of_range_index_or_unknown_caller_is_not_found() {
+        let mut app = app();
+        let (agent, _) = background_pair(&mut app);
+        let r = app.handle_control(&Req::Focus {
+            index: 5,
+            caller: Some(agent),
+        });
+        assert_eq!(r.code.as_deref(), Some("not_found"));
+        let r = app.handle_control(&Req::List {
+            caller: Some("nope-1".into()),
+        });
         assert_eq!(r.code.as_deref(), Some("not_found"));
     }
 }

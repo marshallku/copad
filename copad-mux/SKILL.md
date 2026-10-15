@@ -40,13 +40,15 @@ Add `--json` to any of them when you need to parse rather than read.
   `$COPAD_MUX_PANE`. It names exactly one pane, anywhere in the mux, for as long as the
   server lives. Every verb you need takes one: `send`, `capture-pane`, `wait-output`,
   `wait-agent`, `split --from`, `jump`, `notify`.
-- **By index** — a position in whatever tab the SERVER considers active, i.e. the tab the
-  *user* is looking at. `send` still accepts one, and `focus`/`close`/`resize` take only one.
+- **By index** — a position in YOUR tab (the one `$COPAD_MUX_PANE` is in), wherever it is,
+  even a tab the user is not looking at. `list`, `send N`, `focus N`, `close N`, `resize N`,
+  `capture-pane --index N` and `wait-output --index N` all count from it, so the index `list`
+  printed is the pane the next verb reaches. `--active` counts in the tab on screen instead.
+  `focus` in a background tab moves that tab's focus only; nobody's view changes.
 
-**Use tokens. Always.** An index is not a stable address: you keep running when the user
-switches tabs, so between one command and the next, index 2 can become a pane in a
-completely different tab, and nothing warns you. There is no way to make an index-addressed
-write race-free — only to narrow the window.
+**Still prefer tokens.** An index is a position, not a name: a pane closing or splitting in
+your tab between `list` and `send 2` shifts what index 2 means, and nothing warns you. A
+token always names the same pane.
 
 Do not record a pane's `id` (`term0`, `term1`, …) instead of its token. Those restart from
 zero every time the server does, so a saved one can address an unrelated pane later. `send`

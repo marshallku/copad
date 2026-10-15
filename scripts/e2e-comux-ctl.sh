@@ -1741,7 +1741,41 @@ rc=0; t 10 "$COMUX" spawn --env COPAD_MUX_PANE=x -- true >/dev/null 2>&1 || rc=$
 t 12 "$COMUX" kill-session "$sp" >/dev/null || fail "spawn cleanup failed"
 ok "argv arrives verbatim with --env; no view moves; the tab closes on exit, or keeps a working shell with --keep"
 
-echo "31. the server is still responsive and shuts down cleanly"
+echo "31. inside a pane, an index counts in the CALLER's tab"
+t 10 "$COMUX" new-session idxtest --json >"$WORK/json" || fail "could not create the index session"
+sp="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["session"]["id"])' <"$WORK/json")"
+A="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+t 10 "$COMUX" split --from "$A" --no-focus --json >"$WORK/json" || fail "split in the index session failed"
+S="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+t 10 "$COMUX" select-session 0 >/dev/null
+v0="$(view)"
+on_screen="$(t 10 "$COMUX" list --json | python3 -c 'import json,sys; print([p["token"] for p in json.load(sys.stdin)["panes"]])')"
+mine="$(COPAD_MUX_PANE="$A" t 10 "$COMUX" list --json | python3 -c 'import json,sys; print([p["token"] for p in json.load(sys.stdin)["panes"]])')"
+[[ "$mine" == "['$A', '$S']" ]] || fail "list inside a background pane should list ITS tab: $mine"
+active="$(COPAD_MUX_PANE="$A" t 10 "$COMUX" list --active --json | python3 -c 'import json,sys; print([p["token"] for p in json.load(sys.stdin)["panes"]])')"
+[[ "$active" == "$on_screen" ]] || fail "list --active should list the tab on screen: $active vs $on_screen"
+# send 1 / capture-pane --index 1 / wait-output --index 1 all reach the sibling list showed.
+COPAD_MUX_PANE="$A" t 10 "$COMUX" send 1 --enter -- 'echo IDX-$((3*4))' >/dev/null || fail "send by index from a background pane failed"
+t 15 "$COMUX" wait-output "$S" "IDX-12" --timeout 10 >/dev/null || fail "send 1 did not reach the caller's sibling: $(t 10 "$COMUX" capture-pane "$S")"
+COPAD_MUX_PANE="$A" t 10 "$COMUX" capture-pane --index 1 --json >"$WORK/json"
+python3 -c 'import json,sys; assert json.load(sys.stdin)["pane"]=="'"$S"'"' <"$WORK/json" || fail "capture-pane --index 1 read another pane: $(cat "$WORK/json")"
+COPAD_MUX_PANE="$A" t 15 "$COMUX" wait-output --index 1 "IDX-12" --timeout 10 --json >"$WORK/json" || fail "wait-output --index from a background pane failed: $(cat "$WORK/json")"
+python3 -c 'import json,sys; assert json.load(sys.stdin)["pane"]=="'"$S"'"' <"$WORK/json" || fail "wait-output --index pinned another pane"
+# focus moves focus in that tab only; close 1 closes the sibling, not a pane on screen.
+COPAD_MUX_PANE="$A" t 10 "$COMUX" focus 1 >/dev/null || fail "focus by index from a background pane failed"
+COPAD_MUX_PANE="$A" t 10 "$COMUX" list --json | python3 -c 'import json,sys; assert json.load(sys.stdin)["focused"]==1' || fail "focus 1 did not focus the caller's sibling"
+[[ "$(view)" == "$v0" ]] || fail "an index verb from a background pane moved a view: $v0 -> $(view)"
+COPAD_MUX_PANE="$A" t 10 "$COMUX" close 1 >/dev/null || fail "close by index from a background pane failed"
+mine="$(COPAD_MUX_PANE="$A" t 10 "$COMUX" list --json | python3 -c 'import json,sys; print([p["token"] for p in json.load(sys.stdin)["panes"]])')"
+[[ "$mine" == "['$A']" ]] || fail "close 1 should have closed the sibling: $mine"
+[[ "$(t 10 "$COMUX" list --json | python3 -c 'import json,sys; print([p["token"] for p in json.load(sys.stdin)["panes"]])')" == "$on_screen" ]] \
+    || fail "close 1 from a background pane touched the tab on screen"
+rc=0; COPAD_MUX_PANE="nope-1" t 10 "$COMUX" list >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 1 ]] || fail "list from an unknown caller pane should fail with 1, got $rc"
+t 12 "$COMUX" kill-session "$sp" >/dev/null || fail "index cleanup failed"
+ok "list/send/capture/wait/focus/close agree on the caller's tab; --active is the tab on screen; no view moves"
+
+echo "32. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"
