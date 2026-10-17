@@ -47,6 +47,7 @@ fn print_usage() {
          \x20 comux wait-agent <pane>     block until that agent's status matches (--status working|ready|blocked)\n\
          \x20 comux agent-log <pane>      the last entries of that agent's own conversation log (--last N)\n\
          \x20 comux jump <pane>           switch to a pane anywhere (by $COPAD_MUX_PANE token)\n\
+         \x20 comux fork [pane]          fork that agent's conversation into a new tab (Ctrl-f in Ctrl-b R)\n\
          \x20 comux mark <1-9> / goto <n>  pin your pane to a slot / go there (Ctrl-b m / Ctrl-b ')\n\
          \x20 comux broadcast ...         type the same input into many panes (--dry-run first)\n\
          \x20 comux last|back|forward     toggle to / walk the session+tab history (Ctrl-b ; < >)\n\

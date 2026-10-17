@@ -230,6 +230,12 @@ pub enum Req {
     Nav { dir: NavDir },
     /// Toggle the zoom of the active tab's focused pane (`Ctrl-b z`). Moves the shared view.
     Zoom,
+    /// Fork a live agent pane's conversation into a new tab of its session (decisions #150).
+    Fork {
+        target: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_focus: bool,
+    },
     /// Pin `target` (a pane token) to `slot` 1–9, or empty the slot with `clear`.
     Mark {
         slot: u8,
@@ -496,6 +502,7 @@ pub const SERVER_CAPS: &[&str] = &[
     CAP_INBOX,
     CAP_BROADCAST,
     CAP_MARKS,
+    CAP_FORK,
 ];
 
 /// The most `send --file` reads. A paste larger than this is a mistake (a binary, a log),
@@ -512,6 +519,9 @@ pub struct MarkInfo {
     #[serde(default)]
     pub label: String,
 }
+
+/// Capability: `fork`.
+pub const CAP_FORK: &str = "fork";
 
 /// Capability: `mark` / `marks` / `goto`.
 pub const CAP_MARKS: &str = "marks";
@@ -1309,6 +1319,23 @@ pub fn run_client(args: &[String]) -> i32 {
                 );
             };
             Req::GotoMark { slot }
+        }
+        "fork" => {
+            let p = parsed!(FORK_SPEC);
+            let Some(target) = p.positionals.first().cloned().or_else(caller_pane) else {
+                return usage_error(
+                    json_out,
+                    "comux fork: which agent pane? (a token; inside a pane it defaults to yours)",
+                    FORK_SPEC.usage,
+                );
+            };
+            if let Err(code) = require_cap(CAP_FORK, cmd, json_out) {
+                return code;
+            }
+            Req::Fork {
+                target,
+                no_focus: p.has("--no-focus"),
+            }
         }
         "zoom" => {
             parsed!(cliargs::bare(
@@ -2343,6 +2370,15 @@ const NOTIFY_SPEC: Spec = Spec {
         opt(&["--result"]),
     ],
     positionals: Positionals::Any,
+};
+
+const FORK_SPEC: Spec = Spec {
+    usage: "usage: comux fork [<pane-token>] [--no-focus]\n\
+            \x20      open a new tab in that agent's session running a FORK of its conversation\n\
+            \x20      (claude --resume <id> --fork-session / codex fork <id>). Both agents then share\n\
+            \x20      the directory and can overwrite each other's edits.",
+    flags: &[flag(&["--no-focus"])],
+    positionals: Positionals::AtMost(1),
 };
 
 const MARK_SPEC: Spec = Spec {
@@ -3809,6 +3845,7 @@ mod verb_args_tests {
         "forward",
         "last",
         "zoom",
+        "fork",
         "mark",
         "marks",
         "goto",

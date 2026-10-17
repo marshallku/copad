@@ -599,6 +599,31 @@ pub fn resume_argv(tool: Tool, id: &str) -> Vec<String> {
     crate::agentstate::resume_argv(tool.bin(), &[tool.bin().to_string()], id)
 }
 
+/// The command that FORKS conversation `id` into a new one (decisions #150): history kept, a
+/// new session id, the original untouched. `None` for an id that is not a UUID — never splice
+/// an unvalidated value onto a command line.
+pub fn fork_argv(tool: Tool, id: &str) -> Option<Vec<String>> {
+    if !crate::agentstate::is_session_uuid(id) {
+        return None;
+    }
+    let args: &[&str] = match tool {
+        Tool::Claude => &["claude", "--resume", id, "--fork-session"],
+        Tool::Codex => &["codex", "fork", id],
+    };
+    Some(args.iter().map(|a| a.to_string()).collect())
+}
+
+impl Tool {
+    /// The tool a pane's foreground label names, when it is one we can fork.
+    pub fn from_label(label: &str) -> Option<Tool> {
+        match label.to_ascii_lowercase().as_str() {
+            "claude" => Some(Tool::Claude),
+            "codex" => Some(Tool::Codex),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,6 +641,18 @@ mod tests {
     fn write(path: &Path, body: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, body).unwrap();
+    }
+
+    #[test]
+    fn fork_argv_shapes_and_refuses_a_non_uuid() {
+        assert_eq!(
+            fork_argv(Tool::Claude, CID).unwrap(),
+            ["claude", "--resume", CID, "--fork-session"]
+        );
+        assert_eq!(fork_argv(Tool::Codex, CID).unwrap(), ["codex", "fork", CID]);
+        assert!(fork_argv(Tool::Claude, "x; rm -rf /").is_none());
+        assert_eq!(Tool::from_label("Codex"), Some(Tool::Codex));
+        assert_eq!(Tool::from_label("zsh"), None);
     }
 
     #[test]

@@ -58,6 +58,7 @@
 #  42. copy mode: ?search into history, V y yanks the line to the client as OSC 52, q leaves
 #  43. pinned slots: mark from inside a pane, goto from elsewhere, and they survive a restart
 #  44. worktree land: refuses dirty work, dry-runs, then lands and cleans up
+#  45. fork: a live agent's conversation forks into a new tab (separate, HOME-isolated server)
 
 set -euo pipefail
 
@@ -96,11 +97,16 @@ mkdir -p "$WORK/cfg/copad"
 
 SERVER_PID=""
 DEAF_PID=""
+# Step 45's separate fork server and its fake agent, so a failing step cannot leave them behind.
+FPID=""
+APID=""
 cleanup() {
     # Step 6's shell ignores SIGHUP by design: kill it explicitly or it is reparented
     # to init and outlives every run of this script.
     [[ -n "$DEAF_PID" ]] && kill -9 "$DEAF_PID" 2>/dev/null || true
     [[ -n "$SERVER_PID" ]] && kill -9 "$SERVER_PID" 2>/dev/null || true
+    [[ -n "$APID" ]] && kill -9 "$APID" 2>/dev/null || true
+    [[ -n "$FPID" ]] && kill -9 "$FPID" 2>/dev/null || true
     rm -rf "$WORK"
     return 0
 }
@@ -2166,7 +2172,79 @@ grep -q "would land 'e2eland'" "$WORK/out" || fail "dry run should describe the 
 [[ -z "$(git -C "$LR" branch --list e2eland)" ]] || fail "the landed branch should be deleted"
 ok "dirty refused, dry run inert, land fast-forwards trunk and removes the worktree + branch"
 
-echo "45. the server is still responsive and shuts down cleanly"
+echo "45. fork: a live agent's conversation forks into a new tab (on a SEPARATE, HOME-isolated server)"
+# A real `claude` must never run here. The agent pane is `sleep` symlinked to the name `claude`
+# (procinfo classifies on argv[0]'s basename), its conversation id comes from a session file
+# under an ISOLATED HOME, and the `claude` the fork launches is a stub that only records its
+# argv. A real login shell rebuilds PATH from system files (macOS path_helper puts Homebrew,
+# and a real `claude`, first), so this server's SHELL is a stand-in named `zsh` that runs the
+# `-c` script without reading any profile. The step still first proves that shell resolves
+# `claude` to the stub — and is skipped, loudly, if it does not. `-i` keeps job control on, as a
+# real interactive shell has it: the agent then runs as the pane's FOREGROUND process (what the
+# label sweep reads) instead of hiding behind the wrapper `sh`.
+FH="$WORK/forkhome"; FB="$WORK/forkbin"; FA="$WORK/forkagent"; FS="$WORK/forkshell/zsh"
+mkdir -p "$FH/.claude/sessions" "$FB" "$FA" "$WORK/forkshell"
+cat >"$FS" <<'SHEOF'
+#!/bin/sh
+while [ $# -gt 0 ] && [ "$1" != "-c" ]; do shift; done
+if [ "$1" = "-c" ]; then shift; script="$1"; shift; exec /bin/sh -i -c "$script" "$@"; fi
+exec /bin/sh -i
+SHEOF
+chmod +x "$FS"
+touch "$FH/.zshrc" # an empty rc: zsh would otherwise offer its new-user setup and wait
+ln -s /bin/sleep "$FA/claude"
+printf '#!/bin/sh\necho "FORKED: $*" >>"%s"\nexec sleep 600\n' "$WORK/fork.log" >"$FB/claude"
+chmod +x "$FB/claude"
+resolved="$(env HOME="$FH" PATH="$FB:$PATH" "$FS" -l -i -c 'command -v claude' 2>/dev/null | tail -1)"
+if [[ "$resolved" != "$FB/claude" ]]; then
+    echo "  SKIP — this machine's login shell resolves claude to '$resolved', not the stub; refusing to risk a real agent"
+else
+    F_SOCK="$WORK/fsock"
+    (
+        export HOME="$FH" PATH="$FB:$PATH" SHELL="$FS" COPAD_MUX_SOCK="$F_SOCK" COPAD_MUX_STATE="$WORK/fstate.json"
+        "$COMUX" server >"$WORK/fserver.log" 2>&1 &
+        echo $! >"$WORK/fserver.pid"
+    )
+    FPID="$(cat "$WORK/fserver.pid")"
+    fx() { env HOME="$FH" PATH="$FB:$PATH" SHELL="$FS" COPAD_MUX_SOCK="$F_SOCK" COPAD_MUX_STATE="$WORK/fstate.json" "$COMUX" "$@"; }
+    for _ in $(seq 1 100); do [[ -S "$F_SOCK" ]] && break; sleep 0.1; done
+    [[ -S "$F_SOCK" ]] || fail "the isolated fork server never came up"
+    t 10 fx spawn --keep --json -- "$FA/claude" 600 >"$WORK/json" || fail "spawning the fake agent failed"
+    AG="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+    for _ in $(seq 1 50); do
+        # Through a file, not a pipe: an early-exiting reader SIGPIPEs `ps`, and with
+        # pipefail + set -e that kills the whole run with no message.
+        ps -Ao pid=,args= >"$WORK/ps.txt"
+        APID="$(awk -v p="$FA/claude" '$2==p {print $1; exit}' "$WORK/ps.txt")"
+        [[ -n "$APID" ]] && break; sleep 0.1
+    done
+    [[ -n "$APID" ]] || fail "could not find the fake agent's pid"
+    FID="0f0f0f0f-1234-4abc-8def-0123456789ab"
+    printf '{"pid":%s,"sessionId":"%s","status":"idle"}\n' "$APID" "$FID" >"$FH/.claude/sessions/$APID.json"
+    for _ in $(seq 1 50); do t 5 fx list-agents --json 2>/dev/null | grep -q "$AG" && break; sleep 0.2; done
+    t 15 fx fork "$AG" --no-focus >"$WORK/out" || fail "comux fork failed: $(cat "$WORK/out")"
+    grep -q "forking claude conversation $FID" "$WORK/out" || fail "fork should say what it opened: $(cat "$WORK/out")"
+    for _ in $(seq 1 50); do [[ -s "$WORK/fork.log" ]] && break; sleep 0.2; done
+    grep -qF -- "FORKED: --resume $FID --fork-session" "$WORK/fork.log" \
+        || fail "the new tab should run claude --resume $FID --fork-session: $(cat "$WORK/fork.log" 2>/dev/null)"
+    # --no-focus left the view on the agent's tab; a plain fork moves it to the new one.
+    active_tab() { t 10 fx list-tabs --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["active_tab"], len(d["tabs"]))'; }
+    before="$(active_tab)"
+    t 15 fx fork "$AG" >/dev/null || fail "a focused fork failed"
+    after="$(active_tab)"
+    [[ "${after#* }" -gt "${before#* }" && "${after% *}" != "${before% *}" ]] \
+        || fail "a plain fork should open AND show a new tab (before: $before, after: $after)"
+    # A plain shell pane is refused, and nothing opens.
+    t 10 fx list --json >"$WORK/json"
+    SH="$(python3 -c 'import json,sys; p=json.load(sys.stdin)["panes"]; print(p[0]["token"])' <"$WORK/json")"
+    rc=0; t 10 fx fork "$SH" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" == 1 ]] || fail "forking a shell pane should be refused, got $rc"
+    t 15 fx kill-server >/dev/null 2>&1 || kill -9 "$FPID" 2>/dev/null || true
+    kill "$APID" 2>/dev/null || true
+    ok "a live (fake) claude pane forks into a tab running 'claude --resume <id> --fork-session'; a shell pane is refused"
+fi
+
+echo "46. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

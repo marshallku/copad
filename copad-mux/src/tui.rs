@@ -3628,6 +3628,69 @@ impl App {
                 }
                 None => Resp::err_code("not_found", format!("slot {slot} is empty")),
             },
+            Req::Fork { target, no_focus } => {
+                let Some(term) = self.resolve_pane_token(target) else {
+                    return Resp::err_code("not_found", format!("unknown pane '{target}'"));
+                };
+                let Some(label) = self.labels.get(&term).cloned() else {
+                    return Resp::err_code("refused", "that pane is not running an agent");
+                };
+                let Some(tool) = agentsessions::Tool::from_label(&label.text) else {
+                    return Resp::err_code(
+                        "refused",
+                        format!(
+                            "'{}' is not an agent comux can fork (claude, codex)",
+                            label.text
+                        ),
+                    );
+                };
+                // Resolved NOW, not from the poller's cache (which may lag a `/new` by seconds
+                // and would fork the PREVIOUS conversation). Covers daemon-backed Codex too.
+                let Some(id) = agentstate::agent_session_id(&label.text, label.pid) else {
+                    return Resp::err_code(
+                        "refused",
+                        "its conversation id is not known yet — send a first message, then retry",
+                    );
+                };
+                let Some(argv) = agentsessions::fork_argv(tool, &id) else {
+                    return Resp::err_code("refused", "its conversation id cannot be forked");
+                };
+                let Some((ws, _, _)) = self.locate_terminal(&term) else {
+                    return Resp::err_code("not_found", "pane vanished");
+                };
+                let cwd = self
+                    .terminal_cwd(&term)
+                    .map(|p| p.to_string_lossy().into_owned());
+                let mut r = self.handle_control_inner(&Req::NewTab {
+                    session: Some(ws.to_string()),
+                    from: None,
+                    cwd,
+                    name: None,
+                    no_focus: *no_focus,
+                    command: argv,
+                    env: Vec::new(),
+                    keep: true,
+                    owner: None,
+                });
+                // `new-tab --session` never activates (decisions #134); a fork without
+                // `--no-focus` is meant to be looked at, so go there explicitly.
+                if r.ok
+                    && !*no_focus
+                    && let Some(created) =
+                        r.pane.as_deref().and_then(|t| self.resolve_pane_token(t))
+                {
+                    self.jump_to_terminal(&created);
+                }
+                if r.ok {
+                    // Tab created and the fork command started — whether the agent then
+                    // succeeds is for the new tab to show.
+                    r.message = Some(format!(
+                        "opened a tab forking {} conversation {id}",
+                        tool.bin()
+                    ));
+                }
+                r
+            }
             Req::Zoom => match self.toggle_zoom() {
                 Ok(()) => {
                     let mut r = Resp::ok();
@@ -4413,6 +4476,8 @@ impl App {
                 KeyCode::Char('n') if ctrl => self.resume_move(1),
                 KeyCode::Char('p') if ctrl => self.resume_move(-1),
                 KeyCode::Enter => self.resume_select(),
+                // Ctrl-f, not `f`: fork the selected conversation into a new tab.
+                KeyCode::Char('f') if ctrl => self.resume_fork(),
                 // Ctrl-a, not `a`: every printable char belongs to the filter.
                 KeyCode::Char('a') if ctrl => self.resume_toggle_all(),
                 KeyCode::Char('r') if ctrl => self.resume_rescan(),
@@ -5821,8 +5886,23 @@ impl App {
         self.resume = None;
         match row.live.clone() {
             Some(term) => self.jump_to_terminal(&term),
-            None => self.open_resumed(row),
+            None => self.open_resumed(row, false),
         }
+    }
+
+    /// `Ctrl-f` in the resume picker: FORK the selected conversation into a new tab — even one
+    /// that is live in a pane, which is exactly when branching off it is useful (Enter would
+    /// only jump there).
+    fn resume_fork(&mut self) {
+        let Some(row) = self
+            .resume
+            .as_ref()
+            .and_then(|st| self.resume_rows(st).get(st.sel).cloned())
+        else {
+            return;
+        };
+        self.resume = None;
+        self.open_resumed(row, true);
     }
 
     /// Open `row`'s conversation in a new tab: in the space already working in that
@@ -5831,8 +5911,15 @@ impl App {
     /// The space switch happens BEFORE the tab is created (a client may only mutate the
     /// workspace it is attached to) and is undone if the pane fails to spawn, so a failed
     /// resume leaves the user exactly where they were.
-    fn open_resumed(&mut self, row: ResumeRow) {
-        let argv = agentsessions::resume_argv(row.tool, &row.id);
+    fn open_resumed(&mut self, row: ResumeRow, fork: bool) {
+        let argv = if fork {
+            match agentsessions::fork_argv(row.tool, &row.id) {
+                Some(a) => a,
+                None => return self.flash("that conversation id cannot be forked".into(), true),
+            }
+        } else {
+            agentsessions::resume_argv(row.tool, &row.id)
+        };
         let Some(line) = build_command_line(&argv) else {
             return;
         };
@@ -8887,7 +8974,7 @@ impl App {
             &mut tx,
             y0,
             &format!(
-                " resume  ({} · ^A {} · ^R rescan) ",
+                " resume  ({} · ^A {} · ^R rescan · ^F fork) ",
                 if st.all { "all" } else { "interactive" },
                 if st.all { "interactive" } else { "all" }
             ),
@@ -14363,5 +14450,57 @@ mod marks {
             found.expect("the mark points at a restored pane")
         };
         assert_eq!(state.workspace(&ws).unwrap().name.as_deref(), Some("keep"));
+    }
+}
+
+#[cfg(test)]
+mod fork {
+    use super::*;
+    use crate::control::Req;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn fork(app: &mut App, target: &str) -> control::Resp {
+        app.handle_control(&Req::Fork {
+            target: target.into(),
+            no_focus: true,
+        })
+    }
+
+    #[test]
+    fn refusals_say_why_and_open_nothing() {
+        let mut app = app();
+        assert_eq!(fork(&mut app, "nope-1").code.as_deref(), Some("not_found"));
+        let term = app.focused_terminal().unwrap();
+        let token = app.panes[&term].pane_token().unwrap().to_string();
+        let tabs = app.tab_ids().len();
+        // A plain shell pane (no label swept yet, or a non-agent label).
+        assert_eq!(fork(&mut app, &token).code.as_deref(), Some("refused"));
+        app.labels.insert(
+            term.clone(),
+            procinfo::Label {
+                text: "vim".into(),
+                kind: procinfo::Kind::Other,
+                pid: 1,
+            },
+        );
+        let r = fork(&mut app, &token);
+        assert!(r.error.unwrap().contains("not an agent comux can fork"));
+        // An agent whose conversation id cannot be resolved (pid 1 has no session file).
+        app.labels.insert(
+            term.clone(),
+            procinfo::Label {
+                text: "claude".into(),
+                kind: procinfo::Kind::Agent,
+                pid: u32::MAX - 7,
+            },
+        );
+        let r = fork(&mut app, &token);
+        assert!(r.error.unwrap().contains("not known yet"));
+        assert_eq!(app.tab_ids().len(), tabs, "nothing was opened");
     }
 }
