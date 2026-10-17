@@ -53,6 +53,7 @@
 #  37. a wide Ctrl-f previews the selected session's pane, live
 #  38. an unread notification shows as ✉ N, and Ctrl-b u lands on it and clears it
 #  39. the sidebar shows a repo's working-tree state, and marks a linked worktree
+#  40. broadcast types into one session's panes (or lists all on a dry run), never the caller's
 
 set -euo pipefail
 
@@ -2015,7 +2016,36 @@ grep -qF "⑂ e2ewt" "$WORK/frame" || { cat "$WORK/frame" >&2; fail "the worktre
 for n in e2egit e2ewt; do t 10 "$COMUX" kill-session "name:$n" >/dev/null 2>&1 || true; done
 ok "a dirty repo reads 'e2emain* +2 −1'; a linked worktree reads '⑂ e2ewt'"
 
-echo "40. the server is still responsive and shuts down cleanly"
+echo "40. broadcast: scoped, dry-run first, never the caller"
+t 10 "$COMUX" new-session --json e2ebc1 >"$WORK/json" || fail "new-session e2ebc1 failed"
+BC1="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+t 10 "$COMUX" new-session --json e2ebc2 >"$WORK/json" || fail "new-session e2ebc2 failed"
+BC2="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+rc=0; t 10 "$COMUX" broadcast --session name:e2ebc1 -- echo x >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 2 ]] || fail "broadcast without --dry-run/--yes should be a usage error, got $rc"
+rc=0; t 10 "$COMUX" broadcast --yes -- echo x >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 2 ]] || fail "broadcast without a scope should be a usage error, got $rc"
+t 10 "$COMUX" broadcast --all --dry-run --json -- 'echo BCDRY-$((1+1))' >"$WORK/json" || fail "broadcast --dry-run failed"
+python3 -c '
+import json,sys
+t=[x["pane"] for x in json.load(sys.stdin)["targets"]]
+assert "'"$BC1"'" in t and "'"$BC2"'" in t, t' <"$WORK/json" || fail "the dry run should list both sessions: $(cat "$WORK/json")"
+# From INSIDE e2ebc1's pane: the session's other panes get it, the caller does not.
+t 10 "$COMUX" split --from "$BC1" -h --json >"$WORK/json" || fail "split in e2ebc1 failed"
+BC1B="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+COPAD_MUX_PANE="$BC1" t 10 "$COMUX" broadcast --session name:e2ebc1 --yes --enter -- 'echo BCSENT-$((20+22))' >"$WORK/out" \
+    || fail "broadcast --yes failed: $(cat "$WORK/out")"
+grep -q "queued for 1 pane" "$WORK/out" || fail "broadcast should report one target: $(cat "$WORK/out")"
+t 15 "$COMUX" wait-output "$BC1B" --timeout 10 BCSENT-42 >/dev/null || fail "the other pane in e2ebc1 never got the broadcast"
+sleep 1
+for p in "$BC1" "$BC2"; do
+    if t 10 "$COMUX" capture-pane "$p" | grep -q "BCSENT-42"; then fail "pane $p should not have received the broadcast"; fi
+    if t 10 "$COMUX" capture-pane "$p" | grep -q "BCDRY-2"; then fail "the dry run typed into $p"; fi
+done
+for n in e2ebc1 e2ebc2; do t 10 "$COMUX" kill-session "name:$n" >/dev/null 2>&1 || true; done
+ok "scope + --dry-run/--yes required; dry run lists and sends nothing; the caller is skipped"
+
+echo "41. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

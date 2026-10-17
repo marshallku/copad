@@ -462,6 +462,15 @@ enum PopupTab {
     Agents,
 }
 
+/// Which panes a `broadcast` goes to.
+struct BroadcastScope<'a> {
+    session: Option<&'a str>,
+    all: bool,
+    agents: bool,
+    status: Option<&'a str>,
+    caller: Option<&'a str>,
+}
+
 /// A status-bar outcome line ([`App::flash`]).
 struct StatusMessage {
     text: String,
@@ -1812,6 +1821,117 @@ impl App {
             };
             self.flash(what.to_string(), false);
         }
+    }
+
+    /// `comux broadcast` (decisions #145). Validates the whole request and resolves EVERY
+    /// target before writing anything, so a refusal never leaves a partial broadcast behind.
+    fn broadcast(
+        &mut self,
+        scope: BroadcastScope,
+        text: &str,
+        paste: bool,
+        enter: bool,
+        dry_run: bool,
+    ) -> control::Resp {
+        use control::Resp;
+        if scope.session.is_some() == scope.all {
+            return Resp::err_code("invalid", "give exactly one of a session or all");
+        }
+        if let Some(st) = scope.status
+            && !matches!(st, "working" | "ready" | "blocked" | "idle")
+        {
+            return Resp::err_code("invalid", format!("unknown status '{st}'"));
+        }
+        let agents_only = scope.agents || scope.status.is_some();
+        // A caller that names itself must BE a pane here: an unresolvable token (stale, or
+        // another server's) means we cannot honour "never your own pane", so refuse.
+        let caller = match scope.caller {
+            Some(t) => match self.resolve_pane_token(t) {
+                Some(tid) => Some(tid),
+                None => {
+                    return Resp::err_code(
+                        "not_found",
+                        format!("your pane '{t}' is not on this server — cannot exclude it"),
+                    );
+                }
+            },
+            None => None,
+        };
+        let sessions = match scope.session {
+            Some(sel) => match self.session_addr(None, Some(sel)) {
+                Ok(ws) => vec![ws],
+                Err((c, m)) => return Resp::err_code(c, &m),
+            },
+            None => self.session_ids(),
+        };
+        let mut targets: Vec<(TerminalId, control::BroadcastTarget)> = Vec::new();
+        for wid in &sessions {
+            let Some(w) = self.state.workspace(wid) else {
+                continue;
+            };
+            let space = self.session_display_name(wid);
+            for (ti, t) in w.tabs.iter().enumerate() {
+                for p in t.layout.panes() {
+                    let Some(tid) = t.layout.terminal_of(&p) else {
+                        continue;
+                    };
+                    if caller.as_ref() == Some(tid) {
+                        continue;
+                    }
+                    let label = self.labels.get(tid);
+                    let is_agent = label.is_some_and(|l| l.kind == procinfo::Kind::Agent);
+                    if agents_only && !is_agent {
+                        continue;
+                    }
+                    let st = is_agent.then(|| self.agent_status(tid).0);
+                    if let Some(want) = scope.status
+                        && st != Some(want)
+                    {
+                        continue;
+                    }
+                    let Some(token) = self.panes.get(tid).and_then(|p| p.pane_token()) else {
+                        continue; // no live terminal: not a target at all
+                    };
+                    targets.push((
+                        tid.clone(),
+                        control::BroadcastTarget {
+                            pane: token.to_string(),
+                            session: space.clone(),
+                            tab: tab_display_title(t.name.as_deref(), ti),
+                            label: label.map(|l| l.text.clone()).unwrap_or_default(),
+                            status: st.map(str::to_string),
+                        },
+                    ));
+                }
+            }
+        }
+        if targets.is_empty() {
+            return Resp::err_code("not_found", "no pane matches");
+        }
+        let n = targets.len();
+        if !dry_run {
+            for (tid, _) in &targets {
+                if let Some(pt) = self.panes.get(tid) {
+                    let mut bytes = if paste {
+                        crate::term::paste_bytes(text, pt.bracketed_paste())
+                    } else {
+                        text.as_bytes().to_vec()
+                    };
+                    if enter {
+                        bytes.push(b'\r');
+                    }
+                    pt.input(&bytes);
+                }
+            }
+        }
+        let mut r = Resp::ok();
+        r.message = Some(if dry_run {
+            format!("would send to {n} pane{}", if n == 1 { "" } else { "s" })
+        } else {
+            format!("queued for {n} pane{}", if n == 1 { "" } else { "s" })
+        });
+        r.targets = Some(targets.into_iter().map(|(_, t)| t).collect());
+        r
     }
 
     /// `session/tab` for a location, by display name — what `comux back` prints.
@@ -3271,6 +3391,29 @@ impl App {
                     Err((c, m)) => Resp::err_code(c, &m),
                 }
             }
+            Req::Broadcast {
+                session,
+                all,
+                agents,
+                status,
+                text,
+                paste,
+                enter,
+                dry_run,
+                caller,
+            } => self.broadcast(
+                BroadcastScope {
+                    session: session.as_deref(),
+                    all: *all,
+                    agents: *agents,
+                    status: status.as_deref(),
+                    caller: caller.as_deref(),
+                },
+                text,
+                *paste,
+                *enter,
+                *dry_run,
+            ),
             Req::Nav { dir } => match self.navigate(*dir) {
                 Some(landed) => {
                     let mut r = Resp::ok();
@@ -12944,5 +13087,177 @@ mod sidebar_git {
         assert!(app.refresh_branches(), "a new reading is a change");
         assert!(app.refresh_branches_for_test().contains("feat-x* ↑1 +5 −2"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod broadcast {
+    use super::*;
+    use crate::control::Req;
+    use agentstate::AgentStatus;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        cfg.notify = false;
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn session(app: &mut App, name: &str) -> String {
+        let r = app.handle_control(&Req::NewSession {
+            name: Some(name.into()),
+            cwd: None,
+        });
+        assert!(r.ok);
+        r.pane.expect("token")
+    }
+
+    fn bc(session: Option<&str>, all: bool, text: &str, dry_run: bool) -> Req {
+        Req::Broadcast {
+            session: session.map(str::to_string),
+            all,
+            agents: false,
+            status: None,
+            text: text.into(),
+            paste: false,
+            enter: true,
+            dry_run,
+            caller: None,
+        }
+    }
+
+    fn targets(r: &control::Resp) -> Vec<String> {
+        let mut v: Vec<String> = r
+            .targets
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|t| t.session.clone())
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn screen(app: &App, token: &str) -> String {
+        let r = app.capture(token);
+        r.text.unwrap_or_default()
+    }
+
+    impl App {
+        fn capture(&self, token: &str) -> control::Resp {
+            let tid = self.resolve_pane_token(token).unwrap();
+            let snap = self.panes[&tid].snapshot();
+            let text = snap
+                .cells
+                .iter()
+                .map(|row| row.iter().map(|c| c.sym.as_str()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut r = control::Resp::ok();
+            r.text = Some(text);
+            r
+        }
+    }
+
+    #[test]
+    fn scope_is_required_and_validated_server_side() {
+        let mut app = app();
+        assert_eq!(
+            app.handle_control(&bc(None, false, "x", true))
+                .code
+                .as_deref(),
+            Some("invalid")
+        );
+        assert_eq!(
+            app.handle_control(&bc(Some("x"), true, "x", true))
+                .code
+                .as_deref(),
+            Some("invalid")
+        );
+        let mut r = bc(None, true, "x", true);
+        if let Req::Broadcast { status, .. } = &mut r {
+            *status = Some("bogus".into());
+        }
+        assert_eq!(app.handle_control(&r).code.as_deref(), Some("invalid"));
+    }
+
+    #[test]
+    fn a_session_broadcast_reaches_only_that_session_and_a_dry_run_sends_nothing() {
+        let mut app = app();
+        let a = session(&mut app, "bca");
+        let b = session(&mut app, "bcb");
+        let r = app.handle_control(&bc(None, true, "echo DRY-$((1+1))", true));
+        assert!(r.ok);
+        assert_eq!(targets(&r), ["bca", "bcb", "local"]);
+        let r = app.handle_control(&bc(Some("name:bca"), false, "echo BC-$((20+22))", false));
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(targets(&r), ["bca"]);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !screen(&app, &a).contains("BC-42") {
+            assert!(std::time::Instant::now() < deadline, "{}", screen(&app, &a));
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !screen(&app, &b).contains("BC-42"),
+            "the other session got nothing"
+        );
+        assert!(
+            !screen(&app, &a).contains("DRY-2"),
+            "the dry run sent nothing"
+        );
+    }
+
+    #[test]
+    fn the_caller_is_never_a_target_and_an_unknown_caller_is_refused() {
+        let mut app = app();
+        let a = session(&mut app, "me");
+        let mut r = bc(Some("name:me"), false, "x", true);
+        if let Req::Broadcast { caller, .. } = &mut r {
+            *caller = Some(a.clone());
+        }
+        assert_eq!(
+            app.handle_control(&r).code.as_deref(),
+            Some("not_found"),
+            "only me there"
+        );
+        if let Req::Broadcast { caller, .. } = &mut r {
+            *caller = Some("stale-0".into());
+        }
+        let resp = app.handle_control(&r);
+        assert!(!resp.ok && resp.error.unwrap().contains("cannot exclude"));
+    }
+
+    #[test]
+    fn status_narrows_to_agents_in_that_status() {
+        let mut app = app();
+        let a = session(&mut app, "ag1");
+        let _b = session(&mut app, "ag2");
+        let ta = app.resolve_pane_token(&a).unwrap();
+        app.labels.insert(
+            ta.clone(),
+            procinfo::Label {
+                text: "claude".into(),
+                kind: procinfo::Kind::Agent,
+                pid: 1,
+            },
+        );
+        app.agent_statuses.insert(
+            ta,
+            AgentState {
+                status: AgentStatus::Blocked,
+                since: std::time::Instant::now(),
+                seq: 0,
+                pid: 1,
+            },
+        );
+        let mut r = bc(None, true, "x", true);
+        if let Req::Broadcast { status, agents, .. } = &mut r {
+            *status = Some("blocked".into());
+            *agents = true;
+        }
+        let resp = app.handle_control(&r);
+        assert_eq!(targets(&resp), ["ag1"]);
+        assert_eq!(resp.targets.unwrap()[0].status.as_deref(), Some("blocked"));
     }
 }

@@ -337,6 +337,30 @@ pub enum Req {
     },
     /// Close every tab `owner` (a pane token) owns. `dry_run` only reports them. Refused as a
     /// whole when one of them holds `caller`, so a cleanup can never close the pane running it.
+    /// Type the same input into many panes (decisions #145): a session's or the whole mux's,
+    /// optionally only agents / agents in one status. Every target is resolved and checked
+    /// BEFORE any byte is written; writes are queued to each pane like `send-keys`, with no
+    /// rollback, so retrying after a lost response can type twice. The caller's own pane is
+    /// never a target.
+    Broadcast {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        all: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        agents: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        text: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        paste: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        enter: bool,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        dry_run: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<String>,
+    },
     CloseOwned {
         owner: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -456,11 +480,29 @@ pub const SERVER_CAPS: &[&str] = &[
     CAP_CALLER_INDEX,
     CAP_OWNER,
     CAP_INBOX,
+    CAP_BROADCAST,
 ];
 
 /// The most `send --file` reads. A paste larger than this is a mistake (a binary, a log),
 /// not something to type into a shell.
 const SEND_FILE_CAP: u64 = 1024 * 1024;
+
+/// One pane a `broadcast` reached.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BroadcastTarget {
+    pub pane: String,
+    pub session: String,
+    pub tab: String,
+    /// Its foreground program, as last swept.
+    #[serde(default)]
+    pub label: String,
+    /// The agent's cached status, for agent panes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// Capability: `broadcast` exists.
+pub const CAP_BROADCAST: &str = "broadcast";
 
 /// Which way `Req::Nav` moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -794,6 +836,9 @@ pub struct Resp {
     /// `inbox`: messages dropped because the inbox was full, since it was last read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dropped: Option<u64>,
+    /// `broadcast`: the panes written to (or, dry-run, that would be).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub targets: Option<Vec<BroadcastTarget>>,
     /// `close-tab --owned-by`: the tabs closed (or, dry-run, that would be).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed: Option<Vec<NodeRef>>,
@@ -848,6 +893,7 @@ impl Resp {
             tree: None,
             messages: None,
             dropped: None,
+            targets: None,
             closed: None,
             skipped: None,
         }
@@ -1388,6 +1434,58 @@ pub fn run_client(args: &[String]) -> i32 {
         // their non-destructive siblings rather than defaulting to the ACTIVE tab /
         // session the way `rename-*` does: an explicit pick is what makes a bare
         // `comux close-tab` safe to type.
+        "broadcast" => {
+            let p = parsed!(BROADCAST_SPEC);
+            let session = p.value("--session").map(str::to_string);
+            let all = p.has("--all");
+            if session.is_some() == all {
+                return usage_error(
+                    json_out,
+                    "comux broadcast: give exactly one of --session <sel> or --all",
+                    BROADCAST_SPEC.usage,
+                );
+            }
+            let dry_run = p.has("--dry-run");
+            if dry_run == p.has("--yes") {
+                return usage_error(
+                    json_out,
+                    "comux broadcast: say --dry-run to look or --yes to send",
+                    BROADCAST_SPEC.usage,
+                );
+            }
+            let status = p.value("--status").map(str::to_string);
+            if let Some(s) = &status
+                && !matches!(s.as_str(), "working" | "ready" | "blocked" | "idle")
+            {
+                return usage_error(
+                    json_out,
+                    &format!("comux broadcast: unknown --status '{s}'"),
+                    BROADCAST_SPEC.usage,
+                );
+            }
+            let text = p.positionals.join(" ");
+            if text.is_empty() && !p.has("--enter") {
+                return usage_error(
+                    json_out,
+                    "comux broadcast: nothing to send",
+                    BROADCAST_SPEC.usage,
+                );
+            }
+            if let Err(code) = require_cap(CAP_BROADCAST, cmd, json_out) {
+                return code;
+            }
+            Req::Broadcast {
+                session,
+                all,
+                agents: p.has("--agents") || status.is_some(),
+                status,
+                text,
+                paste: p.has("--paste"),
+                enter: p.has("--enter"),
+                dry_run,
+                caller: caller_pane(),
+            }
+        }
         "close-tab" | "kill-tab" if owned_by_form(&rest) => {
             let p = parsed!(CLOSE_OWNED_SPEC);
             let Some(owner) = p.value("--owned-by").map(str::to_string) else {
@@ -2150,6 +2248,25 @@ const NOTIFY_SPEC: Spec = Spec {
     positionals: Positionals::Any,
 };
 
+const BROADCAST_SPEC: Spec = Spec {
+    usage: "usage: comux broadcast (--session <sel> | --all) [--agents] [--status working|ready|blocked|idle]\n\
+            \x20      [--paste] [--enter] (--dry-run | --yes) [--] <text...>\n\
+            \x20      types the same input into every matching pane except your own; writes are queued\n\
+            \x20      with no rollback (a retry types twice). --agents/--status match the CACHED sweep.\n\
+            \x20      Without bracketed paste a newline in the text submits, --enter or not.",
+    flags: &[
+        opt(&["--session", "-t"]),
+        flag(&["--all"]),
+        flag(&["--agents"]),
+        opt(&["--status"]),
+        flag(&["--paste"]),
+        flag(&["--enter"]),
+        flag(&["--dry-run", "-n"]),
+        flag(&["--yes", "-y"]),
+    ],
+    positionals: Positionals::Any,
+};
+
 const CLOSE_OWNED_SPEC: Spec = Spec {
     usage: "usage: comux close-tab --owned-by <pane-token> --dry-run|--yes [--json]\n\
             \x20      closes every tab that pane owns (new-tab/spawn --owner); never the caller's own",
@@ -2899,6 +3016,22 @@ fn print_human(req: &Req, resp: &Resp) {
                 );
             }
         }
+        Req::Broadcast { .. } => {
+            println!("{}", resp.message.as_deref().unwrap_or("ok"));
+            for t in resp.targets.as_deref().unwrap_or_default() {
+                println!(
+                    "  {}  {}/{}  {}{}",
+                    t.pane,
+                    t.session,
+                    t.tab,
+                    t.label,
+                    t.status
+                        .as_deref()
+                        .map(|s| format!(" ({s})"))
+                        .unwrap_or_default()
+                );
+            }
+        }
         Req::CloseOwned { .. } => {
             println!("{}", resp.message.as_deref().unwrap_or("ok"));
             for t in resp.closed.as_deref().unwrap_or_default() {
@@ -3374,6 +3507,7 @@ mod verb_args_tests {
         "back",
         "forward",
         "last",
+        "broadcast",
         "list-tabs",
         "new-tab",
         "spawn",
