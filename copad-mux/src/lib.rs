@@ -24,6 +24,7 @@ pub mod doctor;
 pub mod fdlimit;
 pub mod fleet;
 pub mod gitinfo;
+pub mod gitpoll;
 pub mod hostmetrics;
 pub mod model;
 pub mod navhist;

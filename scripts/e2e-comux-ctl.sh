@@ -52,6 +52,7 @@
 #  36. outcomes reach the status bar (no toast needed); modes say how to leave them
 #  37. a wide Ctrl-f previews the selected session's pane, live
 #  38. an unread notification shows as ✉ N, and Ctrl-b u lands on it and clears it
+#  39. the sidebar shows a repo's working-tree state, and marks a linked worktree
 
 set -euo pipefail
 
@@ -1996,7 +1997,25 @@ fi
 t 10 "$COMUX" kill-session name:e2e-unread >/dev/null 2>&1 || true
 ok "a background notification shows ✉ 1; Ctrl-b u jumps there and reads it"
 
-echo "39. the server is still responsive and shuts down cleanly"
+echo "39. sidebar git detail: dirty / +a −r, and the linked-worktree marker"
+REPO_DIR="$WORK/gitrepo"
+mkdir -p "$REPO_DIR"
+g() { env -u GIT_DIR -u GIT_WORK_TREE git -C "$REPO_DIR" -c user.name=e2e -c user.email=e2e@e2e -c commit.gpgsign=false "$@" >/dev/null 2>&1; }
+g init -q -b e2emain || fail "git init failed"
+printf 'one\ntwo\n' >"$REPO_DIR/f.txt"
+g add f.txt && g commit -q -m init || fail "the fixture's first revision failed"
+printf 'one\nTWO\nthree\n' >"$REPO_DIR/f.txt"
+g worktree add -q -b e2ewt "$WORK/gitwt" || fail "git worktree add failed"
+(cd "$REPO_DIR" && t 10 "$COMUX" new-session e2egit >/dev/null) || fail "new-session in the repo failed"
+(cd "$WORK/gitwt" && t 10 "$COMUX" new-session e2ewt >/dev/null) || fail "new-session in the worktree failed"
+sleep 8 # the label sweep (5s while detached) + the poller's first read
+python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+grep -qF "e2emain* +2 −1" "$WORK/frame" || { cat "$WORK/frame" >&2; fail "the repo session should read 'e2emain* +2 −1'"; }
+grep -qF "⑂ e2ewt" "$WORK/frame" || { cat "$WORK/frame" >&2; fail "the worktree session should carry the ⑂ marker"; }
+for n in e2egit e2ewt; do t 10 "$COMUX" kill-session "name:$n" >/dev/null 2>&1 || true; done
+ok "a dirty repo reads 'e2emain* +2 −1'; a linked worktree reads '⑂ e2ewt'"
+
+echo "40. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

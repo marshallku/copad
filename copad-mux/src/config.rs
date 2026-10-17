@@ -853,6 +853,10 @@ pub struct MuxConfig {
     /// While the prefix is armed, show the most useful next keys (from the live keymap) in
     /// the status bar in place of the tab chips. Presentation only; on by default.
     pub prefix_hint: bool,
+    /// Decorate each session's sidebar branch with working-tree state from `git status`
+    /// (dirty `*`, ahead/behind, `+a −r` against HEAD), read off-loop every few seconds.
+    /// `false` keeps the fork-free branch name only. Read at server start.
+    pub sidebar_git: bool,
     /// Show a one-row bar along the TOP of the mux (host CPU/memory/GPU/load).
     ///
     /// Off by default: it costs a row of the pane grid, and an existing user's layout should
@@ -948,6 +952,7 @@ struct RawConfig {
     notify: Option<bool>,
     bell: Option<bool>,
     prefix_hint: Option<bool>,
+    sidebar_git: Option<bool>,
     top_bar: Option<bool>,
     sidebar: Option<bool>,
     sidebar_width: Option<i64>,
@@ -1053,6 +1058,7 @@ impl MuxConfig {
             notify: true,
             bell: true,
             prefix_hint: true,
+            sidebar_git: true,
             top_bar: false,
             sidebar: true,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
@@ -1170,6 +1176,7 @@ impl MuxConfig {
                 notify: raw.notify.unwrap_or(true),
                 bell: raw.bell.unwrap_or(true),
                 prefix_hint: raw.prefix_hint.unwrap_or(true),
+                sidebar_git: raw.sidebar_git.unwrap_or(true),
                 top_bar: raw.top_bar.unwrap_or(false),
                 sidebar: raw.sidebar.unwrap_or(true),
                 sidebar_width,

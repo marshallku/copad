@@ -26,6 +26,7 @@ use crate::agentstate;
 use crate::config::{self, Action, Chord, MuxConfig, SortBy, TabLabels, UsageLayout, UsageStyle};
 use crate::control;
 use crate::gitinfo;
+use crate::gitpoll;
 use crate::model::{
     ClientId, Dir, LayoutSpec, PaneId, PaneRect, Rect, Role, SplitTree, TabId, TerminalId,
     WorkspaceId,
@@ -814,6 +815,8 @@ pub struct App {
     /// Shared "what is each agent doing" readings, written by the `agentpoll` thread and
     /// read (never blocked on) when building agent rows.
     agent_poll: agentpoll::Shared,
+    /// Working-tree state per repo for the sidebar subtitle (`gitpoll`); idle unless started.
+    git_poll: gitpoll::Shared,
     /// Shared host CPU/memory/GPU/load reading, written by the `hostmetrics` poller.
     host_poll: hostmetrics::Shared,
     /// Shared "update available" hint, written by the `versionpoll` thread
@@ -987,6 +990,7 @@ impl App {
             // App without a server never spawn the poller thread.
             usage_poll: usagepoll::idle(),
             agent_poll: agentpoll::idle(),
+            git_poll: gitpoll::idle(),
             host_poll: hostmetrics::idle(),
             version_poll: versionpoll::idle(),
             version_shown: None,
@@ -6213,6 +6217,14 @@ impl App {
         self.agent_poll = agentpoll::spawn();
     }
 
+    /// Start the git working-tree poller (server-only). `sidebar_git = false` never starts
+    /// it, so that setting forks no `git` at all.
+    pub fn start_git_poll(&mut self) {
+        if self.cfg.sidebar_git {
+            self.git_poll = gitpoll::spawn();
+        }
+    }
+
     /// Start the background GitHub-release update checker (server-only; see
     /// `versionpoll`). Skipped when `update_check = false` so a disabled check
     /// costs no network polling (matching `COPAD_MUX_UPDATE_CHECK=0`).
@@ -6247,12 +6259,15 @@ impl App {
         }
     }
 
-    /// Recompute each session's git branch from its focused pane's shell cwd (for the
-    /// `spaces` subtitle). Rebuilt each pass so a `cd` out of a repo clears it.
+    /// Recompute each session's git subtitle from its focused pane's shell cwd: the branch
+    /// (fork-free, `gitinfo`) decorated with the poller's last fresh reading for that repo
+    /// (`gitpoll`) — `⑂ feat-x* ↑2 +12 −3`. Rebuilt each pass so a `cd` out of a repo clears
+    /// it, and compared as the RENDERED string so a new poll result repaints.
     fn refresh_branches(&mut self) -> bool {
         let mut next = HashMap::new();
+        let mut roots = Vec::new();
         for wid in self.state.workspace_ids() {
-            let branch = self
+            let Some(cwd) = self
                 .state
                 .workspace(&wid)
                 .and_then(|w| w.tab(&w.active_tab))
@@ -6260,14 +6275,36 @@ impl App {
                 .and_then(|tid| self.panes.get(&tid))
                 .and_then(|pane| pane.pid())
                 .and_then(procinfo::process_cwd)
-                .and_then(|cwd| gitinfo::branch(&cwd));
-            if let Some(branch) = branch {
-                next.insert(wid, branch);
-            }
+            else {
+                continue;
+            };
+            let Some(branch) = gitinfo::branch(&cwd) else {
+                continue;
+            };
+            let sub = match gitinfo::repo(&cwd) {
+                Some(repo) if self.cfg.sidebar_git => {
+                    let reading = gitpoll::reading(&self.git_poll, &repo.root);
+                    roots.push(repo.root.clone());
+                    gitpoll::subtitle(&branch, repo.linked, reading.as_ref())
+                }
+                Some(repo) => gitpoll::subtitle(&branch, repo.linked, None),
+                None => branch,
+            };
+            next.insert(wid, sub);
         }
+        gitpoll::set_wanted(&self.git_poll, roots);
         let changed = next != self.branches;
         self.branches = next;
         changed
+    }
+
+    /// Refresh, then every subtitle joined — what the tests compare.
+    #[cfg(test)]
+    fn refresh_branches_for_test(&mut self) -> String {
+        self.refresh_branches();
+        let mut v: Vec<&String> = self.branches.values().collect();
+        v.sort();
+        v.into_iter().cloned().collect::<Vec<_>>().join("|")
     }
 
     /// Recompute each agent pane's status (working/ready/blocked/idle) from Claude's
@@ -6782,7 +6819,14 @@ impl App {
                 Style::default().fg(dot_color).bg(panel_bg),
             );
             put(buf, &mut x, y, " ", name_style);
-            put(buf, &mut x, y, &name, name_style);
+            // Ellipsis instead of a hard cut, leaving room for the bell marker after it.
+            let bell_w = if self.cfg.bell && self.session_has_bell(sid) {
+                2
+            } else {
+                0
+            };
+            let budget = sidebar_w.saturating_sub(x + bell_w) as usize;
+            put(buf, &mut x, y, &clip_width(&name, budget), name_style);
             // A bell anywhere in this space. Placed after the name so it does not shift the
             // names out of alignment when one space rings and the others do not.
             if self.cfg.bell && self.session_has_bell(sid) {
@@ -6806,7 +6850,8 @@ impl App {
                 .unwrap_or_else(|| self.session_focus_label(sid));
             if entry_sp > 1 {
                 let mut sx = 4u16;
-                put(buf, &mut sx, y + 1, &sub, sub_style);
+                let budget = sidebar_w.saturating_sub(sx) as usize;
+                put(buf, &mut sx, y + 1, &clip_width(&sub, budget), sub_style);
             } else {
                 put_trailing(buf, x, y, &sub, sub_style);
             }
@@ -7054,7 +7099,8 @@ impl App {
                 Style::default().fg(CAT_SUBTEXT).bg(panel_bg)
             };
             put(buf, &mut x, y, " ", name_style);
-            put(buf, &mut x, y, &row.title, name_style);
+            let budget = sidebar_w.saturating_sub(x) as usize;
+            put(buf, &mut x, y, &clip_width(&row.title, budget), name_style);
             let waited = fmt_elapsed(row.for_secs);
             if entry_ag > 1 {
                 let sub = if waited.is_empty() {
@@ -8540,6 +8586,9 @@ fn home_short_in(path: &std::path::Path, home: Option<&std::path::Path>) -> Stri
 fn clip_width(s: &str, max: usize) -> String {
     if s.width() <= max {
         return s.to_string();
+    }
+    if max == 0 {
+        return String::new(); // not even the `…` fits
     }
     let mut out = String::new();
     let mut used = 0usize;
@@ -12815,5 +12864,85 @@ mod attention {
         assert_eq!(app.unread_count(), 1, "landing alone is not evidence");
         app.ack_focused_bell(); // what the server calls on a key/mouse event
         assert_eq!(app.unread_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod sidebar_git {
+    use super::*;
+    use crate::control::Req;
+    use ratatui::layout::Rect;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn sidebar_text(app: &App) -> String {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        app.render_to(&mut buf);
+        let w = app.sidebar_w();
+        (0..30)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf.cell(Position::new(x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_long_session_name_ends_in_an_ellipsis() {
+        let mut app = app();
+        assert!(
+            app.handle_control(&Req::NewSession {
+                name: Some("a-very-long-session-name-that-cannot-fit".into()),
+                cwd: None,
+            })
+            .ok
+        );
+        let side = sidebar_text(&app);
+        assert!(side.contains("a-very-long-session"), "{side}");
+        assert!(side.contains('…'), "{side}");
+    }
+
+    #[test]
+    fn a_fresh_reading_decorates_the_branch() {
+        let dir = std::env::temp_dir().join(format!("comux-sbgit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/feat-x\n").unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let mut app = app();
+        assert!(
+            app.handle_control(&Req::NewSession {
+                name: Some("repo".into()),
+                cwd: Some(dir.to_string_lossy().into_owned()),
+            })
+            .ok
+        );
+        // The shell needs a moment to exist before its cwd can be read.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !app.refresh_branches_for_test().contains("feat-x") {
+            assert!(std::time::Instant::now() < deadline, "branch never read");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        gitpoll::publish(
+            &app.git_poll,
+            dir.clone(),
+            gitpoll::GitStat {
+                head: "feat-x".into(),
+                changed: 2,
+                ahead: 1,
+                added: 5,
+                removed: 2,
+                ..Default::default()
+            },
+        );
+        assert!(app.refresh_branches(), "a new reading is a change");
+        assert!(app.refresh_branches_for_test().contains("feat-x* ↑1 +5 −2"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

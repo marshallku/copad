@@ -355,6 +355,7 @@ pub fn run() -> io::Result<()> {
     // hint). Detached thread; `COPAD_MUX_UPDATE_CHECK=0` / `update_check = false`
     // disables it.
     app.start_agent_poll();
+    app.start_git_poll();
     app.start_host_poll();
     app.start_version_poll();
 

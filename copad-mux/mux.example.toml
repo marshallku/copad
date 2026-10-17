@@ -43,6 +43,10 @@ sidebar_density = "comfortable"
                           #     half that would otherwise overflow
 scroll_step = 3           # lines per mouse-wheel notch (1..50; the wheel over the SIDEBAR
                           #   scrolls that half by one entry instead)
+sidebar_git = true        # decorate each space's branch with git status: `*` dirty, ↑/↓
+                          #   ahead/behind, +a −r vs HEAD, ⑂ = linked worktree. Read off-loop
+                          #   every ~5s with no optional locks; false = branch only, no forks.
+                          #   Turning it ON needs `comux server restart`.
 prefix_hint = true        # while the prefix is armed, the status bar shows the next keys
                           #   (`? all keys · c tab · …`) in place of the tab chips
 sort_by = "created"       # session order in the sidebar / Ctrl-f switcher / )( cycle:
