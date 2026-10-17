@@ -72,6 +72,9 @@ struct Notification {
     body: String,
     /// The pane it came from — `Enter` in the center jumps here.
     terminal: TerminalId,
+    /// Seen: by the same evidence that acknowledges a bell (a key or click while that pane
+    /// is focused), or by jumping to it. Drives the `✉ N` chip and `Ctrl-b u`.
+    read: bool,
 }
 
 /// A tab's display title: its custom name when it has a meaningful one, else its 1-based
@@ -2296,7 +2299,9 @@ impl App {
         if blocked.is_empty() {
             return;
         }
-        blocked.sort_by_key(|t| t.to_string()); // stable order
+        // Longest-waiting first: the queue order an attention key should walk. Ties (and the
+        // ordering among equally old ones) fall back to the id so the cycle is stable.
+        blocked.sort_by_key(|t| (self.agent_statuses.get(t).map(|s| s.since), t.to_string()));
         // Cycle: the blocked agent immediately AFTER the current focus (wrapping), so
         // repeated presses visit every one.
         let cur = self.focused_terminal();
@@ -3842,7 +3847,11 @@ impl App {
             return;
         };
         if let Some(count) = self.panes.get(&tid).map(|p| p.bell_count()) {
-            self.bell_seen.insert(tid, count);
+            self.bell_seen.insert(tid.clone(), count);
+        }
+        // A notification from the pane being acted on has been seen, for the same reason.
+        for n in self.notifications.iter_mut().filter(|n| n.terminal == tid) {
+            n.read = true;
         }
         // Pane ids are never reused, so a stale entry is pure growth on a server that lives
         // for weeks. Pruned only when it can actually have grown.
@@ -4126,6 +4135,7 @@ impl App {
             KillSession => self.open_kill_session_confirm(),
             NotificationCenter => self.open_center(),
             JumpAttention => self.jump_to_attention(),
+            JumpUnread => self.jump_unread(),
             Detach => return KeyAction::Detach,
             ClosePane => self.close_focused(),
             ToggleSidebar => self.toggle_sidebar(),
@@ -5451,15 +5461,49 @@ impl App {
             && let Some(note) = self.notifications.get(sel).cloned()
         {
             self.center = None;
-            if let Some((wid, tab, pane)) = self.locate_terminal(&note.terminal) {
-                self.switch_session(wid.clone());
-                self.select_tab(wid, tab);
-                let _ = self.state.apply(Command::FocusPane {
-                    client: self.client,
-                    pane,
-                });
-                self.reflow();
+            self.mark_read(&note.terminal);
+            self.jump_to_terminal(&note.terminal);
+        }
+    }
+
+    /// Mark every notification from `term` read.
+    fn mark_read(&mut self, term: &TerminalId) {
+        for n in self
+            .notifications
+            .iter_mut()
+            .filter(|n| n.terminal == *term)
+        {
+            n.read = true;
+        }
+    }
+
+    /// Unread notifications whose pane still exists.
+    fn unread_count(&self) -> usize {
+        self.notifications
+            .iter()
+            .filter(|n| !n.read && self.panes.contains_key(&n.terminal))
+            .count()
+    }
+
+    /// `Ctrl-b u`: go to the pane of the NEWEST unread notification and mark it read. A
+    /// notification whose pane is gone is marked read on the way (there is nothing to see).
+    fn jump_unread(&mut self) {
+        let target = loop {
+            let Some(n) = self.notifications.iter_mut().find(|n| !n.read) else {
+                break None;
+            };
+            n.read = true;
+            let term = n.terminal.clone();
+            if self.panes.contains_key(&term) {
+                break Some(term);
             }
+        };
+        match target {
+            Some(term) => {
+                self.mark_read(&term);
+                self.jump_to_terminal(&term);
+            }
+            None => self.flash("no unread notifications".into(), false),
         }
     }
 
@@ -6408,6 +6452,7 @@ impl App {
             tab,
             body,
             terminal: term,
+            read: false,
         });
         while self.notifications.len() > NOTIFY_LOG_CAP {
             self.notifications.pop_back();
@@ -7307,6 +7352,16 @@ impl App {
                 Style::default()
                     .fg(CAT_BASE)
                     .bg(CAT_YELLOW)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        let unread = self.unread_count();
+        if unread > 0 {
+            segs.push((
+                format!(" ✉ {unread} "),
+                Style::default()
+                    .fg(CAT_BASE)
+                    .bg(CAT_MAUVE)
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -8379,8 +8434,9 @@ impl App {
             inner_x,
             inner_w,
             &format!(
-                " notifications ({}) — j/k · enter jump · d dismiss · D clear · q ",
-                self.notifications.len()
+                " notifications ({}, {} unread) — j/k · enter jump · d dismiss · D clear · q ",
+                self.notifications.len(),
+                self.unread_count()
             ),
             Style::default()
                 .fg(CAT_MAUVE)
@@ -8419,8 +8475,9 @@ impl App {
             let selected = i == sel;
             let glyph = if note.kind == "blocked" { "▲" } else { "✓" };
             let row = format!(
-                "{} {} {} {}  {}",
+                "{}{} {} {} {}  {}",
                 if selected { "▸" } else { " " },
+                if note.read { " " } else { "•" },
                 note.when,
                 glyph,
                 notify_title(&note.tool, &note.space, &note.tab),
@@ -12658,5 +12715,105 @@ mod switcher_preview {
         };
         assert_eq!(sessions("@"), ["api", "docs"]);
         assert_eq!(sessions("!"), ["web"]);
+    }
+}
+
+#[cfg(test)]
+mod attention {
+    use super::*;
+    use crate::control::Req;
+    use agentstate::AgentStatus;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        cfg.notify = false; // never raise a real desktop toast from a test
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn sessions(app: &mut App, names: &[&str]) -> Vec<TerminalId> {
+        names
+            .iter()
+            .map(|n| {
+                assert!(
+                    app.handle_control(&Req::NewSession {
+                        name: Some((*n).into()),
+                        cwd: None,
+                    })
+                    .ok
+                );
+                app.focused_terminal().unwrap()
+            })
+            .collect()
+    }
+
+    fn blocked(app: &mut App, term: &TerminalId, waited_secs: u64) {
+        app.labels.insert(
+            term.clone(),
+            procinfo::Label {
+                text: "claude".into(),
+                kind: procinfo::Kind::Agent,
+                pid: 1,
+            },
+        );
+        app.agent_statuses.insert(
+            term.clone(),
+            AgentState {
+                status: AgentStatus::Blocked,
+                since: std::time::Instant::now() - Duration::from_secs(waited_secs),
+                seq: 0,
+                pid: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn the_attention_key_walks_the_longest_waiting_first() {
+        let mut app = app();
+        let t = sessions(&mut app, &["a", "b", "c", "home"]);
+        blocked(&mut app, &t[0], 10);
+        blocked(&mut app, &t[1], 300);
+        blocked(&mut app, &t[2], 60);
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            app.jump_to_attention();
+            seen.push(app.focused_terminal().unwrap());
+        }
+        assert_eq!(seen, vec![t[1].clone(), t[2].clone(), t[0].clone()]);
+    }
+
+    #[test]
+    fn unread_notifications_count_until_seen_and_jump_to_the_newest() {
+        let mut app = app();
+        let t = sessions(&mut app, &["a", "b", "home"]);
+        app.raise_notification(t[0].clone(), "claude".into(), "done", "first".into());
+        app.raise_notification(t[1].clone(), "claude".into(), "blocked", "second".into());
+        assert_eq!(app.unread_count(), 2);
+        // Acting in an unrelated pane acknowledges nothing.
+        app.ack_focused_bell();
+        assert_eq!(app.unread_count(), 2);
+        app.jump_unread();
+        assert_eq!(
+            app.focused_terminal(),
+            Some(t[1].clone()),
+            "the newest first"
+        );
+        assert_eq!(app.unread_count(), 1);
+        app.jump_unread();
+        assert_eq!(app.focused_terminal(), Some(t[0].clone()));
+        assert_eq!(app.unread_count(), 0);
+        app.jump_unread();
+        assert!(app.message.as_ref().unwrap().text.contains("no unread"));
+    }
+
+    #[test]
+    fn acting_on_the_pane_marks_its_notification_read() {
+        let mut app = app();
+        let t = sessions(&mut app, &["a", "home"]);
+        app.raise_notification(t[0].clone(), "claude".into(), "done", "x".into());
+        app.jump_to_terminal(&t[0]);
+        assert_eq!(app.unread_count(), 1, "landing alone is not evidence");
+        app.ack_focused_bell(); // what the server calls on a key/mouse event
+        assert_eq!(app.unread_count(), 0);
     }
 }

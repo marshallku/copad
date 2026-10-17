@@ -51,6 +51,7 @@
 #  35. Ctrl-b ? lists the live keymap; an armed prefix shows the next keys in the status bar
 #  36. outcomes reach the status bar (no toast needed); modes say how to leave them
 #  37. a wide Ctrl-f previews the selected session's pane, live
+#  38. an unread notification shows as ✉ N, and Ctrl-b u lands on it and clears it
 
 set -euo pipefail
 
@@ -1979,7 +1980,23 @@ grep -q "PV-TWO-4" "$WORK/frame" || { cat "$WORK/frame" >&2; fail "the preview d
 t 10 "$COMUX" kill-session name:e2e-preview >/dev/null 2>&1 || true
 ok "Ctrl-f at 130 cols previews the previous session's pane and repaints on its output"
 
-echo "38. the server is still responsive and shuts down cleanly"
+echo "38. unread notifications: the ✉ chip and Ctrl-b u"
+t 10 "$COMUX" new-session --json e2e-unread >"$WORK/json" || fail "new-session e2e-unread failed"
+UN="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+t 10 "$COMUX" last >/dev/null
+here="$(attached)"
+t 10 "$COMUX" notify --pane "$UN" --kind done -- "e2e unread" >/dev/null || fail "notify failed"
+python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+tail -1 "$WORK/frame" | grep -qF "✉ 1" || { cat "$WORK/frame" >&2; fail "an unread notification should show as ✉ 1"; }
+PTY_KEYS='\x02u' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+[[ "$(attached)" == e2e-unread ]] || fail "Ctrl-b u should land on the notifying session (was on $here, now $(attached))"
+if tail -1 "$WORK/frame" | grep -qF "✉"; then
+    cat "$WORK/frame" >&2; fail "the chip should clear once the notification is read"
+fi
+t 10 "$COMUX" kill-session name:e2e-unread >/dev/null 2>&1 || true
+ok "a background notification shows ✉ 1; Ctrl-b u jumps there and reads it"
+
+echo "39. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"
