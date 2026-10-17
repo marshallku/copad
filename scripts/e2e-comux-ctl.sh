@@ -48,6 +48,7 @@
 #  33. navigation history: last toggles, back/forward walk it, a kill lands on the previous session,
 #      and Ctrl-f opens on the previous session in a REAL rendered frame
 #  34. a Korean session name keeps every overlay's border where it belongs
+#  35. Ctrl-b ? lists the live keymap; an armed prefix shows the next keys in the status bar
 
 set -euo pipefail
 
@@ -1926,7 +1927,23 @@ PYEOF
 t 10 "$COMUX" kill-session "name:$KO" >/dev/null 2>&1 || true
 ok "the switcher lists the Korean name inside an intact border"
 
-echo "35. the server is still responsive and shuts down cleanly"
+echo "35. the key help and the armed-prefix hint, in a real frame"
+PTY_KEYS='\x02?' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+grep -q "split the pane side by side" "$WORK/frame" \
+    || { cat "$WORK/frame" >&2; fail "Ctrl-b ? should list the keymap"; }
+grep -q "prefix — press ^b first" "$WORK/frame" \
+    || { cat "$WORK/frame" >&2; fail "the help should name the live prefix"; }
+# A rebinding shows up as bound NOW, via reload — the help is built from the live keymap.
+printf '[keys]\nkey-help = "/"\n' >"$XDG_CONFIG_HOME/copad/mux.toml"
+t 10 "$COMUX" reload >/dev/null || fail "reload failed"
+PTY_KEYS='\x02' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+tail -1 "$WORK/frame" | grep -qF "/ all keys" \
+    || { cat "$WORK/frame" >&2; fail "the armed prefix should hint '/ all keys' in the status bar"; }
+rm -f "$XDG_CONFIG_HOME/copad/mux.toml"
+t 10 "$COMUX" reload >/dev/null
+ok "Ctrl-b ? lists the keymap under the live prefix; the armed-prefix hint follows a rebinding"
+
+echo "36. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

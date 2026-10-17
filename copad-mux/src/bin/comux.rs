@@ -58,7 +58,7 @@ fn print_usage() {
          \x20 comux server restart        stop + restart the server (restores the workspace)\n\
          \x20 comux kill-server           stop the server\n\
          \n\
-         inside the TUI: Ctrl-b C new session (name prompt) · Ctrl-b W new worktree · \
+         inside the TUI: Ctrl-b ? every key · Ctrl-b C new session (name prompt) · Ctrl-b W new worktree · \
          Ctrl-b c new tab · Ctrl-b , rename tab · Ctrl-b % / \" split"
     );
 }

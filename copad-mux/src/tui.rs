@@ -23,7 +23,7 @@ use ratatui::style::{Color, Modifier, Style};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agentstate;
-use crate::config::{self, Action, MuxConfig, SortBy, TabLabels, UsageLayout, UsageStyle};
+use crate::config::{self, Action, Chord, MuxConfig, SortBy, TabLabels, UsageLayout, UsageStyle};
 use crate::control;
 use crate::gitinfo;
 use crate::model::{
@@ -720,6 +720,9 @@ pub struct App {
     confirm: Option<Confirm>,
     /// When `Some`, a right-click context menu (tmux `display-menu`) is open.
     menu: Option<Menu>,
+    /// When `Some(scroll)`, the `Ctrl-b ?` key help is open, scrolled `scroll` rows down
+    /// (clamped at render, so a resize or a reload that shortens the list can't strand it).
+    help: Option<usize>,
     /// Per-half manual scroll (wheel over the sidebar), each dropped as soon as its
     /// auto-anchor moves. `None` = follow the focus, which is the default behaviour.
     spaces_scroll: Option<SidebarScroll>,
@@ -905,6 +908,7 @@ impl App {
             prompt: None,
             confirm: None,
             menu: None,
+            help: None,
             spaces_scroll: None,
             agents_scroll: None,
             spaces_view: RefCell::new(HalfView::default()),
@@ -3832,6 +3836,25 @@ impl App {
             return KeyAction::Continue;
         }
 
+        // The key help scrolls with j/k/arrows/PgUp/PgDn/g/G; any other key closes it.
+        if let Some(scroll) = self.help {
+            *prefix = false;
+            let page = self.rows.saturating_sub(4).max(1) as usize;
+            self.help = match k.code {
+                KeyCode::Down | KeyCode::Char('j') => Some(scroll + 1),
+                KeyCode::Up | KeyCode::Char('k') => Some(scroll.saturating_sub(1)),
+                KeyCode::PageDown | KeyCode::Char(' ') => Some(scroll + page),
+                KeyCode::PageUp => Some(scroll.saturating_sub(page)),
+                KeyCode::Char('g') | KeyCode::Home => Some(0),
+                KeyCode::Char('G') | KeyCode::End => Some(usize::MAX),
+                _ => None,
+            };
+            if let Some(s) = self.help {
+                self.help = Some(s.min(self.help_max_scroll()));
+            }
+            return KeyAction::Continue;
+        }
+
         // An open right-click context menu captures input (tmux display-menu keys):
         // `j`/`k`/arrows navigate, Enter runs the selection, anything else closes.
         if self.menu.is_some() {
@@ -4046,6 +4069,7 @@ impl App {
             NavLast => {
                 self.navigate(control::NavDir::Last);
             }
+            KeyHelp => self.help = Some(0),
             EnterPrefix => {} // handled by the caller (arms the prefix)
         }
         KeyAction::Continue
@@ -4148,6 +4172,19 @@ impl App {
     ) -> Option<String> {
         if !self.cfg.mouse {
             return None; // mouse disabled in config (client also skips capture)
+        }
+        // The key help is modal: the wheel scrolls it, a click (either button) closes it,
+        // and nothing reaches the panes, the sidebar or a pane app underneath.
+        if let Some(scroll) = self.help {
+            match kind {
+                MouseKind::ScrollUp => self.help = Some(scroll.saturating_sub(3)),
+                MouseKind::ScrollDown => {
+                    self.help = Some((scroll + 3).min(self.help_max_scroll()));
+                }
+                MouseKind::Click | MouseKind::RightClick => self.help = None,
+                _ => {}
+            }
+            return None;
         }
         // Right-button events + clicks on an OPEN menu belong to the context menu.
         match kind {
@@ -5587,6 +5624,10 @@ impl App {
         if self.menu.is_some() {
             self.render_menu(buf);
         }
+        // On top of every other overlay: it is the one you open to find out how to leave them.
+        if self.help.is_some() {
+            self.render_help(buf);
+        }
         // Last, over everything every widget wrote: no cell may carry DIM and BOLD at once.
         resolve_dim_bold(buf);
 
@@ -5598,6 +5639,7 @@ impl App {
             && self.prompt.is_none()
             && self.confirm.is_none()
             && self.menu.is_none()
+            && self.help.is_none()
             && self.sidebar_focus.is_none()
         {
             cursor_pos
@@ -7342,8 +7384,25 @@ impl App {
                 (format!(" {bell}{dot}{inner} "), agent)
             })
             .collect();
-        let widths: Vec<u16> = chips.iter().map(|(s, _)| s.width() as u16).collect();
         let tab_end = w.saturating_sub(right_total);
+        // Prefix armed: the next keys in place of the tab chips, rather than over the bottom
+        // pane row. `prefix_armed` means SOME client is mid-chord, and an idle one can leave it
+        // set — covering everyone's terminal content for that long would be the wrong trade.
+        let hint = (self.prefix_armed && self.cfg.prefix_hint)
+            .then(|| self.prefix_hint_text())
+            .filter(|h| !h.is_empty());
+        let chips = if hint.is_some() { Vec::new() } else { chips };
+        if let Some(h) = &hint {
+            x = put_str(
+                buf,
+                x,
+                y,
+                tab_end,
+                h,
+                Style::default().fg(CAT_TEXT).bg(CAT_BASE),
+            );
+        }
+        let widths: Vec<u16> = chips.iter().map(|(s, _)| s.width() as u16).collect();
         let avail = tab_end.saturating_sub(x);
         let (start, end, marker_l, marker_r) = tab_window(&widths, active_idx, avail);
         let dim = Style::default().fg(CAT_OVERLAY).bg(CAT_BASE);
@@ -7529,6 +7588,196 @@ impl App {
                 Style::default().fg(item.color).bg(bg)
             };
             put(buf, y, inner_x, inner_w, &padded, st);
+        }
+    }
+
+    /// The `Ctrl-b ?` help rows from the LIVE keymap: `(chords, description)`, with `None`
+    /// chords marking a section header. One row per action per table; tabs 1–9 fold into
+    /// one row when bound to consecutive digits.
+    fn help_lines(&self) -> Vec<(Option<String>, String)> {
+        let km = &self.cfg.keymap;
+        let mut out = Vec::new();
+        for prefix in [true, false] {
+            let rows: Vec<(Chord, Action)> = km
+                .bindings()
+                .into_iter()
+                .filter(|(p, _, _)| *p == prefix)
+                .map(|(_, c, a)| (c, a))
+                .collect();
+            if rows.is_empty() {
+                continue;
+            }
+            out.push((
+                None,
+                if prefix {
+                    format!("prefix — press {} first, then", self.prefix_label())
+                } else {
+                    "no prefix".to_string()
+                },
+            ));
+            let mut seen: Vec<Action> = Vec::new();
+            for (_, a) in &rows {
+                if seen.contains(a) {
+                    continue;
+                }
+                if let Action::SelectTab(_) = a {
+                    // Every tab row at once: folded to `1–9` only for the conventional
+                    // range, else one row per tab so a rebinding says which key goes where.
+                    let mut tabs: Vec<(u8, String)> = rows
+                        .iter()
+                        .filter_map(|(c, b)| match b {
+                            Action::SelectTab(n) => Some((*n, c.label())),
+                            _ => None,
+                        })
+                        .collect();
+                    tabs.sort();
+                    seen.extend((0..9).map(Action::SelectTab));
+                    match fold_tab_range(&tabs) {
+                        Some(range) => push_help(&mut out, &[range], "go to tab 1–9"),
+                        None => {
+                            for n in 0..9u8 {
+                                let chords: Vec<String> = tabs
+                                    .iter()
+                                    .filter(|(m, _)| *m == n)
+                                    .map(|(_, l)| l.clone())
+                                    .collect();
+                                if !chords.is_empty() {
+                                    push_help(&mut out, &chords, &format!("go to tab {}", n + 1));
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+                seen.push(*a);
+                let chords: Vec<String> = rows
+                    .iter()
+                    .filter(|(_, b)| b == a)
+                    .map(|(c, _)| c.label())
+                    .collect();
+                push_help(&mut out, &chords, a.describe());
+            }
+        }
+        out
+    }
+
+    /// Rows the help box shows at once on this terminal.
+    fn help_visible(&self) -> usize {
+        // Borders, and the frame's own status bar row.
+        self.rows.saturating_sub(4) as usize
+    }
+
+    fn help_max_scroll(&self) -> usize {
+        self.help_lines()
+            .len()
+            .saturating_sub(self.help_visible().max(1))
+    }
+
+    /// The status-bar hint while the prefix is armed: the most useful next keys, as bound
+    /// NOW. An action left unbound simply drops out, `?` included.
+    fn prefix_hint_text(&self) -> String {
+        use Action::*;
+        let mut parts: Vec<(String, &'static str)> = Vec::new();
+        // `?` FIRST: on a narrow bar the hint is clipped from the right, and the key that
+        // shows everything else is the one that must survive.
+        for a in [
+            KeyHelp,
+            NewTab,
+            NewSession,
+            NavLast,
+            NextSession,
+            PrevSession,
+            SplitRight,
+            SplitDown,
+            Scrollback,
+            ResumePicker,
+            Detach,
+        ] {
+            let (Some(short), Some(c)) = (
+                a.short(),
+                self.cfg.keymap.chords_for(true, a).first().copied(),
+            ) else {
+                continue;
+            };
+            match parts.last_mut() {
+                // `% " split`: the two splits share one noun.
+                Some((keys, s)) if *s == short => {
+                    keys.push(' ');
+                    keys.push_str(&c.label());
+                }
+                _ => parts.push((c.label(), short)),
+            }
+        }
+        parts
+            .iter()
+            .map(|(k, s)| format!("{k} {s}"))
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+
+    /// The key help (`Ctrl-b ?`): a centered, scrollable list of the live keymap.
+    fn render_help(&self, buf: &mut Buffer) {
+        let Some(scroll) = self.help else { return };
+        let area = buf.area;
+        let lines = self.help_lines();
+        let maxw = area.width.saturating_sub(2).max(1);
+        let w = 72u16.min(maxw);
+        let maxh = area.height.saturating_sub(2).max(1);
+        let h = (lines.len() as u16 + 2).min(maxh).max(3.min(maxh));
+        let x0 = (area.width.saturating_sub(w)) / 2;
+        let y0 = (area.height.saturating_sub(h)) / 2;
+        let border = Style::default().fg(CAT_BLUE).bg(Color::Reset);
+        draw_box(buf, x0, y0, w, h, border);
+        let visible = h.saturating_sub(2) as usize;
+        let start = scroll.min(lines.len().saturating_sub(visible));
+        let more = if lines.len() > visible {
+            format!(
+                " {}–{}/{} · j/k scroll",
+                start + 1,
+                (start + visible).min(lines.len()),
+                lines.len()
+            )
+        } else {
+            String::new()
+        };
+        put_str(
+            buf,
+            x0 + 2,
+            y0,
+            x0 + w.saturating_sub(2),
+            &format!(" keys{more} · any other key closes "),
+            border.add_modifier(Modifier::BOLD),
+        );
+        let inner_x = x0 + 2;
+        let max_x = x0 + w.saturating_sub(2);
+        for (i, (chords, text)) in lines.iter().skip(start).take(visible).enumerate() {
+            let y = y0 + 1 + i as u16;
+            match chords {
+                None => {
+                    put_str(
+                        buf,
+                        inner_x,
+                        y,
+                        max_x,
+                        text,
+                        Style::default().fg(CAT_MAUVE).add_modifier(Modifier::BOLD),
+                    );
+                }
+                Some(keys) => {
+                    let end = put_str(
+                        buf,
+                        inner_x + 1,
+                        y,
+                        max_x,
+                        keys,
+                        Style::default().fg(CAT_YELLOW),
+                    );
+                    // Rows wrap their chords to HELP_KEY_W, so the description column lines
+                    // up; a single chord wider than that pushes its own description over.
+                    let desc_x = end.max(inner_x + 1 + HELP_KEY_W as u16) + 1;
+                    put_str(buf, desc_x, y, max_x, text, Style::default().fg(CAT_TEXT));
+                }
+            }
         }
     }
 
@@ -7933,6 +8182,51 @@ fn clip_width(s: &str, max: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// Columns the help gives the key column before the description.
+const HELP_KEY_W: usize = 14;
+
+/// Push one action's help row, wrapping its chords onto continuation rows (description on the
+/// first only) instead of clipping them: the help promises EVERY binding.
+fn push_help(out: &mut Vec<(Option<String>, String)>, chords: &[String], desc: &str) {
+    let mut line = String::new();
+    let mut first = true;
+    for c in chords {
+        if !line.is_empty() && line.width() + 1 + c.width() > HELP_KEY_W {
+            let d = if first {
+                desc.to_string()
+            } else {
+                String::new()
+            };
+            out.push((Some(std::mem::take(&mut line)), d));
+            first = false;
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(c);
+    }
+    let d = if first {
+        desc.to_string()
+    } else {
+        String::new()
+    };
+    out.push((Some(line), d));
+}
+
+/// `1 … 9` (or `M-1 … M-9`) as `1–9` / `M-1–9` — only when tab `n` has exactly the one chord
+/// `<stem><n+1>`. Anything else is not a range and is listed per tab.
+fn fold_tab_range(tabs: &[(u8, String)]) -> Option<String> {
+    if tabs.len() != 9 {
+        return None;
+    }
+    let stem = tabs[0].1.strip_suffix('1')?;
+    let conventional = tabs
+        .iter()
+        .enumerate()
+        .all(|(i, (n, label))| *n as usize == i && *label == format!("{stem}{}", i + 1));
+    conventional.then(|| format!("{stem}1–9"))
 }
 
 /// Draw an overlay box: a rounded-free single-line border in `border`, and a CLEARED interior
@@ -11600,5 +11894,185 @@ mod overlay_width {
         assert_eq!(pad_width("ab한", 3), "ab ");
         assert_eq!(tail_width("가나다█", 5), "나다█");
         assert_eq!(tail_width("abc", 10), "abc");
+    }
+}
+
+#[cfg(test)]
+mod key_help {
+    use super::*;
+    use ratatui::layout::Rect;
+
+    fn app_from(toml: &str) -> App {
+        let mut cfg = config::tests::config_from_str(toml);
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn press(app: &mut App, prefix: &mut bool, code: KeyCode, mods: KeyModifiers) {
+        app.feed_key(KeyEvent::new(code, mods), prefix);
+    }
+
+    fn open(app: &mut App) {
+        let mut prefix = false;
+        press(app, &mut prefix, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        press(app, &mut prefix, KeyCode::Char('?'), KeyModifiers::SHIFT);
+    }
+
+    fn text(app: &App) -> Vec<String> {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        app.render_to(&mut buf);
+        (0..30)
+            .map(|y| {
+                (0..100)
+                    .map(|x| buf.cell(Position::new(x, y)).unwrap().symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn opens_on_prefix_question_mark_scrolls_and_closes() {
+        let mut app = app_from("");
+        open(&mut app);
+        assert_eq!(app.help, Some(0));
+        let shown = text(&app).join("\n");
+        assert!(shown.contains("split the pane side by side"), "{shown}");
+        assert!(shown.contains("prefix — press ^b first"), "{shown}");
+        assert!(shown.contains("1–9"), "tabs fold into one row: {shown}");
+        let mut prefix = false;
+        press(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('j'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.help, Some(1.min(app.help_max_scroll())));
+        press(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('G'),
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.help, Some(app.help_max_scroll()), "clamped to the end");
+        press(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('q'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.help, None);
+        assert!(!prefix, "closing does not leave the prefix armed");
+    }
+
+    #[test]
+    fn a_rebound_key_shows_as_bound_now() {
+        let mut app = app_from("prefix = \"C-a\"\n[keys]\nnew-tab = \"t\"\nkey-help = \"/\"");
+        let mut prefix = false;
+        press(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL,
+        );
+        press(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('/'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.help, Some(0));
+        let lines = app.help_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|(k, d)| k.as_deref() == Some("t") && d == "new tab")
+        );
+        assert!(lines.iter().any(|(k, d)| k.is_none() && d.contains("^a")));
+        assert!(app.prefix_hint_text().contains("/ all keys"));
+        assert!(app.prefix_hint_text().contains("t tab"));
+    }
+
+    #[test]
+    fn a_rebound_tab_key_is_listed_per_tab_and_a_multibyte_one_does_not_panic() {
+        let app = app_from("[keys]\ntab-1 = \"가\"");
+        let lines = app.help_lines();
+        assert!(
+            lines
+                .iter()
+                .any(|(k, d)| k.as_deref() == Some("가") && d == "go to tab 1"),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|(k, d)| k.as_deref() == Some("2") && d == "go to tab 2")
+        );
+        assert!(
+            !lines.iter().any(|(k, _)| k.as_deref() == Some("1–9")),
+            "the prefix table's tabs are not a range any more"
+        );
+        // The global table's Alt-digits are still the conventional range.
+        assert!(
+            lines
+                .iter()
+                .any(|(k, d)| k.as_deref() == Some("M-1–9") && d == "go to tab 1–9")
+        );
+    }
+
+    #[test]
+    fn many_aliases_wrap_instead_of_being_clipped() {
+        let app = app_from(
+            "[keys]\ndetach = [\"d\", \"q\", \"D\", \"Q\", \"z\", \"Z\", \"y\", \"Y\", \"u\"]",
+        );
+        let lines = app.help_lines();
+        let at = lines
+            .iter()
+            .position(|(_, d)| d == "detach this client")
+            .unwrap();
+        let mut keys: Vec<String> = Vec::new();
+        for (k, d) in &lines[at..] {
+            if d != "detach this client" && !d.is_empty() {
+                break;
+            }
+            let k = k.as_ref().unwrap();
+            assert!(k.width() <= HELP_KEY_W, "{k}");
+            keys.extend(k.split(' ').map(str::to_string));
+        }
+        keys.sort();
+        assert_eq!(keys, ["D", "Q", "Y", "Z", "d", "q", "u", "y", "z"]);
+    }
+
+    #[test]
+    fn the_mouse_never_reaches_what_the_help_covers() {
+        let mut app = app_from("");
+        let r = app.handle_control(&control::Req::Split {
+            dir: "right".into(),
+            from: None,
+            no_focus: false,
+        });
+        assert!(r.ok);
+        let focused = app.focused_terminal();
+        open(&mut app);
+        // A click on the left pane would normally focus it.
+        app.mouse_at(ClientId(0), 2, 2, MouseKind::ScrollDown);
+        assert!(app.help.is_some(), "the wheel scrolls, it does not close");
+        app.mouse_at(ClientId(0), 2, 2, MouseKind::Click);
+        assert_eq!(app.help, None, "a click closes it");
+        assert_eq!(app.focused_terminal(), focused, "and is consumed");
+    }
+
+    #[test]
+    fn the_prefix_hint_replaces_the_tab_chips_only_while_armed() {
+        let mut app = app_from("");
+        let bar = |app: &App| text(app)[29].clone();
+        assert!(!bar(&app).contains("all keys"));
+        app.set_prefix_armed(true);
+        let armed = bar(&app);
+        assert!(armed.contains("? all keys"), "{armed}");
+        assert!(armed.contains("; last"), "{armed}");
+        assert!(armed.contains("% \" split"), "{armed}");
+        let mut app = app_from("prefix_hint = false");
+        app.set_prefix_armed(true);
+        assert!(!bar(&app).contains("all keys"));
     }
 }

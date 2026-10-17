@@ -353,9 +353,79 @@ pub enum Action {
     NavBack,
     NavForward,
     NavLast,
+    /// `Ctrl-b ?` (tmux `list-keys`): every binding of the LIVE keymap with what it does.
+    KeyHelp,
     /// Arm the prefix (`Ctrl-b`). A global-table action like any other, but prefix
     /// entry always wins over a colliding user binding.
     EnterPrefix,
+}
+
+impl Action {
+    /// One line on what the action does, for the `Ctrl-b ?` help.
+    pub fn describe(self) -> &'static str {
+        use Action::*;
+        match self {
+            SplitRight => "split the pane side by side",
+            SplitDown => "split the pane top / bottom",
+            NewTab => "new tab",
+            NextTab => "next tab",
+            PrevTab => "previous tab",
+            CloseTab => "close the tab",
+            SelectTab(_) => "go to tab 1–9",
+            RenameTab => "rename the tab",
+            NewSession => "new session (name prompt)",
+            NewWorktree => "new git worktree + session (branch prompt)",
+            RenameSession => "rename the session",
+            NextSession => "next session",
+            PrevSession => "previous session",
+            KillSession => "kill the session (y/n)",
+            NotificationCenter => "notification center",
+            JumpAttention => "jump to an agent waiting for input",
+            Detach => "detach this client",
+            ClosePane => "close the pane",
+            ToggleSidebar => "show / hide the sidebar",
+            Scrollback => "scrollback (copy mode)",
+            FocusNext => "focus the next pane",
+            FocusLeft => "focus the pane to the left",
+            FocusDown => "focus the pane below",
+            FocusUp => "focus the pane above",
+            FocusRight => "focus the pane to the right",
+            ResizeLeft => "narrow the pane",
+            ResizeDown => "make the pane taller",
+            ResizeUp => "make the pane shorter",
+            ResizeRight => "widen the pane",
+            Popup => "switch session / jump to agent (fuzzy)",
+            Redraw => "force a full repaint",
+            FocusSidebar => "keyboard-focus the sidebar",
+            ResumePicker => "resume a past Claude/Codex conversation",
+            NavBack => "back along the navigation history",
+            NavForward => "forward along the navigation history",
+            NavLast => "toggle to the previous session / tab",
+            KeyHelp => "this help",
+            EnterPrefix => "the prefix",
+        }
+    }
+
+    /// A short noun for the hint the status bar shows while the prefix is armed — only the
+    /// handful worth a glance; the rest are one `?` away.
+    pub fn short(self) -> Option<&'static str> {
+        use Action::*;
+        Some(match self {
+            NewTab => "tab",
+            NewSession => "session",
+            NavLast => "last",
+            NextSession => "next/prev",
+            PrevSession => "next/prev",
+            SplitRight => "split",
+            SplitDown => "split",
+            Scrollback => "scroll",
+            Popup => "find",
+            ResumePicker => "resume",
+            Detach => "detach",
+            KeyHelp => "all keys",
+            _ => return None,
+        })
+    }
 }
 
 /// A canonical key on the pane keyboard.
@@ -600,6 +670,7 @@ fn action_from_name(name: &str) -> Option<Action> {
         "nav-back" | "back" => Action::NavBack,
         "nav-forward" | "forward" => Action::NavForward,
         "nav-last" | "last" => Action::NavLast,
+        "key-help" | "help" => Action::KeyHelp,
         "prefix" => Action::EnterPrefix,
         _ => {
             // tab-1 .. tab-9
@@ -679,6 +750,7 @@ fn default_bindings() -> Vec<(Action, Ctx, &'static [&'static str])> {
         (NavLast, Prefix, &[";", "Tab"]),
         (NavBack, Prefix, &["<"]),
         (NavForward, Prefix, &[">"]),
+        (KeyHelp, Prefix, &["?"]),
     ]
 }
 
@@ -698,6 +770,39 @@ impl Keymap {
     /// Resolve a prefix-less chord.
     pub fn global_action(&self, chord: &Chord) -> Option<Action> {
         self.global_map.get(chord).copied()
+    }
+
+    /// Every binding, `(is_prefix_table, chord, action)`, in the built-in declaration order
+    /// of the actions and then by chord label — stable, so the help reads the same each time.
+    pub fn bindings(&self) -> Vec<(bool, Chord, Action)> {
+        let order: Vec<Action> = {
+            let mut seen = Vec::new();
+            for (a, _, _) in default_bindings() {
+                if !seen.contains(&a) {
+                    seen.push(a);
+                }
+            }
+            seen
+        };
+        let rank = |a: &Action| order.iter().position(|o| o == a).unwrap_or(usize::MAX);
+        let mut out: Vec<(bool, Chord, Action)> = self
+            .prefix_map
+            .iter()
+            .map(|(c, a)| (true, *c, *a))
+            .chain(self.global_map.iter().map(|(c, a)| (false, *c, *a)))
+            .collect();
+        // The prefix table first: it is where nearly everything lives.
+        out.sort_by_key(|(p, c, a)| (!*p, rank(a), c.label()));
+        out
+    }
+
+    /// The chords that run `action` in the prefix table (`true`) or the global one.
+    pub fn chords_for(&self, prefix: bool, action: Action) -> Vec<Chord> {
+        self.bindings()
+            .into_iter()
+            .filter(|(p, _, a)| *p == prefix && *a == action)
+            .map(|(_, c, _)| c)
+            .collect()
     }
 }
 
@@ -740,6 +845,9 @@ pub struct MuxConfig {
     /// preference. There is deliberately no desktop toast — shells ring for ambiguous
     /// tab-completion, end of history and end of pager, which would bury the agent toasts.
     pub bell: bool,
+    /// While the prefix is armed, show the most useful next keys (from the live keymap) in
+    /// the status bar in place of the tab chips. Presentation only; on by default.
+    pub prefix_hint: bool,
     /// Show a one-row bar along the TOP of the mux (host CPU/memory/GPU/load).
     ///
     /// Off by default: it costs a row of the pane grid, and an existing user's layout should
@@ -834,6 +942,7 @@ struct RawConfig {
     osc52: Option<bool>,
     notify: Option<bool>,
     bell: Option<bool>,
+    prefix_hint: Option<bool>,
     top_bar: Option<bool>,
     sidebar: Option<bool>,
     sidebar_width: Option<i64>,
@@ -938,6 +1047,7 @@ impl MuxConfig {
             osc52: true,
             notify: true,
             bell: true,
+            prefix_hint: true,
             top_bar: false,
             sidebar: true,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
@@ -1054,6 +1164,7 @@ impl MuxConfig {
                 osc52: raw.osc52.unwrap_or(true),
                 notify: raw.notify.unwrap_or(true),
                 bell: raw.bell.unwrap_or(true),
+                prefix_hint: raw.prefix_hint.unwrap_or(true),
                 top_bar: raw.top_bar.unwrap_or(false),
                 sidebar: raw.sidebar.unwrap_or(true),
                 sidebar_width,
@@ -1496,7 +1607,7 @@ fn config_dir() -> PathBuf {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn ev(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
@@ -1985,5 +2096,39 @@ mod tests {
     fn load_str(toml: &str) -> (MuxConfig, Vec<String>) {
         let raw: RawConfig = toml::from_str(toml).unwrap();
         MuxConfig::from_raw(raw)
+    }
+
+    /// The test-only door for other modules' tests: a config from TOML text.
+    pub(crate) fn config_from_str(toml: &str) -> MuxConfig {
+        load_str(toml).0
+    }
+
+    #[test]
+    fn bindings_reflect_the_live_keymap() {
+        let labels = |cfg: &MuxConfig, a: Action| -> Vec<String> {
+            cfg.keymap
+                .chords_for(true, a)
+                .iter()
+                .map(|c| c.label())
+                .collect()
+        };
+        let d = MuxConfig::default();
+        assert_eq!(labels(&d, Action::KeyHelp), ["?"]);
+        assert_eq!(labels(&d, Action::NavLast), [";", "Tab"]);
+        let (cfg, warns) = load_str("[keys]\nnew-tab = \"t\"\nkey-help = \"/\"");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(labels(&cfg, Action::NewTab), ["t"]);
+        assert_eq!(labels(&cfg, Action::KeyHelp), ["/"]);
+        // The prefix table lists before the global one.
+        let b = cfg.keymap.bindings();
+        let first_global = b.iter().position(|(p, _, _)| !p).unwrap();
+        assert!(b[..first_global].iter().all(|(p, _, _)| *p));
+        assert!(b[first_global..].iter().all(|(p, _, _)| !p));
+    }
+
+    #[test]
+    fn prefix_hint_parses_and_defaults_on() {
+        assert!(MuxConfig::default().prefix_hint);
+        assert!(!load_str("prefix_hint = false").0.prefix_hint);
     }
 }
