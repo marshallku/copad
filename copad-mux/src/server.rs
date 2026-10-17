@@ -428,6 +428,8 @@ pub fn run() -> io::Result<()> {
         } else {
             LABEL_INTERVAL
         });
+        // Again after the sweep: it can re-sort the switcher's agents under the selection.
+        dirty |= app.reconcile_popup();
         dirty |= app.maybe_auto_roll_usage(); // usage carousel auto-advance (usage_rotate_secs)
         dirty |= app.maybe_expire_message(); // a status-bar message timed out
         dirty |= app.poll_agent_sessions(); // resume-picker scan landed (Ctrl-b R)

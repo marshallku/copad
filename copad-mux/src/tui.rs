@@ -434,7 +434,7 @@ struct Confirm {
 }
 
 /// A destination in the `Ctrl-f` fuzzy switcher.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum PopupTarget {
     /// Switch to this session (workspace).
     Session(WorkspaceId),
@@ -465,6 +465,10 @@ struct StatusMessage {
     until: std::time::Instant,
 }
 
+/// The smallest frame the `Ctrl-f` switcher shows a pane preview in; below it, list only.
+const POPUP_PREVIEW_MIN_COLS: u16 = 110;
+const POPUP_PREVIEW_MIN_ROWS: u16 = 16;
+
 /// How long a status message stays up. Errors linger: they are the ones worth reading.
 const MESSAGE_SECS: u64 = 5;
 const ERROR_MESSAGE_SECS: u64 = 10;
@@ -474,6 +478,48 @@ struct PopupState {
     tab: PopupTab,
     filter: String,
     sel: usize,
+    /// What `sel` pointed at when the user last chose it. The rows re-sort live (agents by
+    /// status) while the switcher is open, so an index alone would silently retarget the
+    /// preview AND Enter; [`App::reconcile_popup`] follows this instead.
+    pinned: Option<PopupTarget>,
+}
+
+/// A leading status operator in the switcher filter (agent-deck style): `!` working,
+/// `@` blocked, `#` ready or idle. Only the FIRST character is an operator; the rest of the
+/// filter is fuzzy-matched as before, so `@api` and `@ api` both mean "blocked, matching api".
+fn split_status_op(filter: &str) -> (Option<&'static [&'static str]>, &str) {
+    let op: Option<&'static [&'static str]> = match filter.chars().next() {
+        Some('!') => Some(&["working"]),
+        Some('@') => Some(&["blocked"]),
+        Some('#') => Some(&["ready", "idle"]),
+        _ => None,
+    };
+    match op {
+        Some(op) => (Some(op), filter[1..].trim_start()),
+        None => (None, filter),
+    }
+}
+
+/// The row the switcher is ON: the pinned target wherever it sits now, else `sel` kept in
+/// range. Everything that reads the selection — render, preview, Enter, ^R, moving — goes
+/// through here, so a re-sort between the last reconcile and this read (the status sweep
+/// runs after it in the server loop) can never retarget it.
+fn pinned_sel(p: &PopupState, items: &[PopupRow]) -> usize {
+    p.pinned
+        .as_ref()
+        .and_then(|t| items.iter().position(|r| r.target == *t))
+        .unwrap_or_else(|| p.sel.min(items.len().saturating_sub(1)))
+}
+
+/// Switcher order for agents: the ones waiting on you first. Within a status the sidebar's
+/// order (session, tab, pane) is kept.
+fn status_rank(status: &str) -> u8 {
+    match status {
+        "blocked" => 0,
+        "working" => 1,
+        "ready" => 2,
+        _ => 3,
+    }
 }
 
 /// Keyboard-focus state for the always-on left sidebar (`Ctrl-b e`): which group
@@ -4728,7 +4774,9 @@ impl App {
             tab: PopupTab::Sessions,
             filter: String::new(),
             sel: self.popup_default_sel(PopupTab::Sessions, ""),
+            pinned: None,
         });
+        self.popup_pin();
     }
 
     /// The row a fresh (unfiltered) list starts on. Sessions: the most recently attached
@@ -4753,9 +4801,18 @@ impl App {
     /// Left/Right switch the tab (owner's tmux `Ctrl-f` session switch + `prefix g` agents).
     fn popup_items(&self, tab: PopupTab, filter: &str) -> Vec<PopupRow> {
         let mut rows = Vec::new();
+        let (op, filter) = split_status_op(filter);
         match tab {
             PopupTab::Sessions => {
+                let agents = op.map(|_| self.agent_rows()).unwrap_or_default();
                 for wid in self.sorted_session_ids() {
+                    if let Some(op) = op
+                        && !agents
+                            .iter()
+                            .any(|a| a.space_id == wid && op.contains(&a.status))
+                    {
+                        continue;
+                    }
                     let name = self
                         .state
                         .workspace(&wid)
@@ -4786,7 +4843,12 @@ impl App {
                 }
             }
             PopupTab::Agents => {
-                for row in self.agent_rows() {
+                let mut agents = self.agent_rows();
+                agents.sort_by_key(|a| status_rank(a.status)); // stable
+                for row in agents {
+                    if op.is_some_and(|op| !op.contains(&row.status)) {
+                        continue;
+                    }
                     let (glyph, color) = match row.status {
                         "working" => ("●", CAT_GREEN),
                         "ready" => ("◐", CAT_BLUE),
@@ -4840,15 +4902,41 @@ impl App {
         let Some((tab, filter)) = self.popup.as_ref().map(|p| (p.tab, p.filter.clone())) else {
             return false;
         };
-        let n = self.popup_items(tab, &filter).len();
-        if let Some(p) = &mut self.popup {
-            let clamped = if n == 0 { 0 } else { p.sel.min(n - 1) };
-            if clamped != p.sel {
-                p.sel = clamped;
-                return true;
-            }
+        let items = self.popup_items(tab, &filter);
+        let n = items.len();
+        let Some(p) = &mut self.popup else {
+            return false;
+        };
+        // Follow the pinned row if it is still listed; else stay in range and re-pin.
+        let found = p
+            .pinned
+            .as_ref()
+            .and_then(|t| items.iter().position(|r| r.target == *t));
+        let want = found.unwrap_or(if n == 0 { 0 } else { p.sel.min(n - 1) });
+        let moved = want != p.sel;
+        p.sel = want;
+        if found.is_none() {
+            p.pinned = items.get(want).map(|r| r.target.clone());
         }
-        false
+        moved
+    }
+
+    /// Record the row now under `sel` as the one the user chose (see `PopupState::pinned`).
+    fn popup_pin(&mut self) {
+        let Some((tab, filter, sel)) = self
+            .popup
+            .as_ref()
+            .map(|p| (p.tab, p.filter.clone(), p.sel))
+        else {
+            return;
+        };
+        let target = self
+            .popup_items(tab, &filter)
+            .get(sel)
+            .map(|r| r.target.clone());
+        if let Some(p) = &mut self.popup {
+            p.pinned = target;
+        }
     }
 
     /// Switch the switcher tab (Left/Right), resetting the selection to the top.
@@ -4864,20 +4952,24 @@ impl App {
         {
             p.sel = sel;
         }
+        self.popup_pin();
     }
 
     /// Move the switcher selection by `delta`, wrapping over the filtered rows.
     fn popup_move(&mut self, delta: i32) {
-        let Some((tab, filter)) = self.popup.as_ref().map(|p| (p.tab, p.filter.clone())) else {
+        let Some(p) = self.popup.as_ref() else {
             return;
         };
-        let n = self.popup_items(tab, &filter).len() as i32;
+        let items = self.popup_items(p.tab, &p.filter);
+        let n = items.len() as i32;
         if n == 0 {
             return;
         }
+        let from = pinned_sel(p, &items) as i32;
         if let Some(p) = &mut self.popup {
-            p.sel = (p.sel as i32 + delta).rem_euclid(n) as usize;
+            p.sel = (from + delta).rem_euclid(n) as usize;
         }
+        self.popup_pin();
     }
 
     /// Append `c` to the switcher filter (resets the selection to the top).
@@ -4886,6 +4978,7 @@ impl App {
             p.filter.push(c);
             p.sel = 0;
         }
+        self.popup_pin();
     }
 
     /// Delete the last filter char.
@@ -4901,6 +4994,7 @@ impl App {
         {
             p.sel = sel;
         }
+        self.popup_pin();
     }
 
     /// Act on the selected row (switch session / jump to agent) and close the switcher.
@@ -4911,7 +5005,7 @@ impl App {
             return;
         };
         let items = self.popup_items(p.tab, &p.filter);
-        let Some(row) = items.get(p.sel) else {
+        let Some(row) = items.get(pinned_sel(p, &items)) else {
             return; // no valid row → keep the switcher open
         };
         let target = row.target.clone();
@@ -4935,7 +5029,7 @@ impl App {
         let Some(PopupRow {
             target: PopupTarget::Session(wid),
             ..
-        }) = items.get(p.sel)
+        }) = items.get(pinned_sel(p, &items))
         else {
             return;
         };
@@ -5740,8 +5834,10 @@ impl App {
     /// (`refresh_host_metrics`), labels, branches, usage and version. Adding a new live
     /// read of `self.panes` to a render path means adding its comparison there too.
     pub fn drain_pane_dirty(&self) -> bool {
-        let visible: std::collections::HashSet<TerminalId> =
+        let mut visible: std::collections::HashSet<TerminalId> =
             self.layout().into_iter().map(|r| r.terminal).collect();
+        // The switcher's preview shows a pane that may be in a background session.
+        visible.extend(self.popup_preview_terminal());
         let mut dirty = false;
         for (tid, pt) in &self.panes {
             // No short-circuit: every flag has to be taken, visible or not.
@@ -7531,13 +7627,24 @@ impl App {
         let Some(p) = self.popup.as_ref() else { return };
         let area = buf.area;
         let items = self.popup_items(p.tab, &p.filter);
+        let sel = pinned_sel(p, &items);
 
         // Clamp bounds so `min <= max` even on tiny/narrow terminals (the popup
         // is the narrow/mobile fallback, so it must never panic there).
         let maxw = area.width.saturating_sub(2).max(1);
-        let w = (area.width / 2).clamp(24.min(maxw), maxw);
+        // Wide enough for a preview: the box takes most of the frame and splits.
+        let preview = area.width >= POPUP_PREVIEW_MIN_COLS && area.height >= POPUP_PREVIEW_MIN_ROWS;
+        let w = if preview {
+            (area.width as u32 * 9 / 10) as u16
+        } else {
+            (area.width / 2).clamp(24.min(maxw), maxw)
+        };
         let maxh = area.height.saturating_sub(2).max(1);
-        let h = ((area.height as u32 * 3 / 5) as u16).clamp(5.min(maxh), maxh);
+        let h = if preview {
+            (area.height as u32 * 4 / 5) as u16
+        } else {
+            ((area.height as u32 * 3 / 5) as u16).clamp(5.min(maxh), maxh)
+        };
         let x0 = (area.width.saturating_sub(w)) / 2;
         let y0 = (area.height.saturating_sub(h)) / 2;
         // Transparent interior (default terminal bg) so a background image shows through;
@@ -7558,7 +7665,7 @@ impl App {
             y0,
             x0 + 2,
             w.saturating_sub(4),
-            " go to  (↵ go · ←/→ tab · ^R rename · esc) ",
+            " go to  (↵ go · ←/→ tab · ^R rename · esc · ! working @ blocked # idle) ",
             Style::default()
                 .fg(Color::Cyan)
                 .bg(bg)
@@ -7566,7 +7673,27 @@ impl App {
         );
 
         let inner_x = x0 + 2;
-        let inner_w = w.saturating_sub(4);
+        let full_w = w.saturating_sub(4);
+        // With a preview the list keeps the left ~40% and the pane gets the rest.
+        let inner_w = if preview {
+            (full_w * 2 / 5).max(30).min(full_w)
+        } else {
+            full_w
+        };
+        if preview {
+            let rule_x = inner_x + inner_w + 1;
+            for y in y0 + 1..y0 + h - 1 {
+                if let Some(bc) = buf.cell_mut(Position::new(rule_x, y)) {
+                    bc.set_symbol("│");
+                    bc.set_skip(false);
+                    bc.set_style(Style::default().fg(CAT_SURFACE0));
+                }
+            }
+            let px = rule_x + 2;
+            let pw = (x0 + w - 2).saturating_sub(px);
+            let target = items.get(sel).map(|r| r.target.clone());
+            self.render_popup_preview(buf, target.as_ref(), px, y0 + 1, pw, h.saturating_sub(2));
+        }
 
         // Row 1: the two tabs (Left/Right switches), active one highlighted.
         let tab_hi = Style::default()
@@ -7625,14 +7752,10 @@ impl App {
             );
             return;
         }
-        let start = if p.sel >= visible {
-            p.sel + 1 - visible
-        } else {
-            0
-        };
+        let start = if sel >= visible { sel + 1 - visible } else { 0 };
         for (row_i, item) in items.iter().enumerate().skip(start).take(visible) {
             let y = list_top + (row_i - start) as u16;
-            let selected = row_i == p.sel;
+            let selected = row_i == sel;
             let arrow = if selected { "▸" } else { " " };
             let text = format!("{arrow} {} {}", item.glyph, item.text);
             let padded = pad_width(&text, inner_w as usize);
@@ -7645,6 +7768,140 @@ impl App {
                 Style::default().fg(item.color).bg(bg)
             };
             put(buf, y, inner_x, inner_w, &padded, st);
+        }
+    }
+
+    /// The terminal the switcher previews for `target`: an agent's own pane, or a session's
+    /// active tab's focused pane.
+    fn preview_terminal(&self, target: &PopupTarget) -> Option<TerminalId> {
+        match target {
+            PopupTarget::Agent(t) => Some(t.clone()),
+            PopupTarget::Session(wid) => {
+                let w = self.state.workspace(wid)?;
+                let tab = w.tab(&w.active_tab)?;
+                tab.layout.terminal_of(&tab.focused).cloned()
+            }
+        }
+    }
+
+    /// The pane the open switcher is previewing, if any — so its output counts as visible
+    /// for repainting (`drain_pane_dirty`), even when it lives in a background session.
+    fn popup_preview_terminal(&self) -> Option<TerminalId> {
+        let p = self.popup.as_ref()?;
+        if self.cols < POPUP_PREVIEW_MIN_COLS || self.rows < POPUP_PREVIEW_MIN_ROWS {
+            return None;
+        }
+        let items = self.popup_items(p.tab, &p.filter);
+        self.preview_terminal(&items.get(pinned_sel(p, &items))?.target)
+    }
+
+    /// Draw the switcher's preview of `target` into `(x, y, w, h)`: a one-line header, then
+    /// the pane's CURRENT viewport (what it would show if you went there — scrolled-up panes
+    /// preview their scrollback), bottom-anchored on its content and cropped to the width.
+    /// Every cell of the region is written, so nothing the pane underneath drew (a wide
+    /// glyph's skipped spacer above all) survives inside it.
+    fn render_popup_preview(
+        &self,
+        buf: &mut Buffer,
+        target: Option<&PopupTarget>,
+        x: u16,
+        y: u16,
+        w: u16,
+        h: u16,
+    ) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        let blank = Style::default().bg(Color::Reset);
+        for yy in y..y + h {
+            for xx in x..x + w {
+                if let Some(bc) = buf.cell_mut(Position::new(xx, yy)) {
+                    bc.set_symbol(" ");
+                    bc.set_skip(false);
+                    bc.set_style(blank);
+                }
+            }
+        }
+        let Some(term) = target.and_then(|t| self.preview_terminal(t)) else {
+            return;
+        };
+        let header = match self.locate_terminal(&term) {
+            Some((wid, tab, _)) => {
+                let loc = Loc {
+                    ws: wid,
+                    tab,
+                    term: None,
+                };
+                let label = self
+                    .labels
+                    .get(&term)
+                    .map(|l| l.text.clone())
+                    .unwrap_or_default();
+                let status = self
+                    .agent_statuses
+                    .get(&term)
+                    .map(|s| format!(" {}", s.status.label()))
+                    .unwrap_or_default();
+                format!("{} · {label}{status}", self.loc_label(&loc))
+            }
+            None => String::new(),
+        };
+        put_str(
+            buf,
+            x,
+            y,
+            x + w,
+            &header,
+            Style::default()
+                .fg(CAT_SUBTEXT)
+                .add_modifier(Modifier::BOLD),
+        );
+        let Some(pt) = self.panes.get(&term) else {
+            return;
+        };
+        let snap = pt.snapshot();
+        let body_h = h.saturating_sub(1) as usize;
+        // Bottom-anchor on the last row with content (or the cursor), so a mostly-empty pane
+        // shows its prompt rather than a screen of blank rows.
+        let last_used = snap
+            .cells
+            .iter()
+            .rposition(|row| row.iter().any(|c| !c.spacer && c.sym.trim() != ""))
+            .unwrap_or(0)
+            .max(snap.cursor.1 as usize);
+        let end = (last_used + 1).min(snap.cells.len());
+        let start = end.saturating_sub(body_h);
+        for (i, row) in snap.cells[start..end].iter().enumerate() {
+            let yy = y + 1 + i as u16;
+            for (cx, cell) in row.iter().enumerate() {
+                let xx = x + cx as u16;
+                if xx >= x + w {
+                    break;
+                }
+                let Some(bc) = buf.cell_mut(Position::new(xx, yy)) else {
+                    continue;
+                };
+                if cell.spacer {
+                    bc.set_symbol(" ");
+                    bc.set_skip(true);
+                    continue;
+                }
+                let wide = cell.sym.width() >= 2;
+                if wide && xx + 1 >= x + w {
+                    // Its second column would fall outside the preview: drop it.
+                    bc.set_symbol(" ");
+                    continue;
+                }
+                let mut style = Style::default().fg(to_color(cell.fg)).bg(to_color(cell.bg));
+                if cell.bold {
+                    style = style.add_modifier(Modifier::BOLD);
+                }
+                if cell.reverse {
+                    style = style.add_modifier(Modifier::REVERSED);
+                }
+                bc.set_symbol(&cell.sym);
+                bc.set_style(style);
+            }
         }
     }
 
@@ -12226,5 +12483,180 @@ mod mode_hints {
         app.feed_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut prefix);
         app.open_new_session_prompt();
         assert!(rows(&app).iter().any(|r| r.contains("esc cancel")));
+    }
+}
+
+#[cfg(test)]
+mod switcher_preview {
+    use super::*;
+    use crate::control::Req;
+    use agentstate::AgentStatus;
+    use ratatui::layout::Rect;
+
+    fn app(cols: u16, rows: u16) -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(cols, rows, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn text(app: &App) -> String {
+        let (cols, rows) = app.size();
+        let mut buf = Buffer::empty(Rect::new(0, 0, cols, rows));
+        app.render_to(&mut buf);
+        (0..rows)
+            .map(|y| {
+                (0..cols)
+                    .map(|x| buf.cell(Position::new(x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Make `term` look like an agent in `status` (the sweep is never run in tests).
+    fn fake_agent(app: &mut App, term: &TerminalId, status: AgentStatus) {
+        app.labels.insert(
+            term.clone(),
+            procinfo::Label {
+                text: "claude".into(),
+                kind: procinfo::Kind::Agent,
+                pid: 1,
+            },
+        );
+        app.agent_statuses.insert(
+            term.clone(),
+            AgentState {
+                status,
+                since: std::time::Instant::now(),
+                seq: 0,
+                pid: 1,
+            },
+        );
+    }
+
+    /// One new session per name, returning each one's terminal.
+    fn sessions(app: &mut App, names: &[&str]) -> Vec<TerminalId> {
+        names
+            .iter()
+            .map(|n| {
+                assert!(
+                    app.handle_control(&Req::NewSession {
+                        name: Some((*n).into()),
+                        cwd: None,
+                    })
+                    .ok
+                );
+                app.focused_terminal().unwrap()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_preview_shows_the_selected_sessions_pane_and_only_when_wide() {
+        let mut app = app(120, 30);
+        let t = sessions(&mut app, &["bg"]);
+        assert!(
+            app.handle_control(&Req::SelectSession {
+                index: Some(0),
+                target: None,
+            })
+            .ok
+        );
+        app.panes[&t[0]].input(b"echo PREVIEW-MARK-$((40+2))\n");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        app.open_popup(); // preselects `bg`, the previous session
+        loop {
+            if text(&app).contains("PREVIEW-MARK-42") {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "{}", text(&app));
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // The previewed pane counts as visible, so a background pane's output repaints.
+        assert_eq!(app.popup_preview_terminal(), Some(t[0].clone()));
+        let narrow = app_narrow();
+        assert!(narrow.popup_preview_terminal().is_none());
+    }
+
+    fn app_narrow() -> App {
+        let mut a = app(100, 30);
+        a.open_popup();
+        a
+    }
+
+    #[test]
+    fn blocked_agents_list_first_and_the_selection_follows_its_row() {
+        let mut app = app(100, 30);
+        let t = sessions(&mut app, &["a", "b", "c"]);
+        fake_agent(&mut app, &t[0], AgentStatus::Working);
+        fake_agent(&mut app, &t[1], AgentStatus::Ready);
+        fake_agent(&mut app, &t[2], AgentStatus::Blocked);
+        app.open_popup();
+        app.popup_tab(PopupTab::Agents);
+        let order = |app: &App| -> Vec<TerminalId> {
+            let p = app.popup.as_ref().unwrap();
+            app.popup_items(p.tab, &p.filter)
+                .into_iter()
+                .map(|r| match r.target {
+                    PopupTarget::Agent(t) => t,
+                    PopupTarget::Session(_) => unreachable!(),
+                })
+                .collect()
+        };
+        assert_eq!(order(&app), vec![t[2].clone(), t[0].clone(), t[1].clone()]);
+        // Select `a` (working, row 1); then it turns blocked and moves to the top.
+        app.popup_move(1);
+        fake_agent(&mut app, &t[0], AgentStatus::Blocked);
+        assert!(app.reconcile_popup(), "the index moved with the row");
+        let p = app.popup.as_ref().unwrap();
+        assert_eq!(order(&app)[p.sel], t[0], "still on `a`");
+        // ...and when it disappears the selection stays in range on something listed.
+        app.labels.remove(&t[0]);
+        app.reconcile_popup();
+        let p = app.popup.as_ref().unwrap();
+        assert!(p.sel < order(&app).len());
+    }
+
+    #[test]
+    fn enter_follows_the_pinned_agent_even_before_a_reconcile() {
+        // The server reconciles BEFORE the status sweep, so a re-sort can land between the
+        // last reconcile and the next key: Enter must still go to the row the user chose.
+        let mut app = app(100, 30);
+        let t = sessions(&mut app, &["a", "b"]);
+        fake_agent(&mut app, &t[0], AgentStatus::Working);
+        fake_agent(&mut app, &t[1], AgentStatus::Blocked);
+        app.open_popup();
+        app.popup_tab(PopupTab::Agents);
+        app.popup_move(1); // `a` (working) sits below the blocked `b`
+        fake_agent(&mut app, &t[0], AgentStatus::Blocked); // re-sorts: `a` moves up
+        fake_agent(&mut app, &t[1], AgentStatus::Ready);
+        app.popup_select();
+        assert_eq!(app.focused_terminal(), Some(t[0].clone()));
+    }
+
+    #[test]
+    fn status_operators_filter_agents_and_sessions() {
+        let mut app = app(100, 30);
+        let t = sessions(&mut app, &["api", "web", "docs"]);
+        fake_agent(&mut app, &t[0], AgentStatus::Blocked);
+        fake_agent(&mut app, &t[1], AgentStatus::Working);
+        fake_agent(&mut app, &t[2], AgentStatus::Blocked);
+        let agents = |f: &str| app.popup_items(PopupTab::Agents, f).len();
+        assert_eq!(agents("@"), 2);
+        assert_eq!(agents("!"), 1);
+        assert_eq!(agents("#"), 0);
+        assert_eq!(agents("@api"), 1, "the rest is fuzzy-matched");
+        assert_eq!(agents("@ api"), 1);
+        let sessions = |f: &str| -> Vec<String> {
+            app.popup_items(PopupTab::Sessions, f)
+                .into_iter()
+                .map(|r| match r.target {
+                    PopupTarget::Session(w) => app.session_display_name(&w),
+                    PopupTarget::Agent(_) => unreachable!(),
+                })
+                .collect()
+        };
+        assert_eq!(sessions("@"), ["api", "docs"]);
+        assert_eq!(sessions("!"), ["web"]);
     }
 }

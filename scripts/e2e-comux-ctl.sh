@@ -50,6 +50,7 @@
 #  34. a Korean session name keeps every overlay's border where it belongs
 #  35. Ctrl-b ? lists the live keymap; an armed prefix shows the next keys in the status bar
 #  36. outcomes reach the status bar (no toast needed); modes say how to leave them
+#  37. a wide Ctrl-f previews the selected session's pane, live
 
 set -euo pipefail
 
@@ -1876,6 +1877,12 @@ os.write(fd, b"\\x1b"); drain(0.5)
 """
 assert "buf = drain(6)\n" in src
 src = src.replace("buf = drain(6)\n", inject, 1)
+# Size and an extra settle after the keys, both from the environment (defaults = the old ones).
+assert "rows, cols = 24, 100\n" in src
+src = src.replace("rows, cols = 24, 100\n",
+    "rows, cols = int(os.environ.get('PTY_ROWS', 24)), int(os.environ.get('PTY_COLS', 100))\n", 1)
+src = src.replace('os.write(fd, b"\\x1b"); drain(0.5)',
+    'buf += drain(float(os.environ.get("PTY_WAIT", "0"))); os.write(fd, b"\\x1b"); drain(0.5)', 1)
 # Replay by DISPLAY width: comux skips a wide glyph's trailing cell, so a one-column-per-char
 # replay shifts every CJK row left and reads as a render bug that is not there.
 old = "    if 0 <= cy < rows and 0 <= cx < cols: grid[cy][cx] = ch\n    cx += 1; i += 1\n"
@@ -1955,7 +1962,24 @@ tail -1 "$WORK/frame" | grep -qE "SCROLL [0-9]+/[0-9]+ · j/k g/G · q" \
     || { cat "$WORK/frame" >&2; fail "scroll mode should show its position and exit keys"; }
 ok "an empty-history key reports in the bar; scroll mode shows position and keys"
 
-echo "37. the server is still responsive and shuts down cleanly"
+echo "37. the switcher previews the selected session's pane, and keeps it live"
+t 10 "$COMUX" new-session --json e2e-preview >"$WORK/json" || fail "new-session e2e-preview failed"
+PV="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+t 10 "$COMUX" send "$PV" $'echo PV-ONE-$((1+1))\n' >/dev/null
+t 10 "$COMUX" last >/dev/null # attach elsewhere: the preview must reach a BACKGROUND pane
+# A second line printed only while the switcher is already open: it reaches the frame only if
+# the previewed (background) pane counts as visible for repainting.
+( sleep 9; "$COMUX" send "$PV" $'echo PV-TWO-$((2+2))\n' >/dev/null ) &
+LATE=$!
+PTY_COLS=130 PTY_ROWS=30 PTY_WAIT=6 PTY_KEYS='\x06' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+# THAT job only: a bare `wait` also waits on the background server and never returns.
+wait "$LATE" || true
+grep -q "PV-ONE-2" "$WORK/frame" || { cat "$WORK/frame" >&2; fail "the preview should show the selected session's pane"; }
+grep -q "PV-TWO-4" "$WORK/frame" || { cat "$WORK/frame" >&2; fail "the preview did not refresh on the background pane's new output"; }
+t 10 "$COMUX" kill-session name:e2e-preview >/dev/null 2>&1 || true
+ok "Ctrl-f at 130 cols previews the previous session's pane and repaints on its output"
+
+echo "38. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"
