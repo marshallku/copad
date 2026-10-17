@@ -54,6 +54,7 @@
 #  38. an unread notification shows as ✉ N, and Ctrl-b u lands on it and clears it
 #  39. the sidebar shows a repo's working-tree state, and marks a linked worktree
 #  40. broadcast types into one session's panes (or lists all on a dry run), never the caller's
+#  41. a split shows pane titles; Ctrl-b z zooms the pane to the whole tab (and its PTY with it)
 
 set -euo pipefail
 
@@ -2045,7 +2046,27 @@ done
 for n in e2ebc1 e2ebc2; do t 10 "$COMUX" kill-session "name:$n" >/dev/null 2>&1 || true; done
 ok "scope + --dry-run/--yes required; dry run lists and sends nothing; the caller is skipped"
 
-echo "41. the server is still responsive and shuts down cleanly"
+echo "41. pane titles and zoom, in a real frame"
+t 10 "$COMUX" new-session --json e2ezoom >"$WORK/json" || fail "new-session e2ezoom failed"
+ZT="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+t 10 "$COMUX" split -v --from "$ZT" >/dev/null || fail "split in e2ezoom failed"
+python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+grep -qE " 1:[^ ]* " "$WORK/frame" || { cat "$WORK/frame" >&2; fail "a split tab should title its lower pane on the divider"; }
+PTY_KEYS='\x02z' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+tail -1 "$WORK/frame" | grep -qF " ZOOM " || { cat "$WORK/frame" >&2; fail "Ctrl-b z should show the ZOOM chip"; }
+t 10 "$COMUX" list --json >"$WORK/json"
+python3 -c '
+import json,sys
+p=json.load(sys.stdin)["panes"]
+z=[x for x in p if x.get("focused")] or p
+big=max(x["rows"] for x in p)
+assert big >= 20, p' <"$WORK/json" || fail "the zoomed pane should have the whole tab's rows: $(cat "$WORK/json")"
+t 10 "$COMUX" zoom >"$WORK/out" || fail "comux zoom failed"
+grep -q unzoomed "$WORK/out" || fail "comux zoom should toggle back: $(cat "$WORK/out")"
+t 10 "$COMUX" kill-session name:e2ezoom >/dev/null 2>&1 || true
+ok "split titles its pane; Ctrl-b z zooms (ZOOM chip, full-height PTY); comux zoom toggles back"
+
+echo "42. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

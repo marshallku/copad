@@ -613,6 +613,39 @@ pub struct Tab {
     pub layout: SplitTree,
     pub focused: PaneId,
     pub rev: Rev,
+    /// tmux `resize-pane -Z`: this pane takes the tab's whole area while set (decisions #146).
+    /// Part of the geometry, not a render trick — `recompute_sizes` gives it the full viewport
+    /// so State and the PTY never disagree. Cleared by any split/close in the tab and by
+    /// focusing another pane.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zoomed: Option<PaneId>,
+}
+
+impl Tab {
+    /// The zoomed pane, when the zoom still means something: it is in this tab and the tab
+    /// has another pane to hide.
+    pub fn zoom(&self) -> Option<&PaneId> {
+        self.zoomed
+            .as_ref()
+            .filter(|p| self.layout.contains(p) && self.layout.panes().len() > 1)
+    }
+
+    /// [`SplitTree::derive_layout`] as the tab is SHOWN: one full-area rect while zoomed.
+    pub fn view_layout(&self, x: u16, y: u16, cols: u16, rows: u16, out: &mut Vec<PaneRect>) {
+        if let Some(z) = self.zoom()
+            && let Some(terminal) = self.layout.terminal_of(z)
+        {
+            out.push(PaneRect {
+                terminal: terminal.clone(),
+                x,
+                y,
+                cols,
+                rows,
+            });
+            return;
+        }
+        self.layout.derive_layout(x, y, cols, rows, out);
+    }
 }
 
 /// A workspace: ordered tabs + the control lease (≤1 controller, invariant G1) +

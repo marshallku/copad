@@ -228,6 +228,8 @@ pub enum Req {
     /// Move the shared view along the navigation history (decisions #140): `back`/`forward`
     /// walk it like a browser, `last` toggles to the previous place like Alt-Tab.
     Nav { dir: NavDir },
+    /// Toggle the zoom of the active tab's focused pane (`Ctrl-b z`). Moves the shared view.
+    Zoom,
     /// Raise an agent notification on behalf of a pane: a desktop toast whose click jumps
     /// back to it, plus an entry in the in-app notification center. The entry point for
     /// agent hooks (Claude `Stop`/`Notification`, Codex turn-complete), which know the
@@ -1218,6 +1220,12 @@ pub fn run_client(args: &[String]) -> i32 {
         "kill-server" => {
             parsed!(cliargs::bare("usage: comux kill-server"));
             Req::KillServer
+        }
+        "zoom" => {
+            parsed!(cliargs::bare(
+                "usage: comux zoom    (toggle the focused pane filling its tab; Ctrl-b z)"
+            ));
+            Req::Zoom
         }
         "back" => {
             parsed!(cliargs::bare(
@@ -3507,6 +3515,7 @@ mod verb_args_tests {
         "back",
         "forward",
         "last",
+        "zoom",
         "broadcast",
         "list-tabs",
         "new-tab",

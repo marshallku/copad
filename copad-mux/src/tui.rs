@@ -783,6 +783,8 @@ pub struct App {
     activity_ws: Option<WorkspaceId>,
     /// Back / forward / last navigation (decisions #140). Global, like the view it records.
     nav: navhist::NavHistory,
+    /// The active tab's zoom as `track_nav` last saw it, to resize PTYs once when it changes.
+    last_zoom: Option<(WorkspaceId, TabId, Option<PaneId>)>,
     /// When `Some`, an inline text prompt (new-session name / rename) is open and
     /// captures keystrokes until Enter (commit) or Esc (cancel).
     prompt: Option<Prompt>,
@@ -982,6 +984,7 @@ impl App {
             activity_clock: 0,
             activity_ws: None,
             nav: navhist::NavHistory::default(),
+            last_zoom: None,
             prompt: None,
             confirm: None,
             menu: None,
@@ -1226,7 +1229,7 @@ impl App {
         if let Some(w) = self.state.workspace(&self.ws)
             && let Some(tab) = w.tab(&w.active_tab)
         {
-            tab.layout.derive_layout(
+            tab.view_layout(
                 self.content_x(),
                 self.content_y(),
                 self.content_cols(),
@@ -1237,11 +1240,61 @@ impl App {
         out
     }
 
+    /// ` 1:claude working ` — a pane's title: its index in the tab exactly as `comux list` and
+    /// the index verbs (`send 1`, `capture-pane --index 1`) count it, its program, and an
+    /// agent's status.
+    fn pane_title_text(&self, term: &TerminalId, index: usize) -> String {
+        let label = self
+            .labels
+            .get(term)
+            .map(|l| l.text.clone())
+            .unwrap_or_default();
+        let status = self
+            .agent_statuses
+            .get(term)
+            .map(|s| format!(" {}", s.status.label()))
+            .unwrap_or_default();
+        format!(" {index}:{label}{status} ")
+    }
+
+    /// The active tab's zoomed pane, if it is zoomed (decisions #146).
+    fn active_zoom(&self) -> Option<PaneId> {
+        let w = self.state.workspace(&self.ws)?;
+        w.tab(&w.active_tab)?.zoom().cloned()
+    }
+
+    /// Apply a focus command and the resize it may carry: focusing another pane UNZOOMS, in
+    /// any session — a background one included, which no later visible-view check would see.
+    fn apply_focus(&mut self, cmd: Command) {
+        if let Ok(events) = self.state.apply(cmd) {
+            self.apply_resized_events(&events);
+            self.last_zoom = self
+                .active_tab_id()
+                .map(|t| (self.ws.clone(), t, self.active_zoom()));
+        }
+    }
+
+    /// `Ctrl-b z` / `comux zoom`: toggle the focused pane filling its tab.
+    fn toggle_zoom(&mut self) -> Result<(), MuxError> {
+        let events = self.state.apply(Command::ToggleZoom {
+            origin: Origin::Client(self.client),
+            workspace: self.ws.clone(),
+        })?;
+        self.apply_resized_events(&events);
+        self.note_view_moved();
+        // Already resized here: keep `track_nav` from resizing the same PTYs a second time.
+        self.last_zoom = self
+            .active_tab_id()
+            .map(|t| (self.ws.clone(), t, self.active_zoom()));
+        Ok(())
+    }
+
     /// The active tab's dividers in screen coordinates — the grab targets for a resize drag.
     fn dividers(&self) -> Vec<crate::model::DividerRect> {
         let mut out = Vec::new();
         if let Some(w) = self.state.workspace(&self.ws)
             && let Some(tab) = w.tab(&w.active_tab)
+            && tab.zoom().is_none()
         {
             tab.layout.derive_dividers(
                 self.content_x(),
@@ -1464,7 +1517,7 @@ impl App {
                 if focus {
                     // tmux-style: focus the freshly created pane. Refused (and ignored) when
                     // it is not in the tab on screen.
-                    let _ = self.state.apply(Command::FocusPane {
+                    self.apply_focus(Command::FocusPane {
                         client: self.client,
                         pane: np,
                     });
@@ -1783,6 +1836,17 @@ impl App {
         if let Some(now) = self.nav_loc() {
             self.nav.observe(now);
         }
+        // A focus move can UNZOOM (state-side), and most focus paths drop the Resized events
+        // their apply returns — so a zoom change is reconciled here, once, for every path.
+        let zoom = self
+            .active_tab_id()
+            .map(|t| (self.ws.clone(), t, self.active_zoom()));
+        if zoom != self.last_zoom {
+            if self.last_zoom.is_some() {
+                self.sync_sizes();
+            }
+            self.last_zoom = zoom;
+        }
     }
 
     /// Bump the attached session's recency, once per arrival.
@@ -1960,7 +2024,7 @@ impl App {
         if let Some(term) = &loc.term
             && let Some(pane) = self.pane_of_terminal(term)
         {
-            let _ = self.state.apply(Command::FocusPane {
+            self.apply_focus(Command::FocusPane {
                 client: self.client,
                 pane,
             });
@@ -3014,7 +3078,7 @@ impl App {
             // In a background tab this focuses the pane within that tab; the view never moves.
             Req::Focus { index, caller } => match self.pane_at(caller.as_deref(), *index) {
                 Ok((ws, pane, _)) => {
-                    let _ = self.state.apply(Command::FocusPaneIn {
+                    self.apply_focus(Command::FocusPaneIn {
                         origin: self.origin_for(&ws),
                         workspace: ws,
                         pane,
@@ -3414,6 +3478,21 @@ impl App {
                 *enter,
                 *dry_run,
             ),
+            Req::Zoom => match self.toggle_zoom() {
+                Ok(()) => {
+                    let mut r = Resp::ok();
+                    r.message = Some(
+                        if self.active_zoom().is_some() {
+                            "zoomed"
+                        } else {
+                            "unzoomed"
+                        }
+                        .into(),
+                    );
+                    r
+                }
+                Err(e) => Resp::err_code("refused", e.to_string()),
+            },
             Req::Nav { dir } => match self.navigate(*dir) {
                 Some(landed) => {
                     let mut r = Resp::ok();
@@ -4305,6 +4384,11 @@ impl App {
             NavForward => self.navigate_or_say(control::NavDir::Forward),
             NavLast => self.navigate_or_say(control::NavDir::Last),
             KeyHelp => self.help = Some(0),
+            ZoomPane => {
+                if self.toggle_zoom().is_err() {
+                    self.flash("only one pane in this tab — nothing to zoom".into(), false);
+                }
+            }
             EnterPrefix => {} // handled by the caller (arms the prefix)
         }
         KeyAction::Continue
@@ -4320,7 +4404,7 @@ impl App {
         };
         let idx = order.iter().position(|p| p == &cur).unwrap_or(0);
         let next = order[(idx + 1) % order.len()].clone();
-        let _ = self.state.apply(Command::FocusPane {
+        self.apply_focus(Command::FocusPane {
             client: self.client,
             pane: next,
         });
@@ -4362,7 +4446,7 @@ impl App {
         if let Some((r, _)) = best
             && let Some(pane) = self.pane_of_terminal(&r.terminal)
         {
-            let _ = self.state.apply(Command::FocusPane {
+            self.apply_focus(Command::FocusPane {
                 client: self.client,
                 pane,
             });
@@ -4528,7 +4612,7 @@ impl App {
                 }
                 if let Some(r) = target {
                     if let Some(pane) = self.pane_of_terminal(&r.terminal) {
-                        let _ = self.state.apply(Command::FocusPane {
+                        self.apply_focus(Command::FocusPane {
                             client: self.client,
                             pane,
                         });
@@ -4669,7 +4753,7 @@ impl App {
         if let Some((wid, tab, pane)) = self.locate_terminal(term) {
             self.switch_session(wid.clone());
             self.select_tab(wid, tab);
-            let _ = self.state.apply(Command::FocusPane {
+            self.apply_focus(Command::FocusPane {
                 client: self.client,
                 pane,
             });
@@ -5790,12 +5874,37 @@ impl App {
         // sidebar rows push into this as they render).
         self.click_zones.borrow_mut().clear();
 
+        // Pane titles (decisions #146), placed against the SAME snapshot the pane is drawn
+        // from so a blank-cell check can never see newer content than the frame shows.
+        let show_titles = self.cfg.pane_titles && rects.len() >= 2;
+        let mut titles: Vec<(u16, u16, u16, String, Style)> = Vec::new();
+        let grid_top = self.content_y();
+
         // 1) pane contents (inactive panes dimmed so the focused one stands out).
-        for rect in &rects {
+        for (pane_i, rect) in rects.iter().enumerate() {
             let Some(pt) = self.panes.get(&rect.terminal) else {
                 continue;
             };
             let snap = pt.snapshot();
+            if show_titles {
+                let is_focused = Some(&rect.terminal) == focused_term.as_ref();
+                let text = self.pane_title_text(&rect.terminal, pane_i);
+                let st = if is_focused {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(CAT_SUBTEXT)
+                };
+                let right = rect.x + rect.cols;
+                if rect.y > grid_top {
+                    // A pane below a split: its title sits on the divider row above it.
+                    titles.push((rect.x + 1, rect.y - 1, right, text, st));
+                } else if let Some(x) = blank_title_slot(&snap, rect, text.width() as u16) {
+                    titles.push((x, rect.y, right, text, st));
+                }
+            }
             let is_focused = Some(&rect.terminal) == focused_term.as_ref();
             // Drag-selection highlight: only the pane the drag started in, once it has moved.
             // Normalize the start the SAME way extraction does so the tint matches the copy.
@@ -5906,6 +6015,11 @@ impl App {
                     bc.set_style(Style::default().fg(color));
                 }
             }
+        }
+
+        // 2b) pane titles, over the dividers they sit on.
+        for (x, y, max_x, text, st) in &titles {
+            put_str(buf, *x, *y, *max_x, text, *st);
         }
 
         // 3) the neovim-style left panel, over the reserved strip.
@@ -7568,6 +7682,15 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        if self.active_zoom().is_some() {
+            segs.push((
+                " ZOOM ".to_string(),
+                Style::default()
+                    .fg(CAT_BASE)
+                    .bg(CAT_PEACH)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if self.sidebar_focus.is_some() {
             segs.push((
                 " SIDEBAR · j/k h/l · ↵ · esc ".to_string(),
@@ -8686,6 +8809,24 @@ impl App {
             put(buf, y, inner_x, inner_w, &padded, st);
         }
     }
+}
+
+/// Where a top-edge pane's title can go: right-aligned on its FIRST row, one cell in from the
+/// edge — and only if every cell it would cover is plainly blank (a space with the default
+/// background, not a wide glyph's spacer, not reverse video, not under the cursor). A title
+/// never covers content; when there is no room it is simply not drawn.
+fn blank_title_slot(snap: &term::Snapshot, rect: &PaneRect, w: u16) -> Option<u16> {
+    if w + 2 > rect.cols {
+        return None;
+    }
+    let start = rect.cols - w - 1; // pane-relative
+    let row = snap.cells.first()?;
+    let blank = (start..start + w).all(|cx| {
+        row.get(cx as usize).is_some_and(|c| {
+            !c.spacer && !c.reverse && c.sym == " " && matches!(c.bg, CellColor::Default)
+        }) && snap.cursor != (cx, 0)
+    });
+    blank.then_some(rect.x + start)
 }
 
 /// Whether a history entry still names a live tab. Its pane may be gone: landing then keeps
@@ -13259,5 +13400,199 @@ mod broadcast {
         let resp = app.handle_control(&r);
         assert_eq!(targets(&resp), ["ag1"]);
         assert_eq!(resp.targets.unwrap()[0].status.as_deref(), Some("blocked"));
+    }
+}
+
+#[cfg(test)]
+mod zoom_titles {
+    use super::*;
+    use crate::control::Req;
+    use ratatui::layout::Rect as BufRect;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn split(app: &mut App, dir: &str) {
+        let r = app.handle_control(&Req::Split {
+            dir: dir.into(),
+            from: None,
+            no_focus: false,
+        });
+        assert!(r.ok, "{:?}", r.error);
+    }
+
+    fn geom(app: &App, t: &TerminalId) -> (u16, u16) {
+        let g = app.state.terminal(t).unwrap();
+        (g.cols, g.rows)
+    }
+
+    #[test]
+    fn zoom_gives_the_focused_pane_the_whole_tab_in_state_and_unzooms_on_focus() {
+        let mut app = app();
+        assert_eq!(
+            app.handle_control(&Req::Zoom).code.as_deref(),
+            Some("refused")
+        );
+        split(&mut app, "right");
+        let z = app.focused_terminal().unwrap();
+        let before = geom(&app, &z);
+        assert!(app.handle_control(&Req::Zoom).ok);
+        let rects = app.layout();
+        assert_eq!(rects.len(), 1);
+        let full = (app.content_cols(), app.content_rows());
+        assert_eq!((rects[0].cols, rects[0].rows), full);
+        assert_eq!(
+            geom(&app, &z),
+            full,
+            "the State geometry IS the zoomed size"
+        );
+        assert!(app.dividers().is_empty());
+        // Focusing the other pane unzooms, and the geometry goes back.
+        assert!(
+            app.handle_control(&Req::Focus {
+                index: 0,
+                caller: None,
+            })
+            .ok
+        );
+        assert_eq!(app.layout().len(), 2);
+        assert_eq!(geom(&app, &z), before);
+    }
+
+    #[test]
+    fn a_split_unzooms_and_zoom_survives_a_tab_round_trip() {
+        let mut app = app();
+        split(&mut app, "right");
+        assert!(app.handle_control(&Req::Zoom).ok);
+        let mut prefix = false;
+        let key = |app: &mut App, prefix: &mut bool, c: char| {
+            app.feed_key(
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+                prefix,
+            );
+            app.feed_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), prefix);
+        };
+        key(&mut app, &mut prefix, 'c'); // new tab
+        key(&mut app, &mut prefix, 'p'); // back to the zoomed tab
+        assert!(
+            app.active_zoom().is_some(),
+            "tmux keeps a window's zoom across switches"
+        );
+        split(&mut app, "down");
+        assert!(app.active_zoom().is_none(), "a split unzooms");
+        assert_eq!(app.layout().len(), 3);
+    }
+
+    #[test]
+    fn a_background_unzoom_resizes_that_pty_too() {
+        let mut app = app();
+        split(&mut app, "right");
+        let zoomed = app.focused_terminal().unwrap();
+        let token = app.panes[&zoomed].pane_token().unwrap().to_string();
+        assert!(app.handle_control(&Req::Zoom).ok);
+        assert!(
+            app.handle_control(&Req::NewSession {
+                name: Some("elsewhere".into()),
+                cwd: None,
+            })
+            .ok
+        );
+        // From the zoomed pane's own shell: focus its sibling (index 0 in ITS tab).
+        assert!(
+            app.handle_control(&Req::Focus {
+                index: 0,
+                caller: Some(token),
+            })
+            .ok
+        );
+        let pty = app.panes[&zoomed].snapshot();
+        assert_eq!(
+            (pty.cols, pty.rows),
+            geom(&app, &zoomed),
+            "the PTY follows State even though that session is not on screen"
+        );
+        assert!(
+            pty.cols < app.content_cols(),
+            "and it is the split size again"
+        );
+    }
+
+    fn snap(row0: &str, cols: u16) -> term::Snapshot {
+        let mut row: Vec<term::CellSnap> = row0
+            .chars()
+            .map(|c| term::CellSnap {
+                sym: c.to_string(),
+                spacer: false,
+                fg: CellColor::Default,
+                bg: CellColor::Default,
+                bold: false,
+                reverse: false,
+            })
+            .collect();
+        while row.len() < cols as usize {
+            row.push(term::CellSnap {
+                sym: " ".into(),
+                spacer: false,
+                fg: CellColor::Default,
+                bg: CellColor::Default,
+                bold: false,
+                reverse: false,
+            });
+        }
+        term::Snapshot {
+            cols,
+            rows: 1,
+            cells: vec![row],
+            wrapped: vec![false],
+            cursor: (0, 5),
+        }
+    }
+
+    #[test]
+    fn a_title_only_takes_blank_cells() {
+        let rect = PaneRect {
+            terminal: TerminalId::new("t"),
+            x: 10,
+            y: 0,
+            cols: 30,
+            rows: 5,
+        };
+        assert_eq!(
+            blank_title_slot(&snap("$ ls", 30), &rect, 8),
+            Some(10 + 30 - 8 - 1)
+        );
+        let busy = format!("{:>30}", "right-aligned prompt");
+        assert_eq!(
+            blank_title_slot(&snap(&busy, 30), &rect, 8),
+            None,
+            "never over content"
+        );
+        assert_eq!(blank_title_slot(&snap("", 30), &rect, 29), None, "no room");
+    }
+
+    #[test]
+    fn titles_show_for_a_split_and_not_for_one_pane_or_when_off() {
+        let mut app = app();
+        let render = |app: &App| -> String {
+            let mut buf = Buffer::empty(BufRect::new(0, 0, 100, 30));
+            app.render_to(&mut buf);
+            (0..30)
+                .map(|y| {
+                    (0..100)
+                        .map(|x| buf.cell(Position::new(x, y)).unwrap().symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert!(!render(&app).contains(" 0:"), "one pane: no titles");
+        split(&mut app, "down");
+        // The lower pane's title sits on the divider row, whatever its first row holds.
+        assert!(render(&app).contains(" 1:"), "{}", render(&app));
+        app.cfg.pane_titles = false;
+        assert!(!render(&app).contains(" 1:"));
     }
 }

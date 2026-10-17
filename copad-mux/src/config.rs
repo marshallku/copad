@@ -357,6 +357,8 @@ pub enum Action {
     NavLast,
     /// `Ctrl-b ?` (tmux `list-keys`): every binding of the LIVE keymap with what it does.
     KeyHelp,
+    /// `Ctrl-b z` (tmux `resize-pane -Z`): the focused pane fills its tab, and back.
+    ZoomPane,
     /// Arm the prefix (`Ctrl-b`). A global-table action like any other, but prefix
     /// entry always wins over a colliding user binding.
     EnterPrefix,
@@ -405,6 +407,7 @@ impl Action {
             NavForward => "forward along the navigation history",
             NavLast => "toggle to the previous session / tab",
             KeyHelp => "this help",
+            ZoomPane => "zoom the pane to the whole tab, and back",
             EnterPrefix => "the prefix",
         }
     }
@@ -675,6 +678,7 @@ fn action_from_name(name: &str) -> Option<Action> {
         "nav-forward" | "forward" => Action::NavForward,
         "nav-last" | "last" => Action::NavLast,
         "key-help" | "help" => Action::KeyHelp,
+        "zoom-pane" | "zoom" => Action::ZoomPane,
         "prefix" => Action::EnterPrefix,
         _ => {
             // tab-1 .. tab-9
@@ -756,6 +760,7 @@ fn default_bindings() -> Vec<(Action, Ctx, &'static [&'static str])> {
         (NavBack, Prefix, &["<"]),
         (NavForward, Prefix, &[">"]),
         (KeyHelp, Prefix, &["?"]),
+        (ZoomPane, Prefix, &["z"]),
     ]
 }
 
@@ -857,6 +862,9 @@ pub struct MuxConfig {
     /// (dirty `*`, ahead/behind, `+a −r` against HEAD), read off-loop every few seconds.
     /// `false` keeps the fork-free branch name only. Read at server start.
     pub sidebar_git: bool,
+    /// Title each pane (`1:claude working`) when a tab shows two or more: on the divider above
+    /// it, or right-aligned on its first row only where that row is blank. Never takes a row.
+    pub pane_titles: bool,
     /// Show a one-row bar along the TOP of the mux (host CPU/memory/GPU/load).
     ///
     /// Off by default: it costs a row of the pane grid, and an existing user's layout should
@@ -953,6 +961,7 @@ struct RawConfig {
     bell: Option<bool>,
     prefix_hint: Option<bool>,
     sidebar_git: Option<bool>,
+    pane_titles: Option<bool>,
     top_bar: Option<bool>,
     sidebar: Option<bool>,
     sidebar_width: Option<i64>,
@@ -1059,6 +1068,7 @@ impl MuxConfig {
             bell: true,
             prefix_hint: true,
             sidebar_git: true,
+            pane_titles: true,
             top_bar: false,
             sidebar: true,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
@@ -1177,6 +1187,7 @@ impl MuxConfig {
                 bell: raw.bell.unwrap_or(true),
                 prefix_hint: raw.prefix_hint.unwrap_or(true),
                 sidebar_git: raw.sidebar_git.unwrap_or(true),
+                pane_titles: raw.pane_titles.unwrap_or(true),
                 top_bar: raw.top_bar.unwrap_or(false),
                 sidebar: raw.sidebar.unwrap_or(true),
                 sidebar_width,

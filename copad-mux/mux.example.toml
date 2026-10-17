@@ -47,6 +47,8 @@ sidebar_git = true        # decorate each space's branch with git status: `*` di
                           #   ahead/behind, +a −r vs HEAD, ⑂ = linked worktree. Read off-loop
                           #   every ~5s with no optional locks; false = branch only, no forks.
                           #   Turning it ON needs `comux server restart`.
+pane_titles = true        # title panes (`1:claude working`) when a tab shows 2+: on the divider
+                          #   above, or on a blank stretch of the first row — never over content
 prefix_hint = true        # while the prefix is armed, the status bar shows the next keys
                           #   (`? all keys · c tab · …`) in place of the tab chips
 sort_by = "created"       # session order in the sidebar / Ctrl-f switcher / )( cycle:
@@ -209,6 +211,7 @@ restore_agent_sessions = true
 # nav-last = [";", "Tab"]  # toggle to the previous session/tab (Alt-Tab; `comux last`)
 # nav-back = "<"          # back along the navigation history (`comux back`)
 # nav-forward = ">"       # forward again (`comux forward`)
+# zoom-pane = "z"         # the focused pane fills the tab, and back (tmux resize-pane -Z)
 # key-help = "?"         # every binding of the live keymap (j/k scroll, any other key closes)
 
 # ---- prefix-less bindings (tmux `bind -n`) ----

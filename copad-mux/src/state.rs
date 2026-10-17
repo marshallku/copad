@@ -56,6 +56,11 @@ pub enum Command {
         client: ClientId,
         pane: PaneId,
     },
+    /// Toggle the zoom of the active tab's focused pane (tmux `resize-pane -Z`).
+    ToggleZoom {
+        origin: Origin,
+        workspace: WorkspaceId,
+    },
     /// Controller-only: change the focused pane of the active tab.
     FocusPane {
         client: ClientId,
@@ -243,6 +248,8 @@ pub enum MuxError {
     NoSuchTab,
     #[error("cannot close the last tab of a workspace")]
     CannotCloseLastTab,
+    #[error("only one pane in this tab — nothing to zoom")]
+    CannotZoomSinglePane,
 }
 
 struct Attach {
@@ -336,6 +343,7 @@ impl State {
             },
             focused: pane.clone(),
             rev: 0,
+            zoomed: None,
         };
         self.workspaces.push(Workspace {
             id: id.clone(),
@@ -405,6 +413,7 @@ impl State {
                 layout,
                 focused,
                 rev: 0,
+                zoomed: None,
             });
             per_tab_terms.push(terms);
         }
@@ -518,6 +527,7 @@ impl State {
                 Ok(vec![]) // accepted; bytes flow to the PTY outside the pure model
             }
             Command::FocusPane { client, pane } => self.focus(client, pane),
+            Command::ToggleZoom { origin, workspace } => self.toggle_zoom(origin, workspace),
             Command::FocusPaneIn {
                 origin,
                 workspace,
@@ -758,7 +768,11 @@ impl State {
             return vec![];
         };
         let mut derived = Vec::new();
-        tab.layout.derive_sizes(area, &mut derived);
+        match tab.zoom().and_then(|z| tab.layout.terminal_of(z)) {
+            // Zoomed: that terminal gets the whole viewport; the hidden ones keep their sizes.
+            Some(t) => derived.push((t.clone(), area.cols, area.rows)),
+            None => tab.layout.derive_sizes(area, &mut derived),
+        }
         let mut out = Vec::with_capacity(derived.len());
         for (tid, c, r) in &derived {
             if let Some(t) = self.terminals.get_mut(tid) {
@@ -789,15 +803,24 @@ impl State {
         if !tab.layout.contains(&pane) {
             return Err(MuxError::NoSuchPane);
         }
+        // Focusing another pane unzooms (tmux); re-focusing the zoomed one keeps it.
+        let unzoomed = tab.zoomed.as_ref().is_some_and(|z| *z != pane);
+        if unzoomed {
+            tab.zoomed = None;
+        }
         tab.focused = pane.clone();
         tab.rev += 1;
         let tab_rev = tab.rev;
-        Ok(vec![Event::Focused {
-            workspace: ws_id,
+        let mut evs = vec![Event::Focused {
+            workspace: ws_id.clone(),
             tab: active,
             pane,
             tab_rev,
-        }])
+        }];
+        if unzoomed {
+            evs.extend(self.resized_event(idx, ws_id));
+        }
+        Ok(evs)
     }
 
     fn focus_in(
@@ -816,15 +839,62 @@ impl State {
         if tab.focused == pane {
             return Ok(vec![]);
         }
+        let unzoomed = tab.zoomed.as_ref().is_some_and(|z| *z != pane);
+        if unzoomed {
+            tab.zoomed = None;
+        }
         tab.focused = pane.clone();
         tab.rev += 1;
         let tab_rev = tab.rev;
-        Ok(vec![Event::Focused {
-            workspace,
-            tab: tab_id,
+        let mut evs = vec![Event::Focused {
+            workspace: workspace.clone(),
+            tab: tab_id.clone(),
             pane,
             tab_rev,
-        }])
+        }];
+        if unzoomed && self.workspaces[idx].active_tab == tab_id {
+            evs.extend(self.resized_event(idx, workspace));
+        }
+        Ok(evs)
+    }
+
+    /// The `Resized` event for re-deriving the active tab of `idx` (e.g. after a zoom change).
+    fn resized_event(&mut self, idx: usize, workspace: WorkspaceId) -> Option<Event> {
+        self.workspaces[idx].rev += 1;
+        let ws_rev = self.workspaces[idx].rev;
+        let terms = self.recompute_sizes(idx);
+        let vp = self.workspaces[idx].viewport;
+        Some(Event::Resized {
+            workspace,
+            cols: vp.cols,
+            rows: vp.rows,
+            terminals: terms,
+            workspace_rev: ws_rev,
+        })
+    }
+
+    /// Toggle the zoom of the ACTIVE tab's focused pane (tmux `resize-pane -Z`). A tab with
+    /// one pane has nothing to zoom: refused, so the caller can say so.
+    fn toggle_zoom(
+        &mut self,
+        origin: Origin,
+        workspace: WorkspaceId,
+    ) -> Result<Vec<Event>, MuxError> {
+        self.authorize_mutation(&origin, &workspace)?;
+        let idx = self.ws_index(&workspace)?;
+        let active = self.workspaces[idx].active_tab.clone();
+        let tab = self.workspaces[idx]
+            .tab_mut(&active)
+            .ok_or(MuxError::NoSuchTab)?;
+        if tab.layout.is_single_leaf() {
+            return Err(MuxError::CannotZoomSinglePane);
+        }
+        tab.zoomed = match tab.zoomed.take() {
+            Some(_) => None,
+            None => Some(tab.focused.clone()),
+        };
+        tab.rev += 1;
+        Ok(self.resized_event(idx, workspace).into_iter().collect())
     }
 
     // --- mutations (spec §4a) ---
@@ -874,6 +944,7 @@ impl State {
             .layout
             .split_leaf(&pane, dir, new_pane.clone(), new_term.clone());
         debug_assert!(ok, "pane was located but split_leaf missed it");
+        tab.zoomed = None; // tmux: a split unzooms
         tab.rev += 1;
         let tab_rev = tab.rev;
         self.workspaces[idx].rev += 1;
@@ -936,6 +1007,7 @@ impl State {
 
         let tab = self.workspaces[idx].tab_mut(&tab_id).unwrap();
         let term = tab.layout.remove_leaf(&pane).ok_or(MuxError::NoSuchPane)?;
+        tab.zoomed = None;
         // Refocus if we closed the focused pane.
         if tab.focused == pane {
             tab.focused = tab.layout.leftmost_pane();
@@ -993,6 +1065,7 @@ impl State {
             },
             focused: pane.clone(),
             rev: 0,
+            zoomed: None,
         };
         self.workspaces[idx].tabs.push(tab);
         if activate {
