@@ -3210,6 +3210,9 @@ const WORKTREE_USAGE: &str = "usage:\n\
          \x20 comux worktree create <branch> [--from <ref>] [--no-attach] [--json]\n\
          \x20 comux worktree list [--plain|--json]\n\
          \x20 comux worktree rm [<path|branch>] [-f|--force] [-d|--delete-branch] [--json]\n\
+         \x20 comux worktree land <path|branch> [--merge] [--keep] [--dry-run] [--json]\n\
+         \x20                     bring its branch into the main worktree's branch (rebase + fast-forward,\n\
+         \x20                     or a merge commit with --merge), then remove it and the landed branch\n\
          \n\
          omitting the `rm` target opens a fuzzy picker over the repo's worktrees.";
 
@@ -3234,6 +3237,7 @@ fn run_worktree_client(args: &[String]) -> i32 {
         "create" | "new" | "add" => worktree_create_client(rest),
         "list" | "ls" => worktree_list_client(rest),
         "rm" | "remove" => worktree_rm_client(rest),
+        "land" => worktree_land_client(rest),
         "help" | "-h" | "--help" => {
             println!("{WORKTREE_USAGE}");
             0
@@ -3403,6 +3407,185 @@ fn collect_worktrees() -> Result<Vec<WorktreeInfo>, String> {
             locked: e.locked,
         })
         .collect())
+}
+
+/// `comux worktree land` (decisions #149). Every refusal is checked before anything is
+/// rewritten; the steps after that report exactly how far they got.
+fn worktree_land_client(rest: &[String]) -> i32 {
+    use crate::worktree::{self as wt, Strategy};
+    const USAGE: &str =
+        "usage: comux worktree land <path|branch> [--merge] [--keep] [--dry-run] [--json]";
+    let (mut target, mut merge, mut keep, mut dry_run, mut json) =
+        (None, false, false, false, false);
+    let mut flags_done = false;
+    for a in rest {
+        match a.as_str() {
+            "--" if !flags_done => flags_done = true,
+            "--merge" if !flags_done => merge = true,
+            "--keep" if !flags_done => keep = true,
+            "--dry-run" | "-n" if !flags_done => dry_run = true,
+            "--json" if !flags_done => json = true,
+            f if !flags_done && f.starts_with('-') => {
+                eprintln!("comux worktree land: unknown flag '{f}'\n{USAGE}");
+                return 2;
+            }
+            t if target.is_none() => target = Some(t.to_string()),
+            t => {
+                eprintln!("comux worktree land: unexpected extra argument '{t}'\n{USAGE}");
+                return 2;
+            }
+        }
+    }
+    let Some(target) = target else {
+        eprintln!("comux worktree land: which worktree? (a path or its branch)\n{USAGE}");
+        return 2;
+    };
+    let report = |ok: bool, msg: &str| -> i32 {
+        if json {
+            println!("{}", serde_json::json!({ "ok": ok, "message": msg }));
+        } else if ok {
+            println!("{msg}");
+        } else {
+            eprintln!("error: {msg}");
+        }
+        if ok { 0 } else { 1 }
+    };
+    let Some(cwd) = std::env::current_dir().ok() else {
+        return report(false, "could not resolve the current directory");
+    };
+    let repo = match wt::resolve_repo_root(&cwd) {
+        Ok(r) => r,
+        Err(e) => return report(false, &e),
+    };
+    let entries = match wt::list_entries(&repo) {
+        Ok(e) => e,
+        Err(e) => return report(false, &e),
+    };
+    let Some(main) = entries.iter().find(|e| e.is_main).map(|e| e.path.clone()) else {
+        return report(false, "no main worktree found");
+    };
+    let entry = match wt::resolve_target(&entries, &target, &cwd) {
+        Ok(e) => e,
+        Err(e) => return report(false, &e),
+    };
+    if wt::canonical_or_lexical(&cwd).starts_with(wt::canonical_or_lexical(&entry.path)) {
+        return report(
+            false,
+            "run it from outside the worktree you are landing (it gets removed)",
+        );
+    }
+    // A live comux session inside: the rebase would rewrite the branch an agent is working on,
+    // and the removal would be refused AFTER the history was rewritten. Refused up front,
+    // `--keep` or not; land never kills sessions. A failed lookup is an error, not a pass.
+    let infos = match collect_worktrees() {
+        Ok(i) => i,
+        Err(e) => return report(false, &format!("could not check for live sessions: {e}")),
+    };
+    if infos.iter().any(|w| {
+        w.live
+            && wt::canonical_or_lexical(Path::new(&w.path)) == wt::canonical_or_lexical(&entry.path)
+    }) {
+        return report(
+            false,
+            "a comux session is still working in that worktree — close it first",
+        );
+    }
+    let _lock = match wt::LandLock::acquire(&main) {
+        Ok(l) => l,
+        Err(e) => return report(false, &e),
+    };
+    let strategy = if merge {
+        Strategy::Merge
+    } else {
+        Strategy::Rebase
+    };
+    let plan = match wt::plan_land(&main, &entry, strategy) {
+        Ok(p) => p,
+        Err(e) => return report(false, &e),
+    };
+    let how = match (plan.ahead, strategy) {
+        (0, _) => "nothing to bring in (already contained)".to_string(),
+        (n, Strategy::Rebase) => format!(
+            "rebase {n} commit(s) onto '{}' and fast-forward it",
+            plan.into
+        ),
+        (n, Strategy::Merge) => format!(
+            "merge {n} commit(s) into '{}' with a merge commit",
+            plan.into
+        ),
+    };
+    let cleanup = if keep {
+        "keep the worktree and the branch".to_string()
+    } else {
+        format!(
+            "remove {} and delete '{}'",
+            plan.worktree.display(),
+            plan.branch
+        )
+    };
+    if dry_run {
+        return report(
+            true,
+            &format!("would land '{}': {how}; then {cleanup}", plan.branch),
+        );
+    }
+    if let Err(e) = wt::perform_land(&plan) {
+        return report(false, &e);
+    }
+    if keep {
+        return report(
+            true,
+            &format!(
+                "landed '{}' into '{}' (kept the worktree)",
+                plan.branch, plan.into
+            ),
+        );
+    }
+    // Removal through the server when one runs (it owns liveness), else under its flock.
+    let path = plan.worktree.display().to_string();
+    let removed = if server_running() {
+        let req = Req::WorktreeRm {
+            target: path.clone(),
+            force: false,
+            delete_branch: false,
+            cwd: caller_cwd(),
+        };
+        match round_trip(&req) {
+            Ok(r) if r.ok => Ok(()),
+            Ok(r) => Err(r.error.unwrap_or_default()),
+            Err(e) => Err(e.to_string()),
+        }
+    } else {
+        match crate::server::try_acquire_lock() {
+            Some(_guard) => wt::remove(&main, &plan.worktree, false),
+            None => Err("a comux server started meanwhile — retry".into()),
+        }
+    };
+    if let Err(e) = removed {
+        return report(
+            false,
+            &format!(
+                "landed '{}' into '{}', but removing {path} failed (kept): {e}",
+                plan.branch, plan.into
+            ),
+        );
+    }
+    match wt::delete_landed_branch(&main, &plan.branch, &plan.into) {
+        Ok(()) => report(
+            true,
+            &format!(
+                "landed '{}' into '{}'; removed {path} and the branch",
+                plan.branch, plan.into
+            ),
+        ),
+        Err(e) => report(
+            false,
+            &format!(
+                "landed '{}' into '{}' and removed {path}, but the branch was kept: {e}",
+                plan.branch, plan.into
+            ),
+        ),
+    }
 }
 
 fn worktree_rm_client(rest: &[String]) -> i32 {

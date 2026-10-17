@@ -348,6 +348,309 @@ pub fn validate_removal(
     Ok(entry)
 }
 
+// --- landing a worktree's branch (`comux worktree land`, decisions #149) ---
+
+/// How a worktree's branch is brought into the main worktree's branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strategy {
+    /// Rebase the branch onto the destination, then fast-forward the destination. Linear
+    /// history; refused for a branch carrying merge commits (a plain rebase drops them).
+    Rebase,
+    /// A merge commit on the destination (`--no-ff --no-edit`).
+    Merge,
+}
+
+/// Everything `land` resolved up front, pinned so a later step can tell if the world moved.
+#[derive(Debug, Clone)]
+pub struct LandPlan {
+    pub main: PathBuf,
+    pub worktree: PathBuf,
+    pub branch: String,
+    /// The main worktree's branch at planning time, and its tip then.
+    pub into: String,
+    pub into_tip: String,
+    pub strategy: Strategy,
+    /// Commits on `branch` not on `into` (0 = nothing to land, go straight to cleanup).
+    pub ahead: u32,
+}
+
+/// Run git as a non-interactive tool: no prompt, no editor, nothing on stdin. Returns
+/// trimmed stdout, or an error carrying git's own stderr.
+fn git_out(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_EDITOR", "true")
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(format!("git {} failed: {err}", args.join(" ")));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// The branch `dir` has checked out, or `None` when detached.
+pub fn current_branch(dir: &Path) -> Result<Option<String>, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["symbolic-ref", "--short", "-q", "HEAD"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("git symbolic-ref: {e}"))?;
+    let b = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Ok((out.status.success() && !b.is_empty()).then_some(b))
+}
+
+/// An operation already in progress in `dir`'s worktree (rebase, merge, cherry-pick,
+/// revert), by name. Land never starts on top of one — and never aborts one it did not start.
+pub fn operation_in_progress(dir: &Path) -> Result<Option<&'static str>, String> {
+    for (marker, what) in [
+        ("rebase-merge", "a rebase"),
+        ("rebase-apply", "a rebase"),
+        ("MERGE_HEAD", "a merge"),
+        ("CHERRY_PICK_HEAD", "a cherry-pick"),
+        ("REVERT_HEAD", "a revert"),
+    ] {
+        let path = git_out(dir, &["rev-parse", "--git-path", marker])?;
+        let path = if Path::new(&path).is_absolute() {
+            PathBuf::from(path)
+        } else {
+            dir.join(path)
+        };
+        if path.exists() {
+            return Ok(Some(what));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether `dir` has changes: tracked always, untracked (non-ignored) too when asked.
+pub fn is_dirty(dir: &Path, untracked: bool) -> Result<bool, String> {
+    let mode = if untracked {
+        "--untracked-files=normal"
+    } else {
+        "--untracked-files=no"
+    };
+    Ok(!git_out(dir, &["status", "--porcelain", mode])?.is_empty())
+}
+
+fn is_ancestor(dir: &Path, a: &str, b: &str) -> Result<bool, String> {
+    let st = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["merge-base", "--is-ancestor", a, b])
+        .stdin(std::process::Stdio::null())
+        .status()
+        .map_err(|e| format!("git merge-base: {e}"))?;
+    match st.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!("git merge-base --is-ancestor {a} {b} failed")),
+    }
+}
+
+/// Everything that can refuse, checked BEFORE anything is rewritten.
+pub fn plan_land(main: &Path, target: &Entry, strategy: Strategy) -> Result<LandPlan, String> {
+    let Some(branch) = target.branch.clone() else {
+        return Err("that worktree is detached — nothing to land".into());
+    };
+    if target.locked {
+        return Err(format!(
+            "worktree {} is locked — unlock it with `git worktree unlock` first",
+            target.path.display()
+        ));
+    }
+    let Some(into) = current_branch(main)? else {
+        return Err("the main worktree is detached — check out the branch to land into".into());
+    };
+    if into == branch {
+        return Err(format!("the main worktree is on '{branch}' itself"));
+    }
+    for (dir, which) in [(main, "main worktree"), (target.path.as_path(), "worktree")] {
+        if let Some(op) = operation_in_progress(dir)? {
+            return Err(format!(
+                "the {which} is in the middle of {op} — finish or abort it first"
+            ));
+        }
+    }
+    if is_dirty(&target.path, true)? {
+        return Err(format!(
+            "{} has uncommitted or untracked changes — commit or stash them (removing it would lose them)",
+            target.path.display()
+        ));
+    }
+    if is_dirty(main, false)? {
+        return Err(
+            "the main worktree has uncommitted changes — commit or stash them first".into(),
+        );
+    }
+    let into_tip = git_out(
+        main,
+        &["rev-parse", "--verify", &format!("refs/heads/{into}")],
+    )?;
+    // Fully qualified: a TAG named like the branch would otherwise win the lookup.
+    let range = format!("refs/heads/{into}..refs/heads/{branch}");
+    let ahead: u32 = git_out(main, &["rev-list", "--count", &range])?
+        .parse()
+        .unwrap_or(0);
+    if strategy == Strategy::Rebase
+        && ahead > 0
+        && !git_out(main, &["rev-list", "--merges", &range])?.is_empty()
+    {
+        return Err(format!(
+            "'{branch}' carries merge commits a rebase would drop — land it with --merge"
+        ));
+    }
+    Ok(LandPlan {
+        main: main.to_path_buf(),
+        worktree: target.path.clone(),
+        branch,
+        into,
+        into_tip,
+        strategy,
+        ahead,
+    })
+}
+
+/// Bring `plan.branch` into `plan.into`. Re-checks that the destination is still the branch
+/// and tip it was planned against right before writing to it. On failure the error says
+/// which phase completed — a successful rebase followed by a failed fast-forward leaves the
+/// rewritten branch in place, and that has to be said, not hidden.
+pub fn perform_land(plan: &LandPlan) -> Result<(), String> {
+    if plan.ahead == 0 {
+        return Ok(()); // already contained: nothing to bring in
+    }
+    let pinned = || -> Result<(), String> {
+        let now = current_branch(&plan.main)?;
+        let tip = git_out(&plan.main, &["rev-parse", "--verify", "HEAD"])?;
+        if now.as_deref() != Some(plan.into.as_str()) || tip != plan.into_tip {
+            return Err(format!(
+                "the main worktree moved since planning (now {} at {}) — nothing was merged",
+                now.as_deref().unwrap_or("detached"),
+                &tip[..tip.len().min(8)]
+            ));
+        }
+        Ok(())
+    };
+    match plan.strategy {
+        Strategy::Rebase => {
+            if let Err(e) = git_out(&plan.worktree, &["rebase", &plan.into_tip]) {
+                // Abort ONLY the rebase this call started (none was running at planning).
+                let aborted = git_out(&plan.worktree, &["rebase", "--abort"]).is_ok();
+                return Err(format!(
+                    "rebasing '{}' onto '{}' failed{} — nothing was merged: {e}",
+                    plan.branch,
+                    plan.into,
+                    if aborted {
+                        " and was aborted"
+                    } else {
+                        " (and `git rebase --abort` failed too — check the worktree)"
+                    }
+                ));
+            }
+            pinned()?;
+            let source = format!("refs/heads/{}", plan.branch);
+            git_out(&plan.main, &["merge", "--ff-only", &source]).map_err(|e| {
+                format!(
+                    "'{}' was rebased onto '{}', but fast-forwarding '{}' failed — the worktree is kept: {e}",
+                    plan.branch, plan.into, plan.into
+                )
+            })?;
+        }
+        Strategy::Merge => {
+            pinned()?;
+            let source = format!("refs/heads/{}", plan.branch);
+            if let Err(e) = git_out(&plan.main, &["merge", "--no-ff", "--no-edit", &source]) {
+                let aborted = git_out(&plan.main, &["merge", "--abort"]).is_ok();
+                return Err(format!(
+                    "merging '{}' into '{}' failed{}: {e}",
+                    plan.branch,
+                    plan.into,
+                    if aborted {
+                        " and was aborted"
+                    } else {
+                        " (and `git merge --abort` failed too — check the main worktree)"
+                    }
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Delete `branch` once its tip is PROVEN contained in `into`. Not `branch -d` (it judges
+/// against the upstream, which a locally landed branch can be ahead of) and not `-D` after a
+/// separate check (another git process could advance the branch in between): the tip is
+/// resolved to an OID, that OID is checked, and the ref is deleted ONLY IF it still holds that
+/// OID (`update-ref -d <ref> <oid>` is atomic). The branch's config section goes after it.
+pub fn delete_landed_branch(main: &Path, branch: &str, into: &str) -> Result<(), String> {
+    // `update-ref` has none of `branch -D`'s protection for a branch some OTHER worktree still
+    // has checked out (`worktree add --force` allows that): deleting it would leave that
+    // worktree's HEAD on a missing ref. Refuse instead.
+    if let Some(other) = list_entries(main)?
+        .into_iter()
+        .find(|e| e.branch.as_deref() == Some(branch))
+    {
+        return Err(format!(
+            "'{branch}' is still checked out in {} — kept",
+            other.path.display()
+        ));
+    }
+    let r = format!("refs/heads/{branch}");
+    let tip = git_out(main, &["rev-parse", "--verify", &r])?;
+    if !is_ancestor(main, &tip, &format!("refs/heads/{into}"))? {
+        return Err(format!(
+            "'{branch}' has commits not on '{into}' (something committed after landing) — kept"
+        ));
+    }
+    git_out(main, &["update-ref", "-d", &r, &tip])
+        .map_err(|e| format!("'{branch}' moved while it was being deleted — kept: {e}"))?;
+    let _ = git_out(
+        main,
+        &["config", "--remove-section", &format!("branch.{branch}")],
+    );
+    Ok(())
+}
+
+/// One land at a time per repository: a lock file in the COMMON git dir, created
+/// exclusively and removed on drop.
+pub struct LandLock(PathBuf);
+
+impl LandLock {
+    pub fn acquire(main: &Path) -> Result<Self, String> {
+        let common = git_out(main, &["rev-parse", "--git-common-dir"])?;
+        let common = if Path::new(&common).is_absolute() {
+            PathBuf::from(common)
+        } else {
+            main.join(common)
+        };
+        let path = common.join("comux-land.lock");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|_| {
+                format!(
+                    "another `comux worktree land` is running in this repo (or left {} behind)",
+                    path.display()
+                )
+            })?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for LandLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -504,5 +807,170 @@ mod tests {
         assert_eq!(run_hook("test -n \"$WORKTREE_PATH\"", &dir), None);
         assert!(run_hook("exit 3", &dir).is_some());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- land ---
+
+    /// A main repo plus a linked worktree on `feat` with one new revision in it.
+    fn repo_and_worktree() -> (PathBuf, PathBuf) {
+        let main = init_repo();
+        let wt = main.with_file_name(format!(
+            "{}-wt",
+            main.file_name().unwrap().to_string_lossy()
+        ));
+        git(
+            &main,
+            &["worktree", "add", "-q", "-b", "feat", wt.to_str().unwrap()],
+        );
+        std::fs::write(wt.join("feature.txt"), "new\n").unwrap();
+        git(&wt, &["add", "-A"]);
+        git(&wt, &["commit", "-qm", "feature"]);
+        (main, wt)
+    }
+
+    fn entry_for(main: &Path, wt: &Path) -> Entry {
+        let entries = list_entries(main).unwrap();
+        resolve_target(&entries, wt.to_str().unwrap(), main).unwrap()
+    }
+
+    fn log(dir: &Path) -> String {
+        git_out(dir, &["log", "--format=%s"]).unwrap()
+    }
+
+    #[test]
+    fn rebase_land_fast_forwards_main_and_the_branch_is_then_deletable() {
+        let (main, wt) = repo_and_worktree();
+        // main moved on too, so the rebase has something to do.
+        std::fs::write(main.join("other.txt"), "x").unwrap();
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "main moved"]);
+        let plan = plan_land(&main, &entry_for(&main, &wt), Strategy::Rebase).unwrap();
+        assert_eq!((plan.into.as_str(), plan.ahead), ("main", 1));
+        perform_land(&plan).unwrap();
+        let l = log(&main);
+        assert!(
+            l.starts_with("feature\nmain moved"),
+            "linear, feature on top: {l}"
+        );
+        remove(&main, &wt, false).unwrap();
+        delete_landed_branch(&main, "feat", "main").unwrap();
+        assert!(
+            git_out(&main, &["branch", "--list", "feat"])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn merge_land_makes_a_merge_revision() {
+        let (main, wt) = repo_and_worktree();
+        std::fs::write(main.join("other.txt"), "x").unwrap();
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "main moved"]);
+        let plan = plan_land(&main, &entry_for(&main, &wt), Strategy::Merge).unwrap();
+        perform_land(&plan).unwrap();
+        let parents = git_out(&main, &["log", "-1", "--format=%p"]).unwrap();
+        assert_eq!(parents.split_whitespace().count(), 2, "a merge revision");
+    }
+
+    #[test]
+    fn a_conflicting_rebase_is_aborted_and_main_is_untouched() {
+        let (main, wt) = repo_and_worktree();
+        std::fs::write(main.join("feature.txt"), "conflicting\n").unwrap();
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "conflict on main"]);
+        let before_main = git_out(&main, &["rev-parse", "HEAD"]).unwrap();
+        let before_feat = git_out(&wt, &["rev-parse", "HEAD"]).unwrap();
+        let plan = plan_land(&main, &entry_for(&main, &wt), Strategy::Rebase).unwrap();
+        let err = perform_land(&plan).unwrap_err();
+        assert!(
+            err.contains("aborted") && err.contains("nothing was merged"),
+            "{err}"
+        );
+        assert_eq!(git_out(&main, &["rev-parse", "HEAD"]).unwrap(), before_main);
+        assert_eq!(git_out(&wt, &["rev-parse", "HEAD"]).unwrap(), before_feat);
+        assert_eq!(
+            operation_in_progress(&wt).unwrap(),
+            None,
+            "no rebase left behind"
+        );
+    }
+
+    #[test]
+    fn refusals_happen_before_anything_is_rewritten() {
+        let (main, wt) = repo_and_worktree();
+        std::fs::write(wt.join("scratch.txt"), "untracked\n").unwrap();
+        let err = plan_land(&main, &entry_for(&main, &wt), Strategy::Rebase).unwrap_err();
+        assert!(err.contains("untracked"), "{err}");
+        std::fs::remove_file(wt.join("scratch.txt")).unwrap();
+        std::fs::write(main.join("README"), "dirty").unwrap();
+        let err = plan_land(&main, &entry_for(&main, &wt), Strategy::Rebase).unwrap_err();
+        assert!(err.contains("main worktree has uncommitted"), "{err}");
+    }
+
+    #[test]
+    fn a_moved_destination_is_refused_and_a_newer_branch_is_kept() {
+        let (main, wt) = repo_and_worktree();
+        let plan = plan_land(&main, &entry_for(&main, &wt), Strategy::Merge).unwrap();
+        // Someone lands something on main between planning and merging.
+        std::fs::write(main.join("late.txt"), "x").unwrap();
+        git(&main, &["add", "-A"]);
+        git(&main, &["commit", "-qm", "late"]);
+        let err = perform_land(&plan).unwrap_err();
+        assert!(err.contains("moved since planning"), "{err}");
+        // A branch with commits not on main is never deleted.
+        let err = delete_landed_branch(&main, "feat", "main").unwrap_err();
+        assert!(err.contains("kept"), "{err}");
+    }
+
+    #[test]
+    fn a_tag_named_like_the_branch_does_not_redirect_the_land() {
+        let (main, wt) = repo_and_worktree();
+        // A tag `feat` on main's base: an unqualified `main..feat` would read it as the tag.
+        git(&main, &["tag", "feat", "main"]);
+        let plan = plan_land(&main, &entry_for(&main, &wt), Strategy::Rebase).unwrap();
+        assert_eq!(plan.ahead, 1, "counted against the BRANCH");
+        perform_land(&plan).unwrap();
+        assert!(log(&main).starts_with("feature"));
+    }
+
+    #[test]
+    fn a_branch_checked_out_elsewhere_is_never_deleted() {
+        let (main, wt) = repo_and_worktree();
+        let plan = plan_land(&main, &entry_for(&main, &wt), Strategy::Rebase).unwrap();
+        perform_land(&plan).unwrap();
+        // A second worktree on the same branch (git allows it with --force).
+        let other = wt.with_file_name(format!(
+            "{}-again",
+            wt.file_name().unwrap().to_string_lossy()
+        ));
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--force",
+                other.to_str().unwrap(),
+                "feat",
+            ],
+        );
+        remove(&main, &wt, false).unwrap();
+        let err = delete_landed_branch(&main, "feat", "main").unwrap_err();
+        assert!(err.contains("still checked out"), "{err}");
+        assert!(
+            !git_out(&main, &["branch", "--list", "feat"])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn one_land_at_a_time() {
+        let main = init_repo();
+        let first = LandLock::acquire(&main).unwrap();
+        assert!(LandLock::acquire(&main).is_err());
+        drop(first);
+        assert!(LandLock::acquire(&main).is_ok());
     }
 }

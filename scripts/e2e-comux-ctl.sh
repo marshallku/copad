@@ -57,6 +57,7 @@
 #  41. a split shows pane titles; Ctrl-b z zooms the pane to the whole tab (and its PTY with it)
 #  42. copy mode: ?search into history, V y yanks the line to the client as OSC 52, q leaves
 #  43. pinned slots: mark from inside a pane, goto from elsewhere, and they survive a restart
+#  44. worktree land: refuses dirty work, dry-runs, then lands and cleans up
 
 set -euo pipefail
 
@@ -2141,7 +2142,31 @@ assert len(m)==1 and m[0]["slot"]==3 and m[0]["session"]=="e2emark", m' <"$WORK/
 for n in e2emark e2emark2; do t 10 "$COMUX" kill-session "name:$n" >/dev/null 2>&1 || true; done
 ok "mark from inside a pane, goto from another session, empty slot = 1; slot 3 survives a restart"
 
-echo "44. the server is still responsive and shuts down cleanly"
+echo "44. worktree land: rebase + fast-forward into main, then the worktree and branch are gone"
+LR="$WORK/landrepo"
+mkdir -p "$LR"
+lg() { env -u GIT_DIR -u GIT_WORK_TREE git -C "$1" -c user.name=e2e -c user.email=e2e@e2e -c commit.gpgsign=false "${@:2}" >/dev/null 2>&1; }
+lg "$LR" init -q -b trunk || fail "git init failed"
+echo base >"$LR/base.txt"
+lg "$LR" add -A && lg "$LR" commit -q -m base || fail "the land fixture's base revision failed"
+lg "$LR" worktree add -q -b e2eland "$WORK/landwt" || fail "git worktree add failed"
+echo feature >"$WORK/landwt/feature.txt"
+lg "$WORK/landwt" add -A && lg "$WORK/landwt" commit -q -m "e2e feature" || fail "the worktree revision failed"
+# Refused while the worktree has untracked work — and nothing is rewritten.
+echo scratch >"$WORK/landwt/scratch.txt"
+rc=0; (cd "$LR" && t 15 "$COMUX" worktree land e2eland >"$WORK/out" 2>&1) || rc=$?
+[[ "$rc" == 1 ]] && grep -q "untracked" "$WORK/out" || fail "a dirty worktree should be refused: rc=$rc $(cat "$WORK/out")"
+rm "$WORK/landwt/scratch.txt"
+(cd "$LR" && t 15 "$COMUX" worktree land e2eland --dry-run >"$WORK/out") || fail "land --dry-run failed: $(cat "$WORK/out")"
+grep -q "would land 'e2eland'" "$WORK/out" || fail "dry run should describe the plan: $(cat "$WORK/out")"
+[[ -d "$WORK/landwt" ]] || fail "a dry run must change nothing"
+(cd "$LR" && t 30 "$COMUX" worktree land e2eland >"$WORK/out" 2>&1) || fail "land failed: $(cat "$WORK/out")"
+[[ "$(git -C "$LR" log -1 --format=%s)" == "e2e feature" ]] || fail "trunk should now end with the feature revision"
+[[ ! -d "$WORK/landwt" ]] || fail "the landed worktree should be removed"
+[[ -z "$(git -C "$LR" branch --list e2eland)" ]] || fail "the landed branch should be deleted"
+ok "dirty refused, dry run inert, land fast-forwards trunk and removes the worktree + branch"
+
+echo "45. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"
