@@ -47,6 +47,7 @@
 #  32. owned tabs, the inbox, and ownership across a server restart
 #  33. navigation history: last toggles, back/forward walk it, a kill lands on the previous session,
 #      and Ctrl-f opens on the previous session in a REAL rendered frame
+#  34. a Korean session name keeps every overlay's border where it belongs
 
 set -euo pipefail
 
@@ -1872,7 +1873,17 @@ for part in os.environ.get("PTY_KEYS", "").split("|"):
 os.write(fd, b"\\x1b"); drain(0.5)
 """
 assert "buf = drain(6)\n" in src
-open(sys.argv[2], "w").write(src.replace("buf = drain(6)\n", inject, 1))
+src = src.replace("buf = drain(6)\n", inject, 1)
+# Replay by DISPLAY width: comux skips a wide glyph's trailing cell, so a one-column-per-char
+# replay shifts every CJK row left and reads as a render bug that is not there.
+old = "    if 0 <= cy < rows and 0 <= cx < cols: grid[cy][cx] = ch\n    cx += 1; i += 1\n"
+assert old in src
+src = src.replace(old, """    cw = 2 if __import__("unicodedata").east_asian_width(ch) in "WF" else 1
+    if 0 <= cy < rows and 0 <= cx < cols: grid[cy][cx] = ch
+    if cw == 2 and 0 <= cy < rows and 0 <= cx + 1 < cols: grid[cy][cx + 1] = ""
+    cx += cw; i += 1
+""")
+open(sys.argv[2], "w").write(src)
 PYEOF
 PTY_KEYS='\x06' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
 grep -E "▸ .*nav1" "$WORK/frame" >/dev/null \
@@ -1886,7 +1897,36 @@ PTY_KEYS='\x02;' python3 "$WORK/keydrive.py" cap -- "$COMUX" >/dev/null 2>&1
 for n in nav1 nav2; do t 10 "$COMUX" kill-session "name:$n" >/dev/null 2>&1 || true; done
 ok "last toggles, back/forward walk the trail, kill lands on the previous session, Ctrl-f preselects it, Ctrl-b ; toggles"
 
-echo "34. the server is still responsive and shuts down cleanly"
+echo "34. wide (Korean) text inside the overlays"
+# The switcher, prompt, confirm and notification center counted CHARS, so a Korean name ran
+# past the box border. Read the real frame back and check the border column on every row.
+KO="한글세션이름이아주길어서박스를넘칠수도있는이름"
+t 10 "$COMUX" new-session "$KO" >/dev/null || fail "new-session with a Korean name failed"
+PTY_KEYS='\x06' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+python3 - "$WORK/frame" <<'PYEOF' || { cat "$WORK/frame" >&2; fail "the switcher border is broken by a Korean name"; }
+import sys, unicodedata
+rows = open(sys.argv[1]).read().splitlines()
+def cells(row):
+    # The file holds chars; a wide glyph's trailing cell was replayed as "" (dropped by
+    # `join`). Re-expand to one entry per screen column so columns compare across rows.
+    out = []
+    for ch in row:
+        out.append(ch)
+        if unicodedata.east_asian_width(ch) in "WF":
+            out.append("")
+    return out
+grid = [cells(r) for r in rows]
+top = next(i for i, r in enumerate(rows) if "┌" in r and "go to" in r)
+right = grid[top].index("┐")
+bottom = next(i for i in range(top + 1, len(rows)) if "└" in rows[i])
+assert any("한글세션" in rows[i] for i in range(top, bottom)), "the Korean session is listed"
+for i in range(top + 1, bottom):
+    assert len(grid[i]) > right and grid[i][right] == "│", f"row {i}: no border at column {right}: {rows[i]!r}"
+PYEOF
+t 10 "$COMUX" kill-session "name:$KO" >/dev/null 2>&1 || true
+ok "the switcher lists the Korean name inside an intact border"
+
+echo "35. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

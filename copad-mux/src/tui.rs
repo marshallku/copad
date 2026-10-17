@@ -7430,49 +7430,11 @@ impl App {
         let border = Style::default().fg(Color::Cyan).bg(bg);
 
         // Box background + border.
-        for y in y0..(y0 + h).min(area.height) {
-            for x in x0..(x0 + w).min(area.width) {
-                let sym = if y == y0 && x == x0 {
-                    "┌"
-                } else if y == y0 && x == x0 + w - 1 {
-                    "┐"
-                } else if y == y0 + h - 1 && x == x0 {
-                    "└"
-                } else if y == y0 + h - 1 && x == x0 + w - 1 {
-                    "┘"
-                } else if y == y0 || y == y0 + h - 1 {
-                    "─"
-                } else if x == x0 || x == x0 + w - 1 {
-                    "│"
-                } else {
-                    " "
-                };
-                if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
-                    bc.set_symbol(sym);
-                    bc.set_skip(false);
-                    let edge = y == y0 || y == y0 + h - 1 || x == x0 || x == x0 + w - 1;
-                    bc.set_style(if edge {
-                        border
-                    } else {
-                        Style::default().bg(bg)
-                    });
-                }
-            }
-        }
+        draw_box(buf, x0, y0, w, h, border);
 
-        let put =
-            |buf: &mut ratatui::buffer::Buffer, y: u16, x: u16, maxw: u16, s: &str, st: Style| {
-                for (i, ch) in s.chars().take(maxw as usize).enumerate() {
-                    if let Some(bc) = buf.cell_mut(Position::new(x + i as u16, y)) {
-                        let mut sb = [0u8; 4];
-                        bc.set_symbol(ch.encode_utf8(&mut sb));
-                        // Clear any wide-char skip flag inherited from the pane cell
-                        // underneath, or buffer-diffing omits the overlay cell.
-                        bc.set_skip(false);
-                        bc.set_style(st);
-                    }
-                }
-            };
+        let put = |buf: &mut Buffer, y: u16, x: u16, maxw: u16, s: &str, st: Style| {
+            put_str(buf, x, y, x.saturating_add(maxw), s, st);
+        };
 
         // Title in the top border (with the key hints).
         put(
@@ -7557,7 +7519,7 @@ impl App {
             let selected = row_i == p.sel;
             let arrow = if selected { "▸" } else { " " };
             let text = format!("{arrow} {} {}", item.glyph, item.text);
-            let padded = format!("{text:<width$}", width = inner_w as usize);
+            let padded = pad_width(&text, inner_w as usize);
             let st = if selected {
                 Style::default()
                     .fg(Color::Black)
@@ -7591,60 +7553,12 @@ impl App {
         let bg = Color::Reset;
         let border = Style::default().fg(CAT_MAUVE).bg(bg);
 
-        for y in y0..(y0 + h).min(area.height) {
-            for x in x0..(x0 + w).min(area.width) {
-                let sym = if y == y0 && x == x0 {
-                    "┌"
-                } else if y == y0 && x == x0 + w - 1 {
-                    "┐"
-                } else if y == y0 + h - 1 && x == x0 {
-                    "└"
-                } else if y == y0 + h - 1 && x == x0 + w - 1 {
-                    "┘"
-                } else if y == y0 || y == y0 + h - 1 {
-                    "─"
-                } else if x == x0 || x == x0 + w - 1 {
-                    "│"
-                } else {
-                    " "
-                };
-                if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
-                    bc.set_symbol(sym);
-                    bc.set_skip(false);
-                    let edge = y == y0 || y == y0 + h - 1 || x == x0 || x == x0 + w - 1;
-                    bc.set_style(if edge {
-                        border
-                    } else {
-                        Style::default().bg(bg)
-                    });
-                }
-            }
-        }
+        draw_box(buf, x0, y0, w, h, border);
 
-        // Display-width-aware writer (a Korean prompt is 2 columns per char): advances `x`
-        // and blanks the trailing cell of a wide glyph so the client's diff stays in step.
+        // Display-width-aware writer (a Korean prompt is 2 columns per char): advances `x`.
         let right_edge = x0 + w - 1;
         let put = |buf: &mut Buffer, x: &mut u16, y: u16, s: &str, style: Style| {
-            for ch in s.chars() {
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
-                if cw == 0 || *x + cw > right_edge {
-                    continue;
-                }
-                if let Some(bc) = buf.cell_mut(Position::new(*x, y)) {
-                    let mut sb = [0u8; 4];
-                    bc.set_symbol(ch.encode_utf8(&mut sb));
-                    bc.set_skip(false);
-                    bc.set_style(style);
-                }
-                if cw == 2
-                    && let Some(bc) = buf.cell_mut(Position::new(*x + 1, y))
-                {
-                    bc.set_symbol(" ");
-                    bc.set_skip(true);
-                    bc.set_style(style);
-                }
-                *x += cw;
-            }
+            *x = put_str(buf, *x, y, right_edge, s, style);
         };
 
         let mut tx = x0 + 2;
@@ -7759,45 +7673,10 @@ impl App {
         let bg = Color::Reset;
         let border = Style::default().fg(CAT_MAUVE).bg(bg);
 
-        for y in y0..(y0 + h).min(area.height) {
-            for x in x0..(x0 + w).min(area.width) {
-                let sym = if y == y0 && x == x0 {
-                    "┌"
-                } else if y == y0 && x == x0 + w - 1 {
-                    "┐"
-                } else if y == y0 + h - 1 && x == x0 {
-                    "└"
-                } else if y == y0 + h - 1 && x == x0 + w - 1 {
-                    "┘"
-                } else if y == y0 || y == y0 + h - 1 {
-                    "─"
-                } else if x == x0 || x == x0 + w - 1 {
-                    "│"
-                } else {
-                    " "
-                };
-                if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
-                    bc.set_symbol(sym);
-                    bc.set_skip(false);
-                    let edge = y == y0 || y == y0 + h - 1 || x == x0 || x == x0 + w - 1;
-                    bc.set_style(if edge {
-                        border
-                    } else {
-                        Style::default().bg(bg)
-                    });
-                }
-            }
-        }
+        draw_box(buf, x0, y0, w, h, border);
 
         let put = |buf: &mut Buffer, y: u16, x: u16, maxw: u16, s: &str, st: Style| {
-            for (i, ch) in s.chars().take(maxw as usize).enumerate() {
-                if let Some(bc) = buf.cell_mut(Position::new(x + i as u16, y)) {
-                    let mut sb = [0u8; 4];
-                    bc.set_symbol(ch.encode_utf8(&mut sb));
-                    bc.set_skip(false);
-                    bc.set_style(st);
-                }
-            }
+            put_str(buf, x, y, x.saturating_add(maxw), s, st);
         };
 
         let title = match p.kind {
@@ -7817,15 +7696,7 @@ impl App {
         // Text line with a trailing block cursor; right-truncate so the caret stays
         // visible as the input grows past the box width.
         let inner_w = w.saturating_sub(4) as usize;
-        let shown: String = {
-            let with_caret = format!("{}█", p.buf);
-            let chars: Vec<char> = with_caret.chars().collect();
-            if chars.len() > inner_w {
-                chars[chars.len() - inner_w..].iter().collect()
-            } else {
-                with_caret
-            }
-        };
+        let shown = tail_width(&format!("{}█", p.buf), inner_w);
         put(
             buf,
             y0 + 1,
@@ -7854,44 +7725,16 @@ impl App {
         let bg = Color::Reset;
         let border = Style::default().fg(CAT_PEACH).bg(bg);
 
-        for y in y0..(y0 + h).min(area.height) {
-            for x in x0..(x0 + w).min(area.width) {
-                let sym = if y == y0 && x == x0 {
-                    "┌"
-                } else if y == y0 && x == x0 + w - 1 {
-                    "┐"
-                } else if y == y0 + h - 1 && x == x0 {
-                    "└"
-                } else if y == y0 + h - 1 && x == x0 + w - 1 {
-                    "┘"
-                } else if y == y0 || y == y0 + h - 1 {
-                    "─"
-                } else if x == x0 || x == x0 + w - 1 {
-                    "│"
-                } else {
-                    " "
-                };
-                if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
-                    bc.set_symbol(sym);
-                    bc.set_skip(false);
-                    let edge = y == y0 || y == y0 + h - 1 || x == x0 || x == x0 + w - 1;
-                    bc.set_style(if edge {
-                        border
-                    } else {
-                        Style::default().bg(bg)
-                    });
-                }
-            }
-        }
+        draw_box(buf, x0, y0, w, h, border);
         let inner_w = w.saturating_sub(4);
-        for (i, ch) in cf.message.chars().take(inner_w as usize).enumerate() {
-            if let Some(bc) = buf.cell_mut(Position::new(x0 + 2 + i as u16, y0 + 1)) {
-                let mut sb = [0u8; 4];
-                bc.set_symbol(ch.encode_utf8(&mut sb));
-                bc.set_skip(false);
-                bc.set_style(Style::default().fg(CAT_TEXT).bg(bg));
-            }
-        }
+        put_str(
+            buf,
+            x0 + 2,
+            y0 + 1,
+            x0 + 2 + inner_w,
+            &cf.message,
+            Style::default().fg(CAT_TEXT).bg(bg),
+        );
     }
 
     /// Draw the right-click context menu at its fixed rect: a bordered box with the
@@ -7904,61 +7747,11 @@ impl App {
         let bg = Color::Reset;
         let border = Style::default().fg(CAT_MAUVE).bg(bg);
 
-        for y in y0..(y0 + h).min(area.height) {
-            for x in x0..(x0 + w).min(area.width) {
-                let sym = if y == y0 && x == x0 {
-                    "┌"
-                } else if y == y0 && x == x0 + w - 1 {
-                    "┐"
-                } else if y == y0 + h - 1 && x == x0 {
-                    "└"
-                } else if y == y0 + h - 1 && x == x0 + w - 1 {
-                    "┘"
-                } else if y == y0 || y == y0 + h - 1 {
-                    "─"
-                } else if x == x0 || x == x0 + w - 1 {
-                    "│"
-                } else {
-                    " "
-                };
-                if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
-                    bc.set_symbol(sym);
-                    bc.set_skip(false);
-                    let edge = y == y0 || y == y0 + h - 1 || x == x0 || x == x0 + w - 1;
-                    bc.set_style(if edge {
-                        border
-                    } else {
-                        Style::default().bg(bg)
-                    });
-                }
-            }
-        }
+        draw_box(buf, x0, y0, w, h, border);
 
         // Width-aware writer (a wide session/tab name must not corrupt the border).
-        let put = |buf: &mut Buffer, mut x: u16, y: u16, max_x: u16, s: &str, st: Style| {
-            for ch in s.chars() {
-                let cw = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
-                if cw == 0 {
-                    continue;
-                }
-                if x + cw > max_x || y >= area.height {
-                    break;
-                }
-                if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
-                    let mut sb = [0u8; 4];
-                    bc.set_symbol(ch.encode_utf8(&mut sb));
-                    bc.set_skip(false);
-                    bc.set_style(st);
-                }
-                if cw == 2
-                    && let Some(bc) = buf.cell_mut(Position::new(x + 1, y))
-                {
-                    bc.set_symbol(" ");
-                    bc.set_skip(true);
-                    bc.set_style(st);
-                }
-                x += cw;
-            }
+        let put = |buf: &mut Buffer, x: u16, y: u16, max_x: u16, s: &str, st: Style| {
+            put_str(buf, x, y, max_x, s, st);
         };
 
         // Title in the top border.
@@ -7983,7 +7776,7 @@ impl App {
             } else {
                 Style::default().fg(CAT_TEXT).bg(bg)
             };
-            let text = format!(" {label:<width$}", width = inner_w.saturating_sub(1));
+            let text = format!(" {}", pad_width(label, inner_w.saturating_sub(1)));
             put(
                 buf,
                 x0 + 1,
@@ -8009,47 +7802,11 @@ impl App {
         let bg = Color::Reset;
         let border = Style::default().fg(CAT_MAUVE).bg(bg);
 
-        for y in y0..(y0 + h).min(area.height) {
-            for x in x0..(x0 + w).min(area.width) {
-                let sym = if y == y0 && x == x0 {
-                    "┌"
-                } else if y == y0 && x == x0 + w - 1 {
-                    "┐"
-                } else if y == y0 + h - 1 && x == x0 {
-                    "└"
-                } else if y == y0 + h - 1 && x == x0 + w - 1 {
-                    "┘"
-                } else if y == y0 || y == y0 + h - 1 {
-                    "─"
-                } else if x == x0 || x == x0 + w - 1 {
-                    "│"
-                } else {
-                    " "
-                };
-                if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
-                    bc.set_symbol(sym);
-                    bc.set_skip(false);
-                    let edge = y == y0 || y == y0 + h - 1 || x == x0 || x == x0 + w - 1;
-                    bc.set_style(if edge {
-                        border
-                    } else {
-                        Style::default().bg(bg)
-                    });
-                }
-            }
-        }
+        draw_box(buf, x0, y0, w, h, border);
 
-        let put =
-            |buf: &mut ratatui::buffer::Buffer, y: u16, x: u16, maxw: u16, s: &str, st: Style| {
-                for (i, ch) in s.chars().take(maxw as usize).enumerate() {
-                    if let Some(bc) = buf.cell_mut(Position::new(x + i as u16, y)) {
-                        let mut sb = [0u8; 4];
-                        bc.set_symbol(ch.encode_utf8(&mut sb));
-                        bc.set_skip(false);
-                        bc.set_style(st);
-                    }
-                }
-            };
+        let put = |buf: &mut Buffer, y: u16, x: u16, maxw: u16, s: &str, st: Style| {
+            put_str(buf, x, y, x.saturating_add(maxw), s, st);
+        };
 
         let inner_x = x0 + 2;
         let inner_w = w.saturating_sub(4);
@@ -8116,13 +7873,12 @@ impl App {
             } else {
                 Style::default().fg(CAT_SUBTEXT).bg(bg)
             };
-            let padded = format!("{row:<width$}", width = inner_w as usize);
+            let padded = pad_width(&row, inner_w as usize);
             put(buf, y, inner_x, inner_w, &padded, st);
         }
     }
 }
 
-/// Does the gap cell `(x, y)` border the focused rect (so its divider is accented)?
 /// Whether a history entry still names a live tab. Its pane may be gone: landing then keeps
 /// whichever pane that tab focuses now.
 fn loc_live(state: &State, l: &Loc) -> bool {
@@ -8131,6 +7887,7 @@ fn loc_live(state: &State, l: &Loc) -> bool {
         .is_some_and(|w| w.tab(&l.tab).is_some())
 }
 
+/// Does the gap cell `(x, y)` border the focused rect (so its divider is accented)?
 fn divider_touches(fr: &PaneRect, x: u16, y: u16) -> bool {
     let in_y = y >= fr.y && y < fr.y + fr.rows;
     let in_x = x >= fr.x && x < fr.x + fr.cols;
@@ -8176,6 +7933,110 @@ fn clip_width(s: &str, max: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// Draw an overlay box: a rounded-free single-line border in `border`, and a CLEARED interior
+/// (the default terminal background, so a background image shows through). Every overlay
+/// (switcher, resume picker, prompt, confirm, menu, notification center) draws through here.
+fn draw_box(buf: &mut Buffer, x0: u16, y0: u16, w: u16, h: u16, border: Style) {
+    let area = buf.area;
+    if w == 0 || h == 0 {
+        return;
+    }
+    let (x1, y1) = (x0 + w - 1, y0 + h - 1);
+    for y in y0..(y0 + h).min(area.height) {
+        for x in x0..(x0 + w).min(area.width) {
+            let sym = match (x, y) {
+                _ if y == y0 && x == x0 => "┌",
+                _ if y == y0 && x == x1 => "┐",
+                _ if y == y1 && x == x0 => "└",
+                _ if y == y1 && x == x1 => "┘",
+                _ if y == y0 || y == y1 => "─",
+                _ if x == x0 || x == x1 => "│",
+                _ => " ",
+            };
+            if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
+                bc.set_symbol(sym);
+                // A wide glyph in the pane underneath leaves its trailing cell flagged as
+                // skipped; an overlay cell that keeps the flag is dropped from the diff.
+                bc.set_skip(false);
+                let edge = y == y0 || y == y1 || x == x0 || x == x1;
+                bc.set_style(if edge {
+                    border
+                } else {
+                    Style::default().bg(Color::Reset)
+                });
+            }
+        }
+    }
+}
+
+/// Write `s` at `(x, y)` by DISPLAY width, stopping before column `max_x` (exclusive).
+///
+/// A char count is wrong for any wide glyph: a Korean session name is 2 columns per char,
+/// so counting chars ran rows past the box border and misaligned the padding. A wide glyph
+/// that would straddle `max_x` is dropped rather than half-drawn, and its trailing cell is
+/// blanked + skipped so the client's diff stays in step. Returns the column after the text.
+fn put_str(buf: &mut Buffer, mut x: u16, y: u16, max_x: u16, s: &str, st: Style) -> u16 {
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+        if cw == 0 {
+            continue;
+        }
+        if x + cw > max_x {
+            break;
+        }
+        if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
+            let mut sb = [0u8; 4];
+            bc.set_symbol(ch.encode_utf8(&mut sb));
+            bc.set_skip(false);
+            bc.set_style(st);
+        }
+        if cw == 2
+            && let Some(bc) = buf.cell_mut(Position::new(x + 1, y))
+        {
+            bc.set_symbol(" ");
+            bc.set_skip(true);
+            bc.set_style(st);
+        }
+        x += cw;
+    }
+    x
+}
+
+/// Fit `s` to EXACTLY `width` DISPLAY columns: clipped by columns, then padded with spaces.
+/// A `{:<width$}` counts chars, which left a CJK row's highlight bar short of the box edge;
+/// and clipping must happen here rather than in the writer, because a wide glyph dropped at
+/// the edge leaves one column the padding never reaches.
+fn pad_width(s: &str, width: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + cw > width {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out.push_str(&" ".repeat(width - used));
+    out
+}
+
+/// The END of `s` that fits in `max` display columns — a prompt keeps its caret visible as
+/// the input grows past the box.
+fn tail_width(s: &str, max: usize) -> String {
+    let mut used = 0usize;
+    let mut start = s.len();
+    for (i, ch) in s.char_indices().rev() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + cw > max {
+            break;
+        }
+        used += cw;
+        start = i;
+    }
+    s[start..].to_string()
 }
 
 /// How closely a space's pane directory `pane` relates to `target`, the directory a
@@ -11608,5 +11469,136 @@ mod nav {
         assert_eq!(here(&app), "local");
         app.cycle_session(1);
         assert_eq!(here(&app), "mid");
+    }
+}
+
+#[cfg(test)]
+mod overlay_width {
+    use super::*;
+    use crate::control::Req;
+    use ratatui::layout::Rect;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn frame(app: &App) -> Buffer {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        app.render_to(&mut buf);
+        buf
+    }
+
+    fn sym(buf: &Buffer, x: u16, y: u16) -> String {
+        buf.cell(Position::new(x, y)).unwrap().symbol().to_string()
+    }
+
+    /// The overlay box whose top-left corner is the first `┌` at or after column `from`
+    /// on row `y` — `(x0, x1)`.
+    fn box_cols(buf: &Buffer, y: u16) -> (u16, u16) {
+        let x0 = (0..100)
+            .find(|&x| sym(buf, x, y) == "┌")
+            .expect("box top-left");
+        let x1 = (x0 + 1..100)
+            .find(|&x| sym(buf, x, y) == "┐")
+            .expect("box top-right");
+        (x0, x1)
+    }
+
+    #[test]
+    fn a_korean_session_name_keeps_the_switcher_border_intact() {
+        let mut app = app();
+        let name = "한글로된아주긴세션이름입니다한글로된아주긴세션이름입니다";
+        assert!(
+            app.handle_control(&Req::NewSession {
+                name: Some(name.into()),
+                cwd: None,
+            })
+            .ok
+        );
+        app.open_popup();
+        let buf = frame(&app);
+        let y0 = (0..30)
+            .find(|&y| (0..100).any(|x| sym(&buf, x, y) == "┌"))
+            .unwrap();
+        let (x0, x1) = box_cols(&buf, y0);
+        let bottom = (y0 + 1..30).find(|&y| sym(&buf, x0, y) == "└").unwrap();
+        for y in y0 + 1..bottom {
+            assert_eq!(sym(&buf, x1, y), "│", "right border broken on row {y}");
+        }
+        // The highlight bar reaches the border on the selected row (padding by width).
+        let sel_y = (y0 + 1..bottom)
+            .find(|&y| (x0..x1).any(|x| sym(&buf, x, y) == "▸"))
+            .unwrap();
+        let before_border = buf.cell(Position::new(x1 - 2, sel_y)).unwrap();
+        assert_eq!(
+            before_border.bg,
+            Color::Cyan,
+            "the selection bar is padded to the edge"
+        );
+    }
+
+    #[test]
+    fn the_selection_bar_reaches_the_edge_at_every_width() {
+        // Odd inner widths are the case a wide glyph cannot fill exactly.
+        for cols in 96..=104u16 {
+            let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+            cfg.persist = false;
+            let mut app = App::new(cols, 30, Vec::new(), Vec::new(), cfg).expect("app");
+            assert!(
+                app.handle_control(&Req::NewSession {
+                    name: Some("한글".repeat(40)),
+                    cwd: None,
+                })
+                .ok
+            );
+            app.open_popup();
+            // Select the Korean row (the switcher preselects the previous session).
+            app.popup.as_mut().unwrap().sel = 1;
+            let mut buf = Buffer::empty(Rect::new(0, 0, cols, 30));
+            app.render_to(&mut buf);
+            let y0 = (0..30)
+                .find(|&y| (0..cols).any(|x| sym(&buf, x, y) == "┌"))
+                .unwrap();
+            let x0 = (0..cols).find(|&x| sym(&buf, x, y0) == "┌").unwrap();
+            let x1 = (x0 + 1..cols).find(|&x| sym(&buf, x, y0) == "┐").unwrap();
+            let sel_y = (y0 + 1..30)
+                .find(|&y| (x0..x1).any(|x| sym(&buf, x, y) == "▸"))
+                .unwrap();
+            let last = buf.cell(Position::new(x1 - 2, sel_y)).unwrap();
+            assert_eq!(last.bg, Color::Cyan, "cols={cols}: the bar stops short");
+        }
+    }
+
+    #[test]
+    fn a_long_korean_prompt_keeps_its_caret_and_border() {
+        let mut app = app();
+        app.open_new_session_prompt();
+        let mut prefix = false;
+        for c in "가나다라마바사아자차카타파하".repeat(4).chars() {
+            app.feed_key(
+                KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+                &mut prefix,
+            );
+        }
+        let buf = frame(&app);
+        let y0 = (0..30)
+            .find(|&y| (0..100).any(|x| sym(&buf, x, y) == "┌"))
+            .unwrap();
+        let (_, x1) = box_cols(&buf, y0);
+        assert_eq!(sym(&buf, x1, y0 + 1), "│");
+        let row: String = (0..100).map(|x| sym(&buf, x, y0 + 1)).collect();
+        assert!(row.contains('█'), "the caret stays visible: {row}");
+    }
+
+    #[test]
+    fn width_helpers_count_columns() {
+        assert_eq!(pad_width("한글", 6).width(), 6);
+        assert_eq!(pad_width("abc", 2), "ab");
+        // A wide glyph that would straddle the edge is dropped and the gap padded.
+        assert_eq!(pad_width("ab한", 3), "ab ");
+        assert_eq!(tail_width("가나다█", 5), "나다█");
+        assert_eq!(tail_width("abc", 10), "abc");
     }
 }
