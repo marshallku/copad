@@ -414,6 +414,7 @@ pub fn run() -> io::Result<()> {
         dirty |= reaped; // a reaped pane changed the layout
         dirty |= app.reconcile_popup();
         dirty |= app.reconcile_center();
+        dirty |= app.reconcile_copy(); // copy mode's pane went away or swapped screens
         // A client just attached after a detached stretch: the sweep has been running on
         // the wide idle interval, so force one now instead of letting the first frame
         // show tab labels and agent statuses that are seconds stale.
@@ -876,6 +877,11 @@ fn handle_incoming(
                     let mut action = KeyAction::Continue;
                     if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
                         action = app.feed_key(k, &mut c.prefix);
+                        // A copy-mode yank goes to the client whose key it was, exactly like
+                        // the text a drag-release returns.
+                        if let Some(text) = app.take_key_copy() {
+                            queue_copy(c, crate::term::next_clipboard_seq(), &text);
+                        }
                     }
                     match action {
                         KeyAction::Detach => {

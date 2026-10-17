@@ -389,7 +389,7 @@ impl Action {
             Detach => "detach this client",
             ClosePane => "close the pane",
             ToggleSidebar => "show / hide the sidebar",
-            Scrollback => "scrollback (copy mode)",
+            Scrollback => "copy mode: move, ?/ search, v select, y yank",
             FocusNext => "focus the next pane",
             FocusLeft => "focus the pane to the left",
             FocusDown => "focus the pane below",

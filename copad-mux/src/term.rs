@@ -61,6 +61,62 @@ pub struct Snapshot {
     pub wrapped: Vec<bool>,
     /// Cursor position in viewport coordinates `(col, row)`.
     pub cursor: (u16, u16),
+    /// Copy mode's cursor and selection, read under the SAME lock as `cells` so what is
+    /// highlighted is exactly what a yank would copy. `None` outside copy mode.
+    pub copy: Option<CopyView>,
+}
+
+/// Copy mode as the renderer needs it, in VIEWPORT rows (a row may be off-screen: negative
+/// or past the bottom when the selection extends beyond the view).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyView {
+    /// The vi cursor, when it is on screen.
+    pub cursor: Option<(u16, u16)>,
+    /// Selection `(start, end)` as `(row, col)`, inclusive, and whether it is a block.
+    pub selection: Option<(CopyCell, CopyCell, bool)>,
+}
+
+/// A `(viewport row, column)` copy-mode position; the row may be off-screen.
+pub type CopyCell = (i32, u16);
+
+impl CopyView {
+    /// Whether viewport cell `(row, col)` is inside the selection.
+    pub fn selected(&self, row: i32, col: u16) -> bool {
+        let Some(((r0, c0), (r1, c1), block)) = self.selection else {
+            return false;
+        };
+        if row < r0 || row > r1 {
+            return false;
+        }
+        if block {
+            return col >= c0.min(c1) && col <= c0.max(c1);
+        }
+        (row > r0 || col >= c0) && (row < r1 || col <= c1)
+    }
+}
+
+/// Largest text a copy-mode yank may produce, in bytes (the same cap as an OSC 52 write).
+pub const MAX_YANK_BYTES: usize = 1 << 20;
+
+/// What a copy-mode search found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchOutcome {
+    Found,
+    /// Found, after wrapping past the top/bottom of the history.
+    Wrapped,
+    NoMatch,
+}
+
+/// Escape `s` for a literal regex match.
+fn regex_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for c in s.chars() {
+        if "\\.+*?()|[]{}^$".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Largest OSC 52 payload a pane app may put on the clipboard, in bytes of decoded text.
@@ -586,6 +642,188 @@ impl PaneTerm {
         snapshot_grid(&self.term.lock())
     }
 
+    // --- copy mode (decisions #147): alacritty's own vi mode, every op under ONE lock ---
+
+    /// Enter copy mode: the vi cursor starts on the terminal cursor (or the viewport's top
+    /// when that is scrolled out of view). Returns whether the alternate screen is up, which
+    /// the caller remembers — a swap clears the selection but NOT the vi cursor, so copy mode
+    /// is cancelled when it changes.
+    pub fn copy_enter(&self) -> bool {
+        let mut t = self.term.lock();
+        if !t.mode().contains(TermMode::VI) {
+            t.toggle_vi_mode();
+        }
+        self.mark_dirty();
+        t.mode().contains(TermMode::ALT_SCREEN)
+    }
+
+    /// Leave copy mode: no selection, vi mode off, back at the live bottom.
+    pub fn copy_exit(&self) {
+        let mut t = self.term.lock();
+        t.selection = None;
+        if t.mode().contains(TermMode::VI) {
+            t.toggle_vi_mode();
+        }
+        t.scroll_display(Scroll::Bottom);
+        drop(t);
+        self.mark_dirty();
+    }
+
+    pub fn copy_motion(&self, motion: alacritty_terminal::vi_mode::ViMotion) {
+        self.term.lock().vi_motion(motion);
+        self.mark_dirty();
+    }
+
+    /// Scroll the view by `lines` (positive = into history) and carry the vi cursor with it,
+    /// the way alacritty's own vi mode pages.
+    pub fn copy_scroll(&self, lines: i32) {
+        let mut t = self.term.lock();
+        // Target first: `scroll_display` already clamps the vi cursor into the new view, and
+        // moving that clamped cursor by `lines` again would page twice as far.
+        let target = t.vi_mode_cursor.scroll(&t, lines);
+        t.scroll_display(Scroll::Delta(lines));
+        t.vi_goto_point(target.point);
+        drop(t);
+        self.mark_dirty();
+    }
+
+    /// The top of the history (`g`).
+    pub fn copy_top(&self) {
+        let mut t = self.term.lock();
+        let top = Point::new(t.topmost_line(), Column(0));
+        t.vi_goto_point(top);
+        drop(t);
+        self.mark_dirty();
+    }
+
+    /// Toggle a selection of `ty` at the vi cursor (`v` / `V`); the same key again clears it.
+    /// Returns whether a selection is up afterwards — read under the same lock, so a swap the
+    /// PTY thread processes right after cannot make the caller believe there never was one.
+    pub fn copy_toggle_selection(&self, lines: bool) -> bool {
+        use alacritty_terminal::index::Side;
+        use alacritty_terminal::selection::{Selection, SelectionType};
+        let ty = if lines {
+            SelectionType::Lines
+        } else {
+            SelectionType::Simple
+        };
+        let mut t = self.term.lock();
+        if t.selection.as_ref().is_some_and(|s| s.ty == ty) {
+            t.selection = None;
+        } else {
+            let at = t.vi_mode_cursor.point;
+            let mut sel = Selection::new(ty, at, Side::Left);
+            // A fresh selection's endpoints coincide, and alacritty never extends an EMPTY
+            // selection along with the cursor — include the cursor cell so it can grow.
+            sel.include_all();
+            t.selection = Some(sel);
+            t.vi_goto_point(at);
+        }
+        let up = t.selection.is_some();
+        drop(t);
+        self.mark_dirty();
+        up
+    }
+
+    /// Whether a selection is up.
+    pub fn copy_has_selection(&self) -> bool {
+        self.term.lock().selection.is_some()
+    }
+
+    /// Clear the selection, keeping copy mode. Returns whether there was one.
+    pub fn copy_clear_selection(&self) -> bool {
+        let had = self.term.lock().selection.take().is_some();
+        self.mark_dirty();
+        had
+    }
+
+    /// Search for `query` (a literal, case-insensitive) from the vi cursor, older (`up`) or
+    /// newer, wrapping at the ends of the history, and move the cursor to the match start.
+    pub fn copy_search(&self, query: &str, up: bool) -> SearchOutcome {
+        use alacritty_terminal::index::{Boundary, Direction, Side};
+        use alacritty_terminal::term::search::RegexSearch;
+        if query.is_empty() {
+            return SearchOutcome::NoMatch;
+        }
+        let Ok(mut regex) = RegexSearch::new(&format!("(?i){}", regex_literal(query))) else {
+            return SearchOutcome::NoMatch;
+        };
+        let mut t = self.term.lock();
+        let at = t.vi_mode_cursor.point;
+        // EXCLUSIVE start: one cell past the cursor in the search direction, so `n` moves on
+        // from the match it is sitting on rather than finding it again.
+        let (origin, dir) = if up {
+            (at.sub(&*t, Boundary::None, 1), Direction::Left)
+        } else {
+            (at.add(&*t, Boundary::None, 1), Direction::Right)
+        };
+        let Some(m) = t.search_next(&mut regex, origin, dir, Side::Left, None) else {
+            return SearchOutcome::NoMatch;
+        };
+        let start = *m.start();
+        let wrapped = if up { start > at } else { start < at };
+        t.vi_goto_point(start);
+        drop(t);
+        self.mark_dirty();
+        if wrapped {
+            SearchOutcome::Wrapped
+        } else {
+            SearchOutcome::Found
+        }
+    }
+
+    /// The selected text (the cursor's line when nothing is selected), via alacritty's own
+    /// extractor — wrapped-row seams and combining marks handled as alacritty handles them.
+    /// Refused BEFORE extraction when it would exceed [`MAX_YANK_BYTES`]: the extractor appends
+    /// every stored scalar with no budget, under the lock the PTY reader also needs.
+    ///
+    /// `expect_selection`: the caller believes a selection is up. If it is gone — cleared by a
+    /// screen swap the PTY thread processed since the caller last looked — this refuses under
+    /// the SAME lock it would extract with, instead of falling back to the cursor's line.
+    pub fn copy_yank(&self, expect_selection: bool) -> Result<String, &'static str> {
+        use alacritty_terminal::index::Side;
+        use alacritty_terminal::selection::{Selection, SelectionType};
+        let mut t = self.term.lock();
+        if expect_selection && t.selection.is_none() {
+            return Err("the screen changed and cleared the selection — nothing copied");
+        }
+        if t.selection.is_none() {
+            let at = t.vi_mode_cursor.point;
+            let mut sel = Selection::new(SelectionType::Lines, at, Side::Left);
+            sel.include_all();
+            t.selection = Some(sel);
+        }
+        let range = t
+            .selection
+            .as_ref()
+            .and_then(|s| s.to_range(&t))
+            .ok_or("nothing selected")?;
+        let mut bytes = 0usize;
+        let cols = t.columns();
+        let grid = t.grid();
+        for line in range.start.line.0..=range.end.line.0 {
+            for c in 0..cols {
+                let p = Point::new(Line(line), Column(c));
+                if !range.contains(p) {
+                    continue;
+                }
+                let cell = &grid[p];
+                bytes += cell.c.len_utf8() + 1; // +1: a separator/newline it may add
+                if let Some(zw) = cell.zerowidth() {
+                    bytes += zw.iter().map(|z| z.len_utf8()).sum::<usize>();
+                }
+                if bytes > MAX_YANK_BYTES {
+                    return Err("selection too large to copy (over 1 MiB)");
+                }
+            }
+        }
+        let text = t.selection_to_string().ok_or("nothing selected")?;
+        if text.len() > MAX_YANK_BYTES {
+            return Err("selection too large to copy (over 1 MiB)");
+        }
+        Ok(text)
+    }
+
     /// How many times this pane has rung the bell since it was spawned. Monotonic; the
     /// caller compares it against how many it has acknowledged.
     pub fn bell_count(&self) -> u64 {
@@ -737,7 +975,33 @@ pub(crate) fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
         cells,
         wrapped,
         cursor: (cursor_col, cursor_row),
+        copy: copy_view(term, display_offset),
     }
+}
+
+/// Copy mode's cursor + selection in viewport rows, or `None` when vi mode is off.
+fn copy_view<L: EventListener>(term: &Term<L>, display_offset: i32) -> Option<CopyView> {
+    if !term.mode().contains(TermMode::VI) {
+        return None;
+    }
+    let rows = term.screen_lines() as i32;
+    let vp = term.vi_mode_cursor.point;
+    let vrow = vp.line.0 + display_offset;
+    let cursor = (0..rows)
+        .contains(&vrow)
+        .then_some((vp.column.0 as u16, vrow as u16));
+    let selection = term
+        .selection
+        .as_ref()
+        .and_then(|s| s.to_range(term))
+        .map(|r| {
+            (
+                (r.start.line.0 + display_offset, r.start.column.0 as u16),
+                (r.end.line.0 + display_offset, r.end.column.0 as u16),
+                r.is_block,
+            )
+        });
+    Some(CopyView { cursor, selection })
 }
 
 /// Server-owned traversal budgets for [`capture_text`]. These bound the WORK, not merely

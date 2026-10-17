@@ -198,7 +198,8 @@ restore_agent_sessions = true
 # redraw = "r"            # force a full repaint (tmux refresh-client) — clears any ghosting
 # focus-sidebar = "e"     # keyboard-focus the sidebar (↑↓ list, ←→ spaces/agents, Enter, Esc)
 # resume-picker = "R"     # past Claude/Codex conversations on disk → resume one in a new tab
-# scrollback = "["
+# scrollback = "["        # copy mode (tmux copy-mode-vi): hjkl/w/b/0/$ move, ?/ search, n N,
+                          #   v/V select, y yank (OSC 52), Esc clears, q leaves
 # focus-next = "o"
 # focus-left = ["h", "Left"]
 # focus-down = ["j", "Down"]

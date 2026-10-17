@@ -55,6 +55,7 @@
 #  39. the sidebar shows a repo's working-tree state, and marks a linked worktree
 #  40. broadcast types into one session's panes (or lists all on a dry run), never the caller's
 #  41. a split shows pane titles; Ctrl-b z zooms the pane to the whole tab (and its PTY with it)
+#  42. copy mode: ?search into history, V y yanks the line to the client as OSC 52, q leaves
 
 set -euo pipefail
 
@@ -1962,8 +1963,8 @@ PTY_KEYS='\x02>' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/d
 tail -1 "$WORK/frame" | grep -qF "nothing to go forward to" \
     || { cat "$WORK/frame" >&2; fail "Ctrl-b > with no forward history should say so in the status bar"; }
 PTY_KEYS='\x02[' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
-tail -1 "$WORK/frame" | grep -qE "SCROLL [0-9]+/[0-9]+ · j/k g/G · q" \
-    || { cat "$WORK/frame" >&2; fail "scroll mode should show its position and exit keys"; }
+tail -1 "$WORK/frame" | grep -qE "COPY [0-9]+/[0-9]+ · \?/ search · v V select · y yank · q" \
+    || { cat "$WORK/frame" >&2; fail "copy mode should show its position and keys"; }
 ok "an empty-history key reports in the bar; scroll mode shows position and keys"
 
 echo "37. the switcher previews the selected session's pane, and keeps it live"
@@ -2066,7 +2067,55 @@ grep -q unzoomed "$WORK/out" || fail "comux zoom should toggle back: $(cat "$WOR
 t 10 "$COMUX" kill-session name:e2ezoom >/dev/null 2>&1 || true
 ok "split titles its pane; Ctrl-b z zooms (ZOOM chip, full-height PTY); comux zoom toggles back"
 
-echo "42. the server is still responsive and shuts down cleanly"
+echo "42. copy mode: search, select, yank (OSC 52 to this client)"
+t 10 "$COMUX" new-session --json e2ecopy >"$WORK/json" || fail "new-session e2ecopy failed"
+CP="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+t 10 "$COMUX" send "$CP" --enter -- 'for i in $(seq 1 60); do echo CPL$i; done; echo CPDONE-$((1+1))' >/dev/null
+t 15 "$COMUX" wait-output "$CP" --timeout 10 CPDONE-2 >/dev/null || fail "the copy fixture never printed"
+# A raw dump of what the client received, to find the OSC 52 the yank sends.
+cat >"$WORK/rawdrive.py" <<'PYEOF'
+import os, pty, sys, time, select, fcntl, termios, struct
+keys = sys.argv[1]; out = sys.argv[2]; cmd = sys.argv[sys.argv.index("--") + 1:]
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm-256color"; os.execvp(cmd[0], cmd)
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+def drain(sec):
+    b = b""; end = time.time() + sec
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if r:
+            try: c = os.read(fd, 65536)
+            except OSError: break
+            if not c: break
+            b += c
+    return b
+buf = drain(5)
+for part in keys.split("|"):
+    os.write(fd, part.encode().decode("unicode_escape").encode()); buf += drain(1.5)
+os.write(fd, b"\x02d"); time.sleep(0.8)
+open(out, "wb").write(buf)
+try: os.close(fd)
+except OSError: pass
+try: os.waitpid(pid, 0)
+except ChildProcessError: pass
+PYEOF
+python3 "$WORK/rawdrive.py" '\x02[|?cpl17|\r|V|y' "$WORK/raw" -- "$COMUX" 2>/dev/null
+python3 - "$WORK/raw" <<'PYEOF' || fail "the yank should reach this client as an OSC 52 copy of 'CPL17'"
+import base64, re, sys
+raw = open(sys.argv[1], "rb").read()
+hits = [base64.b64decode(m) for m in re.findall(rb"\x1b\]52;[a-z]*;([A-Za-z0-9+/=]+)(?:\x07|\x1b\\)", raw)]
+assert any(h.strip() == b"CPL17" for h in hits), hits
+PYEOF
+# y left copy mode: no COPY chip in a fresh frame, and q (separately) leaves too.
+python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+if tail -1 "$WORK/frame" | grep -qF " COPY "; then fail "y should have left copy mode"; fi
+PTY_KEYS='\x02[|q' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+if tail -1 "$WORK/frame" | grep -qF " COPY "; then fail "q should leave copy mode"; fi
+t 10 "$COMUX" kill-session name:e2ecopy >/dev/null 2>&1 || true
+ok "?search finds history (case-insensitive), V y sends 'CPL17' over OSC 52 to this client; y and q leave"
+
+echo "43. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

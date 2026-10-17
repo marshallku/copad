@@ -471,6 +471,21 @@ struct BroadcastScope<'a> {
     caller: Option<&'a str>,
 }
 
+/// Copy mode's own state (alacritty holds the cursor and the selection).
+struct CopyState {
+    /// Whether the alternate screen was up at entry; a swap since then ends copy mode.
+    alt: bool,
+    /// An open search prompt: `(searching up, typed so far)`.
+    prompt: Option<(bool, String)>,
+    /// The last search, for `n` / `N`.
+    last: Option<(String, bool)>,
+    /// The user has a selection up (`v`/`V`). If alacritty's selection disappears while this
+    /// is set, a screen swap cleared it — possibly a round trip between two ticks, which the
+    /// current-screen comparison cannot see — and a `y` would silently copy the cursor's line
+    /// instead of what was selected. Copy mode ends instead.
+    selecting: bool,
+}
+
 /// A status-bar outcome line ([`App::flash`]).
 struct StatusMessage {
     text: String,
@@ -670,6 +685,11 @@ pub struct App {
     /// terminal it was entered on, so a focus change (click / another client) can't
     /// strand that pane scrolled-up. Keys scroll it; exit bottoms it. Shared state.
     scroll_pane: Option<TerminalId>,
+    /// Copy-mode state that is not alacritty's (the search prompt, the last search, and the
+    /// screen the mode was entered on). `Some` exactly when `scroll_pane` is.
+    copy: Option<CopyState>,
+    /// A copy-mode yank waiting for the server to deliver (`take_key_copy`).
+    key_copy: Option<String>,
     /// Pids of currently attached clients, oldest first — the walk-up start point for
     /// raising the right terminal window after a notification jump.
     client_pids: Vec<u32>,
@@ -948,6 +968,8 @@ impl App {
             sidebar: cfg.sidebar,
             popup: None,
             scroll_pane: None,
+            copy: None,
+            key_copy: None,
             client_pids: Vec::new(),
             client_copad: Vec::new(),
             view_gen: 0,
@@ -4261,29 +4283,24 @@ impl App {
             return KeyAction::Continue;
         }
 
-        // Scrollback mode (`Ctrl-b [`): keys drive the BOUND pane's history (bound at
-        // entry, so a focus change can't strand it). If that pane is gone, drop out.
+        // Copy mode (`Ctrl-b [`, decisions #147): tmux copy-mode-vi keys on the BOUND pane
+        // (bound at entry, so a focus change can't strand it), driving alacritty's own vi
+        // mode. If that pane is gone — or its screen swapped since entry — drop out.
         if let Some(term) = self.scroll_pane.clone() {
-            if !self.panes.contains_key(&term) {
-                self.scroll_pane = None;
+            *prefix = false;
+            let alt_now = self.panes.get(&term).map(|p| p.in_alt_screen());
+            if alt_now.is_none() || self.copy.as_ref().map(|c| c.alt) != alt_now {
+                self.exit_copy_mode();
+            } else if self.copy_selection_lost(&term) {
+                // The key that noticed is consumed: it was meant for copy mode, not the shell.
+                self.exit_copy_mode();
+                self.flash(
+                    "copy mode ended: the screen changed and cleared the selection".into(),
+                    false,
+                );
+                return KeyAction::Continue;
             } else {
-                let page = (self.term_rows(&term) / 2).max(1) as i32;
-                match k.code {
-                    KeyCode::Char('k') | KeyCode::Up => self.scroll_term(&term, 1),
-                    KeyCode::Char('j') | KeyCode::Down => self.scroll_term(&term, -1),
-                    KeyCode::PageUp => self.scroll_term(&term, page),
-                    KeyCode::PageDown => self.scroll_term(&term, -page),
-                    KeyCode::Char('u') if ctrl => self.scroll_term(&term, page),
-                    KeyCode::Char('d') if ctrl => self.scroll_term(&term, -page),
-                    KeyCode::Char('g') => self.scroll_term(&term, 1_000_000), // clamps to top
-                    // `G`/`q`/`Esc` return the bound pane to the live bottom AND exit.
-                    KeyCode::Char('G') | KeyCode::Char('q') | KeyCode::Esc => {
-                        self.scroll_pane = None;
-                        self.scroll_term_to_bottom(&term);
-                    }
-                    _ => {}
-                }
-                *prefix = false;
+                self.copy_key(&term, k);
                 return KeyAction::Continue;
             }
         }
@@ -4365,7 +4382,7 @@ impl App {
             Detach => return KeyAction::Detach,
             ClosePane => self.close_focused(),
             ToggleSidebar => self.toggle_sidebar(),
-            Scrollback => self.scroll_pane = self.focused_terminal(),
+            Scrollback => self.enter_copy_mode(),
             FocusNext => self.focus_next(),
             FocusLeft => self.focus_dir(FocusDir::Left),
             FocusDown => self.focus_dir(FocusDir::Down),
@@ -4944,17 +4961,202 @@ impl App {
         }
     }
 
-    /// Scroll a specific terminal by `lines` (positive = up / older).
-    fn scroll_term(&self, term: &TerminalId, lines: i32) {
-        if let Some(pt) = self.panes.get(term) {
-            pt.scroll(lines);
+    // --- copy mode (Ctrl-b [, decisions #147) ---
+
+    fn enter_copy_mode(&mut self) {
+        let Some(term) = self.focused_terminal() else {
+            return;
+        };
+        let Some(pt) = self.panes.get(&term) else {
+            return;
+        };
+        let alt = pt.copy_enter();
+        self.copy = Some(CopyState {
+            alt,
+            prompt: None,
+            last: None,
+            selecting: false,
+        });
+        self.scroll_pane = Some(term);
+    }
+
+    /// End copy mode when its pane is gone or is now showing the OTHER screen than the one
+    /// it was entered on. Called every server tick (not only on keys), so copy mode never
+    /// lingers over a full-screen app that started while you were reading. Returns whether it
+    /// ended (a repaint). A swap there-and-back between ticks is benign: alacritty restores the
+    /// primary grid with its history, the vi cursor's position is valid in it again, and the
+    /// selection the swap cleared is simply gone.
+    pub fn reconcile_copy(&mut self) -> bool {
+        let Some(term) = self.scroll_pane.clone() else {
+            return false;
+        };
+        let alt_now = self.panes.get(&term).map(|p| p.in_alt_screen());
+        if alt_now.is_none() || self.copy.as_ref().map(|c| c.alt) != alt_now {
+            self.exit_copy_mode();
+            return true;
+        }
+        if self.copy_selection_lost(&term) {
+            self.exit_copy_mode();
+            self.flash(
+                "copy mode ended: the screen changed and cleared the selection".into(),
+                false,
+            );
+            return true;
+        }
+        false
+    }
+
+    /// The user's selection vanished without them clearing it (see `CopyState::selecting`).
+    fn copy_selection_lost(&self, term: &TerminalId) -> bool {
+        self.copy.as_ref().is_some_and(|c| c.selecting)
+            && self
+                .panes
+                .get(term)
+                .is_some_and(|p| !p.copy_has_selection())
+    }
+
+    fn exit_copy_mode(&mut self) {
+        if let Some(term) = self.scroll_pane.take()
+            && let Some(pt) = self.panes.get(&term)
+        {
+            pt.copy_exit();
+        }
+        self.copy = None;
+    }
+
+    /// One key in copy mode. The search prompt, when open, takes the key first.
+    fn copy_key(&mut self, term: &TerminalId, k: KeyEvent) {
+        use alacritty_terminal::vi_mode::ViMotion;
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if let Some((up, mut buf)) = self.copy.as_mut().and_then(|c| c.prompt.take()) {
+            match k.code {
+                KeyCode::Enter => {
+                    if let Some(c) = &mut self.copy {
+                        c.last = Some((buf.clone(), up));
+                    }
+                    self.copy_search(term, &buf, up);
+                }
+                KeyCode::Esc => {}
+                KeyCode::Backspace => {
+                    buf.pop();
+                    if let Some(c) = &mut self.copy {
+                        c.prompt = Some((up, buf));
+                    }
+                }
+                KeyCode::Char(ch) if !ctrl => {
+                    buf.push(ch);
+                    if let Some(c) = &mut self.copy {
+                        c.prompt = Some((up, buf));
+                    }
+                }
+                _ => {
+                    if let Some(c) = &mut self.copy {
+                        c.prompt = Some((up, buf));
+                    }
+                }
+            }
+            return;
+        }
+        let Some(pt) = self.panes.get(term) else {
+            return;
+        };
+        let page = (self.term_rows(term) / 2).max(1) as i32;
+        let motion = |m: ViMotion| pt.copy_motion(m);
+        match k.code {
+            KeyCode::Char('k') | KeyCode::Up => motion(ViMotion::Up),
+            KeyCode::Char('j') | KeyCode::Down => motion(ViMotion::Down),
+            KeyCode::Char('h') | KeyCode::Left => motion(ViMotion::Left),
+            KeyCode::Char('l') | KeyCode::Right => motion(ViMotion::Right),
+            KeyCode::Char('w') => motion(ViMotion::WordRight),
+            KeyCode::Char('b') if !ctrl => motion(ViMotion::WordLeft),
+            KeyCode::Char('e') => motion(ViMotion::WordRightEnd),
+            KeyCode::Char('0') | KeyCode::Home => motion(ViMotion::First),
+            KeyCode::Char('^') => motion(ViMotion::FirstOccupied),
+            KeyCode::Char('$') | KeyCode::End => motion(ViMotion::Last),
+            KeyCode::Char('H') => motion(ViMotion::High),
+            KeyCode::Char('L') => motion(ViMotion::Low),
+            KeyCode::PageUp => pt.copy_scroll(page * 2),
+            KeyCode::PageDown => pt.copy_scroll(-page * 2),
+            KeyCode::Char('u') if ctrl => pt.copy_scroll(page),
+            KeyCode::Char('d') if ctrl => pt.copy_scroll(-page),
+            KeyCode::Char('b') if ctrl => pt.copy_scroll(page * 2),
+            KeyCode::Char('f') if ctrl => pt.copy_scroll(-page * 2),
+            KeyCode::Char('g') => pt.copy_top(),
+            KeyCode::Char('v') | KeyCode::Char('V') => {
+                let on = pt.copy_toggle_selection(k.code == KeyCode::Char('V'));
+                if let Some(c) = &mut self.copy {
+                    c.selecting = on;
+                }
+            }
+            KeyCode::Char('?') => self.open_copy_prompt(true),
+            KeyCode::Char('/') => self.open_copy_prompt(false),
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                let reverse = k.code == KeyCode::Char('N');
+                match self.copy.as_ref().and_then(|c| c.last.clone()) {
+                    Some((q, up)) => self.copy_search(term, &q, up != reverse),
+                    None => self.flash("no previous search".into(), false),
+                }
+            }
+            KeyCode::Char('y') | KeyCode::Enter => {
+                match pt.copy_yank(self.copy.as_ref().is_some_and(|c| c.selecting)) {
+                    Ok(text) => {
+                        let n = text.lines().count().max(1);
+                        self.key_copy = Some(text);
+                        self.exit_copy_mode();
+                        self.flash(
+                            format!("copied {n} line{}", if n == 1 { "" } else { "s" }),
+                            false,
+                        );
+                    }
+                    Err(why) => self.flash(why.into(), true),
+                }
+            }
+            // Esc clears a selection first (tmux); with none it leaves, like q and G.
+            KeyCode::Esc => {
+                if pt.copy_clear_selection() {
+                    if let Some(c) = &mut self.copy {
+                        c.selecting = false;
+                    }
+                } else {
+                    self.exit_copy_mode();
+                }
+            }
+            KeyCode::Char('q') | KeyCode::Char('G') => self.exit_copy_mode(),
+            _ => {}
         }
     }
 
-    fn scroll_term_to_bottom(&self, term: &TerminalId) {
-        if let Some(pt) = self.panes.get(term) {
-            pt.scroll_to_bottom();
+    fn open_copy_prompt(&mut self, up: bool) {
+        if let Some(c) = &mut self.copy {
+            c.prompt = Some((up, String::new()));
         }
+    }
+
+    fn copy_search(&mut self, term: &TerminalId, query: &str, up: bool) {
+        let Some(pt) = self.panes.get(term) else {
+            return;
+        };
+        match pt.copy_search(query, up) {
+            term::SearchOutcome::Found => {}
+            term::SearchOutcome::Wrapped => self.flash(
+                format!(
+                    "search wrapped ({})",
+                    if up {
+                        "from the bottom"
+                    } else {
+                        "from the top"
+                    }
+                ),
+                false,
+            ),
+            term::SearchOutcome::NoMatch => self.flash(format!("no match for '{query}'"), false),
+        }
+    }
+
+    /// Text a copy-mode yank produced, for the server to send to the client whose key it was
+    /// (the same OSC 52 path a drag-copy takes). Taken, not read.
+    pub fn take_key_copy(&mut self) -> Option<String> {
+        self.key_copy.take()
     }
 
     /// On-screen rows of a terminal (the page size for page scrolling).
@@ -5954,6 +6156,15 @@ impl App {
                         // wide glyph tints both of its columns). Overrides the cell's own bg.
                         if row_sel.is_some_and(|(c0, c1)| rx as u16 >= c0 && rx as u16 <= c1) {
                             style = style.bg(SEL_BG);
+                        }
+                        // Copy mode: its selection and its cursor, from the same snapshot.
+                        if let Some(cv) = &snap.copy {
+                            if cv.selected(ry as i32, rx as u16) {
+                                style = style.bg(SEL_BG);
+                            }
+                            if cv.cursor == Some((rx as u16, ry as u16)) {
+                                style = style.add_modifier(Modifier::REVERSED);
+                            }
                         }
                         bc.set_symbol(&cell.sym);
                         bc.set_style(style);
@@ -7674,8 +7885,12 @@ impl App {
                 .get(sp)
                 .map(|p| format!(" {}/{}", p.scroll_offset(), p.history_len()))
                 .unwrap_or_default();
+            let text = match self.copy.as_ref().and_then(|c| c.prompt.as_ref()) {
+                Some((up, q)) => format!(" search {}: {q}█ ", if *up { "↑" } else { "↓" }),
+                None => format!(" COPY{pos} · ?/ search · v V select · y yank · q "),
+            };
             segs.push((
-                format!(" SCROLL{pos} · j/k g/G · q "),
+                text,
                 Style::default()
                     .fg(CAT_BASE)
                     .bg(CAT_YELLOW)
@@ -10105,6 +10320,7 @@ mod tests {
             wrapped: vec![false; cells.len()],
             cells,
             cursor: (0, 0),
+            copy: None,
         }
     }
 
@@ -10218,6 +10434,7 @@ mod tests {
             wrapped: vec![false],
             cells,
             cursor: (0, 0),
+            copy: None,
         };
         assert_eq!(extract_selection(&s, (0, 0), (2, 0)), "가X");
         // Starting the drag on the glyph's RIGHT half (the spacer at col 1) must still include
@@ -12861,8 +13078,8 @@ mod mode_hints {
     fn modes_say_how_to_leave_them() {
         let mut app = app();
         chord(&mut app, '[');
-        assert!(bar(&app).contains("SCROLL 0/"), "{}", bar(&app));
-        assert!(bar(&app).contains("· q"));
+        assert!(bar(&app).contains("COPY 0/"), "{}", bar(&app));
+        assert!(bar(&app).contains("y yank · q"));
         let mut prefix = false;
         app.feed_key(
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
@@ -13548,6 +13765,7 @@ mod zoom_titles {
             cells: vec![row],
             wrapped: vec![false],
             cursor: (0, 5),
+            copy: None,
         }
     }
 
@@ -13594,5 +13812,192 @@ mod zoom_titles {
         assert!(render(&app).contains(" 1:"), "{}", render(&app));
         app.cfg.pane_titles = false;
         assert!(!render(&app).contains(" 1:"));
+    }
+}
+
+#[cfg(test)]
+mod copy_mode {
+    use super::*;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn press(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+        app.feed_key(KeyEvent::new(code, mods), &mut false);
+    }
+
+    fn typ(app: &mut App, s: &str) {
+        for c in s.chars() {
+            press(app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+    }
+
+    /// A pane that has printed `L1` … `L80` (more than a screen, so some is in history).
+    fn app_with_lines() -> App {
+        let app = app();
+        let term = app.focused_terminal().unwrap();
+        app.panes[&term].input(b"for i in $(seq 1 80); do echo L$i; done; echo DONE-$((1+1))\n");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let cap = app.panes[&term].capture(Some(200));
+            if cap.text.contains("DONE-2") {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell never printed"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        app
+    }
+
+    fn enter(app: &mut App) {
+        let mut prefix = false;
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &mut prefix,
+        );
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+            &mut prefix,
+        );
+    }
+
+    #[test]
+    fn search_up_into_history_then_yank_the_line() {
+        let mut app = app_with_lines();
+        enter(&mut app);
+        assert!(app.scroll_pane.is_some());
+        typ(&mut app, "?l12");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        // Lowercase query, uppercase text: the search is case-insensitive.
+        typ(&mut app, "V");
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        let copied = app.take_key_copy().expect("a yank");
+        assert_eq!(copied.trim_end(), "L12");
+        assert!(app.scroll_pane.is_none(), "y leaves copy mode");
+        assert!(app.copy.is_none());
+    }
+
+    #[test]
+    fn n_moves_on_and_a_char_selection_extends_with_the_cursor() {
+        let mut app = app_with_lines();
+        enter(&mut app);
+        typ(&mut app, "?L7");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE); // L79
+        typ(&mut app, "n"); // L78
+        typ(&mut app, "vl"); // `L7`
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert_eq!(app.take_key_copy().as_deref(), Some("L7"));
+    }
+
+    #[test]
+    fn esc_clears_a_selection_before_it_leaves() {
+        let mut app = app_with_lines();
+        enter(&mut app);
+        typ(&mut app, "v");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(
+            app.scroll_pane.is_some(),
+            "the first Esc only clears the selection"
+        );
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(app.scroll_pane.is_none());
+    }
+
+    #[test]
+    fn no_match_says_so_and_stays() {
+        let mut app = app_with_lines();
+        enter(&mut app);
+        typ(&mut app, "/zzz-not-there");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.message.as_ref().unwrap().text.contains("no match"));
+        assert!(app.scroll_pane.is_some());
+        typ(&mut app, "q");
+        assert!(app.scroll_pane.is_none());
+    }
+
+    #[test]
+    fn a_screen_swap_while_idle_ends_copy_mode_on_the_next_tick() {
+        let mut app = app_with_lines();
+        enter(&mut app);
+        assert!(!app.reconcile_copy(), "nothing changed yet");
+        let term = app.focused_terminal().unwrap();
+        app.panes[&term].input(b"printf '\\033[?1049h'; sleep 30\n");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !app.panes[&term].in_alt_screen() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never entered the alt screen"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            app.reconcile_copy(),
+            "the tick ends copy mode without any key"
+        );
+        assert!(app.scroll_pane.is_none() && app.copy.is_none());
+    }
+
+    #[test]
+    fn a_selection_cleared_behind_our_back_ends_copy_mode_instead_of_yanking_the_line() {
+        let mut app = app_with_lines();
+        enter(&mut app);
+        typ(&mut app, "?L30");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        typ(&mut app, "vll");
+        // What an alt-screen round trip between two ticks leaves behind: the same screen,
+        // no selection.
+        let term = app.focused_terminal().unwrap();
+        app.panes[&term].copy_clear_selection();
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.take_key_copy().is_none(), "nothing is copied");
+        assert!(app.scroll_pane.is_none(), "copy mode ended");
+        assert!(
+            app.message
+                .as_ref()
+                .unwrap()
+                .text
+                .contains("cleared the selection")
+        );
+    }
+
+    #[test]
+    fn paging_moves_the_view_by_exactly_one_page() {
+        let mut app = app_with_lines();
+        enter(&mut app);
+        let term = app.focused_terminal().unwrap();
+        let rows = app.term_rows(&term) as usize;
+        let before = app.panes[&term].scroll_offset();
+        // Ctrl-u pages half a screen up and carries the cursor with it.
+        press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        let after = app.panes[&term].scroll_offset();
+        let half = (rows / 2).max(1);
+        assert_eq!(after, before + half, "one half-page, not two");
+    }
+
+    #[test]
+    fn the_rendered_cursor_and_selection_come_from_the_snapshot() {
+        let mut app = app_with_lines();
+        enter(&mut app);
+        typ(&mut app, "?L50");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        typ(&mut app, "vl");
+        let snap = app.panes[&app.focused_terminal().unwrap()].snapshot();
+        let cv = snap.copy.expect("copy view while in copy mode");
+        let (cx, cy) = cv.cursor.expect("the cursor is on screen after a search");
+        assert!(
+            cv.selected(cy as i32, cx),
+            "the cursor cell is inside the selection"
+        );
+        let row: String = snap.cells[cy as usize]
+            .iter()
+            .map(|c| c.sym.as_str())
+            .collect();
+        assert!(row.starts_with("L50"), "{row}");
     }
 }

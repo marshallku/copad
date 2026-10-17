@@ -573,6 +573,7 @@ mod tests {
             cells,
             wrapped,
             cursor: (0, 0),
+            copy: None,
         }
     }
 
