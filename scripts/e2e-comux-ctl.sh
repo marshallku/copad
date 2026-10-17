@@ -49,6 +49,7 @@
 #      and Ctrl-f opens on the previous session in a REAL rendered frame
 #  34. a Korean session name keeps every overlay's border where it belongs
 #  35. Ctrl-b ? lists the live keymap; an armed prefix shows the next keys in the status bar
+#  36. outcomes reach the status bar (no toast needed); modes say how to leave them
 
 set -euo pipefail
 
@@ -1943,7 +1944,18 @@ rm -f "$XDG_CONFIG_HOME/copad/mux.toml"
 t 10 "$COMUX" reload >/dev/null
 ok "Ctrl-b ? lists the keymap under the live prefix; the armed-prefix hint follows a rebinding"
 
-echo "36. the server is still responsive and shuts down cleanly"
+echo "36. the status-bar message line and mode hints, in a real frame"
+# With COPAD_MUX_NOTIFY=0 (set for this whole run) a toast could never show: the outcome of a
+# key has to reach the frame itself.
+PTY_KEYS='\x02>' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+tail -1 "$WORK/frame" | grep -qF "nothing to go forward to" \
+    || { cat "$WORK/frame" >&2; fail "Ctrl-b > with no forward history should say so in the status bar"; }
+PTY_KEYS='\x02[' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+tail -1 "$WORK/frame" | grep -qE "SCROLL [0-9]+/[0-9]+ · j/k g/G · q" \
+    || { cat "$WORK/frame" >&2; fail "scroll mode should show its position and exit keys"; }
+ok "an empty-history key reports in the bar; scroll mode shows position and keys"
+
+echo "37. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

@@ -546,6 +546,11 @@ impl PaneTerm {
         self.term.lock().grid().display_offset()
     }
 
+    /// Lines of scrollback above the screen — the ceiling for [`Self::scroll_offset`].
+    pub fn history_len(&self) -> usize {
+        self.term.lock().grid().history_size()
+    }
+
     /// Bytes to feed the child for ONE wheel notch, honoring the app's active input mode
     /// (tmux-style), or `None` if the app wants no wheel input — then the caller scrolls
     /// the pane's OWN scrollback instead. `col`/`row` are 1-based cell coords WITHIN the

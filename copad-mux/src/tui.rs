@@ -458,6 +458,17 @@ enum PopupTab {
     Agents,
 }
 
+/// A status-bar outcome line ([`App::flash`]).
+struct StatusMessage {
+    text: String,
+    error: bool,
+    until: std::time::Instant,
+}
+
+/// How long a status message stays up. Errors linger: they are the ones worth reading.
+const MESSAGE_SECS: u64 = 5;
+const ERROR_MESSAGE_SECS: u64 = 10;
+
 /// The `Ctrl-f` fuzzy switcher state: which tab, the typed filter, the selected row.
 struct PopupState {
     tab: PopupTab,
@@ -720,6 +731,11 @@ pub struct App {
     confirm: Option<Confirm>,
     /// When `Some`, a right-click context menu (tmux `display-menu`) is open.
     menu: Option<Menu>,
+    /// A short outcome line for something the user just did (a failed spawn, a worktree
+    /// warning, `Ctrl-b <` with no history), shown in the status bar in place of the tab
+    /// chips until it expires. Replaces the desktop toast these used to need, which never
+    /// appeared at all under `COPAD_MUX_NOTIFY=0` or on a machine without a notifier.
+    message: Option<StatusMessage>,
     /// When `Some(scroll)`, the `Ctrl-b ?` key help is open, scrolled `scroll` rows down
     /// (clamped at render, so a resize or a reload that shortens the list can't strand it).
     help: Option<usize>,
@@ -909,6 +925,7 @@ impl App {
             confirm: None,
             menu: None,
             help: None,
+            message: None,
             spaces_scroll: None,
             agents_scroll: None,
             spaces_view: RefCell::new(HalfView::default()),
@@ -1731,6 +1748,19 @@ impl App {
         self.mru_sessions().into_iter().find(|w| w != dying)
     }
 
+    /// [`Self::navigate`] from a key: an empty direction says so instead of doing nothing.
+    fn navigate_or_say(&mut self, dir: control::NavDir) {
+        if self.navigate(dir).is_none() {
+            let what = match dir {
+                control::NavDir::Back | control::NavDir::Last => {
+                    "no earlier session/tab to go back to"
+                }
+                control::NavDir::Forward => "nothing to go forward to",
+            };
+            self.flash(what.to_string(), false);
+        }
+    }
+
     /// `session/tab` for a location, by display name — what `comux back` prints.
     fn loc_label(&self, loc: &Loc) -> String {
         let w = self.state.workspace(&loc.ws);
@@ -1831,34 +1861,47 @@ impl App {
         }
     }
 
-    /// Tell the user why a pane they just asked for did not appear.
-    ///
-    /// The TUI has no inline message line, so this goes out as a desktop toast — the
-    /// same channel, and for the same reason, as a failed `Ctrl-b W` worktree create:
-    /// it is direct feedback for a key the user just pressed, so it is deliberately
-    /// NOT gated on the `notify` config (a `notify = false` user would otherwise get
-    /// no signal at all that their keypress failed). `COPAD_MUX_NOTIFY=0` still
-    /// hard-disables every toast.
+    /// Tell the user why a pane they just asked for did not appear: on the status-bar
+    /// message line (it used to be a desktop toast, which `COPAD_MUX_NOTIFY=0` or a machine
+    /// without a notifier silently swallowed), and in `last_spawn_error` for the control
+    /// API to report the same reason.
     fn report_spawn_failure(&mut self, what: &str, reason: &str) {
         self.last_spawn_error = Some(reason.to_string());
-        if notify::env_override().unwrap_or(true) {
-            notify::desktop(
-                &format!("comux: {what} failed"),
-                reason,
-                None,
-                &self.desktop_env(),
-            );
-        }
+        self.flash(format!("{what} failed: {reason}"), true);
     }
 
-    /// Tell the user something about an action they just took, on the same channel and for
-    /// the same reason as [`Self::report_spawn_failure`]: the TUI has no message line, and a
-    /// `notify = false` user still needs feedback for a key they pressed. `COPAD_MUX_NOTIFY=0`
-    /// still hard-disables every toast.
-    fn report_note(&self, title: &str, body: &str) {
-        if notify::env_override().unwrap_or(true) {
-            notify::desktop(title, body, None, &self.desktop_env());
+    /// Tell the user something about an action they just took, on the message line.
+    fn report_note(&mut self, body: &str) {
+        self.flash(body.to_string(), false);
+    }
+
+    /// Show `text` in the status bar for a few seconds (see [`App::message`]).
+    fn flash(&mut self, text: String, error: bool) {
+        let secs = if error {
+            ERROR_MESSAGE_SECS
+        } else {
+            MESSAGE_SECS
+        };
+        self.message = Some(StatusMessage {
+            // One line: a multi-line reason would otherwise draw control characters.
+            text: text.split_whitespace().collect::<Vec<_>>().join(" "),
+            error,
+            until: std::time::Instant::now() + Duration::from_secs(secs),
+        });
+    }
+
+    /// Drop an expired status message. Returns whether the bar changed, for the render loop —
+    /// nothing else repaints an otherwise idle screen when a message times out.
+    pub fn maybe_expire_message(&mut self) -> bool {
+        if self
+            .message
+            .as_ref()
+            .is_some_and(|m| std::time::Instant::now() >= m.until)
+        {
+            self.message = None;
+            return true;
         }
+        false
     }
 
     /// Drop any recorded spawn reason before attempting a new pane-creating mutation.
@@ -2055,7 +2098,7 @@ impl App {
             .and_then(|w| w.name.clone())
             .unwrap_or_else(|| ws.to_string());
         self.confirm = Some(Confirm {
-            message: format!("kill session '{name}'? (y/n)"),
+            message: format!("kill session '{name}'? (y = kill, any other key cancels)"),
             action: ConfirmAction::KillSession(ws),
         });
     }
@@ -2159,21 +2202,16 @@ impl App {
             PromptKind::NewWorktree => {
                 let Some(branch) = name else { return };
                 // The worktree is resolved from the focused pane's repo (tmux-style cwd).
-                // The CLI returns errors/warnings directly; the TUI has no inline message
-                // line, so a failure OR a non-fatal hook warning is surfaced as a toast.
-                // This is direct feedback for a key the user just pressed, so — unlike the
-                // routine agent-turn toasts — it is NOT gated by the `notify` config (else
-                // a `notify=false` user would get NO signal that their action failed).
-                // `COPAD_MUX_NOTIFY=0` still hard-disables all toasts. Success needs no
-                // note — the session visibly switched.
-                let note = match self.create_worktree_session(&branch, "", self.focused_cwd()) {
-                    Ok(c) => c.warning,
-                    Err(e) => Some(e),
-                };
-                if let Some(msg) = note
-                    && notify::env_override().unwrap_or(true)
-                {
-                    notify::desktop("comux worktree", &msg, None, &self.desktop_env());
+                // The CLI returns errors/warnings directly; here a failure OR a non-fatal
+                // hook warning goes to the status-bar message line. Success needs no note —
+                // the session visibly switched.
+                match self.create_worktree_session(&branch, "", self.focused_cwd()) {
+                    Ok(c) => {
+                        if let Some(w) = c.warning {
+                            self.flash(format!("worktree: {w}"), false);
+                        }
+                    }
+                    Err(e) => self.flash(format!("worktree: {e}"), true),
                 }
             }
             PromptKind::RenameSession(ws) => self.rename_session(&ws, name),
@@ -4060,15 +4098,9 @@ impl App {
             ResumePicker => self.open_resume(),
             Redraw => return KeyAction::Redraw,
             FocusSidebar => self.open_sidebar_focus(),
-            NavBack => {
-                self.navigate(control::NavDir::Back);
-            }
-            NavForward => {
-                self.navigate(control::NavDir::Forward);
-            }
-            NavLast => {
-                self.navigate(control::NavDir::Last);
-            }
+            NavBack => self.navigate_or_say(control::NavDir::Back),
+            NavForward => self.navigate_or_say(control::NavDir::Forward),
+            NavLast => self.navigate_or_say(control::NavDir::Last),
             KeyHelp => self.help = Some(0),
             EnterPrefix => {} // handled by the caller (arms the prefix)
         }
@@ -5148,10 +5180,9 @@ impl App {
                         .as_ref()
                         .map(|c| c.display().to_string())
                         .unwrap_or_else(|| "the default directory".into());
-                    self.report_note(
-                        "comux: resumed elsewhere",
-                        &format!("recorded directory is gone — opened in {where_}"),
-                    );
+                    self.report_note(&format!(
+                        "resumed elsewhere: the recorded directory is gone — opened in {where_}"
+                    ));
                 }
             }
             None => self.switch_session(prev),
@@ -7183,12 +7214,26 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        if self.scroll_pane.is_some() {
+        if let Some(sp) = &self.scroll_pane {
+            let pos = self
+                .panes
+                .get(sp)
+                .map(|p| format!(" {}/{}", p.scroll_offset(), p.history_len()))
+                .unwrap_or_default();
             segs.push((
-                " SCROLL ".to_string(),
+                format!(" SCROLL{pos} · j/k g/G · q "),
                 Style::default()
                     .fg(CAT_BASE)
                     .bg(CAT_YELLOW)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if self.sidebar_focus.is_some() {
+            segs.push((
+                " SIDEBAR · j/k h/l · ↵ · esc ".to_string(),
+                Style::default()
+                    .fg(CAT_BASE)
+                    .bg(CAT_BLUE)
                     .add_modifier(Modifier::BOLD),
             ));
         }
@@ -7391,7 +7436,12 @@ impl App {
         let hint = (self.prefix_armed && self.cfg.prefix_hint)
             .then(|| self.prefix_hint_text())
             .filter(|h| !h.is_empty());
-        let chips = if hint.is_some() { Vec::new() } else { chips };
+        let message = self.message.as_ref().filter(|_| hint.is_none());
+        let chips = if hint.is_some() || message.is_some() {
+            Vec::new()
+        } else {
+            chips
+        };
         if let Some(h) = &hint {
             x = put_str(
                 buf,
@@ -7401,6 +7451,13 @@ impl App {
                 h,
                 Style::default().fg(CAT_TEXT).bg(CAT_BASE),
             );
+        } else if let Some(m) = message {
+            let st = if m.error {
+                Style::default().fg(CAT_BASE).bg(CAT_RED)
+            } else {
+                Style::default().fg(CAT_BASE).bg(CAT_YELLOW)
+            };
+            x = put_str(buf, x, y, tab_end, &format!(" {} ", m.text), st);
         }
         let widths: Vec<u16> = chips.iter().map(|(s, _)| s.width() as u16).collect();
         let avail = tab_end.saturating_sub(x);
@@ -7501,7 +7558,7 @@ impl App {
             y0,
             x0 + 2,
             w.saturating_sub(4),
-            " go to  (←/→ tab · ^R rename) ",
+            " go to  (↵ go · ←/→ tab · ^R rename · esc) ",
             Style::default()
                 .fg(Color::Cyan)
                 .bg(bg)
@@ -7929,10 +7986,10 @@ impl App {
         };
 
         let title = match p.kind {
-            PromptKind::NewSession => " new session ",
-            PromptKind::NewWorktree => " new worktree (branch) ",
-            PromptKind::RenameSession(_) => " rename session ",
-            PromptKind::RenameTab(..) => " rename tab ",
+            PromptKind::NewSession => " new session · ↵ create · esc cancel ",
+            PromptKind::NewWorktree => " new worktree (branch) · ↵ create · esc cancel ",
+            PromptKind::RenameSession(_) => " rename session · ↵ save · esc cancel ",
+            PromptKind::RenameTab(..) => " rename tab · ↵ save (empty clears) · esc cancel ",
         };
         put(
             buf,
@@ -12074,5 +12131,100 @@ mod key_help {
         let mut app = app_from("prefix_hint = false");
         app.set_prefix_armed(true);
         assert!(!bar(&app).contains("all keys"));
+    }
+}
+
+#[cfg(test)]
+mod mode_hints {
+    use super::*;
+    use ratatui::layout::Rect;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn rows(app: &App) -> Vec<String> {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        app.render_to(&mut buf);
+        (0..30)
+            .map(|y| {
+                (0..100)
+                    .map(|x| buf.cell(Position::new(x, y)).unwrap().symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn bar(app: &App) -> String {
+        rows(app)[29].clone()
+    }
+
+    fn chord(app: &mut App, c: char) {
+        let mut prefix = false;
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &mut prefix,
+        );
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            &mut prefix,
+        );
+    }
+
+    #[test]
+    fn an_empty_history_says_so_and_the_message_expires() {
+        let mut app = app();
+        chord(&mut app, '<');
+        assert!(
+            bar(&app).contains("no earlier session/tab"),
+            "{}",
+            bar(&app)
+        );
+        assert!(!app.maybe_expire_message(), "not yet");
+        app.message.as_mut().unwrap().until = std::time::Instant::now();
+        assert!(app.maybe_expire_message(), "expiry repaints");
+        assert!(!bar(&app).contains("no earlier"));
+    }
+
+    #[test]
+    fn a_spawn_failure_is_shown_in_the_bar_and_kept_for_the_api() {
+        let mut app = app();
+        app.report_spawn_failure("new tab", "Too many open files\n(os error 24)");
+        assert!(
+            bar(&app).contains("new tab failed: Too many open files (os error 24)"),
+            "{}",
+            bar(&app)
+        );
+        assert!(app.message.as_ref().unwrap().error);
+        assert!(app.last_spawn_error.is_some());
+    }
+
+    #[test]
+    fn the_armed_prefix_hint_wins_over_a_message() {
+        let mut app = app();
+        app.flash("something happened".into(), false);
+        app.set_prefix_armed(true);
+        assert!(bar(&app).contains("all keys"));
+        assert!(!bar(&app).contains("something happened"));
+    }
+
+    #[test]
+    fn modes_say_how_to_leave_them() {
+        let mut app = app();
+        chord(&mut app, '[');
+        assert!(bar(&app).contains("SCROLL 0/"), "{}", bar(&app));
+        assert!(bar(&app).contains("· q"));
+        let mut prefix = false;
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            &mut prefix,
+        );
+        chord(&mut app, 'e');
+        assert!(bar(&app).contains("SIDEBAR"), "{}", bar(&app));
+        app.feed_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut prefix);
+        app.open_new_session_prompt();
+        assert!(rows(&app).iter().any(|r| r.contains("esc cancel")));
     }
 }
