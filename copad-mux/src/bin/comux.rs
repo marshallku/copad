@@ -47,6 +47,7 @@ fn print_usage() {
          \x20 comux wait-agent <pane>     block until that agent's status matches (--status working|ready|blocked)\n\
          \x20 comux agent-log <pane>      the last entries of that agent's own conversation log (--last N)\n\
          \x20 comux jump <pane>           switch to a pane anywhere (by $COPAD_MUX_PANE token)\n\
+         \x20 comux last|back|forward     toggle to / walk the session+tab history (Ctrl-b ; < >)\n\
          \x20 comux notify <body...>      raise an agent toast for this pane (--kind done|blocked)\n\
          \x20 comux notify --to owner ... leave a message in the inbox of the pane that owns your tab\n\
          \x20 comux inbox [--wait]       read (and acknowledge) the messages left for your pane\n\

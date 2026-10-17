@@ -30,6 +30,7 @@ use crate::model::{
     ClientId, Dir, LayoutSpec, PaneId, PaneRect, Rect, Role, SplitTree, TabId, TerminalId,
     WorkspaceId,
 };
+use crate::navhist::{self, Loc};
 use crate::notify;
 use crate::persist::{self, MAX_LEAVES_PER_TAB, MAX_TOTAL_PANES, PLayout};
 use crate::selector;
@@ -700,10 +701,18 @@ pub struct App {
     /// Monotonic counter for minting unique session (workspace) ids (`local` is the
     /// first, so new sessions start at `s1`).
     next_session: u64,
-    /// Per-session last-activated tick (for `sort_by = recent`), bumped on switch.
+    /// Per-session last-activated tick: the session MRU behind `sort_by = recent`, the
+    /// switcher's preselection and the kill/exit fallback. Bumped by [`Self::track_nav`]
+    /// whenever the attached session differs from the last one it saw, so EVERY path that
+    /// moves the view counts — not just the ones that happen to call `switch_session`.
     session_activity: HashMap<WorkspaceId, u64>,
     /// Monotonic tick source for `session_activity`.
     activity_clock: u64,
+    /// The session `track_nav` last saw attached, so it bumps `session_activity` once per
+    /// arrival instead of on every input.
+    activity_ws: Option<WorkspaceId>,
+    /// Back / forward / last navigation (decisions #140). Global, like the view it records.
+    nav: navhist::NavHistory,
     /// When `Some`, an inline text prompt (new-session name / rename) is open and
     /// captures keystrokes until Enter (commit) or Esc (cancel).
     prompt: Option<Prompt>,
@@ -891,6 +900,8 @@ impl App {
             next_session,
             session_activity: HashMap::new(),
             activity_clock: 0,
+            activity_ws: None,
+            nav: navhist::NavHistory::default(),
             prompt: None,
             confirm: None,
             menu: None,
@@ -920,6 +931,7 @@ impl App {
             last_clipboard_seq: 0,
         };
         app.reflow();
+        app.track_nav();
         Ok(app)
     }
 
@@ -1647,10 +1659,6 @@ impl App {
             return;
         }
         self.note_view_moved();
-        // Record recency for `sort_by = recent`.
-        self.activity_clock += 1;
-        self.session_activity
-            .insert(wid.clone(), self.activity_clock);
         self.ws = wid.clone();
         let cols = self.content_cols().max(1);
         let rows = self.content_rows().max(1);
@@ -1663,6 +1671,114 @@ impl App {
             rows,
         });
         self.sync_sizes();
+    }
+
+    // --- navigation history (decisions #140) ---
+
+    /// Where the view is right now: the attached session, its active tab, the focused pane.
+    fn nav_loc(&self) -> Option<Loc> {
+        let w = self.state.workspace(&self.ws)?;
+        Some(Loc {
+            ws: self.ws.clone(),
+            tab: w.active_tab.clone(),
+            term: self.focused_terminal(),
+        })
+    }
+
+    /// Observe the landed view once per handled input (the public entry points wrap their
+    /// bodies so every early return passes through here). Prunes dead history and recency
+    /// first, which is what keeps reaping and background kills — paths that never call a
+    /// navigation helper — from leaving stale entries behind.
+    fn track_nav(&mut self) {
+        let live: HashSet<WorkspaceId> = self.session_ids().into_iter().collect();
+        self.session_activity.retain(|w, _| live.contains(w));
+        let state = &self.state;
+        self.nav.prune(|l| loc_live(state, l));
+        if live.contains(&self.ws) {
+            self.note_arrival();
+        }
+        if let Some(now) = self.nav_loc() {
+            self.nav.observe(now);
+        }
+    }
+
+    /// Bump the attached session's recency, once per arrival.
+    fn note_arrival(&mut self) {
+        if self.activity_ws.as_ref() == Some(&self.ws) {
+            return;
+        }
+        self.activity_clock += 1;
+        self.session_activity
+            .insert(self.ws.clone(), self.activity_clock);
+        self.activity_ws = Some(self.ws.clone());
+    }
+
+    /// Live sessions, most recently attached first; never-attached ones (restored, or made
+    /// in the background) follow in creation order so every session stays reachable.
+    fn mru_sessions(&self) -> Vec<WorkspaceId> {
+        let mut ids = self.session_ids();
+        // Stable: ties (all the never-visited zeros) keep creation order.
+        ids.sort_by_key(|w| std::cmp::Reverse(self.session_activity.get(w).copied().unwrap_or(0)));
+        ids
+    }
+
+    /// The session to land on when the attached one goes away: the most recent survivor.
+    fn fallback_session(&self, dying: &WorkspaceId) -> Option<WorkspaceId> {
+        self.mru_sessions().into_iter().find(|w| w != dying)
+    }
+
+    /// `session/tab` for a location, by display name — what `comux back` prints.
+    fn loc_label(&self, loc: &Loc) -> String {
+        let w = self.state.workspace(&loc.ws);
+        let index = w
+            .and_then(|w| w.tabs.iter().position(|t| t.id == loc.tab))
+            .unwrap_or(0);
+        let tab = w
+            .and_then(|w| w.tab(&loc.tab))
+            .and_then(|t| t.name.as_deref());
+        format!(
+            "{}/{}",
+            self.session_display_name(&loc.ws),
+            tab_display_title(tab, index)
+        )
+    }
+
+    /// Put the view at `loc`: its session, its tab, and its pane if that is still there.
+    fn go_to_loc(&mut self, loc: &Loc) {
+        self.switch_session(loc.ws.clone());
+        let active = self.active_tab_id();
+        if active.as_ref() != Some(&loc.tab) {
+            self.select_tab(loc.ws.clone(), loc.tab.clone());
+        }
+        if let Some(term) = &loc.term
+            && let Some(pane) = self.pane_of_terminal(term)
+        {
+            let _ = self.state.apply(Command::FocusPane {
+                client: self.client,
+                pane,
+            });
+        }
+        self.reflow();
+    }
+
+    /// Move along the history. Returns where the view landed, or `None` when there is
+    /// nowhere to go in that direction.
+    fn navigate(&mut self, dir: control::NavDir) -> Option<Loc> {
+        // Settle anything the input that led here did first (a click, then the key).
+        self.track_nav();
+        let state = &self.state;
+        let valid = |l: &Loc| loc_live(state, l);
+        let target = match dir {
+            control::NavDir::Back => self.nav.back(valid),
+            control::NavDir::Forward => self.nav.forward(valid),
+            control::NavDir::Last => self.nav.last(valid),
+        }?;
+        self.go_to_loc(&target);
+        // The entry's pane may have died; record where the view ACTUALLY is.
+        let landed = self.nav_loc()?;
+        self.nav.settle(landed.clone());
+        self.note_arrival();
+        Some(landed)
     }
 
     /// The working directory of the focused pane's shell, for inheriting into a new
@@ -1963,7 +2079,7 @@ impl App {
                 self.panes.remove(t);
             }
         }
-        if killing_active && let Some(surv) = self.session_ids().into_iter().next() {
+        if killing_active && let Some(surv) = self.fallback_session(wid) {
             // `self.ws` still names the removed session, so `switch_session` proceeds.
             self.switch_session(surv);
         }
@@ -2063,10 +2179,14 @@ impl App {
 
     /// Switch to the next/previous session (wrapping): `+1` next, `-1` previous.
     fn cycle_session(&mut self, delta: i32) {
-        // Cycle in STABLE creation order (not the display sort): `sort_by = recent` mutates
-        // the sorted order on every switch, so cycling by it would ping-pong between two
-        // sessions and never reach the rest. Creation order always visits every session.
-        let ids = self.session_ids();
+        // Cycle in the order the sidebar SHOWS when that order is stable, so `)` moves to the
+        // row below. `recent` and `activity` reorder as you go (cycling `recent` would
+        // ping-pong between two sessions and never reach the rest), so those cycle in
+        // creation order, which always visits every session.
+        let ids = match self.cfg.sort_by {
+            SortBy::Created | SortBy::Alphabetical => self.sorted_session_ids(),
+            SortBy::Recent | SortBy::Activity => self.session_ids(),
+        };
         if ids.len() < 2 {
             return;
         }
@@ -2487,6 +2607,12 @@ impl App {
     /// Handle one control request, mutating state as the sole writer. Returns the
     /// wire response. Never blocks.
     pub fn handle_control(&mut self, req: &control::Req) -> control::Resp {
+        let resp = self.handle_control_inner(req);
+        self.track_nav();
+        resp
+    }
+
+    fn handle_control_inner(&mut self, req: &control::Req) -> control::Resp {
         use control::{PaneInfo, Req, Resp};
         match req {
             Req::Host => {
@@ -3048,6 +3174,14 @@ impl App {
                     Err((c, m)) => Resp::err_code(c, &m),
                 }
             }
+            Req::Nav { dir } => match self.navigate(*dir) {
+                Some(landed) => {
+                    let mut r = Resp::ok();
+                    r.message = Some(self.loc_label(&landed));
+                    r
+                }
+                None => Resp::err_code("not_found", "no navigation history in that direction"),
+            },
             Req::Jump { target } => match self.resolve_pane_target(target) {
                 Some(term) => {
                     self.jump_to_terminal(&term);
@@ -3659,6 +3793,12 @@ impl App {
     /// PER-CLIENT (`prefix`, owned by the caller) so a chord can't span connections
     /// when several clients share input; the popup is shared workspace state.
     pub fn feed_key(&mut self, k: KeyEvent, prefix: &mut bool) -> KeyAction {
+        let action = self.feed_key_inner(k, prefix);
+        self.track_nav();
+        action
+    }
+
+    fn feed_key_inner(&mut self, k: KeyEvent, prefix: &mut bool) -> KeyAction {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
 
         // An open inline prompt (new-session name / rename) captures all input: type
@@ -3897,6 +4037,15 @@ impl App {
             ResumePicker => self.open_resume(),
             Redraw => return KeyAction::Redraw,
             FocusSidebar => self.open_sidebar_focus(),
+            NavBack => {
+                self.navigate(control::NavDir::Back);
+            }
+            NavForward => {
+                self.navigate(control::NavDir::Forward);
+            }
+            NavLast => {
+                self.navigate(control::NavDir::Last);
+            }
             EnterPrefix => {} // handled by the caller (arms the prefix)
         }
         KeyAction::Continue
@@ -3979,6 +4128,18 @@ impl App {
     /// Returns `Some(text)` only on a button-up that ends a real drag — the pane text the
     /// server should ship to the initiating `client` as an OSC 52 clipboard copy.
     pub fn mouse_at(
+        &mut self,
+        client: ClientId,
+        x: u16,
+        y: u16,
+        kind: MouseKind,
+    ) -> Option<String> {
+        let copied = self.mouse_at_inner(client, x, y, kind);
+        self.track_nav();
+        copied
+    }
+
+    fn mouse_at_inner(
         &mut self,
         client: ClientId,
         x: u16,
@@ -4491,13 +4652,31 @@ impl App {
         self.reflow();
     }
 
-    /// Open the `Ctrl-f` fuzzy switcher (Sessions tab, empty filter, first row selected).
+    /// Open the `Ctrl-f` fuzzy switcher on the Sessions tab with the PREVIOUS session
+    /// selected, so `Ctrl-f Enter` toggles between two sessions like Alt-Tab.
     fn open_popup(&mut self) {
         self.popup = Some(PopupState {
             tab: PopupTab::Sessions,
             filter: String::new(),
-            sel: 0,
+            sel: self.popup_default_sel(PopupTab::Sessions, ""),
         });
+    }
+
+    /// The row a fresh (unfiltered) list starts on. Sessions: the most recently attached
+    /// session other than this one, found BY IDENTITY because the rows follow `sort_by` and
+    /// a positional guess (row 1) lands on the current or an unrelated session under any
+    /// order but `recent`. A filter means the user is searching: the best match, row 0.
+    fn popup_default_sel(&self, tab: PopupTab, filter: &str) -> usize {
+        if tab != PopupTab::Sessions || !filter.is_empty() {
+            return 0;
+        }
+        let Some(prev) = self.mru_sessions().into_iter().find(|w| *w != self.ws) else {
+            return 0;
+        };
+        self.popup_items(tab, filter)
+            .iter()
+            .position(|r| matches!(&r.target, PopupTarget::Session(w) if *w == prev))
+            .unwrap_or(0)
     }
 
     /// The switcher rows for `tab` matching `filter`: SESSIONS (name + git branch) or
@@ -4607,7 +4786,14 @@ impl App {
     fn popup_tab(&mut self, to: PopupTab) {
         if let Some(p) = &mut self.popup {
             p.tab = to;
-            p.sel = 0;
+        }
+        if let Some(sel) = self
+            .popup
+            .as_ref()
+            .map(|p| self.popup_default_sel(p.tab, &p.filter))
+            && let Some(p) = &mut self.popup
+        {
+            p.sel = sel;
         }
     }
 
@@ -4637,7 +4823,14 @@ impl App {
     fn popup_backspace(&mut self) {
         if let Some(p) = &mut self.popup {
             p.filter.pop();
-            p.sel = 0;
+        }
+        if let Some(sel) = self
+            .popup
+            .as_ref()
+            .map(|p| self.popup_default_sel(p.tab, &p.filter))
+            && let Some(p) = &mut self.popup
+        {
+            p.sel = sel;
         }
     }
 
@@ -5115,6 +5308,14 @@ impl App {
     /// whether it CHANGED visible state (so the render loop repaints the removed pane);
     /// the caller checks [`is_empty`](Self::is_empty) separately to decide whether to quit.
     pub fn reap_exited(&mut self) -> bool {
+        let changed = self.reap_exited_inner();
+        if changed {
+            self.track_nav();
+        }
+        changed
+    }
+
+    fn reap_exited_inner(&mut self) -> bool {
         let exited: Vec<TerminalId> = self
             .panes
             .iter()
@@ -5200,9 +5401,7 @@ impl App {
                         for t in &terms {
                             self.panes.remove(t);
                         }
-                        if was_active
-                            && let Some(next) = self.state.workspace_ids().into_iter().next()
-                        {
+                        if was_active && let Some(next) = self.fallback_session(&wid) {
                             self.switch_session(next);
                         }
                     }
@@ -7924,6 +8123,14 @@ impl App {
 }
 
 /// Does the gap cell `(x, y)` border the focused rect (so its divider is accented)?
+/// Whether a history entry still names a live tab. Its pane may be gone: landing then keeps
+/// whichever pane that tab focuses now.
+fn loc_live(state: &State, l: &Loc) -> bool {
+    state
+        .workspace(&l.ws)
+        .is_some_and(|w| w.tab(&l.tab).is_some())
+}
+
 fn divider_touches(fr: &PaneRect, x: u16, y: u16) -> bool {
     let in_y = y >= fr.y && y < fr.y + fr.rows;
     let in_x = x >= fr.x && x < fr.x + fr.cols;
@@ -11125,5 +11332,281 @@ mod owner_inbox {
             "a ref to no leaf owns nothing"
         );
         assert_eq!(owners.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod nav {
+    use super::*;
+    use crate::control::{NavDir, Req};
+
+    fn app_with(sort_by: SortBy) -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        cfg.sort_by = sort_by;
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn new_session(app: &mut App, name: &str) {
+        let r = app.handle_control(&Req::NewSession {
+            name: Some(name.into()),
+            cwd: None,
+        });
+        assert!(r.ok, "{:?}", r.error);
+    }
+
+    fn select(app: &mut App, name: &str) {
+        let r = app.handle_control(&Req::SelectSession {
+            index: None,
+            target: Some(format!("name:{name}")),
+        });
+        assert!(r.ok, "{:?}", r.error);
+    }
+
+    fn nav(app: &mut App, dir: NavDir) -> bool {
+        app.handle_control(&Req::Nav { dir }).ok
+    }
+
+    /// The attached session's display name.
+    fn here(app: &App) -> String {
+        app.session_display_name(&app.ws)
+    }
+
+    fn key(app: &mut App, prefix: &mut bool, code: KeyCode, mods: KeyModifiers) {
+        app.feed_key(KeyEvent::new(code, mods), prefix);
+    }
+
+    /// `local`, then `a`, `b`, `c`, each attached as it is made.
+    fn four_sessions(sort_by: SortBy) -> App {
+        let mut app = app_with(sort_by);
+        for n in ["a", "b", "c"] {
+            new_session(&mut app, n);
+        }
+        app
+    }
+
+    #[test]
+    fn last_toggles_and_back_forward_walk_the_trail() {
+        let mut app = four_sessions(SortBy::Created);
+        assert_eq!(here(&app), "c");
+        assert!(nav(&mut app, NavDir::Last));
+        assert_eq!(here(&app), "b");
+        assert!(nav(&mut app, NavDir::Last));
+        assert_eq!(here(&app), "c", "last again comes back");
+        assert!(nav(&mut app, NavDir::Back));
+        assert_eq!(here(&app), "b");
+        assert!(nav(&mut app, NavDir::Back));
+        assert_eq!(here(&app), "a");
+        assert!(nav(&mut app, NavDir::Forward));
+        assert_eq!(here(&app), "b");
+    }
+
+    #[test]
+    fn nowhere_to_go_is_an_error_not_a_silent_ok() {
+        let mut app = app_with(SortBy::Created);
+        let r = app.handle_control(&Req::Nav { dir: NavDir::Back });
+        assert!(!r.ok);
+        assert_eq!(r.code.as_deref(), Some("not_found"));
+    }
+
+    #[test]
+    fn a_tab_change_is_a_jump_too() {
+        let mut app = app_with(SortBy::Created);
+        let t0 = app.active_tab_id().unwrap();
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &mut false,
+        );
+        let mut prefix = false;
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        );
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('c'),
+            KeyModifiers::NONE,
+        ); // new tab
+        let t1 = app.active_tab_id().unwrap();
+        assert_ne!(t0, t1);
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        );
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char(';'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(
+            app.active_tab_id().unwrap(),
+            t0,
+            "Ctrl-b ; returned to the first tab"
+        );
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        );
+        key(&mut app, &mut prefix, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(app.active_tab_id().unwrap(), t1, "Ctrl-b Tab toggles back");
+    }
+
+    #[test]
+    fn a_session_made_from_the_prompt_is_recorded() {
+        // The prompt commit returns early from the key handler — exactly the path a
+        // bottom-of-function hook would miss.
+        let mut app = app_with(SortBy::Created);
+        let mut prefix = false;
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        );
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('C'),
+            KeyModifiers::SHIFT,
+        );
+        for c in "work".chars() {
+            key(&mut app, &mut prefix, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        key(&mut app, &mut prefix, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(here(&app), "work");
+        assert!(nav(&mut app, NavDir::Last));
+        assert_eq!(here(&app), "local");
+    }
+
+    #[test]
+    fn killing_the_attached_session_lands_on_the_previous_one() {
+        let mut app = four_sessions(SortBy::Created);
+        select(&mut app, "a");
+        select(&mut app, "c");
+        let r = app.handle_control(&Req::KillSession {
+            index: None,
+            target: Some("name:c".into()),
+        });
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(
+            here(&app),
+            "a",
+            "the most recent survivor, not the first-created"
+        );
+        // History pruned the dead session, and the fallback is not left atop `back`: `back`
+        // MOVES (to the session visited before `a`), it does not report success in place.
+        assert!(nav(&mut app, NavDir::Back));
+        assert_ne!(here(&app), "a");
+        assert_ne!(here(&app), "c");
+    }
+
+    #[test]
+    fn mru_lists_every_session_even_the_never_visited() {
+        let mut app = app_with(SortBy::Created);
+        new_session(&mut app, "a");
+        new_session(&mut app, "b");
+        // A session made in the background never becomes attached.
+        let r = app.handle_control(&Req::NewSession {
+            name: Some("bg".into()),
+            cwd: None,
+        });
+        assert!(r.ok);
+        select(&mut app, "a");
+        let names: Vec<String> = app
+            .mru_sessions()
+            .iter()
+            .map(|w| app.session_display_name(w))
+            .collect();
+        assert_eq!(names[0], "a");
+        assert_eq!(names.len(), 4, "{names:?}");
+    }
+
+    /// The selected switcher row's session.
+    fn preselected(app: &App) -> String {
+        let p = app.popup.as_ref().expect("open");
+        match &app.popup_items(p.tab, &p.filter)[p.sel].target {
+            PopupTarget::Session(w) => app.session_display_name(w),
+            PopupTarget::Agent(_) => panic!("agent row"),
+        }
+    }
+
+    #[test]
+    fn the_switcher_opens_on_the_previous_session_under_every_order() {
+        for sort in [SortBy::Created, SortBy::Alphabetical, SortBy::Recent] {
+            let mut app = four_sessions(sort);
+            select(&mut app, "b");
+            select(&mut app, "a");
+            app.open_popup();
+            assert_eq!(preselected(&app), "b", "{sort:?}");
+            // Enter switches there: Ctrl-f Enter is the Alt-Tab toggle.
+            let mut prefix = false;
+            key(&mut app, &mut prefix, KeyCode::Enter, KeyModifiers::NONE);
+            assert_eq!(here(&app), "b", "{sort:?}");
+        }
+    }
+
+    #[test]
+    fn typing_a_filter_selects_the_best_match_and_clearing_it_restores_the_default() {
+        let mut app = four_sessions(SortBy::Created);
+        select(&mut app, "a");
+        app.open_popup();
+        app.popup_type('c');
+        assert_eq!(app.popup.as_ref().unwrap().sel, 0);
+        app.popup_backspace();
+        assert_eq!(preselected(&app), "c");
+    }
+
+    #[test]
+    fn going_back_to_a_tab_whose_pane_died_lands_on_its_survivor() {
+        let mut app = app_with(SortBy::Created);
+        let r = app.handle_control(&Req::Split {
+            dir: "right".into(),
+            from: None,
+            no_focus: false,
+        });
+        assert!(r.ok, "{:?}", r.error);
+        let split = app.focused_terminal().unwrap();
+        new_session(&mut app, "other");
+        // Back in `local`, the split pane is closed while we are away.
+        assert!(
+            app.handle_control(&Req::SelectSession {
+                index: Some(0),
+                target: None,
+            })
+            .ok
+        );
+        let r = app.handle_control(&Req::Close {
+            index: 1,
+            caller: None,
+        });
+        assert!(r.ok, "{:?}", r.error);
+        select(&mut app, "other");
+        assert!(nav(&mut app, NavDir::Back));
+        assert_eq!(here(&app), "local");
+        let now = app.focused_terminal().unwrap();
+        assert_ne!(now, split, "the dead pane is not focused");
+        assert_eq!(app.nav.current().unwrap().term.as_ref(), Some(&now));
+    }
+
+    #[test]
+    fn cycling_follows_a_stable_display_order() {
+        let mut app = app_with(SortBy::Alphabetical);
+        for n in ["zeta", "alpha", "mid"] {
+            new_session(&mut app, n);
+        }
+        select(&mut app, "alpha");
+        app.cycle_session(1);
+        // Alphabetical: alpha, local, mid, zeta.
+        assert_eq!(here(&app), "local");
+        app.cycle_session(1);
+        assert_eq!(here(&app), "mid");
     }
 }

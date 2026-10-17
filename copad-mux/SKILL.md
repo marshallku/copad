@@ -299,8 +299,8 @@ tab). Check it: that line is the only non-transient evidence you addressed the r
 - **Do not `send` to your own pane** (`$COPAD_MUX_PANE`).
 - **Do not `kill-session`, `close`, `close-tab` or `kill-server`** unless the user asked in
   this conversation. They destroy panes you did not create and cannot be undone.
-- **Do not `jump`, `select-session` or `select-tab`** without asking. They move what the
-  user is looking at, and token addressing means you almost never need to.
+- **Do not `jump`, `select-session`, `select-tab`, `back`, `forward` or `last`** without
+  asking. They move what the user is looking at, and token addressing means you almost never need to.
 - **Do not poll in a shell loop.** `wait-output` / `wait-agent` already poll, under one
   deadline, with a floor on the interval.
 - **Do not treat a `124` as success.** Report the timeout.

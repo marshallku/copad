@@ -26,6 +26,7 @@ pub mod fleet;
 pub mod gitinfo;
 pub mod hostmetrics;
 pub mod model;
+pub mod navhist;
 pub mod notify;
 pub mod persist;
 pub mod picker;

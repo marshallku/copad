@@ -45,6 +45,8 @@
 #  30. spawn runs argv verbatim in a background tab; it closes on exit unless --keep
 #  31. inside a pane, list and the index verbs count in the caller's tab
 #  32. owned tabs, the inbox, and ownership across a server restart
+#  33. navigation history: last toggles, back/forward walk it, a kill lands on the previous session,
+#      and Ctrl-f opens on the previous session in a REAL rendered frame
 
 set -euo pipefail
 
@@ -1837,7 +1839,54 @@ t 10 "$COMUX" close-tab --owned-by "$NEWPARENT" --yes --json >"$WORK/json" || fa
 [[ "$(count closed)" == 1 && "$(owned "$NEWPARENT")" == "[]" ]] || fail "the owned tab should be gone"
 ok "spawn --owner, notify --to owner -> inbox (read, then acked), scoped cleanup, owner restored with the new token"
 
-echo "33. the server is still responsive and shuts down cleanly"
+echo "33. navigation history (last / back / forward) and the switcher's preselection"
+# Every way the view moves funnels into one observation per handled input, so this drives the
+# verbs AND a real client: the history has to be the same whichever surface moved the view.
+attached() { t 10 "$COMUX" list-sessions --json | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["sessions"][d["active_session"]]["name"])'; }
+for n in nav1 nav2 nav3; do t 10 "$COMUX" new-session "$n" >/dev/null || fail "new-session $n failed"; done
+[[ "$(attached)" == nav3 ]] || fail "new-session should attach nav3, on $(attached)"
+t 10 "$COMUX" last >/dev/null || fail "comux last failed"
+[[ "$(attached)" == nav2 ]] || fail "last should go to nav2, on $(attached)"
+t 10 "$COMUX" last >/dev/null
+[[ "$(attached)" == nav3 ]] || fail "last again should come back to nav3, on $(attached)"
+t 10 "$COMUX" back >/dev/null
+t 10 "$COMUX" back >/dev/null
+[[ "$(attached)" == nav1 ]] || fail "back twice should reach nav1, on $(attached)"
+t 10 "$COMUX" forward >"$WORK/out" || fail "comux forward failed"
+[[ "$(attached)" == nav2 ]] || fail "forward should return to nav2, on $(attached)"
+grep -q "nav2/" "$WORK/out" || fail "forward should print where it landed: $(cat "$WORK/out")"
+# Killing the attached session lands on the one used before it, not the first-created.
+t 10 "$COMUX" select-session name:nav3 >/dev/null
+t 10 "$COMUX" kill-session name:nav3 >/dev/null || fail "kill-session nav3 failed"
+[[ "$(attached)" == nav2 ]] || fail "killing nav3 should land on nav2 (previous), on $(attached)"
+# The rendered switcher: Ctrl-f opens with the PREVIOUS session marked, so Enter toggles.
+t 10 "$COMUX" select-session name:nav1 >/dev/null
+t 10 "$COMUX" select-session name:nav2 >/dev/null
+python3 - "$WORK/ptydrive.py" "$WORK/keydrive.py" <<'PYEOF'
+import sys
+src = open(sys.argv[1]).read()
+inject = """buf = drain(6)
+for part in os.environ.get("PTY_KEYS", "").split("|"):
+    if part:
+        os.write(fd, part.encode().decode("unicode_escape").encode()); buf += drain(1.5)
+os.write(fd, b"\\x1b"); drain(0.5)
+"""
+assert "buf = drain(6)\n" in src
+open(sys.argv[2], "w").write(src.replace("buf = drain(6)\n", inject, 1))
+PYEOF
+PTY_KEYS='\x06' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
+grep -E "▸ .*nav1" "$WORK/frame" >/dev/null \
+    || { cat "$WORK/frame" >&2; fail "Ctrl-f should open with the previous session (nav1) selected"; }
+# ...and Enter on it switches there — the two-key toggle.
+PTY_KEYS='\x06|\r' python3 "$WORK/keydrive.py" cap -- "$COMUX" >/dev/null 2>&1
+[[ "$(attached)" == nav1 ]] || fail "Ctrl-f Enter should toggle to nav1, on $(attached)"
+# The prefix key: Ctrl-b ; toggles back.
+PTY_KEYS='\x02;' python3 "$WORK/keydrive.py" cap -- "$COMUX" >/dev/null 2>&1
+[[ "$(attached)" == nav2 ]] || fail "Ctrl-b ; should toggle back to nav2, on $(attached)"
+for n in nav1 nav2; do t 10 "$COMUX" kill-session "name:$n" >/dev/null 2>&1 || true; done
+ok "last toggles, back/forward walk the trail, kill lands on the previous session, Ctrl-f preselects it, Ctrl-b ; toggles"
+
+echo "34. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

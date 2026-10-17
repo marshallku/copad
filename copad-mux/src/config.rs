@@ -348,6 +348,11 @@ pub enum Action {
     /// `Ctrl-b R`: open the resume picker — past Claude/Codex conversations on disk,
     /// newest first, fuzzy-filtered (decision #99).
     ResumePicker,
+    /// Navigation history (decisions #140): back / forward like a browser, and `NavLast` to
+    /// toggle to the previous session/tab like Alt-Tab.
+    NavBack,
+    NavForward,
+    NavLast,
     /// Arm the prefix (`Ctrl-b`). A global-table action like any other, but prefix
     /// entry always wins over a colliding user binding.
     EnterPrefix,
@@ -592,6 +597,9 @@ fn action_from_name(name: &str) -> Option<Action> {
         "redraw" => Action::Redraw,
         "focus-sidebar" => Action::FocusSidebar,
         "resume-picker" => Action::ResumePicker,
+        "nav-back" | "back" => Action::NavBack,
+        "nav-forward" | "forward" => Action::NavForward,
+        "nav-last" | "last" => Action::NavLast,
         "prefix" => Action::EnterPrefix,
         _ => {
             // tab-1 .. tab-9
@@ -668,6 +676,9 @@ fn default_bindings() -> Vec<(Action, Ctx, &'static [&'static str])> {
         (ResizeDown, Prefix, &["J"]),
         (ResizeUp, Prefix, &["K"]),
         (ResizeRight, Prefix, &["L"]),
+        (NavLast, Prefix, &[";", "Tab"]),
+        (NavBack, Prefix, &["<"]),
+        (NavForward, Prefix, &[">"]),
     ]
 }
 

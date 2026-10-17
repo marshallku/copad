@@ -45,6 +45,9 @@ scroll_step = 3           # lines per mouse-wheel notch (1..50; the wheel over t
                           #   scrolls that half by one entry instead)
 sort_by = "created"       # session order in the sidebar / Ctrl-f switcher / )( cycle:
                           #   created (default) | alphabetical | recent | activity
+                          #   `)`/`(` follow it for created/alphabetical; recent/activity
+                          #   reorder as you move, so the cycle uses creation order there.
+                          #   Ctrl-f always opens on the PREVIOUS session (Enter toggles).
 usage = "bar"             # status-bar Claude/Codex rate-limit readout:
                           #   bar (default) — a progress bar per window on wide terminals
                           #     (5h ━━━╌╌╌╌╌ 34%), falling back to percentages when narrow
@@ -197,6 +200,9 @@ restore_agent_sessions = true
 # resize-down = "J"
 # resize-up = "K"
 # resize-right = "L"
+# nav-last = [";", "Tab"]  # toggle to the previous session/tab (Alt-Tab; `comux last`)
+# nav-back = "<"          # back along the navigation history (`comux back`)
+# nav-forward = ">"       # forward again (`comux forward`)
 
 # ---- prefix-less bindings (tmux `bind -n`) ----
 [global]

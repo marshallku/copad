@@ -225,6 +225,9 @@ pub enum Req {
     /// of the session variables a GUI command needs, and a long-lived daemon is the wrong
     /// process to attribute macOS automation permission to.
     Jump { target: String },
+    /// Move the shared view along the navigation history (decisions #140): `back`/`forward`
+    /// walk it like a browser, `last` toggles to the previous place like Alt-Tab.
+    Nav { dir: NavDir },
     /// Raise an agent notification on behalf of a pane: a desktop toast whose click jumps
     /// back to it, plus an entry in the in-app notification center. The entry point for
     /// agent hooks (Claude `Stop`/`Notification`, Codex turn-complete), which know the
@@ -458,6 +461,15 @@ pub const SERVER_CAPS: &[&str] = &[
 /// The most `send --file` reads. A paste larger than this is a mistake (a binary, a log),
 /// not something to type into a shell.
 const SEND_FILE_CAP: u64 = 1024 * 1024;
+
+/// Which way `Req::Nav` moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NavDir {
+    Back,
+    Forward,
+    Last,
+}
 
 /// A session or tab a mutating verb created or acted on: its stable id and display name.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1160,6 +1172,26 @@ pub fn run_client(args: &[String]) -> i32 {
         "kill-server" => {
             parsed!(cliargs::bare("usage: comux kill-server"));
             Req::KillServer
+        }
+        "back" => {
+            parsed!(cliargs::bare(
+                "usage: comux back    (go to where the view was before; Ctrl-b <)"
+            ));
+            Req::Nav { dir: NavDir::Back }
+        }
+        "forward" => {
+            parsed!(cliargs::bare(
+                "usage: comux forward (undo a `comux back`; Ctrl-b >)"
+            ));
+            Req::Nav {
+                dir: NavDir::Forward,
+            }
+        }
+        "last" => {
+            parsed!(cliargs::bare(
+                "usage: comux last    (toggle to the previous session/tab; Ctrl-b ;)"
+            ));
+            Req::Nav { dir: NavDir::Last }
         }
         "list-tabs" | "tabs" => {
             let p = parsed!(LIST_TABS_SPEC);
@@ -3339,6 +3371,9 @@ mod verb_args_tests {
         "host",
         "reload",
         "kill-server",
+        "back",
+        "forward",
+        "last",
         "list-tabs",
         "new-tab",
         "spawn",
@@ -3388,6 +3423,9 @@ mod verb_args_tests {
             "host",
             "reload",
             "kill-server",
+            "back",
+            "forward",
+            "last",
             "list-tabs",
             "new-tab",
             "list-sessions",
