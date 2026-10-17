@@ -57,6 +57,16 @@ pub struct PersistState {
     #[serde(default)]
     pub active_session: usize,
     pub sessions: Vec<PSession>,
+    /// Pinned pane slots (`Ctrl-b m`), by the leaf `pane_ref` they point at (decisions #148).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub marks: Vec<PMark>,
+}
+
+/// One pinned slot: `slot` 1–9 → the leaf carrying `pane_ref`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PMark {
+    pub slot: u8,
+    pub pane_ref: u32,
 }
 
 /// One persisted session (workspace).
@@ -96,7 +106,7 @@ pub enum PLayout {
         /// argument boundaries survive. `None`/missing = restore a bare shell.
         #[serde(default)]
         command: Option<Vec<String>>,
-        /// A snapshot-local id, set only on a leaf some tab's `owner` points at.
+        /// A snapshot-local id, set only on a leaf some tab's `owner` or a mark points at.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane_ref: Option<u32>,
     },
@@ -323,6 +333,7 @@ mod tests {
 
     fn sample() -> PersistState {
         PersistState {
+            marks: Vec::new(),
             version: SCHEMA_VERSION,
             saved_at: 12345,
             active_session: 1,

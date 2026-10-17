@@ -359,6 +359,10 @@ pub enum Action {
     KeyHelp,
     /// `Ctrl-b z` (tmux `resize-pane -Z`): the focused pane fills its tab, and back.
     ZoomPane,
+    /// `Ctrl-b m` then 1–9: pin the focused pane to that slot (harpoon / vim marks).
+    Mark,
+    /// `Ctrl-b '` then 1–9: go to the pane pinned in that slot, wherever it is.
+    GotoMark,
     /// Arm the prefix (`Ctrl-b`). A global-table action like any other, but prefix
     /// entry always wins over a colliding user binding.
     EnterPrefix,
@@ -408,6 +412,8 @@ impl Action {
             NavLast => "toggle to the previous session / tab",
             KeyHelp => "this help",
             ZoomPane => "zoom the pane to the whole tab, and back",
+            Mark => "pin the pane to a slot (then 1–9)",
+            GotoMark => "go to a pinned slot (then 1–9)",
             EnterPrefix => "the prefix",
         }
     }
@@ -679,6 +685,8 @@ fn action_from_name(name: &str) -> Option<Action> {
         "nav-last" | "last" => Action::NavLast,
         "key-help" | "help" => Action::KeyHelp,
         "zoom-pane" | "zoom" => Action::ZoomPane,
+        "mark" => Action::Mark,
+        "goto-mark" => Action::GotoMark,
         "prefix" => Action::EnterPrefix,
         _ => {
             // tab-1 .. tab-9
@@ -761,6 +769,8 @@ fn default_bindings() -> Vec<(Action, Ctx, &'static [&'static str])> {
         (NavForward, Prefix, &[">"]),
         (KeyHelp, Prefix, &["?"]),
         (ZoomPane, Prefix, &["z"]),
+        (Mark, Prefix, &["m"]),
+        (GotoMark, Prefix, &["'"]),
     ]
 }
 

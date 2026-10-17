@@ -212,6 +212,8 @@ restore_agent_sessions = true
 # nav-last = [";", "Tab"]  # toggle to the previous session/tab (Alt-Tab; `comux last`)
 # nav-back = "<"          # back along the navigation history (`comux back`)
 # nav-forward = ">"       # forward again (`comux forward`)
+# mark = "m"              # then 1-9: pin the focused pane to that slot (harpoon / vim marks)
+# goto-mark = "'"         # then 1-9: go to the pinned pane, in whatever session
 # zoom-pane = "z"         # the focused pane fills the tab, and back (tmux resize-pane -Z)
 # key-help = "?"         # every binding of the live keymap (j/k scroll, any other key closes)
 

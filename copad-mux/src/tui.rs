@@ -486,6 +486,17 @@ struct CopyState {
     selecting: bool,
 }
 
+/// Pinned pane slots (`Ctrl-b m` / `Ctrl-b '`).
+const MARK_SLOTS: usize = 9;
+
+/// The one-key modal after `Ctrl-b m` / `Ctrl-b '`.
+enum MarkModal {
+    /// Pin THIS pane — captured when the modal opened, so another client moving focus before
+    /// the digit cannot redirect the pin.
+    Set(TerminalId),
+    Go,
+}
+
 /// A status-bar outcome line ([`App::flash`]).
 struct StatusMessage {
     text: String,
@@ -803,6 +814,10 @@ pub struct App {
     activity_ws: Option<WorkspaceId>,
     /// Back / forward / last navigation (decisions #140). Global, like the view it records.
     nav: navhist::NavHistory,
+    /// Pinned pane slots 1–9 (`Ctrl-b m` / `Ctrl-b '`, decisions #148), index = slot − 1.
+    marks: [Option<TerminalId>; MARK_SLOTS],
+    /// An open one-key mark modal (`Ctrl-b m` / `Ctrl-b '`), waiting for the slot digit.
+    mark_modal: Option<MarkModal>,
     /// The active tab's zoom as `track_nav` last saw it, to resize PTYs once when it changes.
     last_zoom: Option<(WorkspaceId, TabId, Option<PaneId>)>,
     /// When `Some`, an inline text prompt (new-session name / rename) is open and
@@ -930,8 +945,8 @@ impl App {
         } else {
             None
         };
-        let (ws, next_session, owners) = match restored {
-            Some(r) => r,
+        let (ws, next_session, owners, restored_marks) = match restored {
+            Some(r) => (r.active, r.next_session, r.owners, r.marks),
             None => {
                 let ws = WorkspaceId::new("local");
                 let (_tab, _pane, term0) =
@@ -945,9 +960,13 @@ impl App {
                 )
                 .map_err(|e| io::Error::other(format!("failed to spawn shell PTY: {e}")))?;
                 panes.insert(term0, pt);
-                (ws, 1, HashMap::new())
+                (ws, 1, HashMap::new(), Vec::new())
             }
         };
+        let mut marks: [Option<TerminalId>; MARK_SLOTS] = Default::default();
+        for (slot, term) in restored_marks {
+            marks[slot as usize - 1] = Some(term);
+        }
         let _ = state.apply(Command::Attach {
             client,
             workspace: ws.clone(),
@@ -1006,6 +1025,8 @@ impl App {
             activity_clock: 0,
             activity_ws: None,
             nav: navhist::NavHistory::default(),
+            marks,
+            mark_modal: None,
             last_zoom: None,
             prompt: None,
             confirm: None,
@@ -1276,7 +1297,7 @@ impl App {
             .get(term)
             .map(|s| format!(" {}", s.status.label()))
             .unwrap_or_default();
-        format!(" {index}:{label}{status} ")
+        format!(" {}{index}:{label}{status} ", self.slot_badge(term))
     }
 
     /// The active tab's zoomed pane, if it is zoomed (decisions #146).
@@ -1850,6 +1871,11 @@ impl App {
     fn track_nav(&mut self) {
         let live: HashSet<WorkspaceId> = self.session_ids().into_iter().collect();
         self.session_activity.retain(|w, _| live.contains(w));
+        for m in self.marks.iter_mut() {
+            if m.as_ref().is_some_and(|t| !self.panes.contains_key(t)) {
+                *m = None;
+            }
+        }
         let state = &self.state;
         self.nav.prune(|l| loc_live(state, l));
         if live.contains(&self.ws) {
@@ -2018,6 +2044,54 @@ impl App {
         });
         r.targets = Some(targets.into_iter().map(|(_, t)| t).collect());
         r
+    }
+
+    // --- pinned slots (decisions #148) ---
+
+    /// Pin `term` to `slot` (1–9), replacing what was there; a pane lives in one slot only.
+    fn set_mark(&mut self, slot: u8, term: &TerminalId) {
+        if !(1..=MARK_SLOTS as u8).contains(&slot) || !self.panes.contains_key(term) {
+            return;
+        }
+        for m in self.marks.iter_mut() {
+            if m.as_ref() == Some(term) {
+                *m = None;
+            }
+        }
+        self.marks[slot as usize - 1] = Some(term.clone());
+        self.flash(format!("pinned to slot {slot} (Ctrl-b ' {slot})"), false);
+    }
+
+    /// Go to slot `slot`'s pane, wherever it is. An empty slot says so.
+    fn goto_mark(&mut self, slot: u8) {
+        match self.mark_target(slot) {
+            Some(term) => self.jump_to_terminal(&term),
+            None => self.flash(
+                format!("slot {slot} is empty (Ctrl-b m {slot} pins a pane)"),
+                false,
+            ),
+        }
+    }
+
+    /// The live pane in `slot`, if any.
+    fn mark_target(&self, slot: u8) -> Option<TerminalId> {
+        let t = self.marks.get((slot as usize).checked_sub(1)?)?.clone()?;
+        self.panes.contains_key(&t).then_some(t)
+    }
+
+    /// The slot `term` is pinned to, if any.
+    fn slot_of(&self, term: &TerminalId) -> Option<u8> {
+        self.marks
+            .iter()
+            .position(|m| m.as_ref() == Some(term))
+            .map(|i| i as u8 + 1)
+    }
+
+    /// `[2] ` for a pinned pane, empty otherwise — the badge rows and titles carry.
+    fn slot_badge(&self, term: &TerminalId) -> String {
+        self.slot_of(term)
+            .map(|n| format!("[{n}] "))
+            .unwrap_or_default()
     }
 
     /// `session/tab` for a location, by display name — what `comux back` prints.
@@ -3500,6 +3574,60 @@ impl App {
                 *enter,
                 *dry_run,
             ),
+            Req::Mark {
+                slot,
+                target,
+                clear,
+            } => {
+                if !(1..=MARK_SLOTS as u8).contains(slot) {
+                    return Resp::err_code("invalid", format!("slot {slot} is not 1-9"));
+                }
+                if *clear {
+                    self.marks[*slot as usize - 1] = None;
+                    return Resp::ok();
+                }
+                let Some(t) = target else {
+                    return Resp::err_code("invalid", "no pane given");
+                };
+                match self.resolve_pane_token(t) {
+                    Some(term) => {
+                        self.set_mark(*slot, &term);
+                        Resp::ok()
+                    }
+                    None => Resp::err_code("not_found", format!("unknown pane '{t}'")),
+                }
+            }
+            Req::Marks => {
+                let marks = (1..=MARK_SLOTS as u8)
+                    .filter_map(|slot| {
+                        let term = self.mark_target(slot)?;
+                        let (ws, tab, _) = self.locate_terminal(&term)?;
+                        let w = self.state.workspace(&ws)?;
+                        let ti = w.tabs.iter().position(|t| t.id == tab)?;
+                        Some(control::MarkInfo {
+                            slot,
+                            pane: self.panes.get(&term)?.pane_token()?.to_string(),
+                            session: self.session_display_name(&ws),
+                            tab: tab_display_title(w.tabs[ti].name.as_deref(), ti),
+                            label: self
+                                .labels
+                                .get(&term)
+                                .map(|l| l.text.clone())
+                                .unwrap_or_default(),
+                        })
+                    })
+                    .collect();
+                let mut r = Resp::ok();
+                r.marks = Some(marks);
+                r
+            }
+            Req::GotoMark { slot } => match self.mark_target(*slot) {
+                Some(term) => {
+                    self.jump_to_terminal(&term);
+                    Resp::ok()
+                }
+                None => Resp::err_code("not_found", format!("slot {slot} is empty")),
+            },
             Req::Zoom => match self.toggle_zoom() {
                 Ok(()) => {
                     let mut r = Resp::ok();
@@ -4177,6 +4305,19 @@ impl App {
             return KeyAction::Continue;
         }
 
+        // The mark modal takes ONE key: a slot digit acts, anything else cancels.
+        if let Some(modal) = self.mark_modal.take() {
+            *prefix = false;
+            match (k.code, modal) {
+                (KeyCode::Char(c @ '1'..='9'), MarkModal::Set(term)) => {
+                    self.set_mark(c as u8 - b'0', &term);
+                }
+                (KeyCode::Char(c @ '1'..='9'), MarkModal::Go) => self.goto_mark(c as u8 - b'0'),
+                _ => {}
+            }
+            return KeyAction::Continue;
+        }
+
         // The key help scrolls with j/k/arrows/PgUp/PgDn/g/G; any other key closes it.
         if let Some(scroll) = self.help {
             *prefix = false;
@@ -4401,6 +4542,8 @@ impl App {
             NavForward => self.navigate_or_say(control::NavDir::Forward),
             NavLast => self.navigate_or_say(control::NavDir::Last),
             KeyHelp => self.help = Some(0),
+            Mark => self.mark_modal = self.focused_terminal().map(MarkModal::Set),
+            GotoMark => self.mark_modal = Some(MarkModal::Go),
             ZoomPane => {
                 if self.toggle_zoom().is_err() {
                     self.flash("only one pane in this tab — nothing to zoom".into(), false);
@@ -5319,17 +5462,19 @@ impl App {
                             row.detail.as_deref().unwrap_or("")
                         ),
                     ) {
+                        let badge = self.slot_badge(&row.term);
                         rows.push(PopupRow {
                             target: PopupTarget::Agent(row.term),
                             glyph,
                             color,
-                            text: agent_popup_text(
-                                &row.tool,
-                                row.status,
-                                row.for_secs,
-                                row.detail.as_deref(),
-                                &place,
-                            ),
+                            text: badge
+                                + &agent_popup_text(
+                                    &row.tool,
+                                    row.status,
+                                    row.for_secs,
+                                    row.detail.as_deref(),
+                                    &place,
+                                ),
                         });
                     }
                 }
@@ -6406,9 +6551,10 @@ impl App {
     pub fn snapshot(&self) -> persist::PersistState {
         // Owner panes get a snapshot-local ref their tabs point at (tokens die with the server).
         let mut refs: HashMap<TerminalId, u32> = HashMap::new();
-        for (_, owner) in self.live_owners() {
+        let marked = self.marks.iter().flatten().cloned();
+        for pane in self.live_owners().into_iter().map(|(_, o)| o).chain(marked) {
             let next = refs.len() as u32;
-            refs.entry(owner).or_insert(next);
+            refs.entry(pane).or_insert(next);
         }
         let mut sessions = Vec::new();
         let mut active_session = 0;
@@ -6437,11 +6583,24 @@ impl App {
                 tabs,
             });
         }
+        let marks = self
+            .marks
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| {
+                let pane_ref = *refs.get(t.as_ref()?)?;
+                Some(persist::PMark {
+                    slot: i as u8 + 1,
+                    pane_ref,
+                })
+            })
+            .collect();
         persist::PersistState {
             version: persist::SCHEMA_VERSION,
             saved_at: now_secs(),
             active_session,
             sessions,
+            marks,
         }
     }
 
@@ -7568,7 +7727,8 @@ impl App {
             };
             put(buf, &mut x, y, " ", name_style);
             let budget = sidebar_w.saturating_sub(x) as usize;
-            put(buf, &mut x, y, &clip_width(&row.title, budget), name_style);
+            let titled = format!("{}{}", self.slot_badge(&row.term), row.title);
+            put(buf, &mut x, y, &clip_width(&titled, budget), name_style);
             let waited = fmt_elapsed(row.for_secs);
             if entry_ag > 1 {
                 let sub = if waited.is_empty() {
@@ -8114,6 +8274,21 @@ impl App {
         let hint = (self.prefix_armed && self.cfg.prefix_hint)
             .then(|| self.prefix_hint_text())
             .filter(|h| !h.is_empty());
+        let modal_hint = self.mark_modal.as_ref().map(|m| match m {
+            MarkModal::Set(_) => " pin this pane to slot: 1-9 · any other key cancels ".to_string(),
+            MarkModal::Go => {
+                let used: Vec<String> = (1..=MARK_SLOTS as u8)
+                    .filter(|s| self.mark_target(*s).is_some())
+                    .map(|s| s.to_string())
+                    .collect();
+                if used.is_empty() {
+                    " go to slot: (none pinned — Ctrl-b m pins) ".to_string()
+                } else {
+                    format!(" go to slot: {} · any other key cancels ", used.join(" "))
+                }
+            }
+        });
+        let hint = hint.or(modal_hint);
         let message = self.message.as_ref().filter(|_| hint.is_none());
         let chips = if hint.is_some() || message.is_some() {
             Vec::new()
@@ -9478,7 +9653,7 @@ fn restore_sessions(
     cols: u16,
     rows: u16,
     sock_env: &[(String, String)],
-) -> Option<(WorkspaceId, u64, HashMap<TabId, TerminalId>)> {
+) -> Option<Restored> {
     let viewport = Rect { cols, rows };
     // Owner refs are snapshot-global (an owner can sit in another session), so they are
     // resolved only once every session is installed.
@@ -9559,8 +9734,29 @@ fn restore_sessions(
         .into_iter()
         .filter_map(|(tab, r)| ref_terms.get(&r).map(|tid| (tab, tid.clone())))
         .collect();
+    // Marks resolve through the same refs; a slot out of range or a pruned leaf is dropped.
+    let marks = snap
+        .marks
+        .iter()
+        .filter(|m| (1..=MARK_SLOTS as u8).contains(&m.slot))
+        .filter_map(|m| ref_terms.get(&m.pane_ref).map(|t| (m.slot, t.clone())))
+        .collect();
     // Restored ids are `local, s1, .., s{n-1}`; next new session must be `s{n}`.
-    Some((active, installed.len() as u64, owners))
+    Some(Restored {
+        active,
+        next_session: installed.len() as u64,
+        owners,
+        marks,
+    })
+}
+
+/// What [`restore_sessions`] brought back.
+struct Restored {
+    active: WorkspaceId,
+    next_session: u64,
+    owners: HashMap<TabId, TerminalId>,
+    /// `(slot 1–9, terminal)` pinned marks.
+    marks: Vec<(u8, TerminalId)>,
 }
 
 /// A restored leaf's PTY and the owner `pane_ref` its leaf carried.
@@ -12340,6 +12536,7 @@ mod owner_inbox {
             version: persist::SCHEMA_VERSION,
             saved_at: 0,
             active_session: 0,
+            marks: Vec::new(),
             sessions: vec![
                 PSession {
                     name: None,
@@ -12380,8 +12577,9 @@ mod owner_inbox {
         };
         let mut state = State::new();
         let mut panes = HashMap::new();
-        let (_, _, owners) =
-            restore_sessions(&mut state, &mut panes, &snap, 80, 24, &[]).expect("restored");
+        let owners = restore_sessions(&mut state, &mut panes, &snap, 80, 24, &[])
+            .expect("restored")
+            .owners;
         let named = |name: &str| {
             state
                 .workspace_ids()
@@ -13999,5 +14197,171 @@ mod copy_mode {
             .map(|c| c.sym.as_str())
             .collect();
         assert!(row.starts_with("L50"), "{row}");
+    }
+}
+
+#[cfg(test)]
+mod marks {
+    use super::*;
+    use crate::control::Req;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn session(app: &mut App, name: &str) -> (String, TerminalId) {
+        let r = app.handle_control(&Req::NewSession {
+            name: Some(name.into()),
+            cwd: None,
+        });
+        assert!(r.ok);
+        let token = r.pane.unwrap();
+        let term = app.resolve_pane_token(&token).unwrap();
+        (token, term)
+    }
+
+    fn chord(app: &mut App, a: char, b: char) {
+        let mut prefix = false;
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &mut prefix,
+        );
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char(a), KeyModifiers::NONE),
+            &mut prefix,
+        );
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char(b), KeyModifiers::NONE),
+            &mut prefix,
+        );
+    }
+
+    #[test]
+    fn pin_with_ctrl_b_m_and_jump_with_ctrl_b_quote_across_sessions() {
+        let mut app = app();
+        let (_, a) = session(&mut app, "a");
+        chord(&mut app, 'm', '2');
+        assert_eq!(app.slot_of(&a), Some(2));
+        session(&mut app, "b");
+        chord(&mut app, '\'', '2');
+        assert_eq!(app.focused_terminal(), Some(a.clone()));
+        // ...and it was a jump like any other: `last` goes back.
+        assert!(
+            app.handle_control(&Req::Nav {
+                dir: control::NavDir::Last
+            })
+            .ok
+        );
+        assert_eq!(app.session_display_name(&app.ws), "b");
+    }
+
+    #[test]
+    fn a_pane_lives_in_one_slot_and_a_slot_holds_one_pane() {
+        let mut app = app();
+        let (_, a) = session(&mut app, "a");
+        let (_, b) = session(&mut app, "b");
+        app.set_mark(1, &a);
+        app.set_mark(3, &a);
+        assert_eq!(app.slot_of(&a), Some(3), "moved, not copied");
+        assert!(app.mark_target(1).is_none());
+        app.set_mark(3, &b);
+        assert_eq!(app.slot_of(&b), Some(3));
+        assert_eq!(app.slot_of(&a), None, "replaced");
+    }
+
+    #[test]
+    fn the_modal_pins_the_pane_focused_when_it_opened_and_cancels_on_a_non_digit() {
+        let mut app = app();
+        let (_, a) = session(&mut app, "a");
+        let mut prefix = false;
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &mut prefix,
+        );
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            &mut prefix,
+        );
+        // Another client moves the view before the digit arrives.
+        session(&mut app, "b");
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE),
+            &mut prefix,
+        );
+        assert_eq!(app.slot_of(&a), Some(4), "the pane captured at Ctrl-b m");
+        chord(&mut app, 'm', 'x');
+        assert!(app.mark_modal.is_none());
+    }
+
+    #[test]
+    fn the_verbs_and_pruning() {
+        let mut app = app();
+        let (ta, a) = session(&mut app, "a");
+        assert!(
+            app.handle_control(&Req::Mark {
+                slot: 5,
+                target: Some(ta.clone()),
+                clear: false,
+            })
+            .ok
+        );
+        let r = app.handle_control(&Req::Marks);
+        let m = r.marks.unwrap();
+        assert_eq!(
+            (m[0].slot, m[0].pane.as_str(), m[0].session.as_str()),
+            (5, ta.as_str(), "a")
+        );
+        assert!(app.handle_control(&Req::GotoMark { slot: 5 }).ok);
+        assert_eq!(
+            app.handle_control(&Req::GotoMark { slot: 6 })
+                .code
+                .as_deref(),
+            Some("not_found")
+        );
+        assert!(
+            app.handle_control(&Req::Mark {
+                slot: 5,
+                target: None,
+                clear: true,
+            })
+            .ok
+        );
+        assert!(app.mark_target(5).is_none());
+        // A pinned pane that goes away empties its slot.
+        app.set_mark(1, &a);
+        app.panes.remove(&a);
+        app.track_nav();
+        assert!(app.marks[0].is_none());
+    }
+
+    #[test]
+    fn marks_survive_a_snapshot_round_trip() {
+        let mut app = app();
+        let (_, a) = session(&mut app, "keep");
+        app.set_mark(7, &a);
+        let snap = app.snapshot();
+        assert_eq!(snap.marks.len(), 1);
+        let mut state = State::new();
+        let mut panes = HashMap::new();
+        let r = restore_sessions(&mut state, &mut panes, &snap, 80, 24, &[]).expect("restored");
+        let (slot, term) = r.marks.first().cloned().expect("a mark came back");
+        assert_eq!(slot, 7);
+        let (ws, _, _) = {
+            let mut found = None;
+            for w in state.workspace_ids() {
+                let ws = state.workspace(&w).unwrap();
+                for t in &ws.tabs {
+                    for p in t.layout.panes() {
+                        if t.layout.terminal_of(&p) == Some(&term) {
+                            found = Some((w.clone(), t.id.clone(), p));
+                        }
+                    }
+                }
+            }
+            found.expect("the mark points at a restored pane")
+        };
+        assert_eq!(state.workspace(&ws).unwrap().name.as_deref(), Some("keep"));
     }
 }

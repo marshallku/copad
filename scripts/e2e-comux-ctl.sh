@@ -56,6 +56,7 @@
 #  40. broadcast types into one session's panes (or lists all on a dry run), never the caller's
 #  41. a split shows pane titles; Ctrl-b z zooms the pane to the whole tab (and its PTY with it)
 #  42. copy mode: ?search into history, V y yanks the line to the client as OSC 52, q leaves
+#  43. pinned slots: mark from inside a pane, goto from elsewhere, and they survive a restart
 
 set -euo pipefail
 
@@ -2115,7 +2116,32 @@ if tail -1 "$WORK/frame" | grep -qF " COPY "; then fail "q should leave copy mod
 t 10 "$COMUX" kill-session name:e2ecopy >/dev/null 2>&1 || true
 ok "?search finds history (case-insensitive), V y sends 'CPL17' over OSC 52 to this client; y and q leave"
 
-echo "43. the server is still responsive and shuts down cleanly"
+echo "43. pinned slots (mark / goto / marks), across a server restart"
+t 10 "$COMUX" new-session --json e2emark >"$WORK/json" || fail "new-session e2emark failed"
+MK="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+rc=0; t 10 "$COMUX" mark 3 >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 2 ]] || fail "mark outside a pane without --pane should be a usage error, got $rc"
+COPAD_MUX_PANE="$MK" t 10 "$COMUX" mark 3 >/dev/null || fail "mark 3 from inside the pane failed"
+t 10 "$COMUX" new-session e2emark2 >/dev/null || fail "new-session e2emark2 failed"
+t 10 "$COMUX" goto 3 >/dev/null || fail "goto 3 failed"
+[[ "$(attached)" == e2emark ]] || fail "goto 3 should land in e2emark, on $(attached)"
+rc=0; t 10 "$COMUX" goto 4 >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 1 ]] || fail "goto on an empty slot should fail with 1, got $rc"
+t 10 "$COMUX" kill-server >/dev/null || fail "kill-server before the restart failed"
+for _ in $(seq 1 100); do [[ -S "$COPAD_MUX_SOCK" ]] || break; sleep 0.1; done
+"$COMUX" server >>"$WORK/server.log" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 100); do t 5 "$COMUX" health >/dev/null 2>&1 && break; sleep 0.1; done
+t 10 "$COMUX" marks --json >"$WORK/json" || fail "marks after the restart failed"
+python3 -c '
+import json,sys
+m=json.load(sys.stdin)["marks"]
+assert len(m)==1 and m[0]["slot"]==3 and m[0]["session"]=="e2emark", m' <"$WORK/json" \
+    || fail "slot 3 should come back pointing at e2emark: $(cat "$WORK/json")"
+for n in e2emark e2emark2; do t 10 "$COMUX" kill-session "name:$n" >/dev/null 2>&1 || true; done
+ok "mark from inside a pane, goto from another session, empty slot = 1; slot 3 survives a restart"
+
+echo "44. the server is still responsive and shuts down cleanly"
 t 10 "$COMUX" health >/dev/null || fail "health failed — the server did not survive the run"
 t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"

@@ -771,6 +771,8 @@ fn ctl_mutates(req: &control::Req) -> bool {
             // statuses, so it neither sweeps processes nor touches a PTY.
             | control::Req::ListAgents { .. }
             | control::Req::ListTree { .. }
+            // Read-only, and pollable (`marks --json`).
+            | control::Req::Marks
             // Inbox traffic is polled by `inbox --wait` and draws nothing.
             | control::Req::Inbox { .. }
             | control::Req::Deliver { .. }

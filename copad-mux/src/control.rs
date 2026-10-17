@@ -230,6 +230,18 @@ pub enum Req {
     Nav { dir: NavDir },
     /// Toggle the zoom of the active tab's focused pane (`Ctrl-b z`). Moves the shared view.
     Zoom,
+    /// Pin `target` (a pane token) to `slot` 1–9, or empty the slot with `clear`.
+    Mark {
+        slot: u8,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        clear: bool,
+    },
+    /// The pinned slots. Read-only.
+    Marks,
+    /// Go to the pane pinned in `slot`. Moves the shared view.
+    GotoMark { slot: u8 },
     /// Raise an agent notification on behalf of a pane: a desktop toast whose click jumps
     /// back to it, plus an entry in the in-app notification center. The entry point for
     /// agent hooks (Claude `Stop`/`Notification`, Codex turn-complete), which know the
@@ -483,11 +495,26 @@ pub const SERVER_CAPS: &[&str] = &[
     CAP_OWNER,
     CAP_INBOX,
     CAP_BROADCAST,
+    CAP_MARKS,
 ];
 
 /// The most `send --file` reads. A paste larger than this is a mistake (a binary, a log),
 /// not something to type into a shell.
 const SEND_FILE_CAP: u64 = 1024 * 1024;
+
+/// One pinned slot.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MarkInfo {
+    pub slot: u8,
+    pub pane: String,
+    pub session: String,
+    pub tab: String,
+    #[serde(default)]
+    pub label: String,
+}
+
+/// Capability: `mark` / `marks` / `goto`.
+pub const CAP_MARKS: &str = "marks";
 
 /// One pane a `broadcast` reached.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -838,6 +865,9 @@ pub struct Resp {
     /// `inbox`: messages dropped because the inbox was full, since it was last read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dropped: Option<u64>,
+    /// `marks`: the pinned slots, lowest first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub marks: Option<Vec<MarkInfo>>,
     /// `broadcast`: the panes written to (or, dry-run, that would be).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub targets: Option<Vec<BroadcastTarget>>,
@@ -896,6 +926,7 @@ impl Resp {
             messages: None,
             dropped: None,
             targets: None,
+            marks: None,
             closed: None,
             skipped: None,
         }
@@ -1220,6 +1251,64 @@ pub fn run_client(args: &[String]) -> i32 {
         "kill-server" => {
             parsed!(cliargs::bare("usage: comux kill-server"));
             Req::KillServer
+        }
+        "mark" => {
+            let p = parsed!(MARK_SPEC);
+            let Some(slot) = p
+                .positionals
+                .first()
+                .and_then(|a| a.parse::<u8>().ok())
+                .filter(|n| (1..=9).contains(n))
+            else {
+                return usage_error(
+                    json_out,
+                    "comux mark: a slot 1-9 is required",
+                    MARK_SPEC.usage,
+                );
+            };
+            let clear = p.has("--clear");
+            // Never the focused pane: a pin aimed by focus lands wherever the user is looking.
+            let target = match p.value("--pane").map(str::to_string).or_else(caller_pane) {
+                Some(t) => Some(t),
+                None if clear => None,
+                None => {
+                    return usage_error(
+                        json_out,
+                        "comux mark: run it inside a pane, or say which with --pane <token>",
+                        MARK_SPEC.usage,
+                    );
+                }
+            };
+            if let Err(code) = require_cap(CAP_MARKS, cmd, json_out) {
+                return code;
+            }
+            Req::Mark {
+                slot,
+                target: if clear { None } else { target },
+                clear,
+            }
+        }
+        "marks" => {
+            parsed!(cliargs::bare(
+                "usage: comux marks [--json]   (the pinned slots)"
+            ));
+            Req::Marks
+        }
+        "goto" | "goto-mark" => {
+            let p = parsed!(GOTO_SPEC);
+            let Some(slot) = p
+                .positionals
+                .first()
+                .and_then(|a| a.parse::<u8>().ok())
+                .filter(|n| (1..=9).contains(n))
+            else {
+                return usage_error(
+                    json_out,
+                    "comux goto: a slot 1-9 is required",
+                    GOTO_SPEC.usage,
+                );
+            };
+            Req::GotoMark { slot }
         }
         "zoom" => {
             parsed!(cliargs::bare(
@@ -2256,6 +2345,19 @@ const NOTIFY_SPEC: Spec = Spec {
     positionals: Positionals::Any,
 };
 
+const MARK_SPEC: Spec = Spec {
+    usage: "usage: comux mark <1-9> [--pane <token>]   pin your pane (or that one) to a slot\n\
+            \x20      comux mark --clear <1-9>          empty the slot",
+    flags: &[opt(&["--pane"]), flag(&["--clear"])],
+    positionals: Positionals::AtMost(1),
+};
+
+const GOTO_SPEC: Spec = Spec {
+    usage: "usage: comux goto <1-9>   go to the pane pinned in that slot (Ctrl-b ' <n>)",
+    flags: &[],
+    positionals: Positionals::AtMost(1),
+};
+
 const BROADCAST_SPEC: Spec = Spec {
     usage: "usage: comux broadcast (--session <sel> | --all) [--agents] [--status working|ready|blocked|idle]\n\
             \x20      [--paste] [--enter] (--dry-run | --yes) [--] <text...>\n\
@@ -3024,6 +3126,14 @@ fn print_human(req: &Req, resp: &Resp) {
                 );
             }
         }
+        Req::Marks => {
+            for m in resp.marks.as_deref().unwrap_or_default() {
+                println!(
+                    "{}  {}  {}/{}  {}",
+                    m.slot, m.pane, m.session, m.tab, m.label
+                );
+            }
+        }
         Req::Broadcast { .. } => {
             println!("{}", resp.message.as_deref().unwrap_or("ok"));
             for t in resp.targets.as_deref().unwrap_or_default() {
@@ -3516,6 +3626,9 @@ mod verb_args_tests {
         "forward",
         "last",
         "zoom",
+        "mark",
+        "marks",
+        "goto",
         "broadcast",
         "list-tabs",
         "new-tab",
