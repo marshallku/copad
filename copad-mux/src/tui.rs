@@ -4927,7 +4927,15 @@ impl App {
                 }
                 let sel = self.selection.take()?; // release always ends the selection
                 if !sel.moved {
-                    return None; // it was a plain click, not a drag — nothing to copy
+                    // A plain click, not a drag — nothing to copy. A mouse-aware app (nvim
+                    // `set mouse`) gets it as press+release at the anchor cell, tmux-style;
+                    // sent on release so a drag still stays comux's copy gesture.
+                    if let Some(pt) = self.panes.get(&sel.term)
+                        && let Some(bytes) = pt.click_bytes(sel.anchor.0 + 1, sel.anchor.1 + 1)
+                    {
+                        pt.input(&bytes);
+                    }
+                    return None;
                 }
                 // Extract from the CURRENT snapshot (WYSIWYG: copy what's highlighted now).
                 let rect = self.layout().into_iter().find(|r| r.terminal == sel.term)?;
@@ -13265,6 +13273,51 @@ mod key_help {
         app.mouse_at(ClientId(0), 2, 2, MouseKind::Click);
         assert_eq!(app.help, None, "a click closes it");
         assert_eq!(app.focused_terminal(), focused, "and is consumed");
+    }
+
+    #[test]
+    fn a_plain_click_reaches_a_mouse_aware_app_but_a_drag_does_not() {
+        let mut app = app_from("");
+        let rect = app.layout()[0].clone();
+        let out = std::env::temp_dir().join(format!("comux-click-{}", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        // The shell plays a mouse-aware app: SGR click reporting on, raw mode, and the
+        // first 18 input bytes (one SGR press+release pair) to a file.
+        let script = format!(
+            "printf '\\033[?1000h\\033[?1006h'; stty raw -echo; head -c 18 > {}\r",
+            out.display()
+        );
+        let pt = app.panes.get(&rect.terminal).unwrap();
+        let wait = |cond: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !cond() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            cond()
+        };
+        // Give the shell a moment to draw its prompt before typing at it.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        pt.input(script.as_bytes());
+        assert!(
+            wait(&|| pt.click_bytes(1, 1).is_some()),
+            "app never enabled mouse mode"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100)); // let `stty raw` land
+
+        // A drag is comux's copy gesture: nothing reaches the app.
+        app.mouse_at(ClientId(0), rect.x + 5, rect.y + 1, MouseKind::Click);
+        app.mouse_at(ClientId(0), rect.x + 9, rect.y + 1, MouseKind::Drag);
+        app.mouse_at(ClientId(0), rect.x + 9, rect.y + 1, MouseKind::Up);
+        // A plain click is forwarded as press+release at that cell (1-based).
+        app.mouse_at(ClientId(0), rect.x + 2, rect.y + 1, MouseKind::Click);
+        app.mouse_at(ClientId(0), rect.x + 2, rect.y + 1, MouseKind::Up);
+
+        let read = || std::fs::read(&out).unwrap_or_default();
+        wait(&|| read().len() >= 18);
+        let got = String::from_utf8_lossy(&read()).into_owned();
+        let _ = std::fs::remove_file(&out);
+        // A leaked drag would show up first, at col 6.
+        assert_eq!(got, "\x1b[<0;3;2M\x1b[<0;3;2m");
     }
 
     #[test]

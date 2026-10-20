@@ -56,7 +56,7 @@ copad is a cross-platform terminal emulator built on a shared Rust core with pla
 - **Splits, tabs, multi-session workspaces** — vim-style pane focus/resize, `Ctrl-b` prefix bindings, prefix-less `Alt`+`1`–`9`, named sessions
 - **git worktree integration** — `comux worktree create <branch>` spins up a worktree plus a session inside it (tmux `twt` parity)
 - **`Ctrl-f` fuzzy switcher** — jump across sessions and agents just by typing
-- **Everything you'd expect** — scrollback/copy-mode, mouse (wheel forwarded to mouse-aware apps), shared multi-client, all configurable via `~/.config/copad/mux.toml`
+- **Everything you'd expect** — scrollback/copy-mode, mouse (wheel and plain clicks forwarded to mouse-aware apps, drag to copy), shared multi-client, all configurable via `~/.config/copad/mux.toml`
 
 ### Panels
 

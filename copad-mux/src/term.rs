@@ -623,6 +623,17 @@ impl PaneTerm {
         wheel_bytes_for_mode(*self.term.lock().mode(), up, col, row)
     }
 
+    /// Bytes for a plain left click at `col`/`row` (1-based, pane-relative), or `None` if
+    /// the app isn't listening for the mouse (a shell) or the pane is scrolled back into
+    /// comux's scrollback, where the click would land on a cell the app isn't showing.
+    pub fn click_bytes(&self, col: u16, row: u16) -> Option<Vec<u8>> {
+        let term = self.term.lock();
+        if term.grid().display_offset() != 0 {
+            return None;
+        }
+        click_bytes_for_mode(*term.mode(), col, row)
+    }
+
     /// Whether the pane's program asked for bracketed paste (`?2004h`).
     pub fn bracketed_paste(&self) -> bool {
         self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
@@ -1225,33 +1236,9 @@ impl Drop for PaneTerm {
 /// The pure mode→wheel-bytes mapping behind [`PaneTerm::wheel_bytes`] (split out so the
 /// encoding is unit-testable without a PTY). See that method for the tmux-style policy.
 fn wheel_bytes_for_mode(mode: TermMode, up: bool, col: u16, row: u16) -> Option<Vec<u8>> {
-    if mode.intersects(TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
-    {
+    if reports_mouse(mode) {
         let button: u16 = if up { 64 } else { 65 };
-        if mode.contains(TermMode::SGR_MOUSE) {
-            return Some(format!("\x1b[<{button};{col};{row}M").into_bytes());
-        }
-        if mode.contains(TermMode::UTF8_MOUSE) {
-            // xterm 1005: `ESC [ M` then Cb,Cx,Cy each as a UTF-8 char = 32 + value. Unlike
-            // legacy this expresses coords past 223 (up to the 2-byte UTF-8 ceiling, 0x7ff),
-            // so wide panes report the right cell.
-            let mut out = vec![0x1b, b'[', b'M'];
-            for v in [button, col, row] {
-                let cp = (v as u32 + 32).min(0x7ff);
-                let mut b = [0u8; 4];
-                out.extend_from_slice(
-                    char::from_u32(cp)
-                        .unwrap_or(' ')
-                        .encode_utf8(&mut b)
-                        .as_bytes(),
-                );
-            }
-            return Some(out);
-        }
-        // Legacy `ESC [ M Cb Cx Cy`: each value offset by 32, clamped to the single-byte
-        // range (coords past 223 can't be expressed and are pinned there, as in xterm).
-        let enc = |v: u16| (v.saturating_add(32)).min(255) as u8;
-        return Some(vec![0x1b, b'[', b'M', enc(button), enc(col), enc(row)]);
+        return Some(encode_mouse(mode, button, col, row, false));
     }
     if mode.contains(TermMode::ALTERNATE_SCROLL) && mode.contains(TermMode::ALT_SCREEN) {
         let arrow: &[u8] = match (up, mode.contains(TermMode::APP_CURSOR)) {
@@ -1263,6 +1250,54 @@ fn wheel_bytes_for_mode(mode: TermMode, up: bool, col: u16, row: u16) -> Option<
         return Some(arrow.to_vec());
     }
     None
+}
+
+/// Whether the app turned on any xterm mouse reporting (1000/1002/1003).
+fn reports_mouse(mode: TermMode) -> bool {
+    mode.intersects(TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
+}
+
+/// The pure mode→click-bytes mapping behind [`PaneTerm::click_bytes`]: a left press +
+/// release at `(col, row)` (1-based, pane-relative) in the app's negotiated encoding, or
+/// `None` when the app isn't reporting the mouse.
+fn click_bytes_for_mode(mode: TermMode, col: u16, row: u16) -> Option<Vec<u8>> {
+    if !reports_mouse(mode) {
+        return None;
+    }
+    let mut out = encode_mouse(mode, 0, col, row, false);
+    out.extend(encode_mouse(mode, 0, col, row, true));
+    Some(out)
+}
+
+/// One xterm mouse report. SGR keeps the button on release and marks it with a final `m`;
+/// the older encodings have no release marker and report button 3 instead.
+fn encode_mouse(mode: TermMode, button: u16, col: u16, row: u16, release: bool) -> Vec<u8> {
+    if mode.contains(TermMode::SGR_MOUSE) {
+        let fin = if release { 'm' } else { 'M' };
+        return format!("\x1b[<{button};{col};{row}{fin}").into_bytes();
+    }
+    let button = if release { 3 } else { button };
+    if mode.contains(TermMode::UTF8_MOUSE) {
+        // xterm 1005: `ESC [ M` then Cb,Cx,Cy each as a UTF-8 char = 32 + value. Unlike
+        // legacy this expresses coords past 223 (up to the 2-byte UTF-8 ceiling, 0x7ff),
+        // so wide panes report the right cell.
+        let mut out = vec![0x1b, b'[', b'M'];
+        for v in [button, col, row] {
+            let cp = (v as u32 + 32).min(0x7ff);
+            let mut b = [0u8; 4];
+            out.extend_from_slice(
+                char::from_u32(cp)
+                    .unwrap_or(' ')
+                    .encode_utf8(&mut b)
+                    .as_bytes(),
+            );
+        }
+        return out;
+    }
+    // Legacy `ESC [ M Cb Cx Cy`: each value offset by 32, clamped to the single-byte
+    // range (coords past 223 can't be expressed and are pinned there, as in xterm).
+    let enc = |v: u16| (v.saturating_add(32)).min(255) as u8;
+    vec![0x1b, b'[', b'M', enc(button), enc(col), enc(row)]
 }
 
 /// Map an alacritty cell color to a renderer-friendly `CellColor`. Named ANSI
@@ -2288,6 +2323,32 @@ mod render_repro {
         want.extend_from_slice('\u{14c}'.to_string().as_bytes());
         want.push(33);
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn click_sgr_sends_press_and_release() {
+        let m = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
+        assert_eq!(
+            click_bytes_for_mode(m, 7, 1).unwrap(),
+            b"\x1b[<0;7;1M\x1b[<0;7;1m"
+        );
+    }
+
+    #[test]
+    fn click_legacy_releases_with_button_3() {
+        let m = TermMode::MOUSE_DRAG;
+        assert_eq!(
+            click_bytes_for_mode(m, 1, 2).unwrap(),
+            vec![0x1b, b'[', b'M', 32, 33, 34, 0x1b, b'[', b'M', 35, 33, 34]
+        );
+    }
+
+    #[test]
+    fn click_without_mouse_reporting_is_not_forwarded() {
+        // A shell, or an alt-screen pager with only alternate-scroll: comux keeps the click.
+        assert!(click_bytes_for_mode(TermMode::empty(), 1, 1).is_none());
+        let pager = TermMode::ALTERNATE_SCROLL | TermMode::ALT_SCREEN;
+        assert!(click_bytes_for_mode(pager, 1, 1).is_none());
     }
 
     #[test]
