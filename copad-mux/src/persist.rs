@@ -77,6 +77,10 @@ pub struct PSession {
     #[serde(default)]
     pub active_tab: usize,
     pub tabs: Vec<PTab>,
+    /// The session's start directory ([`crate::model::Workspace::dir`]). Missing in older
+    /// snapshots — restore then falls back to the first pane's cwd.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
 }
 
 /// One persisted tab (a BSP layout).
@@ -119,6 +123,15 @@ pub enum PLayout {
 }
 
 impl PLayout {
+    /// The cwd of the leftmost leaf — a pre-`dir` snapshot's best guess at where its session
+    /// started (the first pane is the one the session was born with).
+    pub fn first_cwd(&self) -> Option<&str> {
+        match self {
+            PLayout::Leaf { cwd, .. } => cwd.as_deref(),
+            PLayout::Branch { first, .. } => first.first_cwd(),
+        }
+    }
+
     /// Count leaves (panes) in this subtree.
     pub fn leaf_count(&self) -> usize {
         match self {
@@ -341,6 +354,7 @@ mod tests {
                 PSession {
                     name: Some("local".into()),
                     active_tab: 0,
+                    dir: Some("/srv/local".into()),
                     tabs: vec![PTab {
                         name: None,
                         layout: PLayout::Branch {
@@ -363,6 +377,7 @@ mod tests {
                 PSession {
                     name: Some("api".into()),
                     active_tab: 1,
+                    dir: None,
                     tabs: vec![
                         PTab {
                             name: None,

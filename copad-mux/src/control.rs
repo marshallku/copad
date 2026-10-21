@@ -44,6 +44,19 @@ pub enum Req {
         /// Leave focus where it is. A split in a tab nobody is looking at never moves focus.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         no_focus: bool,
+        /// Start the new pane here instead of in the split source's cwd.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd: Option<String>,
+        /// `comux split … -- argv`: run this as the new pane's program (as `spawn` does for a
+        /// tab) — how a task is started inside an already-open tab without typing into a
+        /// shell. Closes with the program unless `keep`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        command: Vec<String>,
+        /// `KEY=VALUE` pairs added to the new pane's environment.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        env: Vec<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        keep: bool,
     },
     /// Grow the pane at `index` toward `dir` (`left`/`right`/`up`/`down`) by nudging
     /// its split divider.
@@ -192,6 +205,10 @@ pub enum Req {
         name: Option<String>,
         #[serde(default)]
         cwd: Option<String>,
+        /// tmux `new-session -d`: create it without switching anyone to it. The response
+        /// still names the new session/tab/pane.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        detached: bool,
     },
     /// Rename the session at `index` (as printed by `list-sessions`), or the ACTIVE
     /// session when `index` is `None`. An empty `name` clears it back to the
@@ -503,7 +520,16 @@ pub const SERVER_CAPS: &[&str] = &[
     CAP_BROADCAST,
     CAP_MARKS,
     CAP_FORK,
+    CAP_DETACHED_SESSION,
+    CAP_SPLIT_SPAWN,
 ];
+
+/// Capability: `new-session --detached` (an older server would ignore the field and switch).
+pub const CAP_DETACHED_SESSION: &str = "detached-session";
+
+/// Capability: `split --cwd/--env/--keep -- argv` (an older server would ignore them and
+/// answer `ok` with a bare shell — a task reported as started that never ran).
+pub const CAP_SPLIT_SPAWN: &str = "split-spawn";
 
 /// The most `send --file` reads. A paste larger than this is a mistake (a binary, a log),
 /// not something to type into a shell.
@@ -638,6 +664,9 @@ pub struct SessionInfo {
     pub panes: usize,
     /// Number of those panes running a classified AI agent.
     pub agents: usize,
+    /// The session's start directory — where `new-tab` opens by default. Empty if unknown.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dir: String,
 }
 
 /// One AI-agent pane in a `list-agents` response.
@@ -1475,12 +1504,30 @@ pub fn run_client(args: &[String]) -> i32 {
             let p = parsed!(NAME_SPEC_NEW_SESSION);
             // Optional name: every positional, space-joined (tmux `new -s`).
             let name = p.positionals.join(" ");
-            Req::NewSession {
-                name: (!name.trim().is_empty()).then(|| name.trim().to_string()),
+            let cwd = match p.value("--cwd").map(absolute_dir).transpose() {
+                Ok(Some(c)) => Some(c),
                 // Start the session's shell where the CLI was invoked (like `tmx $name`).
-                cwd: std::env::current_dir()
+                Ok(None) => std::env::current_dir()
                     .ok()
                     .and_then(|p| p.to_str().map(|s| s.to_string())),
+                Err(e) => return usage_error(json_out, &e, NAME_SPEC_NEW_SESSION.usage),
+            };
+            let detached = p.has("--detached");
+            if detached {
+                // A cold start spawns a server from THIS binary, which has the capability —
+                // so start it first, or the check below would fail for want of a server.
+                if let Err(e) = crate::client::ensure_running(&socket_path()) {
+                    eprintln!("comux: could not start server: {e}");
+                    return 1;
+                }
+                if let Err(code) = require_cap(CAP_DETACHED_SESSION, cmd, json_out) {
+                    return code;
+                }
+            }
+            Req::NewSession {
+                name: (!name.trim().is_empty()).then(|| name.trim().to_string()),
+                cwd,
+                detached,
             }
         }
         "rename-session" | "rename" => {
@@ -1662,7 +1709,20 @@ pub fn run_client(args: &[String]) -> i32 {
                     _ => {}
                 }
             }
-            match p.positionals.first().map(|s| s.as_str()) {
+            // Before `--`: at most a direction. After it: the program to run.
+            let split_at = p.literal_at.unwrap_or(p.positionals.len());
+            let (head, tail) = p.positionals.split_at(split_at);
+            let command = tail.to_vec();
+            if let Some(extra) = head.get(1) {
+                return usage_error(
+                    json_out,
+                    &format!(
+                        "comux split: unexpected argument '{extra}' (put a program after `--`)"
+                    ),
+                    SPLIT_SPEC.usage,
+                );
+            }
+            match head.first().map(|s| s.as_str()) {
                 None => {}
                 Some("down") => dir = "down",
                 Some("right") => dir = "right",
@@ -1678,10 +1738,36 @@ pub fn run_client(args: &[String]) -> i32 {
             if no_focus && let Err(code) = require_cap(CAP_PLACEMENT, cmd, json_out) {
                 return code;
             }
+            let cwd = match p.value("--cwd").map(absolute_dir).transpose() {
+                Ok(c) => c,
+                Err(e) => return usage_error(json_out, &e, SPLIT_SPEC.usage),
+            };
+            let env: Vec<String> = p
+                .flags
+                .iter()
+                .filter(|(f, _)| *f == "--env")
+                .filter_map(|(_, v)| v.clone())
+                .collect();
+            if let Some(e) = env.iter().find_map(|kv| env_pair(kv).err()) {
+                return usage_error(json_out, &format!("comux split: {e}"), SPLIT_SPEC.usage);
+            }
+            if let Some(e) = command.iter().find_map(|a| spawn_arg(a).err()) {
+                return usage_error(json_out, &format!("comux split: {e}"), SPLIT_SPEC.usage);
+            }
+            let keep = p.has("--keep");
+            if (cwd.is_some() || !env.is_empty() || keep || !command.is_empty())
+                && let Err(code) = require_cap(CAP_SPLIT_SPAWN, cmd, json_out)
+            {
+                return code;
+            }
             Req::Split {
                 from: p.value("--from").map(str::to_string),
                 dir: dir.to_string(),
                 no_focus,
+                cwd,
+                command,
+                env,
+                keep,
             }
         }
         "focus" | "close" => {
@@ -2272,8 +2358,10 @@ const LIST_TABS_SPEC: Spec = Spec {
 };
 
 const NAME_SPEC_NEW_SESSION: Spec = Spec {
-    usage: "usage: comux new-session [name...] [--json]   (use `--` before a name starting with '-')",
-    flags: &[],
+    usage: "usage: comux new-session [name...] [--cwd DIR] [--detached] [--json]   (use `--` before a name starting with '-')\n\
+            \x20      --cwd starts it (and every new tab of it) in DIR instead of here;\n\
+            \x20      --detached (-d) creates it without switching anyone to it",
+    flags: &[opt(&["--cwd", "-c"]), flag(&["--detached", "-d"])],
     positionals: Positionals::Any,
 };
 
@@ -2292,15 +2380,19 @@ const RENAME_TAB_SPEC: Spec = Spec {
 };
 
 const SPLIT_SPEC: Spec = Spec {
-    usage: "usage: comux split [-v|-h] [--from <pane-token>] [--no-focus] [--json]\n\
-            \x20      --from splits that pane wherever it is; --no-focus leaves focus alone",
+    usage: "usage: comux split [-v|-h] [--from <pane-token>] [--no-focus] [--cwd DIR] [--env K=V]... [--keep] [--json] [-- <argv...>]\n\
+            \x20      --from splits that pane wherever it is; --no-focus leaves focus alone;\n\
+            \x20      `-- argv` runs that program in the new pane (closes with it unless --keep)",
     flags: &[
         flag(&["-v", "--vertical"]),
         flag(&["-h", "--horizontal"]),
         opt(&["--from"]),
         flag(&["--no-focus", "-d"]),
+        opt(&["--cwd", "-c"]),
+        opt(&["--env", "-e"]),
+        flag(&["--keep", "-k"]),
     ],
-    positionals: Positionals::AtMost(1),
+    positionals: Positionals::Any,
 };
 
 const NEW_TAB_SPEC: Spec = Spec {

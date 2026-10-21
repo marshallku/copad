@@ -76,7 +76,19 @@ comux new-tab --session s4 --name worker --json   # a tab in s4, behind its acti
 comux new-tab --no-focus --json                   # a tab beside YOUR pane, not selected
 ```
 
-Either way the shell starts in `--cwd DIR`, else in your pane's directory. `split --from
+Either way the shell starts in `--cwd DIR`, else in your pane's directory.
+
+A plain `new-session` SWITCHES the user's view to the new session. Make one in the background
+with `--detached` (tmux `new -d`); `--cwd` sets where it starts — and where its later tabs open
+by default (a session keeps the directory it was created in; `list-sessions --json` shows it as
+`dir`):
+
+```bash
+comux new-session review --cwd ~/dev/api --detached --json   # nobody's view moves
+```
+
+The response's `pane` is the new session's own pane, so you can `send` to it or `split --from`
+it straight away. `split --from
 <token>` splits that pane wherever it is — another tab, another session — and only moves focus
 when the pane is in the tab on screen (`--no-focus` stops even that).
 
@@ -102,6 +114,17 @@ pane matters: split something else and the command runs in a directory you did n
 comux send <new-token> "make build"
 comux send <new-token> $'\n'
 ```
+
+To start a task in a tab that is ALREADY open — yours, another tab, another session — split a
+pane of it and give the split a program, exactly as `spawn` takes one:
+
+```bash
+comux split --from <token> -v --no-focus --keep -- cargo test --workspace
+comux split --from <token> --cwd ~/dev/api --env RUST_LOG=debug --no-focus -- ./run.sh
+```
+
+Everything after `--` is the argv, passed through untouched; a direction (`down`/`right`) goes
+before it. Without `--keep` the pane closes when the program exits.
 
 To run ONE program in its own tab rather than in a shell you type into, `spawn` it:
 

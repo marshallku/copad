@@ -20,6 +20,7 @@ pub mod codexdaemon;
 pub mod config;
 pub mod control;
 pub mod copadlink;
+pub mod dirbrowse;
 pub mod doctor;
 pub mod fdlimit;
 pub mod fleet;

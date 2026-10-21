@@ -62,6 +62,9 @@ pub struct Parsed {
     /// `(canonical name, value)` in command-line order; a repeated flag appears repeatedly.
     pub flags: Vec<(&'static str, Option<String>)>,
     pub positionals: Vec<String>,
+    /// Where `--` fell, as an index into `positionals` — what lets a verb that takes both a
+    /// positional argument AND a trailing argv (`split down -- cargo test`) tell them apart.
+    pub literal_at: Option<usize>,
 }
 
 impl Parsed {
@@ -102,6 +105,7 @@ pub fn parse(spec: &Spec, args: &[&str]) -> Result<Parsed, Stop> {
         }
         if a == "--" {
             literal = true;
+            out.literal_at = Some(out.positionals.len());
             continue;
         }
         // A verb's own flag wins over help, so `split -h` keeps meaning "horizontal".
@@ -187,6 +191,16 @@ mod tests {
     fn help_after_the_separator_is_just_text() {
         let p = parse(&SPEC, &["--", "--help"]).unwrap();
         assert_eq!(p.positionals, vec!["--help"]);
+    }
+
+    #[test]
+    fn the_separator_position_is_kept() {
+        // `split down -- cargo test` must not read as three positionals.
+        let p = parse(&SPEC, &["down", "--", "x"]).unwrap();
+        assert_eq!((p.positionals.len(), p.literal_at), (2, Some(1)));
+        let p = parse(&SPEC, &["--", "down"]).unwrap();
+        assert_eq!(p.literal_at, Some(0));
+        assert_eq!(parse(&SPEC, &["down"]).unwrap().literal_at, None);
     }
 
     #[test]

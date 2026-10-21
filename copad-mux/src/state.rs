@@ -323,6 +323,14 @@ impl State {
         self.clients.get(&client).map(|a| a.role)
     }
 
+    /// Record a workspace's start directory (see [`Workspace::dir`]). Metadata only: no
+    /// rev bump, nothing renders it. (Server bootstrap; not a `Command`.)
+    pub fn set_workspace_dir(&mut self, id: &WorkspaceId, dir: Option<std::path::PathBuf>) {
+        if let Some(w) = self.workspaces.iter_mut().find(|w| &w.id == id) {
+            w.dir = dir;
+        }
+    }
+
     /// Seed a workspace with one full-viewport terminal pane. Returns the ids so
     /// tests/servers can address them. (Server bootstrap; not a `Command`.)
     pub fn create_workspace(
@@ -348,6 +356,7 @@ impl State {
         self.workspaces.push(Workspace {
             id: id.clone(),
             name,
+            dir: None,
             tabs: vec![tab],
             active_tab: tab_id.clone(),
             controller: None,
@@ -428,6 +437,7 @@ impl State {
         self.workspaces.push(Workspace {
             id,
             name,
+            dir: None,
             tabs: built,
             active_tab,
             controller: None,

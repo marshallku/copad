@@ -654,6 +654,12 @@ impl Tab {
 pub struct Workspace {
     pub id: WorkspaceId,
     pub name: Option<String>,
+    /// The session's START directory (tmux `session_path`): where it was created, and where
+    /// a new tab opens by default. Fixed at birth on purpose — a `cd` in one of its panes
+    /// must not move where the next tab lands. `None` = unknown (fall back to the focused
+    /// pane's cwd).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<std::path::PathBuf>,
     pub tabs: Vec<Tab>,
     pub active_tab: TabId,
     pub controller: Option<ClientId>,

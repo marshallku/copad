@@ -73,7 +73,7 @@ A session is a self-contained workspace. Create several — say one per project 
 
 | Action | Key | CLI |
 | --- | --- | --- |
-| New session (inline name prompt) | `Ctrl-b C` | `comux new-session [name]` |
+| New session (pick a directory, then a name) | `Ctrl-b C` | `comux new-session [name] [--cwd DIR] [-d]` |
 | Rename session | `Ctrl-b $` | `comux rename-session [index] <name>` |
 | Kill session (with y/n confirm) | `Ctrl-b X` | `comux kill-session [index]` |
 | Next / previous session | `Ctrl-b )` / `Ctrl-b (` | — |
@@ -84,14 +84,39 @@ A session is a self-contained workspace. Create several — say one per project 
 CLI kills straight away (tmux `kill-session` behaves the same). The mux always keeps at least one
 session, so killing the last one is refused.
 
-### cwd inheritance
+### Picking the directory (`Ctrl-b C`)
 
-New sessions, tabs, and splits start in the **current directory**, like tmux's `-c '#{pane_current_path}'`:
+`Ctrl-b C` opens a directory browser at `~`. The first row, `.  create session here`, picks the
+directory you are in; `..` goes up; every other row is a subdirectory.
+
+| Key | Does |
+| --- | --- |
+| type | narrow the list (prefix matches first; start with `.` to see hidden directories) |
+| `/…` or `~/…` | type a path; Enter jumps there |
+| `↑` `↓` / `Ctrl-n` `Ctrl-p` | move |
+| `Enter` | enter the directory (or, on `.`, go on to the name) |
+| `→` / `Tab` | enter the directory |
+| `←` / `Backspace` on an empty filter | go up |
+| `Esc` | cancel |
+
+The name prompt that follows is pre-filled with the directory's name — Enter accepts it, and Esc
+goes back to the browser.
+
+### Where shells start
+
+A session remembers the directory it was **created in** (tmux's session path). New tabs in it
+(`Ctrl-b c`) always open there — a `cd` in one tab does not change where the next tab lands.
+Splits start in the directory of the pane being split, like tmux's `-c '#{pane_current_path}'`.
+
+From the CLI, a new session starts where you run the command:
 
 ```bash
 cd ~/dev/myproject
-comux new-session myproject      # the session's shell starts in ~/dev/myproject
+comux new-session myproject                # starts in ~/dev/myproject
+comux new-session api --cwd ~/dev/api -d   # starts in ~/dev/api, without switching to it
 ```
+
+`comux list-sessions --json` reports each session's start directory as `dir`.
 
 `comux new-session` also **auto-starts the server** if none is running — so you can go from a plain shell straight into a named workspace in one command.
 

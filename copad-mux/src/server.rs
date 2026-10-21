@@ -435,6 +435,8 @@ pub fn run() -> io::Result<()> {
         dirty |= app.maybe_auto_roll_usage(); // usage carousel auto-advance (usage_rotate_secs)
         dirty |= app.maybe_expire_message(); // a status-bar message timed out
         dirty |= app.poll_agent_sessions(); // resume-picker scan landed (Ctrl-b R)
+        dirty |= app.poll_dir_listing(); // new-session browser listing landed (Ctrl-b C)
+        app.maybe_probe_session_dirs(); // re-check session start dirs off-loop (Ctrl-b c)
         let pane_dirty = app.drain_pane_dirty(); // a VISIBLE pane's screen advanced (PTY output)
         dirty |= pane_dirty;
         // A full-screen app (nvim/less/htop/…) just ENTERED or LEFT the alternate screen:
@@ -1557,6 +1559,10 @@ mod tests {
             from: None,
             dir: "right".into(),
             no_focus: false,
+            cwd: None,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
         }));
         assert!(ctl_mutates(&Req::Focus {
             index: 0,
@@ -1564,7 +1570,8 @@ mod tests {
         }));
         assert!(ctl_mutates(&Req::NewSession {
             name: None,
-            cwd: None
+            cwd: None,
+            detached: false,
         }));
     }
 

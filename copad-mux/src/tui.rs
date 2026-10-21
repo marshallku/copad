@@ -25,6 +25,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::agentstate;
 use crate::config::{self, Action, Chord, MuxConfig, SortBy, TabLabels, UsageLayout, UsageStyle};
 use crate::control;
+use crate::dirbrowse;
 use crate::gitinfo;
 use crate::gitpoll;
 use crate::model::{
@@ -250,8 +251,9 @@ struct ClickZone {
 /// An inline single-line text prompt (session name entry / rename), tmux `command-prompt`.
 #[derive(Clone, PartialEq, Eq)]
 enum PromptKind {
-    /// `Ctrl-b C`: create a session with the typed name (empty → auto `sN`).
-    NewSession,
+    /// `Ctrl-b C` step 2: create a session in this directory (picked in the browser) with
+    /// the typed name (empty → auto `sN`). Esc goes back to the browser, not out.
+    NewSessionIn(PathBuf),
     /// `Ctrl-b W`: create a git worktree for the typed branch + a session in it.
     NewWorktree,
     /// `Ctrl-b $`: rename this session (empty → revert to its id). Captures the TARGET
@@ -511,6 +513,8 @@ const POPUP_PREVIEW_MIN_ROWS: u16 = 16;
 /// How long a status message stays up. Errors linger: they are the ones worth reading.
 const MESSAGE_SECS: u64 = 5;
 const ERROR_MESSAGE_SECS: u64 = 10;
+/// How often session start directories are re-probed (off-loop; see `DirProbe`).
+const DIR_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 
 /// The `Ctrl-f` fuzzy switcher state: which tab, the typed filter, the selected row.
 struct PopupState {
@@ -566,6 +570,23 @@ fn status_rank(status: &str) -> u8 {
 struct SidebarFocus {
     tab: PopupTab,
     sel: usize,
+}
+
+/// `Ctrl-b C` step 1: pick the new session's directory by browsing (from `$HOME`). Step 2
+/// is the inline name prompt ([`PromptKind::NewSessionIn`]), seeded with the directory name.
+struct DirBrowser {
+    /// The directory being browsed.
+    dir: PathBuf,
+    /// Its subdirectories: `None` while the listing thread runs, `Err` when unreadable.
+    listing: Option<Result<dirbrowse::Listing, String>>,
+    /// The request id the browser is waiting on / showing; a late result for an older
+    /// navigation is dropped.
+    req: u64,
+    /// Typed filter (or a `/…`·`~…` path to jump to).
+    filter: String,
+    sel: usize,
+    /// Select this child once the listing lands — the directory we just came up out of.
+    reselect: Option<std::ffi::OsString>,
 }
 
 /// The `Ctrl-b R` resume picker: past Claude/Codex conversations found on disk
@@ -724,6 +745,18 @@ pub struct App {
     center: Option<usize>,
     /// When `Some`, the resume picker (`Ctrl-b R`) is open.
     resume: Option<ResumeState>,
+    /// When `Some`, the new-session directory browser (`Ctrl-b C`) is open.
+    browser: Option<DirBrowser>,
+    /// Where the browser's listing thread publishes; read by [`Self::poll_dir_listing`].
+    dir_slot: dirbrowse::Slot,
+    /// The newest listing request id. Monotonic for the server's life — NOT per browser —
+    /// because a listing thread from a closed browser can still finish and publish later.
+    dir_req: u64,
+    /// Whether each session's start directory still exists, learned off-loop so
+    /// [`Self::session_dir`] never stats on the loop (a dead mount would freeze `Ctrl-b c`).
+    dir_probe: dirbrowse::DirProbe,
+    /// When `dir_probe` was last refreshed (see [`Self::maybe_probe_session_dirs`]).
+    dir_probed: Option<std::time::Instant>,
     /// Where the detached transcript scanner publishes; read by [`Self::poll_agent_sessions`].
     sessions: agentsessions::Shared,
     /// The scan the picker renders. Copied out of `sessions` once per scan so rendering
@@ -951,6 +984,8 @@ impl App {
                 let ws = WorkspaceId::new("local");
                 let (_tab, _pane, term0) =
                     state.create_workspace(ws.clone(), None, Rect { cols, rows });
+                // The boot shell starts in the server's cwd (no explicit dir below).
+                state.set_workspace_dir(&ws, std::env::current_dir().ok());
                 let pt = PaneTerm::spawn_with_env(
                     cols.max(1),
                     rows.max(1),
@@ -996,6 +1031,11 @@ impl App {
             hook_owned: HashSet::new(),
             center: None,
             resume: None,
+            browser: None,
+            dir_slot: Default::default(),
+            dir_req: 0,
+            dir_probe: Default::default(),
+            dir_probed: None,
             sessions: agentsessions::idle(),
             sessions_shown: Vec::new(),
             scan_req: 0,
@@ -1505,26 +1545,30 @@ impl App {
             return;
         };
         let ws = self.ws.clone();
-        self.split_at(&ws, pane, dir, true);
+        self.split_at(&ws, pane, dir, true, PaneLaunch::default());
     }
 
-    /// Split `pane` of `ws` (any tab, any session), spawning the new pane's shell in the
-    /// source's cwd (tmux `-c '#{pane_current_path}'`). `focus` moves focus to the new pane
-    /// — only ever in the tab on screen; a split elsewhere moves nothing anyone sees.
-    /// Returns the new pane's terminal, or `None` with the split rolled back.
+    /// Split `pane` of `ws` (any tab, any session), spawning the new pane in `launch.cwd`,
+    /// else the source's cwd (tmux `-c '#{pane_current_path}'`), running `launch.argv` if
+    /// given, else a shell. `focus` moves focus to the new pane — only ever in the tab on
+    /// screen; a split elsewhere moves nothing anyone sees. Returns the new pane's terminal,
+    /// or `None` with the split rolled back.
     fn split_at(
         &mut self,
         ws: &WorkspaceId,
         pane: PaneId,
         dir: Dir,
         focus: bool,
+        launch: PaneLaunch,
     ) -> Option<TerminalId> {
-        let cwd = self
-            .state
-            .workspace(ws)
-            .and_then(|w| w.tab_of_pane(&pane))
-            .and_then(|t| t.layout.terminal_of(&pane))
-            .and_then(|t| self.terminal_cwd(t));
+        let PaneLaunch { cwd, argv, env } = launch;
+        let cwd = cwd.or_else(|| {
+            self.state
+                .workspace(ws)
+                .and_then(|w| w.tab_of_pane(&pane))
+                .and_then(|t| t.layout.terminal_of(&pane))
+                .and_then(|t| self.terminal_cwd(t))
+        });
         let origin = self.origin_for(ws);
         let events = self
             .state
@@ -1544,14 +1588,14 @@ impl App {
             } => Some((new_terminal.clone(), new_pane.clone())),
             _ => None,
         })?;
-        let pane_env = self.pane_env();
-        let made = match PaneTerm::spawn_with_env(
-            self.cols.max(1),
-            self.rows.max(1),
-            None,
-            cwd,
-            &pane_env,
-        ) {
+        let mut pane_env = self.pane_env();
+        pane_env.extend(env);
+        let (cols, rows) = (self.cols.max(1), self.rows.max(1));
+        let spawned = match &argv {
+            Some(argv) => PaneTerm::spawn_argv(cols, rows, argv, cwd, &pane_env),
+            None => PaneTerm::spawn_with_env(cols, rows, None, cwd, &pane_env),
+        };
+        let made = match spawned {
             Ok(pt) => {
                 self.panes.insert(nt.clone(), pt);
                 // `sync_sizes` below only reaches the session on screen; a split in another
@@ -1651,9 +1695,8 @@ impl App {
     /// Create a new tab (a fresh single-pane layout) and switch to it, spawning its
     /// shell. Rolls the tab back if the PTY can't spawn (never leave a blank tab).
     fn new_tab(&mut self) -> Option<TerminalId> {
-        // Inherit the current pane's cwd into the new tab's shell (tmux-style).
-        let cwd = self.focused_cwd();
         let ws = self.ws.clone();
+        let cwd = self.session_dir(&ws).or_else(|| self.focused_cwd());
         self.new_tab_in(
             &ws,
             TabLaunch {
@@ -1662,6 +1705,38 @@ impl App {
                 ..TabLaunch::default()
             },
         )
+    }
+
+    /// Where a new tab in `ws` opens by default: the session's start directory (tmux
+    /// `session_path`), while it still exists. A `cd` in one of the session's panes does not
+    /// move it — that was the bug: every new tab followed whichever pane happened to be
+    /// focused. Existence comes from [`Self::dir_probe`], never a stat here — and it has to
+    /// be checked at all because a PTY spawned in a missing directory does NOT fail:
+    /// alacritty ignores the child's `chdir` error, so the shell would quietly start in the
+    /// server's own cwd.
+    fn session_dir(&self, ws: &WorkspaceId) -> Option<PathBuf> {
+        let dir = self.state.workspace(ws)?.dir.clone()?;
+        self.dir_probe.usable(&dir).then_some(dir)
+    }
+
+    /// Re-check every session's start directory off-loop, at most every
+    /// [`DIR_PROBE_INTERVAL`]. Called from the server loop.
+    pub fn maybe_probe_session_dirs(&mut self) {
+        let now = std::time::Instant::now();
+        if self
+            .dir_probed
+            .is_some_and(|t| now.duration_since(t) < DIR_PROBE_INTERVAL)
+        {
+            return;
+        }
+        self.dir_probed = Some(now);
+        let dirs: Vec<PathBuf> = self
+            .state
+            .workspace_ids()
+            .iter()
+            .filter_map(|ws| self.state.workspace(ws)?.dir.clone())
+            .collect();
+        self.dir_probe.refresh(dirs);
     }
 
     /// Create a tab in `ws` running what `launch` says, returning its terminal. A tab in the
@@ -2162,11 +2237,20 @@ impl App {
             .and_then(procinfo::process_cwd)
     }
 
-    /// Create a new session (a fresh single-pane workspace) and switch to it. `name`
-    /// is the tmux-style session name (`None` → shown by its `sN` id); `cwd` is the
-    /// directory to start its shell in (`None` → the server's cwd). Rolls the session
-    /// back if the PTY can't spawn (never leave a blank session).
-    fn new_session(&mut self, name: Option<String>, cwd: Option<PathBuf>) {
+    /// Create a new session (a fresh single-pane workspace). `name` is the tmux-style
+    /// session name (`None` → shown by its `sN` id); `cwd` is the directory to start its
+    /// shell in (`None` → the server's cwd), which also becomes the session's start
+    /// directory. `switch` moves the attached view to it — a human creating a session wants
+    /// to be in it; an agent's `new-session --detached` must not move anybody. Returns the
+    /// new session's one terminal, so a caller never has to infer it from focus (which
+    /// `switch = false` leaves on the old session). Rolls the session back if the PTY can't
+    /// spawn (never leave a blank session).
+    fn new_session(
+        &mut self,
+        name: Option<String>,
+        cwd: Option<PathBuf>,
+        switch: bool,
+    ) -> Option<TerminalId> {
         let n = self.next_session;
         self.next_session += 1;
         let id = WorkspaceId::new(format!("s{n}"));
@@ -2175,11 +2259,19 @@ impl App {
         let (_tab, _pane, term0) =
             self.state
                 .create_workspace(id.clone(), name, Rect { cols, rows });
+        let dir = cwd.clone().or_else(|| std::env::current_dir().ok());
+        self.state.set_workspace_dir(&id, dir.clone());
         let pane_env = self.pane_env();
         match PaneTerm::spawn_with_env(self.cols.max(1), self.rows.max(1), None, cwd, &pane_env) {
             Ok(pt) => {
-                self.panes.insert(term0, pt);
-                self.switch_session(id);
+                self.panes.insert(term0.clone(), pt);
+                if let Some(dir) = dir {
+                    self.dir_probe.mark_alive(dir);
+                }
+                if switch {
+                    self.switch_session(id);
+                }
+                Some(term0)
             }
             Err(reason) => {
                 // Spawn failed — drop the just-created session so state never holds a
@@ -2190,6 +2282,7 @@ impl App {
                     }
                 }
                 self.report_spawn_failure("new session", &reason);
+                None
             }
         }
     }
@@ -2395,12 +2488,14 @@ impl App {
     /// Open a session named after the worktree dir, in the worktree. Detects a shell
     /// spawn failure via the session-count delta and reports it (the worktree stays).
     fn spawn_worktree_session(&mut self, planned: &crate::worktree::Planned) -> Result<(), String> {
-        let before = self.session_count();
-        self.new_session(
-            Some(planned.dir_name.clone()),
-            Some(planned.worktree_path.clone()),
-        );
-        if self.session_count() > before {
+        if self
+            .new_session(
+                Some(planned.dir_name.clone()),
+                Some(planned.worktree_path.clone()),
+                true,
+            )
+            .is_some()
+        {
             Ok(())
         } else {
             Err(format!(
@@ -2466,12 +2561,139 @@ impl App {
         true
     }
 
-    /// Open the inline new-session name prompt (`Ctrl-b C`); Enter commits, Esc cancels.
+    /// Open the new-session directory browser (`Ctrl-b C`) at `$HOME`.
     fn open_new_session_prompt(&mut self) {
-        self.prompt = Some(Prompt {
-            kind: PromptKind::NewSession,
-            buf: String::new(),
+        let home = home_dir();
+        self.open_browser_at(home, None);
+    }
+
+    /// Open (or re-point) the browser at `dir`, listing it off-loop. `reselect` names the
+    /// child to select once the listing lands.
+    fn open_browser_at(&mut self, dir: PathBuf, reselect: Option<std::ffi::OsString>) {
+        self.dir_req += 1;
+        let req = self.dir_req;
+        dirbrowse::spawn_list(self.dir_slot.clone(), req, dir.clone());
+        self.browser = Some(DirBrowser {
+            dir,
+            listing: None,
+            req,
+            filter: String::new(),
+            sel: 0,
+            reselect,
         });
+    }
+
+    /// Adopt a finished directory listing that answers the browser's current request.
+    /// Returns whether the browser needs a repaint. Called from the server loop.
+    pub fn poll_dir_listing(&mut self) -> bool {
+        let Some(b) = self.browser.as_mut() else {
+            return false;
+        };
+        if b.listing.is_some() {
+            return false;
+        }
+        // Only ever take the answer to THIS request; an older one is left to be replaced
+        // (`spawn_list` never lets it overwrite a newer one).
+        let Some(res) = self.dir_slot.lock().ok().and_then(|mut g| {
+            g.as_ref()
+                .is_some_and(|r| r.req == b.req)
+                .then(|| g.take())
+                .flatten()
+        }) else {
+            return false;
+        };
+        b.listing = Some(res.listing);
+        if let Some(name) = b.reselect.take() {
+            let rows = self.browser_rows();
+            let at = rows
+                .iter()
+                .position(|r| matches!(r, dirbrowse::Row::Dir(n) if *n == name));
+            if let (Some(i), Some(b)) = (at, self.browser.as_mut()) {
+                b.sel = i;
+            }
+        }
+        true
+    }
+
+    /// The browser's rows (empty while it is closed).
+    fn browser_rows(&self) -> Vec<dirbrowse::Row> {
+        let Some(b) = self.browser.as_ref() else {
+            return Vec::new();
+        };
+        let empty = dirbrowse::Listing::default();
+        let listing = match &b.listing {
+            Some(Ok(l)) => l,
+            _ => &empty,
+        };
+        dirbrowse::rows(&b.dir, listing, &b.filter, &home_dir())
+    }
+
+    /// Move the browser selection by `delta`, wrapping.
+    fn browser_move(&mut self, delta: i32) {
+        let n = self.browser_rows().len() as i32;
+        if let Some(b) = self.browser.as_mut()
+            && n > 0
+        {
+            b.sel = (b.sel as i32 + delta).rem_euclid(n) as usize;
+        }
+    }
+
+    /// Edit the browser filter: `Some(c)` appends; `None` backspaces — or, on an empty
+    /// filter, goes up a directory (the file-manager reflex).
+    fn browser_edit(&mut self, c: Option<char>) {
+        let Some(b) = self.browser.as_mut() else {
+            return;
+        };
+        match c {
+            Some(c) => b.filter.push(c),
+            None if b.filter.is_empty() => return self.browser_up(),
+            None => {
+                b.filter.pop();
+            }
+        }
+        b.sel = 0;
+    }
+
+    /// Go to the parent directory, selecting the one we came out of.
+    fn browser_up(&mut self) {
+        let Some(b) = self.browser.as_ref() else {
+            return;
+        };
+        if let Some(parent) = b.dir.parent().map(Path::to_path_buf) {
+            let from = b.dir.file_name().map(|n| n.to_os_string());
+            self.open_browser_at(parent, from);
+        }
+    }
+
+    /// Act on the selected row. `descend_only` (→ / Tab) never leaves the browser: it
+    /// enters a directory and ignores the "create here" row.
+    fn browser_activate(&mut self, descend_only: bool) {
+        let Some(b) = self.browser.as_ref() else {
+            return;
+        };
+        let Some(row) = self.browser_rows().get(b.sel).cloned() else {
+            return;
+        };
+        match row {
+            dirbrowse::Row::Here if !descend_only => {
+                let dir = b.dir.clone();
+                self.browser = None;
+                self.prompt = Some(Prompt {
+                    buf: dirbrowse::default_name(&dir),
+                    kind: PromptKind::NewSessionIn(dir),
+                });
+            }
+            dirbrowse::Row::Here => {}
+            dirbrowse::Row::Up => self.browser_up(),
+            dirbrowse::Row::Dir(name) => {
+                let dir = b.dir.join(name);
+                self.open_browser_at(dir, None);
+            }
+            // No `is_dir` here: even one stat can hang on a dead mount, and this is the
+            // server loop. The listing thread finds out — a non-directory lands as an
+            // "unreadable" listing, from which `..` / Esc still work.
+            dirbrowse::Row::Path(p) => self.open_browser_at(p, None),
+        }
     }
 
     /// Open the inline new-worktree prompt (`Ctrl-b W`): the typed text is the branch
@@ -2530,8 +2752,9 @@ impl App {
         let trimmed = p.buf.trim();
         let name = (!trimmed.is_empty()).then(|| trimmed.to_string());
         match p.kind {
-            // A session created from the TUI inherits the focused pane's cwd (tmux-style).
-            PromptKind::NewSession => self.new_session(name, self.focused_cwd()),
+            PromptKind::NewSessionIn(dir) => {
+                self.new_session(name, Some(dir), true);
+            }
             PromptKind::NewWorktree => {
                 let Some(branch) = name else { return };
                 // The worktree is resolved from the focused pane's repo (tmux-style cwd).
@@ -3104,6 +3327,10 @@ impl App {
                 dir,
                 from,
                 no_focus,
+                cwd,
+                command,
+                env,
+                keep,
             } => {
                 let d = match dir.as_str() {
                     "down" => Dir::Down,
@@ -3133,10 +3360,34 @@ impl App {
                         None => return Resp::err_code("not_found", "no focused pane"),
                     },
                 };
+                // Validate the launch before anything is split: a refusal must leave no pane.
+                let mut extra_env = Vec::with_capacity(env.len());
+                for kv in env {
+                    match control::env_pair(kv) {
+                        Ok((k, v)) => extra_env.push((k.to_string(), v.to_string())),
+                        Err(e) => return Resp::err_code("invalid", e),
+                    }
+                }
+                if let Some(e) = command.iter().find_map(|a| control::spawn_arg(a).err()) {
+                    return Resp::err_code("invalid", e);
+                }
+                let cwd = match cwd {
+                    Some(c) if !Path::new(c).is_dir() => {
+                        return Resp::err_code("invalid", format!("not a directory: {c}"));
+                    }
+                    c => c.as_ref().map(PathBuf::from),
+                };
+                let launch = PaneLaunch {
+                    cwd,
+                    argv: (!command.is_empty()).then(|| {
+                        spawn_argv(std::env::var("SHELL").ok().as_deref(), command, *keep)
+                    }),
+                    env: extra_env,
+                };
                 self.clear_spawn_error();
                 // Name the pane we created, so no caller ever has to infer it by diffing
                 // listings (which a concurrent focus or tab change can defeat).
-                match self.split_at(&ws, pane, d, !no_focus) {
+                match self.split_at(&ws, pane, d, !no_focus, launch) {
                     Some(term) => self.created(&term),
                     None => Resp::err_code("spawn_failed", self.take_spawn_error("split")),
                 }
@@ -3336,9 +3587,11 @@ impl App {
                         return Resp::err_code("invalid", format!("not a directory: {c}"));
                     }
                     Some(c) => Some(PathBuf::from(c)),
+                    // A caller's own directory wins (the agent contract in SKILL.md); with no
+                    // caller, the tab opens where its session started, like `Ctrl-b c`.
                     None => match &caller {
                         Some((_, tid)) => self.terminal_cwd(tid),
-                        None => self.focused_cwd(),
+                        None => self.session_dir(&ws).or_else(|| self.focused_cwd()),
                     },
                 };
                 self.clear_spawn_error();
@@ -3484,13 +3737,22 @@ impl App {
                             tabs,
                             panes,
                             agents,
+                            dir: self
+                                .state
+                                .workspace(wid)
+                                .and_then(|w| w.dir.as_deref())
+                                .map(|d| d.display().to_string())
+                                .unwrap_or_default(),
                         }
                     })
                     .collect();
                 Resp::session_list(infos, active_idx)
             }
-            Req::NewSession { name, cwd } => {
-                let before = self.session_count();
+            Req::NewSession {
+                name,
+                cwd,
+                detached,
+            } => {
                 // Prefer the caller's cwd (CLI); fall back to the focused pane's.
                 let dir = cwd
                     .clone()
@@ -3498,16 +3760,9 @@ impl App {
                     .filter(|p| p.is_dir())
                     .or_else(|| self.focused_cwd());
                 self.clear_spawn_error();
-                self.new_session(name.clone(), dir);
-                if self.session_count() > before {
-                    // A successful `new_session` switched to it, so its one pane is the
-                    // focused one.
-                    match self.focused_terminal() {
-                        Some(term) => self.created(&term),
-                        None => Resp::ok(),
-                    }
-                } else {
-                    Resp::err_code("spawn_failed", self.take_spawn_error("new-session"))
+                match self.new_session(name.clone(), dir, !detached) {
+                    Some(term) => self.created(&term),
+                    None => Resp::err_code("spawn_failed", self.take_spawn_error("new-session")),
                 }
             }
             Req::RenameSession {
@@ -4344,7 +4599,12 @@ impl App {
             *prefix = false;
             match k.code {
                 KeyCode::Enter => self.commit_prompt(p),
-                KeyCode::Esc => {} // cancel: dropped by the take()
+                // Naming a session you just browsed to: Esc steps back to the browser.
+                KeyCode::Esc => {
+                    if let PromptKind::NewSessionIn(dir) = p.kind {
+                        self.open_browser_at(dir, None);
+                    }
+                }
                 KeyCode::Backspace => {
                     p.buf.pop();
                     self.prompt = Some(p);
@@ -4461,6 +4721,26 @@ impl App {
                 KeyCode::Backspace => self.popup_backspace(),
                 // Any other printable char extends the fuzzy filter.
                 KeyCode::Char(c) if !ctrl => self.popup_type(c),
+                _ => {}
+            }
+            return KeyAction::Continue;
+        }
+
+        // The new-session browser (`Ctrl-b C`) captures all input while open. Every printable
+        // character belongs to the filter, so navigation is arrows / Tab / Enter.
+        if self.browser.is_some() {
+            *prefix = false;
+            match k.code {
+                KeyCode::Down => self.browser_move(1),
+                KeyCode::Up => self.browser_move(-1),
+                KeyCode::Char('n') if ctrl => self.browser_move(1),
+                KeyCode::Char('p') if ctrl => self.browser_move(-1),
+                KeyCode::Enter => self.browser_activate(false),
+                KeyCode::Right | KeyCode::Tab => self.browser_activate(true),
+                KeyCode::Left => self.browser_up(),
+                KeyCode::Esc => self.browser = None,
+                KeyCode::Backspace => self.browser_edit(None),
+                KeyCode::Char(c) if !ctrl => self.browser_edit(Some(c)),
                 _ => {}
             }
             return KeyAction::Continue;
@@ -5005,7 +5285,7 @@ impl App {
                 // A text prompt / y-n confirm owns the keyboard (feed_key handles them
                 // before the menu), so a menu opened over one would render on top while
                 // keystrokes still edit the overlay underneath. Refuse instead.
-                if self.prompt.is_some() || self.confirm.is_some() {
+                if self.prompt.is_some() || self.confirm.is_some() || self.browser.is_some() {
                     return None;
                 }
                 // A re-press on the open menu's items re-arms hold-release mode.
@@ -6496,6 +6776,9 @@ impl App {
         if self.resume.is_some() {
             self.render_resume(buf);
         }
+        if self.browser.is_some() {
+            self.render_browser(buf);
+        }
         if self.prompt.is_some() {
             self.render_prompt(buf);
         }
@@ -6517,6 +6800,7 @@ impl App {
             && self.scroll_pane.is_none()
             && self.center.is_none()
             && self.resume.is_none()
+            && self.browser.is_none()
             && self.prompt.is_none()
             && self.confirm.is_none()
             && self.menu.is_none()
@@ -6676,6 +6960,11 @@ impl App {
                 name: w.name.clone(),
                 active_tab,
                 tabs,
+                dir: w
+                    .dir
+                    .as_deref()
+                    .and_then(|d| d.to_str())
+                    .map(str::to_string),
             });
         }
         let marks = self
@@ -9071,6 +9360,108 @@ impl App {
         }
     }
 
+    /// Draw the new-session directory browser: the directory being browsed + the filter on
+    /// top, then `.` (create here), `..`, and its subdirectories. Same box as the resume
+    /// picker.
+    fn render_browser(&self, buf: &mut Buffer) {
+        let Some(b) = self.browser.as_ref() else {
+            return;
+        };
+        let area = buf.area;
+        let rows = self.browser_rows();
+
+        let maxw = area.width.saturating_sub(2).max(1);
+        let w = ((area.width as u32 * 3 / 5) as u16).clamp(40.min(maxw), maxw);
+        let maxh = area.height.saturating_sub(2).max(1);
+        let h = ((area.height as u32 * 3 / 4) as u16).clamp(6.min(maxh), maxh);
+        let x0 = (area.width.saturating_sub(w)) / 2;
+        let y0 = (area.height.saturating_sub(h)) / 2;
+        let bg = Color::Reset;
+        let border = Style::default().fg(CAT_MAUVE).bg(bg);
+        draw_box(buf, x0, y0, w, h, border);
+
+        let right_edge = x0 + w - 1;
+        let put = |buf: &mut Buffer, x: &mut u16, y: u16, s: &str, style: Style| {
+            *x = put_str(buf, *x, y, right_edge, s, style);
+        };
+        let inner_x = x0 + 2;
+        let inner_w = w.saturating_sub(4) as usize;
+
+        let mut tx = inner_x;
+        put(
+            buf,
+            &mut tx,
+            y0,
+            &clip_width(
+                &format!(
+                    " new session · {} · ↵ open/create · ← up · esc cancel ",
+                    home_short(&b.dir)
+                ),
+                inner_w,
+            ),
+            border.add_modifier(Modifier::BOLD),
+        );
+
+        let mut fx = inner_x;
+        put(
+            buf,
+            &mut fx,
+            y0 + 1,
+            &tail_width(&format!("> {}█", b.filter), inner_w),
+            Style::default().fg(CAT_TEXT).bg(bg),
+        );
+
+        let list_top = y0 + 2;
+        let visible = (h.saturating_sub(3)) as usize;
+        let dim = Style::default().fg(CAT_OVERLAY).bg(bg);
+        // The `.`/`..` rows are usable before the listing lands; say why the rest is missing.
+        let note = match &b.listing {
+            None => Some("loading…".to_string()),
+            Some(Err(e)) => Some(format!("unreadable: {e}")),
+            Some(Ok(l)) if l.truncated => Some("(list truncated — type a path)".to_string()),
+            Some(Ok(_)) if rows.is_empty() => Some("(no match)".to_string()),
+            Some(Ok(_)) => None,
+        };
+        let room = visible.saturating_sub(usize::from(note.is_some()));
+        let start = if b.sel >= room { b.sel + 1 - room } else { 0 };
+        let mut y = list_top;
+        for (i, row) in rows.iter().enumerate().skip(start).take(room) {
+            let selected = i == b.sel;
+            let arrow = if selected { "▸" } else { " " };
+            let (label, base) = match row {
+                dirbrowse::Row::Here => (
+                    format!("{arrow} .   create session here"),
+                    Style::default().fg(CAT_GREEN).bg(bg),
+                ),
+                dirbrowse::Row::Up => (format!("{arrow} .."), dim),
+                dirbrowse::Row::Dir(n) => (
+                    format!("{arrow} {}/", n.to_string_lossy()),
+                    Style::default().fg(CAT_TEXT).bg(bg),
+                ),
+                // No `is_dir` here: rendering runs every frame, and a stat can block.
+                dirbrowse::Row::Path(p) => (
+                    format!("{arrow} go to {}", p.display()),
+                    Style::default().fg(CAT_TEXT).bg(bg),
+                ),
+            };
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(CAT_MAUVE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                base
+            };
+            let mut x = inner_x;
+            put(buf, &mut x, y, &clip_width(&label, inner_w), style);
+            y += 1;
+        }
+        if let Some(n) = note {
+            let mut x = inner_x;
+            put(buf, &mut x, y, &clip_width(&format!("  {n}"), inner_w), dim);
+        }
+    }
+
     /// Draw the inline single-line prompt (new-session name / rename) as a small
     /// centered box with the typed text + a block cursor. Clamps on tiny terminals.
     fn render_prompt(&self, buf: &mut Buffer) {
@@ -9094,18 +9485,20 @@ impl App {
             put_str(buf, x, y, x.saturating_add(maxw), s, st);
         };
 
-        let title = match p.kind {
-            PromptKind::NewSession => " new session · ↵ create · esc cancel ",
-            PromptKind::NewWorktree => " new worktree (branch) · ↵ create · esc cancel ",
-            PromptKind::RenameSession(_) => " rename session · ↵ save · esc cancel ",
-            PromptKind::RenameTab(..) => " rename tab · ↵ save (empty clears) · esc cancel ",
+        let title = match &p.kind {
+            PromptKind::NewSessionIn(dir) => {
+                format!(" new session in {} · ↵ create · esc back ", home_short(dir))
+            }
+            PromptKind::NewWorktree => " new worktree (branch) · ↵ create · esc cancel ".into(),
+            PromptKind::RenameSession(_) => " rename session · ↵ save · esc cancel ".into(),
+            PromptKind::RenameTab(..) => " rename tab · ↵ save (empty clears) · esc cancel ".into(),
         };
         put(
             buf,
             y0,
             x0 + 2,
             w.saturating_sub(4),
-            title,
+            &title,
             border.add_modifier(Modifier::BOLD),
         );
         // Text line with a trailing block cursor; right-truncate so the caret stays
@@ -9336,6 +9729,14 @@ fn divider_touches(fr: &PaneRect, x: u16, y: u16) -> bool {
 /// ellipsis when clipped. Width-aware so CJK/emoji names truncate cleanly.
 /// `/Users/me/dev/copad` → `~/dev/copad`, so a row spends its width on the part that
 /// distinguishes it. Left alone when it isn't under `$HOME`.
+/// `$HOME`, else `/` — where the new-session browser opens.
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|h| h.is_absolute())
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
 fn home_short(path: &std::path::Path) -> String {
     home_short_in(path, std::env::var_os("HOME").map(PathBuf::from).as_deref())
 }
@@ -9796,6 +10197,12 @@ fn restore_sessions(
         };
         let per_tab_terms =
             state.install_restored_session(id.clone(), ps.name.clone(), restored_tabs, viewport);
+        let dir = ps
+            .dir
+            .as_deref()
+            .or_else(|| ps.tabs.first().and_then(|t| t.layout.first_cwd()))
+            .map(PathBuf::from);
+        state.set_workspace_dir(&id, dir);
 
         // Phase 3: attach the already-spawned PaneTerms by the ids State minted (DFS order
         // matches spawn order, since both walk the same pruned spec first-then-second).
@@ -9952,6 +10359,18 @@ struct Mailbox {
     msgs: VecDeque<control::InboxMsg>,
     /// Dropped since the reader last acknowledged.
     dropped: u64,
+}
+
+/// What a split's new pane runs (`comux split … -- argv`): the split counterpart of
+/// [`TabLaunch`], for running a task inside an already-open tab.
+#[derive(Default)]
+struct PaneLaunch {
+    /// Overrides the split source's cwd.
+    cwd: Option<PathBuf>,
+    /// Run this argv as the pane's process instead of a login shell (see [`spawn_argv`]).
+    argv: Option<Vec<String>>,
+    /// Added to the pane's environment, after (so over) the usual pane variables.
+    env: Vec<(String, String)>,
 }
 
 /// What a new tab runs, and where. The default is a login shell in the server's cwd, created
@@ -11911,6 +12330,10 @@ mod app_render_fidelity {
                 dir: (*dir).to_string(),
                 from: None,
                 no_focus: false,
+                cwd: None,
+                command: Vec::new(),
+                env: Vec::new(),
+                keep: false,
             });
         }
         app.resize(shape.cols, shape.rows);
@@ -12078,6 +12501,7 @@ mod placement {
             app.handle_control(&Req::NewSession {
                 name: Some("other".into()),
                 cwd: None,
+                detached: false,
             })
             .ok
         );
@@ -12106,6 +12530,10 @@ mod placement {
             dir: "right".into(),
             from: Some(token),
             no_focus: false,
+            cwd: None,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
         });
         assert!(s.ok, "{:?}", s.error);
         assert_eq!(s.tab.unwrap().id, tab.id, "the split landed in that tab");
@@ -12200,6 +12628,323 @@ mod placement {
     }
 }
 
+/// `Ctrl-b C`'s directory browser, the session start directory it records, and the
+/// focus-free agent verbs (`new-session --detached`, `split -- argv`).
+#[cfg(test)]
+mod new_session_dir {
+    use super::*;
+    use crate::control::Req;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    /// A fresh directory with the given subdirectories, canonicalized (macOS `/var` is a
+    /// symlink to `/private/var`, and a process cwd reads back canonical).
+    fn tree(tag: &str, subdirs: &[&str]) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("comux-nsd-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        for s in subdirs {
+            std::fs::create_dir_all(d.join(s)).unwrap();
+        }
+        std::fs::create_dir_all(&d).unwrap();
+        d.canonicalize().unwrap()
+    }
+
+    fn key(app: &mut App, code: KeyCode) {
+        let mut prefix = false;
+        app.feed_key(KeyEvent::new(code, KeyModifiers::NONE), &mut prefix);
+    }
+
+    fn typed(app: &mut App, s: &str) {
+        for c in s.chars() {
+            key(app, KeyCode::Char(c));
+        }
+    }
+
+    /// Wait for the browser's off-loop listing to land.
+    fn settle(app: &mut App) {
+        for _ in 0..200 {
+            app.poll_dir_listing();
+            if app.browser.as_ref().is_some_and(|b| b.listing.is_some()) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("listing never landed");
+    }
+
+    fn browsing(app: &App) -> PathBuf {
+        app.browser.as_ref().expect("browser open").dir.clone()
+    }
+
+    #[test]
+    fn the_browser_navigates_then_names_the_session_after_the_directory() {
+        let root = tree("nav", &["alpha", "beta/inner"]);
+        let mut app = app();
+        app.open_browser_at(root.clone(), None);
+        settle(&mut app);
+        assert_eq!(
+            app.browser_rows(),
+            [
+                dirbrowse::Row::Here,
+                dirbrowse::Row::Up,
+                dirbrowse::Row::Dir("alpha".into()),
+                dirbrowse::Row::Dir("beta".into()),
+            ]
+        );
+
+        // Type to narrow, Enter descends into the best match.
+        typed(&mut app, "be");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(browsing(&app), root.join("beta"));
+        settle(&mut app);
+        assert!(app.browser.as_ref().unwrap().filter.is_empty());
+
+        // Left goes back up and lands on the directory we came out of.
+        key(&mut app, KeyCode::Left);
+        settle(&mut app);
+        assert_eq!(browsing(&app), root);
+        let b = app.browser.as_ref().unwrap();
+        assert_eq!(
+            app.browser_rows()[b.sel],
+            dirbrowse::Row::Dir("beta".into())
+        );
+
+        // Tab descends too; Backspace on an empty filter goes up.
+        key(&mut app, KeyCode::Tab);
+        assert_eq!(browsing(&app), root.join("beta"));
+        key(&mut app, KeyCode::Backspace);
+        assert_eq!(browsing(&app), root);
+        settle(&mut app);
+
+        // A typed path jumps there.
+        typed(&mut app, &format!("{}/beta/inner", root.display()));
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(browsing(&app), root.join("beta/inner"));
+        settle(&mut app);
+
+        // `.` (the first row) moves on to the name, seeded with the directory's name; Esc
+        // steps back to the browser instead of throwing the choice away.
+        key(&mut app, KeyCode::Enter);
+        assert!(app.browser.is_none());
+        let p = app.prompt.as_ref().expect("name prompt");
+        assert_eq!(p.buf, "inner");
+        assert!(matches!(&p.kind, PromptKind::NewSessionIn(d) if *d == root.join("beta/inner")));
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(browsing(&app), root.join("beta/inner"));
+        settle(&mut app);
+
+        let before = app.session_count();
+        key(&mut app, KeyCode::Enter);
+        key(&mut app, KeyCode::Backspace);
+        typed(&mut app, "X");
+        key(&mut app, KeyCode::Enter);
+        assert_eq!(app.session_count(), before + 1);
+        let w = app.state.workspace(&app.ws).expect("switched to it");
+        assert_eq!(w.name.as_deref(), Some("inneX"));
+        assert_eq!(w.dir.as_deref(), Some(root.join("beta/inner").as_path()));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unreadable_directory_still_offers_here_and_up() {
+        let mut app = app();
+        let missing = std::env::temp_dir().join("comux-nsd-definitely-missing");
+        app.open_browser_at(missing, None);
+        settle(&mut app);
+        assert!(matches!(
+            app.browser.as_ref().unwrap().listing,
+            Some(Err(_))
+        ));
+        assert_eq!(
+            app.browser_rows(),
+            [dirbrowse::Row::Here, dirbrowse::Row::Up]
+        );
+    }
+
+    #[test]
+    fn a_new_tab_opens_in_the_session_start_dir_not_the_focused_panes() {
+        let a = tree("start-a", &[]);
+        let b = tree("start-b", &[]);
+        let mut app = app();
+        let r = app.handle_control(&Req::NewSession {
+            name: Some("s".into()),
+            cwd: Some(a.display().to_string()),
+            detached: false,
+        });
+        assert!(r.ok, "{:?}", r.error);
+        let ws = app.ws.clone();
+        // A session's own birth directory is known good without a probe.
+        assert_eq!(app.session_dir(&ws).as_deref(), Some(a.as_path()));
+
+        // Pretend the session started in `b` (so the focused pane, in `a`, differs). A dir
+        // the off-loop probe has not confirmed yet is not used.
+        app.state.set_workspace_dir(&ws, Some(b.clone()));
+        assert_eq!(app.session_dir(&ws), None, "unprobed");
+        probe_until(&mut app, &ws, |d| d.is_some());
+        let term = app.new_tab().expect("tab");
+        assert_eq!(app.terminal_cwd(&term).as_deref(), Some(b.as_path()));
+
+        // Once the probe sees the start dir gone, a new tab falls back to the focused pane.
+        std::fs::remove_dir_all(&b).unwrap();
+        app.dir_probed = None;
+        probe_until(&mut app, &ws, |d| d.is_none());
+        app.cycle_tab(1); // back to the first tab, whose pane is in `a`
+        let term = app.new_tab().expect("fallback tab");
+        assert_eq!(app.terminal_cwd(&term).as_deref(), Some(a.as_path()));
+        let _ = std::fs::remove_dir_all(&a);
+    }
+
+    /// Run the off-loop start-dir probe until `session_dir(ws)` satisfies `done`.
+    fn probe_until(app: &mut App, ws: &WorkspaceId, done: impl Fn(Option<PathBuf>) -> bool) {
+        for _ in 0..400 {
+            app.dir_probed = None;
+            app.maybe_probe_session_dirs();
+            if done(app.session_dir(ws)) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("probe never settled");
+    }
+
+    #[test]
+    fn a_detached_session_moves_nobody_and_names_its_own_pane() {
+        let dir = tree("detached", &[]);
+        let mut app = app();
+        let before_ws = app.ws.clone();
+        let before_term = app.focused_terminal();
+        let r = app.handle_control(&Req::NewSession {
+            name: Some("bg".into()),
+            cwd: Some(dir.display().to_string()),
+            detached: true,
+        });
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(app.ws, before_ws, "the view did not move");
+        assert_eq!(app.focused_terminal(), before_term);
+
+        let session = r.session.expect("session named");
+        assert_ne!(session.id, before_ws.to_string());
+        assert_eq!(session.name, "bg");
+        // The token is the NEW session's pane, never the focused one.
+        let token = r.pane.expect("pane");
+        let tid = app.resolve_pane_token(&token).expect("live token");
+        let (ws, ..) = app.locate_terminal(&tid).unwrap();
+        assert_eq!(ws.to_string(), session.id);
+        assert_eq!(
+            app.state.workspace(&ws).unwrap().dir.as_deref(),
+            Some(dir.as_path())
+        );
+
+        // ...and it lists with its start dir.
+        let l = app.handle_control(&Req::ListSessions);
+        let row = l
+            .sessions
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == session.id)
+            .unwrap();
+        assert_eq!(row.dir, dir.display().to_string());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn split(from: &str, command: &[&str], env: &[&str], cwd: Option<&Path>) -> Req {
+        Req::Split {
+            dir: "down".into(),
+            from: Some(from.into()),
+            no_focus: true,
+            cwd: cwd.map(|c| c.display().to_string()),
+            command: command.iter().map(|s| s.to_string()).collect(),
+            env: env.iter().map(|s| s.to_string()).collect(),
+            keep: false,
+        }
+    }
+
+    fn pane_count(app: &App, ws: &WorkspaceId) -> usize {
+        app.state
+            .workspace(ws)
+            .map(|w| w.tabs.iter().map(|t| t.layout.panes().len()).sum())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_split_runs_a_task_in_another_sessions_tab_without_moving_anyone() {
+        let dir = tree("split", &[]);
+        let mut app = app();
+        let home_ws = app.ws.clone();
+        let r = app.handle_control(&Req::NewSession {
+            name: Some("work".into()),
+            cwd: None,
+            detached: true,
+        });
+        let token = r.pane.unwrap();
+        let ws = app
+            .locate_terminal(&app.resolve_pane_token(&token).unwrap())
+            .unwrap()
+            .0;
+
+        let s = app.handle_control(&split(&token, &["sleep", "30"], &["FOO=bar"], Some(&dir)));
+        assert!(s.ok, "{:?}", s.error);
+        assert_eq!(app.ws, home_ws, "the view did not move");
+        assert_eq!(pane_count(&app, &ws), 2);
+        let made = app.resolve_pane_token(&s.pane.unwrap()).unwrap();
+        assert_eq!(app.terminal_cwd(&made).as_deref(), Some(dir.as_path()));
+
+        // A refused launch splits nothing.
+        for bad in [
+            split(&token, &["true"], &["1X=y"], None),
+            split(&token, &["a\0b"], &[], None),
+            split(&token, &["true"], &[], Some(&dir.join("missing"))),
+        ] {
+            assert_eq!(app.handle_control(&bad).code.as_deref(), Some("invalid"));
+        }
+        assert_eq!(pane_count(&app, &ws), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_keeps_the_saved_start_dir_and_guesses_one_for_old_snapshots() {
+        use persist::{PLayout, PSession, PTab, PersistState};
+        let leaf = |cwd: &str| PLayout::Leaf {
+            cwd: Some(cwd.into()),
+            command: None,
+            pane_ref: None,
+        };
+        let session = |dir: Option<&str>, cwd: &str| PSession {
+            name: None,
+            active_tab: 0,
+            dir: dir.map(str::to_string),
+            tabs: vec![PTab {
+                name: None,
+                layout: leaf(cwd),
+                owner: None,
+            }],
+        };
+        let snap = PersistState {
+            version: persist::SCHEMA_VERSION,
+            saved_at: 0,
+            active_session: 0,
+            sessions: vec![session(Some("/saved"), "/tmp"), session(None, "/tmp")],
+            marks: Vec::new(),
+        };
+        let mut state = State::new();
+        let mut panes = HashMap::new();
+        let r = restore_sessions(&mut state, &mut panes, &snap, 80, 24, &[]).expect("restored");
+        let dirs: Vec<_> = ["local", "s1"]
+            .iter()
+            .map(|id| state.workspace(&WorkspaceId::new(*id)).unwrap().dir.clone())
+            .collect();
+        assert_eq!(
+            dirs,
+            [Some(PathBuf::from("/saved")), Some(PathBuf::from("/tmp"))]
+        );
+        assert_eq!(r.active, WorkspaceId::new("local"));
+    }
+}
+
 /// A-2: inside a pane, an index counts in the CALLER's tab, so `list` and every index verb
 /// agree for an agent in a tab the user is not looking at.
 #[cfg(test)]
@@ -12232,6 +12977,10 @@ mod caller_index {
             dir: "right".into(),
             from: Some(agent.clone()),
             no_focus: true,
+            cwd: None,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
         });
         assert!(s.ok, "{:?}", s.error);
         (agent, s.pane.unwrap())
@@ -12517,6 +13266,7 @@ mod owner_inbox {
         let r = app.handle_control(&Req::NewSession {
             name: Some("kids".into()),
             cwd: None,
+            detached: false,
         });
         assert!(r.ok, "{:?}", r.error);
         let first = r.pane.unwrap();
@@ -12636,6 +13386,7 @@ mod owner_inbox {
                 PSession {
                     name: None,
                     active_tab: 0,
+                    dir: None,
                     tabs: vec![
                         PTab {
                             name: Some("parent".into()),
@@ -12662,6 +13413,7 @@ mod owner_inbox {
                 PSession {
                     name: Some("other".into()),
                     active_tab: 0,
+                    dir: None,
                     tabs: vec![PTab {
                         name: Some("far child".into()),
                         layout: leaf(None),
@@ -12720,6 +13472,7 @@ mod nav {
         let r = app.handle_control(&Req::NewSession {
             name: Some(name.into()),
             cwd: None,
+            detached: false,
         });
         assert!(r.ok, "{:?}", r.error);
     }
@@ -12846,6 +13599,9 @@ mod nav {
             KeyCode::Char('C'),
             KeyModifiers::SHIFT,
         );
+        // The browser's first row is "create here"; that opens the name prompt.
+        key(&mut app, &mut prefix, KeyCode::Enter, KeyModifiers::NONE);
+        app.prompt.as_mut().expect("name prompt").buf.clear();
         for c in "work".chars() {
             key(&mut app, &mut prefix, KeyCode::Char(c), KeyModifiers::NONE);
         }
@@ -12886,6 +13642,7 @@ mod nav {
         let r = app.handle_control(&Req::NewSession {
             name: Some("bg".into()),
             cwd: None,
+            detached: false,
         });
         assert!(r.ok);
         select(&mut app, "a");
@@ -12940,6 +13697,10 @@ mod nav {
             dir: "right".into(),
             from: None,
             no_focus: false,
+            cwd: None,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
         });
         assert!(r.ok, "{:?}", r.error);
         let split = app.focused_terminal().unwrap();
@@ -13022,6 +13783,7 @@ mod overlay_width {
             app.handle_control(&Req::NewSession {
                 name: Some(name.into()),
                 cwd: None,
+                detached: false,
             })
             .ok
         );
@@ -13058,6 +13820,7 @@ mod overlay_width {
                 app.handle_control(&Req::NewSession {
                     name: Some("한글".repeat(40)),
                     cwd: None,
+                    detached: false,
                 })
                 .ok
             );
@@ -13263,6 +14026,10 @@ mod key_help {
             dir: "right".into(),
             from: None,
             no_focus: false,
+            cwd: None,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
         });
         assert!(r.ok);
         let focused = app.focused_terminal();
@@ -13488,6 +14255,7 @@ mod switcher_preview {
                     app.handle_control(&Req::NewSession {
                         name: Some((*n).into()),
                         cwd: None,
+                        detached: false,
                     })
                     .ok
                 );
@@ -13627,6 +14395,7 @@ mod attention {
                     app.handle_control(&Req::NewSession {
                         name: Some((*n).into()),
                         cwd: None,
+                        detached: false,
                     })
                     .ok
                 );
@@ -13739,6 +14508,7 @@ mod sidebar_git {
             app.handle_control(&Req::NewSession {
                 name: Some("a-very-long-session-name-that-cannot-fit".into()),
                 cwd: None,
+                detached: false,
             })
             .ok
         );
@@ -13759,6 +14529,7 @@ mod sidebar_git {
             app.handle_control(&Req::NewSession {
                 name: Some("repo".into()),
                 cwd: Some(dir.to_string_lossy().into_owned()),
+                detached: false,
             })
             .ok
         );
@@ -13803,6 +14574,7 @@ mod broadcast {
         let r = app.handle_control(&Req::NewSession {
             name: Some(name.into()),
             cwd: None,
+            detached: false,
         });
         assert!(r.ok);
         r.pane.expect("token")
@@ -13975,6 +14747,10 @@ mod zoom_titles {
             dir: dir.into(),
             from: None,
             no_focus: false,
+            cwd: None,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
         });
         assert!(r.ok, "{:?}", r.error);
     }
@@ -14052,6 +14828,7 @@ mod zoom_titles {
             app.handle_control(&Req::NewSession {
                 name: Some("elsewhere".into()),
                 cwd: None,
+                detached: false,
             })
             .ok
         );
@@ -14355,6 +15132,7 @@ mod marks {
         let r = app.handle_control(&Req::NewSession {
             name: Some(name.into()),
             cwd: None,
+            detached: false,
         });
         assert!(r.ok);
         let token = r.pane.unwrap();

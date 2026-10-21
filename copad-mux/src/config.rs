@@ -381,7 +381,7 @@ impl Action {
             CloseTab => "close the tab",
             SelectTab(_) => "go to tab 1–9",
             RenameTab => "rename the tab",
-            NewSession => "new session (name prompt)",
+            NewSession => "new session (pick dir, name)",
             NewWorktree => "new git worktree + session (branch prompt)",
             RenameSession => "rename the session",
             NextSession => "next session",
