@@ -6,9 +6,24 @@
 use std::collections::HashMap;
 
 use crate::model::{
-    AgentState, ClientId, Dir, LayoutSpec, PaneId, Rect, Role, SplitTree, Tab, TabId, Terminal,
-    TerminalId, Workspace, WorkspaceId,
+    AgentState, ClientId, Dir, LayoutPreset, LayoutSpec, PaneId, Rect, Role, SplitTree, Tab, TabId,
+    Terminal, TerminalId, Workspace, WorkspaceId,
 };
+
+/// How [`Command::Rearrange`] reorders the panes of a tab. Every one keeps each pane with its
+/// terminal; only positions and the tree around them change.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Rearrange {
+    /// Trade places with the pane `delta` slots away in DFS order, wrapping (tmux
+    /// `swap-pane`: `{` is `-1`, `}` is `+1`).
+    Swap(i32),
+    /// Every pane moves one slot (tmux `rotate-window`; `true` = up, its default).
+    Rotate(bool),
+    /// Rebuild in a preset shape (tmux `select-layout`).
+    Preset(LayoutPreset),
+    /// Keep the shape, even out every split (tmux `select-layout -E`).
+    Spread,
+}
 
 /// One tab to restore: its name, split-layout shape, and whether it was the active tab.
 pub struct RestoredTab {
@@ -132,6 +147,31 @@ pub enum Command {
         path: Vec<bool>,
         ratio: f32,
     },
+    /// Reorder or reshape the tab holding `pane` (swap, rotate, preset layout, spread).
+    /// Clears the tab's zoom. Controller/API only. A no-op (one pane, ratios already even)
+    /// emits nothing.
+    Rearrange {
+        origin: Origin,
+        workspace: WorkspaceId,
+        pane: PaneId,
+        op: Rearrange,
+    },
+    /// Move `pane` out of its tab into a NEW tab of its own, right after it, and make that
+    /// active (tmux `break-pane`). The terminal moves with it — nothing is respawned. Refused
+    /// for a tab's only pane.
+    BreakPane {
+        origin: Origin,
+        workspace: WorkspaceId,
+        pane: PaneId,
+    },
+    /// Move `tab` to position `to` in the workspace's tab order (tmux `move-window` /
+    /// `swap-window`), clamped to the ends.
+    MoveTab {
+        origin: Origin,
+        workspace: WorkspaceId,
+        tab: TabId,
+        to: usize,
+    },
 }
 
 /// A terminal's derived geometry + its new revision, carried in `Resized` so a
@@ -208,6 +248,11 @@ pub enum Event {
         terminal: TerminalId,
         workspace_rev: u64,
     },
+    /// The workspace's tabs changed ORDER (no geometry moved).
+    TabsReordered {
+        workspace: WorkspaceId,
+        workspace_rev: u64,
+    },
     /// The active tab changed (geometry of the newly-active tab is re-derived and
     /// carried in the accompanying `Resized`).
     TabSelected {
@@ -250,6 +295,8 @@ pub enum MuxError {
     CannotCloseLastTab,
     #[error("only one pane in this tab — nothing to zoom")]
     CannotZoomSinglePane,
+    #[error("only one pane in this tab — nothing to break out")]
+    CannotBreakOnlyPane,
 }
 
 struct Attach {
@@ -584,6 +631,23 @@ impl State {
                 path,
                 ratio,
             } => self.set_split_ratio(origin, workspace, path, ratio),
+            Command::Rearrange {
+                origin,
+                workspace,
+                pane,
+                op,
+            } => self.rearrange(origin, workspace, pane, op),
+            Command::BreakPane {
+                origin,
+                workspace,
+                pane,
+            } => self.break_pane(origin, workspace, pane),
+            Command::MoveTab {
+                origin,
+                workspace,
+                tab,
+                to,
+            } => self.move_tab(origin, workspace, tab, to),
         }
     }
 
@@ -1264,6 +1328,148 @@ impl State {
         }
         tab.rev += 1;
         self.workspaces[idx].rev += 1;
+        let ws_rev = self.workspaces[idx].rev;
+        let terms = self.recompute_sizes(idx);
+        let vp = self.workspaces[idx].viewport;
+        Ok(vec![Event::Resized {
+            workspace,
+            cols: vp.cols,
+            rows: vp.rows,
+            terminals: terms,
+            workspace_rev: ws_rev,
+        }])
+    }
+
+    fn rearrange(
+        &mut self,
+        origin: Origin,
+        workspace: WorkspaceId,
+        pane: PaneId,
+        op: Rearrange,
+    ) -> Result<Vec<Event>, MuxError> {
+        self.authorize_mutation(&origin, &workspace)?;
+        let idx = self.ws_index(&workspace)?;
+        let tab = self.workspaces[idx]
+            .tab_of_pane_mut(&pane)
+            .ok_or(MuxError::NoSuchPane)?;
+        let tab_id = tab.id.clone();
+        let changed = match op {
+            Rearrange::Swap(delta) => tab.layout.swap_with(&pane, delta),
+            Rearrange::Rotate(up) => tab.layout.rotate(up),
+            Rearrange::Spread => tab.layout.spread(),
+            Rearrange::Preset(p) => {
+                let leaves = tab.layout.leaves();
+                if leaves.len() < 2 {
+                    false
+                } else {
+                    match SplitTree::preset(leaves, p) {
+                        Some(t) if t != tab.layout => {
+                            tab.layout = t;
+                            true
+                        }
+                        _ => false,
+                    }
+                }
+            }
+        };
+        if !changed {
+            return Ok(vec![]);
+        }
+        // A rearranged tab is shown whole: the zoom was over a pane in a layout that is gone.
+        tab.zoomed = None;
+        tab.rev += 1;
+        self.workspaces[idx].rev += 1;
+        self.resized_if_active(idx, &tab_id, workspace)
+    }
+
+    fn break_pane(
+        &mut self,
+        origin: Origin,
+        workspace: WorkspaceId,
+        pane: PaneId,
+    ) -> Result<Vec<Event>, MuxError> {
+        self.authorize_mutation(&origin, &workspace)?;
+        let idx = self.ws_index(&workspace)?;
+        let tab = self.workspaces[idx]
+            .tab_of_pane_mut(&pane)
+            .ok_or(MuxError::NoSuchPane)?;
+        if tab.layout.is_single_leaf() {
+            return Err(MuxError::CannotBreakOnlyPane);
+        }
+        let source = tab.id.clone();
+        let terminal = tab.layout.remove_leaf(&pane).ok_or(MuxError::NoSuchPane)?;
+        if tab.focused == pane {
+            tab.focused = tab.layout.leftmost_pane();
+        }
+        tab.zoomed = None;
+        tab.rev += 1;
+        let n = self.next_tab;
+        self.next_tab += 1;
+        let tab_id = TabId::new(format!("{workspace}:t{n}"));
+        let ws = &mut self.workspaces[idx];
+        let at = ws
+            .tabs
+            .iter()
+            .position(|t| t.id == source)
+            .map_or(ws.tabs.len(), |i| i + 1);
+        ws.tabs.insert(
+            at,
+            Tab {
+                id: tab_id.clone(),
+                name: None,
+                layout: SplitTree::Leaf {
+                    pane: pane.clone(),
+                    terminal,
+                },
+                focused: pane,
+                rev: 0,
+                zoomed: None,
+            },
+        );
+        ws.active_tab = tab_id.clone();
+        ws.rev += 1;
+        self.resized_if_active(idx, &tab_id, workspace)
+    }
+
+    fn move_tab(
+        &mut self,
+        origin: Origin,
+        workspace: WorkspaceId,
+        tab: TabId,
+        to: usize,
+    ) -> Result<Vec<Event>, MuxError> {
+        self.authorize_mutation(&origin, &workspace)?;
+        let idx = self.ws_index(&workspace)?;
+        let ws = &mut self.workspaces[idx];
+        let from = ws
+            .tabs
+            .iter()
+            .position(|t| t.id == tab)
+            .ok_or(MuxError::NoSuchTab)?;
+        let to = to.min(ws.tabs.len() - 1);
+        if from == to {
+            return Ok(vec![]);
+        }
+        let t = ws.tabs.remove(from);
+        ws.tabs.insert(to, t);
+        ws.rev += 1;
+        Ok(vec![Event::TabsReordered {
+            workspace,
+            workspace_rev: ws.rev,
+        }])
+    }
+
+    /// The `Resized` event for a geometry change in `tab`, when `tab` is the one on screen
+    /// (a background tab keeps its frozen sizes until it is selected).
+    fn resized_if_active(
+        &mut self,
+        idx: usize,
+        tab: &TabId,
+        workspace: WorkspaceId,
+    ) -> Result<Vec<Event>, MuxError> {
+        if self.workspaces[idx].active_tab != *tab {
+            return Ok(vec![]);
+        }
         let ws_rev = self.workspaces[idx].rev;
         let terms = self.recompute_sizes(idx);
         let vp = self.workspaces[idx].viewport;
@@ -2293,6 +2499,9 @@ mod proptests {
         NewTab,
         SelectTab(usize),
         CloseTab(usize),
+        Arrange(usize, u8), // pane index, which rearrangement
+        BreakPane(usize),
+        MoveTab(usize, usize),
     }
 
     fn op_strategy() -> impl Strategy<Value = Op> {
@@ -2309,6 +2518,9 @@ mod proptests {
             Just(Op::NewTab),
             (0usize..6).prop_map(Op::SelectTab),
             (0usize..6).prop_map(Op::CloseTab),
+            (0usize..6, 0u8..9).prop_map(|(p, k)| Op::Arrange(p, k)),
+            (0usize..6).prop_map(Op::BreakPane),
+            (0usize..6, 0usize..6).prop_map(|(t, to)| Op::MoveTab(t, to)),
         ]
     }
 
@@ -2402,6 +2614,34 @@ mod proptests {
                         let tabs = tab_ids(&s, &ws);
                         let t = tabs[ti % tabs.len()].clone();
                         let _ = s.apply(Command::CloseTab { origin: Origin::Api, workspace: ws.clone(), tab: t });
+                    }
+                    Op::Arrange(pi, k) => {
+                        let Some(p) = pick(pi) else { continue };
+                        let op = match k {
+                            0 => Rearrange::Swap(-1),
+                            1 => Rearrange::Swap(1),
+                            2 => Rearrange::Rotate(true),
+                            3 => Rearrange::Rotate(false),
+                            4 => Rearrange::Spread,
+                            n => Rearrange::Preset(LayoutPreset::CYCLE[(n as usize - 5) % 5]),
+                        };
+                        let before: std::collections::BTreeSet<String> =
+                            panes(&s, &ws).iter().map(|p| p.to_string()).collect();
+                        let _ = s.apply(Command::Rearrange { origin: Origin::Api, workspace: ws.clone(), pane: p, op });
+                        let after: std::collections::BTreeSet<String> =
+                            panes(&s, &ws).iter().map(|p| p.to_string()).collect();
+                        prop_assert_eq!(before, after, "a rearrangement lost or invented a pane");
+                    }
+                    Op::BreakPane(pi) => {
+                        let Some(p) = pick(pi) else { continue };
+                        let n = panes(&s, &ws).len();
+                        let _ = s.apply(Command::BreakPane { origin: Origin::Api, workspace: ws.clone(), pane: p });
+                        prop_assert_eq!(panes(&s, &ws).len(), n, "break-pane changed the pane count");
+                    }
+                    Op::MoveTab(ti, to) => {
+                        let tabs = tab_ids(&s, &ws);
+                        let t = tabs[ti % tabs.len()].clone();
+                        let _ = s.apply(Command::MoveTab { origin: Origin::Api, workspace: ws.clone(), tab: t, to });
                     }
                 }
 

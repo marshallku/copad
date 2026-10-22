@@ -368,6 +368,25 @@ pub enum Action {
     /// Arm the prefix (`Ctrl-b`). A global-table action like any other, but prefix
     /// entry always wins over a colliding user binding.
     EnterPrefix,
+    /// `Ctrl-b {` / `}` (tmux `swap-pane -U`/`-D`): trade places with the previous / next
+    /// pane; focus stays on the pane that moved.
+    SwapPaneUp,
+    SwapPaneDown,
+    /// `Ctrl-b Ctrl-o` / `M-o` (tmux `rotate-window`): every pane moves one slot.
+    RotatePanes,
+    RotatePanesBack,
+    /// `Ctrl-b Space` (tmux `next-layout`): cycle the tab through the preset layouts.
+    NextLayout,
+    /// `Ctrl-b M-1`..`M-5` (tmux `select-layout`): one preset outright.
+    Layout(crate::model::LayoutPreset),
+    /// `Ctrl-b E` (tmux `select-layout -E`): keep the shape, even out every split.
+    SpreadPanes,
+    /// `Ctrl-b B` (tmux `break-pane`, which comux's `!` already means something else for):
+    /// move the focused pane into a new tab of its own.
+    BreakPane,
+    /// `Ctrl-b S-Left` / `S-Right`: move the active tab one place along the tab bar.
+    MoveTabLeft,
+    MoveTabRight,
     /// `Ctrl-b Ctrl-b` (tmux `send-prefix`): type the prefix key itself into the pane, for
     /// a nested tmux/comux or readline's back-char. Bound to the prefix chord by default,
     /// whatever `prefix` is set to.
@@ -418,6 +437,20 @@ impl Action {
             NavLast => "toggle to the previous session / tab",
             KeyHelp => "this help",
             SendPrefix => "send the prefix key to the pane",
+            SwapPaneUp => "swap the pane with the previous one",
+            SwapPaneDown => "swap the pane with the next one",
+            RotatePanes => "rotate the panes",
+            RotatePanesBack => "rotate the panes the other way",
+            NextLayout => "next preset layout",
+            Layout(crate::model::LayoutPreset::EvenHorizontal) => "layout: side by side",
+            Layout(crate::model::LayoutPreset::EvenVertical) => "layout: stacked",
+            Layout(crate::model::LayoutPreset::MainHorizontal) => "layout: main on top",
+            Layout(crate::model::LayoutPreset::MainVertical) => "layout: main on the left",
+            Layout(crate::model::LayoutPreset::Tiled) => "layout: tiled grid",
+            SpreadPanes => "spread the panes evenly",
+            BreakPane => "move the pane to a new tab",
+            MoveTabLeft => "move the tab left",
+            MoveTabRight => "move the tab right",
             ZoomPane => "zoom the pane to the whole tab, and back",
             Mark => "pin the pane to a slot (then 1–9)",
             GotoMark => "go to a pinned slot (then 1–9)",
@@ -705,6 +738,18 @@ fn action_from_name(name: &str) -> Option<Action> {
         "goto-mark" => Action::GotoMark,
         "prefix" => Action::EnterPrefix,
         "send-prefix" => Action::SendPrefix,
+        "swap-pane-up" => Action::SwapPaneUp,
+        "swap-pane-down" => Action::SwapPaneDown,
+        "rotate-panes" => Action::RotatePanes,
+        "rotate-panes-back" => Action::RotatePanesBack,
+        "next-layout" => Action::NextLayout,
+        "spread-panes" => Action::SpreadPanes,
+        "break-pane" => Action::BreakPane,
+        "move-tab-left" => Action::MoveTabLeft,
+        "move-tab-right" => Action::MoveTabRight,
+        _ if name.starts_with("layout-") => Action::Layout(crate::model::LayoutPreset::from_name(
+            &name["layout-".len()..],
+        )?),
         _ => {
             // tab-1 .. tab-9
             let n = name.strip_prefix("tab-")?.parse::<u8>().ok()?;
@@ -788,6 +833,36 @@ fn default_bindings() -> Vec<(Action, Ctx, &'static [&'static str])> {
         (ZoomPane, Prefix, &["z"]),
         (Mark, Prefix, &["m"]),
         (GotoMark, Prefix, &["'"]),
+        (SwapPaneUp, Prefix, &["{"]),
+        (SwapPaneDown, Prefix, &["}"]),
+        (RotatePanes, Prefix, &["C-o"]),
+        (RotatePanesBack, Prefix, &["M-o"]),
+        (NextLayout, Prefix, &["Space"]),
+        (
+            Layout(crate::model::LayoutPreset::EvenHorizontal),
+            Prefix,
+            &["M-1"],
+        ),
+        (
+            Layout(crate::model::LayoutPreset::EvenVertical),
+            Prefix,
+            &["M-2"],
+        ),
+        (
+            Layout(crate::model::LayoutPreset::MainHorizontal),
+            Prefix,
+            &["M-3"],
+        ),
+        (
+            Layout(crate::model::LayoutPreset::MainVertical),
+            Prefix,
+            &["M-4"],
+        ),
+        (Layout(crate::model::LayoutPreset::Tiled), Prefix, &["M-5"]),
+        (SpreadPanes, Prefix, &["E"]),
+        (BreakPane, Prefix, &["B"]),
+        (MoveTabLeft, Prefix, &["S-Left"]),
+        (MoveTabRight, Prefix, &["S-Right"]),
         // No literal default: `build_keymap` binds it to whatever the prefix chord is.
         (SendPrefix, Prefix, &[]),
     ]

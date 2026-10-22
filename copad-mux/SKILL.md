@@ -139,6 +139,15 @@ nothing to quote — under your login shell's PATH. The tab goes in your own ses
 output with it; pass `--keep` when you will want to read the result, or when a failure to
 start would otherwise vanish.
 
+Once several panes share your tab, arrange them instead of nudging dividers. Every one acts on
+YOUR tab (the one holding `$COPAD_MUX_PANE`):
+
+```bash
+comux select-layout tiled          # even-horizontal | even-vertical | main-horizontal | main-vertical | tiled
+comux select-layout -E             # keep the shape, even out the splits
+comux break-pane --pane <token>    # move that pane into a tab of its own
+```
+
 `send` writes raw bytes: it does not escape anything and it does not press Enter for you.
 `--enter` presses it after the text; `--paste` sends a multi-line prompt as ONE paste (bracketed
 when the program enabled that, as agent TUIs do); `--file PATH` sends a file's contents.
@@ -334,6 +343,9 @@ tab). Check it: that line is the only non-transient evidence you addressed the r
   moves their view.
 - **Do not `jump`, `select-session`, `select-tab`, `back`, `forward`, `last` or `zoom`** without
   asking. They move what the user is looking at, and token addressing means you almost never need to.
+- **Do not `select-layout`, `swap-pane`, `rotate-window`, `break-pane` or `move-tab` a tab the
+  user is working in** without asking: a layout they arranged by hand is theirs. Arranging panes
+  you created in a tab of your own is fine.
 - **Do not poll in a shell loop.** `wait-output` / `wait-agent` already poll, under one
   deadline, with a floor on the interval.
 - **Do not treat a `124` as success.** Report the timeout.

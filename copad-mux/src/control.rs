@@ -247,6 +247,25 @@ pub enum Req {
     Nav { dir: NavDir },
     /// Toggle the zoom of the active tab's focused pane (`Ctrl-b z`). Moves the shared view.
     Zoom,
+    /// Rearrange the tab holding the caller's pane (or the focused one): `op` is a preset
+    /// (`even-horizontal`, `even-vertical`, `main-horizontal`, `main-vertical`, `tiled`),
+    /// `next`, `spread`, `swap-up`/`swap-down`, or `rotate`/`rotate-back` (decisions #158).
+    Arrange {
+        op: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<String>,
+    },
+    /// Move the caller's pane (or the focused one) into a new tab of its own (`break-pane`).
+    BreakPane {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<String>,
+    },
+    /// Move the caller's tab (or the active one) to position `to` (0-based).
+    MoveTab {
+        to: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<String>,
+    },
     /// Fork a live agent pane's conversation into a new tab of its session (decisions #150).
     Fork {
         target: String,
@@ -522,6 +541,7 @@ pub const SERVER_CAPS: &[&str] = &[
     CAP_FORK,
     CAP_DETACHED_SESSION,
     CAP_SPLIT_SPAWN,
+    CAP_ARRANGE,
 ];
 
 /// Capability: `new-session --detached` (an older server would ignore the field and switch).
@@ -548,6 +568,9 @@ pub struct MarkInfo {
 
 /// Capability: `fork`.
 pub const CAP_FORK: &str = "fork";
+
+/// Capability: `select-layout` / `swap-pane` / `rotate-window` / `break-pane` / `move-tab`.
+pub const CAP_ARRANGE: &str = "arrange";
 
 /// Capability: `mark` / `marks` / `goto`.
 pub const CAP_MARKS: &str = "marks";
@@ -1376,6 +1399,77 @@ pub fn run_client(args: &[String]) -> i32 {
                 "usage: comux zoom    (toggle the focused pane filling its tab; Ctrl-b z)"
             ));
             Req::Zoom
+        }
+        "select-layout" | "swap-pane" | "rotate-window" => {
+            let (spec, op) = match cmd {
+                "select-layout" => {
+                    let p = parsed!(SELECT_LAYOUT_SPEC);
+                    let op = if p.has("-E") {
+                        Some("spread".to_string())
+                    } else {
+                        p.positionals.first().cloned()
+                    };
+                    let known = op.as_deref().is_some_and(|o| {
+                        o == "next"
+                            || o == "spread"
+                            || crate::model::LayoutPreset::from_name(o).is_some()
+                    });
+                    if !known {
+                        return usage_error(
+                            json_out,
+                            "comux select-layout: which layout?",
+                            SELECT_LAYOUT_SPEC.usage,
+                        );
+                    }
+                    (p, op.unwrap_or_default())
+                }
+                "swap-pane" => {
+                    let p = parsed!(SWAP_PANE_SPEC);
+                    let op = if p.has("-U") { "swap-up" } else { "swap-down" };
+                    (p, op.to_string())
+                }
+                _ => {
+                    let p = parsed!(ROTATE_SPEC);
+                    let op = if p.has("-D") { "rotate-back" } else { "rotate" };
+                    (p, op.to_string())
+                }
+            };
+            if let Err(code) = require_cap(CAP_ARRANGE, cmd, json_out) {
+                return code;
+            }
+            Req::Arrange {
+                op,
+                caller: spec
+                    .value("--pane")
+                    .map(str::to_string)
+                    .or_else(caller_pane),
+            }
+        }
+        "break-pane" => {
+            let p = parsed!(BREAK_PANE_SPEC);
+            if let Err(code) = require_cap(CAP_ARRANGE, cmd, json_out) {
+                return code;
+            }
+            Req::BreakPane {
+                caller: p.value("--pane").map(str::to_string).or_else(caller_pane),
+            }
+        }
+        "move-tab" => {
+            let p = parsed!(MOVE_TAB_SPEC);
+            let Some(to) = p.positionals.first().and_then(|s| s.parse::<usize>().ok()) else {
+                return usage_error(
+                    json_out,
+                    "comux move-tab: to which position?",
+                    MOVE_TAB_SPEC.usage,
+                );
+            };
+            if let Err(code) = require_cap(CAP_ARRANGE, cmd, json_out) {
+                return code;
+            }
+            Req::MoveTab {
+                to,
+                caller: p.value("--pane").map(str::to_string).or_else(caller_pane),
+            }
         }
         "back" => {
             parsed!(cliargs::bare(
@@ -2467,6 +2561,42 @@ const NOTIFY_SPEC: Spec = Spec {
         opt(&["--result"]),
     ],
     positionals: Positionals::Any,
+};
+
+const SELECT_LAYOUT_SPEC: Spec = Spec {
+    usage: "usage: comux select-layout <layout> [--pane <token>]   re-arrange your tab (Ctrl-b M-1..5)\n\
+            \x20      layouts: even-horizontal even-vertical main-horizontal main-vertical tiled\n\
+            \x20               next (Ctrl-b Space)   -E / spread: even out the splits (Ctrl-b E)",
+    flags: &[flag(&["-E"]), opt(&["--pane"])],
+    positionals: Positionals::AtMost(1),
+};
+
+const SWAP_PANE_SPEC: Spec = Spec {
+    usage: "usage: comux swap-pane -U|-D [--pane <token>]   trade places with the previous (-U) or\n\
+            \x20      next (-D, default) pane in your tab (Ctrl-b { / })",
+    flags: &[flag(&["-U"]), flag(&["-D"]), opt(&["--pane"])],
+    positionals: Positionals::AtMost(0),
+};
+
+const ROTATE_SPEC: Spec = Spec {
+    usage: "usage: comux rotate-window [-U|-D] [--pane <token>]   every pane in your tab moves one\n\
+            \x20      slot (Ctrl-b C-o / M-o)",
+    flags: &[flag(&["-U"]), flag(&["-D"]), opt(&["--pane"])],
+    positionals: Positionals::AtMost(0),
+};
+
+const BREAK_PANE_SPEC: Spec = Spec {
+    usage: "usage: comux break-pane [--pane <token>]   move your pane into a new tab of its own\n\
+            \x20      (Ctrl-b B)",
+    flags: &[opt(&["--pane"])],
+    positionals: Positionals::AtMost(0),
+};
+
+const MOVE_TAB_SPEC: Spec = Spec {
+    usage: "usage: comux move-tab <position> [--pane <token>]   move your tab to that position\n\
+            \x20      (0 = first; Ctrl-b S-Left / S-Right move it one place)",
+    flags: &[opt(&["--pane"])],
+    positionals: Positionals::AtMost(1),
 };
 
 const FORK_SPEC: Spec = Spec {
@@ -3942,6 +4072,11 @@ mod verb_args_tests {
         "forward",
         "last",
         "zoom",
+        "select-layout",
+        "swap-pane",
+        "rotate-window",
+        "break-pane",
+        "move-tab",
         "fork",
         "mark",
         "marks",

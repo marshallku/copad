@@ -124,6 +124,60 @@ pub enum LayoutSpec {
     },
 }
 
+/// A preset arrangement (tmux `select-layout`). Rebuilding a tab in one keeps every pane and
+/// its terminal — only the tree around them changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LayoutPreset {
+    /// Every pane side by side, equal widths.
+    EvenHorizontal,
+    /// Every pane stacked, equal heights.
+    EvenVertical,
+    /// The first pane across the top, the rest side by side beneath it.
+    MainHorizontal,
+    /// The first pane on the left, the rest stacked to its right.
+    MainVertical,
+    /// As near a square grid as the pane count allows.
+    Tiled,
+}
+
+impl LayoutPreset {
+    /// tmux's `next-layout` order.
+    pub const CYCLE: [LayoutPreset; 5] = [
+        LayoutPreset::EvenHorizontal,
+        LayoutPreset::EvenVertical,
+        LayoutPreset::MainHorizontal,
+        LayoutPreset::MainVertical,
+        LayoutPreset::Tiled,
+    ];
+
+    /// tmux's name for it (`even-horizontal`, …).
+    pub fn name(self) -> &'static str {
+        match self {
+            LayoutPreset::EvenHorizontal => "even-horizontal",
+            LayoutPreset::EvenVertical => "even-vertical",
+            LayoutPreset::MainHorizontal => "main-horizontal",
+            LayoutPreset::MainVertical => "main-vertical",
+            LayoutPreset::Tiled => "tiled",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<LayoutPreset> {
+        LayoutPreset::CYCLE.into_iter().find(|p| p.name() == s)
+    }
+
+    /// The one after `self` in [`LayoutPreset::CYCLE`], wrapping.
+    pub fn next(self) -> LayoutPreset {
+        let i = LayoutPreset::CYCLE
+            .iter()
+            .position(|p| *p == self)
+            .unwrap_or(0);
+        LayoutPreset::CYCLE[(i + 1) % LayoutPreset::CYCLE.len()]
+    }
+}
+
+/// The main pane's share in the `main-*` presets.
+const MAIN_SHARE: f32 = 0.6;
+
 /// A rectangle in terminal cells, used to derive per-pane geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rect {
@@ -283,6 +337,176 @@ impl SplitTree {
         matches!(self, SplitTree::Leaf { .. })
     }
 
+    /// Every leaf's `(pane, terminal)`, DFS pre-order.
+    pub fn leaves(&self) -> Vec<(PaneId, TerminalId)> {
+        match self {
+            SplitTree::Leaf { pane, terminal } => vec![(pane.clone(), terminal.clone())],
+            SplitTree::Branch { first, second, .. } => {
+                let mut v = first.leaves();
+                v.extend(second.leaves());
+                v
+            }
+        }
+    }
+
+    /// Put `leaves` into this tree's leaf slots in DFS pre-order, keeping its shape. The
+    /// caller passes exactly as many as there are slots (a permutation of [`Self::leaves`]).
+    fn refill(&mut self, leaves: &mut std::vec::IntoIter<(PaneId, TerminalId)>) {
+        match self {
+            SplitTree::Leaf { pane, terminal } => {
+                if let Some((p, t)) = leaves.next() {
+                    *pane = p;
+                    *terminal = t;
+                }
+            }
+            SplitTree::Branch { first, second, .. } => {
+                first.refill(leaves);
+                second.refill(leaves);
+            }
+        }
+    }
+
+    /// Trade places with the pane `delta` slots away in DFS order, wrapping (tmux
+    /// `swap-pane -U`/`-D`). Returns false when there is nothing to swap.
+    pub fn swap_with(&mut self, pane: &PaneId, delta: i32) -> bool {
+        let mut leaves = self.leaves();
+        let n = leaves.len() as i32;
+        let Some(i) = leaves.iter().position(|(p, _)| p == pane) else {
+            return false;
+        };
+        if n < 2 {
+            return false;
+        }
+        let j = (i as i32 + delta).rem_euclid(n) as usize;
+        leaves.swap(i, j);
+        self.refill(&mut leaves.into_iter());
+        true
+    }
+
+    /// Every pane moves one slot along DFS order, the end wrapping round (tmux
+    /// `rotate-window`; `up` = towards the first slot). Returns false for a single pane.
+    pub fn rotate(&mut self, up: bool) -> bool {
+        let mut leaves = self.leaves();
+        if leaves.len() < 2 {
+            return false;
+        }
+        if up {
+            leaves.rotate_left(1);
+        } else {
+            leaves.rotate_right(1);
+        }
+        self.refill(&mut leaves.into_iter());
+        true
+    }
+
+    /// The tree for `leaves` (DFS order kept) arranged as `preset`.
+    pub fn preset(leaves: Vec<(PaneId, TerminalId)>, preset: LayoutPreset) -> Option<SplitTree> {
+        if leaves.is_empty() {
+            return None;
+        }
+        Some(match preset {
+            LayoutPreset::EvenHorizontal => Self::even(leaves, Dir::Right),
+            LayoutPreset::EvenVertical => Self::even(leaves, Dir::Down),
+            LayoutPreset::MainHorizontal | LayoutPreset::MainVertical => {
+                let (main_dir, rest_dir) = if preset == LayoutPreset::MainVertical {
+                    (Dir::Right, Dir::Down)
+                } else {
+                    (Dir::Down, Dir::Right)
+                };
+                let mut it = leaves.into_iter();
+                let (pane, terminal) = it.next()?;
+                let main = SplitTree::Leaf { pane, terminal };
+                let rest: Vec<_> = it.collect();
+                if rest.is_empty() {
+                    return Some(main);
+                }
+                SplitTree::Branch {
+                    dir: main_dir,
+                    ratio: MAIN_SHARE,
+                    first: Box::new(main),
+                    second: Box::new(Self::even(rest, rest_dir)),
+                }
+            }
+            LayoutPreset::Tiled => {
+                // tmux's grid: as many columns as the square root rounds up to, rows to fit.
+                let n = leaves.len();
+                let cols = (1..=n).find(|c| c * c >= n).unwrap_or(1);
+                let rows: Vec<Vec<_>> = leaves.chunks(cols).map(|c| c.to_vec()).collect();
+                let rows: Vec<SplitTree> = rows
+                    .into_iter()
+                    .map(|r| Self::even(r, Dir::Right))
+                    .collect();
+                Self::even_trees(rows, Dir::Down)
+            }
+        })
+    }
+
+    /// `leaves` in a row (`Right`) or column (`Down`), each an equal share.
+    fn even(leaves: Vec<(PaneId, TerminalId)>, dir: Dir) -> SplitTree {
+        let trees = leaves
+            .into_iter()
+            .map(|(pane, terminal)| SplitTree::Leaf { pane, terminal })
+            .collect();
+        Self::even_trees(trees, dir)
+    }
+
+    /// `trees` along `dir`, each an equal share. Built BALANCED (halves of halves) rather
+    /// than as a chain of `1/n`, `1/(n-1)`, …: every ratio stays within `[1/3, 1/2]`, far from
+    /// the clamp `split3` applies to extreme ones, so forty panes still come out equal.
+    fn even_trees(mut trees: Vec<SplitTree>, dir: Dir) -> SplitTree {
+        let n = trees.len();
+        if n == 1 {
+            return trees.pop().expect("one tree");
+        }
+        let second = trees.split_off(n / 2);
+        SplitTree::Branch {
+            dir,
+            ratio: (n / 2) as f32 / n as f32,
+            first: Box::new(Self::even_trees(trees, dir)),
+            second: Box::new(Self::even_trees(second, dir)),
+        }
+    }
+
+    /// Keep the shape but even out every split (tmux `select-layout -E`): each side of a
+    /// branch gets a share proportional to how many panes it lines up ALONG that branch's
+    /// direction, so `a | (b | c)` becomes thirds and `a | (b / c)` halves. Returns whether
+    /// any ratio moved.
+    pub fn spread(&mut self) -> bool {
+        match self {
+            SplitTree::Leaf { .. } => false,
+            SplitTree::Branch {
+                dir,
+                ratio,
+                first,
+                second,
+            } => {
+                let (a, b) = (first.slots_along(*dir), second.slots_along(*dir));
+                let want = a as f32 / (a + b) as f32;
+                let moved = (*ratio - want).abs() > f32::EPSILON;
+                *ratio = want;
+                let f = first.spread();
+                let s = second.spread();
+                moved || f || s
+            }
+        }
+    }
+
+    /// How many panes this subtree lines up along `dir`.
+    fn slots_along(&self, dir: Dir) -> usize {
+        match self {
+            SplitTree::Leaf { .. } => 1,
+            SplitTree::Branch {
+                dir: d,
+                first,
+                second,
+                ..
+            } => {
+                let (a, b) = (first.slots_along(dir), second.slots_along(dir));
+                if *d == dir { a + b } else { a.max(b) }
+            }
+        }
+    }
+
     /// Nudge the divider of the DEEPEST ancestor branch on `axis` that contains
     /// `pane`, growing (or shrinking) `pane`'s share by `step` (a 0..1 fraction of
     /// that branch's extent). Returns false if no such branch exists (e.g. a single
@@ -309,7 +533,10 @@ impl SplitTree {
                 // `ratio` is first's share. Growing the side holding `pane` means
                 // +step when it's `first`, -step when it's `second`.
                 let delta = if in_first == grow { step } else { -step };
-                let new = (*ratio + delta).clamp(0.05, 0.95);
+                // The 5–95% bounds widen to include where the ratio already is: `spread` over a
+                // long chain legitimately sets `1/n`, and clamping that up to 5% would GROW a pane
+                // the user asked to shrink.
+                let new = (*ratio + delta).clamp(ratio.min(0.05), ratio.max(0.95));
                 // Already at the clamp boundary → no real change (don't churn revs).
                 if (new - *ratio).abs() <= f32::EPSILON {
                     return false;
@@ -330,7 +557,10 @@ impl SplitTree {
     fn split3(extent: u16, ratio: f32) -> (u16, u16, u16) {
         let divider = if extent >= 1 { 1 } else { 0 };
         let usable = extent - divider;
-        let r = ratio.clamp(0.05, 0.95);
+        // Only a guard against a degenerate ratio (0, 1, NaN off disk). Interactive resizing
+        // keeps its own 5–95% bounds; `spread` on a long chain of splits legitimately asks for
+        // `1/n`, which a 5% floor would silently turn unequal past twenty panes.
+        let r = ratio.clamp(0.01, 0.99);
         let a = (((usable as f32) * r).round() as u16).min(usable);
         (a, usable - a, divider)
     }
@@ -966,5 +1196,144 @@ mod terminal_walk_tests {
             .collect();
         assert_eq!(tree.terminals(), via_panes);
         assert_eq!(tree.terminals().len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod arrange {
+    use super::*;
+
+    fn leaf(n: u32) -> SplitTree {
+        SplitTree::Leaf {
+            pane: PaneId::new(format!("p{n}")),
+            terminal: TerminalId::new(format!("t{n}")),
+        }
+    }
+
+    fn branch(dir: Dir, ratio: f32, a: SplitTree, b: SplitTree) -> SplitTree {
+        SplitTree::Branch {
+            dir,
+            ratio,
+            first: Box::new(a),
+            second: Box::new(b),
+        }
+    }
+
+    fn order(t: &SplitTree) -> Vec<String> {
+        t.panes().iter().map(|p| p.to_string()).collect()
+    }
+
+    fn sizes(t: &SplitTree, cols: u16, rows: u16) -> Vec<(u16, u16)> {
+        let mut out = Vec::new();
+        t.derive_sizes(Rect { cols, rows }, &mut out);
+        out.into_iter().map(|(_, c, r)| (c, r)).collect()
+    }
+
+    #[test]
+    fn swap_and_rotate_keep_the_shape_and_move_the_panes() {
+        let mut t = branch(
+            Dir::Right,
+            0.3,
+            leaf(1),
+            branch(Dir::Down, 0.5, leaf(2), leaf(3)),
+        );
+        let shape = sizes(&t, 100, 40);
+        assert!(t.swap_with(&PaneId::new("p1"), 1));
+        assert_eq!(order(&t), ["p2", "p1", "p3"]);
+        assert_eq!(sizes(&t, 100, 40), shape, "the shape is untouched");
+        // Wraps backwards from the first slot to the last.
+        assert!(t.swap_with(&PaneId::new("p2"), -1));
+        assert_eq!(order(&t), ["p3", "p1", "p2"]);
+        assert!(t.rotate(true));
+        assert_eq!(order(&t), ["p1", "p2", "p3"]);
+        assert!(t.rotate(false));
+        assert_eq!(order(&t), ["p3", "p1", "p2"]);
+        // A pane keeps its terminal wherever it goes.
+        assert_eq!(t.terminal_of(&PaneId::new("p2")).unwrap().to_string(), "t2");
+        assert!(!leaf(1).clone().rotate(true));
+    }
+
+    #[test]
+    fn presets_give_tmux_shapes() {
+        let leaves = |n: u32| {
+            (1..=n)
+                .map(|i| match leaf(i) {
+                    SplitTree::Leaf { pane, terminal } => (pane, terminal),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>()
+        };
+        let even = SplitTree::preset(leaves(3), LayoutPreset::EvenHorizontal).unwrap();
+        assert_eq!(sizes(&even, 101, 10), [(33, 10), (33, 10), (33, 10)]);
+        let stacked = SplitTree::preset(leaves(2), LayoutPreset::EvenVertical).unwrap();
+        assert_eq!(sizes(&stacked, 10, 21), [(10, 10), (10, 10)]);
+        let main = SplitTree::preset(leaves(3), LayoutPreset::MainVertical).unwrap();
+        let s = sizes(&main, 101, 21);
+        assert_eq!(s[0], (60, 21), "the main pane takes 60% on the left");
+        assert_eq!(&s[1..], [(40, 10), (40, 10)]);
+        let tiled = SplitTree::preset(leaves(4), LayoutPreset::Tiled).unwrap();
+        assert_eq!(
+            sizes(&tiled, 101, 21),
+            [(50, 10), (50, 10), (50, 10), (50, 10)]
+        );
+        let tiled5 = SplitTree::preset(leaves(5), LayoutPreset::Tiled).unwrap();
+        assert_eq!(sizes(&tiled5, 101, 21).len(), 5);
+        // Forty panes still come out equal (a 1/n chain hit the ratio clamp past twenty).
+        let wide = SplitTree::preset(leaves(40), LayoutPreset::EvenHorizontal).unwrap();
+        let w: Vec<u16> = sizes(&wide, 400, 5).iter().map(|s| s.0).collect();
+        let (lo, hi) = (*w.iter().min().unwrap(), *w.iter().max().unwrap());
+        assert!(hi - lo <= 1, "{w:?}");
+        assert_eq!(order(&tiled5), ["p1", "p2", "p3", "p4", "p5"]);
+        assert_eq!(LayoutPreset::Tiled.next(), LayoutPreset::EvenHorizontal);
+        assert_eq!(
+            LayoutPreset::from_name("main-vertical"),
+            Some(LayoutPreset::MainVertical)
+        );
+    }
+
+    #[test]
+    fn spread_evens_out_by_panes_along_each_split() {
+        // `split, split, split` halves forever: 50 / 25 / 12.5 / 12.5.
+        let mut t = branch(
+            Dir::Right,
+            0.5,
+            leaf(1),
+            branch(
+                Dir::Right,
+                0.5,
+                leaf(2),
+                branch(Dir::Right, 0.5, leaf(3), leaf(4)),
+            ),
+        );
+        assert!(t.spread());
+        let w: Vec<u16> = sizes(&t, 103, 5).iter().map(|s| s.0).collect();
+        let (lo, hi) = (*w.iter().min().unwrap(), *w.iter().max().unwrap());
+        assert!(hi - lo <= 2, "even to within cell rounding: {w:?}");
+        assert!(!t.spread(), "already even");
+        // A pane spread below the 5% resize floor still shrinks when asked, never grows.
+        let mut chain = leaf(40);
+        for i in (1..40).rev() {
+            chain = branch(Dir::Right, 0.5, leaf(i), chain);
+        }
+        chain.spread();
+        let first = |t: &SplitTree| match t {
+            SplitTree::Branch { ratio, .. } => *ratio,
+            _ => unreachable!(),
+        };
+        let r0 = first(&chain);
+        assert!(r0 < 0.05);
+        chain.resize(&PaneId::new("p1"), Dir::Right, false, 0.04);
+        assert!(first(&chain) <= r0, "shrinking must not grow it");
+        chain.resize(&PaneId::new("p1"), Dir::Right, true, 0.04);
+        assert!(first(&chain) > r0);
+        // Across a perpendicular split the stack counts once: `a | (b / c)` is halves.
+        let mut t = branch(
+            Dir::Right,
+            0.2,
+            leaf(1),
+            branch(Dir::Down, 0.5, leaf(2), leaf(3)),
+        );
+        t.spread();
+        assert_eq!(sizes(&t, 101, 10)[0], (50, 10));
     }
 }

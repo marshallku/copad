@@ -770,6 +770,8 @@ pub struct App {
     scroll_pane: Option<TerminalId>,
     /// What the last `render_to` saw of the focused pane's cursor: `(visible, shape)`.
     cursor_look: Cell<(bool, u8)>,
+    /// The preset each tab was last arranged in, so `next-layout` continues from it.
+    tab_layout: HashMap<TabId, crate::model::LayoutPreset>,
     /// Copy-mode state that is not alacritty's (the search prompt, the last search, and the
     /// screen the mode was entered on). `Some` exactly when `scroll_pane` is.
     copy: Option<CopyState>,
@@ -1079,6 +1081,7 @@ impl App {
             popup: None,
             scroll_pane: None,
             cursor_look: Cell::new((true, 0)),
+            tab_layout: HashMap::new(),
             copy: None,
             key_copy: None,
             client_pids: Vec::new(),
@@ -1416,6 +1419,132 @@ impl App {
     }
 
     /// `Ctrl-b z` / `comux zoom`: toggle the focused pane filling its tab.
+    /// Swap, rotate, re-shape or spread the tab holding `at` (the focused pane when `None`).
+    /// Returns what happened, for a flash or a CLI response.
+    fn arrange(
+        &mut self,
+        at: Option<(WorkspaceId, PaneId)>,
+        op: crate::state::Rearrange,
+    ) -> Result<String, String> {
+        use crate::state::Rearrange;
+        let (ws, pane) = match at {
+            Some(a) => a,
+            None => (
+                self.ws.clone(),
+                self.focused_pane().ok_or("no pane is focused")?,
+            ),
+        };
+        let (tab, before) = self
+            .state
+            .workspace(&ws)
+            .and_then(|w| w.tab_of_pane(&pane))
+            .map(|t| (t.id.clone(), t.layout.clone()))
+            .ok_or("that pane is gone")?;
+        let events = self
+            .state
+            .apply(Command::Rearrange {
+                origin: self.origin_for(&ws),
+                workspace: ws,
+                pane,
+                op,
+            })
+            .map_err(|e| e.to_string())?;
+        if let Rearrange::Preset(p) = op {
+            // `next-layout` continues from the last preset this tab was given.
+            self.tab_layout.insert(tab.clone(), p);
+        }
+        // Whether the LAYOUT changed — not whether events came back: a tab that is not on
+        // screen is rearranged without a resize event.
+        let changed = self
+            .state
+            .workspace_ids()
+            .iter()
+            .filter_map(|w| self.state.workspace(w))
+            .flat_map(|w| w.tabs.iter())
+            .find(|t| t.id == tab)
+            .is_some_and(|t| t.layout != before);
+        if !changed {
+            return Ok(match op {
+                Rearrange::Spread => "already even".into(),
+                Rearrange::Preset(p) => format!("already {}", p.name()),
+                _ => "only one pane — nothing to move".into(),
+            });
+        }
+        self.note_view_moved();
+        self.apply_resized_events(&events);
+        self.sync_sizes();
+        Ok(match op {
+            Rearrange::Swap(_) => "swapped".into(),
+            Rearrange::Rotate(_) => "rotated".into(),
+            Rearrange::Preset(p) => format!("layout: {}", p.name()),
+            Rearrange::Spread => "spread evenly".into(),
+        })
+    }
+
+    /// `Ctrl-b Space` (tmux `next-layout`): the preset after the one this tab last got.
+    fn next_layout(&mut self) -> Result<String, String> {
+        let next = self
+            .active_tab_id()
+            .and_then(|t| self.tab_layout.get(&t).copied())
+            .map_or(crate::model::LayoutPreset::EvenHorizontal, |p| p.next());
+        self.arrange(None, crate::state::Rearrange::Preset(next))
+    }
+
+    /// Run a rearrangement from a key, saying what happened.
+    fn arrange_key(&mut self, op: crate::state::Rearrange) {
+        let out = self.arrange(None, op);
+        self.flash_result(out);
+    }
+
+    fn flash_result(&mut self, out: Result<String, String>) {
+        match out {
+            Ok(m) => self.flash(m, false),
+            Err(e) => self.flash(e, true),
+        }
+    }
+
+    /// Move `at` (the focused pane when `None`) out into a new tab of its own, right after
+    /// its old one (tmux `break-pane`).
+    fn break_pane(&mut self, at: Option<(WorkspaceId, PaneId)>) -> Result<String, String> {
+        let (ws, pane) = match at {
+            Some(a) => a,
+            None => (
+                self.ws.clone(),
+                self.focused_pane().ok_or("no pane is focused")?,
+            ),
+        };
+        self.note_view_moved();
+        let events = self
+            .state
+            .apply(Command::BreakPane {
+                origin: self.origin_for(&ws),
+                workspace: ws,
+                pane,
+            })
+            .map_err(|e| e.to_string())?;
+        self.apply_resized_events(&events);
+        self.sync_sizes();
+        Ok("moved the pane to a new tab".into())
+    }
+
+    /// Move the active tab `delta` places along the tab bar.
+    fn move_active_tab(&mut self, delta: i32) {
+        let Some(w) = self.state.workspace(&self.ws) else {
+            return;
+        };
+        let Some(i) = w.tabs.iter().position(|t| t.id == w.active_tab) else {
+            return;
+        };
+        let to = (i as i32 + delta).clamp(0, w.tabs.len() as i32 - 1) as usize;
+        let tab = w.active_tab.clone();
+        let _ = self.state.apply(Command::MoveTab {
+            origin: Origin::Client(self.client),
+            workspace: self.ws.clone(),
+            tab,
+            to,
+        });
+    }
+
     fn toggle_zoom(&mut self) -> Result<(), MuxError> {
         let events = self.state.apply(Command::ToggleZoom {
             origin: Origin::Client(self.client),
@@ -3154,6 +3283,20 @@ impl App {
             .map_err(|e| (e.code(), e.message().to_string()))
     }
 
+    /// `(session, pane)` for a verb that acts on the caller's pane when given its token, and on
+    /// the focused pane (`None`) otherwise.
+    fn caller_pane_at(
+        &self,
+        caller: Option<&str>,
+    ) -> Result<Option<(WorkspaceId, PaneId)>, String> {
+        match caller {
+            Some(tok) => self
+                .caller_location(tok)
+                .map(|(ws, _, pane)| Some((ws, pane))),
+            None => Ok(None),
+        }
+    }
+
     /// Where the caller's pane lives, for a verb that defaults to "the caller's tab/session".
     /// Token-only, like every write: a raw terminal id can name an unrelated pane after a
     /// server restart.
@@ -4064,6 +4207,81 @@ impl App {
                     ));
                 }
                 r
+            }
+            Req::Arrange { op, caller } => {
+                use crate::state::Rearrange;
+                let at = match self.caller_pane_at(caller.as_deref()) {
+                    Ok(a) => a,
+                    Err(e) => return Resp::err_code("not_found", e),
+                };
+                let out = match op.as_str() {
+                    "next" => {
+                        let tab = match &at {
+                            Some((ws, pane)) => self
+                                .state
+                                .workspace(ws)
+                                .and_then(|w| w.tab_of_pane(pane))
+                                .map(|t| t.id.clone()),
+                            None => self.active_tab_id(),
+                        };
+                        let next = tab
+                            .and_then(|t| self.tab_layout.get(&t).copied())
+                            .map_or(crate::model::LayoutPreset::EvenHorizontal, |p| p.next());
+                        self.arrange(at, Rearrange::Preset(next))
+                    }
+                    "spread" => self.arrange(at, Rearrange::Spread),
+                    "swap-up" => self.arrange(at, Rearrange::Swap(-1)),
+                    "swap-down" => self.arrange(at, Rearrange::Swap(1)),
+                    "rotate" => self.arrange(at, Rearrange::Rotate(true)),
+                    "rotate-back" => self.arrange(at, Rearrange::Rotate(false)),
+                    name => match crate::model::LayoutPreset::from_name(name) {
+                        Some(p) => self.arrange(at, Rearrange::Preset(p)),
+                        None => Err(format!("unknown arrangement '{name}'")),
+                    },
+                };
+                match out {
+                    Ok(m) => {
+                        let mut r = Resp::ok();
+                        r.message = Some(m);
+                        r
+                    }
+                    Err(e) => Resp::err_code("refused", e),
+                }
+            }
+            Req::BreakPane { caller } => {
+                let at = match self.caller_pane_at(caller.as_deref()) {
+                    Ok(a) => a,
+                    Err(e) => return Resp::err_code("not_found", e),
+                };
+                match self.break_pane(at) {
+                    Ok(m) => {
+                        let mut r = Resp::ok();
+                        r.message = Some(m);
+                        r
+                    }
+                    Err(e) => Resp::err_code("refused", e),
+                }
+            }
+            Req::MoveTab { to, caller } => {
+                let (ws, tab) = match caller.as_deref() {
+                    Some(tok) => match self.caller_location(tok) {
+                        Ok((ws, tab, _)) => (ws, tab),
+                        Err(e) => return Resp::err_code("not_found", e),
+                    },
+                    None => match self.active_tab_id() {
+                        Some(t) => (self.ws.clone(), t),
+                        None => return Resp::err_code("not_found", "no active tab"),
+                    },
+                };
+                match self.state.apply(Command::MoveTab {
+                    origin: self.origin_for(&ws),
+                    workspace: ws,
+                    tab,
+                    to: *to,
+                }) {
+                    Ok(_) => Resp::ok(),
+                    Err(e) => Resp::err_code("refused", e.to_string()),
+                }
             }
             Req::Zoom => match self.toggle_zoom() {
                 Ok(()) => {
@@ -5075,6 +5293,22 @@ impl App {
             }
             EnterPrefix => {} // handled by the caller (arms the prefix)
             SendPrefix => self.key_to_focused(chord_key(&self.cfg.keymap.prefix_chord)),
+            SwapPaneUp => self.arrange_key(crate::state::Rearrange::Swap(-1)),
+            SwapPaneDown => self.arrange_key(crate::state::Rearrange::Swap(1)),
+            RotatePanes => self.arrange_key(crate::state::Rearrange::Rotate(true)),
+            RotatePanesBack => self.arrange_key(crate::state::Rearrange::Rotate(false)),
+            NextLayout => {
+                let out = self.next_layout();
+                self.flash_result(out);
+            }
+            Layout(p) => self.arrange_key(crate::state::Rearrange::Preset(p)),
+            SpreadPanes => self.arrange_key(crate::state::Rearrange::Spread),
+            BreakPane => {
+                let out = self.break_pane(None);
+                self.flash_result(out);
+            }
+            MoveTabLeft => self.move_active_tab(-1),
+            MoveTabRight => self.move_active_tab(1),
         }
         KeyAction::Continue
     }
@@ -16247,5 +16481,159 @@ mod copy_mode_vi {
         goto(&mut app, "abxb");
         typ(&mut app, "vtb;");
         assert_eq!(yank(&mut app), "abx");
+    }
+}
+
+#[cfg(test)]
+mod arrange_keys {
+    use super::*;
+    use crate::control::Req;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(120, 40, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn split(app: &mut App, dir: &str) {
+        let r = app.handle_control(&Req::Split {
+            dir: dir.into(),
+            from: None,
+            no_focus: false,
+            cwd: None,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
+        });
+        assert!(r.ok, "{:?}", r.error);
+    }
+
+    fn prefixed(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+        let mut prefix = Prefix::default();
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &mut prefix,
+        );
+        app.feed_key(KeyEvent::new(code, mods), &mut prefix);
+    }
+
+    fn order(app: &App) -> Vec<TerminalId> {
+        app.layout().into_iter().map(|r| r.terminal).collect()
+    }
+
+    #[test]
+    fn swap_keeps_focus_on_the_pane_that_moved() {
+        let mut app = app();
+        split(&mut app, "right");
+        split(&mut app, "right");
+        let before = order(&app);
+        let focused = app.focused_terminal().unwrap();
+        assert_eq!(before.last(), Some(&focused));
+        prefixed(&mut app, KeyCode::Char('{'), KeyModifiers::NONE);
+        let after = order(&app);
+        assert_eq!(after[1], focused, "moved one slot left");
+        assert_eq!(app.focused_terminal(), Some(focused));
+        prefixed(&mut app, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert_ne!(order(&app), after, "rotated");
+    }
+
+    #[test]
+    fn space_cycles_presets_and_each_one_conserves_the_panes() {
+        let mut app = app();
+        for _ in 0..3 {
+            split(&mut app, "down");
+        }
+        let mut seen = Vec::new();
+        for _ in 0..5 {
+            prefixed(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+            let rects = app.layout();
+            assert_eq!(rects.len(), 4);
+            seen.push(
+                rects
+                    .iter()
+                    .map(|r| (r.x, r.y, r.cols, r.rows))
+                    .collect::<Vec<_>>(),
+            );
+        }
+        // even-horizontal: four columns on one row.
+        assert!(seen[0].iter().all(|r| r.1 == seen[0][0].1));
+        // even-vertical: four rows in one column.
+        assert!(seen[1].iter().all(|r| r.0 == seen[1][0].0));
+        // tiled: a 2×2 grid.
+        let xs: std::collections::BTreeSet<_> = seen[4].iter().map(|r| r.0).collect();
+        let ys: std::collections::BTreeSet<_> = seen[4].iter().map(|r| r.1).collect();
+        assert_eq!((xs.len(), ys.len()), (2, 2));
+        // M-5 picks tiled outright; the status flash names it.
+        prefixed(&mut app, KeyCode::Char('2'), KeyModifiers::ALT);
+        prefixed(&mut app, KeyCode::Char('5'), KeyModifiers::ALT);
+        let ys: std::collections::BTreeSet<_> = app.layout().iter().map(|r| r.y).collect();
+        assert_eq!(ys.len(), 2);
+    }
+
+    #[test]
+    fn break_pane_moves_it_to_a_new_tab_after_its_own_and_keeps_its_terminal() {
+        let mut app = app();
+        split(&mut app, "right");
+        app.new_tab();
+        app.select_tab_index(0);
+        let moving = app.focused_terminal().unwrap();
+        prefixed(&mut app, KeyCode::Char('B'), KeyModifiers::SHIFT);
+        let w = app.state.workspace(&app.ws).unwrap();
+        assert_eq!(w.tabs.len(), 3);
+        assert_eq!(
+            w.tabs[1].id, w.active_tab,
+            "inserted right after the source tab"
+        );
+        assert_eq!(order(&app), vec![moving.clone()]);
+        assert!(
+            app.panes.contains_key(&moving),
+            "the same live terminal, not a respawn"
+        );
+        // A lone pane cannot be broken out.
+        prefixed(&mut app, KeyCode::Char('B'), KeyModifiers::SHIFT);
+        assert_eq!(app.state.workspace(&app.ws).unwrap().tabs.len(), 3);
+    }
+
+    #[test]
+    fn tabs_move_along_the_bar_and_from_the_cli() {
+        let mut app = app();
+        app.new_tab();
+        app.new_tab();
+        let ids = |app: &App| -> Vec<TabId> {
+            app.state
+                .workspace(&app.ws)
+                .unwrap()
+                .tabs
+                .iter()
+                .map(|t| t.id.clone())
+                .collect()
+        };
+        let start = ids(&app);
+        // The third tab is active; S-Left moves it one place left.
+        prefixed(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
+        assert_eq!(
+            ids(&app),
+            vec![start[0].clone(), start[2].clone(), start[1].clone()]
+        );
+        assert!(
+            app.handle_control(&Req::MoveTab {
+                to: 0,
+                caller: None
+            })
+            .ok
+        );
+        assert_eq!(ids(&app)[0], start[2]);
+        let r = app.handle_control(&Req::Arrange {
+            op: "nonsense".into(),
+            caller: None,
+        });
+        assert!(!r.ok);
+        split(&mut app, "right");
+        let r = app.handle_control(&Req::Arrange {
+            op: "even-vertical".into(),
+            caller: None,
+        });
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.message.as_deref(), Some("layout: even-vertical"));
     }
 }
