@@ -114,6 +114,12 @@ pub enum ServerMsg {
         mouse: bool,
         #[serde(default)]
         update_environment: Vec<String>,
+        /// The server understands [`ClientMsg::Paste`], so the client may turn on bracketed
+        /// paste in its own terminal. A server built before this field never says so — it
+        /// would silently drop the unknown message — so the client keeps the old behaviour
+        /// there and a paste still arrives as keystrokes.
+        #[serde(default)]
+        paste: bool,
     },
     /// A render frame (delta or full).
     Frame(FrameMsg),
@@ -190,6 +196,12 @@ pub enum ClientMsg {
     },
     /// A forwarded key event (interpreted server-side: prefix/nav/tabs/input).
     Key(KeyEvent),
+    /// A paste the client's terminal delivered as ONE bracketed paste (a Cmd-V, or a file
+    /// dropped on the window). Forwarded whole so the pane's program can see it as a paste:
+    /// Claude Code only attaches a dropped image when its path arrives as a paste, and
+    /// replaying it as keystrokes makes it plain typed text. Sent only when the server's
+    /// `Hello` advertised `paste`.
+    Paste { text: String },
     /// A forwarded mouse action at frame cell `(x, y)`.
     Mouse { x: u16, y: u16, kind: MouseKind },
     /// The client's terminal was resized.
@@ -272,9 +284,12 @@ mod tests {
             ServerMsg::Hello {
                 mouse,
                 update_environment,
+                paste,
             } => {
                 assert!(mouse);
                 assert!(update_environment.is_empty());
+                // An old server can't take a `Paste`, so the client must not enable it.
+                assert!(!paste);
             }
             _ => panic!("expected Hello"),
         }

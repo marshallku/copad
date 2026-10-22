@@ -4589,6 +4589,50 @@ impl App {
         action
     }
 
+    /// Feed one bracketed paste from a client (Cmd-V, or a file dropped on its window).
+    ///
+    /// With nothing in the way it goes to the focused pane AS a paste — re-bracketed when
+    /// that program asked for it — because that framing is the whole point: Claude Code
+    /// attaches a dropped image only when its path arrives pasted, not typed. When an
+    /// overlay owns input (a prompt, a picker, copy mode, …) or the prefix is armed, it is
+    /// replayed as the keystrokes a terminal without bracketed paste would have sent, so
+    /// pasting into a rename prompt keeps working exactly as before.
+    pub fn feed_paste(&mut self, text: &str, prefix: &mut bool) -> KeyAction {
+        if *prefix || self.input_captured() {
+            let mut action = KeyAction::Continue;
+            for code in paste_keys(text) {
+                action = self.feed_key(KeyEvent::new(code, KeyModifiers::NONE), prefix);
+                if action == KeyAction::Detach {
+                    break;
+                }
+            }
+            return action;
+        }
+        if let Some(term) = self.focused_terminal()
+            && let Some(pt) = self.panes.get(&term)
+        {
+            pt.scroll_to_bottom();
+            pt.input(&crate::term::paste_bytes(text, pt.bracketed_paste()));
+        }
+        KeyAction::Continue
+    }
+
+    /// Whether an overlay is open that takes keys before the focused pane does — the
+    /// modal checks at the top of `feed_key_inner`, in the same order.
+    fn input_captured(&self) -> bool {
+        self.prompt.is_some()
+            || self.confirm.is_some()
+            || self.mark_modal.is_some()
+            || self.help.is_some()
+            || self.menu.is_some()
+            || self.sidebar_focus.is_some()
+            || self.popup.is_some()
+            || self.browser.is_some()
+            || self.resume.is_some()
+            || self.scroll_pane.is_some()
+            || self.center.is_some()
+    }
+
     fn feed_key_inner(&mut self, k: KeyEvent, prefix: &mut bool) -> KeyAction {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
 
@@ -10880,6 +10924,28 @@ fn to_color(c: CellColor) -> Color {
     }
 }
 
+/// The keys a terminal without bracketed paste would deliver for a paste of `text`: one
+/// `Enter` per line break (`\r\n` counts once), `Tab` for a tab, every other character as
+/// itself.
+fn paste_keys(text: &str) -> Vec<KeyCode> {
+    let mut keys = Vec::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        keys.push(match c {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                KeyCode::Enter
+            }
+            '\n' => KeyCode::Enter,
+            '\t' => KeyCode::Tab,
+            c => KeyCode::Char(c),
+        });
+    }
+    keys
+}
+
 /// Translate a key event into the bytes a PTY expects.
 fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
     let alt = mods.contains(KeyModifiers::ALT);
@@ -15333,5 +15399,100 @@ mod fork {
         let r = fork(&mut app, &token);
         assert!(r.error.unwrap().contains("not known yet"));
         assert_eq!(app.tab_ids().len(), tabs, "nothing was opened");
+    }
+}
+
+#[cfg(test)]
+mod paste {
+    use super::*;
+    use crate::control::Req;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        cfg.notify = false;
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn key(app: &mut App, code: KeyCode, mods: KeyModifiers, prefix: &mut bool) {
+        app.feed_key(KeyEvent::new(code, mods), prefix);
+    }
+
+    #[test]
+    fn paste_keys_are_what_an_unbracketed_terminal_would_send() {
+        assert_eq!(
+            paste_keys("a\tb\r\nc\nd\re"),
+            [
+                KeyCode::Char('a'),
+                KeyCode::Tab,
+                KeyCode::Char('b'),
+                KeyCode::Enter,
+                KeyCode::Char('c'),
+                KeyCode::Enter,
+                KeyCode::Char('d'),
+                KeyCode::Enter,
+                KeyCode::Char('e'),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_paste_into_an_open_prompt_is_typed_into_it() {
+        let mut app = app();
+        let mut prefix = false;
+        key(
+            &mut app,
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+            &mut prefix,
+        );
+        key(
+            &mut app,
+            KeyCode::Char(','),
+            KeyModifiers::NONE,
+            &mut prefix,
+        );
+        assert!(app.prompt.is_some(), "Ctrl-b , opens the rename prompt");
+        app.feed_paste("api", &mut prefix);
+        assert_eq!(app.prompt.as_ref().map(|p| p.buf.as_str()), Some("api"));
+    }
+
+    /// The point of the whole path: a program that enabled bracketed paste receives the
+    /// paste re-bracketed, which is how Claude Code tells a dropped image path from typing.
+    #[test]
+    fn a_paste_reaches_the_focused_pane_bracketed() {
+        let mut app = app();
+        let r = app.handle_control(&Req::NewSession {
+            name: Some("paste".into()),
+            cwd: None,
+            detached: false,
+        });
+        assert!(r.ok, "{:?}", r.error);
+        let tid = app.resolve_pane_token(&r.pane.expect("token")).unwrap();
+        let screen = |app: &App| {
+            app.panes[&tid]
+                .snapshot()
+                .cells
+                .iter()
+                .map(|row| row.iter().map(|c| c.sym.as_str()).collect::<String>())
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let wait = |app: &App, want: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !screen(app).contains(want) {
+                assert!(std::time::Instant::now() < deadline, "{}", screen(app));
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        };
+        // A stand-in for Claude Code: turn bracketed paste on, then show raw input.
+        app.panes[&tid].input(b"stty -echo; printf '\\033[?2004h'; echo READY-$((40+2)); cat -v\r");
+        wait(&app, "READY-42");
+        // The printf ran before the echo, so the mode bit is already set.
+        assert!(app.panes[&tid].bracketed_paste());
+        let mut prefix = false;
+        app.feed_paste("/tmp/shot.png", &mut prefix);
+        app.panes[&tid].input(b"\r");
+        wait(&app, "^[[200~/tmp/shot.png^[[201~");
     }
 }

@@ -14,8 +14,9 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::crossterm::cursor::{self, MoveTo, RestorePosition, SavePosition};
 use ratatui::crossterm::event::{
-    self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
-    Event as CEvent, KeyEventKind, MouseButton, MouseEventKind,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event as CEvent, KeyEventKind, MouseButton,
+    MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -383,6 +384,7 @@ fn size_from_clamped_cursor(col: u16, row: u16) -> Option<(u16, u16)> {
 /// says so (server-authoritative), and disabled on drop only if it was enabled.
 struct TermGuard {
     mouse: bool,
+    paste: bool,
 }
 
 impl TermGuard {
@@ -404,7 +406,10 @@ impl TermGuard {
         // repairs. Restored on the way out.
         write!(io::stdout(), "\u{1b}[?7l")?;
         io::stdout().flush()?;
-        Ok(Self { mouse: false })
+        Ok(Self {
+            mouse: false,
+            paste: false,
+        })
     }
 
     /// Turn on mouse capture (wheel scrollback + click-to-focus/navigate). Trade-off:
@@ -417,6 +422,18 @@ impl TermGuard {
         }
         Ok(())
     }
+
+    /// Ask our terminal for bracketed paste, so a paste or a dropped file reaches us as ONE
+    /// `Event::Paste` rather than a burst of keys — the only form in which the pane's program
+    /// can still tell it was pasted. Called once, when `Hello { paste: true }` says the server
+    /// can forward it.
+    fn enable_paste(&mut self) -> io::Result<()> {
+        if !self.paste {
+            execute!(io::stdout(), EnableBracketedPaste)?;
+            self.paste = true;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for TermGuard {
@@ -424,6 +441,9 @@ impl Drop for TermGuard {
         let _ = disable_raw_mode();
         if self.mouse {
             let _ = execute!(io::stdout(), DisableMouseCapture);
+        }
+        if self.paste {
+            let _ = execute!(io::stdout(), DisableBracketedPaste);
         }
         let _ = write!(io::stdout(), "\u{1b}[?7h"); // restore autowrap (see `enter`)
         let _ = execute!(io::stdout(), DisableFocusChange, LeaveAlternateScreen);
@@ -636,7 +656,11 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                 Ok(ServerMsg::Hello {
                     mouse,
                     update_environment,
+                    paste,
                 }) => {
+                    if paste {
+                        let _ = guard.enable_paste();
+                    }
                     // Server-authoritative: only now (not from local config) do we decide
                     // whether to capture the mouse, so every client agrees with the server.
                     if mouse {
@@ -788,6 +812,9 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                 match event::read()? {
                     CEvent::Key(k) if k.kind != KeyEventKind::Release => {
                         let _ = send(&mut wr, &ClientMsg::Key(k));
+                    }
+                    CEvent::Paste(text) => {
+                        let _ = send(&mut wr, &ClientMsg::Paste { text });
                     }
                     CEvent::Mouse(m) => {
                         // Forward wheel + left-click at their cell; the server maps to

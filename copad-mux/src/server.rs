@@ -676,6 +676,7 @@ fn serve_client(
     let hello = ServerMsg::Hello {
         mouse: cfg.mouse,
         update_environment: (*cfg.env_names).clone(),
+        paste: true,
     };
     if writeln!(writer, "{}", json(&hello)).is_err() || writer.flush().is_err() {
         return;
@@ -847,7 +848,10 @@ fn handle_incoming(
             // honest evidence that the focused pane has been seen. Bells are acknowledged
             // here rather than anywhere in the frame path: composing, queueing, or even
             // flushing a frame all say the server emitted something, not that anyone looked.
-            if matches!(msg, ClientMsg::Key(_) | ClientMsg::Mouse { .. }) {
+            if matches!(
+                msg,
+                ClientMsg::Key(_) | ClientMsg::Paste { .. } | ClientMsg::Mouse { .. }
+            ) {
                 app.ack_focused_bell();
             }
             match msg {
@@ -913,6 +917,34 @@ fn handle_incoming(
                         KeyAction::Continue => {}
                     }
                     true // a key may change any visible state
+                }
+                ClientMsg::Paste { text } => {
+                    // Typed input in every respect but its framing: same selection clear,
+                    // same env adoption (a paste into an open prompt can commit it and
+                    // spawn a pane), same per-client prefix.
+                    app.clear_selection();
+                    if let Some(e) = clients.iter().find(|c| c.id == id).map(|c| c.env.clone()) {
+                        app.set_client_env(e);
+                    }
+                    let mut action = KeyAction::Continue;
+                    if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
+                        action = app.feed_paste(&text, &mut c.prefix);
+                        // Replayed keys can yank in copy mode; the copy is this client's.
+                        if let Some(text) = app.take_key_copy() {
+                            queue_copy(c, crate::term::next_clipboard_seq(), &text);
+                        }
+                    }
+                    if action == KeyAction::Detach
+                        && let Some(pos) = clients.iter().position(|c| c.id == id)
+                    {
+                        let gone = clients.remove(pos);
+                        forget_client(app, &gone);
+                        detach_client(gone);
+                        app.clear_selection_of(ClientId(id));
+                        app.close_menu_of(ClientId(id));
+                        recompute_viewport(app, clients);
+                    }
+                    true
                 }
                 ClientMsg::Mouse { x, y, kind } => {
                     // Scroll the pane under the cursor / click-to-focus / drag-select — shared,
