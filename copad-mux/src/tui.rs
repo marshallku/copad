@@ -490,6 +490,10 @@ struct CopyState {
     /// current-screen comparison cannot see — and a `y` would silently copy the cursor's line
     /// instead of what was selected. Copy mode ends instead.
     selecting: bool,
+    /// `f`/`F`/`t`/`T` was pressed and waits for its character: `(forward, till)`.
+    pending_jump: Option<(bool, bool)>,
+    /// The last jump, for `;` (again) and `,` (reversed): `(char, forward, till)`.
+    last_jump: Option<(char, bool, bool)>,
 }
 
 /// Pinned pane slots (`Ctrl-b m` / `Ctrl-b '`).
@@ -732,6 +736,19 @@ struct Sel {
     moved: bool,
 }
 
+/// A click remembered to count the next one at the same cell (double/triple click).
+struct LastClick {
+    client: ClientId,
+    term: TerminalId,
+    cell: (u16, u16),
+    at: std::time::Instant,
+    /// 1 = single, 2 = double, 3 = triple; a fourth click starts over.
+    count: u8,
+}
+
+/// How quickly the next click must follow to count as a double/triple click.
+const MULTI_CLICK: Duration = Duration::from_millis(400);
+
 /// The multi-pane application: the authoritative layout `State` + a live shell per
 /// terminal. The local TUI is the single controller client (`ClientId(0)`).
 pub struct App {
@@ -966,6 +983,9 @@ pub struct App {
     /// The in-progress mouse drag-selection, if any (tmux-style copy). `None` except between
     /// a button-down and its button-up; the highlight only shows during the drag.
     selection: Option<Sel>,
+    /// The last plain left click in a pane whose program does not take the mouse, for
+    /// double-click (word) and triple-click (line) selection.
+    last_click: Option<LastClick>,
     /// An in-progress divider drag. Client-OWNED like `selection`, and for the same reason:
     /// input is multi-client, so only the client that grabbed a divider may move or release
     /// it. At most one at a time — two clients dragging the same divider would fight.
@@ -1133,6 +1153,7 @@ impl App {
             usage_rolled_at: std::time::Instant::now(),
             alt_screen: HashMap::new(),
             selection: None,
+            last_click: None,
             resize_drag: None,
             last_clipboard_seq: 0,
         };
@@ -5385,12 +5406,51 @@ impl App {
                     // A plain click, not a drag — nothing to copy. A mouse-aware app (nvim
                     // `set mouse`) gets it as press+release at the anchor cell, tmux-style;
                     // sent on release so a drag still stays comux's copy gesture.
-                    if let Some(pt) = self.panes.get(&sel.term)
-                        && let Some(bytes) = pt.click_bytes(sel.anchor.0 + 1, sel.anchor.1 + 1)
-                    {
+                    let pt = self.panes.get(&sel.term)?;
+                    if let Some(bytes) = pt.click_bytes(sel.anchor.0 + 1, sel.anchor.1 + 1) {
                         pt.input(&bytes);
+                        self.last_click = None;
+                        return None;
                     }
-                    return None;
+                    // Otherwise count it: a double click selects the word, a triple click the
+                    // (wrapped) line, and copies it — tmux's `DoubleClick1Pane`/`TripleClick1Pane`.
+                    let now = std::time::Instant::now();
+                    let count = match &self.last_click {
+                        Some(lc)
+                            if lc.client == client
+                                && lc.term == sel.term
+                                && lc.cell == sel.anchor
+                                && now.duration_since(lc.at) < MULTI_CLICK =>
+                        {
+                            lc.count % 3 + 1
+                        }
+                        _ => 1,
+                    };
+                    self.last_click = Some(LastClick {
+                        client,
+                        term: sel.term.clone(),
+                        cell: sel.anchor,
+                        at: now,
+                        count,
+                    });
+                    if count < 2 {
+                        return None;
+                    }
+                    let snap = pt.snapshot();
+                    let (anchor, head) = if count == 2 {
+                        word_bounds(&snap, sel.anchor)?
+                    } else {
+                        line_bounds(&snap, sel.anchor.1)
+                    };
+                    let text = extract_selection(&snap, anchor, head);
+                    // Leave it highlighted until the next click or key, as a receipt.
+                    self.selection = Some(Sel {
+                        anchor,
+                        head,
+                        moved: true,
+                        ..sel
+                    });
+                    return (!text.is_empty()).then_some(text);
                 }
                 // Extract from the CURRENT snapshot (WYSIWYG: copy what's highlighted now).
                 let rect = self.layout().into_iter().find(|r| r.terminal == sel.term)?;
@@ -5647,6 +5707,8 @@ impl App {
             prompt: None,
             last: None,
             selecting: false,
+            pending_jump: None,
+            last_jump: None,
         });
         self.scroll_pane = Some(term);
     }
@@ -5695,36 +5757,55 @@ impl App {
         self.copy = None;
     }
 
-    /// One key in copy mode. The search prompt, when open, takes the key first.
+    /// One key in copy mode. The search prompt, when open, takes the key first. The keys are
+    /// tmux's `copy-mode-vi` table (with vim's `v` for a character selection).
     fn copy_key(&mut self, term: &TerminalId, k: KeyEvent) {
         use alacritty_terminal::vi_mode::ViMotion;
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         if let Some((up, mut buf)) = self.copy.as_mut().and_then(|c| c.prompt.take()) {
+            let mut keep = true;
             match k.code {
                 KeyCode::Enter => {
+                    keep = false;
                     if let Some(c) = &mut self.copy {
                         c.last = Some((buf.clone(), up));
                     }
                     self.copy_search(term, &buf, up);
                 }
-                KeyCode::Esc => {}
+                KeyCode::Esc => {
+                    keep = false;
+                    // Back to highlighting the search that was active before the prompt.
+                    let last = self.copy.as_ref().and_then(|c| c.last.clone()).map(|l| l.0);
+                    if let Some(pt) = self.panes.get(term) {
+                        pt.copy_set_query(last);
+                    }
+                }
                 KeyCode::Backspace => {
                     buf.pop();
-                    if let Some(c) = &mut self.copy {
-                        c.prompt = Some((up, buf));
-                    }
                 }
-                KeyCode::Char(ch) if !ctrl => {
-                    buf.push(ch);
-                    if let Some(c) = &mut self.copy {
-                        c.prompt = Some((up, buf));
-                    }
+                KeyCode::Char(ch) if !ctrl => buf.push(ch),
+                _ => {}
+            }
+            if keep {
+                // Incremental: every match on screen lights up as the query is typed.
+                if let Some(pt) = self.panes.get(term) {
+                    pt.copy_set_query((!buf.is_empty()).then(|| buf.clone()));
                 }
-                _ => {
-                    if let Some(c) = &mut self.copy {
-                        c.prompt = Some((up, buf));
-                    }
+                if let Some(c) = &mut self.copy {
+                    c.prompt = Some((up, buf));
                 }
+            }
+            return;
+        }
+        // `f`/`F`/`t`/`T` take the NEXT key as their character.
+        if let Some((forward, till)) = self.copy.as_mut().and_then(|c| c.pending_jump.take()) {
+            if let KeyCode::Char(ch) = k.code
+                && !ctrl
+            {
+                if let Some(c) = &mut self.copy {
+                    c.last_jump = Some((ch, forward, till));
+                }
+                self.copy_jump(term, ch, forward, till, false);
             }
             return;
         }
@@ -5734,31 +5815,86 @@ impl App {
         let page = (self.term_rows(term) / 2).max(1) as i32;
         let motion = |m: ViMotion| pt.copy_motion(m);
         match k.code {
-            KeyCode::Char('k') | KeyCode::Up => motion(ViMotion::Up),
-            KeyCode::Char('j') | KeyCode::Down => motion(ViMotion::Down),
-            KeyCode::Char('h') | KeyCode::Left => motion(ViMotion::Left),
+            KeyCode::Char('k') | KeyCode::Up if !ctrl => motion(ViMotion::Up),
+            KeyCode::Char('j') | KeyCode::Down if !ctrl => motion(ViMotion::Down),
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => motion(ViMotion::Left),
             KeyCode::Char('l') | KeyCode::Right => motion(ViMotion::Right),
-            KeyCode::Char('w') => motion(ViMotion::WordRight),
-            KeyCode::Char('b') if !ctrl => motion(ViMotion::WordLeft),
-            KeyCode::Char('e') => motion(ViMotion::WordRightEnd),
+            // vim's split: `w`/`b`/`e` stop at punctuation, `W`/`B`/`E` only at whitespace.
+            KeyCode::Char('w') => motion(ViMotion::SemanticRight),
+            KeyCode::Char('b') if !ctrl => motion(ViMotion::SemanticLeft),
+            KeyCode::Char('e') if !ctrl => motion(ViMotion::SemanticRightEnd),
+            KeyCode::Char('W') => motion(ViMotion::WordRight),
+            KeyCode::Char('B') => motion(ViMotion::WordLeft),
+            KeyCode::Char('E') => motion(ViMotion::WordRightEnd),
             KeyCode::Char('0') | KeyCode::Home => motion(ViMotion::First),
             KeyCode::Char('^') => motion(ViMotion::FirstOccupied),
             KeyCode::Char('$') | KeyCode::End => motion(ViMotion::Last),
             KeyCode::Char('H') => motion(ViMotion::High),
+            KeyCode::Char('M') => motion(ViMotion::Middle),
             KeyCode::Char('L') => motion(ViMotion::Low),
+            KeyCode::Char('{') => motion(ViMotion::ParagraphUp),
+            KeyCode::Char('}') => motion(ViMotion::ParagraphDown),
+            KeyCode::Char('%') => motion(ViMotion::Bracket),
             KeyCode::PageUp => pt.copy_scroll(page * 2),
             KeyCode::PageDown => pt.copy_scroll(-page * 2),
             KeyCode::Char('u') if ctrl => pt.copy_scroll(page),
             KeyCode::Char('d') if ctrl => pt.copy_scroll(-page),
             KeyCode::Char('b') if ctrl => pt.copy_scroll(page * 2),
             KeyCode::Char('f') if ctrl => pt.copy_scroll(-page * 2),
+            // One line at a time (tmux `scroll-up`/`scroll-down`).
+            KeyCode::Char('y') if ctrl => pt.copy_scroll(1),
+            KeyCode::Char('e') if ctrl => pt.copy_scroll(-1),
+            KeyCode::Char('K') | KeyCode::Up => pt.copy_scroll(1),
+            KeyCode::Char('J') | KeyCode::Down => pt.copy_scroll(-1),
             KeyCode::Char('g') => pt.copy_top(),
-            KeyCode::Char('v') | KeyCode::Char('V') => {
-                let on = pt.copy_toggle_selection(k.code == KeyCode::Char('V'));
+            // Rectangle (tmux `rectangle-toggle`, vim's `Ctrl-v`).
+            KeyCode::Char('v') if ctrl => {
+                let on = pt.copy_toggle_selection(term::SelKind::Block);
                 if let Some(c) = &mut self.copy {
                     c.selecting = on;
                 }
             }
+            KeyCode::Char('v') | KeyCode::Char('V') | KeyCode::Char(' ') => {
+                let kind = if k.code == KeyCode::Char('V') {
+                    term::SelKind::Lines
+                } else {
+                    term::SelKind::Chars
+                };
+                // Space only ever BEGINS a selection (tmux `begin-selection`).
+                if k.code == KeyCode::Char(' ') && pt.copy_has_selection() {
+                    return;
+                }
+                let on = pt.copy_toggle_selection(kind);
+                if let Some(c) = &mut self.copy {
+                    c.selecting = on;
+                }
+            }
+            KeyCode::Char('o') => {
+                pt.copy_other_end();
+            }
+            KeyCode::Char(c @ ('f' | 'F' | 't' | 'T')) if !ctrl => {
+                if let Some(cs) = &mut self.copy {
+                    cs.pending_jump = Some((c.is_lowercase(), matches!(c, 't' | 'T')));
+                }
+            }
+            KeyCode::Char(c @ (';' | ',')) => {
+                match self.copy.as_ref().and_then(|cs| cs.last_jump) {
+                    Some((ch, forward, till)) => {
+                        self.copy_jump(term, ch, forward == (c == ';'), till, true)
+                    }
+                    None => self.flash("no previous jump (f F t T)".into(), false),
+                }
+            }
+            KeyCode::Char(c @ ('*' | '#')) => match pt.copy_word_at_cursor() {
+                Some(word) => {
+                    let up = c == '#';
+                    if let Some(cs) = &mut self.copy {
+                        cs.last = Some((word.clone(), up));
+                    }
+                    self.copy_search(term, &word, up);
+                }
+                None => self.flash("no word under the cursor".into(), false),
+            },
             KeyCode::Char('?') => self.open_copy_prompt(true),
             KeyCode::Char('/') => self.open_copy_prompt(false),
             KeyCode::Char('n') | KeyCode::Char('N') => {
@@ -5792,8 +5928,20 @@ impl App {
                     self.exit_copy_mode();
                 }
             }
+            KeyCode::Char('c') if ctrl => self.exit_copy_mode(),
             KeyCode::Char('q') | KeyCode::Char('G') => self.exit_copy_mode(),
             _ => {}
+        }
+    }
+
+    /// Run one `f`/`F`/`t`/`T` jump, saying so when the character is not on the line.
+    fn copy_jump(&mut self, term: &TerminalId, ch: char, forward: bool, till: bool, repeat: bool) {
+        let found = self
+            .panes
+            .get(term)
+            .is_some_and(|pt| pt.copy_jump(ch, forward, till, repeat));
+        if !found {
+            self.flash(format!("'{ch}' is not on this line"), false);
         }
     }
 
@@ -5807,6 +5955,8 @@ impl App {
         let Some(pt) = self.panes.get(term) else {
             return;
         };
+        // What is lit is always what `n`/`N` will find — whichever path started the search.
+        pt.copy_set_query(Some(query.to_string()));
         match pt.copy_search(query, up) {
             term::SearchOutcome::Found => {}
             term::SearchOutcome::Wrapped => self.flash(
@@ -6858,6 +7008,9 @@ impl App {
                         if let Some(cv) = &snap.copy {
                             if cv.selected(ry as i32, rx as u16) {
                                 style = style.bg(SEL_BG);
+                            } else if cv.matched(ry as i32, rx as u16) {
+                                // Search matches: yellow like tmux's `copy-mode-match-style`.
+                                style = style.bg(CAT_YELLOW).fg(CAT_BASE);
                             }
                             if cv.cursor == Some((rx as u16, ry as u16)) {
                                 style = style.add_modifier(Modifier::REVERSED);
@@ -8614,9 +8767,19 @@ impl App {
                 .get(sp)
                 .map(|p| format!(" {}/{}", p.scroll_offset(), p.history_len()))
                 .unwrap_or_default();
+            let pending = self.copy.as_ref().and_then(|c| c.pending_jump);
             let text = match self.copy.as_ref().and_then(|c| c.prompt.as_ref()) {
                 Some((up, q)) => format!(" search {}: {q}█ ", if *up { "↑" } else { "↓" }),
-                None => format!(" COPY{pos} · ?/ search · v V select · y yank · q "),
+                None => match pending {
+                    Some((forward, till)) => format!(
+                        " jump {}{}: type a character ",
+                        if till { "to " } else { "" },
+                        if forward { "forward" } else { "backward" }
+                    ),
+                    None => {
+                        format!(" COPY{pos} · ?/ search · v V ^v select · o end · y yank · q ")
+                    }
+                },
             };
             segs.push((
                 text,
@@ -10697,6 +10860,57 @@ fn sel_start_norm(snap: &crate::term::Snapshot, start: (u16, u16)) -> (u16, u16)
     } else {
         start
     }
+}
+
+/// Characters that end a double-clicked word: whitespace plus alacritty's default
+/// `semantic_escape_chars`, so a path or URL selects whole but `(foo)` gives `foo`.
+const WORD_STOPS: &str = ",│`|:\"' ()[]{}<>\t";
+
+/// The `(anchor, head)` cells of the word under pane cell `at`, or `None` on a blank or a
+/// separator. A wide glyph's spacer belongs to the glyph before it.
+fn word_bounds(snap: &crate::term::Snapshot, at: (u16, u16)) -> Option<((u16, u16), (u16, u16))> {
+    let row = snap.cells.get(at.1 as usize)?;
+    let stop = |c: &crate::term::CellSnap| {
+        !c.spacer
+            && c.sym
+                .chars()
+                .next()
+                .is_none_or(|ch| WORD_STOPS.contains(ch))
+    };
+    let mut x = at.0 as usize;
+    // Clicked the right half of a wide glyph: start from the glyph itself.
+    while x > 0 && row.get(x).is_some_and(|c| c.spacer) {
+        x -= 1;
+    }
+    if row.get(x).is_none_or(stop) {
+        return None;
+    }
+    let mut lo = x;
+    while lo > 0 && !stop(&row[lo - 1]) {
+        lo -= 1;
+    }
+    let mut hi = x;
+    while hi + 1 < row.len() && !stop(&row[hi + 1]) {
+        hi += 1;
+    }
+    Some(((lo as u16, at.1), (hi as u16, at.1)))
+}
+
+/// The `(anchor, head)` cells of the whole line through pane row `row`, following soft
+/// wraps up and down so a long command copies as the one line it is.
+fn line_bounds(snap: &crate::term::Snapshot, row: u16) -> ((u16, u16), (u16, u16)) {
+    let mut top = row as usize;
+    while top > 0 && snap.wrapped.get(top - 1).copied().unwrap_or(false) {
+        top -= 1;
+    }
+    let mut bottom = row as usize;
+    while bottom + 1 < snap.cells.len() && snap.wrapped.get(bottom).copied().unwrap_or(false) {
+        bottom += 1;
+    }
+    (
+        (0, top as u16),
+        (snap.cols.saturating_sub(1), bottom as u16),
+    )
 }
 
 fn extract_selection(snap: &crate::term::Snapshot, anchor: (u16, u16), head: (u16, u16)) -> String {
@@ -15841,5 +16055,197 @@ mod prefix_keys {
         prefixed(&mut app, &mut prefix, '&');
         assert!(app.confirm.is_none());
         assert_eq!(tabs(&app), 1);
+    }
+}
+
+#[cfg(test)]
+mod copy_mode_vi {
+    use super::*;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn press(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+        app.feed_key(KeyEvent::new(code, mods), &mut Prefix::default());
+    }
+
+    fn typ(app: &mut App, s: &str) {
+        for c in s.chars() {
+            press(app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+    }
+
+    /// A pane that printed `body` (via printf) and then a fresh marker.
+    fn app_printing(body: &str) -> App {
+        let app = app();
+        let term = app.focused_terminal().unwrap();
+        let cmd = format!("clear; printf '{body}\\n'; echo DONE-$((2+3))\n");
+        app.panes[&term].input(cmd.as_bytes());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !app.panes[&term].capture(Some(50)).text.contains("DONE-5") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the shell never printed"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        app
+    }
+
+    fn enter(app: &mut App) {
+        let mut prefix = Prefix::default();
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &mut prefix,
+        );
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+            &mut prefix,
+        );
+    }
+
+    /// Search up for `q` (Enter), leaving the cursor on its first character.
+    fn goto(app: &mut App, q: &str) {
+        typ(app, "?");
+        typ(app, q);
+        press(app, KeyCode::Enter, KeyModifiers::NONE);
+    }
+
+    fn yank(app: &mut App) -> String {
+        press(app, KeyCode::Char('y'), KeyModifiers::NONE);
+        app.take_key_copy().expect("a yank")
+    }
+
+    #[test]
+    fn ctrl_v_selects_a_rectangle() {
+        let mut app = app_printing("abc1\\nabc2\\nabc3");
+        enter(&mut app);
+        goto(&mut app, "abc1");
+        press(&mut app, KeyCode::Char('v'), KeyModifiers::CONTROL);
+        typ(&mut app, "jjl");
+        assert_eq!(yank(&mut app), "ab\nab\nab");
+    }
+
+    #[test]
+    fn v_then_capital_v_reshapes_the_selection_in_place() {
+        let mut app = app_printing("abc1\\nabc2");
+        enter(&mut app);
+        goto(&mut app, "c1");
+        typ(&mut app, "vjV");
+        assert_eq!(yank(&mut app).trim_end(), "abc1\nabc2");
+    }
+
+    #[test]
+    fn f_t_and_repeat_jump_along_the_line() {
+        let mut app = app_printing("x foo,bar,baz y");
+        enter(&mut app);
+        goto(&mut app, "foo,bar");
+        typ(&mut app, "vt,");
+        assert_eq!(yank(&mut app), "foo");
+        enter(&mut app);
+        goto(&mut app, "foo,bar");
+        typ(&mut app, "vf,;");
+        assert_eq!(yank(&mut app), "foo,bar,");
+        enter(&mut app);
+        goto(&mut app, "baz y");
+        typ(&mut app, "vF,");
+        assert_eq!(yank(&mut app), ",b");
+    }
+
+    #[test]
+    fn o_swaps_to_the_other_end_which_then_moves() {
+        let mut app = app_printing("x foo,bar,baz y");
+        enter(&mut app);
+        goto(&mut app, "foo,bar");
+        typ(&mut app, "veoh");
+        assert_eq!(yank(&mut app), " foo");
+    }
+
+    #[test]
+    fn star_searches_the_word_under_the_cursor() {
+        let mut app = app_printing("needle one\\nhay\\nneedle two");
+        enter(&mut app);
+        goto(&mut app, "needle two");
+        let term = app.focused_terminal().unwrap();
+        typ(&mut app, "#");
+        let lit = app.panes[&term].snapshot().copy.unwrap().matches.len();
+        assert!(lit >= 2, "both needles are lit for n/N: {lit}");
+        typ(&mut app, "Vy");
+        assert_eq!(app.take_key_copy().unwrap().trim_end(), "needle one");
+    }
+
+    #[test]
+    fn typing_a_query_highlights_every_match_and_esc_drops_it() {
+        let mut app = app_printing("zz-a zz-b\\nzz-c");
+        let term = app.focused_terminal().unwrap();
+        enter(&mut app);
+        typ(&mut app, "?zz-");
+        let snap = app.panes[&term].snapshot();
+        let m = &snap.copy.as_ref().unwrap().matches;
+        // The command line echoed `zz-` too; the three printed ones are what matter.
+        assert!(m.len() >= 3, "{m:?}");
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
+        let snap = app.panes[&term].snapshot();
+        assert!(snap.copy.as_ref().unwrap().matches.is_empty());
+        // A committed search stays lit for n/N.
+        goto(&mut app, "zz-");
+        let snap = app.panes[&term].snapshot();
+        assert!(!snap.copy.as_ref().unwrap().matches.is_empty());
+        // Leaving copy mode drops it.
+        typ(&mut app, "q");
+        assert!(app.panes[&term].snapshot().copy.is_none());
+    }
+
+    #[test]
+    fn double_click_copies_the_word_and_triple_click_the_line() {
+        let mut app = app_printing("see path/to-file.rs (here)");
+        let term = app.focused_terminal().unwrap();
+        let rect = app
+            .layout()
+            .into_iter()
+            .find(|r| r.terminal == term)
+            .unwrap();
+        let snap = app.panes[&term].snapshot();
+        let (row, col) = snap
+            .cells
+            .iter()
+            .enumerate()
+            .find_map(|(r, cells)| {
+                let line: String = cells.iter().map(|c| c.sym.as_str()).collect();
+                (line.starts_with("see path")).then(|| (r as u16, line.find("to-").unwrap() as u16))
+            })
+            .expect("the printed row");
+        let (x, y) = (rect.x + col, rect.y + row);
+        let click = |app: &mut App| {
+            app.mouse_at(ClientId(0), x, y, MouseKind::Click);
+            app.mouse_at(ClientId(0), x, y, MouseKind::Up)
+        };
+        assert_eq!(click(&mut app), None, "a single click copies nothing");
+        assert_eq!(click(&mut app).as_deref(), Some("path/to-file.rs"));
+        assert_eq!(
+            click(&mut app).as_deref(),
+            Some("see path/to-file.rs (here)")
+        );
+        // The copied line stays highlighted as a receipt (the server clears it on a key).
+        assert!(app.selection.as_ref().is_some_and(|s| s.moved));
+        // `f` lands on an adjacent character too.
+        let mut app = app_printing("ab");
+        enter(&mut app);
+        goto(&mut app, "ab");
+        typ(&mut app, "vfb");
+        assert_eq!(yank(&mut app), "ab");
+        // `t` to an ADJACENT target stays put; `;` then moves on to the next one.
+        let mut app = app_printing("abxb");
+        enter(&mut app);
+        goto(&mut app, "abxb");
+        typ(&mut app, "vtb");
+        assert_eq!(yank(&mut app), "a");
+        enter(&mut app);
+        goto(&mut app, "abxb");
+        typ(&mut app, "vtb;");
+        assert_eq!(yank(&mut app), "abx");
     }
 }

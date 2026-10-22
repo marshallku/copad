@@ -86,6 +86,9 @@ pub struct CopyView {
     pub cursor: Option<(u16, u16)>,
     /// Selection `(start, end)` as `(row, col)`, inclusive, and whether it is a block.
     pub selection: Option<(CopyCell, CopyCell, bool)>,
+    /// Every on-screen match of the active search, `(start, end)` inclusive (a match may wrap
+    /// onto the next row). Highlighted so `n`/`N` has somewhere visible to go.
+    pub matches: Vec<(CopyCell, CopyCell)>,
 }
 
 /// A `(viewport row, column)` copy-mode position; the row may be off-screen.
@@ -105,7 +108,26 @@ impl CopyView {
         }
         (row > r0 || col >= c0) && (row < r1 || col <= c1)
     }
+
+    /// Whether viewport cell `(row, col)` is part of a search match.
+    pub fn matched(&self, row: i32, col: u16) -> bool {
+        self.matches.iter().any(|&((r0, c0), (r1, c1))| {
+            row >= r0 && row <= r1 && (row > r0 || col >= c0) && (row < r1 || col <= c1)
+        })
+    }
 }
+
+/// How a copy-mode selection is shaped (`v`, `V`, `Ctrl-v`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelKind {
+    Chars,
+    Lines,
+    Block,
+}
+
+/// The most matches one frame highlights; a pathological one-letter query on a screen of
+/// that letter should cost a bounded walk under the pane lock.
+const MAX_HIGHLIGHTS: usize = 512;
 
 /// Largest text a copy-mode yank may produce, in bytes (the same cap as an OSC 52 write).
 pub const MAX_YANK_BYTES: usize = 1 << 20;
@@ -338,6 +360,8 @@ pub struct PaneTerm {
     /// [`next_pane_token`]) — read back out of the spawn env rather than passed
     /// separately, so every spawn path that builds a pane env gets it for free.
     pane_token: Option<String>,
+    /// The copy-mode search to highlight (the literal query), while one is active.
+    copy_query: std::sync::Mutex<Option<String>>,
 }
 
 /// Turn a pane-spawn I/O error into a message worth showing a user.
@@ -500,6 +524,7 @@ impl PaneTerm {
             fg_fd,
             spawn_cwd,
             pane_token,
+            copy_query: std::sync::Mutex::new(None),
         })
     }
 
@@ -672,7 +697,8 @@ impl PaneTerm {
     /// Snapshot the visible viewport for rendering. Keeps the term lock only for
     /// the copy so the reader thread isn't starved.
     pub fn snapshot(&self) -> Snapshot {
-        snapshot_grid(&self.term.lock())
+        let query = self.copy_query.lock().ok().and_then(|q| q.clone());
+        snapshot_with_search(&self.term.lock(), query.as_deref())
     }
 
     // --- copy mode (decisions #147): alacritty's own vi mode, every op under ONE lock ---
@@ -699,6 +725,9 @@ impl PaneTerm {
         }
         t.scroll_display(Scroll::Bottom);
         drop(t);
+        if let Ok(mut q) = self.copy_query.lock() {
+            *q = None;
+        }
         self.mark_dirty();
     }
 
@@ -732,17 +761,22 @@ impl PaneTerm {
     /// Toggle a selection of `ty` at the vi cursor (`v` / `V`); the same key again clears it.
     /// Returns whether a selection is up afterwards — read under the same lock, so a swap the
     /// PTY thread processes right after cannot make the caller believe there never was one.
-    pub fn copy_toggle_selection(&self, lines: bool) -> bool {
+    pub fn copy_toggle_selection(&self, kind: SelKind) -> bool {
         use alacritty_terminal::index::Side;
         use alacritty_terminal::selection::{Selection, SelectionType};
-        let ty = if lines {
-            SelectionType::Lines
-        } else {
-            SelectionType::Simple
+        let ty = match kind {
+            SelKind::Chars => SelectionType::Simple,
+            SelKind::Lines => SelectionType::Lines,
+            SelKind::Block => SelectionType::Block,
         };
         let mut t = self.term.lock();
         if t.selection.as_ref().is_some_and(|s| s.ty == ty) {
             t.selection = None;
+        } else if let Some(sel) = t.selection.as_mut() {
+            // Another shape is up: reshape it in place, keeping its anchor (vim's `v` → `V`
+            // → `Ctrl-v`), rather than starting over at the cursor.
+            sel.ty = ty;
+            sel.include_all();
         } else {
             let at = t.vi_mode_cursor.point;
             let mut sel = Selection::new(ty, at, Side::Left);
@@ -756,6 +790,116 @@ impl PaneTerm {
         drop(t);
         self.mark_dirty();
         up
+    }
+
+    /// Move the cursor to the selection's OTHER end (tmux `other-end`, vim `o`), which
+    /// becomes the end that moves. Returns whether there was a selection.
+    pub fn copy_other_end(&self) -> bool {
+        use alacritty_terminal::index::Side;
+        use alacritty_terminal::selection::{Selection, SelectionType};
+        let mut t = self.term.lock();
+        let Some((ty, range)) = t
+            .selection
+            .as_ref()
+            .and_then(|s| Some((s.ty, s.to_range(&*t)?)))
+        else {
+            return false;
+        };
+        let at = t.vi_mode_cursor.point;
+        // The anchor is whichever end the cursor is not on; for lines and blocks, the opposite
+        // row (and, for a block, the opposite column) of the cursor.
+        let other_line = if at.line == range.start.line {
+            range.end.line
+        } else {
+            range.start.line
+        };
+        let other = match ty {
+            SelectionType::Lines => Point::new(other_line, at.column),
+            SelectionType::Block => {
+                let col = if at.column == range.start.column {
+                    range.end.column
+                } else {
+                    range.start.column
+                };
+                Point::new(other_line, col)
+            }
+            _ if at == range.start => range.end,
+            _ => range.start,
+        };
+        let mut sel = Selection::new(ty, at, Side::Left);
+        sel.update(other, Side::Left);
+        sel.include_all();
+        t.selection = Some(sel);
+        t.vi_goto_point(other);
+        drop(t);
+        self.mark_dirty();
+        true
+    }
+
+    /// `f`/`F`/`t`/`T`: jump to the next `ch` on the cursor's (wrapped) line, forward or
+    /// back, landing ON it or one cell short (`till`). Returns whether it was found.
+    pub fn copy_jump(&self, ch: char, forward: bool, till: bool, repeat: bool) -> bool {
+        use alacritty_terminal::index::Boundary;
+        let mut t = self.term.lock();
+        let at = t.vi_mode_cursor.point;
+        let needle = ch.to_string();
+        // alacritty's inline search starts AFTER the given point, so the cursor itself is
+        // passed. Only a REPEATED `t` (`;`) starts one cell further: it is sitting just short
+        // of the last match and would otherwise find it again and never move.
+        let skip = till && repeat;
+        let hit = if forward {
+            let from = if skip {
+                at.add(&*t, Boundary::None, 1)
+            } else {
+                at
+            };
+            t.inline_search_right(from, &needle).ok().map(|p| {
+                if till {
+                    p.sub(&*t, Boundary::None, 1)
+                } else {
+                    p
+                }
+            })
+        } else {
+            let from = if skip {
+                at.sub(&*t, Boundary::None, 1)
+            } else {
+                at
+            };
+            t.inline_search_left(from, &needle).ok().map(|p| {
+                if till {
+                    p.add(&*t, Boundary::None, 1)
+                } else {
+                    p
+                }
+            })
+        };
+        let Some(p) = hit else {
+            return false;
+        };
+        t.vi_goto_point(p);
+        drop(t);
+        self.mark_dirty();
+        true
+    }
+
+    /// The word under the copy cursor (vim's `*`), if it is on one.
+    pub fn copy_word_at_cursor(&self) -> Option<String> {
+        let t = self.term.lock();
+        let at = t.vi_mode_cursor.point;
+        let start = t.semantic_search_left(at);
+        let end = t.semantic_search_right(at);
+        let word = t.bounds_to_string(start, end);
+        let word = word.trim();
+        (!word.is_empty() && !word.contains(char::is_whitespace)).then(|| word.to_string())
+    }
+
+    /// Highlight `query` on screen while copy mode shows it (`None` clears).
+    pub fn copy_set_query(&self, query: Option<String>) {
+        if let Ok(mut q) = self.copy_query.lock() {
+            *q = query;
+        }
+        self.mark_dirty();
     }
 
     /// Whether a selection is up.
@@ -892,7 +1036,16 @@ impl PaneTerm {
 /// out of [`PaneTerm::snapshot`] so tests can drive a bare `Term` (via the VTE parser)
 /// deterministically — no PTY, no shell, no timing. `pub(crate)` so the render-fidelity
 /// harness in `tui.rs` can read a REFERENCE emulator's screen too.
+#[cfg(test)]
 pub(crate) fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
+    snapshot_with_search(term, None)
+}
+
+/// [`snapshot_grid`], highlighting copy mode's `query` (a literal) on screen.
+pub(crate) fn snapshot_with_search<L: EventListener>(
+    term: &Term<L>,
+    query: Option<&str>,
+) -> Snapshot {
     let cols = term.columns();
     let rows = term.screen_lines();
     let grid = term.grid();
@@ -1017,7 +1170,7 @@ pub(crate) fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
         cursor: (cursor_col, cursor_row),
         cursor_visible: term.mode().contains(TermMode::SHOW_CURSOR) && display_offset == 0,
         cursor_shape: decscusr(term.cursor_style()),
-        copy: copy_view(term, display_offset),
+        copy: copy_view(term, display_offset, query),
     }
 }
 
@@ -1081,7 +1234,11 @@ fn decscusr(style: CursorStyle) -> u8 {
 }
 
 /// Copy mode's cursor + selection in viewport rows, or `None` when vi mode is off.
-fn copy_view<L: EventListener>(term: &Term<L>, display_offset: i32) -> Option<CopyView> {
+fn copy_view<L: EventListener>(
+    term: &Term<L>,
+    display_offset: i32,
+    query: Option<&str>,
+) -> Option<CopyView> {
     if !term.mode().contains(TermMode::VI) {
         return None;
     }
@@ -1102,7 +1259,44 @@ fn copy_view<L: EventListener>(term: &Term<L>, display_offset: i32) -> Option<Co
                 r.is_block,
             )
         });
-    Some(CopyView { cursor, selection })
+    let matches = query
+        .map(|q| visible_matches(term, display_offset, q))
+        .unwrap_or_default();
+    Some(CopyView {
+        cursor,
+        selection,
+        matches,
+    })
+}
+
+/// The on-screen matches of a literal, case-insensitive `query`, in viewport rows.
+fn visible_matches<L: EventListener>(
+    term: &Term<L>,
+    display_offset: i32,
+    query: &str,
+) -> Vec<(CopyCell, CopyCell)> {
+    use alacritty_terminal::index::Direction;
+    use alacritty_terminal::term::search::{RegexIter, RegexSearch};
+    let rows = term.screen_lines() as i32;
+    let cols = term.columns();
+    if query.is_empty() || rows == 0 || cols == 0 {
+        return Vec::new();
+    }
+    let Ok(mut regex) = RegexSearch::new(&format!("(?i){}", regex_literal(query))) else {
+        return Vec::new();
+    };
+    let start = Point::new(Line(-display_offset), Column(0));
+    let end = Point::new(Line(rows - 1 - display_offset), Column(cols - 1));
+    RegexIter::new(start, end, Direction::Right, term, &mut regex)
+        .take(MAX_HIGHLIGHTS)
+        .map(|m| {
+            let (a, b) = (*m.start(), *m.end());
+            (
+                (a.line.0 + display_offset, a.column.0 as u16),
+                (b.line.0 + display_offset, b.column.0 as u16),
+            )
+        })
+        .collect()
 }
 
 /// Server-owned traversal budgets for [`capture_text`]. These bound the WORK, not merely

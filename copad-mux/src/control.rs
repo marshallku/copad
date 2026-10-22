@@ -1099,14 +1099,19 @@ pub fn runtime_dir() -> PathBuf {
 /// The control/attach socket path: `$COPAD_MUX_SOCK` if set (caller-managed, e.g.
 /// tests), else `<runtime_dir>/sock`.
 pub fn socket_path() -> PathBuf {
+    // A unit test must never reach the user's LIVE server. Ignoring an unset variable is not
+    // enough: every comux pane EXPORTS `COPAD_MUX_SOCK`, so `cargo test` run from inside one
+    // read the real socket and a parse test's `split -h` split the owner's tab (three stray
+    // shells, 2026-10-23). Test builds read only their own variable, set by the tests that
+    // want a specific dead socket, and otherwise a path nothing listens on.
+    if cfg!(test) {
+        return std::env::var("COPAD_MUX_TEST_SOCK").map_or_else(
+            |_| std::env::temp_dir().join("copad-mux-unit-tests-no-listener.sock"),
+            PathBuf::from,
+        );
+    }
     if let Ok(p) = std::env::var("COPAD_MUX_SOCK") {
         return PathBuf::from(p);
-    }
-    // A unit test must never reach the user's LIVE server: the env var is process-global, so
-    // one test clearing it while another runs `run_client` once sent a real `split` to the
-    // owner's session. Test builds fall back to a path nothing listens on.
-    if cfg!(test) {
-        return std::env::temp_dir().join("copad-mux-unit-tests-no-listener.sock");
     }
     runtime_dir().join("sock")
 }
@@ -4149,9 +4154,9 @@ mod server_admin_tests {
         let path = std::env::temp_dir().join(format!("copad-mux-admin-test-{name}.sock"));
         let _ = std::fs::remove_file(&path);
         // SAFETY: single-threaded within this closure; the var is restored on the way out.
-        unsafe { std::env::set_var("COPAD_MUX_SOCK", &path) };
+        unsafe { std::env::set_var("COPAD_MUX_TEST_SOCK", &path) };
         let out = f();
-        unsafe { std::env::remove_var("COPAD_MUX_SOCK") };
+        unsafe { std::env::remove_var("COPAD_MUX_TEST_SOCK") };
         out
     }
 
