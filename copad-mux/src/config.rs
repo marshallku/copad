@@ -27,6 +27,8 @@ use serde::Deserialize;
 
 // ---- default constants (the config clamps toward / falls back to these) ----
 pub const DEFAULT_SIDEBAR_WIDTH: u16 = 24;
+/// tmux's `repeat-time` default.
+pub const DEFAULT_REPEAT_TIME: u64 = 500;
 pub const DEFAULT_SIDEBAR_MIN_COLS: u16 = 80;
 pub const DEFAULT_SCROLL_STEP: i32 = 3;
 /// Default periodic autosave interval (seconds) for session persistence.
@@ -366,6 +368,10 @@ pub enum Action {
     /// Arm the prefix (`Ctrl-b`). A global-table action like any other, but prefix
     /// entry always wins over a colliding user binding.
     EnterPrefix,
+    /// `Ctrl-b Ctrl-b` (tmux `send-prefix`): type the prefix key itself into the pane, for
+    /// a nested tmux/comux or readline's back-char. Bound to the prefix chord by default,
+    /// whatever `prefix` is set to.
+    SendPrefix,
 }
 
 impl Action {
@@ -411,6 +417,7 @@ impl Action {
             NavForward => "forward along the navigation history",
             NavLast => "toggle to the previous session / tab",
             KeyHelp => "this help",
+            SendPrefix => "send the prefix key to the pane",
             ZoomPane => "zoom the pane to the whole tab, and back",
             Mark => "pin the pane to a slot (then 1–9)",
             GotoMark => "go to a pinned slot (then 1–9)",
@@ -437,6 +444,15 @@ impl Action {
             KeyHelp => "all keys",
             _ => return None,
         })
+    }
+
+    /// Whether the action keeps the prefix table live for `repeat_time` afterwards (tmux
+    /// `bind -r`), so `Ctrl-b H H H` nudges three times. Only actions you press in bursts and
+    /// whose keys mean nothing urgent to a shell: a burst of focus moves would eat the next
+    /// letters you type into vim.
+    pub fn repeatable(self) -> bool {
+        use Action::*;
+        matches!(self, ResizeLeft | ResizeDown | ResizeUp | ResizeRight)
     }
 }
 
@@ -688,6 +704,7 @@ fn action_from_name(name: &str) -> Option<Action> {
         "mark" => Action::Mark,
         "goto-mark" => Action::GotoMark,
         "prefix" => Action::EnterPrefix,
+        "send-prefix" => Action::SendPrefix,
         _ => {
             // tab-1 .. tab-9
             let n = name.strip_prefix("tab-")?.parse::<u8>().ok()?;
@@ -771,6 +788,8 @@ fn default_bindings() -> Vec<(Action, Ctx, &'static [&'static str])> {
         (ZoomPane, Prefix, &["z"]),
         (Mark, Prefix, &["m"]),
         (GotoMark, Prefix, &["'"]),
+        // No literal default: `build_keymap` binds it to whatever the prefix chord is.
+        (SendPrefix, Prefix, &[]),
     ]
 }
 
@@ -868,6 +887,12 @@ pub struct MuxConfig {
     /// While the prefix is armed, show the most useful next keys (from the live keymap) in
     /// the status bar in place of the tab chips. Presentation only; on by default.
     pub prefix_hint: bool,
+    /// How long, in milliseconds, a repeatable binding (the resize keys) stays live after it
+    /// runs, without pressing the prefix again (tmux `repeat-time`). `0` turns repeat off.
+    pub repeat_time: u64,
+    /// Ask `y/n` before `Ctrl-b x` closes a pane or `Ctrl-b &` closes a tab (tmux
+    /// `confirm-before`). One keystroke otherwise kills a running agent with no undo.
+    pub confirm_close: bool,
     /// Decorate each session's sidebar branch with working-tree state from `git status`
     /// (dirty `*`, ahead/behind, `+a −r` against HEAD), read off-loop every few seconds.
     /// `false` keeps the fork-free branch name only. Read at server start.
@@ -970,6 +995,8 @@ struct RawConfig {
     notify: Option<bool>,
     bell: Option<bool>,
     prefix_hint: Option<bool>,
+    repeat_time: Option<i64>,
+    confirm_close: Option<bool>,
     sidebar_git: Option<bool>,
     pane_titles: Option<bool>,
     top_bar: Option<bool>,
@@ -1077,6 +1104,8 @@ impl MuxConfig {
             notify: true,
             bell: true,
             prefix_hint: true,
+            repeat_time: DEFAULT_REPEAT_TIME,
+            confirm_close: true,
             sidebar_git: true,
             pane_titles: true,
             top_bar: false,
@@ -1163,6 +1192,14 @@ impl MuxConfig {
             "scroll_step",
             &mut warnings,
         ) as i32;
+        let repeat_time = clamp_field(
+            raw.repeat_time,
+            DEFAULT_REPEAT_TIME as i64,
+            0,
+            5000,
+            "repeat_time",
+            &mut warnings,
+        ) as u64;
         // autosave: 0 explicitly disables periodic saves; any other value is clamped to
         // a sane [5, 3600] s (a bad-but-nonzero value shouldn't hammer the disk).
         let autosave_secs = match raw.autosave_secs {
@@ -1196,6 +1233,8 @@ impl MuxConfig {
                 notify: raw.notify.unwrap_or(true),
                 bell: raw.bell.unwrap_or(true),
                 prefix_hint: raw.prefix_hint.unwrap_or(true),
+                repeat_time,
+                confirm_close: raw.confirm_close.unwrap_or(true),
                 sidebar_git: raw.sidebar_git.unwrap_or(true),
                 pane_titles: raw.pane_titles.unwrap_or(true),
                 top_bar: raw.top_bar.unwrap_or(false),
@@ -1611,6 +1650,11 @@ fn build_keymap(
             "[global] {a:?} shadows the prefix {prefix_chord:?} — dropped so the prefix works"
         ));
         global_map.insert(prefix_chord, Action::EnterPrefix);
+    }
+    // `send-prefix` defaults to the prefix pressed twice, tracking a changed `prefix`. A user
+    // binding for it, or anything already on that chord, wins.
+    if !prefix_over.contains_key(&Action::SendPrefix) {
+        prefix_map.entry(prefix_chord).or_insert(Action::SendPrefix);
     }
 
     (

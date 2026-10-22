@@ -124,7 +124,7 @@ struct Client {
     last_cursor: Option<(u16, u16)>,
     /// This client's OWN `Ctrl-b` prefix state — per-connection so a chord can't span
     /// clients when input is shared.
-    prefix: bool,
+    prefix: crate::tui::Prefix,
     epoch: u64,
     cols: u16,
     rows: u16,
@@ -819,7 +819,7 @@ fn handle_incoming(
                 needs_full: true,
                 pending: false,
                 last_cursor: None,
-                prefix: false,
+                prefix: crate::tui::Prefix::default(),
                 epoch: 0,
                 // The attach frame is `full` — every cell, applied over a cleared screen — so
                 // both self-heal walks start one interval OUT rather than firing immediately
@@ -1040,7 +1040,7 @@ fn prune_dead_clients(app: &mut App, clients: &mut Vec<Client>, dead: &[u64]) ->
     // (`dirty |= clients.iter().any(|c| c.needs_full || c.pending)`). Terminating: each prune
     // strictly shrinks `clients`. Centralized here rather than at the call sites so a future
     // prune path cannot reintroduce the stuck indicator.
-    if app.prefix_armed() != clients.iter().any(|c| c.prefix) {
+    if app.prefix_armed() != clients.iter().any(|c| c.prefix.is_armed()) {
         for c in clients.iter_mut() {
             c.pending = true;
         }
@@ -1144,7 +1144,7 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
     // bar's `^b` indicator shows whether ANY client is mid-chord. Recomputed here rather
     // than pushed from the key path because a client can also leave the prefix armed and
     // then detach — reading the live client list each frame can't go stale.
-    let armed = clients.iter().any(|c| c.prefix);
+    let armed = clients.iter().any(|c| c.prefix.is_armed());
     app.set_prefix_armed(armed);
 
     // Self-heal cadence, read live so `comux reload` changes it on the running server.
@@ -1308,7 +1308,7 @@ mod tests {
             needs_full: true,
             pending: false,
             last_cursor: None,
-            prefix: false,
+            prefix: crate::tui::Prefix::default(),
             epoch: 0,
             repaint_at: Instant::now() + Duration::from_secs(3600),
             resync_at: Instant::now() + Duration::from_secs(3600),
@@ -1410,7 +1410,7 @@ mod tests {
 
         let (idle, _idle_guard) = test_client(1, 80, 24);
         let (mut armed, _armed_guard) = test_client(2, 80, 24);
-        armed.prefix = true;
+        armed.prefix = crate::tui::Prefix::armed();
         let mut clients = vec![idle, armed];
 
         push_frames(&mut app, &mut clients);
@@ -1421,7 +1421,7 @@ mod tests {
         );
 
         // The chord completed (or the key was not bound): the flag must go with it.
-        clients[1].prefix = false;
+        clients[1].prefix = crate::tui::Prefix::default();
         push_frames(&mut app, &mut clients);
         assert!(
             !status_row(&app).contains("^b"),
@@ -1431,7 +1431,7 @@ mod tests {
 
         // Armed again, then that client vanishes without ever resolving the chord — the
         // indicator is recomputed from the live client list, so it cannot outlive them.
-        clients[1].prefix = true;
+        clients[1].prefix = crate::tui::Prefix::armed();
         push_frames(&mut app, &mut clients);
         assert!(status_row(&app).contains("^b"));
         clients.pop();
@@ -1484,7 +1484,7 @@ mod tests {
 
         let (live, _live_guard) = test_client(1, 80, 24);
         let (mut dying, dying_guard) = test_client(2, 80, 24);
-        dying.prefix = true;
+        dying.prefix = crate::tui::Prefix::armed();
         drop(dying_guard); // its writer is gone — the send will report `Disconnected`
         let mut clients = vec![live, dying];
 
@@ -1518,7 +1518,7 @@ mod tests {
 
         let (live, _live_guard) = test_client(1, 80, 24);
         let (mut dying, dying_guard) = test_client(2, 80, 24);
-        dying.prefix = true;
+        dying.prefix = crate::tui::Prefix::armed();
         super::queue_copy(&mut dying, 1, "a drag copy it will never receive");
         drop(dying_guard);
         let mut clients = vec![live, dying];

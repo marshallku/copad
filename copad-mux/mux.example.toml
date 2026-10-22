@@ -51,6 +51,11 @@ pane_titles = true        # title panes (`1:claude working`) when a tab shows 2+
                           #   above, or on a blank stretch of the first row — never over content
 prefix_hint = true        # while the prefix is armed, the status bar shows the next keys
                           #   (`? all keys · c tab · …`) in place of the tab chips
+repeat_time = 500         # ms a repeatable key (the H/J/K/L resize keys) stays live after it
+                          #   runs, so `Ctrl-b H H H` nudges three times (tmux repeat-time);
+                          #   0 = always press the prefix
+confirm_close = true      # ask y/n before Ctrl-b x closes a pane / Ctrl-b & closes a tab (tmux
+                          #   confirm-before); x on a tab's last pane closes the tab
 sort_by = "created"       # session order in the sidebar / Ctrl-f switcher / )( cycle:
                           #   created (default) | alphabetical | recent | activity
                           #   `)`/`(` follow it for created/alphabetical; recent/activity
@@ -216,6 +221,8 @@ restore_agent_sessions = true
 # goto-mark = "'"         # then 1-9: go to the pinned pane, in whatever session
 # zoom-pane = "z"         # the focused pane fills the tab, and back (tmux resize-pane -Z)
 # key-help = "?"         # every binding of the live keymap (j/k scroll, any other key closes)
+# send-prefix = "C-b"     # type the prefix itself into the pane (nested tmux, readline);
+                          #   defaults to the prefix pressed twice, whatever `prefix` is
 
 # ---- prefix-less bindings (tmux `bind -n`) ----
 [global]

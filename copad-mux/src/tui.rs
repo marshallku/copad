@@ -431,6 +431,10 @@ fn menu_origin(ax: u16, ay: u16, w: u16, h: u16, cols: u16, rows: u16) -> (u16, 
 enum ConfirmAction {
     /// Kill (remove) this workspace/session.
     KillSession(WorkspaceId),
+    /// `Ctrl-b x`: close this pane (tmux `confirm-before kill-pane`).
+    ClosePane(WorkspaceId, PaneId),
+    /// `Ctrl-b &` (or `x` on a tab's last pane): close this tab.
+    CloseTab(WorkspaceId, TabId),
 }
 
 /// An open confirm modal: a message + the action to run on `y`.
@@ -631,6 +635,36 @@ pub enum KeyAction {
     /// The user pressed the redraw chord (`Ctrl-b r`): force a full repaint to the client
     /// that asked (server re-sends a `full` frame; the client clears + repaints).
     Redraw,
+}
+
+/// One client's prefix state. Per-connection (the server keeps one per client) so a chord
+/// can't span two clients.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Prefix {
+    /// `Ctrl-b` was pressed and the next chord resolves through the prefix table.
+    armed: bool,
+    /// After a repeatable binding (tmux `bind -r`): until this instant another repeatable
+    /// prefix-table chord runs without the prefix. Any other key ends it and is handled as
+    /// if it never was. Deliberately not shown in the status bar, like tmux.
+    repeat_until: Option<std::time::Instant>,
+}
+
+impl Prefix {
+    /// An armed prefix, as if `Ctrl-b` was just pressed.
+    pub fn armed() -> Prefix {
+        Prefix {
+            armed: true,
+            repeat_until: None,
+        }
+    }
+
+    pub fn is_armed(&self) -> bool {
+        self.armed
+    }
+
+    fn clear(&mut self) {
+        *self = Prefix::default();
+    }
 }
 
 /// Height of the always-on bottom status bar (tmux-style).
@@ -1661,13 +1695,66 @@ impl App {
         }
     }
 
+    /// `Ctrl-b x` (tmux `kill-pane`): close the focused pane, after a `y/n` unless
+    /// `confirm_close = false`. On a tab's only pane it closes the TAB, as tmux kills the
+    /// window — it used to do nothing at all, silently.
     fn close_focused(&mut self) {
-        if let Some(pane) = self.focused_pane() {
-            // The `x` key ignores a rejected close (e.g. the last pane stays;
-            // the shell-exit path handles quitting).
-            let ws = self.ws.clone();
-            let _ = self.close_pane(&ws, pane);
+        let Some(pane) = self.focused_pane() else {
+            return;
+        };
+        let ws = self.ws.clone();
+        if self.pane_order().len() <= 1 {
+            if let Some(tab) = self.active_tab_id() {
+                self.request_close_tab(ws, tab);
+            }
+            return;
         }
+        if !self.cfg.confirm_close {
+            let _ = self.close_pane(&ws, pane);
+            return;
+        }
+        let what = self
+            .focused_terminal()
+            .and_then(|t| self.labels.get(&t))
+            .map(|l| format!(" ({})", l.text))
+            .unwrap_or_default();
+        let index = self
+            .pane_order()
+            .iter()
+            .position(|p| *p == pane)
+            .map_or(0, |i| i + 1);
+        self.confirm = Some(Confirm {
+            message: format!("kill pane {index}{what}? (y = kill, any other key cancels)"),
+            action: ConfirmAction::ClosePane(ws, pane),
+        });
+    }
+
+    /// Close a tab of `ws` from a key, after a `y/n` unless `confirm_close = false`. A
+    /// session's last tab is refused with a word instead of a silent no-op.
+    fn request_close_tab(&mut self, ws: WorkspaceId, tab: TabId) {
+        let Some(w) = self.state.workspace(&ws) else {
+            return;
+        };
+        if w.tabs.len() <= 1 {
+            self.flash(
+                "the session's last tab — exit its shell, or kill the session".into(),
+                false,
+            );
+            return;
+        }
+        if !self.cfg.confirm_close {
+            let _ = self.close_tab(&ws, tab);
+            return;
+        }
+        let index = w.tabs.iter().position(|t| t.id == tab).map_or(0, |i| i + 1);
+        let panes = w.tab(&tab).map_or(0, |t| t.layout.terminals().len());
+        let plural = if panes == 1 { "" } else { "s" };
+        self.confirm = Some(Confirm {
+            message: format!(
+                "kill tab {index} ({panes} pane{plural})? (y = kill, any other key cancels)"
+            ),
+            action: ConfirmAction::CloseTab(ws, tab),
+        });
     }
 
     /// Close a specific pane of `ws` (used by the `x` key on the focused pane and by the
@@ -1866,7 +1953,7 @@ impl App {
         let Some(active) = self.active_tab_id() else {
             return;
         };
-        let _ = self.close_tab(&self.ws.clone(), active);
+        self.request_close_tab(self.ws.clone(), active);
     }
 
     /// Close a specific tab of `ws` (context menu can target a non-active one) and reap
@@ -2535,6 +2622,14 @@ impl App {
         match action {
             ConfirmAction::KillSession(wid) => {
                 self.kill_session(&wid);
+            }
+            // Revalidated by the state actor: a pane or tab that went away meanwhile (or
+            // became the last one) is refused, and there is nothing worth saying about it.
+            ConfirmAction::ClosePane(ws, pane) => {
+                let _ = self.close_pane(&ws, pane);
+            }
+            ConfirmAction::CloseTab(ws, tab) => {
+                let _ = self.close_tab(&ws, tab);
             }
         }
     }
@@ -4583,7 +4678,7 @@ impl App {
     /// Returns [`KeyAction::Detach`] on the detach chord. The `Ctrl-b` prefix state is
     /// PER-CLIENT (`prefix`, owned by the caller) so a chord can't span connections
     /// when several clients share input; the popup is shared workspace state.
-    pub fn feed_key(&mut self, k: KeyEvent, prefix: &mut bool) -> KeyAction {
+    pub fn feed_key(&mut self, k: KeyEvent, prefix: &mut Prefix) -> KeyAction {
         let action = self.feed_key_inner(k, prefix);
         self.track_nav();
         action
@@ -4597,8 +4692,8 @@ impl App {
     /// overlay owns input (a prompt, a picker, copy mode, …) or the prefix is armed, it is
     /// replayed as the keystrokes a terminal without bracketed paste would have sent, so
     /// pasting into a rename prompt keeps working exactly as before.
-    pub fn feed_paste(&mut self, text: &str, prefix: &mut bool) -> KeyAction {
-        if *prefix || self.input_captured() {
+    pub fn feed_paste(&mut self, text: &str, prefix: &mut Prefix) -> KeyAction {
+        if prefix.armed || self.input_captured() {
             let mut action = KeyAction::Continue;
             for code in paste_keys(text) {
                 action = self.feed_key(KeyEvent::new(code, KeyModifiers::NONE), prefix);
@@ -4633,14 +4728,14 @@ impl App {
             || self.center.is_some()
     }
 
-    fn feed_key_inner(&mut self, k: KeyEvent, prefix: &mut bool) -> KeyAction {
+    fn feed_key_inner(&mut self, k: KeyEvent, prefix: &mut Prefix) -> KeyAction {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
 
         // An open inline prompt (new-session name / rename) captures all input: type
         // to edit, Enter commits, Esc cancels. Shared state, so clear this client's
         // pending prefix too.
         if let Some(mut p) = self.prompt.take() {
-            *prefix = false;
+            prefix.clear();
             match k.code {
                 KeyCode::Enter => self.commit_prompt(p),
                 // Naming a session you just browsed to: Esc steps back to the browser.
@@ -4665,7 +4760,7 @@ impl App {
         // A y/n confirm modal (kill-session) captures input while open: `y`/`Y`
         // performs the captured action, anything else cancels.
         if let Some(cf) = self.confirm.take() {
-            *prefix = false;
+            prefix.clear();
             if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
                 self.perform_confirm(cf.action);
             }
@@ -4674,7 +4769,7 @@ impl App {
 
         // The mark modal takes ONE key: a slot digit acts, anything else cancels.
         if let Some(modal) = self.mark_modal.take() {
-            *prefix = false;
+            prefix.clear();
             match (k.code, modal) {
                 (KeyCode::Char(c @ '1'..='9'), MarkModal::Set(term)) => {
                     self.set_mark(c as u8 - b'0', &term);
@@ -4687,7 +4782,7 @@ impl App {
 
         // The key help scrolls with j/k/arrows/PgUp/PgDn/g/G; any other key closes it.
         if let Some(scroll) = self.help {
-            *prefix = false;
+            prefix.clear();
             let page = self.rows.saturating_sub(4).max(1) as usize;
             self.help = match k.code {
                 KeyCode::Down | KeyCode::Char('j') => Some(scroll + 1),
@@ -4707,7 +4802,7 @@ impl App {
         // An open right-click context menu captures input (tmux display-menu keys):
         // `j`/`k`/arrows navigate, Enter runs the selection, anything else closes.
         if self.menu.is_some() {
-            *prefix = false;
+            prefix.clear();
             match k.code {
                 KeyCode::Down | KeyCode::Char('j') => self.menu_move(1),
                 KeyCode::Up | KeyCode::Char('k') => self.menu_move(-1),
@@ -4728,7 +4823,7 @@ impl App {
         // Sidebar keyboard-focus mode (`Ctrl-b e`): hjkl/arrows navigate the spaces/agents
         // lists (h/l or ←/→ switch group, j/k or ↑/↓ move), Enter selects, Esc/q exits.
         if self.sidebar_focus.is_some() {
-            *prefix = false;
+            prefix.clear();
             match k.code {
                 KeyCode::Down | KeyCode::Char('j') => self.sidebar_focus_move(1),
                 KeyCode::Up | KeyCode::Char('k') => self.sidebar_focus_move(-1),
@@ -4746,7 +4841,7 @@ impl App {
         // must not survive another client's popup interaction and fire a stray mux
         // command (close/detach) after the popup closes.
         if self.popup.is_some() {
-            *prefix = false;
+            prefix.clear();
             match k.code {
                 // ↑/↓ (or Ctrl-n/p) move the list; ←/→ switch the sessions/agents tab.
                 KeyCode::Down => self.popup_move(1),
@@ -4773,7 +4868,7 @@ impl App {
         // The new-session browser (`Ctrl-b C`) captures all input while open. Every printable
         // character belongs to the filter, so navigation is arrows / Tab / Enter.
         if self.browser.is_some() {
-            *prefix = false;
+            prefix.clear();
             match k.code {
                 KeyCode::Down => self.browser_move(1),
                 KeyCode::Up => self.browser_move(-1),
@@ -4793,7 +4888,7 @@ impl App {
         // The resume picker (`Ctrl-b R`) captures all input while open, for the same
         // shared-state reason as the switcher above.
         if self.resume.is_some() {
-            *prefix = false;
+            prefix.clear();
             match k.code {
                 KeyCode::Down => self.resume_move(1),
                 KeyCode::Up => self.resume_move(-1),
@@ -4817,7 +4912,7 @@ impl App {
         // (bound at entry, so a focus change can't strand it), driving alacritty's own vi
         // mode. If that pane is gone — or its screen swapped since entry — drop out.
         if let Some(term) = self.scroll_pane.clone() {
-            *prefix = false;
+            prefix.clear();
             let alt_now = self.panes.get(&term).map(|p| p.in_alt_screen());
             if alt_now.is_none() || self.copy.as_ref().map(|c| c.alt) != alt_now {
                 self.exit_copy_mode();
@@ -4846,7 +4941,7 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('q') => self.center = None,
                 _ => {}
             }
-            *prefix = false;
+            prefix.clear();
             return KeyAction::Continue;
         }
 
@@ -4854,7 +4949,7 @@ impl App {
         // A key we never bind (function keys, etc.) can't form a chord — treat it as
         // shell input (and disarm a dangling prefix).
         let Some(chord) = config::chord_of(&k) else {
-            *prefix = false;
+            prefix.clear();
             if let Some(bytes) = key_to_bytes(k.code, k.modifiers) {
                 self.input_focused(&bytes);
             }
@@ -4862,19 +4957,30 @@ impl App {
         };
 
         // Prefix armed: the next chord is a prefix-table binding (or nothing).
-        if *prefix {
-            *prefix = false;
+        if prefix.armed {
+            prefix.clear();
             if let Some(action) = self.cfg.keymap.prefix_action(&chord) {
-                return self.dispatch(action);
+                return self.dispatch_prefixed(action, prefix);
             }
             return KeyAction::Continue;
+        }
+
+        // Inside a repeat window (tmux `bind -r`): another repeatable prefix chord runs
+        // without the prefix. Anything else ends the window and falls through as the
+        // ordinary key it is — so typing right after a resize burst still reaches the shell.
+        if let Some(until) = prefix.repeat_until.take()
+            && std::time::Instant::now() < until
+            && let Some(action) = self.cfg.keymap.prefix_action(&chord)
+            && action.repeatable()
+        {
+            return self.dispatch_prefixed(action, prefix);
         }
 
         // Prefix-less: a global binding wins (incl. entering the prefix); otherwise the
         // key is shell input.
         if let Some(action) = self.cfg.keymap.global_action(&chord) {
             if action == Action::EnterPrefix {
-                *prefix = true;
+                *prefix = Prefix::armed();
                 return KeyAction::Continue;
             }
             return self.dispatch(action);
@@ -4883,6 +4989,15 @@ impl App {
             self.input_focused(&bytes);
         }
         KeyAction::Continue
+    }
+
+    /// Run a prefix-table action and, when it is repeatable, open the repeat window.
+    fn dispatch_prefixed(&mut self, action: Action, prefix: &mut Prefix) -> KeyAction {
+        if action.repeatable() && self.cfg.repeat_time > 0 {
+            prefix.repeat_until =
+                Some(std::time::Instant::now() + Duration::from_millis(self.cfg.repeat_time));
+        }
+        self.dispatch(action)
     }
 
     /// Execute a resolved keymap [`Action`]. Returns [`KeyAction::Detach`] for the
@@ -4939,6 +5054,12 @@ impl App {
                 }
             }
             EnterPrefix => {} // handled by the caller (arms the prefix)
+            SendPrefix => {
+                let c = self.cfg.keymap.prefix_chord;
+                if let Some(bytes) = chord_bytes(&c) {
+                    self.input_focused(&bytes);
+                }
+            }
         }
         KeyAction::Continue
     }
@@ -10946,6 +11067,32 @@ fn paste_keys(text: &str) -> Vec<KeyCode> {
     keys
 }
 
+/// The bytes a chord types into a pane, for `send-prefix`.
+fn chord_bytes(c: &Chord) -> Option<Vec<u8>> {
+    use config::Key;
+    let code = match c.key {
+        Key::Char(ch) if c.shift => KeyCode::Char(ch.to_ascii_uppercase()),
+        Key::Char(ch) => KeyCode::Char(ch),
+        Key::Left => KeyCode::Left,
+        Key::Right => KeyCode::Right,
+        Key::Up => KeyCode::Up,
+        Key::Down => KeyCode::Down,
+        Key::Enter => KeyCode::Enter,
+        Key::Tab => KeyCode::Tab,
+        Key::Space => KeyCode::Char(' '),
+        Key::Esc => KeyCode::Esc,
+        Key::Backspace => KeyCode::Backspace,
+    };
+    let mut mods = KeyModifiers::NONE;
+    if c.ctrl {
+        mods |= KeyModifiers::CONTROL;
+    }
+    if c.alt {
+        mods |= KeyModifiers::ALT;
+    }
+    key_to_bytes(code, mods)
+}
+
 /// Translate a key event into the bytes a PTY expects.
 fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
     let alt = mods.contains(KeyModifiers::ALT);
@@ -12720,7 +12867,7 @@ mod new_session_dir {
     }
 
     fn key(app: &mut App, code: KeyCode) {
-        let mut prefix = false;
+        let mut prefix = Prefix::default();
         app.feed_key(KeyEvent::new(code, KeyModifiers::NONE), &mut prefix);
     }
 
@@ -13560,7 +13707,7 @@ mod nav {
         app.session_display_name(&app.ws)
     }
 
-    fn key(app: &mut App, prefix: &mut bool, code: KeyCode, mods: KeyModifiers) {
+    fn key(app: &mut App, prefix: &mut Prefix, code: KeyCode, mods: KeyModifiers) {
         app.feed_key(KeyEvent::new(code, mods), prefix);
     }
 
@@ -13603,9 +13750,9 @@ mod nav {
         let t0 = app.active_tab_id().unwrap();
         app.feed_key(
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
-            &mut false,
+            &mut Prefix::default(),
         );
-        let mut prefix = false;
+        let mut prefix = Prefix::default();
         key(
             &mut app,
             &mut prefix,
@@ -13652,7 +13799,7 @@ mod nav {
         // The prompt commit returns early from the key handler — exactly the path a
         // bottom-of-function hook would miss.
         let mut app = app_with(SortBy::Created);
-        let mut prefix = false;
+        let mut prefix = Prefix::default();
         key(
             &mut app,
             &mut prefix,
@@ -13739,7 +13886,7 @@ mod nav {
             app.open_popup();
             assert_eq!(preselected(&app), "b", "{sort:?}");
             // Enter switches there: Ctrl-f Enter is the Alt-Tab toggle.
-            let mut prefix = false;
+            let mut prefix = Prefix::default();
             key(&mut app, &mut prefix, KeyCode::Enter, KeyModifiers::NONE);
             assert_eq!(here(&app), "b", "{sort:?}");
         }
@@ -13912,7 +14059,7 @@ mod overlay_width {
     fn a_long_korean_prompt_keeps_its_caret_and_border() {
         let mut app = app();
         app.open_new_session_prompt();
-        let mut prefix = false;
+        let mut prefix = Prefix::default();
         for c in "가나다라마바사아자차카타파하".repeat(4).chars() {
             app.feed_key(
                 KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
@@ -13951,12 +14098,12 @@ mod key_help {
         App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
     }
 
-    fn press(app: &mut App, prefix: &mut bool, code: KeyCode, mods: KeyModifiers) {
+    fn press(app: &mut App, prefix: &mut Prefix, code: KeyCode, mods: KeyModifiers) {
         app.feed_key(KeyEvent::new(code, mods), prefix);
     }
 
     fn open(app: &mut App) {
-        let mut prefix = false;
+        let mut prefix = Prefix::default();
         press(app, &mut prefix, KeyCode::Char('b'), KeyModifiers::CONTROL);
         press(app, &mut prefix, KeyCode::Char('?'), KeyModifiers::SHIFT);
     }
@@ -13982,7 +14129,7 @@ mod key_help {
         assert!(shown.contains("split the pane side by side"), "{shown}");
         assert!(shown.contains("prefix — press ^b first"), "{shown}");
         assert!(shown.contains("1–9"), "tabs fold into one row: {shown}");
-        let mut prefix = false;
+        let mut prefix = Prefix::default();
         press(
             &mut app,
             &mut prefix,
@@ -14004,13 +14151,16 @@ mod key_help {
             KeyModifiers::NONE,
         );
         assert_eq!(app.help, None);
-        assert!(!prefix, "closing does not leave the prefix armed");
+        assert!(
+            !prefix.is_armed(),
+            "closing does not leave the prefix armed"
+        );
     }
 
     #[test]
     fn a_rebound_key_shows_as_bound_now() {
         let mut app = app_from("prefix = \"C-a\"\n[keys]\nnew-tab = \"t\"\nkey-help = \"/\"");
-        let mut prefix = false;
+        let mut prefix = Prefix::default();
         press(
             &mut app,
             &mut prefix,
@@ -14197,7 +14347,7 @@ mod mode_hints {
     }
 
     fn chord(app: &mut App, c: char) {
-        let mut prefix = false;
+        let mut prefix = Prefix::default();
         app.feed_key(
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
             &mut prefix,
@@ -14251,7 +14401,7 @@ mod mode_hints {
         chord(&mut app, '[');
         assert!(bar(&app).contains("COPY 0/"), "{}", bar(&app));
         assert!(bar(&app).contains("y yank · q"));
-        let mut prefix = false;
+        let mut prefix = Prefix::default();
         app.feed_key(
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
             &mut prefix,
@@ -14864,8 +15014,8 @@ mod zoom_titles {
         let mut app = app();
         split(&mut app, "right");
         assert!(app.handle_control(&Req::Zoom).ok);
-        let mut prefix = false;
-        let key = |app: &mut App, prefix: &mut bool, c: char| {
+        let mut prefix = Prefix::default();
+        let key = |app: &mut App, prefix: &mut Prefix, c: char| {
             app.feed_key(
                 KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
                 prefix,
@@ -15007,7 +15157,7 @@ mod copy_mode {
     }
 
     fn press(app: &mut App, code: KeyCode, mods: KeyModifiers) {
-        app.feed_key(KeyEvent::new(code, mods), &mut false);
+        app.feed_key(KeyEvent::new(code, mods), &mut Prefix::default());
     }
 
     fn typ(app: &mut App, s: &str) {
@@ -15037,7 +15187,7 @@ mod copy_mode {
     }
 
     fn enter(app: &mut App) {
-        let mut prefix = false;
+        let mut prefix = Prefix::default();
         app.feed_key(
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
             &mut prefix,
@@ -15207,7 +15357,7 @@ mod marks {
     }
 
     fn chord(app: &mut App, a: char, b: char) {
-        let mut prefix = false;
+        let mut prefix = Prefix::default();
         app.feed_key(
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
             &mut prefix,
@@ -15259,7 +15409,7 @@ mod marks {
     fn the_modal_pins_the_pane_focused_when_it_opened_and_cancels_on_a_non_digit() {
         let mut app = app();
         let (_, a) = session(&mut app, "a");
-        let mut prefix = false;
+        let mut prefix = Prefix::default();
         app.feed_key(
             KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
             &mut prefix,
@@ -15414,7 +15564,7 @@ mod paste {
         App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
     }
 
-    fn key(app: &mut App, code: KeyCode, mods: KeyModifiers, prefix: &mut bool) {
+    fn key(app: &mut App, code: KeyCode, mods: KeyModifiers, prefix: &mut Prefix) {
         app.feed_key(KeyEvent::new(code, mods), prefix);
     }
 
@@ -15439,7 +15589,7 @@ mod paste {
     #[test]
     fn a_paste_into_an_open_prompt_is_typed_into_it() {
         let mut app = app();
-        let mut prefix = false;
+        let mut prefix = Prefix::default();
         key(
             &mut app,
             KeyCode::Char('b'),
@@ -15490,9 +15640,212 @@ mod paste {
         wait(&app, "READY-42");
         // The printf ran before the echo, so the mode bit is already set.
         assert!(app.panes[&tid].bracketed_paste());
-        let mut prefix = false;
+        let mut prefix = Prefix::default();
         app.feed_paste("/tmp/shot.png", &mut prefix);
         app.panes[&tid].input(b"\r");
         wait(&app, "^[[200~/tmp/shot.png^[[201~");
+    }
+}
+
+#[cfg(test)]
+mod prefix_keys {
+    use super::*;
+    use crate::control::Req;
+
+    fn app_with(toml: &str) -> App {
+        let mut cfg = config::tests::config_from_str(toml);
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn split(app: &mut App) {
+        let r = app.handle_control(&Req::Split {
+            dir: "right".into(),
+            from: None,
+            no_focus: false,
+            cwd: None,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
+        });
+        assert!(r.ok, "{:?}", r.error);
+    }
+
+    fn press(app: &mut App, prefix: &mut Prefix, code: KeyCode, mods: KeyModifiers) {
+        app.feed_key(KeyEvent::new(code, mods), prefix);
+    }
+
+    fn prefixed(app: &mut App, prefix: &mut Prefix, c: char) {
+        press(app, prefix, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        press(app, prefix, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+
+    fn width(app: &App) -> u16 {
+        let t = app.focused_terminal().unwrap();
+        app.state.terminal(&t).unwrap().cols
+    }
+
+    #[test]
+    fn send_prefix_follows_the_configured_prefix() {
+        let app = app_with("");
+        let km = &app.cfg.keymap;
+        assert_eq!(km.prefix_action(&km.prefix_chord), Some(Action::SendPrefix));
+        assert_eq!(chord_bytes(&km.prefix_chord), Some(vec![0x02]));
+
+        let app = app_with("prefix = \"C-a\"");
+        let km = &app.cfg.keymap;
+        assert_eq!(km.prefix_action(&km.prefix_chord), Some(Action::SendPrefix));
+        assert_eq!(chord_bytes(&km.prefix_chord), Some(vec![0x01]));
+        assert!(
+            km.bindings()
+                .iter()
+                .any(|(p, _, a)| *p && *a == Action::SendPrefix),
+            "the help lists it"
+        );
+    }
+
+    #[test]
+    fn resize_keys_repeat_without_the_prefix_and_other_keys_end_it() {
+        let mut app = app_with("");
+        split(&mut app);
+        let mut prefix = Prefix::default();
+        let w0 = width(&app);
+        prefixed(&mut app, &mut prefix, 'H');
+        let w1 = width(&app);
+        assert!(w1 < w0, "the first H narrows: {w0} -> {w1}");
+        press(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('H'),
+            KeyModifiers::SHIFT,
+        );
+        press(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('H'),
+            KeyModifiers::SHIFT,
+        );
+        let w3 = width(&app);
+        assert!(w3 < w1, "H repeats inside the window: {w1} -> {w3}");
+        // A non-repeatable key ends the window and is NOT read from the prefix table: `x`
+        // would otherwise ask to kill the pane.
+        press(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        );
+        assert!(app.confirm.is_none());
+        press(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('H'),
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(
+            width(&app),
+            w3,
+            "the window is over: H is just a letter now"
+        );
+    }
+
+    #[test]
+    fn repeat_time_zero_turns_repeat_off() {
+        let mut app = app_with("repeat_time = 0");
+        split(&mut app);
+        let mut prefix = Prefix::default();
+        prefixed(&mut app, &mut prefix, 'H');
+        let w1 = width(&app);
+        press(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('H'),
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(width(&app), w1);
+    }
+
+    #[test]
+    fn focus_keys_do_not_repeat() {
+        let mut app = app_with("");
+        split(&mut app);
+        let mut prefix = Prefix::default();
+        let right = app.focused_terminal();
+        prefixed(&mut app, &mut prefix, 'h');
+        let left = app.focused_terminal();
+        assert_ne!(left, right);
+        // `l` straight after must be typed into the pane, not move focus back.
+        press(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('l'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.focused_terminal(), left);
+    }
+
+    #[test]
+    fn closing_a_pane_asks_first_and_only_y_kills() {
+        let mut app = app_with("");
+        split(&mut app);
+        let mut prefix = Prefix::default();
+        prefixed(&mut app, &mut prefix, 'x');
+        assert!(app.confirm.is_some(), "x asks");
+        assert_eq!(app.pane_order().len(), 2);
+        press(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('n'),
+            KeyModifiers::NONE,
+        );
+        assert!(app.confirm.is_none());
+        assert_eq!(app.pane_order().len(), 2, "any other key cancels");
+        prefixed(&mut app, &mut prefix, 'x');
+        press(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(app.pane_order().len(), 1);
+    }
+
+    #[test]
+    fn confirm_close_false_closes_at_once() {
+        let mut app = app_with("confirm_close = false");
+        split(&mut app);
+        let mut prefix = Prefix::default();
+        prefixed(&mut app, &mut prefix, 'x');
+        assert!(app.confirm.is_none());
+        assert_eq!(app.pane_order().len(), 1);
+    }
+
+    #[test]
+    fn x_on_a_tabs_last_pane_closes_the_tab_and_the_last_tab_is_refused() {
+        let mut app = app_with("");
+        app.new_tab();
+        let tabs = |app: &App| app.state.workspace(&app.ws).unwrap().tabs.len();
+        assert_eq!(tabs(&app), 2);
+        let mut prefix = Prefix::default();
+        prefixed(&mut app, &mut prefix, 'x');
+        let msg = app
+            .confirm
+            .as_ref()
+            .map(|c| c.message.clone())
+            .unwrap_or_default();
+        assert!(msg.starts_with("kill tab 2 (1 pane)"), "{msg}");
+        press(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('y'),
+            KeyModifiers::NONE,
+        );
+        assert_eq!(tabs(&app), 1);
+        // The session's last tab: no confirm, a word instead.
+        prefixed(&mut app, &mut prefix, 'x');
+        assert!(app.confirm.is_none());
+        prefixed(&mut app, &mut prefix, '&');
+        assert!(app.confirm.is_none());
+        assert_eq!(tabs(&app), 1);
     }
 }
