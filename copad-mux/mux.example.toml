@@ -197,7 +197,7 @@ restore_agent_sessions = true
 # prev-session = "("
 # notification-center = "a"
 # jump-attention = "!"
-# detach = ["d", "q"]
+# detach = "d"            # (tmux's q now numbers the panes — `detach = ["d", "q"]` for the old way)
 # close-pane = "x"
 # toggle-sidebar = "s"
 # redraw = "r"            # force a full repaint (tmux refresh-client) — clears any ghosting
@@ -223,6 +223,22 @@ restore_agent_sessions = true
 # key-help = "?"         # every binding of the live keymap (j/k scroll, any other key closes)
 # send-prefix = "C-b"     # type the prefix itself into the pane (nested tmux, readline);
                           #   defaults to the prefix pressed twice, whatever `prefix` is
+# display-panes = "q"     # number the panes for 2s; a digit jumps there (tmux display-panes)
+# last-pane = "`"         # back to the pane focused before this one (tmux last-pane)
+# swap-pane-up = "{"      # trade places with the previous / next pane (tmux swap-pane)
+# swap-pane-down = "}"
+# rotate-panes = "C-o"    # every pane moves one slot (tmux rotate-window; M-o the other way)
+# rotate-panes-back = "M-o"
+# next-layout = "Space"   # cycle even-horizontal → even-vertical → main-horizontal →
+                          #   main-vertical → tiled (tmux next-layout)
+# layout-even-horizontal = "M-1"   # … layout-even-vertical M-2, layout-main-horizontal M-3,
+                                   #   layout-main-vertical M-4, layout-tiled M-5
+# spread-panes = "E"      # keep the shape, even out every split (tmux select-layout -E)
+# break-pane = "B"        # move the pane into a new tab of its own (tmux break-pane)
+# move-tab-left = "S-Left"   # move the tab along the tab bar
+# move-tab-right = "S-Right"
+# synchronize-panes = "S" # typing goes to every pane of the tab (status bar: SYNC)
+# toggle-lock = "C-g"     # lock: Ctrl-f, Alt-1… go to the program; Ctrl-b C-g unlocks
 
 # ---- prefix-less bindings (tmux `bind -n`) ----
 [global]

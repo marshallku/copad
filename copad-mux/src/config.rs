@@ -384,6 +384,16 @@ pub enum Action {
     /// `Ctrl-b B` (tmux `break-pane`, which comux's `!` already means something else for):
     /// move the focused pane into a new tab of its own.
     BreakPane,
+    /// `Ctrl-b q` (tmux `display-panes`): number the tab's panes; a digit jumps there.
+    DisplayPanes,
+    /// `Ctrl-b \`` (tmux `last-pane`, whose `;` comux spends on the previous session/tab):
+    /// back to the pane focused before this one in the tab.
+    LastPane,
+    /// `Ctrl-b Ctrl-g` (zellij's locked mode): the prefix-less bindings stand down so
+    /// programs get `Ctrl-f`, `Alt-1`…; the prefix keeps working.
+    ToggleLock,
+    /// `Ctrl-b S` (tmux `synchronize-panes`): typing goes to every pane of the tab.
+    ToggleSync,
     /// `Ctrl-b S-Left` / `S-Right`: move the active tab one place along the tab bar.
     MoveTabLeft,
     MoveTabRight,
@@ -449,6 +459,10 @@ impl Action {
             Layout(crate::model::LayoutPreset::Tiled) => "layout: tiled grid",
             SpreadPanes => "spread the panes evenly",
             BreakPane => "move the pane to a new tab",
+            DisplayPanes => "number the panes; a digit jumps there",
+            ToggleLock => "lock: prefix-less keys go to the program",
+            ToggleSync => "type into every pane of the tab (synchronize)",
+            LastPane => "back to the previously focused pane",
             MoveTabLeft => "move the tab left",
             MoveTabRight => "move the tab right",
             ZoomPane => "zoom the pane to the whole tab, and back",
@@ -745,6 +759,10 @@ fn action_from_name(name: &str) -> Option<Action> {
         "next-layout" => Action::NextLayout,
         "spread-panes" => Action::SpreadPanes,
         "break-pane" => Action::BreakPane,
+        "display-panes" => Action::DisplayPanes,
+        "toggle-lock" | "lock" => Action::ToggleLock,
+        "synchronize-panes" | "sync" => Action::ToggleSync,
+        "last-pane" => Action::LastPane,
         "move-tab-left" => Action::MoveTabLeft,
         "move-tab-right" => Action::MoveTabRight,
         _ if name.starts_with("layout-") => Action::Layout(crate::model::LayoutPreset::from_name(
@@ -817,7 +835,11 @@ fn default_bindings() -> Vec<(Action, Ctx, &'static [&'static str])> {
         (PrevSession, Prefix, &["("]),
         (JumpAttention, Prefix, &["!"]),
         (JumpUnread, Prefix, &["u"]),
-        (Detach, Prefix, &["d", "q"]),
+        (Detach, Prefix, &["d"]),
+        (DisplayPanes, Prefix, &["q"]),
+        (LastPane, Prefix, &["`"]),
+        (ToggleLock, Prefix, &["C-g"]),
+        (ToggleSync, Prefix, &["S"]),
         (FocusLeft, Prefix, &["h", "Left"]),
         (FocusDown, Prefix, &["j", "Down"]),
         (FocusUp, Prefix, &["k", "Up"]),
@@ -1850,9 +1872,10 @@ pub(crate) mod tests {
             km.prefix_action(&parse_chord("d").unwrap()),
             Some(Action::Detach)
         );
+        // tmux's `q`: number the panes (it used to be a second detach chord).
         assert_eq!(
             km.prefix_action(&parse_chord("q").unwrap()),
-            Some(Action::Detach)
+            Some(Action::DisplayPanes)
         );
         assert_eq!(
             km.prefix_action(&parse_chord("1").unwrap()),
@@ -1901,8 +1924,11 @@ pub(crate) mod tests {
             km.prefix_action(&parse_chord("e").unwrap()),
             Some(Action::Detach)
         );
-        // `q` was part of detach's DEFAULT set, replaced by [d,e] → q now unbound.
-        assert_eq!(km.prefix_action(&parse_chord("q").unwrap()), None);
+        // `q` belongs to display-panes, untouched by rebinding detach.
+        assert_eq!(
+            km.prefix_action(&parse_chord("q").unwrap()),
+            Some(Action::DisplayPanes)
+        );
         // User's next-tab=l steals `l` from the default focus-right (user beats default),
         // which is warned; focus-right is still reachable via its arrow alias.
         assert_eq!(

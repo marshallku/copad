@@ -671,6 +671,20 @@ impl Prefix {
     }
 }
 
+/// 3×5 block digits for `display-panes` (`#` = a filled cell), after tmux's own font.
+const BIG_DIGITS: [[&str; 5]; 10] = [
+    ["###", "# #", "# #", "# #", "###"],
+    [" # ", "## ", " # ", " # ", "###"],
+    ["###", "  #", "###", "#  ", "###"],
+    ["###", "  #", "###", "  #", "###"],
+    ["# #", "# #", "###", "  #", "  #"],
+    ["###", "#  ", "###", "  #", "###"],
+    ["###", "#  ", "###", "# #", "###"],
+    ["###", "  #", "  #", "  #", "  #"],
+    ["###", "# #", "###", "# #", "###"],
+    ["###", "# #", "###", "  #", "###"],
+];
+
 /// Height of the always-on bottom status bar (tmux-style).
 const STATUS_H: u16 = 1;
 
@@ -772,6 +786,18 @@ pub struct App {
     cursor_look: Cell<(bool, u8)>,
     /// The preset each tab was last arranged in, so `next-layout` continues from it.
     tab_layout: HashMap<TabId, crate::model::LayoutPreset>,
+    /// `Ctrl-b q` (tmux `display-panes`): pane numbers are up until this instant, and a digit
+    /// focuses that pane.
+    pane_numbers: Option<std::time::Instant>,
+    /// The focused pane as last seen, and per tab the one focused before it (tmux
+    /// `last-pane`).
+    seen_focus: HashMap<TabId, PaneId>,
+    prev_focus: HashMap<TabId, PaneId>,
+    /// Lock mode (zellij's): the prefix-less bindings stand down so `Ctrl-f`, `Alt-1`… reach
+    /// the program; the prefix still works, and `Ctrl-b Ctrl-g` unlocks.
+    locked: bool,
+    /// Tabs whose typing goes to EVERY pane (tmux `synchronize-panes`).
+    synced_tabs: HashSet<TabId>,
     /// Copy-mode state that is not alacritty's (the search prompt, the last search, and the
     /// screen the mode was entered on). `Some` exactly when `scroll_pane` is.
     copy: Option<CopyState>,
@@ -1082,6 +1108,11 @@ impl App {
             scroll_pane: None,
             cursor_look: Cell::new((true, 0)),
             tab_layout: HashMap::new(),
+            pane_numbers: None,
+            seen_focus: HashMap::new(),
+            prev_focus: HashMap::new(),
+            locked: false,
+            synced_tabs: HashSet::new(),
             copy: None,
             key_copy: None,
             client_pids: Vec::new(),
@@ -2199,6 +2230,7 @@ impl App {
         if let Some(now) = self.nav_loc() {
             self.nav.observe(now);
         }
+        self.track_pane_focus();
         // A focus move can UNZOOM (state-side), and most focus paths drop the Resized events
         // their apply returns — so a zoom change is reconciled here, once, for every path.
         let zoom = self
@@ -2210,6 +2242,54 @@ impl App {
             }
             self.last_zoom = zoom;
         }
+    }
+
+    /// Remember the pane focused before the current one, per tab, for `last-pane`. Sampled
+    /// where the navigation history is, so every path that moves focus is covered.
+    fn track_pane_focus(&mut self) {
+        let (Some(tab), Some(pane)) = (self.active_tab_id(), self.focused_pane()) else {
+            return;
+        };
+        // Per tab, so a focus change made on the way INTO a tab (a mark, a jump) still counts:
+        // the tab's own last-seen pane is what it is compared against.
+        if let Some(seen) = self.seen_focus.insert(tab.clone(), pane.clone())
+            && seen != pane
+        {
+            self.prev_focus.insert(tab, seen);
+        }
+    }
+
+    /// `last-pane`: back to the pane focused before this one in the same tab.
+    fn last_pane(&mut self) {
+        let Some(tab) = self.active_tab_id() else {
+            return;
+        };
+        let target = self
+            .prev_focus
+            .get(&tab)
+            .filter(|p| self.pane_order().contains(p))
+            .cloned();
+        match target {
+            Some(pane) => self.apply_focus(Command::FocusPane {
+                client: self.client,
+                pane,
+            }),
+            None => self.flash("no previous pane in this tab".into(), false),
+        }
+    }
+
+    /// How long `Ctrl-b q` keeps the pane numbers up (tmux's `display-panes-time` is 1s,
+    /// which most people raise).
+    const PANE_NUMBERS: Duration = Duration::from_millis(2000);
+
+    /// `Ctrl-b q`: number every pane of the tab; a digit within the window focuses it.
+    fn display_panes(&mut self) {
+        self.pane_numbers = Some(std::time::Instant::now() + Self::PANE_NUMBERS);
+    }
+
+    fn pane_numbers_up(&self) -> bool {
+        self.pane_numbers
+            .is_some_and(|until| std::time::Instant::now() < until)
     }
 
     /// Bump the attached session's recency, once per arrival.
@@ -2559,6 +2639,10 @@ impl App {
     /// Drop an expired status message. Returns whether the bar changed, for the render loop —
     /// nothing else repaints an otherwise idle screen when a message times out.
     pub fn maybe_expire_message(&mut self) -> bool {
+        if self.pane_numbers.is_some() && !self.pane_numbers_up() {
+            self.pane_numbers = None;
+            return true;
+        }
         if self
             .message
             .as_ref()
@@ -4945,11 +5029,11 @@ impl App {
             }
             return action;
         }
-        if let Some(term) = self.focused_terminal()
-            && let Some(pt) = self.panes.get(&term)
-        {
-            pt.scroll_to_bottom();
-            pt.input(&crate::term::paste_bytes(text, pt.bracketed_paste()));
+        for term in self.input_targets() {
+            if let Some(pt) = self.panes.get(&term) {
+                pt.scroll_to_bottom();
+                pt.input(&crate::term::paste_bytes(text, pt.bracketed_paste()));
+            }
         }
         KeyAction::Continue
     }
@@ -4968,6 +5052,7 @@ impl App {
             || self.resume.is_some()
             || self.scroll_pane.is_some()
             || self.center.is_some()
+            || self.pane_numbers_up()
     }
 
     fn feed_key_inner(&mut self, k: KeyEvent, prefix: &mut Prefix) -> KeyAction {
@@ -5018,6 +5103,28 @@ impl App {
                 }
                 (KeyCode::Char(c @ '1'..='9'), MarkModal::Go) => self.goto_mark(c as u8 - b'0'),
                 _ => {}
+            }
+            return KeyAction::Continue;
+        }
+
+        // Pane numbers (`Ctrl-b q`): a digit focuses that pane; any other key just dismisses
+        // them, as in tmux. Once they have timed out the key is an ordinary key again.
+        if let Some(until) = self.pane_numbers.take()
+            && std::time::Instant::now() < until
+        {
+            prefix.clear();
+            if let KeyCode::Char(c @ '1'..='9') = k.code {
+                let order = self.pane_order();
+                match order.get(c as usize - '1' as usize) {
+                    Some(pane) => {
+                        let pane = pane.clone();
+                        self.apply_focus(Command::FocusPane {
+                            client: self.client,
+                            pane,
+                        });
+                    }
+                    None => self.flash(format!("no pane {c} in this tab"), false),
+                }
             }
             return KeyAction::Continue;
         }
@@ -5218,7 +5325,12 @@ impl App {
 
         // Prefix-less: a global binding wins (incl. entering the prefix); otherwise the
         // key is shell input.
-        if let Some(action) = self.cfg.keymap.global_action(&chord) {
+        if let Some(action) = self
+            .cfg
+            .keymap
+            .global_action(&chord)
+            .filter(|a| !self.locked || *a == Action::EnterPrefix)
+        {
             if action == Action::EnterPrefix {
                 *prefix = Prefix::armed();
                 return KeyAction::Continue;
@@ -5307,6 +5419,20 @@ impl App {
                 let out = self.break_pane(None);
                 self.flash_result(out);
             }
+            DisplayPanes => self.display_panes(),
+            ToggleLock => {
+                self.locked = !self.locked;
+                self.flash(
+                    if self.locked {
+                        "locked: Ctrl-f, Alt-1… go to the program (prefix still works)".into()
+                    } else {
+                        "unlocked".into()
+                    },
+                    false,
+                );
+            }
+            ToggleSync => self.toggle_sync(),
+            LastPane => self.last_pane(),
             MoveTabLeft => self.move_active_tab(-1),
             MoveTabRight => self.move_active_tab(1),
         }
@@ -5375,26 +5501,53 @@ impl App {
     /// Type one key into the focused pane, encoded for the modes ITS program asked for
     /// (application cursor keys, the kitty keyboard protocol).
     fn key_to_focused(&self, k: KeyEvent) {
-        let Some(term) = self.focused_terminal() else {
-            return;
-        };
-        let modes = self
-            .panes
-            .get(&term)
-            .map(|p| p.key_modes())
-            .unwrap_or_default();
-        if let Some(bytes) = crate::keys::encode(k.code, k.modifiers, modes) {
-            self.input_focused(&bytes);
+        // Encoded per pane: in a synchronized tab, vim in one pane may have asked for the
+        // kitty protocol while a shell in the next did not.
+        for term in self.input_targets() {
+            if let Some(pt) = self.panes.get(&term)
+                && let Some(bytes) = crate::keys::encode(k.code, k.modifiers, pt.key_modes())
+            {
+                pt.scroll_to_bottom(); // typing returns to the live bottom
+                pt.input(&bytes);
+            }
         }
     }
 
-    fn input_focused(&self, bytes: &[u8]) {
-        if let Some(term) = self.focused_terminal()
-            && let Some(pt) = self.panes.get(&term)
+    /// Where typed input goes: the focused pane, or every pane of a synchronized tab.
+    fn input_targets(&self) -> Vec<TerminalId> {
+        let synced = self
+            .active_tab_id()
+            .is_some_and(|t| self.synced_tabs.contains(&t));
+        if synced
+            && let Some(t) = self
+                .state
+                .workspace(&self.ws)
+                .and_then(|w| w.tab(&w.active_tab))
         {
-            pt.scroll_to_bottom(); // typing returns to the live bottom
-            pt.input(bytes);
+            return t.layout.terminals().into_iter().cloned().collect();
         }
+        self.focused_terminal().into_iter().collect()
+    }
+
+    /// `Ctrl-b S` (tmux `synchronize-panes`): toggle typing into every pane of this tab.
+    fn toggle_sync(&mut self) {
+        let Some(tab) = self.active_tab_id() else {
+            return;
+        };
+        let on = if self.synced_tabs.remove(&tab) {
+            false
+        } else {
+            self.synced_tabs.insert(tab);
+            true
+        };
+        self.flash(
+            if on {
+                "synchronized: typing goes to every pane in this tab".into()
+            } else {
+                "synchronize off".into()
+            },
+            false,
+        );
     }
 
     // --- scrollback ---
@@ -7319,6 +7472,11 @@ impl App {
             put_str(buf, *x, *y, *max_x, text, *st);
         }
 
+        // 2c) `Ctrl-b q`: a big number in the middle of every pane.
+        if self.pane_numbers_up() {
+            self.render_pane_numbers(buf, &rects, focused_term.as_ref());
+        }
+
         // 3) the neovim-style left panel, over the reserved strip.
         if self.sidebar_visible() {
             self.render_sidebar(buf);
@@ -9023,6 +9181,27 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        if self.locked {
+            segs.push((
+                " LOCKED ".to_string(),
+                Style::default()
+                    .fg(CAT_BASE)
+                    .bg(CAT_RED)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        if self
+            .active_tab_id()
+            .is_some_and(|t| self.synced_tabs.contains(&t))
+        {
+            segs.push((
+                " SYNC ".to_string(),
+                Style::default()
+                    .fg(CAT_BASE)
+                    .bg(CAT_RED)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         if self.active_zoom().is_some() {
             segs.push((
                 " ZOOM ".to_string(),
@@ -9625,6 +9804,71 @@ impl App {
                 style = style.add_modifier(cell.attrs);
                 bc.set_symbol(&cell.sym);
                 bc.set_style(style);
+            }
+        }
+    }
+
+    /// `Ctrl-b q` (tmux `display-panes`): each pane's 1-based number, drawn large in its
+    /// middle — peach for the focused pane, blue for the rest, like tmux's
+    /// `display-panes-active-colour` / `display-panes-colour`. A pane too small for the
+    /// 3×5 digits gets the plain number.
+    fn render_pane_numbers(
+        &self,
+        buf: &mut Buffer,
+        rects: &[PaneRect],
+        focused: Option<&TerminalId>,
+    ) {
+        // Numbered by the tab's pane order — the order a digit selects in — not by what is
+        // visible: a zoomed tab shows one rect, which is not necessarily pane 1.
+        let order: Vec<TerminalId> = self
+            .state
+            .workspace(&self.ws)
+            .and_then(|w| w.tab(&w.active_tab))
+            .map(|t| t.layout.terminals().into_iter().cloned().collect())
+            .unwrap_or_default();
+        for r in rects {
+            let Some(i) = order.iter().position(|t| *t == r.terminal) else {
+                continue;
+            };
+            let label = (i + 1).to_string();
+            let color = if Some(&r.terminal) == focused {
+                CAT_PEACH
+            } else {
+                CAT_BLUE
+            };
+            let n = label.len() as u16;
+            let (w, h) = (n * 4 - 1, 5);
+            if r.cols >= w + 2 && r.rows >= h + 2 {
+                let x0 = r.x + (r.cols - w) / 2;
+                let y0 = r.y + (r.rows - h) / 2;
+                for (k, ch) in label.chars().enumerate() {
+                    let glyph = BIG_DIGITS[ch.to_digit(10).unwrap_or(0) as usize];
+                    for (dy, row) in glyph.iter().enumerate() {
+                        for (dx, on) in row.chars().enumerate() {
+                            let pos = Position::new(x0 + k as u16 * 4 + dx as u16, y0 + dy as u16);
+                            if on == '#'
+                                && let Some(c) = buf.cell_mut(pos)
+                            {
+                                c.set_symbol(" ");
+                                c.set_style(Style::default().bg(color));
+                            }
+                        }
+                    }
+                }
+            } else {
+                let x = r.x + r.cols.saturating_sub(n) / 2;
+                let y = r.y + r.rows / 2;
+                put_str(
+                    buf,
+                    x,
+                    y,
+                    r.x + r.cols,
+                    &label,
+                    Style::default()
+                        .fg(CAT_BASE)
+                        .bg(color)
+                        .add_modifier(Modifier::BOLD),
+                );
             }
         }
     }
@@ -16635,5 +16879,257 @@ mod arrange_keys {
         });
         assert!(r.ok, "{:?}", r.error);
         assert_eq!(r.message.as_deref(), Some("layout: even-vertical"));
+    }
+}
+
+#[cfg(test)]
+mod pane_numbers {
+    use super::*;
+    use crate::control::Req;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(120, 40, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn split(app: &mut App) {
+        let r = app.handle_control(&Req::Split {
+            dir: "right".into(),
+            from: None,
+            no_focus: false,
+            cwd: None,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
+        });
+        assert!(r.ok, "{:?}", r.error);
+    }
+
+    fn prefixed(app: &mut App, c: char) {
+        let mut prefix = Prefix::default();
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &mut prefix,
+        );
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            &mut prefix,
+        );
+    }
+
+    fn press(app: &mut App, c: char) {
+        app.feed_key(
+            KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE),
+            &mut Prefix::default(),
+        );
+    }
+
+    #[test]
+    fn q_numbers_the_panes_and_a_digit_jumps_there() {
+        let mut app = app();
+        split(&mut app);
+        split(&mut app);
+        let order: Vec<TerminalId> = app.layout().into_iter().map(|r| r.terminal).collect();
+        assert_eq!(app.focused_terminal().as_ref(), order.last());
+        prefixed(&mut app, 'q');
+        assert!(app.pane_numbers_up());
+        // Each pane shows its number in the middle, the focused one in peach.
+        let mut buf = Buffer::empty(ratatui::layout::Rect::new(0, 0, 120, 40));
+        app.render_to(&mut buf);
+        let r = &app.layout()[2];
+        let mid = Position::new(r.x + r.cols / 2, r.y + r.rows / 2);
+        assert_eq!(buf.cell(mid).unwrap().bg, CAT_PEACH);
+        press(&mut app, '1');
+        assert_eq!(app.focused_terminal().as_ref(), order.first());
+        assert!(!app.pane_numbers_up());
+        // Any other key just dismisses them — it is not typed into the pane.
+        prefixed(&mut app, 'q');
+        press(&mut app, 'x');
+        assert!(!app.pane_numbers_up());
+        assert_eq!(app.focused_terminal().as_ref(), order.first());
+        // Timed out: the numbers come down on the next tick.
+        prefixed(&mut app, 'q');
+        app.pane_numbers = Some(std::time::Instant::now() - Duration::from_millis(1));
+        assert!(app.maybe_expire_message());
+        assert!(app.pane_numbers.is_none());
+    }
+
+    #[test]
+    fn a_zoomed_pane_is_numbered_by_its_place_in_the_tab() {
+        let mut app = app();
+        split(&mut app);
+        split(&mut app);
+        assert!(app.handle_control(&Req::Zoom).ok);
+        prefixed(&mut app, 'q');
+        let mut buf = Buffer::empty(ratatui::layout::Rect::new(0, 0, 120, 40));
+        app.render_to(&mut buf);
+        let r = &app.layout()[0];
+        // A "3" has its middle row filled all the way across; a "1" does not.
+        let (x0, y0) = (r.x + (r.cols - 3) / 2, r.y + (r.rows - 5) / 2);
+        let row2: Vec<_> = (0..3)
+            .map(|dx| buf.cell(Position::new(x0 + dx, y0 + 2)).unwrap().bg)
+            .collect();
+        assert_eq!(row2, [CAT_PEACH; 3], "the zoomed third pane says 3");
+    }
+
+    #[test]
+    fn last_pane_counts_a_focus_change_made_on_the_way_into_a_tab() {
+        let mut app = app();
+        let left = app.focused_terminal().unwrap();
+        split(&mut app);
+        let right = app.focused_terminal().unwrap();
+        prefixed(&mut app, 'h'); // tab 1 is left on `left`
+        app.new_tab();
+        // Jump straight to `right` in tab 1 from tab 2 (as a mark or the switcher would).
+        app.jump_to_terminal(&right);
+        prefixed(&mut app, '`');
+        assert_eq!(app.focused_terminal(), Some(left));
+    }
+
+    #[test]
+    fn backtick_toggles_between_the_last_two_panes() {
+        let mut app = app();
+        let left = app.focused_terminal().unwrap();
+        split(&mut app);
+        let right = app.focused_terminal().unwrap();
+        prefixed(&mut app, 'h');
+        assert_eq!(app.focused_terminal(), Some(left.clone()));
+        prefixed(&mut app, '`');
+        assert_eq!(app.focused_terminal(), Some(right.clone()));
+        prefixed(&mut app, '`');
+        assert_eq!(app.focused_terminal(), Some(left));
+    }
+}
+
+#[cfg(test)]
+mod lock_and_sync {
+    use super::*;
+    use crate::control::Req;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(120, 40, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn key(app: &mut App, prefix: &mut Prefix, code: KeyCode, mods: KeyModifiers) {
+        app.feed_key(KeyEvent::new(code, mods), prefix);
+    }
+
+    fn wait_for(app: &App, term: &TerminalId, needle: &str) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if app.panes[term].capture(Some(50)).text.contains(needle) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    #[test]
+    fn lock_hands_global_keys_to_the_program_but_keeps_the_prefix() {
+        let mut app = app();
+        let mut prefix = Prefix::default();
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        );
+        assert!(app.popup.is_some(), "unlocked, Ctrl-f opens the switcher");
+        key(&mut app, &mut prefix, KeyCode::Esc, KeyModifiers::NONE);
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        );
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+        );
+        assert!(app.locked);
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        );
+        assert!(app.popup.is_none(), "locked, Ctrl-f is the program's");
+        // The prefix still works, and unlocks.
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        );
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('g'),
+            KeyModifiers::CONTROL,
+        );
+        assert!(!app.locked);
+    }
+
+    #[test]
+    fn a_synchronized_tab_types_into_every_pane() {
+        let mut app = app();
+        let first = app.focused_terminal().unwrap();
+        let r = app.handle_control(&Req::Split {
+            dir: "right".into(),
+            from: None,
+            no_focus: false,
+            cwd: None,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
+        });
+        assert!(r.ok);
+        let second = app.focused_terminal().unwrap();
+        let mut prefix = Prefix::default();
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        );
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('S'),
+            KeyModifiers::SHIFT,
+        );
+        for c in "echo SYNC-$((6*7))".chars() {
+            key(&mut app, &mut prefix, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        key(&mut app, &mut prefix, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            wait_for(&app, &first, "SYNC-42"),
+            "the unfocused pane got it"
+        );
+        assert!(wait_for(&app, &second, "SYNC-42"));
+        // A paste goes to both as well (a shell inserts a bracketed paste without running it).
+        app.feed_paste("echo PASTE-MARK", &mut prefix);
+        assert!(wait_for(&app, &first, "PASTE-MARK"));
+        assert!(wait_for(&app, &second, "PASTE-MARK"));
+        // Off again: only the focused pane hears.
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        );
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('S'),
+            KeyModifiers::SHIFT,
+        );
+        assert_eq!(app.input_targets(), vec![second]);
     }
 }
