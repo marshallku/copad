@@ -68,6 +68,9 @@ impl WireCell {
     }
 }
 
+/// An 8-bit RGB triple.
+pub type Rgb8 = (u8, u8, u8);
+
 fn shown() -> bool {
     true
 }
@@ -133,9 +136,24 @@ pub enum ServerMsg {
         /// there and a paste still arrives as keystrokes.
         #[serde(default)]
         paste: bool,
+        /// The server understands [`ClientMsg::Focus`] (its terminal gained/lost focus), so the
+        /// client may forward focus events. Same old-server reasoning as `paste`.
+        #[serde(default)]
+        focus: bool,
+        /// The server understands [`ClientMsg::Colors`], so the client may report its
+        /// terminal's foreground/background for panes that ask (OSC 10/11).
+        #[serde(default)]
+        colors: bool,
     },
     /// A render frame (delta or full).
     Frame(FrameMsg),
+    /// A pane rang the bell: ring this client's terminal too (tmux `bell-action any`), so the
+    /// dock bounces / the tab marks itself as it would without a multiplexer. An older client
+    /// cannot parse this and skips it.
+    Bell,
+    /// Set this client's terminal title (tmux `set-titles`): the focused pane's title or
+    /// program, and the session.
+    Title { text: String },
     /// Put `text` on the system clipboard (the result of a mouse-drag selection copy). The
     /// client emits an OSC 52 sequence to its own terminal — so it works over SSH, unlike a
     /// server-side `pbcopy`/`xclip`. Sent only to the client that made the selection.
@@ -215,6 +233,13 @@ pub enum ClientMsg {
     /// replaying it as keystrokes makes it plain typed text. Sent only when the server's
     /// `Hello` advertised `paste`.
     Paste { text: String },
+    /// This client's terminal gained (`true`) or lost focus. Sent only when the server's
+    /// `Hello` says `focus`.
+    Focus { gained: bool },
+    /// This client's terminal colours, read once at attach (OSC 10/11), so a pane asking for
+    /// its background (dark/light detection in nvim, Claude Code, …) gets the real answer.
+    /// Sent only when the server's `Hello` says `colors`.
+    Colors { fg: Rgb8, bg: Rgb8 },
     /// A forwarded mouse action at frame cell `(x, y)`.
     Mouse { x: u16, y: u16, kind: MouseKind },
     /// The client's terminal was resized.
@@ -298,11 +323,15 @@ mod tests {
                 mouse,
                 update_environment,
                 paste,
+                focus,
+                colors,
             } => {
                 assert!(mouse);
                 assert!(update_environment.is_empty());
                 // An old server can't take a `Paste`, so the client must not enable it.
                 assert!(!paste);
+                // …nor a `Focus` or `Colors`.
+                assert!(!focus && !colors);
             }
             _ => panic!("expected Hello"),
         }

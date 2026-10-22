@@ -178,7 +178,7 @@ pub fn next_clipboard_seq() -> u64 {
 /// Minimal `EventListener`: forwards `PtyWrite` replies (DSR/DA/OSC answers) so
 /// prompts that query the terminal don't hang, latches child-exit, captures OSC 52
 /// clipboard WRITES for the render loop to relay, counts BELs, and records the pane
-/// title (OSC 0/2). Colour queries are still dropped.
+/// title (OSC 0/2), and answers colour queries (OSC 10/11/12) from [`set_outer_colors`].
 #[derive(Clone)]
 struct MuxListener {
     sender: Arc<std::sync::Mutex<Option<EventLoopSender>>>,
@@ -208,6 +208,33 @@ struct MuxListener {
     /// identity — `procinfo`'s label is — and it is not instructions. Stripping control
     /// characters is hygiene for the renderer, not a trust boundary.
     title: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// The attached terminal's foreground and background, as its client reported them (OSC 10/11
+/// probe at attach). Process-wide because every pane answers the same question about the same
+/// terminal; the latest client to report wins, like the size of the shared view.
+static OUTER_COLORS: std::sync::RwLock<Option<(crate::proto::Rgb8, crate::proto::Rgb8)>> =
+    std::sync::RwLock::new(None);
+
+/// Record the attached terminal's `(fg, bg)` for answering panes' colour queries.
+pub fn set_outer_colors(fg: crate::proto::Rgb8, bg: crate::proto::Rgb8) {
+    if let Ok(mut c) = OUTER_COLORS.write() {
+        *c = Some((fg, bg));
+    }
+}
+
+/// The answer to a pane's colour query for alacritty colour `index`: OSC 10 (foreground,
+/// 256), OSC 11 (background, 257) and OSC 12 (cursor, 258, answered with the foreground).
+/// `None` = stay silent, which is what comux did before it knew the colours, and what a
+/// palette query (OSC 4) still gets.
+fn outer_color(index: usize) -> Option<alacritty_terminal::vte::ansi::Rgb> {
+    let (fg, bg) = (*OUTER_COLORS.read().ok()?)?;
+    let (r, g, b) = match index {
+        256 | 258 => fg,
+        257 => bg,
+        _ => return None,
+    };
+    Some(alacritty_terminal::vte::ansi::Rgb { r, g, b })
 }
 
 /// Longest pane title retained. A title is redrawn on every shell prompt and a hostile pane
@@ -307,6 +334,15 @@ impl EventListener for MuxListener {
             }
             Event::ResetTitle => {
                 *self.title.lock().unwrap() = None;
+            }
+            // OSC 10/11/12 `?`: answered with the attached terminal's own colours when its
+            // client reported them, so dark/light detection sees the real background.
+            Event::ColorRequest(index, format) => {
+                if let Some(rgb) = outer_color(index)
+                    && let Some(s) = self.sender.lock().unwrap().as_ref()
+                {
+                    let _ = s.send(Msg::Input(format(rgb).into_bytes().into()));
+                }
             }
             _ => {}
         }
@@ -673,6 +709,16 @@ impl PaneTerm {
     /// Whether the pane's program asked for bracketed paste (`?2004h`).
     pub fn bracketed_paste(&self) -> bool {
         self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// Tell the program its pane gained or lost focus (`ESC [ I` / `ESC [ O`), if it asked
+    /// for focus reports (`?1004h`). Returns whether it did.
+    pub fn report_focus(&self, gained: bool) -> bool {
+        if !self.term.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
+            return false;
+        }
+        self.input(if gained { b"\x1b[I" } else { b"\x1b[O" });
+        true
     }
 
     /// The input modes the pane's program asked for, which decide how a key is encoded.

@@ -984,6 +984,14 @@ pub struct MuxConfig {
     /// While the prefix is armed, show the most useful next keys (from the live keymap) in
     /// the status bar in place of the tab chips. Presentation only; on by default.
     pub prefix_hint: bool,
+    /// Set the attached terminal's title (tmux `set-titles`) to the focused pane's title —
+    /// what Claude Code, vim, a shell's prompt put there — or its program, then the session.
+    /// The old title is pushed on attach and restored on detach.
+    pub set_titles: bool,
+    /// Ring the attached terminal's bell when any pane rings (tmux `bell-action any`), so the
+    /// dock bounces / the tab marks itself as it would without a multiplexer. At most once a
+    /// second.
+    pub bell_passthrough: bool,
     /// How long, in milliseconds, a repeatable binding (the resize keys) stays live after it
     /// runs, without pressing the prefix again (tmux `repeat-time`). `0` turns repeat off.
     pub repeat_time: u64,
@@ -1094,6 +1102,8 @@ struct RawConfig {
     prefix_hint: Option<bool>,
     repeat_time: Option<i64>,
     confirm_close: Option<bool>,
+    set_titles: Option<bool>,
+    bell_passthrough: Option<bool>,
     sidebar_git: Option<bool>,
     pane_titles: Option<bool>,
     top_bar: Option<bool>,
@@ -1203,6 +1213,8 @@ impl MuxConfig {
             prefix_hint: true,
             repeat_time: DEFAULT_REPEAT_TIME,
             confirm_close: true,
+            set_titles: true,
+            bell_passthrough: true,
             sidebar_git: true,
             pane_titles: true,
             top_bar: false,
@@ -1332,6 +1344,8 @@ impl MuxConfig {
                 prefix_hint: raw.prefix_hint.unwrap_or(true),
                 repeat_time,
                 confirm_close: raw.confirm_close.unwrap_or(true),
+                set_titles: raw.set_titles.unwrap_or(true),
+                bell_passthrough: raw.bell_passthrough.unwrap_or(true),
                 sidebar_git: raw.sidebar_git.unwrap_or(true),
                 pane_titles: raw.pane_titles.unwrap_or(true),
                 top_bar: raw.top_bar.unwrap_or(false),

@@ -1142,6 +1142,10 @@ pub fn socket_path() -> PathBuf {
 /// The `comux ctl ...` CLI client: parse args, round-trip one request over the
 /// socket, print the response. Returns a process exit code.
 pub fn run_client(args: &[String]) -> i32 {
+    // `apply-layout` composes many requests client-side (decisions #162).
+    if args.first().map(|s| s.as_str()) == Some("apply-layout") {
+        return apply_layout_client(&args[1..]);
+    }
     // `worktree` has its own nested grammar (subcommands + `--from`/`--plain`/`-d`), so it
     // is parsed BEFORE the flat `--json`-stripping path below could reinterpret its flags.
     if args.first().map(|s| s.as_str()) == Some("worktree") {
@@ -2481,7 +2485,8 @@ const RENAME_TAB_SPEC: Spec = Spec {
 const SPLIT_SPEC: Spec = Spec {
     usage: "usage: comux split [-v|-h] [--from <pane-token>] [--no-focus] [--cwd DIR] [--env K=V]... [--keep] [--json] [-- <argv...>]\n\
             \x20      --from splits that pane wherever it is; --no-focus leaves focus alone;\n\
-            \x20      `-- argv` runs that program in the new pane (closes with it unless --keep)",
+            \x20      `-- argv` runs that program in the new pane (closes with it unless --keep, which\n\
+            \x20      holds it: exit status shown, Enter runs it again, anything else gives a shell)",
     flags: &[
         flag(&["-v", "--vertical"]),
         flag(&["-h", "--horizontal"]),
@@ -2519,7 +2524,8 @@ const AGENT_LOG_SPEC: Spec = Spec {
 const SPAWN_SPEC: Spec = Spec {
     usage: "usage: comux spawn [--session <s1|name:hub>] [--cwd DIR] [--name N] [--env K=V]... [--keep] [--owner TOKEN] [--json] -- <argv...>\n\
             \x20      runs argv in a new tab without moving anyone's view (in --session, else beside\n\
-            \x20      the calling pane); the tab closes when it exits unless --keep leaves a shell",
+            \x20      the calling pane); the tab closes when it exits unless --keep holds it (exit\n\
+            \x20      status shown, Enter runs it again, anything else gives a shell)",
     flags: &[
         opt(&["--session", "-s"]),
         opt(&["--cwd", "-c"]),
@@ -3609,6 +3615,243 @@ fn worktree_create_client(rest: &[String]) -> i32 {
     code
 }
 
+const APPLY_LAYOUT_USAGE: &str = "usage: comux apply-layout <file.toml> [--name N] [--detached] [--dry-run]\n\
+\x20      build a whole session from a layout file: its tabs, each tab's preset layout and the\n\
+\x20      lines to type into each pane (see `comux skill`); --dry-run prints what it would build";
+
+/// `comux apply-layout FILE`: build the session a layout file describes, out of the same
+/// requests a script would send — `new-session`, `new-tab`, `split`, `select-layout`, `send`
+/// — so it needs nothing new from the server and an older one runs it too. Then switch to it
+/// (and attach, from a plain shell) unless `--detached`.
+fn apply_layout_client(rest: &[String]) -> i32 {
+    let mut file = None;
+    let (mut name, mut detached, mut dry_run) = (None, false, false);
+    let mut it = rest.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--help" | "-h" => {
+                println!("{APPLY_LAYOUT_USAGE}");
+                return 0;
+            }
+            "--detached" | "-d" => detached = true,
+            "--dry-run" => dry_run = true,
+            "--name" => match it.next() {
+                Some(n) => name = Some(n.clone()),
+                None => {
+                    eprintln!("{APPLY_LAYOUT_USAGE}");
+                    return 2;
+                }
+            },
+            f if file.is_none() && !f.starts_with('-') => file = Some(f.to_string()),
+            _ => {
+                eprintln!("{APPLY_LAYOUT_USAGE}");
+                return 2;
+            }
+        }
+    }
+    let Some(file) = file else {
+        eprintln!("{APPLY_LAYOUT_USAGE}");
+        return 2;
+    };
+    let mut plan = match crate::layoutfile::load(Path::new(&file)) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("comux apply-layout: {e}");
+            return 2;
+        }
+    };
+    if let Some(n) = name {
+        plan.session = n;
+    }
+    let missing = plan.missing_dirs();
+    if !missing.is_empty() {
+        for d in &missing {
+            eprintln!("comux apply-layout: no such directory: {}", d.display());
+        }
+        return 2;
+    }
+    if dry_run {
+        print!("{}", plan.describe());
+        return 0;
+    }
+    if let Err(e) = crate::client::ensure_running(&socket_path()) {
+        eprintln!("comux: could not start server: {e}");
+        return 1;
+    }
+    match build_layout(&plan) {
+        Ok(session) => {
+            println!(
+                "built session {} ({} tab{})",
+                plan.session,
+                plan.tabs.len(),
+                if plan.tabs.len() == 1 { "" } else { "s" }
+            );
+            if detached {
+                return 0;
+            }
+            if let Err(e) = round_trip(&Req::SelectSession {
+                index: None,
+                target: Some(session),
+            }) {
+                eprintln!("comux: {e}");
+                return 1;
+            }
+            // Like `worktree create`: from a plain shell, drop into the new session.
+            if std::env::var_os("COPAD_MUX").is_none()
+                && let Err(e) = crate::client::run()
+            {
+                eprintln!("comux: attach failed: {e}");
+                return 1;
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("comux apply-layout: {e}");
+            1
+        }
+    }
+}
+
+/// Run `plan` against the server; returns the new session's id. A failure part-way leaves
+/// what was built so far (it is an ordinary session) and says where it stopped.
+fn build_layout(plan: &crate::layoutfile::Plan) -> Result<String, String> {
+    let call = |req: &Req, what: &str| -> Result<Resp, String> {
+        let r = round_trip(req)?;
+        if r.ok {
+            Ok(r)
+        } else {
+            Err(format!(
+                "{what}: {}",
+                r.error.unwrap_or_else(|| "refused".into())
+            ))
+        }
+    };
+    let path = |p: &Path| p.to_string_lossy().into_owned();
+    let created = call(
+        &Req::NewSession {
+            name: Some(plan.session.clone()),
+            cwd: Some(path(&plan.cwd)),
+            detached: true,
+        },
+        "creating the session",
+    )?;
+    let (Some(session), Some(first)) = (created.session.map(|s| s.id), created.pane) else {
+        return Err("the server did not say which session it created".into());
+    };
+    for (ti, tab) in plan.tabs.iter().enumerate() {
+        let what = |s: &str| format!("tab {}: {s}", ti + 1);
+        let head = if ti == 0 {
+            if let Some(n) = &tab.name {
+                call(
+                    &Req::RenameTab {
+                        index: None,
+                        pane: Some(first.clone()),
+                        target: None,
+                        name: n.clone(),
+                    },
+                    &what("naming it"),
+                )?;
+            }
+            // The session's first shell starts in the SESSION's directory (where its new tabs
+            // open). When this tab's first pane belongs elsewhere, open a shell there and close
+            // the original — the pane order puts the original first in the tab — rather than
+            // typing a `cd` that the pane's commands would then have to be chained behind.
+            if tab.panes[0].cwd != plan.cwd {
+                let moved = call(
+                    &Req::Split {
+                        dir: "right".into(),
+                        from: Some(first.clone()),
+                        no_focus: true,
+                        cwd: Some(path(&tab.panes[0].cwd)),
+                        command: Vec::new(),
+                        env: Vec::new(),
+                        keep: false,
+                    },
+                    &what("pane 1"),
+                )?
+                .pane
+                .ok_or_else(|| what("the server did not name a pane"))?;
+                call(
+                    &Req::Close {
+                        index: 0,
+                        caller: Some(moved.clone()),
+                    },
+                    &what("pane 1"),
+                )?;
+                moved
+            } else {
+                first.clone()
+            }
+        } else {
+            call(
+                &Req::NewTab {
+                    session: Some(session.clone()),
+                    from: None,
+                    // Its first pane's directory: the tab's shell starts there, no `cd` needed.
+                    cwd: Some(path(&tab.panes[0].cwd)),
+                    name: tab.name.clone(),
+                    no_focus: true,
+                    command: Vec::new(),
+                    env: Vec::new(),
+                    keep: false,
+                    owner: None,
+                },
+                &what("creating it"),
+            )?
+            .pane
+            .ok_or_else(|| what("the server did not name its pane"))?
+        };
+        let mut tokens = vec![head.clone()];
+        for (pi, pane) in tab.panes.iter().enumerate().skip(1) {
+            // Each split comes off the pane made last, so the tree's pane order — which the
+            // preset keeps — is the file's order.
+            let last = tokens.last().cloned().unwrap_or_else(|| head.clone());
+            let r = call(
+                &Req::Split {
+                    dir: "right".into(),
+                    from: Some(last),
+                    no_focus: true,
+                    cwd: Some(path(&pane.cwd)),
+                    command: Vec::new(),
+                    env: Vec::new(),
+                    keep: false,
+                },
+                &what(&format!("pane {}", pi + 1)),
+            )?;
+            tokens.push(
+                r.pane
+                    .ok_or_else(|| what("the server did not name a pane"))?,
+            );
+        }
+        if let Some(layout) = tab.layout {
+            call(
+                &Req::Arrange {
+                    op: layout.name().into(),
+                    caller: Some(head.clone()),
+                },
+                &what("arranging it"),
+            )?;
+        }
+        for (pi, (tok, pane)) in tokens.iter().zip(&tab.panes).enumerate() {
+            let lines = pane.run.clone();
+            for line in lines {
+                call(
+                    &Req::SendKeys {
+                        target: Some(tok.clone()),
+                        index: None,
+                        text: line,
+                        paste: false,
+                        enter: true,
+                        caller: None,
+                    },
+                    &what(&format!("typing into pane {}", pi + 1)),
+                )?;
+            }
+        }
+    }
+    Ok(session)
+}
+
 fn worktree_list_client(rest: &[String]) -> i32 {
     let mut json = false;
     let mut plain = false;
@@ -4077,6 +4320,7 @@ mod verb_args_tests {
         "rotate-window",
         "break-pane",
         "move-tab",
+        "apply-layout",
         "fork",
         "mark",
         "marks",

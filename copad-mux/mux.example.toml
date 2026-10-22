@@ -54,6 +54,10 @@ prefix_hint = true        # while the prefix is armed, the status bar shows the 
 repeat_time = 500         # ms a repeatable key (the H/J/K/L resize keys) stays live after it
                           #   runs, so `Ctrl-b H H H` nudges three times (tmux repeat-time);
                           #   0 = always press the prefix
+set_titles = true         # set the terminal's title to the focused pane's (what Claude Code, vim,
+                          #   your prompt put there) — session; restored on detach (tmux set-titles)
+bell_passthrough = true   # a pane's bell rings your terminal too, at most once a second (tmux
+                          #   bell-action any); the ! markers are `bell`
 confirm_close = true      # ask y/n before Ctrl-b x closes a pane / Ctrl-b & closes a tab (tmux
                           #   confirm-before); x on a tab's last pane closes the tab
 sort_by = "created"       # session order in the sidebar / Ctrl-f switcher / )( cycle:

@@ -671,6 +671,27 @@ impl Prefix {
     }
 }
 
+/// The box-drawing glyph for a divider cell joined to dividers `up`/`down`/`left`/`right`.
+fn divider_glyph(up: bool, down: bool, left: bool, right: bool) -> &'static str {
+    match (up || down, left || right) {
+        (true, true) => match (up, down, left, right) {
+            (true, true, true, true) => "┼",
+            (true, true, false, true) => "├",
+            (true, true, true, false) => "┤",
+            (false, true, true, true) => "┬",
+            (true, false, true, true) => "┴",
+            (false, true, false, true) => "┌",
+            (false, true, true, false) => "┐",
+            (true, false, false, true) => "└",
+            _ => "┘",
+        },
+        (true, false) => "│",
+        (false, true) => "─",
+        // An isolated cell (a 1-cell gap): pick by nothing — vertical reads best.
+        (false, false) => "│",
+    }
+}
+
 /// 3×5 block digits for `display-panes` (`#` = a filled cell), after tmux's own font.
 const BIG_DIGITS: [[&str; 5]; 10] = [
     ["###", "# #", "# #", "# #", "###"],
@@ -798,6 +819,12 @@ pub struct App {
     locked: bool,
     /// Tabs whose typing goes to EVERY pane (tmux `synchronize-panes`).
     synced_tabs: HashSet<TabId>,
+    /// Whether any attached client's terminal has focus (assumed until one says otherwise),
+    /// and the pane last told it HAS focus (`ESC [ I`), for focus reporting.
+    outer_focus: bool,
+    focus_reported: Option<TerminalId>,
+    /// Per pane, how many of its bells have been relayed to the attached terminals.
+    bell_relayed: HashMap<TerminalId, u64>,
     /// Copy-mode state that is not alacritty's (the search prompt, the last search, and the
     /// screen the mode was entered on). `Some` exactly when `scroll_pane` is.
     copy: Option<CopyState>,
@@ -1113,6 +1140,9 @@ impl App {
             prev_focus: HashMap::new(),
             locked: false,
             synced_tabs: HashSet::new(),
+            outer_focus: true,
+            focus_reported: None,
+            bell_relayed: HashMap::new(),
             copy: None,
             key_copy: None,
             client_pids: Vec::new(),
@@ -2231,6 +2261,7 @@ impl App {
             self.nav.observe(now);
         }
         self.track_pane_focus();
+        self.sync_focus_reports();
         // A focus move can UNZOOM (state-side), and most focus paths drop the Resized events
         // their apply returns — so a zoom change is reconciled here, once, for every path.
         let zoom = self
@@ -2257,6 +2288,82 @@ impl App {
         {
             self.prev_focus.insert(tab, seen);
         }
+    }
+
+    /// The attached terminals gained or lost focus (any one focused counts as focused).
+    pub fn set_outer_focus(&mut self, focused: bool) {
+        self.outer_focus = focused;
+        self.sync_focus_reports();
+    }
+
+    /// Focus reporting (`?1004`), tmux `focus-events`: the pane that has focus — the focused
+    /// pane, while a terminal showing it has focus — hears `ESC [ I`, and the one that loses
+    /// it `ESC [ O`. Only panes whose program asked get either (`PaneTerm::report_focus`).
+    fn sync_focus_reports(&mut self) {
+        let want = if self.outer_focus {
+            self.focused_terminal()
+        } else {
+            None
+        };
+        if want == self.focus_reported {
+            return;
+        }
+        if let Some(old) = self.focus_reported.take()
+            && let Some(pt) = self.panes.get(&old)
+        {
+            pt.report_focus(false);
+        }
+        if let Some(new) = &want
+            && let Some(pt) = self.panes.get(new)
+        {
+            pt.report_focus(true);
+        }
+        self.focus_reported = want;
+    }
+
+    /// Whether any pane rang its bell since the last call — for relaying it to the attached
+    /// terminals (`bell_passthrough`). Separate from the markers' acknowledgement on purpose:
+    /// relaying a bell is not the same as anyone having seen it.
+    pub fn take_new_bells(&mut self) -> bool {
+        if !self.cfg.bell_passthrough {
+            return false;
+        }
+        let mut rang = false;
+        for (tid, pt) in &self.panes {
+            let n = pt.bell_count();
+            let seen = self.bell_relayed.entry(tid.clone()).or_insert(0);
+            if n > *seen {
+                *seen = n;
+                rang = true;
+            }
+        }
+        if self.bell_relayed.len() > self.panes.len() {
+            self.bell_relayed.retain(|t, _| self.panes.contains_key(t));
+        }
+        rang
+    }
+
+    /// The title for the attached terminals (`set_titles`): the focused pane's own title when
+    /// its program set one, else its program, then the session — `claude · ✳ fix the bug`
+    /// reads as `✳ fix the bug — work`. `None` when titles are off.
+    pub fn outer_title(&self) -> Option<String> {
+        if !self.cfg.set_titles {
+            return None;
+        }
+        let term = self.focused_terminal()?;
+        let title = self
+            .panes
+            .get(&term)
+            .and_then(|p| p.title())
+            .filter(|t| !t.trim().is_empty())
+            .or_else(|| self.labels.get(&term).map(|l| l.text.clone()))
+            .unwrap_or_else(|| "comux".to_string());
+        let session = self
+            .state
+            .workspace(&self.ws)
+            .and_then(|w| w.name.clone())
+            .unwrap_or_else(|| self.ws.to_string());
+        Some(format!("{title} — {session}"))
     }
 
     /// `last-pane`: back to the pane focused before this one in the same tab.
@@ -7452,9 +7559,24 @@ impl App {
                 {
                     continue;
                 }
-                let left = xx > 0 && covered[yy as usize][(xx - 1) as usize];
-                let right = (xx + 1) < area.width && covered[yy as usize][(xx + 1) as usize];
-                let glyph = if left || right { "│" } else { "─" };
+                // A divider cell joins the divider cells around it: `├` where a pane's bottom
+                // edge meets the vertical line beside it, `┼` where four panes meet — not a
+                // straight `│` or `─` broken at every crossing (tmux's border_set).
+                let is_div = |x: i32, y: i32| {
+                    x >= content_x as i32
+                        && y >= content_y as i32
+                        && y < (content_y + content_rows) as i32
+                        && x < area.width as i32
+                        && y < area.height as i32
+                        && !covered[y as usize][x as usize]
+                };
+                let (x, y) = (xx as i32, yy as i32);
+                let glyph = divider_glyph(
+                    is_div(x, y - 1),
+                    is_div(x, y + 1),
+                    is_div(x - 1, y),
+                    is_div(x + 1, y),
+                );
                 let accent = focus_rect
                     .as_ref()
                     .map(|fr| divider_touches(fr, xx, yy))
@@ -11219,9 +11341,10 @@ struct TabLaunch {
 /// quoting, no line editor, no startup race that could eat or mangle the command.
 ///
 /// `exec` makes the program the pane's process, so the pane ends when it does. `keep`
-/// instead runs it as a child and then becomes an interactive login shell, leaving the output
-/// (or the error) on screen. `-i` keeps an interrupted program from taking that shell down
-/// with it, and sources the same rc files a pane's shell does.
+/// instead runs it as a child and HOLDS the pane like a zellij command pane: the output stays,
+/// a status line says how it exited (`exited 1`), Enter runs it again, and anything else
+/// drops to an interactive login shell. `-i` keeps an interrupted program from taking that
+/// shell down with it, and sources the same rc files a pane's shell does.
 ///
 /// The `"$@"` script is POSIX; a shell that is not (fish, nu, …) is replaced by `/bin/sh` as
 /// the wrapper — the program still gets its argv verbatim, but that shell's own profile does
@@ -11238,11 +11361,7 @@ fn spawn_argv(shell: Option<&str>, argv: &[String], keep: bool) -> Vec<String> {
         Some(sh) => (sh, &["-l", "-i", "-c"]),
         None => ("/bin/sh", &["-l", "-c"]),
     };
-    let script = if keep {
-        r#""$@"; exec "${SHELL:-/bin/sh}" -l"#
-    } else {
-        r#"exec "$@""#
-    };
+    let script = if keep { HOLD_SCRIPT } else { r#"exec "$@""# };
     let mut out = vec![wrapper.to_string()];
     out.extend(flags.iter().map(|f| f.to_string()));
     out.push(script.to_string());
@@ -11250,6 +11369,28 @@ fn spawn_argv(shell: Option<&str>, argv: &[String], keep: bool) -> Vec<String> {
     out.extend(argv.iter().cloned());
     out
 }
+
+/// The `--keep` wrapper: run `"$@"`, report how it exited in reverse video, re-run on Enter,
+/// become a login shell on any other key — ONE key, read raw (`stty -icanon -isig`, `dd` a
+/// byte), so Ctrl-c is just another key here rather than a SIGINT that would abort the whole
+/// `-i -c` script and close the pane — or at end of input. POSIX `sh`; where stdin is not a
+/// terminal the `stty`s fail quietly and the byte is read all the same.
+const HOLD_SCRIPT: &str = r#""$@"; s=$?
+nl='
+'
+cr=$(printf '\r')
+while :; do
+  printf '\n\033[7m exited %s \033[0m \033[2mEnter: run again · any other key: a shell here\033[0m\n' "$s"
+  t=$(stty -g 2>/dev/null); stty -icanon -isig -echo 2>/dev/null
+  k=$(dd bs=1 count=1 2>/dev/null; echo x)
+  [ -n "$t" ] && stty "$t" 2>/dev/null
+  k=${k%x}
+  case $k in
+    "$nl" | "$cr") "$@"; s=$? ;;
+    *) break ;;
+  esac
+done
+exec "${SHELL:-/bin/sh}" -l"#;
 
 /// Build a shell command line from a saved argv by POSIX single-quoting each argument, so
 /// argument boundaries + any metacharacters/newlines are preserved literally (the shell
@@ -13504,8 +13645,47 @@ mod placement {
             ["/bin/sh", "-l", "-c"],
             "a non-POSIX shell is not the wrapper"
         );
-        assert!(keep[3].starts_with(r#""$@"; exec"#), "{keep:?}");
+        assert_eq!(keep[3], HOLD_SCRIPT, "{keep:?}");
         assert_eq!(spawn_argv(None, &argv, false)[0], "/bin/sh");
+    }
+
+    #[test]
+    fn a_kept_command_reports_its_exit_and_reruns_on_enter() {
+        // The hold script itself, in the real `sh`: exit status shown, Enter re-runs, and
+        // anything else hands over to a shell (here `true`, so the test can see it end).
+        let run = |input: &str| {
+            let out = std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    HOLD_SCRIPT,
+                    "comux-spawn",
+                    "sh",
+                    "-c",
+                    "echo RAN; exit 3",
+                ])
+                .env("SHELL", "/usr/bin/true")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .and_then(|mut c| {
+                    use std::io::Write;
+                    c.stdin.take().unwrap().write_all(input.as_bytes())?;
+                    c.wait_with_output()
+                })
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let once = run("q");
+        assert_eq!(once.matches("RAN").count(), 1, "{once}");
+        assert!(once.contains(" exited 3 "), "{once}");
+        let twice = run("\nq");
+        assert_eq!(
+            twice.matches("RAN").count(),
+            2,
+            "Enter runs it again: {twice}"
+        );
+        // End of input (the pane's stdin closing) is a way out too, never a loop.
+        assert_eq!(run("").matches("RAN").count(), 1);
     }
 
     #[test]
@@ -17131,5 +17311,123 @@ mod lock_and_sync {
             KeyModifiers::SHIFT,
         );
         assert_eq!(app.input_targets(), vec![second]);
+    }
+}
+
+#[cfg(test)]
+mod passthrough {
+    use super::*;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn wait_until(mut f: impl FnMut() -> bool) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    #[test]
+    fn a_pane_that_asked_hears_focus_leave_and_return() {
+        let mut app = app();
+        let term = app.focused_terminal().unwrap();
+        app.panes[&term].input(b"stty -echo; printf '\\033[?1004h'; echo READY-$((3*3)); cat -v\n");
+        assert!(wait_until(|| app.panes[&term]
+            .capture(Some(200))
+            .text
+            .contains("READY-9")));
+        app.set_outer_focus(false);
+        app.set_outer_focus(true);
+        app.panes[&term].input(b"\n");
+        assert!(wait_until(|| {
+            let t = app.panes[&term].capture(Some(200)).text;
+            t.contains("^[[O^[[I")
+        }));
+    }
+
+    #[test]
+    fn bells_are_relayed_once_and_titles_follow_the_focused_pane() {
+        let mut app = app();
+        let term = app.focused_terminal().unwrap();
+        assert!(!app.take_new_bells());
+        app.panes[&term].input(b"printf '\\a\\033]2;MY-TITLE\\a'; echo DONE-$((2*4)); sleep 5\n");
+        assert!(wait_until(|| app.panes[&term]
+            .capture(Some(200))
+            .text
+            .contains("DONE-8")));
+        assert!(app.take_new_bells());
+        assert!(!app.take_new_bells(), "the same bell is relayed once");
+        // (The `sleep` holds off the prompt, which would set its own title.)
+        let title = app.outer_title().unwrap();
+        assert!(title.starts_with("MY-TITLE — "), "{title}");
+        app.cfg.set_titles = false;
+        assert_eq!(app.outer_title(), None);
+    }
+}
+
+#[cfg(test)]
+mod junctions {
+    use super::*;
+    use crate::control::Req;
+
+    #[test]
+    fn dividers_meet_in_junction_glyphs() {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        cfg.sidebar = false;
+        cfg.pane_titles = false;
+        let mut app = App::new(80, 24, Vec::new(), Vec::new(), cfg).expect("app");
+        let split = |app: &mut App, dir: &str| {
+            let r = app.handle_control(&Req::Split {
+                dir: dir.into(),
+                from: None,
+                no_focus: false,
+                cwd: None,
+                command: Vec::new(),
+                env: Vec::new(),
+                keep: false,
+            });
+            assert!(r.ok, "{:?}", r.error);
+        };
+        // | left | right-top / right-bottom |
+        split(&mut app, "right");
+        split(&mut app, "down");
+        let mut buf = Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24));
+        app.render_to(&mut buf);
+        let glyphs: String = (0..80u16)
+            .flat_map(|x| (0..23u16).map(move |y| (x, y)))
+            .map(|(x, y)| buf.cell(Position::new(x, y)).unwrap().symbol().to_string())
+            .collect();
+        assert!(glyphs.contains('├'), "the T where the right pane splits");
+        assert!(!glyphs.contains('┼'));
+        // A 2×2 grid crosses in the middle — and the titles on the divider row (on by
+        // default) start after the crossing, so it stays visible.
+        app.cfg.pane_titles = true;
+        split(&mut app, "down");
+        assert!(
+            app.handle_control(&Req::Arrange {
+                op: "tiled".into(),
+                caller: None
+            })
+            .ok
+        );
+        let mut buf = Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 24));
+        app.render_to(&mut buf);
+        let found = (0..80u16)
+            .flat_map(|x| (0..23u16).map(move |y| (x, y)))
+            .any(|(x, y)| buf.cell(Position::new(x, y)).unwrap().symbol() == "┼");
+        assert!(found, "the crossing of a 2×2 grid");
+        assert_eq!(divider_glyph(true, true, true, true), "┼");
+        assert_eq!(divider_glyph(false, false, true, true), "─");
+        assert_eq!(divider_glyph(true, true, false, false), "│");
+        assert_eq!(divider_glyph(false, true, true, true), "┬");
     }
 }

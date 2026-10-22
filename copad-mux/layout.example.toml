@@ -1,0 +1,34 @@
+# A comux layout: one file that builds a whole session (decisions #162).
+#
+#   comux apply-layout layout.example.toml            # build it, switch to it (attach from a plain shell)
+#   comux apply-layout layout.example.toml --dry-run  # print what it would build
+#   comux apply-layout dev.toml --name dev-2 -d       # another copy, under another name, in the background
+#
+# Every pane is a shell; `run` lines are TYPED into it (like tmuxinator), so your aliases and
+# rc files apply, the shell's history has them, and their output stays when they end.
+
+name = "api"            # the session's name (default: this file's name)
+cwd = "~/dev/api"       # where it starts — and where its new tabs open (default: this file's directory)
+
+[[tab]]
+name = "code"
+layout = "main-vertical"  # even-horizontal | even-vertical | main-horizontal | main-vertical | tiled (default)
+
+[[tab.pane]]              # the first pane is the main one
+run = "nvim ."
+
+[[tab.pane]]
+run = ["cargo build", "cargo watch -x test"]   # several lines, in order
+
+[[tab.pane]]              # a plain shell
+
+[[tab]]
+name = "agents"
+layout = "even-horizontal"
+
+[[tab.pane]]
+run = "claude"
+
+[[tab.pane]]
+cwd = "web"               # relative to the session's cwd (or the tab's, when it has one)
+run = "codex"

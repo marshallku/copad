@@ -36,6 +36,8 @@ use crate::tui::{App, KeyAction};
 /// `Wakeup`, input, chrome-data change, clock rollover) — an idle attached session
 /// composes nothing. The per-client buffer diff then keeps the wire delta minimal.
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
+/// The fastest the attached terminals' bell is rung on a pane's behalf.
+const BELL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Loop cadence while **no client is attached**. With nobody watching there is no
 /// frame to compose, so waking 30 times a second only pays for the loop body itself —
@@ -155,6 +157,13 @@ struct Client {
     /// pane that writes the clipboard every tick would overwrite — and with backpressure, starve
     /// — an undelivered drag copy that happened later.
     pending_copy: Option<(u64, String)>,
+    /// Whether this client's terminal has focus (assumed until it says otherwise).
+    focused: bool,
+    /// The title last sent to this client, and one waiting out channel backpressure.
+    last_title: Option<String>,
+    pending_title: Option<String>,
+    /// A bell waiting to be rung on this client's terminal.
+    pending_bell: bool,
 }
 
 /// What a client's `attach` line said about itself: its id (server-minted), the terminal
@@ -370,6 +379,7 @@ pub fn run() -> io::Result<()> {
     let mut clients: Vec<Client> = Vec::new();
     let mut kill = false;
     let mut last_frame = Instant::now();
+    let mut last_bell = Instant::now() - BELL_INTERVAL;
     let mut last_min = app.clock_minute();
     let mut last_save = Instant::now();
     // Idle-skip: only compose+diff a frame when something that affects it changed since
@@ -480,6 +490,27 @@ pub fn run() -> io::Result<()> {
             }
         }
         drain_pending_copies(&mut app, &mut clients);
+        // tmux `bell-action any` + `set-titles`: ring every attached terminal when a pane
+        // rings (at most once a second — a `yes $'\a'` must not machine-gun the dock), and keep
+        // its title on the focused pane's.
+        if app.take_new_bells() && last_bell.elapsed() >= BELL_INTERVAL {
+            last_bell = Instant::now();
+            for c in clients.iter_mut() {
+                c.pending_bell = true;
+            }
+        }
+        let title = app.outer_title();
+        for c in clients.iter_mut() {
+            if title.is_some() && title != c.last_title {
+                c.last_title = title.clone();
+                c.pending_title = title.clone();
+            }
+        }
+        drain_pending_notices(&mut app, &mut clients);
+        // Focus follows membership too: a client attaching (assumed focused), detaching or
+        // being pruned changes "is any terminal showing this focused" as surely as a focus
+        // event does. No clients = nobody looking = unfocused. Cheap when nothing changed.
+        app.set_outer_focus(clients.iter().any(|c| c.focused));
         if dirty && last_frame.elapsed() >= FRAME_INTERVAL {
             last_frame = Instant::now();
             last_min = min;
@@ -679,6 +710,8 @@ fn serve_client(
         mouse: cfg.mouse,
         update_environment: (*cfg.env_names).clone(),
         paste: true,
+        focus: true,
+        colors: true,
     };
     if writeln!(writer, "{}", json(&hello)).is_err() || writer.flush().is_err() {
         return;
@@ -835,6 +868,10 @@ fn handle_incoming(
                 pid,
                 env: Vec::new(),
                 pending_copy: None,
+                focused: true,
+                last_title: None,
+                pending_title: None,
+                pending_bell: false,
             });
             if let Some(p) = pid {
                 app.set_client_pid(p);
@@ -858,6 +895,17 @@ fn handle_incoming(
                 app.ack_focused_bell();
             }
             match msg {
+                ClientMsg::Focus { gained } => {
+                    if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
+                        c.focused = gained;
+                    }
+                    app.set_outer_focus(clients.iter().any(|c| c.focused));
+                    false
+                }
+                ClientMsg::Colors { fg, bg } => {
+                    crate::term::set_outer_colors(fg, bg);
+                    false
+                }
                 ClientMsg::Env { vars, copad_host } => {
                     // tmux update-environment: store this client's session vars and adopt
                     // them now, so the next pane it spawns inherits its live SSH/display env.
@@ -1066,6 +1114,29 @@ fn drain_pending_copies(app: &mut App, clients: &mut Vec<Client>) {
             // was blocked isn't demoted back to the older text.
             Err(TrySendError::Full(_)) => queue_copy(c, seq, &text),
             Err(TrySendError::Disconnected(_)) => dead.push(c.id), // writer gone; prune
+        }
+    }
+    prune_dead_clients(app, clients, &dead);
+}
+
+/// Deliver pending bells and titles like copies: non-blocking, retried while the cap-1
+/// channel is full, a vanished client pruned.
+fn drain_pending_notices(app: &mut App, clients: &mut Vec<Client>) {
+    let mut dead = Vec::new();
+    for c in clients.iter_mut() {
+        if c.pending_bell {
+            match c.out.try_send(ServerMsg::Bell) {
+                Ok(()) => c.pending_bell = false,
+                Err(TrySendError::Full(_)) => {}
+                Err(TrySendError::Disconnected(_)) => dead.push(c.id),
+            }
+        }
+        if let Some(text) = c.pending_title.take() {
+            match c.out.try_send(ServerMsg::Title { text: text.clone() }) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => c.pending_title = Some(text),
+                Err(TrySendError::Disconnected(_)) => dead.push(c.id),
+            }
         }
     }
     prune_dead_clients(app, clients, &dead);
@@ -1331,6 +1402,10 @@ mod tests {
             pid: None,
             env: Vec::new(),
             pending_copy: None,
+            focused: true,
+            last_title: None,
+            pending_title: None,
+            pending_bell: false,
         };
         (
             client,

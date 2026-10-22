@@ -15,8 +15,9 @@ use ratatui::buffer::{Buffer, Cell};
 use ratatui::crossterm::cursor::{self, MoveTo, RestorePosition, SavePosition};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture, Event as CEvent, KeyEventKind, KeyboardEnhancementFlags,
-    MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    EnableFocusChange, EnableMouseCapture, Event as CEvent, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -390,11 +391,21 @@ struct TermGuard {
     keys: bool,
     /// We changed the cursor shape (`DECSCUSR`) at some point; restored to the default on drop.
     cursor_shaped: bool,
+    /// We pushed the terminal's title (`CSI 22 t`) before setting our own; popped on drop.
+    title_pushed: bool,
+    /// The terminal's `(fg, bg)`, read at attach (OSC 10/11), if it answered.
+    colors: Option<(crate::proto::Rgb8, crate::proto::Rgb8)>,
+    /// Keys the user typed while the colour probe was reading stdin that could not be put
+    /// back on the terminal's input queue; sent as keys once the server is listening.
+    typed: Vec<KeyEvent>,
 }
 
 impl TermGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
+        // First of all, while the terminal reports nothing on its own yet (focus reporting and
+        // mouse capture come later) and before crossterm's reader exists: this reads stdin raw.
+        let (colors, typed) = probe_colors();
         // Focus reporting lets us re-probe the true terminal size when the window regains focus
         // (e.g. after the display woke from sleep) — the sanctioned recovery for a stale OS
         // winsize. Harmless on terminals that ignore it.
@@ -417,6 +428,9 @@ impl TermGuard {
             paste: false,
             keys,
             cursor_shaped: false,
+            title_pushed: false,
+            colors,
+            typed,
         })
     }
 
@@ -459,9 +473,352 @@ impl Drop for TermGuard {
         if self.cursor_shaped {
             let _ = write!(io::stdout(), "\u{1b}[0 q");
         }
+        if self.title_pushed {
+            let _ = write!(io::stdout(), "\u{1b}[23;0t"); // XTWINOPS: pop the saved title
+        }
         let _ = write!(io::stdout(), "\u{1b}[?7h"); // restore autowrap (see `enter`)
         let _ = execute!(io::stdout(), DisableFocusChange, LeaveAlternateScreen);
     }
+}
+
+/// Read our terminal's foreground and background (OSC 10/11 `?`), so panes asking for them —
+/// nvim's `background` detection, Claude Code's light/dark — get the real colours instead of
+/// silence. A DA1 query rides behind them as the sentinel every terminal answers, so one that
+/// ignores colour queries costs a round trip, not the timeout. Reads stdin RAW, so it runs
+/// before crossterm's event reader is ever started. `COPAD_MUX_COLOR_PROBE=0` skips it.
+fn probe_colors() -> (
+    Option<(crate::proto::Rgb8, crate::proto::Rgb8)>,
+    Vec<KeyEvent>,
+) {
+    use std::os::fd::AsRawFd;
+    if std::env::var("COPAD_MUX_COLOR_PROBE").is_ok_and(|v| v == "0") {
+        return (None, Vec::new());
+    }
+    let mut out = io::stdout();
+    if write!(out, "\u{1b}]10;?\u{1b}\\\u{1b}]11;?\u{1b}\\\u{1b}[c").is_err()
+        || out.flush().is_err()
+    {
+        return (None, Vec::new());
+    }
+    let fd = io::stdin().as_raw_fd();
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut got = Vec::new();
+    while !da1_answered(&got) && got.len() < 4096 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd for the duration of the call.
+        if unsafe { libc::poll(&mut pfd, 1, left.as_millis() as i32) } <= 0 {
+            break;
+        }
+        let mut chunk = [0u8; 512];
+        // SAFETY: `chunk` is a valid writable buffer of the length passed.
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n <= 0 {
+            break;
+        }
+        got.extend_from_slice(&chunk[..n as usize]);
+    }
+    // A keystroke whose bytes straddle the DA1 reply would be cut in two: wait for the rest,
+    // exactly as crossterm's own parser would. A lone ESC gets a short window (nothing
+    // following it IS the Esc key, the rule every terminal parser uses); an `ESC [`/`ESC O`
+    // sequence or a UTF-8 scalar already begun is waited for until it completes — crossterm
+    // waits for those indefinitely too, and over SSH a key's bytes can arrive fragmented.
+    let started = Instant::now();
+    while let Some(wait) = ends_mid_key(&without_replies(&got)) {
+        let timeout = match wait {
+            MidKey::LoneEsc => {
+                let left = (started + LONE_ESC).saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                left.as_millis() as i32
+            }
+            MidKey::Begun => -1,
+        };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd for the duration of the call.
+        if unsafe { libc::poll(&mut pfd, 1, timeout) } <= 0 {
+            break;
+        }
+        let mut chunk = [0u8; 64];
+        // SAFETY: `chunk` is a valid writable buffer of the length passed.
+        let n = unsafe { libc::read(fd, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if n <= 0 {
+            break;
+        }
+        got.extend_from_slice(&chunk[..n as usize]);
+    }
+    let colors = osc_color(&got, b"10").zip(osc_color(&got, b"11"));
+    // Anything else read here is the user typing during the probe (the terminal reports
+    // nothing unasked yet). It belongs to the event reader, which has not started: put it back
+    // on the terminal's input queue (TIOCSTI — allowed for one's own controlling terminal on
+    // macOS, and on Linux with `legacy_tiocsti`), and where that is refused, decode what is
+    // left into keys the caller sends itself.
+    let rest = without_replies(&got);
+    let mut pushed = 0;
+    for b in &rest {
+        // SAFETY: `fd` is our stdin and `b` a valid byte for the duration of the call.
+        if unsafe { libc::ioctl(fd, libc::TIOCSTI, b as *const u8) } != 0 {
+            break;
+        }
+        pushed += 1;
+    }
+    (colors, decode_typed(&rest[pushed..]))
+}
+
+/// Decode raw keyboard bytes into key events. Complete for what a terminal can send at this
+/// point: the probe runs before kitty keys, bracketed paste, mouse and focus reporting are
+/// turned on, so input is LEGACY keyboard encoding only — UTF-8 text, C0 controls, `Alt` as
+/// an ESC prefix, and the xterm CSI/SS3 forms of the cursor, editing and function keys with
+/// their modifier parameter.
+fn decode_typed(bytes: &[u8]) -> Vec<KeyEvent> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let (code, mut mods, len) = match b {
+            b'\r' | b'\n' => (KeyCode::Enter, KeyModifiers::NONE, 1),
+            b'\t' => (KeyCode::Tab, KeyModifiers::NONE, 1),
+            0x7f | 0x08 => (KeyCode::Backspace, KeyModifiers::NONE, 1),
+            0x1b => match bytes.get(i + 1) {
+                None => (KeyCode::Esc, KeyModifiers::NONE, 1),
+                Some(b'[') | Some(b'O') => {
+                    let ss3 = bytes[i + 1] == b'O';
+                    let end = bytes[i + 2..]
+                        .iter()
+                        .position(|c| (0x40..=0x7e).contains(c))
+                        .map_or(bytes.len() - i, |p| p + 3);
+                    if let Some(k) = decode_csi(&bytes[i + 2..i + end], ss3) {
+                        out.push(k);
+                    }
+                    i += end;
+                    continue;
+                }
+                Some(_) => {
+                    // Alt+key: decode the next key and mark it.
+                    let inner = decode_typed(&bytes[i + 1..]);
+                    if let Some(first) = inner.into_iter().next() {
+                        let consumed = encoded_len(&bytes[i + 1..]);
+                        out.push(KeyEvent::new(
+                            first.code,
+                            first.modifiers | KeyModifiers::ALT,
+                        ));
+                        i += 1 + consumed;
+                        continue;
+                    }
+                    (KeyCode::Esc, KeyModifiers::NONE, 1)
+                }
+            },
+            0 => (KeyCode::Char(' '), KeyModifiers::CONTROL, 1),
+            1..=26 => (
+                KeyCode::Char((b'a' + b - 1) as char),
+                KeyModifiers::CONTROL,
+                1,
+            ),
+            0x1c..=0x1f => (
+                KeyCode::Char(['\\', ']', '^', '_'][(b - 0x1c) as usize]),
+                KeyModifiers::CONTROL,
+                1,
+            ),
+            _ => {
+                let len = encoded_len(&bytes[i..]);
+                match std::str::from_utf8(&bytes[i..i + len])
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                {
+                    Some(c) if !c.is_control() => (KeyCode::Char(c), KeyModifiers::NONE, len),
+                    _ => {
+                        i += len;
+                        continue;
+                    }
+                }
+            }
+        };
+        if let KeyCode::Char(c) = code
+            && c.is_ascii_uppercase()
+        {
+            mods |= KeyModifiers::SHIFT;
+        }
+        out.push(KeyEvent::new(code, mods));
+        i += len;
+    }
+    out
+}
+
+/// One xterm CSI (`ESC [`) or SS3 (`ESC O`) key sequence, given its body (parameters and
+/// final byte). `None` for anything a keyboard does not send.
+fn decode_csi(body: &[u8], ss3: bool) -> Option<KeyEvent> {
+    let (&fin, params) = body.split_last()?;
+    let params = std::str::from_utf8(params).ok()?;
+    let mut nums = params.split(';').map(|p| p.parse::<u32>().ok());
+    let first = nums.next().flatten();
+    let modp = nums.next().flatten().unwrap_or(1);
+    let bits = modp.saturating_sub(1);
+    let mut mods = KeyModifiers::NONE;
+    if bits & 1 != 0 {
+        mods |= KeyModifiers::SHIFT;
+    }
+    if bits & 2 != 0 {
+        mods |= KeyModifiers::ALT;
+    }
+    if bits & 4 != 0 {
+        mods |= KeyModifiers::CONTROL;
+    }
+    let code = match fin {
+        b'A' => KeyCode::Up,
+        b'B' => KeyCode::Down,
+        b'C' => KeyCode::Right,
+        b'D' => KeyCode::Left,
+        b'H' => KeyCode::Home,
+        b'F' => KeyCode::End,
+        b'P' => KeyCode::F(1),
+        b'Q' => KeyCode::F(2),
+        b'R' => KeyCode::F(3),
+        b'S' => KeyCode::F(4),
+        b'Z' if !ss3 => return Some(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+        b'~' if !ss3 => match first? {
+            1 | 7 => KeyCode::Home,
+            2 => KeyCode::Insert,
+            3 => KeyCode::Delete,
+            4 | 8 => KeyCode::End,
+            5 => KeyCode::PageUp,
+            6 => KeyCode::PageDown,
+            n @ 11..=15 => KeyCode::F((n - 10) as u8),
+            n @ 17..=21 => KeyCode::F((n - 11) as u8),
+            n @ 23..=24 => KeyCode::F((n - 12) as u8),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(KeyEvent::new(code, mods))
+}
+
+/// The byte length of the UTF-8 scalar starting `bytes` (1 for anything malformed).
+fn encoded_len(bytes: &[u8]) -> usize {
+    let n = match bytes.first() {
+        Some(b) if *b >= 0xf0 => 4,
+        Some(b) if *b >= 0xe0 => 3,
+        Some(b) if *b >= 0xc0 => 2,
+        _ => 1,
+    };
+    n.min(bytes.len()).max(1)
+}
+
+/// How long a lone ESC at the end of the probe may still turn out to start a sequence.
+const LONE_ESC: Duration = Duration::from_millis(50);
+
+/// Why the probe's leftover bytes are not a whole key yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MidKey {
+    /// A lone ESC — the Esc key itself, unless more follows at once.
+    LoneEsc,
+    /// An `ESC [` / `ESC O` sequence without its final byte, or a UTF-8 scalar missing
+    /// continuation bytes: only the front of a key still arriving.
+    Begun,
+}
+
+/// Whether `buf` ends partway through a key, and how.
+fn ends_mid_key(buf: &[u8]) -> Option<MidKey> {
+    if buf.last() == Some(&0x1b) {
+        return Some(MidKey::LoneEsc);
+    }
+    if let Some(esc) = buf.iter().rposition(|b| *b == 0x1b)
+        && matches!(buf.get(esc + 1), Some(b'[') | Some(b'O'))
+        && !buf[esc + 2..].iter().any(|c| (0x40..=0x7e).contains(c))
+    {
+        return Some(MidKey::Begun);
+    }
+    // Walk back over continuation bytes to the lead byte and compare the lengths.
+    let tail = buf.iter().rev().take_while(|b| **b & 0xc0 == 0x80).count();
+    match buf.len().checked_sub(tail + 1).map(|i| buf[i]) {
+        Some(lead) if lead >= 0xc0 && encoded_len(&[lead, 0x80, 0x80, 0x80]) > tail + 1 => {
+            Some(MidKey::Begun)
+        }
+        _ => None,
+    }
+}
+
+/// `buf` minus the replies `probe_colors` asked for: the OSC 10/11 reports (BEL- or
+/// ST-terminated) and the DA1 reply.
+fn without_replies(buf: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(buf.len());
+    let mut i = 0;
+    while i < buf.len() {
+        let rest = &buf[i..];
+        if rest.starts_with(b"\x1b]10;") || rest.starts_with(b"\x1b]11;") {
+            // Up to and including BEL or ST; an unterminated one is dropped whole.
+            let end = rest
+                .iter()
+                .enumerate()
+                .find_map(|(k, b)| match b {
+                    0x07 => Some(k + 1),
+                    b'\\' if k > 0 && rest[k - 1] == 0x1b => Some(k + 1),
+                    _ => None,
+                })
+                .unwrap_or(rest.len());
+            i += end;
+            continue;
+        }
+        if rest.starts_with(b"\x1b[?") {
+            let body = rest[3..]
+                .iter()
+                .take_while(|b| b.is_ascii_digit() || **b == b';')
+                .count();
+            if rest.get(3 + body) == Some(&b'c') {
+                i += 3 + body + 1;
+                continue;
+            }
+        }
+        out.push(buf[i]);
+        i += 1;
+    }
+    out
+}
+
+/// Whether `buf` holds a DA1 reply (`ESC [ ? … c`).
+fn da1_answered(buf: &[u8]) -> bool {
+    buf.windows(3).enumerate().any(|(i, w)| {
+        w == b"\x1b[?"
+            && buf[i + 3..]
+                .iter()
+                .find(|b| !(b.is_ascii_digit() || **b == b';'))
+                .is_some_and(|b| *b == b'c')
+    })
+}
+
+/// Parse an `ESC ] <code> ; rgb:R/G/B` reply out of `buf` (1–4 hex digits per channel,
+/// scaled to 8 bits, as XParseColor allows).
+fn osc_color(buf: &[u8], code: &[u8]) -> Option<(u8, u8, u8)> {
+    let mut head = b"\x1b]".to_vec();
+    head.extend_from_slice(code);
+    head.extend_from_slice(b";rgb:");
+    let at = buf.windows(head.len()).position(|w| w == head.as_slice())? + head.len();
+    let body: Vec<u8> = buf[at..]
+        .iter()
+        .take_while(|b| b.is_ascii_hexdigit() || **b == b'/')
+        .copied()
+        .collect();
+    let body = std::str::from_utf8(&body).ok()?;
+    let mut it = body.split('/').map(|h| {
+        if h.is_empty() || h.len() > 4 {
+            return None;
+        }
+        let v = u32::from_str_radix(h, 16).ok()?;
+        let max = (1u32 << (4 * h.len())) - 1;
+        Some(((v * 255 + max / 2) / max) as u8)
+    });
+    Some((it.next()??, it.next()??, it.next()??))
 }
 
 /// Ask our terminal for the kitty keyboard protocol's "disambiguate" reports when it speaks
@@ -679,6 +1036,8 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
     // The SAME reader is then moved into the reader thread so no buffered bytes are lost.
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut pending_first: Option<ServerMsg> = None;
+    // What the server's `Hello` said it understands (an older one says neither).
+    let mut send_focus = false;
     {
         let mut line = String::new();
         loop {
@@ -696,7 +1055,10 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     mouse,
                     update_environment,
                     paste,
+                    focus,
+                    colors,
                 }) => {
+                    send_focus = focus;
                     if paste {
                         let _ = guard.enable_paste();
                     }
@@ -731,6 +1093,12 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                             copad_host,
                         },
                     );
+                    if colors && let Some((fg, bg)) = guard.colors {
+                        let _ = send(&mut wr, &ClientMsg::Colors { fg, bg });
+                    }
+                    for k in std::mem::take(&mut guard.typed) {
+                        let _ = send(&mut wr, &ClientMsg::Key(k));
+                    }
                     break;
                 }
                 Ok(ServerMsg::Bye) => return Ok(()),
@@ -908,7 +1276,15 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     }
                     // Window regained focus (e.g. the display woke): the OS winsize may be stale,
                     // so probe the terminal's true size below.
-                    CEvent::FocusGained => probe_needed = true,
+                    CEvent::FocusGained => {
+                        probe_needed = true;
+                        if send_focus {
+                            let _ = send(&mut wr, &ClientMsg::Focus { gained: true });
+                        }
+                    }
+                    CEvent::FocusLost if send_focus => {
+                        let _ = send(&mut wr, &ClientMsg::Focus { gained: false });
+                    }
                     _ => {}
                 }
                 if !event::poll(Duration::from_millis(0))? {
@@ -996,6 +1372,22 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                 Ok(ServerMsg::Copy { text }) => {
                     let _ = write_osc52(&text);
                 }
+                Ok(ServerMsg::Bell) => {
+                    let mut out = io::stdout();
+                    let _ = out.write_all(b"\x07");
+                    let _ = out.flush();
+                }
+                Ok(ServerMsg::Title { text }) => {
+                    let mut out = io::stdout();
+                    if !guard.title_pushed {
+                        // Save the terminal's own title so detaching puts it back.
+                        let _ = out.write_all(b"\x1b[22;0t");
+                        guard.title_pushed = true;
+                    }
+                    let clean: String = text.chars().filter(|c| !c.is_control()).collect();
+                    let _ = write!(out, "\u{1b}]2;{clean}\u{7}");
+                    let _ = out.flush();
+                }
                 // Hello is consumed synchronously during the handshake above; a server
                 // never sends a second one, so this arm is unreachable in practice.
                 Ok(ServerMsg::Hello { .. }) => {}
@@ -1080,9 +1472,11 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::MidKey;
     use super::{
-        AttachOpts, PROBE_CORNER, PROBE_MAX, base64, connect_only, emit_view, io, repaint_all,
-        size_from_clamped_cursor,
+        AttachOpts, PROBE_CORNER, PROBE_MAX, base64, connect_only, da1_answered, decode_typed,
+        emit_view, ends_mid_key, io, osc_color, repaint_all, size_from_clamped_cursor,
+        without_replies,
     };
     use ratatui::backend::CrosstermBackend;
     use ratatui::buffer::Buffer;
@@ -1103,6 +1497,89 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn colour_replies_parse_at_any_precision_and_da1_ends_the_wait() {
+        let reply = b"\x1b]10;rgb:cdcd/d6d6/f4f4\x1b\\\x1b]11;rgb:1e/1e/2e\x07\x1b[?62;22c";
+        assert_eq!(osc_color(reply, b"10"), Some((0xcd, 0xd6, 0xf4)));
+        assert_eq!(osc_color(reply, b"11"), Some((0x1e, 0x1e, 0x2e)));
+        assert_eq!(
+            osc_color(b"\x1b]11;rgb:f/0/8\x07", b"11"),
+            Some((255, 0, 136))
+        );
+        assert_eq!(osc_color(b"\x1b]11;rgb:zz/0/0\x07", b"11"), None);
+        assert_eq!(
+            osc_color(b"\x1b[?62c", b"11"),
+            None,
+            "a terminal that ignored the query"
+        );
+        assert!(da1_answered(reply));
+        assert!(da1_answered(b"\x1b[?6c"));
+        assert!(!da1_answered(b"\x1b]11;rgb:1e/1e/2e\x07"));
+        assert!(!da1_answered(b"\x1b[?62;22"), "not finished yet");
+        // Whatever else arrived is kept for the event reader, in order.
+        let mixed = b"ab\x1b]10;rgb:1/2/3\x07c\x1b]11;rgb:4/5/6\x1b\\\x1b[?62;22cd\x1b[A";
+        assert_eq!(without_replies(mixed), b"abcd\x1b[A");
+        // …and what TIOCSTI refused is decoded into keys instead of being dropped.
+        use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+        let keys: Vec<_> = decode_typed("aZ한\r\x03\x1bx\x1b[A\x7f".as_bytes())
+            .into_iter()
+            .map(|k| (k.code, k.modifiers))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                (KeyCode::Char('a'), KeyModifiers::NONE),
+                (KeyCode::Char('Z'), KeyModifiers::SHIFT),
+                (KeyCode::Char('한'), KeyModifiers::NONE),
+                (KeyCode::Enter, KeyModifiers::NONE),
+                (KeyCode::Char('c'), KeyModifiers::CONTROL),
+                (KeyCode::Char('x'), KeyModifiers::ALT),
+                (KeyCode::Up, KeyModifiers::NONE),
+                (KeyCode::Backspace, KeyModifiers::NONE),
+            ]
+        );
+        // The C0 controls that are not letters.
+        let keys: Vec<_> = decode_typed(b"\x00\x1c\x1f")
+            .into_iter()
+            .map(|k| (k.code, k.modifiers))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                (KeyCode::Char(' '), KeyModifiers::CONTROL),
+                (KeyCode::Char('\\'), KeyModifiers::CONTROL),
+                (KeyCode::Char('_'), KeyModifiers::CONTROL),
+            ]
+        );
+        // A key cut off by the end of the probe is waited for, not split.
+        let short = Some(MidKey::LoneEsc);
+        let begun = Some(MidKey::Begun);
+        assert_eq!(ends_mid_key(b"a\x1b"), short, "maybe the Esc key itself");
+        assert_eq!(ends_mid_key(b"a\x1b[1;5"), begun);
+        assert_eq!(ends_mid_key("한".as_bytes().split_last().unwrap().1), begun);
+        assert_eq!(ends_mid_key(b"a\x1b[A"), None);
+        assert_eq!(ends_mid_key("a한".as_bytes()), None);
+        // Every key a legacy keyboard sends, modifiers included.
+        let keys: Vec<_> =
+            decode_typed(b"\x1b[1;5D\x1bOP\x1b[15~\x1b[24;2~\x1b[3~\x1b[5~\x1b[Z\x1b[1;3H")
+                .into_iter()
+                .map(|k| (k.code, k.modifiers))
+                .collect();
+        assert_eq!(
+            keys,
+            [
+                (KeyCode::Left, KeyModifiers::CONTROL),
+                (KeyCode::F(1), KeyModifiers::NONE),
+                (KeyCode::F(5), KeyModifiers::NONE),
+                (KeyCode::F(12), KeyModifiers::SHIFT),
+                (KeyCode::Delete, KeyModifiers::NONE),
+                (KeyCode::PageUp, KeyModifiers::NONE),
+                (KeyCode::BackTab, KeyModifiers::SHIFT),
+                (KeyCode::Home, KeyModifiers::ALT),
+            ]
+        );
     }
 
     #[test]
