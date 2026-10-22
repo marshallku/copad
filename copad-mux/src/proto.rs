@@ -68,6 +68,10 @@ impl WireCell {
     }
 }
 
+fn shown() -> bool {
+    true
+}
+
 /// A render frame: the cells that changed since the client's previous frame, plus
 /// the cursor. `full` marks a baseline repaint (diff against an empty buffer) that
 /// the client must apply after clearing — emitted on attach, resize, and takeover.
@@ -82,6 +86,15 @@ pub struct FrameMsg {
     pub full: bool,
     pub cells: Vec<WireCell>,
     pub cursor: Option<(u16, u16)>,
+    /// The program in the focused pane hid its cursor (`?25l`). `cursor` still carries where it
+    /// is, so the client can park the real (hidden) cursor there for an IME. Defaults to shown,
+    /// which is what a frame from an older server meant.
+    #[serde(default = "shown")]
+    pub cursor_visible: bool,
+    /// The focused program's cursor shape as a `DECSCUSR` parameter; `0` = the terminal's own
+    /// default (also what an older server's frame means).
+    #[serde(default)]
+    pub cursor_shape: u8,
     /// **Silent full repaint.** Re-emit every cell of the client's buffer to the terminal
     /// after applying this frame, WITHOUT clearing it first — the self-healing counterpart
     /// to `full`, which the client honours with a `Clear(All)` that flashes a blank frame.

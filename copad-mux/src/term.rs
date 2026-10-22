@@ -20,7 +20,8 @@ use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{ClipboardType, Config, Term, TermMode};
 use alacritty_terminal::tty::{self, Options as TtyOptions, Pty, Shell};
-use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor};
+use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, CursorStyle, NamedColor};
+use ratatui::style::Modifier;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// A cell color resolved to something a renderer can map directly.
@@ -47,6 +48,10 @@ pub struct CellSnap {
     pub bg: CellColor,
     pub bold: bool,
     pub reverse: bool,
+    /// The rest of the cell's SGR attributes — italic, dim, underline (any style), blink,
+    /// hidden, strikethrough — as the ratatui modifiers the wire already carries. Bold and
+    /// reverse keep their own fields above.
+    pub attrs: Modifier,
 }
 
 /// A snapshot of the visible grid + cursor for one render tick.
@@ -61,6 +66,13 @@ pub struct Snapshot {
     pub wrapped: Vec<bool>,
     /// Cursor position in viewport coordinates `(col, row)`.
     pub cursor: (u16, u16),
+    /// Whether the program wants the cursor shown (`?25h`) and it is on screen (not
+    /// scrolled into history). A hidden cursor still has a position: the client parks the
+    /// real cursor there so an IME's composition window opens where the text goes.
+    pub cursor_visible: bool,
+    /// The program's cursor shape as a `DECSCUSR` parameter (`1`–`6`, vim's insert-mode bar
+    /// is `6`), or `0` when it never set one — the outer terminal's own default.
+    pub cursor_shape: u8,
     /// Copy mode's cursor and selection, read under the SAME lock as `cells` so what is
     /// highlighted is exactly what a yank would copy. `None` outside copy mode.
     pub copy: Option<CopyView>,
@@ -435,6 +447,13 @@ impl PaneTerm {
         if let Some(dir) = cwd {
             opts.working_directory = Some(dir);
         }
+        // A pane is comux's terminal, not the one the server happened to be born in: without
+        // this a server started from Ghostty hands every pane `TERM=xterm-ghostty` (features
+        // comux's emulator does not have, and a terminfo an SSH host may lack), and one started
+        // by launchd hands it no TERM at all. tmux does the same with `default-terminal`. An
+        // explicit `--env` below still wins.
+        opts.env.insert("TERM".into(), "xterm-256color".into());
+        opts.env.insert("COLORTERM".into(), "truecolor".into());
         let mut pane_token = None;
         for (k, v) in env {
             if k == PANE_TOKEN_ENV {
@@ -462,15 +481,7 @@ impl PaneTerm {
 
         let term_size = TermSize::new(cols as usize, rows as usize);
         let listener = MuxListener::new();
-        // A generous scrollback so panes have history to scroll back through.
-        let config = Config {
-            scrolling_history: 10_000,
-            // Pin the parser-level OSC 52 policy to copy-only. This is alacritty's own
-            // default today; pinning it means a future default change can never hand a pane
-            // program the PASTE direction (reading the host clipboard) behind our back.
-            osc52: alacritty_terminal::term::Osc52::OnlyCopy,
-            ..Config::default()
-        };
+        let config = pane_config();
         let term = Term::new(config, &term_size, listener.clone());
         let term = Arc::new(FairMutex::new(term));
 
@@ -637,6 +648,17 @@ impl PaneTerm {
     /// Whether the pane's program asked for bracketed paste (`?2004h`).
     pub fn bracketed_paste(&self) -> bool {
         self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// The input modes the pane's program asked for, which decide how a key is encoded.
+    pub fn key_modes(&self) -> crate::keys::KeyModes {
+        let term = self.term.lock();
+        let mode = term.mode();
+        crate::keys::KeyModes {
+            app_cursor: mode.contains(TermMode::APP_CURSOR),
+            kitty_disambiguate: mode.contains(TermMode::DISAMBIGUATE_ESC_CODES),
+            kitty_all_keys: mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC),
+        }
     }
 
     /// Whether the pane is currently on the ALTERNATE screen (`?1049h`) — i.e. a
@@ -956,6 +978,12 @@ pub(crate) fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
                     " ".repeat(span) // unrepresentable at this width — blank the leading cell
                 };
             }
+            // Concealed text (`SGR 8`, a typed password) is blanked HERE rather than sent with
+            // a hidden attribute: ratatui's crossterm emit has no `Hidden`, so the attribute
+            // alone would put the secret on screen. Same width, so the invariant above holds.
+            if flags.contains(Flags::HIDDEN) && !spacer {
+                sym = " ".repeat(span);
+            }
             row.push(CellSnap {
                 sym,
                 spacer,
@@ -963,6 +991,7 @@ pub(crate) fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
                 bg: ansi_to_cell(cell.bg),
                 bold: flags.contains(Flags::BOLD),
                 reverse: flags.contains(Flags::INVERSE),
+                attrs: cell_attrs(flags),
             });
             prev_spans_two = span == 2;
         }
@@ -986,7 +1015,68 @@ pub(crate) fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
         cells,
         wrapped,
         cursor: (cursor_col, cursor_row),
+        cursor_visible: term.mode().contains(TermMode::SHOW_CURSOR) && display_offset == 0,
+        cursor_shape: decscusr(term.cursor_style()),
         copy: copy_view(term, display_offset),
+    }
+}
+
+/// The emulator configuration every pane runs with.
+fn pane_config() -> Config {
+    Config {
+        // A generous scrollback so panes have history to scroll back through.
+        scrolling_history: 10_000,
+        // Pin the parser-level OSC 52 policy to copy-only. This is alacritty's own
+        // default today; pinning it means a future default change can never hand a pane
+        // program the PASTE direction (reading the host clipboard) behind our back.
+        osc52: alacritty_terminal::term::Osc52::OnlyCopy,
+        // Answer `CSI ? u` and track `CSI > flags u`, so a program can ask for the kitty
+        // keyboard protocol — Claude Code and nvim then get Shift+Enter, Ctrl+Enter, … as
+        // distinct keys. The encoding side is `crate::keys`, fed by `key_modes`.
+        kitty_keyboard: true,
+        // See `decscusr`: the "never set" marker.
+        default_cursor_style: CursorStyle {
+            shape: CursorShape::HollowBlock,
+            blinking: false,
+        },
+        ..Config::default()
+    }
+}
+
+/// alacritty's cell flags → the ratatui modifiers for everything but bold and reverse.
+/// Every underline style (curly, double, dotted, dashed) becomes a plain underline: ratatui
+/// has no styles to carry them, and an underline in the wrong style beats none at all.
+fn cell_attrs(flags: Flags) -> Modifier {
+    let mut m = Modifier::empty();
+    if flags.contains(Flags::DIM) {
+        m |= Modifier::DIM;
+    }
+    if flags.contains(Flags::ITALIC) {
+        m |= Modifier::ITALIC;
+    }
+    if flags.intersects(Flags::ALL_UNDERLINES) {
+        m |= Modifier::UNDERLINED;
+    }
+    if flags.contains(Flags::STRIKEOUT) {
+        m |= Modifier::CROSSED_OUT;
+    }
+    if flags.contains(Flags::HIDDEN) {
+        m |= Modifier::HIDDEN;
+    }
+    m
+}
+
+/// The cursor style as a `DECSCUSR` parameter. A pane's default style is `HollowBlock`
+/// (set in `spawn_with_env`), which no `DECSCUSR` can select, so it reliably means "the
+/// program never chose one" → `0`, the outer terminal's own default — forcing a block
+/// on someone whose terminal draws a beam would be a regression nobody asked for.
+fn decscusr(style: CursorStyle) -> u8 {
+    let blink = |on: u8, off: u8| if style.blinking { on } else { off };
+    match style.shape {
+        CursorShape::Block => blink(1, 2),
+        CursorShape::Underline => blink(3, 4),
+        CursorShape::Beam => blink(5, 6),
+        CursorShape::HollowBlock | CursorShape::Hidden => 0,
     }
 }
 
@@ -2903,5 +2993,65 @@ mod paste_tests {
                 "{evil:?} -> {body:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod attrs_and_cursor {
+    use super::*;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::vte::ansi::Processor;
+
+    fn snap_of(bytes: &[u8]) -> Snapshot {
+        let size = TermSize::new(20, 3);
+        let mut t = Term::new(pane_config(), &size, VoidListener);
+        let mut p: Processor = Processor::new();
+        p.advance(&mut t, bytes);
+        snapshot_grid(&t)
+    }
+
+    #[test]
+    fn every_sgr_attribute_survives_into_the_snapshot() {
+        let s = snap_of(b"\x1b[3mI\x1b[0m\x1b[4mU\x1b[0m\x1b[4:3mC\x1b[0m\x1b[2mD\x1b[0m\x1b[9mS\x1b[0m\x1b[8mH\x1b[0mN");
+        let a = |i: usize| s.cells[0][i].attrs;
+        assert_eq!(a(0), Modifier::ITALIC);
+        assert_eq!(a(1), Modifier::UNDERLINED);
+        assert_eq!(
+            a(2),
+            Modifier::UNDERLINED,
+            "a curly underline is still an underline"
+        );
+        assert_eq!(a(3), Modifier::DIM);
+        assert_eq!(a(4), Modifier::CROSSED_OUT);
+        assert_eq!(a(5), Modifier::HIDDEN);
+        assert_eq!(
+            s.cells[0][5].sym, " ",
+            "a hidden password is never sent at all"
+        );
+        assert_eq!(a(6), Modifier::empty());
+    }
+
+    #[test]
+    fn the_cursor_carries_visibility_and_shape() {
+        let s = snap_of(b"hi");
+        assert!(s.cursor_visible);
+        assert_eq!(
+            s.cursor_shape, 0,
+            "never set = the outer terminal's default"
+        );
+        let s = snap_of(b"\x1b[?25l");
+        assert!(!s.cursor_visible);
+        assert_eq!(
+            snap_of(b"\x1b[6 q").cursor_shape,
+            6,
+            "vim's insert-mode bar"
+        );
+        assert_eq!(snap_of(b"\x1b[1 q").cursor_shape, 1);
+        assert_eq!(snap_of(b"\x1b[4 q").cursor_shape, 4);
+        assert_eq!(
+            snap_of(b"\x1b[6 q\x1b[0 q").cursor_shape,
+            0,
+            "reset to default"
+        );
     }
 }

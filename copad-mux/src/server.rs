@@ -122,6 +122,8 @@ struct Client {
     /// The cursor position the client last received, so a cursor-only move (no cell
     /// change) still gets shipped instead of leaving a stale cursor.
     last_cursor: Option<(u16, u16)>,
+    /// The cursor `(visible, shape)` that frame carried.
+    last_look: (bool, u8),
     /// This client's OWN `Ctrl-b` prefix state — per-connection so a chord can't span
     /// clients when input is shared.
     prefix: crate::tui::Prefix,
@@ -819,6 +821,7 @@ fn handle_incoming(
                 needs_full: true,
                 pending: false,
                 last_cursor: None,
+                last_look: (true, 0),
                 prefix: crate::tui::Prefix::default(),
                 epoch: 0,
                 // The attach frame is `full` — every cell, applied over a cleared screen — so
@@ -1155,6 +1158,7 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
     let area = RRect::new(0, 0, cols.max(1), rows.max(1));
     let mut buf = Buffer::empty(area);
     let cursor = app.render_to(&mut buf).map(|p| (p.x, p.y));
+    let look = app.cursor_look();
 
     let mut dead = Vec::new();
     for c in clients.iter_mut() {
@@ -1207,7 +1211,12 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
         // Send when cells changed, a baseline is due, a repaint is due, OR the cursor moved.
         // A repaint alone is a ~60-byte line carrying no cells, which is the point: it asks
         // the client to re-emit what it already holds.
-        if changed.is_empty() && !c.needs_full && !repaint && cursor == c.last_cursor {
+        if changed.is_empty()
+            && !c.needs_full
+            && !repaint
+            && cursor == c.last_cursor
+            && look == c.last_look
+        {
             // Nothing to say — and that also settles a client marked `pending`. `pending` means
             // it did not receive the LAST frame, but `c.last` was never advanced for that frame,
             // so an empty diff against it proves the client's content is already current: the
@@ -1229,6 +1238,8 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
             full: c.needs_full,
             cells,
             cursor,
+            cursor_visible: look.0,
+            cursor_shape: look.1,
             repaint,
         };
         match c.out.try_send(ServerMsg::Frame(frame)) {
@@ -1245,6 +1256,7 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
                 c.needs_full = false;
                 c.pending = false;
                 c.last_cursor = cursor;
+                c.last_look = look;
             }
             // Coalesced under backpressure: the client did NOT get this frame. Leave
             // `last` un-advanced (so the next diff is the delta that catches it up) and
@@ -1308,6 +1320,7 @@ mod tests {
             needs_full: true,
             pending: false,
             last_cursor: None,
+            last_look: (true, 0),
             prefix: crate::tui::Prefix::default(),
             epoch: 0,
             repaint_at: Instant::now() + Duration::from_secs(3600),

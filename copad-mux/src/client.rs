@@ -15,12 +15,13 @@ use ratatui::buffer::{Buffer, Cell};
 use ratatui::crossterm::cursor::{self, MoveTo, RestorePosition, SavePosition};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture, Event as CEvent, KeyEventKind, MouseButton,
-    MouseEventKind,
+    EnableFocusChange, EnableMouseCapture, Event as CEvent, KeyEventKind, KeyboardEnhancementFlags,
+    MouseButton, MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use ratatui::layout::{Position, Rect as RRect};
 use ratatui::{Terminal, TerminalOptions, Viewport};
@@ -385,6 +386,10 @@ fn size_from_clamped_cursor(col: u16, row: u16) -> Option<(u16, u16)> {
 struct TermGuard {
     mouse: bool,
     paste: bool,
+    /// We pushed kitty keyboard flags onto our terminal (popped on drop).
+    keys: bool,
+    /// We changed the cursor shape (`DECSCUSR`) at some point; restored to the default on drop.
+    cursor_shaped: bool,
 }
 
 impl TermGuard {
@@ -406,9 +411,12 @@ impl TermGuard {
         // repairs. Restored on the way out.
         write!(io::stdout(), "\u{1b}[?7l")?;
         io::stdout().flush()?;
+        let keys = enable_key_disambiguation();
         Ok(Self {
             mouse: false,
             paste: false,
+            keys,
+            cursor_shaped: false,
         })
     }
 
@@ -445,9 +453,40 @@ impl Drop for TermGuard {
         if self.paste {
             let _ = execute!(io::stdout(), DisableBracketedPaste);
         }
+        if self.keys {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
+        if self.cursor_shaped {
+            let _ = write!(io::stdout(), "\u{1b}[0 q");
+        }
         let _ = write!(io::stdout(), "\u{1b}[?7h"); // restore autowrap (see `enter`)
         let _ = execute!(io::stdout(), DisableFocusChange, LeaveAlternateScreen);
     }
+}
+
+/// Ask our terminal for the kitty keyboard protocol's "disambiguate" reports when it speaks
+/// it (kitty, Ghostty, WezTerm, iTerm2, foot, …), so Shift+Enter, Ctrl+Enter, Ctrl+I vs Tab
+/// reach the server as distinct keys instead of the bytes a legacy terminal cannot tell
+/// apart. The server re-encodes each key for the pane it is for (`crate::keys`), so nothing
+/// changes for a pane that never asked. `COPAD_MUX_EXTENDED_KEYS=0` opts out.
+fn enable_key_disambiguation() -> bool {
+    if std::env::var("COPAD_MUX_EXTENDED_KEYS").is_ok_and(|v| v == "0") {
+        return false;
+    }
+    if !matches!(supports_keyboard_enhancement(), Ok(true)) {
+        return false;
+    }
+    execute!(
+        io::stdout(),
+        // Alternate keys too: the terminal then reports the SHIFTED character it produced
+        // (`Alt+Shift+1` → `Char('!')` + ALT, layout-aware), which is what a legacy pane must
+        // be typed — `ESC !`, not `ESC 1`. crossterm keeps the shifted key and drops SHIFT.
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        )
+    )
+    .is_ok()
 }
 
 /// Connect to the running server, spawning a detached one if none answers, then run
@@ -760,6 +799,11 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
     // regression against `Terminal::draw`, which asserted visibility on every frame that had a
     // cursor. Unknown forces the first frame to state it either way.
     let mut cursor_shown: Option<bool> = None;
+    // The focused program's own wishes for the cursor (`?25l`, `DECSCUSR`), from the frame.
+    let mut cursor_visible = true;
+    let mut cursor_shape: u8 = 0;
+    // The shape we last told our terminal; `0` = its default, which is where we start.
+    let mut shape_sent: u8 = 0;
     // A resize has cleared the screen since the last paint (see `baseline_is_stale`).
     let mut resized = false;
     // Client-local silent-repaint period, DEFAULT OFF — additive to the cadence the server
@@ -811,6 +855,11 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
             loop {
                 match event::read()? {
                     CEvent::Key(k) if k.kind != KeyEventKind::Release => {
+                        let k = if guard.keys {
+                            k
+                        } else {
+                            crate::keys::unalias_legacy_c0(k)
+                        };
                         let _ = send(&mut wr, &ClientMsg::Key(k));
                     }
                     CEvent::Paste(text) => {
@@ -932,6 +981,8 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     // `relay_fidelity_pure_delta_churn`.
                     fix_wide_spacers(&mut buf);
                     cursor = f.cursor;
+                    cursor_visible = f.cursor_visible;
+                    cursor_shape = f.cursor_shape;
                     have_frame = true;
                     dirty = true;
                     // The server asked for a silent full repaint (self-heal). Sticky until the
@@ -994,9 +1045,21 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
             } else {
                 Some(&painted)
             };
+            // Synchronized output (`?2026`): a terminal that supports it shows the frame only
+            // once it is complete, so a fast-scrolling pane never tears mid-frame; others ignore
+            // the unknown mode. Closed after the cursor is settled, below.
+            write!(terminal.backend_mut(), "\u{1b}[?2026h")?;
             emit_view(&mut terminal, baseline, &next, cursor)?;
             painted = next;
-            let want_cursor = cursor.is_some_and(|(cx, cy)| cx < cols && cy < rows);
+            // A hidden cursor is still PLACED (by `emit_view`): an IME opens its composition
+            // window at the terminal cursor whether or not it is drawn.
+            let want_cursor =
+                cursor_visible && cursor.is_some_and(|(cx, cy)| cx < cols && cy < rows);
+            if cursor_shape != shape_sent {
+                write!(terminal.backend_mut(), "\u{1b}[{cursor_shape} q")?;
+                shape_sent = cursor_shape;
+                guard.cursor_shaped |= cursor_shape != 0;
+            }
             if cursor_visibility_needs_stating(cursor_shown, want_cursor) {
                 if want_cursor {
                     terminal.show_cursor()?;
@@ -1005,6 +1068,8 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                 }
                 cursor_shown = Some(want_cursor);
             }
+            write!(terminal.backend_mut(), "\u{1b}[?2026l")?;
+            Backend::flush(terminal.backend_mut())?;
             if force_repaint || cleared {
                 last_repaint = Instant::now();
             }

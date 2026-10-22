@@ -562,6 +562,7 @@ mod tests {
                         bg: CellColor::Default,
                         bold: false,
                         reverse: false,
+                        attrs: ratatui::style::Modifier::empty(),
                     })
                     .collect()
             })
@@ -573,6 +574,8 @@ mod tests {
             cells,
             wrapped,
             cursor: (0, 0),
+            cursor_visible: true,
+            cursor_shape: 0,
             copy: None,
         }
     }

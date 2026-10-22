@@ -751,6 +751,8 @@ pub struct App {
     /// terminal it was entered on, so a focus change (click / another client) can't
     /// strand that pane scrolled-up. Keys scroll it; exit bottoms it. Shared state.
     scroll_pane: Option<TerminalId>,
+    /// What the last `render_to` saw of the focused pane's cursor: `(visible, shape)`.
+    cursor_look: Cell<(bool, u8)>,
     /// Copy-mode state that is not alacritty's (the search prompt, the last search, and the
     /// screen the mode was entered on). `Some` exactly when `scroll_pane` is.
     copy: Option<CopyState>,
@@ -1056,6 +1058,7 @@ impl App {
             sidebar: cfg.sidebar,
             popup: None,
             scroll_pane: None,
+            cursor_look: Cell::new((true, 0)),
             copy: None,
             key_copy: None,
             client_pids: Vec::new(),
@@ -4950,9 +4953,7 @@ impl App {
         // shell input (and disarm a dangling prefix).
         let Some(chord) = config::chord_of(&k) else {
             prefix.clear();
-            if let Some(bytes) = key_to_bytes(k.code, k.modifiers) {
-                self.input_focused(&bytes);
-            }
+            self.key_to_focused(k);
             return KeyAction::Continue;
         };
 
@@ -4985,9 +4986,7 @@ impl App {
             }
             return self.dispatch(action);
         }
-        if let Some(bytes) = key_to_bytes(k.code, k.modifiers) {
-            self.input_focused(&bytes);
-        }
+        self.key_to_focused(k);
         KeyAction::Continue
     }
 
@@ -5054,12 +5053,7 @@ impl App {
                 }
             }
             EnterPrefix => {} // handled by the caller (arms the prefix)
-            SendPrefix => {
-                let c = self.cfg.keymap.prefix_chord;
-                if let Some(bytes) = chord_bytes(&c) {
-                    self.input_focused(&bytes);
-                }
-            }
+            SendPrefix => self.key_to_focused(chord_key(&self.cfg.keymap.prefix_chord)),
         }
         KeyAction::Continue
     }
@@ -5120,6 +5114,22 @@ impl App {
                 client: self.client,
                 pane,
             });
+        }
+    }
+
+    /// Type one key into the focused pane, encoded for the modes ITS program asked for
+    /// (application cursor keys, the kitty keyboard protocol).
+    fn key_to_focused(&self, k: KeyEvent) {
+        let Some(term) = self.focused_terminal() else {
+            return;
+        };
+        let modes = self
+            .panes
+            .get(&term)
+            .map(|p| p.key_modes())
+            .unwrap_or_default();
+        if let Some(bytes) = crate::keys::encode(k.code, k.modifiers, modes) {
+            self.input_focused(&bytes);
         }
     }
 
@@ -6752,6 +6762,7 @@ impl App {
     /// same code path serves both the local terminal and the (headless) server that
     /// ships cell diffs to a remote client.
     pub fn render_to(&self, buf: &mut Buffer) -> Option<Position> {
+        self.cursor_look.set((true, 0));
         let area = buf.area;
         let rects = self.layout();
         let focused_term = self.focused_terminal();
@@ -6834,6 +6845,7 @@ impl App {
                         if cell.reverse {
                             style = style.add_modifier(Modifier::REVERSED);
                         }
+                        style = style.add_modifier(cell.attrs);
                         if !is_focused {
                             style = style.add_modifier(Modifier::DIM);
                         }
@@ -6857,6 +6869,8 @@ impl App {
                 }
             }
             if is_focused {
+                self.cursor_look
+                    .set((snap.cursor_visible, snap.cursor_shape));
                 let (cx, cy) = snap.cursor;
                 if cx < rect.cols && cy < rect.rows {
                     let (ax, ay) = (rect.x + cx, rect.y + cy);
@@ -6976,6 +6990,12 @@ impl App {
         } else {
             None
         }
+    }
+
+    /// The focused pane's cursor as of the last `render_to`: `(visible, DECSCUSR shape)`. The
+    /// position `render_to` returns stands even when it is hidden (see `Snapshot`).
+    pub fn cursor_look(&self) -> (bool, u8) {
+        self.cursor_look.get()
     }
 
     /// The current viewport size (terminal size the app renders at).
@@ -9205,6 +9225,7 @@ impl App {
                 if cell.reverse {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
+                style = style.add_modifier(cell.attrs);
                 bc.set_symbol(&cell.sym);
                 bc.set_style(style);
             }
@@ -11067,8 +11088,9 @@ fn paste_keys(text: &str) -> Vec<KeyCode> {
     keys
 }
 
-/// The bytes a chord types into a pane, for `send-prefix`.
-fn chord_bytes(c: &Chord) -> Option<Vec<u8>> {
+/// The key event a chord stands for, for `send-prefix` — typed through the same mode-aware
+/// encoding as any other key, so a kitty-mode pane gets `CSI 98;5u`, not `^B`.
+fn chord_key(c: &Chord) -> KeyEvent {
     use config::Key;
     let code = match c.key {
         Key::Char(ch) if c.shift => KeyCode::Char(ch.to_ascii_uppercase()),
@@ -11084,63 +11106,16 @@ fn chord_bytes(c: &Chord) -> Option<Vec<u8>> {
         Key::Backspace => KeyCode::Backspace,
     };
     let mut mods = KeyModifiers::NONE;
+    if c.shift {
+        mods |= KeyModifiers::SHIFT;
+    }
     if c.ctrl {
         mods |= KeyModifiers::CONTROL;
     }
     if c.alt {
         mods |= KeyModifiers::ALT;
     }
-    key_to_bytes(code, mods)
-}
-
-/// Translate a key event into the bytes a PTY expects.
-fn key_to_bytes(code: KeyCode, mods: KeyModifiers) -> Option<Vec<u8>> {
-    let alt = mods.contains(KeyModifiers::ALT);
-    let ctrl = mods.contains(KeyModifiers::CONTROL);
-    let esc = |mut v: Vec<u8>| {
-        if alt {
-            v.insert(0, 0x1b);
-        }
-        v
-    };
-
-    let bytes = match code {
-        KeyCode::Char(ch) => {
-            let utf8 = |ch: char| {
-                let mut s = [0u8; 4];
-                ch.encode_utf8(&mut s).as_bytes().to_vec()
-            };
-            if ctrl {
-                // Only the ASCII control combinations map to control bytes;
-                // Ctrl with digits / non-ASCII passes the char through unchanged.
-                match ch {
-                    ' ' | '@' => vec![0], // Ctrl-Space / Ctrl-@ → NUL
-                    'a'..='z' | 'A'..='Z' => vec![(ch.to_ascii_lowercase() as u8) & 0x1f],
-                    '[' | '\\' | ']' | '^' | '_' => vec![(ch as u8) & 0x1f],
-                    _ => utf8(ch),
-                }
-            } else {
-                utf8(ch)
-            }
-        }
-        KeyCode::Enter => vec![b'\r'],
-        KeyCode::Backspace => vec![0x7f],
-        KeyCode::Tab => vec![b'\t'],
-        KeyCode::BackTab => vec![0x1b, b'[', b'Z'],
-        KeyCode::Esc => vec![0x1b],
-        KeyCode::Left => vec![0x1b, b'[', b'D'],
-        KeyCode::Right => vec![0x1b, b'[', b'C'],
-        KeyCode::Up => vec![0x1b, b'[', b'A'],
-        KeyCode::Down => vec![0x1b, b'[', b'B'],
-        KeyCode::Home => vec![0x1b, b'[', b'H'],
-        KeyCode::End => vec![0x1b, b'[', b'F'],
-        KeyCode::PageUp => vec![0x1b, b'[', b'5', b'~'],
-        KeyCode::PageDown => vec![0x1b, b'[', b'6', b'~'],
-        KeyCode::Insert => vec![0x1b, b'[', b'2', b'~'],
-        KeyCode::Delete => vec![0x1b, b'[', b'3', b'~'],
-        _ => return None,
-    };
-    Some(esc(bytes))
+    KeyEvent::new(code, mods)
 }
 
 #[cfg(test)]
@@ -11232,6 +11207,7 @@ mod tests {
                         bg: CellColor::Default,
                         bold: false,
                         reverse: false,
+                        attrs: ratatui::style::Modifier::empty(),
                     })
                     .collect()
             })
@@ -11243,6 +11219,8 @@ mod tests {
             wrapped: vec![false; cells.len()],
             cells,
             cursor: (0, 0),
+            cursor_visible: true,
+            cursor_shape: 0,
             copy: None,
         }
     }
@@ -11333,6 +11311,7 @@ mod tests {
                 bg: CellColor::Default,
                 bold: false,
                 reverse: false,
+                attrs: ratatui::style::Modifier::empty(),
             },
             CellSnap {
                 sym: " ".into(),
@@ -11341,6 +11320,7 @@ mod tests {
                 bg: CellColor::Default,
                 bold: false,
                 reverse: false,
+                attrs: ratatui::style::Modifier::empty(),
             },
             CellSnap {
                 sym: "X".into(),
@@ -11349,6 +11329,7 @@ mod tests {
                 bg: CellColor::Default,
                 bold: false,
                 reverse: false,
+                attrs: ratatui::style::Modifier::empty(),
             },
         ]];
         let s = Snapshot {
@@ -11357,6 +11338,8 @@ mod tests {
             wrapped: vec![false],
             cells,
             cursor: (0, 0),
+            cursor_visible: true,
+            cursor_shape: 0,
             copy: None,
         };
         assert_eq!(extract_selection(&s, (0, 0), (2, 0)), "가X");
@@ -15078,6 +15061,7 @@ mod zoom_titles {
                 bg: CellColor::Default,
                 bold: false,
                 reverse: false,
+                attrs: ratatui::style::Modifier::empty(),
             })
             .collect();
         while row.len() < cols as usize {
@@ -15088,6 +15072,7 @@ mod zoom_titles {
                 bg: CellColor::Default,
                 bold: false,
                 reverse: false,
+                attrs: ratatui::style::Modifier::empty(),
             });
         }
         term::Snapshot {
@@ -15096,6 +15081,8 @@ mod zoom_titles {
             cells: vec![row],
             wrapped: vec![false],
             cursor: (0, 5),
+            cursor_visible: true,
+            cursor_shape: 0,
             copy: None,
         }
     }
@@ -15690,12 +15677,19 @@ mod prefix_keys {
         let app = app_with("");
         let km = &app.cfg.keymap;
         assert_eq!(km.prefix_action(&km.prefix_chord), Some(Action::SendPrefix));
-        assert_eq!(chord_bytes(&km.prefix_chord), Some(vec![0x02]));
+        let bytes = |c: &Chord| {
+            let k = chord_key(c);
+            crate::keys::encode(k.code, k.modifiers, crate::keys::KeyModes::default())
+        };
+        assert_eq!(bytes(&km.prefix_chord), Some(vec![0x02]));
 
         let app = app_with("prefix = \"C-a\"");
         let km = &app.cfg.keymap;
         assert_eq!(km.prefix_action(&km.prefix_chord), Some(Action::SendPrefix));
-        assert_eq!(chord_bytes(&km.prefix_chord), Some(vec![0x01]));
+        assert_eq!(bytes(&km.prefix_chord), Some(vec![0x01]));
+        // A shifted prefix keeps its Shift on the way into the pane.
+        let shifted = config::parse_chord("S-Enter").unwrap();
+        assert!(chord_key(&shifted).modifiers.contains(KeyModifiers::SHIFT));
         assert!(
             km.bindings()
                 .iter()

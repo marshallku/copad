@@ -27,6 +27,7 @@ pub mod fleet;
 pub mod gitinfo;
 pub mod gitpoll;
 pub mod hostmetrics;
+pub mod keys;
 pub mod model;
 pub mod navhist;
 pub mod notify;
