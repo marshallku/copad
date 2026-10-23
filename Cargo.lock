@@ -76,8 +76,6 @@ dependencies = [
 [[package]]
 name = "alacritty_terminal"
 version = "0.26.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bda177466b9524d59f1b12f0dd30b68696788e9992a7e959021c4a0ed96fcf59"
 dependencies = [
  "base64 0.22.1",
  "bitflags 2.11.0",
@@ -818,11 +816,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "copad-keys"
+version = "1.2.2"
+
+[[package]]
 name = "copad-linux"
 version = "1.2.2"
 dependencies = [
  "copad-core",
  "copad-daemon",
+ "copad-keys",
  "dirs 6.0.0",
  "env_logger",
  "gtk4",
@@ -1031,6 +1034,7 @@ name = "copad-term"
 version = "1.2.2"
 dependencies = [
  "alacritty_terminal",
+ "copad-keys",
  "libc",
 ]
 

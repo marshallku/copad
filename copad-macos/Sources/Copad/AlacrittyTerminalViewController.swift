@@ -275,6 +275,7 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         // we actually render. applyTheme reapplies on every theme
         // hot-reload — same code path keeps the two in sync.
         termHandle?.applyPaletteFromTheme(theme)
+        termHandle?.setKittyKeyboard(config.kittyKeyboard)
         if let initialInput {
             termHandle?.input(Array(initialInput.utf8))
         }
@@ -285,6 +286,12 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         if let render = renderView {
             view.window?.makeFirstResponder(render)
         }
+    }
+
+    /// Config hot-reload: `[terminal] kitty_keyboard`. Turning it off drops whatever flags a
+    /// running program negotiated (it gets legacy keys from then on).
+    func applyKittyKeyboard(_ enabled: Bool) {
+        termHandle?.setKittyKeyboard(enabled)
     }
 
     /// Config hot-reload: flip the OSC 52 policy on the live render
@@ -2956,6 +2963,11 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             super.keyDown(with: event)
             return
         }
+        // A program that negotiated the kitty keyboard protocol gets every key in its forms
+        // (Shift+Enter as `CSI 13;2u`); text still goes through the IME path below.
+        if kittyKeyDown(event) {
+            return
+        }
         if mods == .control, let bytes = controlBytes(for: event) {
             // User typed → jump back to bottom so the keypress lands
             // visibly. Matches Terminal.app / iTerm2 behavior.
@@ -2995,6 +3007,135 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             return
         }
         interpretKeyEvents([event])
+    }
+
+    // MARK: - kitty keyboard protocol (decisions #164)
+
+    /// keyCodes whose press went out encoded, so their release (flag 2) does too — and only
+    /// theirs: a key a menu or the IME took never reports a release.
+    private var kittyPressed: Set<UInt16> = []
+    /// The event `interpretKeyEvents` is processing while the IME owns it.
+    private var kittyPending: NSEvent?
+
+    private var kittyFlags: UInt8 {
+        termHandle?.keyboardFlags ?? 0
+    }
+
+    /// True when the active input source is an input method (Korean, Japanese, …) rather
+    /// than a plain keyboard layout.
+    private var inputMethodActive: Bool {
+        guard let id = inputContext?.selectedKeyboardInputSource else { return false }
+        return !id.contains(".keylayout.")
+    }
+
+    private static func kittyMods(_ flags: NSEvent.ModifierFlags) -> UInt8 {
+        var m: UInt8 = 0
+        if flags.contains(.shift) { m |= 1 }
+        if flags.contains(.option) { m |= 2 }
+        if flags.contains(.control) { m |= 4 }
+        if flags.contains(.command) { m |= 8 }
+        if flags.contains(.capsLock) { m |= 64 }
+        return m
+    }
+
+    /// The text a key event types on its own: none for a Ctrl chord or an Option-as-Alt
+    /// chord (with Option as a compose key, `Option+e` types its accent and stays text).
+    private func kittyText(_ event: NSEvent) -> String {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if mods.contains(.control) || mods.contains(.command) { return "" }
+        if mods.contains(.option), optionAsAlt { return "" }
+        return event.characters ?? ""
+    }
+
+    private func kittyEncode(_ event: NSEvent, action: UInt8) -> CopadTermFFI.Handle.KeyEncoding {
+        guard let h = termHandle else { return .text }
+        let isKey = event.type == .keyDown || event.type == .keyUp
+        return h.encodeKey(
+            keyCode: event.keyCode,
+            mods: Self.kittyMods(event.modifierFlags),
+            action: action,
+            unmodified: isKey ? event.characters(byApplyingModifiers: []) ?? "" : "",
+            shifted: isKey ? event.characters(byApplyingModifiers: .shift) ?? "" : "",
+            text: isKey ? kittyText(event) : ""
+        )
+    }
+
+    /// Encode and send one event. False = it types text, which the caller delivers.
+    private func sendKittyKey(_ event: NSEvent, action: UInt8) -> Bool {
+        switch kittyEncode(event, action: action) {
+        case let .bytes(bytes):
+            if action != 2 {
+                scrollToBottomOnInput()
+                kittyPressed.insert(event.keyCode)
+            }
+            sendInput(bytes)
+            return true
+        case .nothing:
+            return true
+        case .text:
+            return false
+        }
+    }
+
+    /// keyDown under the kitty keyboard protocol. False = not handled here (protocol off,
+    /// or the key types text), so the legacy / IME path runs.
+    private func kittyKeyDown(_ event: NSEvent) -> Bool {
+        let flags = kittyFlags
+        guard flags != 0 else { return false }
+        if hasMarkedText() {
+            // Mid-composition the IME sees the key first; if it passes it on, doCommand
+            // sends it encoded — so Shift+Enter after a Hangul syllable commits the
+            // syllable and THEN sends the newline, in that order.
+            kittyPending = event
+            interpretKeyEvents([event])
+            kittyPending = nil
+            return true
+        }
+        // "Report all keys" would turn text keys into escape codes; with an input method
+        // active they still compose through it (kitty sends input-method text as text too).
+        if flags & 8 != 0, inputMethodActive, !kittyText(event).isEmpty {
+            return false
+        }
+        return sendKittyKey(event, action: event.isARepeat ? 1 : 0)
+    }
+
+    override func keyUp(with event: NSEvent) {
+        if kittyPressed.remove(event.keyCode) != nil {
+            _ = sendKittyKey(event, action: 2)
+            return
+        }
+        super.keyUp(with: event)
+    }
+
+    /// Modifier keys report press/release only under "report all keys" (flag 8).
+    override func flagsChanged(with event: NSEvent) {
+        super.flagsChanged(with: event)
+        guard kittyFlags & 8 != 0, !hasMarkedText() else { return }
+        // Device-dependent bits (IOLLEvent.h NX_DEVICE*KEYMASK) tell left from right, so
+        // releasing one Shift while the other is held is still a release.
+        let raw = event.modifierFlags.rawValue
+        let down: Bool
+        switch event.keyCode {
+        case 56: down = raw & 0x02 != 0 // left shift
+        case 60: down = raw & 0x04 != 0 // right shift
+        case 59: down = raw & 0x01 != 0 // left control
+        case 62: down = raw & 0x2000 != 0 // right control
+        case 58: down = raw & 0x20 != 0 // left option
+        case 61: down = raw & 0x40 != 0 // right option
+        case 55: down = raw & 0x08 != 0 // left command
+        case 54: down = raw & 0x10 != 0 // right command
+        case 57: down = true // caps lock: one event per press
+        default: return
+        }
+        if case let .bytes(bytes) = kittyEncode(event, action: down ? 0 : 2) {
+            sendInput(bytes)
+        }
+    }
+
+    override func resignFirstResponder() -> Bool {
+        kittyPressed.removeAll()
+        kittyPending = nil
+        return super.resignFirstResponder()
     }
 
     /// Build the `ESC + utf8(base_char)` byte sequence for an
@@ -3168,6 +3309,14 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     }
 
     override func doCommand(by selector: Selector) {
+        // The IME owned this key (it was composing) and passed it on: send the key itself in
+        // the negotiated encoding, after whatever the IME committed. Once per event.
+        if let pending = kittyPending {
+            kittyPending = nil
+            if sendKittyKey(pending, action: pending.isARepeat ? 1 : 0) {
+                return
+            }
+        }
         if let bytes = commandBytes(for: selector) {
             scrollToBottomOnInput()
             sendInput(bytes)

@@ -8,6 +8,7 @@ members = [
     "copad-cli",
     "copad-ffi",
     "copad-term",
+    "copad-keys",
     "copad-mux",
     "plugins/echo",
     "plugins/kb",
@@ -32,3 +33,9 @@ edition = "2024"
 license = "MIT"
 description = "Cross-platform custom terminal emulator"
 repository = "https://github.com/marshallku/copad"
+
+# alacritty_terminal 0.26.0 panics on the 4097th kitty keyboard push (it evicts from the
+# title stack). Fixed upstream, unreleased: see vendor/alacritty_terminal/COPAD-PATCH.md.
+[patch.crates-io]
+alacritty_terminal = { path = "vendor/alacritty_terminal" }
+

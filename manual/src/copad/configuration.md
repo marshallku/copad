@@ -19,6 +19,7 @@ copad --config-path     # print the resolved path
 | `font_family` | `"JetBrainsMono Nerd Font Mono"` | Any installed font family |
 | `font_size` | `14` | Points |
 | `close_on_exit` | `true` | `false` keeps the dead-PTY viewport visible; close the pane manually |
+| `kitty_keyboard` | `true` | Programs may turn on the [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) — how Claude Code, Neovim and Helix tell Shift+Enter from Enter. `false` keeps every program on the classic key encoding |
 
 ```toml
 [terminal]

@@ -316,6 +316,56 @@ enum CopadTermFFI {
             return MouseReportLevel(rawValue: copad_term_mouse_report_level(ptr)) ?? .none
         }
 
+        /// kitty keyboard protocol flags the program negotiated (0 = legacy keys).
+        var keyboardFlags: UInt8 {
+            guard let ptr else { return 0 }
+            return copad_term_keyboard_flags(ptr)
+        }
+
+        func setKittyKeyboard(_ enabled: Bool) {
+            guard let ptr else { return }
+            copad_term_set_kitty_keyboard(ptr, enabled)
+        }
+
+        enum KeyEncoding {
+            /// Send the event's text the normal way (IME, insertText).
+            case text
+            case bytes([UInt8])
+            case nothing
+        }
+
+        /// Encode one key event for the kitty keyboard protocol. `.text` whenever the
+        /// protocol is off, so callers can try this first and fall back.
+        func encodeKey(
+            keyCode: UInt16, mods: UInt8, action: UInt8,
+            unmodified: String, shifted: String, text: String
+        ) -> KeyEncoding {
+            guard let ptr else { return .text }
+            var out = [UInt8](repeating: 0, count: 256)
+            var outLen = 0
+            let u = Array(unmodified.utf8), s = Array(shifted.utf8), t = Array(text.utf8)
+            let code = u.withUnsafeBufferPointer { ub in
+                s.withUnsafeBufferPointer { sb in
+                    t.withUnsafeBufferPointer { tb in
+                        var input = CopadKeyInput(
+                            key_code: keyCode, mods: mods, action: action,
+                            unmodified: ub.baseAddress, unmodified_len: ub.count,
+                            shifted: sb.baseAddress, shifted_len: sb.count,
+                            text: tb.baseAddress, text_len: tb.count
+                        )
+                        return out.withUnsafeMutableBufferPointer { ob in
+                            copad_term_encode_key(ptr, &input, ob.baseAddress, ob.count, &outLen)
+                        }
+                    }
+                }
+            }
+            switch Int32(code) {
+            case COPAD_KEY_BYTES: return .bytes(Array(out[0 ..< outLen]))
+            case COPAD_KEY_NOTHING: return .nothing
+            default: return .text
+            }
+        }
+
         /// True when the terminal has `\e[?2004h` bracketed paste on.
         var bracketedPasteActive: Bool {
             guard let ptr else { return false }

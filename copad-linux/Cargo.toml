@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 copad-core = { path = "../copad-core" }
+copad-keys = { path = "../copad-keys" }
 copad-daemon = { path = "../copad-daemon" }
 gtk4 = { version = "0.9", features = ["gnome_46"] }
 vte4 = { version = "0.8", features = ["v0_76"] }

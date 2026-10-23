@@ -78,6 +78,12 @@ pub struct TerminalConfig {
     /// the long-standing Linux behavior pre-config.
     #[serde(default = "default_true")]
     pub close_on_exit: bool,
+
+    /// Let programs negotiate the kitty keyboard protocol (`CSI > flags u`), which is how
+    /// Claude Code receives Shift+Enter as a newline (decisions #164). `false` leaves the
+    /// query unanswered, so programs keep the legacy key encoding.
+    #[serde(default = "default_true")]
+    pub kitty_keyboard: bool,
 }
 
 impl Default for TerminalConfig {
@@ -87,6 +93,7 @@ impl Default for TerminalConfig {
             font_family: default_font_family(),
             font_size: default_font_size(),
             close_on_exit: true,
+            kitty_keyboard: true,
         }
     }
 }

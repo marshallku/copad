@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use gtk4::gdk;
@@ -10,6 +10,7 @@ use vte4::prelude::*;
 use copad_core::config::CopadConfig;
 use copad_core::theme::Theme;
 
+use crate::kitty_relay::{self, Relay};
 use crate::panel::Panel;
 use crate::search::SearchBar;
 
@@ -134,6 +135,64 @@ pub struct TerminalPanel {
     /// `cwd` arg, then refreshed by tabs.rs's OSC 7 handler. Read at
     /// window-close time by session persistence.
     pub last_cwd: Rc<std::cell::RefCell<Option<String>>>,
+    /// The kitty keyboard protocol relay between the shell and VTE, when the panel runs
+    /// behind one (`[terminal] kitty_keyboard`, decisions #164).
+    relay: Rc<RefCell<Option<Relay>>>,
+    exit: Rc<ExitLatch>,
+}
+
+/// A relayed panel's exit: VTE has consumed every byte (its `eof`) AND the shell's status is
+/// in. They arrive in either order — a shell can close its terminal and keep running, or
+/// exit while a descendant still writes — and `child-exited` is emitted once both are.
+#[derive(Default)]
+struct ExitLatch {
+    eof: Cell<bool>,
+    status: Cell<Option<i32>>,
+    done: Cell<bool>,
+}
+
+impl ExitLatch {
+    fn try_finish(&self, terminal: &Terminal) {
+        if self.done.get() || !self.eof.get() {
+            return;
+        }
+        let Some(status) = self.status.get() else {
+            return;
+        };
+        self.done.set(true);
+        terminal.emit_by_name::<()>("child-exited", &[&status]);
+    }
+}
+
+impl Drop for TerminalPanel {
+    fn drop(&mut self) {
+        // The panel is going away: no exit to report, and stopping the relay closes the
+        // shell's PTY, which hangs the shell up.
+        self.exit.done.set(true);
+        self.relay.borrow_mut().take();
+    }
+}
+
+/// Put a [`Relay`] in front of `terminal`: VTE reads a raw PTY the relay feeds, and the
+/// returned PTY is the shell's, to spawn on. Nothing is spawned yet, so a failure leaves the
+/// terminal free for the plain path.
+fn prepare_relay(
+    terminal: &Terminal,
+    slot: &Rc<RefCell<Option<Relay>>>,
+) -> std::io::Result<vte4::Pty> {
+    let other = |e: glib::Error| std::io::Error::other(e.to_string());
+    let (r_master, r_slave) = kitty_relay::open_raw_pty()?;
+    let r_pty = vte4::Pty::foreign_sync(r_master, gtk4::gio::Cancellable::NONE).map_err(other)?;
+    let p_pty = vte4::Pty::new_sync(vte4::PtyFlags::DEFAULT, gtk4::gio::Cancellable::NONE)
+        .map_err(other)?;
+    let relay = Relay::start(p_pty.fd(), r_slave)?;
+    relay.set_size(
+        terminal.row_count().clamp(1, u16::MAX as i64) as u16,
+        terminal.column_count().clamp(1, u16::MAX as i64) as u16,
+    );
+    terminal.set_pty(Some(&r_pty));
+    *slot.borrow_mut() = Some(relay);
+    Ok(p_pty)
 }
 
 impl TerminalPanel {
@@ -291,33 +350,90 @@ impl TerminalPanel {
         // the race where the caller writes before the child
         // is actually attached to the PTY.
         let terminal_for_init = terminal.clone();
-        terminal.spawn_async(
-            vte4::PtyFlags::DEFAULT,
-            cwd_arg,
-            &[&shell],
-            &[&socket_env, &panel_id_env],
-            gtk4::glib::SpawnFlags::DEFAULT,
-            || {},
-            -1,
-            gtk4::gio::Cancellable::NONE,
-            move |result| match &result {
-                Ok(pid) => {
-                    eprintln!("[copad] shell spawned, child_pid={}", pid.0);
-                    pid_cell.set(pid.0);
-                    if let Some(text) = &initial_input {
-                        // feed_child writes directly to the PTY
-                        // master — at this point the slave is
-                        // attached to the just-spawned shell, so
-                        // the bytes land in the shell's stdin
-                        // queue without ambiguity.
-                        terminal_for_init.feed_child(text.as_bytes());
-                    }
+        let on_spawned = move |result: Result<glib::Pid, glib::Error>| match &result {
+            Ok(pid) => {
+                eprintln!("[copad] shell spawned, child_pid={}", pid.0);
+                pid_cell.set(pid.0);
+                if let Some(text) = &initial_input {
+                    // feed_child writes directly to the PTY
+                    // master — at this point the slave is
+                    // attached to the just-spawned shell, so
+                    // the bytes land in the shell's stdin
+                    // queue without ambiguity.
+                    terminal_for_init.feed_child(text.as_bytes());
                 }
-                Err(e) => {
-                    eprintln!("[copad] shell spawn error: {e}");
-                }
-            },
-        );
+            }
+            Err(e) => {
+                eprintln!("[copad] shell spawn error: {e}");
+            }
+        };
+        let relay: Rc<RefCell<Option<Relay>>> = Rc::new(RefCell::new(None));
+        let exit = Rc::new(ExitLatch::default());
+        let argv = [shell.as_str()];
+        let envv = [socket_env.as_str(), panel_id_env.as_str()];
+        // Behind a relay the panel speaks the kitty keyboard protocol; if the relay cannot
+        // be set up, the shell starts the way it always did.
+        let p_pty = if config.terminal.kitty_keyboard {
+            prepare_relay(&terminal, &relay)
+                .inspect_err(|e| {
+                    log::warn!("[copad] kitty keyboard relay unavailable ({e}); plain PTY")
+                })
+                .ok()
+        } else {
+            None
+        };
+        match p_pty {
+            Some(p_pty) => {
+                crate::kitty_keys::attach(&terminal, relay.clone());
+                let exit_e = exit.clone();
+                terminal.connect_eof(move |t| {
+                    exit_e.eof.set(true);
+                    exit_e.try_finish(t);
+                });
+                let (relay_w, exit_w, term_w) =
+                    (Rc::downgrade(&relay), exit.clone(), terminal.downgrade());
+                let keep = p_pty.clone();
+                p_pty.spawn_async(
+                    cwd_arg,
+                    &argv,
+                    &envv,
+                    gtk4::glib::SpawnFlags::DEFAULT,
+                    || {},
+                    -1,
+                    gtk4::gio::Cancellable::NONE,
+                    move |result| {
+                        // The shell's PTY object lives until the spawn finished; the relay
+                        // holds its own copies of the descriptor.
+                        drop(keep);
+                        if let Ok(pid) = &result {
+                            glib::child_watch_add_local(*pid, move |_, status| {
+                                if let Some(r) = relay_w.upgrade()
+                                    && let Some(r) = r.borrow().as_ref()
+                                {
+                                    r.child_exited();
+                                }
+                                exit_w.status.set(Some(status));
+                                if let Some(t) = term_w.upgrade() {
+                                    exit_w.try_finish(&t);
+                                }
+                            });
+                        }
+                        on_spawned(result);
+                    },
+                );
+            }
+            None => terminal.spawn_async(
+                vte4::PtyFlags::DEFAULT,
+                cwd_arg,
+                &argv,
+                &envv,
+                gtk4::glib::SpawnFlags::DEFAULT,
+                || {},
+                -1,
+                gtk4::gio::Cancellable::NONE,
+                on_spawned,
+            ),
+        }
 
         terminal.connect_child_exited(move |_terminal, _status| {
             on_exit();
@@ -342,6 +458,35 @@ impl TerminalPanel {
         // the same image instead of each terminal owning its own copy.
         let overlay = gtk4::Overlay::new();
         overlay.set_child(Some(&terminal));
+        if relay.borrow().is_some() {
+            // VTE sizes its own PTY (R) when it is allocated; the shell's (P) follows. An
+            // invisible overlay child is allocated right after the terminal in the same
+            // pass, so its `resize` sees the new grid. A font change moves the grid without
+            // resizing anything, hence the second hook.
+            let sync = {
+                let (term, relay) = (terminal.downgrade(), Rc::downgrade(&relay));
+                move || {
+                    if let (Some(t), Some(r)) = (term.upgrade(), relay.upgrade())
+                        && let Some(r) = r.borrow().as_ref()
+                    {
+                        r.set_size(
+                            t.row_count().clamp(1, u16::MAX as i64) as u16,
+                            t.column_count().clamp(1, u16::MAX as i64) as u16,
+                        );
+                    }
+                }
+            };
+            let probe = gtk4::DrawingArea::new();
+            probe.set_can_target(false);
+            probe.set_focusable(false);
+            let on_resize = sync.clone();
+            probe.connect_resize(move |_, _, _| on_resize());
+            overlay.add_overlay(&probe);
+            terminal.connect_char_size_changed(move |_, _, _| {
+                let sync = sync.clone();
+                glib::timeout_add_local_once(std::time::Duration::from_millis(50), sync);
+            });
+        }
         overlay.add_overlay(&search_bar.container);
         overlay.set_hexpand(true);
         overlay.set_vexpand(true);
@@ -355,6 +500,8 @@ impl TerminalPanel {
             child_pid,
             search_bar,
             last_cwd,
+            relay,
+            exit,
         }
     }
 

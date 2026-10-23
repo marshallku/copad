@@ -240,6 +240,30 @@ void copad_string_destroy(CopadString* s);
 bool copad_term_mouse_mode_active(CopadHandle* handle);
 bool copad_term_bracketed_paste_active(CopadHandle* handle);
 
+// The kitty keyboard protocol (decisions #164). Flags the program on the visible screen
+// negotiated with `CSI > flags u` (0 = none: send the legacy encoding). Off via
+// copad_term_set_kitty_keyboard(false): the query goes unanswered and pushes are ignored.
+uint8_t copad_term_keyboard_flags(CopadHandle* handle);
+void copad_term_set_kitty_keyboard(CopadHandle* handle, bool enabled);
+
+typedef struct CopadKeyInput {
+    uint16_t key_code;          // NSEvent.keyCode
+    uint8_t mods;               // shift 1, alt 2, ctrl 4, super 8, caps lock 64
+    uint8_t action;             // 0 press, 1 repeat, 2 release
+    const uint8_t* unmodified;  // characters(byApplyingModifiers: []), UTF-8
+    size_t unmodified_len;
+    const uint8_t* shifted;     // characters(byApplyingModifiers: .shift), UTF-8
+    size_t shifted_len;
+    const uint8_t* text;        // the text this event types; empty for a chord
+    size_t text_len;
+} CopadKeyInput;
+
+#define COPAD_KEY_TEXT    0  // send the text the normal way (also: protocol off)
+#define COPAD_KEY_BYTES   1  // out[0..*out_len] holds the bytes to send
+#define COPAD_KEY_NOTHING 2  // send nothing
+uint8_t copad_term_encode_key(CopadHandle* handle, const CopadKeyInput* input,
+                              uint8_t* out, size_t out_cap, size_t* out_len);
+
 // Mouse-event encoding negotiated by the TUI (SGR / legacy / UTF8 /
 // none). Returns 0 when no reporting mode is on; otherwise picks the
 // matching mutually-exclusive encoding bit. Use to format the bytes

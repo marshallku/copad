@@ -536,7 +536,13 @@ pub unsafe extern "C" fn copad_term_create(
 
     let term_size = TermSize::new(safe_cols as usize, safe_rows as usize);
     let listener = CopadListener::new();
-    let term = Term::new(Config::default(), &term_size, listener.clone());
+    // `kitty_keyboard` makes alacritty_terminal keep the per-screen flag stacks and answer
+    // `CSI ? u`; the GUI encodes keys against those flags via `copad_term_encode_key`.
+    let config = Config {
+        kitty_keyboard: true,
+        ..Config::default()
+    };
+    let term = Term::new(config, &term_size, listener.clone());
     let term = Arc::new(FairMutex::new(term));
 
     let event_loop = match EventLoop::new(Arc::clone(&term), listener.clone(), pty, false, false) {
@@ -2427,6 +2433,160 @@ pub unsafe extern "C" fn copad_term_bracketed_paste_active(handle: *mut CopadHan
         .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
 }
 
+/// The kitty keyboard protocol flags the program on the visible screen negotiated (`CSI > flags
+/// u`), 0 when it negotiated none — keys then go out in the legacy encoding.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `copad_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_keyboard_flags(handle: *mut CopadHandle) -> u8 {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return 0;
+    };
+    kitty_flags(*h.term.lock().mode())
+}
+
+fn kitty_flags(mode: TermMode) -> u8 {
+    use copad_keys::flags;
+    [
+        (TermMode::DISAMBIGUATE_ESC_CODES, flags::DISAMBIGUATE),
+        (TermMode::REPORT_EVENT_TYPES, flags::EVENT_TYPES),
+        (TermMode::REPORT_ALTERNATE_KEYS, flags::ALTERNATE_KEYS),
+        (TermMode::REPORT_ALL_KEYS_AS_ESC, flags::ALL_KEYS),
+        (TermMode::REPORT_ASSOCIATED_TEXT, flags::ASSOCIATED_TEXT),
+    ]
+    .into_iter()
+    .filter(|(m, _)| mode.contains(*m))
+    .fold(0, |acc, (_, f)| acc | f)
+}
+
+/// Turn the kitty keyboard protocol off (`[terminal] kitty_keyboard = false`) or back on.
+/// Off, `CSI > flags u` is ignored and `CSI ? u` goes unanswered, so programs fall back to
+/// the legacy encoding.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `copad_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_set_kitty_keyboard(handle: *mut CopadHandle, enabled: bool) {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return;
+    };
+    let mut term = h.term.lock();
+    let config = Config {
+        kitty_keyboard: enabled,
+        ..Config::default()
+    };
+    term.set_options(config);
+}
+
+/// One macOS key event, as `copad_term_encode_key` needs it. Strings are UTF-8, not
+/// NUL-terminated, and may be NULL when their length is 0.
+#[repr(C)]
+pub struct CopadKeyInput {
+    /// The hardware virtual key code (`NSEvent.keyCode`).
+    pub key_code: u16,
+    /// kitty modifier bits: shift 1, alt 2, ctrl 4, super 8, caps lock 64.
+    pub mods: u8,
+    /// 0 press, 1 repeat, 2 release.
+    pub action: u8,
+    /// What the key types with no modifiers (`characters(byApplyingModifiers: [])`).
+    pub unmodified: *const u8,
+    pub unmodified_len: usize,
+    /// What it types with Shift (`characters(byApplyingModifiers: .shift)`).
+    pub shifted: *const u8,
+    pub shifted_len: usize,
+    /// The text this event types — empty when Ctrl / Option-as-Alt made it a chord.
+    pub text: *const u8,
+    pub text_len: usize,
+}
+
+/// Send the event's text through the normal text path (also: the protocol is off).
+pub const COPAD_KEY_TEXT: u8 = 0;
+/// `out[..*out_len]` holds the bytes to send.
+pub const COPAD_KEY_BYTES: u8 = 1;
+/// Send nothing.
+pub const COPAD_KEY_NOTHING: u8 = 2;
+
+unsafe fn ffi_str<'a>(ptr: *const u8, len: usize) -> &'a str {
+    if ptr.is_null() || len == 0 {
+        return "";
+    }
+    // SAFETY: caller contract — `ptr` points to `len` readable bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    std::str::from_utf8(bytes).unwrap_or("")
+}
+
+/// Encode a key event for the kitty keyboard protocol the program negotiated. Returns
+/// `COPAD_KEY_TEXT` when the protocol is off (flags 0) or the key simply types its text,
+/// `COPAD_KEY_BYTES` with the bytes in `out`, or `COPAD_KEY_NOTHING`.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer from `copad_term_create`; `input` must point to a
+/// valid `CopadKeyInput` whose strings follow its contract; `out` must have `out_cap` writable
+/// bytes and `out_len` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_encode_key(
+    handle: *mut CopadHandle,
+    input: *const CopadKeyInput,
+    out: *mut u8,
+    out_cap: usize,
+    out_len: *mut usize,
+) -> u8 {
+    let (Some(h), Some(input)) = (unsafe { handle.as_ref() }, unsafe { input.as_ref() }) else {
+        return COPAD_KEY_TEXT;
+    };
+    let (flags, app_cursor) = {
+        let term = h.term.lock();
+        let mode = *term.mode();
+        (kitty_flags(mode), mode.contains(TermMode::APP_CURSOR))
+    };
+    if flags == 0 {
+        return COPAD_KEY_TEXT;
+    }
+    let unmodified = unsafe { ffi_str(input.unmodified, input.unmodified_len) };
+    let shifted = unsafe { ffi_str(input.shifted, input.shifted_len) };
+    let text = unsafe { ffi_str(input.text, input.text_len) };
+    let Some(key) = copad_keys::layout::macos_key(input.key_code, unmodified) else {
+        return if text.is_empty() {
+            COPAD_KEY_NOTHING
+        } else {
+            COPAD_KEY_TEXT
+        };
+    };
+    let ev = copad_keys::KeyEvent {
+        key,
+        shifted: copad_keys::layout::single_char(shifted),
+        base: copad_keys::layout::us_base_macos(input.key_code),
+        mods: input.mods,
+        action: match input.action {
+            1 => copad_keys::Action::Repeat,
+            2 => copad_keys::Action::Release,
+            _ => copad_keys::Action::Press,
+        },
+        text,
+    };
+    match copad_keys::encode(&ev, flags, app_cursor) {
+        copad_keys::Encoded::Text => COPAD_KEY_TEXT,
+        copad_keys::Encoded::Nothing => COPAD_KEY_NOTHING,
+        copad_keys::Encoded::Bytes(bytes) => {
+            if out.is_null() || out_len.is_null() || bytes.len() > out_cap {
+                return COPAD_KEY_NOTHING;
+            }
+            // SAFETY: caller contract — `out` has `out_cap` writable bytes.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+                *out_len = bytes.len();
+            }
+            COPAD_KEY_BYTES
+        }
+    }
+}
+
 /// Scroll-direction discriminator for `copad_term_scroll`. Mirrors
 /// `alacritty_terminal::grid::Scroll` so the renderer doesn't have to
 /// bring the enum across the FFI.
@@ -3207,5 +3367,78 @@ mod osc52_parse_tests {
             parser.advance(&mut term, &[*b]);
         }
         assert_eq!(*listener.pending_clipboard.lock().unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod kitty_keyboard_tests {
+    use super::*;
+    use alacritty_terminal::term::test::TermSize;
+    use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
+
+    #[derive(Clone, Default)]
+    struct Replies(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl EventListener for Replies {
+        fn send_event(&self, event: Event) {
+            if let Event::PtyWrite(s) = event {
+                self.0.lock().unwrap().push(s);
+            }
+        }
+    }
+
+    fn term(kitty: bool) -> (Term<Replies>, Replies) {
+        let replies = Replies::default();
+        let config = Config {
+            kitty_keyboard: kitty,
+            ..Config::default()
+        };
+        (
+            Term::new(config, &TermSize::new(20, 5), replies.clone()),
+            replies,
+        )
+    }
+
+    fn feed(term: &mut Term<Replies>, bytes: &[u8]) {
+        let mut parser = Processor::<StdSyncHandler>::default();
+        parser.advance(term, bytes);
+    }
+
+    /// The handshake Claude Code performs: query, then push disambiguate.
+    #[test]
+    fn negotiation_reaches_the_flags_the_encoder_reads() {
+        let (mut t, replies) = term(true);
+        feed(&mut t, b"\x1b[?u");
+        assert_eq!(*replies.0.lock().unwrap(), vec!["\x1b[?0u".to_string()]);
+        feed(&mut t, b"\x1b[>1u");
+        assert_eq!(kitty_flags(*t.mode()), copad_keys::flags::DISAMBIGUATE);
+        feed(&mut t, b"\x1b[>31u");
+        assert_eq!(kitty_flags(*t.mode()), copad_keys::flags::ALL);
+        feed(&mut t, b"\x1b[<u");
+        assert_eq!(kitty_flags(*t.mode()), 1);
+        // The alternate screen has its own stack.
+        feed(&mut t, b"\x1b[?1049h");
+        assert_eq!(kitty_flags(*t.mode()), 0);
+        feed(&mut t, b"\x1b[?1049l");
+        assert_eq!(kitty_flags(*t.mode()), 1);
+    }
+
+    /// 0.26.0 evicted from the title stack at the 4097th push and panicked; copad builds the
+    /// patched copy in vendor/alacritty_terminal.
+    #[test]
+    fn a_flood_of_pushes_evicts_from_the_keyboard_stack() {
+        let (mut t, _) = term(true);
+        let flood = b"\x1b[>1u".repeat(4200);
+        feed(&mut t, &flood);
+        feed(&mut t, b"\x1b[>5u");
+        assert_eq!(kitty_flags(*t.mode()), 5);
+    }
+
+    #[test]
+    fn turned_off_the_protocol_is_neither_answered_nor_applied() {
+        let (mut t, replies) = term(false);
+        feed(&mut t, b"\x1b[?u\x1b[>1u");
+        assert!(replies.0.lock().unwrap().is_empty());
+        assert_eq!(kitty_flags(*t.mode()), 0);
     }
 }

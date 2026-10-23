@@ -93,6 +93,10 @@ struct CopadConfig {
     /// so the user can read the exit message. Default `true` matches
     /// Linux's long-standing behavior.
     let closeOnExit: Bool
+    /// `[terminal] kitty_keyboard` — let programs negotiate the kitty keyboard protocol
+    /// (`CSI > flags u`), which is how Claude Code receives Shift+Enter as a newline.
+    /// Default `true`; `false` leaves the query unanswered so programs keep legacy keys.
+    let kittyKeyboard: Bool
     let themeName: String
     let backgroundPath: String?
     let backgroundTint: Double
@@ -251,6 +255,7 @@ struct CopadConfig {
             optionAsAlt: tomlBool(terminal, "option_as_alt") ?? d.optionAsAlt,
             forceMetaKeys: tomlStringArray(terminal, "force_meta_keys") ?? d.forceMetaKeys,
             closeOnExit: tomlBool(terminal, "close_on_exit") ?? d.closeOnExit,
+            kittyKeyboard: tomlBool(terminal, "kitty_keyboard") ?? d.kittyKeyboard,
             themeName: tomlString(theme, "name") ?? d.themeName,
             backgroundPath: bgPath,
             backgroundTint: clamp01(tomlDouble(background, "tint") ?? d.backgroundTint),
@@ -386,6 +391,7 @@ struct CopadConfig {
             optionAsAlt: true,
             forceMetaKeys: ["Return"],
             closeOnExit: true,
+            kittyKeyboard: true,
             themeName: "catppuccin-mocha",
             backgroundPath: nil,
             backgroundTint: 0.6,

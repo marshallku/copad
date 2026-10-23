@@ -612,6 +612,7 @@ final class PaneManager {
     /// the `TerminalCapable` protocol — the protocol covers the
     /// socket-facing surface, not internal config hooks).
     func applyConfig(_ newConfig: CopadConfig, theme newTheme: CopadTheme) {
+        let oldKitty = config.kittyKeyboard
         config = newConfig
         theme = newTheme
         for pane in root.allLeaves() {
@@ -621,6 +622,9 @@ final class PaneManager {
                 alac.applyFontThicken(newConfig.fontThicken)
                 alac.applyAlphaBlending(newConfig.alphaBlending)
                 alac.applyOSC52Policy(newConfig.osc52)
+                if newConfig.kittyKeyboard != oldKitty {
+                    alac.applyKittyKeyboard(newConfig.kittyKeyboard)
+                }
                 alac.applyWindowOpacity(newConfig.windowOpacity)
             }
         }

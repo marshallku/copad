@@ -5,6 +5,8 @@ mod cockpit_panel;
 mod command_palette;
 mod daemon_forward;
 mod gui_client;
+mod kitty_keys;
+mod kitty_relay;
 mod panel;
 mod plugin_panel;
 mod search;
