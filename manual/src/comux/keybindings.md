@@ -5,7 +5,7 @@ comux keybindings come in two kinds:
 - **Prefix bindings** — press the prefix (`Ctrl-b` by default), release, then the command key. Like tmux. While the prefix is armed, a red **`^b`** flag appears in the [status bar](./status-bar.md#the-prefix-flag) so you can tell it registered.
 - **Prefix-less (global) bindings** — a single chord, no prefix. Like tmux's `bind -n`.
 
-All of these are remappable in `mux.toml` — see [Customizing bindings](#customizing-bindings) and [Configuration](./configuration.md).
+All of these are remappable in `mux.toml` — see [Customizing bindings](#customizing-bindings) and [Configuration](./configuration.md). `Ctrl-b ?` lists every binding of the keymap you are actually running.
 
 ## Chord notation
 
@@ -30,6 +30,8 @@ All of these are remappable in `mux.toml` — see [Customizing bindings](#custom
 | Focus pane up | `C-S-k`, `C-S-Up` |
 | Focus pane right | `C-S-l`, `C-S-Right` |
 
+A program that needs one of these keys (readline's `Ctrl-f`, vim's page-down) can have them back: `Ctrl-b Ctrl-g` toggles **lock mode** (a red `LOCKED` chip), in which the prefix-less bindings stand down. The prefix itself keeps working — that is how you unlock.
+
 ---
 
 ## Prefix bindings (after `Ctrl-b`)
@@ -42,8 +44,26 @@ All of these are remappable in `mux.toml` — see [Customizing bindings](#custom
 | Split top/bottom (stacked) | `"` |
 | Focus next pane | `o` |
 | Focus left / down / up / right | `h` / `j` / `k` / `l` (or arrows) |
-| Resize left / down / up / right | `H` / `J` / `K` / `L` |
-| Close pane | `x` |
+| Back to the previously focused pane (tmux `last-pane`) | `` ` `` |
+| Number the panes; a digit jumps there (tmux `display-panes`) | `q` |
+| Resize left / down / up / right — **repeatable**: `Ctrl-b H H H` | `H` / `J` / `K` / `L` |
+| Zoom the pane to the whole tab, and back | `z` |
+| Close pane (asks `y/n`; a tab's only pane closes the tab) | `x` |
+| Type into every pane of the tab (synchronize; red `SYNC` chip) | `S` |
+| Send the prefix key itself to the program (nested tmux, readline) | `C-b` (the prefix, twice) |
+
+### Arranging panes
+
+See [Layouts & Arranging Panes](./layouts.md).
+
+| Action | Chord |
+| --- | --- |
+| Swap with the previous / next pane | `{` / `}` |
+| Rotate every pane one slot (and back) | `C-o` / `M-o` |
+| Next preset layout | `Space` |
+| even-horizontal / even-vertical / main-horizontal / main-vertical / tiled | `M-1` / `M-2` / `M-3` / `M-4` / `M-5` |
+| Keep the shape, even out every split | `E` |
+| Move the pane into a new tab of its own (tmux `break-pane`) | `B` |
 
 ### Tabs
 
@@ -51,19 +71,23 @@ All of these are remappable in `mux.toml` — see [Customizing bindings](#custom
 | --- | --- |
 | New tab | `c` |
 | Next / previous tab | `n` / `p` |
-| Close tab | `&` |
+| Move the tab left / right along the bar | `S-Left` / `S-Right` |
+| Close tab (asks `y/n`) | `&` |
 | Rename tab (empty clears) | `,` |
 | Select tab 1–9 | `1` … `9` |
 
-### Sessions
+### Sessions & navigation
 
 | Action | Chord |
 | --- | --- |
-| New session (inline name prompt) | `C` |
+| New session (directory browser, then a name) | `C` |
 | New worktree (branch prompt → git worktree + session) | `W` |
 | Rename session | `$` |
 | Kill session (y/n confirm) | `X` |
 | Next / previous session | `)` / `(` |
+| Toggle to the previous session/tab (Alt-Tab) | `;`, `Tab` |
+| Back / forward along the navigation history | `<` / `>` |
+| Pin the pane to slot 1–9 / go to a pinned slot | `m` then a digit / `'` then a digit |
 
 ### Sidebar & miscellaneous
 
@@ -74,9 +98,12 @@ All of these are remappable in `mux.toml` — see [Customizing bindings](#custom
 | Resume a past Claude/Codex conversation | `R` |
 | Notification center | `a` |
 | Jump to a blocked (attention) agent | `!` |
-| Detach this client | `d` (or `q`) |
-| Enter scrollback (copy-mode) | `[` |
+| Jump to the newest unread notification | `u` |
+| Detach this client | `d` |
+| Enter copy mode (scrollback) | `[` |
 | Force full repaint (tmux `refresh-client`) | `r` |
+| Every binding of the live keymap | `?` |
+| Lock mode on / off | `C-g` |
 
 ---
 
@@ -84,9 +111,40 @@ All of these are remappable in `mux.toml` — see [Customizing bindings](#custom
 
 These are fixed keys within their respective modes, not remappable prefix bindings.
 
-### Copy-mode / scrollback (after `Ctrl-b [`)
+### Copy mode (after `Ctrl-b [`)
 
-`k`/`↑` up · `j`/`↓` down · `PageUp`/`Ctrl-u` up half-page · `PageDown`/`Ctrl-d` down half-page · `g` top · `G`/`q`/`Esc` back to live and exit.
+tmux's `copy-mode-vi` table, with vim's `v` for a character selection:
+
+| Keys | Does |
+| --- | --- |
+| `h` `j` `k` `l` / arrows | move |
+| `w` `b` `e` | next word / previous word / end of word (stopping at punctuation) |
+| `W` `B` `E` | the same by whitespace-separated WORDs |
+| `0` `^` `$` | line start / first non-blank / line end |
+| `H` `M` `L` | top / middle / bottom of the screen |
+| `{` `}` | previous / next paragraph |
+| `%` | matching bracket |
+| `f` `F` `t` `T` + a character, then `;` `,` | jump to (or just before) it on the line, again / reversed |
+| `g` / `G` | top of history / leave |
+| `Ctrl-u` `Ctrl-d`, `Ctrl-b` `Ctrl-f`, `PgUp` `PgDn` | half page / full page |
+| `Ctrl-y` `Ctrl-e`, `K` `J` | scroll one line |
+| `/` `?` then `n` `N` | search down / up (case-insensitive); every match on screen lights up as you type |
+| `*` `#` | search the word under the cursor |
+| `v` / `Space` | start a character selection |
+| `V` | line selection |
+| `Ctrl-v` | rectangle selection (pressing another of `v` `V` `Ctrl-v` reshapes the selection in place) |
+| `o` | jump to the other end of the selection |
+| `y` / `Enter` | copy and leave |
+| `Esc` | clear the selection, or leave |
+| `q` / `Ctrl-c` | leave |
+
+### Mouse
+
+Drag in a pane to select and copy. **Double-click** copies the word under the pointer, **triple-click** the whole (wrapped) line — in a pane whose program does not take the mouse itself.
+
+### Pane numbers (`Ctrl-b q`)
+
+A digit within two seconds focuses that pane; any other key just closes the numbers.
 
 ### Fuzzy switcher (`Ctrl-f`)
 
@@ -104,9 +162,9 @@ These are fixed keys within their respective modes, not remappable prefix bindin
 
 `j`/`↓`, `k`/`↑` move · `Enter` jump · `d` dismiss one · `D` clear all · `Esc`/`q` close.
 
-### Kill-session confirm
+### Confirm prompts (kill session, close pane / tab)
 
-`y`/`Y` confirms; anything else cancels.
+`y`/`Y` confirms; anything else cancels. Set `confirm_close = false` to close panes and tabs without asking.
 
 ---
 
@@ -126,13 +184,16 @@ prefix = "C-a"          # use Ctrl-a as the prefix instead of Ctrl-b
 split-down  = '"'       # keep the default
 split-right = "|"       # remap the side-by-side split to |
 new-tab     = ["c", "t"]  # both c and t create a tab
+detach      = ["d", "q"]  # q detaches too (it numbers the panes by default)
 
 [global]
 popup = "C-Space"       # open the fuzzy switcher with Ctrl-Space instead of Ctrl-f
 ```
 
+`repeat_time` (milliseconds, default 500, `0` = off) is how long the resize keys stay live after one press, so `Ctrl-b H H H` nudges three times.
+
 ### Recognized action names
 
-`split-right`, `split-down`, `new-tab`, `next-tab`, `prev-tab`, `close-tab`, `rename-tab`, `new-session`, `new-worktree`, `rename-session`, `next-session`, `prev-session`, `kill-session`, `notification-center`, `jump-attention`, `detach`, `close-pane`, `toggle-sidebar`, `scrollback`, `focus-next`, `focus-left`, `focus-down`, `focus-up`, `focus-right`, `resize-left`, `resize-down`, `resize-up`, `resize-right`, `popup` (the fuzzy switcher), `redraw`, `focus-sidebar`, `prefix`, and `tab-1` … `tab-9`.
+`split-right`, `split-down`, `new-tab`, `next-tab`, `prev-tab`, `close-tab`, `rename-tab`, `move-tab-left`, `move-tab-right`, `new-session`, `new-worktree`, `rename-session`, `next-session`, `prev-session`, `kill-session`, `notification-center`, `jump-attention`, `jump-unread`, `detach`, `close-pane`, `toggle-sidebar`, `scrollback`, `focus-next`, `focus-left`, `focus-down`, `focus-up`, `focus-right`, `last-pane`, `display-panes`, `resize-left`, `resize-down`, `resize-up`, `resize-right`, `zoom-pane`, `swap-pane-up`, `swap-pane-down`, `rotate-panes`, `rotate-panes-back`, `next-layout`, `layout-even-horizontal`, `layout-even-vertical`, `layout-main-horizontal`, `layout-main-vertical`, `layout-tiled`, `spread-panes`, `break-pane`, `synchronize-panes`, `toggle-lock`, `popup` (the fuzzy switcher), `redraw`, `focus-sidebar`, `resume-picker`, `nav-back`, `nav-forward`, `nav-last`, `mark`, `goto-mark`, `key-help`, `prefix`, `send-prefix`, and `tab-1` … `tab-9`.
 
 An unknown action name warns once on startup and is ignored. A `[global]` binding equal to the prefix chord is dropped (with a warning) so prefix entry always wins. Keybinding changes are **live-reloadable** — edit `mux.toml` and run `comux reload`.

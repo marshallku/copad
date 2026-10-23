@@ -237,6 +237,9 @@ fn outer_color(index: usize) -> Option<alacritty_terminal::vte::ansi::Rgb> {
     Some(alacritty_terminal::vte::ansi::Rgb { r, g, b })
 }
 
+/// Longest pane name kept, in characters.
+pub const MAX_PANE_NAME: usize = 48;
+
 /// Longest pane title retained. A title is redrawn on every shell prompt and a hostile pane
 /// could stream megabytes of it; nothing displays more than a few columns anyway.
 const MAX_TITLE_BYTES: usize = 256;
@@ -398,6 +401,9 @@ pub struct PaneTerm {
     pane_token: Option<String>,
     /// The copy-mode search to highlight (the literal query), while one is active.
     copy_query: std::sync::Mutex<Option<String>>,
+    /// A name the user gave the pane (`Ctrl-b T`, `comux rename-pane`); beats the program on
+    /// its title. Saved with the layout.
+    name: std::sync::Mutex<Option<String>>,
 }
 
 /// Turn a pane-spawn I/O error into a message worth showing a user.
@@ -561,6 +567,7 @@ impl PaneTerm {
             spawn_cwd,
             pane_token,
             copy_query: std::sync::Mutex::new(None),
+            name: std::sync::Mutex::new(None),
         })
     }
 
@@ -938,6 +945,28 @@ impl PaneTerm {
         let word = t.bounds_to_string(start, end);
         let word = word.trim();
         (!word.is_empty() && !word.contains(char::is_whitespace)).then(|| word.to_string())
+    }
+
+    /// The pane's user-given name, if it has one.
+    pub fn name(&self) -> Option<String> {
+        self.name.lock().ok().and_then(|n| n.clone())
+    }
+
+    /// Name the pane (`None` or blank clears). Control characters are dropped and the name is
+    /// bounded, like a title: it is drawn into the chrome.
+    pub fn set_name(&self, name: Option<&str>) {
+        let clean = name
+            .map(|n| {
+                sanitize_title(n.trim())
+                    .chars()
+                    .take(MAX_PANE_NAME)
+                    .collect::<String>()
+            })
+            .filter(|n| !n.is_empty());
+        if let Ok(mut slot) = self.name.lock() {
+            *slot = clean;
+        }
+        self.mark_dirty();
     }
 
     /// Highlight `query` on screen while copy mode shows it (`None` clears).

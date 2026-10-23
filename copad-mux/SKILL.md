@@ -130,7 +130,7 @@ To run ONE program in its own tab rather than in a shell you type into, `spawn` 
 
 ```bash
 pane=$(comux spawn --name tests -- cargo test --workspace)
-comux spawn --keep --env RUST_LOG=debug -- ./run-server.sh   # hold the pane when it exits
+comux spawn --keep --env RUST_LOG=debug -- ./run-server.sh   # exit status + a shell when it exits
 ```
 
 The argv reaches the program exactly as given — nothing is typed into a shell, so there is
@@ -138,8 +138,8 @@ nothing to quote — under your login shell's PATH. The tab goes in your own ses
 `--session S`) and never moves the user's view. It CLOSES when the program exits, taking the
 output with it; pass `--keep` when you will want to read the result, or when a failure to
 start would otherwise vanish. A kept pane ends with a line like ` exited 1 `
-— read it back with `capture-pane` to learn how the program finished; a bare Enter (`comux send
-<token> --enter`) runs it again, and anything else turns the pane into a shell.
+— read it back with `capture-pane` to learn how the program finished — and is then a shell that
+takes what you `send`.
 
 Once several panes share your tab, arrange them instead of nudging dividers. Every one acts on
 YOUR tab (the one holding `$COPAD_MUX_PANE`):

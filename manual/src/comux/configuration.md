@@ -30,6 +30,10 @@ comux reload          # re-read mux.toml on the live server (alias: comux source
 | `sidebar_width` | `24` | `8`–`80` | Sidebar columns |
 | `sidebar_min_cols` | `80` | `40`–`400` (forced ≥ `sidebar_width + 20`) | Hide the sidebar below this terminal width |
 | `scroll_step` | `3` | `1`–`50` | Lines per mouse-wheel notch |
+| `repeat_time` | `500` | `0`–`5000` ms (`0` = off) | How long the resize keys stay live after a press, so `Ctrl-b H H H` repeats (tmux `repeat-time`) |
+| `confirm_close` | `true` | bool | Ask `y/n` before `Ctrl-b x` closes a pane or `Ctrl-b &` a tab |
+| `set_titles` | `true` | bool | Set your terminal's title to the focused pane's title (or program) and the session; restored on detach (tmux `set-titles`) |
+| `bell_passthrough` | `true` | bool | A pane's bell rings your terminal too, at most once a second (tmux `bell-action any`) |
 | `sort_by` | `"created"` | `created` / `alphabetical` / `recent` / `activity` | Session order in sidebar, switcher, and `)(`/cycle |
 | `tab_labels` | `"number"` | `number` / `name` / `both` | What each status-bar tab chip shows |
 | `reconcile_secs` | `3` | `0`–`3600` (`0` disables) | How often each client silently repaints its whole screen — the render-residue self-heal (see below) |

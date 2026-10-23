@@ -264,6 +264,8 @@ enum PromptKind {
     /// switch (this client or a concurrent one) while the prompt is up can't retarget
     /// or silently drop it.
     RenameTab(WorkspaceId, TabId),
+    /// `Ctrl-b T`: name this pane (empty clears).
+    RenamePane(TerminalId),
 }
 
 /// A sidebar half scrolled BY HAND (wheel), plus the auto-anchor that was in effect at the
@@ -1450,9 +1452,10 @@ impl App {
     /// agent's status.
     fn pane_title_text(&self, term: &TerminalId, index: usize) -> String {
         let label = self
-            .labels
+            .panes
             .get(term)
-            .map(|l| l.text.clone())
+            .and_then(|p| p.name())
+            .or_else(|| self.labels.get(term).map(|l| l.text.clone()))
             .unwrap_or_default();
         let status = self
             .agent_statuses
@@ -1540,6 +1543,71 @@ impl App {
             Rearrange::Preset(p) => format!("layout: {}", p.name()),
             Rearrange::Spread => "spread evenly".into(),
         })
+    }
+
+    /// `Ctrl-b C-e` (zellij `EditScrollback`): the focused pane's whole history in `$VISUAL` /
+    /// `$EDITOR` (else `less`), in a new tab of this session — search it, copy from it, save it,
+    /// with the tools you already have. The text goes to a private file (`0600`) first; the
+    /// editor tab works on that copy, and the pane itself is untouched.
+    fn edit_scrollback(&mut self) {
+        let Some(term) = self.focused_terminal() else {
+            return;
+        };
+        let Some(pt) = self.panes.get(&term) else {
+            return;
+        };
+        let cap = pt.capture(Some(crate::term::CAPTURE_MAX_ROWS));
+        let path = std::env::temp_dir().join(format!(
+            "comux-scrollback-{}-{}.txt",
+            pt.pane_token().unwrap_or("pane"),
+            now_secs()
+        ));
+        let written = {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .and_then(|mut f| {
+                    f.write_all(cap.text.as_bytes())?;
+                    f.write_all(b"\n")
+                })
+        };
+        if let Err(e) = written {
+            self.flash(format!("could not write the scrollback: {e}"), true);
+            return;
+        }
+        // The editor is resolved by the pane's own login shell (`spawn_argv`), so `$EDITOR`
+        // from the user's rc files applies even though the server's environment lacks it.
+        let argv = spawn_argv(
+            std::env::var("SHELL").ok().as_deref(),
+            &[
+                "sh".to_string(),
+                "-c".to_string(),
+                r#"exec ${VISUAL:-${EDITOR:-less}} "$1""#.to_string(),
+                "comux-edit".to_string(),
+                path.to_string_lossy().into_owned(),
+            ],
+            false,
+        );
+        let ws = self.ws.clone();
+        let cwd = self.focused_cwd();
+        if self
+            .new_tab_in(
+                &ws,
+                TabLaunch {
+                    cwd,
+                    activate: true,
+                    argv: Some(argv),
+                    env: Vec::new(),
+                },
+            )
+            .is_some()
+        {
+            self.sync_sizes();
+        }
     }
 
     /// `Ctrl-b Space` (tmux `next-layout`): the preset after the one this tab last got.
@@ -3186,6 +3254,22 @@ impl App {
         });
     }
 
+    /// `Ctrl-b T`: the inline prompt to name the focused pane, seeded with its name.
+    fn open_rename_pane_prompt(&mut self) {
+        let Some(term) = self.focused_terminal() else {
+            return;
+        };
+        let seed = self
+            .panes
+            .get(&term)
+            .and_then(|p| p.name())
+            .unwrap_or_default();
+        self.prompt = Some(Prompt {
+            kind: PromptKind::RenamePane(term),
+            buf: seed,
+        });
+    }
+
     /// Apply the open prompt on Enter: create (name → `None` when blank) or rename.
     fn commit_prompt(&mut self, p: Prompt) {
         let trimmed = p.buf.trim();
@@ -3211,6 +3295,11 @@ impl App {
             }
             PromptKind::RenameSession(ws) => self.rename_session(&ws, name),
             PromptKind::RenameTab(ws, tab) => self.rename_tab(&ws, &tab, name),
+            PromptKind::RenamePane(term) => {
+                if let Some(pt) = self.panes.get(&term) {
+                    pt.set_name(name.as_deref());
+                }
+            }
         }
     }
 
@@ -3770,6 +3859,10 @@ impl App {
                             status,
                             title,
                             bell,
+                            name: term
+                                .as_ref()
+                                .and_then(|tid| self.panes.get(tid))
+                                .and_then(|pt| pt.name()),
                         }
                     })
                     .collect();
@@ -4399,6 +4492,15 @@ impl App {
                 }
                 r
             }
+            Req::RenamePane { target, name } => match self.resolve_pane_token(target) {
+                Some(term) => {
+                    if let Some(pt) = self.panes.get(&term) {
+                        pt.set_name(Some(name));
+                    }
+                    Resp::ok()
+                }
+                None => Resp::err_code("not_found", format!("unknown pane '{target}'")),
+            },
             Req::Arrange { op, caller } => {
                 use crate::state::Rearrange;
                 let at = match self.caller_pane_at(caller.as_deref()) {
@@ -5527,6 +5629,8 @@ impl App {
                 self.flash_result(out);
             }
             DisplayPanes => self.display_panes(),
+            EditScrollback => self.edit_scrollback(),
+            RenamePane => self.open_rename_pane_prompt(),
             ToggleLock => {
                 self.locked = !self.locked;
                 self.flash(
@@ -7890,6 +7994,7 @@ impl App {
                     cwd,
                     command,
                     pane_ref: refs.get(terminal).copied(),
+                    name: self.panes.get(terminal).and_then(|p| p.name()),
                 }
             }
             SplitTree::Branch {
@@ -10441,6 +10546,7 @@ impl App {
             PromptKind::NewWorktree => " new worktree (branch) · ↵ create · esc cancel ".into(),
             PromptKind::RenameSession(_) => " rename session · ↵ save · esc cancel ".into(),
             PromptKind::RenameTab(..) => " rename tab · ↵ save (empty clears) · esc cancel ".into(),
+            PromptKind::RenamePane(..) => " name pane · ↵ save (empty clears) · esc cancel ".into(),
         };
         put(
             buf,
@@ -11230,6 +11336,7 @@ fn spawn_layout(
             cwd,
             command,
             pane_ref,
+            name,
         } => {
             if *budget == 0 {
                 return None;
@@ -11248,6 +11355,8 @@ fn spawn_layout(
             )
             .ok()?;
             *budget -= 1;
+            // Untrusted like the rest of the file: `set_name` sanitizes and bounds it.
+            pt.set_name(name.as_deref());
             // Re-run a whitelisted program (agent): shell-quote each argv element and
             // inject the line into the fresh shell. Quoting preserves argument boundaries
             // and neutralizes metacharacters/newlines (a saved `claude "a; b"` stays one
@@ -11341,10 +11450,9 @@ struct TabLaunch {
 /// quoting, no line editor, no startup race that could eat or mangle the command.
 ///
 /// `exec` makes the program the pane's process, so the pane ends when it does. `keep`
-/// instead runs it as a child and HOLDS the pane like a zellij command pane: the output stays,
-/// a status line says how it exited (`exited 1`), Enter runs it again, and anything else
-/// drops to an interactive login shell. `-i` keeps an interrupted program from taking that
-/// shell down with it, and sources the same rc files a pane's shell does.
+/// instead runs it as a child, reports how it exited, and then becomes an interactive login
+/// shell, leaving the output (or the error) on screen. `-i` keeps an interrupted program from
+/// taking that shell down with it, and sources the same rc files a pane's shell does.
 ///
 /// The `"$@"` script is POSIX; a shell that is not (fish, nu, …) is replaced by `/bin/sh` as
 /// the wrapper — the program still gets its argv verbatim, but that shell's own profile does
@@ -11370,26 +11478,11 @@ fn spawn_argv(shell: Option<&str>, argv: &[String], keep: bool) -> Vec<String> {
     out
 }
 
-/// The `--keep` wrapper: run `"$@"`, report how it exited in reverse video, re-run on Enter,
-/// become a login shell on any other key — ONE key, read raw (`stty -icanon -isig`, `dd` a
-/// byte), so Ctrl-c is just another key here rather than a SIGINT that would abort the whole
-/// `-i -c` script and close the pane — or at end of input. POSIX `sh`; where stdin is not a
-/// terminal the `stty`s fail quietly and the byte is read all the same.
+/// The `--keep` wrapper: run `"$@"`, say how it exited in a reverse-video line (` exited 3 `),
+/// then BECOME the login shell — at once, so whatever is typed next (by a person or by
+/// `comux send`) is the shell's input, the contract `--keep` always had. POSIX `sh`.
 const HOLD_SCRIPT: &str = r#""$@"; s=$?
-nl='
-'
-cr=$(printf '\r')
-while :; do
-  printf '\n\033[7m exited %s \033[0m \033[2mEnter: run again · any other key: a shell here\033[0m\n' "$s"
-  t=$(stty -g 2>/dev/null); stty -icanon -isig -echo 2>/dev/null
-  k=$(dd bs=1 count=1 2>/dev/null; echo x)
-  [ -n "$t" ] && stty "$t" 2>/dev/null
-  k=${k%x}
-  case $k in
-    "$nl" | "$cr") "$@"; s=$? ;;
-    *) break ;;
-  esac
-done
+printf '\n\033[7m exited %s \033[0m\n' "$s"
 exec "${SHELL:-/bin/sh}" -l"#;
 
 /// Build a shell command line from a saved argv by POSIX single-quoting each argument, so
@@ -11937,6 +12030,13 @@ fn chord_key(c: &Chord) -> KeyEvent {
         Key::Space => KeyCode::Char(' '),
         Key::Esc => KeyCode::Esc,
         Key::Backspace => KeyCode::Backspace,
+        Key::Home => KeyCode::Home,
+        Key::End => KeyCode::End,
+        Key::PageUp => KeyCode::PageUp,
+        Key::PageDown => KeyCode::PageDown,
+        Key::Insert => KeyCode::Insert,
+        Key::Delete => KeyCode::Delete,
+        Key::F(n) => KeyCode::F(n),
     };
     let mut mods = KeyModifiers::NONE;
     if c.shift {
@@ -13650,42 +13750,38 @@ mod placement {
     }
 
     #[test]
-    fn a_kept_command_reports_its_exit_and_reruns_on_enter() {
-        // The hold script itself, in the real `sh`: exit status shown, Enter re-runs, and
-        // anything else hands over to a shell (here `true`, so the test can see it end).
-        let run = |input: &str| {
-            let out = std::process::Command::new("/bin/sh")
-                .args([
-                    "-c",
-                    HOLD_SCRIPT,
-                    "comux-spawn",
-                    "sh",
-                    "-c",
-                    "echo RAN; exit 3",
-                ])
-                .env("SHELL", "/usr/bin/true")
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .and_then(|mut c| {
-                    use std::io::Write;
-                    c.stdin.take().unwrap().write_all(input.as_bytes())?;
-                    c.wait_with_output()
-                })
-                .unwrap();
-            String::from_utf8_lossy(&out.stdout).into_owned()
-        };
-        let once = run("q");
-        assert_eq!(once.matches("RAN").count(), 1, "{once}");
-        assert!(once.contains(" exited 3 "), "{once}");
-        let twice = run("\nq");
-        assert_eq!(
-            twice.matches("RAN").count(),
-            2,
-            "Enter runs it again: {twice}"
+    fn a_kept_command_reports_its_exit_and_leaves_a_shell() {
+        // The hold script itself, in the real `sh`: the exit status is shown, and the shell
+        // (here `sh`) runs the input that follows — none of it eaten.
+        let out = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                HOLD_SCRIPT,
+                "comux-spawn",
+                "sh",
+                "-c",
+                "echo RAN; exit 3",
+            ])
+            .env("SHELL", "/bin/sh")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin
+                    .take()
+                    .unwrap()
+                    .write_all(b"echo TYPED-$((4+4))\n")?;
+                c.wait_with_output()
+            })
+            .unwrap();
+        let out = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.matches("RAN").count(), 1, "{out}");
+        assert!(out.contains(" exited 3 "), "{out}");
+        assert!(
+            out.contains("TYPED-8"),
+            "the next input reaches the shell whole: {out}"
         );
-        // End of input (the pane's stdin closing) is a way out too, never a loop.
-        assert_eq!(run("").matches("RAN").count(), 1);
     }
 
     #[test]
@@ -13980,6 +14076,7 @@ mod new_session_dir {
             cwd: Some(cwd.into()),
             command: None,
             pane_ref: None,
+            name: None,
         };
         let session = |dir: Option<&str>, cwd: &str| PSession {
             name: None,
@@ -14429,6 +14526,7 @@ mod owner_inbox {
             cwd: None,
             command: None,
             pane_ref,
+            name: None,
         }
     }
 
@@ -16866,16 +16964,23 @@ mod copy_mode_vi {
             .into_iter()
             .find(|r| r.terminal == term)
             .unwrap();
-        let snap = app.panes[&term].snapshot();
-        let (row, col) = snap
-            .cells
-            .iter()
-            .enumerate()
-            .find_map(|(r, cells)| {
+        // The row is read off the rendered grid, which can trail the capture under load.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let (row, col) = loop {
+            let snap = app.panes[&term].snapshot();
+            let found = snap.cells.iter().enumerate().find_map(|(r, cells)| {
                 let line: String = cells.iter().map(|c| c.sym.as_str()).collect();
                 (line.starts_with("see path")).then(|| (r as u16, line.find("to-").unwrap() as u16))
-            })
-            .expect("the printed row");
+            });
+            if let Some(at) = found {
+                break at;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the printed row never showed"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
         let (x, y) = (rect.x + col, rect.y + row);
         let click = |app: &mut App| {
             app.mouse_at(ClientId(0), x, y, MouseKind::Click);
@@ -17429,5 +17534,158 @@ mod junctions {
         assert_eq!(divider_glyph(false, false, true, true), "─");
         assert_eq!(divider_glyph(true, true, false, false), "│");
         assert_eq!(divider_glyph(false, true, true, true), "┬");
+    }
+}
+
+#[cfg(test)]
+mod pane_names_and_keys {
+    use super::*;
+    use crate::control::Req;
+
+    fn app_with(toml: &str) -> App {
+        let mut cfg = config::tests::config_from_str(toml);
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn key(app: &mut App, prefix: &mut Prefix, code: KeyCode, mods: KeyModifiers) {
+        app.feed_key(KeyEvent::new(code, mods), prefix);
+    }
+
+    #[test]
+    fn function_and_page_keys_are_bindable() {
+        let mut app = app_with("[global]\npopup = \"F1\"\n[keys]\nkey-help = \"PgUp\"\n");
+        let mut prefix = Prefix::default();
+        key(&mut app, &mut prefix, KeyCode::F(1), KeyModifiers::NONE);
+        assert!(app.popup.is_some(), "F1 opened the switcher");
+        key(&mut app, &mut prefix, KeyCode::Esc, KeyModifiers::NONE);
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        );
+        key(&mut app, &mut prefix, KeyCode::PageUp, KeyModifiers::NONE);
+        assert!(app.help.is_some(), "prefix + PgUp opened the key help");
+        key(&mut app, &mut prefix, KeyCode::Esc, KeyModifiers::NONE);
+        // An unbound F-key still reaches the program (and is not eaten as a chord).
+        let km = &app.cfg.keymap;
+        assert_eq!(km.global_action(&config::parse_chord("F2").unwrap()), None);
+        assert_eq!(config::parse_chord("S-F5").unwrap().label(), "S-F5");
+        assert_eq!(config::parse_chord("C-PgDn").unwrap().label(), "^PgDn");
+        assert!(config::parse_chord("F25").is_err());
+    }
+
+    #[test]
+    fn a_named_pane_shows_its_name_and_keeps_it_across_a_save() {
+        let mut app = app_with("");
+        let r = app.handle_control(&Req::Split {
+            dir: "right".into(),
+            from: None,
+            no_focus: false,
+            cwd: None,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
+        });
+        assert!(r.ok);
+        let term = app.focused_terminal().unwrap();
+        let mut prefix = Prefix::default();
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        );
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('T'),
+            KeyModifiers::SHIFT,
+        );
+        for c in "build\u{7}box".chars() {
+            key(&mut app, &mut prefix, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        key(&mut app, &mut prefix, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            app.panes[&term].name().as_deref(),
+            Some("buildbox"),
+            "control characters are dropped"
+        );
+        assert!(app.pane_title_text(&term, 2).contains("2:buildbox"));
+        // Saved with the layout, so a restore gets it back.
+        let json = serde_json::to_string(&app.snapshot()).unwrap();
+        assert!(json.contains("\"name\":\"buildbox\""), "{json}");
+        // The CLI form, and clearing it.
+        let token = app.panes[&term].pane_token().unwrap().to_string();
+        assert!(
+            app.handle_control(&Req::RenamePane {
+                target: token.clone(),
+                name: String::new(),
+            })
+            .ok
+        );
+        assert_eq!(app.panes[&term].name(), None);
+        let r = app.handle_control(&Req::RenamePane {
+            target: "nope-1".into(),
+            name: "x".into(),
+        });
+        assert_eq!(r.code.as_deref(), Some("not_found"));
+    }
+
+    #[test]
+    fn edit_scrollback_opens_the_history_in_a_new_tab() {
+        let mut app = app_with("");
+        let term = app.focused_terminal().unwrap();
+        app.panes[&term].input(b"echo SCROLLBACK-$((5*5))\n");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !app.panes[&term]
+            .capture(Some(200))
+            .text
+            .contains("SCROLLBACK-25")
+        {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let tabs = |app: &App| app.state.workspace(&app.ws).unwrap().tabs.len();
+        let before = tabs(&app);
+        let mut prefix = Prefix::default();
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('b'),
+            KeyModifiers::CONTROL,
+        );
+        key(
+            &mut app,
+            &mut prefix,
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL,
+        );
+        assert_eq!(tabs(&app), before + 1, "the editor got a tab");
+        // The history went to a private file the editor reads.
+        let dir = std::env::temp_dir();
+        let token = app.panes[&term].pane_token().unwrap().to_string();
+        let file = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&format!("comux-scrollback-{token}-")))
+            })
+            .expect("the scrollback file");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("SCROLLBACK-25")
+        );
+        let _ = std::fs::remove_file(file);
     }
 }

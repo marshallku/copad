@@ -113,6 +113,9 @@ pub enum PLayout {
         /// A snapshot-local id, set only on a leaf some tab's `owner` or a mark points at.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane_ref: Option<u32>,
+        /// The pane's user-given name (`Ctrl-b T`), if any.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
     },
     Branch {
         dir: Dir,
@@ -364,11 +367,13 @@ mod tests {
                                 cwd: Some("/tmp".into()),
                                 command: Some(vec!["claude".into(), "--resume".into()]),
                                 pane_ref: Some(0),
+                                name: None,
                             }),
                             second: Box::new(PLayout::Leaf {
                                 cwd: None,
                                 command: None,
                                 pane_ref: None,
+                                name: None,
                             }),
                         },
                         owner: None,
@@ -385,6 +390,7 @@ mod tests {
                                 cwd: None,
                                 command: None,
                                 pane_ref: None,
+                                name: None,
                             },
                             owner: None,
                         },
@@ -394,6 +400,7 @@ mod tests {
                                 cwd: Some("/var".into()),
                                 command: None,
                                 pane_ref: None,
+                                name: None,
                             },
                             owner: Some(0),
                         },

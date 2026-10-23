@@ -389,6 +389,11 @@ pub enum Action {
     /// `Ctrl-b \`` (tmux `last-pane`, whose `;` comux spends on the previous session/tab):
     /// back to the pane focused before this one in the tab.
     LastPane,
+    /// `Ctrl-b C-e` (zellij `EditScrollback`): the pane's history in `$EDITOR`, in a new tab.
+    EditScrollback,
+    /// `Ctrl-b T` (zellij rename-pane, tmux `select-pane -T`): name the focused pane; the name
+    /// beats the program on its title.
+    RenamePane,
     /// `Ctrl-b Ctrl-g` (zellij's locked mode): the prefix-less bindings stand down so
     /// programs get `Ctrl-f`, `Alt-1`…; the prefix keeps working.
     ToggleLock,
@@ -461,6 +466,8 @@ impl Action {
             BreakPane => "move the pane to a new tab",
             DisplayPanes => "number the panes; a digit jumps there",
             ToggleLock => "lock: prefix-less keys go to the program",
+            EditScrollback => "open the pane's history in $EDITOR (new tab)",
+            RenamePane => "name the pane",
             ToggleSync => "type into every pane of the tab (synchronize)",
             LastPane => "back to the previously focused pane",
             MoveTabLeft => "move the tab left",
@@ -516,6 +523,14 @@ pub enum Key {
     Space,
     Esc,
     Backspace,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Insert,
+    Delete,
+    /// A function key, `F1`–`F24`.
+    F(u8),
 }
 
 /// A fully-canonicalized chord: modifier bits + one key. Two chords are equal iff a
@@ -567,8 +582,18 @@ impl Chord {
                     Key::Space => "Space",
                     Key::Esc => "Esc",
                     Key::Backspace => "BSpace",
+                    Key::Home => "Home",
+                    Key::End => "End",
+                    Key::PageUp => "PgUp",
+                    Key::PageDown => "PgDn",
+                    Key::Insert => "Ins",
+                    Key::Delete => "Del",
+                    Key::F(_) => "",
                     Key::Char(_) => unreachable!("handled above"),
                 });
+                if let Key::F(n) = named {
+                    s.push_str(&format!("F{n}"));
+                }
             }
         }
         s
@@ -620,6 +645,13 @@ pub fn chord_of(k: &KeyEvent) -> Option<Chord> {
         KeyCode::Tab => Key::Tab,
         KeyCode::Esc => Key::Esc,
         KeyCode::Backspace => Key::Backspace,
+        KeyCode::Home => Key::Home,
+        KeyCode::End => Key::End,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
+        KeyCode::Insert => Key::Insert,
+        KeyCode::Delete => Key::Delete,
+        KeyCode::F(n) if (1..=24).contains(&n) => Key::F(n),
         _ => return None,
     };
     Some(normalize(Chord {
@@ -692,6 +724,19 @@ fn parse_key(tok: &str, shift: &mut bool) -> Option<Key> {
         "Tab" | "tab" => Some(Key::Tab),
         "Esc" | "esc" | "Escape" => Some(Key::Esc),
         "BSpace" | "bspace" | "Backspace" | "backspace" => Some(Key::Backspace),
+        "Home" | "home" => Some(Key::Home),
+        "End" | "end" => Some(Key::End),
+        "PageUp" | "pageup" | "PgUp" | "pgup" | "PPage" => Some(Key::PageUp),
+        "PageDown" | "pagedown" | "PgDn" | "pgdn" | "NPage" => Some(Key::PageDown),
+        "Insert" | "insert" | "Ins" | "IC" => Some(Key::Insert),
+        "Delete" | "delete" | "Del" | "DC" => Some(Key::Delete),
+        _ if tok.len() >= 2
+            && (tok.starts_with('F') || tok.starts_with('f'))
+            && tok[1..].chars().all(|c| c.is_ascii_digit()) =>
+        {
+            let n: u8 = tok[1..].parse().ok()?;
+            (1..=24).contains(&n).then_some(Key::F(n))
+        }
         _ if tok.chars().count() == 1 => {
             let c = tok.chars().next().unwrap();
             if c.is_ascii_alphabetic() {
@@ -760,6 +805,8 @@ fn action_from_name(name: &str) -> Option<Action> {
         "spread-panes" => Action::SpreadPanes,
         "break-pane" => Action::BreakPane,
         "display-panes" => Action::DisplayPanes,
+        "edit-scrollback" => Action::EditScrollback,
+        "rename-pane" => Action::RenamePane,
         "toggle-lock" | "lock" => Action::ToggleLock,
         "synchronize-panes" | "sync" => Action::ToggleSync,
         "last-pane" => Action::LastPane,
@@ -839,6 +886,8 @@ fn default_bindings() -> Vec<(Action, Ctx, &'static [&'static str])> {
         (DisplayPanes, Prefix, &["q"]),
         (LastPane, Prefix, &["`"]),
         (ToggleLock, Prefix, &["C-g"]),
+        (EditScrollback, Prefix, &["C-e"]),
+        (RenamePane, Prefix, &["T"]),
         (ToggleSync, Prefix, &["S"]),
         (FocusLeft, Prefix, &["h", "Left"]),
         (FocusDown, Prefix, &["j", "Down"]),

@@ -247,6 +247,8 @@ pub enum Req {
     Nav { dir: NavDir },
     /// Toggle the zoom of the active tab's focused pane (`Ctrl-b z`). Moves the shared view.
     Zoom,
+    /// Name a pane by its token (`Ctrl-b T`); an empty name clears it.
+    RenamePane { target: String, name: String },
     /// Rearrange the tab holding the caller's pane (or the focused one): `op` is a preset
     /// (`even-horizontal`, `even-vertical`, `main-horizontal`, `main-vertical`, `tiled`),
     /// `next`, `spread`, `swap-up`/`swap-down`, or `rotate`/`rotate-back` (decisions #158).
@@ -654,6 +656,9 @@ pub struct PaneInfo {
     /// a script's behaviour must not depend on a display preference.
     #[serde(default)]
     pub bell: bool,
+    /// The name the user gave the pane (`Ctrl-b T`, `comux rename-pane`), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 /// One tab in a `list-tabs` response.
@@ -1403,6 +1408,30 @@ pub fn run_client(args: &[String]) -> i32 {
                 "usage: comux zoom    (toggle the focused pane filling its tab; Ctrl-b z)"
             ));
             Req::Zoom
+        }
+        "rename-pane" => {
+            let p = parsed!(RENAME_PANE_SPEC);
+            // `rename-pane <token> <name…>`, or just `<name…>` for the calling pane.
+            let (target, words) = match p.positionals.first() {
+                Some(first) if matches!(classify_pane_arg(first), Some(PaneArg::Token(_))) => {
+                    (Some(first.clone()), &p.positionals[1..])
+                }
+                _ => (caller_pane(), &p.positionals[..]),
+            };
+            let Some(target) = target else {
+                return usage_error(
+                    json_out,
+                    "comux rename-pane: which pane? (a token; inside a pane it defaults to yours)",
+                    RENAME_PANE_SPEC.usage,
+                );
+            };
+            if let Err(code) = require_cap(CAP_ARRANGE, cmd, json_out) {
+                return code;
+            }
+            Req::RenamePane {
+                target,
+                name: words.join(" "),
+            }
         }
         "select-layout" | "swap-pane" | "rotate-window" => {
             let (spec, op) = match cmd {
@@ -2486,7 +2515,7 @@ const SPLIT_SPEC: Spec = Spec {
     usage: "usage: comux split [-v|-h] [--from <pane-token>] [--no-focus] [--cwd DIR] [--env K=V]... [--keep] [--json] [-- <argv...>]\n\
             \x20      --from splits that pane wherever it is; --no-focus leaves focus alone;\n\
             \x20      `-- argv` runs that program in the new pane (closes with it unless --keep, which\n\
-            \x20      holds it: exit status shown, Enter runs it again, anything else gives a shell)",
+            \x20      reports its exit status and leaves a shell)",
     flags: &[
         flag(&["-v", "--vertical"]),
         flag(&["-h", "--horizontal"]),
@@ -2524,8 +2553,8 @@ const AGENT_LOG_SPEC: Spec = Spec {
 const SPAWN_SPEC: Spec = Spec {
     usage: "usage: comux spawn [--session <s1|name:hub>] [--cwd DIR] [--name N] [--env K=V]... [--keep] [--owner TOKEN] [--json] -- <argv...>\n\
             \x20      runs argv in a new tab without moving anyone's view (in --session, else beside\n\
-            \x20      the calling pane); the tab closes when it exits unless --keep holds it (exit\n\
-            \x20      status shown, Enter runs it again, anything else gives a shell)",
+            \x20      the calling pane); the tab closes when it exits unless --keep, which\n\
+            \x20      reports its exit status and leaves a shell",
     flags: &[
         opt(&["--session", "-s"]),
         opt(&["--cwd", "-c"]),
@@ -2566,6 +2595,13 @@ const NOTIFY_SPEC: Spec = Spec {
         opt(&["--to"]),
         opt(&["--result"]),
     ],
+    positionals: Positionals::Any,
+};
+
+const RENAME_PANE_SPEC: Spec = Spec {
+    usage: "usage: comux rename-pane [<pane-token>] <name...>   name a pane (yours by default);\n\
+            \x20      the name beats the program on its title (Ctrl-b T); \"\" clears it",
+    flags: &[],
     positionals: Positionals::Any,
 };
 
@@ -4321,6 +4357,7 @@ mod verb_args_tests {
         "break-pane",
         "move-tab",
         "apply-layout",
+        "rename-pane",
         "fork",
         "mark",
         "marks",

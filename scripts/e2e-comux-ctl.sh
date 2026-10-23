@@ -1971,7 +1971,7 @@ PTY_KEYS='\x02>' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/d
 tail -1 "$WORK/frame" | grep -qF "nothing to go forward to" \
     || { cat "$WORK/frame" >&2; fail "Ctrl-b > with no forward history should say so in the status bar"; }
 PTY_KEYS='\x02[' python3 "$WORK/keydrive.py" cap -- "$COMUX" >"$WORK/frame" 2>/dev/null
-tail -1 "$WORK/frame" | grep -qE "COPY [0-9]+/[0-9]+ · \?/ search · v V select · y yank · q" \
+tail -1 "$WORK/frame" | grep -qE "COPY [0-9]+/[0-9]+ · \?/ search · v V \^v select · o end · y yank · q" \
     || { cat "$WORK/frame" >&2; fail "copy mode should show its position and keys"; }
 ok "an empty-history key reports in the bar; scroll mode shows position and keys"
 

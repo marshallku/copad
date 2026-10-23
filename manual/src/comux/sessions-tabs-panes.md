@@ -159,24 +159,18 @@ With the mouse enabled (the default), you can also click directly:
 
 ## Scrollback (copy-mode)
 
-Enter scrollback for the focused pane with `Ctrl-b [`:
-
-| Key | Action |
-| --- | --- |
-| `k` / `↑` | Up one line |
-| `j` / `↓` | Down one line |
-| `PageUp` / `Ctrl-u` | Up half a page |
-| `PageDown` / `Ctrl-d` | Down half a page |
-| `g` | Jump to the top |
-| `G` / `q` / `Esc` | Return to the live bottom and exit |
+Enter copy mode for the focused pane with `Ctrl-b [`. It speaks tmux's `copy-mode-vi` — `hjkl`, `w`/`b`/`e`,
+`f`/`t` jumps, `/` and `?` search with every match lit up as you type, `v`/`V`/`Ctrl-v` character, line and rectangle
+selections, `o` for the other end, `y` to copy and leave. The full table is in
+[Keybindings](./keybindings.md#copy-mode-after-ctrl-b-).
 
 The **mouse wheel** scrolls the pane under the cursor — but if that pane's app has mouse reporting on (Claude Code, `nvim` with `set mouse`), the wheel is forwarded to the app instead, and an alt-screen pager (`less`, `man`) gets cursor-key presses. Only a plain shell scrolls comux's own scrollback.
 
 ### Copying text
 
-A left-**drag** inside a pane runs comux's own selection (clamped to that pane, so the sidebar and other panes are never included) and, on release, copies that pane's text to your system clipboard via **OSC 52** — which works over SSH. A plain click just focuses.
+A left-**drag** inside a pane runs comux's own selection (clamped to that pane, so the sidebar and other panes are never included) and, on release, copies that pane's text to your system clipboard via **OSC 52** — which works over SSH. **Double-click** copies the word under the pointer and **triple-click** the whole line. A plain click just focuses. For anything beyond the screen — or a rectangle — use copy mode.
 
-> **Known v1 limits (deliberate):** no scrollback-drag, no block selection, and a VS16/ZWJ emoji copies as its base glyph (`❤️` → `❤`). There is no keyboard yank binding — selection is mouse-only.
+> **Known limits (deliberate):** a mouse drag stays within the visible screen, and a VS16/ZWJ emoji copies as its base glyph (`❤️` → `❤`).
 
 Programs **inside** a pane can set the clipboard too: comux relays their OSC 52 writes out to every attached client, which re-emits them to its own terminal (tmux `set-clipboard`). So `nvim` with `set clipboard=unnamedplus` and an osc52 provider, or any `yank`-style helper, lands on the clipboard of the machine you are sitting at — including over SSH. Set `osc52 = false` in `mux.toml` to stop a background pane from clobbering your clipboard. Clipboard **reads** (`OSC 52 ... ?`) are never answered, so no program in a pane can exfiltrate what you have copied.
 
@@ -188,7 +182,7 @@ Either path needs your terminal to accept OSC 52: kitty, WezTerm, Alacritty and 
 
 | Action | Key |
 | --- | --- |
-| Detach this client | `Ctrl-b d` (or `Ctrl-b q`) |
+| Detach this client | `Ctrl-b d` |
 | Re-attach | run `comux` again |
 | Force a full repaint (clears drift/ghosting) | `Ctrl-b r` |
 

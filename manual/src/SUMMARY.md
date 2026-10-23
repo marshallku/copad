@@ -9,6 +9,7 @@
 - [Overview](./comux/index.md)
 - [Sessions, Tabs & Panes](./comux/sessions-tabs-panes.md)
 - [Keybindings](./comux/keybindings.md)
+- [Layouts & Arranging Panes](./comux/layouts.md)
 - [Git Worktrees](./comux/worktrees.md)
 - [Persistence & Agent Resume](./comux/persistence.md)
 - [The Status Bar](./comux/status-bar.md)
