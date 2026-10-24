@@ -39,6 +39,12 @@ impl Endpoint {
     /// interactive. `BatchMode` makes a host that wants a password or an unknown host key
     /// FAIL with a reason instead of hanging on a prompt nobody can see.
     pub fn ssh(dest: &str) -> Self {
+        Self::ssh_with(dest, "comux")
+    }
+
+    /// [`Endpoint::ssh`] with a remote comux command other than `comux` — a binary that is not
+    /// on the login PATH, or one carrying its own environment (`env COPAD_MUX_SOCK=… comux`).
+    pub fn ssh_with(dest: &str, comux: &str) -> Self {
         Endpoint::Command {
             program: "ssh".into(),
             args: vec![
@@ -50,7 +56,7 @@ impl Endpoint {
                 "-o".into(),
                 "ServerAliveInterval=15".into(),
                 dest.into(),
-                remote_proxy_command(),
+                remote_proxy_command_for(comux),
             ],
         }
     }
@@ -60,7 +66,12 @@ impl Endpoint {
 /// exec channel is non-interactive and would otherwise miss the PATH entries comux installs
 /// into; `exec` so the proxy is the process ssh talks to.
 pub fn remote_proxy_command() -> String {
-    "exec \"${SHELL:-/bin/sh}\" -lc 'exec comux proxy --stdio'".into()
+    remote_proxy_command_for("comux")
+}
+
+/// [`remote_proxy_command`] for a given remote comux command.
+pub fn remote_proxy_command_for(comux: &str) -> String {
+    format!("exec \"${{SHELL:-/bin/sh}}\" -lc 'exec {comux} proxy --stdio'")
 }
 
 /// comux's socket path: `$COPAD_MUX_SOCK`, else

@@ -523,6 +523,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         closePaneItem.target = self
         shellMenu.addItem(closePaneItem)
 
+        let remoteItem = NSMenuItem(title: "Open Remote comux…", action: #selector(openRemoteComuxPrompt), keyEquivalent: "")
+        remoteItem.target = self
+        shellMenu.addItem(remoteItem)
+
         shellMenu.addItem(.separator())
 
         let splitHItem = NSMenuItem(title: "Split Pane Horizontally", action: #selector(splitHorizontal), keyEquivalent: "d")
@@ -623,6 +627,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Tab / Pane Actions
+
+    /// Ask for an SSH destination and open its comux in a new tab, natively hosted.
+    @objc private func openRemoteComuxPrompt() {
+        let alert = NSAlert()
+        alert.messageText = "Open Remote comux"
+        alert.informativeText = "An ~/.ssh/config host or user@host. comux must be installed there."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
+        field.placeholderString = "user@host"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Open")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let dest = field.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !dest.isEmpty, let vc = tabVC else { return }
+        if let err = vc.openRemoteComux(dest: dest, comux: "comux") {
+            let e = NSAlert()
+            e.messageText = "Can't open \(dest)"
+            e.informativeText = err
+            e.runModal()
+        }
+    }
 
     @objc private func newTab() {
         tabVC?.newTab()
@@ -1317,6 +1343,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case "tab.new":
             vc.newTab()
             completion(["ok": true])
+
+        // Open a remote comux natively (decisions #171). No `dest` = ask for it.
+        case "comux.open_remote":
+            let comux = (params["comux"] as? String) ?? "comux"
+            guard let dest = params["dest"] as? String, !dest.isEmpty else {
+                openRemoteComuxPrompt()
+                completion(["ok": true, "prompted": true])
+                return
+            }
+            if let err = vc.openRemoteComux(dest: dest, comux: comux) {
+                completion(["ok": false, "error": err])
+            } else {
+                completion(["ok": true])
+            }
 
         case "tab.close":
             vc.closeActivePane()

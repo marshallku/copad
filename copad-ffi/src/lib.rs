@@ -1621,6 +1621,56 @@ pub unsafe extern "C" fn copad_muxhost_command(h: *const MuxHostHandle, req_json
     }
 }
 
+/// Start a host on a REMOTE comux: `ssh -T <dest> <comux> proxy --stdio`. NULL when the
+/// destination or command is refused (see `copad_core::muxhost::valid_dest`).
+///
+/// # Safety
+/// Both arguments valid strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_start_remote(
+    dest: *const c_char,
+    comux: *const c_char,
+) -> *mut MuxHostHandle {
+    // SAFETY: caller contract.
+    let (Some(d), Some(c)) = (unsafe { cstr(dest) }, unsafe { cstr(comux) }) else {
+        return ptr::null_mut();
+    };
+    match copad_core::muxhost::remote_endpoint(d, c) {
+        Some(ep) => Box::into_raw(Box::new(MuxHostHandle(
+            copad_core::muxhost::MuxHost::start(ep),
+        ))),
+        None => ptr::null_mut(),
+    }
+}
+
+/// A fresh binding tag for a remote tab. Free with `copad_ffi_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn copad_muxhost_new_remote_tag() -> *mut c_char {
+    into_c(copad_core::muxhost::new_remote_tag())
+}
+
+/// The command a copad tab runs to attach the remote comux with `tag`. NULL when refused.
+/// Free with `copad_ffi_free_string`.
+///
+/// # Safety
+/// All arguments valid strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_remote_attach_command(
+    dest: *const c_char,
+    comux: *const c_char,
+    tag: *const c_char,
+) -> *mut c_char {
+    // SAFETY: caller contract.
+    match (unsafe { cstr(dest) }, unsafe { cstr(comux) }, unsafe {
+        cstr(tag)
+    }) {
+        (Some(d), Some(c), Some(t)) => {
+            copad_core::muxhost::remote_attach_command(d, c, t).map_or(ptr::null_mut(), into_c)
+        }
+        _ => ptr::null_mut(),
+    }
+}
+
 /// Answer a delegated overlay. `choice`/`text` NULL when absent; both NULL = cancelled.
 ///
 /// # Safety

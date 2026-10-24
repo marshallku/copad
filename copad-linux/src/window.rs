@@ -575,6 +575,7 @@ impl CopadWindow {
         // comux's sidebar / notification center beside the notebook — hidden unless a visible
         // pane runs a comux client whose sidebar this window claimed (decisions #169).
         let comux = crate::comux_panel::ComuxPanel::new();
+        crate::comux_panel::set_global(&comux);
         let middle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         middle.set_vexpand(true);
         tab_manager.notebook.set_hexpand(true);

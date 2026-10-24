@@ -597,3 +597,124 @@ mod tests {
         assert!(c.held().is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Remote comux (decisions #171): copad opens the remote session itself, so it knows which tab
+// is which host — no guessing from what a hand-typed `ssh` printed.
+// ---------------------------------------------------------------------------------------------
+
+/// An ssh destination copad will put on a command line: a `~/.ssh/config` alias or
+/// `[user@]host[:port]`-shaped token. Anything that could be read as an option or break out of
+/// the quoting is refused rather than escaped.
+pub fn valid_dest(dest: &str) -> bool {
+    !dest.is_empty()
+        && !dest.starts_with('-')
+        && dest
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@._:-[]%".contains(c))
+}
+
+/// The remote comux command (default `comux`): may carry arguments and an `env` prefix, but no
+/// quotes, backslashes, `$`, backticks, `;`, `&`, `|` or newlines — it is spliced into quoted
+/// remote shell text.
+pub fn valid_comux(cmd: &str) -> bool {
+    !cmd.trim().is_empty() && !cmd.chars().any(|c| "'\"\\$`;&|<>\n\r".contains(c))
+}
+
+/// The ssh program copad runs for remote comux: `COPAD_SSH` (a wrapper, `tsh`, an ssh outside
+/// PATH) or `ssh`. An absolute path also survives a tab shell that rebuilds `PATH` in its rc
+/// files. A value that could break the command line is ignored.
+pub fn ssh_program() -> String {
+    std::env::var("COPAD_SSH")
+        .ok()
+        .filter(|p| {
+            !p.is_empty()
+                && p.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "/._-+~".contains(c))
+        })
+        .unwrap_or_else(|| "ssh".into())
+}
+
+/// A fresh binding tag for a remote tab.
+pub fn new_remote_tag() -> String {
+    let mut b = [0u8; 12];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        let _ = f.read_exact(&mut b);
+    }
+    let hex: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("copad-remote:{hex}")
+}
+
+/// What the copad tab runs to attach the remote comux client with `tag`: through a login
+/// shell (so a comux in `~/.local/bin` is found) with the tag in its environment — the remote
+/// client reports it, which is how the L0 connection finds the attachment. `None` when the
+/// destination or command is not acceptable.
+pub fn remote_attach_command(dest: &str, comux: &str, tag: &str) -> Option<String> {
+    if !valid_dest(dest) || !valid_comux(comux) || !valid_comux(tag) {
+        return None;
+    }
+    Some(format!(
+        "{} -t {dest} 'exec env COPAD_MUX_HOST_TAG={tag} \"${{SHELL:-/bin/sh}}\" -lc \"exec {comux}\"'",
+        ssh_program()
+    ))
+}
+
+/// The L0 endpoint for the same remote comux.
+pub fn remote_endpoint(dest: &str, comux: &str) -> Option<Endpoint> {
+    if !valid_dest(dest) || !valid_comux(comux) {
+        return None;
+    }
+    Some(match Endpoint::ssh_with(dest, comux) {
+        Endpoint::Command { args, .. } => Endpoint::Command {
+            program: ssh_program(),
+            args,
+        },
+        other => other,
+    })
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::*;
+
+    #[test]
+    fn destinations_that_could_be_options_or_escape_quoting_are_refused() {
+        for ok in ["box", "me@box.tail.ts.net", "box:2222", "a_b-c.d", "[::1]"] {
+            assert!(valid_dest(ok), "{ok}");
+        }
+        for bad in ["", "-oProxyCommand=x", "a b", "a;b", "a'b", "$(x)", "a\nb"] {
+            assert!(!valid_dest(bad), "{bad:?}");
+        }
+        assert!(valid_comux("env COPAD_MUX_SOCK=/tmp/x/s /home/u/comux"));
+        for bad in ["comux'", "comux; rm -rf ~", "$(x)", "`x`", "a\\b", "a | b"] {
+            assert!(!valid_comux(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_attach_command_carries_the_tag_through_a_login_shell() {
+        let c = remote_attach_command("box", "comux", "copad-remote:ab12").unwrap();
+        assert_eq!(
+            c,
+            r#"ssh -t box 'exec env COPAD_MUX_HOST_TAG=copad-remote:ab12 "${SHELL:-/bin/sh}" -lc "exec comux"'"#
+        );
+        assert!(remote_attach_command("-oX", "comux", "t").is_none());
+        let t = new_remote_tag();
+        assert!(t.starts_with("copad-remote:") && t.len() == "copad-remote:".len() + 24);
+        assert_ne!(t, new_remote_tag());
+    }
+
+    #[test]
+    fn the_proxy_endpoint_uses_the_same_remote_command() {
+        let Some(Endpoint::Command { program, args }) = remote_endpoint("box", "env A=1 /x/comux")
+        else {
+            panic!()
+        };
+        assert_eq!(program, "ssh");
+        assert_eq!(
+            args.last().unwrap(),
+            r#"exec "${SHELL:-/bin/sh}" -lc 'exec env A=1 /x/comux proxy --stdio'"#
+        );
+    }
+}

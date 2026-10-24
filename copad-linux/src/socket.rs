@@ -295,6 +295,29 @@ pub fn dispatch(
                 .send(Response::success(req.id.clone(), json!({ "status": "ok" })));
         }
 
+        // Open a remote comux natively (decisions #171). No `dest` = ask for it.
+        "comux.open_remote" => {
+            let comux = req
+                .params
+                .get("comux")
+                .and_then(|v| v.as_str())
+                .unwrap_or("comux")
+                .to_string();
+            let resp = match req.params.get("dest").and_then(|v| v.as_str()) {
+                Some(dest) if !dest.is_empty() => {
+                    match crate::comux_panel::open_remote(mgr, window, dest, &comux) {
+                        Ok(()) => Response::success(req.id.clone(), json!({ "ok": true })),
+                        Err(e) => Response::error(req.id.clone(), "refused", &e),
+                    }
+                }
+                _ => {
+                    crate::comux_panel::prompt_open_remote(mgr, window);
+                    Response::success(req.id.clone(), json!({ "ok": true, "prompted": true }))
+                }
+            };
+            let _ = cmd.reply.send(resp);
+        }
+
         "tab.close" => {
             mgr.close_focused(window);
             let _ = cmd

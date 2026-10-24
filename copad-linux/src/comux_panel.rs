@@ -15,6 +15,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use crate::panel::Panel;
 use crate::tabs::TabManager;
 
 /// How often the visible-panel set is re-read (tab switches, splits and closes all change it).
@@ -32,7 +33,11 @@ pub struct ComuxPanel {
     agents: gtk4::ListBox,
     notif_list: gtk4::ListBox,
     bell: gtk4::Button,
-    host: MuxHost,
+    /// Every comux this window hosts: the local one first, then remote ones copad opened
+    /// over SSH (decisions #171), by key.
+    hosts: RefCell<Vec<(String, Rc<MuxHost>)>>,
+    /// The one the visible panes host (the local one when none does).
+    current: RefCell<Rc<MuxHost>>,
     socket: String,
     last_gen: Cell<u64>,
     last_serve: Cell<Option<Instant>>,
@@ -137,6 +142,7 @@ impl ComuxPanel {
         status.set_margin_end(6);
         status.set_visible(false);
 
+        let local = Rc::new(MuxHost::start(Endpoint::local()));
         let this = Rc::new(Self {
             sidebar,
             notifications,
@@ -147,7 +153,8 @@ impl ComuxPanel {
             agents,
             notif_list,
             bell,
-            host: MuxHost::start(Endpoint::local()),
+            hosts: RefCell::new(vec![(String::new(), local.clone())]),
+            current: RefCell::new(local),
             socket: copad_core::paths::gui_socket_path(std::process::id())
                 .display()
                 .to_string(),
@@ -189,7 +196,7 @@ impl ComuxPanel {
                     _ => p.notif_actions.borrow().get(i).cloned().unwrap_or_default(),
                 };
                 for r in reqs {
-                    p.host.command(r);
+                    p.cur().command(r);
                 }
             });
         }
@@ -211,25 +218,76 @@ impl ComuxPanel {
             } else {
                 Vec::new()
             };
+            let local = self.hosts.borrow()[0].1.clone();
             for p in &panels {
-                self.host
-                    .bind(p, &copad_mux_proto::copad_tag(p, &self.socket));
+                local.bind(p, &copad_mux_proto::copad_tag(p, &self.socket));
             }
             if *self.served.borrow() != panels {
-                self.host.serve(&panels);
+                for (_, h) in self.hosts.borrow().iter() {
+                    h.serve(&panels);
+                }
                 *self.served.borrow_mut() = panels;
             }
         }
-        let generation = self.host.generation();
+        // Any host moving is a change; then pick the one the visible panes host.
+        let generation: u64 = self
+            .hosts
+            .borrow()
+            .iter()
+            .map(|(_, h)| h.generation())
+            .sum();
         if generation != self.last_gen.get() {
             self.last_gen.set(generation);
+            let pick = self
+                .hosts
+                .borrow()
+                .iter()
+                .find(|(_, h)| self.hosting(&h.state_json()))
+                .map(|(_, h)| h.clone());
+            let pick = pick.unwrap_or_else(|| self.hosts.borrow()[0].1.clone());
+            *self.current.borrow_mut() = pick;
             self.rebuild();
             self.present_overlay(window);
         }
     }
 
     fn state(&self) -> Value {
-        self.host.state_json()
+        self.cur().state_json()
+    }
+
+    fn cur(&self) -> Rc<MuxHost> {
+        self.current.borrow().clone()
+    }
+
+    /// Prepare a REMOTE comux: start (or reuse) the L0 host for `dest` and mint a tag. Returns
+    /// the host, the tag (bind the panel to it once it exists) and the command the panel runs.
+    pub fn prepare_remote(
+        &self,
+        dest: &str,
+        comux: &str,
+    ) -> Result<(Rc<MuxHost>, String, String), String> {
+        let refused = || format!("refused destination or command: {dest} / {comux}");
+        let key = format!("{dest}|{comux}");
+        let existing = self
+            .hosts
+            .borrow()
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, h)| h.clone());
+        let host = match existing {
+            Some(h) => h,
+            None => {
+                let ep = copad_core::muxhost::remote_endpoint(dest, comux).ok_or_else(refused)?;
+                let h = Rc::new(MuxHost::start(ep));
+                h.serve(&self.served.borrow());
+                self.hosts.borrow_mut().push((key, h.clone()));
+                h
+            }
+        };
+        let tag = copad_core::muxhost::new_remote_tag();
+        let cmd =
+            copad_core::muxhost::remote_attach_command(dest, comux, &tag).ok_or_else(refused)?;
+        Ok((host, tag, cmd))
     }
 
     /// Whether a visible panel runs a comux client whose sidebar we hold.
@@ -287,7 +345,7 @@ impl ComuxPanel {
             let w = Rc::downgrade(self);
             b.connect_clicked(move |_| {
                 if let Some(p) = w.upgrade() {
-                    p.host.command(json!({"cmd": "select-tab", "target": id}));
+                    p.cur().command(json!({"cmd": "select-tab", "target": id}));
                 }
             });
             self.status.append(&b);
@@ -378,7 +436,7 @@ impl ComuxPanel {
             return;
         }
         self.overlay_shown.set(None);
-        self.host.answer(id, choice, text);
+        self.cur().answer(id, choice, text);
         if let Some(w) = self.overlay_window.borrow_mut().take() {
             w.destroy();
         }
@@ -673,4 +731,69 @@ fn overlay_dialog(
     });
     win.present();
     win
+}
+
+thread_local! {
+    /// The window's panel, for socket commands (GTK main thread only).
+    static PANEL: RefCell<Option<Rc<ComuxPanel>>> = const { RefCell::new(None) };
+}
+
+pub fn set_global(p: &Rc<ComuxPanel>) {
+    PANEL.with(|g| *g.borrow_mut() = Some(p.clone()));
+}
+
+/// `comux.open_remote` (decisions #171): a new tab running the remote comux client with a
+/// fresh binding tag, and the L0 link to the same host, so the native chrome follows it.
+pub fn open_remote(
+    mgr: &Rc<TabManager>,
+    window: &gtk4::ApplicationWindow,
+    dest: &str,
+    comux: &str,
+) -> Result<(), String> {
+    let panel = PANEL
+        .with(|g| g.borrow().clone())
+        .ok_or("no comux panel in this window")?;
+    if !copad_core::muxhost::valid_dest(dest) || !copad_core::muxhost::valid_comux(comux) {
+        return Err(format!("refused destination or command: {dest} / {comux}"));
+    }
+    let (host, tag, cmd) = panel.prepare_remote(dest, comux)?;
+    // Handed to the tab as INITIAL input, which the terminal feeds once its shell has spawned —
+    // input written before that can be lost (codex P4 C1).
+    let (term, _) = mgr.add_tab_with_cwd_and_initial_input(window, None, Some(format!("{cmd}\n")));
+    host.bind(term.id(), &tag);
+    Ok(())
+}
+
+/// Ask for the destination, then [`open_remote`].
+pub fn prompt_open_remote(mgr: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
+    let win = gtk4::Window::builder()
+        .transient_for(window)
+        .modal(true)
+        .title("Open Remote comux")
+        .default_width(360)
+        .build();
+    let vb = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    vb.set_margin_top(12);
+    vb.set_margin_bottom(12);
+    vb.set_margin_start(12);
+    vb.set_margin_end(12);
+    vb.append(&heading(
+        "An ~/.ssh/config host or user@host (comux must be installed there)",
+    ));
+    let entry = gtk4::Entry::new();
+    entry.set_placeholder_text(Some("user@host"));
+    vb.append(&entry);
+    win.set_child(Some(&vb));
+    let (m, w2, win2) = (mgr.clone(), window.clone(), win.clone());
+    entry.connect_activate(move |e| {
+        let dest = e.text().trim().to_string();
+        win2.close();
+        if !dest.is_empty()
+            && let Err(err) = open_remote(&m, &w2, &dest, "comux")
+        {
+            log::warn!("comux.open_remote: {err}");
+        }
+    });
+    win.present();
+    entry.grab_focus();
 }

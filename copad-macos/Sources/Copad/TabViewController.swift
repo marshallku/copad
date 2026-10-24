@@ -51,6 +51,8 @@ final class TabViewController: NSViewController {
     private var comuxObservation: AnyCancellable?
     private var comuxServeTimer: Timer?
     private var comuxServed: [String] = []
+    /// What this window's comux chrome shows (the comux its visible panes host).
+    private let comuxWindow = ComuxWindow()
     /// Window-level background image (Phase 10b follow-up). One image
     /// fills the entire `contentArea` so splits share the same
     /// wallpaper instead of each pane duplicating it. Lazily created
@@ -495,7 +497,7 @@ final class TabViewController: NSViewController {
     // MARK: - comux chrome (decisions #169)
 
     private func installComuxChrome() {
-        let host = ComuxHost.shared
+        let host = comuxWindow
         let settle: () -> Void = { [weak self] in self?.settleComuxInput() }
         let sidebar = NSHostingView(rootView: ComuxSidebar(host: host, settle: settle, toggleNotifications: { [weak self] in
             self?.comuxNotificationsOpen.toggle()
@@ -530,7 +532,7 @@ final class TabViewController: NSViewController {
         sidebar.isHidden = true
         notifications.isHidden = true
         status.isHidden = true
-        comuxObservation = host.$state.sink { [weak self] _ in
+        comuxObservation = ComuxHost.shared.$states.sink { [weak self] _ in
             DispatchQueue.main.async { self?.refreshComuxChrome() }
         }
         // Which panes are on screen changes with tab switches, splits and closes; re-reading it
@@ -557,7 +559,8 @@ final class TabViewController: NSViewController {
 
     private func refreshComuxChrome() {
         guard comuxSidebar != nil else { return }
-        let on = ComuxHost.shared.hosts(panels: comuxServed)
+        comuxWindow.update(panels: comuxServed)
+        let on = comuxWindow.state != nil
         comuxSidebar.isHidden = !on
         comuxSidebarWidth.constant = on ? 240 : 0
         let notif = on && comuxNotificationsOpen
@@ -570,7 +573,7 @@ final class TabViewController: NSViewController {
 
     /// Show the oldest overlay a comux client in THIS window's visible panes opened, as a sheet.
     private func presentComuxOverlay() {
-        let host = ComuxHost.shared
+        let host = comuxWindow
         let mine = host.state?.overlays.first { o in o.panel.map(comuxServed.contains) ?? false }
         if let shown = comuxOverlayShown, mine?.overlay != shown {
             // Answered elsewhere, or comux closed it: drop our sheet.
@@ -590,6 +593,19 @@ final class TabViewController: NSViewController {
         })
         comuxOverlaySheet = vc
         presentAsSheet(vc)
+    }
+
+    /// Open a remote comux in a new tab (decisions #171): copad starts the remote client itself
+    /// (`ssh -t`), with a fresh binding tag, and the L0 link to the same host — so the native
+    /// chrome follows a REMOTE comux exactly as it does a local one. Returns an error message.
+    func openRemoteComux(dest: String, comux: String) -> String? {
+        newTab()
+        guard let panel = activePaneManager?.activePane.panelID else { return "no new tab" }
+        guard let cmd = ComuxHost.shared.openRemote(dest: dest, comux: comux, panel: panel) else {
+            return "refused destination or command: \(dest) / \(comux)"
+        }
+        execCommand(cmd)
+        return nil
     }
 
     /// Commit the focused terminal's IME composition before a panel click moves comux's view,

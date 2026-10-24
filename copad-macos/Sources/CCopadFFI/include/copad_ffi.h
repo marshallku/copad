@@ -293,6 +293,12 @@ void copad_muxhost_serve(const MuxHostHandle *h, const char *panels_json);
 /// Free with copad_ffi_free_string.
 char *copad_muxhost_state_json(const MuxHostHandle *h);
 void copad_muxhost_command(const MuxHostHandle *h, const char *req_json);
+/// Remote comux (decisions #171). NULL when dest/comux are refused.
+MuxHostHandle *copad_muxhost_start_remote(const char *dest, const char *comux);
+/// Free with copad_ffi_free_string.
+char *copad_muxhost_new_remote_tag(void);
+/// The command a tab runs to attach the remote comux; NULL when refused. Free with copad_ffi_free_string.
+char *copad_muxhost_remote_attach_command(const char *dest, const char *comux, const char *tag);
 /// Answer a delegated overlay; choice/text NULL when absent (both NULL = cancel).
 void copad_muxhost_answer(const MuxHostHandle *h, unsigned long long overlay, const char *choice, const char *text);
 /// Free with copad_ffi_free_string.

@@ -26,9 +26,18 @@ final class ComuxHost: ObservableObject {
         var overlays: [L0Overlay]
     }
 
-    @Published private(set) var state: State?
-    private var handle: OpaquePointer?
-    private var lastGen: UInt64 = 0
+    /// One comux this app hosts: the local one (key `""`) or a remote one copad opened over SSH
+    /// (key `dest|command`, decisions #171).
+    private final class Link {
+        let handle: OpaquePointer
+        var lastGen: UInt64 = 0
+        init(_ h: OpaquePointer) { handle = h }
+        deinit { copad_muxhost_destroy(handle) }
+    }
+
+    /// Every host's latest state, by key.
+    @Published private(set) var states: [String: State] = [:]
+    private var links: [String: Link] = [:]
     private var timer: Timer?
     /// window id → the terminal panels it shows.
     private var served: [ObjectIdentifier: [String]] = [:]
@@ -38,20 +47,21 @@ final class ComuxHost: ObservableObject {
     let guiSocket = "/tmp/copad-\(ProcessInfo.processInfo.processIdentifier).sock"
 
     private init() {
-        handle = copad_muxhost_start(nil)
+        if let h = copad_muxhost_start(nil) { links[""] = Link(h) }
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.poll() }
         }
     }
 
     private func poll() {
-        guard let h = handle else { return }
-        let gen = copad_muxhost_generation(h)
-        guard gen != lastGen else { return }
-        lastGen = gen
-        guard let p = copad_muxhost_state_json(h) else { return }
-        defer { copad_ffi_free_string(p) }
-        state = try? JSONDecoder().decode(State.self, from: Data(String(cString: p).utf8))
+        for (key, link) in links {
+            let gen = copad_muxhost_generation(link.handle)
+            guard gen != link.lastGen else { continue }
+            link.lastGen = gen
+            guard let p = copad_muxhost_state_json(link.handle) else { continue }
+            defer { copad_ffi_free_string(p) }
+            states[key] = try? JSONDecoder().decode(State.self, from: Data(String(cString: p).utf8))
+        }
     }
 
     /// The binding tag of `panel` (one definition, in Rust).
@@ -63,49 +73,92 @@ final class ComuxHost: ObservableObject {
 
     /// A window now shows `panels` (every terminal split of its visible tab).
     func serve(window: ObjectIdentifier, panels: [String]) {
-        guard let h = handle else { return }
-        for p in panels { copad_muxhost_bind(h, p, tag(for: p)) }
-        served[window] = panels
-        let all = served.values.flatMap { $0 }
-        if let data = try? JSONEncoder().encode(all), let s = String(data: data, encoding: .utf8) {
-            copad_muxhost_serve(h, s)
+        if let local = links[""] {
+            for p in panels { copad_muxhost_bind(local.handle, p, tag(for: p)) }
         }
+        served[window] = panels
+        pushServed()
+    }
+
+    private func pushServed() {
+        let all = served.values.flatMap { $0 }
+        guard let data = try? JSONEncoder().encode(all), let s = String(data: data, encoding: .utf8) else { return }
+        for link in links.values { copad_muxhost_serve(link.handle, s) }
     }
 
     func windowClosed(_ window: ObjectIdentifier) {
         served[window] = nil
-        serve(window: window, panels: [])
-        served[window] = nil
+        pushServed()
     }
 
     func panelClosed(_ panel: String) {
-        guard let h = handle else { return }
-        copad_muxhost_unbind(h, panel)
+        for link in links.values { copad_muxhost_unbind(link.handle, panel) }
     }
 
-    /// Whether this window should draw the native sidebar: one of its shown panels runs a
-    /// comux client whose sidebar we hold.
-    func hosts(panels: [String]) -> Bool {
-        guard let s = state else { return false }
-        return panels.contains { p in s.bound[p].map { s.claimed.contains($0) } ?? false }
+    /// The host whose comux client runs in one of `panels` with its chrome claimed.
+    func key(for panels: [String]) -> String? {
+        states.first { _, s in
+            panels.contains { p in s.bound[p].map { s.claimed.contains($0) } ?? false }
+        }?.key
+    }
+
+    /// Open a REMOTE comux in `panel`: start (or reuse) the L0 host for `dest`, bind the panel
+    /// to a fresh tag, and return the command the panel must run to attach the remote client
+    /// carrying that tag. `nil` = refused destination/command.
+    func openRemote(dest: String, comux: String, panel: String) -> String? {
+        let key = "\(dest)|\(comux)"
+        if links[key] == nil {
+            guard let h = copad_muxhost_start_remote(dest, comux) else { return nil }
+            links[key] = Link(h)
+        }
+        guard let link = links[key], let t = copad_muxhost_new_remote_tag() else { return nil }
+        let tag = String(cString: t)
+        copad_ffi_free_string(t)
+        guard let c = copad_muxhost_remote_attach_command(dest, comux, tag) else { return nil }
+        defer { copad_ffi_free_string(c) }
+        copad_muxhost_bind(link.handle, panel, tag)
+        pushServed()
+        return String(cString: c)
     }
 
     /// Answer a delegated overlay (comux runs the action).
-    func answer(_ overlay: UInt64, choice: String?, text: String?) {
-        guard let h = handle else { return }
-        copad_muxhost_answer(h, overlay, choice, text)
+    func answer(key: String, _ overlay: UInt64, choice: String?, text: String?) {
+        guard let link = links[key] else { return }
+        copad_muxhost_answer(link.handle, overlay, choice, text)
+    }
+
+    func command(key: String, _ req: [String: Any]) {
+        guard let link = links[key], let d = try? JSONSerialization.data(withJSONObject: req),
+              let s = String(data: d, encoding: .utf8) else { return }
+        copad_muxhost_command(link.handle, s)
+    }
+}
+
+/// What ONE window shows: the state of the comux its visible panes host, and the way to talk
+/// to that comux (local or remote).
+@MainActor
+final class ComuxWindow: ObservableObject {
+    @Published private(set) var state: ComuxHost.State?
+    private(set) var key: String?
+
+    func update(panels: [String]) {
+        let host = ComuxHost.shared
+        key = host.key(for: panels)
+        state = key.flatMap { host.states[$0] }
     }
 
     func command(_ req: [String: Any]) {
-        guard let h = handle, let d = try? JSONSerialization.data(withJSONObject: req),
-              let s = String(data: d, encoding: .utf8) else { return }
-        copad_muxhost_command(h, s)
+        if let key { ComuxHost.shared.command(key: key, req) }
+    }
+
+    func answer(_ overlay: UInt64, choice: String?, text: String?) {
+        if let key { ComuxHost.shared.answer(key: key, overlay, choice: choice, text: text) }
     }
 }
 
 /// The left panel: spaces, then every agent with its status and time in it.
 struct ComuxSidebar: View {
-    @ObservedObject var host: ComuxHost
+    @ObservedObject var host: ComuxWindow
     var settle: () -> Void
     var toggleNotifications: () -> Void
 
@@ -177,7 +230,7 @@ struct ComuxSidebar: View {
 
 /// The right panel: the notification center, newest first.
 struct ComuxNotifications: View {
-    @ObservedObject var host: ComuxHost
+    @ObservedObject var host: ComuxWindow
     var settle: () -> Void
 
     var body: some View {
@@ -227,7 +280,7 @@ private func statusColor(_ s: String) -> Color {
 /// session, its tabs, the armed prefix, the outcome line, bells, attention, agents, unread,
 /// usage, update, host — so comux can stop drawing its own.
 struct ComuxStatusStrip: View {
-    @ObservedObject var host: ComuxHost
+    @ObservedObject var host: ComuxWindow
     var settle: () -> Void
 
     var body: some View {
