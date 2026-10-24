@@ -241,10 +241,11 @@ read, one that has run no tools yet, or a format that has moved. Never branch on
 it is a hint for a human scanning a list.
 
 `transcript_path` (with `agent_session_id`) is the file the agent logs its conversation to —
-Claude's `~/.claude/projects/…/<id>.jsonl`, Codex's rollout. Reading it is a better way to follow
-another agent's progress than `capture-pane`, whose bottom rows are the agent's own input box
-and status line. Absent until comux has resolved it; a Codex pane can lag a `/new` by ~30s.
-`agent-log` reads it for you, normalized across both tools:
+Claude's `~/.claude/projects/…/<id>.jsonl`, Codex's rollout, grok's `chat_history.jsonl`, agy's
+`brain/<id>/…/transcript.jsonl`. Reading it is a better way to follow another agent's progress
+than `capture-pane`, whose bottom rows are the agent's own input box and status line. Absent
+until comux has resolved it; a Codex or agy pane can lag a `/new` by ~30s. `agent-log` reads it
+for you, normalized across all four tools (grok records carry no timestamps):
 
 ```bash
 comux agent-log <token> --last 10            # 12:43:01 assistant tool_use Bash: run the tests

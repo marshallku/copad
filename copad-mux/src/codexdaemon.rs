@@ -70,10 +70,21 @@ pub fn session_id(pid: u32) -> Option<String> {
         .iter()
         .map(|p| candidate(p))
         .collect::<Option<_>>()?;
-    let sibling = shares_cwd_with_another_tui(pid, &cwd)?;
     let key = (pid, start);
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     let mem = guard.get_or_insert_with(Memory::default);
+    let argv = procinfo::process_command(pid)?;
+    if let Some(id) = launched_resume(&argv, &candidates, &cwd) {
+        mem.resolved.insert(key, id.clone());
+        return Some(id);
+    }
+    // Launched to resume a thread, and that thread now shares the cwd with another: most likely
+    // this TUI's own `/new`. Whatever was remembered for it — the shortcut's answer, or a unique
+    // answer from before — is the conversation it LEFT, so it is forgotten rather than reported.
+    if resumed_thread_is_shared(&argv, &candidates, &cwd) {
+        mem.resolved.remove(&key);
+    }
+    let sibling = shares_cwd_with_another_tui(pid, &cwd)?;
     // Forget threads the daemon has unloaded, so the set stays bounded.
     mem.tainted
         .retain(|id| candidates.iter().any(|c| &c.id == id));
@@ -92,6 +103,52 @@ pub fn session_id(pid: u32) -> Option<String> {
     }?;
     mem.resolved.insert(key, id.clone());
     Some(id)
+}
+
+/// The rollout file of the conversation [`session_id`] resolves for `pid`, so the activity
+/// poller and `agent-log` can read a daemon-attached TUI's transcript like any other codex's.
+pub fn rollout_path(pid: u32) -> Option<PathBuf> {
+    let id = session_id(pid)?;
+    daemon_rollouts()?
+        .into_iter()
+        .find(|p| crate::agentstate::rollout_session_id(p).as_deref() == Some(id.as_str()))
+}
+
+/// A TUI launched as `codex resume <id>` — how comux restores one — whose thread is the ONE
+/// interactive thread loaded for its cwd is in that conversation, whatever else is true.
+///
+/// Without this, `comux server restart` lost the conversation of every daemon-attached codex it
+/// had just resumed: the old pane's codex is still exiting when the new one starts, so the two
+/// count as siblings, the thread is tainted for the server's lifetime, and an idle resumed
+/// thread was never written since launch anyway. The launch argument is not trusted blindly — a
+/// `/new` inside the TUI loads a second thread here, and then this says nothing and the
+/// correlation below decides as before. Another TUI sharing the thread would be in the same
+/// conversation, so the answer is right for it too.
+fn launched_resume(argv: &[String], candidates: &[Candidate], cwd: &Path) -> Option<String> {
+    let arg = resume_arg(argv)?;
+    let here: Vec<&Candidate> = loaded_here(candidates, cwd).collect();
+    match here[..] {
+        [only] if only.id == arg => Some(only.id.clone()),
+        _ => None,
+    }
+}
+
+/// Launched as `codex resume <id>`, that thread still loaded here, and NOT alone (the lone case
+/// is [`launched_resume`]'s).
+fn resumed_thread_is_shared(argv: &[String], candidates: &[Candidate], cwd: &Path) -> bool {
+    resume_arg(argv).is_some_and(|a| {
+        let here: Vec<&Candidate> = loaded_here(candidates, cwd).collect();
+        here.len() > 1 && here.iter().any(|c| c.id == a)
+    })
+}
+
+/// The `<id>` of a `codex … resume <id>` launch (not past `--`, where it is a prompt).
+fn resume_arg(argv: &[String]) -> Option<&str> {
+    argv.windows(2)
+        .skip(1)
+        .take_while(|w| w[0] != "--")
+        .find(|w| w[0] == "resume" && crate::agentstate::is_session_uuid(&w[1]))
+        .map(|w| w[1].as_str())
 }
 
 /// Interactive threads the daemon holds for `cwd`.
@@ -291,6 +348,43 @@ mod tests {
         // A lone thread untouched since before our launch belongs to a TUI that exited first.
         assert_eq!(
             pick(&cs, Path::new(REPO), at(250), &recall(None, &none())),
+            None
+        );
+    }
+
+    #[test]
+    fn a_tui_comux_resumed_owns_its_thread_while_it_is_the_only_one_here() {
+        let argv = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let resumed = argv(&["/opt/homebrew/bin/codex", "resume", A]);
+        // Idle since before launch (never written) — the case the time filter can't answer.
+        let cs = [cand(A, REPO, 50)];
+        assert_eq!(
+            launched_resume(&resumed, &cs, Path::new(REPO)).as_deref(),
+            Some(A)
+        );
+        assert!(!resumed_thread_is_shared(&resumed, &cs, Path::new(REPO)));
+        // `/new` loaded a second thread here: say nothing, and forget what was remembered —
+        // it is the conversation this TUI left.
+        let cs2 = [cand(A, REPO, 50), cand(B, REPO, 300)];
+        assert_eq!(launched_resume(&resumed, &cs2, Path::new(REPO)), None);
+        assert!(resumed_thread_is_shared(&resumed, &cs2, Path::new(REPO)));
+        assert!(!resumed_thread_is_shared(
+            &argv(&["codex"]),
+            &cs2,
+            Path::new(REPO)
+        ));
+        // The named thread is not loaded for this cwd, or no resume argument at all.
+        assert_eq!(
+            launched_resume(&resumed, &[cand(B, REPO, 50)], Path::new(REPO)),
+            None
+        );
+        assert_eq!(
+            launched_resume(&argv(&["codex"]), &cs, Path::new(REPO)),
+            None
+        );
+        // Past `--` it is a prompt, not a subcommand.
+        assert_eq!(
+            launched_resume(&argv(&["codex", "--", "resume", A]), &cs, Path::new(REPO)),
             None
         );
     }

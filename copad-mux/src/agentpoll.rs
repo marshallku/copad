@@ -12,6 +12,12 @@
 //!   `input.command` / `input.file_path`.
 //! * **Codex** — the rollout file the process holds open, whose `item_completed` events carry
 //!   `CommandExecution` / `Reasoning` / `AgentMessage`.
+//! * **grok** — `$GROK_HOME/active_sessions.json` names the pid's session; its transcript is
+//!   `sessions/<encoded cwd>/<id>/chat_history.jsonl`, whose `assistant` records carry
+//!   `tool_calls[]` with a `name` and JSON-string `arguments`.
+//! * **agy** — the conversation whose presence lock the process holds (a fork, like codex); its
+//!   transcript is `brain/<id>/.system_generated/logs/transcript.jsonl`, whose
+//!   `PLANNER_RESPONSE` steps carry `tool_calls[]` with a `toolSummary`.
 //!
 //! **Why a thread.** `procinfo::open_files` forks `lsof` on macOS and decision #88 forbids
 //! forking on the sweep cadence; Claude's path needs no fork but does need a bounded tail read
@@ -64,6 +70,13 @@ const CLAUDE_TAIL: u64 = 256 * 1024;
 /// Tail budget for a codex rollout. Its records are far smaller.
 const CODEX_TAIL: u64 = 64 * 1024;
 
+/// Tail budget for a grok `chat_history.jsonl`: its `tool_result` records carry whole file
+/// reads, like Claude's.
+const GROK_TAIL: u64 = 256 * 1024;
+
+/// Tail budget for an agy `transcript.jsonl`: one record per step, results included.
+const AGY_TAIL: u64 = 256 * 1024;
+
 /// Longest detail string published. Cut on a CHAR boundary — tool descriptions here are
 /// routinely non-ASCII.
 const MAX_DETAIL: usize = 72;
@@ -104,14 +117,32 @@ pub fn set_wanted(shared: &Shared, wanted: Vec<(u32, String)>) {
 /// The conversation `pid` is in, as `(id, transcript path)`, when its log has been resolved.
 ///
 /// As fresh as the poller's resolution: Claude's is re-checked against its session file every
-/// tick, Codex's every [`SOURCE_RECHECK`], so a Codex pane that just switched conversation can
-/// report the previous one for that long. A Codex TUI attached to the shared app-server daemon
-/// holds no rollout of its own and reports nothing here.
+/// tick, Codex's (and agy's) every [`SOURCE_RECHECK`], so a Codex pane that just switched
+/// conversation can report the previous one for that long. A Codex TUI attached to the shared
+/// app-server daemon reports the daemon-held rollout [`crate::codexdaemon`] correlates to it,
+/// and nothing when that correlation is ambiguous.
 pub fn conversation(shared: &Shared, pid: u32) -> Option<(String, PathBuf)> {
     let path = shared.lock().ok()?.sources.get(&pid).cloned()?;
-    let id = crate::agentstate::rollout_session_id(&path)
-        .or_else(|| path.file_stem()?.to_str().map(str::to_string))?;
-    Some((id, path))
+    Some((transcript_session_id(&path)?, path))
+}
+
+/// The conversation id a transcript path belongs to. Each tool puts it somewhere else — the
+/// trailing uuid of a codex `rollout-<ts>-<uuid>`, Claude's file stem, the session DIRECTORY
+/// for grok (`…/<id>/chat_history.jsonl`) and agy (`brain/<id>/.system_generated/logs/…`) — so
+/// it is the nearest path component that IS a session uuid, never just "the stem".
+fn transcript_session_id(path: &Path) -> Option<String> {
+    if let Some(id) = crate::agentstate::rollout_session_id(path) {
+        return Some(id);
+    }
+    let stem = path.file_stem().and_then(|s| s.to_str());
+    stem.into_iter()
+        .chain(
+            path.ancestors()
+                .skip(1)
+                .filter_map(|a| a.file_name()?.to_str()),
+        )
+        .find(|c| crate::agentstate::is_session_uuid(c))
+        .map(str::to_string)
 }
 
 /// The activity last read for `pid`, if any.
@@ -161,7 +192,7 @@ enum Source {
 /// Whether resolving this tool's source costs a fork. See [`RESOLVE_BUDGET`] and
 /// [`SOURCE_RECHECK`], which both branch on it.
 fn forks(tool: &str) -> bool {
-    tool == "codex"
+    matches!(tool, "codex" | "agy")
 }
 
 pub fn spawn() -> Shared {
@@ -257,7 +288,7 @@ fn sweep(
         // The cheap oracle, for the tool that has one. codex has none, so it is the timer in
         // `want` that decides for it and this stays `false`.
         let changed = !forks(tool)
-            && match claude_source(home, *pid, e.path.as_deref()) {
+            && match cheap_source(home, *pid, tool, e.path.as_deref()) {
                 Source::Unknown | Source::Same => false,
                 Source::Changed => {
                     // A positively different conversation invalidates the reading AT ONCE —
@@ -348,9 +379,89 @@ fn sweep(
 fn resolve_log(home: &Path, pid: u32, tool: &str) -> Option<Option<PathBuf>> {
     match tool {
         "claude" => claude_transcript(home, pid),
-        "codex" => crate::agentstate::codex_rollout_path(pid),
+        "codex" => codex_rollout(pid),
+        "grok" => grok_transcript(pid),
+        "agy" => agy_transcript(home, pid),
         _ => None,
     }
+}
+
+/// The rollout a codex TUI holds open, else — a TUI attached to the shared app-server daemon
+/// holds none — the daemon-held rollout [`crate::codexdaemon`] correlates to it, the same
+/// answer session restore uses.
+fn codex_rollout(pid: u32) -> Option<Option<PathBuf>> {
+    match crate::agentstate::codex_rollout_path(pid)? {
+        Some(own) => Some(Some(own)),
+        None => Some(crate::codexdaemon::rollout_path(pid)),
+    }
+}
+
+/// [`claude_source`] for whichever fork-free tool `tool` is: Claude's session file, or grok's
+/// session registry. Either names the conversation the pid is in NOW (Claude `/clear`, grok
+/// `/new` both mint a new id in place), compared against the id the held path belongs to.
+fn cheap_source(home: &Path, pid: u32, tool: &str, path: Option<&Path>) -> Source {
+    match tool {
+        "claude" => claude_source(home, pid, path),
+        "grok" => match crate::agentstate::grok_session_id(pid) {
+            None => Source::Unknown,
+            Some(id) if path.and_then(transcript_session_id).as_deref() == Some(id.as_str()) => {
+                Source::Same
+            }
+            Some(_) => Source::Changed,
+        },
+        _ => Source::Unknown,
+    }
+}
+
+/// grok's transcript for `pid`. `None` = the registry has no live row for it (cannot observe);
+/// `Some(None)` = it names a session whose transcript is not on disk.
+fn grok_transcript(pid: u32) -> Option<Option<PathBuf>> {
+    let id = crate::agentstate::grok_session_id(pid)?;
+    grok_transcript_in(&crate::agentstate::grok_home_of(pid)?.join("sessions"), &id)
+}
+
+/// `<sessions>/*/<id>/chat_history.jsonl`. The directory level is grok's encoding of the cwd,
+/// which we do not reproduce; it is enumerated instead, with the same rule as
+/// [`claude_transcript`]: an entry we could not read makes the answer "cannot observe", never
+/// a confirmed absence.
+///
+/// `NotADirectory` is an absence like `NotFound`: grok keeps its `session_search.sqlite` index
+/// in the same directory as the per-cwd folders, and `<that file>/<id>/…` fails with ENOTDIR —
+/// which, read as "cannot observe", blanked every grok pane's detail on a real install.
+fn grok_transcript_in(sessions: &Path, id: &str) -> Option<Option<PathBuf>> {
+    for entry in std::fs::read_dir(sessions).ok()? {
+        let candidate = entry.ok()?.path().join(id).join("chat_history.jsonl");
+        match std::fs::metadata(&candidate) {
+            Ok(m) if m.is_file() => return Some(Some(candidate)),
+            Ok(_) => {}
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) => {}
+            Err(_) => return None,
+        }
+    }
+    Some(None)
+}
+
+/// agy's transcript for `pid`, under the conversation [`crate::agentstate::agy_session_id`]
+/// resolves (a fork on macOS — the caller budgets it like codex).
+fn agy_transcript(home: &Path, pid: u32) -> Option<Option<PathBuf>> {
+    let id = crate::agentstate::agy_session_id(pid)?;
+    let path = agy_transcript_path(home, &id);
+    match std::fs::metadata(&path) {
+        Ok(m) if m.is_file() => Some(Some(path)),
+        Ok(_) => Some(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+    }
+}
+
+pub(crate) fn agy_transcript_path(home: &Path, id: &str) -> PathBuf {
+    home.join(".gemini/antigravity-cli/brain")
+        .join(id)
+        .join(".system_generated/logs/transcript.jsonl")
 }
 
 /// Whether the transcript we hold is still the conversation `pid` is in.
@@ -449,6 +560,8 @@ fn read_detail(path: &Path, tool: &str) -> Option<Option<Activity>> {
     let (budget, parse): (u64, fn(&str) -> Option<String>) = match tool {
         "claude" => (CLAUDE_TAIL, claude_line_detail),
         "codex" => (CODEX_TAIL, codex_line_detail),
+        "grok" => (GROK_TAIL, grok_line_detail),
+        "agy" => (AGY_TAIL, agy_line_detail),
         _ => return None,
     };
     let text = tail(path, budget)?;
@@ -538,6 +651,77 @@ fn codex_line_detail(line: &str) -> Option<String> {
     }
 }
 
+/// One grok `chat_history.jsonl` record → `"run_terminal_command: Create empty probe file"`.
+fn grok_line_detail(line: &str) -> Option<String> {
+    if !line.contains("\"tool_calls\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+        return None;
+    }
+    let call = v.get("tool_calls")?.as_array()?.last()?;
+    let name = call.get("name").and_then(|n| n.as_str())?;
+    // `arguments` is a JSON STRING, as in the OpenAI wire format grok mirrors.
+    let args = call
+        .get("arguments")
+        .and_then(|a| a.as_str())
+        .and_then(|a| serde_json::from_str::<serde_json::Value>(a).ok());
+    let hint = args.as_ref().and_then(|a| {
+        [
+            "description",
+            "command",
+            "target_file",
+            "file_path",
+            "pattern",
+            "query",
+        ]
+        .iter()
+        .find_map(|k| a.get(*k).and_then(|x| x.as_str()))
+        .map(clean)
+        .filter(|h| !h.is_empty())
+    });
+    Some(match hint {
+        Some(h) => format!("{name}: {h}"),
+        None => name.to_string(),
+    })
+}
+
+/// One agy `transcript.jsonl` step → `"run_command: Touch approval-probe.txt"`.
+fn agy_line_detail(line: &str) -> Option<String> {
+    if !line.contains("\"tool_calls\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("PLANNER_RESPONSE") {
+        return None;
+    }
+    let call = v.get("tool_calls")?.as_array()?.last()?;
+    let name = call.get("name").and_then(|n| n.as_str())?;
+    let hint = [
+        "toolSummary",
+        "CommandLine",
+        "TargetFile",
+        "AbsolutePath",
+        "Query",
+    ]
+    .iter()
+    .find_map(|k| call.pointer(&format!("/args/{k}")).and_then(agy_arg))
+    .map(|h| clean(&h))
+    .filter(|h| !h.is_empty());
+    Some(match hint {
+        Some(h) => format!("{name}: {h}"),
+        None => name.to_string(),
+    })
+}
+
+/// One agy tool-call argument. agy stores each value JSON-ENCODED inside the string
+/// (`"\"touch x\""`), so decode that layer when it is there and keep the raw text otherwise.
+pub(crate) fn agy_arg(v: &serde_json::Value) -> Option<String> {
+    let raw = v.as_str()?;
+    Some(serde_json::from_str::<String>(raw).unwrap_or_else(|_| raw.to_string()))
+}
+
 /// The human-readable command out of a codex `CommandExecution` item.
 ///
 /// `command` is an ARRAY, not a string — `["/bin/zsh", "-lc", "git status --short"]` — so the
@@ -580,6 +764,79 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grok_and_agy_conversations_are_named_by_their_session_directory() {
+        let grok = Path::new(
+            "/h/.grok/sessions/%2Fp/01a16e02-ad06-7380-97f5-03eb32ae7487/chat_history.jsonl",
+        );
+        let agy = Path::new(
+            "/h/.gemini/antigravity-cli/brain/60cc988c-b6b0-4d35-a98f-b4c6e31e449b/.system_generated/logs/transcript.jsonl",
+        );
+        assert_eq!(
+            transcript_session_id(grok).as_deref(),
+            Some("01a16e02-ad06-7380-97f5-03eb32ae7487")
+        );
+        assert_eq!(
+            transcript_session_id(agy).as_deref(),
+            Some("60cc988c-b6b0-4d35-a98f-b4c6e31e449b")
+        );
+        assert_eq!(
+            transcript_session_id(Path::new("/h/x/chat_history.jsonl")),
+            None
+        );
+    }
+
+    #[test]
+    fn grok_tool_calls_read_as_a_detail() {
+        // Verbatim grok 1.0.70 chat_history.jsonl records, trimmed of model metadata.
+        let call = r#"{"type": "assistant", "content": "I'll create `grok-probe.txt` and confirm when it's done.", "tool_calls": [{"id": "call-cfbf2c5c-905f-4233-a859-78885565fd89-0", "name": "run_terminal_command", "arguments": "{\"command\":\"touch grok-probe.txt\",\"description\":\"Create empty grok-probe.txt file\"}"}], "model_id": "grok-4.7"}"#;
+        assert_eq!(
+            grok_line_detail(call).as_deref(),
+            Some("run_terminal_command: Create empty grok-probe.txt file")
+        );
+        let read = r#"{"type": "assistant", "content": "", "tool_calls": [{"id": "c", "name": "read_file", "arguments": "{\"target_file\":\"/Users/u/SKILL.md\"}"}]}"#;
+        assert_eq!(
+            grok_line_detail(read).as_deref(),
+            Some("read_file: /Users/u/SKILL.md")
+        );
+        let reply = r#"{"type": "assistant", "content": "Done.", "model_id": "grok-4.7"}"#;
+        assert_eq!(grok_line_detail(reply), None);
+        let result = r#"{"type": "tool_result", "tool_call_id": "c", "content": "exit: 0\n"}"#;
+        assert_eq!(grok_line_detail(result), None);
+    }
+
+    #[test]
+    fn agy_tool_calls_read_as_a_detail() {
+        // Verbatim agy 1.4.7 transcript.jsonl step — argument values are JSON-encoded strings.
+        let step = r#"{"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-10-24T13:01:30Z", "input_tokens": 6897, "cache_read_tokens": 0, "output_tokens": 195, "tool_calls": [{"name": "run_command", "args": {"CommandLine": "\"touch approval-probe.txt\"", "WaitMsBeforeAsync": "5000", "toolSummary": "\"Touch approval-probe.txt\""}}]}"#;
+        assert_eq!(
+            agy_line_detail(step).as_deref(),
+            Some("run_command: Touch approval-probe.txt")
+        );
+        let reply = r#"{"step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "content": "done"}"#;
+        assert_eq!(agy_line_detail(reply), None);
+    }
+
+    #[test]
+    fn a_grok_transcript_is_found_under_any_cwd_directory() {
+        let dir = std::env::temp_dir().join(format!("grok-tr-{}", std::process::id()));
+        let id = "01a16e02-ad06-7380-97f5-03eb32ae7487";
+        let want = dir.join("%2Fp%2Fq").join(id).join("chat_history.jsonl");
+        std::fs::create_dir_all(want.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(dir.join("%2Fother")).unwrap();
+        // grok's own search index sits beside the per-cwd directories.
+        std::fs::write(dir.join("session_search.sqlite"), "").unwrap();
+        std::fs::write(&want, "{}\n").unwrap();
+        assert_eq!(grok_transcript_in(&dir, id), Some(Some(want)));
+        assert_eq!(
+            grok_transcript_in(&dir, "01a16e02-ad06-7380-97f5-000000000000"),
+            Some(None),
+            "a listed session with no transcript is an observed absence"
+        );
+        assert_eq!(grok_transcript_in(&dir.join("missing"), id), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_conversation_is_published_with_its_id_whether_or_not_it_has_a_detail() {

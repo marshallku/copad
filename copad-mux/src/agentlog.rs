@@ -47,6 +47,8 @@ pub fn read(path: &Path, tool: &str, last: usize, max_chars: usize) -> Result<Lo
     let parse: fn(&str) -> Vec<Entry> = match tool {
         "claude" => claude_line,
         "codex" => codex_line,
+        "grok" => grok_line,
+        "agy" => agy_line,
         other => return Err(format!("no log reader for '{other}'")),
     };
     let (text, partial) = crate::agentpoll::tail_from(path, TAIL_BUDGET)
@@ -235,6 +237,142 @@ fn codex_line(line: &str) -> Vec<Entry> {
     vec![e]
 }
 
+/// One grok `chat_history.jsonl` record → its entries. grok records carry no timestamps.
+///
+/// Only a user record with `prompt_index` is something the user typed; the rest of the user
+/// role is grok's own injection (`<user_info>`, skill lists, hook feedback marked
+/// `synthetic_reason`).
+fn grok_line(line: &str) -> Vec<Entry> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return Vec::new();
+    };
+    let entry = |role, kind, name: Option<String>, text: String| Entry {
+        ts: None,
+        role,
+        kind,
+        name,
+        text,
+    };
+    let out = match v.get("type").and_then(|t| t.as_str()) {
+        Some("user") if v.get("prompt_index").is_some() => vec![entry(
+            "user",
+            "text",
+            None,
+            crate::agentsessions::grok_user_text(&v),
+        )],
+        Some("assistant") => {
+            let mut out = Vec::new();
+            if let Some(text) = v.get("content").and_then(|c| c.as_str()) {
+                out.push(entry("assistant", "text", None, text.to_string()));
+            }
+            for call in v
+                .get("tool_calls")
+                .and_then(|c| c.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let Some(name) = call.get("name").and_then(|n| n.as_str()) else {
+                    continue;
+                };
+                out.push(entry(
+                    "assistant",
+                    "tool_use",
+                    Some(name.to_string()),
+                    tool_input(call.get("arguments")),
+                ));
+            }
+            out
+        }
+        Some("reasoning") => vec![entry(
+            "assistant",
+            "thinking",
+            None,
+            flatten(v.get("summary").unwrap_or(&serde_json::Value::Null)),
+        )],
+        Some("tool_result") => vec![entry(
+            "tool",
+            "tool_result",
+            None,
+            flatten(v.get("content").unwrap_or(&serde_json::Value::Null)),
+        )],
+        _ => Vec::new(),
+    };
+    out.into_iter()
+        .filter(|e| !e.text.trim().is_empty() || e.kind == "tool_use")
+        .collect()
+}
+
+/// One agy `transcript.jsonl` step → its entries.
+///
+/// `USER_INPUT` wraps what was typed in `<USER_REQUEST>`, followed by agy's own metadata
+/// blocks; `GENERIC` steps from the model are tool results; `SYSTEM_MESSAGE` is agy talking to
+/// the model and is skipped.
+fn agy_line(line: &str) -> Vec<Entry> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return Vec::new();
+    };
+    let ts = v
+        .get("created_at")
+        .and_then(|t| t.as_str())
+        .map(str::to_string);
+    let entry = |role, kind, name: Option<String>, text: String| Entry {
+        ts: ts.clone(),
+        role,
+        kind,
+        name,
+        text,
+    };
+    let content = || {
+        v.get("content")
+            .and_then(|c| c.as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let out = match v.get("type").and_then(|t| t.as_str()) {
+        Some("USER_INPUT") => {
+            let text = content();
+            let typed = match (text.find("<USER_REQUEST>"), text.find("</USER_REQUEST>")) {
+                (Some(a), Some(b)) if b > a => {
+                    text[a + "<USER_REQUEST>".len()..b].trim().to_string()
+                }
+                _ => text,
+            };
+            vec![entry("user", "text", None, typed)]
+        }
+        Some("PLANNER_RESPONSE") => {
+            let mut out = Vec::new();
+            if let Some(t) = v.get("thinking").and_then(|t| t.as_str()) {
+                out.push(entry("assistant", "thinking", None, t.to_string()));
+            }
+            out.push(entry("assistant", "text", None, content()));
+            for call in v
+                .get("tool_calls")
+                .and_then(|c| c.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let Some(name) = call.get("name").and_then(|n| n.as_str()) else {
+                    continue;
+                };
+                let args = call.get("args");
+                let text = ["toolSummary", "CommandLine", "TargetFile", "AbsolutePath"]
+                    .iter()
+                    .find_map(|k| args?.get(*k).and_then(crate::agentpoll::agy_arg))
+                    .unwrap_or_else(|| args.map(|a| a.to_string()).unwrap_or_default());
+                out.push(entry("assistant", "tool_use", Some(name.to_string()), text));
+            }
+            out
+        }
+        Some("GENERIC") if v.get("source").and_then(|s| s.as_str()) == Some("MODEL") => {
+            vec![entry("tool", "tool_result", None, content())]
+        }
+        _ => Vec::new(),
+    };
+    out.into_iter()
+        .filter(|e| !e.text.trim().is_empty() || e.kind == "tool_use")
+        .collect()
+}
+
 /// The context Codex prepends to a thread as user messages.
 fn is_injected(text: &str) -> bool {
     let t = text.trim_start();
@@ -317,6 +455,84 @@ fn cut(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grok_turns_tools_and_results_are_read_and_injections_are_not() {
+        // Verbatim-shaped grok 1.0.70 chat_history.jsonl records (long fields trimmed).
+        let lines = [
+            r#"{"type":"system","content":"You are Grok 4.7"}"#,
+            r#"{"type":"user","content":[{"type":"text","text":"<user_info>\nOS Version: macos\n</user_info>"}]}"#,
+            r#"{"type":"user","content":[{"type":"text","text":"<system-reminder>skills</system-reminder>"}],"synthetic_reason":"skills"}"#,
+            r#"{"type":"user","content":[{"type":"text","text":"<user_query>\nRun the shell command: touch grok-probe.txt   then say done\n</user_query>"}],"prompt_index":0}"#,
+            r#"{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"Simple request."}],"encrypted_content":"x","status":"completed"}"#,
+            r#"{"type":"assistant","content":"I'll create it.","tool_calls":[{"id":"c0","name":"run_terminal_command","arguments":"{\"command\":\"touch grok-probe.txt\",\"description\":\"Create empty grok-probe.txt file\"}"}]}"#,
+            r#"{"type":"tool_result","tool_call_id":"c0","content":"exit: 0\n"}"#,
+            r#"{"type":"assistant","content":"Done.","model_id":"grok-4.7"}"#,
+        ];
+        let got: Vec<Entry> = lines.iter().flat_map(|l| grok_line(l)).collect();
+        let shape: Vec<(&str, &str, Option<&str>, &str)> = got
+            .iter()
+            .map(|e| (e.role, e.kind, e.name.as_deref(), e.text.trim()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (
+                    "user",
+                    "text",
+                    None,
+                    "Run the shell command: touch grok-probe.txt   then say done"
+                ),
+                ("assistant", "thinking", None, "Simple request."),
+                ("assistant", "text", None, "I'll create it."),
+                (
+                    "assistant",
+                    "tool_use",
+                    Some("run_terminal_command"),
+                    "Create empty grok-probe.txt file"
+                ),
+                ("tool", "tool_result", None, "exit: 0"),
+                ("assistant", "text", None, "Done."),
+            ]
+        );
+    }
+
+    #[test]
+    fn agy_steps_are_read_and_system_messages_are_not() {
+        // Verbatim agy 1.4.7 transcript.jsonl steps (long fields trimmed).
+        let lines = [
+            r#"{"step_index": 0, "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE", "created_at": "2026-10-24T13:01:30Z", "content": "<USER_REQUEST>\nRun the shell command: touch approval-probe.txt   then say done\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-10-24T22:01:30+09:00.\n</ADDITIONAL_METADATA>"}"#,
+            r#"{"step_index": 1, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-10-24T13:01:30Z", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "\"touch approval-probe.txt\"", "toolSummary": "\"Touch approval-probe.txt\""}}]}"#,
+            r#"{"step_index": 2, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-10-24T13:01:33Z", "content": "Command exited with code 0."}"#,
+            r#"{"step_index": 5, "source": "SYSTEM", "type": "SYSTEM_MESSAGE", "status": "DONE", "created_at": "2026-10-24T13:02:43Z", "content": "The following is a <SYSTEM_MESSAGE>"}"#,
+            r#"{"step_index": 3, "source": "MODEL", "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-10-24T13:02:08Z", "content": "done"}"#,
+        ];
+        let got: Vec<Entry> = lines.iter().flat_map(|l| agy_line(l)).collect();
+        let shape: Vec<(&str, &str, Option<&str>, &str)> = got
+            .iter()
+            .map(|e| (e.role, e.kind, e.name.as_deref(), e.text.as_str()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                (
+                    "user",
+                    "text",
+                    None,
+                    "Run the shell command: touch approval-probe.txt   then say done"
+                ),
+                (
+                    "assistant",
+                    "tool_use",
+                    Some("run_command"),
+                    "Touch approval-probe.txt"
+                ),
+                ("tool", "tool_result", None, "Command exited with code 0."),
+                ("assistant", "text", None, "done"),
+            ]
+        );
+        assert_eq!(got[0].ts.as_deref(), Some("2026-10-24T13:01:30Z"));
+    }
 
     #[test]
     fn claude_turns_tools_and_results_are_read_and_noise_is_not() {

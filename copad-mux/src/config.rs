@@ -446,7 +446,7 @@ impl Action {
             Popup => "switch session / jump to agent (fuzzy)",
             Redraw => "force a full repaint",
             FocusSidebar => "keyboard-focus the sidebar",
-            ResumePicker => "resume a past Claude/Codex conversation",
+            ResumePicker => "resume a past agent conversation (Claude, Codex, grok, agy)",
             NavBack => "back along the navigation history",
             NavForward => "forward along the navigation history",
             NavLast => "toggle to the previous session / tab",

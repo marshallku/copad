@@ -10375,7 +10375,7 @@ impl App {
             let msg = if self.sessions_shown.is_empty() && self.scan_shown.is_none() {
                 "  scanning ~/.claude and ~/.codex…"
             } else if self.sessions_shown.is_empty() {
-                "  no Claude or Codex transcripts found"
+                "  no Claude, Codex, grok or agy conversations found"
             } else {
                 "  (no match)"
             };
