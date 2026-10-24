@@ -1,5 +1,7 @@
 import AppKit
+import Combine
 import CopadCore
+import SwiftUI
 
 /// Manages multiple tabs, each backed by a PaneManager (split-pane tree).
 /// Panels can be terminals or webviews.
@@ -34,6 +36,16 @@ final class TabViewController: NSViewController {
     /// plugin construction needs. nil-returning name → unavailable placeholder.
     var pluginFactory: ((_ name: String, _ panelName: String?) -> (any CopadPanel)?)?
     private var contentArea: NSView!
+    /// comux's sidebar / notification center, drawn natively while a visible pane of this
+    /// window runs a comux client whose sidebar we claimed (decisions #169). Zero width otherwise.
+    private var comuxSidebar: NSView!
+    private var comuxNotifications: NSView!
+    private var comuxSidebarWidth: NSLayoutConstraint!
+    private var comuxNotificationsWidth: NSLayoutConstraint!
+    private var comuxNotificationsOpen = false
+    private var comuxObservation: AnyCancellable?
+    private var comuxServeTimer: Timer?
+    private var comuxServed: [String] = []
     /// Window-level background image (Phase 10b follow-up). One image
     /// fills the entire `contentArea` so splits share the same
     /// wallpaper instead of each pane duplicating it. Lazily created
@@ -289,6 +301,7 @@ final class TabViewController: NSViewController {
         contentArea = NSView()
         contentArea.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(contentArea)
+        installComuxChrome()
 
         // Tier 4.2 — status bar pinned to either the top or bottom of
         // the root view, depending on `[statusbar] position`. Tab bar
@@ -468,6 +481,83 @@ final class TabViewController: NSViewController {
     deinit {
         for token in globalObservers {
             NotificationCenter.default.removeObserver(token)
+        }
+        comuxServeTimer?.invalidate()
+        let me = ObjectIdentifier(self)
+        Task { @MainActor in ComuxHost.shared.windowClosed(me) }
+    }
+
+    // MARK: - comux chrome (decisions #169)
+
+    private func installComuxChrome() {
+        let host = ComuxHost.shared
+        let settle: () -> Void = { [weak self] in self?.settleComuxInput() }
+        let sidebar = NSHostingView(rootView: ComuxSidebar(host: host, settle: settle, toggleNotifications: { [weak self] in
+            self?.comuxNotificationsOpen.toggle()
+            self?.refreshComuxChrome()
+        }))
+        let notifications = NSHostingView(rootView: ComuxNotifications(host: host, settle: settle))
+        for v in [sidebar, notifications] as [NSView] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            contentArea.addSubview(v)
+        }
+        comuxSidebar = sidebar
+        comuxNotifications = notifications
+        comuxSidebarWidth = sidebar.widthAnchor.constraint(equalToConstant: 0)
+        comuxNotificationsWidth = notifications.widthAnchor.constraint(equalToConstant: 0)
+        NSLayoutConstraint.activate([
+            sidebar.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
+            sidebar.topAnchor.constraint(equalTo: contentArea.topAnchor),
+            sidebar.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
+            comuxSidebarWidth,
+            notifications.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
+            notifications.topAnchor.constraint(equalTo: contentArea.topAnchor),
+            notifications.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
+            comuxNotificationsWidth,
+        ])
+        sidebar.isHidden = true
+        notifications.isHidden = true
+        comuxObservation = host.$state.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.refreshComuxChrome() }
+        }
+        // Which panes are on screen changes with tab switches, splits and closes; re-reading it
+        // once a second is cheaper than threading a hook through every one of those paths.
+        comuxServeTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.reportComuxServed() }
+        }
+    }
+
+    /// The terminal panels this window shows (every split of the visible tab).
+    private var visibleTerminalPanels: [String] {
+        (activePaneManager?.allPanels() ?? [])
+            .filter { $0 is AlacrittyTerminalViewController }
+            .map(\.panelID)
+    }
+
+    private func reportComuxServed() {
+        let panels = view.window?.isVisible == true ? visibleTerminalPanels : []
+        guard panels != comuxServed else { return }
+        comuxServed = panels
+        ComuxHost.shared.serve(window: ObjectIdentifier(self), panels: panels)
+        refreshComuxChrome()
+    }
+
+    private func refreshComuxChrome() {
+        guard comuxSidebar != nil else { return }
+        let on = ComuxHost.shared.hosts(panels: comuxServed)
+        comuxSidebar.isHidden = !on
+        comuxSidebarWidth.constant = on ? 240 : 0
+        let notif = on && comuxNotificationsOpen
+        comuxNotifications.isHidden = !notif
+        comuxNotificationsWidth.constant = notif ? 300 : 0
+    }
+
+    /// Commit the focused terminal's IME composition before a panel click moves comux's view,
+    /// so a half-typed syllable is not delivered to the pane comux switches to.
+    private func settleComuxInput() {
+        if let client = activePaneManager?.activePane.focusTarget as? NSTextInputClient,
+           client.hasMarkedText() {
+            client.unmarkText()
         }
     }
 
@@ -697,8 +787,9 @@ final class TabViewController: NSViewController {
         contentArea.addSubview(manager.containerView)
         NSLayoutConstraint.activate([
             manager.containerView.topAnchor.constraint(equalTo: contentArea.topAnchor),
-            manager.containerView.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
-            manager.containerView.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
+            // Between the comux panels, which are zero-width unless this window hosts a comux.
+            manager.containerView.leadingAnchor.constraint(equalTo: comuxSidebar.trailingAnchor),
+            manager.containerView.trailingAnchor.constraint(equalTo: comuxNotifications.leadingAnchor),
             manager.containerView.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
         ])
 

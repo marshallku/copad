@@ -847,6 +847,25 @@ impl TabManager {
         next_panel.grab_focus();
     }
 
+    /// The terminal panel ids of the tab on screen — every split of it. What the native comux
+    /// sidebar serves (decisions #169).
+    pub fn visible_terminal_ids(&self) -> Vec<String> {
+        let Some(cur) = self.current_tab() else {
+            return Vec::new();
+        };
+        let tabs = self.tabs.borrow();
+        let Some(tab) = tabs.get(cur as usize) else {
+            return Vec::new();
+        };
+        let mut panels = Vec::new();
+        tab.root.borrow().collect_panels(&mut panels);
+        panels
+            .iter()
+            .filter(|p| p.panel_type() == "terminal")
+            .map(|p| p.id().to_string())
+            .collect()
+    }
+
     /// Return info for all panels across all tabs
     pub fn all_panels_info(&self) -> Vec<serde_json::Value> {
         let tabs = self.tabs.borrow();

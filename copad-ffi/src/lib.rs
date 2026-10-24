@@ -1494,6 +1494,149 @@ pub unsafe extern "C" fn copad_ffi_browser_validate_fill(json: *const c_char) ->
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// comux host (decisions #169): the macOS GUI draws comux's sidebar natively. No callback
+// crosses into Swift — the GUI polls `copad_muxhost_generation` and re-reads the state when it
+// moves, so a window closing can never race a call into freed Swift memory.
+// ---------------------------------------------------------------------------------------------
+
+/// Opaque handle to a running [`copad_core::muxhost::MuxHost`].
+pub struct MuxHostHandle(copad_core::muxhost::MuxHost);
+
+/// Borrow a C string as `&str` (`None` for NULL or invalid UTF-8).
+///
+/// # Safety
+/// `p` must be NULL or a valid NUL-terminated string for the duration of the borrow.
+unsafe fn cstr<'a>(p: *const c_char) -> Option<&'a str> {
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: caller contract.
+    unsafe { CStr::from_ptr(p) }.to_str().ok()
+}
+
+fn into_c(s: String) -> *mut c_char {
+    CString::new(s).map_or(ptr::null_mut(), CString::into_raw)
+}
+
+/// Start a host on the LOCAL comux socket (`dest` NULL) or on `ssh -T <dest> comux proxy
+/// --stdio` (P4). Free with `copad_muxhost_destroy`.
+///
+/// # Safety
+/// `dest` must be NULL or a valid NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_start(dest: *const c_char) -> *mut MuxHostHandle {
+    use copad_mux_proto::link::Endpoint;
+    // SAFETY: caller contract.
+    let ep = match unsafe { cstr(dest) } {
+        Some(d) if !d.is_empty() => Endpoint::ssh(d),
+        _ => Endpoint::local(),
+    };
+    Box::into_raw(Box::new(MuxHostHandle(
+        copad_core::muxhost::MuxHost::start(ep),
+    )))
+}
+
+/// # Safety
+/// `h` must come from `copad_muxhost_start` and not be used afterwards.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_destroy(h: *mut MuxHostHandle) {
+    if !h.is_null() {
+        // SAFETY: caller contract.
+        drop(unsafe { Box::from_raw(h) });
+    }
+}
+
+/// Moves whenever anything the GUI could show changed.
+///
+/// # Safety
+/// `h` must be a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_generation(h: *const MuxHostHandle) -> u64 {
+    // SAFETY: caller contract.
+    unsafe { h.as_ref() }.map_or(0, |h| h.0.generation())
+}
+
+/// # Safety
+/// `h` live; `panel`, `tag` valid strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_bind(
+    h: *const MuxHostHandle,
+    panel: *const c_char,
+    tag: *const c_char,
+) {
+    // SAFETY: caller contract.
+    if let (Some(h), Some(p), Some(t)) = (unsafe { h.as_ref() }, unsafe { cstr(panel) }, unsafe {
+        cstr(tag)
+    }) {
+        h.0.bind(p, t);
+    }
+}
+
+/// # Safety
+/// `h` live; `panel` a valid string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_unbind(h: *const MuxHostHandle, panel: *const c_char) {
+    // SAFETY: caller contract.
+    if let (Some(h), Some(p)) = (unsafe { h.as_ref() }, unsafe { cstr(panel) }) {
+        h.0.unbind(p);
+    }
+}
+
+/// The panels on screen, as a JSON array of panel ids.
+///
+/// # Safety
+/// `h` live; `panels_json` a valid string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_serve(h: *const MuxHostHandle, panels_json: *const c_char) {
+    // SAFETY: caller contract.
+    if let (Some(h), Some(j)) = (unsafe { h.as_ref() }, unsafe { cstr(panels_json) })
+        && let Ok(panels) = serde_json::from_str::<Vec<String>>(j)
+    {
+        h.0.serve(&panels);
+    }
+}
+
+/// The state as JSON (see `MuxHost::state_json`). Free with `copad_ffi_free_string`.
+///
+/// # Safety
+/// `h` live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_state_json(h: *const MuxHostHandle) -> *mut c_char {
+    // SAFETY: caller contract.
+    unsafe { h.as_ref() }.map_or(ptr::null_mut(), |h| into_c(h.0.state_json().to_string()))
+}
+
+/// Run a comux control request (`{"cmd":…}` JSON).
+///
+/// # Safety
+/// `h` live; `req_json` a valid string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_command(h: *const MuxHostHandle, req_json: *const c_char) {
+    // SAFETY: caller contract.
+    if let (Some(h), Some(j)) = (unsafe { h.as_ref() }, unsafe { cstr(req_json) })
+        && let Ok(v) = serde_json::from_str(j)
+    {
+        h.0.command(v);
+    }
+}
+
+/// The binding tag a comux client in this panel reports. Free with `copad_ffi_free_string`.
+///
+/// # Safety
+/// Both arguments valid strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_copad_tag(
+    panel: *const c_char,
+    socket: *const c_char,
+) -> *mut c_char {
+    // SAFETY: caller contract.
+    match (unsafe { cstr(panel) }, unsafe { cstr(socket) }) {
+        (Some(p), Some(s)) => into_c(copad_mux_proto::copad_tag(p, s)),
+        _ => ptr::null_mut(),
+    }
+}
+
 #[cfg(test)]
 mod browser_ffi_tests {
     use super::*;

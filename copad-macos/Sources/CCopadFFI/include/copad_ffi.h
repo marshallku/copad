@@ -280,6 +280,22 @@ char *copad_ffi_browser_credentials_remove(const char *json);
 /// SAME synchronous step that performs the injection.
 char *copad_ffi_browser_validate_fill(const char *json);
 
+// --- comux host (decisions #169) ---------------------------------------------------------
+typedef struct MuxHostHandle MuxHostHandle;
+/// dest NULL/"" = the local comux socket; else `ssh -T <dest> comux proxy --stdio`.
+MuxHostHandle *copad_muxhost_start(const char *dest);
+void copad_muxhost_destroy(MuxHostHandle *h);
+unsigned long long copad_muxhost_generation(const MuxHostHandle *h);
+void copad_muxhost_bind(const MuxHostHandle *h, const char *panel, const char *tag);
+void copad_muxhost_unbind(const MuxHostHandle *h, const char *panel);
+/// JSON array of the panel ids on screen.
+void copad_muxhost_serve(const MuxHostHandle *h, const char *panels_json);
+/// Free with copad_ffi_free_string.
+char *copad_muxhost_state_json(const MuxHostHandle *h);
+void copad_muxhost_command(const MuxHostHandle *h, const char *req_json);
+/// Free with copad_ffi_free_string.
+char *copad_muxhost_copad_tag(const char *panel, const char *socket);
+
 #ifdef __cplusplus
 }
 #endif

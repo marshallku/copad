@@ -3,6 +3,7 @@ mod background;
 mod browser;
 mod cockpit_panel;
 mod command_palette;
+mod comux_panel;
 mod daemon_forward;
 mod gui_client;
 mod kitty_keys;

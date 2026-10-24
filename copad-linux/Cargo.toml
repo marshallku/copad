@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 copad-core = { path = "../copad-core" }
+# comux L0 host API (decisions #169).
+copad-mux-proto = { path = "../copad-mux-proto" }
 copad-keys = { path = "../copad-keys" }
 copad-daemon = { path = "../copad-daemon" }
 gtk4 = { version = "0.9", features = ["gnome_46"] }

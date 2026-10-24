@@ -17,3 +17,5 @@ thiserror = "2"
 log = "0.4"
 libc = "0.2"
 crossbeam-channel = "0.5"
+# comux L0 host API (decisions #166/#169): the GUIs draw comux's sidebar natively.
+copad-mux-proto = { path = "../copad-mux-proto" }

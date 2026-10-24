@@ -777,6 +777,7 @@ dependencies = [
 name = "copad-core"
 version = "1.2.2"
 dependencies = [
+ "copad-mux-proto",
  "crossbeam-channel",
  "dirs 6.0.0",
  "libc",
@@ -812,6 +813,7 @@ name = "copad-ffi"
 version = "1.2.2"
 dependencies = [
  "copad-core",
+ "copad-mux-proto",
  "serde_json",
 ]
 
@@ -826,6 +828,7 @@ dependencies = [
  "copad-core",
  "copad-daemon",
  "copad-keys",
+ "copad-mux-proto",
  "dirs 6.0.0",
  "env_logger",
  "gtk4",
