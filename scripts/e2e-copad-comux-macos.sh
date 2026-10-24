@@ -28,10 +28,25 @@ scripts/codesign-dev.sh "$APP" >/dev/null 2>&1 || true
 W="$(mktemp -d /tmp/cmc.XXXX)"
 APP_PID=""
 CAF=""
+# The dev instance shares the real Copad's session file: put it back afterwards.
+SESSION="$HOME/Library/Application Support/copad/session.json"
+SESSION_BAK="$(mktemp /tmp/copad-session.XXXX)"
+SESSION_EXISTED=""
+if [[ -f "$SESSION" ]]; then SESSION_EXISTED=1; cp "$SESSION" "$SESSION_BAK"; fi
+DEV_PID="" # the dev instance's pid, kept until it has really exited
 cleanup() {
     [[ -n "$APP_PID" ]] && kill "$APP_PID" 2>/dev/null || true
     [[ -n "$CAF" ]] && kill "$CAF" 2>/dev/null || true
     COPAD_MUX_SOCK="$W/s" "$COMUX" kill-server >/dev/null 2>&1 || true
+    # Only after the app has EXITED (it saves its session on the way out).
+    if [[ -n "$DEV_PID" ]]; then
+        kill "$DEV_PID" 2>/dev/null || true
+        for _ in $(seq 1 100); do kill -0 "$DEV_PID" 2>/dev/null || break; sleep 0.1; done
+        kill -9 "$DEV_PID" 2>/dev/null || true
+        for _ in $(seq 1 50); do kill -0 "$DEV_PID" 2>/dev/null || break; sleep 0.1; done
+    fi
+    if [[ -n "$SESSION_EXISTED" ]]; then cp "$SESSION_BAK" "$SESSION"; else rm -f "$SESSION"; fi
+    rm -f "$SESSION_BAK"
     [[ "${KEEP:-}" == 1 ]] && { log "kept $W"; return 0; }
     rm -rf "$W"
 }
@@ -66,6 +81,7 @@ open -n --env COPAD_MUX_SOCK="$COPAD_MUX_SOCK" --env COPAD_MUX_STATE="$COPAD_MUX
     --env XDG_CONFIG_HOME="$XDG_CONFIG_HOME" "$APP"
 for _ in $(seq 1 100); do
     APP_PID="$(comm -13 <(echo "$before" | sort) <(pgrep -x Copad | sort) | head -1)"
+    [[ -n "$APP_PID" ]] && DEV_PID="$APP_PID" # kept as soon as it exists
     [[ -n "$APP_PID" && -S "/tmp/copad-$APP_PID.sock" ]] && break
     sleep 0.1
 done
