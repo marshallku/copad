@@ -15,6 +15,14 @@
 //!   `session_meta` record with `session_id` / `cwd` / `originator`; the first user prompt is
 //!   much deeper (a multi-KB developer preamble precedes it).
 //!
+//! - grok: `$GROK_HOME/sessions/<percent-encoded cwd>/<uuid>/summary.json` carries `info.cwd`
+//!   and a `generated_title`; when the title is missing the first `prompt_index` user record
+//!   of the sibling `chat_history.jsonl` (its `<user_query>` unwrapped) stands in.
+//! - agy: `~/.gemini/antigravity-cli/conversation_summaries.db`, a SQLite table agy keeps for its
+//!   own picker (title, workspace URIs, last-modified time). Read through the system `sqlite3`
+//!   binary rather than a linked SQLite (see [`agy_entries`]); sub-agent conversations
+//!   (`nesting_depth > 0`) are not resumable on their own and are skipped.
+//!
 //! `~/.claude/history.jsonl` looks like a cheaper index and is NOT used: on the owner's
 //! machine only 59 of its 223 session ids still have a transcript, and 638 transcripts are
 //! absent from it entirely — it is a prompt log with its own retention, not a session index.
@@ -154,6 +162,13 @@ pub fn spawn_scan(out: Shared, req: u64, home: PathBuf, deep: bool) {
 pub fn scan(home: &Path, deep: bool) -> Vec<Entry> {
     let mut found: Vec<(Tool, PathBuf, String, SystemTime)> = claude_files(home);
     found.extend(codex_files(home));
+    found.extend(grok_files(&grok_root(home)));
+    // agy's index already holds everything a row needs, so its rows arrive parsed.
+    let mut agy: std::collections::HashMap<String, Meta> = std::collections::HashMap::new();
+    for (id, mtime, meta) in agy_entries(home) {
+        found.push((Tool::Agy, PathBuf::new(), id.clone(), mtime));
+        agy.insert(id, meta);
+    }
     // Sort BEFORE truncating so the cap drops the oldest, and parse in the same order so the
     // read budget is spent on the transcripts the user is most likely looking for.
     found.sort_by_key(|f| std::cmp::Reverse(f.3));
@@ -169,7 +184,8 @@ pub fn scan(home: &Path, deep: bool) -> Vec<Entry> {
             let meta = match tool {
                 Tool::Claude => parse_claude(&path, &mut budget, deep),
                 Tool::Codex => parse_codex(&path, &mut budget, deep),
-                Tool::Agy | Tool::Grok => Meta::default(),
+                Tool::Grok => parse_grok(&path, &mut budget),
+                Tool::Agy => agy.remove(&id).unwrap_or_default(),
             };
             Entry {
                 tool,
@@ -355,6 +371,288 @@ fn codex_files(home: &Path) -> Vec<(Tool, PathBuf, String, SystemTime)> {
         }
     }
     out
+}
+
+/// grok's data directory for the scan: `$GROK_HOME` (what the server, and so a resumed grok,
+/// would use), else `<home>/.grok`.
+fn grok_root(home: &Path) -> PathBuf {
+    std::env::var_os("GROK_HOME")
+        .filter(|h| !h.is_empty())
+        .map_or_else(|| home.join(".grok"), PathBuf::from)
+}
+
+/// `<grok>/sessions/<encoded cwd>/<uuid>/summary.json` — two directory levels, walked with the
+/// same no-symlink, visit-budgeted rules as the other tools.
+fn grok_files(root: &Path) -> Vec<(Tool, PathBuf, String, SystemTime)> {
+    let mut out = Vec::new();
+    let mut visits = 0usize;
+    let Ok(cwds) = std::fs::read_dir(root.join("sessions")) else {
+        return out;
+    };
+    for cwd in cwds {
+        visits += 1;
+        if out.len() >= MAX_FILES || visits >= MAX_VISITS {
+            break;
+        }
+        let Ok(cwd) = cwd else { continue };
+        let path = cwd.path();
+        if !std::fs::symlink_metadata(&path).is_ok_and(|md| md.is_dir()) {
+            continue;
+        }
+        let Ok(sessions) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for session in sessions {
+            visits += 1;
+            if out.len() >= MAX_FILES || visits >= MAX_VISITS {
+                break;
+            }
+            let Ok(session) = session else { continue };
+            let dir = session.path();
+            let Some(id) = dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|n| crate::agentstate::is_session_uuid(n))
+                .map(str::to_string)
+            else {
+                continue; // `prompt_history.jsonl` and friends live beside the session dirs
+            };
+            if !std::fs::symlink_metadata(&dir).is_ok_and(|md| md.is_dir()) {
+                continue;
+            }
+            let summary = dir.join("summary.json");
+            let Some(mtime) = regular_file_mtime(&summary) else {
+                continue;
+            };
+            out.push((Tool::Grok, summary, id, mtime));
+        }
+    }
+    out
+}
+
+/// grok `summary.json` → cwd + title; the first typed prompt from `chat_history.jsonl` when
+/// grok has not generated a title yet. grok writes no headless marker we have seen, so every
+/// session counts as interactive (the denylist rule: unknown stays visible).
+fn parse_grok(path: &Path, budget: &mut Budget) -> Meta {
+    let mut meta = Meta::default();
+    let grant = budget.allow();
+    let want_title = grant.want_title;
+    let summary: String = match bounded_lines(path, &grant, budget) {
+        Some(lines) => lines.collect::<Vec<_>>().join("\n"),
+        None => return meta,
+    };
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&summary) {
+        meta.cwd = v
+            .pointer("/info/cwd")
+            .and_then(|c| c.as_str())
+            .filter(|c| !c.is_empty())
+            .map(PathBuf::from);
+        meta.title = ["generated_title", "session_summary"]
+            .iter()
+            .filter_map(|k| v.get(*k).and_then(|t| t.as_str()))
+            .map(clean_title)
+            .find(|t| !t.is_empty())
+            .unwrap_or_default();
+    }
+    if !meta.title.is_empty() || !want_title {
+        return meta;
+    }
+    let history = path.with_file_name("chat_history.jsonl");
+    let grant = budget.allow();
+    let Some(lines) = bounded_lines(&history, &grant, budget) else {
+        return meta;
+    };
+    for line in lines {
+        // A typed prompt carries `prompt_index`; injected context (`synthetic_reason`) and the
+        // `<user_info>` preamble do not. Cheap pre-filter before the parse — the system record
+        // that opens the file is the whole system prompt.
+        if !line.contains("\"prompt_index\"") {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("user") {
+            continue;
+        }
+        let text = grok_user_text(&v);
+        if let Some(title) = prompt_title(&text) {
+            meta.title = title;
+            break;
+        }
+    }
+    meta
+}
+
+/// A grok user record's typed text: its `content[].text`, with the `<user_query>` wrapper grok
+/// puts around what the user typed removed.
+pub(crate) fn grok_user_text(v: &serde_json::Value) -> String {
+    let text = v
+        .get("content")
+        .and_then(|c| c.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|i| i.get("text").and_then(|t| t.as_str()))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    tag_value(&text, "user_query").unwrap_or(text)
+}
+
+/// Rows read from agy's index at most. The query also sorts newest first, so this keeps the
+/// newest conversations.
+const AGY_MAX_ROWS: usize = MAX_ENTRIES;
+/// Bytes of `sqlite3` output accepted. A row is a uuid, a title, a URI list and a time.
+const AGY_MAX_OUTPUT: u64 = 8 * 1024 * 1024;
+/// How long the `sqlite3` child may run before it is killed.
+const AGY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// agy's conversations out of its own SQLite index, newest first.
+///
+/// Through the system `sqlite3` binary on purpose: linking SQLite would put a C library in a
+/// binary that installs standalone for one optional reader, and this already runs on the scan
+/// thread, which exists to absorb I/O. The child is bounded like every other read here — capped
+/// output, a deadline after which it is killed AND reaped, arguments passed directly (no
+/// shell), stderr discarded. Missing `sqlite3` or any failure → no agy rows, nothing worse.
+///
+/// Opened `mode=ro`, never writable: a read-write connection that turned out to be the last one
+/// could checkpoint agy's WAL on close. `mode=ro` cannot open a WAL database whose `-shm` is
+/// absent (agy not running), and `immutable=1` is exactly right then — there is no WAL to miss.
+fn agy_entries(home: &Path) -> Vec<(String, SystemTime, Meta)> {
+    let db = home
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("conversation_summaries.db");
+    if regular_file_mtime(&db).is_none() {
+        return Vec::new();
+    }
+    let query = format!(
+        "SELECT conversation_id AS id, title, workspace_uris AS ws,          CAST(strftime('%s', last_modified_time) AS INTEGER) AS mtime          FROM conversation_summaries WHERE nesting_depth = 0          ORDER BY last_modified_time DESC LIMIT {AGY_MAX_ROWS}"
+    );
+    let db = uri_path(&db);
+    ["mode=ro", "immutable=1"]
+        .iter()
+        .find_map(|mode| sqlite_json(&format!("file:{db}?{mode}"), &query))
+        .map(|rows| parse_agy_rows(&rows))
+        .unwrap_or_default()
+}
+
+/// `path` percent-encoded for a `file:` URI: a home directory containing `?`, `#` or `%` would
+/// otherwise be read as URI syntax and open some other file (or none).
+fn uri_path(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = String::new();
+    for &b in path.as_os_str().as_bytes() {
+        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Run one `sqlite3 -json` query, bounded. `None` on any failure, including a nonzero exit.
+fn sqlite_json(uri: &str, query: &str) -> Option<String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new("sqlite3")
+        .args(["-json", uri, query])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    // Drained on its own thread so a child that fills the pipe can't stall the deadline loop.
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.take(AGY_MAX_OUTPUT).read_to_end(&mut buf);
+        buf
+    });
+    let deadline = std::time::Instant::now() + AGY_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let out = reader.join().ok()?;
+    (status?.success() && (out.len() as u64) < AGY_MAX_OUTPUT)
+        .then(|| String::from_utf8_lossy(&out).into_owned())
+}
+
+/// `sqlite3 -json` output → rows. An empty result prints NOTHING (not `[]`), which is an
+/// empty list, not a failure.
+fn parse_agy_rows(json: &str) -> Vec<(String, SystemTime, Meta)> {
+    if json.trim().is_empty() {
+        return Vec::new();
+    }
+    let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(json) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|r| {
+            let id = r.get("id")?.as_str()?;
+            if !crate::agentstate::is_session_uuid(id) {
+                return None;
+            }
+            let secs = u64::try_from(r.get("mtime")?.as_i64()?).ok()?;
+            let cwd = r
+                .get("ws")
+                .and_then(|w| w.as_str())
+                .and_then(|w| serde_json::from_str::<Vec<String>>(w).ok())
+                .and_then(|uris| uris.into_iter().find_map(|u| file_uri_path(&u)));
+            let title = r
+                .get("title")
+                .and_then(|t| t.as_str())
+                .map(clean_title)
+                .unwrap_or_default();
+            Some((
+                id.to_string(),
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                Meta {
+                    cwd,
+                    title,
+                    headless: false,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// `file:///a/b%20c` → `/a/b c`. `None` for any other scheme or a non-UTF-8 decode.
+fn file_uri_path(uri: &str) -> Option<PathBuf> {
+    let raw = uri.strip_prefix("file://")?;
+    if !raw.starts_with('/') {
+        return None;
+    }
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Some(b) = std::str::from_utf8(&bytes[i + 1..i + 3])
+                .ok()
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(b);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok().map(PathBuf::from)
 }
 
 /// The conversation id from a transcript filename: the stem with `prefix` stripped, and for
@@ -904,6 +1202,144 @@ mod tests {
         assert_eq!(e.len(), 2);
         assert_eq!(e[0].id, CID, "newest transcript first");
         assert_eq!(e[1].id, a);
+    }
+
+    const GID: &str = "01a16e02-ad06-7380-97f5-03eb32ae7487";
+
+    #[test]
+    fn grok_sessions_list_with_their_title_and_cwd() {
+        let home = tmpdir("grok");
+        let dir = home.join(format!(".grok/sessions/%2Fp%2Fq/{GID}"));
+        // Verbatim-shaped summary.json (grok 1.0.70), trimmed.
+        write(
+            &dir.join("summary.json"),
+            &format!(
+                r#"{{"info":{{"id":"{GID}","cwd":"/p/q"}},"session_summary":"","generated_title":"Touch grok-probe then choose red or blue","num_messages":36}}"#
+            ),
+        );
+        // Not a session dir: lives beside them.
+        write(
+            &home.join(".grok/sessions/%2Fp%2Fq/prompt_history.jsonl"),
+            "{}\n",
+        );
+        let e = scan(&home, false);
+        assert_eq!(e.len(), 1);
+        assert_eq!(e[0].tool, Tool::Grok);
+        assert_eq!(e[0].id, GID);
+        assert_eq!(e[0].cwd.as_deref(), Some(Path::new("/p/q")));
+        assert_eq!(e[0].title, "Touch grok-probe then choose red or blue");
+        assert!(!e[0].headless);
+        assert_eq!(resume_argv(Tool::Grok, GID), ["grok", "--resume", GID]);
+    }
+
+    #[test]
+    fn an_untitled_grok_session_is_titled_by_its_first_typed_prompt() {
+        let home = tmpdir("grok-untitled");
+        let dir = home.join(format!(".grok/sessions/%2Fp/{GID}"));
+        write(
+            &dir.join("summary.json"),
+            &format!(r#"{{"info":{{"id":"{GID}","cwd":"/p"}},"session_summary":""}}"#),
+        );
+        // chat_history.jsonl record shapes as grok writes them: the injected preamble and
+        // synthetic reminders carry no `prompt_index`; the typed prompt is wrapped.
+        write(
+            &dir.join("chat_history.jsonl"),
+            concat!(
+                r#"{"type":"system","content":"You are Grok"}"#,
+                "\n",
+                r#"{"type":"user","content":[{"type":"text","text":"<user_info>\nOS Version: macos\n</user_info>"}]}"#,
+                "\n",
+                r#"{"type":"user","content":[{"type":"text","text":"<system-reminder>skills</system-reminder>"}],"synthetic_reason":"x"}"#,
+                "\n",
+                r#"{"type":"user","content":[{"type":"text","text":"<user_query>\nRun the shell command: touch grok-probe.txt\n</user_query>"}],"prompt_index":0}"#,
+                "\n",
+            ),
+        );
+        let e = scan(&home, false);
+        assert_eq!(e[0].title, "Run the shell command: touch grok-probe.txt");
+    }
+
+    #[test]
+    fn a_db_path_is_percent_encoded_into_its_uri() {
+        assert_eq!(
+            uri_path(Path::new("/Users/a b/x?y#z%1.db")),
+            "/Users/a%20b/x%3Fy%23z%251.db"
+        );
+        assert_eq!(
+            file_uri_path(&format!("file://{}", uri_path(Path::new("/a?b%c")))),
+            Some(PathBuf::from("/a?b%c"))
+        );
+    }
+
+    #[test]
+    fn agy_rows_parse_out_of_sqlite_json() {
+        // `sqlite3 -json` output shape for the picker query.
+        let json = format!(
+            r#"[{{"id":"{CID}","title":"Executing Shell Command File Creation","ws":"[\"file:///private/tmp/a%20b\"]","mtime":1792846986}},
+{{"id":"not-a-uuid","title":"x","ws":"[]","mtime":1}},
+{{"id":"{GID}","title":"","ws":"[\"https://example.com\"]","mtime":5}}]"#
+        );
+        let rows = parse_agy_rows(&json);
+        assert_eq!(rows.len(), 2, "a non-uuid id is dropped");
+        assert_eq!(rows[0].0, CID);
+        assert_eq!(
+            rows[0].2.cwd.as_deref(),
+            Some(Path::new("/private/tmp/a b"))
+        );
+        assert_eq!(rows[0].2.title, "Executing Shell Command File Creation");
+        assert_eq!(rows[1].2.cwd, None, "only file:// workspaces are a cwd");
+        assert!(
+            parse_agy_rows("").is_empty(),
+            "an empty result prints nothing"
+        );
+        assert!(parse_agy_rows("garbage").is_empty());
+        assert_eq!(resume_argv(Tool::Agy, CID), ["agy", "--conversation", CID]);
+    }
+
+    /// End to end through the real `sqlite3` binary, against a WAL database like agy's with no
+    /// `-shm` beside it (agy closed) — the case `mode=ro` cannot open and `immutable=1` must.
+    /// Skipped where `sqlite3` is not installed, which is exactly the case that yields no rows.
+    #[test]
+    fn agy_index_is_read_through_sqlite3_without_writing_it() {
+        // URI metacharacters in the home path must survive into the `file:` URI.
+        let home = tmpdir("agy").join("odd ?#%41 home");
+        let dir = home.join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("conversation_summaries.db");
+        let sql = format!(
+            "PRAGMA journal_mode=WAL; \
+             CREATE TABLE conversation_summaries (conversation_id text, title text, \
+             last_modified_time datetime, workspace_uris text, nesting_depth integer); \
+             INSERT INTO conversation_summaries VALUES \
+             ('{CID}', 'Top level', '2026-10-24 13:03:06.951966+00:00', '[\"file:///w\"]', 0), \
+             ('{GID}', '', '2026-10-24 13:04:00+00:00', '[\"file:///w\"]', 1);"
+        );
+        let Ok(st) = std::process::Command::new("sqlite3")
+            .arg(&db)
+            .arg(&sql)
+            .stdout(std::process::Stdio::null())
+            .status()
+        else {
+            return; // no sqlite3 on this machine
+        };
+        assert!(st.success());
+        let before = std::fs::read(&db).unwrap();
+        let rows = agy_entries(&home);
+        assert_eq!(rows.len(), 1, "a sub-agent conversation is not listed");
+        assert_eq!(rows[0].0, CID);
+        assert_eq!(rows[0].2.cwd.as_deref(), Some(Path::new("/w")));
+        assert_eq!(
+            rows[0].1,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_792_846_986)
+        );
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            before,
+            "the index is never written"
+        );
+        let e = scan(&home, false);
+        assert_eq!(e.len(), 1);
+        assert_eq!((e[0].tool, e[0].title.as_str()), (Tool::Agy, "Top level"));
     }
 
     #[test]

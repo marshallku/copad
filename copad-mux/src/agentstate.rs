@@ -421,23 +421,62 @@ pub fn agent_session_id(comm: &str, pid: u32) -> Option<String> {
 /// any sub-agent conversation it touches, so the lock is the identity). Costs a fork on macOS
 /// (`lsof`), like codex.
 pub fn agy_session_id(pid: u32) -> Option<String> {
-    agy_presence_id(&crate::procinfo::open_files(pid)?)
+    let open = crate::procinfo::open_files(pid)?;
+    agy_live_id(&open, || crate::procinfo::process_command(pid))
 }
 
-/// The conversation id among `open`'s presence locks — only when there is exactly ONE. Two
-/// distinct locks mean we cannot tell which conversation is the foreground one, and guessing
-/// would resume (or fork) the wrong conversation; no answer restores a fresh agy instead.
-fn agy_presence_id(open: &[std::path::PathBuf]) -> Option<String> {
-    let mut ids = open.iter().filter_map(|p| {
-        let dir = p.parent()?;
-        if dir.file_name()? != "presence" || dir.parent()?.file_name()? != "antigravity-cli" {
-            return None;
-        }
-        let id = p.file_name()?.to_str()?.strip_suffix(".lock")?;
-        is_session_uuid(id).then(|| id.to_string())
-    });
-    let first = ids.next()?;
-    ids.all(|id| id == first).then_some(first)
+/// The presence lock decides; with NO lock, the process's own `--conversation <id>`.
+///
+/// agy takes the lock when a turn starts, not at launch, so an agy just restored with
+/// `--conversation <id>` holds none until its first message — and without the fallback the
+/// very conversation comux resumed would read as unknown (no live marker in the picker, fork
+/// refused). Using the launch argument then is safe: any NEWER conversation in that process
+/// would have run a turn, and so taken a lock. Several distinct locks stay ambiguous → `None`:
+/// guessing would resume (or fork) the wrong conversation.
+fn agy_live_id(
+    open: &[std::path::PathBuf],
+    argv: impl FnOnce() -> Option<Vec<String>>,
+) -> Option<String> {
+    match agy_presence_ids(open).as_slice() {
+        [one] => Some(one.clone()),
+        [] => conversation_arg(&argv()?),
+        _ => None,
+    }
+}
+
+/// `--conversation <id>` / `--conversation=<id>` in an agy argv, validated.
+fn conversation_arg(argv: &[String]) -> Option<String> {
+    let mut it = argv.iter().skip(1);
+    while let Some(a) = it.next() {
+        let id = match a.strip_prefix("--conversation") {
+            Some("") => it.next()?.as_str(),
+            Some(rest) => match rest.strip_prefix('=') {
+                Some(v) => v,
+                None => continue,
+            },
+            None => continue,
+        };
+        return is_session_uuid(id).then(|| id.to_string());
+    }
+    None
+}
+
+/// The distinct conversation ids among `open`'s presence locks.
+fn agy_presence_ids(open: &[std::path::PathBuf]) -> Vec<String> {
+    let mut ids: Vec<String> = open
+        .iter()
+        .filter_map(|p| {
+            let dir = p.parent()?;
+            if dir.file_name()? != "presence" || dir.parent()?.file_name()? != "antigravity-cli" {
+                return None;
+            }
+            let id = p.file_name()?.to_str()?.strip_suffix(".lock")?;
+            is_session_uuid(id).then(|| id.to_string())
+        })
+        .collect();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 /// grok's data directory: `$GROK_HOME`, else `~/.grok` — what grok itself resolves — as seen
@@ -1343,16 +1382,37 @@ mod tests {
             lock(ID),
             p(&format!("{base}/presence")),
         ];
-        assert_eq!(agy_presence_id(&open), Some(ID.to_string()));
+        let no_argv = || None;
+        assert_eq!(agy_live_id(&open, no_argv), Some(ID.to_string()));
         // The db alone is not identity, and a lock outside agy's tree is not agy's.
-        assert_eq!(agy_presence_id(&open[..2]), None);
+        assert_eq!(agy_live_id(&open[..2], no_argv), None);
         assert_eq!(
-            agy_presence_id(&[p(&format!("/tmp/presence/{ID}.lock"))]),
+            agy_live_id(&[p(&format!("/tmp/presence/{ID}.lock"))], no_argv),
             None
         );
-        // Two different conversations' locks: refuse to guess.
-        assert_eq!(agy_presence_id(&[lock(ID), lock(GID)]), None);
-        assert_eq!(agy_presence_id(&[lock(ID), lock(ID)]), Some(ID.to_string()));
+        // Two different conversations' locks: refuse to guess — even with a launch argument.
+        let resumed = || Some(vec!["agy".into(), "--conversation".into(), GID.into()]);
+        assert_eq!(agy_live_id(&[lock(ID), lock(GID)], resumed), None);
+        assert_eq!(
+            agy_live_id(&[lock(ID), lock(ID)], no_argv),
+            Some(ID.to_string())
+        );
+        // The lock outranks the launch argument (a newer conversation ran a turn).
+        assert_eq!(agy_live_id(&[lock(ID)], resumed), Some(ID.to_string()));
+        // No lock yet (restored, no turn since): the process's own `--conversation`.
+        assert_eq!(agy_live_id(&open[..2], resumed), Some(GID.to_string()));
+        let eq = || Some(vec!["agy".into(), format!("--conversation={GID}")]);
+        assert_eq!(agy_live_id(&[], eq), Some(GID.to_string()));
+        let bad = || {
+            Some(vec![
+                "agy".into(),
+                "--conversation".into(),
+                "x; rm -rf /".into(),
+            ])
+        };
+        assert_eq!(agy_live_id(&[], bad), None);
+        let other = || Some(vec!["agy".into(), "--conversationx".into(), GID.into()]);
+        assert_eq!(agy_live_id(&[], other), None);
     }
 
     #[test]
