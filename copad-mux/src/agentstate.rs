@@ -410,8 +410,97 @@ pub fn agent_session_id(comm: &str, pid: u32) -> Option<String> {
     match comm.to_ascii_lowercase().as_str() {
         "claude" => claude_session_id(pid),
         "codex" => codex_session_id(pid),
+        "agy" => agy_session_id(pid),
+        "grok" => grok_session_id(pid),
         _ => None,
     }
+}
+
+/// agy's live conversation: a running agy holds `~/.gemini/antigravity-cli/presence/<id>.lock`
+/// open for the conversation on screen (it also holds `conversations/<id>.db`, but so would
+/// any sub-agent conversation it touches, so the lock is the identity). Costs a fork on macOS
+/// (`lsof`), like codex.
+pub fn agy_session_id(pid: u32) -> Option<String> {
+    agy_presence_id(&crate::procinfo::open_files(pid)?)
+}
+
+/// The conversation id among `open`'s presence locks — only when there is exactly ONE. Two
+/// distinct locks mean we cannot tell which conversation is the foreground one, and guessing
+/// would resume (or fork) the wrong conversation; no answer restores a fresh agy instead.
+fn agy_presence_id(open: &[std::path::PathBuf]) -> Option<String> {
+    let mut ids = open.iter().filter_map(|p| {
+        let dir = p.parent()?;
+        if dir.file_name()? != "presence" || dir.parent()?.file_name()? != "antigravity-cli" {
+            return None;
+        }
+        let id = p.file_name()?.to_str()?.strip_suffix(".lock")?;
+        is_session_uuid(id).then(|| id.to_string())
+    });
+    let first = ids.next()?;
+    ids.all(|id| id == first).then_some(first)
+}
+
+/// grok's data directory: `$GROK_HOME`, else `~/.grok` — what grok itself resolves — as seen
+/// by THIS process.
+pub fn grok_home() -> Option<std::path::PathBuf> {
+    match std::env::var_os("GROK_HOME") {
+        Some(h) if !h.is_empty() => Some(h.into()),
+        _ => Some(std::path::Path::new(&std::env::var_os("HOME")?).join(".grok")),
+    }
+}
+
+/// The data directory grok process `pid` is actually using: the `GROK_HOME` it was started
+/// with, which a pane can override inline (`GROK_HOME=/x grok`), else [`grok_home`].
+pub fn grok_home_of(pid: u32) -> Option<std::path::PathBuf> {
+    crate::procinfo::process_env(pid, "GROK_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(grok_home)
+}
+
+/// Environment an agent needs to find its conversation again when it is relaunched, as
+/// `K=V` strings: a grok started with its own `GROK_HOME` keeps its sessions THERE, and resuming
+/// its id under the default home would not find it. An inline `GROK_HOME=/x grok` is exactly
+/// what a restored pane's fresh shell cannot rebuild from rc files, so restore and fork carry it.
+pub fn relaunch_env(comm: &str, pid: u32) -> Vec<String> {
+    if !comm.eq_ignore_ascii_case("grok") {
+        return Vec::new();
+    }
+    crate::procinfo::process_env(pid, "GROK_HOME")
+        .map(|h| vec![format!("GROK_HOME={h}")])
+        .unwrap_or_default()
+}
+
+/// grok's live session: `$GROK_HOME/active_sessions.json` lists every running grok as
+/// `{session_id, pid, pid_start, cwd, …}`. No fork needed.
+pub fn grok_session_id(pid: u32) -> Option<String> {
+    let json = std::fs::read_to_string(grok_home_of(pid)?.join("active_sessions.json")).ok()?;
+    grok_active_session(&json, pid, crate::procinfo::process_start_time(pid)?)
+}
+
+/// The session `pid` is running per grok's registry. `pid_start` is the process start time in
+/// epoch MICROSECONDS (matches `ps -o lstart` exactly), and it is REQUIRED to match `started`:
+/// the file is rewritten by every grok on the machine and a stale row can outlive its process,
+/// so a bare pid match could hand a recycled pid somebody else's conversation. Several rows
+/// for one live pid with different ids → ambiguous → `None`.
+fn grok_active_session(json: &str, pid: u32, started: std::time::SystemTime) -> Option<String> {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(json).ok()?;
+    let started_us = started
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_micros();
+    let mut ids = rows.iter().filter_map(|r| {
+        if r.get("pid")?.as_u64()? != u64::from(pid) {
+            return None;
+        }
+        let at = u128::from(r.get("pid_start")?.as_u64()?);
+        if at.abs_diff(started_us) > 1_000_000 {
+            return None;
+        }
+        let id = r.get("session_id")?.as_str()?;
+        is_session_uuid(id).then(|| id.to_string())
+    });
+    let first = ids.next()?;
+    ids.all(|id| id == first).then_some(first)
 }
 
 /// Rebuild a whitelisted agent's argv into a resume command for `session_id`. `comm` is the
@@ -425,8 +514,125 @@ pub fn resume_argv(comm: &str, argv: &[String], session_id: &str) -> Vec<String>
     match comm.to_ascii_lowercase().as_str() {
         "claude" => claude_resume_argv(argv, session_id),
         "codex" => codex_resume_argv(argv, session_id),
+        "agy" => agy_resume_argv(argv, session_id),
+        "grok" => grok_resume_argv(argv, session_id),
         _ => argv.to_vec(),
     }
+}
+
+/// agy (1.4.7 `agy --help`) runtime flags carried into a resumed conversation. `--add-dir` is
+/// repeatable and `--project`/`--new-project` select WHERE the conversation lives, so they are
+/// dropped rather than risk contradicting the conversation being resumed.
+const AGY_BOOL_FLAGS: &[&str] = &["--dangerously-skip-permissions", "--sandbox"];
+const AGY_VALUE_FLAGS: &[&str] = &["--model", "--mode", "--effort", "--agent"];
+/// agy's print-mode switches: a one-shot run has no interactive conversation to come back to.
+const AGY_ONE_SHOT: &[&str] = &[
+    "-p",
+    "--print",
+    "--prompt",
+    "--input-format",
+    "--output-format",
+];
+const AGY_SUBCOMMANDS: &[&str] = &[
+    "agent",
+    "agents",
+    "changelog",
+    "help",
+    "install",
+    "mcp",
+    "mic-serve",
+    "models",
+    "plugin",
+    "plugins",
+    "remote-control",
+    "update",
+];
+
+/// `agy … → agy --conversation <id> <carried-flags…>` — the command agy itself prints on exit.
+/// Left unchanged for print mode and subcommands (any token, as for codex: skipping is the
+/// safe direction when a value flag could put a word ahead of the subcommand).
+fn agy_resume_argv(argv: &[String], session_id: &str) -> Vec<String> {
+    if argv[1..].iter().any(|a| {
+        AGY_SUBCOMMANDS.contains(&a.as_str())
+            || AGY_ONE_SHOT.contains(&a.split('=').next().unwrap_or(a))
+    }) {
+        return argv.to_vec();
+    }
+    let mut out = vec![
+        argv[0].clone(),
+        "--conversation".to_string(),
+        session_id.to_string(),
+    ];
+    out.extend(carry_flags(&argv[1..], AGY_BOOL_FLAGS, AGY_VALUE_FLAGS));
+    out
+}
+
+/// grok (1.0.70 `grok --help`) runtime flags carried into a resumed session. Session selectors
+/// (`-r`/`-c`/`-s`/`--fork-session`/`-w`) and `--cwd` (the pane's saved cwd decides) are dropped.
+const GROK_BOOL_FLAGS: &[&str] = &[
+    "--always-approve",
+    "--no-plan",
+    "--no-subagents",
+    "--disable-web-search",
+    "--fullscreen",
+    "--minimal",
+    "--no-alt-screen",
+];
+const GROK_VALUE_FLAGS: &[&str] = &[
+    "--model",
+    "-m",
+    "--permission-mode",
+    "--reasoning-effort",
+    "--effort",
+    "--sandbox",
+    "--agent",
+];
+const GROK_ONE_SHOT: &[&str] = &["-p", "--single", "--prompt-file", "--prompt-json"];
+const GROK_SUBCOMMANDS: &[&str] = &[
+    "agent",
+    "clone",
+    "completions",
+    "dashboard",
+    "doctor",
+    "du",
+    "disk-usage",
+    "export",
+    "help",
+    "inspect",
+    "leader",
+    "login",
+    "logout",
+    "mcp",
+    "memory",
+    "models",
+    "plugin",
+    "sessions",
+    "setup",
+    "trace",
+    "update",
+    "usage",
+    "version",
+    "v",
+    "worker",
+    "worktree",
+    "wrap",
+];
+
+/// `grok … → grok --resume <id> <carried-flags…>` — the command grok prints on exit.
+fn grok_resume_argv(argv: &[String], session_id: &str) -> Vec<String> {
+    if argv[1..].iter().any(|a| {
+        GROK_SUBCOMMANDS.contains(&a.as_str())
+            || GROK_ONE_SHOT.contains(&a.split('=').next().unwrap_or(a))
+    }) {
+        return argv.to_vec();
+    }
+    let mut out = vec![
+        argv[0].clone(),
+        "--resume".to_string(),
+        session_id.to_string(),
+    ];
+    out.extend(carry_flags(&argv[1..], GROK_BOOL_FLAGS, GROK_VALUE_FLAGS));
+    out
 }
 
 /// Claude runtime flags safe to carry into a resumed session, with their arity. Session
@@ -1043,6 +1249,138 @@ mod tests {
             "     Done.",
         ]);
         assert_eq!(screen_status_for("grok", &s), AgentStatus::Idle);
+    }
+
+    // ===== agy / grok restore
+
+    const GID: &str = "01a16e02-ad06-7380-97f5-03eb32ae7487";
+
+    #[test]
+    fn agy_resume_rebuilds_to_its_conversation_flag() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            resume_argv("agy", &a(&["/Users/u/.local/bin/agy"]), ID),
+            a(&["/Users/u/.local/bin/agy", "--conversation", ID])
+        );
+        assert_eq!(
+            resume_argv(
+                "agy",
+                &a(&[
+                    "agy",
+                    "--dangerously-skip-permissions",
+                    "--model",
+                    "x",
+                    "-i",
+                    "do it",
+                    "--add-dir",
+                    "/d"
+                ]),
+                ID
+            ),
+            a(&[
+                "agy",
+                "--conversation",
+                ID,
+                "--dangerously-skip-permissions",
+                "--model",
+                "x"
+            ])
+        );
+        // `-c` / an older `--conversation` are selectors, replaced by the live id.
+        assert_eq!(
+            resume_argv("agy", &a(&["agy", "-c"]), ID),
+            a(&["agy", "--conversation", ID])
+        );
+        // print mode and subcommands are left alone.
+        for argv in [
+            a(&["agy", "-p", "hi"]),
+            a(&["agy", "--print=hi"]),
+            a(&["agy", "mcp", "list"]),
+        ] {
+            assert_eq!(resume_argv("agy", &argv, ID), argv);
+        }
+    }
+
+    #[test]
+    fn grok_resume_rebuilds_to_resume_flag() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            resume_argv(
+                "grok",
+                &a(&["grok", "--always-approve", "-m", "grok-4.7", "-c", "fix it"]),
+                GID
+            ),
+            a(&[
+                "grok",
+                "--resume",
+                GID,
+                "--always-approve",
+                "-m",
+                "grok-4.7"
+            ])
+        );
+        assert_eq!(
+            resume_argv("grok", &a(&["grok", "-r", "old title"]), GID),
+            a(&["grok", "--resume", GID])
+        );
+        for argv in [
+            a(&["grok", "-p", "hi"]),
+            a(&["grok", "--prompt-file=/x"]),
+            a(&["grok", "sessions", "list"]),
+        ] {
+            assert_eq!(resume_argv("grok", &argv, GID), argv);
+        }
+    }
+
+    #[test]
+    fn agy_presence_lock_names_the_conversation_only_when_unambiguous() {
+        let base = "/Users/u/.gemini/antigravity-cli";
+        let p = |s: &str| std::path::PathBuf::from(s);
+        let lock = |id: &str| p(&format!("{base}/presence/{id}.lock"));
+        let open = vec![
+            p(&format!("{base}/conversation_summaries.db")),
+            p(&format!("{base}/conversations/{GID}.db")),
+            lock(ID),
+            p(&format!("{base}/presence")),
+        ];
+        assert_eq!(agy_presence_id(&open), Some(ID.to_string()));
+        // The db alone is not identity, and a lock outside agy's tree is not agy's.
+        assert_eq!(agy_presence_id(&open[..2]), None);
+        assert_eq!(
+            agy_presence_id(&[p(&format!("/tmp/presence/{ID}.lock"))]),
+            None
+        );
+        // Two different conversations' locks: refuse to guess.
+        assert_eq!(agy_presence_id(&[lock(ID), lock(GID)]), None);
+        assert_eq!(agy_presence_id(&[lock(ID), lock(ID)]), Some(ID.to_string()));
+    }
+
+    #[test]
+    fn grok_registry_requires_the_process_incarnation_to_match() {
+        // Verbatim shape of ~/.grok/active_sessions.json (grok 1.0.70).
+        let json = format!(
+            r#"[{{"session_id":"{GID}","pid":45318,"pid_start":1792847018385881,"cwd":"/p","opened_at":"2026-10-24T13:03:51.696160Z"}}]"#
+        );
+        let at = |us: u64| std::time::UNIX_EPOCH + std::time::Duration::from_micros(us);
+        assert_eq!(
+            grok_active_session(&json, 45318, at(1_792_847_018_385_881)),
+            Some(GID.to_string())
+        );
+        // Same pid, a different process (recycled): the stale row must not be trusted.
+        assert_eq!(
+            grok_active_session(&json, 45318, at(1_792_900_000_000_000)),
+            None
+        );
+        assert_eq!(
+            grok_active_session(&json, 1, at(1_792_847_018_385_881)),
+            None
+        );
+        assert_eq!(grok_active_session("not json", 45318, at(0)), None);
+        // Two live sessions claiming the same incarnation: ambiguous.
+        let two = format!(
+            r#"[{{"session_id":"{GID}","pid":7,"pid_start":5}},{{"session_id":"{ID}","pid":7,"pid_start":5}}]"#
+        );
+        assert_eq!(grok_active_session(&two, 7, at(5)), None);
     }
 
     #[test]

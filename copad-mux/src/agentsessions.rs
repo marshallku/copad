@@ -33,6 +33,8 @@ use std::time::SystemTime;
 pub enum Tool {
     Claude,
     Codex,
+    Agy,
+    Grok,
 }
 
 impl Tool {
@@ -41,6 +43,8 @@ impl Tool {
         match self {
             Tool::Claude => "claude",
             Tool::Codex => "codex",
+            Tool::Agy => "agy",
+            Tool::Grok => "grok",
         }
     }
 }
@@ -165,6 +169,7 @@ pub fn scan(home: &Path, deep: bool) -> Vec<Entry> {
             let meta = match tool {
                 Tool::Claude => parse_claude(&path, &mut budget, deep),
                 Tool::Codex => parse_codex(&path, &mut budget, deep),
+                Tool::Agy | Tool::Grok => Meta::default(),
             };
             Entry {
                 tool,
@@ -601,7 +606,7 @@ pub fn resume_argv(tool: Tool, id: &str) -> Vec<String> {
 
 /// The command that FORKS conversation `id` into a new one (decisions #150): history kept, a
 /// new session id, the original untouched. `None` for an id that is not a UUID — never splice
-/// an unvalidated value onto a command line.
+/// an unvalidated value onto a command line — and for agy, which has no fork.
 pub fn fork_argv(tool: Tool, id: &str) -> Option<Vec<String>> {
     if !crate::agentstate::is_session_uuid(id) {
         return None;
@@ -609,16 +614,20 @@ pub fn fork_argv(tool: Tool, id: &str) -> Option<Vec<String>> {
     let args: &[&str] = match tool {
         Tool::Claude => &["claude", "--resume", id, "--fork-session"],
         Tool::Codex => &["codex", "fork", id],
+        Tool::Grok => &["grok", "--resume", id, "--fork-session"],
+        Tool::Agy => return None,
     };
     Some(args.iter().map(|a| a.to_string()).collect())
 }
 
 impl Tool {
-    /// The tool a pane's foreground label names, when it is one we can fork.
+    /// The tool a pane's foreground label names, when it is one comux knows conversations of.
     pub fn from_label(label: &str) -> Option<Tool> {
         match label.to_ascii_lowercase().as_str() {
             "claude" => Some(Tool::Claude),
             "codex" => Some(Tool::Codex),
+            "agy" => Some(Tool::Agy),
+            "grok" => Some(Tool::Grok),
             _ => None,
         }
     }
@@ -650,6 +659,12 @@ mod tests {
             ["claude", "--resume", CID, "--fork-session"]
         );
         assert_eq!(fork_argv(Tool::Codex, CID).unwrap(), ["codex", "fork", CID]);
+        assert_eq!(
+            fork_argv(Tool::Grok, CID).unwrap(),
+            ["grok", "--resume", CID, "--fork-session"]
+        );
+        assert!(fork_argv(Tool::Agy, CID).is_none(), "agy has no fork");
+        assert_eq!(Tool::from_label("agy"), Some(Tool::Agy));
         assert!(fork_argv(Tool::Claude, "x; rm -rf /").is_none());
         assert_eq!(Tool::from_label("Codex"), Some(Tool::Codex));
         assert_eq!(Tool::from_label("zsh"), None);

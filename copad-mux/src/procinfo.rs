@@ -137,6 +137,45 @@ pub fn process_command(pid: u32) -> Option<Vec<String>> {
 
 #[cfg(target_os = "macos")]
 pub fn process_command(pid: u32) -> Option<Vec<String>> {
+    procargs(pid)
+        .map(|(args, _)| args)
+        .filter(|a| !a.is_empty())
+}
+
+/// One variable from the environment `pid` was STARTED with (Linux `/proc/<pid>/environ`,
+/// macOS the tail of `KERN_PROCARGS2`). `None` when it is unset, empty, or unreadable — an
+/// agent launched as `GROK_HOME=/x grok` keeps its data where THAT says, not where the server's
+/// own environment would put it.
+#[cfg(target_os = "linux")]
+pub fn process_env(pid: u32, name: &str) -> Option<String> {
+    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    env_lookup(
+        raw.split(|&b| b == 0)
+            .map(|e| String::from_utf8_lossy(e).into_owned()),
+        name,
+    )
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_env(pid: u32, name: &str) -> Option<String> {
+    env_lookup(procargs(pid)?.1.into_iter(), name)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_env(_pid: u32, _name: &str) -> Option<String> {
+    None
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn env_lookup(env: impl Iterator<Item = String>, name: &str) -> Option<String> {
+    env.filter_map(|e| Some(e.strip_prefix(name)?.strip_prefix('=')?.to_string()))
+        .next()
+        .filter(|v| !v.is_empty())
+}
+
+/// `pid`'s `(argv, environment)` out of one `KERN_PROCARGS2` read.
+#[cfg(target_os = "macos")]
+fn procargs(pid: u32) -> Option<(Vec<String>, Vec<String>)> {
     // KERN_PROCARGS2 buffer: [argc: i32][exec_path\0][padding \0…][argv0\0 argv1\0 …][env…].
     let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
     let mut size: libc::size_t = 0;
@@ -192,7 +231,13 @@ pub fn process_command(pid: u32) -> Option<Vec<String>> {
         args.push(String::from_utf8_lossy(&buf[start..p]).into_owned());
         p += 1; // skip the NUL
     }
-    (!args.is_empty()).then_some(args)
+    // The environment follows argv: NUL-terminated `K=V` strings up to an empty one.
+    let env = buf[p.min(buf.len())..]
+        .split(|&b| b == 0)
+        .take_while(|e| !e.is_empty())
+        .map(|e| String::from_utf8_lossy(e).into_owned())
+        .collect();
+    Some((args, env))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -638,6 +683,52 @@ impl ProcTree {
 
 #[cfg(test)]
 mod tests {
+
+    /// Child for [`process_env_reads_the_target_process_environment`]: just stays alive.
+    #[test]
+    #[ignore]
+    fn env_probe_child() {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+    }
+
+    /// The environment a child was STARTED with is readable — and is its own, not ours. The
+    /// child is this test binary rather than `/bin/sleep`: macOS withholds the environment of
+    /// platform binaries from `KERN_PROCARGS2`, which says nothing about an agent like grok.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn process_env_reads_the_target_process_environment() {
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                "procinfo::tests::env_probe_child",
+                "--ignored",
+                "--quiet",
+            ])
+            .env("GROK_HOME", "/tmp/comux-grok-home-probe")
+            .env("COMUX_EMPTY_PROBE", "")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // `spawn` returns after fork; wait for the exec so we read the child's block, not ours.
+        let mut got = None;
+        for _ in 0..200 {
+            got = process_env(pid, "GROK_HOME");
+            if got.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let empty = process_env(pid, "COMUX_EMPTY_PROBE");
+        let prefix = process_env(pid, "GROK");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(got.as_deref(), Some("/tmp/comux-grok-home-probe"));
+        assert_eq!(empty, None, "an empty value counts as unset");
+        assert_eq!(prefix, None, "a name must match whole, not as a prefix");
+    }
+
     use super::*;
 
     #[test]

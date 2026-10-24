@@ -4440,7 +4440,7 @@ impl App {
                     return Resp::err_code(
                         "refused",
                         format!(
-                            "'{}' is not an agent comux can fork (claude, codex)",
+                            "'{}' is not an agent comux can fork (claude, codex, grok)",
                             label.text
                         ),
                     );
@@ -4454,7 +4454,10 @@ impl App {
                     );
                 };
                 let Some(argv) = agentsessions::fork_argv(tool, &id) else {
-                    return Resp::err_code("refused", "its conversation id cannot be forked");
+                    return Resp::err_code(
+                        "refused",
+                        format!("{} has no way to fork a conversation", tool.bin()),
+                    );
                 };
                 let Some((ws, _, _)) = self.locate_terminal(&term) else {
                     return Resp::err_code("not_found", "pane vanished");
@@ -4469,7 +4472,7 @@ impl App {
                     name: None,
                     no_focus: *no_focus,
                     command: argv,
-                    env: Vec::new(),
+                    env: agentstate::relaunch_env(&label.text, label.pid),
                     keep: true,
                     owner: None,
                 });
@@ -7983,6 +7986,15 @@ impl App {
                         && let Some(id) = agentstate::agent_session_id(&label.text, label.pid)
                     {
                         argv = agentstate::resume_argv(&label.text, &argv, &id);
+                        // The saved command is re-typed into a fresh shell, so an environment
+                        // the session id depends on rides along as an `env K=V …` prefix.
+                        let env = agentstate::relaunch_env(&label.text, label.pid);
+                        if !env.is_empty() {
+                            argv = std::iter::once("env".to_string())
+                                .chain(env)
+                                .chain(argv)
+                                .collect();
+                        }
                     }
                     let total: usize = argv.iter().map(|a| a.len() + 1).sum();
                     if argv.is_empty() || argv.len() > 64 || total > persist::MAX_COMMAND_LEN {
