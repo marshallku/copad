@@ -1,0 +1,108 @@
+import XCTest
+
+/// End-to-end on the simulator against a REAL comux over a REAL SSH connection: a throwaway
+/// user-level sshd on the Mac and an isolated comux server, both set up by
+/// `scripts/e2e-native.sh`, which passes their coordinates in `TEST_RUNNER_E2E_*`.
+final class NativeE2ETests: XCTestCase {
+    private var app: XCUIApplication!
+
+    override func setUpWithError() throws {
+        continueAfterFailure = false
+        let env = ProcessInfo.processInfo.environment
+        guard let host = env["E2E_HOST"] else {
+            throw XCTSkip("run through scripts/e2e-native.sh")
+        }
+        app = XCUIApplication()
+        app.launchArguments = [
+            "-E2EHost", host,
+            "-E2EPort", env["E2E_PORT"] ?? "22",
+            "-E2EUser", env["E2E_USER"] ?? "",
+            "-E2EKeySeed", env["E2E_SEED"] ?? "",
+            "-E2EHostKey", env["E2E_HOSTKEY"] ?? "",
+            "-E2ECommand", env["E2E_COMMAND"] ?? "",
+            "-E2EAutoConnect", "YES",
+            "-copad.webMode", "NO",
+        ]
+        app.launch()
+    }
+
+    private var terminal: XCUIElement { app.otherElements["terminal"] }
+
+    private func screen() -> String { (terminal.value as? String) ?? "" }
+
+    private func waitScreen(_ needle: String, timeout: TimeInterval = 15,
+                            file: StaticString = #filePath, line: UInt = #line) {
+        let end = Date().addingTimeInterval(timeout)
+        while Date() < end {
+            if screen().contains(needle) { return }
+            Thread.sleep(forTimeInterval: 0.3)
+        }
+        XCTFail("screen never showed \(needle):\n\(screen())", file: file, line: line)
+    }
+
+    func testNativeSessionEndToEnd() throws {
+        // 1. Live: the tab strip comes from L0 and the screen from the render channel.
+        XCTAssertTrue(app.buttons["tab-1"].waitForExistence(timeout: 30), "never went live")
+        XCTAssertTrue(terminal.waitForExistence(timeout: 5))
+
+        // 2. The phone is the only client and claimed the chrome: comux's own sidebar is gone.
+        let end = Date().addingTimeInterval(10)
+        while Date() < end, screen().contains("spaces") { Thread.sleep(forTimeInterval: 0.3) }
+        XCTAssertFalse(screen().contains("spaces"), "TUI sidebar still drawn:\n\(screen())")
+
+        // 3. Typing reaches the shell (committed text → keys, Return → Enter).
+        terminal.tap()
+        app.typeText("echo NATIVE-$((6*7))\n")
+        waitScreen("NATIVE-42")
+
+        // 4. Hangul through the text system, committed as text.
+        app.typeText("echo 한글-확인\n")
+        waitScreen("한글-확인")
+        snapshot("typed")
+
+        // 5. The key bar: ^b c opens a tab, which the native tab strip shows.
+        app.buttons["key-newtab"].tap()
+        XCTAssertTrue(app.buttons["tab-2"].waitForExistence(timeout: 10), "^b c did not add a tab")
+
+        // 6. The spaces drawer lists the other session and the fake agent; a tap switches.
+        app.buttons["openSpaces"].tap()
+        XCTAssertTrue(app.buttons["space-e2e-two"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.descendants(matching: .any).matching(
+            NSPredicate(format: "identifier BEGINSWITH 'agent-'")).firstMatch.waitForExistence(timeout: 10),
+            "the fake agent is not in the drawer")
+        snapshot("spaces-drawer")
+        app.buttons["space-e2e-two"].tap()
+        let active = app.staticTexts["activeSession"]
+        let switched = NSPredicate(format: "label == 'e2e-two'")
+        expectation(for: switched, evaluatedWith: active)
+        waitForExpectations(timeout: 10)
+
+        // 7. Notifications: the pre-raised one is listed; tapping it marks it read and jumps.
+        app.buttons["openNotifications"].tap()
+        let notif = app.descendants(matching: .any).matching(
+            NSPredicate(format: "identifier BEGINSWITH 'notif-'")).firstMatch
+        XCTAssertTrue(notif.waitForExistence(timeout: 10))
+        snapshot("notifications")
+        notif.tap()
+        let back = NSPredicate(format: "label != 'e2e-two'")
+        expectation(for: back, evaluatedWith: active)
+        waitForExpectations(timeout: 10)
+
+        // 8. Background and return: the session reconnects (replacing its attachment).
+        XCUIDevice.shared.press(.home)
+        Thread.sleep(forTimeInterval: 2)
+        app.activate()
+        XCTAssertTrue(app.buttons["tab-1"].waitForExistence(timeout: 30), "did not come back")
+        terminal.tap()
+        app.typeText("echo BACK-$((1+1))\n")
+        waitScreen("BACK-2")
+        snapshot("after-resume")
+    }
+
+    private func snapshot(_ name: String) {
+        let a = XCTAttachment(screenshot: app.screenshot())
+        a.name = name
+        a.lifetime = .keepAlways
+        add(a)
+    }
+}

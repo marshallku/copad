@@ -7,6 +7,14 @@ options:
   deploymentTarget:
     iOS: "17.0"
   createIntermediateGroups: true
+# The native comux client speaks SSH itself (decisions #168): apple/swift-nio-ssh.
+packages:
+  swift-nio-ssh:
+    url: https://github.com/apple/swift-nio-ssh
+    exactVersion: 0.15.0
+  swift-nio:
+    url: https://github.com/apple/swift-nio
+    exactVersion: 2.104.0
 settings:
   base:
     # Ad-hoc ("-") signing needs no developer team, so `xcodebuild -sdk
@@ -30,6 +38,13 @@ targets:
         GENERATE_INFOPLIST_FILE: "NO"
         INFOPLIST_FILE: Sources/Info.plist
         CODE_SIGN_ENTITLEMENTS: copad-ios.entitlements
+    dependencies:
+      - package: swift-nio-ssh
+        product: NIOSSH
+      - package: swift-nio
+        product: NIOCore
+      - package: swift-nio
+        product: NIOPosix
     info:
       path: Sources/Info.plist
       properties:
@@ -50,3 +65,37 @@ targets:
         # Never NSAllowsArbitraryLoads.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+  copad-iosTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests
+    dependencies:
+      - target: copad-ios
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: "YES"
+        PRODUCT_BUNDLE_IDENTIFIER: com.marshall.copad.ios.tests
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/copad-ios.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/copad-ios"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+  copad-iosUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - UITests
+    dependencies:
+      - target: copad-ios
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: "YES"
+        PRODUCT_BUNDLE_IDENTIFIER: com.marshall.copad.ios.uitests
+        TEST_TARGET_NAME: copad-ios
+schemes:
+  copad-ios:
+    build:
+      targets:
+        copad-ios: all
+    test:
+      targets:
+        - copad-iosTests
+        - copad-iosUITests
