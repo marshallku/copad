@@ -24,9 +24,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// What a desktop host takes over. The status bar stays comux's until every field it carries
-/// has a native replacement (plan § P2; overlay delegation is P3).
-pub const FEATURES: [Feature; 1] = [Feature::Sidebar];
+/// What a desktop host takes over: the sidebar, the status bar (every field it carries has a
+/// native replacement in the window's comux status strip) and the overlays (`Ctrl-f`,
+/// `Ctrl-b a`, prompts, confirms — decisions #170).
+pub const FEATURES: [Feature; 3] = [Feature::Sidebar, Feature::Status, Feature::Overlays];
 
 /// The claim state machine — pure, so its transitions are unit-tested without a server.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -132,6 +133,12 @@ impl Claims {
     pub fn held(&self) -> &BTreeSet<u64> {
         &self.held
     }
+
+    /// Held, or claimed and not yet confirmed: the server accepts a claim at once but its
+    /// `clients` topic can lag behind an overlay it already sent us (codex P3 C1).
+    pub fn covers(&self, attachment: u64) -> bool {
+        self.held.contains(&attachment) || self.pending == Some(attachment)
+    }
 }
 
 /// Everything a GUI reads.
@@ -144,6 +151,8 @@ struct State {
     binds: BTreeMap<String, String>,
     served: BTreeSet<String>,
     claims: Claims,
+    /// Overlays comux handed us for attachments we hold: (overlay id, attachment, spec).
+    overlays: Vec<(u64, u64, copad_mux_proto::OverlaySpec)>,
 }
 
 impl State {
@@ -235,6 +244,24 @@ impl MuxHost {
         self.with(|s| s.served = panels.iter().cloned().collect());
     }
 
+    /// Answer a delegated overlay (`choice` for a picker/confirm, `text` for a prompt; both
+    /// `None` = cancelled).
+    pub fn answer(&self, overlay: u64, choice: Option<String>, text: Option<String>) {
+        if let Ok(mut s) = self.inner.state.lock() {
+            s.overlays.retain(|o| o.0 != overlay);
+            if let Ok(g) = self.inner.link.lock()
+                && let Some(l) = g.as_ref()
+            {
+                let _ = l.send(&SubMsg::OverlayResult {
+                    overlay,
+                    choice,
+                    text,
+                });
+            }
+        }
+        self.inner.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Run a control request (`{"cmd":"select-session",…}`).
     pub fn command(&self, req: Value) {
         if let Some(l) = self.inner.link.lock().ok().and_then(|l| l.clone()) {
@@ -248,14 +275,27 @@ impl MuxHost {
         let Ok(s) = self.inner.state.lock() else {
             return json!({ "connected": false });
         };
+        let bound = s.bound();
+        let overlays: Vec<Value> = s
+            .overlays
+            .iter()
+            .map(|(id, client, spec)| {
+                let panel = bound
+                    .iter()
+                    .find(|(_, a)| **a == *client)
+                    .map(|(p, _)| p.clone());
+                json!({ "overlay": id, "client": client, "panel": panel, "spec": spec })
+            })
+            .collect();
         json!({
+            "overlays": overlays,
             "connected": s.connected,
             "error": s.error,
             "tree": s.model.tree,
             "agents": s.model.agents,
             "notifications": s.model.notifications,
             "status": s.model.status,
-            "bound": s.bound(),
+            "bound": bound,
             "claimed": s.claims.held(),
         })
     }
@@ -374,10 +414,23 @@ fn on_event(inner: &Arc<Inner>, ev: LinkEvent, closed: &std::sync::mpsc::Sender<
         };
         match &ev {
             LinkEvent::Msg(PubMsg::Error { .. }) => s.claims.refused(),
+            LinkEvent::Msg(PubMsg::Overlay {
+                overlay,
+                client,
+                spec,
+            }) => {
+                if s.claims.covers(*client) {
+                    s.overlays.push((*overlay, *client, spec.clone()));
+                }
+            }
+            LinkEvent::Msg(PubMsg::OverlayClosed { overlay }) => {
+                s.overlays.retain(|o| o.0 != *overlay);
+            }
             LinkEvent::Msg(m) => {
                 if s.model.apply(m) == Applied::Welcome {
                     // A new server: every attachment id and claim we held is meaningless.
                     s.claims = Claims::default();
+                    s.overlays.clear();
                     s.connected = true;
                     s.error = None;
                 }
@@ -391,6 +444,7 @@ fn on_event(inner: &Arc<Inner>, ev: LinkEvent, closed: &std::sync::mpsc::Sender<
                 s.error = Some(why.clone());
                 s.model = Model::default();
                 s.claims = Claims::default();
+                s.overlays.clear();
             }
         }
     }
@@ -425,6 +479,10 @@ mod tests {
         if with_lists {
             put("tree", serde_json::to_value(Tree::default()).unwrap());
             put("agents", serde_json::to_value(Agents::default()).unwrap());
+            put(
+                "status",
+                serde_json::to_value(copad_mux_proto::Status::default()).unwrap(),
+            );
         }
         m.apply(&PubMsg::Snapshot { rev: 1, topics });
         m
@@ -454,7 +512,7 @@ mod tests {
             [],
             "one claim in flight"
         );
-        let m = model(vec![client(3, "copad:p1@s", &[Feature::Sidebar])], true);
+        let m = model(vec![client(3, "copad:p1@s", &FEATURES)], true);
         assert_eq!(c.reconcile(&m, &tags(&["copad:p1@s"])), []);
         assert!(c.held().contains(&3));
     }
@@ -464,7 +522,7 @@ mod tests {
         let mut c = Claims::default();
         let m = model(vec![client(3, "t", &[])], true);
         c.reconcile(&m, &tags(&["t"]));
-        let held = model(vec![client(3, "t", &[Feature::Sidebar])], true);
+        let held = model(vec![client(3, "t", &FEATURES)], true);
         c.reconcile(&held, &tags(&["t"]));
         // The tab went to the background.
         assert_eq!(c.reconcile(&held, &tags(&[])), [ClaimOp::Gone(3)]);
@@ -481,7 +539,7 @@ mod tests {
         let owned = model(vec![client(3, "t", &[])], true);
         assert_eq!(c.reconcile(&owned, &tags(&["t"])), [ClaimOp::Ready(3)]);
         c.refused();
-        let other = model(vec![client(3, "t", &[Feature::Sidebar])], true);
+        let other = model(vec![client(3, "t", &FEATURES)], true);
         assert_eq!(
             c.reconcile(&other, &tags(&["t"])),
             [],
@@ -507,7 +565,7 @@ mod tests {
     fn repeated_successful_claims_never_exhaust_the_budget() {
         let mut c = Claims::default();
         let free = model(vec![client(3, "t", &[])], true);
-        let ours = model(vec![client(3, "t", &[Feature::Sidebar])], true);
+        let ours = model(vec![client(3, "t", &FEATURES)], true);
         for _ in 0..5 {
             assert_eq!(c.reconcile(&free, &tags(&["t"])), [ClaimOp::Ready(3)]);
             c.reconcile(&ours, &tags(&["t"]));
@@ -519,10 +577,7 @@ mod tests {
     fn losing_the_clients_topic_releases_instead_of_forgetting() {
         let mut c = Claims::default();
         c.reconcile(&model(vec![client(3, "t", &[])], true), &tags(&["t"]));
-        c.reconcile(
-            &model(vec![client(3, "t", &[Feature::Sidebar])], true),
-            &tags(&["t"]),
-        );
+        c.reconcile(&model(vec![client(3, "t", &FEATURES)], true), &tags(&["t"]));
         let mut gone = Model::default();
         gone.apply(&PubMsg::Unavailable {
             topic: "clients".into(),
@@ -537,10 +592,7 @@ mod tests {
     fn a_detached_attachment_is_forgotten_without_a_release() {
         let mut c = Claims::default();
         c.reconcile(&model(vec![client(3, "t", &[])], true), &tags(&["t"]));
-        c.reconcile(
-            &model(vec![client(3, "t", &[Feature::Sidebar])], true),
-            &tags(&["t"]),
-        );
+        c.reconcile(&model(vec![client(3, "t", &FEATURES)], true), &tags(&["t"]));
         assert_eq!(c.reconcile(&model(vec![], true), &tags(&["t"])), []);
         assert!(c.held().is_empty());
     }

@@ -64,6 +64,31 @@ final class NativeE2ETests: XCTestCase {
         app.buttons["key-newtab"].tap()
         XCTAssertTrue(app.buttons["tab-2"].waitForExistence(timeout: 10), "^b c did not add a tab")
 
+        // 5b. Overlays are native (decisions #170): ^b $ opens comux's rename prompt as a
+        //     SHEET (the TUI never draws it), and the answer renames the session.
+        app.buttons["key-prefix"].tap()
+        app.typeText("$")
+        let field = app.textFields["overlayText"]
+        XCTAssertTrue(field.waitForExistence(timeout: 10), "rename prompt was not delegated")
+        XCTAssertFalse(screen().contains("rename"), "the TUI drew the prompt too")
+        field.tap()
+        field.press(forDuration: 1.0)
+        if app.menuItems["Select All"].waitForExistence(timeout: 2) { app.menuItems["Select All"].tap() }
+        field.typeText("ios-renamed")
+        app.buttons["overlayOK"].tap()
+        let activeName = app.staticTexts["activeSession"]
+        expectation(for: NSPredicate(format: "label CONTAINS 'ios-renamed'"), evaluatedWith: activeName)
+        waitForExpectations(timeout: 10)
+        snapshot("renamed")
+        // ^f arrives as a native picker; filtering + Return picks the other session.
+        terminal.tap()
+        app.buttons["key-switcher"].tap()
+        let filter = app.textFields["overlayFilter"]
+        XCTAssertTrue(filter.waitForExistence(timeout: 10), "^f was not delegated")
+        snapshot("switcher")
+        app.buttons["overlayCancel"].tap()
+        terminal.tap()
+
         // 6. The spaces drawer lists the other session and the fake agent; a tap switches.
         app.buttons["openSpaces"].tap()
         XCTAssertTrue(app.buttons["space-e2e-two"].waitForExistence(timeout: 10))

@@ -23,6 +23,11 @@ const SERVE_EVERY: Duration = Duration::from_secs(1);
 pub struct ComuxPanel {
     pub sidebar: gtk4::Box,
     pub notifications: gtk4::Box,
+    /// comux's status bar, natively (decisions #170): under the notebook.
+    pub status: gtk4::Box,
+    /// The overlay currently shown as a dialog, and that dialog.
+    overlay_shown: Cell<Option<u64>>,
+    overlay_window: RefCell<Option<gtk4::Window>>,
     spaces: gtk4::ListBox,
     agents: gtk4::ListBox,
     notif_list: gtk4::ListBox,
@@ -126,10 +131,18 @@ impl ComuxPanel {
         notifications.append(&nscroll);
         sidebar.set_visible(false);
         notifications.set_visible(false);
+        let status = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        status.set_widget_name("comux-status");
+        status.set_margin_start(6);
+        status.set_margin_end(6);
+        status.set_visible(false);
 
         let this = Rc::new(Self {
             sidebar,
             notifications,
+            status,
+            overlay_shown: Cell::new(None),
+            overlay_window: RefCell::new(None),
             spaces,
             agents,
             notif_list,
@@ -185,7 +198,8 @@ impl ComuxPanel {
 
     /// Called from the window's main-loop timer: re-report the visible panels now and then,
     /// and rebuild the lists when the host's state moved.
-    pub fn tick(&self, mgr: &TabManager, window_visible: bool) {
+    pub fn tick(self: &Rc<Self>, mgr: &TabManager, window: &gtk4::ApplicationWindow) {
+        let window_visible = window.is_visible();
         if self
             .last_serve
             .get()
@@ -210,6 +224,7 @@ impl ComuxPanel {
         if generation != self.last_gen.get() {
             self.last_gen.set(generation);
             self.rebuild();
+            self.present_overlay(window);
         }
     }
 
@@ -233,10 +248,145 @@ impl ComuxPanel {
         let on = self.hosting(&self.state());
         self.sidebar.set_visible(on);
         self.notifications.set_visible(on && self.notif_open.get());
+        self.status.set_visible(on);
     }
 
-    fn rebuild(&self) {
+    /// comux's status bar: session, its tabs, the armed prefix, the outcome line, bells,
+    /// attention, agents, unread, usage, update, host — every field the TUI bar carries.
+    fn rebuild_status(self: &Rc<Self>, s: &Value) {
+        clear_box(&self.status);
+        let st = &s["status"];
+        let sess = s["tree"]["sessions"]
+            .as_array()
+            .and_then(|a| a.iter().find(|x| x["active"] == true));
+        let pill = gtk4::Label::new(None);
+        pill.set_markup(&format!(
+            "<b>{}</b>",
+            gtk4::glib::markup_escape_text(sess.and_then(|x| x["name"].as_str()).unwrap_or(""))
+        ));
+        self.status.append(&pill);
+        for t in sess
+            .and_then(|x| x["tabs"].as_array())
+            .into_iter()
+            .flatten()
+        {
+            let mut label = format!(
+                "{} {}",
+                t["index"].as_u64().unwrap_or(0) + 1,
+                t["title"].as_str().unwrap_or_default()
+            );
+            if t["bell"] == true {
+                label.push_str(" !");
+            }
+            let b = gtk4::Button::with_label(&label);
+            b.add_css_class("flat");
+            if t["active"] == true {
+                b.add_css_class("suggested-action");
+            }
+            let id = t["id"].clone();
+            let w = Rc::downgrade(self);
+            b.connect_clicked(move |_| {
+                if let Some(p) = w.upgrade() {
+                    p.host.command(json!({"cmd": "select-tab", "target": id}));
+                }
+            });
+            self.status.append(&b);
+        }
+        let mut middle: Vec<String> = Vec::new();
+        if st["prefix_armed"] == true {
+            middle.push(format!("[{}]", st["prefix_label"].as_str().unwrap_or("^b")));
+        }
+        if let Some(f) = st["flash"]["text"].as_str() {
+            middle.push(f.to_string());
+        }
+        let line = gtk4::Label::new(Some(&middle.join("  ")));
+        line.set_hexpand(true);
+        line.set_xalign(0.0);
+        line.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        self.status.append(&line);
+        let mut tail: Vec<String> = Vec::new();
+        let n = |k: &str| st[k].as_u64().unwrap_or(0);
+        if n("bells") > 0 {
+            tail.push(format!("! {}", n("bells")));
+        }
+        if n("attention") > 0 {
+            tail.push(format!("⚑{}", n("attention")));
+        }
+        if n("agents") > 0 {
+            tail.push(format!("● {}", n("agents")));
+        }
+        if n("unread") > 0 {
+            tail.push(format!("✉ {}", n("unread")));
+        }
+        for w in st["usage"]["windows"].as_array().into_iter().flatten() {
+            tail.push(format!(
+                "{}{} {} {:.0}%",
+                if w["stale"] == true { "~" } else { "" },
+                w["provider"].as_str().unwrap_or_default(),
+                w["window"].as_str().unwrap_or_default(),
+                w["pct"].as_f64().unwrap_or(0.0)
+            ));
+        }
+        if let Some(u) = st["update"].as_str() {
+            tail.push(format!("⬆ {u}"));
+        }
+        if let Some(h) = st["host"].as_str() {
+            tail.push(h.to_string());
+        }
+        self.status
+            .append(&gtk4::Label::new(Some(&tail.join("  "))));
+    }
+
+    /// Show the oldest overlay a comux client in a VISIBLE pane opened, as a modal dialog.
+    fn present_overlay(self: &Rc<Self>, window: &gtk4::ApplicationWindow) {
         let s = self.state();
+        let served = self.served.borrow().clone();
+        let mine = s["overlays"].as_array().and_then(|a| {
+            a.iter()
+                .find(|o| {
+                    o["panel"]
+                        .as_str()
+                        .is_some_and(|p| served.iter().any(|x| x == p))
+                })
+                .cloned()
+        });
+        let mine_id = mine.as_ref().and_then(|o| o["overlay"].as_u64());
+        if let Some(shown) = self.overlay_shown.get()
+            && mine_id != Some(shown)
+        {
+            // Answered elsewhere, or comux closed it.
+            if let Some(w) = self.overlay_window.borrow_mut().take() {
+                w.destroy();
+            }
+            self.overlay_shown.set(None);
+        }
+        let (Some(o), None) = (mine, self.overlay_shown.get()) else {
+            return;
+        };
+        let Some(id) = o["overlay"].as_u64() else {
+            return;
+        };
+        self.overlay_shown.set(Some(id));
+        let dlg = overlay_dialog(self, window, id, &o["spec"]);
+        *self.overlay_window.borrow_mut() = Some(dlg);
+    }
+
+    /// Send the user's answer and close the dialog (once: a close after an answer is not a
+    /// second, cancelling answer).
+    fn answer(&self, id: u64, choice: Option<String>, text: Option<String>) {
+        if self.overlay_shown.get() != Some(id) {
+            return;
+        }
+        self.overlay_shown.set(None);
+        self.host.answer(id, choice, text);
+        if let Some(w) = self.overlay_window.borrow_mut().take() {
+            w.destroy();
+        }
+    }
+
+    fn rebuild(self: &Rc<Self>) {
+        let s = self.state();
+        self.rebuild_status(&s);
         clear(&self.spaces);
         let mut sa = Vec::new();
         for sess in s["tree"]["sessions"].as_array().into_iter().flatten() {
@@ -305,4 +455,222 @@ impl ComuxPanel {
         });
         self.refresh_visibility();
     }
+}
+
+fn clear_box(b: &gtk4::Box) {
+    while let Some(c) = b.first_child() {
+        b.remove(&c);
+    }
+}
+
+/// A delegated comux overlay as a modal GTK window (decisions #170): a filterable picker, a
+/// text prompt or a confirm. Whatever the user picks goes back to comux, which runs it.
+fn overlay_dialog(
+    panel: &Rc<ComuxPanel>,
+    parent: &gtk4::ApplicationWindow,
+    id: u64,
+    spec: &Value,
+) -> gtk4::Window {
+    let win = gtk4::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .default_width(460)
+        .title(spec["title"].as_str().unwrap_or("comux"))
+        .build();
+    win.set_widget_name("comux-overlay");
+    let vb = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    vb.set_margin_top(12);
+    vb.set_margin_bottom(12);
+    vb.set_margin_start(12);
+    vb.set_margin_end(12);
+    let w = Rc::downgrade(panel);
+    let answer: Rc<dyn Fn(Option<String>, Option<String>)> = Rc::new(move |choice, text| {
+        if let Some(p) = w.upgrade() {
+            p.answer(id, choice, text);
+        }
+    });
+    match spec["kind"].as_str() {
+        Some("prompt") => {
+            vb.append(&heading(spec["title"].as_str().unwrap_or_default()));
+            let entry = gtk4::Entry::new();
+            entry.set_text(spec["initial"].as_str().unwrap_or_default());
+            let a = answer.clone();
+            entry.connect_activate(move |e| a(None, Some(e.text().to_string())));
+            vb.append(&entry);
+            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+            row.set_halign(gtk4::Align::End);
+            let cancel = gtk4::Button::with_label("Cancel");
+            let a = answer.clone();
+            cancel.connect_clicked(move |_| a(None, None));
+            let ok = gtk4::Button::with_label("OK");
+            ok.add_css_class("suggested-action");
+            let a = answer.clone();
+            let e2 = entry.clone();
+            ok.connect_clicked(move |_| a(None, Some(e2.text().to_string())));
+            row.append(&cancel);
+            row.append(&ok);
+            vb.append(&row);
+            entry.grab_focus();
+        }
+        Some("picker") => {
+            let search = gtk4::SearchEntry::new();
+            vb.append(&search);
+            let list = gtk4::ListBox::new();
+            let mut ids: Vec<String> = Vec::new();
+            let actions: Vec<String> = spec["actions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|a| a["id"].as_str().map(str::to_string))
+                .collect();
+            let tabs = spec["tabs"].as_array().cloned().unwrap_or_default();
+            for tab in &tabs {
+                if tabs.len() > 1 {
+                    let r = gtk4::ListBoxRow::new();
+                    r.set_child(Some(&heading(tab["name"].as_str().unwrap_or_default())));
+                    r.set_activatable(false);
+                    r.set_selectable(false);
+                    list.append(&r);
+                    ids.push(String::new());
+                }
+                for row in tab["rows"].as_array().into_iter().flatten() {
+                    let rid = row["id"].as_str().unwrap_or_default().to_string();
+                    let label = row["label"].as_str().unwrap_or_default();
+                    let detail = row["detail"].as_str().unwrap_or_default();
+                    let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+                    let txt = two_line(label, detail, row["current"] == true);
+                    txt.set_hexpand(true);
+                    b.append(&txt);
+                    if let Some(badge) = row["badge"].as_str() {
+                        b.append(&gtk4::Label::new(Some(badge)));
+                    }
+                    for act in &actions {
+                        let btn = gtk4::Button::with_label(act);
+                        btn.add_css_class("flat");
+                        let a = answer.clone();
+                        let choice = format!("{act}:{rid}");
+                        btn.connect_clicked(move |_| a(Some(choice.clone()), None));
+                        b.append(&btn);
+                    }
+                    let r = gtk4::ListBoxRow::new();
+                    r.set_child(Some(&b));
+                    // The text the filter matches, kept on the row.
+                    r.set_widget_name(&format!("{label} {detail}").to_lowercase());
+                    list.append(&r);
+                    ids.push(rid);
+                }
+            }
+            // The TUI's own default row (Ctrl-f opens on the previous session).
+            if let Some(sel) = spec["selected"].as_str()
+                && let Some(i) = ids.iter().position(|x| x == sel)
+            {
+                list.select_row(list.row_at_index(i as i32).as_ref());
+            }
+            let ids = Rc::new(ids);
+            let a = answer.clone();
+            let ids2 = ids.clone();
+            list.connect_row_activated(move |_, row| {
+                if let Some(id) = ids2.get(row.index() as usize).filter(|s| !s.is_empty()) {
+                    a(Some(id.clone()), None);
+                }
+            });
+            let s2 = search.clone();
+            list.set_filter_func(move |row| {
+                let f = s2.text().to_lowercase();
+                f.is_empty() || row.widget_name().contains(f.as_str())
+            });
+            let l2 = list.clone();
+            search.connect_search_changed(move |_| l2.invalidate_filter());
+            let a = answer.clone();
+            let l3 = list.clone();
+            let s3 = search.clone();
+            let ids3 = ids.clone();
+            search.connect_activate(move |_| {
+                let f = s3.text().to_lowercase();
+                // The highlighted row first, if the filter still shows it.
+                if let Some(r) = l3.selected_row()
+                    && (f.is_empty() || r.widget_name().contains(f.as_str()))
+                    && let Some(id) = ids3.get(r.index() as usize).filter(|s| !s.is_empty())
+                {
+                    a(Some(id.clone()), None);
+                    return;
+                }
+                let mut i = 0;
+                while let Some(r) = l3.row_at_index(i) {
+                    if (f.is_empty() || r.widget_name().contains(f.as_str()))
+                        && let Some(id) = ids3.get(i as usize).filter(|s| !s.is_empty())
+                    {
+                        a(Some(id.clone()), None);
+                        return;
+                    }
+                    i += 1;
+                }
+            });
+            // ↑/↓ in the filter move the highlight over the rows the filter shows.
+            let keys = gtk4::EventControllerKey::new();
+            let l4 = list.clone();
+            let s4 = search.clone();
+            let ids4 = ids.clone();
+            keys.connect_key_pressed(move |_, key, _, _| {
+                let d: i32 = match key {
+                    gtk4::gdk::Key::Down => 1,
+                    gtk4::gdk::Key::Up => -1,
+                    _ => return gtk4::glib::Propagation::Proceed,
+                };
+                let f = s4.text().to_lowercase();
+                let visible: Vec<i32> = (0..ids4.len() as i32)
+                    .filter(|i| {
+                        !ids4[*i as usize].is_empty()
+                            && l4.row_at_index(*i).is_some_and(|r| {
+                                f.is_empty() || r.widget_name().contains(f.as_str())
+                            })
+                    })
+                    .collect();
+                if visible.is_empty() {
+                    return gtk4::glib::Propagation::Stop;
+                }
+                let cur = l4
+                    .selected_row()
+                    .and_then(|r| visible.iter().position(|i| *i == r.index()))
+                    .unwrap_or(0) as i32;
+                let next = visible[((cur + d).rem_euclid(visible.len() as i32)) as usize];
+                l4.select_row(l4.row_at_index(next).as_ref());
+                gtk4::glib::Propagation::Stop
+            });
+            search.add_controller(keys);
+            let scroll = gtk4::ScrolledWindow::new();
+            scroll.set_min_content_height(320);
+            scroll.set_child(Some(&list));
+            vb.append(&scroll);
+            let close = gtk4::Button::with_label("Close");
+            let a = answer.clone();
+            close.connect_clicked(move |_| a(None, None));
+            vb.append(&close);
+            search.grab_focus();
+        }
+        _ => {
+            vb.append(&gtk4::Label::new(spec["message"].as_str()));
+            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+            row.set_halign(gtk4::Align::End);
+            let cancel = gtk4::Button::with_label("Cancel");
+            let a = answer.clone();
+            cancel.connect_clicked(move |_| a(None, None));
+            let yes = gtk4::Button::with_label("Confirm");
+            yes.add_css_class("destructive-action");
+            let a = answer.clone();
+            yes.connect_clicked(move |_| a(Some("yes".into()), None));
+            row.append(&cancel);
+            row.append(&yes);
+            vb.append(&row);
+        }
+    }
+    win.set_child(Some(&vb));
+    // Closing the window any other way is a cancel (a no-op after an answer).
+    let a = answer.clone();
+    win.connect_close_request(move |_| {
+        a(None, None);
+        gtk4::glib::Propagation::Proceed
+    });
+    win.present();
+    win
 }

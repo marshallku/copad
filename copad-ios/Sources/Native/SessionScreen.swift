@@ -44,6 +44,15 @@ struct SessionScreen: View {
             }
         }
         .onChange(of: session.phase) { _, p in if p == .live { term.focus() } }
+        .sheet(item: Binding(get: { session.overlays.first }, set: { _ in })) { o in
+            ComuxOverlayView(overlay: o) { choice, text in
+                session.answerOverlay(o.overlay, choice: choice, text: text)
+                term.focus()
+            }
+            .presentationDetents(o.isPicker ? [.medium, .large] : [.height(220)])
+            .preferredColorScheme(.dark)
+            .interactiveDismissDisabled()
+        }
         .alert("Trust this host?", isPresented: Binding(
             get: { session.pendingHostKey != nil }, set: { if !$0 { session.pendingHostKey = nil } })) {
             Button("Trust") {
@@ -108,15 +117,27 @@ struct SessionScreen: View {
                     .accessibilityIdentifier("flash")
             }
             Spacer()
+            if let b = st?.bells, b > 0 {
+                Text("!\(b)").font(.caption.bold()).foregroundStyle(.red)
+            }
+            if let u = st?.unread, u > 0 {
+                Label("\(u)", systemImage: "envelope.fill").font(.caption2).foregroundStyle(.blue)
+            }
             if let a = st?.attention, a > 0 {
                 Label("\(a)", systemImage: "flag.fill").font(.caption).foregroundStyle(.orange)
             }
             if let n = st?.agents, n > 0 {
                 Label("\(n)", systemImage: "circle.fill").font(.caption2).foregroundStyle(.yellow)
             }
-            if let u = st?.usage?.windows.first {
-                Text("\(u.provider) \(u.window) \(Int(u.pct))%").font(.caption2.monospaced())
+            ForEach(Array((st?.usage?.windows ?? []).enumerated()), id: \.offset) { _, u in
+                Text("\(u.stale ? "~" : "")\(u.provider) \(u.window) \(Int(u.pct))%").font(.caption2.monospaced())
                     .foregroundStyle(u.pct >= 90 ? .red : u.pct >= 70 ? .yellow : .green)
+            }
+            if let up = st?.update {
+                Text("⬆ \(up)").font(.caption2).foregroundStyle(.green)
+            }
+            if let h = st?.host, !h.isEmpty {
+                Text(h).font(.caption2.monospaced()).foregroundStyle(.secondary)
             }
         }
         .padding(.horizontal, 10)
@@ -326,4 +347,8 @@ struct NotificationsDrawer: View {
         .frame(width: 300)
         .accessibilityIdentifier("notificationsDrawer")
     }
+}
+
+extension L0Overlay {
+    var isPicker: Bool { if case .picker = spec { return true } else { return false } }
 }

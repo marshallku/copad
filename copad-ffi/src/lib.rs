@@ -1621,6 +1621,25 @@ pub unsafe extern "C" fn copad_muxhost_command(h: *const MuxHostHandle, req_json
     }
 }
 
+/// Answer a delegated overlay. `choice`/`text` NULL when absent; both NULL = cancelled.
+///
+/// # Safety
+/// `h` live; `choice`, `text` NULL or valid strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_answer(
+    h: *const MuxHostHandle,
+    overlay: u64,
+    choice: *const c_char,
+    text: *const c_char,
+) {
+    // SAFETY: caller contract.
+    if let Some(h) = unsafe { h.as_ref() } {
+        let choice = unsafe { cstr(choice) }.map(str::to_string);
+        let text = unsafe { cstr(text) }.map(str::to_string);
+        h.0.answer(overlay, choice, text);
+    }
+}
+
 /// The binding tag a comux client in this panel reports. Free with `copad_ffi_free_string`.
 ///
 /// # Safety

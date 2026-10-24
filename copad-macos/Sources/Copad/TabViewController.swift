@@ -42,6 +42,11 @@ final class TabViewController: NSViewController {
     private var comuxNotifications: NSView!
     private var comuxSidebarWidth: NSLayoutConstraint!
     private var comuxNotificationsWidth: NSLayoutConstraint!
+    private var comuxStatus: NSView!
+    private var comuxStatusHeight: NSLayoutConstraint!
+    /// The delegated overlay this window is showing as a sheet, if any.
+    private var comuxOverlayShown: UInt64?
+    private weak var comuxOverlaySheet: NSViewController?
     private var comuxNotificationsOpen = false
     private var comuxObservation: AnyCancellable?
     private var comuxServeTimer: Timer?
@@ -497,26 +502,34 @@ final class TabViewController: NSViewController {
             self?.refreshComuxChrome()
         }))
         let notifications = NSHostingView(rootView: ComuxNotifications(host: host, settle: settle))
-        for v in [sidebar, notifications] as [NSView] {
+        let status = NSHostingView(rootView: ComuxStatusStrip(host: host, settle: settle))
+        for v in [sidebar, notifications, status] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             contentArea.addSubview(v)
         }
         comuxSidebar = sidebar
         comuxNotifications = notifications
+        comuxStatus = status
+        comuxStatusHeight = status.heightAnchor.constraint(equalToConstant: 0)
         comuxSidebarWidth = sidebar.widthAnchor.constraint(equalToConstant: 0)
         comuxNotificationsWidth = notifications.widthAnchor.constraint(equalToConstant: 0)
         NSLayoutConstraint.activate([
             sidebar.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
             sidebar.topAnchor.constraint(equalTo: contentArea.topAnchor),
-            sidebar.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
+            sidebar.bottomAnchor.constraint(equalTo: status.topAnchor),
             comuxSidebarWidth,
+            status.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
+            status.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
+            status.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
+            comuxStatusHeight,
             notifications.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
             notifications.topAnchor.constraint(equalTo: contentArea.topAnchor),
-            notifications.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
+            notifications.bottomAnchor.constraint(equalTo: status.topAnchor),
             comuxNotificationsWidth,
         ])
         sidebar.isHidden = true
         notifications.isHidden = true
+        status.isHidden = true
         comuxObservation = host.$state.sink { [weak self] _ in
             DispatchQueue.main.async { self?.refreshComuxChrome() }
         }
@@ -550,6 +563,33 @@ final class TabViewController: NSViewController {
         let notif = on && comuxNotificationsOpen
         comuxNotifications.isHidden = !notif
         comuxNotificationsWidth.constant = notif ? 300 : 0
+        comuxStatus.isHidden = !on
+        comuxStatusHeight.constant = on ? 24 : 0
+        presentComuxOverlay()
+    }
+
+    /// Show the oldest overlay a comux client in THIS window's visible panes opened, as a sheet.
+    private func presentComuxOverlay() {
+        let host = ComuxHost.shared
+        let mine = host.state?.overlays.first { o in o.panel.map(comuxServed.contains) ?? false }
+        if let shown = comuxOverlayShown, mine?.overlay != shown {
+            // Answered elsewhere, or comux closed it: drop our sheet.
+            if let sheet = comuxOverlaySheet { dismiss(sheet) }
+            comuxOverlayShown = nil
+        }
+        guard comuxOverlayShown == nil, let o = mine else { return }
+        settleComuxInput()
+        comuxOverlayShown = o.overlay
+        let vc = NSHostingController(rootView: ComuxOverlayView(overlay: o) { [weak self] choice, text in
+            host.answer(o.overlay, choice: choice, text: text)
+            if let self, let sheet = self.comuxOverlaySheet { self.dismiss(sheet) }
+            self?.comuxOverlayShown = nil
+            if let p = self?.activePaneManager?.activePane {
+                self?.view.window?.makeFirstResponder(p.focusTarget)
+            }
+        })
+        comuxOverlaySheet = vc
+        presentAsSheet(vc)
     }
 
     /// Commit the focused terminal's IME composition before a panel click moves comux's view,
@@ -790,7 +830,7 @@ final class TabViewController: NSViewController {
             // Between the comux panels, which are zero-width unless this window hosts a comux.
             manager.containerView.leadingAnchor.constraint(equalTo: comuxSidebar.trailingAnchor),
             manager.containerView.trailingAnchor.constraint(equalTo: comuxNotifications.leadingAnchor),
-            manager.containerView.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
+            manager.containerView.bottomAnchor.constraint(equalTo: comuxStatus.topAnchor),
         ])
 
         view.layoutSubtreeIfNeeded()

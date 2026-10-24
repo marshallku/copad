@@ -232,3 +232,239 @@ impl App {
         n
     }
 }
+
+/// An overlay handed to a host UI instead of being drawn (decisions #170). The TUI state it
+/// replaces is kept here, so the host's answer runs exactly the code a key would have.
+pub(super) enum Delegated {
+    Prompt(PromptKind),
+    Confirm(ConfirmAction),
+    Switcher,
+    Center,
+}
+
+/// Which delegable overlays are open — taken before a key is fed, compared after, so only an
+/// overlay THAT key opened is delegated (one another client opened stays its TUI).
+#[derive(Clone, Copy, Default)]
+pub struct OverlayMarks([bool; 4]);
+
+fn prompt_title(kind: &PromptKind) -> &'static str {
+    match kind {
+        PromptKind::NewSessionIn(_) => "New session name",
+        PromptKind::NewWorktree => "New worktree branch",
+        PromptKind::RenameSession(_) => "Rename session",
+        PromptKind::RenameTab(..) => "Rename tab",
+        PromptKind::RenamePane(_) => "Name pane",
+    }
+}
+
+impl App {
+    pub fn overlay_marks(&self) -> OverlayMarks {
+        OverlayMarks([
+            self.prompt.is_some(),
+            self.confirm.is_some(),
+            self.popup.is_some(),
+            self.center.is_some(),
+        ])
+    }
+
+    /// Turn every overlay opened since `before` into a host overlay: the TUI state is
+    /// cleared (so the shared frame never shows it) and remembered under a fresh id.
+    pub fn delegate_new_overlays(&mut self, before: OverlayMarks) -> Vec<(u64, l0::OverlaySpec)> {
+        let mut out = Vec::new();
+        let mut next = |me: &mut Self, d: Delegated, spec: l0::OverlaySpec| {
+            me.overlay_seq += 1;
+            me.delegated.insert(me.overlay_seq, d);
+            out.push((me.overlay_seq, spec));
+        };
+        if !before.0[0]
+            && let Some(p) = self.prompt.take()
+        {
+            let spec = l0::OverlaySpec::Prompt {
+                title: prompt_title(&p.kind).into(),
+                initial: p.buf.clone(),
+                placeholder: String::new(),
+            };
+            next(self, Delegated::Prompt(p.kind), spec);
+        }
+        if !before.0[1]
+            && let Some(c) = self.confirm.take()
+        {
+            let message = c
+                .message
+                .split(" (y = ")
+                .next()
+                .unwrap_or(&c.message)
+                .to_string();
+            next(
+                self,
+                Delegated::Confirm(c.action),
+                l0::OverlaySpec::Confirm { message },
+            );
+        }
+        if !before.0[2] && self.popup.take().is_some() {
+            let spec = self.switcher_spec();
+            next(self, Delegated::Switcher, spec);
+        }
+        if !before.0[3] && self.center.take().is_some() {
+            let spec = self.center_spec();
+            next(self, Delegated::Center, spec);
+        }
+        out
+    }
+
+    fn switcher_spec(&self) -> l0::OverlaySpec {
+        let row = |r: &PopupRow| {
+            let (id, current) = match &r.target {
+                PopupTarget::Session(w) => (format!("s:{w}"), *w == self.ws),
+                PopupTarget::Agent(t) => (
+                    format!("a:{t}"),
+                    self.focused_terminal().as_ref() == Some(t),
+                ),
+            };
+            let badge = match &r.target {
+                PopupTarget::Agent(t) => self.agent_status(t).0.to_string(),
+                PopupTarget::Session(_) => String::new(),
+            };
+            l0::PickerRow {
+                id,
+                label: r.text.clone(),
+                detail: String::new(),
+                badge,
+                current,
+            }
+        };
+        // The TUI's own default row (the previous session), so Ctrl-f Enter still toggles.
+        let selected = self
+            .popup_items(PopupTab::Sessions, "")
+            .get(self.popup_default_sel(PopupTab::Sessions, ""))
+            .map(|r| row(r).id);
+        l0::OverlaySpec::Picker {
+            selected,
+            title: "Switch".into(),
+            tabs: vec![
+                l0::PickerTab {
+                    name: "sessions".into(),
+                    rows: self
+                        .popup_items(PopupTab::Sessions, "")
+                        .iter()
+                        .map(row)
+                        .collect(),
+                },
+                l0::PickerTab {
+                    name: "agents".into(),
+                    rows: self
+                        .popup_items(PopupTab::Agents, "")
+                        .iter()
+                        .map(row)
+                        .collect(),
+                },
+            ],
+            tab: 0,
+            actions: Vec::new(),
+        }
+    }
+
+    fn center_spec(&self) -> l0::OverlaySpec {
+        let rows = self
+            .notifications
+            .iter()
+            .map(|n| l0::PickerRow {
+                id: format!("n:{}", n.id),
+                label: format!("{} · {}/{}  {}", n.tool, n.space, n.tab, n.when),
+                detail: n.body.clone(),
+                badge: n.kind.into(),
+                current: !n.read,
+            })
+            .collect();
+        l0::OverlaySpec::Picker {
+            selected: None,
+            title: "Notifications".into(),
+            tabs: vec![l0::PickerTab {
+                name: "notifications".into(),
+                rows,
+            }],
+            tab: 0,
+            actions: vec![l0::PickerAction {
+                id: "dismiss".into(),
+                label: "Dismiss".into(),
+            }],
+        }
+    }
+
+    /// A host answered overlay `id`: run what the TUI would have run. `choice`/`text` both
+    /// absent = cancelled. Returns whether anything visible changed.
+    pub fn overlay_result(
+        &mut self,
+        id: u64,
+        choice: Option<String>,
+        text: Option<String>,
+    ) -> bool {
+        let Some(d) = self.delegated.remove(&id) else {
+            return false;
+        };
+        match d {
+            Delegated::Prompt(kind) => {
+                let Some(buf) = text else { return false };
+                self.commit_prompt(Prompt { kind, buf });
+            }
+            Delegated::Confirm(action) => {
+                if choice.as_deref() != Some("yes") {
+                    return false;
+                }
+                self.perform_confirm(action);
+            }
+            Delegated::Switcher => {
+                let Some(c) = choice else { return false };
+                if let Some(w) = c.strip_prefix("s:") {
+                    let Some(ws) = self
+                        .state
+                        .workspace_ids()
+                        .into_iter()
+                        .find(|x| x.to_string() == w)
+                    else {
+                        self.flash("that session is gone".into(), false);
+                        return true;
+                    };
+                    self.switch_session(ws);
+                } else if let Some(t) = c.strip_prefix("a:") {
+                    let Some(term) = self.panes.keys().find(|x| x.to_string() == t).cloned() else {
+                        self.flash("that agent's pane is gone".into(), false);
+                        return true;
+                    };
+                    self.jump_to_terminal(&term);
+                }
+            }
+            Delegated::Center => {
+                let Some(c) = choice else { return false };
+                let (dismiss, nid) = match c.strip_prefix("dismiss:") {
+                    Some(rest) => (true, rest),
+                    None => (false, c.as_str()),
+                };
+                let Some(n) = nid.strip_prefix("n:").and_then(|s| s.parse::<u64>().ok()) else {
+                    return false;
+                };
+                let Some(pos) = self.notifications.iter().position(|x| x.id == n) else {
+                    return false;
+                };
+                if dismiss {
+                    self.notifications.remove(pos);
+                } else {
+                    let term = self.notifications[pos].terminal.clone();
+                    self.mark_read(&term);
+                    if self.panes.contains_key(&term) {
+                        self.jump_to_terminal(&term);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    /// The host that held these overlays is gone: they are simply dropped (the TUI never
+    /// showed them, so there is nothing to close).
+    pub fn forget_overlays(&mut self, ids: &[u64]) {
+        for id in ids {
+            self.delegated.remove(id);
+        }
+    }
+}

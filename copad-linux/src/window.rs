@@ -579,7 +579,12 @@ impl CopadWindow {
         middle.set_vexpand(true);
         tab_manager.notebook.set_hexpand(true);
         middle.append(&comux.sidebar);
-        middle.append(&tab_manager.notebook);
+        let center = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        center.set_hexpand(true);
+        tab_manager.notebook.set_vexpand(true);
+        center.append(&tab_manager.notebook);
+        center.append(&comux.status);
+        middle.append(&center);
         middle.append(&comux.notifications);
         if config.statusbar.position == "top" {
             layout.append(&statusbar.container);
@@ -651,7 +656,7 @@ impl CopadWindow {
         let last_applied_ht = Cell::new(false);
         let comux_tick = comux.clone();
         glib::timeout_add_local(Duration::from_millis(50), move || {
-            comux_tick.tick(&mgr, win.is_visible());
+            comux_tick.tick(&mgr, &win);
             // Cut-over consumer runs BEFORE pump_all: when the daemon's
             // register ack lands with `host_triggers=true`, clear the
             // local engine on the SAME tick so no events dispatch

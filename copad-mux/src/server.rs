@@ -472,6 +472,7 @@ pub fn run() -> io::Result<()> {
         // and who claims them, BEFORE any frame is composed this pass (decisions #166).
         dirty |= hub.expire();
         dirty |= sync_host_chrome(&mut app, &mut clients, &mut hub);
+        app.forget_overlays(&hub.prune_overlays());
         // The server itself quits only when the last shell exits (app empty) — NOT
         // when the last client detaches (the whole point of detach: shells live on).
         let reaped = app.reap_exited();
@@ -574,6 +575,7 @@ pub fn run() -> io::Result<()> {
             let (values, notifs) = topic_values(&app, &hub, &clients);
             let flashes = app.take_flashes();
             for over in hub.publish(values, flashes, &notifs) {
+                app.forget_overlays(&hub.take_overlays_of(over));
                 hub.remove(over);
             }
         } else if hub.is_empty() {
@@ -800,6 +802,21 @@ fn expire_silent_clients(app: &mut App, clients: &mut Vec<Client>) -> bool {
     prune_dead_clients(app, clients, &silent)
 }
 
+/// If `client`'s host draws overlays, hand it every overlay `client`'s input just opened
+/// (decisions #170); they never reach the shared frame.
+fn delegate_overlays(app: &mut App, hub: &mut Hub, client: u64, before: crate::tui::OverlayMarks) {
+    let Some(sub) = hub.host_of(client, Feature::Overlays) else {
+        return;
+    };
+    for (ov, spec) in app.delegate_new_overlays(before) {
+        if !hub.send_overlay(sub, ov, client, spec) {
+            app.forget_overlays(&hub.take_overlays_of(sub));
+            hub.remove(sub);
+            return;
+        }
+    }
+}
+
 /// One line from a subscriber. Returns whether it may have changed what is rendered.
 fn handle_sub(
     id: u64,
@@ -863,8 +880,24 @@ fn handle_sub(
             }
             false
         }
-        // Overlay delegation answers (P3) and a second subscribe are not acted on yet.
-        SubMsg::OverlayResult { .. } | SubMsg::Subscribe { .. } => false,
+        SubMsg::OverlayResult {
+            overlay,
+            choice,
+            text,
+        } => {
+            // Only the host the overlay was handed to may answer it.
+            match hub.take_overlay(id, overlay, &attach_views(clients)) {
+                Some(true) => app.overlay_result(overlay, choice, text),
+                // Ours, but ownership ended (detached / released): the delegated state goes.
+                Some(false) => {
+                    app.forget_overlays(&[overlay]);
+                    false
+                }
+                // Not this subscriber's overlay: someone else's stays untouched.
+                None => false,
+            }
+        }
+        SubMsg::Subscribe { .. } => false,
     }
 }
 
@@ -1243,6 +1276,7 @@ fn handle_incoming(
             false
         }
         Incoming::SubGone { id } => {
+            app.forget_overlays(&hub.take_overlays_of(id));
             hub.remove(id);
             false
         }
@@ -1384,6 +1418,7 @@ fn handle_incoming(
                     // completed by another's key. Detach removes ONLY the client that
                     // pressed the chord; the others keep going.
                     let mut action = KeyAction::Continue;
+                    let marks = app.overlay_marks();
                     if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
                         action = app.feed_key(k, &mut c.prefix);
                         // A copy-mode yank goes to the client whose key it was, exactly like
@@ -1392,6 +1427,7 @@ fn handle_incoming(
                             queue_copy(c, crate::term::next_clipboard_seq(), &text);
                         }
                     }
+                    delegate_overlays(app, hub, id, marks);
                     match action {
                         KeyAction::Detach => {
                             if let Some(pos) = clients.iter().position(|c| c.id == id) {
@@ -1428,6 +1464,7 @@ fn handle_incoming(
                         app.set_client_env(e);
                     }
                     let mut action = KeyAction::Continue;
+                    let marks = app.overlay_marks();
                     if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
                         action = app.feed_paste(&text, &mut c.prefix);
                         // Replayed keys can yank in copy mode; the copy is this client's.
@@ -1435,6 +1472,7 @@ fn handle_incoming(
                             queue_copy(c, crate::term::next_clipboard_seq(), &text);
                         }
                     }
+                    delegate_overlays(app, hub, id, marks);
                     if action == KeyAction::Detach
                         && let Some(pos) = clients.iter().position(|c| c.id == id)
                     {
@@ -1451,11 +1489,14 @@ fn handle_incoming(
                     // Scroll the pane under the cursor / click-to-focus / drag-select — shared,
                     // so any client's wheel drives the one composite. A drag-release returns the
                     // selected pane text, which we hand back to THIS client to copy (OSC 52).
+                    let marks = app.overlay_marks();
                     if let Some(text) = app.mouse_at(ClientId(id), x, y, kind)
                         && let Some(c) = clients.iter_mut().find(|c| c.id == id)
                     {
                         queue_copy(c, crate::term::next_clipboard_seq(), &text);
                     }
+                    // A context-menu item can open a prompt (rename tab/session).
+                    delegate_overlays(app, hub, id, marks);
                     true
                 }
                 ClientMsg::Resize { cols, rows } => {

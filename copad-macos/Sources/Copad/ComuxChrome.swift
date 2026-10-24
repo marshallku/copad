@@ -23,6 +23,7 @@ final class ComuxHost: ObservableObject {
         var status: L0Status?
         var bound: [String: UInt64]
         var claimed: [UInt64]
+        var overlays: [L0Overlay]
     }
 
     @Published private(set) var state: State?
@@ -87,6 +88,12 @@ final class ComuxHost: ObservableObject {
     func hosts(panels: [String]) -> Bool {
         guard let s = state else { return false }
         return panels.contains { p in s.bound[p].map { s.claimed.contains($0) } ?? false }
+    }
+
+    /// Answer a delegated overlay (comux runs the action).
+    func answer(_ overlay: UInt64, choice: String?, text: String?) {
+        guard let h = handle else { return }
+        copad_muxhost_answer(h, overlay, choice, text)
     }
 
     func command(_ req: [String: Any]) {
@@ -213,5 +220,64 @@ private func statusColor(_ s: String) -> Color {
     case "working": return .yellow
     case "ready": return .green
     default: return .gray
+    }
+}
+
+/// comux's status bar as a native strip (decisions #170): every field the TUI bar carries —
+/// session, its tabs, the armed prefix, the outcome line, bells, attention, agents, unread,
+/// usage, update, host — so comux can stop drawing its own.
+struct ComuxStatusStrip: View {
+    @ObservedObject var host: ComuxHost
+    var settle: () -> Void
+
+    var body: some View {
+        let s = host.state
+        let st = s?.status
+        let session = s?.tree?.sessions.first { $0.active }
+        HStack(spacing: 8) {
+            Text(session?.name ?? "").font(.caption.bold())
+                .padding(.horizontal, 6).background(Capsule().fill(Color.purple.opacity(0.45)))
+            ForEach(session?.tabs ?? []) { t in
+                Button {
+                    settle()
+                    host.command(["cmd": "select-tab", "target": t.id])
+                } label: {
+                    HStack(spacing: 3) {
+                        if t.panes.contains(where: { $0.kind == "agent" }) {
+                            Circle().fill(.yellow).frame(width: 5, height: 5)
+                        }
+                        Text("\(t.index + 1) \(t.title)").lineLimit(1)
+                        if t.bell { Text("!").bold().foregroundStyle(.red) }
+                    }
+                    .font(.caption.monospaced())
+                    .padding(.horizontal, 6)
+                    .background(Capsule().fill(t.active ? Color.accentColor.opacity(0.45) : Color.white.opacity(0.06)))
+                }
+                .buttonStyle(.plain)
+            }
+            if st?.prefix_armed == true {
+                Text(st?.prefix_label ?? "^b").font(.caption.monospaced().bold())
+                    .padding(.horizontal, 4).background(Capsule().fill(Color.yellow)).foregroundStyle(.black)
+            }
+            if let f = st?.flash {
+                Text(f.text).font(.caption).foregroundStyle(f.error ? .red : .secondary).lineLimit(1)
+            }
+            Spacer()
+            if let b = st?.bells, b > 0 { Text("! \(b)").font(.caption.bold()).foregroundStyle(.red) }
+            if let a = st?.attention, a > 0 { Text("⚑\(a)").font(.caption).foregroundStyle(.orange) }
+            if let n = st?.agents, n > 0 { Text("● \(n)").font(.caption).foregroundStyle(.yellow) }
+            if let u = st?.unread, u > 0 { Text("✉ \(u)").font(.caption).foregroundStyle(.blue) }
+            ForEach(Array((st?.usage?.windows ?? []).enumerated()), id: \.offset) { _, w in
+                Text("\(w.stale ? "~" : "")\(w.provider) \(w.window) \(Int(w.pct))%")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(w.pct >= 90 ? .red : w.pct >= 70 ? .yellow : .green)
+            }
+            if let up = st?.update { Text("⬆ \(up)").font(.caption2).foregroundStyle(.green) }
+            Text(Date.now, style: .time).font(.caption2.monospaced()).foregroundStyle(.secondary)
+            if let h = st?.host { Text(h).font(.caption2.bold()) }
+        }
+        .padding(.horizontal, 8)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityIdentifier("comuxStatus")
     }
 }

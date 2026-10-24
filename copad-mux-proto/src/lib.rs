@@ -210,6 +210,10 @@ pub enum OverlaySpec {
         /// center); the host answers with `choice = "<action>:<row id>"`.
         #[serde(default)]
         actions: Vec<PickerAction>,
+        /// The row a plain Enter picks before anything is typed (the TUI's own default —
+        /// `Ctrl-f` opens on the previous session so `Ctrl-f Enter` toggles).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selected: Option<String>,
     },
     /// A single-line text prompt (rename, new session name, worktree branch).
     Prompt {

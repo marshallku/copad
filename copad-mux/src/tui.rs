@@ -50,6 +50,7 @@ use crate::usagepoll::{self, UsagePart, UsageSnapshot};
 use crate::versionpoll::{self, VersionStatus};
 
 mod host;
+pub use host::OverlayMarks;
 
 /// Direction for focus navigation with the arrow keys.
 #[derive(Clone, Copy)]
@@ -1042,6 +1043,9 @@ pub struct App {
     flash_log: Vec<copad_mux_proto::Flash>,
     /// The last notification id handed out.
     notif_seq: u64,
+    /// Overlays a host UI is showing instead of the TUI (decisions #170), by overlay id.
+    delegated: HashMap<u64, host::Delegated>,
+    overlay_seq: u64,
     /// When the carousel last advanced — a manual page OR an auto-rotate tick resets
     /// it, so `usage_rotate_secs` counts from the last change, not a fixed cadence
     /// (a manual scroll never jumps again immediately after).
@@ -1234,6 +1238,8 @@ impl App {
             host_hidden: (false, false),
             flash_log: Vec::new(),
             notif_seq: 0,
+            delegated: HashMap::new(),
+            overlay_seq: 0,
             bell_seen: HashMap::new(),
             usage_rolled_at: std::time::Instant::now(),
             alt_screen: HashMap::new(),
@@ -17830,6 +17836,92 @@ mod host_api {
         assert_eq!(app.host_notifications().unread, 1);
         app.handle_control(&Req::NotifRead { id: None });
         assert_eq!(app.host_notifications().unread, 0);
+    }
+
+    /// Overlay delegation (decisions #170): an overlay the input opened goes to the host,
+    /// never into the frame, and the host's answer runs the TUI's own action.
+    #[test]
+    fn a_delegated_prompt_renames_through_the_tuis_own_commit() {
+        let mut app = app();
+        let marks = app.overlay_marks();
+        app.open_rename_prompt();
+        let ovs = app.delegate_new_overlays(marks);
+        assert_eq!(ovs.len(), 1);
+        assert!(app.prompt.is_none(), "the TUI never shows it");
+        let (id, spec) = &ovs[0];
+        assert!(matches!(spec, copad_mux_proto::OverlaySpec::Prompt { .. }));
+        assert!(app.overlay_result(*id, None, Some("renamed".into())));
+        assert_eq!(app.host_tree().sessions[0].name, "renamed");
+        assert!(
+            !app.overlay_result(*id, None, Some("again".into())),
+            "an answer runs once"
+        );
+    }
+
+    #[test]
+    fn a_delegated_confirm_only_acts_on_yes_and_an_open_overlay_is_not_stolen() {
+        let mut app = app();
+        app.handle_control(&Req::NewSession {
+            name: Some("doomed".into()),
+            cwd: None,
+            detached: false,
+        });
+        assert_eq!(app.host_tree().sessions.len(), 2);
+        // Another client already had the switcher open: it is not taken over.
+        app.open_popup();
+        let marks = app.overlay_marks();
+        app.open_kill_session_confirm();
+        let ovs = app.delegate_new_overlays(marks);
+        assert_eq!(ovs.len(), 1, "only the confirm this input opened");
+        assert!(app.popup.is_some());
+        let id = ovs[0].0;
+        assert!(!app.overlay_result(id, None, None), "cancel does nothing");
+        assert_eq!(app.host_tree().sessions.len(), 2);
+        app.open_kill_session_confirm();
+        let marks2 = crate::tui::OverlayMarks::default();
+        let id = app.delegate_new_overlays(marks2)[0].0;
+        assert!(app.overlay_result(id, Some("yes".into()), None));
+        assert_eq!(app.host_tree().sessions.len(), 1);
+    }
+
+    #[test]
+    fn the_switcher_and_center_answer_with_row_ids() {
+        let mut app = app();
+        app.handle_control(&Req::NewSession {
+            name: Some("other".into()),
+            cwd: None,
+            detached: true,
+        });
+        let other = app
+            .host_tree()
+            .sessions
+            .iter()
+            .find(|s| s.name == "other")
+            .unwrap()
+            .id
+            .clone();
+        let marks = app.overlay_marks();
+        app.open_popup();
+        let (id, spec) = app.delegate_new_overlays(marks).remove(0);
+        let copad_mux_proto::OverlaySpec::Picker { tabs, selected, .. } = spec else {
+            panic!()
+        };
+        assert!(tabs[0].rows.iter().any(|r| r.id == format!("s:{other}")));
+        assert!(
+            selected.is_some(),
+            "the TUI's default row travels with the picker"
+        );
+        assert!(app.overlay_result(id, Some(format!("s:{other}")), None));
+        assert_eq!(app.host_tree().active, other);
+
+        let term = app.focused_terminal().unwrap();
+        app.raise_notification(term, "claude".into(), "done", "x".into());
+        let marks = app.overlay_marks();
+        app.open_center();
+        let (id, _) = app.delegate_new_overlays(marks).remove(0);
+        let nid = app.host_notifications().items[0].id;
+        assert!(app.overlay_result(id, Some(format!("dismiss:n:{nid}")), None));
+        assert!(app.host_notifications().items.is_empty());
     }
 
     #[test]

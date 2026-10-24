@@ -172,6 +172,8 @@ final class KeyBar: UIInputView {
             ("←", "key-left", { [weak self] in self?.send(.init(code: .left)) }),
             ("→", "key-right", { [weak self] in self?.send(.init(code: .right)) }),
             ("^b", "key-prefix", { [weak self] in self?.send(.ctrl("b")) }),
+            ("^f", "key-switcher", { [weak self] in self?.send(.ctrl("f")) }),
+            ("^b a", "key-center", { [weak self] in self?.chord("a") }),
             ("^b c", "key-newtab", { [weak self] in self?.chord("c") }),
             ("^b n", "key-next", { [weak self] in self?.chord("n") }),
             ("^b p", "key-prev", { [weak self] in self?.chord("p") }),

@@ -178,6 +178,9 @@ pub struct Hub {
     /// Last published (serialized data, rev) per topic.
     last: BTreeMap<&'static str, (String, u64)>,
     last_pub: Option<Instant>,
+    /// Delegated overlays (decisions #170): overlay id → (the subscriber showing it, the
+    /// attachment it was opened for).
+    overlays: HashMap<u64, (u64, u64)>,
     /// Highest notification id already announced as a `notify` event; `None` until the first
     /// publication pass, which only records the high-water mark.
     notif_seen: Option<u64>,
@@ -340,6 +343,73 @@ impl Hub {
         if let Some(s) = self.subs.iter_mut().find(|s| s.id == sub) {
             s.last_seen = Instant::now();
         }
+    }
+
+    /// Hand overlay `ov` to subscriber `sub`. `false` = it must be disconnected.
+    pub fn send_overlay(&mut self, sub: u64, ov: u64, client: u64, spec: l0::OverlaySpec) -> bool {
+        self.overlays.insert(ov, (sub, client));
+        self.send(
+            sub,
+            &PubMsg::Overlay {
+                overlay: ov,
+                client,
+                spec,
+            },
+        )
+    }
+
+    /// Whether `sub` is the one showing overlay `ov` AND still owns that attachment's
+    /// overlays (so its answer may run).
+    ///
+    /// `attached` is the CURRENT client list: a detach handled earlier in the same input batch
+    /// has not been folded into the claims yet, so the attachment's presence is checked here
+    /// directly (codex P3 r2 C2).
+    ///
+    /// `None` = not `sub`'s overlay (nothing changes — another host's overlay stays theirs);
+    /// `Some(true)` = its answer may run; `Some(false)` = it was `sub`'s but ownership ended,
+    /// and the record is gone (the caller drops the delegated state too).
+    pub fn take_overlay(&mut self, sub: u64, ov: u64, attached: &[AttachView]) -> Option<bool> {
+        match self.overlays.get(&ov) {
+            Some(&(s, attachment)) if s == sub => {
+                self.overlays.remove(&ov);
+                Some(
+                    attached.iter().any(|a| a.id == attachment)
+                        && self.host_of(attachment, Feature::Overlays) == Some(sub),
+                )
+            }
+            _ => None,
+        }
+    }
+
+    /// Overlays whose host no longer owns their attachment's overlays (released, expired,
+    /// detached): cancelled server-side and told to the host as `overlay-closed`, so an old
+    /// answer — a destructive confirm — can never run after ownership ended (codex P3 C2).
+    pub fn prune_overlays(&mut self) -> Vec<u64> {
+        let dead: Vec<(u64, u64)> = self
+            .overlays
+            .iter()
+            .filter(|(_, (sub, a))| self.host_of(*a, Feature::Overlays) != Some(*sub))
+            .map(|(ov, (sub, _))| (*ov, *sub))
+            .collect();
+        for (ov, sub) in &dead {
+            self.overlays.remove(ov);
+            let _ = self.send(*sub, &PubMsg::OverlayClosed { overlay: *ov });
+        }
+        dead.into_iter().map(|(ov, _)| ov).collect()
+    }
+
+    /// The overlays a departing subscriber was showing.
+    pub fn take_overlays_of(&mut self, sub: u64) -> Vec<u64> {
+        let ids: Vec<u64> = self
+            .overlays
+            .iter()
+            .filter(|(_, (s, _))| *s == sub)
+            .map(|(o, _)| *o)
+            .collect();
+        for o in &ids {
+            self.overlays.remove(o);
+        }
+        ids
     }
 
     /// Drop a subscriber and every claim it held. Returns whether claims changed.
@@ -708,6 +778,58 @@ mod tests {
         assert!(hub.remove(1), "removing the owner releases the claim");
         assert!(hub.hidden(&one).is_empty());
         hub.claim(2, 9, inc, vec![Feature::Status], &one).unwrap();
+    }
+
+    #[test]
+    fn an_overlay_dies_with_its_attachments_claim_and_cannot_be_answered_after() {
+        let mut hub = Hub::default();
+        let (s, _p) = sub_pair(1);
+        let ob = s.outbox.clone();
+        hub.subs.push(s);
+        let one = [view(4, Some("t"))];
+        let inc = crate::term::incarnation();
+        hub.claim(1, 4, inc, vec![Feature::Overlays], &one).unwrap();
+        assert!(hub.send_overlay(
+            1,
+            77,
+            4,
+            l0::OverlaySpec::Confirm {
+                message: "kill?".into()
+            }
+        ));
+        assert!(hub.prune_overlays().is_empty(), "still owned");
+        hub.release(1, 4);
+        assert_eq!(hub.prune_overlays(), [77]);
+        let lines = ob.next_batch().unwrap();
+        assert!(
+            lines.iter().any(|l| l.contains(r#""t":"overlay-closed""#)),
+            "{lines:?}"
+        );
+        assert_eq!(
+            hub.take_overlay(1, 77, &one),
+            None,
+            "already pruned: not anyone's"
+        );
+        // Claimed, but the attachment detached in this very batch: refused too.
+        hub.claim(1, 4, inc, vec![Feature::Overlays], &one).unwrap();
+        assert!(hub.send_overlay(
+            1,
+            78,
+            4,
+            l0::OverlaySpec::Confirm {
+                message: "k".into()
+            }
+        ));
+        assert_eq!(
+            hub.take_overlay(2, 78, &one),
+            None,
+            "another subscriber cannot touch it"
+        );
+        assert_eq!(
+            hub.take_overlay(1, 78, &[]),
+            Some(false),
+            "the attachment is gone"
+        );
     }
 
     #[test]

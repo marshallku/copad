@@ -293,6 +293,8 @@ void copad_muxhost_serve(const MuxHostHandle *h, const char *panels_json);
 /// Free with copad_ffi_free_string.
 char *copad_muxhost_state_json(const MuxHostHandle *h);
 void copad_muxhost_command(const MuxHostHandle *h, const char *req_json);
+/// Answer a delegated overlay; choice/text NULL when absent (both NULL = cancel).
+void copad_muxhost_answer(const MuxHostHandle *h, unsigned long long overlay, const char *choice, const char *text);
 /// Free with copad_ffi_free_string.
 char *copad_muxhost_copad_tag(const char *panel, const char *socket);
 

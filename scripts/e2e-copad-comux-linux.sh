@@ -7,6 +7,9 @@
 #   scripts/e2e-copad-comux-linux.sh                 # after cargo build -p copad-linux -p copad-mux -p copad-cli
 #   SHOT_WAIT=25 scripts/e2e-copad-comux-linux.sh    # hold the window for a screenshot of
 #                                                    # http://127.0.0.1:8097/ (the broadway page)
+#   OVERLAY_DRIVER=1 …   # also open comux's rename prompt (Ctrl-b $) and wait up to 90s for
+#                        # something to type "linuxrenamed" + Enter into the native dialog on
+#                        # the broadway page (the Mac drives it with tabd through an ssh tunnel)
 set -euo pipefail
 R="$(cd "$(dirname "$0")/.." && pwd)"
 COMUX=$R/target/debug/comux; COCTL=$R/target/debug/coctl; COPAD=$R/target/debug/copad
@@ -56,15 +59,31 @@ $COCTL --socket "$GUI" terminal exec "env COPAD_MUX_SOCK=$W/s COPAD_MUX_QUIET_SS
 ok=""
 for _ in $(seq 1 60); do
   c=$(clients)
-  python3 -c 'import json,sys; c=json.loads(sys.argv[1]); sys.exit(0 if any(x["tag"].startswith("copad:") and "sidebar" in x["claimed"] for x in c["clients"]) and "sidebar" in c["hidden"] else 1)' "$c" && { ok=1; break; }
+  python3 -c 'import json,sys; c=json.loads(sys.argv[1]); sys.exit(0 if any(x["tag"].startswith("copad:") and {"sidebar","status","overlays"} <= set(x["claimed"]) for x in c["clients"]) and {"sidebar","status"} <= set(c["hidden"]) else 1)' "$c" && { ok=1; break; }
   sleep 0.5
 done
 [[ -n "$ok" ]] || fail "copad-linux never claimed the sidebar: $(clients)"
-echo "ok — copad-linux found its tab's comux by tag and claimed the sidebar"
+echo "ok — copad-linux found its tab's comux by tag and claimed sidebar, status and overlays"
 SCREEN=$($COCTL --socket "$GUI" terminal read 2>/dev/null || true)
 grep -q "spaces" <<<"$SCREEN" && fail "TUI sidebar still drawn: $SCREEN"
 echo "ok — comux in the copad tab no longer draws its sidebar"
 $COMUX new-session --detached linux-three >/dev/null
+if [[ -n "${OVERLAY_DRIVER:-}" ]]; then
+  names() { python3 - <<'PY'
+import json, os, socket
+s = socket.socket(socket.AF_UNIX); s.connect(os.environ["COPAD_MUX_SOCK"])
+s.sendall(b'{"t":"subscribe","v":1}\n'); f = s.makefile(); f.readline()
+print(" ".join(x["name"] for x in json.loads(f.readline())["topics"]["tree"]["data"]["sessions"]))
+PY
+  }
+  $COCTL --socket "$GUI" terminal feed $'\x02$' >/dev/null
+  echo "OVERLAY_OPEN"
+  for _ in $(seq 1 180); do names | grep -q linuxrenamed && break; sleep 0.5; done
+  names | grep -q linuxrenamed || fail "the native rename dialog never renamed the session: $(names)"
+  SCREEN=$($COCTL --socket "$GUI" terminal read 2>/dev/null || true)
+  grep -q "rename session" <<<"$SCREEN" && fail "the TUI drew the prompt as well"
+  echo "ok — Ctrl-b \$ became a native GTK dialog and its answer renamed the session"
+fi
 sleep 2
 echo "BROADWAY http://127.0.0.1:8097/  W=$W"
 if [[ -n "${SHOT_WAIT:-}" ]]; then sleep "$SHOT_WAIT"; fi

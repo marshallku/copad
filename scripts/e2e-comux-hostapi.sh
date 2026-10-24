@@ -20,6 +20,8 @@
 #  15. an attach that replaces its earlier attachment (matching tag) evicts it; a wrong tag does not
 #  16. a heartbeat client that goes silent is detached (and its size stops pinning the view)
 #  17. kill-server sent as a render-channel Command is answered before the server exits
+#  18. overlays: a host that claims `overlays` receives the rename prompt Ctrl-b $ opens (the
+#      TUI never draws it), and its answer renames the session; Ctrl-f arrives as a picker
 
 set -euo pipefail
 
@@ -410,6 +412,38 @@ hb.close()
 ok("a heartbeat client silent past the expiry was detached")
 
 c.detach()
+
+# 18. overlay delegation
+ov_client = Raw("raw-ov")
+oh = Sub(); oh.recv(5); oh.recv(5)
+oh.wait(lambda s: any(x["tag"] == "raw-ov" for x in s.model["clients"]["clients"]), what="raw-ov listed")
+att = [x for x in oh.model["clients"]["clients"] if x["tag"] == "raw-ov"][0]["id"]
+oh.send({"t": "host-ready", "attachment": att, "incarnation": INC, "features": ["overlays"]})
+time.sleep(0.5)
+ov_client.key({"Char": "b"}, "CONTROL"); ov_client.key({"Char": "$"})
+ovm = None
+end = time.time() + 8
+while time.time() < end and not ovm:
+    m = oh.recv(0.5)
+    if m and m["t"] == "overlay":
+        ovm = m
+if not ovm or ovm["spec"]["kind"] != "prompt" or ovm["client"] != att:
+    fail(f"no delegated prompt: {ovm}")
+oh.send({"t": "overlay-result", "overlay": ovm["overlay"], "text": "delegated-name"})
+oh.wait(lambda s: any(x["name"] == "delegated-name" for x in s.model["tree"]["sessions"]),
+        what="the session renamed by the host's answer")
+ov_client.key({"Char": "f"}, "CONTROL")
+pick = None
+end = time.time() + 8
+while time.time() < end and not pick:
+    m = oh.recv(0.5)
+    if m and m["t"] == "overlay":
+        pick = m
+if not pick or pick["spec"]["kind"] != "picker" or [t["name"] for t in pick["spec"]["tabs"]] != ["sessions", "agents"]:
+    fail(f"Ctrl-f was not delegated as a picker: {pick}")
+oh.send({"t": "overlay-result", "overlay": pick["overlay"]})  # cancel
+oh.close(); ov_client.close()
+ok("overlays went to the claiming host: a prompt answered by it renamed the session; Ctrl-f arrived as a picker")
 
 # 17. kill-server sent as a render-channel Command is answered before the server goes
 k = Raw("raw-kill")

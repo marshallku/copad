@@ -30,6 +30,8 @@ final class MuxSession: ObservableObject, KeySink {
     @Published private(set) var flash: L0Flash?
     /// The newest notification announced since connecting (for an in-app banner).
     @Published private(set) var lastNotify: L0Notification?
+    /// Overlays comux handed this app (decisions #170), oldest first; the first is shown.
+    @Published private(set) var overlays: [L0Overlay] = []
     /// Unknown host key awaiting the user's confirmation (TOFU).
     @Published var pendingHostKey: String?
 
@@ -61,7 +63,7 @@ final class MuxSession: ObservableObject, KeySink {
     private var previous: UInt64?
 
     static let deadline: TimeInterval = 30
-    static let features = ["sidebar", "status"]
+    static let features = ["sidebar", "status", "overlays"]
 
     /// This install's binding tag: how the host finds our attachment in `clients`.
     static var tag: String {
@@ -159,11 +161,22 @@ final class MuxSession: ObservableObject, KeySink {
         }
     }
 
+    /// Answer the overlay comux handed us: `choice` for a picker/confirm, `text` for a prompt,
+    /// both nil to cancel. comux runs the action itself.
+    func answerOverlay(_ id: UInt64, choice: String?, text: String?) {
+        overlays.removeAll { $0.overlay == id }
+        var m: [String: Any] = ["t": "overlay-result", "overlay": id]
+        if let choice { m["choice"] = choice }
+        if let text { m["text"] = text }
+        l0?.write(Self.line(m))
+    }
+
     private func teardown(reason: String?) {
         pingTimer?.invalidate(); pingTimer = nil
         l0?.close(); render?.close(); ssh?.close()
         l0 = nil; render = nil; ssh = nil
         attachment = nil; claimed = false; gotFull = false
+        overlays.removeAll()
         replies.removeAll()
         grid.reset()
         onGrid?()
@@ -230,6 +243,14 @@ final class MuxSession: ObservableObject, KeySink {
                           let n = try? JSONDecoder().decode(L0Notification.self, from: data) {
                     lastNotify = n
                 }
+            case "overlay":
+                guard let data = try? JSONSerialization.data(withJSONObject: m),
+                      let o = try? JSONDecoder().decode(L0Overlay.self, from: data),
+                      o.client == attachment else { break }
+                overlays.append(o)
+            case "overlay-closed":
+                let id = (m["overlay"] as? NSNumber)?.uint64Value
+                overlays.removeAll { $0.overlay == id }
             case "error":
                 // A refused claim: the TUI chrome simply stays. Not fatal.
                 claimed = false

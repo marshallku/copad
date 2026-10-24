@@ -79,13 +79,13 @@ sleep 2
 claimed=""
 for _ in $(seq 1 60); do
     c="$(clients)"
-    if python3 -c 'import json,sys; c=json.loads(sys.argv[1]); sys.exit(0 if any(x["tag"].startswith("copad:") and "sidebar" in x["claimed"] for x in c["clients"]) and "sidebar" in c["hidden"] else 1)' "$c"; then
+    if python3 -c 'import json,sys; c=json.loads(sys.argv[1]); sys.exit(0 if any(x["tag"].startswith("copad:") and set(["sidebar","status","overlays"]) <= set(x["claimed"]) for x in c["clients"]) and set(["sidebar","status"]) <= set(c["hidden"]) else 1)' "$c"; then
         claimed=1; break
     fi
     sleep 0.5
 done
 [[ -n "$claimed" ]] || fail "copad never claimed the comux client's sidebar: $(clients)"
-log "ok — copad found its tab's comux client by tag and claimed the sidebar"
+log "ok — copad found its tab's comux client by tag and claimed sidebar, status and overlays"
 
 # comux no longer draws its sidebar in that tab: the screen has no `spaces` header.
 SCREEN="$("$COCTL" --socket "$GUI" terminal read 2>/dev/null || true)"
@@ -116,6 +116,28 @@ PY
 if [[ -n "$WID" ]]; then
     screencapture -o -x -l"$WID" "$W/native-sidebar.png" && log "screenshot: $W/native-sidebar.png"
 fi
+
+# An overlay is delegated: Ctrl-b $ in the tab opens comux's rename prompt as a native SHEET
+# in this window; typing a name there renames the session.
+session_names() { python3 - <<'PY'
+import json, os, socket
+s = socket.socket(socket.AF_UNIX); s.connect(os.environ["COPAD_MUX_SOCK"])
+s.sendall(b'{"t":"subscribe","v":1}\n'); f = s.makefile(); f.readline()
+print(" ".join(x["name"] for x in json.loads(f.readline())["topics"]["tree"]["data"]["sessions"]))
+PY
+}
+"$COCTL" --socket "$GUI" terminal feed $'\x02$' >/dev/null
+sleep 2
+[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/overlay-sheet.png" && log "screenshot: $W/overlay-sheet.png"
+osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" \
+          -e 'tell application "System Events" to keystroke "macrenamed"' \
+          -e 'tell application "System Events" to key code 36' >/dev/null
+for _ in $(seq 1 20); do session_names | grep -q macrenamed && break; sleep 0.5; done
+session_names | grep -q macrenamed || fail "the delegated prompt did not rename the session: $(session_names)"
+log "ok — Ctrl-b \$ became a native sheet and its answer renamed the session"
+SCREEN="$("$COCTL" --socket "$GUI" terminal read 2>/dev/null || true)"
+grep -q "rename session" <<<"$SCREEN" && fail "the TUI drew the prompt as well"
+[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/after-rename.png"
 
 # Closing copad releases the claim: comux draws its own sidebar again for the next client.
 kill "$APP_PID"; APP_PID=""

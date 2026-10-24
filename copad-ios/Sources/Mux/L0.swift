@@ -216,3 +216,61 @@ func elapsedLabel(since: Int64, now: Date = Date()) -> String {
     if m < 60 { return "\(m)m" }
     return "\(m / 60)h\(m % 60)m"
 }
+
+// MARK: delegated overlays (decisions #170)
+
+struct L0PickerRow: Codable, Equatable, Identifiable {
+    var id: String
+    var label: String
+    var detail: String?
+    var badge: String?
+    var current: Bool?
+}
+
+struct L0PickerTab: Codable, Equatable {
+    var name: String
+    var rows: [L0PickerRow]
+}
+
+struct L0PickerAction: Codable, Equatable {
+    var id: String
+    var label: String
+}
+
+/// What comux asks a host to show instead of a TUI overlay. Three shapes cover them all; comux
+/// keeps the meaning and runs the answer itself.
+enum L0OverlaySpec: Decodable, Equatable {
+    case picker(title: String, tabs: [L0PickerTab], tab: Int, actions: [L0PickerAction], selected: String?)
+    case prompt(title: String, initial: String, placeholder: String)
+    case confirm(message: String)
+
+    private enum K: String, CodingKey { case kind, title, tabs, tab, actions, initial, placeholder, message, selected }
+
+    init(from d: Decoder) throws {
+        let c = try d.container(keyedBy: K.self)
+        switch try c.decode(String.self, forKey: .kind) {
+        case "picker":
+            self = .picker(title: try c.decode(String.self, forKey: .title),
+                           tabs: try c.decodeIfPresent([L0PickerTab].self, forKey: .tabs) ?? [],
+                           tab: try c.decodeIfPresent(Int.self, forKey: .tab) ?? 0,
+                           actions: try c.decodeIfPresent([L0PickerAction].self, forKey: .actions) ?? [],
+                           selected: try c.decodeIfPresent(String.self, forKey: .selected))
+        case "prompt":
+            self = .prompt(title: try c.decode(String.self, forKey: .title),
+                           initial: try c.decodeIfPresent(String.self, forKey: .initial) ?? "",
+                           placeholder: try c.decodeIfPresent(String.self, forKey: .placeholder) ?? "")
+        default:
+            self = .confirm(message: try c.decodeIfPresent(String.self, forKey: .message) ?? "")
+        }
+    }
+}
+
+/// One delegated overlay. `panel` is filled by the desktop host (the copad panel whose comux
+/// client opened it); the iOS client owns its single attachment and leaves it nil.
+struct L0Overlay: Decodable, Equatable, Identifiable {
+    var overlay: UInt64
+    var client: UInt64
+    var panel: String?
+    var spec: L0OverlaySpec
+    var id: UInt64 { overlay }
+}
