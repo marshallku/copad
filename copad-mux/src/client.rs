@@ -1088,6 +1088,8 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
             rows,
             pid: Some(std::process::id()),
             expect_incarnation: None,
+            heartbeat: false,
+            replaces: None,
         },
     )?;
 
@@ -1456,6 +1458,8 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                 // never sends a second one, so this arm is unreachable in practice.
                 Ok(ServerMsg::Hello { .. }) => {}
                 Ok(ServerMsg::Bye) => return Ok(()),
+                // Only answer a Command / Ping, which this client never sends.
+                Ok(ServerMsg::Reply { .. } | ServerMsg::Pong { .. }) => {}
                 // Only answers an `expect_incarnation`, which this client never sends.
                 Ok(ServerMsg::Refused { code, message }) => {
                     return Err(io::Error::other(format!("{code}: {message}")));

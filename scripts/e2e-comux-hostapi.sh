@@ -15,6 +15,11 @@
 #  10. `comux proxy --stdio` bridges the same server (same incarnation)
 #  11. an attach naming the wrong incarnation is refused BEFORE it joins the shared view
 #  12. a restarted server announces a new incarnation
+#  13. a render-channel Command runs AFTER the keys sent before it on that connection
+#  14. ping/pong on the render channel; Hello advertises commands
+#  15. an attach that replaces its earlier attachment (matching tag) evicts it; a wrong tag does not
+#  16. a heartbeat client that goes silent is detached (and its size stops pinning the view)
+#  17. kill-server sent as a render-channel Command is answered before the server exits
 
 set -euo pipefail
 
@@ -323,7 +328,96 @@ if any(x["cols"] == 20 for x in q.model["clients"]["clients"]):
 q.close()
 ok("an attach expecting another incarnation was refused and never registered")
 
+class Raw:
+    """A native render client over the raw socket (what the iOS app speaks)."""
+    def __init__(self, tag, cols=90, rows=20, **attach):
+        self.s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.s.connect(SOCK)
+        self.f = self.s.makefile("rb")
+        m = {"t": "attach", "cols": cols, "rows": rows}
+        m.update(attach)
+        self.send(m)
+        self.hello = self.read_until(lambda m: m["t"] in ("hello", "refused"))
+        self.send({"t": "env", "vars": [], "host_tag": tag})
+    def send(self, m):
+        self.s.sendall((json.dumps(m) + "\n").encode())
+    def read_until(self, pred, timeout=8):
+        self.s.settimeout(timeout)
+        while True:
+            line = self.f.readline()
+            if not line:
+                return None
+            m = json.loads(line)
+            if pred(m):
+                return m
+    def key(self, code, mods=""):
+        self.send({"t": "key", "code": code, "modifiers": mods, "kind": "Press", "state": ""})
+    def close(self):
+        self.s.close()
+
+def ids():
+    q = Sub(); q.recv(5); q.recv(5)
+    out = [x["id"] for x in q.model["clients"]["clients"]]
+    q.close()
+    return out
+
+# 13. a Command runs after the keys sent before it: Ctrl-b c (new tab, handled synchronously
+# by the server) then list-tabs on the same connection must already count the new tab.
+r1 = Raw("raw-1")
+if not r1.hello.get("commands"):
+    fail(f"Hello does not advertise commands: {r1.hello}")
+r1.send({"t": "command", "id": "x0", "req": {"cmd": "list-tabs"}})
+before = len(r1.read_until(lambda m: m["t"] == "reply" and m["id"] == "x0")["resp"]["tabs"])
+r1.key({"Char": "b"}, "CONTROL")
+r1.key({"Char": "c"})
+r1.send({"t": "command", "id": "x1", "req": {"cmd": "list-tabs"}})
+rep = r1.read_until(lambda m: m["t"] == "reply" and m["id"] == "x1")
+after = len(rep["resp"]["tabs"])
+if after != before + 1:
+    fail(f"the command overtook the keys before it: tabs {before} -> {after}")
+ok(f"a render-channel Command saw the effect of the keys sent before it (tabs {before} -> {after})")
+
+# 14. ping / pong
+r1.send({"t": "ping", "id": 77})
+if not r1.read_until(lambda m: m["t"] == "pong" and m["id"] == 77):
+    fail("no pong")
+ok("render-channel ping answered")
+
+# 15. replace: a wrong tag does not evict, the right one does
+old = r1.hello["attachment"]
+bad = Raw("raw-2", replaces={"attachment": old, "tag": "not-raw-1"})
+time.sleep(0.5)
+if old not in ids():
+    fail("a replace with the wrong tag evicted the attachment")
+good = Raw("raw-1", replaces={"attachment": old, "tag": "raw-1"})
+time.sleep(0.5)
+now = ids()
+if old in now or good.hello["attachment"] not in now:
+    fail(f"replace did not swap {old} -> {good.hello['attachment']}: {now}")
+bad.close(); good.close(); r1.close()
+ok("replace evicts only the attachment whose tag matches")
+
+# 16. a silent heartbeat client is detached
+hb = Raw("raw-hb", cols=40, rows=10, heartbeat=True)
+hid = hb.hello["attachment"]
+time.sleep(0.5)
+if hid not in ids():
+    fail("heartbeat client never attached")
+time.sleep(33)
+if hid in ids():
+    fail("a silent heartbeat client was not detached")
+hb.close()
+ok("a heartbeat client silent past the expiry was detached")
+
 c.detach()
+
+# 17. kill-server sent as a render-channel Command is answered before the server goes
+k = Raw("raw-kill")
+k.send({"t": "command", "id": "k1", "req": {"cmd": "kill-server"}})
+rep = k.read_until(lambda m: m["t"] == "reply" and m["id"] == "k1")
+if not rep or not rep["resp"].get("ok"):
+    fail(f"kill-server over the render channel got no answer: {rep}")
+ok("kill-server over the render channel was answered before shutdown")
 print("INC", INC)
 PYEOF
 
@@ -332,8 +426,8 @@ grep -q '^FAIL' "$WORK/out" && exit 1
 OLD_INC="$(awk '/^INC /{print $2}' "$WORK/out")"
 [[ -n "$OLD_INC" ]] || { echo "FAIL: driver did not finish"; exit 1; }
 
-# 12. a restarted server is a new incarnation
-"$COMUX" kill-server >/dev/null
+# 12. a restarted server is a new incarnation (step 17 already stopped it)
+"$COMUX" kill-server >/dev/null 2>&1 || true
 for _ in $(seq 1 50); do kill -0 "$SERVER_PID" 2>/dev/null || break; sleep 0.1; done
 sleep 1.1 # the incarnation is pid + boot second; make the second differ too
 start_server

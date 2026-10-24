@@ -116,6 +116,13 @@ pub struct FrameMsg {
     pub repaint: bool,
 }
 
+/// Which earlier attachment a reconnecting client replaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Replaces {
+    pub attachment: u64,
+    pub tag: String,
+}
+
 /// Server → client messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "kebab-case")]
@@ -153,7 +160,15 @@ pub enum ServerMsg {
         /// host claims chrome for. `0` from an older server.
         #[serde(default)]
         attachment: u64,
+        /// The server runs [`ClientMsg::Command`] / answers [`ClientMsg::Ping`] on this
+        /// connection (decisions #167). An older server says nothing and would drop both.
+        #[serde(default)]
+        commands: bool,
     },
+    /// The answer to a [`ClientMsg::Command`] (an opaque control `Resp`).
+    Reply { id: String, resp: serde_json::Value },
+    /// The answer to a [`ClientMsg::Ping`].
+    Pong { id: u64 },
     /// The attach was refused before it registered (e.g. `expect_incarnation` did not match:
     /// the server restarted between the host's L0 subscribe and this attach). Nothing about
     /// the shared view changed; the connection closes after this line.
@@ -221,6 +236,15 @@ pub enum ClientMsg {
         /// subscribed first and must not attach to a different, restarted server.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         expect_incarnation: Option<String>,
+        /// The client pings (decisions #167): the server detaches it after
+        /// `HEARTBEAT_EXPIRY` of silence, so a suspended phone stops pinning the shared size.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        heartbeat: bool,
+        /// This attach replaces an earlier attachment of the same client (a phone
+        /// reconnecting): that one is detached first — but only if its tag matches, so a stale
+        /// id cannot evict somebody else.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replaces: Option<Replaces>,
     },
     /// The client's values for the variables the server advertised in
     /// [`ServerMsg::Hello::update_environment`] (only those the client actually has,
@@ -265,6 +289,12 @@ pub enum ClientMsg {
     Colors { fg: Rgb8, bg: Rgb8 },
     /// A forwarded mouse action at frame cell `(x, y)`.
     Mouse { x: u16, y: u16, kind: MouseKind },
+    /// Run a control request (the `{"cmd":…}` object) IN ORDER with this connection's keys
+    /// and pastes — so a native client's navigation can never overtake text it already sent
+    /// (decisions #167). Answered by [`ServerMsg::Reply`].
+    Command { id: String, req: serde_json::Value },
+    /// Liveness; answered by [`ServerMsg::Pong`].
+    Ping { id: u64 },
     /// The client's terminal was resized.
     Resize { cols: u16, rows: u16 },
     /// Explicit detach request (a dropped connection detaches too).

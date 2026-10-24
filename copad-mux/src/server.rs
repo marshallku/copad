@@ -29,7 +29,7 @@ use ratatui::layout::{Position, Rect as RRect};
 use crate::control::{self, runtime_dir, socket_path};
 use crate::hostapi::{self, Hub};
 use crate::model::ClientId;
-use crate::proto::{ClientMsg, FrameMsg, ServerMsg, WireCell};
+use crate::proto::{ClientMsg, FrameMsg, Replaces, ServerMsg, WireCell};
 use crate::tui::{App, KeyAction};
 use copad_mux_proto::{self as l0, Feature, PubMsg, SubMsg};
 
@@ -75,6 +75,19 @@ const IDLE_LABEL_INTERVAL: Duration = Duration::from_secs(5);
 /// itself wrong, which is what a resync fixes.
 const RESYNC_PASS: Duration = Duration::from_secs(60);
 
+/// Silence after which a client that opted into heartbeats is detached (decisions #167).
+const HEARTBEAT_EXPIRY: Duration = Duration::from_secs(30);
+
+/// Replies a client may have waiting before a further Command is refused UNEXECUTED.
+const REPLY_QUEUE: usize = 8;
+
+/// Bytes of replies a client may have waiting before the same refusal.
+const REPLY_BYTES: usize = 1 << 20;
+
+/// Queued replies beyond which the client is plainly not reading: it is disconnected rather
+/// than left with requests that will never be answered (decisions #167).
+const REPLY_HARD: usize = REPLY_QUEUE * 2;
+
 /// Bands a [`RESYNC_PASS`] is split into, so no single frame carries a whole screen.
 const RESYNC_BANDS: u16 = 8;
 
@@ -97,6 +110,8 @@ enum Incoming {
         /// A clone of the connection, so the main loop can `shutdown` it to force a
         /// detach even when the bounded frame queue can't take a `Bye`.
         conn: UnixStream,
+        heartbeat: bool,
+        replaces: Option<Replaces>,
     },
     /// A forwarded message from an attached client.
     Client { id: u64, msg: ClientMsg },
@@ -179,6 +194,16 @@ struct Client {
     /// The binding tag it reported (`ClientMsg::Env::host_tag`): how a host UI finds this
     /// attachment in the L0 `clients` topic (decisions #166).
     tag: Option<String>,
+    /// It pings; detach it after [`HEARTBEAT_EXPIRY`] of silence (decisions #167).
+    heartbeat: bool,
+    /// When it last sent anything.
+    last_seen: Instant,
+    /// Replies / pongs waiting for the cap-1 frame channel, oldest first, and their size.
+    /// Drained before frames; bounded by admission in [`handle_command`].
+    replies: std::collections::VecDeque<ServerMsg>,
+    reply_bytes: usize,
+    /// The reply queue hit [`REPLY_HARD`]: pruned on the next drain.
+    overflowed: bool,
 }
 
 /// What a client's `attach` line said about itself: its id (server-minted), the terminal
@@ -191,6 +216,8 @@ struct AttachInfo {
     pid: Option<u32>,
     /// Refuse before registering unless the server is this incarnation (decisions #166).
     expect_incarnation: Option<String>,
+    heartbeat: bool,
+    replaces: Option<Replaces>,
 }
 
 /// Per-connection handshake config threaded from [`run`] to each attaching client: the
@@ -436,6 +463,9 @@ pub fn run() -> io::Result<()> {
             Err(RecvTimeoutError::Disconnected) => break,
         }
         if kill {
+            // A render-channel `kill-server` was answered into the reply queue: make sure the
+            // writer threads have WRITTEN it before the sockets close (decisions #167).
+            flush_before_shutdown(&mut app, &mut clients);
             break;
         }
         // Chrome a host draws: re-derive what the shared frame hides from who is attached
@@ -515,6 +545,8 @@ pub fn run() -> io::Result<()> {
                 queue_copy(c, seq, &text);
             }
         }
+        dirty |= expire_silent_clients(&mut app, &mut clients);
+        drain_pending_replies(&mut app, &mut clients);
         drain_pending_copies(&mut app, &mut clients);
         // tmux `bell-action any` + `set-titles`: ring every attached terminal when a pane
         // rings (at most once a second — a `yes $'\a'` must not machine-gun the dock), and keep
@@ -643,6 +675,129 @@ fn sync_host_chrome(app: &mut App, clients: &mut [Client], hub: &mut Hub) -> boo
         }
     }
     changed
+}
+
+/// Queue a reply for the cap-1 channel; [`drain_pending_replies`] delivers it. A client
+/// already [`REPLY_HARD`] behind is marked for disconnection instead — every reply it would
+/// be owed is then unanswerable, and saying so by closing beats leaving requests hanging or
+/// growing the queue (pings included) without bound.
+fn queue_reply(c: &mut Client, msg: ServerMsg) {
+    if c.replies.len() >= REPLY_HARD {
+        c.overflowed = true;
+        return;
+    }
+    c.reply_bytes += serde_json::to_string(&msg).map_or(0, |s| s.len());
+    c.replies.push_back(msg);
+}
+
+/// A render-channel Command (decisions #167): run it in this connection's order, unless the
+/// client is not draining its replies — then refuse it WITHOUT executing, so a client never
+/// has to wonder whether a mutation it got no answer for happened.
+fn handle_command(
+    client: u64,
+    cid: String,
+    req: serde_json::Value,
+    app: &mut App,
+    clients: &mut [Client],
+    kill: &mut bool,
+) -> bool {
+    let Some(c) = clients.iter_mut().find(|c| c.id == client) else {
+        return false;
+    };
+    if c.replies.len() >= REPLY_QUEUE || c.reply_bytes >= REPLY_BYTES {
+        // The refusal is small; past REPLY_HARD the client is disconnected (queue_reply).
+        let resp = control::Resp::err_code("busy", "too many unanswered commands");
+        queue_reply(
+            c,
+            ServerMsg::Reply {
+                id: cid,
+                resp: serde_json::to_value(resp).unwrap_or_default(),
+            },
+        );
+        return false;
+    }
+    let (resp, mutates) = match serde_json::from_value::<control::Req>(req) {
+        Err(e) => (control::Resp::err(format!("bad request: {e}")), false),
+        Ok(control::Req::KillServer) => {
+            *kill = true;
+            (control::Resp::ok(), false)
+        }
+        Ok(req) => {
+            let mutates = ctl_mutates(&req);
+            (app.handle_control(&req), mutates)
+        }
+    };
+    if let Some(c) = clients.iter_mut().find(|c| c.id == client) {
+        queue_reply(
+            c,
+            ServerMsg::Reply {
+                id: cid,
+                resp: serde_json::to_value(resp).unwrap_or_default(),
+            },
+        );
+    }
+    mutates
+}
+
+/// Deliver queued replies ahead of frames, without blocking; a vanished client is pruned.
+fn drain_pending_replies(app: &mut App, clients: &mut Vec<Client>) {
+    let mut dead: Vec<u64> = clients
+        .iter()
+        .filter(|c| c.overflowed)
+        .map(|c| c.id)
+        .collect();
+    for c in clients.iter_mut().filter(|c| !c.overflowed) {
+        while let Some(msg) = c.replies.pop_front() {
+            let size = serde_json::to_string(&msg).map_or(0, |s| s.len());
+            match c.out.try_send(msg) {
+                Ok(()) => c.reply_bytes = c.reply_bytes.saturating_sub(size),
+                Err(TrySendError::Full(msg)) => {
+                    c.replies.push_front(msg);
+                    break;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    dead.push(c.id);
+                    break;
+                }
+            }
+        }
+    }
+    prune_dead_clients(app, clients, &dead);
+}
+
+/// Before shutdown: deliver every queued reply, then prove each writer has written it. The
+/// frame channel is cap-1 and the writer writes in order, so once a `Bye` is in the channel a
+/// SECOND send can only succeed after the writer has taken that `Bye` — which it does only
+/// after writing and flushing everything queued before it. Bounded to ~1s; a client that
+/// never reads simply loses its reply, as it would have anyway.
+fn flush_before_shutdown(app: &mut App, clients: &mut Vec<Client>) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < deadline && clients.iter().any(|c| !c.replies.is_empty()) {
+        drain_pending_replies(app, clients);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    for c in clients.iter() {
+        let mut sent_bye = false;
+        while Instant::now() < deadline {
+            match c.out.try_send(ServerMsg::Bye) {
+                Ok(()) if sent_bye => break,
+                Ok(()) => sent_bye = true,
+                Err(TrySendError::Full(_)) => std::thread::sleep(Duration::from_millis(5)),
+                Err(TrySendError::Disconnected(_)) => break,
+            }
+        }
+    }
+}
+
+/// Detach clients that promised heartbeats and went silent (a suspended phone). Returns
+/// whether any went.
+fn expire_silent_clients(app: &mut App, clients: &mut Vec<Client>) -> bool {
+    let silent: Vec<u64> = clients
+        .iter()
+        .filter(|c| c.heartbeat && c.last_seen.elapsed() > HEARTBEAT_EXPIRY)
+        .map(|c| c.id)
+        .collect();
+    prune_dead_clients(app, clients, &silent)
 }
 
 /// One line from a subscriber. Returns whether it may have changed what is rendered.
@@ -774,6 +929,8 @@ fn handle_conn(stream: UnixStream, id: u64, tx: Sender<Incoming>, cfg: AttachCfg
         rows,
         pid,
         expect_incarnation,
+        heartbeat,
+        replaces,
     }) = serde_json::from_str::<ClientMsg>(&first)
     {
         serve_client(
@@ -783,6 +940,8 @@ fn handle_conn(stream: UnixStream, id: u64, tx: Sender<Incoming>, cfg: AttachCfg
                 rows,
                 pid,
                 expect_incarnation,
+                heartbeat,
+                replaces,
             },
             reader,
             stream,
@@ -917,6 +1076,8 @@ fn serve_client(
         rows,
         pid,
         expect_incarnation,
+        heartbeat,
+        replaces,
     } = info;
     // A host that subscribed first names the server it expects: a restart in between must
     // fail HERE, before the attachment registers and resizes the shared view.
@@ -946,6 +1107,7 @@ fn serve_client(
         colors: true,
         incarnation: crate::term::incarnation().to_string(),
         attachment: id,
+        commands: true,
     };
     if writeln!(writer, "{}", json(&hello)).is_err() || writer.flush().is_err() {
         return;
@@ -961,6 +1123,8 @@ fn serve_client(
             pid,
             out: out_tx,
             conn,
+            heartbeat,
+            replaces,
         })
         .is_err()
     {
@@ -1104,7 +1268,19 @@ fn handle_incoming(
             pid,
             out,
             conn,
+            heartbeat,
+            replaces,
         } => {
+            // A reconnecting client replaces its previous attachment — through the full
+            // prune path (pid bookkeeping, owned overlays, viewport, prefix repaint), and only
+            // when the tag matches, so a stale id cannot evict somebody else (decisions #167).
+            if let Some(Replaces { attachment, tag }) = replaces
+                && clients
+                    .iter()
+                    .any(|c| c.id == attachment && c.tag.as_deref() == Some(tag.as_str()))
+            {
+                prune_dead_clients(app, clients, &[attachment]);
+            }
             // Shared attach: ADD the client (no takeover), then re-fit to the smallest.
             clients.push(Client {
                 id,
@@ -1133,6 +1309,11 @@ fn handle_incoming(
                 pending_title: None,
                 pending_bell: false,
                 tag: None,
+                heartbeat,
+                last_seen: Instant::now(),
+                replies: std::collections::VecDeque::new(),
+                reply_bytes: 0,
+                overflowed: false,
             });
             if let Some(p) = pid {
                 app.set_client_pid(p);
@@ -1142,9 +1323,10 @@ fn handle_incoming(
         }
         Incoming::Client { id, msg } => {
             // Only accept from a currently-attached client (ignore stale ids).
-            if !clients.iter().any(|c| c.id == id) {
+            let Some(c) = clients.iter_mut().find(|c| c.id == id) else {
                 return false;
-            }
+            };
+            c.last_seen = Instant::now();
             // A key or a mouse event is a human acting on the CURRENT view, which is the only
             // honest evidence that the focused pane has been seen. Bells are acknowledged
             // here rather than anywhere in the frame path: composing, queueing, or even
@@ -1295,6 +1477,15 @@ fn handle_incoming(
                         recompute_viewport(app, clients);
                     }
                     true
+                }
+                ClientMsg::Command { id: cid, req } => {
+                    handle_command(id, cid, req, app, clients, kill)
+                }
+                ClientMsg::Ping { id: n } => {
+                    if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
+                        queue_reply(c, ServerMsg::Pong { id: n });
+                    }
+                    false
                 }
                 ClientMsg::Attach { .. } => false,
             }
@@ -1675,6 +1866,11 @@ mod tests {
             pending_title: None,
             pending_bell: false,
             tag: None,
+            heartbeat: false,
+            last_seen: Instant::now(),
+            replies: std::collections::VecDeque::new(),
+            reply_bytes: 0,
+            overflowed: false,
         };
         (
             client,
@@ -1683,6 +1879,89 @@ mod tests {
                 _peer: peer,
             },
         )
+    }
+
+    fn cmd_app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(std::path::Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false;
+        App::new(80, 24, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    /// Render-channel commands (decisions #167): answered in order, and refused UNEXECUTED
+    /// once the client stops draining replies — never executed-then-dropped.
+    #[test]
+    fn commands_reply_in_order_and_a_backlog_refuses_without_executing() {
+        let mut app = cmd_app();
+        let (c, guard) = test_client(1, 80, 24);
+        let mut clients = vec![c];
+        let mut kill = false;
+        let new_session = || serde_json::json!({"cmd": "new-session", "detached": true});
+        for i in 0..super::REPLY_QUEUE {
+            super::handle_command(
+                1,
+                format!("c{i}"),
+                new_session(),
+                &mut app,
+                &mut clients,
+                &mut kill,
+            );
+        }
+        let sessions = app.host_tree().sessions.len();
+        assert_eq!(sessions, 1 + super::REPLY_QUEUE);
+        // The client has not read a single reply: the next one is refused, not run.
+        super::handle_command(
+            1,
+            "over".into(),
+            new_session(),
+            &mut app,
+            &mut clients,
+            &mut kill,
+        );
+        assert_eq!(
+            app.host_tree().sessions.len(),
+            sessions,
+            "a refused command must not run"
+        );
+        let last = clients[0].replies.back().unwrap();
+        let ServerMsg::Reply { id, resp } = last else {
+            panic!("{last:?}")
+        };
+        assert_eq!(id, "over");
+        assert_eq!(resp["code"], "busy");
+        // Draining delivers the oldest first.
+        super::drain_pending_replies(&mut app, &mut clients);
+        let first = guard._rx.try_recv().unwrap();
+        assert!(
+            matches!(first, ServerMsg::Reply { ref id, .. } if id == "c0"),
+            "{first:?}"
+        );
+    }
+
+    #[test]
+    fn a_client_that_never_reads_is_disconnected_not_left_hanging() {
+        let mut app = cmd_app();
+        let (c, _g) = test_client(1, 80, 24);
+        let mut clients = vec![c];
+        for i in 0..=super::REPLY_HARD as u64 {
+            super::queue_reply(&mut clients[0], ServerMsg::Pong { id: i });
+        }
+        assert_eq!(clients[0].replies.len(), super::REPLY_HARD, "bounded");
+        assert!(clients[0].overflowed);
+        super::drain_pending_replies(&mut app, &mut clients);
+        assert!(clients.is_empty(), "an overflowed client is pruned");
+    }
+
+    #[test]
+    fn a_silent_heartbeat_client_is_detached_and_a_quiet_ordinary_one_is_not() {
+        let mut app = cmd_app();
+        let (mut a, _ga) = test_client(1, 80, 24);
+        let (mut b, _gb) = test_client(2, 80, 24);
+        a.heartbeat = true;
+        a.last_seen = Instant::now() - super::HEARTBEAT_EXPIRY - Duration::from_secs(1);
+        b.last_seen = a.last_seen; // no heartbeat promised: silence means nothing
+        let mut clients = vec![a, b];
+        assert!(super::expire_silent_clients(&mut app, &mut clients));
+        assert_eq!(clients.iter().map(|c| c.id).collect::<Vec<_>>(), [2]);
     }
 
     #[test]
