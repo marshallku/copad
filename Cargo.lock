@@ -1024,6 +1024,7 @@ version = "1.2.2"
 dependencies = [
  "axum",
  "copad-core",
+ "copad-mux-proto",
  "dirs 5.0.1",
  "futures-util",
  "portable-pty",

@@ -104,15 +104,54 @@ pub struct Link {
     writer: Arc<Mutex<Box<dyn Write + Send>>>,
     closed: Arc<AtomicBool>,
     next_id: AtomicU64,
+    closer: Arc<Closer>,
+}
+
+/// Silence after which the link gives up on the server: three missed pongs. A server that is
+/// stopped (`SIGSTOP`, a wedged loop) keeps its socket open, so EOF never comes — without
+/// this, a host would keep showing the last snapshot as if it were current.
+pub const SILENCE: Duration = Duration::from_secs(PING_SECS * 3);
+
+/// The ping cadence; shortened under test so the silence cut can be exercised.
+const PING: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(PING_SECS)
+};
+const CUT: Duration = if cfg!(test) {
+    Duration::from_millis(400)
+} else {
+    SILENCE
+};
+
+/// What tears the transport down; shared with the ping thread so a silent server can be cut.
+struct Closer {
     child: Mutex<Option<Child>>,
     shutdown: Option<UnixStream>,
+    /// Why the link was cut from OUR side, reported instead of a bare "connection closed".
+    reason: Mutex<Option<String>>,
+}
+
+impl Closer {
+    fn close(&self, closed: &AtomicBool) {
+        closed.store(true, Ordering::SeqCst);
+        if let Some(s) = &self.shutdown {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+        if let Ok(mut c) = self.child.lock()
+            && let Some(child) = c.as_mut()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl Link {
     /// Connect, send `subscribe`, and start delivering messages to `on` from a reader
     /// thread. `on` is called for every message in order, then once with
     /// [`LinkEvent::Closed`].
-    pub fn open<F>(ep: &Endpoint, mut on: F) -> io::Result<Link>
+    pub fn open<F>(ep: &Endpoint, on: F) -> io::Result<Link>
     where
         F: FnMut(LinkEvent) + Send + 'static,
     {
@@ -143,18 +182,46 @@ impl Link {
         };
         let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(writer));
         let closed = Arc::new(AtomicBool::new(false));
+        let closer = Arc::new(Closer {
+            child: Mutex::new(child),
+            shutdown,
+            reason: Mutex::new(None),
+        });
         let link = Link {
             writer: writer.clone(),
             closed: closed.clone(),
             next_id: AtomicU64::new(1),
-            child: Mutex::new(child),
-            shutdown,
+            closer: closer.clone(),
         };
+        // Milliseconds since `born` at which the last line arrived (pongs included).
+        let born = std::time::Instant::now();
+        // The callback is shared by the reader and the silence cut, and `Closed` is delivered
+        // exactly once by whichever ends the link first: a cut cannot rely on the reader
+        // seeing EOF, because a grandchild of the transport can hold the pipe open.
+        let on = Arc::new(Mutex::new(on));
+        let reported = Arc::new(AtomicBool::new(false));
+        let finish = {
+            let on = on.clone();
+            let reported = reported.clone();
+            move |why: String| {
+                // Flip `reported` UNDER the callback lock, so a message the reader is about
+                // to deliver is either before this `Closed` or not delivered at all.
+                if let Ok(mut f) = on.lock()
+                    && !reported.swap(true, Ordering::SeqCst)
+                {
+                    f(LinkEvent::Closed(why));
+                }
+            }
+        };
+        let pfinish = finish.clone();
+        let last_rx = Arc::new(AtomicU64::new(0));
         link.send(&SubMsg::Subscribe { v: PROTO })?;
 
         // Reader: every line is one PubMsg. The FIRST line must be a welcome — anything else
         // is a remote shell talking before comux (a login banner, `command not found`).
         let rclosed = closed.clone();
+        let rlast = last_rx.clone();
+        let rcloser = closer.clone();
         std::thread::spawn(move || {
             let mut lines = BufReader::new(reader).lines();
             let mut first = true;
@@ -163,6 +230,7 @@ impl Link {
                     None => break "connection closed".to_string(),
                     Some(Err(e)) => break format!("read failed: {e}"),
                     Some(Ok(line)) => {
+                        rlast.store(born.elapsed().as_millis() as u64, Ordering::SeqCst);
                         let t = line.trim();
                         if t.is_empty() {
                             continue;
@@ -178,7 +246,15 @@ impl Link {
                                     break "comux did not start the stream with a welcome".into();
                                 }
                                 first = false;
-                                on(LinkEvent::Msg(msg));
+                                // Checked under the same lock `finish` holds: no message can
+                                // follow `Closed`.
+                                let Ok(mut f) = on.lock() else {
+                                    break String::new();
+                                };
+                                if reported.load(Ordering::SeqCst) {
+                                    break String::new();
+                                }
+                                f(LinkEvent::Msg(msg));
                             }
                             Err(_) if first => {
                                 break format!(
@@ -192,13 +268,19 @@ impl Link {
                 }
             };
             rclosed.store(true, Ordering::SeqCst);
+            let why = rcloser
+                .reason
+                .lock()
+                .ok()
+                .and_then(|mut r| r.take())
+                .unwrap_or(why);
             let why = match stderr.and_then(|s| s.lock().ok().map(|q| q.clone())) {
                 Some(q) if !q.is_empty() => {
                     format!("{why} — {}", q.into_iter().collect::<Vec<_>>().join(" / "))
                 }
                 _ => why,
             };
-            on(LinkEvent::Closed(why));
+            finish(why);
         });
 
         // Ping: keeps chrome claims alive and notices a dead peer from our side too.
@@ -207,8 +289,25 @@ impl Link {
         std::thread::spawn(move || {
             let mut id = 0u64;
             loop {
-                std::thread::sleep(Duration::from_secs(PING_SECS));
+                std::thread::sleep(PING);
                 if pclosed.load(Ordering::SeqCst) {
+                    return;
+                }
+                // Saturating: the reader may store a stamp newer than this sample.
+                let quiet = (born.elapsed().as_millis() as u64)
+                    .saturating_sub(last_rx.load(Ordering::SeqCst));
+                if quiet > CUT.as_millis() as u64 {
+                    if let Ok(mut r) = closer.reason.lock() {
+                        *r = Some(format!(
+                            "comux stopped answering ({}s without a reply)",
+                            quiet / 1000
+                        ));
+                    }
+                    closer.close(&pclosed);
+                    pfinish(format!(
+                        "comux stopped answering ({}s without a reply)",
+                        quiet / 1000
+                    ));
                     return;
                 }
                 id += 1;
@@ -245,16 +344,7 @@ impl Link {
 
     /// Close the stream (idempotent). The callback still receives `Closed`.
     pub fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
-        if let Some(s) = &self.shutdown {
-            let _ = s.shutdown(std::net::Shutdown::Both);
-        }
-        if let Ok(mut c) = self.child.lock()
-            && let Some(child) = c.as_mut()
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.closer.close(&self.closed);
     }
 }
 
@@ -331,6 +421,17 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn a_server_that_stops_answering_is_cut() {
+        // A welcome, then silence with the pipe held open — a SIGSTOPped server.
+        let ev =
+            run(r#"echo '{"t":"welcome","proto":1,"incarnation":"i","version":"1"}'; sleep 30"#);
+        let LinkEvent::Closed(why) = ev.last().unwrap() else {
+            panic!("{ev:?}")
+        };
+        assert!(why.contains("stopped answering"), "{why}");
     }
 
     #[test]

@@ -18,6 +18,9 @@
           crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.js"
           crossorigin="anonymous"></script>
+  <!-- GPU renderer: the DOM renderer was the reason the phone terminal felt slow. -->
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-webgl@0.18.0/lib/addon-webgl.js"
+          crossorigin="anonymous"></script>
 
   <!-- type="module" so it is deferred: it must run after the two classic xterm scripts
        above have executed and after #root is parsed, which the old inline script got by

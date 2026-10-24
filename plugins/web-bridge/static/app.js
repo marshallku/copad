@@ -1619,6 +1619,23 @@
       enterMux(true);
     }
 
+    // Paint with WebGL when the browser can (decisions #166): the DOM renderer re-lays-out a
+    // span per cell run on every frame, which is what made the phone terminal feel slow. iOS
+    // drops WebGL contexts when the page is backgrounded, so a lost context disposes the addon
+    // and xterm falls back to its DOM renderer instead of going blank.
+    function useGpuRenderer(term) {
+      const Webgl = window.WebglAddon?.WebglAddon;
+      if (!Webgl) return false;
+      try {
+        const gl = new Webgl();
+        gl.onContextLoss(() => gl.dispose());
+        term.loadAddon(gl);
+        return true;
+      } catch (_) {
+        return false; // no WebGL2: the DOM renderer stays
+      }
+    }
+
     function openMuxTerminal() {
       if (state.term || state.ws.attach) return;
       const host = document.getElementById("term-host");
@@ -1634,6 +1651,7 @@
       const fit = FitAddon ? new FitAddon() : null;
       if (fit) term.loadAddon(fit);
       term.open(host);
+      useGpuRenderer(term);
       state.term = term;
       state.fit = fit;
       // Own the keyboard without fighting for it. xterm's own mousedown handler calls
@@ -1725,6 +1743,7 @@
       if (fit) term.loadAddon(fit);
 
       term.open(host);
+      useGpuRenderer(term);
       if (fit) fit.fit();
       state.term = term;
       state.fit = fit;

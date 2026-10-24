@@ -27,6 +27,7 @@ mod cockpit;
 mod comux;
 mod daemon_client;
 mod font;
+mod mux_live;
 mod push;
 mod tmux;
 
@@ -257,6 +258,9 @@ struct AppState {
     /// bound is the point: comux's client reads its socket with no deadline, so a wedged
     /// server turns every concurrent poll into another stuck child.
     board_cache: Arc<tokio::sync::Mutex<Option<TmuxCacheEntry>>>,
+    /// The live L0 subscription (decisions #166): when synced, `/api/board` is served from it
+    /// with no comux child at all; the CLI path above is the fallback.
+    mux_live: mux_live::Shared,
     /// VAPID config from env. `None` disables the push endpoints (501).
     push_config: Arc<Option<push::PushConfig>>,
     /// Loaded subscription list — serialised through this Mutex on
@@ -384,6 +388,7 @@ async fn run_server(
         symbol_font,
         tmux_cache: Arc::new(tokio::sync::Mutex::new(None)),
         board_cache: Arc::new(tokio::sync::Mutex::new(None)),
+        mux_live: mux_live::start(),
         push_config: Arc::new(push_config),
         push_subs: Arc::new(tokio::sync::Mutex::new(push::load_subscriptions())),
         default_subscribe_patterns: Arc::new(vec![
@@ -1419,6 +1424,20 @@ async fn handle_pilot_cancel(
 async fn handle_board(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> Result<axum::Json<Value>, AppError> {
+    // The live subscription first: comux's own published values, no child, no TTL needed.
+    if let Some((sessions, agents)) = mux_live::board(&state.mux_live) {
+        return Ok(axum::Json(json!({
+            "fetched_at_ms": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0),
+            "sessions": sessions,
+            "agents": agents,
+            "status_is_inferred": true,
+            "errors": [],
+            "source": "live",
+        })));
+    }
     const TTL: std::time::Duration = std::time::Duration::from_secs(2);
     // Held across the fetch — see `AppState::board_cache`.
     let mut cache = state.board_cache.lock().await;

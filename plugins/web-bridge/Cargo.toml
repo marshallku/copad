@@ -12,6 +12,8 @@ path = "src/main.rs"
 
 [dependencies]
 copad-core = { path = "../../copad-core" }
+# The comux L0 host API (decisions #166): the board's live data source.
+copad-mux-proto = { path = "../../copad-mux-proto" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
