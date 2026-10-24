@@ -49,6 +49,8 @@ use crate::term::{self, CellColor, PaneTerm};
 use crate::usagepoll::{self, UsagePart, UsageSnapshot};
 use crate::versionpoll::{self, VersionStatus};
 
+mod host;
+
 /// Direction for focus navigation with the arrow keys.
 #[derive(Clone, Copy)]
 enum FocusDir {
@@ -61,6 +63,8 @@ enum FocusDir {
 /// One logged agent-turn event, shown in the notification center (`Ctrl-b a`).
 #[derive(Debug, Clone)]
 struct Notification {
+    /// Monotonic within the server's life: the L0 `notif-read` target.
+    id: u64,
     /// Wall-clock `HH:MM` when it happened.
     when: String,
     /// `"done"` (turn finished) or `"blocked"` (awaiting input).
@@ -212,6 +216,10 @@ fn drag_ratio(pos: u16, origin: u16, extent: u16) -> Option<f32> {
 
 /// Max notifications retained in the center.
 const NOTIFY_LOG_CAP: usize = 100;
+
+/// Outcome lines kept between two L0 publications; a burst beyond this is not worth a host's
+/// attention line by line (the status topic still carries the latest).
+const FLASH_LOG_CAP: usize = 16;
 
 /// Max hook-ownership records kept before pruning to live panes (see
 /// [`App::claim_hook_kind`]).
@@ -1026,6 +1034,14 @@ pub struct App {
     /// is shared by every client. Same precedent as an open context menu or a drag
     /// selection: client-OWNED, but visible in everyone's view.
     prefix_armed: bool,
+    /// Chrome a host UI draws instead (L0 host-ready, decisions #166): `(sidebar, status)`.
+    /// Set by the server only while EVERY attached client is claimed for it — the frame is
+    /// shared, so hiding it for one client would hide it for all.
+    host_hidden: (bool, bool),
+    /// Outcome lines since the server last published (each becomes an L0 `flash` event).
+    flash_log: Vec<copad_mux_proto::Flash>,
+    /// The last notification id handed out.
+    notif_seq: u64,
     /// When the carousel last advanced — a manual page OR an auto-rotate tick resets
     /// it, so `usage_rotate_secs` counts from the last change, not a fixed cadence
     /// (a manual scroll never jumps again immediately after).
@@ -1215,6 +1231,9 @@ impl App {
             usage_shown: None,
             usage_page: 0,
             prefix_armed: false,
+            host_hidden: (false, false),
+            flash_log: Vec::new(),
+            notif_seq: 0,
             bell_seen: HashMap::new(),
             usage_rolled_at: std::time::Instant::now(),
             alt_screen: HashMap::new(),
@@ -1272,7 +1291,7 @@ impl App {
     /// Is the sidebar actually drawn? Toggled on AND wide enough (size-adaptive:
     /// narrow / mobile widths fall back to the popup).
     fn sidebar_visible(&self) -> bool {
-        self.sidebar && self.cols >= self.cfg.sidebar_min_cols
+        self.sidebar && !self.host_hidden.0 && self.cols >= self.cfg.sidebar_min_cols
     }
 
     /// Sidebar width in columns (configurable; a 1-col border is added to its right).
@@ -1422,10 +1441,15 @@ impl App {
         }
     }
 
+    /// Rows the bottom status bar occupies: none while a host draws it (decisions #166).
+    fn status_h(&self) -> u16 {
+        if self.host_hidden.1 { 0 } else { STATUS_H }
+    }
+
     /// Height available to the pane grid, between the top bar and the bottom status bar.
     fn content_rows(&self) -> u16 {
         self.rows
-            .saturating_sub(STATUS_H)
+            .saturating_sub(self.status_h())
             .saturating_sub(self.top_h())
     }
 
@@ -2803,9 +2827,16 @@ impl App {
         } else {
             MESSAGE_SECS
         };
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if self.flash_log.len() < FLASH_LOG_CAP {
+            self.flash_log.push(copad_mux_proto::Flash {
+                text: text.clone(),
+                error,
+            });
+        }
         self.message = Some(StatusMessage {
             // One line: a multi-line reason would otherwise draw control characters.
-            text: text.split_whitespace().collect::<Vec<_>>().join(" "),
+            text,
             error,
             until: std::time::Instant::now() + Duration::from_secs(secs),
         });
@@ -4396,6 +4427,13 @@ impl App {
                         Resp::ok()
                     }
                     None => Resp::err_code("not_found", format!("unknown pane '{t}'")),
+                }
+            }
+            Req::NotifRead { id } => {
+                let n = self.notif_read(*id);
+                Resp {
+                    message: Some(format!("{n} marked read")),
+                    ..Resp::ok()
                 }
             }
             Req::Marks => {
@@ -7716,8 +7754,11 @@ impl App {
             self.render_top_bar(buf);
         }
 
-        // 5) the always-on bottom status bar (session · tabs · scroll/agents/clock/host).
-        self.render_status_bar(buf);
+        // 5) the always-on bottom status bar (session · tabs · scroll/agents/clock/host) —
+        // unless a host UI draws it (decisions #166).
+        if self.status_h() > 0 {
+            self.render_status_bar(buf);
+        }
 
         // 6) the Ctrl-f switcher popup / notification center, over everything.
         if self.popup.is_some() {
@@ -8461,7 +8502,9 @@ impl App {
             let action = self.jump_action(&term);
             notify::desktop(&title, &body, action.as_deref(), &self.desktop_env());
         }
+        self.notif_seq += 1;
         self.notifications.push_front(Notification {
+            id: self.notif_seq,
             when: local_hhmm(),
             kind,
             tool,
@@ -17699,5 +17742,105 @@ mod pane_names_and_keys {
                 .contains("SCROLLBACK-25")
         );
         let _ = std::fs::remove_file(file);
+    }
+}
+
+/// The L0 host API's view of the app (decisions #166): topic values and chrome hiding.
+#[cfg(test)]
+mod host_api {
+    use super::*;
+    use crate::control::Req;
+    use ratatui::layout::Rect;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        cfg.notify = false;
+        App::new(120, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn row(app: &App, y: u16) -> String {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 30));
+        app.render_to(&mut buf);
+        (0..120)
+            .map(|x| buf.cell((x, y)).map_or(" ", |c| c.symbol()).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_tree_names_sessions_and_tabs_by_their_selectable_ids() {
+        let mut app = app();
+        app.new_tab();
+        let t = app.host_tree();
+        assert_eq!(t.sessions.len(), 1);
+        let s = &t.sessions[0];
+        assert!(s.active && s.id == t.active);
+        assert_eq!(s.tabs.len(), 2);
+        assert!(s.tabs[1].active, "the new tab is focused");
+        assert!(s.tabs[0].id.contains(":t"), "{}", s.tabs[0].id);
+        assert!(!s.tabs[0].panes[0].token.is_empty());
+        // `select-tab` takes exactly that id back.
+        let r = app.handle_control(&Req::SelectTab {
+            index: None,
+            target: Some(s.tabs[0].id.clone()),
+        });
+        assert!(r.ok, "{:?}", r.error);
+        assert!(app.host_tree().sessions[0].tabs[0].active);
+    }
+
+    #[test]
+    fn hiding_chrome_gives_its_rows_and_columns_to_the_panes() {
+        let mut app = app();
+        let bottom = row(&app, 29);
+        assert!(app.sidebar_visible());
+        let (cols, rows) = (app.content_cols(), app.content_rows());
+        assert!(app.set_host_hidden(true, true));
+        assert!(!app.set_host_hidden(true, true), "no change, no reflow");
+        assert!(!app.sidebar_visible());
+        assert_eq!(
+            app.content_rows(),
+            rows + 1,
+            "the status bar row is the pane's now"
+        );
+        assert!(
+            app.content_cols() > cols,
+            "the sidebar strip is the pane's now"
+        );
+        assert_ne!(row(&app, 29), bottom, "the status bar is no longer drawn");
+        assert!(app.set_host_hidden(false, false));
+        assert_eq!((app.content_cols(), app.content_rows()), (cols, rows));
+        assert_eq!(row(&app, 29), bottom, "and it comes back intact");
+    }
+
+    #[test]
+    fn notifications_carry_ids_and_can_be_read_by_one_or_all() {
+        let mut app = app();
+        let term = app.focused_terminal().unwrap();
+        app.raise_notification(term.clone(), "claude".into(), "done", "a".into());
+        app.raise_notification(term, "claude".into(), "blocked", "b".into());
+        let n = app.host_notifications();
+        assert_eq!(n.unread, 2);
+        assert_eq!(n.items[0].body, "b", "newest first");
+        assert!(n.items[0].id > n.items[1].id);
+        assert!(!n.items[0].token.is_empty());
+        let r = app.handle_control(&Req::NotifRead {
+            id: Some(n.items[1].id),
+        });
+        assert!(r.ok);
+        assert_eq!(app.host_notifications().unread, 1);
+        app.handle_control(&Req::NotifRead { id: None });
+        assert_eq!(app.host_notifications().unread, 0);
+    }
+
+    #[test]
+    fn every_flash_is_logged_for_the_host_until_taken() {
+        let mut app = app();
+        app.flash("one".into(), false);
+        app.flash("two   lines\nhere".into(), true);
+        assert_eq!(app.host_status().flash.unwrap().text, "two lines here");
+        let f = app.take_flashes();
+        assert_eq!(f.len(), 2);
+        assert!(f[1].error);
+        assert!(app.take_flashes().is_empty());
     }
 }

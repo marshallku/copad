@@ -1,0 +1,11 @@
+[package]
+name = "copad-mux-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "comux Mux API v1 (L0): host-facing wire types + a blocking subscriber client, shared by comux, copad and web-bridge"
+repository.workspace = true
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -27,9 +27,11 @@ use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Position, Rect as RRect};
 
 use crate::control::{self, runtime_dir, socket_path};
+use crate::hostapi::{self, Hub};
 use crate::model::ClientId;
 use crate::proto::{ClientMsg, FrameMsg, ServerMsg, WireCell};
 use crate::tui::{App, KeyAction};
+use copad_mux_proto::{self as l0, Feature, PubMsg, SubMsg};
 
 /// ~30 Hz max frame cadence: the loop wakes at least this often to check for changes,
 /// but only COMPOSES a frame when a dirty signal fired since the last render (PTY
@@ -100,6 +102,16 @@ enum Incoming {
     Client { id: u64, msg: ClientMsg },
     /// A client connection closed.
     Disconnect { id: u64 },
+    /// An L0 host API subscriber connected (decisions #166).
+    Subscribe {
+        id: u64,
+        outbox: std::sync::Arc<hostapi::Outbox>,
+        conn: UnixStream,
+    },
+    /// A line from a subscriber.
+    Sub { id: u64, msg: SubMsg },
+    /// A subscriber's connection ended (EOF, write failure, or stall).
+    SubGone { id: u64 },
 }
 
 /// The currently-attached streaming client (v1: at most one at a time).
@@ -164,6 +176,9 @@ struct Client {
     pending_title: Option<String>,
     /// A bell waiting to be rung on this client's terminal.
     pending_bell: bool,
+    /// The binding tag it reported (`ClientMsg::Env::host_tag`): how a host UI finds this
+    /// attachment in the L0 `clients` topic (decisions #166).
+    tag: Option<String>,
 }
 
 /// What a client's `attach` line said about itself: its id (server-minted), the terminal
@@ -174,6 +189,8 @@ struct AttachInfo {
     cols: u16,
     rows: u16,
     pid: Option<u32>,
+    /// Refuse before registering unless the server is this incarnation (decisions #166).
+    expect_incarnation: Option<String>,
 }
 
 /// Per-connection handshake config threaded from [`run`] to each attaching client: the
@@ -377,6 +394,8 @@ pub fn run() -> io::Result<()> {
     // to the SMALLEST attached client so everyone sees the whole thing; the same
     // composite is broadcast to all (each with its own diff baseline).
     let mut clients: Vec<Client> = Vec::new();
+    // L0 host API subscribers + their chrome claims (decisions #166).
+    let mut hub = Hub::default();
     let mut kill = false;
     let mut last_frame = Instant::now();
     let mut last_bell = Instant::now() - BELL_INTERVAL;
@@ -392,21 +411,24 @@ pub fn run() -> io::Result<()> {
     loop {
         // Detached (no clients) → idle cadence; anything that needs prompt handling
         // still arrives as a message and interrupts the wait.
-        let tick = if clients.is_empty() {
-            IDLE_INTERVAL
-        } else {
+        let tick = if !clients.is_empty() {
             FRAME_INTERVAL
+        } else if !hub.is_empty() {
+            // A host is watching the lists: publish at its cadence, not the idle one.
+            hostapi::PUBLISH_INTERVAL
+        } else {
+            IDLE_INTERVAL
         };
         match rx.recv_timeout(tick) {
             Ok(msg) => {
-                dirty |= handle_incoming(msg, &mut app, &mut clients, &mut kill);
+                dirty |= handle_incoming(msg, &mut app, &mut clients, &mut hub, &mut kill);
                 // Bound the drain so a key/ctl flood can't starve rendering, PTY
                 // reaping, or shutdown — fall back to the frame tick after a batch.
                 let mut budget = 256u32;
                 while budget > 0
                     && let Ok(m) = rx.try_recv()
                 {
-                    dirty |= handle_incoming(m, &mut app, &mut clients, &mut kill);
+                    dirty |= handle_incoming(m, &mut app, &mut clients, &mut hub, &mut kill);
                     budget -= 1;
                 }
             }
@@ -416,6 +438,10 @@ pub fn run() -> io::Result<()> {
         if kill {
             break;
         }
+        // Chrome a host draws: re-derive what the shared frame hides from who is attached
+        // and who claims them, BEFORE any frame is composed this pass (decisions #166).
+        dirty |= hub.expire();
+        dirty |= sync_host_chrome(&mut app, &mut clients, &mut hub);
         // The server itself quits only when the last shell exits (app empty) — NOT
         // when the last client detaches (the whole point of detach: shells live on).
         let reaped = app.reap_exited();
@@ -437,7 +463,7 @@ pub fn run() -> io::Result<()> {
         was_attached = attached;
         // Sidebar/status data actually changed. Swept far less often while detached —
         // see IDLE_LABEL_INTERVAL.
-        dirty |= app.maybe_refresh_labels(if clients.is_empty() {
+        dirty |= app.maybe_refresh_labels(if clients.is_empty() && hub.is_empty() {
             IDLE_LABEL_INTERVAL
         } else {
             LABEL_INTERVAL
@@ -511,6 +537,17 @@ pub fn run() -> io::Result<()> {
         // being pruned changes "is any terminal showing this focused" as surely as a focus
         // event does. No clients = nobody looking = unfocused. Cheap when nothing changed.
         app.set_outer_focus(clients.iter().any(|c| c.focused));
+        // L0 publication: changed topics into every subscriber's slots, plus events.
+        if hub.due() {
+            let (values, notifs) = topic_values(&app, &hub, &clients);
+            let flashes = app.take_flashes();
+            for over in hub.publish(values, flashes, &notifs) {
+                hub.remove(over);
+            }
+        } else if hub.is_empty() {
+            // Nobody to tell: don't let a later subscriber receive stale outcome lines.
+            app.take_flashes();
+        }
         if dirty && last_frame.elapsed() >= FRAME_INTERVAL {
             last_frame = Instant::now();
             last_min = min;
@@ -551,6 +588,129 @@ pub fn run() -> io::Result<()> {
     // live process + held flock + no socket — blocking restart). The save + socket removal
     // are done; the OS reaps the threads/PTYs and releases the flock on exit.
     std::process::exit(0);
+}
+
+/// The render attachments as the host API sees them.
+fn attach_views(clients: &[Client]) -> Vec<hostapi::AttachView> {
+    clients
+        .iter()
+        .map(|c| hostapi::AttachView {
+            id: c.id,
+            tag: c.tag.clone(),
+            cols: c.cols,
+            rows: c.rows,
+        })
+        .collect()
+}
+
+/// Every L0 topic, freshly computed and serialized (plus the notifications value itself,
+/// which the publisher also reads for `notify` events).
+fn topic_values(
+    app: &App,
+    hub: &Hub,
+    clients: &[Client],
+) -> (hostapi::TopicValues, l0::Notifications) {
+    let notifs = app.host_notifications();
+    let values = hostapi::TopicValues(vec![
+        (l0::topic::TREE, hostapi::ser(&app.host_tree())),
+        (l0::topic::AGENTS, hostapi::ser(&app.host_agents())),
+        (l0::topic::NOTIFICATIONS, hostapi::ser(&notifs)),
+        (l0::topic::STATUS, hostapi::ser(&app.host_status())),
+        (
+            l0::topic::CLIENTS,
+            hostapi::ser(&hub.clients_topic(&attach_views(clients))),
+        ),
+    ]);
+    (values, notifs)
+}
+
+/// Apply the shared-frame hiding rule. Drops claims on attachments that are gone, then
+/// hides a feature only while every attached client is claimed for it. On a change every
+/// client gets a full baseline — the content area moved, so geometry, hit zones and diff
+/// baselines reset together. Returns whether anything changed.
+fn sync_host_chrome(app: &mut App, clients: &mut [Client], hub: &mut Hub) -> bool {
+    let views = attach_views(clients);
+    hub.retain_attachments(&views);
+    let hidden = hub.hidden(&views);
+    let changed = app.set_host_hidden(
+        hidden.contains(&Feature::Sidebar),
+        hidden.contains(&Feature::Status),
+    );
+    if changed {
+        for c in clients.iter_mut() {
+            c.needs_full = true;
+            c.last = Buffer::empty(c.last.area);
+        }
+    }
+    changed
+}
+
+/// One line from a subscriber. Returns whether it may have changed what is rendered.
+fn handle_sub(
+    id: u64,
+    msg: SubMsg,
+    app: &mut App,
+    clients: &mut [Client],
+    hub: &mut Hub,
+    kill: &mut bool,
+) -> bool {
+    match msg {
+        SubMsg::Cmd { id: cid, req } => {
+            let (resp, mutates) = match serde_json::from_value::<control::Req>(req) {
+                Err(e) => (control::Resp::err(format!("bad request: {e}")), false),
+                Ok(control::Req::KillServer) => {
+                    *kill = true;
+                    (control::Resp::ok(), false)
+                }
+                Ok(req) => {
+                    let mutates = ctl_mutates(&req);
+                    (app.handle_control(&req), mutates)
+                }
+            };
+            let reply = PubMsg::Reply {
+                id: cid,
+                resp: serde_json::to_value(resp).unwrap_or_default(),
+            };
+            if !hub.send(id, &reply) {
+                hub.remove(id);
+            }
+            mutates
+        }
+        SubMsg::HostReady {
+            attachment,
+            incarnation,
+            features,
+        } => {
+            if let Err((code, message)) = hub.claim(
+                id,
+                attachment,
+                &incarnation,
+                features,
+                &attach_views(clients),
+            ) {
+                let err = PubMsg::Error {
+                    code: code.into(),
+                    message,
+                };
+                if !hub.send(id, &err) {
+                    hub.remove(id);
+                }
+            }
+            false // sync_host_chrome on the next pass reports the real change
+        }
+        SubMsg::HostGone { attachment } => {
+            hub.release(id, attachment);
+            false
+        }
+        SubMsg::Ping { id: n } => {
+            if !hub.send(id, &PubMsg::Pong { id: n }) {
+                hub.remove(id);
+            }
+            false
+        }
+        // Overlay delegation answers (P3) and a second subscribe are not acted on yet.
+        SubMsg::OverlayResult { .. } | SubMsg::Subscribe { .. } => false,
+    }
 }
 
 /// Re-derive the shared viewport = the SMALLEST attached client (min cols, min rows),
@@ -609,8 +769,12 @@ fn handle_conn(stream: UnixStream, id: u64, tx: Sender<Incoming>, cfg: AttachCfg
     // A `{"cmd":…}` line is a control request; a `{"t":"attach",…}` opens a stream.
     if let Ok(req) = serde_json::from_str::<control::Req>(&first) {
         serve_ctl(Some(req), reader, stream, tx);
-    } else if let Ok(ClientMsg::Attach { cols, rows, pid }) =
-        serde_json::from_str::<ClientMsg>(&first)
+    } else if let Ok(ClientMsg::Attach {
+        cols,
+        rows,
+        pid,
+        expect_incarnation,
+    }) = serde_json::from_str::<ClientMsg>(&first)
     {
         serve_client(
             AttachInfo {
@@ -618,12 +782,15 @@ fn handle_conn(stream: UnixStream, id: u64, tx: Sender<Incoming>, cfg: AttachCfg
                 cols,
                 rows,
                 pid,
+                expect_incarnation,
             },
             reader,
             stream,
             tx,
             cfg,
         );
+    } else if let Ok(SubMsg::Subscribe { .. }) = serde_json::from_str::<SubMsg>(&first) {
+        serve_sub(id, reader, stream, tx);
     } else {
         let mut w = stream;
         let _ = writeln!(
@@ -633,6 +800,55 @@ fn handle_conn(stream: UnixStream, id: u64, tx: Sender<Incoming>, cfg: AttachCfg
         );
     }
 }
+
+/// An L0 host API subscriber (decisions #166): register an outbox with the main loop, run
+/// its writer on its own thread, and forward every line it sends. The main loop queues the
+/// welcome + snapshot before the subscriber can receive anything else.
+fn serve_sub(id: u64, mut reader: BufReader<UnixStream>, stream: UnixStream, tx: Sender<Incoming>) {
+    let Ok(conn) = stream.try_clone() else { return };
+    let outbox = hostapi::Outbox::new();
+    if tx
+        .send(Incoming::Subscribe {
+            id,
+            outbox: outbox.clone(),
+            conn,
+        })
+        .is_err()
+    {
+        return;
+    }
+    let gone_tx = tx.clone();
+    hostapi::spawn_writer(outbox.clone(), stream, move || {
+        let _ = gone_tx.send(Incoming::SubGone { id });
+    });
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        // A runaway line from a confused peer must not grow without bound.
+        if line.len() > MAX_SUB_LINE {
+            break;
+        }
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // An unknown message (a newer host) is skipped, not fatal.
+        if let Ok(msg) = serde_json::from_str::<SubMsg>(t)
+            && tx.send(Incoming::Sub { id, msg }).is_err()
+        {
+            break;
+        }
+    }
+    outbox.kill();
+    let _ = tx.send(Incoming::SubGone { id });
+}
+
+/// The longest line a subscriber may send (a `cmd` carrying a `send --paste` is the big one).
+const MAX_SUB_LINE: usize = 4 << 20;
 
 fn json<T: serde::Serialize>(v: T) -> String {
     serde_json::to_string(&v).unwrap_or_else(|_| "{\"ok\":false}".to_string())
@@ -700,7 +916,23 @@ fn serve_client(
         cols,
         rows,
         pid,
+        expect_incarnation,
     } = info;
+    // A host that subscribed first names the server it expects: a restart in between must
+    // fail HERE, before the attachment registers and resizes the shared view.
+    if let Some(want) = expect_incarnation
+        && want != crate::term::incarnation()
+    {
+        let refused = ServerMsg::Refused {
+            code: "stale".into(),
+            message: format!(
+                "expected server {want}, this is {}; resubscribe",
+                crate::term::incarnation()
+            ),
+        };
+        let _ = writeln!(writer, "{}", json(&refused));
+        return;
+    }
     // A clone the main loop can shut down to force-detach this client reliably.
     let Ok(conn) = writer.try_clone() else { return };
     // Server-authoritative handshake FIRST (before any frame): tell the client whether
@@ -712,6 +944,8 @@ fn serve_client(
         paste: true,
         focus: true,
         colors: true,
+        incarnation: crate::term::incarnation().to_string(),
+        attachment: id,
     };
     if writeln!(writer, "{}", json(&hello)).is_err() || writer.flush().is_err() {
         return;
@@ -823,9 +1057,35 @@ fn handle_incoming(
     msg: Incoming,
     app: &mut App,
     clients: &mut Vec<Client>,
+    hub: &mut Hub,
     kill: &mut bool,
 ) -> bool {
     match msg {
+        Incoming::Subscribe { id, outbox, conn } => {
+            // Someone is about to look at the agents list: don't hand them a sweep that is
+            // seconds old because the server was idle.
+            app.invalidate_labels();
+            let (values, _) = topic_values(app, hub, clients);
+            hub.add(
+                hostapi::Sub {
+                    id,
+                    outbox,
+                    conn,
+                    last_seen: Instant::now(),
+                },
+                values,
+                env!("CARGO_PKG_VERSION"),
+            );
+            false
+        }
+        Incoming::SubGone { id } => {
+            hub.remove(id);
+            false
+        }
+        Incoming::Sub { id, msg } => {
+            hub.touch(id);
+            handle_sub(id, msg, app, clients, hub, kill)
+        }
         Incoming::Ctl { req, reply } => {
             if matches!(req, control::Req::KillServer) {
                 *kill = true;
@@ -872,6 +1132,7 @@ fn handle_incoming(
                 last_title: None,
                 pending_title: None,
                 pending_bell: false,
+                tag: None,
             });
             if let Some(p) = pid {
                 app.set_client_pid(p);
@@ -906,7 +1167,14 @@ fn handle_incoming(
                     crate::term::set_outer_colors(fg, bg);
                     false
                 }
-                ClientMsg::Env { vars, copad_host } => {
+                ClientMsg::Env {
+                    vars,
+                    copad_host,
+                    host_tag,
+                } => {
+                    if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
+                        c.tag = host_tag.filter(|t| !t.is_empty());
+                    }
                     // tmux update-environment: store this client's session vars and adopt
                     // them now, so the next pane it spawns inherits its live SSH/display env.
                     let pid = clients.iter().find(|c| c.id == id).and_then(|c| c.pid);
@@ -1406,6 +1674,7 @@ mod tests {
             last_title: None,
             pending_title: None,
             pending_bell: false,
+            tag: None,
         };
         (
             client,

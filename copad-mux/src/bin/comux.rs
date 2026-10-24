@@ -60,6 +60,7 @@ fn print_usage() {
          \x20 comux health                live server counters (panes/labeled/sweep failures)\n\
          \x20 comux server restart        stop + restart the server (restores the workspace)\n\
          \x20 comux kill-server           stop the server\n\
+         \x20 comux proxy --stdio         bridge the server socket to stdin/stdout (ssh host UIs)\n\
          \n\
          inside the TUI: Ctrl-b ? every key · Ctrl-b C new session (name prompt) · Ctrl-b W new worktree · \
          Ctrl-b c new tab · Ctrl-b , rename tab · Ctrl-b % / \" split"
@@ -82,6 +83,9 @@ fn main() {
             let no_spawn = args.iter().any(|a| a == "--no-spawn");
             copad_mux::client::run_with(copad_mux::client::AttachOpts { no_spawn })
         }
+        // `proxy --stdio` bridges the comux socket to stdin/stdout — one SSH exec channel per
+        // connection, for a host UI on another machine (decisions #166).
+        Some("proxy") => std::process::exit(copad_mux::client::run_proxy(&args[1..])),
         // `doctor` is a local diagnostic — it must run without (and report on) the
         // server, so it's dispatched here rather than through the control client.
         Some("doctor") => std::process::exit(copad_mux::doctor::run(&args[1..])),

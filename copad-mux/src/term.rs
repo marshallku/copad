@@ -367,16 +367,22 @@ pub const PANE_TOKEN_ENV: &str = "COPAD_MUX_PANE";
 /// stale click resolve to nothing, which reports "unknown pane" instead.
 pub fn next_pane_token() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}-{n}", incarnation())
+}
+
+/// This server process's identity (pid + boot second, hex) — the nonce every pane token is
+/// qualified by, and the `incarnation` the L0 host API and the render `Hello` announce, so a
+/// host can tell a restarted server from the one whose ids it holds (decisions #166).
+pub fn incarnation() -> &'static str {
     static NONCE: OnceLock<String> = OnceLock::new();
-    let nonce = NONCE.get_or_init(|| {
+    NONCE.get_or_init(|| {
         let secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
         format!("{:x}{:x}", std::process::id(), secs)
-    });
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{nonce}-{n}")
+    })
 }
 
 pub struct PaneTerm {

@@ -846,6 +846,7 @@ name = "copad-mux"
 version = "1.2.2"
 dependencies = [
  "alacritty_terminal",
+ "copad-mux-proto",
  "copad-usage",
  "crossterm",
  "libc",
@@ -858,6 +859,14 @@ dependencies = [
  "thiserror 2.0.18",
  "toml 0.8.23",
  "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "copad-mux-proto"
+version = "1.2.2"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

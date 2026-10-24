@@ -17,6 +17,7 @@ Cross-platform custom terminal emulator with shared Rust core and platform-nativ
 
 - `copad-core/` — Shared Rust library (config, background, plugin, protocol, theme, error)
 - `copad-usage/` — Shared subscription rate-limit readout (Claude OAuth + Codex rollout) used by `coctl usage --limits` and comux's status bar. Kept out of `copad-core` so its `reqwest`+`chrono` deps don't reach the GUIs (decision #74 amendment).
+- `copad-mux-proto/` — comux Mux API v1 (L0, decisions #166): the serde-only host-facing types (topics `tree`/`agents`/`notifications`/`status`/`clients`, commands, per-attachment chrome claims) + `link`, a blocking subscriber over the comux socket or `ssh -T host comux proxy --stdio`. Lets copad / web-bridge / the iOS app draw comux's chrome natively; the server half is `copad-mux/src/hostapi.rs`. Plan: `docs/comux-native-integration-plan.md`.
 - `copad-keys/` — the kitty keyboard protocol (decisions #164): a spec-derived key encoder, the negotiation `Tracker`, and key tables, shared by copad-term (macOS, flags from alacritty_terminal) and copad-linux (flags from a relay PTY in front of VTE, which has no support). comux keeps its own crossterm-shaped `keys.rs`.
 - `copad-linux/` — GTK4 + VTE4 native terminal app (binary: `copad`)
 - `copad-cli/` — CLI control tool (binary: `coctl`)

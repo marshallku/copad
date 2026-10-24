@@ -284,6 +284,12 @@ pub enum Req {
     },
     /// The pinned slots. Read-only.
     Marks,
+    /// Mark a notification-center entry read (`id`), or all of them (no `id`) — what a host
+    /// UI's notification panel does when the user has seen an entry (decisions #166).
+    NotifRead {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
+    },
     /// Go to the pane pinned in `slot`. Moves the shared view.
     GotoMark { slot: u8 },
     /// Raise an agent notification on behalf of a pane: a desktop toast whose click jumps

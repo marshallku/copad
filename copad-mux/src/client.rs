@@ -3,7 +3,7 @@
 //! local terminal. Detaching (`Ctrl-b d`) or losing the connection just exits the
 //! client — the server + shells live on. This is what `copad-mux` (bare) runs.
 
-use std::io::{self, BufRead, BufReader, Stdout, Write};
+use std::io::{self, BufRead, BufReader, Read, Stdout, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -886,6 +886,66 @@ pub fn run_with(opts: AttachOpts) -> io::Result<()> {
     run_attached(stream)
 }
 
+/// `comux proxy --stdio [--no-spawn]`: connect to the server (starting one, like bare
+/// `comux`, unless `--no-spawn`) and copy bytes both ways until either side closes.
+///
+/// This is how a host UI reaches a REMOTE comux: `ssh -T host comux proxy --stdio` is one
+/// socket connection, so a client opens one per role (render, L0). Nothing is printed on
+/// stdout before the bridge starts — the server's first line is the version handshake, and a
+/// stray line there (a login banner) is exactly what the host reports as a broken remote.
+/// Diagnostics go to stderr only. Returns the exit code.
+pub fn run_proxy(args: &[String]) -> i32 {
+    if !args.iter().any(|a| a == "--stdio") {
+        eprintln!("usage: comux proxy --stdio [--no-spawn]");
+        return 2;
+    }
+    let sock = socket_path();
+    let conn = if args.iter().any(|a| a == "--no-spawn") {
+        connect_only(&sock)
+    } else {
+        connect_or_spawn(&sock)
+    };
+    let stream = match conn {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("comux proxy: {e}");
+            return 1;
+        }
+    };
+    let Ok(mut to_server) = stream.try_clone() else {
+        return 1;
+    };
+    // stdin → server. On EOF half-close, so the server sees the peer leave while its last
+    // replies can still drain to stdout.
+    std::thread::spawn(move || {
+        let _ = io::copy(&mut io::stdin().lock(), &mut to_server);
+        let _ = to_server.shutdown(std::net::Shutdown::Write);
+    });
+    // server → stdout, flushed per read: the peer is a protocol, not a pager.
+    let mut from_server = stream;
+    let mut out = io::stdout().lock();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match from_server.read(&mut buf) {
+            Ok(0) | Err(_) => return 0,
+            Ok(n) => {
+                if out.write_all(&buf[..n]).is_err() || out.flush().is_err() {
+                    return 0;
+                }
+            }
+        }
+    }
+}
+
+/// The binding tag this client reports (decisions #166): `COPAD_MUX_HOST_TAG` when a host
+/// launched us with one (a copad remote tab, a test), else the copad tab we run in.
+fn host_tag(copad_host: Option<&(String, String)>) -> Option<String> {
+    std::env::var("COPAD_MUX_HOST_TAG")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .or_else(|| copad_host.map(|(sock, panel)| copad_mux_proto::copad_tag(panel, sock)))
+}
+
 /// Connect to `sock` and fail if nothing answers, rather than starting a server.
 ///
 /// Deliberately ONE attempt with no retry: the caller asked not to create a server, so there
@@ -1027,6 +1087,7 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
             cols,
             rows,
             pid: Some(std::process::id()),
+            expect_incarnation: None,
         },
     )?;
 
@@ -1057,6 +1118,7 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     paste,
                     focus,
                     colors,
+                    ..
                 }) => {
                     send_focus = focus;
                     if paste {
@@ -1086,11 +1148,13 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                         .ok()
                         .zip(std::env::var("COPAD_PANEL_ID").ok())
                         .filter(|(s, p)| !s.is_empty() && !p.is_empty());
+                    let host_tag = host_tag(copad_host.as_ref());
                     let _ = send(
                         &mut wr,
                         &ClientMsg::Env {
                             vars: env,
                             copad_host,
+                            host_tag,
                         },
                     );
                     if colors && let Some((fg, bg)) = guard.colors {
@@ -1392,6 +1456,10 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                 // never sends a second one, so this arm is unreachable in practice.
                 Ok(ServerMsg::Hello { .. }) => {}
                 Ok(ServerMsg::Bye) => return Ok(()),
+                // Only answers an `expect_incarnation`, which this client never sends.
+                Ok(ServerMsg::Refused { code, message }) => {
+                    return Err(io::Error::other(format!("{code}: {message}")));
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()), // server gone
             }

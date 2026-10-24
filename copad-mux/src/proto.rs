@@ -144,7 +144,20 @@ pub enum ServerMsg {
         /// terminal's foreground/background for panes that ask (OSC 10/11).
         #[serde(default)]
         colors: bool,
+        /// The server process's identity (decisions #166): changes on every restart, and is
+        /// the same value the L0 host API's `welcome` carries, so a host holding both a render
+        /// and an L0 connection can check they reached the same server. Empty from an older one.
+        #[serde(default)]
+        incarnation: String,
+        /// This render connection's attachment id — what the L0 `clients` topic lists and a
+        /// host claims chrome for. `0` from an older server.
+        #[serde(default)]
+        attachment: u64,
     },
+    /// The attach was refused before it registered (e.g. `expect_incarnation` did not match:
+    /// the server restarted between the host's L0 subscribe and this attach). Nothing about
+    /// the shared view changed; the connection closes after this line.
+    Refused { code: String, message: String },
     /// A render frame (delta or full).
     Frame(FrameMsg),
     /// A pane rang the bell: ring this client's terminal too (tmux `bell-action any`), so the
@@ -203,6 +216,11 @@ pub enum ClientMsg {
         rows: u16,
         #[serde(default)]
         pid: Option<u32>,
+        /// Refuse unless the server's incarnation is this one, BEFORE the attachment
+        /// registers (and so before it can resize the shared view). Set by a host that
+        /// subscribed first and must not attach to a different, restarted server.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect_incarnation: Option<String>,
     },
     /// The client's values for the variables the server advertised in
     /// [`ServerMsg::Hello::update_environment`] (only those the client actually has,
@@ -224,6 +242,11 @@ pub enum ClientMsg {
         /// `serde(default)` so a client built before this field still parses.
         #[serde(default)]
         copad_host: Option<(String, String)>,
+        /// The binding tag a host UI finds this attachment by in the L0 `clients` topic
+        /// (decisions #166): `COPAD_MUX_HOST_TAG` when set, else the copad tab's
+        /// `copad:<panel>@<socket>`. Discovery only — a host still claims by attachment id.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host_tag: Option<String>,
     },
     /// A forwarded key event (interpreted server-side: prefix/nav/tabs/input).
     Key(KeyEvent),
@@ -259,7 +282,9 @@ mod tests {
     fn attach_without_pid_still_parses() {
         let old = r#"{"t":"attach","cols":80,"rows":24}"#;
         match serde_json::from_str::<ClientMsg>(old).expect("old attach must parse") {
-            ClientMsg::Attach { cols, rows, pid } => {
+            ClientMsg::Attach {
+                cols, rows, pid, ..
+            } => {
                 assert_eq!((cols, rows), (80, 24));
                 assert_eq!(pid, None);
             }
@@ -278,11 +303,14 @@ mod tests {
                 ("SSH_CONNECTION".to_string(), "1.2.3.4 5 6".to_string()),
             ],
             copad_host: Some(("/run/copad/gui-9.sock".into(), "panel-7".into())),
+            host_tag: None,
         };
         let line = serde_json::to_string(&msg).expect("Env must serialize");
         assert!(line.contains("\"t\":\"env\""));
         match serde_json::from_str::<ClientMsg>(&line).expect("Env must deserialize") {
-            ClientMsg::Env { vars, copad_host } => {
+            ClientMsg::Env {
+                vars, copad_host, ..
+            } => {
                 assert_eq!(vars.len(), 2);
                 assert_eq!(vars[0], ("DISPLAY".to_string(), ":0".to_string()));
                 assert_eq!(
@@ -325,6 +353,7 @@ mod tests {
                 paste,
                 focus,
                 colors,
+                ..
             } => {
                 assert!(mouse);
                 assert!(update_environment.is_empty());
@@ -335,5 +364,88 @@ mod tests {
             }
             _ => panic!("expected Hello"),
         }
+    }
+}
+
+/// The render wire's JSON grammar, PINNED (decisions #166). A native client (the iOS app)
+/// implements exactly these strings; they come from ratatui's and crossterm's serde impls, so a
+/// dependency bump that changes one must fail here rather than silently break that client.
+#[cfg(test)]
+mod wire_grammar {
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::style::{Color, Modifier};
+
+    fn round<T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug>(
+        v: T,
+        wire: &str,
+    ) {
+        assert_eq!(serde_json::to_string(&v).unwrap(), wire);
+        assert_eq!(serde_json::from_str::<T>(wire).unwrap(), v, "{wire}");
+    }
+
+    #[test]
+    fn colors() {
+        round(Color::Reset, r#""Reset""#);
+        round(Color::Red, r#""Red""#);
+        round(Color::LightBlue, r#""LightBlue""#);
+        round(Color::DarkGray, r#""DarkGray""#);
+        round(Color::Rgb(1, 2, 255), r##""#0102FF""##);
+        round(Color::Indexed(12), r#""12""#);
+    }
+
+    #[test]
+    fn modifiers() {
+        round(Modifier::empty(), r#""""#);
+        round(Modifier::BOLD, r#""BOLD""#);
+        round(
+            Modifier::BOLD | Modifier::DIM | Modifier::REVERSED,
+            r#""BOLD | DIM | REVERSED""#,
+        );
+        round(
+            Modifier::all(),
+            r#""BOLD | DIM | ITALIC | UNDERLINED | SLOW_BLINK | RAPID_BLINK | REVERSED | HIDDEN | CROSSED_OUT""#,
+        );
+    }
+
+    #[test]
+    fn keys() {
+        let k = |c, m| KeyEvent::new(c, m);
+        round(
+            k(KeyCode::Char('a'), KeyModifiers::NONE),
+            r#"{"code":{"Char":"a"},"modifiers":"","kind":"Press","state":""}"#,
+        );
+        round(
+            k(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            r#"{"code":{"Char":"b"},"modifiers":"CONTROL","kind":"Press","state":""}"#,
+        );
+        round(
+            k(KeyCode::Enter, KeyModifiers::SHIFT | KeyModifiers::ALT),
+            r#"{"code":"Enter","modifiers":"SHIFT | ALT","kind":"Press","state":""}"#,
+        );
+        round(
+            k(KeyCode::F(5), KeyModifiers::NONE),
+            r#"{"code":{"F":5},"modifiers":"","kind":"Press","state":""}"#,
+        );
+        for (code, name) in [
+            (KeyCode::Up, "Up"),
+            (KeyCode::Esc, "Esc"),
+            (KeyCode::Backspace, "Backspace"),
+            (KeyCode::Tab, "Tab"),
+            (KeyCode::Left, "Left"),
+            (KeyCode::PageUp, "PageUp"),
+        ] {
+            round(
+                k(code, KeyModifiers::NONE),
+                &format!(r#"{{"code":"{name}","modifiers":"","kind":"Press","state":""}}"#),
+            );
+        }
+        round(
+            k(KeyCode::BackTab, KeyModifiers::SHIFT),
+            r#"{"code":"BackTab","modifiers":"SHIFT","kind":"Press","state":""}"#,
+        );
+        round(
+            k(KeyCode::Char('한'), KeyModifiers::NONE),
+            r#"{"code":{"Char":"한"},"modifiers":"","kind":"Press","state":""}"#,
+        );
     }
 }

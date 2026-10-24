@@ -26,6 +26,7 @@ pub mod fdlimit;
 pub mod fleet;
 pub mod gitinfo;
 pub mod gitpoll;
+pub mod hostapi;
 pub mod hostmetrics;
 pub mod keys;
 pub mod layoutfile;
