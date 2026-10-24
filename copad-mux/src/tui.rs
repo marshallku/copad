@@ -8302,7 +8302,7 @@ impl App {
             if let Some(a) = agentpoll::activity(&self.agent_poll, label.pid) {
                 details.insert(tid.clone(), a.detail);
             }
-            let status = agentstate::resolve_with(Some(label.pid), || pane.snapshot());
+            let status = agentstate::resolve_with(&label.text, Some(label.pid), || pane.snapshot());
             let prev = self.agent_statuses.get(tid).copied();
             let body = match (prev.map(|p| p.status), status) {
                 // turn just finished (was running, now parked at the prompt)

@@ -35,9 +35,9 @@ impl AgentStatus {
 }
 
 /// Resolve an agent pane's status: Claude session file first (accurate, pid-keyed),
-/// else the screen-text fallback.
-pub fn resolve(pid: Option<u32>, snap: &Snapshot) -> AgentStatus {
-    session_first(pid).unwrap_or_else(|| screen_status(snap))
+/// else the screen-text fallback for `tool` (the pane's agent basename).
+pub fn resolve(tool: &str, pid: Option<u32>, snap: &Snapshot) -> AgentStatus {
+    session_first(pid).unwrap_or_else(|| screen_status_for(tool, snap))
 }
 
 /// [`resolve`], but the screen snapshot is only taken IF the fallback is reached.
@@ -47,8 +47,21 @@ pub fn resolve(pid: Option<u32>, snap: &Snapshot) -> AgentStatus {
 /// meant building and discarding a screen copy per agent per sweep (2 Hz attached, every
 /// agent in every session). The closure defers that to the panes that actually need it:
 /// codex, and anything with no session file.
-pub fn resolve_with(pid: Option<u32>, snap: impl FnOnce() -> Snapshot) -> AgentStatus {
-    session_first(pid).unwrap_or_else(|| screen_status(&snap()))
+pub fn resolve_with(tool: &str, pid: Option<u32>, snap: impl FnOnce() -> Snapshot) -> AgentStatus {
+    session_first(pid).unwrap_or_else(|| screen_status_for(tool, &snap()))
+}
+
+/// The screen-text classifier for one agent. agy and grok draw UIs that share almost no
+/// furniture with Claude/Codex — and the furniture they DO share is unsafe to trust globally
+/// (agy's composer is a bare ASCII `>`, grok echoes every past prompt behind the same `❯` its
+/// composer uses) — so each gets its own rules, and only for its own panes. Everything else
+/// keeps the shared [`screen_status`].
+pub fn screen_status_for(tool: &str, snap: &Snapshot) -> AgentStatus {
+    match tool.to_ascii_lowercase().as_str() {
+        "agy" => agy_status(snap),
+        "grok" => grok_status(snap),
+        _ => screen_status(snap),
+    }
 }
 
 /// The PRIMARY signal, shared by both resolvers so the policy cannot drift between them.
@@ -140,6 +153,13 @@ const WRAP_TOLERANT_MARKERS: &[&str] = &[
     "Would you like to send input to the existing terminal?",
     "Do you trust the contents of this directory?",
     "Press enter to confirm or esc to",
+    // codex-cli 0.164.0 replaced the 0.154 trust question with this one; the old marker stays
+    // for older installs.
+    "Trust this folder? Codex can read, edit, and run files here",
+    // codex-cli 0.164.0 plan-mode `request_user_input` — the "agent has a question" dialog.
+    // Its footer also carries `esc to interrupt`, which is why this has to be a DECISION
+    // marker: checked any later, the question read as `working` and never raised a toast.
+    "enter to submit answer",
 ];
 
 /// `WRAP_TOLERANT_MARKERS` + the running hint, pre-squeezed once rather than on every sweep.
@@ -164,19 +184,7 @@ const SPINNERS: &[char] = &['✱', '✻', '✷', '✸', '✹', '✺'];
 /// Screen-text fallback: inspect the last 30 lines of the pane in tmx's strict
 /// priority order — decision > interrupt > ready-prompt > spinner > idle.
 pub fn screen_status(snap: &Snapshot) -> AgentStatus {
-    let lines: Vec<String> = snap
-        .cells
-        .iter()
-        .rev()
-        .take(30)
-        .map(|row| {
-            row.iter()
-                .map(|c| c.sym.as_str())
-                .collect::<String>()
-                .trim_end()
-                .to_string()
-        })
-        .collect();
+    let lines = window(snap);
     let joined = lines.join("\n");
     // Markers are matched with ALL whitespace removed from both sides. A terminal hard-wraps
     // at the pane width, and it wraps MID-WORD: in a 27-column split pane codex's
@@ -189,7 +197,7 @@ pub fn screen_status(snap: &Snapshot) -> AgentStatus {
     //
     // NOTE `lines` is bottom-up, so this must run in SCREEN order or the two halves of a
     //      wrapped phrase swap and match nothing.
-    let flat = squeeze(lines.iter().rev().flat_map(|l| l.chars()));
+    let flat = squeezed(&lines);
 
     // 1) a decision dialog wins over everything.
     if DECISION_MARKERS.iter().any(|m| joined.contains(m))
@@ -225,6 +233,118 @@ pub fn screen_status(snap: &Snapshot) -> AgentStatus {
         return AgentStatus::Working;
     }
     // 5) nothing recognised.
+    AgentStatus::Idle
+}
+
+/// The last 30 screen rows, BOTTOM-UP, each with trailing blanks trimmed — the window every
+/// classifier reads. Bottom-up because "the bottom-most X" is the question they all ask.
+fn window(snap: &Snapshot) -> Vec<String> {
+    snap.cells
+        .iter()
+        .rev()
+        .take(30)
+        .map(|row| {
+            row.iter()
+                .map(|c| c.sym.as_str())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+/// [`window`] with all whitespace squeezed out, in SCREEN order, for wrap-tolerant matching.
+fn squeezed(lines: &[String]) -> String {
+    squeeze(lines.iter().rev().flat_map(|l| l.chars()))
+}
+
+/// agy's selection footer, pre-squeezed. Every agy dialog that waits on the user draws it —
+/// the permission prompt (`↑/↓ Navigate · tab Amend · …`), `ask_user` questions (`… · enter
+/// Select · esc Skip`) and the folder-trust prompt (`… · enter Confirm`).
+const AGY_NAVIGATE: &str = "↑/↓Navigate·";
+/// …and so do its `/` command and `@` file autocomplete menus, which open while the agent is
+/// idle and the user is TYPING. Those, and only those, offer `tab Complete`. Squeezed, so a
+/// narrow pane that wraps the footer between the two still pairs them up.
+const AGY_AUTOCOMPLETE: &str = "tabComplete";
+
+/// agy (Antigravity CLI 1.4.7). Fixtures in the tests are verbatim `capture-pane` reads.
+///
+/// Its footer is the reliable part: `esc to cancel` while a turn runs, `? for shortcuts` while
+/// parked. The selection footer has to win over both, because agy keeps `esc to cancel` up
+/// while a dialog waits — and the autocomplete exception has to win over THAT, or typing `/`
+/// at an idle prompt would raise an "awaiting input" toast.
+fn agy_status(snap: &Snapshot) -> AgentStatus {
+    let lines = window(snap);
+    let flat = squeezed(&lines);
+    if flat.contains(AGY_NAVIGATE) {
+        return if flat.contains(AGY_AUTOCOMPLETE) {
+            AgentStatus::Ready
+        } else {
+            AgentStatus::Blocked
+        };
+    }
+    let footer = lines.iter().map(|l| l.trim_start()).find(|l| !l.is_empty());
+    if footer.is_some_and(|f| f.starts_with("esc to cancel")) {
+        return AgentStatus::Working;
+    }
+    if footer.is_some_and(|f| f.starts_with("? for shortcuts")) {
+        return AgentStatus::Ready;
+    }
+    // No footer we know (a notice took its place): fall back to the composer itself — a `>`
+    // row FRAMED by the two full-width rules agy draws around its input. The frame is the
+    // point: a bare `>` is ordinary output (a quoted email, a shell redirect), and the echoed
+    // past prompts in the history sit under a rule but never above one.
+    let framed = (1..lines.len().saturating_sub(1)).find(|&i| {
+        lines[i].trim_start().starts_with('>') && is_rule(&lines[i - 1]) && is_rule(&lines[i + 1])
+    });
+    if framed.is_some() {
+        return AgentStatus::Ready;
+    }
+    AgentStatus::Idle
+}
+
+/// A horizontal rule row (`────…`), as agy draws above and below its composer.
+fn is_rule(line: &str) -> bool {
+    let t = line.trim();
+    t.chars().count() >= 8 && t.chars().all(|c| c == '─')
+}
+
+/// grok's blocking dialogs, pre-squeezed: the tool-permission footer, the `ask_user_question`
+/// footer, and the spinner row that names the pending question. Its folder-trust prompt is the
+/// codex sentence, caught by [`WRAP_TOLERANT_MARKERS`].
+const GROK_DECISION: &[&str] = &[
+    "Tab/Space:permission",
+    "Shift+x:dismiss",
+    "Waitingonanswersfor",
+];
+
+/// grok (Grok Build 1.0.70). Fixtures in the tests are verbatim `capture-pane` reads.
+///
+/// A turn in flight draws a spinner row ending `[stop]` and a `Ctrl+c:cancel` footer; both
+/// stay up while a dialog waits, so the decision markers go first. Parked, it shows only its
+/// composer box.
+fn grok_status(snap: &Snapshot) -> AgentStatus {
+    let lines = window(snap);
+    let flat = squeezed(&lines);
+    if GROK_DECISION.iter().any(|m| flat.contains(m))
+        || SQUEEZED_MARKERS.iter().any(|m| flat.contains(m.as_str()))
+    {
+        return AgentStatus::Blocked;
+    }
+    if lines.iter().any(|l| l.ends_with("[stop]")) || flat.contains("Ctrl+c:cancel") {
+        return AgentStatus::Working;
+    }
+    // The composer is `│ ❯ …` INSIDE its box. The leading border is required: grok echoes every
+    // past prompt into the history as `     ❯ <prompt>`, with the same glyph and no border, so
+    // a cursor glyph alone would vote `ready` off a stale prompt.
+    let composer = lines.iter().any(|l| {
+        l.trim_start()
+            .strip_prefix('│')
+            .is_some_and(|rest| rest.trim_start().starts_with('❯'))
+    });
+    if composer {
+        return AgentStatus::Ready;
+    }
     AgentStatus::Idle
 }
 
@@ -694,6 +814,235 @@ mod tests {
         // Same for the working marker, which wraps just as easily.
         let w = snap_from(&["• Working (2s • esc to inte", "rrupt)"]);
         assert_eq!(screen_status(&w), AgentStatus::Working);
+    }
+
+    // ===== codex-cli 0.164.0 — two dialogs that changed under the 0.154 markers. Both are
+    // verbatim `capture-pane` reads. Before the fix the trust prompt read `idle` and the
+    // plan-mode question read `working` (its footer carries `esc to interrupt`), so an agent
+    // waiting on the user raised no toast.
+
+    #[test]
+    fn codex_0_164_folder_trust_prompt_is_blocked() {
+        let s = snap_from(&[
+            "  Folder access",
+            "  /private/tmp/probe",
+            "  Trust this folder? Codex can read, edit, and run files here, subject to your permission settings. Folder settings can run code automatically,",
+            "  even without a model request. Continue only if you trust these files. Your trust decision will be saved.",
+            "› 1. Trust and continue",
+            "  2. Back to Agent Command Center",
+            "  enter continue · esc back",
+        ]);
+        assert_eq!(screen_status(&s), AgentStatus::Blocked);
+    }
+
+    #[test]
+    fn codex_0_164_question_is_blocked_not_working() {
+        let s = snap_from(&[
+            "• Model changed to gpt-6.1-sol medium for Plan mode.",
+            "› Plan adding a color theme file here. Before planning, you MUST ask me via your request_user_input tool which color: red or blue.",
+            "  Question 1/1 (1 unanswered)",
+            "  Which color should the theme use: red or blue?",
+            "  › 1. Red (Recommended)  Use red as the theme’s primary color.",
+            "    2. Blue               Use blue as the theme’s primary color.",
+            "    3. None of the above  Optionally, add details in notes (tab)",
+            "  tab to add notes | enter to submit answer | esc to interrupt",
+        ]);
+        assert_eq!(screen_status(&s), AgentStatus::Blocked);
+        assert_eq!(screen_status_for("codex", &s), AgentStatus::Blocked);
+    }
+
+    #[test]
+    fn codex_0_164_approval_is_still_blocked() {
+        let s = snap_from(&[
+            "• Running curl -sI https://example.com | head -1",
+            "  Would you like to run the following command?",
+            "  Environment: local",
+            "  $ curl -sI https://example.com | head -1",
+            "› 1. Yes, proceed (y)",
+            "  3. No, and tell Codex what to do differently (esc)",
+            "  Press enter to confirm or esc to cancel",
+        ]);
+        assert_eq!(screen_status(&s), AgentStatus::Blocked);
+    }
+
+    // ===== agy (Antigravity CLI 1.4.7). Verbatim `capture-pane` reads, long rules shortened.
+
+    const AGY_RULE: &str = "────────────────────────────────────────────────────────────";
+
+    #[test]
+    fn agy_parked_at_its_composer_is_ready() {
+        let s = snap_from(&[
+            "● Ran (touch approval-probe.txt) (ctrl+o to expand)",
+            "  done",
+            AGY_RULE,
+            ">",
+            AGY_RULE,
+            "? for shortcuts                                    Gemini 3.8 Flash · high",
+        ]);
+        assert_eq!(screen_status_for("agy", &s), AgentStatus::Ready);
+    }
+
+    #[test]
+    fn agy_running_a_turn_is_working() {
+        let s = snap_from(&[
+            "> Run the shell command: touch approval-probe.txt   then say done",
+            "⣻  Generating...",
+            AGY_RULE,
+            ">",
+            AGY_RULE,
+            "esc to cancel                                      Gemini 3.8 Flash · high",
+        ]);
+        assert_eq!(screen_status_for("agy", &s), AgentStatus::Working);
+    }
+
+    #[test]
+    fn agy_permission_question_and_trust_dialogs_are_blocked() {
+        // The permission prompt keeps `esc to cancel` up below it: the selection footer has
+        // to outrank the working footer.
+        let permission = snap_from(&[
+            "Requesting permission for:",
+            "   touch approval-probe.txt",
+            "Run this command?",
+            "> 1. Yes, run command",
+            "  4. No, cancel",
+            "  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command",
+            "esc to cancel                                      Gemini 3.8 Flash · high",
+        ]);
+        let question = snap_from(&[
+            "Question 1/1: Which color do you prefer?",
+            "> 1. (Recommended) Red",
+            "  2. Blue",
+            "  3. Write-in...",
+            "  ↑/↓ Navigate · enter Select · esc Skip",
+            "esc to cancel                                      Gemini 3.8 Flash · high",
+        ]);
+        let trust = snap_from(&[
+            "Do you trust the contents of this project?",
+            "Antigravity CLI requires permission to read, edit, and execute files here.",
+            "> Yes, I trust this folder",
+            "  No, exit",
+            "  ↑/↓ Navigate · enter Confirm",
+        ]);
+        for s in [permission, question, trust] {
+            assert_eq!(screen_status_for("agy", &s), AgentStatus::Blocked);
+        }
+    }
+
+    #[test]
+    fn agy_autocomplete_menus_are_typing_not_a_dialog() {
+        // `/` and `@` open a menu with the SAME selection footer while the agent is idle —
+        // plus `esc to cancel`. Neither may read as blocked (a toast) or working.
+        let slash = snap_from(&[
+            AGY_RULE,
+            "> /",
+            AGY_RULE,
+            "> /add-dir             Add a directory to the workspace",
+            "  /agents              List available custom agents",
+            "   ↓ 41 more",
+            "  ↑/↓ Navigate · enter Select · tab Complete",
+            "esc to cancel                                      Gemini 3.8 Flash · high",
+        ]);
+        let at = snap_from(&[
+            AGY_RULE,
+            "> @",
+            AGY_RULE,
+            "> notes.txt           File        /private/tmp/probe/...",
+            "  ↑/↓ Navigate · enter Select · tab Complete",
+        ]);
+        for s in [slash, at] {
+            assert_eq!(screen_status_for("agy", &s), AgentStatus::Ready);
+        }
+    }
+
+    #[test]
+    fn agy_footer_wrapped_by_a_narrow_pane_still_pairs_up() {
+        let menu = snap_from(&["  ↑/↓ Navigate · enter Select · t", "ab Complete"]);
+        assert_eq!(screen_status_for("agy", &menu), AgentStatus::Ready);
+        let dialog = snap_from(&["  ↑/↓ Navi", "gate · tab Amend", "esc to cancel"]);
+        assert_eq!(screen_status_for("agy", &dialog), AgentStatus::Blocked);
+    }
+
+    #[test]
+    fn agy_trusts_a_bare_gt_only_inside_the_composer_frame() {
+        // A quoted line in ordinary output is not a prompt.
+        let s = snap_from(&["  here is the reply:", "> quoted text", "more output"]);
+        assert_eq!(screen_status_for("agy", &s), AgentStatus::Idle);
+        // …but the framed composer is, even when a notice replaced the footer.
+        let s = snap_from(&[AGY_RULE, "> draft", AGY_RULE, "Press Ctrl+C again to exit"]);
+        assert_eq!(screen_status_for("agy", &s), AgentStatus::Ready);
+        // And agy's rules never leak into the shared classifier.
+        let s = snap_from(&[AGY_RULE, ">", AGY_RULE, "? for shortcuts"]);
+        assert_eq!(screen_status(&s), AgentStatus::Idle);
+    }
+
+    // ===== grok (Grok Build 1.0.70). Verbatim `capture-pane` reads, long rows shortened.
+
+    #[test]
+    fn grok_parked_at_its_composer_is_ready() {
+        let s = snap_from(&[
+            "  Read Terms and Privacy Policy.",
+            "  ╭────────────────────────────────────────╮",
+            "  │ ❯ Build anything                       │",
+            "  ╰──────────────────── Grok 4.7 (high) ─╯",
+            "  Ctrl+e:expand thinking  │  Space:prompt  │  Ctrl+.:shortcuts",
+        ]);
+        assert_eq!(screen_status_for("grok", &s), AgentStatus::Ready);
+    }
+
+    #[test]
+    fn grok_running_a_turn_is_working_though_its_composer_is_drawn() {
+        let s = snap_from(&[
+            "     ◆ Ran create empty grok-probe.txt file",
+            "    ⠼ Waiting for response… 1.0s                       4.0s ⇣28.6k [stop]",
+            "  Read Terms and Privacy Policy.",
+            "  ╭────────────────────────────────────────╮",
+            "  │ ❯                                      │",
+            "  ╰──────────────────── Grok 4.7 (high) ─╯",
+            "  Shift+Tab:mode  │  Ctrl+c:cancel  │  Ctrl+.:shortcuts",
+        ]);
+        assert_eq!(screen_status_for("grok", &s), AgentStatus::Working);
+    }
+
+    #[test]
+    fn grok_permission_and_question_dialogs_are_blocked() {
+        let permission = snap_from(&[
+            "    ◆ Check git baseline and probe file… 8.6s          25s ⇣32.0k [↓][stop]",
+            "  ┃  ›  Check git baseline and probe file",
+            "  ┃  1 (○) Yes, and don't ask again for anything (always-approve mode)",
+            "  ┃  2 (●) Yes, proceed",
+            "  ┃  3 (○) No, reject (type to add feedback)",
+            "  ┃",
+            "  Tab/Space:permission  │  Ctrl+e:expand thinking  │  Ctrl+c:cancel  │  Ctrl+b:send to bg  │  Ctrl+.:shortcuts",
+        ]);
+        let question = snap_from(&[
+            "    ◆ Waiting on answers for Red or blue?              7.8s ⇣32.9k [stop]",
+            "  ┃  Red or blue?",
+            "  ┃  1 (○) Red (Recommended)  Choose red.",
+            "  ┃  2 (○) Blue               Choose blue.",
+            "  ┃  z (○) Type your answer here",
+            "  ┃  ↑/↓ navigate · y copy                             Enter:submit",
+            "  Tab:next answer  │  Esc:scrollback  │  Shift+x:dismiss",
+        ]);
+        let trust = snap_from(&[
+            "              Do you trust the contents of this directory?",
+            "                    /private/tmp/probe",
+            "              Grok Build may run or modify contents in this directory,",
+            "                          Yes, proceed                 y",
+            "                          No, quit                     n",
+        ]);
+        for s in [permission, question, trust] {
+            assert_eq!(screen_status_for("grok", &s), AgentStatus::Blocked);
+        }
+    }
+
+    #[test]
+    fn grok_echoed_prompts_are_not_a_composer() {
+        // History rows reuse the composer's `❯`, without its box border.
+        let s = snap_from(&[
+            "     ❯ Run the shell command: touch grok-probe.txt",
+            "     Done.",
+        ]);
+        assert_eq!(screen_status_for("grok", &s), AgentStatus::Idle);
     }
 
     #[test]

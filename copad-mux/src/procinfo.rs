@@ -281,7 +281,8 @@ pub struct Label {
 
 /// Case-insensitive basenames treated as AI agents.
 const AGENTS: &[&str] = &[
-    "claude", "codex", "aider", "cursor", "gemini", "opencode", "droid", "copilot", "qwen", "crush",
+    "claude", "codex", "agy", "grok", "aider", "cursor", "gemini", "opencode", "droid", "copilot",
+    "qwen", "crush",
 ];
 
 /// The built-in AI-agent basenames — the default whitelist for restoring running
