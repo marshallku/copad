@@ -8,6 +8,7 @@ struct HostsScreen: View {
     @State private var publicKey = ""
     @State private var keyError = ""
     @State private var confirmNewKey = false
+    @ObservedObject private var push = PushRegistry.shared
     var openWeb: () -> Void
 
     var body: some View {
@@ -37,6 +38,12 @@ struct HostsScreen: View {
                         .font(.caption2.monospaced()).textSelection(.enabled)
                         .accessibilityIdentifier("devicePublicKey")
                     Button("Copy public key") { UIPasteboard.general.string = publicKey }
+                    ForEach(push.status.sorted(by: { $0.key < $1.key }), id: \.key) { key, text in
+                        let name = hosts.first { $0.id.uuidString == key }?.name
+                        Label(name.map { "\($0): \(text)" } ?? text, systemImage: "bell.slash")
+                            .font(.caption).foregroundStyle(.orange)
+                            .accessibilityIdentifier("pushStatus")
+                    }
                     if DeviceKey.secureEnclaveAvailable && DeviceKey.kind != .secureEnclave {
                         Button("New Secure Enclave key") { confirmNewKey = true }
                             .accessibilityIdentifier("newEnclaveKey")
@@ -73,6 +80,18 @@ struct HostsScreen: View {
                 })
             }
             .onAppear(perform: setUp)
+            // A tapped push (decisions #175): open its host, then jump to its pane.
+            .onReceive(push.$tapped) { route in
+                guard let route, let h = hosts.first(where: { $0.id.uuidString == route.host }) else { return }
+                push.tapped = nil
+                if let s = session, s.host.id == h.id {
+                    if s.inputEnabled { s.jump(route.pane) } else { s.pendingJump = route.pane }
+                } else {
+                    let s = MuxSession(host: h)
+                    s.pendingJump = route.pane
+                    session = s
+                }
+            }
             .confirmationDialog("Replace this device's key?", isPresented: $confirmNewKey, titleVisibility: .visible) {
                 Button("New Secure Enclave key", role: .destructive) {
                     do {

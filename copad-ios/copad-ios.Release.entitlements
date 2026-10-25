@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- TestFlight / App Store: production APNs, and the keychain group under the team
+         prefix the distribution profile grants (decisions #175, #176). -->
+    <key>aps-environment</key>
+    <string>production</string>
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)com.marshall.copad.ios</string>
+    </array>
+</dict>
+</plist>

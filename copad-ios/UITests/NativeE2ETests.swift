@@ -65,6 +65,9 @@ final class NativeE2ETests: XCTestCase {
         if enclave { try authorizeEnclaveKey() }
         // 1. Live: the tab strip comes from L0 and the screen from the render channel.
         XCTAssertTrue(app.buttons["tab-1"].waitForExistence(timeout: 30), "never went live")
+        // The first live session asks for notification permission (decisions #175).
+        let allow = springboard.buttons["Allow"]
+        if allow.waitForExistence(timeout: 5) { allow.tap() }
         XCTAssertTrue(terminal.waitForExistence(timeout: 5))
 
         // 2. The phone is the only client and claimed the chrome: comux's own sidebar is gone.
@@ -169,7 +172,35 @@ final class NativeE2ETests: XCTestCase {
         app.typeText("echo BACK-$((1+1))\n")
         waitScreen("BACK-2")
         snapshot("after-resume")
+
+        // 9. APNs (decisions #175), when the script configured a real key: once comux has our
+        //    token, background the app and let the script raise a notification for e2e-two's
+        //    pane; Apple's sandbox delivers it, and tapping the banner jumps there.
+        if let dir = ProcessInfo.processInfo.environment["E2E_PUSH_DIR"], !dir.isEmpty {
+            let reg = URL(fileURLWithPath: dir).appendingPathComponent("comux-push.json")
+            let end = Date().addingTimeInterval(30)
+            while Date() < end, !((try? String(contentsOf: reg, encoding: .utf8)) ?? "").contains("\"token\"") {
+                Thread.sleep(forTimeInterval: 0.5)
+            }
+            XCTAssertTrue(((try? String(contentsOf: reg, encoding: .utf8)) ?? "").contains("\"token\""),
+                          "the app never registered for pushes")
+            XCUIDevice.shared.press(.home)
+            FileManager.default.createFile(atPath: dir + "/notify-now", contents: Data())
+            let banner = springboard.descendants(matching: .any)
+                .matching(NSPredicate(format: "label CONTAINS 'push e2e'")).firstMatch
+            XCTAssertTrue(banner.waitForExistence(timeout: 60), "no push arrived")
+            let shot = XCTAttachment(screenshot: XCUIScreen.main.screenshot())
+            shot.name = "push-banner"
+            shot.lifetime = .keepAlways
+            add(shot)
+            banner.tap()
+            expectation(for: NSPredicate(format: "label == 'e2e-two'"), evaluatedWith: app.staticTexts["activeSession"])
+            waitForExpectations(timeout: 30)
+            snapshot("push-jumped")
+        }
     }
+
+    private var springboard: XCUIApplication { XCUIApplication(bundleIdentifier: "com.apple.springboard") }
 
     private func snapshot(_ name: String) {
         let a = XCTAttachment(screenshot: app.screenshot())

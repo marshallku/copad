@@ -30,8 +30,12 @@ unicode-width = "0.2"
 # GitHub-release update check for the status-bar "update available" hint
 # (versionpoll). reqwest is already in-tree via copad-usage; mirror its TLS
 # features (OS trust store + webpki roots) so a corporate CA is trusted.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
+# http2: APNs only speaks HTTP/2 (decisions #175).
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "http2", "rustls-tls-webpki-roots", "rustls-tls-native-roots"] }
 semver = "1"
+# APNs provider tokens: ES256 with the team's .p8 key. Both already in-tree (rustls, reqwest).
+ring = "0.17"
+base64 = "0.22"
 
 [[bin]]
 name = "comux"

@@ -506,6 +506,7 @@ pub fn run() -> io::Result<()> {
         dirty |= app.poll_agent_sessions(); // resume-picker scan landed (Ctrl-b R)
         dirty |= app.poll_dir_listing(); // new-session browser listing landed (Ctrl-b C)
         resend_delegated(&mut app, &mut hub); // a host-drawn browser / resume picker's rows landed
+        app.poll_push_dead(); // APNs said a device token is gone
         app.maybe_probe_session_dirs(); // re-check session start dirs off-loop (Ctrl-b c)
         let pane_dirty = app.drain_pane_dirty(); // a VISIBLE pane's screen advanced (PTY output)
         dirty |= pane_dirty;
@@ -1323,6 +1324,9 @@ fn ctl_mutates(req: &control::Req) -> bool {
             // Inbox traffic is polled by `inbox --wait` and draws nothing.
             | control::Req::Inbox { .. }
             | control::Req::Deliver { .. }
+            // Push registrations draw nothing.
+            | control::Req::PushRegister { .. }
+            | control::Req::PushUnregister { .. }
     )
 }
 

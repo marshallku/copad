@@ -278,3 +278,14 @@ restore_agent_sessions = true
 # [machines.gpu]
 # ssh = "gpu-box"            # a Host alias from ~/.ssh/config works too
 # socket = "/run/user/1000/comux.sock"   # only when that server is not at the default path
+
+# --- Phone pushes (APNs) ------------------------------------------------------------------
+# With an Apple Push Notifications auth key, this server pushes every agent notification it
+# raises (turn done / blocked) to each copad iOS app that connected to it and allowed
+# notifications; tapping one opens that host and jumps to the pane (decisions #175). All three
+# keys or none. The key must belong to the team that signs the app.
+#
+# [push]
+# apns_key = "~/.config/copad/apns.p8"
+# apns_key_id = "ABC123DEFG"
+# apns_team_id = "8QNJMX7JJ2"

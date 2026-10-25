@@ -1133,6 +1133,9 @@ pub struct MuxConfig {
     pub never_inherit: Vec<String>,
     /// `comux worktree create` naming + post-create hooks.
     pub worktree: WorktreeConfig,
+    /// `[push]` — the team APNs key that lets this server push agent notifications to the
+    /// copad iOS app (decisions #175). `None` = no pushes; `push-register` says so.
+    pub push: Option<crate::push::PushConfig>,
     /// `[machines.<name>]` — the SSH fleet, in configured (alphabetical) order.
     ///
     /// DECLARATIVE, like `~/.ssh/config`: there is deliberately no `comux machine add` that
@@ -1182,6 +1185,14 @@ struct RawConfig {
     global: Option<HashMap<String, ChordSpec>>,
     worktree: Option<RawWorktree>,
     machines: Option<std::collections::BTreeMap<String, RawMachine>>,
+    push: Option<RawPush>,
+}
+
+#[derive(Deserialize, Default)]
+struct RawPush {
+    apns_key: Option<String>,
+    apns_key_id: Option<String>,
+    apns_team_id: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1294,6 +1305,7 @@ impl MuxConfig {
                 scripts: HashMap::new(),
             },
             machines: Vec::new(),
+            push: None,
         }
     }
 
@@ -1374,6 +1386,7 @@ impl MuxConfig {
         };
 
         let worktree = build_worktree(raw.worktree, &mut warnings);
+        let push = build_push(raw.push, &mut warnings);
         let machines = build_machines(raw.machines, &mut warnings);
         let never_inherit = build_never_inherit(raw.never_inherit, &mut warnings);
         let update_environment = build_update_environment(raw.update_environment, &mut warnings);
@@ -1500,6 +1513,7 @@ impl MuxConfig {
                 update_environment,
                 never_inherit,
                 worktree,
+                push,
                 machines,
             },
             warnings,
@@ -1660,6 +1674,30 @@ fn build_machines(
         }
     }
     out
+}
+
+/// `[push]`: all three keys or none (a partial section warns and pushes nothing). A leading
+/// `~/` in `apns_key` is the home directory.
+fn build_push(raw: Option<RawPush>, warnings: &mut Vec<String>) -> Option<crate::push::PushConfig> {
+    let raw = raw?;
+    let (Some(key), Some(key_id), Some(team_id)) =
+        (raw.apns_key, raw.apns_key_id, raw.apns_team_id)
+    else {
+        warnings.push("[push] needs apns_key, apns_key_id and apns_team_id; push is off".into());
+        return None;
+    };
+    let key_file = match key.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join(rest),
+        None => PathBuf::from(key),
+    };
+    Some(crate::push::PushConfig {
+        key_file,
+        key_id,
+        team_id,
+    })
 }
 
 fn build_worktree(raw: Option<RawWorktree>, warnings: &mut Vec<String>) -> WorktreeConfig {

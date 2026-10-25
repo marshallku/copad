@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import NIOSSH
 import SwiftUI
@@ -74,7 +75,38 @@ final class MuxSession: ObservableObject, KeySink {
         return t
     }
 
-    init(host: MuxHost) { self.host = host }
+    init(host: MuxHost) {
+        self.host = host
+        // A token that arrives (or changes) while connected is registered at once (codex C4).
+        pushSub = PushRegistry.shared.$token.sink { [weak self] _ in
+            Task { @MainActor in self?.whenReady() }
+        }
+    }
+
+    private var pushSub: AnyCancellable?
+    /// The token this connection last registered with comux.
+    private var pushSent: String?
+    /// A tapped notification's pane, jumped to once the session is ready.
+    var pendingJump: String?
+
+    /// Once input works: register for pushes, and take a pending notification jump.
+    private func whenReady() {
+        guard inputEnabled else { return }
+        PushRegistry.shared.enable()
+        if let pane = pendingJump {
+            pendingJump = nil
+            if !pane.isEmpty { jump(pane) }
+        }
+        guard let token = PushRegistry.shared.token, token != pushSent else { return }
+        pushSent = token
+        let hostID = host.id.uuidString
+        command(["cmd": "push-register", "token": token, "env": PushRegistry.environment,
+                 "topic": Bundle.main.bundleIdentifier ?? "", "host": hostID,
+                 "device": UIDevice.current.name]) { resp in
+            let ok = resp["ok"] as? Bool ?? false
+            PushRegistry.shared.setStatus(host: hostID, ok ? nil : (resp["error"] as? String ?? "push refused"))
+        }
+    }
 
     var inputEnabled: Bool { phase == .live && gotFull && attachment != nil && model.tree != nil }
 
@@ -185,7 +217,7 @@ final class MuxSession: ObservableObject, KeySink {
         pingTimer?.invalidate(); pingTimer = nil
         l0?.close(); render?.close(); ssh?.close()
         l0 = nil; render = nil; ssh = nil
-        attachment = nil; claimed = false; gotFull = false
+        attachment = nil; claimed = false; gotFull = false; pushSent = nil
         overlays.removeAll()
         replies.removeAll()
         grid.reset()
@@ -241,6 +273,7 @@ final class MuxSession: ObservableObject, KeySink {
             case "snapshot":
                 _ = model.apply(m)
                 if render == nil { Task { await openRender(gen) } }
+                whenReady()
             case "state", "unavailable":
                 _ = model.apply(m)
                 maybeClaim()
@@ -305,6 +338,7 @@ final class MuxSession: ObservableObject, KeySink {
                 if f.full, !gotFull {
                     gotFull = true
                     phase = .live
+                    whenReady()
                 }
             case .bell: onBell?()
             case let .title(t): title = t

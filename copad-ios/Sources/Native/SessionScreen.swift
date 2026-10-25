@@ -32,7 +32,11 @@ struct SessionScreen: View {
             drawers
         }
         .preferredColorScheme(.dark)
-        .onAppear { if session.phase == .idle { session.connect() } }
+        .onAppear {
+            PushRegistry.shared.visibleHost = session.host.id.uuidString
+            if session.phase == .idle { session.connect() }
+        }
+        .onDisappear { PushRegistry.shared.visibleHost = nil }
         .onChange(of: scenePhase) { _, p in
             switch p {
             case .background:

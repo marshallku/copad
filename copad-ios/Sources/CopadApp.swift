@@ -5,6 +5,8 @@ import SwiftUI
 /// native UI. The web-bridge PWA shell (`ContentView`) stays reachable as "Web". See README.md.
 @main
 struct CopadApp: App {
+    /// APNs token callbacks and notification presentation (decisions #175).
+    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @AppStorage("copad.webMode") private var webMode = false
 
     var body: some Scene {

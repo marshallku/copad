@@ -41,7 +41,12 @@ targets:
         TARGETED_DEVICE_FAMILY: "1,2"
         GENERATE_INFOPLIST_FILE: "NO"
         INFOPLIST_FILE: Sources/Info.plist
-        CODE_SIGN_ENTITLEMENTS: copad-ios.entitlements
+      # aps-environment must match the profile: development for debug, production for TestFlight.
+      configs:
+        Debug:
+          CODE_SIGN_ENTITLEMENTS: copad-ios.entitlements
+        Release:
+          CODE_SIGN_ENTITLEMENTS: copad-ios.Release.entitlements
     dependencies:
       - package: swift-nio-ssh
         product: NIOSSH

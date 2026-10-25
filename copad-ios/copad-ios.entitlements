@@ -7,6 +7,9 @@
          (errSecMissingEntitlement) on an ad-hoc/unsigned build. The bundle-id
          group needs no developer team, so ad-hoc ("-") signing still builds on
          any machine. -->
+    <!-- APNs for agent notifications (decisions #175): the sandbox in debug builds. -->
+    <key>aps-environment</key>
+    <string>development</string>
     <key>keychain-access-groups</key>
     <array>
         <string>com.marshall.copad.ios</string>

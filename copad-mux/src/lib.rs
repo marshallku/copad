@@ -37,6 +37,7 @@ pub mod persist;
 pub mod picker;
 pub mod procinfo;
 pub mod proto;
+pub mod push;
 pub mod selector;
 pub mod server;
 pub mod state;

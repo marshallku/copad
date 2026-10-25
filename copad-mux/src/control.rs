@@ -284,6 +284,24 @@ pub enum Req {
     },
     /// The pinned slots. Read-only.
     Marks,
+    /// Register an app install for APNs pushes of agent notifications (decisions #175): what
+    /// the copad iOS app sends once it has a device token. Refused when this server has no
+    /// `[push]` key.
+    PushRegister {
+        token: String,
+        env: crate::push::ApnsEnv,
+        topic: String,
+        /// The app's id for the saved host entry, echoed back in each push.
+        host: String,
+        #[serde(default)]
+        device: String,
+    },
+    /// Stop pushing to `token` (for one host entry, or all).
+    PushUnregister {
+        token: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<String>,
+    },
     /// Mark a notification-center entry read (`id`), or all of them (no `id`) — what a host
     /// UI's notification panel does when the user has seen an entry (decisions #166).
     NotifRead {

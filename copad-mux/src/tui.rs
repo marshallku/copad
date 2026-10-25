@@ -865,6 +865,9 @@ pub struct App {
     /// (`comux notify`), so the status sweep must not toast them a second time. Keyed by
     /// pid, not pane alone: a later agent in the same pane is a different owner.
     hook_owned: HashSet<(TerminalId, u32, &'static str)>,
+    /// Phones registered for APNs pushes, and the worker that sends them (decisions #175).
+    push_reg: crate::push::Registry,
+    pusher: crate::push::Pusher,
     /// When `Some(sel)`, the notification center (`Ctrl-b a`) is open at row `sel`.
     center: Option<usize>,
     /// When `Some`, the resume picker (`Ctrl-b R`) is open.
@@ -1180,6 +1183,8 @@ impl App {
             view_gen: 0,
             notifications: VecDeque::new(),
             hook_owned: HashSet::new(),
+            push_reg: crate::push::Registry::load(crate::push::Registry::default_path()),
+            pusher: crate::push::Pusher::default(),
             center: None,
             resume: None,
             browser: None,
@@ -4447,6 +4452,31 @@ impl App {
                         Resp::ok()
                     }
                     None => Resp::err_code("not_found", format!("unknown pane '{t}'")),
+                }
+            }
+            Req::PushRegister {
+                token,
+                env,
+                topic,
+                host,
+                device,
+            } => {
+                if self.cfg.push.is_none() {
+                    return Resp::err(
+                        "push is not configured on this host: add [push] apns_key, apns_key_id \
+                         and apns_team_id to mux.toml"
+                            .to_string(),
+                    );
+                }
+                match self.push_reg.register(token, *env, topic, host, device) {
+                    Ok(()) => Resp::ok(),
+                    Err(e) => Resp::err(e),
+                }
+            }
+            Req::PushUnregister { token, host } => {
+                match self.push_reg.unregister(token, host.as_deref()) {
+                    Ok(_) => Resp::ok(),
+                    Err(e) => Resp::err(e),
                 }
             }
             Req::NotifRead { id } => {
@@ -8527,6 +8557,7 @@ impl App {
             let action = self.jump_action(&term);
             notify::desktop(&title, &body, action.as_deref(), &self.desktop_env());
         }
+        self.push_to_phones(&term, &title, &body);
         self.notif_seq += 1;
         self.notifications.push_front(Notification {
             id: self.notif_seq,
@@ -8543,6 +8574,34 @@ impl App {
             self.notifications.pop_back();
         }
         title
+    }
+
+    /// Queue one APNs push per registered phone (decisions #175). Off the loop: the worker
+    /// thread does the network. Independent of `notify`, which is about THIS machine's desktop.
+    fn push_to_phones(&self, term: &TerminalId, title: &str, body: &str) {
+        let Some(cfg) = self.cfg.push.as_ref() else {
+            return;
+        };
+        if self.push_reg.is_empty() {
+            return;
+        }
+        let pane = self.token_of(term).unwrap_or_default();
+        for reg in self.push_reg.targets() {
+            let payload = crate::push::payload(title, body, &reg.host, &pane);
+            self.pusher.push(crate::push::Job {
+                cfg: cfg.clone(),
+                reg,
+                payload,
+                collapse: pane.clone(),
+            });
+        }
+    }
+
+    /// Forget device tokens APNs reported dead. Called from the server loop.
+    pub fn poll_push_dead(&mut self) {
+        for d in self.pusher.take_dead() {
+            self.push_reg.drop_dead(&d.token, d.generation);
+        }
     }
 
     /// Number of agent panes currently BLOCKED (awaiting input) — the status-bar

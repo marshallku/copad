@@ -91,6 +91,14 @@ kill -0 "$SSHD_PID" || { log "sshd did not start"; cat "$W/sshd.log"; exit 1; }
 MUXENV=(COPAD_MUX_SOCK="$W/s" COPAD_MUX_STATE="$W/state.json" COPAD_MUX_NOTIFY=0
         COPAD_MUX_USAGE=0 COPAD_MUX_UPDATE_CHECK=0 COPAD_MUX_QUIET_SSH=1 XDG_CONFIG_HOME="$W/cfg")
 mkdir -p "$W/cfg/copad" "$W/bin"
+# APNs (decisions #175): with the team's key in E2E_APNS_KEY / _KEY_ID / _TEAM, this comux
+# pushes to the Simulator through Apple's REAL sandbox, and the UI test taps the banner.
+PUSH=0
+if [[ -n "${E2E_APNS_KEY:-}" && -n "${E2E_APNS_KEY_ID:-}" && -n "${E2E_APNS_TEAM:-}" ]]; then
+    PUSH=1
+    printf '[push]\napns_key = "%s"\napns_key_id = "%s"\napns_team_id = "%s"\n' \
+        "$E2E_APNS_KEY" "$E2E_APNS_KEY_ID" "$E2E_APNS_TEAM" >"$W/cfg/copad/mux.toml"
+fi
 mux() { env -u COPAD_MUX_PANE -u COPAD_MUX "${MUXENV[@]}" "$COMUX" "$@"; }
 # The server's HOME is a fixture: the native Ctrl-b C browser lists it (decisions #172).
 mkdir -p "$W/home/proj/sub"
@@ -102,6 +110,15 @@ mux new-session --detached e2e-two >/dev/null
 ln -s /bin/sleep "$W/bin/claude"
 tok() { mux list-tree --json | python3 -c 'import json,sys; t=json.load(sys.stdin)["tree"]; print(t[int(sys.argv[1])]["tabs"][0]["panes"][0]["token"])' "$1"; }
 TOK="$(tok 0)"
+# The push step: once the app has registered and gone to the background it drops
+# `notify-now`; the notification is raised for e2e-two's pane, so tapping it must switch there.
+if [[ $PUSH == 1 ]]; then
+    TOK2="$(tok 1)"
+    ( for _ in $(seq 1 1200); do
+          if [[ -f "$W/notify-now" ]]; then mux notify --pane "$TOK2" --kind done "push e2e" >/dev/null; break; fi
+          sleep 0.25
+      done ) &
+fi
 # In the OTHER session, so the pane the test types into keeps its focus.
 mux split --from "$(tok 1)" -- "$W/bin/claude" 1000 >/dev/null
 mux notify --pane "$TOK" --kind done "e2e notification" >/dev/null
@@ -115,7 +132,7 @@ log "running the UI test"
 set +e
 TEST_RUNNER_E2E_HOST=127.0.0.1 TEST_RUNNER_E2E_PORT="$PORT" TEST_RUNNER_E2E_USER="$USER" \
 TEST_RUNNER_E2E_SEED="$SEED" TEST_RUNNER_E2E_P256="$P256" TEST_RUNNER_E2E_ENCLAVE="$ENCLAVE" TEST_RUNNER_E2E_AUTHKEYS="$W/authorized_keys" TEST_RUNNER_E2E_HOSTKEY="$(cut -d' ' -f1,2 "$W/hostkey.pub")" \
-TEST_RUNNER_E2E_COMMAND="$REMOTE" \
+TEST_RUNNER_E2E_COMMAND="$REMOTE" TEST_RUNNER_E2E_PUSH_DIR="$([[ $PUSH == 1 ]] && echo "$W")" \
 xcodebuild -project copad-ios.xcodeproj -scheme copad-ios -destination "$DEST" \
     -derivedDataPath build -skipPackagePluginValidation \
     -resultBundlePath "$W/e2e.xcresult" \
