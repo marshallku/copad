@@ -41,6 +41,25 @@ machine) so the Keychain entitlement (`copad-ios.entitlements`,
 `keychain-access-groups`) applies — without it `SecItemAdd` fails `-34018` on the
 Simulator and the token can't persist.
 
+## TestFlight
+
+`scripts/testflight.sh` drives `fastlane/Fastfile` (both modeled on AIDE's) with the App Store
+Connect API key — no Apple ID login — on this Mac or in GitHub Actions (decisions #176):
+
+```bash
+copad-ios/scripts/testflight.sh                   # build + upload from this Mac (clean tree only)
+copad-ios/scripts/testflight.sh --version 0.2.0   # … with that marketing version
+copad-ios/scripts/testflight.sh --build-only      # signed build/fastlane/copad.ipa, no upload
+copad-ios/scripts/testflight.sh --ci              # run .github/workflows/testflight.yml on HEAD
+copad-ios/scripts/testflight.sh status            # recent builds and their processing state
+```
+
+CI needs `IOS_DISTRIBUTION_CERTIFICATE_BASE64` / `_PASSWORD` (the "Apple Distribution" .p12)
+besides the `APP_STORE_CONNECT_*` secrets release.yml already uses.
+Release builds use `copad-ios.Release.entitlements` (production APNs, the keychain group under
+the team prefix); Debug keeps ad-hoc signing and the sandbox. The App Store Connect app record
+for `com.marshall.copad.ios` must exist before `beta` can upload — an API key cannot create one.
+
 ## Build & run (Simulator)
 
 Requires Xcode + [`xcodegen`](https://github.com/yonaskolb/XcodeGen)

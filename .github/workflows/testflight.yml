@@ -1,0 +1,119 @@
+name: TestFlight
+
+# Uploads the copad iOS app to TestFlight from GitHub's runners (decisions #176). The same
+# copad-ios/scripts/testflight.sh uploads from a Mac without spending Actions minutes; this is
+# the other way, started by `copad-ios/scripts/testflight.sh --ci` or by hand:
+#
+#   gh workflow run testflight.yml -f ref=master [-f version=0.2.0]
+#
+# Secrets:
+#   IOS_DISTRIBUTION_CERTIFICATE_BASE64    the "Apple Distribution" certificate and key, .p12, base64
+#   IOS_DISTRIBUTION_CERTIFICATE_PASSWORD  its .p12 password
+#   APP_STORE_CONNECT_KEY_ID / _ISSUER_ID / _KEY_P8
+#                                          the App Store Connect API key (shared with release.yml's
+#                                          notarization); fetches the profile and uploads
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to build"
+        required: true
+        default: master
+      version:
+        description: "Marketing version X.Y.Z (empty = project.yml's)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+# One upload at a time: two would race for the same "latest + 1" build number.
+concurrency: testflight
+
+jobs:
+  testflight:
+    name: Build and upload
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install xcodegen and fastlane
+        run: |
+          brew install xcodegen
+          command -v fastlane >/dev/null || brew install fastlane
+
+      # A throwaway keychain holding only the distribution certificate; removed in the last step.
+      # Unlike the desktop release there is no ad-hoc fallback: TestFlight needs a real identity.
+      - name: Import the Apple Distribution certificate
+        env:
+          CERTIFICATE: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_BASE64 }}
+          PASSWORD: ${{ secrets.IOS_DISTRIBUTION_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [[ -n "$CERTIFICATE" && -n "$PASSWORD" ]] || { echo "::error::IOS_DISTRIBUTION_CERTIFICATE_* secrets are missing"; exit 1; }
+          keychain="$RUNNER_TEMP/copad-ios.keychain-db"
+          keychain_password="$(openssl rand -hex 24)"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          printf '%s' "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$PASSWORD" -T /usr/bin/codesign
+          rm -f "$RUNNER_TEMP/certificate.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          security find-identity -v -p codesigning "$keychain" | grep -q "Apple Distribution" \
+            || { echo "::error::the certificate isn't an Apple Distribution identity"; exit 1; }
+
+      - name: Install the App Store Connect key
+        env:
+          KEY: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          [[ -n "$KEY" && -n "$KEY_ID" && -n "$ISSUER_ID" ]] || { echo "::error::APP_STORE_CONNECT_* secrets are missing"; exit 1; }
+          path="$RUNNER_TEMP/AuthKey_$KEY_ID.p8"
+          if grep -q "BEGIN PRIVATE KEY" <<<"$KEY"; then
+            printf '%s\n' "$KEY" > "$path"
+          else
+            printf '%s' "$KEY" | base64 --decode > "$path"
+          fi
+          chmod 600 "$path"
+          {
+            echo "APP_STORE_CONNECT_KEY_PATH=$path"
+            echo "APP_STORE_CONNECT_KEY_ID=$KEY_ID"
+            echo "APP_STORE_CONNECT_ISSUER_ID=$ISSUER_ID"
+          } >> "$GITHUB_ENV"
+
+      # Inputs go through env, never into the script text.
+      - name: Build and upload
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$VERSION" ]]; then
+            copad-ios/scripts/testflight.sh --version "$VERSION"
+          else
+            copad-ios/scripts/testflight.sh
+          fi
+
+      - name: Keep the fastlane log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testflight-log
+          path: copad-ios/build/fastlane/testflight.log
+          if-no-files-found: ignore
+
+      - name: Remove the keychain and key
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/copad-ios.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP"/AuthKey_*.p8

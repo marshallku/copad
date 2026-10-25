@@ -39,6 +39,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.marshall.copad.ios
         TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: "NO"
         INFOPLIST_FILE: Sources/Info.plist
       # aps-environment must match the profile: development for debug, production for TestFlight.
@@ -58,6 +59,12 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: copad
+        # From the build settings, so fastlane's CURRENT_PROJECT_VERSION reaches TestFlight.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        # SSH uses only standard, exempt encryption (same declaration as AIDE); without it every
+        # TestFlight build waits on the export-compliance question (decisions #176).
+        ITSAppUsesNonExemptEncryption: false
         UIAppFonts:
           - JetBrainsMonoNerdFontMono-Regular.ttf
           - JetBrainsMonoNerdFontMono-Bold.ttf

@@ -6,3 +6,5 @@ build/
 DerivedData/
 *.app
 .DS_Store
+# fastlane run output.
+fastlane/report.xml
