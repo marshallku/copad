@@ -8,8 +8,13 @@ final class TerminalView: UIView {
     weak var session: MuxSession?
     let input = InputProxy()
 
-    private let font = UIFont.monospacedSystemFont(ofSize: 13, weight: .regular)
-    private lazy var boldFont = UIFont.monospacedSystemFont(ofSize: 13, weight: .bold)
+    /// The bundled JetBrains Mono Nerd Font Mono (decisions #174): powerline separators and
+    /// Nerd icons render, one cell wide, instead of tofu. The system monospaced font stands in
+    /// if the bundled one fails to load; CJK and emoji fall back through the system cascade.
+    private let font = UIFont(name: "JetBrainsMonoNFM-Regular", size: 13)
+        ?? .monospacedSystemFont(ofSize: 13, weight: .regular)
+    private lazy var boldFont = UIFont(name: "JetBrainsMonoNFM-Bold", size: 13)
+        ?? .monospacedSystemFont(ofSize: 13, weight: .bold)
     private(set) var cellW: CGFloat = 8
     private(set) var cellH: CGFloat = 16
     private var dirty = false

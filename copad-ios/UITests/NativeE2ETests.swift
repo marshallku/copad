@@ -81,6 +81,11 @@ final class NativeE2ETests: XCTestCase {
         app.typeText("echo 한글-확인\n")
         waitScreen("한글-확인")
         snapshot("typed")
+        // Nerd glyphs render from the bundled font (decisions #174): powerline + icons.
+        app.typeText("printf 'NF \\ue0b0 \\uf121 \\uf113 \\ue0b2 END\\n'\n")
+        waitScreen("END")
+        Thread.sleep(forTimeInterval: 1)
+        snapshot("nerd-glyphs")
 
         // 5. The key bar: ^b c opens a tab, which the native tab strip shows.
         app.buttons["key-newtab"].tap()

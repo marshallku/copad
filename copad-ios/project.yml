@@ -31,6 +31,10 @@ targets:
     platform: iOS
     sources:
       - Sources
+      # JetBrains Mono Nerd Font Mono (OFL, Resources/Fonts/OFL.txt): powerline + Nerd icons in
+      # the terminal, one cell wide (decisions #174).
+      - path: Resources
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.marshall.copad.ios
@@ -49,6 +53,9 @@ targets:
       path: Sources/Info.plist
       properties:
         CFBundleDisplayName: copad
+        UIAppFonts:
+          - JetBrainsMonoNerdFontMono-Regular.ttf
+          - JetBrainsMonoNerdFontMono-Bold.ttf
         UILaunchScreen:
           UIColorName: LaunchBackground
         UISupportedInterfaceOrientations:

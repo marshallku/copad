@@ -1,6 +1,7 @@
 import XCTest
 @testable import copad_ios
 import CryptoKit
+import UIKit
 
 /// The native client's protocol layer, against the grammar comux pins in
 /// `copad-mux/src/proto.rs` (`wire_grammar`) — the same strings, from the other side.
@@ -244,5 +245,23 @@ final class DeviceKeyTests: XCTestCase {
 
     func testABadKeyIsRefused() {
         XCTAssertThrowsError(try DeviceKey.importP256(base64: "AAAA"))
+    }
+}
+
+/// The bundled Nerd Font (decisions #174): it loads, and it carries the glyphs prompts and
+/// TUIs draw — powerline separators and Nerd icons — so they are not tofu.
+final class TerminalFontTests: XCTestCase {
+    func testTheBundledNerdFontLoadsWithItsIcons() throws {
+        for name in ["JetBrainsMonoNFM-Regular", "JetBrainsMonoNFM-Bold"] {
+            let f = try XCTUnwrap(UIFont(name: name, size: 13), "\(name) is not registered")
+            let ct = f as CTFont
+            // U+E0B0 powerline arrow, U+F121 nf-fa-code, U+F0001 (nf-md, a surrogate pair).
+            for scalar in [0xE0B0, 0xF121, 0xF0001] {
+                var chars = Array(String(UnicodeScalar(scalar)!).utf16)
+                var glyphs = [CGGlyph](repeating: 0, count: chars.count)
+                XCTAssertTrue(CTFontGetGlyphsForCharacters(ct, &chars, &glyphs, chars.count),
+                              "\(name) lacks U+\(String(scalar, radix: 16, uppercase: true))")
+            }
+        }
     }
 }
