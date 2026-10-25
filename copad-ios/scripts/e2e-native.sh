@@ -32,10 +32,23 @@ trap cleanup EXIT
 
 # --- the SSH server ---------------------------------------------------------------------
 ssh-keygen -q -t ed25519 -N '' -f "$W/hostkey"
-ssh-keygen -q -t ed25519 -N '' -f "$W/client" -C copad-ios-e2e
-cp "$W/client.pub" "$W/authorized_keys"
-# The app takes the client key as its 32-byte Ed25519 seed (DeviceKey.importSeed).
-SEED="$(python3 - "$W/client" <<'PY'
+# The client key (decisions #173). Default `enclave`: the app makes a REAL Secure Enclave key
+# (the Simulator has one on Apple silicon) and the UI test appends its public line to
+# authorized_keys before connecting. `E2E_KEY=ecdsa` imports a software P-256 key (same ECDSA
+# path, for a Mac without an enclave); `E2E_KEY=ed25519` the Ed25519 path.
+KEYTYPE="${E2E_KEY:-enclave}"
+if [[ "$KEYTYPE" == enclave ]]; then
+    : >"$W/authorized_keys"
+elif [[ "$KEYTYPE" == ed25519 ]]; then
+    ssh-keygen -q -t ed25519 -N '' -f "$W/client" -C copad-ios-e2e
+else
+    ssh-keygen -q -t ecdsa -b 256 -N '' -f "$W/client" -C copad-ios-e2e
+fi
+[[ "$KEYTYPE" == enclave ]] || cp "$W/client.pub" "$W/authorized_keys"
+# The app takes the private key as raw bytes: the 32-byte Ed25519 seed
+# (DeviceKey.importSeed) or the 32-byte P-256 scalar (DeviceKey.importP256).
+KEYB64=""
+[[ "$KEYTYPE" == enclave ]] || KEYB64="$(python3 - "$W/client" <<'PY'
 import base64, struct, sys
 raw = open(sys.argv[1]).read().split('-----')[2]
 b = base64.b64decode(''.join(raw.split()))
@@ -45,10 +58,19 @@ def s(b, i):
     n = struct.unpack('>I', b[i:i + 4])[0]
     return b[i + 4:i + 4 + n], i + 4 + n
 _, i = s(b, i); _, i = s(b, i); _, i = s(b, i); i += 4; _, i = s(b, i); priv, i = s(b, i)
-j = 8; _, j = s(priv, j); _, j = s(priv, j); sk, j = s(priv, j)
-print(base64.b64encode(sk[:32]).decode())
+j = 8; kt, j = s(priv, j)
+if kt == b'ssh-ed25519':
+    _, j = s(priv, j); sk, j = s(priv, j)
+    out = sk[:32]
+else:
+    _, j = s(priv, j); _, j = s(priv, j); d, j = s(priv, j)
+    out = d.lstrip(b'\0').rjust(32, b'\0')
+print(base64.b64encode(out).decode())
 PY
 )"
+SEED=""; P256=""
+case "$KEYTYPE" in ed25519) SEED="$KEYB64" ;; ecdsa) P256="$KEYB64" ;; esac
+ENCLAVE=0; [[ "$KEYTYPE" == enclave ]] && ENCLAVE=1
 cat >"$W/sshd_config" <<EOF
 Port $PORT
 ListenAddress 127.0.0.1
@@ -92,7 +114,7 @@ DEST='platform=iOS Simulator,name=iPhone 17'
 log "running the UI test"
 set +e
 TEST_RUNNER_E2E_HOST=127.0.0.1 TEST_RUNNER_E2E_PORT="$PORT" TEST_RUNNER_E2E_USER="$USER" \
-TEST_RUNNER_E2E_SEED="$SEED" TEST_RUNNER_E2E_HOSTKEY="$(cut -d' ' -f1,2 "$W/hostkey.pub")" \
+TEST_RUNNER_E2E_SEED="$SEED" TEST_RUNNER_E2E_P256="$P256" TEST_RUNNER_E2E_ENCLAVE="$ENCLAVE" TEST_RUNNER_E2E_AUTHKEYS="$W/authorized_keys" TEST_RUNNER_E2E_HOSTKEY="$(cut -d' ' -f1,2 "$W/hostkey.pub")" \
 TEST_RUNNER_E2E_COMMAND="$REMOTE" \
 xcodebuild -project copad-ios.xcodeproj -scheme copad-ios -destination "$DEST" \
     -derivedDataPath build -skipPackagePluginValidation \
@@ -108,6 +130,10 @@ CAP="$(mux capture-pane "$TOK" -S 200 2>/dev/null || true)"
 grep -q "NATIVE-42" <<<"$CAP" || { log "FAIL: NATIVE-42 never reached the pane"; rc=1; }
 grep -q "한글-확인" <<<"$CAP" || { log "FAIL: the Hangul line never reached the pane"; rc=1; }
 grep -q "BACK-2" <<<"$CAP" || { log "FAIL: input after resume never reached the pane"; rc=1; }
+# The app authenticated with the key type under test.
+if [[ "$KEYTYPE" == ed25519 ]]; then want=ED25519; else want=ECDSA; fi
+grep -q "Accepted publickey for .* $want " "$W/sshd.log" \
+    || { log "FAIL: sshd never accepted a $want key from the app"; rc=1; }
 mkdir -p "$W/shots"
 xcrun xcresulttool export attachments --path "$W/e2e.xcresult" --output-path "$W/shots" >/dev/null 2>&1 || true
 [[ $rc == 0 ]] && log "PASS: native comux client end to end" || log "FAIL (xcodebuild log: $W/xcodebuild.log)"

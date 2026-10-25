@@ -1,5 +1,6 @@
 import XCTest
 @testable import copad_ios
+import CryptoKit
 
 /// The native client's protocol layer, against the grammar comux pins in
 /// `copad-mux/src/proto.rs` (`wire_grammar`) — the same strings, from the other side.
@@ -198,5 +199,50 @@ final class InputProxyTests: XCTestCase {
         XCTAssertEqual(r.out.first, "key:[\"Char\": \"c\"]/CONTROL")
         XCTAssertEqual(r.out.last, "text:x")
         XCTAssertFalse(p.ctrlArmed)
+    }
+}
+
+/// The device key (decisions #173). The Simulator has no Secure Enclave, so the ECDSA path an
+/// enclave key takes is exercised with an imported software P-256 key; the Ed25519 path is
+/// what a Simulator (or an older install) uses on its own.
+final class DeviceKeyTests: XCTestCase {
+    override func tearDown() {
+        UserDefaults.standard.removeObject(forKey: "copad.ssh.kind")
+    }
+
+    func testAnImportedP256KeyIsOfferedAsECDSA() throws {
+        let k = P256.Signing.PrivateKey()
+        try DeviceKey.importP256(base64: k.rawRepresentation.base64EncodedString())
+        XCTAssertEqual(DeviceKey.kind, .p256)
+        let line = try DeviceKey.publicLine()
+        XCTAssertTrue(line.hasPrefix("ecdsa-sha2-nistp256 "), line)
+        // RFC 5656: string "ecdsa-sha2-nistp256", string "nistp256", string Q (uncompressed).
+        func str(_ d: Data) -> Data { withUnsafeBytes(of: UInt32(d.count).bigEndian) { Data($0) } + d }
+        let blob = str(Data("ecdsa-sha2-nistp256".utf8)) + str(Data("nistp256".utf8))
+            + str(k.publicKey.x963Representation)
+        XCTAssertEqual(line, "ecdsa-sha2-nistp256 \(blob.base64EncodedString()) copad-ios")
+    }
+
+    func testAnEd25519SeedRoundTrips() throws {
+        let k = Curve25519.Signing.PrivateKey()
+        try DeviceKey.importSeed(base64: k.rawRepresentation.base64EncodedString())
+        XCTAssertEqual(DeviceKey.kind, .ed25519)
+        XCTAssertTrue(try DeviceKey.publicLine().hasPrefix("ssh-ed25519 "))
+    }
+
+    /// The Simulator on Apple silicon has an enclave, so the real path runs here too.
+    func testANewEnclaveKeyIsOfferedAsECDSA() throws {
+        try XCTSkipUnless(DeviceKey.secureEnclaveAvailable, "no Secure Enclave")
+        try DeviceKey.useNewSecureEnclaveKey()
+        XCTAssertEqual(DeviceKey.kind, .secureEnclave)
+        let first = try DeviceKey.publicLine()
+        XCTAssertTrue(first.hasPrefix("ecdsa-sha2-nistp256 "), first)
+        XCTAssertEqual(try DeviceKey.publicLine(), first, "the enclave key is reloaded, not regenerated")
+        try DeviceKey.useNewSecureEnclaveKey()
+        XCTAssertNotEqual(try DeviceKey.publicLine(), first, "a new key replaces it")
+    }
+
+    func testABadKeyIsRefused() {
+        XCTAssertThrowsError(try DeviceKey.importP256(base64: "AAAA"))
     }
 }

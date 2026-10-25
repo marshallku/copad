@@ -18,12 +18,33 @@ final class NativeE2ETests: XCTestCase {
             "-E2EPort", env["E2E_PORT"] ?? "22",
             "-E2EUser", env["E2E_USER"] ?? "",
             "-E2EKeySeed", env["E2E_SEED"] ?? "",
+            "-E2EKeyP256", env["E2E_P256"] ?? "",
             "-E2EHostKey", env["E2E_HOSTKEY"] ?? "",
             "-E2ECommand", env["E2E_COMMAND"] ?? "",
-            "-E2EAutoConnect", "YES",
+            "-E2EAutoConnect", enclave ? "NO" : "YES",
+            "-E2EKeyEnclave", enclave ? "YES" : "NO",
             "-copad.webMode", "NO",
         ]
         app.launch()
+    }
+
+    /// The e2e generates a REAL Secure Enclave key in the app (the Simulator has one on Apple
+    /// silicon): its public line is read off the hosts screen into the throwaway sshd's
+    /// authorized_keys before connecting (decisions #173).
+    private var enclave: Bool { ProcessInfo.processInfo.environment["E2E_ENCLAVE"] == "1" }
+
+    private func authorizeEnclaveKey() throws {
+        let env = ProcessInfo.processInfo.environment
+        let key = app.staticTexts["devicePublicKey"]
+        XCTAssertTrue(key.waitForExistence(timeout: 10))
+        let line = key.label
+        XCTAssertTrue(line.hasPrefix("ecdsa-sha2-nistp256 "), "not an enclave key: \(line)")
+        let path = try XCTUnwrap(env["E2E_AUTHKEYS"])
+        let h = try XCTUnwrap(FileHandle(forWritingAtPath: path))
+        h.seekToEndOfFile()
+        h.write(Data((line + "\n").utf8))
+        try h.close()
+        app.buttons["host-e2e"].tap()
     }
 
     private var terminal: XCUIElement { app.otherElements["terminal"] }
@@ -41,6 +62,7 @@ final class NativeE2ETests: XCTestCase {
     }
 
     func testNativeSessionEndToEnd() throws {
+        if enclave { try authorizeEnclaveKey() }
         // 1. Live: the tab strip comes from L0 and the screen from the render channel.
         XCTAssertTrue(app.buttons["tab-1"].waitForExistence(timeout: 30), "never went live")
         XCTAssertTrue(terminal.waitForExistence(timeout: 5))
