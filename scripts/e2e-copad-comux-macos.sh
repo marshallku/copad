@@ -56,7 +56,12 @@ export COPAD_MUX_SOCK="$W/s" COPAD_MUX_STATE="$W/state.json" COPAD_MUX_NOTIFY=0 
        COPAD_MUX_USAGE=0 COPAD_MUX_UPDATE_CHECK=0 COPAD_MUX_QUIET_SSH=1 XDG_CONFIG_HOME="$W/cfg"
 unset COPAD_MUX_PANE COPAD_MUX COPAD_SOCKET COPAD_PANEL_ID COPAD_MUX_HOST_TAG
 mkdir -p "$W/cfg/copad"
-"$COMUX" server >"$W/server.log" 2>&1 &
+# The server's HOME is a fixture: Ctrl-b C browses it, Ctrl-b R scans its transcripts.
+mkdir -p "$W/home/proj/sub" "$W/home/.claude/projects/-p"
+printf '%s\n' '{"type":"attachment","cwd":"/p","entrypoint":"cli"}' \
+    '{"type":"user","message":{"role":"user","content":"mac resume probe"}}' \
+    >"$W/home/.claude/projects/-p/0c8e9f4a-1b2c-4d5e-8f90-a1b2c3d4e5f7.jsonl"
+HOME="$W/home" "$COMUX" server >"$W/server.log" 2>&1 &
 for _ in $(seq 1 50); do "$COMUX" list-sessions >/dev/null 2>&1 && break; sleep 0.1; done
 "$COMUX" new-session --detached macos-two >/dev/null
 
@@ -154,6 +159,57 @@ log "ok — Ctrl-b \$ became a native sheet and its answer renamed the session"
 SCREEN="$("$COCTL" --socket "$GUI" terminal read 2>/dev/null || true)"
 grep -q "rename session" <<<"$SCREEN" && fail "the TUI drew the prompt as well"
 [[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/after-rename.png"
+
+# Ctrl-b C (decisions #172): the directory browser is a native sheet, filled once comux's
+# listing lands; picking "proj" descends, "Create session here" leads to comux's name prompt.
+keys() { osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" \
+                   -e "tell application \"System Events\" to keystroke \"$1\"" \
+                   -e 'tell application "System Events" to key code 36' >/dev/null; }
+session_dirs() { python3 - <<'PY'
+import json, os, socket
+s = socket.socket(socket.AF_UNIX); s.connect(os.environ["COPAD_MUX_SOCK"])
+s.sendall(b'{"t":"subscribe","v":1}\n'); f = s.makefile(); f.readline()
+print(" ".join(x["name"] + "=" + x["dir"] for x in json.loads(f.readline())["topics"]["tree"]["data"]["sessions"]))
+PY
+}
+"$COCTL" --socket "$GUI" terminal feed $'\x02C' >/dev/null
+sleep 3
+[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/browser-sheet.png"
+keys proj; sleep 3
+[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/browser-proj.png"
+keys create; sleep 3
+keys browsed
+for _ in $(seq 1 20); do session_dirs | grep -q "browsed=.*/proj" && break; sleep 0.5; done
+session_dirs | grep -q "browsed=.*/proj" || fail "the native browser did not create the session in proj: $(session_dirs)"
+log "ok — Ctrl-b C was a native sheet: descending into proj and 'Create session here' made a session there"
+
+# The sidebar's resume button asks comux to open Ctrl-b R for this client; the native sheet
+# lists the fixture transcript.
+# Click it where it is drawn (the sidebar header, left of the bell): a real pointer event.
+osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" >/dev/null
+python3 - "$APP_PID" <<'PY'
+import sys, time, Quartz
+for w in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID):
+    if w.get("kCGWindowOwnerPID") == int(sys.argv[1]) and w["kCGWindowBounds"]["Width"] > 200:
+        b = w["kCGWindowBounds"]; break
+pt = (b["X"] + 199, b["Y"] + 82)
+for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+    e = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, e)
+    time.sleep(0.05)
+PY
+found=""
+sheet_text() {
+    osascript -e "tell application \"System Events\" to set b to button 1 of UI element 1 of row 2 of outline 1 of scroll area 1 of group 1 of sheet 1 of window 1 of (first process whose unix id is $APP_PID)" -e "tell application \"System Events\" to return value of attribute \"AXIdentifier\" of b" 2>&1
+}
+for _ in $(seq 1 20); do sheet_text | grep -q "overlayRow-c:0" && { found=1; break; }; sleep 0.5; done
+[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/resume-sheet.png"
+if [[ -z "$found" ]]; then
+    sheet_text | head -c 800 >&2
+    fail "the resume button did not bring up comux's resume picker natively"
+fi
+osascript -e 'tell application "System Events" to key code 53' >/dev/null
+log "ok — the native resume button opened comux's Ctrl-b R picker as a sheet with the fixture conversation"
 
 # Closing copad releases the claim: comux draws its own sidebar again for the next client.
 kill "$APP_PID"; APP_PID=""

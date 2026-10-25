@@ -29,6 +29,9 @@ pub struct ComuxPanel {
     /// The overlay currently shown as a dialog, and that dialog.
     overlay_shown: Cell<Option<u64>>,
     overlay_window: RefCell<Option<gtk4::Window>>,
+    /// The spec that dialog was built from: the same overlay id with a new spec means its
+    /// rows landed (decisions #172) and the dialog is rebuilt.
+    overlay_spec: RefCell<Value>,
     spaces: gtk4::ListBox,
     agents: gtk4::ListBox,
     notif_list: gtk4::ListBox,
@@ -47,6 +50,15 @@ pub struct ComuxPanel {
     space_actions: RefCell<Vec<Value>>,
     agent_actions: RefCell<Vec<Value>>,
     notif_actions: RefCell<Vec<Vec<Value>>>,
+}
+
+/// What a native context-menu item does.
+#[derive(Clone)]
+enum Act {
+    /// Open a comux overlay (`rename-session`, …) for our client, with an optional target.
+    Open(&'static str, Option<String>),
+    /// Run a control request.
+    Cmd(Value),
 }
 
 fn heading(text: &str) -> gtk4::Label {
@@ -111,6 +123,16 @@ impl ComuxPanel {
         let title = heading("comux");
         title.set_hexpand(true);
         head.append(&title);
+        let new_session = gtk4::Button::with_label("+");
+        new_session.add_css_class("flat");
+        new_session.set_tooltip_text(Some("New session… (Ctrl-b C)"));
+        new_session.set_widget_name("comux-new-session");
+        head.append(&new_session);
+        let resume = gtk4::Button::with_label("⟲");
+        resume.add_css_class("flat");
+        resume.set_tooltip_text(Some("Resume a conversation… (Ctrl-b R)"));
+        resume.set_widget_name("comux-resume");
+        head.append(&resume);
         let bell = gtk4::Button::with_label("🔔");
         bell.add_css_class("flat");
         head.append(&bell);
@@ -149,6 +171,7 @@ impl ComuxPanel {
             status,
             overlay_shown: Cell::new(None),
             overlay_window: RefCell::new(None),
+            overlay_spec: RefCell::new(Value::Null),
             spaces,
             agents,
             notif_list,
@@ -166,6 +189,14 @@ impl ComuxPanel {
             agent_actions: RefCell::new(Vec::new()),
             notif_actions: RefCell::new(Vec::new()),
         });
+        for (b, what) in [(&new_session, "new-session"), (&resume, "resume")] {
+            let w = Rc::downgrade(&this);
+            b.connect_clicked(move |_| {
+                if let Some(p) = w.upgrade() {
+                    p.open(what, None);
+                }
+            });
+        }
         let w = Rc::downgrade(&this);
         this.bell.connect_clicked(move |_| {
             if let Some(p) = w.upgrade() {
@@ -290,6 +321,29 @@ impl ComuxPanel {
         Ok((host, tag, cmd))
     }
 
+    /// Ask comux to open one of its overlays for the visible client we host (decisions #172);
+    /// it comes back as a delegated overlay.
+    fn open(&self, what: &str, target: Option<String>) {
+        let s = self.state();
+        let claimed: Vec<u64> = s["claimed"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_u64).collect())
+            .unwrap_or_default();
+        let panel = self
+            .served
+            .borrow()
+            .iter()
+            .find(|p| {
+                s["bound"][p.as_str()]
+                    .as_u64()
+                    .is_some_and(|a| claimed.contains(&a))
+            })
+            .cloned();
+        if let Some(p) = panel {
+            self.cur().open(&p, what, target);
+        }
+    }
+
     /// Whether a visible panel runs a comux client whose sidebar we hold.
     fn hosting(&self, s: &Value) -> bool {
         let claimed: Vec<u64> = s["claimed"]
@@ -348,6 +402,19 @@ impl ComuxPanel {
                     p.cur().command(json!({"cmd": "select-tab", "target": id}));
                 }
             });
+            let target = format!(
+                "{}/{}",
+                sess.and_then(|x| x["id"].as_str()).unwrap_or_default(),
+                t["id"].as_str().unwrap_or_default()
+            );
+            self.context_menu(
+                &b,
+                vec![
+                    ("Rename tab…", Act::Open("rename-tab", Some(target.clone()))),
+                    ("New tab", Act::Cmd(json!({"cmd": "new-tab"}))),
+                    ("Close tab…", Act::Open("close-tab", Some(target))),
+                ],
+            );
             self.status.append(&b);
         }
         let mut middle: Vec<String> = Vec::new();
@@ -418,6 +485,17 @@ impl ComuxPanel {
             }
             self.overlay_shown.set(None);
         }
+        // The same overlay with a new spec: its rows landed — rebuild the dialog. `destroy`
+        // emits no close-request, so this is not a cancel.
+        if let Some(o) = &mine
+            && mine_id == self.overlay_shown.get()
+            && o["spec"] != *self.overlay_spec.borrow()
+        {
+            if let Some(w) = self.overlay_window.borrow_mut().take() {
+                w.destroy();
+            }
+            self.overlay_shown.set(None);
+        }
         let (Some(o), None) = (mine, self.overlay_shown.get()) else {
             return;
         };
@@ -425,6 +503,7 @@ impl ComuxPanel {
             return;
         };
         self.overlay_shown.set(Some(id));
+        *self.overlay_spec.borrow_mut() = o["spec"].clone();
         let dlg = overlay_dialog(self, window, id, &o["spec"]);
         *self.overlay_window.borrow_mut() = Some(dlg);
     }
@@ -442,6 +521,43 @@ impl ComuxPanel {
         }
     }
 
+    /// A right-click menu on `widget` (decisions #172): each item opens a comux overlay for our
+    /// client or runs a command.
+    fn context_menu(self: &Rc<Self>, widget: &impl IsA<gtk4::Widget>, items: Vec<(&str, Act)>) {
+        let click = gtk4::GestureClick::new();
+        click.set_button(3);
+        let w = Rc::downgrade(self);
+        let anchor = widget.as_ref().clone();
+        let items: Rc<Vec<(String, Act)>> =
+            Rc::new(items.into_iter().map(|(l, a)| (l.to_string(), a)).collect());
+        click.connect_pressed(move |g, _, x, y| {
+            g.set_state(gtk4::EventSequenceState::Claimed);
+            let pop = gtk4::Popover::new();
+            pop.set_parent(&anchor);
+            pop.set_pointing_to(Some(&gtk4::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+            let vb = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+            for (label, act) in items.iter() {
+                let b = gtk4::Button::with_label(label);
+                b.add_css_class("flat");
+                let (w, act, pop2) = (w.clone(), act.clone(), pop.clone());
+                b.connect_clicked(move |_| {
+                    pop2.popdown();
+                    if let Some(p) = w.upgrade() {
+                        match &act {
+                            Act::Open(what, target) => p.open(what, target.clone()),
+                            Act::Cmd(req) => p.cur().command(req.clone()),
+                        }
+                    }
+                });
+                vb.append(&b);
+            }
+            pop.set_child(Some(&vb));
+            pop.connect_closed(|p| p.unparent());
+            pop.popup();
+        });
+        widget.add_controller(click);
+    }
+
     fn rebuild(self: &Rc<Self>) {
         let s = self.state();
         self.rebuild_status(&s);
@@ -450,11 +566,17 @@ impl ComuxPanel {
         for sess in s["tree"]["sessions"].as_array().into_iter().flatten() {
             let name = sess["name"].as_str().unwrap_or_default();
             let branch = sess["branch"].as_str().unwrap_or_default();
-            self.spaces.append(&two_line(
-                name,
-                branch,
-                sess["active"].as_bool() == Some(true),
-            ));
+            let row = two_line(name, branch, sess["active"].as_bool() == Some(true));
+            let sid = sess["id"].as_str().map(str::to_string);
+            self.context_menu(
+                &row,
+                vec![
+                    ("Rename session…", Act::Open("rename-session", sid.clone())),
+                    ("New session…", Act::Open("new-session", None)),
+                    ("Kill session…", Act::Open("kill-session", sid)),
+                ],
+            );
+            self.spaces.append(&row);
             sa.push(json!({"cmd": "select-session", "target": sess["id"]}));
         }
         *self.space_actions.borrow_mut() = sa;
@@ -479,8 +601,23 @@ impl ComuxPanel {
                 .as_str()
                 .or(a["tool"].as_str())
                 .unwrap_or_default();
-            self.agents
-                .append(&two_line(&title, sub, a["status"] == "blocked"));
+            let row = two_line(&title, sub, a["status"] == "blocked");
+            let tab = format!(
+                "{}/{}",
+                a["space_id"].as_str().unwrap_or_default(),
+                a["tab_id"].as_str().unwrap_or_default()
+            );
+            self.context_menu(
+                &row,
+                vec![
+                    (
+                        "Jump to pane",
+                        Act::Cmd(json!({"cmd": "jump", "target": a["token"]})),
+                    ),
+                    ("Rename tab…", Act::Open("rename-tab", Some(tab))),
+                ],
+            );
+            self.agents.append(&row);
             aa.push(json!({"cmd": "jump", "target": a["token"]}));
         }
         *self.agent_actions.borrow_mut() = aa;
@@ -570,7 +707,39 @@ fn overlay_dialog(
             vb.append(&row);
             entry.grab_focus();
         }
+        Some("menu") => {
+            if let Some(t) = spec["title"].as_str().filter(|t| !t.is_empty()) {
+                vb.append(&heading(t));
+            }
+            for item in spec["items"].as_array().into_iter().flatten() {
+                let b = gtk4::Button::with_label(item["label"].as_str().unwrap_or_default());
+                b.add_css_class("flat");
+                if item["destructive"] == true {
+                    b.add_css_class("destructive-action");
+                }
+                let a = answer.clone();
+                let id = item["id"].as_str().unwrap_or_default().to_string();
+                b.connect_clicked(move |_| a(Some(id.clone()), None));
+                vb.append(&b);
+            }
+            let cancel = gtk4::Button::with_label("Cancel");
+            let a = answer.clone();
+            cancel.connect_clicked(move |_| a(None, None));
+            vb.append(&cancel);
+        }
         Some("picker") => {
+            if spec["loading"] == true {
+                let spin = gtk4::Spinner::new();
+                spin.start();
+                spin.set_widget_name("comux-overlay-loading");
+                vb.append(&spin);
+            }
+            if let Some(n) = spec["note"].as_str().filter(|n| !n.is_empty()) {
+                let l = gtk4::Label::new(Some(n));
+                l.add_css_class("warning");
+                l.set_wrap(true);
+                vb.append(&l);
+            }
             let search = gtk4::SearchEntry::new();
             vb.append(&search);
             let list = gtk4::ListBox::new();
@@ -602,7 +771,7 @@ fn overlay_dialog(
                     if let Some(badge) = row["badge"].as_str() {
                         b.append(&gtk4::Label::new(Some(badge)));
                     }
-                    for act in &actions {
+                    for act in actions.iter().filter(|_| row["no_actions"] != true) {
                         let btn = gtk4::Button::with_label(act);
                         btn.add_css_class("flat");
                         let a = answer.clone();
@@ -706,7 +875,7 @@ fn overlay_dialog(
             vb.append(&close);
             search.grab_focus();
         }
-        _ => {
+        Some("confirm") => {
             vb.append(&gtk4::Label::new(spec["message"].as_str()));
             let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
             row.set_halign(gtk4::Align::End);
@@ -720,6 +889,11 @@ fn overlay_dialog(
             row.append(&cancel);
             row.append(&yes);
             vb.append(&row);
+        }
+        // A kind this build doesn't know: answered as cancelled, never guessed at.
+        _ => {
+            let a = answer.clone();
+            gtk4::glib::idle_add_local_once(move || a(None, None));
         }
     }
     win.set_child(Some(&vb));

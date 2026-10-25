@@ -46,7 +46,7 @@ final class TabViewController: NSViewController {
     private var comuxStatusHeight: NSLayoutConstraint!
     /// The delegated overlay this window is showing as a sheet, if any.
     private var comuxOverlayShown: UInt64?
-    private weak var comuxOverlaySheet: NSViewController?
+    private weak var comuxOverlaySheet: NSHostingController<ComuxOverlayView>?
     private var comuxNotificationsOpen = false
     private var comuxObservation: AnyCancellable?
     private var comuxServeTimer: Timer?
@@ -571,7 +571,8 @@ final class TabViewController: NSViewController {
         presentComuxOverlay()
     }
 
-    /// Show the oldest overlay a comux client in THIS window's visible panes opened, as a sheet.
+    /// Show the oldest overlay a comux client in THIS window's visible panes opened: a sheet, or
+    /// for a context menu (decisions #172) a native menu at the pointer.
     private func presentComuxOverlay() {
         let host = comuxWindow
         let mine = host.state?.overlays.first { o in o.panel.map(comuxServed.contains) ?? false }
@@ -580,19 +581,56 @@ final class TabViewController: NSViewController {
             if let sheet = comuxOverlaySheet { dismiss(sheet) }
             comuxOverlayShown = nil
         }
+        // The same overlay again = its rows landed (a directory listing): refresh in place.
+        if let o = mine, o.overlay == comuxOverlayShown, let sheet = comuxOverlaySheet,
+           sheet.rootView.overlay != o {
+            sheet.rootView = overlayView(o)
+        }
         guard comuxOverlayShown == nil, let o = mine else { return }
         settleComuxInput()
         comuxOverlayShown = o.overlay
-        let vc = NSHostingController(rootView: ComuxOverlayView(overlay: o) { [weak self] choice, text in
+        if case let .menu(_, items) = o.spec {
+            popUpComuxMenu(o.overlay, items: items)
+            return
+        }
+        let vc = NSHostingController(rootView: overlayView(o))
+        comuxOverlaySheet = vc
+        presentAsSheet(vc)
+    }
+
+    private func overlayView(_ o: L0Overlay) -> ComuxOverlayView {
+        let host = comuxWindow
+        return ComuxOverlayView(overlay: o) { [weak self] choice, text in
             host.answer(o.overlay, choice: choice, text: text)
             if let self, let sheet = self.comuxOverlaySheet { self.dismiss(sheet) }
             self?.comuxOverlayShown = nil
-            if let p = self?.activePaneManager?.activePane {
-                self?.view.window?.makeFirstResponder(p.focusTarget)
+            self?.refocusPane()
+        }
+    }
+
+    private func refocusPane() {
+        if let p = activePaneManager?.activePane { view.window?.makeFirstResponder(p.focusTarget) }
+    }
+
+    /// comux's right-click menu as an NSMenu where the pointer is; closing it unpicked cancels.
+    private func popUpComuxMenu(_ overlay: UInt64, items: [L0MenuItem]) {
+        let menu = NSMenu()
+        let picker = ComuxMenuPicker()
+        for item in items {
+            let mi = NSMenuItem(title: item.label, action: #selector(ComuxMenuPicker.pick(_:)), keyEquivalent: "")
+            mi.target = picker
+            mi.representedObject = item.id
+            if item.destructive == true {
+                mi.attributedTitle = NSAttributedString(string: item.label, attributes: [.foregroundColor: NSColor.systemRed])
             }
-        })
-        comuxOverlaySheet = vc
-        presentAsSheet(vc)
+            menu.addItem(mi)
+        }
+        let at = view.window.map { view.convert($0.mouseLocationOutsideOfEventStream, from: nil) } ?? .zero
+        // popUp blocks until the menu closes; the picked item (if any) was recorded by then.
+        menu.popUp(positioning: nil, at: at, in: view)
+        comuxWindow.answer(overlay, choice: picker.picked, text: nil)
+        comuxOverlayShown = nil
+        refocusPane()
     }
 
     /// Open a remote comux in a new tab (decisions #171): copad starts the remote client itself
@@ -1277,4 +1315,10 @@ final class TabViewController: NSViewController {
     private static func rootBg(theme: CopadTheme, opacity: Double) -> CGColor {
         opacity < 1.0 ? NSColor.clear.cgColor : theme.background.nsColor.cgColor
     }
+}
+
+/// Records which comux menu item was picked (NSMenu actions need an object target).
+private final class ComuxMenuPicker: NSObject {
+    var picked: String?
+    @objc func pick(_ sender: NSMenuItem) { picked = sender.representedObject as? String }
 }

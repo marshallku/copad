@@ -171,6 +171,16 @@ final class MuxSession: ObservableObject, KeySink {
         l0?.write(Self.line(m))
     }
 
+    /// Ask comux to open one of its overlays for our attachment (`new-session`, `resume`,
+    /// `rename-session`, `kill-session`, `rename-tab`, `close-tab`, …; decisions #172). It
+    /// arrives as an ordinary delegated overlay.
+    func openOverlay(_ what: String, target: String? = nil) {
+        guard let attachment, claimed else { return }
+        var m: [String: Any] = ["t": "open", "attachment": attachment, "what": what]
+        if let target { m["target"] = target }
+        l0?.write(Self.line(m))
+    }
+
     private func teardown(reason: String?) {
         pingTimer?.invalidate(); pingTimer = nil
         l0?.close(); render?.close(); ssh?.close()
@@ -247,7 +257,12 @@ final class MuxSession: ObservableObject, KeySink {
                 guard let data = try? JSONSerialization.data(withJSONObject: m),
                       let o = try? JSONDecoder().decode(L0Overlay.self, from: data),
                       o.client == attachment else { break }
-                overlays.append(o)
+                // The same id again = its rows landed (decisions #172): replace in place.
+                if let i = overlays.firstIndex(where: { $0.overlay == o.overlay }) {
+                    overlays[i] = o
+                } else {
+                    overlays.append(o)
+                }
             case "overlay-closed":
                 let id = (m["overlay"] as? NSNumber)?.uint64Value
                 overlays.removeAll { $0.overlay == id }

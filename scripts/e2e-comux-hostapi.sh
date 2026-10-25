@@ -22,6 +22,11 @@
 #  17. kill-server sent as a render-channel Command is answered before the server exits
 #  18. overlays: a host that claims `overlays` receives the rename prompt Ctrl-b $ opens (the
 #      TUI never draws it), and its answer renames the session; Ctrl-f arrives as a picker
+#  19. async overlays (decisions #172): Ctrl-b C reaches the host as a loading picker that is
+#      re-sent with the listing; descending opens the next directory; "here" leads to comux's
+#      seeded name prompt and the session is created in that directory. Ctrl-b R lists a
+#      transcript from the (fake) HOME, and the headless toggle opens a fresh picker. A host
+#      `open` for rename-session comes back as the prompt; a refused one is a flash.
 
 set -euo pipefail
 
@@ -52,8 +57,14 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# The server's HOME is a fixture: the Ctrl-b C browser starts there and the Ctrl-b R picker
+# scans its transcripts (step 19).
+mkdir -p "$WORK/home/proj/sub" "$WORK/home/.claude/projects/-p"
+printf '%s\n' '{"type":"attachment","cwd":"/p","entrypoint":"cli"}' \
+    '{"type":"user","message":{"role":"user","content":"e2e resume probe"}}' \
+    >"$WORK/home/.claude/projects/-p/0c8e9f4a-1b2c-4d5e-8f90-a1b2c3d4e5f6.jsonl"
 start_server() {
-    "$COMUX" server >"$WORK/server.log" 2>&1 &
+    HOME="$WORK/home" "$COMUX" server >"$WORK/server.log" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 100); do
         "$COMUX" list-sessions >/dev/null 2>&1 && return 0
@@ -442,8 +453,89 @@ while time.time() < end and not pick:
 if not pick or pick["spec"]["kind"] != "picker" or [t["name"] for t in pick["spec"]["tabs"]] != ["sessions", "agents"]:
     fail(f"Ctrl-f was not delegated as a picker: {pick}")
 oh.send({"t": "overlay-result", "overlay": pick["overlay"]})  # cancel
-oh.close(); ov_client.close()
 ok("overlays went to the claiming host: a prompt answered by it renamed the session; Ctrl-f arrived as a picker")
+
+# 19. async overlays
+def next_overlay(pred=lambda m: True, timeout=8):
+    end = time.time() + timeout
+    while time.time() < end:
+        m = oh.recv(0.5)
+        if m and m["t"] == "overlay" and pred(m):
+            return m
+    return None
+
+def loaded(first):
+    """The overlay as first sent, or — when it was still loading — its re-send."""
+    if not first["spec"].get("loading"):
+        return first
+    again = next_overlay(lambda m: m["overlay"] == first["overlay"])
+    if not again or again["spec"].get("loading"):
+        fail(f"overlay {first['overlay']} was never re-sent with its rows: {again}")
+    return again
+
+def rows(m):
+    return [r for t in m["spec"]["tabs"] for r in t["rows"]]
+
+def row_id(m, label):
+    for r in rows(m):
+        if r["label"] == label:
+            return r["id"]
+    fail(f"no row {label!r} in {m}")
+
+ov_client.key({"Char": "b"}, "CONTROL"); ov_client.key({"Char": "C"}, "SHIFT")
+br = next_overlay()
+if not br or br["spec"]["kind"] != "picker":
+    fail(f"Ctrl-b C was not delegated as a picker: {br}")
+br = loaded(br)
+oh.send({"t": "overlay-result", "overlay": br["overlay"], "choice": row_id(br, "proj")})
+sub = next_overlay(lambda m: m["overlay"] != br["overlay"])
+if not sub:
+    fail("descending into proj opened no next overlay")
+sub = loaded(sub)
+if not any(r["label"] == "sub" for r in rows(sub)):
+    fail(f"the next overlay does not list proj's subdirectory: {sub}")
+oh.send({"t": "overlay-result", "overlay": sub["overlay"], "choice": "here"})
+name = next_overlay(lambda m: m["spec"]["kind"] == "prompt")
+if not name or name["spec"]["initial"] != "proj":
+    fail(f"'here' did not lead to the seeded name prompt: {name}")
+oh.send({"t": "overlay-result", "overlay": name["overlay"], "text": "browsed"})
+oh.wait(lambda s: any(x["name"] == "browsed" and x["dir"].endswith("/proj")
+                      for x in s.model["tree"]["sessions"]),
+        what="a session created in the browsed directory")
+
+ov_client.key({"Char": "b"}, "CONTROL"); ov_client.key({"Char": "R"}, "SHIFT")
+rs = next_overlay()
+if not rs or rs["spec"]["kind"] != "picker":
+    fail(f"Ctrl-b R was not delegated: {rs}")
+rs = loaded(rs)
+if not any(r["label"] == "e2e resume probe" for r in rows(rs)):
+    fail(f"the resume picker does not list the fixture transcript: {rs}")
+toggle = [r for r in rows(rs) if r["id"] == "toggle-all"]
+if not toggle or not toggle[0].get("no_actions"):
+    fail(f"no action-less headless toggle row: {rs}")
+oh.send({"t": "overlay-result", "overlay": rs["overlay"], "choice": "toggle-all"})
+rs2 = next_overlay(lambda m: m["overlay"] != rs["overlay"])
+if not rs2 or not loaded(rs2):
+    fail("the headless toggle opened no fresh picker")
+oh.send({"t": "overlay-result", "overlay": rs2["overlay"]})  # cancel
+
+oh.send({"t": "open", "attachment": att, "what": "rename-session"})
+op = next_overlay(lambda m: m["spec"]["kind"] == "prompt")
+if not op or op["spec"]["initial"] != "browsed":
+    fail(f"open rename-session did not come back as comux's seeded prompt: {op}")
+oh.send({"t": "overlay-result", "overlay": op["overlay"], "text": "opened-name"})
+oh.wait(lambda s: any(x["name"] == "opened-name" for x in s.model["tree"]["sessions"]),
+        what="the session renamed through a host-opened prompt")
+oh.send({"t": "open", "attachment": att, "what": "explode"})
+end = time.time() + 8
+refused = False
+while time.time() < end and not refused:
+    m = oh.recv(0.5)
+    refused = bool(m and m["t"] == "event" and m["kind"] == "flash" and "explode" in m["data"]["text"])
+if not refused:
+    fail("a refused open was not reported as a flash")
+oh.close(); ov_client.close()
+ok("Ctrl-b C / Ctrl-b R reached the host loading then filled; browsing created a session in proj; host opens came back as comux overlays")
 
 # 17. kill-server sent as a render-channel Command is answered before the server goes
 k = Raw("raw-kill")

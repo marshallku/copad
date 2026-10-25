@@ -9,7 +9,9 @@
 #                                                    # http://127.0.0.1:8097/ (the broadway page)
 #   OVERLAY_DRIVER=1 …   # also open comux's rename prompt (Ctrl-b $) and wait up to 90s for
 #                        # something to type "linuxrenamed" + Enter into the native dialog on
-#                        # the broadway page (the Mac drives it with tabd through an ssh tunnel)
+#                        # the broadway page (the Mac drives it with tabd through an ssh tunnel);
+#                        # then Ctrl-b C (BROWSER_OPEN): the driver types "proj" Enter, "create"
+#                        # Enter, "browsed" Enter, and a session must appear in ~/proj
 set -euo pipefail
 R="$(cd "$(dirname "$0")/.." && pwd)"
 COMUX=$R/target/debug/comux; COCTL=$R/target/debug/coctl; COPAD=$R/target/debug/copad
@@ -27,7 +29,9 @@ fail() { echo "FAIL: $*"; exit 1; }
 export COPAD_MUX_SOCK=$W/s COPAD_MUX_STATE=$W/st.json COPAD_MUX_NOTIFY=0 COPAD_MUX_USAGE=0 \
        COPAD_MUX_UPDATE_CHECK=0 COPAD_MUX_QUIET_SSH=1
 unset COPAD_MUX_PANE COPAD_MUX COPAD_SOCKET COPAD_PANEL_ID
-$COMUX server >$W/server.log 2>&1 &
+# The server's HOME is a fixture: Ctrl-b C browses it (decisions #172).
+mkdir -p $W/home/proj/sub
+HOME=$W/home $COMUX server >$W/server.log 2>&1 &
 for _ in $(seq 1 50); do $COMUX list-sessions >/dev/null 2>&1 && break; sleep 0.1; done
 $COMUX new-session --detached linux-two >/dev/null
 
@@ -83,6 +87,18 @@ PY
   SCREEN=$($COCTL --socket "$GUI" terminal read 2>/dev/null || true)
   grep -q "rename session" <<<"$SCREEN" && fail "the TUI drew the prompt as well"
   echo "ok — Ctrl-b \$ became a native GTK dialog and its answer renamed the session"
+  dirs() { python3 - <<'PY'
+import json, os, socket
+s = socket.socket(socket.AF_UNIX); s.connect(os.environ["COPAD_MUX_SOCK"])
+s.sendall(b'{"t":"subscribe","v":1}\n'); f = s.makefile(); f.readline()
+print(" ".join(x["name"] + "=" + x["dir"] for x in json.loads(f.readline())["topics"]["tree"]["data"]["sessions"]))
+PY
+  }
+  $COCTL --socket "$GUI" terminal feed $'\x02C' >/dev/null
+  echo "BROWSER_OPEN"
+  for _ in $(seq 1 180); do dirs | grep -q "browsed=.*/proj" && break; sleep 0.5; done
+  dirs | grep -q "browsed=.*/proj" || fail "the native browser never created a session in proj: $(dirs)"
+  echo "ok — Ctrl-b C was a native GTK browser: descending into proj and creating there made the session"
 fi
 sleep 2
 echo "BROADWAY http://127.0.0.1:8097/  W=$W"

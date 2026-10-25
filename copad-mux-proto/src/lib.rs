@@ -126,6 +126,18 @@ pub enum SubMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         text: Option<String>,
     },
+    /// Ask comux to open one of its overlays FOR `attachment` (decisions #172): what a key
+    /// would open, delegated straight back to this host. Native buttons and context menus use
+    /// it so a rename still gets comux's seeded prompt and a kill still asks comux's confirm.
+    /// `what` = `new-session` | `resume` | `switcher` | `notifications` | `new-worktree` |
+    /// `rename-session` | `kill-session` | `rename-tab` | `close-tab`; `target` names the
+    /// session (`<session id>`) or tab (`<session id>/<tab id>`), default = the active one.
+    Open {
+        attachment: u64,
+        what: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+    },
 }
 
 /// One topic value inside a snapshot.
@@ -214,6 +226,14 @@ pub enum OverlaySpec {
         /// `Ctrl-f` opens on the previous session so `Ctrl-f Enter` toggles).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selected: Option<String>,
+        /// The rows are still being gathered off-loop (a directory listing, a transcript
+        /// scan): show a spinner. The same overlay id is sent again with the rows; a host
+        /// REPLACES an open overlay whose id it already shows (decisions #172).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        loading: bool,
+        /// A line shown above the rows (an unreadable directory's error).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        note: String,
     },
     /// A single-line text prompt (rename, new session name, worktree branch).
     Prompt {
@@ -225,6 +245,18 @@ pub enum OverlaySpec {
     },
     /// A yes/no question (kill session, close pane).
     Confirm { message: String },
+    /// A context menu (right-click on a tab chip / session / agent): the host shows its own
+    /// menu and answers with the chosen item's id.
+    Menu { title: String, items: Vec<MenuItem> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MenuItem {
+    pub id: String,
+    pub label: String,
+    /// Kills or closes something (drawn red).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub destructive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -245,6 +277,10 @@ pub struct PickerRow {
     pub badge: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub current: bool,
+    /// The picker's per-row actions don't apply to this row (the resume picker's
+    /// "Show headless runs" toggle).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_actions: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

@@ -368,17 +368,26 @@ impl Hub {
     /// `None` = not `sub`'s overlay (nothing changes — another host's overlay stays theirs);
     /// `Some(true)` = its answer may run; `Some(false)` = it was `sub`'s but ownership ended,
     /// and the record is gone (the caller drops the delegated state too).
-    pub fn take_overlay(&mut self, sub: u64, ov: u64, attached: &[AttachView]) -> Option<bool> {
+    pub fn take_overlay(
+        &mut self,
+        sub: u64,
+        ov: u64,
+        attached: &[AttachView],
+    ) -> Option<(bool, u64)> {
         match self.overlays.get(&ov) {
             Some(&(s, attachment)) if s == sub => {
                 self.overlays.remove(&ov);
-                Some(
-                    attached.iter().any(|a| a.id == attachment)
-                        && self.host_of(attachment, Feature::Overlays) == Some(sub),
-                )
+                let owns = attached.iter().any(|a| a.id == attachment)
+                    && self.host_of(attachment, Feature::Overlays) == Some(sub);
+                Some((owns, attachment))
             }
             _ => None,
         }
+    }
+
+    /// Who shows overlay `ov`: `(subscriber, attachment)`.
+    pub fn overlay_owner(&self, ov: u64) -> Option<(u64, u64)> {
+        self.overlays.get(&ov).copied()
     }
 
     /// Overlays whose host no longer owns their attachment's overlays (released, expired,
@@ -827,7 +836,7 @@ mod tests {
         );
         assert_eq!(
             hub.take_overlay(1, 78, &[]),
-            Some(false),
+            Some((false, 4)),
             "the attachment is gone"
         );
     }

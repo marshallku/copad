@@ -89,6 +89,26 @@ final class NativeE2ETests: XCTestCase {
         app.buttons["overlayCancel"].tap()
         terminal.tap()
 
+        // 5c. "New session…" asks comux to open Ctrl-b C for us (decisions #172): the directory
+        //     browser is a sheet filled once comux's listing lands; descending into proj and
+        //     "Create session here" lead to comux's seeded name prompt.
+        app.buttons["sessionMenu"].tap()
+        app.buttons["menuNewSession"].tap()
+        let proj = app.buttons["overlayRow-d:2"]
+        XCTAssertTrue(proj.waitForExistence(timeout: 15), "the browser sheet never listed ~/proj")
+        snapshot("browser")
+        proj.tap()
+        let here = app.buttons["overlayRow-here"]
+        XCTAssertTrue(app.staticTexts["~/proj"].waitForExistence(timeout: 15), "did not descend into proj")
+        snapshot("browser-proj")
+        here.tap()
+        let name = app.textFields["overlayText"]
+        XCTAssertTrue(name.waitForExistence(timeout: 10), "no name prompt after 'Create session here'")
+        app.buttons["overlayOK"].tap()
+        expectation(for: NSPredicate(format: "label == 'proj'"), evaluatedWith: app.staticTexts["activeSession"])
+        waitForExpectations(timeout: 10)
+        terminal.tap()
+
         // 6. The spaces drawer lists the other session and the fake agent; a tap switches.
         app.buttons["openSpaces"].tap()
         XCTAssertTrue(app.buttons["space-e2e-two"].waitForExistence(timeout: 10))

@@ -505,6 +505,7 @@ pub fn run() -> io::Result<()> {
         dirty |= app.maybe_expire_message(); // a status-bar message timed out
         dirty |= app.poll_agent_sessions(); // resume-picker scan landed (Ctrl-b R)
         dirty |= app.poll_dir_listing(); // new-session browser listing landed (Ctrl-b C)
+        resend_delegated(&mut app, &mut hub); // a host-drawn browser / resume picker's rows landed
         app.maybe_probe_session_dirs(); // re-check session start dirs off-loop (Ctrl-b c)
         let pane_dirty = app.drain_pane_dirty(); // a VISIBLE pane's screen advanced (PTY output)
         dirty |= pane_dirty;
@@ -817,6 +818,49 @@ fn delegate_overlays(app: &mut App, hub: &mut Hub, client: u64, before: crate::t
     }
 }
 
+/// Hand overlays an answer opened straight to subscriber `sub` (no marks diff: they never
+/// were TUI state).
+fn send_overlays(
+    app: &mut App,
+    hub: &mut Hub,
+    sub: u64,
+    client: u64,
+    overlays: Vec<(u64, copad_mux_proto::OverlaySpec)>,
+) {
+    for (ov, spec) in overlays {
+        if !hub.send_overlay(sub, ov, client, spec) {
+            app.forget_overlays(&hub.take_overlays_of(sub));
+            hub.remove(sub);
+            return;
+        }
+    }
+}
+
+/// Re-send each host-drawn overlay whose off-loop data landed (decisions #172), under its
+/// own id, to the host showing it.
+fn resend_delegated(app: &mut App, hub: &mut Hub) {
+    for (ov, spec) in app.poll_delegated() {
+        if let Some((sub, client)) = hub.overlay_owner(ov)
+            && !hub.send_overlay(sub, ov, client, spec)
+        {
+            app.forget_overlays(&hub.take_overlays_of(sub));
+            hub.remove(sub);
+        }
+    }
+}
+
+/// A pane an answer spawns (a new session, a resumed conversation) gets the env of the client
+/// it is for, exactly as one its key spawned would.
+fn adopt_client_env(app: &mut App, clients: &[Client], client: u64) {
+    if let Some(e) = clients
+        .iter()
+        .find(|c| c.id == client)
+        .map(|c| c.env.clone())
+    {
+        app.set_client_env(e);
+    }
+}
+
 /// One line from a subscriber. Returns whether it may have changed what is rendered.
 fn handle_sub(
     id: u64,
@@ -887,15 +931,49 @@ fn handle_sub(
         } => {
             // Only the host the overlay was handed to may answer it.
             match hub.take_overlay(id, overlay, &attach_views(clients)) {
-                Some(true) => app.overlay_result(overlay, choice, text),
+                Some((true, client)) => {
+                    adopt_client_env(app, clients, client);
+                    let marks = app.overlay_marks();
+                    let (changed, next) = app.overlay_result(overlay, choice, text);
+                    // What the answer opened goes back to the same host: a browser's next
+                    // directory, or a menu item's rename prompt (decisions #172).
+                    send_overlays(app, hub, id, client, next);
+                    delegate_overlays(app, hub, client, marks);
+                    changed
+                }
                 // Ours, but ownership ended (detached / released): the delegated state goes.
-                Some(false) => {
+                Some((false, _)) => {
                     app.forget_overlays(&[overlay]);
                     false
                 }
                 // Not this subscriber's overlay: someone else's stays untouched.
                 None => false,
             }
+        }
+        SubMsg::Open {
+            attachment,
+            what,
+            target,
+        } => {
+            // Only the host that draws this attachment's overlays may open them for it.
+            let attached = clients.iter().any(|c| c.id == attachment);
+            let res = if attached && hub.host_of(attachment, Feature::Overlays) == Some(id) {
+                adopt_client_env(app, clients, attachment);
+                let marks = app.overlay_marks();
+                let res = app.open_for_host(&what, target.as_deref());
+                delegate_overlays(app, hub, attachment, marks);
+                res
+            } else {
+                Err(format!(
+                    "attachment {attachment} is not claimed for overlays by this host"
+                ))
+            };
+            // Said like any refused action: a flash (an `error` line would read as a refused
+            // claim to the host).
+            if let Err(message) = res {
+                app.flash(message, true);
+            }
+            true
         }
         SubMsg::Subscribe { .. } => false,
     }

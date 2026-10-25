@@ -70,7 +70,9 @@ MUXENV=(COPAD_MUX_SOCK="$W/s" COPAD_MUX_STATE="$W/state.json" COPAD_MUX_NOTIFY=0
         COPAD_MUX_USAGE=0 COPAD_MUX_UPDATE_CHECK=0 COPAD_MUX_QUIET_SSH=1 XDG_CONFIG_HOME="$W/cfg")
 mkdir -p "$W/cfg/copad" "$W/bin"
 mux() { env -u COPAD_MUX_PANE -u COPAD_MUX "${MUXENV[@]}" "$COMUX" "$@"; }
-mux server >"$W/server.log" 2>&1 &
+# The server's HOME is a fixture: the native Ctrl-b C browser lists it (decisions #172).
+mkdir -p "$W/home/proj/sub"
+HOME="$W/home" mux server >"$W/server.log" 2>&1 &
 for _ in $(seq 1 50); do mux list-sessions >/dev/null 2>&1 && break; sleep 0.1; done
 mux new-session --detached e2e-two >/dev/null
 # A fake agent: `claude` is classified by argv[0]'s basename — a SYMLINK, run by absolute path

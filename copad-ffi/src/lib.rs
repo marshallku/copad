@@ -1621,6 +1621,27 @@ pub unsafe extern "C" fn copad_muxhost_command(h: *const MuxHostHandle, req_json
     }
 }
 
+/// Ask comux to open one of its overlays (`what`: `new-session`, `resume`, `rename-session`,
+/// …) for `panel`'s client; `target` NULL = the active session/tab (decisions #172).
+///
+/// # Safety
+/// `h` live; `panel`, `what` valid strings; `target` NULL or a valid string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_open(
+    h: *const MuxHostHandle,
+    panel: *const c_char,
+    what: *const c_char,
+    target: *const c_char,
+) {
+    // SAFETY: caller contract.
+    if let (Some(h), Some(p), Some(w)) = (unsafe { h.as_ref() }, unsafe { cstr(panel) }, unsafe {
+        cstr(what)
+    }) {
+        let target = unsafe { cstr(target) }.map(str::to_string);
+        h.0.open(p, w, target);
+    }
+}
+
 /// Start a host on a REMOTE comux: `ssh -T <dest> <comux> proxy --stdio`. NULL when the
 /// destination or command is refused (see `copad_core::muxhost::valid_dest`).
 ///

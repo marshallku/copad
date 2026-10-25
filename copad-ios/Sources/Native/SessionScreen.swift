@@ -49,7 +49,7 @@ struct SessionScreen: View {
                 session.answerOverlay(o.overlay, choice: choice, text: text)
                 term.focus()
             }
-            .presentationDetents(o.isPicker ? [.medium, .large] : [.height(220)])
+            .presentationDetents(o.isPicker ? [.medium, .large] : o.isMenu ? [.medium] : [.height(220)])
             .preferredColorScheme(.dark)
             .interactiveDismissDisabled()
         }
@@ -91,9 +91,14 @@ struct SessionScreen: View {
             .accessibilityIdentifier("openNotifications")
             Menu {
                 Button("New tab") { navigate { session.newTab() } }
+                Button("New session…") { navigate { session.openOverlay("new-session") } }
+                    .accessibilityIdentifier("menuNewSession")
+                Button("Resume conversation…") { navigate { session.openOverlay("resume") } }
+                    .accessibilityIdentifier("menuResume")
                 Button("Reconnect") { session.connect() }
                 Button("Disconnect", role: .destructive) { session.suspend(); onClose() }
             } label: { Image(systemName: "ellipsis.circle").padding(6) }
+                .accessibilityIdentifier("sessionMenu")
         }
         .padding(.horizontal, 6)
         .frame(height: 40)
@@ -236,6 +241,15 @@ struct TabStrip: View {
                             .background(Capsule().fill(tab.active ? Color.accentColor.opacity(0.45) : Color.white.opacity(0.08)))
                         }
                         .id(tab.id)
+                        .contextMenu {
+                            if let sid = session.model.activeSession?.id {
+                                Button("Rename tab…") { session.openOverlay("rename-tab", target: "\(sid)/\(tab.id)") }
+                                Button("New tab") { session.newTab() }
+                                Button("Close tab…", role: .destructive) {
+                                    session.openOverlay("close-tab", target: "\(sid)/\(tab.id)")
+                                }
+                            }
+                        }
                         .accessibilityIdentifier("tab-\(tab.index + 1)")
                     }
                 }
@@ -254,7 +268,7 @@ struct SpacesDrawer: View {
 
     var body: some View {
         List {
-            Section("spaces") {
+            Section {
                 ForEach(session.model.tree?.sessions ?? []) { s in
                     Button {
                         act { session.selectSession(s.id) }
@@ -270,7 +284,23 @@ struct SpacesDrawer: View {
                             }
                         }
                     }
+                    .contextMenu {
+                        Button("Rename session…") { act { session.openOverlay("rename-session", target: s.id) } }
+                        Button("New session…") { act { session.openOverlay("new-session") } }
+                        Button("Kill session…", role: .destructive) {
+                            act { session.openOverlay("kill-session", target: s.id) }
+                        }
+                    }
                     .accessibilityIdentifier("space-\(s.name)")
+                }
+            } header: {
+                HStack {
+                    Text("spaces")
+                    Spacer()
+                    Button { act { session.openOverlay("new-session") } } label: { Image(systemName: "plus") }
+                        .buttonStyle(.borderless).accessibilityIdentifier("drawerNewSession")
+                    Button { act { session.openOverlay("resume") } } label: { Image(systemName: "clock.arrow.circlepath") }
+                        .buttonStyle(.borderless).accessibilityIdentifier("drawerResume")
                 }
             }
             Section("agents") {
@@ -289,6 +319,10 @@ struct SpacesDrawer: View {
                             }
                             Text(a.detail ?? a.tool).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                         }
+                    }
+                    .contextMenu {
+                        Button("Jump to pane") { act { session.jump(a.token) } }
+                        Button("Rename tab…") { act { session.openOverlay("rename-tab", target: "\(a.space_id)/\(a.tab_id)") } }
                     }
                     .accessibilityIdentifier("agent-\(a.token)")
                 }
@@ -351,4 +385,5 @@ struct NotificationsDrawer: View {
 
 extension L0Overlay {
     var isPicker: Bool { if case .picker = spec { return true } else { return false } }
+    var isMenu: Bool { if case .menu = spec { return true } else { return false } }
 }

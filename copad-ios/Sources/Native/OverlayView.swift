@@ -11,9 +11,25 @@ struct ComuxOverlayView: View {
 
     var body: some View {
         switch overlay.spec {
-        case let .picker(title, tabs, tab, actions, selected):
-            PickerOverlay(title: title, tabs: tabs, initialTab: tab, actions: actions,
-                          initialSelection: selected, answer: answer)
+        case let .picker(p):
+            PickerOverlay(picker: p, answer: answer)
+        case let .menu(title, items):
+            VStack(alignment: .leading, spacing: 4) {
+                if !title.isEmpty { Text(title).font(.headline).padding(.bottom, 6) }
+                ForEach(items) { item in
+                    Button(role: item.destructive == true ? .destructive : nil) { answer(item.id, nil) } label: {
+                        Text(item.label).frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 6)
+                    }
+                    .accessibilityIdentifier("overlayMenu-\(item.label)")
+                }
+                Divider()
+                Button("Cancel") { answer(nil, nil) }.keyboardShortcut(.cancelAction)
+                    .accessibilityIdentifier("overlayCancel")
+            }
+            .padding(20)
+            .frame(minWidth: 280)
+        case .unsupported:
+            Color.clear.frame(width: 1, height: 1).onAppear { answer(nil, nil) }
         case let .prompt(title, initial, placeholder):
             PromptOverlay(title: title, initial: initial, placeholder: placeholder, answer: answer)
         case let .confirm(message):
@@ -64,17 +80,16 @@ private struct PromptOverlay: View {
 }
 
 private struct PickerOverlay: View {
-    let title: String
-    let tabs: [L0PickerTab]
-    let initialTab: Int
-    let actions: [L0PickerAction]
-    let initialSelection: String?
+    let picker: L0Picker
     let answer: (String?, String?) -> Void
     @State private var tab = 0
     @State private var filter = ""
     /// The highlighted row: Enter picks it, ↑/↓ move it.
     @State private var sel: String?
     @FocusState private var focused: Bool
+
+    private var tabs: [L0PickerTab] { picker.tabs }
+    private var actions: [L0PickerAction] { picker.actions }
 
     private var rows: [L0PickerRow] {
         guard tabs.indices.contains(tab) else { return [] }
@@ -92,10 +107,14 @@ private struct PickerOverlay: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Text(title).font(.headline)
+                Text(picker.title).font(.headline).lineLimit(1).truncationMode(.head)
+                if picker.loading { ProgressView().controlSize(.small).accessibilityIdentifier("overlayLoading") }
                 Spacer()
                 Button("Close") { answer(nil, nil) }.keyboardShortcut(.cancelAction)
                     .accessibilityIdentifier("overlayCancel")
+            }
+            if !picker.note.isEmpty {
+                Text(picker.note).font(.caption).foregroundStyle(.orange)
             }
             if tabs.count > 1 {
                 Picker("", selection: $tab) {
@@ -132,8 +151,10 @@ private struct PickerOverlay: View {
                 .buttonStyle(.plain)
                 .listRowBackground(r.id == current ? Color.accentColor.opacity(0.25) : Color.clear)
                 .contextMenu {
-                    ForEach(actions, id: \.id) { a in
-                        Button(a.label) { answer("\(a.id):\(r.id)", nil) }
+                    if r.no_actions != true {
+                        ForEach(actions, id: \.id) { a in
+                            Button(a.label) { answer("\(a.id):\(r.id)", nil) }
+                        }
                     }
                 }
                 .accessibilityIdentifier("overlayRow-\(r.id)")
@@ -143,9 +164,14 @@ private struct PickerOverlay: View {
         .padding(16)
         .frame(minWidth: 420, minHeight: 360)
         .onAppear {
-            tab = min(max(initialTab, 0), max(tabs.count - 1, 0))
-            sel = initialSelection ?? rows.first?.id
+            tab = min(max(picker.tab, 0), max(tabs.count - 1, 0))
+            sel = picker.selected ?? rows.first?.id
             focused = true
+        }
+        // The same overlay re-sent with its rows (decisions #172): take its default row now —
+        // the one chosen while it was still loading pointed at nothing (or the toggle).
+        .onChange(of: picker.loading) { _, loading in
+            if !loading { sel = picker.selected ?? rows.first?.id }
         }
     }
 

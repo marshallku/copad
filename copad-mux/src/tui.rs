@@ -49,8 +49,9 @@ use crate::term::{self, CellColor, PaneTerm};
 use crate::usagepoll::{self, UsagePart, UsageSnapshot};
 use crate::versionpoll::{self, VersionStatus};
 
+mod delegate;
 mod host;
-pub use host::OverlayMarks;
+pub use delegate::OverlayMarks;
 
 /// Direction for focus navigation with the arrow keys.
 #[derive(Clone, Copy)]
@@ -606,6 +607,10 @@ struct DirBrowser {
     sel: usize,
     /// Select this child once the listing lands — the directory we just came up out of.
     reselect: Option<std::ffi::OsString>,
+    /// The listing thread has been started. It starts on the server loop's next poll, not
+    /// when the browser opens: a browser a host takes over right after the key (#172) must not
+    /// leave an uncapped listing behind it.
+    started: bool,
 }
 
 /// The `Ctrl-b R` resume picker: past Claude/Codex conversations found on disk
@@ -874,6 +879,9 @@ pub struct App {
     /// Whether each session's start directory still exists, learned off-loop so
     /// [`Self::session_dir`] never stats on the loop (a dead mount would freeze `Ctrl-b c`).
     dir_probe: dirbrowse::DirProbe,
+    /// Directory listings started for host-drawn browsers that have not returned yet
+    /// (decisions #172): a dead mount strands each one, so they are capped.
+    host_listings: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// When `dir_probe` was last refreshed (see [`Self::maybe_probe_session_dirs`]).
     dir_probed: Option<std::time::Instant>,
     /// Where the detached transcript scanner publishes; read by [`Self::poll_agent_sessions`].
@@ -1044,7 +1052,7 @@ pub struct App {
     /// The last notification id handed out.
     notif_seq: u64,
     /// Overlays a host UI is showing instead of the TUI (decisions #170), by overlay id.
-    delegated: HashMap<u64, host::Delegated>,
+    delegated: HashMap<u64, delegate::Delegated>,
     overlay_seq: u64,
     /// When the carousel last advanced — a manual page OR an auto-rotate tick resets
     /// it, so `usage_rotate_secs` counts from the last change, not a fixed cadence
@@ -1178,6 +1186,7 @@ impl App {
             dir_slot: Default::default(),
             dir_req: 0,
             dir_probe: Default::default(),
+            host_listings: Default::default(),
             dir_probed: None,
             sessions: agentsessions::idle(),
             sessions_shown: Vec::new(),
@@ -2827,7 +2836,7 @@ impl App {
     }
 
     /// Show `text` in the status bar for a few seconds (see [`App::message`]).
-    fn flash(&mut self, text: String, error: bool) {
+    pub(crate) fn flash(&mut self, text: String, error: bool) {
         let secs = if error {
             ERROR_MESSAGE_SECS
         } else {
@@ -3116,7 +3125,6 @@ impl App {
     fn open_browser_at(&mut self, dir: PathBuf, reselect: Option<std::ffi::OsString>) {
         self.dir_req += 1;
         let req = self.dir_req;
-        dirbrowse::spawn_list(self.dir_slot.clone(), req, dir.clone());
         self.browser = Some(DirBrowser {
             dir,
             listing: None,
@@ -3124,6 +3132,7 @@ impl App {
             filter: String::new(),
             sel: 0,
             reselect,
+            started: false,
         });
     }
 
@@ -3134,6 +3143,11 @@ impl App {
             return false;
         };
         if b.listing.is_some() {
+            return false;
+        }
+        if !b.started {
+            b.started = true;
+            dirbrowse::spawn_list(self.dir_slot.clone(), b.req, b.dir.clone());
             return false;
         }
         // Only ever take the answer to THIS request; an older one is left to be replaced
@@ -7080,6 +7094,11 @@ impl App {
     /// `all`, fuzzy-filtered over tool + prompt + path together (so `copad codex` narrows by
     /// project AND tool).
     fn resume_rows(&self, st: &ResumeState) -> Vec<ResumeRow> {
+        self.resume_rows_in(st, &self.sessions_shown)
+    }
+
+    /// [`Self::resume_rows`] over any scan's entries (a host-drawn picker keeps its own).
+    fn resume_rows_in(&self, st: &ResumeState, entries: &[agentsessions::Entry]) -> Vec<ResumeRow> {
         let now = std::time::SystemTime::now();
         // Two tiers: rows whose text CONTAINS the query verbatim, then rows it merely
         // scatters through. A subsequence match over a whole prompt plus a path hits almost
@@ -7087,7 +7106,7 @@ impl App {
         // word buries its own hits under coincidences. Recency order holds within each tier.
         let mut exact = Vec::new();
         let mut fuzzy = Vec::new();
-        for e in self.sessions_shown.iter().filter(|e| st.all || !e.headless) {
+        for e in entries.iter().filter(|e| st.all || !e.headless) {
             let path = e.cwd.as_deref().map(home_short).unwrap_or_default();
             let Some(rank) =
                 resume_rank(&st.filter, &format!("{} {} {path}", e.tool.bin(), e.title))
@@ -17850,10 +17869,10 @@ mod host_api {
         assert!(app.prompt.is_none(), "the TUI never shows it");
         let (id, spec) = &ovs[0];
         assert!(matches!(spec, copad_mux_proto::OverlaySpec::Prompt { .. }));
-        assert!(app.overlay_result(*id, None, Some("renamed".into())));
+        assert!(app.overlay_result(*id, None, Some("renamed".into())).0);
         assert_eq!(app.host_tree().sessions[0].name, "renamed");
         assert!(
-            !app.overlay_result(*id, None, Some("again".into())),
+            !app.overlay_result(*id, None, Some("again".into())).0,
             "an answer runs once"
         );
     }
@@ -17875,12 +17894,12 @@ mod host_api {
         assert_eq!(ovs.len(), 1, "only the confirm this input opened");
         assert!(app.popup.is_some());
         let id = ovs[0].0;
-        assert!(!app.overlay_result(id, None, None), "cancel does nothing");
+        assert!(!app.overlay_result(id, None, None).0, "cancel does nothing");
         assert_eq!(app.host_tree().sessions.len(), 2);
         app.open_kill_session_confirm();
         let marks2 = crate::tui::OverlayMarks::default();
         let id = app.delegate_new_overlays(marks2)[0].0;
-        assert!(app.overlay_result(id, Some("yes".into()), None));
+        assert!(app.overlay_result(id, Some("yes".into()), None).0);
         assert_eq!(app.host_tree().sessions.len(), 1);
     }
 
@@ -17911,7 +17930,7 @@ mod host_api {
             selected.is_some(),
             "the TUI's default row travels with the picker"
         );
-        assert!(app.overlay_result(id, Some(format!("s:{other}")), None));
+        assert!(app.overlay_result(id, Some(format!("s:{other}")), None).0);
         assert_eq!(app.host_tree().active, other);
 
         let term = app.focused_terminal().unwrap();
@@ -17920,8 +17939,213 @@ mod host_api {
         app.open_center();
         let (id, _) = app.delegate_new_overlays(marks).remove(0);
         let nid = app.host_notifications().items[0].id;
-        assert!(app.overlay_result(id, Some(format!("dismiss:n:{nid}")), None));
+        assert!(
+            app.overlay_result(id, Some(format!("dismiss:n:{nid}")), None)
+                .0
+        );
         assert!(app.host_notifications().items.is_empty());
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "comux-delegate-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Wait for a host-drawn overlay's off-loop rows (decisions #172).
+    fn landed(app: &mut App, id: u64) -> copad_mux_proto::OverlaySpec {
+        for _ in 0..500 {
+            if let Some((_, spec)) = app.poll_delegated().into_iter().find(|(i, _)| *i == id) {
+                return spec;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("overlay {id} never landed");
+    }
+
+    fn rows_of(spec: &copad_mux_proto::OverlaySpec) -> Vec<copad_mux_proto::PickerRow> {
+        let copad_mux_proto::OverlaySpec::Picker { tabs, .. } = spec else {
+            panic!("not a picker: {spec:?}")
+        };
+        tabs.iter().flat_map(|t| t.rows.clone()).collect()
+    }
+
+    fn row_id(spec: &copad_mux_proto::OverlaySpec, label: &str) -> String {
+        rows_of(spec)
+            .into_iter()
+            .find(|r| r.label == label)
+            .unwrap_or_else(|| panic!("no row {label:?} in {spec:?}"))
+            .id
+    }
+
+    #[test]
+    fn a_host_drawn_browser_descends_and_creates_the_session_there() {
+        let mut app = app();
+        let root = scratch("browse");
+        std::fs::create_dir_all(root.join("alpha/inner")).unwrap();
+        std::fs::create_dir_all(root.join("beta")).unwrap();
+        std::fs::create_dir_all(root.join(".secret")).unwrap();
+        let marks = app.overlay_marks();
+        app.open_browser_at(root.clone(), None);
+        let (id, spec) = app.delegate_new_overlays(marks).remove(0);
+        assert!(
+            !app.browser.as_ref().is_some_and(|b| b.started),
+            "no TUI listing thread was left behind the delegated one"
+        );
+        assert!(app.browser.is_none(), "the TUI never shows it");
+        assert!(
+            matches!(
+                spec,
+                copad_mux_proto::OverlaySpec::Picker { loading: true, .. }
+            ),
+            "sent at once, still listing: {spec:?}"
+        );
+        let spec = landed(&mut app, id);
+        assert!(matches!(
+            spec,
+            copad_mux_proto::OverlaySpec::Picker { loading: false, .. }
+        ));
+        // Hidden directories travel in their own tab: the host filters only what it was sent.
+        let copad_mux_proto::OverlaySpec::Picker { tabs, .. } = &spec else {
+            panic!()
+        };
+        assert_eq!(tabs.len(), 2, "{tabs:?}");
+        assert!(tabs[1].rows.iter().any(|r| r.label == ".secret"));
+        assert!(!tabs[0].rows.iter().any(|r| r.label == ".secret"));
+        let alpha = row_id(&spec, "alpha");
+        // Descending answers this overlay and opens the next one for the same host.
+        let (_, next) = app.overlay_result(id, Some(alpha), None);
+        assert_eq!(next.len(), 1);
+        let id2 = next[0].0;
+        assert_ne!(id2, id);
+        let spec2 = landed(&mut app, id2);
+        assert!(rows_of(&spec2).iter().any(|r| r.label == "inner"));
+        // "Create session here" opens comux's own name prompt, seeded with the directory.
+        let marks = app.overlay_marks();
+        let (changed, next) = app.overlay_result(id2, Some("here".into()), None);
+        assert!(changed && next.is_empty());
+        let (pid, pspec) = app.delegate_new_overlays(marks).remove(0);
+        let copad_mux_proto::OverlaySpec::Prompt { initial, .. } = pspec else {
+            panic!("{pspec:?}")
+        };
+        assert_eq!(initial, "alpha");
+        assert!(app.overlay_result(pid, None, Some("made-here".into())).0);
+        let ws = app
+            .state
+            .workspace_ids()
+            .into_iter()
+            .find(|w| {
+                app.state
+                    .workspace(w)
+                    .and_then(|x| x.name.clone())
+                    .as_deref()
+                    == Some("made-here")
+            })
+            .expect("session created");
+        assert_eq!(
+            app.state.workspace(&ws).unwrap().dir.as_deref(),
+            Some(root.join("alpha").as_path())
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn two_host_browsers_never_take_each_others_listing() {
+        let mut app = app();
+        let (a, b) = (scratch("a"), scratch("b"));
+        std::fs::create_dir_all(a.join("only-in-a")).unwrap();
+        std::fs::create_dir_all(b.join("only-in-b")).unwrap();
+        let marks = app.overlay_marks();
+        app.open_browser_at(a.clone(), None);
+        let (ia, _) = app.delegate_new_overlays(marks).remove(0);
+        let marks = app.overlay_marks();
+        app.open_browser_at(b.clone(), None);
+        let (ib, _) = app.delegate_new_overlays(marks).remove(0);
+        let mut got = HashMap::new();
+        for _ in 0..500 {
+            got.extend(app.poll_delegated());
+            if got.len() == 2 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (sa, sb) = (got.remove(&ia).unwrap(), got.remove(&ib).unwrap());
+        assert!(rows_of(&sa).iter().any(|r| r.label == "only-in-a"));
+        assert!(rows_of(&sb).iter().any(|r| r.label == "only-in-b"));
+        assert!(!rows_of(&sa).iter().any(|r| r.label == "only-in-b"));
+        // An id from no snapshot of this overlay does nothing.
+        assert_eq!(
+            app.overlay_result(ia, Some("d:999".into()), None).1.len(),
+            0
+        );
+        let _ = (std::fs::remove_dir_all(&a), std::fs::remove_dir_all(&b));
+    }
+
+    #[test]
+    fn host_listings_are_capped_while_dead_mounts_strand_threads() {
+        let mut app = app();
+        app.host_listings
+            .store(4, std::sync::atomic::Ordering::SeqCst);
+        let marks = app.overlay_marks();
+        app.open_browser_at(std::env::temp_dir(), None);
+        let (_, spec) = app.delegate_new_overlays(marks).remove(0);
+        let copad_mux_proto::OverlaySpec::Picker { loading, note, .. } = &spec else {
+            panic!()
+        };
+        assert!(!loading && note.contains("too many"), "{spec:?}");
+        assert_eq!(rows_of(&spec).len(), 1, "only `..` — no thread was started");
+    }
+
+    #[test]
+    fn a_context_menu_goes_to_the_host_and_its_items_open_comux_prompts() {
+        let mut app = app();
+        let ws = app.ws.clone();
+        let marks = app.overlay_marks();
+        app.open_menu(ClientId(1), 0, 0, ClickTarget::Session(ws));
+        let (id, spec) = app.delegate_new_overlays(marks).remove(0);
+        assert!(app.menu.is_none());
+        let copad_mux_proto::OverlaySpec::Menu { items, .. } = spec else {
+            panic!("{spec:?}")
+        };
+        assert_eq!(items.len(), 3);
+        assert!(items[2].destructive && !items[0].destructive, "{items:?}");
+        let marks = app.overlay_marks();
+        assert!(app.overlay_result(id, Some(items[0].id.clone()), None).0);
+        let follow = app.delegate_new_overlays(marks);
+        assert!(
+            matches!(follow[0].1, copad_mux_proto::OverlaySpec::Prompt { .. }),
+            "rename session → comux's own prompt, delegated too"
+        );
+    }
+
+    #[test]
+    fn a_host_can_open_comux_overlays_by_name_and_target() {
+        let mut app = app();
+        app.new_tab();
+        let t = app.host_tree();
+        let tab = &t.sessions[0].tabs[0];
+        let target = format!("{}/{}", t.sessions[0].id, tab.id);
+        let marks = app.overlay_marks();
+        app.open_for_host("rename-tab", Some(&target)).unwrap();
+        let (id, _) = app.delegate_new_overlays(marks).remove(0);
+        assert!(app.overlay_result(id, None, Some("named".into())).0);
+        assert_eq!(app.host_tree().sessions[0].tabs[0].title, "named");
+        assert!(app.open_for_host("explode", None).is_err());
+        assert!(app.open_for_host("rename-tab", Some("nope/x")).is_err());
+        assert!(
+            app.open_for_host("kill-session", None).is_err(),
+            "the last session"
+        );
+        // A TUI prompt another client has open is not replaced.
+        app.open_rename_prompt();
+        assert!(app.open_for_host("rename-session", None).is_err());
     }
 
     #[test]

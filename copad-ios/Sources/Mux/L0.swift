@@ -225,6 +225,8 @@ struct L0PickerRow: Codable, Equatable, Identifiable {
     var detail: String?
     var badge: String?
     var current: Bool?
+    /// The picker's per-row actions don't apply (the resume picker's headless toggle).
+    var no_actions: Bool?
 }
 
 struct L0PickerTab: Codable, Equatable {
@@ -237,30 +239,63 @@ struct L0PickerAction: Codable, Equatable {
     var label: String
 }
 
-/// What comux asks a host to show instead of a TUI overlay. Three shapes cover them all; comux
-/// keeps the meaning and runs the answer itself.
+struct L0MenuItem: Codable, Equatable, Identifiable {
+    var id: String
+    var label: String
+    var destructive: Bool?
+}
+
+struct L0Picker: Equatable {
+    var title: String
+    var tabs: [L0PickerTab]
+    var tab: Int
+    var actions: [L0PickerAction]
+    var selected: String?
+    /// Rows still being gathered (a directory listing, a transcript scan): the same overlay id
+    /// arrives again with them (decisions #172).
+    var loading: Bool
+    /// A line above the rows (an unreadable directory's error).
+    var note: String
+}
+
+/// What comux asks a host to show instead of a TUI overlay; comux keeps the meaning and runs
+/// the answer itself.
 enum L0OverlaySpec: Decodable, Equatable {
-    case picker(title: String, tabs: [L0PickerTab], tab: Int, actions: [L0PickerAction], selected: String?)
+    case picker(L0Picker)
     case prompt(title: String, initial: String, placeholder: String)
     case confirm(message: String)
+    case menu(title: String, items: [L0MenuItem])
+    /// A kind this build doesn't know: answered as cancelled, never guessed at.
+    case unsupported(kind: String)
 
-    private enum K: String, CodingKey { case kind, title, tabs, tab, actions, initial, placeholder, message, selected }
+    private enum K: String, CodingKey {
+        case kind, title, tabs, tab, actions, initial, placeholder, message, selected, loading, note, items
+    }
 
     init(from d: Decoder) throws {
         let c = try d.container(keyedBy: K.self)
-        switch try c.decode(String.self, forKey: .kind) {
+        let kind = try c.decode(String.self, forKey: .kind)
+        switch kind {
         case "picker":
-            self = .picker(title: try c.decode(String.self, forKey: .title),
-                           tabs: try c.decodeIfPresent([L0PickerTab].self, forKey: .tabs) ?? [],
-                           tab: try c.decodeIfPresent(Int.self, forKey: .tab) ?? 0,
-                           actions: try c.decodeIfPresent([L0PickerAction].self, forKey: .actions) ?? [],
-                           selected: try c.decodeIfPresent(String.self, forKey: .selected))
+            self = .picker(L0Picker(
+                title: try c.decode(String.self, forKey: .title),
+                tabs: try c.decodeIfPresent([L0PickerTab].self, forKey: .tabs) ?? [],
+                tab: try c.decodeIfPresent(Int.self, forKey: .tab) ?? 0,
+                actions: try c.decodeIfPresent([L0PickerAction].self, forKey: .actions) ?? [],
+                selected: try c.decodeIfPresent(String.self, forKey: .selected),
+                loading: try c.decodeIfPresent(Bool.self, forKey: .loading) ?? false,
+                note: try c.decodeIfPresent(String.self, forKey: .note) ?? ""))
         case "prompt":
             self = .prompt(title: try c.decode(String.self, forKey: .title),
                            initial: try c.decodeIfPresent(String.self, forKey: .initial) ?? "",
                            placeholder: try c.decodeIfPresent(String.self, forKey: .placeholder) ?? "")
-        default:
+        case "confirm":
             self = .confirm(message: try c.decodeIfPresent(String.self, forKey: .message) ?? "")
+        case "menu":
+            self = .menu(title: try c.decodeIfPresent(String.self, forKey: .title) ?? "",
+                         items: try c.decodeIfPresent([L0MenuItem].self, forKey: .items) ?? [])
+        default:
+            self = .unsupported(kind: kind)
         }
     }
 }

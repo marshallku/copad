@@ -293,6 +293,8 @@ void copad_muxhost_serve(const MuxHostHandle *h, const char *panels_json);
 /// Free with copad_ffi_free_string.
 char *copad_muxhost_state_json(const MuxHostHandle *h);
 void copad_muxhost_command(const MuxHostHandle *h, const char *req_json);
+/// Ask comux to open one of its overlays for a panel's client (decisions #172); target NULL = active.
+void copad_muxhost_open(const MuxHostHandle *h, const char *panel, const char *what, const char *target);
 /// Remote comux (decisions #171). NULL when dest/comux are refused.
 MuxHostHandle *copad_muxhost_start_remote(const char *dest, const char *comux);
 /// Free with copad_ffi_free_string.

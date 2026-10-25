@@ -127,6 +127,13 @@ final class ComuxHost: ObservableObject {
         copad_muxhost_answer(link.handle, overlay, choice, text)
     }
 
+    /// Ask comux to open one of its overlays for `panel`'s client (decisions #172): it comes
+    /// back as a delegated overlay, so a rename gets comux's seeded prompt.
+    func open(key: String, panel: String, _ what: String, target: String?) {
+        guard let link = links[key] else { return }
+        copad_muxhost_open(link.handle, panel, what, target)
+    }
+
     func command(key: String, _ req: [String: Any]) {
         guard let link = links[key], let d = try? JSONSerialization.data(withJSONObject: req),
               let s = String(data: d, encoding: .utf8) else { return }
@@ -141,10 +148,20 @@ final class ComuxWindow: ObservableObject {
     @Published private(set) var state: ComuxHost.State?
     private(set) var key: String?
 
+    /// The visible panel whose comux client this window hosts — what host-initiated overlays
+    /// are opened for.
+    private(set) var panel: String?
+
     func update(panels: [String]) {
         let host = ComuxHost.shared
         key = host.key(for: panels)
         state = key.flatMap { host.states[$0] }
+        panel = state.flatMap { s in panels.first { p in s.bound[p].map { s.claimed.contains($0) } ?? false } }
+    }
+
+    /// `new-session`, `resume`, `rename-session`, `kill-session`, `rename-tab`, `close-tab`, …
+    func open(_ what: String, target: String? = nil) {
+        if let key, let panel { ComuxHost.shared.open(key: key, panel: panel, what, target: target) }
     }
 
     func command(_ req: [String: Any]) {
@@ -168,6 +185,12 @@ struct ComuxSidebar: View {
             HStack {
                 Text("comux").font(.caption.bold()).foregroundStyle(.secondary)
                 Spacer()
+                Button { host.open("new-session") } label: { Image(systemName: "plus") }
+                    .buttonStyle(.borderless).help("New session… (Ctrl-b C)")
+                    .accessibilityIdentifier("comuxNewSession")
+                Button { host.open("resume") } label: { Image(systemName: "clock.arrow.circlepath") }
+                    .buttonStyle(.borderless).help("Resume a conversation… (Ctrl-b R)")
+                    .accessibilityIdentifier("comuxResume")
                 Button(action: toggleNotifications) {
                     HStack(spacing: 2) {
                         Image(systemName: "bell")
@@ -195,6 +218,12 @@ struct ComuxSidebar: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .contextMenu {
+                            Button("Rename Session…") { host.open("rename-session", target: sess.id) }
+                            Button("New Session…") { host.open("new-session") }
+                            Divider()
+                            Button("Kill Session…", role: .destructive) { host.open("kill-session", target: sess.id) }
+                        }
                         .accessibilityIdentifier("comux-space-\(sess.name)")
                     }
                 }
@@ -219,6 +248,10 @@ struct ComuxSidebar: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
+                        .contextMenu {
+                            Button("Jump to Pane") { settle(); host.command(["cmd": "jump", "target": a.token]) }
+                            Button("Rename Tab…") { host.open("rename-tab", target: "\(a.space_id)/\(a.tab_id)") }
+                        }
                     }
                 }
             }
@@ -307,6 +340,14 @@ struct ComuxStatusStrip: View {
                     .background(Capsule().fill(t.active ? Color.accentColor.opacity(0.45) : Color.white.opacity(0.06)))
                 }
                 .buttonStyle(.plain)
+                .contextMenu {
+                    if let sid = session?.id {
+                        Button("Rename Tab…") { host.open("rename-tab", target: "\(sid)/\(t.id)") }
+                        Button("New Tab") { settle(); host.command(["cmd": "new-tab"]) }
+                        Divider()
+                        Button("Close Tab…", role: .destructive) { host.open("close-tab", target: "\(sid)/\(t.id)") }
+                    }
+                }
             }
             if st?.prefix_armed == true {
                 Text(st?.prefix_label ?? "^b").font(.caption.monospaced().bold())

@@ -262,6 +262,31 @@ impl MuxHost {
         self.inner.generation.fetch_add(1, Ordering::SeqCst);
     }
 
+    /// Ask comux to open one of its overlays for a panel's client (`new-session`, `resume`,
+    /// `rename-session`, `kill-session`, `rename-tab`, `close-tab`, …; decisions #172). It
+    /// comes back as an ordinary delegated overlay.
+    ///
+    /// `panel` is the copad panel whose comux client it is for; nothing happens while that
+    /// panel's client is unbound.
+    pub fn open(&self, panel: &str, what: &str, target: Option<String>) {
+        let Some(attachment) = self
+            .inner
+            .state
+            .lock()
+            .ok()
+            .and_then(|s| s.bound().get(panel).copied())
+        else {
+            return;
+        };
+        if let Some(l) = self.inner.link.lock().ok().and_then(|l| l.clone()) {
+            let _ = l.send(&SubMsg::Open {
+                attachment,
+                what: what.to_string(),
+                target,
+            });
+        }
+    }
+
     /// Run a control request (`{"cmd":"select-session",…}`).
     pub fn command(&self, req: Value) {
         if let Some(l) = self.inner.link.lock().ok().and_then(|l| l.clone()) {
@@ -419,7 +444,10 @@ fn on_event(inner: &Arc<Inner>, ev: LinkEvent, closed: &std::sync::mpsc::Sender<
                 client,
                 spec,
             }) => {
-                if s.claims.covers(*client) {
+                // The same id again = its rows landed (decisions #172): replace in place.
+                if let Some(o) = s.overlays.iter_mut().find(|o| o.0 == *overlay) {
+                    o.2 = spec.clone();
+                } else if s.claims.covers(*client) {
                     s.overlays.push((*overlay, *client, spec.clone()));
                 }
             }
