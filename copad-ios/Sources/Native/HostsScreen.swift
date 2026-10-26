@@ -29,7 +29,10 @@ struct HostsScreen: View {
                         .accessibilityIdentifier("host-\(h.name)")
                         .swipeActions {
                             Button("Edit") { editing = h }.tint(.blue)
-                            Button("Delete", role: .destructive) { save(hosts.filter { $0.id != h.id }) }
+                            Button("Delete", role: .destructive) {
+                                PushKeys.remove(host: h.id.uuidString)
+                                save(hosts.filter { $0.id != h.id })
+                            }
                         }
                     }
                 }

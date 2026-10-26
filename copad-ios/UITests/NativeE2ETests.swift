@@ -173,9 +173,11 @@ final class NativeE2ETests: XCTestCase {
         waitScreen("BACK-2")
         snapshot("after-resume")
 
-        // 9. APNs (decisions #175), when the script configured a real key: once comux has our
-        //    token, background the app and let the script raise a notification for e2e-two's
-        //    pane; Apple's sandbox delivers it, and tapping the banner jumps there.
+        // 9. APNs (decisions #175, #177), when the script configured pushes: once comux has our
+        //    token and key, background the app and let the script raise a notification for
+        //    e2e-two's pane; Apple's sandbox delivers a sealed push, the notification service
+        //    extension opens it (the banner shows the real body, not the placeholder), and
+        //    tapping it jumps there.
         if let dir = ProcessInfo.processInfo.environment["E2E_PUSH_DIR"], !dir.isEmpty {
             let reg = URL(fileURLWithPath: dir).appendingPathComponent("comux-push.json")
             let end = Date().addingTimeInterval(30)

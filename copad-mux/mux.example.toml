@@ -280,12 +280,19 @@ restore_agent_sessions = true
 # socket = "/run/user/1000/comux.sock"   # only when that server is not at the default path
 
 # --- Phone pushes (APNs) ------------------------------------------------------------------
-# With an Apple Push Notifications auth key, this server pushes every agent notification it
-# raises (turn done / blocked) to each copad iOS app that connected to it and allowed
-# notifications; tapping one opens that host and jumps to the pane (decisions #175). All three
-# keys or none. The key must belong to the team that signs the app.
+# This server pushes every agent notification it raises (turn done / blocked) to each copad iOS
+# app that connected to it and allowed notifications; tapping one opens that host and jumps to
+# the pane (decisions #175, #177). It works with no setup: pushes go through the copad push relay,
+# which holds the app's APNs key. Every push is end-to-end encrypted with a key the app sent over
+# SSH, so the relay and Apple only see "copad: Agent notification".
 #
 # [push]
+# relay = "off"                                  # no phone pushes from this host
+# relay = "https://aide-push.marshallku.dev"     # the default
+#
+# For an app you build and sign under your own Apple team, push straight to APNs with that
+# team's auth key instead (all three keys; they win over relay):
+#
 # apns_key = "~/.config/copad/apns.p8"
 # apns_key_id = "ABC123DEFG"
-# apns_team_id = "8QNJMX7JJ2"
+# apns_team_id = "YOURTEAMID"

@@ -91,13 +91,22 @@ kill -0 "$SSHD_PID" || { log "sshd did not start"; cat "$W/sshd.log"; exit 1; }
 MUXENV=(COPAD_MUX_SOCK="$W/s" COPAD_MUX_STATE="$W/state.json" COPAD_MUX_NOTIFY=0
         COPAD_MUX_USAGE=0 COPAD_MUX_UPDATE_CHECK=0 COPAD_MUX_QUIET_SSH=1 XDG_CONFIG_HOME="$W/cfg")
 mkdir -p "$W/cfg/copad" "$W/bin"
-# APNs (decisions #175): with the team's key in E2E_APNS_KEY / _KEY_ID / _TEAM, this comux
-# pushes to the Simulator through Apple's REAL sandbox, and the UI test taps the banner.
+# Pushes (decisions #175, #177), against Apple's REAL sandbox: the UI test backgrounds the app,
+# a notification is raised, and the banner must show its DECRYPTED text (the relay and APNs only
+# carry a placeholder) before the test taps it.
+#   E2E_PUSH_RELAY=<url>           through a push relay (https://aide-push.marshallku.dev, or a
+#                                  local `aide push-relay` on http://127.0.0.1:<port>)
+#   E2E_APNS_KEY / _KEY_ID / _TEAM straight to APNs with the team's key
 PUSH=0
-if [[ -n "${E2E_APNS_KEY:-}" && -n "${E2E_APNS_KEY_ID:-}" && -n "${E2E_APNS_TEAM:-}" ]]; then
+if [[ -n "${E2E_PUSH_RELAY:-}" ]]; then
+    PUSH=1
+    printf '[push]\nrelay = "%s"\n' "$E2E_PUSH_RELAY" >"$W/cfg/copad/mux.toml"
+elif [[ -n "${E2E_APNS_KEY:-}" && -n "${E2E_APNS_KEY_ID:-}" && -n "${E2E_APNS_TEAM:-}" ]]; then
     PUSH=1
     printf '[push]\napns_key = "%s"\napns_key_id = "%s"\napns_team_id = "%s"\n' \
         "$E2E_APNS_KEY" "$E2E_APNS_KEY_ID" "$E2E_APNS_TEAM" >"$W/cfg/copad/mux.toml"
+else
+    printf '[push]\nrelay = "off"\n' >"$W/cfg/copad/mux.toml"
 fi
 mux() { env -u COPAD_MUX_PANE -u COPAD_MUX "${MUXENV[@]}" "$COMUX" "$@"; }
 # The server's HOME is a fixture: the native Ctrl-b C browser lists it (decisions #172).
@@ -147,6 +156,11 @@ CAP="$(mux capture-pane "$TOK" -S 200 2>/dev/null || true)"
 grep -q "NATIVE-42" <<<"$CAP" || { log "FAIL: NATIVE-42 never reached the pane"; rc=1; }
 grep -q "한글-확인" <<<"$CAP" || { log "FAIL: the Hangul line never reached the pane"; rc=1; }
 grep -q "BACK-2" <<<"$CAP" || { log "FAIL: input after resume never reached the pane"; rc=1; }
+# The registration carries the app's key, and the push went out sealed.
+if [[ $PUSH == 1 ]]; then
+    grep -q '"key"' "$W/comux-push.json" 2>/dev/null || { log "FAIL: the app registered without a push key"; rc=1; }
+    grep -q "comux push:" "$W/server.log" && { log "FAIL: the push worker reported an error:"; grep "comux push:" "$W/server.log" >&2; rc=1; }
+fi
 # The app authenticated with the key type under test.
 if [[ "$KEYTYPE" == ed25519 ]]; then want=ED25519; else want=ECDSA; fi
 grep -q "Accepted publickey for .* $want " "$W/sshd.log" \

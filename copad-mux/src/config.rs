@@ -1133,9 +1133,10 @@ pub struct MuxConfig {
     pub never_inherit: Vec<String>,
     /// `comux worktree create` naming + post-create hooks.
     pub worktree: WorktreeConfig,
-    /// `[push]` — the team APNs key that lets this server push agent notifications to the
-    /// copad iOS app (decisions #175). `None` = no pushes; `push-register` says so.
-    pub push: Option<crate::push::PushConfig>,
+    /// `[push]` — how this server pushes agent notifications to the copad iOS app (decisions
+    /// #175, #177): through the push relay by default, straight to APNs with the team's own key,
+    /// or not at all.
+    pub push: crate::push::PushMode,
     /// `[machines.<name>]` — the SSH fleet, in configured (alphabetical) order.
     ///
     /// DECLARATIVE, like `~/.ssh/config`: there is deliberately no `comux machine add` that
@@ -1190,6 +1191,7 @@ struct RawConfig {
 
 #[derive(Deserialize, Default)]
 struct RawPush {
+    relay: Option<String>,
     apns_key: Option<String>,
     apns_key_id: Option<String>,
     apns_team_id: Option<String>,
@@ -1305,7 +1307,7 @@ impl MuxConfig {
                 scripts: HashMap::new(),
             },
             machines: Vec::new(),
-            push: None,
+            push: crate::push::PushMode::default(),
         }
     }
 
@@ -1676,28 +1678,46 @@ fn build_machines(
     out
 }
 
-/// `[push]`: all three keys or none (a partial section warns and pushes nothing). A leading
-/// `~/` in `apns_key` is the home directory.
-fn build_push(raw: Option<RawPush>, warnings: &mut Vec<String>) -> Option<crate::push::PushConfig> {
-    let raw = raw?;
-    let (Some(key), Some(key_id), Some(team_id)) =
-        (raw.apns_key, raw.apns_key_id, raw.apns_team_id)
-    else {
-        warnings.push("[push] needs apns_key, apns_key_id and apns_team_id; push is off".into());
-        return None;
+/// `[push]`: the team's APNs key (all three `apns_*` keys; it wins over the relay), else `relay`
+/// (`"off"` turns pushes off; a bad URL warns and keeps the default relay), else the default
+/// relay. A partial key section warns and falls back to the relay. A leading `~/` in `apns_key`
+/// is the home directory.
+fn build_push(raw: Option<RawPush>, warnings: &mut Vec<String>) -> crate::push::PushMode {
+    use crate::push::PushMode;
+    let Some(raw) = raw else {
+        return PushMode::default();
     };
-    let key_file = match key.strip_prefix("~/") {
-        Some(rest) => std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_default()
-            .join(rest),
-        None => PathBuf::from(key),
-    };
-    Some(crate::push::PushConfig {
-        key_file,
-        key_id,
-        team_id,
-    })
+    match (raw.apns_key, raw.apns_key_id, raw.apns_team_id) {
+        (Some(key), Some(key_id), Some(team_id)) => {
+            let key_file = match key.strip_prefix("~/") {
+                Some(rest) => std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .unwrap_or_default()
+                    .join(rest),
+                None => PathBuf::from(key),
+            };
+            return PushMode::Direct(crate::push::PushConfig {
+                key_file,
+                key_id,
+                team_id,
+            });
+        }
+        (None, None, None) => {}
+        _ => warnings.push(
+            "[push] needs all of apns_key, apns_key_id and apns_team_id; using the relay".into(),
+        ),
+    }
+    match raw.relay.as_deref().map(str::trim) {
+        None | Some("") => PushMode::default(),
+        Some("off") => PushMode::Off,
+        Some(url) => match crate::push::check_relay_url(url) {
+            Ok(()) => PushMode::Relay(url.trim_end_matches('/').to_string()),
+            Err(e) => {
+                warnings.push(format!("[push] {e}; using the default relay"));
+                PushMode::default()
+            }
+        },
+    }
 }
 
 fn build_worktree(raw: Option<RawWorktree>, warnings: &mut Vec<String>) -> WorktreeConfig {

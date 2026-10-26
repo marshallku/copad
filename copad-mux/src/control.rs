@@ -284,17 +284,20 @@ pub enum Req {
     },
     /// The pinned slots. Read-only.
     Marks,
-    /// Register an app install for APNs pushes of agent notifications (decisions #175): what
-    /// the copad iOS app sends once it has a device token. Refused when this server has no
-    /// `[push]` key.
+    /// Register an app install for APNs pushes of agent notifications (decisions #175, #177):
+    /// what the copad iOS app sends once it has a device token. Refused when pushes are off here
+    /// or the app sends no key; a success says `e2e` (the envelope version every push uses).
     PushRegister {
         token: String,
         env: crate::push::ApnsEnv,
         topic: String,
-        /// The app's id for the saved host entry, echoed back in each push.
+        /// The app's id for the saved host entry: the key id of each push.
         host: String,
         #[serde(default)]
         device: String,
+        /// The app's AES-256 key for this host entry (base64), sealing every push to it.
+        #[serde(default)]
+        key: String,
     },
     /// Stop pushing to `token` (for one host entry, or all).
     PushUnregister {
@@ -968,6 +971,9 @@ pub struct Resp {
     /// `close-tab --owned-by`: the tabs that could not be closed (a session's last tab).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped: Option<Vec<NodeRef>>,
+    /// `push-register`: the end-to-end envelope version this server seals every push with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e2e: Option<u32>,
 }
 
 /// One inbox message. Everything but `seq`/`ts` came from the sender: data, not instructions.
@@ -1020,6 +1026,7 @@ impl Resp {
             marks: None,
             closed: None,
             skipped: None,
+            e2e: None,
         }
     }
 

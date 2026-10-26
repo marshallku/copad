@@ -1,15 +1,20 @@
-//! Agent notifications pushed to phones over APNs (decisions #175).
+//! Agent notifications pushed to phones over APNs (decisions #175, #177).
 //!
 //! The copad iOS app registers its device token through the L0 command channel
 //! (`push-register`); this server keeps the registrations on disk and, for every notification it
-//! raises, hands one push per device to a worker thread that talks HTTP/2 to Apple. Nothing here
-//! runs on the server loop: the loop only enqueues, and learns about dead tokens by polling.
+//! raises, hands one push per device to a worker thread. Nothing here runs on the server loop: the
+//! loop only enqueues, and learns about dead tokens by polling.
 //!
-//! Credentials are the team's APNs auth key (`[push]` in mux.toml): a `.p8` PKCS#8 P-256 key,
-//! its key id and the team id. The JWT is signed with `ring` and reused for 50 minutes (Apple
-//! refuses one older than an hour and throttles ones refreshed more often than every 20).
+//! Every push is end-to-end encrypted. The app sends a 32-byte key per host entry with its
+//! registration; the title, body and pane are sealed with AES-256-GCM and only the app's
+//! notification service extension can open them. What leaves this machine is a placeholder alert
+//! plus the ciphertext, so neither the relay nor Apple sees what an agent said.
+//!
+//! Two ways out (`[push]` in mux.toml): the push relay (default — it holds the app's APNs key, so
+//! no Apple developer account is needed here), or the team's own APNs key for a self-built app (a
+//! `.p8` PKCS#8 P-256 key; the JWT is signed with `ring` and reused for 50 minutes).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -24,16 +29,70 @@ const MAX_REGS: usize = 64;
 const QUEUE_CAP: usize = 64;
 const TITLE_MAX: usize = 160;
 const BODY_MAX: usize = 1024;
-/// Apple's limit for an alert payload.
-const PAYLOAD_MAX: usize = 4096;
+/// The sealed plaintext's budget: its base64 envelope must fit the relay's 3000 bytes, and the
+/// whole payload Apple's 4 KB.
+const SEALED_PLAIN_MAX: usize = 2200;
 const JWT_TTL: Duration = Duration::from_secs(50 * 60);
+/// The relay serving the copad app (AIDE's `aide push-relay`; AIDE ADR-0023).
+pub const DEFAULT_RELAY: &str = "https://aide-push.marshallku.dev";
+/// What a push shows when it can't be opened; the relay and Apple see only this.
+pub const PLACEHOLDER_TITLE: &str = "copad";
+pub const PLACEHOLDER_BODY: &str = "Agent notification";
+/// The envelope version the app checks for (`e2e` in the `push-register` reply).
+pub const E2E_VERSION: u32 = 1;
+const AAD_PREFIX: &[u8] = b"comux-push-v1\0";
 
-/// `[push]` in mux.toml.
+/// The team's own APNs key (`[push] apns_key`, `apns_key_id`, `apns_team_id`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushConfig {
     pub key_file: PathBuf,
     pub key_id: String,
     pub team_id: String,
+}
+
+/// How pushes leave this server (`[push]` in mux.toml).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushMode {
+    Off,
+    /// Through the push relay at this base URL.
+    Relay(String),
+    /// Straight to APNs with the team's key.
+    Direct(PushConfig),
+}
+
+impl Default for PushMode {
+    fn default() -> Self {
+        Self::Relay(DEFAULT_RELAY.to_string())
+    }
+}
+
+impl PushMode {
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Off => "off".into(),
+            Self::Relay(url) => format!("relay {url}"),
+            Self::Direct(c) => format!("APNs key {}", c.key_id),
+        }
+    }
+}
+
+/// A relay URL: https, or http to this machine (tests, a local relay).
+pub fn check_relay_url(url: &str) -> Result<(), String> {
+    let Ok(u) = reqwest::Url::parse(url) else {
+        return Err(format!("push relay '{url}' is not a URL"));
+    };
+    let local = matches!(
+        u.host_str(),
+        Some("localhost" | "127.0.0.1" | "[::1]" | "::1")
+    );
+    if u.query().is_some() || u.fragment().is_some() || u.host_str().is_none() {
+        return Err(format!("push relay '{url}' is not a base URL"));
+    }
+    match u.scheme() {
+        "https" => Ok(()),
+        "http" if local => Ok(()),
+        _ => Err(format!("push relay '{url}' must use https")),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +114,10 @@ pub struct Reg {
     pub host: String,
     #[serde(default)]
     pub device: String,
+    /// The app's key for this host entry (base64, 32 bytes): every push to it is sealed with
+    /// it. Registrations stored before encryption have none and are never sent to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     /// Monotonic; a dead-token report only removes registrations at or before it, so one
     /// refreshed meanwhile survives.
     pub generation: u64,
@@ -70,6 +133,16 @@ struct Stored {
 pub struct Registry {
     path: PathBuf,
     st: Stored,
+}
+
+/// A `push-register` request.
+pub struct NewReg<'a> {
+    pub token: &'a str,
+    pub env: ApnsEnv,
+    pub topic: &'a str,
+    pub host: &'a str,
+    pub device: &'a str,
+    pub key: &'a str,
 }
 
 /// A device token: hex, as the app prints `deviceToken`.
@@ -107,20 +180,27 @@ impl Registry {
     }
 
     /// Add or refresh `(token, host)`. Refused input is reported, never stored.
-    pub fn register(
-        &mut self,
-        token: &str,
-        env: ApnsEnv,
-        topic: &str,
-        host: &str,
-        device: &str,
-    ) -> Result<(), String> {
+    pub fn register(&mut self, r: NewReg<'_>) -> Result<(), String> {
+        let NewReg {
+            token,
+            env,
+            topic,
+            host,
+            device,
+            key,
+        } = r;
         let token = token.to_ascii_lowercase();
         if !valid_token(&token) {
             return Err("not an APNs device token".into());
         }
-        if !valid_word(topic, 200) || !valid_word(host, 80) {
+        // The host id doubles as the relay's `kid` (at most 64 of the same characters).
+        if !valid_word(topic, 200) || !valid_word(host, 64) {
             return Err("bad topic or host id".into());
+        }
+        if parse_key(key).is_none() {
+            return Err(
+                "this copad app sends no encryption key: update the app to get pushes".into(),
+            );
         }
         self.st.next += 1;
         let generation = self.st.next;
@@ -133,6 +213,7 @@ impl Registry {
             topic: topic.to_string(),
             host: host.to_string(),
             device: device.chars().take(80).collect(),
+            key: Some(key.to_string()),
             generation,
         });
         while self.st.regs.len() > MAX_REGS {
@@ -156,10 +237,12 @@ impl Registry {
     }
 
     /// One registration per device token: the most recent one (the host entry the user last
-    /// connected through), so a device never gets the same notification twice.
+    /// connected through), so a device never gets the same notification twice. Registrations
+    /// without a key (stored before pushes were encrypted) are skipped: nothing goes out in the
+    /// clear.
     pub fn targets(&self) -> Vec<Reg> {
         let mut out: Vec<Reg> = Vec::new();
-        for r in &self.st.regs {
+        for r in self.st.regs.iter().filter(|r| r.key.is_some()) {
             match out.iter_mut().find(|x| x.token == r.token) {
                 Some(x) if x.generation < r.generation => *x = r.clone(),
                 Some(_) => {}
@@ -214,39 +297,103 @@ fn clip(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-/// The APNs payload: alert + routing (`comux.host`, `comux.pane`). Bounded to Apple's 4 KB —
-/// title and body are cut first, and the body is dropped if that is still not enough; the
-/// routing fields always survive.
-pub fn payload(title: &str, body: &str, host: &str, pane: &str) -> Vec<u8> {
-    let build = |body: Option<&str>| {
-        let mut alert = serde_json::json!({ "title": clip(title, TITLE_MAX) });
-        if let Some(b) = body {
-            alert["body"] = serde_json::Value::String(clip(b, BODY_MAX));
-        }
+fn parse_key(b64: &str) -> Option<[u8; 32]> {
+    base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .ok()?
+        .try_into()
+        .ok()
+}
+
+/// Seal `{title, body, pane}` for `host`'s key: base64 of nonce ‖ ciphertext ‖ tag (CryptoKit's
+/// `AES.GCM.SealedBox.combined`), bound to the host id. Title and body are cut to fit; the body is
+/// shortened, then dropped, when the envelope would outgrow the relay's limit.
+pub fn seal(key_b64: &str, host: &str, title: &str, body: &str, pane: &str) -> Option<String> {
+    use ring::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
+    use ring::rand::SecureRandom;
+    let key = parse_key(key_b64)?;
+    let plain = |body: &str| {
         serde_json::to_vec(&serde_json::json!({
-            "aps": { "alert": alert, "sound": "default", "thread-id": host },
-            "comux": { "host": host, "pane": pane },
+            "title": clip(title, TITLE_MAX),
+            "body": body,
+            "pane": pane,
         }))
         .unwrap_or_default()
     };
-    let full = build(Some(body));
-    if full.len() <= PAYLOAD_MAX {
-        full
-    } else {
-        build(None)
+    let mut msg = plain(&clip(body, BODY_MAX));
+    if msg.len() > SEALED_PLAIN_MAX {
+        msg = plain(&clip(body, 256));
     }
+    if msg.len() > SEALED_PLAIN_MAX {
+        msg = plain("");
+    }
+    let mut nonce = [0u8; NONCE_LEN];
+    ring::rand::SystemRandom::new().fill(&mut nonce).ok()?;
+    let sealer = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key).ok()?);
+    let mut aad = AAD_PREFIX.to_vec();
+    aad.extend_from_slice(host.as_bytes());
+    sealer
+        .seal_in_place_append_tag(
+            Nonce::assume_unique_for_key(nonce),
+            Aad::from(aad),
+            &mut msg,
+        )
+        .ok()?;
+    let mut out = nonce.to_vec();
+    out.extend_from_slice(&msg);
+    Some(base64::engine::general_purpose::STANDARD.encode(out))
+}
+
+/// Same notification, same id: a newer one for the pane replaces one not yet delivered.
+pub fn collapse_id(host: &str, pane: &str) -> String {
+    let d = ring::digest::digest(&ring::digest::SHA256, format!("{host}\0{pane}").as_bytes());
+    d.as_ref()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The APNs payload for direct sends: the placeholder alert, `mutable-content` for the app's
+/// extension, and the sealed envelope with the key id (the host entry). The relay builds the
+/// same from a relay request.
+pub fn payload(host: &str, sealed: &str) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "aps": {
+            "alert": { "title": PLACEHOLDER_TITLE, "body": PLACEHOLDER_BODY },
+            "sound": "default",
+            "thread-id": host,
+            "mutable-content": 1,
+        },
+        "sealed": sealed,
+        "kid": host,
+    }))
+    .unwrap_or_default()
+}
+
+/// The push relay's request (`POST /v1/notify`).
+fn relay_request(reg: &Reg, sealed: &str, collapse: &str) -> serde_json::Value {
+    serde_json::json!({
+        "token": reg.token,
+        "env": reg.env,
+        "collapseId": collapse,
+        "title": PLACEHOLDER_TITLE,
+        "body": PLACEHOLDER_BODY,
+        "threadId": reg.host,
+        "bundle": reg.topic,
+        "sealed": sealed,
+        "kid": reg.host,
+    })
 }
 
 /// One push for the worker.
 pub struct Job {
-    pub cfg: PushConfig,
+    pub mode: PushMode,
     pub reg: Reg,
-    pub payload: Vec<u8>,
-    /// `apns-collapse-id`: a newer notification for the same pane replaces an undelivered one.
+    pub sealed: String,
     pub collapse: String,
 }
 
-/// APNs said a token is gone (410, or 400 BadDeviceToken).
+/// APNs (or the relay) said a token is gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dead {
     pub token: String,
@@ -267,7 +414,7 @@ struct Shared {
 pub struct Pusher {
     shared: Arc<Shared>,
     started: Arc<std::sync::Once>,
-    /// Base URL override, for tests against a local server.
+    /// APNs base URL override, for tests against a local server.
     base: Option<String>,
 }
 
@@ -299,7 +446,7 @@ impl Pusher {
         let base = self.base.clone();
         self.started.call_once(move || {
             let _ = std::thread::Builder::new()
-                .name("apns".into())
+                .name("push".into())
                 .spawn(move || worker(shared, base));
         });
         if let Ok(mut q) = self.shared.queue.lock() {
@@ -331,18 +478,64 @@ impl Pusher {
     }
 }
 
-/// The worker: one HTTP/2 client, a cached JWT, no retries (a notification is best-effort and
-/// the next one for the pane supersedes it through its collapse id).
+/// What one send came to.
+#[derive(Debug, PartialEq, Eq)]
+enum Outcome {
+    Sent,
+    /// The token will never work again.
+    Dead,
+    /// Hold off: this device only, or everything, until the instant.
+    Wait {
+        device: bool,
+        secs: u64,
+    },
+    Failed,
+}
+
+/// The relay's answer, by status and error code.
+fn relay_outcome(status: u16, code: &str, retry_after: Option<u64>) -> Outcome {
+    let secs = retry_after.unwrap_or(60).clamp(1, 3600);
+    match status {
+        204 => Outcome::Sent,
+        410 => Outcome::Dead,
+        429 => Outcome::Wait {
+            device: code == "device_rate_limited",
+            secs,
+        },
+        503 => Outcome::Wait {
+            device: false,
+            secs,
+        },
+        _ => Outcome::Failed,
+    }
+}
+
+/// The last six characters of a token: enough to tell devices apart in a log, not to send.
+fn tail(token: &str) -> &str {
+    &token[token.len().saturating_sub(6)..]
+}
+
+/// The worker: no retries (a notification is best-effort and the next one for the pane supersedes
+/// it through its collapse id), but it honours the relay's Retry-After — for one device, or for
+/// everything — by dropping what arrives meanwhile.
 fn worker(shared: Arc<Shared>, base: Option<String>) {
-    let client = reqwest::blocking::Client::builder()
+    let apns = reqwest::blocking::Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
         .http2_prior_knowledge()
         .build();
-    let Ok(client) = client else {
+    let relay = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        // A redirect would carry the notification somewhere nobody configured.
+        .redirect(reqwest::redirect::Policy::none())
+        .build();
+    let (Ok(apns), Ok(relay)) = (apns, relay) else {
         return;
     };
     let mut jwt: Option<(PushConfig, String, Instant)> = None;
+    let mut hold_all: Option<Instant> = None;
+    let mut hold: HashMap<String, Instant> = HashMap::new();
     loop {
         let job = {
             let Ok(mut q) = shared.queue.lock() else {
@@ -358,73 +551,144 @@ fn worker(shared: Arc<Shared>, base: Option<String>) {
                 };
             }
         };
-        let fresh = jwt
-            .as_ref()
-            .is_some_and(|(c, _, at)| *c == job.cfg && at.elapsed() < JWT_TTL);
-        if !fresh {
-            match sign_jwt(&job.cfg) {
-                Ok(t) => jwt = Some((job.cfg.clone(), t, Instant::now())),
-                Err(e) => {
-                    eprintln!("comux push: {e}");
-                    shared.failed.fetch_add(1, Ordering::Relaxed);
-                    continue;
-                }
-            }
-        }
-        let Some((_, token, _)) = jwt.as_ref() else {
+        let now = Instant::now();
+        hold.retain(|_, until| *until > now);
+        if hold_all.is_some_and(|t| t > now) || hold.contains_key(&job.reg.token) {
+            shared.dropped.fetch_add(1, Ordering::Relaxed);
             continue;
+        }
+        let outcome = match &job.mode {
+            PushMode::Off => continue,
+            PushMode::Relay(url) => send_relay(&relay, url, &job),
+            PushMode::Direct(cfg) => send_direct(&apns, base.as_deref(), cfg, &mut jwt, &job),
         };
-        let host = base.clone().unwrap_or_else(|| {
-            match job.reg.env {
-                ApnsEnv::Sandbox => "https://api.sandbox.push.apple.com",
-                ApnsEnv::Production => "https://api.push.apple.com",
-            }
-            .to_string()
-        });
-        let res = client
-            .post(format!("{host}/3/device/{}", job.reg.token))
-            .header("authorization", format!("bearer {token}"))
-            .header("apns-topic", &job.reg.topic)
-            .header("apns-push-type", "alert")
-            .header("apns-priority", "10")
-            .header("apns-collapse-id", clip(&job.collapse, 64))
-            .body(job.payload)
-            .send();
-        match res {
-            Ok(r) if r.status().is_success() => {
+        match outcome {
+            Outcome::Sent => {
                 shared.sent.fetch_add(1, Ordering::Relaxed);
             }
-            Ok(r) => {
+            Outcome::Dead => {
                 shared.failed.fetch_add(1, Ordering::Relaxed);
-                let status = r.status().as_u16();
-                let reason = r
-                    .json::<serde_json::Value>()
-                    .ok()
-                    .and_then(|v| v["reason"].as_str().map(str::to_string))
-                    .unwrap_or_default();
-                if is_dead(status, &reason) {
-                    if let Ok(mut d) = shared.dead.lock() {
-                        d.push(Dead {
-                            token: job.reg.token.clone(),
-                            generation: job.reg.generation,
-                        });
-                    }
+                if let Ok(mut d) = shared.dead.lock() {
+                    d.push(Dead {
+                        token: job.reg.token.clone(),
+                        generation: job.reg.generation,
+                    });
+                }
+            }
+            Outcome::Wait { device, secs } => {
+                shared.failed.fetch_add(1, Ordering::Relaxed);
+                let until = Instant::now() + Duration::from_secs(secs);
+                if device {
+                    hold.insert(job.reg.token.clone(), until);
                 } else {
-                    // The device token is the owner's: never logged whole.
-                    eprintln!(
-                        "comux push: APNs {status} {reason} for …{}",
-                        &job.reg.token[job.reg.token.len().saturating_sub(6)..]
-                    );
-                }
-                if reason == "ExpiredProviderToken" || reason == "InvalidProviderToken" {
-                    jwt = None;
+                    hold_all = Some(until);
                 }
             }
-            Err(e) => {
+            Outcome::Failed => {
                 shared.failed.fetch_add(1, Ordering::Relaxed);
-                // The URL carries the device token.
-                eprintln!("comux push: {}", e.without_url());
             }
+        }
+    }
+}
+
+fn send_relay(client: &reqwest::blocking::Client, url: &str, job: &Job) -> Outcome {
+    let res = client
+        .post(format!("{}/v1/notify", url.trim_end_matches('/')))
+        .json(&relay_request(&job.reg, &job.sealed, &job.collapse))
+        .send();
+    match res {
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let retry = r
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse().ok());
+            let code = r
+                .json::<serde_json::Value>()
+                .ok()
+                .and_then(|v| v["error"]["code"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            let out = relay_outcome(status, &code, retry);
+            if matches!(out, Outcome::Failed | Outcome::Wait { .. }) {
+                eprintln!(
+                    "comux push: relay {status} {code} for …{}",
+                    tail(&job.reg.token)
+                );
+            }
+            out
+        }
+        Err(e) => {
+            eprintln!("comux push: relay: {}", e.without_url());
+            Outcome::Failed
+        }
+    }
+}
+
+fn send_direct(
+    client: &reqwest::blocking::Client,
+    base: Option<&str>,
+    cfg: &PushConfig,
+    jwt: &mut Option<(PushConfig, String, Instant)>,
+    job: &Job,
+) -> Outcome {
+    let fresh = jwt
+        .as_ref()
+        .is_some_and(|(c, _, at)| c == cfg && at.elapsed() < JWT_TTL);
+    if !fresh {
+        match sign_jwt(cfg) {
+            Ok(t) => *jwt = Some((cfg.clone(), t, Instant::now())),
+            Err(e) => {
+                eprintln!("comux push: {e}");
+                return Outcome::Failed;
+            }
+        }
+    }
+    let Some((_, token, _)) = jwt.as_ref() else {
+        return Outcome::Failed;
+    };
+    let host = base.map(str::to_string).unwrap_or_else(|| {
+        match job.reg.env {
+            ApnsEnv::Sandbox => "https://api.sandbox.push.apple.com",
+            ApnsEnv::Production => "https://api.push.apple.com",
+        }
+        .to_string()
+    });
+    let res = client
+        .post(format!("{host}/3/device/{}", job.reg.token))
+        .header("authorization", format!("bearer {token}"))
+        .header("apns-topic", &job.reg.topic)
+        .header("apns-push-type", "alert")
+        .header("apns-priority", "10")
+        .header("apns-collapse-id", &job.collapse)
+        .body(payload(&job.reg.host, &job.sealed))
+        .send();
+    match res {
+        Ok(r) if r.status().is_success() => Outcome::Sent,
+        Ok(r) => {
+            let status = r.status().as_u16();
+            let reason = r
+                .json::<serde_json::Value>()
+                .ok()
+                .and_then(|v| v["reason"].as_str().map(str::to_string))
+                .unwrap_or_default();
+            if reason == "ExpiredProviderToken" || reason == "InvalidProviderToken" {
+                *jwt = None;
+            }
+            if is_dead(status, &reason) {
+                return Outcome::Dead;
+            }
+            // The device token is the owner's: never logged whole.
+            eprintln!(
+                "comux push: APNs {status} {reason} for …{}",
+                tail(&job.reg.token)
+            );
+            Outcome::Failed
+        }
+        Err(e) => {
+            // The URL carries the device token.
+            eprintln!("comux push: {}", e.without_url());
+            Outcome::Failed
         }
     }
 }
@@ -486,10 +750,32 @@ mod tests {
     const TOK_A: &str = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90";
     const TOK_B: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
 
+    const KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+
+    fn new<'a>(
+        token: &'a str,
+        env: ApnsEnv,
+        topic: &'a str,
+        host: &'a str,
+        device: &'a str,
+    ) -> NewReg<'a> {
+        NewReg {
+            token,
+            env,
+            topic,
+            host,
+            device,
+            key: KEY,
+        }
+    }
+
     fn reg() -> (Registry, PathBuf) {
+        // macOS clocks tick in microseconds: parallel tests need more than the time to differ.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!(
-            "comux-push-{}-{}.json",
+            "comux-push-{}-{}-{}.json",
             std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -501,18 +787,24 @@ mod tests {
     #[test]
     fn one_push_per_device_routed_to_the_latest_host_entry() {
         let (mut r, p) = reg();
-        r.register(TOK_A, ApnsEnv::Sandbox, "com.x.app", "host-1", "phone")
+        r.register(new(TOK_A, ApnsEnv::Sandbox, "com.x.app", "host-1", "phone"))
             .unwrap();
-        r.register(TOK_B, ApnsEnv::Production, "com.x.app", "host-1", "pad")
-            .unwrap();
-        r.register(TOK_A, ApnsEnv::Sandbox, "com.x.app", "host-2", "phone")
+        r.register(new(
+            TOK_B,
+            ApnsEnv::Production,
+            "com.x.app",
+            "host-1",
+            "pad",
+        ))
+        .unwrap();
+        r.register(new(TOK_A, ApnsEnv::Sandbox, "com.x.app", "host-2", "phone"))
             .unwrap();
         let t = r.targets();
         assert_eq!(t.len(), 2, "one per token");
         let a = t.iter().find(|x| x.token == TOK_A).unwrap();
         assert_eq!(a.host, "host-2", "the entry registered last wins");
         // Re-registering host-1 makes it the destination again.
-        r.register(TOK_A, ApnsEnv::Sandbox, "com.x.app", "host-1", "phone")
+        r.register(new(TOK_A, ApnsEnv::Sandbox, "com.x.app", "host-1", "phone"))
             .unwrap();
         assert_eq!(
             r.targets().iter().find(|x| x.token == TOK_A).unwrap().host,
@@ -526,10 +818,10 @@ mod tests {
     #[test]
     fn a_dead_report_spares_a_registration_refreshed_since() {
         let (mut r, p) = reg();
-        r.register(TOK_A, ApnsEnv::Sandbox, "com.x.app", "h", "")
+        r.register(new(TOK_A, ApnsEnv::Sandbox, "com.x.app", "h", ""))
             .unwrap();
         let old = r.targets()[0].generation;
-        r.register(TOK_A, ApnsEnv::Sandbox, "com.x.app", "h", "")
+        r.register(new(TOK_A, ApnsEnv::Sandbox, "com.x.app", "h", ""))
             .unwrap();
         r.drop_dead(TOK_A, old);
         assert_eq!(r.len(), 1, "refreshed after the failing push: kept");
@@ -543,35 +835,171 @@ mod tests {
     fn bad_input_is_refused_not_stored() {
         let (mut r, _) = reg();
         assert!(
-            r.register("zz", ApnsEnv::Sandbox, "com.x", "h", "")
+            r.register(new("zz", ApnsEnv::Sandbox, "com.x", "h", ""))
                 .is_err()
         );
         assert!(
-            r.register(TOK_A, ApnsEnv::Sandbox, "com.x/../y", "h", "")
+            r.register(new(TOK_A, ApnsEnv::Sandbox, "com.x/../y", "h", ""))
                 .is_err()
         );
         assert!(
-            r.register(TOK_A, ApnsEnv::Sandbox, "com.x", "", "")
+            r.register(new(TOK_A, ApnsEnv::Sandbox, "com.x", "", ""))
                 .is_err()
         );
         assert!(r.is_empty());
     }
 
+    /// What the app's extension does (CryptoKit `AES.GCM.open` on the combined box).
+    fn open(key_b64: &str, host: &str, sealed: &str) -> Option<serde_json::Value> {
+        use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
+        let key = parse_key(key_b64)?;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(sealed)
+            .ok()?;
+        let (nonce, rest) = raw.split_at(12);
+        let mut buf = rest.to_vec();
+        let opener = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, &key).ok()?);
+        let mut aad = AAD_PREFIX.to_vec();
+        aad.extend_from_slice(host.as_bytes());
+        let plain = opener
+            .open_in_place(
+                Nonce::try_assume_unique_for_key(nonce).ok()?,
+                Aad::from(aad),
+                &mut buf,
+            )
+            .ok()?;
+        serde_json::from_slice(plain).ok()
+    }
+
     #[test]
-    fn the_payload_stays_under_four_kilobytes_and_keeps_its_routing() {
-        let body = "한글 본문 ".repeat(2000);
-        let p = payload(&"t".repeat(500), &body, "host-1", "nonce-7");
-        assert!(p.len() <= PAYLOAD_MAX);
-        let v: serde_json::Value = serde_json::from_slice(&p).unwrap();
-        assert_eq!(v["comux"]["pane"], "nonce-7");
-        assert_eq!(v["comux"]["host"], "host-1");
-        let b = v["aps"]["alert"]["body"].as_str().unwrap();
-        assert!(b.len() <= BODY_MAX && b.ends_with('…'));
-        assert!(v["aps"]["alert"]["title"].as_str().unwrap().len() <= TITLE_MAX);
-        // A body that is all escapes still fits: the body goes, the routing stays.
-        let nasty = "\u{1}".repeat(1024);
-        let p = payload("t", &nasty, "h", "p");
-        assert!(p.len() <= PAYLOAD_MAX);
+    fn a_sealed_push_opens_only_with_its_key_and_host() {
+        let sealed = seal(KEY, "host-1", "Claude finished", "본문", "nonce-7").unwrap();
+        let v = open(KEY, "host-1", &sealed).expect("opens");
+        assert_eq!(v["title"], "Claude finished");
+        assert_eq!(v["body"], "본문");
+        assert_eq!(v["pane"], "nonce-7");
+        assert!(
+            open(KEY, "host-2", &sealed).is_none(),
+            "bound to the host id"
+        );
+        let other = "HwECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+        assert!(open(other, "host-1", &sealed).is_none());
+        assert_ne!(
+            sealed,
+            seal(KEY, "host-1", "Claude finished", "본문", "nonce-7").unwrap(),
+            "a fresh nonce every time"
+        );
+        assert!(seal("short", "h", "t", "b", "p").is_none());
+    }
+
+    /// A fixed envelope (key 0..31, made with Python's `cryptography`); copad-ios'
+    /// `PushEnvelopeTests` opens the same bytes, so both sides agree on the format.
+    const VECTOR: &str = "ZGVmZ2hpamtsbW5vMzm8CR2QdKQciexQMcnS327gdmvlCdFIhb/DJpjGiH+2xWK0JWb3Yd/JWnyRI7+rfnv+jk4jMkCflY6rYoNG4P6NsvSrWFyi8wUC4g==";
+
+    #[test]
+    fn the_shared_vector_opens() {
+        let v = open(KEY, "host-1", VECTOR).expect("opens");
+        assert_eq!(v["title"], "Claude finished");
+        assert_eq!(v["body"], "본문");
+        assert_eq!(v["pane"], "nonce-7");
+    }
+
+    #[test]
+    fn the_envelope_fits_the_relay_and_the_payload_apns() {
+        for body in ["한글 본문 ".repeat(2000), "\u{1}".repeat(1024)] {
+            let sealed = seal(KEY, "host-1", &"t".repeat(500), &body, "nonce-7").unwrap();
+            assert!(sealed.len() <= 3000, "relay limit: {}", sealed.len());
+            let v = open(KEY, "host-1", &sealed).unwrap();
+            assert_eq!(v["pane"], "nonce-7", "the routing always survives");
+            assert!(v["title"].as_str().unwrap().len() <= TITLE_MAX);
+            let p = payload("host-1", &sealed);
+            assert!(p.len() <= 4096);
+            let p: serde_json::Value = serde_json::from_slice(&p).unwrap();
+            assert_eq!(p["aps"]["mutable-content"], 1);
+            assert_eq!(p["aps"]["alert"]["title"], PLACEHOLDER_TITLE);
+            assert_eq!(p["kid"], "host-1");
+            assert!(p.get("comux").is_none(), "no routing in the clear");
+        }
+    }
+
+    #[test]
+    fn keyless_registrations_load_but_are_never_sent_to() {
+        let (_, p) = reg();
+        std::fs::write(
+            &p,
+            format!(
+                r#"{{"regs":[{{"token":"{TOK_A}","env":"sandbox","topic":"com.x.app","host":"h","generation":1}}],"next":1}}"#
+            ),
+        )
+        .unwrap();
+        let mut r = Registry::load(p.clone());
+        assert_eq!(r.len(), 1, "an old file still loads");
+        assert!(r.targets().is_empty(), "but nothing goes out in the clear");
+        r.register(new(TOK_A, ApnsEnv::Sandbox, "com.x.app", "h", ""))
+            .unwrap();
+        assert_eq!(r.targets().len(), 1, "re-registering replaces it");
+        let mut keyless = new(TOK_B, ApnsEnv::Sandbox, "com.x.app", "h", "");
+        keyless.key = "";
+        assert!(
+            r.register(keyless).is_err(),
+            "an app without a key is refused"
+        );
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn the_relay_request_and_its_answers() {
+        let (mut r, p) = reg();
+        r.register(new(TOK_A, ApnsEnv::Sandbox, "com.x.app", "host-1", ""))
+            .unwrap();
+        let reg = &r.targets()[0];
+        let v = relay_request(reg, "c2VhbGVk", &collapse_id("host-1", "pane"));
+        assert_eq!(v["env"], "sandbox");
+        assert_eq!(v["bundle"], "com.x.app");
+        assert_eq!(v["kid"], "host-1");
+        assert_eq!(v["title"], PLACEHOLDER_TITLE);
+        let c = v["collapseId"].as_str().unwrap();
+        assert!(
+            c.len() == 32
+                && c.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        );
+        assert_eq!(relay_outcome(204, "", None), Outcome::Sent);
+        assert_eq!(relay_outcome(410, "unregistered", None), Outcome::Dead);
+        assert_eq!(
+            relay_outcome(429, "device_rate_limited", Some(30)),
+            Outcome::Wait {
+                device: true,
+                secs: 30
+            }
+        );
+        assert_eq!(
+            relay_outcome(429, "rate_limited", None),
+            Outcome::Wait {
+                device: false,
+                secs: 60
+            }
+        );
+        assert_eq!(
+            relay_outcome(503, "unavailable", Some(99999)),
+            Outcome::Wait {
+                device: false,
+                secs: 3600
+            }
+        );
+        // A 200 is some other page at a wrong URL, not a delivery.
+        assert_eq!(relay_outcome(200, "", None), Outcome::Failed);
+        assert_eq!(relay_outcome(400, "bad_request", None), Outcome::Failed);
+        let _ = std::fs::remove_file(p);
+    }
+
+    #[test]
+    fn relay_urls_are_https_or_local() {
+        assert!(check_relay_url("https://aide-push.marshallku.dev").is_ok());
+        assert!(check_relay_url("http://127.0.0.1:18090").is_ok());
+        assert!(check_relay_url("http://example.com").is_err());
+        assert!(check_relay_url("https://x.dev/?a=1").is_err());
+        assert!(check_relay_url("nope").is_err());
     }
 
     #[test]

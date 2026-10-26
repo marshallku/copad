@@ -100,11 +100,15 @@ final class MuxSession: ObservableObject, KeySink {
         guard let token = PushRegistry.shared.token, token != pushSent else { return }
         pushSent = token
         let hostID = host.id.uuidString
+        let key: String
+        do { key = try PushKeys.ensure(host: hostID) } catch {
+            PushRegistry.shared.setStatus(host: hostID, error.localizedDescription)
+            return
+        }
         command(["cmd": "push-register", "token": token, "env": PushRegistry.environment,
                  "topic": Bundle.main.bundleIdentifier ?? "", "host": hostID,
-                 "device": UIDevice.current.name]) { resp in
-            let ok = resp["ok"] as? Bool ?? false
-            PushRegistry.shared.setStatus(host: hostID, ok ? nil : (resp["error"] as? String ?? "push refused"))
+                 "device": UIDevice.current.name, "key": key]) { resp in
+            PushRegistry.shared.setStatus(host: hostID, PushRegistry.registrationProblem(resp))
         }
     }
 

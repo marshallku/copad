@@ -4460,16 +4460,28 @@ impl App {
                 topic,
                 host,
                 device,
+                key,
             } => {
-                if self.cfg.push.is_none() {
+                if self.cfg.push == crate::push::PushMode::Off {
                     return Resp::err(
-                        "push is not configured on this host: add [push] apns_key, apns_key_id \
-                         and apns_team_id to mux.toml"
+                        "pushes are off on this host ([push] relay = \"off\" in mux.toml)"
                             .to_string(),
                     );
                 }
-                match self.push_reg.register(token, *env, topic, host, device) {
-                    Ok(()) => Resp::ok(),
+                let reg = crate::push::NewReg {
+                    token,
+                    env: *env,
+                    topic,
+                    host,
+                    device,
+                    key,
+                };
+                match self.push_reg.register(reg) {
+                    Ok(()) => Resp {
+                        message: Some(format!("pushes via {}", self.cfg.push.describe())),
+                        e2e: Some(crate::push::E2E_VERSION),
+                        ..Resp::ok()
+                    },
                     Err(e) => Resp::err(e),
                 }
             }
@@ -8579,20 +8591,22 @@ impl App {
     /// Queue one APNs push per registered phone (decisions #175). Off the loop: the worker
     /// thread does the network. Independent of `notify`, which is about THIS machine's desktop.
     fn push_to_phones(&self, term: &TerminalId, title: &str, body: &str) {
-        let Some(cfg) = self.cfg.push.as_ref() else {
-            return;
-        };
-        if self.push_reg.is_empty() {
+        if self.cfg.push == crate::push::PushMode::Off || self.push_reg.is_empty() {
             return;
         }
         let pane = self.token_of(term).unwrap_or_default();
         for reg in self.push_reg.targets() {
-            let payload = crate::push::payload(title, body, &reg.host, &pane);
+            let Some(key) = reg.key.as_deref() else {
+                continue;
+            };
+            let Some(sealed) = crate::push::seal(key, &reg.host, title, body, &pane) else {
+                continue;
+            };
             self.pusher.push(crate::push::Job {
-                cfg: cfg.clone(),
+                mode: self.cfg.push.clone(),
+                collapse: crate::push::collapse_id(&reg.host, &pane),
                 reg,
-                payload,
-                collapse: pane.clone(),
+                sealed,
             });
         }
     }

@@ -27,12 +27,16 @@ UI, surfaces the local-notification permission state, and **persists the bearer
 token in the Keychain + seeds it so the PWA loads straight to the dashboard**
 (confirmed by screenshot: token page skipped, live tmux-pane list shown).
 
-**Not yet built** (needs an Apple developer account + a real device):
-- `registerForRemoteNotifications` + APNs — real background push. Pairs with
-  web-bridge **WU2b** (APNs device-token registration + send). v1 intentionally
-  does NOT call it (no `aps-environment` entitlement → would only fail).
-- Native keyboard accessory (the PWA ships its own on-screen `.kbd-bar`).
-- Biometric (Face ID) gate on the token, TestFlight distribution.
+## Push notifications
+
+comux pushes agent notifications to the native client (decisions #175, #177). By default every
+comux sends through the copad push relay (`https://aide-push.marshallku.dev`, AIDE's `aide
+push-relay`), which holds the app's APNs key — no Apple developer account on the host. Pushes are
+**end-to-end encrypted**: the app makes an AES-256 key per saved host, hands it to that host's
+comux with `push-register` over SSH, and comux seals title, body and pane with it. The relay and
+Apple see only "copad: Agent notification"; the `NotificationService` extension opens the
+envelope with the key from the shared Keychain group, and a tap is routed only from a push that
+opens. A comux older than this answers without `e2e`, and the hosts screen says to update it.
 
 ## Signing
 
@@ -57,7 +61,8 @@ copad-ios/scripts/testflight.sh status            # recent builds and their proc
 CI needs `IOS_DISTRIBUTION_CERTIFICATE_BASE64` / `_PASSWORD` (the "Apple Distribution" .p12)
 besides the `APP_STORE_CONNECT_*` secrets release.yml already uses.
 Release builds use `copad-ios.Release.entitlements` (production APNs, the keychain group under
-the team prefix); Debug keeps ad-hoc signing and the sandbox. The App Store Connect app record
+the team prefix) and the extension `com.marshall.copad.ios.NotificationService` gets its own
+profile in the same group; Debug keeps ad-hoc signing and the sandbox. The App Store Connect app record
 for `com.marshall.copad.ios` must exist before `beta` can upload — an API key cannot create one.
 
 ## Build & run (Simulator)

@@ -2,10 +2,11 @@ import SwiftUI
 import UIKit
 import UserNotifications
 
-/// APNs for agent notifications (decisions #175). comux pushes a notification it raises to every
-/// phone that registered with it; this app registers its device token with each comux it
-/// connects to, keeps a banner from showing for the host already on screen, and turns a tap into
-/// "open that host, jump to that pane".
+/// APNs for agent notifications (decisions #175, #177). comux pushes a notification it raises to
+/// every phone that registered with it, sealed with the key this app gave it for that host; this
+/// app registers its device token and key with each comux it connects to, keeps a banner from
+/// showing for the host already on screen, and turns a tap into "open that host, jump to that
+/// pane" — only for a push that opens with that host's key.
 @MainActor
 final class PushRegistry: ObservableObject {
     static let shared = PushRegistry()
@@ -51,6 +52,14 @@ final class PushRegistry: ObservableObject {
     }
 
     func setStatus(host: String, _ text: String?) { status[host] = text }
+
+    /// What's wrong with a `push-register` reply, or nil. A comux that doesn't say it seals
+    /// pushes (`e2e`) is older than encryption: count it as no pushes rather than trust it.
+    nonisolated static func registrationProblem(_ resp: [String: Any]) -> String? {
+        guard resp["ok"] as? Bool ?? false else { return resp["error"] as? String ?? "push refused" }
+        guard (resp["e2e"] as? Int ?? 0) >= 1 else { return "update comux on this host to get pushes" }
+        return nil
+    }
 }
 
 /// The app delegate SwiftUI lacks: APNs token callbacks and notification presentation.
@@ -72,7 +81,7 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
     /// A push for the host on screen shows nothing: the user is already looking at it.
     func userNotificationCenter(_ center: UNUserNotificationCenter, willPresent n: UNNotification,
                                 withCompletionHandler done: @escaping (UNNotificationPresentationOptions) -> Void) {
-        let host = Self.route(n.request.content.userInfo)?.host
+        let host = PushEnvelope.open(n.request.content.userInfo)?.host
         Task { @MainActor in
             done(host != nil && host == PushRegistry.shared.visibleHost ? [] : [.banner, .list, .sound])
         }
@@ -80,15 +89,11 @@ final class AppDelegate: NSObject, UIApplicationDelegate, UNUserNotificationCent
 
     func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive r: UNNotificationResponse,
                                 withCompletionHandler done: @escaping () -> Void) {
-        if let route = Self.route(r.notification.request.content.userInfo) {
-            Task { @MainActor in PushRegistry.shared.tapped = route }
+        // Routing is trusted only from a push that opens with the host's key: the relay could
+        // otherwise send any host and pane, with or without the extension having run.
+        if let opened = PushEnvelope.open(r.notification.request.content.userInfo) {
+            Task { @MainActor in PushRegistry.shared.tapped = (opened.host, opened.pane) }
         }
         done()
-    }
-
-    /// `comux.host` / `comux.pane` from the payload.
-    nonisolated static func route(_ info: [AnyHashable: Any]) -> (host: String, pane: String)? {
-        guard let c = info["comux"] as? [String: Any], let host = c["host"] as? String else { return nil }
-        return (host, c["pane"] as? String ?? "")
     }
 }

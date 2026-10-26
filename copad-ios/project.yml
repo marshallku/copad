@@ -25,12 +25,20 @@ settings:
     CODE_SIGN_IDENTITY: "-"
     MARKETING_VERSION: "0.1.0"
     CURRENT_PROJECT_VERSION: "1"
+  # The Keychain group the app and its notification service extension share (push keys,
+  # decisions #177); it must match the entitlements of each configuration.
+  configs:
+    Debug:
+      COPAD_KEYCHAIN_GROUP: com.marshall.copad.ios
+    Release:
+      COPAD_KEYCHAIN_GROUP: $(AppIdentifierPrefix)com.marshall.copad.ios
 targets:
   copad-ios:
     type: application
     platform: iOS
     sources:
       - Sources
+      - Shared
       # JetBrains Mono Nerd Font Mono (OFL, Resources/Fonts/OFL.txt): powerline + Nerd icons in
       # the terminal, one cell wide (decisions #174).
       - path: Resources
@@ -49,6 +57,9 @@ targets:
         Release:
           CODE_SIGN_ENTITLEMENTS: copad-ios.Release.entitlements
     dependencies:
+      # Opens the end-to-end encrypted pushes (decisions #177).
+      - target: NotificationService
+        embed: true
       - package: swift-nio-ssh
         product: NIOSSH
       - package: swift-nio
@@ -62,6 +73,7 @@ targets:
         # From the build settings, so fastlane's CURRENT_PROJECT_VERSION reaches TestFlight.
         CFBundleShortVersionString: $(MARKETING_VERSION)
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        CopadKeychainGroup: $(COPAD_KEYCHAIN_GROUP)
         # SSH uses only standard, exempt encryption (same declaration as AIDE); without it every
         # TestFlight build waits on the export-compliance question (decisions #176).
         ITSAppUsesNonExemptEncryption: false
@@ -84,6 +96,24 @@ targets:
         # Never NSAllowsArbitraryLoads.
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+  NotificationService:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: NotificationService
+        excludes: ["Info.plist", "*.entitlements"]
+      - Shared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.marshall.copad.ios.NotificationService
+        TARGETED_DEVICE_FAMILY: "1,2"
+        GENERATE_INFOPLIST_FILE: "NO"
+        INFOPLIST_FILE: NotificationService/Info.plist
+      configs:
+        Debug:
+          CODE_SIGN_ENTITLEMENTS: NotificationService/NotificationService.entitlements
+        Release:
+          CODE_SIGN_ENTITLEMENTS: NotificationService/NotificationService.Release.entitlements
   copad-iosTests:
     type: bundle.unit-test
     platform: iOS

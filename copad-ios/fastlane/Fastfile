@@ -4,6 +4,8 @@ default_platform(:ios)
 # Connect API key, so no Apple ID login. Run through copad-ios/scripts/testflight.sh (locally or
 # in .github/workflows/testflight.yml); CI passes the key through the APP_STORE_CONNECT_* env.
 APP_ID   = "com.marshall.copad.ios"
+# The notification service extension that opens end-to-end encrypted pushes (decisions #177).
+EXT_ID   = "com.marshall.copad.ios.NotificationService"
 TEAM_ID  = "8QNJMX7JJ2"
 KEY_ID   = ENV.fetch("APP_STORE_CONNECT_KEY_ID", "46AYC5A487")
 ISSUER   = ENV.fetch("APP_STORE_CONNECT_ISSUER_ID", "9cf136f0-5d38-441e-bed9-68fd87649ecf")
@@ -22,6 +24,17 @@ def connect_api
   )
 end
 
+def ensure_bundle(identifier, name)
+  bundle = Spaceship::ConnectAPI::BundleId.all.find { |b| b.identifier == identifier }
+  if bundle
+    UI.message("Bundle ID #{identifier} already registered")
+    return bundle
+  end
+  bundle = Spaceship::ConnectAPI::BundleId.create(name: name, identifier: identifier, platform: "IOS")
+  UI.success("Registered bundle ID #{identifier}")
+  bundle
+end
+
 platform :ios do
   # Registers the bundle ID if missing and enables Push Notifications on it (comux pushes
   # agent turns over APNs). Apple invalidates existing profiles when a capability changes, so
@@ -29,13 +42,8 @@ platform :ios do
   # an API key: create it once at appstoreconnect.apple.com before running `beta`.
   lane :register do
     connect_api
-    bundle = Spaceship::ConnectAPI::BundleId.all.find { |b| b.identifier == APP_ID }
-    if bundle
-      UI.message("Bundle ID #{APP_ID} already registered")
-    else
-      bundle = Spaceship::ConnectAPI::BundleId.create(name: "copad", identifier: APP_ID, platform: "IOS")
-      UI.success("Registered bundle ID #{APP_ID}")
-    end
+    bundle = ensure_bundle(APP_ID, "copad")
+    ensure_bundle(EXT_ID, "copad notifications")
     push = Spaceship::ConnectAPI::BundleIdCapability::Type::PUSH_NOTIFICATIONS
     if bundle.get_capabilities.any? { |c| c.capability_type == push }
       UI.message("Push Notifications already enabled")
@@ -63,20 +71,23 @@ platform :ios do
       1
     end
 
-    get_provisioning_profile(app_identifier: APP_ID, api_key: key, output_path: OUT, force: @capabilities_changed == true)
-    profile_name = lane_context[SharedValues::SIGH_NAME]
-
-    # Signing goes on the app target only: as xcargs it would reach the Swift packages'
-    # targets, which refuse a provisioning profile.
-    update_code_signing_settings(
-      path: "copad-ios.xcodeproj",
-      targets: ["copad-ios"],
-      build_configurations: ["Release"],
-      use_automatic_signing: false,
-      team_id: TEAM_ID,
-      code_sign_identity: "Apple Distribution",
-      profile_name: profile_name,
-    )
+    # One App Store profile per target; signing goes on the targets only: as xcargs it would
+    # reach the Swift packages' targets, which refuse a provisioning profile.
+    profiles = { APP_ID => "copad-ios", EXT_ID => "NotificationService" }.to_h do |id, target|
+      get_provisioning_profile(app_identifier: id, api_key: key, output_path: OUT,
+                               force: @capabilities_changed == true)
+      name = lane_context[SharedValues::SIGH_NAME]
+      update_code_signing_settings(
+        path: "copad-ios.xcodeproj",
+        targets: [target],
+        build_configurations: ["Release"],
+        use_automatic_signing: false,
+        team_id: TEAM_ID,
+        code_sign_identity: "Apple Distribution",
+        profile_name: name,
+      )
+      [id, name]
+    end
 
     build_app(
       project: "copad-ios.xcodeproj",
@@ -87,7 +98,7 @@ platform :ios do
       output_name: "copad.ipa",
       export_options: {
         signingStyle: "manual",
-        provisioningProfiles: { APP_ID => profile_name },
+        provisioningProfiles: profiles,
       },
       xcargs: [
         "-skipPackagePluginValidation",
