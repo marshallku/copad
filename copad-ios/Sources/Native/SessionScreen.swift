@@ -346,7 +346,8 @@ struct SpacesDrawer: View {
     }
 }
 
-/// The notification center: newest first; a tap jumps to the pane and marks it read.
+/// The notification center: newest first; a tap jumps to the pane and removes its
+/// notifications, a swipe dismisses one.
 struct NotificationsDrawer: View {
     @ObservedObject var session: MuxSession
     var act: (() -> Void) -> Void
@@ -356,10 +357,7 @@ struct NotificationsDrawer: View {
             Section {
                 ForEach(session.model.notifications?.items ?? []) { n in
                     Button {
-                        act {
-                            session.markRead(n.id)
-                            if !n.token.isEmpty { session.jump(n.token) }
-                        }
+                        act { session.openNotification(n) }
                     } label: {
                         VStack(alignment: .leading, spacing: 2) {
                             HStack {
@@ -373,12 +371,13 @@ struct NotificationsDrawer: View {
                         }
                     }
                     .accessibilityIdentifier("notif-\(n.id)")
+                    .swipeActions { Button("Dismiss", role: .destructive) { session.dismissNotification(n.id) } }
                 }
             } header: {
                 HStack {
                     Text("notifications")
                     Spacer()
-                    Button("Mark all read") { act { session.markRead(nil) } }.font(.caption)
+                    Button("Clear all") { session.dismissNotification(nil) }.font(.caption)
                 }
             }
         }

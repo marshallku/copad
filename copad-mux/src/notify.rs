@@ -92,6 +92,8 @@ pub fn action_command(exe: &str, target: &str, env: &[(String, String)]) -> Stri
     }
     parts.push(shell_quote(exe));
     parts.push("jump".to_string());
+    // A clicked toast has been seen: its pane's notifications leave the center.
+    parts.push("--consume".to_string());
     parts.push(shell_quote(target));
     parts.join(" ")
 }
@@ -284,7 +286,7 @@ mod tests {
             "{cmd}"
         );
         assert!(
-            cmd.ends_with("'/usr/local/bin/comux' jump 'a1b2-7'"),
+            cmd.ends_with("'/usr/local/bin/comux' jump --consume 'a1b2-7'"),
             "{cmd}"
         );
     }

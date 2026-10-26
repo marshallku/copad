@@ -395,6 +395,25 @@ final class MuxSession: ObservableObject, KeySink {
     func selectTab(_ id: String) { command(["cmd": "select-tab", "target": id]) }
     func jump(_ token: String) { command(["cmd": "jump", "target": token]) }
     func newTab() { command(["cmd": "new-tab"]) }
+    /// Open a notification: go to its pane, which also removes that pane's notifications
+    /// (`consume`; an older comux ignores it and just jumps). One whose pane is gone is
+    /// simply dismissed.
+    func openNotification(_ n: L0Notification) {
+        markRead(n.id)
+        if n.token.isEmpty {
+            dismissNotification(n.id)
+        } else {
+            command(["cmd": "jump", "target": n.token, "consume": true])
+        }
+    }
+
+    /// Remove one notification, or all of them.
+    func dismissNotification(_ id: UInt64?) {
+        var req: [String: Any] = ["cmd": "notif-dismiss"]
+        if let id { req["id"] = id }
+        command(req)
+    }
+
     func markRead(_ id: UInt64?) {
         var req: [String: Any] = ["cmd": "notif-read"]
         if let id { req["id"] = id }

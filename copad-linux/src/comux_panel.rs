@@ -150,7 +150,14 @@ impl ComuxPanel {
         let notifications = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         notifications.set_width_request(300);
         notifications.set_widget_name("comux-notifications");
-        notifications.append(&heading("notifications"));
+        let notif_head = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        let notif_title = heading("notifications");
+        notif_title.set_hexpand(true);
+        notif_head.append(&notif_title);
+        let clear_all = gtk4::Button::with_label("Clear all");
+        clear_all.add_css_class("flat");
+        notif_head.append(&clear_all);
+        notifications.append(&notif_head);
         let notif_list = gtk4::ListBox::new();
         let nscroll = gtk4::ScrolledWindow::new();
         nscroll.set_vexpand(true);
@@ -197,6 +204,12 @@ impl ComuxPanel {
                 }
             });
         }
+        let w = Rc::downgrade(&this);
+        clear_all.connect_clicked(move |_| {
+            if let Some(p) = w.upgrade() {
+                p.cur().command(json!({"cmd": "notif-dismiss"}));
+            }
+        });
         let w = Rc::downgrade(&this);
         this.bell.connect_clicked(move |_| {
             if let Some(p) = w.upgrade() {
@@ -633,11 +646,17 @@ impl ComuxPanel {
                 n["when"].as_str().unwrap_or_default()
             );
             let body = n["body"].as_str().unwrap_or_default();
-            self.notif_list
-                .append(&two_line(&title, body, n["read"].as_bool() != Some(true)));
+            let row = two_line(&title, body, n["read"].as_bool() != Some(true));
+            let dismiss = json!({"cmd": "notif-dismiss", "id": n["id"]});
+            self.context_menu(&row, vec![("Dismiss", Act::Cmd(dismiss.clone()))]);
+            self.notif_list.append(&row);
+            // Opening one consumes it and its pane's others (`consume`, which an older comux
+            // ignores while still jumping); one whose pane is gone is just dismissed.
             let mut acts = vec![json!({"cmd": "notif-read", "id": n["id"]})];
             if n["token"].as_str().is_some_and(|t| !t.is_empty()) {
-                acts.push(json!({"cmd": "jump", "target": n["token"]}));
+                acts.push(json!({"cmd": "jump", "target": n["token"], "consume": true}));
+            } else {
+                acts.push(dismiss);
             }
             na.push(acts);
         }

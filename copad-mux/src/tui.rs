@@ -249,6 +249,9 @@ enum ClickTarget {
     Usage,
 }
 
+/// The notification center's box `(x0, y0, x1, y1)` and its `(row y, notification id)`s.
+type CenterHits = ((u16, u16, u16, u16), Vec<(u16, u64)>);
+
 /// A rectangular hit region (inclusive `x0..=x1`, `y0..=y1`) recorded during render.
 struct ClickZone {
     x0: u16,
@@ -1018,6 +1021,9 @@ pub struct App {
     /// `mouse_at` can hit-test a click on the status bar / sidebar. Interior mutability
     /// because rendering is `&self`; only ever touched on the single main-loop thread.
     click_zones: RefCell<Vec<ClickZone>>,
+    /// The open notification center as last drawn: its box `(x0, y0, x1, y1)` (inclusive) and
+    /// `(row y, notification id)` per visible entry — what a click on it hits.
+    center_hits: RefCell<CenterHits>,
     /// Shared usage/limits readout (`coctl usage --limits`), written by a background
     /// poller thread (`usagepoll`), read into `usage_shown` at the label cadence.
     usage_poll: usagepoll::Shared,
@@ -1238,6 +1244,7 @@ impl App {
             sidebar_focus: None,
             cfg,
             click_zones: RefCell::new(Vec::new()),
+            center_hits: RefCell::new(((0, 0, 0, 0), Vec::new())),
             // Idle until `start_usage_poll` (called by the server); tests that build an
             // App without a server never spawn the poller thread.
             usage_poll: usagepoll::idle(),
@@ -4491,6 +4498,13 @@ impl App {
                     Err(e) => Resp::err(e),
                 }
             }
+            Req::NotifDismiss { id, same_pane } => {
+                let n = self.notif_dismiss(*id, *same_pane);
+                Resp {
+                    message: Some(format!("{n} dismissed")),
+                    ..Resp::ok()
+                }
+            }
             Req::NotifRead { id } => {
                 let n = self.notif_read(*id);
                 Resp {
@@ -4702,8 +4716,11 @@ impl App {
                 }
                 None => Resp::err_code("not_found", "no navigation history in that direction"),
             },
-            Req::Jump { target } => match self.resolve_pane_target(target) {
+            Req::Jump { target, consume } => match self.resolve_pane_target(target) {
                 Some(term) => {
+                    if *consume {
+                        self.consume_notifications(&term);
+                    }
                     self.jump_to_terminal(&term);
                     Resp::jump(self.raise_target(), self.copad_target())
                 }
@@ -5905,6 +5922,13 @@ impl App {
                 MouseKind::Click | MouseKind::RightClick => self.help = None,
                 _ => {}
             }
+            return None;
+        }
+        // The notification center is modal too: the wheel moves the selection, a click on an
+        // entry opens it (jump + its pane's notifications leave), a click outside the box
+        // closes it, and nothing reaches what is underneath.
+        if self.center.is_some() {
+            self.center_mouse(x, y, kind);
             return None;
         }
         // Right-button events + clicks on an OPEN menu belong to the context menu.
@@ -7438,6 +7462,28 @@ impl App {
         }
     }
 
+    fn center_mouse(&mut self, x: u16, y: u16, kind: MouseKind) {
+        match kind {
+            MouseKind::ScrollUp => self.center_move(-1),
+            MouseKind::ScrollDown => self.center_move(1),
+            MouseKind::Click => {
+                let ((x0, y0, x1, y1), rows) = self.center_hits.borrow().clone();
+                if x < x0 || x > x1 || y < y0 || y > y1 {
+                    self.center = None;
+                    return;
+                }
+                let hit = rows.iter().find(|(ry, _)| *ry == y).map(|(_, id)| *id);
+                if let Some(pos) =
+                    hit.and_then(|id| self.notifications.iter().position(|n| n.id == id))
+                {
+                    self.center = Some(pos);
+                    self.center_jump();
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Jump to the selected notification's source pane (session + tab + focus) and
     /// close the center.
     fn center_jump(&mut self) {
@@ -7445,20 +7491,16 @@ impl App {
             && let Some(note) = self.notifications.get(sel).cloned()
         {
             self.center = None;
-            self.mark_read(&note.terminal);
+            self.consume_notifications(&note.terminal);
             self.jump_to_terminal(&note.terminal);
         }
     }
 
-    /// Mark every notification from `term` read.
-    fn mark_read(&mut self, term: &TerminalId) {
-        for n in self
-            .notifications
-            .iter_mut()
-            .filter(|n| n.terminal == *term)
-        {
-            n.read = true;
-        }
+    /// The user is going to `term`: its notifications have been seen and leave the center
+    /// (opening one from the center, `Ctrl-b u`, a clicked toast or a host's row).
+    fn consume_notifications(&mut self, term: &TerminalId) {
+        self.notifications.retain(|n| n.terminal != *term);
+        self.reconcile_center();
     }
 
     /// Unread notifications whose pane still exists.
@@ -7484,7 +7526,7 @@ impl App {
         };
         match target {
             Some(term) => {
-                self.mark_read(&term);
+                self.consume_notifications(&term);
                 self.jump_to_terminal(&term);
             }
             None => self.flash("no unread notifications".into(), false),
@@ -10819,6 +10861,7 @@ impl App {
         let border = Style::default().fg(CAT_MAUVE).bg(bg);
 
         draw_box(buf, x0, y0, w, h, border);
+        let mut hits = Vec::new();
 
         let put = |buf: &mut Buffer, y: u16, x: u16, maxw: u16, s: &str, st: Style| {
             put_str(buf, x, y, x.saturating_add(maxw), s, st);
@@ -10832,7 +10875,7 @@ impl App {
             inner_x,
             inner_w,
             &format!(
-                " notifications ({}, {} unread) — j/k · enter jump · d dismiss · D clear · q ",
+                " notifications ({}, {} unread) — j/k · enter/click open · d dismiss · D clear · q ",
                 self.notifications.len(),
                 self.unread_count()
             ),
@@ -10851,6 +10894,7 @@ impl App {
                 "  (no notifications yet)",
                 Style::default().fg(CAT_OVERLAY).bg(bg),
             );
+            *self.center_hits.borrow_mut() = ((x0, y0, x0 + w - 1, y0 + h - 1), hits);
             return;
         }
 
@@ -10893,7 +10937,9 @@ impl App {
             };
             let padded = pad_width(&row, inner_w as usize);
             put(buf, y, inner_x, inner_w, &padded, st);
+            hits.push((y, note.id));
         }
+        *self.center_hits.borrow_mut() = ((x0, y0, x0 + w - 1, y0 + h - 1), hits);
     }
 }
 
@@ -17928,6 +17974,133 @@ mod host_api {
         assert_eq!(app.host_notifications().unread, 1);
         app.handle_control(&Req::NotifRead { id: None });
         assert_eq!(app.host_notifications().unread, 0);
+    }
+
+    /// Opening a notification consumes it and every other one from its pane (owner: clicking
+    /// one used to leave it there); other panes' entries stay.
+    #[test]
+    fn opening_a_notification_removes_its_panes_entries() {
+        let mut app = app();
+        let first = app.focused_terminal().unwrap();
+        let second = app.new_tab().expect("tab");
+        app.raise_notification(first.clone(), "claude".into(), "done", "a".into());
+        app.raise_notification(first.clone(), "claude".into(), "blocked", "b".into());
+        app.raise_notification(second.clone(), "codex".into(), "done", "c".into());
+        // A host's row click: jump with consume.
+        let token = app.token_of(&first).unwrap();
+        assert!(
+            app.handle_control(&Req::Jump {
+                target: token,
+                consume: true
+            })
+            .ok
+        );
+        let left: Vec<String> = app
+            .host_notifications()
+            .items
+            .iter()
+            .map(|n| n.body.clone())
+            .collect();
+        assert_eq!(left, vec!["c"], "only the other pane's entry is left");
+        assert_eq!(app.focused_terminal(), Some(first.clone()));
+        // A plain jump (sidebar agent row) does not consume.
+        let t2 = app.token_of(&second).unwrap();
+        assert!(
+            app.handle_control(&Req::Jump {
+                target: t2,
+                consume: false
+            })
+            .ok
+        );
+        assert_eq!(app.host_notifications().items.len(), 1);
+        // The TUI center: Enter on the selected entry consumes too.
+        app.open_center();
+        app.center_jump();
+        assert!(app.host_notifications().items.is_empty());
+        assert!(app.center.is_none());
+    }
+
+    #[test]
+    fn notifications_are_dismissed_one_by_pane_or_all() {
+        let mut app = app();
+        let first = app.focused_terminal().unwrap();
+        let second = app.new_tab().expect("tab");
+        for (t, b) in [(&first, "a"), (&first, "b"), (&second, "c"), (&second, "d")] {
+            app.raise_notification(t.clone(), "claude".into(), "done", b.into());
+        }
+        let id = |app: &App, body: &str| {
+            app.host_notifications()
+                .items
+                .iter()
+                .find(|n| n.body == body)
+                .unwrap()
+                .id
+        };
+        let d = id(&app, "d");
+        app.handle_control(&Req::NotifDismiss {
+            id: Some(d),
+            same_pane: false,
+        });
+        assert_eq!(app.host_notifications().items.len(), 3, "one entry");
+        let a = id(&app, "a");
+        app.handle_control(&Req::NotifDismiss {
+            id: Some(a),
+            same_pane: true,
+        });
+        let left: Vec<String> = app
+            .host_notifications()
+            .items
+            .iter()
+            .map(|n| n.body.clone())
+            .collect();
+        assert_eq!(left, vec!["c"], "a and its pane-mate b");
+        let r = app.handle_control(&Req::NotifDismiss {
+            id: Some(9999),
+            same_pane: true,
+        });
+        assert!(
+            r.ok && app.host_notifications().items.len() == 1,
+            "a stale id removes nothing"
+        );
+        // The center stays valid while entries go under it.
+        app.open_center();
+        app.center = Some(0);
+        app.handle_control(&Req::NotifDismiss {
+            id: None,
+            same_pane: false,
+        });
+        assert!(app.host_notifications().items.is_empty());
+        app.reconcile_center();
+        assert_eq!(app.center, Some(0), "open, empty");
+    }
+
+    /// The center takes the mouse while open: a click on an entry opens it, a click outside
+    /// the box closes it, and nothing falls through to the panes.
+    #[test]
+    fn the_center_is_clickable_and_modal() {
+        let mut app = app();
+        let first = app.focused_terminal().unwrap();
+        let second = app.new_tab().expect("tab");
+        app.raise_notification(first.clone(), "claude".into(), "done", "here".into());
+        app.open_center();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 100, 30));
+        app.render_center(&mut buf);
+        let ((x0, y0, x1, y1), rows) = app.center_hits.borrow().clone();
+        assert_eq!(rows.len(), 1);
+        // Inside the box but not on a row: nothing happens, the center stays.
+        app.center_mouse(x0 + 2, y1, MouseKind::Click);
+        assert!(app.center.is_some());
+        assert_eq!(app.focused_terminal(), Some(second.clone()));
+        let (ry, _) = rows[0];
+        app.center_mouse(x0 + 4, ry, MouseKind::Click);
+        assert!(app.center.is_none(), "opened");
+        assert_eq!(app.focused_terminal(), Some(first));
+        assert!(app.host_notifications().items.is_empty());
+        // Outside the box: closes.
+        app.open_center();
+        app.render_center(&mut buf);
+        app.center_mouse(x1 + 1, y0, MouseKind::Click);
+        assert!(app.center.is_none());
     }
 
     /// Overlay delegation (decisions #170): an overlay the input opened goes to the host,

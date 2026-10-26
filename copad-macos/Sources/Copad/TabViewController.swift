@@ -44,6 +44,12 @@ final class TabViewController: NSViewController {
     private var comuxNotificationsWidth: NSLayoutConstraint!
     private var comuxStatus: NSView!
     private var comuxStatusHeight: NSLayoutConstraint!
+    /// Where the docked notification panel takes room from the terminal; zero while it floats
+    /// over the terminal instead (a window too narrow for both panels and 40 columns).
+    private var comuxNotifSlot: NSView!
+    private var comuxNotifSlotWidth: NSLayoutConstraint!
+    /// Closes the floating notification panel on Esc or a click outside it.
+    private var comuxFloatMonitor: Any?
     /// The delegated overlay this window is showing as a sheet, if any.
     private var comuxOverlayShown: UInt64?
     private weak var comuxOverlaySheet: NSHostingController<ComuxOverlayView>?
@@ -486,6 +492,7 @@ final class TabViewController: NSViewController {
     /// (new/close/switch tab, split, rename). Coalesces bursts into one atomic
     /// write ~800ms later on the main run loop. No-op while restoring.
     deinit {
+        if let m = comuxFloatMonitor { NSEvent.removeMonitor(m) }
         for token in globalObservers {
             NotificationCenter.default.removeObserver(token)
         }
@@ -505,16 +512,19 @@ final class TabViewController: NSViewController {
         }))
         let notifications = NSHostingView(rootView: ComuxNotifications(host: host, settle: settle))
         let status = NSHostingView(rootView: ComuxStatusStrip(host: host, settle: settle))
-        for v in [sidebar, notifications, status] as [NSView] {
+        let slot = NSView()
+        for v in [slot, sidebar, notifications, status] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             contentArea.addSubview(v)
         }
         comuxSidebar = sidebar
         comuxNotifications = notifications
         comuxStatus = status
+        comuxNotifSlot = slot
         comuxStatusHeight = status.heightAnchor.constraint(equalToConstant: 0)
         comuxSidebarWidth = sidebar.widthAnchor.constraint(equalToConstant: 0)
         comuxNotificationsWidth = notifications.widthAnchor.constraint(equalToConstant: 0)
+        comuxNotifSlotWidth = slot.widthAnchor.constraint(equalToConstant: 0)
         NSLayoutConstraint.activate([
             sidebar.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
             sidebar.topAnchor.constraint(equalTo: contentArea.topAnchor),
@@ -528,7 +538,12 @@ final class TabViewController: NSViewController {
             notifications.topAnchor.constraint(equalTo: contentArea.topAnchor),
             notifications.bottomAnchor.constraint(equalTo: status.topAnchor),
             comuxNotificationsWidth,
+            slot.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
+            slot.topAnchor.constraint(equalTo: contentArea.topAnchor),
+            slot.bottomAnchor.constraint(equalTo: status.topAnchor),
+            comuxNotifSlotWidth,
         ])
+        comuxWindow.style = ComuxStyle.make(config: config, theme: theme)
         sidebar.isHidden = true
         notifications.isHidden = true
         status.isHidden = true
@@ -562,13 +577,70 @@ final class TabViewController: NSViewController {
         comuxWindow.update(panels: comuxServed)
         let on = comuxWindow.state != nil
         comuxSidebar.isHidden = !on
-        comuxSidebarWidth.constant = on ? 240 : 0
-        let notif = on && comuxNotificationsOpen
-        comuxNotifications.isHidden = !notif
-        comuxNotificationsWidth.constant = notif ? 300 : 0
         comuxStatus.isHidden = !on
-        comuxStatusHeight.constant = on ? 24 : 0
+        layoutComuxChrome()
         presentComuxOverlay()
+    }
+
+    /// Panel sizes follow the terminal font (decisions #178) within a budget of the window: the
+    /// sidebar takes at most 30% of it, the notification panel 35%, and when the two would
+    /// leave the terminal under 40 columns the notification panel floats over it instead.
+    private func layoutComuxChrome() {
+        guard comuxSidebar != nil else { return }
+        let on = comuxWindow.state != nil
+        let st = comuxWindow.style
+        let width = contentArea.bounds.width
+        let side = on ? min(max(30 * st.advance, 200), max(0.3 * width, 160)).rounded() : 0
+        let notifOpen = on && comuxNotificationsOpen
+        let notif = notifOpen ? min(max(38 * st.advance, 260), max(0.35 * width, 220)).rounded() : 0
+        let floating = notifOpen && width - side - notif < 40 * st.advance
+        set(comuxSidebarWidth, side)
+        set(comuxStatusHeight, on ? st.statusHeight : 0)
+        set(comuxNotificationsWidth, notif)
+        set(comuxNotifSlotWidth, floating ? 0 : notif)
+        comuxNotifications.isHidden = !notifOpen
+        if comuxWindow.notificationsFloating != floating { comuxWindow.notificationsFloating = floating }
+        watchFloatingNotifications(floating)
+    }
+
+    private func set(_ c: NSLayoutConstraint, _ v: CGFloat) {
+        if c.constant != v { c.constant = v }
+    }
+
+    /// While the notification panel floats, Esc or a click outside it closes it.
+    private func watchFloatingNotifications(_ on: Bool) {
+        if !on {
+            if let m = comuxFloatMonitor { NSEvent.removeMonitor(m) }
+            comuxFloatMonitor = nil
+            return
+        }
+        guard comuxFloatMonitor == nil else { return }
+        comuxFloatMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown]) { [weak self] e in
+            guard let self, e.window === self.view.window, self.comuxNotificationsOpen else { return e }
+            if e.type == .keyDown, e.keyCode == 53 {
+                self.closeComuxNotifications()
+                return nil
+            }
+            if e.type == .leftMouseDown {
+                // The sidebar (whose bell toggles this panel) is not "outside": closing here
+                // and then running the bell's toggle would reopen it.
+                let inside = [self.comuxNotifications, self.comuxSidebar].contains { v in
+                    v.map { $0.bounds.contains($0.convert(e.locationInWindow, from: nil)) } ?? false
+                }
+                if !inside { self.closeComuxNotifications() }
+            }
+            return e
+        }
+    }
+
+    private func closeComuxNotifications() {
+        comuxNotificationsOpen = false
+        refreshComuxChrome()
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        layoutComuxChrome()
     }
 
     /// Show the oldest overlay a comux client in THIS window's visible panes opened: a sheet, or
@@ -878,12 +950,13 @@ final class TabViewController: NSViewController {
         activeIndex = index
         let manager = paneManagers[index]
 
-        contentArea.addSubview(manager.containerView)
+        // Under the comux chrome, so a floating notification panel stays on top of it.
+        contentArea.addSubview(manager.containerView, positioned: .below, relativeTo: comuxNotifSlot)
         NSLayoutConstraint.activate([
             manager.containerView.topAnchor.constraint(equalTo: contentArea.topAnchor),
             // Between the comux panels, which are zero-width unless this window hosts a comux.
             manager.containerView.leadingAnchor.constraint(equalTo: comuxSidebar.trailingAnchor),
-            manager.containerView.trailingAnchor.constraint(equalTo: comuxNotifications.leadingAnchor),
+            manager.containerView.trailingAnchor.constraint(equalTo: comuxNotifSlot.leadingAnchor),
             manager.containerView.bottomAnchor.constraint(equalTo: comuxStatus.topAnchor),
         ])
 
@@ -973,6 +1046,8 @@ final class TabViewController: NSViewController {
         // outer bar bgs pick up the alpha.
         tabBar?.applyWindowOpacity(newConfig.windowOpacity, theme: theme)
         statusBar?.applyWindowOpacity(newConfig.windowOpacity, theme: theme)
+        comuxWindow.style = ComuxStyle.make(config: newConfig, theme: theme)
+        layoutComuxChrome()
 
         // Fan out to existing pane trees (theme/font/security; current zoom preserved).
         for paneManager in paneManagers {

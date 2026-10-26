@@ -221,6 +221,26 @@ impl App {
     }
 
     /// `notif-read`: mark one notification (or all) read. Returns how many changed.
+    /// Remove entry `id` (with `same_pane`, every entry from its pane), or all of them.
+    /// Returns how many went; an unknown id removes nothing.
+    pub(super) fn notif_dismiss(&mut self, id: Option<u64>, same_pane: bool) -> usize {
+        let before = self.notifications.len();
+        match id {
+            None => self.notifications.clear(),
+            Some(id) => {
+                let pane = self
+                    .notifications
+                    .iter()
+                    .find(|n| n.id == id)
+                    .map(|n| n.terminal.clone());
+                self.notifications
+                    .retain(|n| n.id != id && !(same_pane && pane.as_ref() == Some(&n.terminal)));
+            }
+        }
+        self.reconcile_center();
+        before - self.notifications.len()
+    }
+
     pub(super) fn notif_read(&mut self, id: Option<u64>) -> usize {
         let mut n = 0;
         for x in self.notifications.iter_mut() {

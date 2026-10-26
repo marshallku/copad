@@ -604,19 +604,27 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
     /// → family lookup → case-insensitive fallback → monospaced
     /// system. Trimmed to the cases we need for the alacritty path.
     private func resolveFont(family: String, size: CGFloat) -> NSFont {
-        if let font = NSFont(name: family, size: size) { return font }
-        let manager = NSFontManager.shared
-        if let font = manager.font(withFamily: family, traits: [], weight: 5, size: size) {
+        resolveTerminalFont(family: family, size: size)
+    }
+}
+
+/// The configured `font_family` as the terminal draws it: a font name, else a family (any
+/// case — configs say "Jetbrains mono nerd font"), else the system monospace. Shared with the
+/// comux chrome so it uses the very same face.
+@MainActor
+func resolveTerminalFont(family: String, size: CGFloat) -> NSFont {
+    if let font = NSFont(name: family, size: size) { return font }
+    let manager = NSFontManager.shared
+    if let font = manager.font(withFamily: family, traits: [], weight: 5, size: size) {
+        return font
+    }
+    let lower = family.lowercased()
+    for fam in manager.availableFontFamilies where fam.lowercased() == lower {
+        if let font = manager.font(withFamily: fam, traits: [], weight: 5, size: size) {
             return font
         }
-        let lower = family.lowercased()
-        for fam in manager.availableFontFamilies where fam.lowercased() == lower {
-            if let font = manager.font(withFamily: fam, traits: [], weight: 5, size: size) {
-                return font
-            }
-        }
-        return .monospacedSystemFont(ofSize: size, weight: .regular)
     }
+    return .monospacedSystemFont(ofSize: size, weight: .regular)
 }
 
 // MARK: - Render view

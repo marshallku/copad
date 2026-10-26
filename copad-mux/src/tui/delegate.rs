@@ -535,7 +535,7 @@ impl App {
             self.notifications.remove(pos);
         } else {
             let term = self.notifications[pos].terminal.clone();
-            self.mark_read(&term);
+            self.consume_notifications(&term);
             if self.panes.contains_key(&term) {
                 self.jump_to_terminal(&term);
             }

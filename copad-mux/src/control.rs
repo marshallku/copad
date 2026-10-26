@@ -241,7 +241,14 @@ pub enum Req {
     /// CLI — not the server — then activates: the server's environment has been scrubbed
     /// of the session variables a GUI command needs, and a long-lived daemon is the wrong
     /// process to attribute macOS automation permission to.
-    Jump { target: String },
+    Jump {
+        target: String,
+        /// Also remove that pane's notifications from the center: the user is going to look at
+        /// it (a toast or a host's notification row was clicked). Older servers ignore it and
+        /// just jump.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        consume: bool,
+    },
     /// Move the shared view along the navigation history (decisions #140): `back`/`forward`
     /// walk it like a browser, `last` toggles to the previous place like Alt-Tab.
     Nav { dir: NavDir },
@@ -310,6 +317,14 @@ pub enum Req {
     NotifRead {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<u64>,
+    },
+    /// Remove a notification-center entry (`id`; with `same_pane`, every entry from its pane
+    /// too), or all of them (no `id`). What a host's dismiss button and "Clear all" send.
+    NotifDismiss {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        same_pane: bool,
     },
     /// Go to the pane pinned in `slot`. Moves the shared view.
     GotoMark { slot: u8 },
@@ -2023,6 +2038,7 @@ pub fn run_client(args: &[String]) -> i32 {
             };
             Req::Jump {
                 target: target.clone(),
+                consume: p.has("--consume"),
             }
         }
         "notify" => {
@@ -2608,10 +2624,10 @@ const CAPTURE_SPEC: Spec = Spec {
 };
 
 const JUMP_SPEC: Spec = Spec {
-    usage: "usage: comux jump <pane-token|terminal-id> [--no-raise]\n\
+    usage: "usage: comux jump <pane-token|terminal-id> [--no-raise] [--consume]\n\
             hint:  a pane's own shell has it in $COPAD_MUX_PANE; \
-            `comux list --json` prints the rest",
-    flags: &[flag(&["--no-raise"])],
+            `comux list --json` prints the rest; --consume also clears that pane's notifications",
+    flags: &[flag(&["--no-raise"]), flag(&["--consume"])],
     positionals: Positionals::AtMost(1),
 };
 

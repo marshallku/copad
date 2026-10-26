@@ -10,7 +10,8 @@
 #   5. a second host cannot steal the claim (refused)
 #   6. the claiming host disconnecting brings the TUI chrome back
 #   7. a subscriber that never reads does not stall rendering
-#   8. notifications: a notify event + unread count, and notif-read clears it
+#   8. notifications: a notify event + unread count, notif-read clears it, jump with consume
+#      removes the pane's notifications and notif-dismiss the rest
 #   9. an outcome line (flash) reaches the host as an event
 #  10. `comux proxy --stdio` bridges the same server (same incarnation)
 #  11. an attach naming the wrong incarnation is refused BEFORE it joins the shared view
@@ -308,6 +309,23 @@ if not r.get("ok"):
     fail(f"notif-read: {r}")
 a.wait(lambda s: s.model["notifications"]["unread"] == 0, what="unread cleared")
 ok("notify event + unread, and notif-read cleared it")
+# Opening one (jump with consume) removes its pane's notifications; notif-dismiss clears.
+for body in ("e2e two", "e2e three"):
+    subprocess.run([COMUX, "notify", "--pane", tok, "--kind", "done", body],
+                   capture_output=True, timeout=10, check=True)
+a.wait(lambda s: len(s.model["notifications"]["items"]) >= 3, what="three notifications")
+r = a.cmd({"cmd": "jump", "target": tok, "consume": True})
+if not r.get("ok"):
+    fail(f"jump consume: {r}")
+a.wait(lambda s: not s.model["notifications"]["items"], what="the pane's notifications consumed")
+subprocess.run([COMUX, "notify", "--pane", tok, "--kind", "done", "e2e four"],
+               capture_output=True, timeout=10, check=True)
+a.wait(lambda s: len(s.model["notifications"]["items"]) == 1, what="one more")
+r = a.cmd({"cmd": "notif-dismiss"})
+if not r.get("ok"):
+    fail(f"notif-dismiss: {r}")
+a.wait(lambda s: not s.model["notifications"]["items"], what="cleared")
+ok("jump with consume removed the pane's notifications, and notif-dismiss cleared the rest")
 
 # 9. a flash reaches the host as an event (Ctrl-b u with nothing unread says so)
 c.keys(b"\x02u")

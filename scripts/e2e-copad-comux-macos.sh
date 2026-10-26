@@ -185,14 +185,16 @@ log "ok — Ctrl-b C was a native sheet: descending into proj and 'Create sessio
 
 # The sidebar's resume button asks comux to open Ctrl-b R for this client; the native sheet
 # lists the fixture transcript.
-# Click it where it is drawn (the sidebar header, left of the bell): a real pointer event.
+# Click it where it is drawn (the sidebar header, left of the bell; the sidebar is 30 columns
+# of the default 14pt font wide): a real pointer event.
 osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" >/dev/null
+sleep 1 # the previous sheet's dismissal, and the window becoming key again
 python3 - "$APP_PID" <<'PY'
 import sys, time, Quartz
 for w in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID):
     if w.get("kCGWindowOwnerPID") == int(sys.argv[1]) and w["kCGWindowBounds"]["Width"] > 200:
         b = w["kCGWindowBounds"]; break
-pt = (b["X"] + 199, b["Y"] + 82)
+pt = (b["X"] + 219, b["Y"] + 82)
 for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
     e = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, e)
