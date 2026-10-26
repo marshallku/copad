@@ -45,7 +45,9 @@ PY
 
 gtk4-broadwayd :17 >$W/broadway.log 2>&1 & BPID=$!
 sleep 1
-XDG_CONFIG_HOME=$W/cfg GDK_BACKEND=broadway BROADWAY_DISPLAY=:17 dbus-run-session -- $COPAD >$W/copad.log 2>&1 &
+# Its own state dir: copad restores and saves ~/.local/state/copad/session.json, which belongs
+# to the copad the user is running.
+XDG_STATE_HOME=$W/state XDG_CONFIG_HOME=$W/cfg GDK_BACKEND=broadway BROADWAY_DISPLAY=:17 dbus-run-session -- $COPAD >$W/copad.log 2>&1 &
 CPID=$!
 GUI=""
 for _ in $(seq 1 100); do

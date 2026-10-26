@@ -398,7 +398,7 @@ struct ComuxSidebar: View {
                     if bell { Text("!").font(st.strong).foregroundStyle(st.yellow) }
                     Spacer(minLength: 0)
                 }
-                Text(s.branch.isEmpty ? " " : s.branch).foregroundStyle(st.dim).lineLimit(1)
+                Text(s.subtitle).foregroundStyle(st.dim).lineLimit(1)
                     .padding(.leading, st.advance * 2)
             }
             .font(st.body)

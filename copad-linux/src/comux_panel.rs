@@ -1,12 +1,18 @@
-//! comux's sidebar and notification center as native GTK widgets (decisions #169) — the
-//! Linux half of `copad-macos/Sources/Copad/ComuxChrome.swift`, over the same shared
+//! comux's sidebar, status bar and notification center as native GTK widgets (decisions #169,
+//! #170) — the Linux half of `copad-macos/Sources/Copad/ComuxChrome.swift`, over the same shared
 //! [`copad_core::muxhost::MuxHost`].
 //!
 //! The window reports which terminal panels it shows; a comux client running in one of them is
-//! found by its binding tag (`COPAD_PANEL_ID` + this GUI's `COPAD_SOCKET`), its TUI sidebar is
-//! claimed, and these widgets show spaces/agents on the left and notifications on the right.
-//! A window whose visible panes run no comux shows neither.
+//! found by its binding tag (`COPAD_PANEL_ID` + this GUI's `COPAD_SOCKET`), its TUI chrome is
+//! claimed, and these widgets show spaces/agents on the left, the status bar under the
+//! terminal and notifications on the right. A window whose visible panes run no comux shows
+//! none of them.
+//!
+//! They are drawn like the comux TUI they replace (decisions #179): the terminal's font, the
+//! theme mapped onto the TUI's colour roles, transparent over the window's wallpaper, spaces and
+//! agents scrolling separately, usage as gauges.
 
+use copad_core::config::CopadConfig;
 use copad_core::muxhost::MuxHost;
 use copad_mux_proto::link::Endpoint;
 use gtk4::prelude::*;
@@ -20,36 +26,247 @@ use crate::tabs::TabManager;
 
 /// How often the visible-panel set is re-read (tab switches, splits and closes all change it).
 const SERVE_EVERY: Duration = Duration::from_secs(1);
+/// Usage gauge length, in pixels.
+const GAUGE_W: i32 = 56;
 
-pub struct ComuxPanel {
-    pub sidebar: gtk4::Box,
-    pub notifications: gtk4::Box,
-    /// comux's status bar, natively (decisions #170): under the notebook.
-    pub status: gtk4::Box,
-    /// The overlay currently shown as a dialog, and that dialog.
-    overlay_shown: Cell<Option<u64>>,
-    overlay_window: RefCell<Option<gtk4::Window>>,
-    /// The spec that dialog was built from: the same overlay id with a new spec means its
-    /// rows landed (decisions #172) and the dialog is rebuilt.
-    overlay_spec: RefCell<Value>,
-    spaces: gtk4::ListBox,
-    agents: gtk4::ListBox,
-    notif_list: gtk4::ListBox,
-    bell: gtk4::Button,
-    /// Every comux this window hosts: the local one first, then remote ones copad opened
-    /// over SSH (decisions #171), by key.
-    hosts: RefCell<Vec<(String, Rc<MuxHost>)>>,
-    /// The one the visible panes host (the local one when none does).
-    current: RefCell<Rc<MuxHost>>,
-    socket: String,
-    last_gen: Cell<u64>,
-    last_serve: Cell<Option<Instant>>,
-    served: RefCell<Vec<String>>,
-    notif_open: Cell<bool>,
-    /// What a click on row N of each list does.
-    space_actions: RefCell<Vec<Value>>,
-    agent_actions: RefCell<Vec<Value>>,
-    notif_actions: RefCell<Vec<Vec<Value>>>,
+/// The chrome's font and colours: the terminal's font and the copad theme mapped onto the roles
+/// the comux TUI paints with (macOS `ComuxStyle`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Style {
+    family: String,
+    size: u32,
+    base: String,
+    text: String,
+    subtext: String,
+    dim: String,
+    rule: String,
+    hover: String,
+    mauve: String,
+    peach: String,
+    green: String,
+    yellow: String,
+    blue: String,
+    red: String,
+}
+
+fn rgb(hex: &str) -> (u8, u8, u8) {
+    let h = hex.trim_start_matches('#');
+    let v = u32::from_str_radix(h.get(..6).unwrap_or("000000"), 16).unwrap_or(0);
+    ((v >> 16) as u8, (v >> 8) as u8, v as u8)
+}
+
+/// The colour halfway between `a` and `b` (the TUI's mauve and peach are not ANSI colours).
+fn mix(a: &str, b: &str) -> String {
+    let (x, y) = (rgb(a), rgb(b));
+    let m = |p: u8, q: u8| ((p as u16 + q as u16) / 2) as u8;
+    format!("#{:02x}{:02x}{:02x}", m(x.0, y.0), m(x.1, y.1), m(x.2, y.2))
+}
+
+impl Style {
+    pub fn from_config(cfg: &CopadConfig) -> Self {
+        let t = copad_core::theme::Theme::by_name(&cfg.theme.name).unwrap_or_default();
+        let p = &t.palette;
+        Self {
+            family: cfg.terminal.font_family.clone(),
+            size: cfg.terminal.font_size.max(7),
+            base: t.background.clone(),
+            text: t.text.clone(),
+            subtext: t.subtext1.clone(),
+            dim: t.subtext0.clone(),
+            rule: t.surface2.clone(),
+            hover: t.surface1.clone(),
+            mauve: mix(&p[5], &p[4]),
+            peach: mix(&p[1], &p[3]),
+            green: p[2].clone(),
+            yellow: p[3].clone(),
+            blue: p[4].clone(),
+            red: t.red.clone(),
+        }
+    }
+
+    /// Every rule the chrome needs, scoped to its three containers (class rules carry the
+    /// container id too: the font/colour rule on `#… *` would outrank a bare class).
+    fn css(&self) -> String {
+        let Style {
+            family,
+            size,
+            base,
+            text,
+            subtext,
+            rule,
+            hover,
+            mauve,
+            yellow,
+            blue,
+            red,
+            ..
+        } = self;
+        let family = family.replace('"', "");
+        format!(
+            r#"
+#comux-sidebar, #comux-sidebar *, #comux-notifications, #comux-notifications *,
+#comux-status, #comux-status * {{ font-family: "{family}"; font-size: {size}pt; color: {subtext}; }}
+#comux-sidebar, #comux-sidebar list, #comux-sidebar row, #comux-sidebar scrolledwindow,
+#comux-sidebar viewport, #comux-notifications list, #comux-notifications row,
+#comux-notifications scrolledwindow, #comux-notifications viewport,
+#comux-status scrolledwindow, #comux-status viewport {{ background: transparent; box-shadow: none; }}
+#comux-sidebar {{ border-right: 1px solid {rule}; }}
+#comux-notifications {{ background: transparent; border-left: 1px solid {rule}; }}
+#comux-notifications.floating {{ background: {base}; box-shadow: -4px 0 12px alpha(black, 0.35); }}
+#comux-sidebar row, #comux-notifications row {{ padding: 0; min-height: 0; border-radius: 4px; }}
+#comux-sidebar row:hover, #comux-notifications row:hover {{ background: alpha({hover}, 0.8); }}
+#comux-sidebar row:selected, #comux-notifications row:selected {{ background: transparent; }}
+#comux-status {{ background: alpha({base}, 0.92); border-top: 1px solid {rule}; padding: 2px 8px; }}
+.comux-rule {{ background: {rule}; min-height: 1px; min-width: 1px; border: none; }}
+.comux-flat {{ background: none; border: none; box-shadow: none; padding: 0 4px; min-height: 0; min-width: 0; }}
+.comux-flat:hover {{ background: alpha({hover}, 0.8); }}
+#comux-status .comux-pill {{ background: {mauve}; color: {base}; font-weight: bold; border-radius: 4px; padding: 0 6px; }}
+#comux-status .comux-chip {{ background: alpha({rule}, 0.7); border-radius: 4px; padding: 0 7px; min-height: 0; border: none; box-shadow: none; }}
+#comux-status .comux-chip.active {{ background: {blue}; }}
+#comux-status .comux-chip.active label {{ color: {base}; font-weight: bold; }}
+#comux-status .comux-badge {{ color: {base}; font-weight: bold; border-radius: 4px; padding: 0 6px; }}
+#comux-status .comux-badge.red {{ background: {red}; }}
+#comux-status .comux-badge.yellow {{ background: {yellow}; }}
+.comux-text {{ color: {text}; }}
+"#
+        )
+    }
+
+    fn status(&self, s: &str) -> (&'static str, &str) {
+        match s {
+            "working" => ("●", &self.green),
+            "ready" => ("◐", &self.blue),
+            "blocked" => ("▲", &self.yellow),
+            _ => ("○", &self.dim),
+        }
+    }
+
+    /// green < 70% ≤ yellow < 90% ≤ red, like the TUI's gauges.
+    fn usage(&self, pct: f64) -> &str {
+        if pct >= 90.0 {
+            &self.red
+        } else if pct >= 70.0 {
+            &self.yellow
+        } else {
+            &self.green
+        }
+    }
+}
+
+/// `text` in `color`, escaped for Pango markup.
+fn span(color: &str, text: &str) -> String {
+    format!(
+        "<span foreground=\"{color}\">{}</span>",
+        gtk4::glib::markup_escape_text(text)
+    )
+}
+
+fn bold(markup: String) -> String {
+    format!("<b>{markup}</b>")
+}
+
+/// One agents-list row (decisions #179): every row the list shows, in order, so a row's index
+/// is also its action's index — headers and rules are rows too.
+#[derive(Debug, PartialEq, Eq)]
+enum AgentRow {
+    /// A blocked agent pinned under the header (agents index). It is duplicated, not moved,
+    /// so the list below never shifts under the pointer.
+    Band(usize),
+    /// The rule closing the band off.
+    Rule,
+    /// A space's header (index of its first agent), only when agents span several spaces.
+    Header(usize),
+    Agent(usize),
+}
+
+/// The agents list's rows, and whether they are grouped under space headers.
+fn agent_rows(agents: &[Value]) -> (Vec<AgentRow>, bool) {
+    let mut out: Vec<AgentRow> = agents
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| a["status"] == "blocked")
+        .map(|(i, _)| AgentRow::Band(i))
+        .collect();
+    if !out.is_empty() {
+        out.push(AgentRow::Rule);
+    }
+    // Groups in the order comux lists them; one space needs no header.
+    let mut order: Vec<&str> = Vec::new();
+    for a in agents {
+        let sid = a["space_id"].as_str().unwrap_or_default();
+        if !order.contains(&sid) {
+            order.push(sid);
+        }
+    }
+    let grouped = order.len() > 1;
+    for sid in order {
+        let mut first = true;
+        for (i, a) in agents.iter().enumerate() {
+            if a["space_id"].as_str().unwrap_or_default() != sid {
+                continue;
+            }
+            if grouped && first {
+                out.push(AgentRow::Header(i));
+            }
+            first = false;
+            out.push(AgentRow::Agent(i));
+        }
+    }
+    (out, grouped)
+}
+
+/// How the sidebar's height is shared (the TUI's `split_sidebar`): a half that needs less than
+/// its share gives the rest to the other; when both overflow they split evenly. Each keeps its
+/// floor; when even the floors do not fit, spaces yields first, down to its header.
+fn split_sidebar(
+    total: i32,
+    spaces: i32,
+    agents: i32,
+    floor_spaces: i32,
+    floor_agents: i32,
+    header: i32,
+) -> i32 {
+    let half = total / 2;
+    let top = if spaces + agents <= total || spaces <= half {
+        spaces
+    } else if agents <= half {
+        total - agents
+    } else {
+        half
+    };
+    top.max(floor_spaces)
+        .min((total - floor_agents).max(header))
+        .max(header.min(total))
+}
+
+/// A space's subtitle, like the TUI's: its git branch, else what its focused pane runs.
+fn space_subtitle(branch: &str, tabs: &[Value]) -> String {
+    if !branch.is_empty() {
+        return branch.to_string();
+    }
+    tabs.iter()
+        .find(|t| t["active"] == true)
+        .and_then(|t| t["panes"].as_array())
+        .and_then(|p| p.iter().find(|x| x["focused"] == true))
+        .and_then(|x| x["label"].as_str())
+        .unwrap_or(" ")
+        .to_string()
+}
+
+/// `2h13m` / `5d19h` until `at` (unix seconds).
+fn until(at: i64) -> String {
+    let m = ((at - now_unix()).max(0)) / 60;
+    match m {
+        0..60 => format!("{m}m"),
+        60..1440 => format!("{}h{}m", m / 60, m % 60),
+        _ => format!("{}d{}h", m / 1440, (m / 60) % 24),
+    }
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 /// What a native context-menu item does.
@@ -70,6 +287,7 @@ fn heading(text: &str) -> gtk4::Label {
     l
 }
 
+/// A two-line row for the overlay dialogs' pickers.
 fn two_line(title: &str, sub: &str, bold: bool) -> gtk4::Box {
     let b = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
     b.set_margin_start(10);
@@ -96,6 +314,78 @@ fn two_line(title: &str, sub: &str, bold: bool) -> gtk4::Box {
     b
 }
 
+/// A label showing `markup`, left-aligned and ellipsized.
+fn markup(m: &str) -> gtk4::Label {
+    let l = gtk4::Label::new(None);
+    l.set_markup(m);
+    l.set_xalign(0.0);
+    l.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    l
+}
+
+/// A label showing `markup` at its full width: what the layout budgets for, never cut.
+fn fixed(m: &str) -> gtk4::Label {
+    let l = gtk4::Label::new(None);
+    l.set_markup(m);
+    l
+}
+
+fn rule() -> gtk4::Separator {
+    let s = gtk4::Separator::new(gtk4::Orientation::Horizontal);
+    s.add_css_class("comux-rule");
+    s.set_hexpand(true);
+    s.set_valign(gtk4::Align::Center);
+    s
+}
+
+/// `name ───`: a section or group header.
+fn header_row(m: &str, badge: Option<String>) -> gtk4::Box {
+    let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    b.set_margin_start(8);
+    b.set_margin_end(8);
+    b.set_margin_top(2);
+    b.set_margin_bottom(2);
+    let l = markup(m);
+    l.set_hexpand(false);
+    b.append(&l);
+    if let Some(badge) = badge {
+        b.append(&markup(&badge));
+    }
+    b.append(&rule());
+    b
+}
+
+/// The TUI's two-row entry: `left … right` over an indented subtitle.
+fn entry(left: &str, right: &str, sub: Option<&str>, indent: i32) -> gtk4::Box {
+    let v = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
+    v.set_margin_start(8);
+    v.set_margin_end(8);
+    v.set_margin_top(3);
+    v.set_margin_bottom(3);
+    let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    let l = markup(left);
+    l.set_hexpand(true);
+    top.append(&l);
+    if !right.is_empty() {
+        top.append(&markup(right));
+    }
+    v.append(&top);
+    if let Some(sub) = sub {
+        let s = markup(sub);
+        s.set_margin_start(indent);
+        v.append(&s);
+    }
+    v
+}
+
+fn list_row(child: &impl IsA<gtk4::Widget>, activatable: bool) -> gtk4::ListBoxRow {
+    let r = gtk4::ListBoxRow::new();
+    r.set_child(Some(child));
+    r.set_activatable(activatable);
+    r.set_selectable(false);
+    r
+}
+
 fn clear(list: &gtk4::ListBox) {
     while let Some(c) = list.first_child() {
         list.remove(&c);
@@ -103,10 +393,7 @@ fn clear(list: &gtk4::ListBox) {
 }
 
 fn elapsed(since: i64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    let s = (now - since).max(0);
+    let s = (now_unix() - since).max(0);
     match s {
         0..60 => format!("{s}s"),
         60..3600 => format!("{}m", s / 60),
@@ -114,75 +401,179 @@ fn elapsed(since: i64) -> String {
     }
 }
 
+fn flat_button(icon: &str, tip: &str, name: &str) -> gtk4::Button {
+    let b = gtk4::Button::from_icon_name(icon);
+    b.add_css_class("comux-flat");
+    b.set_tooltip_text(Some(tip));
+    b.set_widget_name(name);
+    b
+}
+
+pub struct ComuxPanel {
+    pub sidebar: gtk4::Box,
+    /// Where the notification panel docks (beside the terminal); while it floats over a narrow
+    /// window it lives in the overlay [`mount`](Self::mount) was given instead.
+    pub notif_dock: gtk4::Box,
+    notifications: gtk4::Box,
+    /// comux's status bar, natively (decisions #170): under the notebook.
+    pub status: gtk4::Box,
+    /// The overlay currently shown as a dialog, and that dialog.
+    overlay_shown: Cell<Option<u64>>,
+    overlay_window: RefCell<Option<gtk4::Window>>,
+    /// The spec that dialog was built from: the same overlay id with a new spec means its
+    /// rows landed (decisions #172) and the dialog is rebuilt.
+    overlay_spec: RefCell<Value>,
+    spaces: gtk4::ListBox,
+    spaces_scroll: gtk4::ScrolledWindow,
+    spaces_head: gtk4::Box,
+    agents: gtk4::ListBox,
+    agents_head: gtk4::Box,
+    notif_list: gtk4::ListBox,
+    bell_count: gtk4::Label,
+    /// Every comux this window hosts: the local one first, then remote ones copad opened
+    /// over SSH (decisions #171), by key.
+    hosts: RefCell<Vec<(String, Rc<MuxHost>)>>,
+    /// The one the visible panes host (the local one when none does).
+    current: RefCell<Rc<MuxHost>>,
+    socket: String,
+    last_gen: Cell<u64>,
+    last_serve: Cell<Option<Instant>>,
+    served: RefCell<Vec<String>>,
+    notif_open: Cell<bool>,
+    /// What a click on row N of each list does (empty = nothing): aligned with EVERY row.
+    space_actions: RefCell<Vec<Vec<Value>>>,
+    agent_actions: RefCell<Vec<Vec<Value>>>,
+    notif_actions: RefCell<Vec<Vec<Value>>>,
+    style: RefCell<Style>,
+    css: gtk4::CssProvider,
+    /// The overlay the notification panel floats in, and whether it does now.
+    float_in: RefCell<Option<gtk4::Overlay>>,
+    floating: Cell<bool>,
+    /// Inputs of the last layout pass (window width, sidebar height, generation), so the
+    /// measuring work runs only when one of them moved.
+    laid_out: Cell<(i32, i32, u64)>,
+    /// The usage readout's level (0 full … 3 one window, 4 hidden), the page shown at level 3,
+    /// and the status width + generation it was chosen for.
+    usage_level: Cell<u8>,
+    usage_page: Cell<usize>,
+    usage_fit: Cell<(i32, u64)>,
+    usage_box: RefCell<Option<gtk4::Box>>,
+    chips: RefCell<Option<gtk4::ScrolledWindow>>,
+    /// The wall-clock minute last drawn: ages and the clock move on.
+    minute: Cell<i64>,
+}
+
 impl ComuxPanel {
-    pub fn new() -> Rc<Self> {
+    pub fn new(config: &CopadConfig) -> Rc<Self> {
+        let style = Style::from_config(config);
+        let css = gtk4::CssProvider::new();
+        css.load_from_string(&style.css());
+        if let Some(display) = gtk4::gdk::Display::default() {
+            gtk4::style_context_add_provider_for_display(
+                &display,
+                &css,
+                gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION + 1,
+            );
+        }
+
         let sidebar = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        sidebar.set_width_request(240);
         sidebar.set_widget_name("comux-sidebar");
-        let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        let title = heading("comux");
+        let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
+        head.set_margin_start(8);
+        head.set_margin_end(4);
+        head.set_margin_top(4);
+        head.set_margin_bottom(2);
+        let title = markup(&bold(span(&style.mauve, "comux")));
         title.set_hexpand(true);
         head.append(&title);
-        let new_session = gtk4::Button::with_label("+");
-        new_session.add_css_class("flat");
-        new_session.set_tooltip_text(Some("New session… (Ctrl-b C)"));
-        new_session.set_widget_name("comux-new-session");
+        let new_session = flat_button(
+            "list-add-symbolic",
+            "New session… (Ctrl-b C)",
+            "comux-new-session",
+        );
         head.append(&new_session);
-        let resume = gtk4::Button::with_label("⟲");
-        resume.add_css_class("flat");
-        resume.set_tooltip_text(Some("Resume a conversation… (Ctrl-b R)"));
-        resume.set_widget_name("comux-resume");
+        let resume = flat_button(
+            "document-open-recent-symbolic",
+            "Resume a conversation… (Ctrl-b R)",
+            "comux-resume",
+        );
         head.append(&resume);
-        let bell = gtk4::Button::with_label("🔔");
-        bell.add_css_class("flat");
+        let bell = gtk4::Button::new();
+        bell.add_css_class("comux-flat");
+        bell.set_tooltip_text(Some("Notifications (Ctrl-b a)"));
+        bell.set_widget_name("comux-bell");
+        let bell_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 2);
+        bell_box.append(&gtk4::Image::from_icon_name(
+            "preferences-system-notifications-symbolic",
+        ));
+        let bell_count = gtk4::Label::new(None);
+        bell_box.append(&bell_count);
+        bell.set_child(Some(&bell_box));
         head.append(&bell);
         sidebar.append(&head);
-        sidebar.append(&heading("spaces"));
+
+        let spaces_head = header_row(&bold(span(&style.dim, "spaces")), None);
+        sidebar.append(&spaces_head);
         let spaces = gtk4::ListBox::new();
-        sidebar.append(&spaces);
-        sidebar.append(&heading("agents"));
+        let spaces_scroll = gtk4::ScrolledWindow::new();
+        spaces_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        spaces_scroll.set_child(Some(&spaces));
+        sidebar.append(&spaces_scroll);
+        let agents_head = header_row(&bold(span(&style.dim, "agents")), None);
+        sidebar.append(&agents_head);
         let agents = gtk4::ListBox::new();
-        let scroll = gtk4::ScrolledWindow::new();
-        scroll.set_vexpand(true);
-        scroll.set_child(Some(&agents));
-        sidebar.append(&scroll);
+        let agents_scroll = gtk4::ScrolledWindow::new();
+        agents_scroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+        agents_scroll.set_vexpand(true);
+        agents_scroll.set_child(Some(&agents));
+        sidebar.append(&agents_scroll);
 
         let notifications = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        notifications.set_width_request(300);
         notifications.set_widget_name("comux-notifications");
         let notif_head = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-        let notif_title = heading("notifications");
+        notif_head.set_margin_start(10);
+        notif_head.set_margin_end(4);
+        notif_head.set_margin_top(4);
+        notif_head.set_margin_bottom(4);
+        let notif_title = markup(&bold(span(&style.dim, "notifications")));
         notif_title.set_hexpand(true);
         notif_head.append(&notif_title);
         let clear_all = gtk4::Button::with_label("Clear all");
-        clear_all.add_css_class("flat");
+        clear_all.add_css_class("comux-flat");
         notif_head.append(&clear_all);
         notifications.append(&notif_head);
+        notifications.append(&rule());
         let notif_list = gtk4::ListBox::new();
         let nscroll = gtk4::ScrolledWindow::new();
+        nscroll.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
         nscroll.set_vexpand(true);
         nscroll.set_child(Some(&notif_list));
         notifications.append(&nscroll);
+        let notif_dock = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        notif_dock.append(&notifications);
         sidebar.set_visible(false);
+        notif_dock.set_visible(false);
         notifications.set_visible(false);
         let status = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         status.set_widget_name("comux-status");
-        status.set_margin_start(6);
-        status.set_margin_end(6);
         status.set_visible(false);
 
         let local = Rc::new(MuxHost::start(Endpoint::local()));
         let this = Rc::new(Self {
             sidebar,
+            notif_dock,
             notifications,
             status,
             overlay_shown: Cell::new(None),
             overlay_window: RefCell::new(None),
             overlay_spec: RefCell::new(Value::Null),
             spaces,
+            spaces_scroll,
+            spaces_head,
             agents,
+            agents_head,
             notif_list,
-            bell,
+            bell_count,
             hosts: RefCell::new(vec![(String::new(), local.clone())]),
             current: RefCell::new(local),
             socket: copad_core::paths::gui_socket_path(std::process::id())
@@ -195,6 +586,17 @@ impl ComuxPanel {
             space_actions: RefCell::new(Vec::new()),
             agent_actions: RefCell::new(Vec::new()),
             notif_actions: RefCell::new(Vec::new()),
+            style: RefCell::new(style),
+            css,
+            float_in: RefCell::new(None),
+            floating: Cell::new(false),
+            laid_out: Cell::new((0, 0, 0)),
+            usage_level: Cell::new(0),
+            usage_page: Cell::new(0),
+            usage_fit: Cell::new((0, 0)),
+            usage_box: RefCell::new(None),
+            chips: RefCell::new(None),
+            minute: Cell::new(0),
         });
         for (b, what) in [(&new_session, "new-session"), (&resume, "resume")] {
             let w = Rc::downgrade(&this);
@@ -211,10 +613,10 @@ impl ComuxPanel {
             }
         });
         let w = Rc::downgrade(&this);
-        this.bell.connect_clicked(move |_| {
+        bell.connect_clicked(move |_| {
             if let Some(p) = w.upgrade() {
                 p.notif_open.set(!p.notif_open.get());
-                p.refresh_visibility();
+                p.relayout(true);
             }
         });
         for (list, which) in [(&this.spaces, 0), (&this.agents, 1), (&this.notif_list, 2)] {
@@ -222,23 +624,12 @@ impl ComuxPanel {
             list.connect_row_activated(move |_, row| {
                 let Some(p) = w.upgrade() else { return };
                 let i = row.index() as usize;
-                let reqs: Vec<Value> = match which {
-                    0 => p
-                        .space_actions
-                        .borrow()
-                        .get(i)
-                        .cloned()
-                        .into_iter()
-                        .collect(),
-                    1 => p
-                        .agent_actions
-                        .borrow()
-                        .get(i)
-                        .cloned()
-                        .into_iter()
-                        .collect(),
-                    _ => p.notif_actions.borrow().get(i).cloned().unwrap_or_default(),
+                let acts = match which {
+                    0 => &p.space_actions,
+                    1 => &p.agent_actions,
+                    _ => &p.notif_actions,
                 };
+                let reqs = acts.borrow().get(i).cloned().unwrap_or_default();
                 for r in reqs {
                     p.cur().command(r);
                 }
@@ -247,8 +638,43 @@ impl ComuxPanel {
         this
     }
 
+    /// Hand the panel the window and the overlay over the terminal area: the notification
+    /// panel floats there when the window is too narrow to dock it, and Esc closes it then.
+    pub fn mount(self: &Rc<Self>, window: &gtk4::ApplicationWindow, over: &gtk4::Overlay) {
+        *self.float_in.borrow_mut() = Some(over.clone());
+        let keys = gtk4::EventControllerKey::new();
+        keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let w = Rc::downgrade(self);
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if let Some(p) = w.upgrade()
+                && key == gtk4::gdk::Key::Escape
+                && p.floating.get()
+                && p.notif_open.get()
+            {
+                p.notif_open.set(false);
+                p.relayout(true);
+                return gtk4::glib::Propagation::Stop;
+            }
+            gtk4::glib::Propagation::Proceed
+        });
+        window.add_controller(keys);
+    }
+
+    /// Config hot-reload: the terminal font or the theme changed.
+    pub fn apply_config(self: &Rc<Self>, config: &CopadConfig) {
+        let style = Style::from_config(config);
+        if *self.style.borrow() == style {
+            return;
+        }
+        self.css.load_from_string(&style.css());
+        *self.style.borrow_mut() = style;
+        self.last_gen.set(0); // rebuild every row in the new colours
+        self.laid_out.set((0, 0, 0));
+        self.usage_fit.set((0, 0));
+    }
+
     /// Called from the window's main-loop timer: re-report the visible panels now and then,
-    /// and rebuild the lists when the host's state moved.
+    /// rebuild the lists when the host's state moved, and re-fit the layout to the window.
     pub fn tick(self: &Rc<Self>, mgr: &TabManager, window: &gtk4::ApplicationWindow) {
         let window_visible = window.is_visible();
         if self
@@ -280,8 +706,10 @@ impl ComuxPanel {
             .iter()
             .map(|(_, h)| h.generation())
             .sum();
-        if generation != self.last_gen.get() {
+        let minute = now_unix() / 60;
+        if generation != self.last_gen.get() || minute != self.minute.get() {
             self.last_gen.set(generation);
+            self.minute.set(minute);
             let pick = self
                 .hosts
                 .borrow()
@@ -293,6 +721,12 @@ impl ComuxPanel {
             self.rebuild();
             self.present_overlay(window);
         }
+        let key = (window.width(), self.sidebar.height(), self.last_gen.get());
+        if key != self.laid_out.get() {
+            self.laid_out.set(key);
+            self.relayout(false);
+        }
+        self.fit_usage();
     }
 
     fn state(&self) -> Value {
@@ -303,6 +737,765 @@ impl ComuxPanel {
         self.current.borrow().clone()
     }
 
+    /// The width of one cell of the chrome's font.
+    fn advance(&self) -> i32 {
+        self.sidebar
+            .create_pango_layout(Some("MMMMMMMMMM"))
+            .pixel_size()
+            .0
+            .max(10)
+            / 10
+    }
+
+    /// Panel sizes follow the font within a budget of the window (sidebar ≤ 30%,
+    /// notifications ≤ 35%); the notification panel floats over the terminal when docking it
+    /// would leave fewer than 40 columns. Then the sidebar's halves are split.
+    fn relayout(&self, force_visibility: bool) {
+        let on = self.hosting(&self.state());
+        let adv = self.advance();
+        let width = self
+            .float_in
+            .borrow()
+            .as_ref()
+            .and_then(|o| o.root())
+            .map_or(0, |r| r.width());
+        let pct = |p: i32| width * p / 100;
+        let side = (30 * adv).max(200).min(pct(30).max(160));
+        let notif = (38 * adv).max(260).min(pct(35).max(220));
+        let open = on && self.notif_open.get();
+        let floating = open && width > 0 && width - side - notif < 40 * adv;
+        self.sidebar.set_width_request(side);
+        self.notifications.set_width_request(notif);
+        self.sidebar.set_visible(on);
+        self.status.set_visible(on);
+        self.place_notifications(floating);
+        self.notifications.set_visible(open);
+        self.notif_dock.set_visible(open && !floating);
+        let _ = force_visibility;
+        self.split();
+    }
+
+    fn place_notifications(&self, floating: bool) {
+        let Some(over) = self.float_in.borrow().clone() else {
+            return;
+        };
+        if floating == self.floating.get() {
+            return;
+        }
+        self.floating.set(floating);
+        if floating {
+            self.notif_dock.remove(&self.notifications);
+            self.notifications.set_halign(gtk4::Align::End);
+            self.notifications.add_css_class("floating");
+            over.add_overlay(&self.notifications);
+        } else {
+            over.remove_overlay(&self.notifications);
+            self.notifications.set_halign(gtk4::Align::Fill);
+            self.notifications.remove_css_class("floating");
+            self.notif_dock.append(&self.notifications);
+        }
+    }
+
+    /// Share the sidebar's height between spaces and agents by what each list needs.
+    fn split(&self) {
+        let total = self.sidebar.height();
+        if total <= 0 {
+            return;
+        }
+        let w = self.sidebar.width().max(1);
+        let (_, head_h, _, _) = self.spaces_head.measure(gtk4::Orientation::Vertical, w);
+        let toolbar = self
+            .sidebar
+            .first_child()
+            .map_or(0, |c| c.measure(gtk4::Orientation::Vertical, w).1);
+        let (_, spaces_h, _, _) = self.spaces.measure(gtk4::Orientation::Vertical, w);
+        let (_, agents_h, _, _) = self.agents.measure(gtk4::Orientation::Vertical, w);
+        let entry = self
+            .spaces
+            .row_at_index(0)
+            .map_or(head_h * 2, |r| r.measure(gtk4::Orientation::Vertical, w).1);
+        let body = total - toolbar - 2 * head_h;
+        let top = split_sidebar(body, spaces_h, agents_h, entry, entry, 0);
+        self.spaces_scroll.set_min_content_height(top);
+        self.spaces_scroll.set_max_content_height(top);
+    }
+
+    fn rebuild(self: &Rc<Self>) {
+        let s = self.state();
+        let st = self.style.borrow().clone();
+        self.rebuild_status(&s, &st);
+
+        // ---- spaces ----
+        clear(&self.spaces);
+        let mut sa = Vec::new();
+        for sess in s["tree"]["sessions"].as_array().into_iter().flatten() {
+            let name = sess["name"].as_str().unwrap_or_default();
+            let branch = sess["branch"].as_str().unwrap_or_default();
+            let active = sess["active"] == true;
+            let tabs = sess["tabs"].as_array().cloned().unwrap_or_default();
+            let agents = tabs.iter().any(|t| {
+                t["panes"]
+                    .as_array()
+                    .is_some_and(|p| p.iter().any(|x| x["kind"] == "agent"))
+            });
+            let bell = tabs.iter().any(|t| t["bell"] == true);
+            let dot = if active {
+                &st.mauve
+            } else if agents {
+                &st.peach
+            } else {
+                &st.dim
+            };
+            let name_m = if active {
+                bold(span(&st.text, name))
+            } else {
+                span(&st.subtext, name)
+            };
+            let left = format!(
+                "{} {}{}",
+                span(dot, "●"),
+                name_m,
+                if bell {
+                    format!(" {}", bold(span(&st.yellow, "!")))
+                } else {
+                    String::new()
+                }
+            );
+            let sub = span(&st.dim, &space_subtitle(branch, &tabs));
+            let row = list_row(&entry(&left, "", Some(&sub), 2 * self.advance()), true);
+            let sid = sess["id"].as_str().map(str::to_string);
+            self.context_menu(
+                &row,
+                vec![
+                    ("Rename session…", Act::Open("rename-session", sid.clone())),
+                    ("New session…", Act::Open("new-session", None)),
+                    ("Kill session…", Act::Open("kill-session", sid)),
+                ],
+            );
+            row.set_widget_name(&format!("comux-space-{name}"));
+            self.spaces.append(&row);
+            sa.push(vec![json!({"cmd": "select-session", "target": sess["id"]})]);
+        }
+        *self.space_actions.borrow_mut() = sa;
+
+        // ---- agents ----
+        clear(&self.agents);
+        let agents: Vec<Value> = s["agents"]["agents"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        let (rows, grouped) = agent_rows(&agents);
+        let blocked = agents.iter().filter(|a| a["status"] == "blocked").count();
+        self.set_agents_badge(&st, blocked);
+        let mut aa = Vec::new();
+        for r in &rows {
+            let (row, act): (gtk4::ListBoxRow, Vec<Value>) = match *r {
+                AgentRow::Band(i) => {
+                    let a = &agents[i];
+                    let left = format!(
+                        "{} {}",
+                        span(&st.yellow, "▲"),
+                        span(
+                            &st.text,
+                            &format!(
+                                "{}/{}",
+                                a["space"].as_str().unwrap_or_default(),
+                                a["title"].as_str().unwrap_or_default()
+                            )
+                        )
+                    );
+                    let right = span(&st.yellow, &elapsed(a["since_unix"].as_i64().unwrap_or(0)));
+                    (
+                        list_row(&entry(&left, &right, None, 0), true),
+                        vec![json!({"cmd": "jump", "target": a["token"]})],
+                    )
+                }
+                AgentRow::Rule => {
+                    let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+                    b.set_margin_start(8);
+                    b.set_margin_end(8);
+                    b.append(&rule());
+                    (list_row(&b, false), Vec::new())
+                }
+                AgentRow::Header(i) => {
+                    let a = &agents[i];
+                    let h = header_row(
+                        &span(&st.dim, a["space"].as_str().unwrap_or_default()),
+                        None,
+                    );
+                    (
+                        list_row(&h, true),
+                        vec![json!({"cmd": "select-session", "target": a["space_id"]})],
+                    )
+                }
+                AgentRow::Agent(i) => {
+                    let a = &agents[i];
+                    let status = a["status"].as_str().unwrap_or_default();
+                    let (glyph, color) = st.status(status);
+                    let title = a["title"].as_str().unwrap_or_default();
+                    let name = if grouped {
+                        title.to_string()
+                    } else {
+                        format!("{}/{title}", a["space"].as_str().unwrap_or_default())
+                    };
+                    let name_m = if a["focused"] == true {
+                        bold(span(&st.text, &name))
+                    } else {
+                        span(&st.subtext, &name)
+                    };
+                    let left = format!("{} {name_m}", span(color, glyph));
+                    let right = span(
+                        color,
+                        &format!(
+                            "{status} {}",
+                            elapsed(a["since_unix"].as_i64().unwrap_or(0))
+                        ),
+                    );
+                    let detail = a["detail"]
+                        .as_str()
+                        .or(a["tool"].as_str())
+                        .unwrap_or_default();
+                    let row = list_row(
+                        &entry(
+                            &left,
+                            &right,
+                            Some(&span(&st.dim, detail)),
+                            2 * self.advance(),
+                        ),
+                        true,
+                    );
+                    let tab = format!(
+                        "{}/{}",
+                        a["space_id"].as_str().unwrap_or_default(),
+                        a["tab_id"].as_str().unwrap_or_default()
+                    );
+                    self.context_menu(
+                        &row,
+                        vec![
+                            (
+                                "Jump to pane",
+                                Act::Cmd(json!({"cmd": "jump", "target": a["token"]})),
+                            ),
+                            ("Rename tab…", Act::Open("rename-tab", Some(tab))),
+                        ],
+                    );
+                    (row, vec![json!({"cmd": "jump", "target": a["token"]})])
+                }
+            };
+            self.agents.append(&row);
+            aa.push(act);
+        }
+        *self.agent_actions.borrow_mut() = aa;
+
+        // ---- notifications ----
+        clear(&self.notif_list);
+        let mut na = Vec::new();
+        for n in s["notifications"]["items"].as_array().into_iter().flatten() {
+            let blocked = n["kind"] == "blocked";
+            let title = format!(
+                "{} · {}/{}",
+                n["tool"].as_str().unwrap_or_default(),
+                n["space"].as_str().unwrap_or_default(),
+                n["tab"].as_str().unwrap_or_default()
+            );
+            let title_m = if n["read"] == true {
+                span(&st.subtext, &title)
+            } else {
+                bold(span(&st.text, &title))
+            };
+            let left = format!(
+                "{} {title_m}",
+                if blocked {
+                    span(&st.yellow, "▲")
+                } else {
+                    span(&st.green, "✓")
+                }
+            );
+            let body = entry(
+                &left,
+                &span(&st.dim, n["when"].as_str().unwrap_or_default()),
+                Some(&span(&st.subtext, n["body"].as_str().unwrap_or_default())),
+                2 * self.advance(),
+            );
+            body.set_hexpand(true);
+            let line = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+            line.append(&body);
+            let dismiss = json!({"cmd": "notif-dismiss", "id": n["id"]});
+            // A text glyph, not an icon: broadway (the headless backend the e2e uses) asserts
+            // when one icon render node is drawn several times in a frame.
+            let x = gtk4::Button::new();
+            x.set_child(Some(&fixed(&span(&st.dim, "✕"))));
+            x.add_css_class("comux-flat");
+            x.set_tooltip_text(Some("Dismiss"));
+            x.set_widget_name("comux-notif-dismiss");
+            x.set_valign(gtk4::Align::Start);
+            let (w, d) = (Rc::downgrade(self), dismiss.clone());
+            x.connect_clicked(move |_| {
+                if let Some(p) = w.upgrade() {
+                    p.cur().command(d.clone());
+                }
+            });
+            line.append(&x);
+            let row = list_row(&line, true);
+            self.context_menu(&row, vec![("Dismiss", Act::Cmd(dismiss.clone()))]);
+            self.notif_list.append(&row);
+            // Opening one consumes it and its pane's others (`consume`, which an older comux
+            // ignores while still jumping); one whose pane is gone is just dismissed.
+            let mut acts = vec![json!({"cmd": "notif-read", "id": n["id"]})];
+            if n["token"].as_str().is_some_and(|t| !t.is_empty()) {
+                acts.push(json!({"cmd": "jump", "target": n["token"], "consume": true}));
+            } else {
+                acts.push(dismiss);
+            }
+            na.push(acts);
+        }
+        *self.notif_actions.borrow_mut() = na;
+        let unread = s["notifications"]["unread"].as_u64().unwrap_or(0);
+        self.bell_count.set_markup(&if unread > 0 {
+            bold(span(&st.yellow, &unread.to_string()))
+        } else {
+            String::new()
+        });
+        self.relayout(false);
+    }
+
+    fn set_agents_badge(&self, st: &Style, blocked: usize) {
+        while let Some(c) = self.agents_head.first_child() {
+            self.agents_head.remove(&c);
+        }
+        let l = markup(&bold(span(&st.dim, "agents")));
+        l.set_hexpand(false);
+        self.agents_head.append(&l);
+        if blocked > 0 {
+            self.agents_head
+                .append(&markup(&bold(span(&st.yellow, &format!("⚑{blocked}")))));
+        }
+        self.agents_head.append(&rule());
+    }
+
+    fn badge(text: &str, color: &str) -> gtk4::Label {
+        let l = gtk4::Label::new(Some(text));
+        l.add_css_class("comux-badge");
+        l.add_css_class(color);
+        l
+    }
+
+    /// comux's status bar (decisions #170, #179): session pill, tab chips (they scroll when
+    /// short of room), the armed prefix, the outcome line, counters, usage, update, clock, host.
+    fn rebuild_status(self: &Rc<Self>, s: &Value, st: &Style) {
+        clear_box(&self.status);
+        let status = &s["status"];
+        let sess = s["tree"]["sessions"]
+            .as_array()
+            .and_then(|a| a.iter().find(|x| x["active"] == true));
+        let adv = self.advance();
+        if let Some(sess) = sess {
+            let pill = gtk4::Label::new(sess["name"].as_str());
+            pill.add_css_class("comux-pill");
+            pill.set_max_width_chars(16);
+            pill.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+            let sid = sess["id"].as_str().map(str::to_string);
+            self.context_menu(
+                &pill,
+                vec![
+                    ("Rename session…", Act::Open("rename-session", sid.clone())),
+                    ("New session…", Act::Open("new-session", None)),
+                    ("Kill session…", Act::Open("kill-session", sid)),
+                ],
+            );
+            self.status.append(&pill);
+        }
+        let chips = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        let mut active_chip: Option<gtk4::Button> = None;
+        for t in sess
+            .and_then(|x| x["tabs"].as_array())
+            .into_iter()
+            .flatten()
+        {
+            let agent = t["panes"]
+                .as_array()
+                .is_some_and(|p| p.iter().any(|x| x["kind"] == "agent"));
+            let active = t["active"] == true;
+            let title = format!(
+                "{} {}",
+                t["index"].as_u64().unwrap_or(0) + 1,
+                t["title"].as_str().unwrap_or_default()
+            );
+            let fg = if active {
+                &st.base
+            } else if agent {
+                &st.yellow
+            } else {
+                &st.subtext
+            };
+            let mut m = String::new();
+            if agent {
+                m.push_str(&span(if active { &st.base } else { &st.yellow }, "● "));
+            }
+            m.push_str(&span(fg, &title));
+            if t["bell"] == true {
+                m.push_str(&bold(span(if active { &st.base } else { &st.red }, " !")));
+            }
+            let l = markup(&if active { bold(m) } else { m });
+            l.set_max_width_chars(24);
+            let b = gtk4::Button::new();
+            b.set_child(Some(&l));
+            b.add_css_class("comux-chip");
+            if active {
+                b.add_css_class("active");
+                active_chip = Some(b.clone());
+            }
+            b.set_tooltip_text(Some(&title));
+            let id = t["id"].clone();
+            let w = Rc::downgrade(self);
+            b.connect_clicked(move |_| {
+                if let Some(p) = w.upgrade() {
+                    p.cur().command(json!({"cmd": "select-tab", "target": id}));
+                }
+            });
+            let target = format!(
+                "{}/{}",
+                sess.and_then(|x| x["id"].as_str()).unwrap_or_default(),
+                t["id"].as_str().unwrap_or_default()
+            );
+            self.context_menu(
+                &b,
+                vec![
+                    ("Rename tab…", Act::Open("rename-tab", Some(target.clone()))),
+                    ("New tab", Act::Cmd(json!({"cmd": "new-tab"}))),
+                    ("Close tab…", Act::Open("close-tab", Some(target))),
+                ],
+            );
+            chips.append(&b);
+        }
+        let scroller = gtk4::ScrolledWindow::new();
+        scroller.set_policy(gtk4::PolicyType::External, gtk4::PolicyType::Never);
+        scroller.set_hexpand(true);
+        scroller.set_min_content_width(8 * adv);
+        scroller.set_propagate_natural_width(true);
+        scroller.set_child(Some(&chips));
+        self.status.append(&scroller);
+        // The active chip into view once the chips have their positions.
+        if let Some(chip) = active_chip {
+            let sc = scroller.clone();
+            gtk4::glib::idle_add_local_once(move || {
+                if let Some(p) = chip.compute_point(&sc, &gtk4::graphene::Point::new(0.0, 0.0)) {
+                    let adj = sc.hadjustment();
+                    let x = adj.value() + p.x() as f64;
+                    if x < adj.value() || x + chip.width() as f64 > adj.value() + adj.page_size() {
+                        adj.set_value(x - 8.0);
+                    }
+                }
+            });
+        }
+        *self.chips.borrow_mut() = Some(scroller);
+        if status["prefix_armed"] == true {
+            self.status.append(&Self::badge(
+                status["prefix_label"].as_str().unwrap_or("^b"),
+                "yellow",
+            ));
+        }
+        if let Some(f) = status["flash"]["text"].as_str() {
+            let l = markup(&span(
+                if status["flash"]["error"] == true {
+                    &st.red
+                } else {
+                    &st.subtext
+                },
+                f,
+            ));
+            l.set_max_width_chars(40);
+            self.status.append(&l);
+        }
+        let n = |k: &str| status[k].as_u64().unwrap_or(0);
+        if n("bells") > 0 {
+            self.status
+                .append(&Self::badge(&format!("! {}", n("bells")), "red"));
+        }
+        if n("attention") > 0 {
+            self.status
+                .append(&Self::badge(&format!("⚑{}", n("attention")), "yellow"));
+        }
+        if n("agents") > 0 {
+            self.status
+                .append(&fixed(&span(&st.peach, &format!("● {}", n("agents")))));
+        }
+        if n("unread") > 0 {
+            self.status
+                .append(&fixed(&span(&st.blue, &format!("✉ {}", n("unread")))));
+        }
+        let usage = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+        self.fill_usage(&usage, status, st, self.usage_level.get());
+        self.status.append(&usage);
+        *self.usage_box.borrow_mut() = Some(usage);
+        if let Some(u) = status["update"].as_str() {
+            self.status
+                .append(&fixed(&span(&st.green, &format!("⬆ {u}"))));
+        }
+        let clock = gtk4::glib::DateTime::now_local()
+            .ok()
+            .and_then(|d| d.format("%H:%M").ok())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        self.status.append(&fixed(&span(&st.subtext, &clock)));
+        if let Some(h) = status["host"].as_str().filter(|h| !h.is_empty()) {
+            self.status.append(&fixed(&bold(span(&st.text, h))));
+        }
+    }
+
+    fn windows(status: &Value) -> Vec<Value> {
+        status["usage"]["windows"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The usage readout at `level`: 0 gauge + % + reset per window, 1 without resets, 2
+    /// percentages only, 3 one window at a time (click for the next), 4 nothing.
+    fn fill_usage(self: &Rc<Self>, into: &gtk4::Box, status: &Value, st: &Style, level: u8) {
+        clear_box(into);
+        let windows = Self::windows(status);
+        if windows.is_empty() || level >= 4 {
+            return;
+        }
+        let item = |w: &Value, label: &str, gauge: bool, reset: bool| {
+            let pct = w["pct"].as_f64().unwrap_or(0.0);
+            let color = st.usage(pct).to_string();
+            let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+            b.append(&fixed(&span(&st.subtext, label)));
+            if gauge {
+                b.append(&gauge_widget(pct, &st.rule, &color, self.advance()));
+            }
+            let stale = if w["stale"] == true { "~" } else { "" };
+            b.append(&fixed(&span(
+                &color,
+                &format!("{stale}{}%", pct.round() as i64),
+            )));
+            let at = w["resets_at"].as_i64();
+            if reset && let Some(at) = at {
+                b.append(&fixed(&span(&st.dim, &format!("⟳ {}", until(at)))));
+            }
+            let tip = match at {
+                Some(at) => format!(
+                    "{} {} resets {}",
+                    w["provider"].as_str().unwrap_or_default(),
+                    w["window"].as_str().unwrap_or_default(),
+                    gtk4::glib::DateTime::from_unix_local(at)
+                        .ok()
+                        .and_then(|d| d.format("%a %H:%M").ok())
+                        .map(|s| s.to_string())
+                        .unwrap_or_default()
+                ),
+                None => String::new(),
+            };
+            if !tip.is_empty() {
+                b.set_tooltip_text(Some(&tip));
+            }
+            b
+        };
+        if level == 3 {
+            let page = self.usage_page.get() % windows.len();
+            let w = &windows[page];
+            let label = format!(
+                "{} {}",
+                w["provider"].as_str().unwrap_or_default(),
+                w["window"].as_str().unwrap_or_default()
+            );
+            let b = item(w, &label, false, false);
+            if windows.len() > 1 {
+                b.append(&fixed(&span(
+                    &st.dim,
+                    &format!("{}/{}", page + 1, windows.len()),
+                )));
+            }
+            let btn = gtk4::Button::new();
+            btn.add_css_class("comux-flat");
+            btn.set_child(Some(&b));
+            let (wk, count) = (Rc::downgrade(self), windows.len());
+            btn.connect_clicked(move |_| {
+                if let Some(p) = wk.upgrade() {
+                    p.usage_page.set((p.usage_page.get() + 1) % count);
+                    p.last_gen.set(0);
+                }
+            });
+            into.append(&btn);
+            return;
+        }
+        let mut providers: Vec<(String, Vec<Value>)> = Vec::new();
+        for w in windows {
+            let p = w["provider"].as_str().unwrap_or_default().to_string();
+            match providers.iter_mut().find(|(n, _)| *n == p) {
+                Some((_, v)) => v.push(w),
+                None => providers.push((p, vec![w])),
+            }
+        }
+        for (name, ws) in providers {
+            let g = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+            g.append(&fixed(&span(&st.dim, &name)));
+            for w in &ws {
+                g.append(&item(
+                    w,
+                    w["window"].as_str().unwrap_or_default(),
+                    level == 0 || level == 1,
+                    level == 0,
+                ));
+            }
+            into.append(&g);
+        }
+    }
+
+    /// Pick the richest usage level that fits the room the rest of the status bar leaves.
+    /// Each level's width is computed with the status bar's own Pango context (same CSS font)
+    /// rather than by building and measuring candidates, which would churn widgets every pass.
+    fn fit_usage(self: &Rc<Self>) {
+        let width = self.status.width();
+        let key = (width, self.last_gen.get());
+        if width <= 0 || !self.status.is_visible() || key == self.usage_fit.get() {
+            return;
+        }
+        self.usage_fit.set(key);
+        let Some(usage) = self.usage_box.borrow().clone() else {
+            return;
+        };
+        let chips = self.chips.borrow().clone();
+        let spacing = self.status.spacing();
+        let mut others = 0;
+        let mut count = 0;
+        let mut c = self.status.first_child();
+        while let Some(w) = c {
+            if w != *usage.upcast_ref::<gtk4::Widget>() {
+                let is_chips = chips
+                    .as_ref()
+                    .is_some_and(|s| w == *s.upcast_ref::<gtk4::Widget>());
+                let (min, nat, _, _) = w.measure(gtk4::Orientation::Horizontal, -1);
+                others += if is_chips { min } else { nat };
+            }
+            count += 1;
+            c = w.next_sibling();
+        }
+        let margins = 16; // #comux-status padding
+        let available = width - others - spacing * (count - 1).max(0) - margins;
+        let windows = Self::windows(&self.state()["status"]);
+        let chosen = (0..4u8)
+            .find(|&l| self.usage_width(&windows, l) <= available)
+            .unwrap_or(4);
+        if chosen != self.usage_level.get() {
+            self.usage_level.set(chosen);
+            let s = self.state();
+            let st = self.style.borrow().clone();
+            self.fill_usage(&usage, &s["status"], &st, chosen);
+        }
+    }
+
+    /// The width [`fill_usage`](Self::fill_usage) will take at `level`, from the same texts
+    /// and spacings.
+    fn usage_width(&self, windows: &[Value], level: u8) -> i32 {
+        if windows.is_empty() {
+            return 0;
+        }
+        let text = |t: &str| self.status.create_pango_layout(Some(t)).pixel_size().0;
+        let pct = |w: &Value| {
+            format!(
+                "{}{}%",
+                if w["stale"] == true { "~" } else { "" },
+                w["pct"].as_f64().unwrap_or(0.0).round() as i64
+            )
+        };
+        let gauge = GAUGE_W + 4;
+        let item = |w: &Value, label: &str, g: bool, reset: bool| {
+            let mut x = text(label) + 4 + text(&pct(w));
+            if g {
+                x += gauge;
+            }
+            if reset && let Some(at) = w["resets_at"].as_i64() {
+                x += 4 + text(&format!("⟳ {}", until(at)));
+            }
+            x
+        };
+        if level == 3 {
+            let w = &windows[self.usage_page.get() % windows.len()];
+            let label = format!(
+                "{} {}",
+                w["provider"].as_str().unwrap_or_default(),
+                w["window"].as_str().unwrap_or_default()
+            );
+            let pages = if windows.len() > 1 {
+                4 + text(&format!("{}/{}", windows.len(), windows.len()))
+            } else {
+                0
+            };
+            return 8 + item(w, &label, false, false) + pages;
+        }
+        let mut groups: Vec<(&str, Vec<&Value>)> = Vec::new();
+        for w in windows {
+            let p = w["provider"].as_str().unwrap_or_default();
+            match groups.iter_mut().find(|(n, _)| *n == p) {
+                Some((_, v)) => v.push(w),
+                None => groups.push((p, vec![w])),
+            }
+        }
+        let g = level <= 1;
+        let r = level == 0;
+        let total: i32 = groups
+            .iter()
+            .map(|(name, ws)| {
+                text(name)
+                    + ws.iter()
+                        .map(|w| 6 + item(w, w["window"].as_str().unwrap_or_default(), g, r))
+                        .sum::<i32>()
+            })
+            .sum();
+        total + 10 * (groups.len() as i32 - 1)
+    }
+}
+
+/// A usage gauge: a capsule track in `track`, filled to `pct` in `fill`.
+fn gauge_widget(pct: f64, track: &str, fill: &str, adv: i32) -> gtk4::DrawingArea {
+    let d = gtk4::DrawingArea::new();
+    let h = (adv / 2).clamp(4, 8);
+    d.set_content_width(GAUGE_W);
+    d.set_content_height(h);
+    d.set_valign(gtk4::Align::Center);
+    let (t, f) = (rgb(track), rgb(fill));
+    let frac = (pct / 100.0).clamp(0.0, 1.0);
+    d.set_draw_func(move |_, cr, w, h| {
+        let capsule = |cr: &gtk4::cairo::Context, width: f64| {
+            let r = h as f64 / 2.0;
+            if width < r * 2.0 {
+                cr.rectangle(0.0, 0.0, width, h as f64);
+                return;
+            }
+            cr.new_sub_path();
+            cr.arc(
+                width - r,
+                r,
+                r,
+                -std::f64::consts::FRAC_PI_2,
+                std::f64::consts::FRAC_PI_2,
+            );
+            cr.arc(
+                r,
+                r,
+                r,
+                std::f64::consts::FRAC_PI_2,
+                3.0 * std::f64::consts::FRAC_PI_2,
+            );
+            cr.close_path();
+        };
+        let c = |v: u8| v as f64 / 255.0;
+        cr.set_source_rgb(c(t.0), c(t.1), c(t.2));
+        capsule(cr, w as f64);
+        let _ = cr.fill();
+        if frac > 0.0 {
+            cr.set_source_rgb(c(f.0), c(f.1), c(f.2));
+            capsule(cr, (w as f64 * frac).max(1.0));
+            let _ = cr.fill();
+        }
+    });
+    d
+}
+
+impl ComuxPanel {
     /// Prepare a REMOTE comux: start (or reuse) the L0 host for `dest` and mint a tag. Returns
     /// the host, the tag (bind the panel to it once it exists) and the command the panel runs.
     pub fn prepare_remote(
@@ -367,112 +1560,6 @@ impl ComuxPanel {
             .borrow()
             .iter()
             .any(|p| s["bound"][p].as_u64().is_some_and(|a| claimed.contains(&a)))
-    }
-
-    fn refresh_visibility(&self) {
-        let on = self.hosting(&self.state());
-        self.sidebar.set_visible(on);
-        self.notifications.set_visible(on && self.notif_open.get());
-        self.status.set_visible(on);
-    }
-
-    /// comux's status bar: session, its tabs, the armed prefix, the outcome line, bells,
-    /// attention, agents, unread, usage, update, host — every field the TUI bar carries.
-    fn rebuild_status(self: &Rc<Self>, s: &Value) {
-        clear_box(&self.status);
-        let st = &s["status"];
-        let sess = s["tree"]["sessions"]
-            .as_array()
-            .and_then(|a| a.iter().find(|x| x["active"] == true));
-        let pill = gtk4::Label::new(None);
-        pill.set_markup(&format!(
-            "<b>{}</b>",
-            gtk4::glib::markup_escape_text(sess.and_then(|x| x["name"].as_str()).unwrap_or(""))
-        ));
-        self.status.append(&pill);
-        for t in sess
-            .and_then(|x| x["tabs"].as_array())
-            .into_iter()
-            .flatten()
-        {
-            let mut label = format!(
-                "{} {}",
-                t["index"].as_u64().unwrap_or(0) + 1,
-                t["title"].as_str().unwrap_or_default()
-            );
-            if t["bell"] == true {
-                label.push_str(" !");
-            }
-            let b = gtk4::Button::with_label(&label);
-            b.add_css_class("flat");
-            if t["active"] == true {
-                b.add_css_class("suggested-action");
-            }
-            let id = t["id"].clone();
-            let w = Rc::downgrade(self);
-            b.connect_clicked(move |_| {
-                if let Some(p) = w.upgrade() {
-                    p.cur().command(json!({"cmd": "select-tab", "target": id}));
-                }
-            });
-            let target = format!(
-                "{}/{}",
-                sess.and_then(|x| x["id"].as_str()).unwrap_or_default(),
-                t["id"].as_str().unwrap_or_default()
-            );
-            self.context_menu(
-                &b,
-                vec![
-                    ("Rename tab…", Act::Open("rename-tab", Some(target.clone()))),
-                    ("New tab", Act::Cmd(json!({"cmd": "new-tab"}))),
-                    ("Close tab…", Act::Open("close-tab", Some(target))),
-                ],
-            );
-            self.status.append(&b);
-        }
-        let mut middle: Vec<String> = Vec::new();
-        if st["prefix_armed"] == true {
-            middle.push(format!("[{}]", st["prefix_label"].as_str().unwrap_or("^b")));
-        }
-        if let Some(f) = st["flash"]["text"].as_str() {
-            middle.push(f.to_string());
-        }
-        let line = gtk4::Label::new(Some(&middle.join("  ")));
-        line.set_hexpand(true);
-        line.set_xalign(0.0);
-        line.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        self.status.append(&line);
-        let mut tail: Vec<String> = Vec::new();
-        let n = |k: &str| st[k].as_u64().unwrap_or(0);
-        if n("bells") > 0 {
-            tail.push(format!("! {}", n("bells")));
-        }
-        if n("attention") > 0 {
-            tail.push(format!("⚑{}", n("attention")));
-        }
-        if n("agents") > 0 {
-            tail.push(format!("● {}", n("agents")));
-        }
-        if n("unread") > 0 {
-            tail.push(format!("✉ {}", n("unread")));
-        }
-        for w in st["usage"]["windows"].as_array().into_iter().flatten() {
-            tail.push(format!(
-                "{}{} {} {:.0}%",
-                if w["stale"] == true { "~" } else { "" },
-                w["provider"].as_str().unwrap_or_default(),
-                w["window"].as_str().unwrap_or_default(),
-                w["pct"].as_f64().unwrap_or(0.0)
-            ));
-        }
-        if let Some(u) = st["update"].as_str() {
-            tail.push(format!("⬆ {u}"));
-        }
-        if let Some(h) = st["host"].as_str() {
-            tail.push(h.to_string());
-        }
-        self.status
-            .append(&gtk4::Label::new(Some(&tail.join("  "))));
     }
 
     /// Show the oldest overlay a comux client in a VISIBLE pane opened, as a modal dialog.
@@ -569,105 +1656,6 @@ impl ComuxPanel {
             pop.popup();
         });
         widget.add_controller(click);
-    }
-
-    fn rebuild(self: &Rc<Self>) {
-        let s = self.state();
-        self.rebuild_status(&s);
-        clear(&self.spaces);
-        let mut sa = Vec::new();
-        for sess in s["tree"]["sessions"].as_array().into_iter().flatten() {
-            let name = sess["name"].as_str().unwrap_or_default();
-            let branch = sess["branch"].as_str().unwrap_or_default();
-            let row = two_line(name, branch, sess["active"].as_bool() == Some(true));
-            let sid = sess["id"].as_str().map(str::to_string);
-            self.context_menu(
-                &row,
-                vec![
-                    ("Rename session…", Act::Open("rename-session", sid.clone())),
-                    ("New session…", Act::Open("new-session", None)),
-                    ("Kill session…", Act::Open("kill-session", sid)),
-                ],
-            );
-            self.spaces.append(&row);
-            sa.push(json!({"cmd": "select-session", "target": sess["id"]}));
-        }
-        *self.space_actions.borrow_mut() = sa;
-
-        clear(&self.agents);
-        let mut aa = Vec::new();
-        let mut agents: Vec<&Value> = s["agents"]["agents"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .collect();
-        agents.sort_by_key(|a| a["status"] != "blocked");
-        for a in agents {
-            let title = format!(
-                "{}/{}  {} {}",
-                a["space"].as_str().unwrap_or_default(),
-                a["title"].as_str().unwrap_or_default(),
-                a["status"].as_str().unwrap_or_default(),
-                elapsed(a["since_unix"].as_i64().unwrap_or(0))
-            );
-            let sub = a["detail"]
-                .as_str()
-                .or(a["tool"].as_str())
-                .unwrap_or_default();
-            let row = two_line(&title, sub, a["status"] == "blocked");
-            let tab = format!(
-                "{}/{}",
-                a["space_id"].as_str().unwrap_or_default(),
-                a["tab_id"].as_str().unwrap_or_default()
-            );
-            self.context_menu(
-                &row,
-                vec![
-                    (
-                        "Jump to pane",
-                        Act::Cmd(json!({"cmd": "jump", "target": a["token"]})),
-                    ),
-                    ("Rename tab…", Act::Open("rename-tab", Some(tab))),
-                ],
-            );
-            self.agents.append(&row);
-            aa.push(json!({"cmd": "jump", "target": a["token"]}));
-        }
-        *self.agent_actions.borrow_mut() = aa;
-
-        clear(&self.notif_list);
-        let mut na = Vec::new();
-        for n in s["notifications"]["items"].as_array().into_iter().flatten() {
-            let title = format!(
-                "{} · {}/{}  {}",
-                n["tool"].as_str().unwrap_or_default(),
-                n["space"].as_str().unwrap_or_default(),
-                n["tab"].as_str().unwrap_or_default(),
-                n["when"].as_str().unwrap_or_default()
-            );
-            let body = n["body"].as_str().unwrap_or_default();
-            let row = two_line(&title, body, n["read"].as_bool() != Some(true));
-            let dismiss = json!({"cmd": "notif-dismiss", "id": n["id"]});
-            self.context_menu(&row, vec![("Dismiss", Act::Cmd(dismiss.clone()))]);
-            self.notif_list.append(&row);
-            // Opening one consumes it and its pane's others (`consume`, which an older comux
-            // ignores while still jumping); one whose pane is gone is just dismissed.
-            let mut acts = vec![json!({"cmd": "notif-read", "id": n["id"]})];
-            if n["token"].as_str().is_some_and(|t| !t.is_empty()) {
-                acts.push(json!({"cmd": "jump", "target": n["token"], "consume": true}));
-            } else {
-                acts.push(dismiss);
-            }
-            na.push(acts);
-        }
-        *self.notif_actions.borrow_mut() = na;
-        let unread = s["notifications"]["unread"].as_u64().unwrap_or(0);
-        self.bell.set_label(&if unread > 0 {
-            format!("🔔 {unread}")
-        } else {
-            "🔔".into()
-        });
-        self.refresh_visibility();
     }
 }
 
@@ -935,6 +1923,13 @@ pub fn set_global(p: &Rc<ComuxPanel>) {
     PANEL.with(|g| *g.borrow_mut() = Some(p.clone()));
 }
 
+/// Config hot-reload: restyle the window's comux chrome (font, theme).
+pub fn apply_config_global(config: &CopadConfig) {
+    if let Some(p) = PANEL.with(|g| g.borrow().clone()) {
+        p.apply_config(config);
+    }
+}
+
 /// `comux.open_remote` (decisions #171): a new tab running the remote comux client with a
 /// fresh binding tag, and the L0 link to the same host, so the native chrome follows it.
 pub fn open_remote(
@@ -989,4 +1984,80 @@ pub fn prompt_open_remote(mgr: &Rc<TabManager>, window: &gtk4::ApplicationWindow
     });
     win.present();
     entry.grab_focus();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent(space: &str, status: &str) -> Value {
+        json!({"space": space, "space_id": space, "status": status, "token": format!("{space}-{status}")})
+    }
+
+    /// Every row the agents list shows has its action at the same index: headers and the
+    /// band's rule shift the rows (codex C2).
+    #[test]
+    fn agent_rows_put_the_band_first_and_group_by_space() {
+        let agents = vec![
+            agent("a", "idle"),
+            agent("b", "blocked"),
+            agent("a", "working"),
+        ];
+        let (rows, grouped) = agent_rows(&agents);
+        assert!(grouped);
+        assert_eq!(
+            rows,
+            vec![
+                AgentRow::Band(1),
+                AgentRow::Rule,
+                AgentRow::Header(0),
+                AgentRow::Agent(0),
+                AgentRow::Agent(2),
+                AgentRow::Header(1),
+                AgentRow::Agent(1),
+            ]
+        );
+        let (rows, grouped) = agent_rows(&[agent("a", "idle"), agent("a", "ready")]);
+        assert!(!grouped, "one space needs no header");
+        assert_eq!(rows, vec![AgentRow::Agent(0), AgentRow::Agent(1)]);
+    }
+
+    #[test]
+    fn a_space_without_a_branch_names_what_its_focused_pane_runs() {
+        let tabs = vec![
+            json!({"active": false, "panes": [{"focused": true, "label": "vim"}]}),
+            json!({"active": true, "panes": [{"focused": false, "label": "zsh"}, {"focused": true, "label": "claude"}]}),
+        ];
+        assert_eq!(space_subtitle("", &tabs), "claude");
+        assert_eq!(space_subtitle("main", &tabs), "main");
+        assert_eq!(space_subtitle("", &[]), " ");
+    }
+
+    #[test]
+    fn the_sidebar_split_gives_slack_to_the_half_that_needs_it() {
+        // Both fit: spaces gets what it needs.
+        assert_eq!(split_sidebar(600, 100, 200, 40, 40, 0), 100);
+        // Spaces small, agents overflow: spaces keeps its need.
+        assert_eq!(split_sidebar(600, 120, 2000, 40, 40, 0), 120);
+        // Spaces overflow, agents small: agents keeps its need.
+        assert_eq!(split_sidebar(600, 2000, 100, 40, 40, 0), 500);
+        // Both overflow: even.
+        assert_eq!(split_sidebar(600, 2000, 2000, 40, 40, 0), 300);
+        // Floors that do not both fit: spaces yields first, down to its header.
+        assert_eq!(split_sidebar(60, 2000, 2000, 40, 40, 20), 20);
+    }
+
+    #[test]
+    fn colours_mix_and_markup_is_escaped() {
+        assert_eq!(mix("#000000", "#ffffff"), "#7f7f7f");
+        assert_eq!(
+            span("#ffffff", "a<b"),
+            "<span foreground=\"#ffffff\">a&lt;b</span>"
+        );
+        let st = Style::from_config(&CopadConfig::default());
+        assert_eq!(st.usage(95.0), st.red);
+        assert_eq!(st.usage(75.0), st.yellow);
+        assert_eq!(st.usage(10.0), st.green);
+        assert!(st.css().contains("#comux-sidebar"));
+    }
 }

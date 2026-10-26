@@ -574,7 +574,7 @@ impl CopadWindow {
         layout.set_vexpand(true);
         // comux's sidebar / notification center beside the notebook — hidden unless a visible
         // pane runs a comux client whose sidebar this window claimed (decisions #169).
-        let comux = crate::comux_panel::ComuxPanel::new();
+        let comux = crate::comux_panel::ComuxPanel::new(config);
         crate::comux_panel::set_global(&comux);
         let middle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         middle.set_vexpand(true);
@@ -583,10 +583,16 @@ impl CopadWindow {
         let center = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         center.set_hexpand(true);
         tab_manager.notebook.set_vexpand(true);
-        center.append(&tab_manager.notebook);
+        // The notification panel floats over the terminal area when the window is too narrow
+        // to dock it (decisions #179).
+        let term_over = gtk4::Overlay::new();
+        term_over.set_child(Some(&tab_manager.notebook));
+        term_over.set_vexpand(true);
+        center.append(&term_over);
         center.append(&comux.status);
         middle.append(&center);
-        middle.append(&comux.notifications);
+        middle.append(&comux.notif_dock);
+        comux.mount(&window, &term_over);
         if config.statusbar.position == "top" {
             layout.append(&statusbar.container);
             layout.append(&middle);
@@ -929,6 +935,7 @@ fn watch_config(
         };
 
         eprintln!("[copad] config reloaded");
+        crate::comux_panel::apply_config_global(&config);
         let theme = copad_core::theme::Theme::by_name(&config.theme.name).unwrap_or_default();
         mgr.update_config(&config);
         sb.reload(&config, &pl);

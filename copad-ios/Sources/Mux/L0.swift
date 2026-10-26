@@ -20,6 +20,14 @@ struct L0Session: Codable, Equatable, Identifiable {
     var tabs: [L0Tab]
 }
 
+extension L0Session {
+    /// The TUI's subtitle: the git branch, else what the focused pane runs.
+    var subtitle: String {
+        if !branch.isEmpty { return branch }
+        return tabs.first { $0.active }?.panes.first { $0.focused }?.label ?? " "
+    }
+}
+
 struct L0Tab: Codable, Equatable, Identifiable {
     var id: String
     var index: Int
