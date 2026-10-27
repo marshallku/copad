@@ -438,7 +438,11 @@ struct StatusLine: View {
                     if let a = st?.attention, a > 0 { badge("⚑\(a)", ComuxLook.yellow) }
                     if let n = st?.agents, n > 0 { Text("● \(n)").foregroundStyle(ComuxLook.peach) }
                     if let u = st?.unread, u > 0 { Text("✉ \(u)").foregroundStyle(ComuxLook.blue) }
-                    if let windows = st?.usage?.windows, !windows.isEmpty { ComuxUsage(windows: windows) }
+                    if let usage = st?.usage, !usage.windows.isEmpty {
+                        ComuxUsageView(usage: usage, look: ComuxLook.overlay, gaugeWidth: 40) { d in
+                            session.command(["cmd": "usage-page", "delta": d])
+                        }
+                    }
                     if let up = st?.update { Text("⬆ \(up)").foregroundStyle(ComuxLook.green) }
                     if let h = st?.host, !h.isEmpty { Text(h).font(ComuxLook.strong).foregroundStyle(ComuxLook.text) }
                 }
@@ -462,78 +466,3 @@ struct StatusLine: View {
     }
 }
 
-/// Usage like the TUI's readout: per window a threshold-coloured gauge, the percentage and the
-/// time to reset; short of room it drops the resets, then the gauges, then shows one window at a
-/// time (tap for the next).
-struct ComuxUsage: View {
-    var windows: [L0UsageWindow]
-    @State private var page = 0
-
-    var body: some View {
-        ViewThatFits(in: .horizontal) {
-            row(gauge: true, reset: true)
-            row(gauge: true, reset: false)
-            row(gauge: false, reset: false)
-            paged
-        }
-    }
-
-    private func row(gauge: Bool, reset: Bool) -> some View {
-        HStack(spacing: 8) {
-            ForEach(Array(providers.enumerated()), id: \.offset) { _, p in
-                HStack(spacing: 5) {
-                    Text(p.name).foregroundStyle(ComuxLook.dim)
-                    ForEach(Array(p.windows.enumerated()), id: \.offset) { _, w in
-                        item(w, label: w.window, gauge: gauge, reset: reset)
-                    }
-                }
-            }
-        }
-        .fixedSize()
-    }
-
-    private var paged: some View {
-        let w = windows[page % windows.count]
-        return Button { page = (page + 1) % windows.count } label: {
-            HStack(spacing: 4) {
-                item(w, label: "\(w.provider) \(w.window)", gauge: false, reset: false)
-                if windows.count > 1 { Text("\(page % windows.count + 1)/\(windows.count)").foregroundStyle(ComuxLook.dim) }
-            }
-        }
-        .buttonStyle(.plain)
-        .fixedSize()
-    }
-
-    private func item(_ w: L0UsageWindow, label: String, gauge: Bool, reset: Bool) -> some View {
-        let color = ComuxLook.usage(w.pct)
-        return HStack(spacing: 4) {
-            Text(label).foregroundStyle(ComuxLook.subtext)
-            if gauge {
-                ZStack(alignment: .leading) {
-                    Capsule().fill(ComuxLook.rule)
-                    Capsule().fill(color).frame(width: 40 * min(max(w.pct, 0), 100) / 100)
-                }
-                .frame(width: 40, height: 5)
-            }
-            Text("\(w.stale ? "~" : "")\(Int(w.pct.rounded()))%").foregroundStyle(color)
-            if reset, let at = w.resets_at { Text("⟳ \(untilLabel(at))").foregroundStyle(ComuxLook.dim) }
-        }
-    }
-
-    private struct Provider {
-        var name: String
-        var windows: [L0UsageWindow]
-    }
-
-    private var providers: [Provider] {
-        var out: [Provider] = []
-        for w in windows {
-            if let i = out.firstIndex(where: { $0.name == w.provider }) {
-                out[i].windows.append(w)
-            } else {
-                out.append(Provider(name: w.provider, windows: [w]))
-            }
-        }
-        return out
-    }
-}

@@ -95,6 +95,8 @@ struct L0UsageWindow: Codable, Equatable {
     var pct: Double
     var resets_at: Int64?
     var stale: Bool
+    /// The reset as the TUI shows it (`usage_reset`), empty when off; nil from an older comux.
+    var reset_text: String?
 }
 
 struct L0Status: Codable, Equatable {
@@ -112,6 +114,18 @@ struct L0Status: Codable, Equatable {
 
 struct L0Usage: Codable, Equatable {
     var windows: [L0UsageWindow]
+    /// The TUI's readout (decisions #182): `paged` (one of `pages`, `page` on screen, rotated by
+    /// comux) or `inline`; `gauge` `bar` / `text`. Absent from an older comux.
+    var layout: String?
+    var pages: [L0UsagePage]?
+    var page: Int?
+    var gauge: String?
+}
+
+/// One carousel page: `full`, `usage` or `reset`; `windows` index into `L0Usage.windows`.
+struct L0UsagePage: Codable, Equatable {
+    var kind: String
+    var windows: [Int]
 }
 
 struct L0Clients: Codable, Equatable {

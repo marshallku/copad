@@ -407,6 +407,9 @@ pub enum Req {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller: Option<String>,
     },
+    /// Page the status bar's usage carousel by `delta` (a native status bar's click or wheel,
+    /// decisions #182); the TUI's wheel over the readout does the same.
+    UsagePage { delta: i32 },
     /// A pane's current viewport as styled runs, bottom-anchored to `rows` × `cols` — the
     /// switcher preview a native host draws (decisions #180). Read-only and polled while a
     /// host's picker shows a preview, so it stays out of `ctl_mutates`.

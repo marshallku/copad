@@ -557,9 +557,30 @@ pub struct Flash {
 }
 
 /// Subscription rate-limit windows, percent used. `None` = not reported.
+///
+/// `windows` are the ones the user's `usage_windows` selects. The rest describes the readout
+/// as the TUI draws it (decisions #182), so a host draws the same thing: `layout` `paged`
+/// (one page at a time, `page` of `pages`, which comux rotates every `usage_rotate_secs`) or
+/// `inline`; `gauge` `bar` or `text`. All empty/0 from an older comux (inline, bars).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Usage {
     pub windows: Vec<UsageWindow>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub layout: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pages: Vec<UsagePage>,
+    #[serde(default)]
+    pub page: usize,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gauge: String,
+}
+
+/// One carousel page: `kind` `full` (gauge + percent + reset), `usage` (gauge + percent) or
+/// `reset` (reset only); `windows` index into [`Usage::windows`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct UsagePage {
+    pub kind: String,
+    pub windows: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -574,6 +595,10 @@ pub struct UsageWindow {
     /// A cached value shown while the live read is failing (`~` in the TUI).
     #[serde(default)]
     pub stale: bool,
+    /// The reset as the TUI shows it (`usage_reset`: `2h13m` / `Wed 09:00`), empty when off
+    /// or unknown. Absent from an older comux: a host then formats `resets_at` itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_text: Option<String>,
 }
 
 /// `clients`: render attachments, so a host can find (and claim) its own.

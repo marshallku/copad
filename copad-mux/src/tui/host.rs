@@ -156,36 +156,7 @@ impl App {
 
     /// `status`: everything the status bar shows besides the tabs.
     pub fn host_status(&self) -> l0::Status {
-        let usage = self.usage_shown.as_ref().map(|u| {
-            let mut windows = Vec::new();
-            let mut push = |provider: &str, window: &str, pct, reset, stale| {
-                if let Some(pct) = pct {
-                    windows.push(l0::UsageWindow {
-                        provider: provider.into(),
-                        window: window.into(),
-                        pct,
-                        resets_at: reset,
-                        stale,
-                    });
-                }
-            };
-            push(
-                "claude",
-                "5h",
-                u.claude_5h,
-                u.claude_5h_reset,
-                u.claude_stale,
-            );
-            push(
-                "claude",
-                "wk",
-                u.claude_wk,
-                u.claude_wk_reset,
-                u.claude_stale,
-            );
-            push("codex", "wk", u.codex_wk, u.codex_wk_reset, u.codex_stale);
-            l0::Usage { windows }
-        });
+        let usage = self.host_usage();
         l0::Status {
             prefix_armed: self.prefix_armed,
             prefix_label: self.prefix_label(),
@@ -252,6 +223,86 @@ impl App {
             }
         }
         n
+    }
+}
+
+impl App {
+    /// The usage readout as the TUI draws it (decisions #182): the windows `usage_windows`
+    /// selects, each with its reset in the `usage_reset` style, and — for the paged layout —
+    /// the carousel's pages and the page on screen. `None` when the readout is off or empty.
+    fn host_usage(&self) -> Option<l0::Usage> {
+        use crate::usagepoll::{PageKind, PageUnit};
+        if self.cfg.usage == UsageStyle::Off {
+            return None;
+        }
+        let u = self.usage_shown.as_ref()?;
+        let sel = self.cfg.usage_windows;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        // One page per window = every selected window, in the readout's order.
+        let windows: Vec<l0::UsageWindow> = u
+            .pages(sel, PageUnit::Window, self.cfg.usage_reset)
+            .into_iter()
+            .flat_map(|p| p.entries)
+            .map(|e| l0::UsageWindow {
+                provider: e.provider.into(),
+                window: e.window.into(),
+                pct: e.pct,
+                resets_at: e.reset,
+                stale: e.stale,
+                reset_text: Some(
+                    e.reset
+                        .and_then(|r| crate::usagepoll::format_reset(r, now, self.cfg.usage_reset))
+                        .unwrap_or_default(),
+                ),
+            })
+            .collect();
+        if windows.is_empty() {
+            return None;
+        }
+        let paged = self.cfg.usage_layout == UsageLayout::Paged;
+        let pages: Vec<l0::UsagePage> = if paged {
+            u.pages(sel, self.cfg.usage_page_unit, self.cfg.usage_reset)
+                .into_iter()
+                .map(|p| l0::UsagePage {
+                    kind: match p.kind {
+                        PageKind::Full => "full",
+                        PageKind::Usage => "usage",
+                        PageKind::Reset => "reset",
+                    }
+                    .into(),
+                    windows: p
+                        .entries
+                        .iter()
+                        .filter_map(|e| {
+                            windows
+                                .iter()
+                                .position(|w| w.provider == e.provider && w.window == e.window)
+                        })
+                        .collect(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let page = if pages.is_empty() {
+            0
+        } else {
+            self.usage_page % pages.len()
+        };
+        Some(l0::Usage {
+            windows,
+            layout: if paged { "paged" } else { "inline" }.into(),
+            pages,
+            page,
+            gauge: if self.cfg.usage == UsageStyle::Bar {
+                "bar"
+            } else {
+                "text"
+            }
+            .into(),
+        })
     }
 }
 

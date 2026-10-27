@@ -162,6 +162,25 @@ impl Style {
     }
 }
 
+/// A usage window's reset as comux formats it for `usage_reset` (`None` when off), else — an
+/// older comux — a countdown.
+fn reset_label(w: &Value) -> Option<String> {
+    match w["reset_text"].as_str() {
+        Some(t) => (!t.is_empty()).then(|| t.to_string()),
+        None => w["resets_at"].as_i64().map(until),
+    }
+}
+
+/// The windows a carousel page shows.
+fn page_windows<'a>(page: &Value, windows: &'a [Value]) -> Vec<&'a Value> {
+    page["windows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|i| windows.get(i.as_u64()? as usize))
+        .collect()
+}
+
 /// A cheap fingerprint of the values a part of the chrome is drawn from.
 fn sig(parts: &[&Value]) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -1436,6 +1455,14 @@ impl ComuxPanel {
         }
     }
 
+    /// The carousel's pages when the readout is paged (and comux says what they are).
+    fn pages(status: &Value) -> Option<Vec<Value>> {
+        (status["usage"]["layout"] == "paged")
+            .then(|| status["usage"]["pages"].as_array().cloned())
+            .flatten()
+            .filter(|p| !p.is_empty())
+    }
+
     fn windows(status: &Value) -> Vec<Value> {
         status["usage"]["windows"]
             .as_array()
@@ -1451,7 +1478,10 @@ impl ComuxPanel {
         if windows.is_empty() || level >= 4 {
             return;
         }
+        // `usage = "text"` in mux.toml: never a gauge.
+        let bars = status["usage"]["gauge"] != "text";
         let item = |w: &Value, label: &str, gauge: bool, reset: bool| {
+            let gauge = gauge && bars;
             let pct = w["pct"].as_f64().unwrap_or(0.0);
             let color = st.usage(pct).to_string();
             let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
@@ -1465,8 +1495,8 @@ impl ComuxPanel {
                 &format!("{stale}{}%", pct.round() as i64),
             )));
             let at = w["resets_at"].as_i64();
-            if reset && let Some(at) = at {
-                b.append(&fixed(&span(&st.dim, &format!("⟳ {}", until(at)))));
+            if reset && let Some(r) = reset_label(w) {
+                b.append(&fixed(&span(&st.dim, &format!("⟳ {r}"))));
             }
             let tip = match at {
                 Some(at) => format!(
@@ -1486,6 +1516,63 @@ impl ComuxPanel {
             }
             b
         };
+        // The TUI's carousel (decisions #182): comux holds the page and rotates it; every page
+        // sits in a Stack so the readout is as wide as its widest page and the chips beside it
+        // never move; a click turns it for every view.
+        if let Some(pages) = Self::pages(status) {
+            let current = status["usage"]["page"].as_u64().unwrap_or(0) as usize % pages.len();
+            let stack = gtk4::Stack::new();
+            stack.set_hhomogeneous(true);
+            stack.set_transition_type(gtk4::StackTransitionType::None);
+            for (i, p) in pages.iter().enumerate() {
+                let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+                for (k, w) in page_windows(p, &windows).into_iter().enumerate() {
+                    if k > 0 {
+                        row.append(&fixed(&span(&st.dim, "·")));
+                    }
+                    let label = format!(
+                        "{}{} {}",
+                        if w["stale"] == true { "~" } else { "" },
+                        w["provider"].as_str().unwrap_or_default(),
+                        w["window"].as_str().unwrap_or_default()
+                    );
+                    match p["kind"].as_str() {
+                        Some("reset") => {
+                            let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+                            b.append(&fixed(&span(&st.subtext, &label)));
+                            let r = reset_label(w).unwrap_or_else(|| "–".into());
+                            b.append(&fixed(&span(&st.dim, &format!("⟳ {r}"))));
+                            row.append(&b);
+                        }
+                        Some("usage") => row.append(&item(w, &label, level == 0, false)),
+                        _ => row.append(&item(w, &label, level == 0, true)),
+                    }
+                }
+                row.set_halign(gtk4::Align::Start);
+                stack.add_named(&row, Some(&i.to_string()));
+            }
+            stack.set_visible_child_name(&current.to_string());
+            let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+            b.append(&stack);
+            if pages.len() > 1 {
+                b.append(&fixed(&span(
+                    &st.dim,
+                    &format!("{}/{}", current + 1, pages.len()),
+                )));
+            }
+            let btn = gtk4::Button::new();
+            btn.add_css_class("comux-flat");
+            btn.set_child(Some(&b));
+            btn.set_tooltip_text(Some("Next page"));
+            let wk = Rc::downgrade(self);
+            btn.connect_clicked(move |_| {
+                if let Some(p) = wk.upgrade() {
+                    p.cur().command(json!({"cmd": "usage-page", "delta": 1}));
+                }
+            });
+            into.append(&btn);
+            return;
+        }
         if level == 3 {
             let page = self.usage_page.get() % windows.len();
             let w = &windows[page];
@@ -1568,10 +1655,19 @@ impl ComuxPanel {
         }
         let margins = 16; // #comux-status padding
         let available = width - others - spacing * (count - 1).max(0) - margins;
-        let windows = Self::windows(&self.state()["status"]);
-        let chosen = (0..4u8)
-            .find(|&l| self.usage_width(&windows, l) <= available)
-            .unwrap_or(4);
+        let status = self.state()["status"].clone();
+        let windows = Self::windows(&status);
+        let bars = status["usage"]["gauge"] != "text";
+        let chosen = match Self::pages(&status) {
+            // Paged: with gauges, else without, else hidden.
+            Some(pages) => [0u8, 1]
+                .into_iter()
+                .find(|&l| self.paged_width(&pages, &windows, l, bars) <= available)
+                .unwrap_or(4),
+            None => (0..4u8)
+                .find(|&l| self.usage_width(&windows, l, bars) <= available)
+                .unwrap_or(4),
+        };
         if chosen != self.usage_level.get() {
             self.usage_level.set(chosen);
             let s = self.state();
@@ -1580,9 +1676,47 @@ impl ComuxPanel {
         }
     }
 
+    /// The width of the paged readout: its widest page, the `n/N` and the button padding.
+    fn paged_width(&self, pages: &[Value], windows: &[Value], level: u8, bars: bool) -> i32 {
+        let text = |t: &str| self.status.create_pango_layout(Some(t)).pixel_size().0;
+        let bars = level == 0 && bars;
+        let widest = pages
+            .iter()
+            .map(|p| {
+                page_windows(p, windows)
+                    .iter()
+                    .enumerate()
+                    .map(|(k, w)| {
+                        let label = format!(
+                            "{} {}",
+                            w["provider"].as_str().unwrap_or_default(),
+                            w["window"].as_str().unwrap_or_default()
+                        );
+                        let sep = if k > 0 { 6 + text("·") + 6 } else { 0 };
+                        let reset = reset_label(w).map_or(0, |r| 4 + text(&format!("⟳ {r}")));
+                        let pct = 4 + text("100%");
+                        sep + text(&label)
+                            + match p["kind"].as_str() {
+                                Some("reset") => reset,
+                                Some("usage") => pct + if bars { GAUGE_W + 4 } else { 0 },
+                                _ => pct + reset + if bars { GAUGE_W + 4 } else { 0 },
+                            }
+                    })
+                    .sum::<i32>()
+            })
+            .max()
+            .unwrap_or(0);
+        let counter = if pages.len() > 1 {
+            6 + text(&format!("{}/{}", pages.len(), pages.len()))
+        } else {
+            0
+        };
+        8 + widest + counter
+    }
+
     /// The width [`fill_usage`](Self::fill_usage) will take at `level`, from the same texts
     /// and spacings.
-    fn usage_width(&self, windows: &[Value], level: u8) -> i32 {
+    fn usage_width(&self, windows: &[Value], level: u8, bars: bool) -> i32 {
         if windows.is_empty() {
             return 0;
         }
@@ -1597,11 +1731,11 @@ impl ComuxPanel {
         let gauge = GAUGE_W + 4;
         let item = |w: &Value, label: &str, g: bool, reset: bool| {
             let mut x = text(label) + 4 + text(&pct(w));
-            if g {
+            if g && bars {
                 x += gauge;
             }
-            if reset && let Some(at) = w["resets_at"].as_i64() {
-                x += 4 + text(&format!("⟳ {}", until(at)));
+            if reset && let Some(r) = reset_label(w) {
+                x += 4 + text(&format!("⟳ {r}"));
             }
             x
         };

@@ -903,7 +903,11 @@ struct ComuxStatusStrip: View {
                 if let a = status?.attention, a > 0 { badge("⚑\(a)", fg: st.base, bg: st.yellow, st) }
                 if let n = status?.agents, n > 0 { Text("● \(n)").foregroundStyle(st.peach) }
                 if let u = status?.unread, u > 0 { Text("✉ \(u)").foregroundStyle(st.blue) }
-                if let windows = status?.usage?.windows, !windows.isEmpty { ComuxUsage(windows: windows, style: st) }
+                if let usage = status?.usage, !usage.windows.isEmpty {
+                    ComuxUsageView(usage: usage, look: st.overlayLook) { d in
+                        host.command(["cmd": "usage-page", "delta": d])
+                    }
+                }
                 if let up = status?.update { Text("⬆ \(up)").foregroundStyle(st.green) }
                 TimelineView(.everyMinute) { ctx in
                     Text(ctx.date, style: .time).foregroundStyle(st.subtext)
@@ -963,88 +967,6 @@ struct ComuxStatusStrip: View {
                 Button("Close Tab…", role: .destructive) { host.open("close-tab", target: "\(sid)/\(t.id)") }
             }
         }
-    }
-}
-
-/// Subscription usage like the TUI's readout: per window a threshold-coloured gauge, the
-/// percentage and the time to reset (`⟳ 2h13m`, the exact time in the tooltip). When the bar
-/// is short of room it drops the reset times, then the gauges, then shows one window at a time
-/// (click for the next).
-struct ComuxUsage: View {
-    var windows: [L0UsageWindow]
-    var style: ComuxStyle
-    @State private var page = 0
-
-    var body: some View {
-        ViewThatFits(in: .horizontal) {
-            row(gauge: true, reset: true)
-            row(gauge: true, reset: false)
-            row(gauge: false, reset: false)
-            paged
-        }
-    }
-
-    private func row(gauge: Bool, reset: Bool) -> some View {
-        HStack(spacing: 10) {
-            ForEach(Array(providers.enumerated()), id: \.offset) { _, p in
-                HStack(spacing: 6) {
-                    Text(p.name).foregroundStyle(style.dim)
-                    ForEach(Array(p.windows.enumerated()), id: \.offset) { _, w in
-                        item(w, label: w.window, gauge: gauge, reset: reset)
-                    }
-                }
-            }
-        }
-        .fixedSize()
-    }
-
-    private var paged: some View {
-        let w = windows[page % windows.count]
-        return Button { page = (page + 1) % windows.count } label: {
-            HStack(spacing: 4) {
-                item(w, label: "\(w.provider) \(w.window)", gauge: false, reset: false)
-                if windows.count > 1 { Text("\(page % windows.count + 1)/\(windows.count)").foregroundStyle(style.dim) }
-            }
-        }
-        .buttonStyle(.plain)
-        .fixedSize()
-        .help("Click for the next window")
-    }
-
-    private func item(_ w: L0UsageWindow, label: String, gauge: Bool, reset: Bool) -> some View {
-        let color = style.usage(w.pct)
-        return HStack(spacing: 4) {
-            Text(label).foregroundStyle(style.subtext)
-            if gauge {
-                ZStack(alignment: .leading) {
-                    Capsule().fill(style.rule)
-                    Capsule().fill(color).frame(width: 56 * min(max(w.pct, 0), 100) / 100)
-                }
-                .frame(width: 56, height: max(4, style.lineHeight * 0.32))
-            }
-            Text("\(w.stale ? "~" : "")\(Int(w.pct.rounded()))%").foregroundStyle(color)
-            if reset, let at = w.resets_at {
-                Text("⟳ \(untilLabel(at))").foregroundStyle(style.dim)
-            }
-        }
-        .help(w.resets_at.map { "\(w.provider) \(w.window) resets \(Date(timeIntervalSince1970: TimeInterval($0)).formatted(date: .abbreviated, time: .shortened))" } ?? "\(w.provider) \(w.window)")
-    }
-
-    private struct Provider {
-        var name: String
-        var windows: [L0UsageWindow]
-    }
-
-    private var providers: [Provider] {
-        var out: [Provider] = []
-        for w in windows {
-            if let i = out.firstIndex(where: { $0.name == w.provider }) {
-                out[i].windows.append(w)
-            } else {
-                out.append(Provider(name: w.provider, windows: [w]))
-            }
-        }
-        return out
     }
 }
 

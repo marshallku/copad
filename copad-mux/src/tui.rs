@@ -4919,6 +4919,10 @@ impl App {
                 }
             }
             Req::PanePreview { target, rows, cols } => self.pane_preview(target, *rows, *cols),
+            Req::UsagePage { delta } => {
+                self.page_usage(*delta);
+                Resp::ok()
+            }
             Req::ListAgents { target } => {
                 // Resolve the target on EVERY request, not once: the pane can close during
                 // a wait, and "gone" must be distinguishable from "not an agent yet".
@@ -8285,9 +8289,10 @@ impl App {
         // Mirror the render gate exactly (cols >= 100, not Off, paged, something
         // visible) so auto-rotate/manual paging only act when the carousel actually
         // shows — a hidden readout must not force needless repaints.
+        // A host drawing the status bar has its own room: the TUI's width gate is not its.
         if self.cfg.usage_layout != UsageLayout::Paged
             || self.cfg.usage == UsageStyle::Off
-            || self.cols < 100
+            || (self.cols < 100 && !self.host_hidden.1)
         {
             return 0;
         }
@@ -18219,6 +18224,64 @@ mod host_api {
                 .0
         );
         assert!(app.host_notifications().items.is_empty());
+    }
+
+    #[test]
+    fn the_status_topic_carries_the_usage_carousel_as_configured() {
+        let mut app = app();
+        let far = 4_000_000_000;
+        app.usage_shown = Some(crate::usagepoll::UsageSnapshot {
+            claude_5h: Some(10.0),
+            claude_wk: Some(40.0),
+            claude_stale: false,
+            codex_wk: Some(5.0),
+            codex_stale: false,
+            claude_5h_reset: Some(far),
+            claude_wk_reset: Some(far),
+            codex_wk_reset: None,
+        });
+        // The owner's config: weekly windows only, split by metric, rotating.
+        app.cfg.usage_windows = crate::usagepoll::UsageWindows {
+            claude_5h: false,
+            claude_wk: true,
+            codex_wk: true,
+        };
+        app.cfg.usage_layout = UsageLayout::Paged;
+        app.cfg.usage_page_unit = crate::usagepoll::PageUnit::Metric;
+        app.cfg.usage_rotate_secs = 10;
+        let u = app.host_status().usage.expect("usage");
+        assert_eq!(
+            u.windows
+                .iter()
+                .map(|w| format!("{}-{}", w.provider, w.window))
+                .collect::<Vec<_>>(),
+            ["claude-wk", "codex-wk"],
+            "usage_windows filters what a host shows"
+        );
+        assert_eq!(u.layout, "paged");
+        assert_eq!(
+            u.pages
+                .iter()
+                .map(|p| (p.kind.as_str(), p.windows.clone()))
+                .collect::<Vec<_>>(),
+            [("usage", vec![0, 1]), ("reset", vec![0, 1])]
+        );
+        assert!(
+            !u.windows[0]
+                .reset_text
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert_eq!(u.page, 0);
+        // A native status bar pages it like the TUI's wheel, even on a narrow terminal.
+        app.set_host_hidden(true, true);
+        app.cols = 40;
+        app.handle_control(&Req::UsagePage { delta: 1 });
+        assert_eq!(app.host_status().usage.unwrap().page, 1);
+        app.cfg.usage_layout = UsageLayout::Inline;
+        let u = app.host_status().usage.unwrap();
+        assert_eq!((u.layout.as_str(), u.pages.len()), ("inline", 0));
     }
 
     #[test]

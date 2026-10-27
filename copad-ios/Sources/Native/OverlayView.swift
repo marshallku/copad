@@ -39,6 +39,9 @@ struct OverlayLook {
         }
     }
 
+    /// green < 70% ≤ yellow < 90% ≤ red, like the TUI's gauges.
+    func usage(_ pct: Double) -> Color { pct >= 90 ? red : pct >= 70 ? yellow : green }
+
     /// A preview colour: the theme for 0–15, xterm's cube and greys above, or rgb.
     func color(_ c: L0RunColor) -> Color {
         switch c {
@@ -825,4 +828,147 @@ private func isSubsequence(_ needle: String, of hay: String) -> Bool {
         if !found { return false }
     }
     return true
+}
+
+// MARK: - usage readout (decisions #179, #182)
+
+/// The status bar's usage readout, as the TUI draws it: `inline` shows every window and sheds
+/// detail when short of room; `paged` is the TUI's carousel — one page at a time with `n/N`,
+/// rotated by comux (`usage_rotate_secs`), a click pages it for everyone (`usage-page`). Its
+/// width is the widest page's, so the chips beside it never shift as it turns.
+struct ComuxUsageView: View {
+    var usage: L0Usage
+    var look: OverlayLook
+    var gaugeWidth: CGFloat = 56
+    /// Page the carousel by a delta (through comux, so every view of it turns together).
+    var turn: (Int) -> Void
+
+    private var windows: [L0UsageWindow] { usage.windows }
+    private var bars: Bool { usage.gauge != "text" }
+
+    var body: some View {
+        if usage.layout == "paged", let pages = usage.pages, !pages.isEmpty {
+            ViewThatFits(in: .horizontal) {
+                carousel(pages, gauge: bars)
+                carousel(pages, gauge: false)
+            }
+        } else {
+            ViewThatFits(in: .horizontal) {
+                row(gauge: bars, reset: true)
+                row(gauge: bars, reset: false)
+                row(gauge: false, reset: false)
+                single
+            }
+        }
+    }
+
+    private func carousel(_ pages: [L0UsagePage], gauge: Bool) -> some View {
+        let current = (usage.page ?? 0) % pages.count
+        return Button { turn(1) } label: {
+            HStack(spacing: 6) {
+                ZStack(alignment: .leading) {
+                    ForEach(Array(pages.enumerated()), id: \.offset) { i, p in
+                        page(p, gauge: gauge).opacity(i == current ? 1 : 0)
+                    }
+                }
+                if pages.count > 1 { Text("\(current + 1)/\(pages.count)").foregroundStyle(look.dim) }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+        .accessibilityIdentifier("usagePage-\(current + 1)")
+    }
+
+    private func page(_ p: L0UsagePage, gauge: Bool) -> some View {
+        let ws = p.windows.filter { windows.indices.contains($0) }.map { windows[$0] }
+        return HStack(spacing: 6) {
+            ForEach(Array(ws.enumerated()), id: \.offset) { i, w in
+                if i > 0 { Text("·").foregroundStyle(look.dim) }
+                let label = "\(w.stale ? "~" : "")\(w.provider) \(w.window)"
+                switch p.kind {
+                case "reset":
+                    HStack(spacing: 4) {
+                        Text(label).foregroundStyle(look.subtext)
+                        Text("⟳ \(w.resetLabel ?? "–")").foregroundStyle(look.dim)
+                    }
+                case "usage":
+                    item(w, label: label, gauge: gauge, reset: false)
+                default:
+                    item(w, label: label, gauge: gauge, reset: true)
+                }
+            }
+        }
+    }
+
+    private func row(gauge: Bool, reset: Bool) -> some View {
+        HStack(spacing: 10) {
+            ForEach(Array(providers.enumerated()), id: \.offset) { _, p in
+                HStack(spacing: 6) {
+                    Text(p.name).foregroundStyle(look.dim)
+                    ForEach(Array(p.windows.enumerated()), id: \.offset) { _, w in
+                        item(w, label: w.window, gauge: gauge, reset: reset)
+                    }
+                }
+            }
+        }
+        .fixedSize()
+    }
+
+    /// Inline but no room for all: one window, clicked through locally.
+    @State private var local = 0
+    private var single: some View {
+        let w = windows[local % windows.count]
+        return Button { local = (local + 1) % windows.count } label: {
+            HStack(spacing: 4) {
+                item(w, label: "\(w.provider) \(w.window)", gauge: false, reset: false)
+                if windows.count > 1 { Text("\(local % windows.count + 1)/\(windows.count)").foregroundStyle(look.dim) }
+            }
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+    }
+
+    private func item(_ w: L0UsageWindow, label: String, gauge: Bool, reset: Bool) -> some View {
+        let color = look.usage(w.pct)
+        return HStack(spacing: 4) {
+            Text(label).foregroundStyle(look.subtext)
+            if gauge {
+                ZStack(alignment: .leading) {
+                    Capsule().fill(look.rule)
+                    Capsule().fill(color).frame(width: gaugeWidth * min(max(w.pct, 0), 100) / 100)
+                }
+                .frame(width: gaugeWidth, height: max(4, look.lineHeight * 0.32))
+            }
+            // A cached value is marked `~`, on its label in the carousel, else on the number.
+            Text("\(w.stale && !label.hasPrefix("~") ? "~" : "")\(Int(w.pct.rounded()))%").foregroundStyle(color)
+            if reset, let r = w.resetLabel { Text("⟳ \(r)").foregroundStyle(look.dim) }
+        }
+    }
+
+    private struct Provider {
+        var name: String
+        var windows: [L0UsageWindow]
+    }
+
+    private var providers: [Provider] {
+        var out: [Provider] = []
+        for w in windows {
+            if let i = out.firstIndex(where: { $0.name == w.provider }) {
+                out[i].windows.append(w)
+            } else {
+                out.append(Provider(name: w.provider, windows: [w]))
+            }
+        }
+        return out
+    }
+}
+
+extension L0UsageWindow {
+    /// The reset as comux formats it for the user's `usage_reset` (nil when off), else — an
+    /// older comux — a countdown.
+    var resetLabel: String? {
+        if let t = reset_text { return t.isEmpty ? nil : t }
+        return resets_at.map { untilLabel($0) }
+    }
 }
