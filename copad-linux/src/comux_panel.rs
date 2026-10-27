@@ -761,19 +761,26 @@ impl ComuxPanel {
             keep.set_propagation_phase(gtk4::PropagationPhase::Capture);
             keep.set_button(0);
             let before: Rc<RefCell<Option<gtk4::Widget>>> = Rc::new(RefCell::new(None));
-            let (b, win, a2) = (before.clone(), window.clone(), area.clone());
-            keep.connect_pressed(move |_, _, _, _| {
+            // Weak: the window owns `area`, which owns this gesture (a strong capture of either
+            // would keep the closed window alive).
+            let (b, win) = (before.clone(), window.downgrade());
+            keep.connect_pressed(move |g, _, _, _| {
+                let (Some(win), Some(area)) = (win.upgrade(), g.widget()) else {
+                    return;
+                };
                 let f = gtk4::prelude::GtkWindowExt::focus(&win);
-                *b.borrow_mut() = f.filter(|f| !f.is_ancestor(&a2) && f != &a2);
+                *b.borrow_mut() = f.filter(|f| !f.is_ancestor(&area) && f != &area);
             });
-            let (w, b, win) = (Rc::downgrade(self), before, window.clone());
+            let (w, b, win) = (Rc::downgrade(self), before, window.downgrade());
             keep.connect_released(move |_, _, _, _| {
                 let Some(prev) = b.borrow_mut().take() else {
                     return;
                 };
                 let (w, win) = (w.clone(), win.clone());
                 gtk4::glib::idle_add_local_once(move || {
-                    let Some(p) = w.upgrade() else { return };
+                    let (Some(p), Some(win)) = (w.upgrade(), win.upgrade()) else {
+                        return;
+                    };
                     if p.nav.active() {
                         return;
                     }
@@ -2031,10 +2038,12 @@ impl ComuxPanel {
         let click = gtk4::GestureClick::new();
         click.set_button(3);
         let w = Rc::downgrade(self);
-        let anchor = widget.as_ref().clone();
         let items: Rc<Vec<(String, Act)>> =
             Rc::new(items.into_iter().map(|(l, a)| (l.to_string(), a)).collect());
+        // Nothing the gesture's owner holds may be captured strongly: widget → gesture →
+        // closure → widget is a cycle, and these rows are rebuilt on every state change.
         click.connect_pressed(move |g, _, x, y| {
+            let Some(anchor) = g.widget() else { return };
             g.set_state(gtk4::EventSequenceState::Claimed);
             let pop = gtk4::Popover::new();
             pop.set_parent(&anchor);
@@ -2043,9 +2052,11 @@ impl ComuxPanel {
             for (label, act) in items.iter() {
                 let b = gtk4::Button::with_label(label);
                 b.add_css_class("flat");
-                let (w, act, pop2) = (w.clone(), act.clone(), pop.clone());
+                let (w, act, pop2) = (w.clone(), act.clone(), pop.downgrade());
                 b.connect_clicked(move |_| {
-                    pop2.popdown();
+                    if let Some(pop) = pop2.upgrade() {
+                        pop.popdown();
+                    }
                     if let Some(p) = w.upgrade() {
                         match &act {
                             Act::Open(what, target) => p.open(what, target.clone()),
@@ -2130,10 +2141,12 @@ pub fn prompt_open_remote(mgr: &Rc<TabManager>, window: &gtk4::ApplicationWindow
     entry.set_placeholder_text(Some("user@host"));
     vb.append(&entry);
     win.set_child(Some(&vb));
-    let (m, w2, win2) = (mgr.clone(), window.clone(), win.clone());
+    let (m, w2, win2) = (mgr.clone(), window.clone(), win.downgrade());
     entry.connect_activate(move |e| {
         let dest = e.text().trim().to_string();
-        win2.close();
+        if let Some(win) = win2.upgrade() {
+            win.close();
+        }
         if !dest.is_empty()
             && let Err(err) = open_remote(&m, &w2, &dest, "comux")
         {

@@ -321,12 +321,16 @@ impl OverlayUi {
         card.set_overflow(gtk4::Overflow::Hidden);
         layer.append(&card);
         // A click outside the card cancels; inside, it is the card's.
+        // Weak: the layer owns this gesture and the card, so a strong capture of either is a
+        // cycle that keeps every closed overlay alive.
         let click = gtk4::GestureClick::new();
-        let (c2, a2) = (card.clone(), handlers.answer.clone());
-        let l2 = layer.clone();
-        click.connect_pressed(move |_, _, x, y| {
-            let inside = c2
-                .compute_bounds(&l2)
+        let (c2, a2) = (card.downgrade(), handlers.answer.clone());
+        click.connect_pressed(move |g, _, x, y| {
+            let (Some(card), Some(layer)) = (c2.upgrade(), g.widget()) else {
+                return;
+            };
+            let inside = card
+                .compute_bounds(&layer)
                 .is_some_and(|b| b.contains_point(&gtk4::graphene::Point::new(x as f32, y as f32)));
             if !inside {
                 a2(None, None);
@@ -1319,9 +1323,11 @@ impl PickerUi {
             );
             let stays = a["stays"] == true;
             let h = self.handlers.clone();
-            let p2 = pop.clone();
+            let p2 = pop.downgrade();
             b.connect_clicked(move |_| {
-                p2.popdown();
+                if let Some(pop) = p2.upgrade() {
+                    pop.popdown();
+                }
                 if stays {
                     (h.act)(choice.clone());
                 } else {

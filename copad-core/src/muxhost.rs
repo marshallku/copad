@@ -265,22 +265,27 @@ impl MuxHost {
 
     /// Register `panel`'s binding tag.
     pub fn bind(&self, panel: &str, tag: &str) {
-        self.with(|s| {
-            s.binds.insert(panel.into(), tag.into());
-        });
+        self.with(|s| s.binds.insert(panel.into(), tag.into()).as_deref() != Some(tag));
     }
 
     /// Forget a closed panel.
     pub fn unbind(&self, panel: &str) {
         self.with(|s| {
-            s.binds.remove(panel);
-            s.served.remove(panel);
+            let bound = s.binds.remove(panel).is_some();
+            s.served.remove(panel) || bound
         });
     }
 
     /// The panels currently on screen (every split of every window's visible tab).
     pub fn serve(&self, panels: &[String]) {
-        self.with(|s| s.served = panels.iter().cloned().collect());
+        self.with(|s| {
+            let served: BTreeSet<String> = panels.iter().cloned().collect();
+            if served == s.served {
+                return false;
+            }
+            s.served = served;
+            true
+        });
     }
 
     /// Answer a delegated overlay (`choice` for a picker/confirm, `text` for a prompt; both
@@ -437,19 +442,27 @@ impl MuxHost {
         })
     }
 
-    /// Apply a GUI-side change, reconcile claims, and bump the generation.
-    fn with(&self, f: impl FnOnce(&mut State)) {
-        {
+    /// Apply a GUI-side change, reconcile claims, and bump the generation when `f` reports a
+    /// change. GUIs re-report bindings on a timer: the reconcile still runs on every report (it
+    /// is what retries a claim a refusal parked), but an unchanged report must not make every
+    /// window re-read and re-render the whole state.
+    fn with(&self, f: impl FnOnce(&mut State) -> bool) {
+        let changed = {
             let Ok(mut s) = self.inner.state.lock() else {
                 return;
             };
-            f(&mut s);
+            let changed = f(&mut s);
             let tags = s.served_tags();
-            let model = s.model.clone();
-            let ops = s.claims.reconcile(&model, &tags);
+            let State { claims, model, .. } = &mut *s;
+            let held = claims.held().clone();
+            let ops = claims.reconcile(model, &tags);
+            let changed = changed || *claims.held() != held;
             send_ops_locked(&self.inner, &s, ops);
+            changed
+        };
+        if changed {
+            self.inner.generation.fetch_add(1, Ordering::SeqCst);
         }
-        self.inner.generation.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -832,6 +845,34 @@ mod tests {
             unsent: Mutex::new(Vec::new()),
             stop: AtomicBool::new(true),
         })
+    }
+
+    #[test]
+    fn re_reporting_unchanged_bindings_leaves_the_generation_alone() {
+        let h = MuxHost { inner: inner() };
+        let g0 = h.generation();
+        h.bind("p1", "t1");
+        let g1 = h.generation();
+        assert!(g1 > g0, "a new binding is a change");
+        h.bind("p1", "t1");
+        h.serve(&["p1".into()]);
+        let g2 = h.generation();
+        assert!(g2 > g1, "a new served set is a change");
+        // The GUIs' periodic re-report: same tag, same set (order and duplicates aside).
+        h.bind("p1", "t1");
+        h.serve(&["p1".into(), "p1".into()]);
+        assert_eq!(h.generation(), g2);
+        h.bind("p1", "t2");
+        assert!(h.generation() > g2, "a changed tag is a change");
+        let g3 = h.generation();
+        h.unbind("nope");
+        assert_eq!(
+            h.generation(),
+            g3,
+            "unbinding an unknown panel changes nothing"
+        );
+        h.unbind("p1");
+        assert!(h.generation() > g3);
     }
 
     fn want(s: &mut State, consumer: &str, inflight: &str) {
