@@ -1745,9 +1745,10 @@ fn handle_terminal_history(req: &Request, mgr: &Rc<TabManager>) -> Response {
     let row_count = term.terminal.row_count();
     let col_count = term.terminal.column_count();
 
-    // Negative rows access scrollback in VTE
-    let start_row = -lines;
-    let end_row = row_count - 1;
+    // History is the `lines` rows above the screen, in VTE's absolute row numbers.
+    let top = term.screen_top_row();
+    let start_row = (top - lines).max(0);
+    let end_row = top + row_count - 1;
 
     let text = term.read_range(start_row, 0, end_row, col_count - 1);
     Response::success(
@@ -1778,7 +1779,12 @@ fn handle_terminal_context(req: &Request, mgr: &Rc<TabManager>) -> Response {
         .and_then(|v| v.as_i64())
         .unwrap_or(50);
     let col_count = term.terminal.column_count();
-    let history = term.read_range(-history_lines, 0, -1, col_count - 1);
+    let top = term.screen_top_row();
+    let history = if top > 0 {
+        term.read_range((top - history_lines).max(0), 0, top - 1, col_count - 1)
+    } else {
+        String::new()
+    };
 
     Response::success(
         req.id.clone(),
