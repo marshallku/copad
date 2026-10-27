@@ -514,12 +514,17 @@ final class TabViewController: NSViewController {
         let host = comuxWindow
         host.consumer = ComuxHost.consumer(ObjectIdentifier(self))
         let settle: () -> Void = { [weak self] in self?.settleComuxInput() }
-        let sidebar = NSHostingView(rootView: ComuxSidebar(host: host, settle: settle, toggleNotifications: { [weak self] in
+        // The chrome never takes the keys from the terminal (it has no text field): a click on a
+        // chip or a row acts and the pane keeps typing. Only `Ctrl-b e` hands the sidebar the keys.
+        let sidebar = ChromeHostingView(rootView: ComuxSidebar(host: host, settle: settle, toggleNotifications: { [weak self] in
             self?.comuxNotificationsOpen.toggle()
             self?.refreshComuxChrome()
         }))
-        let notifications = NSHostingView(rootView: ComuxNotifications(host: host, settle: settle))
-        let status = NSHostingView(rootView: ComuxStatusStrip(host: host, settle: settle))
+        sidebar.takesKeys = { [weak host] in host?.sidebarFocus != nil }
+        let notifications = ChromeHostingView(rootView: ComuxNotifications(host: host, settle: settle, close: { [weak self] in
+            self?.closeComuxNotifications()
+        }))
+        let status = ChromeHostingView(rootView: ComuxStatusStrip(host: host, settle: settle))
         let slot = NSView()
         let card = PassThroughHostingView(rootView: ComuxHoverCard(host: host))
         // The sidebar's right edge resizes it (decisions #181).
@@ -636,7 +641,9 @@ final class TabViewController: NSViewController {
         let side = on ? (dragged > 0 ? min(max(dragged, 160), max(0.6 * width, 160)) : natural).rounded() : 0
         let notifOpen = on && comuxNotificationsOpen
         let notif = notifOpen ? min(max(38 * st.advance, 260), max(0.35 * width, 220)).rounded() : 0
-        let floating = notifOpen && width - side - notif < 40 * st.advance
+        // Always over the terminal, never beside it: opening it must not reflow the panes, and
+        // opening a notification closes it anyway.
+        let floating = notifOpen
         set(comuxSidebarWidth, side)
         set(comuxCardWidth, on ? (72 * st.advance + 40).rounded() : 0)
         set(comuxStatusHeight, on ? st.statusHeight : 0)
@@ -690,6 +697,7 @@ final class TabViewController: NSViewController {
     private func closeComuxNotifications() {
         comuxNotificationsOpen = false
         refreshComuxChrome()
+        refocusPane()
     }
 
     override func viewDidLayout() {
@@ -1493,4 +1501,12 @@ final class ComuxResizeGrip: NSView {
     override func mouseUp(with e: NSEvent) {
         start = nil
     }
+}
+
+/// A hosting view for comux chrome that a click never makes first responder (so the terminal
+/// keeps the keys), unless `takesKeys` says it should have them (sidebar keyboard mode, #181).
+final class ChromeHostingView<Content: View>: NSHostingView<Content> {
+    var takesKeys: () -> Bool = { false }
+    override var acceptsFirstResponder: Bool { takesKeys() }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }

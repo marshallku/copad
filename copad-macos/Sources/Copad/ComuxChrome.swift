@@ -787,6 +787,8 @@ struct ComuxSidebar: View {
 struct ComuxNotifications: View {
     @ObservedObject var host: ComuxWindow
     var settle: () -> Void
+    /// Close the panel: opening a notification goes to its pane, which is what the panel was for.
+    var close: () -> Void = {}
 
     var body: some View {
         let st = host.style
@@ -829,6 +831,7 @@ struct ComuxNotifications: View {
             // older than that ignores it and only jumps.
             host.command(["cmd": "jump", "target": n.token, "consume": true])
         }
+        close()
     }
 
     private func row(_ n: L0Notification, _ st: ComuxStyle) -> some View {

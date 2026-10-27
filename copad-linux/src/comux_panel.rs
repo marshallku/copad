@@ -696,8 +696,14 @@ impl ComuxPanel {
                     _ => &p.notif_actions,
                 };
                 let reqs = acts.borrow().get(i).cloned().unwrap_or_default();
+                let acted = !reqs.is_empty();
                 for r in reqs {
                     p.cur().command(r);
+                }
+                // An opened notification goes to its pane: the panel has done its job.
+                if which == 2 && acted && p.notif_open.get() {
+                    p.notif_open.set(false);
+                    p.relayout(true);
                 }
             });
         }
@@ -742,6 +748,43 @@ impl ComuxPanel {
             gtk4::glib::Propagation::Proceed
         });
         window.add_controller(keys);
+        // The chrome never keeps the keys (#183): it has no text field, so a click on a chip, a
+        // row or a button acts and the terminal goes on typing. Whatever had focus before the
+        // press gets it back once the click is handled — unless that was the chrome itself, or
+        // sidebar keyboard mode is on.
+        for area in [
+            self.sidebar.clone().upcast::<gtk4::Widget>(),
+            self.status.clone().upcast(),
+            self.notifications.clone().upcast(),
+        ] {
+            let keep = gtk4::GestureClick::new();
+            keep.set_propagation_phase(gtk4::PropagationPhase::Capture);
+            keep.set_button(0);
+            let before: Rc<RefCell<Option<gtk4::Widget>>> = Rc::new(RefCell::new(None));
+            let (b, win, a2) = (before.clone(), window.clone(), area.clone());
+            keep.connect_pressed(move |_, _, _, _| {
+                let f = gtk4::prelude::GtkWindowExt::focus(&win);
+                *b.borrow_mut() = f.filter(|f| !f.is_ancestor(&a2) && f != &a2);
+            });
+            let (w, b, win) = (Rc::downgrade(self), before, window.clone());
+            keep.connect_released(move |_, _, _, _| {
+                let Some(prev) = b.borrow_mut().take() else {
+                    return;
+                };
+                let (w, win) = (w.clone(), win.clone());
+                gtk4::glib::idle_add_local_once(move || {
+                    let Some(p) = w.upgrade() else { return };
+                    if p.nav.active() {
+                        return;
+                    }
+                    let now = gtk4::prelude::GtkWindowExt::focus(&win);
+                    if now.as_ref() != Some(&prev) && prev.is_mapped() {
+                        prev.grab_focus();
+                    }
+                });
+            });
+            area.add_controller(keep);
+        }
         // A click anywhere ends sidebar keyboard mode (the click itself goes through).
         let click = gtk4::GestureClick::new();
         click.set_propagation_phase(gtk4::PropagationPhase::Capture);
@@ -933,7 +976,9 @@ impl ComuxPanel {
         };
         let notif = (38 * adv).max(260).min(pct(35).max(220));
         let open = on && self.notif_open.get();
-        let floating = open && width > 0 && width - side - notif < 40 * adv;
+        // Always over the terminal, never beside it (#183): opening it must not reflow the panes,
+        // and opening a notification closes it anyway.
+        let floating = open;
         match self.paned.borrow().as_ref() {
             Some(paned) => {
                 // The split decides the width; the request is only its floor.

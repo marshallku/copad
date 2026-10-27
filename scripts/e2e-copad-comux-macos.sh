@@ -243,6 +243,19 @@ for _ in $(seq 1 20); do [[ "$(active_session)" == macos-two ]] && break; sleep 
 [[ "$(active_session)" == macos-two ]] || fail "Ctrl-f, typing and Enter did not switch the session: $(active_session)"
 log "ok — Ctrl-f drew the switcher over the window; ←/→ switched tabs, typing filtered and Enter switched"
 
+# A real pointer click at window point (x, y); a negative y counts from the bottom.
+click_at() { python3 - "$APP_PID" "$1" "$2" <<'PY'
+import sys, time, Quartz
+for w in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID):
+    if w.get("kCGWindowOwnerPID") == int(sys.argv[1]) and w["kCGWindowBounds"]["Width"] > 200:
+        b = w["kCGWindowBounds"]; break
+x = b["X"] + int(sys.argv[2]); y = b["Y"] + (int(sys.argv[3]) if int(sys.argv[3]) >= 0 else b["Height"] + int(sys.argv[3]))
+for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, Quartz.CGEventCreateMouseEvent(None, kind, (x, y), Quartz.kCGMouseButtonLeft))
+    time.sleep(0.05)
+PY
+}
+
 # The notification center keeps the TUI's letters: d dismisses one and the center stays up,
 # so D then clears the rest (it would be typed into the shell if the center had closed).
 notif_count() { python3 - <<'PY'
@@ -269,6 +282,40 @@ for _ in $(seq 1 20); do [[ "$(notif_count)" == 0 ]] && break; sleep 0.5; done
 [[ "$(notif_count)" == 0 ]] || fail "the center closed after d (D did not clear the rest): $(notif_count)"
 osascript -e 'tell application "System Events" to key code 53' >/dev/null
 log "ok — the native center dismissed with d, stayed open, and D cleared the rest"
+
+# The notification panel opens OVER the terminal (#183) and opening a notification closes it.
+PANE_TOK="$("$COMUX" list --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["panes"][0]["token"])')"
+"$COMUX" notify --pane "$PANE_TOK" --kind done "panel probe" >/dev/null
+for _ in $(seq 1 20); do [[ "$(notif_count)" == 1 ]] && break; sleep 0.5; done
+click_at 245 82 # the sidebar's bell
+sleep 1.5
+[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/notif-panel.png" && log "screenshot: $W/notif-panel.png"
+WW="$(python3 - "$APP_PID" <<'PY'
+import sys, Quartz
+for w in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID):
+    if w.get("kCGWindowOwnerPID") == int(sys.argv[1]) and w["kCGWindowBounds"]["Width"] > 200:
+        print(int(w["kCGWindowBounds"]["Width"])); break
+PY
+)"
+click_at $((WW - 200)) 112 # the first notification row
+for _ in $(seq 1 20); do [[ "$(notif_count)" == 0 ]] && break; sleep 0.5; done
+[[ "$(notif_count)" == 0 ]] || fail "clicking the notification did not open it"
+sleep 1
+[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/notif-closed.png" && log "screenshot: $W/notif-closed.png"
+log "ok — the notification panel opened over the terminal and opening a notification consumed it"
+
+# The chrome never takes the keys (#183): after a click on the status bar's tab chip, typing
+# still goes to the terminal.
+osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" >/dev/null
+sleep 0.5
+click_at 140 -40 # the "1 zsh" tab chip
+sleep 1
+osascript -e 'tell application "System Events" to keystroke "echo kept-"' -e 'tell application "System Events" to keystroke "focus"' >/dev/null
+sleep 1
+"$COCTL" --socket "$GUI" terminal read 2>/dev/null | grep -q "echo kept-focus" \
+    || fail "a click on the native status bar took the keys from the terminal"
+osascript -e 'tell application "System Events" to key code 51' -e 'tell application "System Events" to keystroke "u" using control down' >/dev/null
+log "ok — clicking the native status bar left the keys with the terminal"
 
 # Ctrl-b e (decisions #181): the native sidebar takes the keys like the TUI's — it starts on the
 # active space, ↓ moves to the next and Enter switches there.
