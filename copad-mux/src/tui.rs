@@ -847,6 +847,10 @@ pub struct App {
     /// and the pane last told it HAS focus (`ESC [ I`), for focus reporting.
     outer_focus: bool,
     focus_reported: Option<TerminalId>,
+    /// Whether any client is attached. Only what a client draws needs the git poller: with
+    /// none, it is asked for no repo at all instead of running `git status` + `git diff`
+    /// every few seconds per repo for nobody.
+    attached: bool,
     /// Per pane, how many of its bells have been relayed to the attached terminals.
     bell_relayed: HashMap<TerminalId, u64>,
     /// Copy-mode state that is not alacritty's (the search prompt, the last search, and the
@@ -1190,6 +1194,7 @@ impl App {
             locked: false,
             synced_tabs: HashSet::new(),
             outer_focus: true,
+            attached: true,
             focus_reported: None,
             bell_relayed: HashMap::new(),
             copy: None,
@@ -2432,6 +2437,11 @@ impl App {
     }
 
     /// The attached terminals gained or lost focus (any one focused counts as focused).
+    /// The server's "is anyone attached", kept in step every loop pass.
+    pub fn set_attached(&mut self, attached: bool) {
+        self.attached = attached;
+    }
+
     pub fn set_outer_focus(&mut self, focused: bool) {
         self.outer_focus = focused;
         self.sync_focus_reports();
@@ -8448,7 +8458,9 @@ impl App {
             let sub = match gitinfo::repo(&cwd) {
                 Some(repo) if self.cfg.sidebar_git => {
                     let reading = gitpoll::reading(&self.git_poll, &repo.root);
-                    roots.push(repo.root.clone());
+                    if self.attached {
+                        roots.push(repo.root.clone());
+                    }
                     gitpoll::subtitle(&branch, repo.linked, reading.as_ref())
                 }
                 Some(repo) => gitpoll::subtitle(&branch, repo.linked, None),

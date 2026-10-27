@@ -437,14 +437,15 @@ pub fn run() -> io::Result<()> {
 
     loop {
         // Detached (no clients) → idle cadence; anything that needs prompt handling
-        // still arrives as a message and interrupts the wait.
-        let tick = if !clients.is_empty() {
-            FRAME_INTERVAL
-        } else if !hub.is_empty() {
-            // A host is watching the lists: publish at its cadence, not the idle one.
-            hostapi::PUBLISH_INTERVAL
-        } else {
+        // still arrives as a message and interrupts the wait. L0 subscribers alone do not
+        // count as attached: copad's host and web-bridge stay subscribed for good, which
+        // kept a server nobody was looking at on the 100 ms tick and the 500 ms process
+        // sweep around the clock. Native chrome needs an attached client to claim, so with
+        // none attached a subscriber is a status board, for which a 500 ms publish is plenty.
+        let tick = if clients.is_empty() {
             IDLE_INTERVAL
+        } else {
+            FRAME_INTERVAL
         };
         match rx.recv_timeout(tick) {
             Ok(msg) => {
@@ -488,13 +489,14 @@ pub fn run() -> io::Result<()> {
         // the wide idle interval, so force one now instead of letting the first frame
         // show tab labels and agent statuses that are seconds stale.
         let attached = !clients.is_empty();
+        app.set_attached(attached);
         if attached && !was_attached {
             app.invalidate_labels();
         }
         was_attached = attached;
         // Sidebar/status data actually changed. Swept far less often while detached —
         // see IDLE_LABEL_INTERVAL.
-        dirty |= app.maybe_refresh_labels(if clients.is_empty() && hub.is_empty() {
+        dirty |= app.maybe_refresh_labels(if clients.is_empty() {
             IDLE_LABEL_INTERVAL
         } else {
             LABEL_INTERVAL
