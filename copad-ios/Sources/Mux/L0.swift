@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 // The comux L0 host API (copad-mux-proto, decisions #166) — the topics the native drawers,
 // tab strip and status line are drawn from. Field names follow the Rust types exactly.
@@ -238,6 +239,20 @@ func elapsedLabel(since: Int64, now: Date = Date()) -> String {
     let m = secs / 60
     if m < 60 { return "\(m)m" }
     return m % 60 == 0 ? "\(m / 60)h" : "\(m / 60)h\(m % 60)m"
+}
+
+/// `elapsedLabel` that keeps itself current: it re-renders when ITS minute rolls (the TUI's
+/// per-agent roll), since the `agents` topic deliberately does not change while a status holds.
+struct ElapsedText: View {
+    let since: Int64
+    var prefix = ""
+
+    var body: some View {
+        TimelineView(.periodic(from: Date(timeIntervalSince1970: TimeInterval(since)), by: 60)) { ctx in
+            let e = elapsedLabel(since: since, now: ctx.date)
+            Text(prefix.isEmpty ? e : e.isEmpty ? prefix : "\(prefix) \(e)")
+        }
+    }
 }
 
 // MARK: delegated overlays (decisions #170)

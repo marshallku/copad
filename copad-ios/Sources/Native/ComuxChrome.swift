@@ -221,7 +221,7 @@ struct SpacesDrawer: View {
                 Text("▲").foregroundStyle(ComuxLook.yellow)
                 Text("\(a.space)/\(a.title)").foregroundStyle(ComuxLook.text).lineLimit(1)
                 Spacer(minLength: 4)
-                Text(elapsedLabel(since: a.since_unix)).foregroundStyle(ComuxLook.yellow)
+                ElapsedText(since: a.since_unix).foregroundStyle(ComuxLook.yellow)
             }
             .font(ComuxLook.body)
             .padding(.horizontal, 12)
@@ -255,7 +255,7 @@ struct SpacesDrawer: View {
                         .font(a.focused ? ComuxLook.strong : ComuxLook.body)
                         .foregroundStyle(a.focused ? ComuxLook.text : ComuxLook.subtext).lineLimit(1)
                     Spacer(minLength: 4)
-                    Text("\(a.status) \(elapsedLabel(since: a.since_unix))").foregroundStyle(color).lineLimit(1)
+                    ElapsedText(since: a.since_unix, prefix: a.status).foregroundStyle(color).lineLimit(1)
                 }
                 Text(a.detail ?? a.tool).foregroundStyle(ComuxLook.dim).lineLimit(1).padding(.leading, 16)
             }

@@ -709,7 +709,7 @@ struct ComuxSidebar: View {
                 Text("▲").foregroundStyle(st.yellow)
                 Text("\(a.space)/\(a.title)").foregroundStyle(st.text).lineLimit(1)
                 Spacer(minLength: 4)
-                Text(elapsedLabel(since: a.since_unix)).foregroundStyle(st.yellow)
+                ElapsedText(since: a.since_unix).foregroundStyle(st.yellow)
             }
             .font(st.body)
             .padding(.horizontal, 8)
@@ -745,7 +745,7 @@ struct ComuxSidebar: View {
                         .font(a.focused ? st.strong : st.body)
                         .foregroundStyle(a.focused ? st.text : st.subtext).lineLimit(1)
                     Spacer(minLength: 4)
-                    Text("\(a.status) \(elapsedLabel(since: a.since_unix))").foregroundStyle(color).lineLimit(1)
+                    ElapsedText(since: a.since_unix, prefix: a.status).foregroundStyle(color).lineLimit(1)
                 }
                 Text(a.detail ?? a.tool).foregroundStyle(st.dim).lineLimit(1)
                     .padding(.leading, st.advance * 2)

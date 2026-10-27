@@ -9,14 +9,6 @@ use crate::control::Resp;
 use crate::term::Snapshot;
 use copad_mux_proto as l0;
 
-/// A monotonic instant as UNIX seconds, for a host that renders its own "4m".
-fn unix_of(at: std::time::Instant) -> i64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    now - at.elapsed().as_secs() as i64
-}
-
 impl App {
     /// `tree`: sessions → tabs → panes, in the sidebar's session order.
     pub fn host_tree(&self) -> l0::Tree {
@@ -115,10 +107,7 @@ impl App {
                     title: r.title,
                     tool: r.tool,
                     status: r.status.to_string(),
-                    since_unix: self
-                        .agent_statuses
-                        .get(&r.term)
-                        .map_or(0, |s| unix_of(s.since)),
+                    since_unix: self.agent_statuses.get(&r.term).map_or(0, |s| s.since_unix),
                     detail: r.detail,
                     focused: focused.as_ref() == Some(&r.term),
                 }

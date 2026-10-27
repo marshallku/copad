@@ -320,6 +320,11 @@ struct AgentState {
     status: agentstate::AgentStatus,
     /// Monotonic instant the pane entered `status`; carried across refreshes while it holds.
     since: std::time::Instant,
+    /// The same moment as UNIX seconds, taken ONCE when the status is entered, for hosts that
+    /// render their own "4m". Derived from `since` on every publish it flapped between two
+    /// seconds (whole-second `now` minus whole-second elapsed), so the `agents` topic changed
+    /// twice a second and every host re-rendered its chrome for nothing.
+    since_unix: i64,
     /// The mux-wide change counter ([`App::agent_seq`]) at the moment `status` was entered;
     /// carried forward with `since`. What `wait-agent --after-seq` compares against.
     seq: u64,
@@ -8513,7 +8518,8 @@ impl App {
             // is also what keeps `changed` honest: an unchanged pass reproduces the map
             // exactly, so the equality check below still means "a status moved" and the
             // render loop's idle-skip survives.
-            let since = status_since(prev, status, std::time::Instant::now());
+            let (since, since_unix) =
+                status_since(prev, status, (std::time::Instant::now(), unix_now()));
             // A NEW status — including the first one seen for this pane, so an agent that
             // reappears after losing its classification is a change — takes the next number.
             let seq = status_seq(prev, label.pid, status, &mut seq_counter);
@@ -8522,6 +8528,7 @@ impl App {
                 AgentState {
                     status,
                     since,
+                    since_unix,
                     seq,
                     pid: label.pid,
                 },
@@ -12069,13 +12076,23 @@ fn selector_views(snap: &SelectorSnap) -> Vec<selector::SessionView<'_>> {
 /// HOLDS, else `now`. Extracted so the carry-forward is pinned by a test — the status map
 /// is rebuilt from scratch twice a second, and resetting the stamp on every pass would peg
 /// every readout at `0s` while looking perfectly correct.
+/// Now as UNIX seconds.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
+}
+
+/// When the pane entered `status`, as (monotonic, UNIX seconds): the previous stamp while the
+/// status HOLDS — both halves, so the published wall-clock value never moves on its own —
+/// else `now`.
 fn status_since(
     prev: Option<AgentState>,
     status: agentstate::AgentStatus,
-    now: std::time::Instant,
-) -> std::time::Instant {
+    now: (std::time::Instant, i64),
+) -> (std::time::Instant, i64) {
     match prev {
-        Some(p) if p.status == status => p.since,
+        Some(p) if p.status == status => (p.since, p.since_unix),
         _ => now,
     }
 }
@@ -13030,6 +13047,7 @@ mod tests {
         let st = |status, seq| AgentState {
             status,
             since: now,
+            since_unix: 0,
             seq,
             pid: 100,
         };
@@ -13071,11 +13089,17 @@ mod tests {
         let prev = AgentState {
             status: AgentStatus::Blocked,
             since: then,
+            since_unix: 1_000,
             seq: 1,
             pid: 1,
         };
-        // Same status → keep the original stamp (still "blocked for 5 minutes").
-        assert_eq!(status_since(Some(prev), AgentStatus::Blocked, now), then);
+        let now = (now, 1_300);
+        // Same status → keep the original stamp (still "blocked for 5 minutes"), and the
+        // wall-clock half with it: re-deriving it each pass made it flap between two seconds.
+        assert_eq!(
+            status_since(Some(prev), AgentStatus::Blocked, now),
+            (then, 1_000)
+        );
         // Moved → restart the clock.
         assert_eq!(status_since(Some(prev), AgentStatus::Ready, now), now);
         // First sighting → start now.
@@ -15642,6 +15666,7 @@ mod switcher_preview {
             AgentState {
                 status,
                 since: std::time::Instant::now(),
+                since_unix: 0,
                 seq: 0,
                 pid: 1,
             },
@@ -15820,6 +15845,7 @@ mod attention {
             AgentState {
                 status: AgentStatus::Blocked,
                 since: std::time::Instant::now() - Duration::from_secs(waited_secs),
+                since_unix: 0,
                 seq: 0,
                 pid: 1,
             },
@@ -16117,6 +16143,7 @@ mod broadcast {
             AgentState {
                 status: AgentStatus::Blocked,
                 since: std::time::Instant::now(),
+                since_unix: 0,
                 seq: 0,
                 pid: 1,
             },
