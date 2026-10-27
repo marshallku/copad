@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -28,6 +28,11 @@ pub struct StatusBar {
     modules: Rc<RefCell<Vec<ModuleHandle>>>,
     /// Label widgets keyed by dom_id for reload lookups
     labels: Rc<RefCell<HashMap<String, gtk4::Label>>>,
+    /// Bumped by every (re)schedule. Each module's poll chain re-arms itself forever, so a
+    /// chain from before a reload must see it is stale and stop — otherwise every config
+    /// reload added another chain per module, each forking its module and holding a label
+    /// that was no longer in the bar.
+    generation: Rc<Cell<u64>>,
 }
 
 /// JSON `{text, tooltip?}` if it parses, otherwise the raw trimmed string.
@@ -236,9 +241,9 @@ impl StatusBar {
             container.set_visible(false);
         }
 
-        // Schedule module execution
-        if has_modules {
-            schedule_modules(&modules);
+        let generation = Rc::new(Cell::new(0));
+        if config.statusbar.enabled && has_modules {
+            schedule_modules(&modules, &generation);
         }
 
         Self {
@@ -246,6 +251,7 @@ impl StatusBar {
             bar,
             modules,
             labels,
+            generation,
         }
     }
 
@@ -362,13 +368,17 @@ impl StatusBar {
         self.container
             .set_visible(config.statusbar.enabled && has_modules);
 
-        if has_modules {
-            schedule_modules(&self.modules);
+        // Stop the previous chains whether or not new ones start (a disabled bar polls nothing).
+        self.generation.set(self.generation.get() + 1);
+        if config.statusbar.enabled && has_modules {
+            schedule_modules(&self.modules, &self.generation);
         }
     }
 }
 
-fn schedule_modules(modules: &Rc<RefCell<Vec<ModuleHandle>>>) {
+fn schedule_modules(modules: &Rc<RefCell<Vec<ModuleHandle>>>, generation: &Rc<Cell<u64>>) {
+    let gen_now = generation.get() + 1;
+    generation.set(gen_now);
     let modules_ref = modules.borrow();
     eprintln!(
         "[copad] statusbar: scheduling {} modules",
@@ -384,6 +394,8 @@ fn schedule_modules(modules: &Rc<RefCell<Vec<ModuleHandle>>>) {
             plugin: module.plugin.clone(),
             module: module.module.clone(),
             interval: module.interval,
+            generation: generation.clone(),
+            gen_at: gen_now,
         };
         run_and_schedule(ctx);
     }
@@ -395,20 +407,20 @@ struct ModuleRunCtx {
     plugin: String,
     module: String,
     interval: u64,
+    generation: Rc<Cell<u64>>,
+    /// The schedule this chain belongs to; a newer one retires it.
+    gen_at: u64,
 }
 
 fn run_and_schedule(ctx: ModuleRunCtx) {
+    if ctx.generation.get() != ctx.gen_at {
+        return;
+    }
     let rx = run_module_via_daemon(&ctx.plugin, &ctx.module);
 
     glib::timeout_add_local(Duration::from_millis(50), move || match rx.try_recv() {
         Ok(output) => {
             let (text, tooltip) = parse_output(&output);
-            eprintln!(
-                "[copad] statusbar: {} -> {:?}",
-                ctx.label.widget_name(),
-                text
-            );
-
             ctx.label.set_text(&text);
             if let Some(tt) = &tooltip {
                 ctx.label.set_tooltip_text(Some(tt));
