@@ -7,7 +7,9 @@ description = "Mock service plugin used to verify the protocol shape end-to-end.
 [[services]]
 name = "main"
 exec = "copad-plugin-echo"
-activation = "onStartup"
+# On demand: it is a liveness probe (`coctl call echo.ping`), not a feature — the first call
+# starts it, instead of a process (and a 30 s heartbeat) living for the daemon's whole life.
+activation = "onAction:echo.*"
 restart = "on-crash"
 provides = ["echo.ping"]
 subscribes = []
