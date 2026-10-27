@@ -35,8 +35,11 @@ final class MuxSession: ObservableObject, KeySink {
     @Published private(set) var overlays: [L0Overlay] = []
     /// Unknown host key awaiting the user's confirmation (TOFU).
     @Published var pendingHostKey: String?
-    /// The open picker's pane preview (decisions #180).
-    @Published private(set) var preview: L0PreviewState?
+    /// Pane previews by owner (`overlay`, `drawer`; decisions #180/#181): each view reads and
+    /// clears only its own, so a picker arriving over the drawer cannot take its preview.
+    @Published private(set) var previews: [String: L0PreviewState] = [:]
+    /// Bumped when this app's comux client pressed `Ctrl-b e`: show the spaces drawer (#181).
+    @Published private(set) var focusSidebarSeq = 0
 
     /// The mirror grid. Not @Published: the terminal view redraws on `onGrid`, capped to the
     /// display — every frame is still APPLIED here (codex C3).
@@ -66,10 +69,10 @@ final class MuxSession: ObservableObject, KeySink {
     private var previous: UInt64?
     /// Overlays answered for good: a same-id update still on its way must not bring one back.
     private var closedOverlays: Set<UInt64> = []
-    /// What the picker wants previewed, the one `pane-preview` in flight, and its cadence.
-    private var previewWant: PreviewWant?
-    private var previewInflight: (id: String, at: Date)?
-    private var previewLastSent: Date?
+    /// What each owner wants previewed, its one `pane-preview` in flight, and its cadence.
+    private var previewWants: [String: PreviewWant] = [:]
+    private var previewInflight: [String: (id: String, at: Date)] = [:]
+    private var previewLastSent: [String: Date] = [:]
     private var previewTimer: Timer?
     /// The comux on this connection predates `pane-preview`.
     private var previewUnsupported = false
@@ -220,6 +223,7 @@ final class MuxSession: ObservableObject, KeySink {
     func answerOverlay(_ id: UInt64, choice: String?, text: String?) {
         overlays.removeAll { $0.overlay == id }
         closedOverlays.insert(id)
+        stopOverlayPreviewIfClosed()
         var m: [String: Any] = ["t": "overlay-result", "overlay": id]
         if let choice { m["choice"] = choice }
         if let text { m["text"] = text }
@@ -233,24 +237,41 @@ final class MuxSession: ObservableObject, KeySink {
         l0?.write(Self.line(["t": "overlay-result", "overlay": id, "choice": choice]))
     }
 
-    /// Keep the preview of `pane` (rows × cols) fresh while a picker shows it; nil stops it.
-    func setPreview(_ pane: String?, rows: Int, cols: Int) {
+    /// No overlay left: its preview stops here rather than waiting for a view's onDisappear —
+    /// a long-press preview SwiftUI built ahead of time can outlive the picker and would keep
+    /// polling (and redrawing the app) forever.
+    private func stopOverlayPreviewIfClosed() {
+        if overlays.isEmpty { setPreview(owner: Self.overlayOwner, nil, rows: 0, cols: 0) }
+    }
+
+    static let overlayOwner = "overlay"
+
+    /// Keep `owner`'s preview of `pane` (rows × cols) fresh while it is shown; nil stops it.
+    func setPreview(owner: String, _ pane: String?, rows: Int, cols: Int) {
+        // A late request from a picker that is already gone.
+        if pane != nil, owner == Self.overlayOwner, overlays.isEmpty { return }
         guard let pane else {
-            previewWant = nil
-            previewInflight = nil
-            previewTimer?.invalidate()
-            previewTimer = nil
-            preview = nil
+            // Nothing to stop: leave the published state alone (a view's onDisappear runs on
+            // every teardown, and a no-op write would still redraw every observer).
+            guard previewWants[owner] != nil || previews[owner] != nil else { return }
+            previewWants[owner] = nil
+            previewInflight[owner] = nil
+            previewLastSent[owner] = nil
+            previews[owner] = nil
+            if previewWants.isEmpty {
+                previewTimer?.invalidate()
+                previewTimer = nil
+            }
             return
         }
         let want = PreviewWant(pane: pane, rows: rows, cols: cols)
-        guard want != previewWant else { return }
-        if previewWant?.pane != pane {
-            preview = L0PreviewState(state: previewUnsupported ? "unsupported" : "loading", preview: nil)
+        guard want != previewWants[owner] else { return }
+        if previewWants[owner]?.pane != pane {
+            previews[owner] = L0PreviewState(state: previewUnsupported ? "unsupported" : "loading", preview: nil)
         }
-        previewWant = want
-        previewInflight = nil
-        previewLastSent = nil
+        previewWants[owner] = want
+        previewInflight[owner] = nil
+        previewLastSent[owner] = nil
         if previewTimer == nil {
             previewTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.pollPreview() }
@@ -258,34 +279,38 @@ final class MuxSession: ObservableObject, KeySink {
         }
     }
 
-    /// One `pane-preview` in flight, every 0.7 s; a request unanswered for 3 s is sent again.
+    /// One `pane-preview` in flight per owner, every 0.7 s; one unanswered for 3 s is resent.
     private func pollPreview() {
-        guard let w = previewWant, !previewUnsupported, let l0 else { return }
+        guard !previewUnsupported, let l0 else { return }
         let now = Date()
-        if let f = previewInflight, now.timeIntervalSince(f.at) < 3 { return }
-        if let t = previewLastSent, now.timeIntervalSince(t) < 0.7 { return }
-        let id = "p\(nextL0Cmd)"
-        nextL0Cmd += 1
-        l0.write(Self.line(["t": "cmd", "id": id,
-                            "req": ["cmd": "pane-preview", "target": w.pane, "rows": w.rows, "cols": w.cols]]))
-        previewInflight = (id, now)
-        previewLastSent = now
+        for (owner, w) in previewWants {
+            if let f = previewInflight[owner], now.timeIntervalSince(f.at) < 3 { continue }
+            if let t = previewLastSent[owner], now.timeIntervalSince(t) < 0.7 { continue }
+            let id = "p\(nextL0Cmd)"
+            nextL0Cmd += 1
+            l0.write(Self.line(["t": "cmd", "id": id,
+                                "req": ["cmd": "pane-preview", "target": w.pane, "rows": w.rows, "cols": w.cols]]))
+            previewInflight[owner] = (id, now)
+            previewLastSent[owner] = now
+        }
     }
 
-    /// A reply on the list channel: only the preview request still in flight counts.
+    /// A reply on the list channel: only a preview request still in flight counts.
     private func onL0Reply(_ id: String?, _ resp: [String: Any]?) {
-        guard let id, id == previewInflight?.id, let resp, let pane = previewWant?.pane else { return }
-        previewInflight = nil
+        guard let id, let resp,
+              let owner = previewInflight.first(where: { $0.value.id == id })?.key,
+              let pane = previewWants[owner]?.pane else { return }
+        previewInflight[owner] = nil
         if (resp["ok"] as? Bool) == true {
             let p = (resp["preview"] as? [String: Any])
                 .flatMap { try? JSONSerialization.data(withJSONObject: $0) }
                 .flatMap { try? JSONDecoder().decode(L0Preview.self, from: $0) }
-            if let p, p.pane == pane { preview = L0PreviewState(state: "ok", preview: p) }
+            if let p, p.pane == pane { previews[owner] = L0PreviewState(state: "ok", preview: p) }
         } else if (resp["code"] as? String) == "not_found" {
-            preview = L0PreviewState(state: "gone", preview: nil)
+            previews[owner] = L0PreviewState(state: "gone", preview: nil)
         } else {
             previewUnsupported = true
-            preview = L0PreviewState(state: "unsupported", preview: nil)
+            for o in previewWants.keys { previews[o] = L0PreviewState(state: "unsupported", preview: nil) }
         }
     }
 
@@ -309,10 +334,11 @@ final class MuxSession: ObservableObject, KeySink {
         closedOverlays.removeAll()
         previewTimer?.invalidate()
         previewTimer = nil
-        previewWant = nil
-        previewInflight = nil
+        previewWants.removeAll()
+        previewInflight.removeAll()
+        previewLastSent.removeAll()
         previewUnsupported = false
-        preview = nil
+        previews.removeAll()
         grid.reset()
         onGrid?()
         if let reason { phase = .failed(reason) }
@@ -379,6 +405,10 @@ final class MuxSession: ObservableObject, KeySink {
                 } else if kind == "notify", let data,
                           let n = try? JSONDecoder().decode(L0Notification.self, from: data) {
                     lastNotify = n
+                } else if kind == "focus-sidebar",
+                          let c = ((m["data"] as? [String: Any])?["client"] as? NSNumber)?.uint64Value,
+                          c == attachment {
+                    focusSidebarSeq += 1
                 }
             case "overlay":
                 guard let data = try? JSONSerialization.data(withJSONObject: m),
@@ -393,6 +423,7 @@ final class MuxSession: ObservableObject, KeySink {
             case "overlay-closed":
                 let id = (m["overlay"] as? NSNumber)?.uint64Value
                 overlays.removeAll { $0.overlay == id }
+                stopOverlayPreviewIfClosed()
             case "reply":
                 onL0Reply(m["id"] as? String, m["resp"] as? [String: Any])
             case "error":

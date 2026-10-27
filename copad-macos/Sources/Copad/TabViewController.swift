@@ -55,6 +55,10 @@ final class TabViewController: NSViewController {
     /// The overlay layer over the content (decisions #180), and the monitor that keeps keys in it.
     private var comuxOverlayLayer: NSView?
     private var comuxOverlayMonitor: Any?
+    /// The sidebar row preview card (decisions #181).
+    private var comuxCardWidth: NSLayoutConstraint!
+    private weak var comuxGrip: NSView?
+    private var comuxCardObservation: AnyCancellable?
     private var comuxNotificationsOpen = false
     private var comuxObservation: AnyCancellable?
     private var comuxServeTimer: Timer?
@@ -517,7 +521,24 @@ final class TabViewController: NSViewController {
         let notifications = NSHostingView(rootView: ComuxNotifications(host: host, settle: settle))
         let status = NSHostingView(rootView: ComuxStatusStrip(host: host, settle: settle))
         let slot = NSView()
-        for v in [slot, sidebar, notifications, status] as [NSView] {
+        let card = PassThroughHostingView(rootView: ComuxHoverCard(host: host))
+        // The sidebar's right edge resizes it (decisions #181).
+        let grip = ComuxResizeGrip()
+        grip.translatesAutoresizingMaskIntoConstraints = false
+        grip.onDrag = { [weak self] width in
+            UserDefaults.standard.set(width, forKey: Self.comuxSidebarWidthKey)
+            self?.layoutComuxChrome()
+        }
+        grip.currentWidth = { [weak self] in self?.comuxSidebar.frame.width ?? 0 }
+        grip.isHidden = true
+        comuxGrip = grip
+        comuxCardWidth = card.widthAnchor.constraint(equalToConstant: 0)
+        card.isHidden = true
+        // Only there while a row is previewed, so it never sits over the terminal otherwise.
+        comuxCardObservation = host.$hoverCard.sink { [weak card] c in
+            DispatchQueue.main.async { card?.isHidden = c == nil }
+        }
+        for v in [slot, sidebar, notifications, status, card, grip] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             contentArea.addSubview(v)
         }
@@ -542,6 +563,14 @@ final class TabViewController: NSViewController {
             notifications.topAnchor.constraint(equalTo: contentArea.topAnchor),
             notifications.bottomAnchor.constraint(equalTo: status.topAnchor),
             comuxNotificationsWidth,
+            grip.centerXAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            grip.widthAnchor.constraint(equalToConstant: 6),
+            grip.topAnchor.constraint(equalTo: sidebar.topAnchor),
+            grip.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
+            card.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            card.topAnchor.constraint(equalTo: contentArea.topAnchor),
+            card.bottomAnchor.constraint(equalTo: status.topAnchor),
+            comuxCardWidth,
             slot.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
             slot.topAnchor.constraint(equalTo: contentArea.topAnchor),
             slot.bottomAnchor.constraint(equalTo: status.topAnchor),
@@ -579,8 +608,15 @@ final class TabViewController: NSViewController {
     private func refreshComuxChrome() {
         guard comuxSidebar != nil else { return }
         comuxWindow.update(panels: comuxServed)
+        // `Ctrl-b e` from a comux client in this window (decisions #181). Only the comux whose
+        // sidebar this window shows can be focused; another link's request stays unanswered.
+        if let key = comuxWindow.key, comuxWindow.state != nil,
+           comuxServed.contains(where: { ComuxHost.shared.takeFocus(key: key, panel: $0) }) {
+            enterComuxSidebarFocus()
+        }
         let on = comuxWindow.state != nil
         comuxSidebar.isHidden = !on
+        comuxGrip?.isHidden = !on
         comuxStatus.isHidden = !on
         layoutComuxChrome()
         presentComuxOverlay()
@@ -594,11 +630,15 @@ final class TabViewController: NSViewController {
         let on = comuxWindow.state != nil
         let st = comuxWindow.style
         let width = contentArea.bounds.width
-        let side = on ? min(max(30 * st.advance, 200), max(0.3 * width, 160)).rounded() : 0
+        let natural = min(max(30 * st.advance, 200), max(0.3 * width, 160))
+        // A width the user dragged to (decisions #181) wins, within what leaves the terminal usable.
+        let dragged = UserDefaults.standard.double(forKey: Self.comuxSidebarWidthKey)
+        let side = on ? (dragged > 0 ? min(max(dragged, 160), max(0.6 * width, 160)) : natural).rounded() : 0
         let notifOpen = on && comuxNotificationsOpen
         let notif = notifOpen ? min(max(38 * st.advance, 260), max(0.35 * width, 220)).rounded() : 0
         let floating = notifOpen && width - side - notif < 40 * st.advance
         set(comuxSidebarWidth, side)
+        set(comuxCardWidth, on ? (72 * st.advance + 40).rounded() : 0)
         set(comuxStatusHeight, on ? st.statusHeight : 0)
         set(comuxNotificationsWidth, notif)
         set(comuxNotifSlotWidth, floating ? 0 : notif)
@@ -636,6 +676,16 @@ final class TabViewController: NSViewController {
             return e
         }
     }
+
+    private func enterComuxSidebarFocus() {
+        settleComuxInput()
+        let active = comuxWindow.state?.tree?.active
+        comuxWindow.onSidebarExit = { [weak self] in self?.refocusPane() }
+        comuxWindow.sidebarFocus = ComuxWindow.SidebarFocus(agents: false, id: active, index: 0)
+        view.window?.makeFirstResponder(comuxSidebar)
+    }
+
+    static let comuxSidebarWidthKey = "comuxSidebarWidth"
 
     private func closeComuxNotifications() {
         comuxNotificationsOpen = false
@@ -1418,4 +1468,29 @@ final class TabViewController: NSViewController {
 private final class ComuxMenuPicker: NSObject {
     var picked: String?
     @objc func pick(_ sender: NSMenuItem) { picked = sender.representedObject as? String }
+}
+
+/// A thin strip on the comux sidebar's right edge: the resize cursor over it, and dragging it sets
+/// the sidebar's width (decisions #181).
+final class ComuxResizeGrip: NSView {
+    var onDrag: ((CGFloat) -> Void)?
+    var currentWidth: (() -> CGFloat)?
+    private var start: (x: CGFloat, width: CGFloat)?
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .resizeLeftRight)
+    }
+
+    override func mouseDown(with e: NSEvent) {
+        start = (e.locationInWindow.x, currentWidth?() ?? 0)
+    }
+
+    override func mouseDragged(with e: NSEvent) {
+        guard let start else { return }
+        onDrag?(max(120, start.width + e.locationInWindow.x - start.x))
+    }
+
+    override func mouseUp(with e: NSEvent) {
+        start = nil
+    }
 }

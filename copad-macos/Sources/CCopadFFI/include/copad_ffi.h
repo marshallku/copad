@@ -305,6 +305,8 @@ char *copad_muxhost_remote_attach_command(const char *dest, const char *comux, c
 void copad_muxhost_answer(const MuxHostHandle *h, unsigned long long overlay, const char *choice, const char *text);
 /// Answer with a staying choice (the overlay stays until comux re-sends it).
 void copad_muxhost_act(const MuxHostHandle *h, unsigned long long overlay, const char *choice);
+/// Whether panel's comux client asked to focus the native sidebar (Ctrl-b e); 1 once per request, else 0.
+int copad_muxhost_take_focus(const MuxHostHandle *h, const char *panel);
 /// Keep consumer's preview of pane (rows x cols) fresh; pane NULL stops it (decisions #180).
 void copad_muxhost_preview(const MuxHostHandle *h, const char *consumer, const char *pane, unsigned short rows, unsigned short cols);
 /// Free with copad_ffi_free_string.

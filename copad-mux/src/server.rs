@@ -807,6 +807,19 @@ fn expire_silent_clients(app: &mut App, clients: &mut Vec<Client>) -> bool {
 /// If `client`'s host draws overlays, hand it every overlay `client`'s input just opened
 /// (decisions #170); they never reach the shared frame.
 fn delegate_overlays(app: &mut App, hub: &mut Hub, client: u64, before: crate::tui::OverlayMarks) {
+    // `Ctrl-b e` from a client whose sidebar its host draws: that host focuses it (#181).
+    if app.take_sidebar_focus_request()
+        && let Some(sub) = hub.host_of(client, Feature::Sidebar)
+    {
+        let ev = copad_mux_proto::PubMsg::Event {
+            kind: "focus-sidebar".into(),
+            data: serde_json::json!({ "client": client }),
+        };
+        if !hub.send(sub, &ev) {
+            app.forget_overlays(&hub.take_overlays_of(sub));
+            hub.remove(sub);
+        }
+    }
     let Some(sub) = hub.host_of(client, Feature::Overlays) else {
         return;
     };
@@ -1503,8 +1516,10 @@ fn handle_incoming(
                     // pressed the chord; the others keep going.
                     let mut action = KeyAction::Continue;
                     let marks = app.overlay_marks();
+                    app.set_key_client_native_sidebar(hub.host_of(id, Feature::Sidebar).is_some());
                     if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
                         action = app.feed_key(k, &mut c.prefix);
+                        app.set_key_client_native_sidebar(false);
                         // A copy-mode yank goes to the client whose key it was, exactly like
                         // the text a drag-release returns.
                         if let Some(text) = app.take_key_copy() {
@@ -1549,8 +1564,10 @@ fn handle_incoming(
                     }
                     let mut action = KeyAction::Continue;
                     let marks = app.overlay_marks();
+                    app.set_key_client_native_sidebar(hub.host_of(id, Feature::Sidebar).is_some());
                     if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
                         action = app.feed_paste(&text, &mut c.prefix);
+                        app.set_key_client_native_sidebar(false);
                         // Replayed keys can yank in copy mode; the copy is this client's.
                         if let Some(text) = app.take_key_copy() {
                             queue_copy(c, crate::term::next_clipboard_seq(), &text);

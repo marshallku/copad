@@ -51,6 +51,10 @@ pub fn css(s: &Style) -> String {
 #comux-overlay .comux-button.filled label {{ color: {base}; font-weight: bold; }}
 #comux-overlay .comux-button.danger {{ background: {red}; }}
 #comux-overlay .comux-button.danger label {{ color: {base}; font-weight: bold; }}
+#comux-split > separator {{ background: none; border: none; box-shadow: none; min-width: 1px; }}
+#comux-sidebar row.comux-kbd {{ background: alpha({hover}, 0.8); box-shadow: inset 3px 0 {accent}; }}
+#comux-preview-pop, #comux-preview-pop * {{ font-family: "{family}"; font-size: {size}pt; color: {text}; }}
+#comux-preview-pop contents {{ background: {base}; border: 1px solid {rule}; }}
 "#,
         red = s.red,
     )
@@ -242,7 +246,7 @@ pub(crate) fn line_markup(s: &Style, line: &[l0::Run]) -> String {
 
 /// A key press in comux's naming (`Left`, `C-r`, `d`); `None` for what the overlay leaves
 /// alone (Super/Alt shortcuts).
-fn key_name(key: gtk4::gdk::Key, state: gtk4::gdk::ModifierType) -> Option<String> {
+pub(crate) fn key_name(key: gtk4::gdk::Key, state: gtk4::gdk::ModifierType) -> Option<String> {
     use gtk4::gdk::{Key, ModifierType};
     let named = match key {
         Key::Left => Some("Left"),

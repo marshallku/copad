@@ -37,7 +37,7 @@ struct SessionScreen: View {
                     overlay: o, look: ComuxLook.overlay,
                     context: OverlayContext(agents: session.model.agents?.agents ?? [],
                                             sessions: session.model.tree?.sessions ?? [],
-                                            preview: session.preview,
+                                            preview: session.previews["overlay"],
                                             compact: hSize == .compact && vSize == .regular),
                     handlers: OverlayHandlers(
                         answer: { choice, text in
@@ -45,7 +45,7 @@ struct SessionScreen: View {
                             term.focus()
                         },
                         act: { session.actOverlay(o.overlay, choice: $0) },
-                        preview: { pane, rows, cols in session.setPreview(pane, rows: rows, cols: cols) }))
+                        preview: { pane, rows, cols in session.setPreview(owner: "overlay", pane, rows: rows, cols: cols) }))
                 .ignoresSafeArea(.container, edges: .bottom)
                 .transition(.opacity)
             }
@@ -67,6 +67,8 @@ struct SessionScreen: View {
             }
         }
         .onChange(of: session.phase) { _, p in if p == .live { term.focus() } }
+        // `Ctrl-b e` (decisions #181): the TUI focuses its sidebar; here that is the drawer.
+        .onChange(of: session.focusSidebarSeq) { _, _ in open(left: true) }
         .alert("Trust this host?", isPresented: Binding(
             get: { session.pendingHostKey != nil }, set: { if !$0 { session.pendingHostKey = nil } })) {
             Button("Trust") {

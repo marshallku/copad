@@ -184,6 +184,9 @@ struct State {
     previews: BTreeMap<String, PreviewWant>,
     /// The comux on this link predates `pane-preview`.
     preview_unsupported: bool,
+    /// Attachments whose user pressed `Ctrl-b e` (decisions #181), until a GUI takes it. A set,
+    /// so two windows' requests before one read are both delivered.
+    focus_pending: BTreeSet<u64>,
 }
 
 impl State {
@@ -312,6 +315,18 @@ impl MuxHost {
                 choice: Some(choice),
                 text: None,
             });
+        }
+    }
+
+    /// Whether `panel`'s comux client asked to focus the native sidebar (`Ctrl-b e`); true
+    /// once per request.
+    pub fn take_focus_request(&self, panel: &str) -> bool {
+        let Ok(mut s) = self.inner.state.lock() else {
+            return false;
+        };
+        match s.bound().get(panel).copied() {
+            Some(a) => s.focus_pending.remove(&a),
+            None => false,
         }
     }
 
@@ -597,6 +612,7 @@ fn take_preview_reply(s: &mut State, id: &str, resp: &Value) -> bool {
 fn reset_connection(s: &mut State) {
     s.overlays.clear();
     s.closed_overlays.clear();
+    s.focus_pending.clear();
     s.preview_unsupported = false;
     for w in s.previews.values_mut() {
         w.inflight = None;
@@ -613,6 +629,14 @@ fn on_event(inner: &Arc<Inner>, ev: LinkEvent, closed: &std::sync::mpsc::Sender<
         };
         match &ev {
             LinkEvent::Msg(PubMsg::Error { .. }) => s.claims.refused(),
+            LinkEvent::Msg(PubMsg::Event { kind, data }) if kind == "focus-sidebar" => {
+                match data["client"].as_u64() {
+                    Some(a) if s.claims.covers(a) => {
+                        s.focus_pending.insert(a);
+                    }
+                    _ => return,
+                }
+            }
             LinkEvent::Msg(PubMsg::Reply { id, resp }) => {
                 if !take_preview_reply(&mut s, id, resp) {
                     return;
@@ -823,6 +847,38 @@ mod tests {
                 ..Default::default()
             },
         );
+    }
+
+    #[test]
+    fn focus_requests_for_two_attachments_are_each_delivered_once() {
+        let i = inner();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        {
+            let mut s = i.state.lock().unwrap();
+            s.model = model(
+                vec![client(3, "t3", &FEATURES), client(4, "t4", &FEATURES)],
+                true,
+            );
+            s.binds.insert("p3".into(), "t3".into());
+            s.binds.insert("p4".into(), "t4".into());
+            s.claims.held.insert(3);
+            s.claims.held.insert(4);
+        }
+        let ev = |a: u64| {
+            LinkEvent::Msg(PubMsg::Event {
+                kind: "focus-sidebar".into(),
+                data: json!({ "client": a }),
+            })
+        };
+        on_event(&i, ev(3), &tx);
+        on_event(&i, ev(4), &tx);
+        on_event(&i, ev(9), &tx); // not ours
+        let h = MuxHost { inner: i.clone() };
+        assert!(h.take_focus_request("p3"));
+        assert!(h.take_focus_request("p4"));
+        assert!(!h.take_focus_request("p3"), "once");
+        assert!(i.state.lock().unwrap().focus_pending.is_empty());
+        std::mem::forget(h); // its Drop would stop the (absent) link threads
     }
 
     #[test]

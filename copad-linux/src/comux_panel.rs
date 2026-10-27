@@ -162,6 +162,44 @@ impl Style {
     }
 }
 
+/// A cheap fingerprint of the values a part of the chrome is drawn from.
+fn sig(parts: &[&Value]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in parts {
+        p.to_string().hash(&mut h);
+    }
+    h.finish().max(1)
+}
+
+/// Where the dragged sidebar width is kept (decisions #181).
+fn sidebar_width_file() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+        })?;
+    Some(base.join("copad").join("comux-sidebar-width"))
+}
+
+fn load_sidebar_width() -> Option<i32> {
+    std::fs::read_to_string(sidebar_width_file()?)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .filter(|w: &i32| *w >= 120)
+}
+
+fn save_sidebar_width(w: i32) {
+    if let Some(f) = sidebar_width_file() {
+        if let Some(d) = f.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(f, w.to_string());
+    }
+}
+
 /// `text` in `color`, escaped for Pango markup.
 pub(crate) fn span(color: &str, text: &str) -> String {
     format!(
@@ -375,12 +413,17 @@ fn clear(list: &gtk4::ListBox) {
     }
 }
 
+/// Time in status, bucketed like the TUI's `fmt_elapsed` (nothing under a minute, then whole
+/// minutes), so the rows change once a minute and not every second.
 pub(crate) fn elapsed(since: i64) -> String {
     let s = (now_unix() - since).max(0);
     match s {
-        0..60 => format!("{s}s"),
+        0..60 => String::new(),
         60..3600 => format!("{}m", s / 60),
-        _ => format!("{}h{}m", s / 3600, (s / 60) % 60),
+        _ => match (s / 3600, (s / 60) % 60) {
+            (h, 0) => format!("{h}h"),
+            (h, m) => format!("{h}h{m}m"),
+        },
     }
 }
 
@@ -403,6 +446,8 @@ pub struct ComuxPanel {
     /// The overlay shown over the window (decisions #180), and the window overlay it sits in.
     overlay_ui: RefCell<Option<crate::comux_overlay::OverlayUi>>,
     overlay_root: RefCell<Option<gtk4::Overlay>>,
+    /// `Ctrl-b e` keyboard mode and row previews on the sidebar (decisions #181).
+    nav: Rc<crate::comux_nav::SidebarNav>,
     spaces: gtk4::ListBox,
     spaces_scroll: gtk4::ScrolledWindow,
     spaces_head: gtk4::Box,
@@ -441,6 +486,20 @@ pub struct ComuxPanel {
     chips: RefCell<Option<gtk4::ScrolledWindow>>,
     /// The wall-clock minute last drawn: ages and the clock move on.
     minute: Cell<i64>,
+    /// What the lists and the status bar were last built from: a state change that leaves them
+    /// as they were (a preview tick, a claim) must not rebuild the rows — that reset the row
+    /// under the pointer every 0.7 s and made it flicker.
+    lists_sig: Cell<u64>,
+    status_sig: Cell<u64>,
+    /// The sidebar width the rows were laid out for (they are rebuilt when it changes).
+    built_width: Cell<i32>,
+    /// The sidebar width the user dragged to (decisions #181), kept across restarts.
+    user_side: Cell<Option<i32>>,
+    /// The split between the sidebar and the terminal: its handle is how the sidebar is
+    /// resized. `setting` marks our own position changes, which are not the user's.
+    paned: RefCell<Option<gtk4::Paned>>,
+    setting: Cell<bool>,
+    save_timer: RefCell<Option<gtk4::glib::SourceId>>,
 }
 
 impl ComuxPanel {
@@ -539,6 +598,7 @@ impl ComuxPanel {
         status.set_visible(false);
 
         let local = Rc::new(MuxHost::start(Endpoint::local()));
+        let nav = crate::comux_nav::SidebarNav::new(&sidebar);
         let this = Rc::new(Self {
             sidebar,
             notif_dock,
@@ -546,6 +606,7 @@ impl ComuxPanel {
             status,
             overlay_ui: RefCell::new(None),
             overlay_root: RefCell::new(None),
+            nav,
             spaces,
             spaces_scroll,
             spaces_head,
@@ -576,6 +637,13 @@ impl ComuxPanel {
             usage_box: RefCell::new(None),
             chips: RefCell::new(None),
             minute: Cell::new(0),
+            lists_sig: Cell::new(0),
+            status_sig: Cell::new(0),
+            built_width: Cell::new(0),
+            user_side: Cell::new(load_sidebar_width()),
+            paned: RefCell::new(None),
+            setting: Cell::new(false),
+            save_timer: RefCell::new(None),
         });
         for (b, what) in [(&new_session, "new-session"), (&resume, "resume")] {
             let w = Rc::downgrade(&this);
@@ -630,7 +698,19 @@ impl ComuxPanel {
         let keys = gtk4::EventControllerKey::new();
         keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let w = Rc::downgrade(self);
-        keys.connect_key_pressed(move |_, key, _, _| {
+        keys.connect_key_pressed(move |_, key, _, state| {
+            // Keyboard mode on the native sidebar takes every key (decisions #181).
+            if let Some(p) = w.upgrade()
+                && p.nav.active()
+            {
+                if let Some(name) = crate::comux_overlay::key_name(key, state)
+                    && let Some(cmd) = p.nav.key(&name)
+                {
+                    p.cur().command(cmd);
+                }
+                p.apply_nav();
+                return gtk4::glib::Propagation::Stop;
+            }
             if let Some(p) = w.upgrade()
                 && key == gtk4::gdk::Key::Escape
                 && p.floating.get()
@@ -643,6 +723,57 @@ impl ComuxPanel {
             gtk4::glib::Propagation::Proceed
         });
         window.add_controller(keys);
+        // A click anywhere ends sidebar keyboard mode (the click itself goes through).
+        let click = gtk4::GestureClick::new();
+        click.set_propagation_phase(gtk4::PropagationPhase::Capture);
+        let w = Rc::downgrade(self);
+        click.connect_pressed(move |_, _, _, _| {
+            if let Some(p) = w.upgrade()
+                && p.nav.active()
+            {
+                p.nav.exit();
+                p.apply_nav();
+            }
+        });
+        window.add_controller(click);
+        let w = Rc::downgrade(self);
+        window.connect_destroy(move |_| {
+            if let Some(p) = w.upgrade() {
+                let host = p.cur();
+                p.nav
+                    .shutdown(&move |req| host.preview(crate::comux_nav::HOVER_CONSUMER, req));
+            }
+        });
+    }
+
+    /// The split the sidebar sits in (window.rs): dragging its handle resizes the sidebar, and
+    /// the width is kept (decisions #181).
+    pub fn set_paned(self: &Rc<Self>, paned: &gtk4::Paned) {
+        *self.paned.borrow_mut() = Some(paned.clone());
+        let w = Rc::downgrade(self);
+        paned.connect_position_notify(move |p| {
+            let Some(me) = w.upgrade() else { return };
+            if me.setting.get() || !me.sidebar.is_visible() {
+                return;
+            }
+            let pos = p.position();
+            me.user_side.set(Some(pos));
+            // Written once the drag settles, not on every motion.
+            if let Some(t) = me.save_timer.borrow_mut().take() {
+                t.remove();
+            }
+            let w2 = Rc::downgrade(&me);
+            let id = gtk4::glib::timeout_add_local_once(
+                std::time::Duration::from_millis(400),
+                move || {
+                    if let Some(me) = w2.upgrade() {
+                        me.save_timer.borrow_mut().take();
+                        save_sidebar_width(pos);
+                    }
+                },
+            );
+            *me.save_timer.borrow_mut() = Some(id);
+        });
     }
 
     /// Config hot-reload: the terminal font or the theme changed.
@@ -654,6 +785,8 @@ impl ComuxPanel {
         self.css.load_from_string(&style.css());
         *self.style.borrow_mut() = style;
         self.last_gen.set(0); // rebuild every row in the new colours
+        self.lists_sig.set(0);
+        self.status_sig.set(0);
         self.laid_out.set((0, 0, 0));
         self.usage_fit.set((0, 0));
     }
@@ -692,6 +825,13 @@ impl ComuxPanel {
             .map(|(_, h)| h.generation())
             .sum();
         let minute = now_unix() / 60;
+        // A resized sidebar (its handle dragged, the window resized) needs rows laid out anew.
+        let width = self.sidebar.width();
+        if self.sidebar.is_visible() && width > 0 && width != self.built_width.get() {
+            self.built_width.set(width);
+            self.lists_sig.set(0);
+            self.last_gen.set(0);
+        }
         if generation != self.last_gen.get() || minute != self.minute.get() {
             self.last_gen.set(generation);
             self.minute.set(minute);
@@ -705,6 +845,15 @@ impl ComuxPanel {
             *self.current.borrow_mut() = pick;
             self.rebuild();
             self.present_overlay(window);
+            // `Ctrl-b e` from a comux client in this window (decisions #181).
+            let served = self.served.borrow().clone();
+            if served.iter().any(|p| self.cur().take_focus_request(p)) {
+                let active = self.state()["tree"]["active"].as_str().map(str::to_string);
+                self.nav.enter(window, active);
+            }
+            self.apply_nav();
+        } else if self.nav.needs_apply() {
+            self.apply_nav();
         }
         let key = (window.width(), self.sidebar.height(), self.last_gen.get());
         if key != self.laid_out.get() {
@@ -716,6 +865,19 @@ impl ComuxPanel {
 
     fn state(&self) -> Value {
         self.cur().state_json()
+    }
+
+    /// Place the sidebar's keyboard mark and row preview (decisions #181).
+    fn apply_nav(&self) {
+        let (w, h) = self
+            .sidebar
+            .create_pango_layout(Some("MMMMMMMMMM"))
+            .pixel_size();
+        let cell = ((w / 10).max(4), h.max(8));
+        let host = self.cur();
+        let preview = move |req| host.preview(crate::comux_nav::HOVER_CONSUMER, req);
+        self.nav
+            .apply(&self.state(), &self.style.borrow(), cell, &preview);
     }
 
     fn cur(&self) -> Rc<MuxHost> {
@@ -745,11 +907,26 @@ impl ComuxPanel {
             .and_then(|o| o.root())
             .map_or(0, |r| r.width());
         let pct = |p: i32| width * p / 100;
-        let side = (30 * adv).max(200).min(pct(30).max(160));
+        let side = match self.user_side.get() {
+            // Dragged by the user: kept, within what leaves the terminal usable.
+            Some(w) => w.clamp(160, pct(60).max(160)),
+            None => (30 * adv).max(200).min(pct(30).max(160)),
+        };
         let notif = (38 * adv).max(260).min(pct(35).max(220));
         let open = on && self.notif_open.get();
         let floating = open && width > 0 && width - side - notif < 40 * adv;
-        self.sidebar.set_width_request(side);
+        match self.paned.borrow().as_ref() {
+            Some(paned) => {
+                // The split decides the width; the request is only its floor.
+                self.sidebar.set_width_request(160.min(side));
+                if on && paned.position() != side {
+                    self.setting.set(true);
+                    paned.set_position(side);
+                    self.setting.set(false);
+                }
+            }
+            None => self.sidebar.set_width_request(side),
+        }
         self.notifications.set_width_request(notif);
         self.sidebar.set_visible(on);
         self.status.set_visible(on);
@@ -808,9 +985,28 @@ impl ComuxPanel {
     fn rebuild(self: &Rc<Self>) {
         let s = self.state();
         let st = self.style.borrow().clone();
-        self.rebuild_status(&s, &st);
+        let minute = now_unix() / 60;
+        let status_sig = sig(&[&s["status"], &s["tree"], &s["claimed"], &json!(minute)]);
+        if status_sig != self.status_sig.get() {
+            self.status_sig.set(status_sig);
+            self.rebuild_status(&s, &st);
+        }
+        let lists_sig = sig(&[
+            &s["tree"],
+            &s["agents"],
+            &s["notifications"],
+            &s["claimed"],
+            &s["bound"],
+            &s["connected"],
+            &json!(minute),
+        ]);
+        if lists_sig == self.lists_sig.get() {
+            return;
+        }
+        self.lists_sig.set(lists_sig);
 
         // ---- spaces ----
+        self.nav.clear_rows();
         clear(&self.spaces);
         let mut sa = Vec::new();
         for sess in s["tree"]["sessions"].as_array().into_iter().flatten() {
@@ -858,6 +1054,15 @@ impl ComuxPanel {
                 ],
             );
             row.set_widget_name(&format!("comux-space-{name}"));
+            let pane = tabs
+                .iter()
+                .find(|t| t["active"] == true)
+                .and_then(|t| t["panes"].as_array())
+                .and_then(|p| p.iter().find(|x| x["focused"] == true))
+                .and_then(|x| x["token"].as_str())
+                .map(str::to_string);
+            self.nav
+                .add(false, &row, sess["id"].as_str().map(str::to_string), pane);
             self.spaces.append(&row);
             sa.push(vec![json!({"cmd": "select-session", "target": sess["id"]})]);
         }
@@ -890,10 +1095,11 @@ impl ComuxPanel {
                         )
                     );
                     let right = span(&st.yellow, &elapsed(a["since_unix"].as_i64().unwrap_or(0)));
-                    (
-                        list_row(&entry(&left, &right, None, 0), true),
-                        vec![json!({"cmd": "jump", "target": a["token"]})],
-                    )
+                    let row = list_row(&entry(&left, &right, None, 0), true);
+                    // Previewed on hover, but not a keyboard stop: the agent's own row is.
+                    self.nav
+                        .add(true, &row, None, a["token"].as_str().map(str::to_string));
+                    (row, vec![json!({"cmd": "jump", "target": a["token"]})])
                 }
                 AgentRow::Rule => {
                     let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
@@ -964,6 +1170,8 @@ impl ComuxPanel {
                             ("Rename tab…", Act::Open("rename-tab", Some(tab))),
                         ],
                     );
+                    let token = a["token"].as_str().map(str::to_string);
+                    self.nav.add(true, &row, token.clone(), token);
                     (row, vec![json!({"cmd": "jump", "target": a["token"]})])
                 }
             };

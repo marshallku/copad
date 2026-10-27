@@ -270,6 +270,81 @@ for _ in $(seq 1 20); do [[ "$(notif_count)" == 0 ]] && break; sleep 0.5; done
 osascript -e 'tell application "System Events" to key code 53' >/dev/null
 log "ok — the native center dismissed with d, stayed open, and D cleared the rest"
 
+# Ctrl-b e (decisions #181): the native sidebar takes the keys like the TUI's — it starts on the
+# active space, ↓ moves to the next and Enter switches there.
+sleep 1
+NEXT="$(python3 - <<'PY'
+import json, os, socket
+s = socket.socket(socket.AF_UNIX); s.connect(os.environ["COPAD_MUX_SOCK"])
+s.sendall(b'{"t":"subscribe","v":1}\n'); f = s.makefile(); f.readline()
+t = json.loads(f.readline())["topics"]["tree"]["data"]
+ids = [x["id"] for x in t["sessions"]]
+print(t["sessions"][(ids.index(t["active"]) + 1) % len(ids)]["name"])
+PY
+)"
+"$COCTL" --socket "$GUI" terminal feed $'\x02e' >/dev/null
+sleep 1.5
+osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" \
+          -e 'tell application "System Events" to key code 125' >/dev/null
+sleep 1.5 # the selected row's preview popover
+[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/sidebar-keys.png" && log "screenshot: $W/sidebar-keys.png"
+osascript -e 'tell application "System Events" to key code 36' >/dev/null
+for _ in $(seq 1 20); do [[ "$(active_session)" == "$NEXT" ]] && break; sleep 0.5; done
+[[ "$(active_session)" == "$NEXT" ]] || fail "Ctrl-b e, Down, Enter did not move to $NEXT: $(active_session)"
+log "ok — Ctrl-b e focused the native sidebar; Down + Enter switched to $NEXT"
+
+# Resting the pointer on a sidebar row previews its pane in a card beside the sidebar (drawn in
+# the window, so it takes no click). Synthetic pointer moves do not always reach the tracking
+# areas, so the row is entered a few times until the area beside it changes.
+python3 - "$APP_PID" "$W" <<'PY' || fail "resting the pointer on a sidebar row showed no preview card"
+import sys, time, subprocess, Quartz
+from PIL import Image, ImageChops, ImageStat
+pid, w = int(sys.argv[1]), sys.argv[2]
+win = [x for x in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID)
+       if x.get("kCGWindowOwnerPID") == pid and x["kCGWindowBounds"]["Width"] > 200][0]
+b, wid = win["kCGWindowBounds"], win["kCGWindowNumber"]
+def move(x, y):
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, (x, y), 0))
+def shot(name):
+    path = f"{w}/{name}.png"
+    subprocess.run(["screencapture", "-o", "-x", f"-l{wid}", path], check=True)
+    im = Image.open(path).convert("RGB")
+    s = im.width / b["Width"]  # retina
+    return im.crop((int(270 * s), int(40 * s), int(800 * s), int(400 * s)))
+move(b["X"] + 700, b["Y"] + 600); time.sleep(1)
+before = shot("sidebar-nohover")
+for _ in range(8):
+    move(b["X"] + 700, b["Y"] + 600); time.sleep(0.3)
+    for dx in (60, 70, 80):
+        move(b["X"] + dx, b["Y"] + 130); time.sleep(0.05)
+    time.sleep(2)
+    after = shot("sidebar-hover")
+    if sum(ImageStat.Stat(ImageChops.difference(before, after)).mean) > 6:
+        sys.exit(0)
+sys.exit(1)
+PY
+log "screenshot: $W/sidebar-hover.png"
+log "ok — resting the pointer on a sidebar row showed its pane preview"
+# With the card up, a click on the sidebar's resume button still lands (the card is not a
+# window that eats the first click).
+sleep 1
+BEFORE="$(tabs_total)"
+python3 - "$APP_PID" <<'PY'
+import sys, time, Quartz
+for w in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID):
+    if w.get("kCGWindowOwnerPID") == int(sys.argv[1]) and w["kCGWindowBounds"]["Width"] > 200:
+        b = w["kCGWindowBounds"]; break
+pt = (b["X"] + 219, b["Y"] + 82)
+for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+    Quartz.CGEventPost(Quartz.kCGHIDEventTap, Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft))
+    time.sleep(0.05)
+PY
+sleep 3
+osascript -e 'tell application "System Events" to key code 36' >/dev/null
+for _ in $(seq 1 20); do [[ "$(tabs_total)" -gt "$BEFORE" ]] && break; sleep 0.5; done
+[[ "$(tabs_total)" -gt "$BEFORE" ]] || fail "a click on the sidebar with the preview card up did not land"
+log "ok — with the preview card up, the sidebar's resume button still took the first click"
+
 # Closing copad releases the claim: comux draws its own sidebar again for the next client.
 kill "$APP_PID"; APP_PID=""
 for _ in $(seq 1 40); do

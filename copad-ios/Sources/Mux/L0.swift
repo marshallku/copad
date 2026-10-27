@@ -218,11 +218,12 @@ struct L0Model: Equatable {
 
 /// "4m", "2h13m" — a host renders elapsed time itself so the topic need not change each second.
 func elapsedLabel(since: Int64, now: Date = Date()) -> String {
+    // The TUI's `fmt_elapsed`: nothing under a minute, then whole minutes.
     let secs = max(0, Int64(now.timeIntervalSince1970) - since)
-    if secs < 60 { return "\(secs)s" }
+    if secs < 60 { return "" }
     let m = secs / 60
     if m < 60 { return "\(m)m" }
-    return "\(m / 60)h\(m % 60)m"
+    return m % 60 == 0 ? "\(m / 60)h" : "\(m / 60)h\(m % 60)m"
 }
 
 // MARK: delegated overlays (decisions #170)

@@ -46,6 +46,21 @@ enum ComuxLook {
         ansi: Palette.ansi.map { Color(red: $0.r, green: $0.g, blue: $0.b) })
 }
 
+/// A drawer row's pane, shown on long-press above its menu (decisions #181).
+struct DrawerPreview: View {
+    @ObservedObject var session: MuxSession
+    let pane: String?
+
+    var body: some View {
+        PanePreview(pane: pane, look: ComuxLook.overlay, state: session.previews["drawer"],
+                    handlers: OverlayHandlers(answer: { _, _ in }, act: { _ in },
+                                              preview: { p, r, c in session.setPreview(owner: "drawer", p, rows: r, cols: c) }))
+            .frame(width: 340, height: 280)
+            .background(ComuxLook.base)
+            .onDisappear { session.setPreview(owner: "drawer", nil, rows: 0, cols: 0) }
+    }
+}
+
 extension Color {
     init(hex: UInt32) {
         self.init(red: Double(hex >> 16 & 0xFF) / 255, green: Double(hex >> 8 & 0xFF) / 255,
@@ -194,6 +209,8 @@ struct SpacesDrawer: View {
             Button("Rename session…") { act { session.openOverlay("rename-session", target: s.id) } }
             Button("New session…") { act { session.openOverlay("new-session") } }
             Button("Kill session…", role: .destructive) { act { session.openOverlay("kill-session", target: s.id) } }
+        } preview: {
+            DrawerPreview(session: session, pane: s.tabs.first { $0.active }?.panes.first { $0.focused }?.token)
         }
         .accessibilityIdentifier("space-\(s.name)")
     }
@@ -251,6 +268,8 @@ struct SpacesDrawer: View {
         .contextMenu {
             Button("Jump to pane") { act { session.jump(a.token) } }
             Button("Rename tab…") { act { session.openOverlay("rename-tab", target: "\(a.space_id)/\(a.tab_id)") } }
+        } preview: {
+            DrawerPreview(session: session, pane: a.token)
         }
         .accessibilityIdentifier("agent-\(a.token)")
     }

@@ -1637,6 +1637,23 @@ pub unsafe extern "C" fn copad_muxhost_act(
     }
 }
 
+/// Whether `panel`'s comux client asked to focus the native sidebar (`Ctrl-b e`, decisions #181);
+/// 1 once per request, else 0.
+///
+/// # Safety
+/// `h` live; `panel` a valid string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_take_focus(
+    h: *const MuxHostHandle,
+    panel: *const c_char,
+) -> i32 {
+    // SAFETY: caller contract.
+    match (unsafe { h.as_ref() }, unsafe { cstr(panel) }) {
+        (Some(h), Some(p)) => i32::from(h.0.take_focus_request(p)),
+        _ => 0,
+    }
+}
+
 /// Keep `consumer`'s preview of `pane` (`rows` × `cols`) fresh; `pane` NULL stops it
 /// (decisions #180). The result is in the state JSON under `previews.<consumer>`.
 ///

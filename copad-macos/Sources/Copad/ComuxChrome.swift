@@ -91,7 +91,16 @@ final class ComuxHost: ObservableObject {
     func windowClosed(_ window: ObjectIdentifier) {
         served[window] = nil
         pushServed()
-        for link in links.values { copad_muxhost_preview(link.handle, Self.consumer(window), nil, 0, 0) }
+        for link in links.values {
+            copad_muxhost_preview(link.handle, Self.consumer(window), nil, 0, 0)
+            copad_muxhost_preview(link.handle, Self.consumer(window) + "-hover", nil, 0, 0)
+        }
+    }
+
+    /// Whether `panel`'s comux client pressed `Ctrl-b e` (decisions #181); true once.
+    func takeFocus(key: String, panel: String) -> Bool {
+        guard let link = links[key] else { return false }
+        return copad_muxhost_take_focus(link.handle, panel) != 0
     }
 
     /// A window's name for its pane preview.
@@ -205,6 +214,50 @@ final class ComuxWindow: ObservableObject {
     }
 
     var previewState: L0PreviewState? { state?.previews?[consumer] }
+
+    /// A sidebar row's pane, previewed on hover or keyboard selection (its own consumer, so it
+    /// never fights an open overlay's preview).
+    func hoverPreview(pane: String?, rows: Int, cols: Int) {
+        hoverPane = pane
+        if let key { ComuxHost.shared.preview(key: key, consumer: consumer + "-hover", pane: pane, rows: rows, cols: cols) }
+    }
+
+    /// A row's popover went away: stop its preview — unless another row's has taken over (a
+    /// closing popover's onDisappear can land after the next one appeared).
+    func endHoverPreview(pane: String?) {
+        if hoverPane == pane { hoverPreview(pane: nil, rows: 0, cols: 0) }
+    }
+
+    private var hoverPane: String?
+
+    var hoverPreviewState: L0PreviewState? { state?.previews?[consumer + "-hover"] }
+
+    /// `Ctrl-b e` keyboard mode on the native sidebar (decisions #181): which half, the selected
+    /// row's id (session id / agent token) and its last index, for when that row goes away.
+    struct SidebarFocus: Equatable {
+        var agents = false
+        var id: String?
+        var index = 0
+    }
+
+    @Published var sidebarFocus: SidebarFocus?
+
+    /// The sidebar row whose pane is previewed beside the sidebar, and its vertical centre in
+    /// the sidebar's coordinates (decisions #181).
+    struct HoverCard: Equatable {
+        var pane: String
+        var midY: CGFloat
+    }
+
+    @Published var hoverCard: HoverCard?
+    /// Called when keyboard mode ends: the pane gets the keys back.
+    var onSidebarExit: (() -> Void)?
+
+    func exitSidebarFocus() {
+        guard sidebarFocus != nil else { return }
+        sidebarFocus = nil
+        onSidebarExit?()
+    }
 }
 
 /// A delegated overlay over the whole window content (decisions #180): it reads the window's
@@ -346,6 +399,107 @@ private extension View {
     func comuxHover(_ s: ComuxStyle) -> some View { modifier(HoverRow(style: s)) }
 }
 
+/// A space or agent row's pointer and keyboard states (decisions #181): the hover highlight, the
+/// `Ctrl-b e` selection (highlight + accent bar, as the TUI marks it), and — once the pointer
+/// rests on it or while it is selected — its pane previewed in a card beside the sidebar
+/// (`ComuxHoverCard`). Not a popover: a popover is a window of its own, and the click that
+/// dismisses it never reached the sidebar button under the pointer.
+private struct SidebarRow: ViewModifier {
+    @ObservedObject var host: ComuxWindow
+    var id: String
+    var pane: String?
+    @State private var over = false
+    @State private var resting = false
+    @State private var wait: Task<Void, Never>?
+    @State private var midY: CGFloat = 0
+
+    func body(content: Content) -> some View {
+        let st = host.style
+        let selected = host.sidebarFocus?.id == id
+        let shows = pane != nil && (selected || (resting && over))
+        content
+            .contentShape(Rectangle())
+            .background(RoundedRectangle(cornerRadius: 4).fill(selected || over ? st.hover.opacity(0.8) : .clear))
+            .overlay(alignment: .leading) {
+                if selected { RoundedRectangle(cornerRadius: 1).fill(st.accent).frame(width: 3).padding(.vertical, 4) }
+            }
+            .background(GeometryReader { g in
+                Color.clear
+                    .onAppear { midY = g.frame(in: .global).midY }
+                    .onChange(of: g.frame(in: .global).midY) { _, y in midY = y }
+            })
+            .onHover { inside in
+                over = inside
+                wait?.cancel()
+                if inside {
+                    wait = Task {
+                        try? await Task.sleep(for: .milliseconds(500))
+                        if !Task.isCancelled { resting = true }
+                    }
+                } else {
+                    resting = false
+                }
+            }
+            .onChange(of: shows) { _, on in report(on) }
+            // The row's pane changed under it (another pane focused in that session): retire
+            // the card for the old one, show the new.
+            .onChange(of: pane) { old, _ in
+                if let old, host.hoverCard?.pane == old { host.hoverCard = nil }
+                if shows { report(true) }
+            }
+            .onChange(of: midY) { _, _ in if shows { report(true) } }
+            .onAppear { if shows { report(true) } }
+            .onDisappear {
+                wait?.cancel()
+                resting = false
+                report(false)
+            }
+            .id(id)
+    }
+
+    private func report(_ on: Bool) {
+        guard let pane else { return }
+        if on {
+            host.hoverCard = ComuxWindow.HoverCard(pane: pane, midY: midY)
+        } else if host.hoverCard?.pane == pane {
+            host.hoverCard = nil
+        }
+    }
+}
+
+/// The previewed sidebar row's pane, in a card beside the sidebar at the row's height. It
+/// never takes a click: everything under it stays usable.
+struct ComuxHoverCard: View {
+    @ObservedObject var host: ComuxWindow
+
+    var body: some View {
+        let st = host.style
+        GeometryReader { geo in
+            if let card = host.hoverCard {
+                let h = 16 * st.lineHeight + 20
+                let y = min(max(card.midY - h / 2, 4), max(geo.size.height - h - 4, 4))
+                PanePreview(pane: card.pane, look: st.overlayLook, state: host.hoverPreviewState,
+                            handlers: OverlayHandlers(answer: { _, _ in }, act: { _ in },
+                                                      preview: { p, r, c in host.hoverPreview(pane: p, rows: r, cols: c) }))
+                    .id(card.pane)
+                    .frame(width: 72 * st.advance + 20, height: h)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(st.base.opacity(0.97)))
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(st.rule, lineWidth: 1))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .shadow(color: .black.opacity(0.3), radius: 10, x: 2, y: 4)
+                    .offset(x: 6, y: y)
+                    .onDisappear { host.endHoverPreview(pane: card.pane) }
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+/// A hosting view that is never the target of a click (the hover card).
+final class PassThroughHostingView<Content: View>: NSHostingView<Content> {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
 /// `  spaces ───` / `  agents ⚑2 ───`: a section header in the TUI's dim bold.
 private struct SectionHeader: View {
     var style: ComuxStyle
@@ -369,6 +523,7 @@ struct ComuxSidebar: View {
     @ObservedObject var host: ComuxWindow
     var settle: () -> Void
     var toggleNotifications: () -> Void
+    @FocusState private var keyboard: Bool
 
     var body: some View {
         let st = host.style
@@ -390,36 +545,96 @@ struct ComuxSidebar: View {
                 VStack(spacing: 0) {
                     VStack(spacing: 0) {
                         SectionHeader(style: st, title: "spaces")
-                        ScrollView(.vertical) {
-                            LazyVStack(spacing: 0) {
-                                ForEach(sessions) { space($0, st) }
+                        ScrollViewReader { proxy in
+                            ScrollView(.vertical) {
+                                LazyVStack(spacing: 0) {
+                                    ForEach(sessions) { space($0, st) }
+                                }
+                            }
+                            .scrollIndicators(.automatic)
+                            .onChange(of: host.sidebarFocus) { _, f in
+                                if let f, !f.agents, let id = f.id { proxy.scrollTo(id) }
                             }
                         }
-                        .scrollIndicators(.automatic)
                     }
                     .frame(height: top)
                     VStack(spacing: 0) {
                         SectionHeader(style: st, title: "agents", badge: blocked.isEmpty ? nil : "⚑\(blocked.count)")
-                        ScrollView(.vertical) {
-                            LazyVStack(spacing: 0) {
-                                // Waiting agents, pinned: duplicated rather than sorted to the
-                                // top, so the list below never moves under the pointer.
-                                ForEach(blocked) { band($0, st) }
-                                if !blocked.isEmpty { Rectangle().fill(st.rule).frame(height: 1).padding(.horizontal, 8) }
-                                ForEach(groups, id: \.id) { g in
-                                    if grouped { groupHeader(g, st) }
-                                    ForEach(g.agents) { agent($0, grouped: grouped, st) }
+                        ScrollViewReader { proxy in
+                            ScrollView(.vertical) {
+                                LazyVStack(spacing: 0) {
+                                    // Waiting agents, pinned: duplicated rather than sorted to the
+                                    // top, so the list below never moves under the pointer.
+                                    ForEach(blocked) { band($0, st) }
+                                    if !blocked.isEmpty { Rectangle().fill(st.rule).frame(height: 1).padding(.horizontal, 8) }
+                                    ForEach(groups, id: \.id) { g in
+                                        if grouped { groupHeader(g, st) }
+                                        ForEach(g.agents) { agent($0, grouped: grouped, st) }
+                                    }
                                 }
                             }
+                            .scrollIndicators(.automatic)
+                            .onChange(of: host.sidebarFocus) { _, f in
+                                if let f, f.agents, let id = f.id { proxy.scrollTo(id) }
+                            }
                         }
-                        .scrollIndicators(.automatic)
                     }
                     .frame(maxHeight: .infinity)
                 }
             }
         }
         .overlay(alignment: .trailing) { Rectangle().fill(st.rule).frame(width: 1) }
+        // `Ctrl-b e` (decisions #181): the TUI sidebar's keyboard mode, natively.
+        .focusable(host.sidebarFocus != nil)
+        .focused($keyboard)
+        .focusEffectDisabled()
+        .onKeyPress(phases: .down) { press in key(press, sessions: sessions, agents: groups.flatMap(\.agents)) }
+        .onChange(of: host.sidebarFocus != nil) { _, on in
+            if on { Task { await focusSoon { keyboard = true } } }
+        }
+        .onChange(of: keyboard) { _, focused in
+            // A click into a pane (anything taking focus away) ends keyboard mode.
+            if !focused, host.sidebarFocus != nil { host.exitSidebarFocus() }
+        }
         .accessibilityIdentifier("comuxSidebar")
+    }
+
+    /// The TUI's sidebar keys: ↑/↓ j/k move, ←/→ h/l switch spaces↔agents, Enter acts like a
+    /// click and leaves, Esc/q leaves.
+    private func key(_ press: KeyPress, sessions: [L0Session], agents: [L0Agent]) -> KeyPress.Result {
+        guard var f = host.sidebarFocus, let name = comuxKeyName(press) else { return .ignored }
+        let ids = { (agentsHalf: Bool) in agentsHalf ? agents.map(\.token) : sessions.map(\.id) }
+        let list = ids(f.agents)
+        let at = f.id.flatMap { list.firstIndex(of: $0) } ?? min(f.index, max(list.count - 1, 0))
+        switch name {
+        case "Up", "k", "Down", "j":
+            guard !list.isEmpty else { return .handled }
+            let d = (name == "Up" || name == "k") ? -1 : 1
+            f.index = (at + d + list.count) % list.count
+            f.id = list[f.index]
+        case "Left", "h", "Right", "l":
+            let toAgents = name == "Right" || name == "l"
+            let other = ids(toAgents)
+            guard !other.isEmpty else { return .handled }
+            f = ComuxWindow.SidebarFocus(agents: toAgents, id: other[0], index: 0)
+        case "Enter":
+            guard list.indices.contains(at) else { return .handled }
+            settle()
+            if f.agents {
+                host.command(["cmd": "jump", "target": list[at]])
+            } else {
+                host.command(["cmd": "select-session", "target": list[at]])
+            }
+            host.exitSidebarFocus()
+            return .handled
+        case "Esc", "q":
+            host.exitSidebarFocus()
+            return .handled
+        default:
+            return .handled // keyboard mode swallows the rest, as the TUI does
+        }
+        host.sidebarFocus = f
+        return .handled
     }
 
     private func toolbar(_ st: ComuxStyle) -> some View {
@@ -470,7 +685,8 @@ struct ComuxSidebar: View {
             .font(st.body)
             .padding(.horizontal, 8)
             .frame(height: st.entryHeight)
-            .comuxHover(st)
+            .modifier(SidebarRow(host: host, id: s.id,
+                                 pane: s.tabs.first { $0.active }?.panes.first { $0.focused }?.token))
         }
         .buttonStyle(.plain)
         .contextMenu {
@@ -537,7 +753,7 @@ struct ComuxSidebar: View {
             .font(st.body)
             .padding(.horizontal, 8)
             .frame(height: st.entryHeight)
-            .comuxHover(st)
+            .modifier(SidebarRow(host: host, id: a.token, pane: a.token))
         }
         .buttonStyle(.plain)
         .contextMenu {

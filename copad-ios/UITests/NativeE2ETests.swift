@@ -139,13 +139,23 @@ final class NativeE2ETests: XCTestCase {
         waitForExpectations(timeout: 10)
         terminal.tap()
 
-        // 6. The spaces drawer lists the other session and the fake agent; a tap switches.
+        // 6. ^b e (decisions #181) opens the spaces drawer, as the TUI focuses its sidebar; it
+        //    lists the other session and the fake agent, a long-press previews the agent's pane,
+        //    and a tap switches.
+        app.buttons["key-prefix"].tap()
+        app.typeText("e")
+        XCTAssertTrue(app.buttons["space-e2e-two"].waitForExistence(timeout: 10), "^b e did not open the drawer")
+        let agentRow = app.descendants(matching: .any).matching(
+            NSPredicate(format: "identifier BEGINSWITH 'agent-'")).firstMatch
+        XCTAssertTrue(agentRow.waitForExistence(timeout: 10), "the fake agent is not in the drawer")
+        snapshot("spaces-drawer")
+        agentRow.press(forDuration: 1.2)
+        Thread.sleep(forTimeInterval: 2)
+        snapshot("drawer-preview")
+        XCTAssertTrue(app.buttons["Jump to pane"].waitForExistence(timeout: 5), "no long-press menu")
+        app.buttons["Jump to pane"].tap()
         app.buttons["openSpaces"].tap()
         XCTAssertTrue(app.buttons["space-e2e-two"].waitForExistence(timeout: 10))
-        XCTAssertTrue(app.descendants(matching: .any).matching(
-            NSPredicate(format: "identifier BEGINSWITH 'agent-'")).firstMatch.waitForExistence(timeout: 10),
-            "the fake agent is not in the drawer")
-        snapshot("spaces-drawer")
         app.buttons["space-e2e-two"].tap()
         let active = app.staticTexts["activeSession"]
         let switched = NSPredicate(format: "label == 'e2e-two'")

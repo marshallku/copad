@@ -567,6 +567,42 @@ if not refused:
 oh.close(); ov_client.close()
 ok("Ctrl-b C / Ctrl-b R reached the host loading then filled; browsing created a session in proj; host opens came back as comux overlays")
 
+# 20. Ctrl-b e routes by the attachment that pressed it (decisions #181): a client whose
+#     sidebar a host draws gets its host told; a plain terminal attached alongside keeps the
+#     TUI's keyboard mode, and the flag set for one dispatch never leaks into the next.
+na = Raw("raw-native"); pb = Raw("raw-plain")
+fh = Sub(); fh.recv(5); fh.recv(5)
+fh.wait(lambda s: {"raw-native", "raw-plain"} <= {x["tag"] for x in s.model["clients"]["clients"]},
+        what="both clients listed")
+na_id = [x for x in fh.model["clients"]["clients"] if x["tag"] == "raw-native"][0]["id"]
+fh.send({"t": "host-ready", "attachment": na_id, "incarnation": INC, "features": ["sidebar", "status", "overlays"]})
+fh.wait(lambda s: any(x["id"] == na_id and "sidebar" in x["claimed"] for x in s.model["clients"]["clients"]),
+        what="the native client's sidebar claimed")
+def focus_event(timeout):
+    end = time.time() + timeout
+    while time.time() < end:
+        m = fh.recv(0.3)
+        if m and m["t"] == "event" and m["kind"] == "focus-sidebar":
+            return m
+    return None
+def ctrl_b_e(cl):
+    cl.key({"Char": "b"}, "CONTROL"); cl.key({"Char": "e"})
+ctrl_b_e(na)
+ev = focus_event(5)
+if not ev or ev["data"]["client"] != na_id:
+    fail(f"Ctrl-b e from the native client did not reach its host: {ev}")
+ctrl_b_e(pb)
+if focus_event(2):
+    fail("Ctrl-b e from the plain terminal was sent to the other client's host")
+pb.key("Esc")  # leave the TUI's sidebar keyboard mode the plain client entered
+time.sleep(0.3)
+ctrl_b_e(na)
+ev = focus_event(5)
+if not ev or ev["data"]["client"] != na_id:
+    fail(f"the native client's second Ctrl-b e was lost: {ev}")
+fh.close(); na.close(); pb.close()
+ok("Ctrl-b e reached the native client's host only, and the plain client kept the TUI's mode")
+
 # 17. kill-server sent as a render-channel Command is answered before the server goes
 k = Raw("raw-kill")
 k.send({"t": "command", "id": "k1", "req": {"cmd": "kill-server"}})

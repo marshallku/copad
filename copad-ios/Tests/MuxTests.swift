@@ -131,7 +131,7 @@ final class L0ModelTests: XCTestCase {
 
     func testElapsedLabels() {
         let now = Date(timeIntervalSince1970: 10_000)
-        XCTAssertEqual(elapsedLabel(since: 9_990, now: now), "10s")
+        XCTAssertEqual(elapsedLabel(since: 9_990, now: now), "", "nothing under a minute, like the TUI")
         XCTAssertEqual(elapsedLabel(since: 9_700, now: now), "5m")
         XCTAssertEqual(elapsedLabel(since: 2_000, now: now), "2h13m")
     }

@@ -579,7 +579,16 @@ impl CopadWindow {
         let middle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         middle.set_vexpand(true);
         tab_manager.notebook.set_hexpand(true);
-        middle.append(&comux.sidebar);
+        // The sidebar and the rest share a split: its handle resizes the sidebar (#181).
+        let split = gtk4::Paned::new(gtk4::Orientation::Horizontal);
+        split.set_hexpand(true);
+        split.set_widget_name("comux-split");
+        split.set_resize_start_child(false);
+        split.set_shrink_start_child(false);
+        split.set_shrink_end_child(false);
+        split.set_start_child(Some(&comux.sidebar));
+        let rest = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        rest.set_hexpand(true);
         let center = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         center.set_hexpand(true);
         tab_manager.notebook.set_vexpand(true);
@@ -590,8 +599,11 @@ impl CopadWindow {
         term_over.set_vexpand(true);
         center.append(&term_over);
         center.append(&comux.status);
-        middle.append(&center);
-        middle.append(&comux.notif_dock);
+        rest.append(&center);
+        rest.append(&comux.notif_dock);
+        split.set_end_child(Some(&rest));
+        middle.append(&split);
+        comux.set_paned(&split);
         if config.statusbar.position == "top" {
             layout.append(&statusbar.container);
             layout.append(&middle);

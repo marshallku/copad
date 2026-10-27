@@ -1015,6 +1015,11 @@ pub struct App {
     sidebar_mid: Cell<u16>,
     /// When `Some`, the sidebar has keyboard focus (`Ctrl-b e`) for in-place navigation.
     sidebar_focus: Option<SidebarFocus>,
+    /// The client whose input is being fed draws its sidebar natively (its host claimed it);
+    /// set by the server before every dispatch (decisions #181).
+    key_client_native_sidebar: bool,
+    /// `Ctrl-b e` from such a client: its host is asked to focus its own sidebar.
+    sidebar_focus_request: bool,
     /// The effective user config (keybindings + options), loaded once at server start.
     cfg: MuxConfig,
     /// Clickable chrome regions (tab chips, sidebar rows), rebuilt every render so
@@ -1242,6 +1247,8 @@ impl App {
             agents_view: RefCell::new(HalfView::default()),
             sidebar_mid: Cell::new(0),
             sidebar_focus: None,
+            key_client_native_sidebar: false,
+            sidebar_focus_request: false,
             cfg,
             click_zones: RefCell::new(Vec::new()),
             center_hits: RefCell::new(((0, 0, 0, 0), Vec::new())),
@@ -1311,6 +1318,16 @@ impl App {
     /// filtered to the configured whitelist. Called before dispatching that client's input.
     pub fn set_client_env(&mut self, env: Vec<(String, String)>) {
         self.client_env = filter_env(env, &self.env_update);
+    }
+
+    /// Whether the client about to be fed draws its sidebar natively (decisions #181).
+    pub fn set_key_client_native_sidebar(&mut self, native: bool) {
+        self.key_client_native_sidebar = native;
+    }
+
+    /// A `Ctrl-b e` that the client's host should handle by focusing its own sidebar.
+    pub fn take_sidebar_focus_request(&mut self) -> bool {
+        std::mem::take(&mut self.sidebar_focus_request)
     }
 
     // --- reads off the authoritative state ---
@@ -7362,6 +7379,12 @@ impl App {
     /// Focus the sidebar for keyboard nav, revealing it if hidden. Falls back to the
     /// `Ctrl-f` switcher when the sidebar can't show (too narrow / mobile).
     fn open_sidebar_focus(&mut self) {
+        // The client's sidebar is a native one: its host focuses that instead, and nothing in
+        // the shared TUI state changes (decisions #181).
+        if self.key_client_native_sidebar {
+            self.sidebar_focus_request = true;
+            return;
+        }
         if !self.sidebar {
             self.sidebar = true;
             self.reflow();
@@ -18196,6 +18219,21 @@ mod host_api {
                 .0
         );
         assert!(app.host_notifications().items.is_empty());
+    }
+
+    #[test]
+    fn ctrl_b_e_from_a_native_sidebar_client_asks_its_host_and_leaves_the_tui_alone() {
+        let mut app = app();
+        app.set_key_client_native_sidebar(true);
+        app.open_sidebar_focus();
+        assert!(app.take_sidebar_focus_request());
+        assert!(!app.take_sidebar_focus_request(), "taken once");
+        assert!(app.popup.is_none() && app.sidebar_focus.is_none());
+        // A plain terminal client keeps the TUI behaviour.
+        app.set_key_client_native_sidebar(false);
+        app.open_sidebar_focus();
+        assert!(!app.take_sidebar_focus_request());
+        assert!(app.popup.is_some() || app.sidebar_focus.is_some());
     }
 
     #[test]
