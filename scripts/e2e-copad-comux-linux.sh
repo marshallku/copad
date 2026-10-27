@@ -18,7 +18,13 @@ COMUX=$R/target/debug/comux; COCTL=$R/target/debug/coctl; COPAD=$R/target/debug/
 W=$(mktemp -d /tmp/cml.XXXX)
 BPID=""; CPID=""
 cleanup() {
-  [[ -n "${APP:-}" ]] && kill "$APP" 2>/dev/null || true
+  # Let copad close its window (which removes its socket) BEFORE its display goes away: killed
+  # together with broadwayd it dies mid-shutdown and leaves a dead gui-<pid>.sock every run.
+  if [[ -n "${APP:-}" ]]; then
+    kill "$APP" 2>/dev/null || true
+    for _ in $(seq 1 50); do kill -0 "$APP" 2>/dev/null || break; sleep 0.1; done
+    rm -f "$XDG_RUNTIME_DIR/copad/gui-$APP.sock" "/tmp/copad-prewarm-$APP.html"
+  fi
   [[ -n "$CPID" ]] && kill "$CPID" 2>/dev/null || true
   [[ -n "$BPID" ]] && kill "$BPID" 2>/dev/null || true
   COPAD_MUX_SOCK=$W/s $COMUX kill-server >/dev/null 2>&1 || true
@@ -112,7 +118,10 @@ fi
 sleep 2
 echo "BROADWAY http://127.0.0.1:8097/  W=$W"
 if [[ -n "${SHOT_WAIT:-}" ]]; then sleep "$SHOT_WAIT"; fi
-kill "$APP"; kill "$CPID" 2>/dev/null; CPID=""
+# Quit copad and let it finish (window destroy removes its socket) before its session bus goes.
+kill "$APP"
+for _ in $(seq 1 50); do kill -0 "$APP" 2>/dev/null || break; sleep 0.1; done
+kill "$CPID" 2>/dev/null || true; CPID=""
 for _ in $(seq 1 40); do
   python3 -c 'import json,sys; c=json.loads(sys.argv[1]); sys.exit(0 if "sidebar" not in c["hidden"] else 1)' "$(clients)" && break
   sleep 0.5
