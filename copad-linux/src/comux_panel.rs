@@ -33,20 +33,24 @@ const GAUGE_W: i32 = 56;
 /// the comux TUI paints with (macOS `ComuxStyle`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Style {
-    family: String,
-    size: u32,
-    base: String,
-    text: String,
-    subtext: String,
-    dim: String,
-    rule: String,
-    hover: String,
-    mauve: String,
-    peach: String,
-    green: String,
-    yellow: String,
-    blue: String,
-    red: String,
+    pub(crate) family: String,
+    pub(crate) size: u32,
+    pub(crate) base: String,
+    pub(crate) text: String,
+    pub(crate) subtext: String,
+    pub(crate) dim: String,
+    pub(crate) rule: String,
+    pub(crate) hover: String,
+    pub(crate) mauve: String,
+    pub(crate) peach: String,
+    pub(crate) green: String,
+    pub(crate) yellow: String,
+    pub(crate) blue: String,
+    pub(crate) red: String,
+    pub(crate) accent: String,
+    /// The terminal's default foreground and 16 ANSI colours (overlay previews, #180).
+    pub(crate) fg: String,
+    pub(crate) ansi: Vec<String>,
 }
 
 fn rgb(hex: &str) -> (u8, u8, u8) {
@@ -81,6 +85,9 @@ impl Style {
             yellow: p[3].clone(),
             blue: p[4].clone(),
             red: t.red.clone(),
+            accent: t.accent.clone(),
+            fg: t.foreground.clone(),
+            ansi: p.to_vec(),
         }
     }
 
@@ -128,12 +135,14 @@ impl Style {
 #comux-status .comux-badge.red {{ background: {red}; }}
 #comux-status .comux-badge.yellow {{ background: {yellow}; }}
 .comux-text {{ color: {text}; }}
-"#
+{overlay}"#,
+            overlay = crate::comux_overlay::css(self),
         )
     }
 
-    fn status(&self, s: &str) -> (&'static str, &str) {
+    pub(crate) fn status(&self, s: &str) -> (&'static str, &str) {
         match s {
+            "done" => ("●", &self.green),
             "working" => ("●", &self.green),
             "ready" => ("◐", &self.blue),
             "blocked" => ("▲", &self.yellow),
@@ -154,14 +163,14 @@ impl Style {
 }
 
 /// `text` in `color`, escaped for Pango markup.
-fn span(color: &str, text: &str) -> String {
+pub(crate) fn span(color: &str, text: &str) -> String {
     format!(
         "<span foreground=\"{color}\">{}</span>",
         gtk4::glib::markup_escape_text(text)
     )
 }
 
-fn bold(markup: String) -> String {
+pub(crate) fn bold(markup: String) -> String {
     format!("<b>{markup}</b>")
 }
 
@@ -240,7 +249,7 @@ fn split_sidebar(
 }
 
 /// A space's subtitle, like the TUI's: its git branch, else what its focused pane runs.
-fn space_subtitle(branch: &str, tabs: &[Value]) -> String {
+pub(crate) fn space_subtitle(branch: &str, tabs: &[Value]) -> String {
     if !branch.is_empty() {
         return branch.to_string();
     }
@@ -263,7 +272,7 @@ fn until(at: i64) -> String {
     }
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
@@ -285,33 +294,6 @@ fn heading(text: &str) -> gtk4::Label {
     l.set_margin_start(10);
     l.set_margin_top(6);
     l
-}
-
-/// A two-line row for the overlay dialogs' pickers.
-fn two_line(title: &str, sub: &str, bold: bool) -> gtk4::Box {
-    let b = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
-    b.set_margin_start(10);
-    b.set_margin_end(10);
-    b.set_margin_top(3);
-    b.set_margin_bottom(3);
-    let t = gtk4::Label::new(None);
-    t.set_xalign(0.0);
-    t.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-    let esc = gtk4::glib::markup_escape_text(title);
-    t.set_markup(&if bold {
-        format!("<b>{esc}</b>")
-    } else {
-        esc.to_string()
-    });
-    b.append(&t);
-    if !sub.is_empty() {
-        let s = gtk4::Label::new(Some(sub));
-        s.set_xalign(0.0);
-        s.add_css_class("dim-label");
-        s.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        b.append(&s);
-    }
-    b
 }
 
 /// A label showing `markup`, left-aligned and ellipsized.
@@ -387,12 +369,13 @@ fn list_row(child: &impl IsA<gtk4::Widget>, activatable: bool) -> gtk4::ListBoxR
 }
 
 fn clear(list: &gtk4::ListBox) {
-    while let Some(c) = list.first_child() {
-        list.remove(&c);
+    // By row: a non-row child (a popover) is never removed and `first_child` would spin.
+    while let Some(r) = list.row_at_index(0) {
+        list.remove(&r);
     }
 }
 
-fn elapsed(since: i64) -> String {
+pub(crate) fn elapsed(since: i64) -> String {
     let s = (now_unix() - since).max(0);
     match s {
         0..60 => format!("{s}s"),
@@ -417,12 +400,9 @@ pub struct ComuxPanel {
     notifications: gtk4::Box,
     /// comux's status bar, natively (decisions #170): under the notebook.
     pub status: gtk4::Box,
-    /// The overlay currently shown as a dialog, and that dialog.
-    overlay_shown: Cell<Option<u64>>,
-    overlay_window: RefCell<Option<gtk4::Window>>,
-    /// The spec that dialog was built from: the same overlay id with a new spec means its
-    /// rows landed (decisions #172) and the dialog is rebuilt.
-    overlay_spec: RefCell<Value>,
+    /// The overlay shown over the window (decisions #180), and the window overlay it sits in.
+    overlay_ui: RefCell<Option<crate::comux_overlay::OverlayUi>>,
+    overlay_root: RefCell<Option<gtk4::Overlay>>,
     spaces: gtk4::ListBox,
     spaces_scroll: gtk4::ScrolledWindow,
     spaces_head: gtk4::Box,
@@ -564,9 +544,8 @@ impl ComuxPanel {
             notif_dock,
             notifications,
             status,
-            overlay_shown: Cell::new(None),
-            overlay_window: RefCell::new(None),
-            overlay_spec: RefCell::new(Value::Null),
+            overlay_ui: RefCell::new(None),
+            overlay_root: RefCell::new(None),
             spaces,
             spaces_scroll,
             spaces_head,
@@ -640,8 +619,14 @@ impl ComuxPanel {
 
     /// Hand the panel the window and the overlay over the terminal area: the notification
     /// panel floats there when the window is too narrow to dock it, and Esc closes it then.
-    pub fn mount(self: &Rc<Self>, window: &gtk4::ApplicationWindow, over: &gtk4::Overlay) {
+    pub fn mount(
+        self: &Rc<Self>,
+        window: &gtk4::ApplicationWindow,
+        over: &gtk4::Overlay,
+        root: &gtk4::Overlay,
+    ) {
         *self.float_in.borrow_mut() = Some(over.clone());
+        *self.overlay_root.borrow_mut() = Some(root.clone());
         let keys = gtk4::EventControllerKey::new();
         keys.set_propagation_phase(gtk4::PropagationPhase::Capture);
         let w = Rc::downgrade(self);
@@ -1576,48 +1561,80 @@ impl ComuxPanel {
                 .cloned()
         });
         let mine_id = mine.as_ref().and_then(|o| o["overlay"].as_u64());
-        if let Some(shown) = self.overlay_shown.get()
-            && mine_id != Some(shown)
-        {
+        let shown = self.overlay_ui.borrow().as_ref().map(|u| u.id);
+        if shown.is_some() && shown != mine_id {
             // Answered elsewhere, or comux closed it.
-            if let Some(w) = self.overlay_window.borrow_mut().take() {
-                w.destroy();
-            }
-            self.overlay_shown.set(None);
+            self.close_overlay();
         }
-        // The same overlay with a new spec: its rows landed — rebuild the dialog. `destroy`
-        // emits no close-request, so this is not a cancel.
-        if let Some(o) = &mine
-            && mine_id == self.overlay_shown.get()
-            && o["spec"] != *self.overlay_spec.borrow()
+        let Some(o) = mine else { return };
+        let Some(id) = mine_id else { return };
+        // The same overlay (rows landed, a live re-send) or the topics moved: in place.
+        if let Some(ui) = self.overlay_ui.borrow().as_ref()
+            && ui.id == id
         {
-            if let Some(w) = self.overlay_window.borrow_mut().take() {
-                w.destroy();
-            }
-            self.overlay_shown.set(None);
+            ui.update(&o["spec"], &s);
+            return;
         }
-        let (Some(o), None) = (mine, self.overlay_shown.get()) else {
-            return;
-        };
-        let Some(id) = o["overlay"].as_u64() else {
-            return;
-        };
-        self.overlay_shown.set(Some(id));
-        *self.overlay_spec.borrow_mut() = o["spec"].clone();
-        let dlg = overlay_dialog(self, window, id, &o["spec"]);
-        *self.overlay_window.borrow_mut() = Some(dlg);
+        let w = Rc::downgrade(self);
+        let answer: Rc<dyn Fn(Option<String>, Option<String>)> = Rc::new(move |choice, text| {
+            if let Some(p) = w.upgrade() {
+                p.answer(id, choice, text);
+            }
+        });
+        let w = Rc::downgrade(self);
+        let act: Rc<dyn Fn(String)> = Rc::new(move |choice| {
+            if let Some(p) = w.upgrade() {
+                p.cur().act(id, choice);
+            }
+        });
+        let w = Rc::downgrade(self);
+        let preview: Rc<dyn Fn(Option<copad_core::muxhost::PreviewReq>)> = Rc::new(move |req| {
+            if let Some(p) = w.upgrade() {
+                p.cur().preview(OVERLAY_CONSUMER, req);
+            }
+        });
+        let ui = crate::comux_overlay::OverlayUi::new(
+            id,
+            &o["spec"],
+            &s,
+            &self.style.borrow(),
+            crate::comux_overlay::Handlers {
+                answer,
+                act,
+                preview,
+            },
+            window,
+        );
+        if let Some(root) = self.overlay_root.borrow().as_ref() {
+            root.add_overlay(&ui.layer);
+        }
+        ui.focus();
+        *self.overlay_ui.borrow_mut() = Some(ui);
     }
 
-    /// Send the user's answer and close the dialog (once: a close after an answer is not a
+    fn close_overlay(&self) {
+        if let Some(ui) = self.overlay_ui.borrow_mut().take() {
+            if let Some(root) = self.overlay_root.borrow().as_ref() {
+                root.remove_overlay(&ui.layer);
+            }
+            ui.close();
+        }
+    }
+
+    /// Send the user's answer and close the overlay (once: a close after an answer is not a
     /// second, cancelling answer).
     fn answer(&self, id: u64, choice: Option<String>, text: Option<String>) {
-        if self.overlay_shown.get() != Some(id) {
+        if self.overlay_ui.borrow().as_ref().map(|u| u.id) != Some(id) {
             return;
         }
-        self.overlay_shown.set(None);
         self.cur().answer(id, choice, text);
-        if let Some(w) = self.overlay_window.borrow_mut().take() {
-            w.destroy();
+        // The widget removal is deferred: this runs inside one of the overlay's own handlers.
+        if let Some(ui) = self.overlay_ui.borrow_mut().take() {
+            if let Some(root) = self.overlay_root.borrow().as_ref() {
+                let (root, layer) = (root.clone(), ui.layer.clone());
+                gtk4::glib::idle_add_local_once(move || root.remove_overlay(&layer));
+            }
+            ui.close();
         }
     }
 
@@ -1665,259 +1682,13 @@ fn clear_box(b: &gtk4::Box) {
     }
 }
 
-/// A delegated comux overlay as a modal GTK window (decisions #170): a filterable picker, a
-/// text prompt or a confirm. Whatever the user picks goes back to comux, which runs it.
-fn overlay_dialog(
-    panel: &Rc<ComuxPanel>,
-    parent: &gtk4::ApplicationWindow,
-    id: u64,
-    spec: &Value,
-) -> gtk4::Window {
-    let win = gtk4::Window::builder()
-        .transient_for(parent)
-        .modal(true)
-        .default_width(460)
-        .title(spec["title"].as_str().unwrap_or("comux"))
-        .build();
-    win.set_widget_name("comux-overlay");
-    let vb = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    vb.set_margin_top(12);
-    vb.set_margin_bottom(12);
-    vb.set_margin_start(12);
-    vb.set_margin_end(12);
-    let w = Rc::downgrade(panel);
-    let answer: Rc<dyn Fn(Option<String>, Option<String>)> = Rc::new(move |choice, text| {
-        if let Some(p) = w.upgrade() {
-            p.answer(id, choice, text);
-        }
-    });
-    match spec["kind"].as_str() {
-        Some("prompt") => {
-            vb.append(&heading(spec["title"].as_str().unwrap_or_default()));
-            let entry = gtk4::Entry::new();
-            entry.set_text(spec["initial"].as_str().unwrap_or_default());
-            let a = answer.clone();
-            entry.connect_activate(move |e| a(None, Some(e.text().to_string())));
-            vb.append(&entry);
-            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-            row.set_halign(gtk4::Align::End);
-            let cancel = gtk4::Button::with_label("Cancel");
-            let a = answer.clone();
-            cancel.connect_clicked(move |_| a(None, None));
-            let ok = gtk4::Button::with_label("OK");
-            ok.add_css_class("suggested-action");
-            let a = answer.clone();
-            let e2 = entry.clone();
-            ok.connect_clicked(move |_| a(None, Some(e2.text().to_string())));
-            row.append(&cancel);
-            row.append(&ok);
-            vb.append(&row);
-            entry.grab_focus();
-        }
-        Some("menu") => {
-            if let Some(t) = spec["title"].as_str().filter(|t| !t.is_empty()) {
-                vb.append(&heading(t));
-            }
-            for item in spec["items"].as_array().into_iter().flatten() {
-                let b = gtk4::Button::with_label(item["label"].as_str().unwrap_or_default());
-                b.add_css_class("flat");
-                if item["destructive"] == true {
-                    b.add_css_class("destructive-action");
-                }
-                let a = answer.clone();
-                let id = item["id"].as_str().unwrap_or_default().to_string();
-                b.connect_clicked(move |_| a(Some(id.clone()), None));
-                vb.append(&b);
-            }
-            let cancel = gtk4::Button::with_label("Cancel");
-            let a = answer.clone();
-            cancel.connect_clicked(move |_| a(None, None));
-            vb.append(&cancel);
-        }
-        Some("picker") => {
-            if spec["loading"] == true {
-                let spin = gtk4::Spinner::new();
-                spin.start();
-                spin.set_widget_name("comux-overlay-loading");
-                vb.append(&spin);
-            }
-            if let Some(n) = spec["note"].as_str().filter(|n| !n.is_empty()) {
-                let l = gtk4::Label::new(Some(n));
-                l.add_css_class("warning");
-                l.set_wrap(true);
-                vb.append(&l);
-            }
-            let search = gtk4::SearchEntry::new();
-            vb.append(&search);
-            let list = gtk4::ListBox::new();
-            let mut ids: Vec<String> = Vec::new();
-            let actions: Vec<String> = spec["actions"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|a| a["id"].as_str().map(str::to_string))
-                .collect();
-            let tabs = spec["tabs"].as_array().cloned().unwrap_or_default();
-            for tab in &tabs {
-                if tabs.len() > 1 {
-                    let r = gtk4::ListBoxRow::new();
-                    r.set_child(Some(&heading(tab["name"].as_str().unwrap_or_default())));
-                    r.set_activatable(false);
-                    r.set_selectable(false);
-                    list.append(&r);
-                    ids.push(String::new());
-                }
-                for row in tab["rows"].as_array().into_iter().flatten() {
-                    let rid = row["id"].as_str().unwrap_or_default().to_string();
-                    let label = row["label"].as_str().unwrap_or_default();
-                    let detail = row["detail"].as_str().unwrap_or_default();
-                    let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-                    let txt = two_line(label, detail, row["current"] == true);
-                    txt.set_hexpand(true);
-                    b.append(&txt);
-                    if let Some(badge) = row["badge"].as_str() {
-                        b.append(&gtk4::Label::new(Some(badge)));
-                    }
-                    for act in actions.iter().filter(|_| row["no_actions"] != true) {
-                        let btn = gtk4::Button::with_label(act);
-                        btn.add_css_class("flat");
-                        let a = answer.clone();
-                        let choice = format!("{act}:{rid}");
-                        btn.connect_clicked(move |_| a(Some(choice.clone()), None));
-                        b.append(&btn);
-                    }
-                    let r = gtk4::ListBoxRow::new();
-                    r.set_child(Some(&b));
-                    // The text the filter matches, kept on the row.
-                    r.set_widget_name(&format!("{label} {detail}").to_lowercase());
-                    list.append(&r);
-                    ids.push(rid);
-                }
-            }
-            // The TUI's own default row (Ctrl-f opens on the previous session).
-            if let Some(sel) = spec["selected"].as_str()
-                && let Some(i) = ids.iter().position(|x| x == sel)
-            {
-                list.select_row(list.row_at_index(i as i32).as_ref());
-            }
-            let ids = Rc::new(ids);
-            let a = answer.clone();
-            let ids2 = ids.clone();
-            list.connect_row_activated(move |_, row| {
-                if let Some(id) = ids2.get(row.index() as usize).filter(|s| !s.is_empty()) {
-                    a(Some(id.clone()), None);
-                }
-            });
-            let s2 = search.clone();
-            list.set_filter_func(move |row| {
-                let f = s2.text().to_lowercase();
-                f.is_empty() || row.widget_name().contains(f.as_str())
-            });
-            let l2 = list.clone();
-            search.connect_search_changed(move |_| l2.invalidate_filter());
-            let a = answer.clone();
-            let l3 = list.clone();
-            let s3 = search.clone();
-            let ids3 = ids.clone();
-            search.connect_activate(move |_| {
-                let f = s3.text().to_lowercase();
-                // The highlighted row first, if the filter still shows it.
-                if let Some(r) = l3.selected_row()
-                    && (f.is_empty() || r.widget_name().contains(f.as_str()))
-                    && let Some(id) = ids3.get(r.index() as usize).filter(|s| !s.is_empty())
-                {
-                    a(Some(id.clone()), None);
-                    return;
-                }
-                let mut i = 0;
-                while let Some(r) = l3.row_at_index(i) {
-                    if (f.is_empty() || r.widget_name().contains(f.as_str()))
-                        && let Some(id) = ids3.get(i as usize).filter(|s| !s.is_empty())
-                    {
-                        a(Some(id.clone()), None);
-                        return;
-                    }
-                    i += 1;
-                }
-            });
-            // ↑/↓ in the filter move the highlight over the rows the filter shows.
-            let keys = gtk4::EventControllerKey::new();
-            let l4 = list.clone();
-            let s4 = search.clone();
-            let ids4 = ids.clone();
-            keys.connect_key_pressed(move |_, key, _, _| {
-                let d: i32 = match key {
-                    gtk4::gdk::Key::Down => 1,
-                    gtk4::gdk::Key::Up => -1,
-                    _ => return gtk4::glib::Propagation::Proceed,
-                };
-                let f = s4.text().to_lowercase();
-                let visible: Vec<i32> = (0..ids4.len() as i32)
-                    .filter(|i| {
-                        !ids4[*i as usize].is_empty()
-                            && l4.row_at_index(*i).is_some_and(|r| {
-                                f.is_empty() || r.widget_name().contains(f.as_str())
-                            })
-                    })
-                    .collect();
-                if visible.is_empty() {
-                    return gtk4::glib::Propagation::Stop;
-                }
-                let cur = l4
-                    .selected_row()
-                    .and_then(|r| visible.iter().position(|i| *i == r.index()))
-                    .unwrap_or(0) as i32;
-                let next = visible[((cur + d).rem_euclid(visible.len() as i32)) as usize];
-                l4.select_row(l4.row_at_index(next).as_ref());
-                gtk4::glib::Propagation::Stop
-            });
-            search.add_controller(keys);
-            let scroll = gtk4::ScrolledWindow::new();
-            scroll.set_min_content_height(320);
-            scroll.set_child(Some(&list));
-            vb.append(&scroll);
-            let close = gtk4::Button::with_label("Close");
-            let a = answer.clone();
-            close.connect_clicked(move |_| a(None, None));
-            vb.append(&close);
-            search.grab_focus();
-        }
-        Some("confirm") => {
-            vb.append(&gtk4::Label::new(spec["message"].as_str()));
-            let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-            row.set_halign(gtk4::Align::End);
-            let cancel = gtk4::Button::with_label("Cancel");
-            let a = answer.clone();
-            cancel.connect_clicked(move |_| a(None, None));
-            let yes = gtk4::Button::with_label("Confirm");
-            yes.add_css_class("destructive-action");
-            let a = answer.clone();
-            yes.connect_clicked(move |_| a(Some("yes".into()), None));
-            row.append(&cancel);
-            row.append(&yes);
-            vb.append(&row);
-        }
-        // A kind this build doesn't know: answered as cancelled, never guessed at.
-        _ => {
-            let a = answer.clone();
-            gtk4::glib::idle_add_local_once(move || a(None, None));
-        }
-    }
-    win.set_child(Some(&vb));
-    // Closing the window any other way is a cancel (a no-op after an answer).
-    let a = answer.clone();
-    win.connect_close_request(move |_| {
-        a(None, None);
-        gtk4::glib::Propagation::Proceed
-    });
-    win.present();
-    win
-}
-
 thread_local! {
     /// The window's panel, for socket commands (GTK main thread only).
     static PANEL: RefCell<Option<Rc<ComuxPanel>>> = const { RefCell::new(None) };
 }
+
+/// The panel's name for its overlay preview (one panel per window, so one consumer per host).
+const OVERLAY_CONSUMER: &str = "overlay";
 
 pub fn set_global(p: &Rc<ComuxPanel>) {
     PANEL.with(|g| *g.borrow_mut() = Some(p.clone()));

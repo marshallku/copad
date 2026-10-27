@@ -4901,6 +4901,7 @@ impl App {
                     None => Resp::err("pane has no live terminal"),
                 }
             }
+            Req::PanePreview { target, rows, cols } => self.pane_preview(target, *rows, *cols),
             Req::ListAgents { target } => {
                 // Resolve the target on EVERY request, not once: the pane can close during
                 // a wait, and "gone" must be distinguishable from "not an agent yet".
@@ -10119,6 +10120,31 @@ impl App {
         self.preview_terminal(&items.get(pinned_sel(p, &items))?.target)
     }
 
+    /// The line above a preview: `space/tab · label status`.
+    fn preview_header(&self, term: &TerminalId) -> String {
+        match self.locate_terminal(term) {
+            Some((wid, tab, _)) => {
+                let loc = Loc {
+                    ws: wid,
+                    tab,
+                    term: None,
+                };
+                let label = self
+                    .labels
+                    .get(term)
+                    .map(|l| l.text.clone())
+                    .unwrap_or_default();
+                let status = self
+                    .agent_statuses
+                    .get(term)
+                    .map(|s| format!(" {}", s.status.label()))
+                    .unwrap_or_default();
+                format!("{} · {label}{status}", self.loc_label(&loc))
+            }
+            None => String::new(),
+        }
+    }
+
     /// Draw the switcher's preview of `target` into `(x, y, w, h)`: a one-line header, then
     /// the pane's CURRENT viewport (what it would show if you went there — scrolled-up panes
     /// preview their scrollback), bottom-anchored on its content and cropped to the width.
@@ -10149,27 +10175,7 @@ impl App {
         let Some(term) = target.and_then(|t| self.preview_terminal(t)) else {
             return;
         };
-        let header = match self.locate_terminal(&term) {
-            Some((wid, tab, _)) => {
-                let loc = Loc {
-                    ws: wid,
-                    tab,
-                    term: None,
-                };
-                let label = self
-                    .labels
-                    .get(&term)
-                    .map(|l| l.text.clone())
-                    .unwrap_or_default();
-                let status = self
-                    .agent_statuses
-                    .get(&term)
-                    .map(|s| format!(" {}", s.status.label()))
-                    .unwrap_or_default();
-                format!("{} · {label}{status}", self.loc_label(&loc))
-            }
-            None => String::new(),
-        };
+        let header = self.preview_header(&term);
         put_str(
             buf,
             x,
@@ -18192,6 +18198,99 @@ mod host_api {
         assert!(app.host_notifications().items.is_empty());
     }
 
+    #[test]
+    fn the_switcher_previews_renames_and_follows_live_changes() {
+        let mut app = app();
+        let marks = app.overlay_marks();
+        app.open_popup();
+        let (id, spec) = app.delegate_new_overlays(marks).remove(0);
+        let copad_mux_proto::OverlaySpec::Picker { actions, keys, .. } = &spec else {
+            panic!()
+        };
+        assert!(actions.iter().any(|a| a.id == "rename" && a.key == "C-r"));
+        assert!(keys.iter().any(|k| k.key == "C-f" && k.choice.is_empty()));
+        let first = rows_of(&spec).remove(0);
+        assert!(
+            !first.pane.is_empty(),
+            "a session row names the pane to preview"
+        );
+        assert_eq!(first.session, app.host_tree().sessions[0].id);
+        assert!(
+            app.poll_delegated().is_empty(),
+            "nothing changed, nothing re-sent"
+        );
+
+        // A new session shows up in the open switcher, under the same id.
+        app.handle_control(&Req::NewSession {
+            name: Some("later".into()),
+            cwd: None,
+            detached: true,
+        });
+        let resent = app.poll_delegated();
+        assert_eq!(resent.len(), 1);
+        assert_eq!(resent[0].0, id);
+        assert!(rows_of(&resent[0].1).iter().any(|r| r.label == "later"));
+
+        // ^R on a session row: switch there and open its rename prompt.
+        let later = app
+            .host_tree()
+            .sessions
+            .iter()
+            .find(|s| s.name == "later")
+            .unwrap()
+            .id
+            .clone();
+        assert!(
+            app.overlay_result(id, Some(format!("rename:s:{later}")), None)
+                .0
+        );
+        assert_eq!(app.host_tree().active, later);
+        assert!(
+            app.prompt.is_some(),
+            "the rename prompt, for the caller to delegate"
+        );
+    }
+
+    #[test]
+    fn dismissing_in_the_center_keeps_it_open_under_the_same_id() {
+        let mut app = app();
+        let term = app.focused_terminal().unwrap();
+        app.raise_notification(term.clone(), "claude".into(), "done", "a".into());
+        app.raise_notification(term, "claude".into(), "blocked", "b".into());
+        let marks = app.overlay_marks();
+        app.open_center();
+        let (id, spec) = app.delegate_new_overlays(marks).remove(0);
+        let copad_mux_proto::OverlaySpec::Picker {
+            no_filter,
+            actions,
+            keys,
+            ..
+        } = &spec
+        else {
+            panic!()
+        };
+        assert!(*no_filter);
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.id == "dismiss" && a.key == "d" && a.stays)
+        );
+        assert!(keys.iter().any(|k| k.key == "D" && k.choice == "clear-all"));
+        assert!(rows_of(&spec).iter().all(|r| !r.pane.is_empty()));
+        let nid = app.host_notifications().items[0].id;
+        let (changed, next) = app.overlay_result(id, Some(format!("dismiss:n:{nid}")), None);
+        assert!(changed);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].0, id, "re-sent in place");
+        assert_eq!(rows_of(&next[0].1).len(), 1);
+        let (changed, next) = app.overlay_result(id, Some("clear-all".into()), None);
+        assert!(changed);
+        assert_eq!(next[0].0, id);
+        assert!(rows_of(&next[0].1).is_empty());
+        assert!(app.host_notifications().items.is_empty());
+        assert!(!app.overlay_result(id, None, None).0, "Esc then closes it");
+    }
+
     fn scratch(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
             "comux-delegate-{tag}-{}-{}",
@@ -18273,6 +18372,16 @@ mod host_api {
         assert_ne!(id2, id);
         let spec2 = landed(&mut app, id2);
         assert!(rows_of(&spec2).iter().any(|r| r.label == "inner"));
+        // The TUI's arrows: ← is `up`, → (`open:`) never creates — on `here` it re-sends.
+        let copad_mux_proto::OverlaySpec::Picker { keys, actions, .. } = &spec2 else {
+            panic!()
+        };
+        assert!(keys.iter().any(|k| k.key == "Left" && k.choice == "up"));
+        assert!(actions.iter().any(|a| a.id == "open" && a.key == "Right"));
+        let marks = app.overlay_marks();
+        let (changed, next) = app.overlay_result(id2, Some("open:here".into()), None);
+        assert!(!changed && app.delegate_new_overlays(marks).is_empty());
+        assert_eq!(next[0].0, id2, "still the same listing");
         // "Create session here" opens comux's own name prompt, seeded with the directory.
         let marks = app.overlay_marks();
         let (changed, next) = app.overlay_result(id2, Some("here".into()), None);

@@ -10,6 +10,8 @@ struct SessionScreen: View {
     @State private var leftOpen = false
     @State private var rightOpen = false
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.horizontalSizeClass) private var hSize
+    @Environment(\.verticalSizeClass) private var vSize
     var onClose: () -> Void
     var onTrustKey: (MuxHost) -> Void
 
@@ -30,6 +32,23 @@ struct SessionScreen: View {
                 statusLine
             }
             drawers
+            if let o = session.overlays.first {
+                ComuxOverlayLayer(
+                    overlay: o, look: ComuxLook.overlay,
+                    context: OverlayContext(agents: session.model.agents?.agents ?? [],
+                                            sessions: session.model.tree?.sessions ?? [],
+                                            preview: session.preview,
+                                            compact: hSize == .compact && vSize == .regular),
+                    handlers: OverlayHandlers(
+                        answer: { choice, text in
+                            session.answerOverlay(o.overlay, choice: choice, text: text)
+                            term.focus()
+                        },
+                        act: { session.actOverlay(o.overlay, choice: $0) },
+                        preview: { pane, rows, cols in session.setPreview(pane, rows: rows, cols: cols) }))
+                .ignoresSafeArea(.container, edges: .bottom)
+                .transition(.opacity)
+            }
         }
         .preferredColorScheme(.dark)
         .onAppear {
@@ -48,15 +67,6 @@ struct SessionScreen: View {
             }
         }
         .onChange(of: session.phase) { _, p in if p == .live { term.focus() } }
-        .sheet(item: Binding(get: { session.overlays.first }, set: { _ in })) { o in
-            ComuxOverlayView(overlay: o) { choice, text in
-                session.answerOverlay(o.overlay, choice: choice, text: text)
-                term.focus()
-            }
-            .presentationDetents(o.isPicker ? [.medium, .large] : o.isMenu ? [.medium] : [.height(220)])
-            .preferredColorScheme(.dark)
-            .interactiveDismissDisabled()
-        }
         .alert("Trust this host?", isPresented: Binding(
             get: { session.pendingHostKey != nil }, set: { if !$0 { session.pendingHostKey = nil } })) {
             Button("Trust") {

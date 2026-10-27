@@ -303,6 +303,10 @@ char *copad_muxhost_new_remote_tag(void);
 char *copad_muxhost_remote_attach_command(const char *dest, const char *comux, const char *tag);
 /// Answer a delegated overlay; choice/text NULL when absent (both NULL = cancel).
 void copad_muxhost_answer(const MuxHostHandle *h, unsigned long long overlay, const char *choice, const char *text);
+/// Answer with a staying choice (the overlay stays until comux re-sends it).
+void copad_muxhost_act(const MuxHostHandle *h, unsigned long long overlay, const char *choice);
+/// Keep consumer's preview of pane (rows x cols) fresh; pane NULL stops it (decisions #180).
+void copad_muxhost_preview(const MuxHostHandle *h, const char *consumer, const char *pane, unsigned short rows, unsigned short cols);
 /// Free with copad_ffi_free_string.
 char *copad_muxhost_copad_tag(const char *panel, const char *socket);
 

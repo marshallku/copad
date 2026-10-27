@@ -235,6 +235,10 @@ struct L0PickerRow: Codable, Equatable, Identifiable {
     var current: Bool?
     /// The picker's per-row actions don't apply (the resume picker's headless toggle).
     var no_actions: Bool?
+    /// The pane to preview for this row, and the `agents` join key (decisions #180).
+    var pane: String?
+    /// The `tree` session this row stands for.
+    var session: String?
 }
 
 struct L0PickerTab: Codable, Equatable {
@@ -245,6 +249,17 @@ struct L0PickerTab: Codable, Equatable {
 struct L0PickerAction: Codable, Equatable {
     var id: String
     var label: String
+    /// The key applying it to the highlighted row (`C-r`, `d`, `Right`).
+    var key: String?
+    /// Answering with it keeps the overlay up (comux re-sends it under the same id).
+    var stays: Bool?
+}
+
+/// A row-independent key (`Left` → `up`, `C-a` → `toggle-all`); an empty choice cancels.
+struct L0PickerKey: Codable, Equatable {
+    var key: String
+    var choice: String?
+    var stays: Bool?
 }
 
 struct L0MenuItem: Codable, Equatable, Identifiable {
@@ -264,6 +279,62 @@ struct L0Picker: Equatable {
     var loading: Bool
     /// A line above the rows (an unreadable directory's error).
     var note: String
+    var keys: [L0PickerKey] = []
+    /// No filter field: printable keys belong to `keys`/`actions` (the center's `d`).
+    var noFilter = false
+}
+
+/// A pane's screen as styled runs (`pane-preview`, decisions #180).
+struct L0Preview: Codable, Equatable {
+    var pane: String
+    var header: String?
+    var cols: Int
+    var lines: [[L0Run]]
+}
+
+struct L0Run: Codable, Equatable {
+    var t: String
+    var fg: L0RunColor?
+    var bg: L0RunColor?
+    var bold: Bool?
+    var dim: Bool?
+    var italic: Bool?
+    var underline: Bool?
+    var reverse: Bool?
+}
+
+/// A palette index (the host's theme for 0–15) or `#rrggbb`.
+enum L0RunColor: Codable, Equatable {
+    case indexed(Int)
+    case rgb(UInt32)
+
+    init(from d: Decoder) throws {
+        let c = try d.singleValueContainer()
+        if let i = try? c.decode(Int.self) {
+            self = .indexed(i)
+            return
+        }
+        let s = try c.decode(String.self)
+        guard s.hasPrefix("#"), s.count == 7, let v = UInt32(s.dropFirst(), radix: 16) else {
+            throw DecodingError.dataCorruptedError(in: c, debugDescription: "not #rrggbb: \(s)")
+        }
+        self = .rgb(v)
+    }
+
+    func encode(to e: Encoder) throws {
+        var c = e.singleValueContainer()
+        switch self {
+        case let .indexed(i): try c.encode(i)
+        case let .rgb(v): try c.encode(String(format: "#%06x", v))
+        }
+    }
+}
+
+/// A preview as a host holds it: `ok`, `loading`, `gone` (the pane closed) or `unsupported`
+/// (an older comux).
+struct L0PreviewState: Codable, Equatable {
+    var state: String
+    var preview: L0Preview?
 }
 
 /// What comux asks a host to show instead of a TUI overlay; comux keeps the meaning and runs
@@ -277,7 +348,8 @@ enum L0OverlaySpec: Decodable, Equatable {
     case unsupported(kind: String)
 
     private enum K: String, CodingKey {
-        case kind, title, tabs, tab, actions, initial, placeholder, message, selected, loading, note, items
+        case kind, title, tabs, tab, actions, initial, placeholder, message, selected, loading, note, items, keys
+        case noFilter = "no_filter"
     }
 
     init(from d: Decoder) throws {
@@ -292,7 +364,9 @@ enum L0OverlaySpec: Decodable, Equatable {
                 actions: try c.decodeIfPresent([L0PickerAction].self, forKey: .actions) ?? [],
                 selected: try c.decodeIfPresent(String.self, forKey: .selected),
                 loading: try c.decodeIfPresent(Bool.self, forKey: .loading) ?? false,
-                note: try c.decodeIfPresent(String.self, forKey: .note) ?? ""))
+                note: try c.decodeIfPresent(String.self, forKey: .note) ?? "",
+                keys: try c.decodeIfPresent([L0PickerKey].self, forKey: .keys) ?? [],
+                noFilter: try c.decodeIfPresent(Bool.self, forKey: .noFilter) ?? false))
         case "prompt":
             self = .prompt(title: try c.decode(String.self, forKey: .title),
                            initial: try c.decodeIfPresent(String.self, forKey: .initial) ?? "",

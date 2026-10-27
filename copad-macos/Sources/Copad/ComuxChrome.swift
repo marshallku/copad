@@ -24,6 +24,8 @@ final class ComuxHost: ObservableObject {
         var bound: [String: UInt64]
         var claimed: [UInt64]
         var overlays: [L0Overlay]
+        /// Pane previews by consumer (a window), decisions #180.
+        var previews: [String: L0PreviewState]?
     }
 
     /// One comux this app hosts: the local one (key `""`) or a remote one copad opened over SSH
@@ -89,7 +91,11 @@ final class ComuxHost: ObservableObject {
     func windowClosed(_ window: ObjectIdentifier) {
         served[window] = nil
         pushServed()
+        for link in links.values { copad_muxhost_preview(link.handle, Self.consumer(window), nil, 0, 0) }
     }
+
+    /// A window's name for its pane preview.
+    nonisolated static func consumer(_ window: ObjectIdentifier) -> String { "w\(UInt(bitPattern: window.hashValue))" }
 
     func panelClosed(_ panel: String) {
         for link in links.values { copad_muxhost_unbind(link.handle, panel) }
@@ -134,6 +140,18 @@ final class ComuxHost: ObservableObject {
         copad_muxhost_open(link.handle, panel, what, target)
     }
 
+    /// Answer with a staying choice (the overlay stays until comux re-sends it).
+    func act(key: String, _ overlay: UInt64, choice: String) {
+        guard let link = links[key] else { return }
+        copad_muxhost_act(link.handle, overlay, choice)
+    }
+
+    /// Keep `consumer`'s preview of `pane` fresh; nil stops it.
+    func preview(key: String, consumer: String, pane: String?, rows: Int, cols: Int) {
+        guard let link = links[key] else { return }
+        copad_muxhost_preview(link.handle, consumer, pane, UInt16(clamping: rows), UInt16(clamping: cols))
+    }
+
     func command(key: String, _ req: [String: Any]) {
         guard let link = links[key], let d = try? JSONSerialization.data(withJSONObject: req),
               let s = String(data: d, encoding: .utf8) else { return }
@@ -151,6 +169,8 @@ final class ComuxWindow: ObservableObject {
     /// The notification panel floats over the terminal (a narrow window) instead of docking.
     @Published var notificationsFloating = false
     private(set) var key: String?
+    /// This window's name for its pane preview (decisions #180).
+    var consumer = ""
 
     /// The visible panel whose comux client this window hosts — what host-initiated overlays
     /// are opened for.
@@ -174,6 +194,42 @@ final class ComuxWindow: ObservableObject {
 
     func answer(_ overlay: UInt64, choice: String?, text: String?) {
         if let key { ComuxHost.shared.answer(key: key, overlay, choice: choice, text: text) }
+    }
+
+    func act(_ overlay: UInt64, choice: String) {
+        if let key { ComuxHost.shared.act(key: key, overlay, choice: choice) }
+    }
+
+    func preview(pane: String?, rows: Int, cols: Int) {
+        if let key { ComuxHost.shared.preview(key: key, consumer: consumer, pane: pane, rows: rows, cols: cols) }
+    }
+
+    var previewState: L0PreviewState? { state?.previews?[consumer] }
+}
+
+/// A delegated overlay over the whole window content (decisions #180): it reads the window's
+/// live state, so a re-sent spec (rows landed, an agent changed) and the preview update in place.
+struct ComuxOverlayHost: View {
+    @ObservedObject var host: ComuxWindow
+    let id: UInt64
+    /// The overlay is gone here (answered or cancelled).
+    let closed: () -> Void
+
+    var body: some View {
+        if let o = host.state?.overlays.first(where: { $0.overlay == id }) {
+            ComuxOverlayLayer(
+                overlay: o, look: host.style.overlayLook,
+                context: OverlayContext(agents: host.state?.agents?.agents ?? [],
+                                        sessions: host.state?.tree?.sessions ?? [],
+                                        preview: host.previewState),
+                handlers: OverlayHandlers(
+                    answer: { choice, text in
+                        host.answer(id, choice: choice, text: text)
+                        closed()
+                    },
+                    act: { host.act(id, choice: $0) },
+                    preview: { pane, rows, cols in host.preview(pane: pane, rows: rows, cols: cols) }))
+        }
     }
 }
 
@@ -200,6 +256,9 @@ struct ComuxStyle: Equatable {
     var yellow: Color
     var blue: Color
     var red: Color
+    /// The terminal's default foreground and ANSI colours (overlay previews).
+    var fg: Color
+    var ansi: [Color]
 
     @MainActor
     static func make(config: CopadConfig, theme: CopadTheme) -> ComuxStyle {
@@ -224,8 +283,15 @@ struct ComuxStyle: Equatable {
             // ANSI colours: mix them from the theme's own so a light theme stays legible.
             mauve: mix(5, 4), peach: mix(1, 3),
             green: ansi(2, theme.accent), yellow: ansi(3, theme.accent), blue: ansi(4, theme.accent),
-            red: c(theme.red)
+            red: c(theme.red),
+            fg: c(theme.text), ansi: p.map(c)
         )
+    }
+
+    var overlayLook: OverlayLook {
+        OverlayLook(body: body, strong: strong, lineHeight: lineHeight, advance: advance, base: base, text: text,
+                    subtext: subtext, dim: dim, rule: rule, hover: hover, accent: accent, mauve: mauve, peach: peach,
+                    green: green, yellow: yellow, blue: blue, red: red, fg: fg, ansi: ansi)
     }
 
     var body: Font { Font(font) }

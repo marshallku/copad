@@ -37,6 +37,13 @@ enum ComuxLook {
 
     /// green < 70% ≤ yellow < 90% ≤ red, like the TUI's gauges.
     static func usage(_ pct: Double) -> Color { pct >= 90 ? red : pct >= 70 ? yellow : green }
+
+    /// The overlays' look (decisions #180): the same font and colours, the TUI's ANSI palette.
+    static let overlay = OverlayLook(
+        body: body, strong: strong, lineHeight: lineHeight, advance: size * 0.6, base: base, text: text,
+        subtext: subtext, dim: dim, rule: rule, hover: hover, accent: blue, mauve: mauve, peach: peach,
+        green: green, yellow: yellow, blue: blue, red: red, fg: text,
+        ansi: Palette.ansi.map { Color(red: $0.r, green: $0.g, blue: $0.b) })
 }
 
 extension Color {

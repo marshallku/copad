@@ -22,7 +22,31 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How often an open preview is refreshed, and how long a request may stay unanswered before
+/// it is sent again (decisions #180).
+const PREVIEW_EVERY: Duration = Duration::from_millis(700);
+const PREVIEW_STALE: Duration = Duration::from_secs(3);
+
+/// What a GUI wants previewed: a pane, sized to the box it draws it in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreviewReq {
+    pub pane: String,
+    pub rows: u16,
+    pub cols: u16,
+}
+
+#[derive(Default)]
+struct PreviewWant {
+    req: Option<PreviewReq>,
+    /// The request id of the one `pane-preview` in flight, and when it went out.
+    inflight: Option<(String, Instant)>,
+    last_sent: Option<Instant>,
+    result: Option<copad_mux_proto::Preview>,
+    /// The pane no longer exists.
+    gone: bool,
+}
 
 /// What a desktop host takes over: the sidebar, the status bar (every field it carries has a
 /// native replacement in the window's comux status strip) and the overlays (`Ctrl-f`,
@@ -153,6 +177,13 @@ struct State {
     claims: Claims,
     /// Overlays comux handed us for attachments we hold: (overlay id, attachment, spec).
     overlays: Vec<(u64, u64, copad_mux_proto::OverlaySpec)>,
+    /// Overlays answered for good here. A same-id update still on its way (the re-send after a
+    /// staying action, a live switcher refresh) must not bring one back (codex #180 plan r3).
+    closed_overlays: BTreeSet<u64>,
+    /// Pane previews, by consumer (a GUI window — each shows its own picker).
+    previews: BTreeMap<String, PreviewWant>,
+    /// The comux on this link predates `pane-preview`.
+    preview_unsupported: bool,
 }
 
 impl State {
@@ -217,6 +248,11 @@ impl MuxHost {
             .name("copad-muxhost".into())
             .spawn(move || run(i))
             .ok();
+        let i = inner.clone();
+        std::thread::Builder::new()
+            .name("copad-muxhost-preview".into())
+            .spawn(move || poll_previews(i))
+            .ok();
         MuxHost { inner }
     }
 
@@ -249,6 +285,7 @@ impl MuxHost {
     pub fn answer(&self, overlay: u64, choice: Option<String>, text: Option<String>) {
         if let Ok(mut s) = self.inner.state.lock() {
             s.overlays.retain(|o| o.0 != overlay);
+            s.closed_overlays.insert(overlay);
             if let Ok(g) = self.inner.link.lock()
                 && let Some(l) = g.as_ref()
             {
@@ -257,6 +294,49 @@ impl MuxHost {
                     choice,
                     text,
                 });
+            }
+        }
+        self.inner.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Answer with a STAYING choice (a picker action/key marked `stays`, decisions #180): the
+    /// overlay stays shown until comux re-sends it under the same id.
+    pub fn act(&self, overlay: u64, choice: String) {
+        if let Ok(s) = self.inner.state.lock()
+            && s.overlays.iter().any(|o| o.0 == overlay)
+            && let Ok(g) = self.inner.link.lock()
+            && let Some(l) = g.as_ref()
+        {
+            let _ = l.send(&SubMsg::OverlayResult {
+                overlay,
+                choice: Some(choice),
+                text: None,
+            });
+        }
+    }
+
+    /// Keep `consumer`'s preview of a pane fresh (`None` stops it and forgets its result: the
+    /// picker closed, the window went away).
+    pub fn preview(&self, consumer: &str, req: Option<PreviewReq>) {
+        if let Ok(mut s) = self.inner.state.lock() {
+            match req {
+                None => {
+                    s.previews.remove(consumer);
+                }
+                Some(req) => {
+                    let w = s.previews.entry(consumer.to_string()).or_default();
+                    if w.req.as_ref() == Some(&req) {
+                        return;
+                    }
+                    if w.req.as_ref().map(|r| &r.pane) != Some(&req.pane) {
+                        w.result = None;
+                        w.gone = false;
+                    }
+                    w.req = Some(req);
+                    // A reply for the old request is no longer this one's.
+                    w.inflight = None;
+                    w.last_sent = None;
+                }
             }
         }
         self.inner.generation.fetch_add(1, Ordering::SeqCst);
@@ -312,7 +392,24 @@ impl MuxHost {
                 json!({ "overlay": id, "client": client, "panel": panel, "spec": spec })
             })
             .collect();
+        let previews: serde_json::Map<String, Value> = s
+            .previews
+            .iter()
+            .map(|(c, w)| {
+                let state = if s.preview_unsupported {
+                    "unsupported"
+                } else if w.gone {
+                    "gone"
+                } else if w.result.is_some() {
+                    "ok"
+                } else {
+                    "loading"
+                };
+                (c.clone(), json!({ "state": state, "preview": w.result }))
+            })
+            .collect();
         json!({
+            "previews": previews,
             "overlays": overlays,
             "connected": s.connected,
             "error": s.error,
@@ -432,6 +529,83 @@ fn run(inner: Arc<Inner>) {
     }
 }
 
+/// Send each wanted preview's `pane-preview` (one in flight per consumer, every
+/// [`PREVIEW_EVERY`]); the replies land in [`on_event`].
+fn poll_previews(inner: Arc<Inner>) {
+    while !inner.stop.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(100));
+        let Ok(mut s) = inner.state.lock() else {
+            return;
+        };
+        if s.preview_unsupported {
+            continue;
+        }
+        let Some(link) = inner.link.lock().ok().and_then(|l| l.clone()) else {
+            continue;
+        };
+        let now = Instant::now();
+        for w in s.previews.values_mut() {
+            let Some(req) = &w.req else { continue };
+            if w.inflight
+                .as_ref()
+                .is_some_and(|(_, at)| now - *at < PREVIEW_STALE)
+                || w.last_sent.is_some_and(|at| now - at < PREVIEW_EVERY)
+            {
+                continue;
+            }
+            let cmd = json!({
+                "cmd": "pane-preview",
+                "target": req.pane,
+                "rows": req.rows,
+                "cols": req.cols,
+            });
+            if let Ok(id) = link.cmd(cmd) {
+                w.inflight = Some((id, now));
+                w.last_sent = Some(now);
+            }
+        }
+    }
+}
+
+/// A `pane-preview` reply: stored only if it answers the request still in flight for that
+/// consumer (a late one, or one for a pane no longer wanted, is dropped). Returns whether it
+/// was one.
+fn take_preview_reply(s: &mut State, id: &str, resp: &Value) -> bool {
+    let Some(w) = s
+        .previews
+        .values_mut()
+        .find(|w| w.inflight.as_ref().is_some_and(|(i, _)| i == id))
+    else {
+        return false;
+    };
+    w.inflight = None;
+    if resp["ok"] == true {
+        w.result = serde_json::from_value(resp["preview"].clone()).ok();
+        w.gone = false;
+    } else if resp["code"] == "not_found" {
+        w.result = None;
+        w.gone = true;
+    } else {
+        // An older comux: `bad request: unknown variant pane-preview`.
+        s.preview_unsupported = true;
+    }
+    true
+}
+
+/// Forget everything tied to one connection: overlay ids, previews in flight and their
+/// results (ids restart with the next connection).
+fn reset_connection(s: &mut State) {
+    s.overlays.clear();
+    s.closed_overlays.clear();
+    s.preview_unsupported = false;
+    for w in s.previews.values_mut() {
+        w.inflight = None;
+        w.last_sent = None;
+        w.result = None;
+        w.gone = false;
+    }
+}
+
 fn on_event(inner: &Arc<Inner>, ev: LinkEvent, closed: &std::sync::mpsc::Sender<()>) {
     {
         let Ok(mut s) = inner.state.lock() else {
@@ -439,12 +613,21 @@ fn on_event(inner: &Arc<Inner>, ev: LinkEvent, closed: &std::sync::mpsc::Sender<
         };
         match &ev {
             LinkEvent::Msg(PubMsg::Error { .. }) => s.claims.refused(),
+            LinkEvent::Msg(PubMsg::Reply { id, resp }) => {
+                if !take_preview_reply(&mut s, id, resp) {
+                    return;
+                }
+            }
             LinkEvent::Msg(PubMsg::Overlay {
                 overlay,
                 client,
                 spec,
             }) => {
                 // The same id again = its rows landed (decisions #172): replace in place.
+                // One answered here stays closed, whatever was still on its way.
+                if s.closed_overlays.contains(overlay) {
+                    return;
+                }
                 if let Some(o) = s.overlays.iter_mut().find(|o| o.0 == *overlay) {
                     o.2 = spec.clone();
                 } else if s.claims.covers(*client) {
@@ -458,7 +641,7 @@ fn on_event(inner: &Arc<Inner>, ev: LinkEvent, closed: &std::sync::mpsc::Sender<
                 if s.model.apply(m) == Applied::Welcome {
                     // A new server: every attachment id and claim we held is meaningless.
                     s.claims = Claims::default();
-                    s.overlays.clear();
+                    reset_connection(&mut s);
                     s.connected = true;
                     s.error = None;
                 }
@@ -472,7 +655,7 @@ fn on_event(inner: &Arc<Inner>, ev: LinkEvent, closed: &std::sync::mpsc::Sender<
                 s.error = Some(why.clone());
                 s.model = Model::default();
                 s.claims = Claims::default();
-                s.overlays.clear();
+                reset_connection(&mut s);
             }
         }
     }
@@ -614,6 +797,98 @@ mod tests {
         });
         assert_eq!(c.reconcile(&gone, &tags(&["t"])), [ClaimOp::Gone(3)]);
         assert!(c.held().is_empty());
+    }
+
+    fn inner() -> Arc<Inner> {
+        Arc::new(Inner {
+            endpoint: Endpoint::Socket("/nonexistent".into()),
+            state: Mutex::new(State::default()),
+            generation: AtomicU64::new(1),
+            link: Mutex::new(None),
+            unsent: Mutex::new(Vec::new()),
+            stop: AtomicBool::new(true),
+        })
+    }
+
+    fn want(s: &mut State, consumer: &str, inflight: &str) {
+        s.previews.insert(
+            consumer.into(),
+            PreviewWant {
+                req: Some(PreviewReq {
+                    pane: "p1".into(),
+                    rows: 10,
+                    cols: 40,
+                }),
+                inflight: Some((inflight.into(), Instant::now())),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn a_preview_reply_lands_only_for_the_request_in_flight() {
+        let mut s = State::default();
+        want(&mut s, "w1", "c1");
+        want(&mut s, "w2", "c2");
+        let ok =
+            json!({"ok": true, "preview": {"pane": "p1", "cols": 40, "lines": [[{"t": "hi"}]]}});
+        assert!(
+            !take_preview_reply(&mut s, "c9", &ok),
+            "not a preview request"
+        );
+        assert!(take_preview_reply(&mut s, "c1", &ok));
+        assert_eq!(
+            s.previews["w1"].result.as_ref().unwrap().lines[0][0].t,
+            "hi"
+        );
+        assert!(
+            s.previews["w2"].result.is_none(),
+            "the other window's is its own"
+        );
+        assert!(
+            !take_preview_reply(&mut s, "c1", &ok),
+            "a late duplicate is dropped"
+        );
+        let gone = json!({"ok": false, "code": "not_found"});
+        assert!(take_preview_reply(&mut s, "c2", &gone));
+        assert!(s.previews["w2"].gone);
+        want(&mut s, "w1", "c3");
+        let old = json!({"ok": false, "error": "bad request: unknown variant `pane-preview`"});
+        assert!(take_preview_reply(&mut s, "c3", &old));
+        assert!(s.preview_unsupported);
+        reset_connection(&mut s);
+        assert!(!s.preview_unsupported && s.previews["w1"].result.is_none());
+    }
+
+    #[test]
+    fn an_overlay_answered_here_is_not_brought_back_by_a_late_update() {
+        let i = inner();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        {
+            let mut s = i.state.lock().unwrap();
+            s.claims.pending = Some(7);
+        }
+        let spec = copad_mux_proto::OverlaySpec::Confirm {
+            message: "x".into(),
+        };
+        let overlay = |ov: u64| {
+            LinkEvent::Msg(PubMsg::Overlay {
+                overlay: ov,
+                client: 7,
+                spec: spec.clone(),
+            })
+        };
+        on_event(&i, overlay(1), &tx);
+        assert_eq!(i.state.lock().unwrap().overlays.len(), 1);
+        MuxHost { inner: i.clone() }.answer(1, None, None);
+        on_event(&i, overlay(1), &tx);
+        assert!(i.state.lock().unwrap().overlays.is_empty(), "stays closed");
+        on_event(&i, overlay(2), &tx);
+        assert_eq!(
+            i.state.lock().unwrap().overlays.len(),
+            1,
+            "a new one still shows"
+        );
     }
 
     #[test]

@@ -234,6 +234,15 @@ pub enum OverlaySpec {
         /// A line shown above the rows (an unreadable directory's error).
         #[serde(default, skip_serializing_if = "String::is_empty")]
         note: String,
+        /// Row-independent keys (the browser's `Left` → `up`, the resume picker's `C-a`).
+        /// A declared key wins over the host's defaults (←/→ switch tabs, ↑/↓ move, Enter
+        /// picks, Esc cancels).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        keys: Vec<PickerKey>,
+        /// No filter field (the notification center): printable keys are free for
+        /// `keys`/`actions` (`d` dismisses, like the TUI).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        no_filter: bool,
     },
     /// A single-line text prompt (rename, new session name, worktree branch).
     Prompt {
@@ -281,12 +290,123 @@ pub struct PickerRow {
     /// "Show headless runs" toggle).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_actions: bool,
+    /// The pane a host previews for this row (`pane-preview`): an agent's own pane, a
+    /// session's active tab's focused pane, a notification's pane. Also the join key into
+    /// the `agents` topic, so a host can draw the row from live state.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub pane: String,
+    /// The `tree` session this row stands for, when it is one.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub session: String,
+}
+
+impl PickerRow {
+    pub fn new(id: String, label: String, detail: String) -> Self {
+        PickerRow {
+            id,
+            label,
+            detail,
+            badge: String::new(),
+            current: false,
+            no_actions: false,
+            pane: String::new(),
+            session: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PickerAction {
     pub id: String,
     pub label: String,
+    /// The key that applies it to the highlighted row (`C-r`, `C-f`, `d`, `Right`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub key: String,
+    /// Answering with it leaves the overlay open: comux re-sends it under the same id
+    /// (dismissing one notification keeps the center up, as in the TUI).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stays: bool,
+}
+
+/// A row-independent key of a picker. Key names: `Left`, `Right`, `C-a` (Ctrl-a), `D` (a
+/// printable character as itself).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PickerKey {
+    pub key: String,
+    /// The answer it sends; empty = cancel.
+    #[serde(default)]
+    pub choice: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stays: bool,
+}
+
+/// A pane's screen as styled runs (`pane-preview`), what the TUI switcher previews.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Preview {
+    pub pane: String,
+    /// `space/tab · label status`, the TUI preview's header.
+    #[serde(default)]
+    pub header: String,
+    pub cols: u16,
+    /// Bottom-anchored rows of the pane's current viewport, top to bottom.
+    pub lines: Vec<Vec<Run>>,
+}
+
+/// Cells of one style. Default colours and false attributes are omitted.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct Run {
+    pub t: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fg: Option<RunColor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg: Option<RunColor>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bold: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dim: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub italic: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub underline: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reverse: bool,
+}
+
+/// A palette index (0–255, the host's theme for 0–15) or `#rrggbb`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunColor {
+    Indexed(u8),
+    Rgb(u8, u8, u8),
+}
+
+impl Serialize for RunColor {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match *self {
+            RunColor::Indexed(i) => s.serialize_u8(i),
+            RunColor::Rgb(r, g, b) => s.serialize_str(&format!("#{r:02x}{g:02x}{b:02x}")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RunColor {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        match Value::deserialize(d)? {
+            Value::Number(n) => n
+                .as_u64()
+                .and_then(|i| u8::try_from(i).ok())
+                .map(RunColor::Indexed)
+                .ok_or_else(|| serde::de::Error::custom("palette index out of range")),
+            Value::String(s) => {
+                let hex = s.strip_prefix('#').filter(|h| h.len() == 6 && h.is_ascii());
+                let byte = |i: usize| hex.and_then(|h| u8::from_str_radix(&h[i..i + 2], 16).ok());
+                match (byte(0), byte(2), byte(4)) {
+                    (Some(r), Some(g), Some(b)) => Ok(RunColor::Rgb(r, g, b)),
+                    _ => Err(serde::de::Error::custom("colour is not #rrggbb")),
+                }
+            }
+            _ => Err(serde::de::Error::custom("colour is a number or #rrggbb")),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------
@@ -710,5 +830,21 @@ mod tests {
         ));
         assert_eq!(m.attachment_for("copad:p1@s").unwrap().id, 9);
         assert!(m.attachment_for("").is_none());
+    }
+}
+
+#[cfg(test)]
+mod run_color_tests {
+    use super::RunColor;
+
+    #[test]
+    fn colours_round_trip_and_malformed_ones_are_errors_not_panics() {
+        let c: RunColor = serde_json::from_str("\"#0a0b0c\"").unwrap();
+        assert_eq!(c, RunColor::Rgb(10, 11, 12));
+        assert_eq!(serde_json::to_string(&RunColor::Indexed(7)).unwrap(), "7");
+        // Six bytes, but not six ASCII hex digits (a multi-byte char straddles the slices).
+        assert!(serde_json::from_str::<RunColor>("\"#aéabc\"").is_err());
+        assert!(serde_json::from_str::<RunColor>("\"#zzzzzz\"").is_err());
+        assert!(serde_json::from_str::<RunColor>("300").is_err());
     }
 }

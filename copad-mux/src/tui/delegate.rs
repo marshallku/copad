@@ -19,8 +19,10 @@ const MAX_HOST_LISTINGS: usize = 4;
 pub(super) enum Delegated {
     Prompt(PromptKind),
     Confirm(ConfirmAction),
-    Switcher,
-    Center,
+    /// The last spec sent: an open switcher / center is re-sent under its id whenever what it
+    /// would show changes, as the TUI's redraws every frame.
+    Switcher(l0::OverlaySpec),
+    Center(l0::OverlaySpec),
     Browser(BrowserOv),
     Resume(ResumeOv),
     Menu(Vec<MenuAction>),
@@ -74,17 +76,29 @@ fn picker(title: String, rows: Vec<l0::PickerRow>) -> l0::OverlaySpec {
         selected: None,
         loading: false,
         note: String::new(),
+        keys: Vec::new(),
+        no_filter: false,
     }
 }
 
 fn row(id: String, label: String, detail: String) -> l0::PickerRow {
-    l0::PickerRow {
-        id,
-        label,
-        detail,
-        badge: String::new(),
-        current: false,
-        no_actions: false,
+    l0::PickerRow::new(id, label, detail)
+}
+
+fn action(id: &str, label: &str, key: &str, stays: bool) -> l0::PickerAction {
+    l0::PickerAction {
+        id: id.into(),
+        label: label.into(),
+        key: key.into(),
+        stays,
+    }
+}
+
+fn key(key: &str, choice: &str, stays: bool) -> l0::PickerKey {
+    l0::PickerKey {
+        key: key.into(),
+        choice: choice.into(),
+        stays,
     }
 }
 
@@ -140,11 +154,11 @@ impl App {
         }
         if !before.0[2] && self.popup.take().is_some() {
             let spec = self.switcher_spec();
-            out.push(self.delegate(Delegated::Switcher, spec));
+            out.push(self.delegate(Delegated::Switcher(spec.clone()), spec));
         }
         if !before.0[3] && self.center.take().is_some() {
             let spec = self.center_spec();
-            out.push(self.delegate(Delegated::Center, spec));
+            out.push(self.delegate(Delegated::Center(spec.clone()), spec));
         }
         if !before.0[4]
             && let Some(b) = self.browser.take()
@@ -227,7 +241,7 @@ impl App {
             Some(home) => agentsessions::spawn_scan(shared, 1, home, ov.st.all),
             None => ov.rows = Some(Vec::new()),
         }
-        let spec = resume_spec(&ov);
+        let spec = resume_spec(&ov, &self.resume_live_tokens(&ov));
         self.delegate(Delegated::Resume(ov), spec)
     }
 
@@ -235,6 +249,31 @@ impl App {
     /// RE-SEND (same id, now with its rows). Called from the server loop.
     pub fn poll_delegated(&mut self) -> Vec<(u64, l0::OverlaySpec)> {
         let home = home_dir();
+        let mut out = Vec::new();
+        // A live switcher / center: re-sent when what it shows changed (an agent finished, a
+        // notification arrived). Same id, so the host keeps its filter and selection.
+        let live: Vec<u64> = self
+            .delegated
+            .iter()
+            .filter(|(_, d)| matches!(d, Delegated::Switcher(_) | Delegated::Center(_)))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in live {
+            let (now, last) = match self.delegated.get(&id) {
+                Some(Delegated::Switcher(last)) => (self.switcher_spec(), last),
+                Some(Delegated::Center(last)) => (self.center_spec(), last),
+                _ => continue,
+            };
+            if now == *last {
+                continue;
+            }
+            out.push((id, now.clone()));
+            if let Some(Delegated::Switcher(last) | Delegated::Center(last)) =
+                self.delegated.get_mut(&id)
+            {
+                *last = now;
+            }
+        }
         let mut ready = Vec::new();
         for (id, d) in &self.delegated {
             let landed = match d {
@@ -250,7 +289,6 @@ impl App {
                 ready.push(*id);
             }
         }
-        let mut out = Vec::new();
         for id in ready {
             let Some(d) = self.delegated.remove(&id) else {
                 continue;
@@ -292,7 +330,8 @@ impl App {
                         .map(|s| s.entries)
                         .unwrap_or_default();
                     r.rows = Some(self.resume_rows_in(&r.st, &entries));
-                    out.push((id, resume_spec(&r)));
+                    let tokens = self.resume_live_tokens(&r);
+                    out.push((id, resume_spec(&r, &tokens)));
                     Delegated::Resume(r)
                 }
                 other => other,
@@ -302,13 +341,33 @@ impl App {
         out
     }
 
-    fn switcher_spec(&self) -> l0::OverlaySpec {
+    /// The pane token of each resume row whose conversation is live in a pane.
+    fn resume_live_tokens(&self, r: &ResumeOv) -> Vec<Option<String>> {
+        r.rows
+            .iter()
+            .flatten()
+            .map(|x| {
+                let t = x.live.as_ref()?;
+                self.panes.get(t)?.pane_token().map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// The `$COPAD_MUX_PANE` token a host previews for `target`.
+    fn preview_token(&self, target: &PopupTarget) -> String {
+        self.preview_terminal(target)
+            .and_then(|t| self.panes.get(&t)?.pane_token().map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    pub(super) fn switcher_spec(&self) -> l0::OverlaySpec {
         let row = |r: &PopupRow| {
-            let (id, current) = match &r.target {
-                PopupTarget::Session(w) => (format!("s:{w}"), *w == self.ws),
+            let (id, current, session) = match &r.target {
+                PopupTarget::Session(w) => (format!("s:{w}"), *w == self.ws, w.to_string()),
                 PopupTarget::Agent(t) => (
                     format!("a:{t}"),
                     self.focused_terminal().as_ref() == Some(t),
+                    String::new(),
                 ),
             };
             let badge = match &r.target {
@@ -316,12 +375,13 @@ impl App {
                 PopupTarget::Session(_) => String::new(),
             };
             l0::PickerRow {
-                id,
-                label: r.text.clone(),
-                detail: String::new(),
                 badge,
                 current,
-                no_actions: false,
+                session,
+                pane: self.preview_token(&r.target),
+                // Only a session is renamed from here (the TUI's ^R).
+                no_actions: matches!(r.target, PopupTarget::Agent(_)),
+                ..l0::PickerRow::new(id, r.text.clone(), String::new())
             }
         };
         // The TUI's own default row (the previous session), so Ctrl-f Enter still toggles.
@@ -351,32 +411,48 @@ impl App {
                 },
             ],
             tab: 0,
-            actions: Vec::new(),
+            actions: vec![action("rename", "Rename", "C-r", false)],
             loading: false,
             note: String::new(),
+            // Ctrl-f again closes it, as in the TUI.
+            keys: vec![key("C-f", "", false)],
+            no_filter: false,
         }
     }
 
-    fn center_spec(&self) -> l0::OverlaySpec {
+    pub(super) fn center_spec(&self) -> l0::OverlaySpec {
         let rows = self
             .notifications
             .iter()
             .map(|n| l0::PickerRow {
-                id: format!("n:{}", n.id),
-                label: format!("{} · {}/{}  {}", n.tool, n.space, n.tab, n.when),
-                detail: n.body.clone(),
                 badge: n.kind.into(),
                 current: !n.read,
-                no_actions: false,
+                pane: self
+                    .panes
+                    .get(&n.terminal)
+                    .and_then(|p| p.pane_token().map(str::to_string))
+                    .unwrap_or_default(),
+                ..l0::PickerRow::new(
+                    format!("n:{}", n.id),
+                    format!("{} · {}/{}  {}", n.tool, n.space, n.tab, n.when),
+                    n.body.clone(),
+                )
             })
             .collect();
         let mut spec = picker("Notifications".into(), rows);
-        if let l0::OverlaySpec::Picker { tabs, actions, .. } = &mut spec {
+        if let l0::OverlaySpec::Picker {
+            tabs,
+            actions,
+            keys,
+            no_filter,
+            ..
+        } = &mut spec
+        {
             tabs[0].name = "notifications".into();
-            actions.push(l0::PickerAction {
-                id: "dismiss".into(),
-                label: "Dismiss".into(),
-            });
+            // The TUI center's keys: d dismisses one, D clears all, and it stays open.
+            actions.push(action("dismiss", "Dismiss", "d", true));
+            keys.push(key("D", "clear-all", true));
+            *no_filter = true;
         }
         spec
     }
@@ -412,18 +488,34 @@ impl App {
                 }
                 yes
             }
-            Delegated::Switcher => match choice {
+            Delegated::Switcher(_) => match choice {
                 Some(c) => {
                     self.switcher_choice(&c);
                     true
                 }
                 None => false,
             },
-            Delegated::Center => match choice {
-                Some(c) => self.center_choice(&c),
+            Delegated::Center(_) => match choice {
+                Some(c) => {
+                    let stays = c == "clear-all" || c.starts_with("dismiss:");
+                    let changed = self.center_choice(&c);
+                    // Dismissing keeps the center up (the TUI's `d` / `D`): the same id again,
+                    // so the host replaces it in place.
+                    if stays {
+                        let spec = self.center_spec();
+                        self.delegated.insert(id, Delegated::Center(spec.clone()));
+                        next.push((id, spec));
+                    }
+                    changed
+                }
                 None => false,
             },
             Delegated::Browser(b) => {
+                // `open:<row>` is `→`: descend into a directory, never create (TUI parity).
+                let (open_only, choice) = match choice.as_deref().map(|c| c.strip_prefix("open:")) {
+                    Some(Some(rest)) => (true, Some(rest.to_string())),
+                    _ => (false, choice),
+                };
                 let picked = choice
                     .as_deref()
                     .and_then(|c| match c {
@@ -434,6 +526,13 @@ impl App {
                     // Only a row this overlay offered (an unreadable directory has no `here`).
                     .filter(|r| b.rows.as_ref().is_some_and(|rows| rows.contains(r)));
                 match picked {
+                    Some(dirbrowse::Row::Here) if open_only => {
+                        // Nothing to descend into: the same listing again (the host dropped it).
+                        let spec = browser_spec(&b);
+                        self.delegated.insert(id, Delegated::Browser(b));
+                        next.push((id, spec));
+                        false
+                    }
                     Some(dirbrowse::Row::Here) => {
                         self.prompt = Some(Prompt {
                             buf: dirbrowse::default_name(&b.dir),
@@ -463,6 +562,11 @@ impl App {
                     let mut st = r.st;
                     st.all = !st.all;
                     next.push(self.delegate_resume(st));
+                    false
+                }
+                // The TUI's ^r: scan again.
+                Some("rescan") => {
+                    next.push(self.delegate_resume(r.st));
                     false
                 }
                 Some(c) => {
@@ -502,6 +606,21 @@ impl App {
     }
 
     fn switcher_choice(&mut self, c: &str) {
+        // ^R on a session row: switch to it and open the rename prompt there (the TUI's
+        // `popup_rename`); the prompt is delegated by the caller's marks diff.
+        if let Some(w) = c.strip_prefix("rename:s:") {
+            let Some(ws) = self
+                .state
+                .workspace_ids()
+                .into_iter()
+                .find(|x| x.to_string() == w)
+            else {
+                return self.flash("that session is gone".into(), false);
+            };
+            self.switch_session(ws);
+            self.open_rename_prompt();
+            return;
+        }
         if let Some(w) = c.strip_prefix("s:") {
             let Some(ws) = self
                 .state
@@ -521,6 +640,11 @@ impl App {
     }
 
     fn center_choice(&mut self, c: &str) -> bool {
+        if c == "clear-all" {
+            let had = !self.notifications.is_empty();
+            self.notifications.clear();
+            return had;
+        }
         let (dismiss, nid) = match c.strip_prefix("dismiss:") {
             Some(rest) => (true, rest),
             None => (false, c),
@@ -651,12 +775,18 @@ fn browser_spec(b: &BrowserOv) -> l0::OverlaySpec {
         .enumerate()
         .filter_map(|(i, r)| {
             Some(match r {
-                dirbrowse::Row::Here => row(
-                    "here".into(),
-                    "Create session here".into(),
-                    home_short(&b.dir),
-                ),
-                dirbrowse::Row::Up => row("up".into(), "..".into(), String::new()),
+                dirbrowse::Row::Here => l0::PickerRow {
+                    no_actions: true,
+                    ..row(
+                        "here".into(),
+                        "Create session here".into(),
+                        home_short(&b.dir),
+                    )
+                },
+                dirbrowse::Row::Up => l0::PickerRow {
+                    no_actions: true,
+                    ..row("up".into(), "..".into(), String::new())
+                },
                 dirbrowse::Row::Dir(n) => row(
                     format!("d:{i}"),
                     n.to_string_lossy().into_owned(),
@@ -667,15 +797,23 @@ fn browser_spec(b: &BrowserOv) -> l0::OverlaySpec {
         })
         .collect();
     let split = b.visible.min(rows.len());
+    let has_up = rows.iter().any(|r| r.id == "up");
     let (shown, hidden) = rows.split_at(split);
     let mut spec = picker(home_short(&b.dir), shown.to_vec());
     if let l0::OverlaySpec::Picker {
         tabs,
         loading,
         note,
+        actions,
+        keys,
         ..
     } = &mut spec
     {
+        // The TUI browser's arrows: ← goes up, → descends without creating.
+        actions.push(action("open", "Open", "Right", false));
+        if has_up {
+            keys.push(key("Left", "up", false));
+        }
         tabs[0].name = "directories".into();
         if !hidden.is_empty() {
             tabs.push(l0::PickerTab {
@@ -689,7 +827,7 @@ fn browser_spec(b: &BrowserOv) -> l0::OverlaySpec {
     spec
 }
 
-fn resume_spec(r: &ResumeOv) -> l0::OverlaySpec {
+fn resume_spec(r: &ResumeOv, live_tokens: &[Option<String>]) -> l0::OverlaySpec {
     let toggle = if r.st.all {
         "Hide headless runs"
     } else {
@@ -712,6 +850,7 @@ fn resume_spec(r: &ResumeOv) -> l0::OverlaySpec {
             } else {
                 String::new()
             },
+            pane: live_tokens.get(i).cloned().flatten().unwrap_or_default(),
             ..row(
                 format!("c:{i}"),
                 label,
@@ -725,10 +864,13 @@ fn resume_spec(r: &ResumeOv) -> l0::OverlaySpec {
         actions,
         loading,
         selected,
+        keys,
         ..
     } = &mut spec
     {
         tabs[0].name = "conversations".into();
+        keys.push(key("C-a", "toggle-all", false));
+        keys.push(key("C-r", "rescan", false));
         // Enter picks the newest conversation, not the headless toggle above it.
         *selected = r
             .rows
@@ -736,10 +878,7 @@ fn resume_spec(r: &ResumeOv) -> l0::OverlaySpec {
             .filter(|x| !x.is_empty())
             .map(|_| "c:0".to_string());
         *loading = r.rows.is_none();
-        actions.push(l0::PickerAction {
-            id: "fork".into(),
-            label: "Fork".into(),
-        });
+        actions.push(action("fork", "Fork", "C-f", false));
     }
     spec
 }

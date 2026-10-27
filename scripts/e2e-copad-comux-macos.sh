@@ -138,7 +138,7 @@ if [[ -n "$WID" ]]; then
     screencapture -o -x -l"$WID" "$W/native-sidebar.png" && log "screenshot: $W/native-sidebar.png"
 fi
 
-# An overlay is delegated: Ctrl-b $ in the tab opens comux's rename prompt as a native SHEET
+# An overlay is delegated: Ctrl-b $ in the tab opens comux's rename prompt natively (an overlay layer)
 # in this window; typing a name there renames the session.
 session_names() { python3 - <<'PY'
 import json, os, socket
@@ -149,18 +149,18 @@ PY
 }
 "$COCTL" --socket "$GUI" terminal feed $'\x02$' >/dev/null
 sleep 2
-[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/overlay-sheet.png" && log "screenshot: $W/overlay-sheet.png"
+[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/overlay-prompt.png" && log "screenshot: $W/overlay-prompt.png"
 osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" \
           -e 'tell application "System Events" to keystroke "macrenamed"' \
           -e 'tell application "System Events" to key code 36' >/dev/null
 for _ in $(seq 1 20); do session_names | grep -q macrenamed && break; sleep 0.5; done
 session_names | grep -q macrenamed || fail "the delegated prompt did not rename the session: $(session_names)"
-log "ok — Ctrl-b \$ became a native sheet and its answer renamed the session"
+log "ok — Ctrl-b \$ was drawn natively and its answer renamed the session"
 SCREEN="$("$COCTL" --socket "$GUI" terminal read 2>/dev/null || true)"
 grep -q "rename session" <<<"$SCREEN" && fail "the TUI drew the prompt as well"
 [[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/after-rename.png"
 
-# Ctrl-b C (decisions #172): the directory browser is a native sheet, filled once comux's
+# Ctrl-b C (decisions #172): the directory browser is drawn natively, filled once comux's
 # listing lands; picking "proj" descends, "Create session here" leads to comux's name prompt.
 keys() { osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" \
                    -e "tell application \"System Events\" to keystroke \"$1\"" \
@@ -174,21 +174,21 @@ PY
 }
 "$COCTL" --socket "$GUI" terminal feed $'\x02C' >/dev/null
 sleep 3
-[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/browser-sheet.png"
+[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/browser.png"
 keys proj; sleep 3
 [[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/browser-proj.png"
 keys create; sleep 3
 keys browsed
 for _ in $(seq 1 20); do session_dirs | grep -q "browsed=.*/proj" && break; sleep 0.5; done
 session_dirs | grep -q "browsed=.*/proj" || fail "the native browser did not create the session in proj: $(session_dirs)"
-log "ok — Ctrl-b C was a native sheet: descending into proj and 'Create session here' made a session there"
+log "ok — Ctrl-b C was drawn natively: descending into proj and 'Create session here' made a session there"
 
-# The sidebar's resume button asks comux to open Ctrl-b R for this client; the native sheet
+# The sidebar's resume button asks comux to open Ctrl-b R for this client; the native picker
 # lists the fixture transcript.
 # Click it where it is drawn (the sidebar header, left of the bell; the sidebar is 30 columns
 # of the default 14pt font wide): a real pointer event.
 osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" >/dev/null
-sleep 1 # the previous sheet's dismissal, and the window becoming key again
+sleep 1 # the previous overlay's dismissal, and the window becoming key again
 python3 - "$APP_PID" <<'PY'
 import sys, time, Quartz
 for w in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID):
@@ -200,18 +200,75 @@ for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, e)
     time.sleep(0.05)
 PY
-found=""
-sheet_text() {
-    osascript -e "tell application \"System Events\" to set b to button 1 of UI element 1 of row 2 of outline 1 of scroll area 1 of group 1 of sheet 1 of window 1 of (first process whose unix id is $APP_PID)" -e "tell application \"System Events\" to return value of attribute \"AXIdentifier\" of b" 2>&1
+# The overlay layer is not in the accessibility tree (nor is the rest of the content area), so
+# it is checked by what it does: Enter on the picker resumes the fixture conversation, which
+# comux opens as a new tab.
+tabs_total() { python3 - <<'PY'
+import json, os, socket
+s = socket.socket(socket.AF_UNIX); s.connect(os.environ["COPAD_MUX_SOCK"])
+s.sendall(b'{"t":"subscribe","v":1}\n'); f = s.makefile(); f.readline()
+print(sum(len(x["tabs"]) for x in json.loads(f.readline())["topics"]["tree"]["data"]["sessions"]))
+PY
 }
-for _ in $(seq 1 20); do sheet_text | grep -q "overlayRow-c:0" && { found=1; break; }; sleep 0.5; done
-[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/resume-sheet.png"
-if [[ -z "$found" ]]; then
-    sheet_text | head -c 800 >&2
-    fail "the resume button did not bring up comux's resume picker natively"
-fi
+BEFORE="$(tabs_total)"
+sleep 3 # the transcript scan
+[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/resume-overlay.png" && log "screenshot: $W/resume-overlay.png"
+osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" \
+          -e 'tell application "System Events" to key code 36' >/dev/null
+for _ in $(seq 1 20); do [[ "$(tabs_total)" -gt "$BEFORE" ]] && break; sleep 0.5; done
+[[ "$(tabs_total)" -gt "$BEFORE" ]] || fail "Enter on the native resume picker did not resume the fixture conversation"
+log "ok — the native resume button opened comux's Ctrl-b R picker over the window and Enter resumed the conversation"
+
+# Ctrl-f (decisions #180): the switcher is drawn over the window like the TUI's, with the
+# selected session's pane previewed live; typing filters and Enter switches.
+active_session() { python3 - <<'PY'
+import json, os, socket
+s = socket.socket(socket.AF_UNIX); s.connect(os.environ["COPAD_MUX_SOCK"])
+s.sendall(b'{"t":"subscribe","v":1}\n'); f = s.makefile(); f.readline()
+t = json.loads(f.readline())["topics"]["tree"]["data"]
+print(next(x["name"] for x in t["sessions"] if x["id"] == t["active"]))
+PY
+}
+sleep 1
+"$COCTL" --socket "$GUI" terminal feed $'\x06' >/dev/null
+sleep 3 # the overlay, then the preview's first refresh
+[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/switcher.png" && log "screenshot: $W/switcher.png"
+osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" \
+          -e 'tell application "System Events" to key code 124' >/dev/null
+sleep 1
+[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/switcher-agents.png" && log "screenshot: $W/switcher-agents.png"
+osascript -e 'tell application "System Events" to key code 123' >/dev/null
+keys macos-two
+for _ in $(seq 1 20); do [[ "$(active_session)" == macos-two ]] && break; sleep 0.5; done
+[[ "$(active_session)" == macos-two ]] || fail "Ctrl-f, typing and Enter did not switch the session: $(active_session)"
+log "ok — Ctrl-f drew the switcher over the window; ←/→ switched tabs, typing filtered and Enter switched"
+
+# The notification center keeps the TUI's letters: d dismisses one and the center stays up,
+# so D then clears the rest (it would be typed into the shell if the center had closed).
+notif_count() { python3 - <<'PY'
+import json, os, socket
+s = socket.socket(socket.AF_UNIX); s.connect(os.environ["COPAD_MUX_SOCK"])
+s.sendall(b'{"t":"subscribe","v":1}\n'); f = s.makefile(); f.readline()
+print(len(json.loads(f.readline())["topics"]["notifications"]["data"]["items"]))
+PY
+}
+PANE_TOK="$("$COMUX" list --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["panes"][0]["token"])')"
+for body in one two three; do "$COMUX" notify --pane "$PANE_TOK" --kind done "e2e $body" >/dev/null; done
+for _ in $(seq 1 20); do [[ "$(notif_count)" == 3 ]] && break; sleep 0.5; done
+sleep 1
+"$COCTL" --socket "$GUI" terminal feed $'\x02a' >/dev/null
+sleep 2
+[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/center.png" && log "screenshot: $W/center.png"
+osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" \
+          -e 'tell application "System Events" to keystroke "d"' >/dev/null
+for _ in $(seq 1 20); do [[ "$(notif_count)" == 2 ]] && break; sleep 0.5; done
+[[ "$(notif_count)" == 2 ]] || fail "d in the native center did not dismiss one notification: $(notif_count)"
+sleep 1
+osascript -e 'tell application "System Events" to keystroke "D"' >/dev/null
+for _ in $(seq 1 20); do [[ "$(notif_count)" == 0 ]] && break; sleep 0.5; done
+[[ "$(notif_count)" == 0 ]] || fail "the center closed after d (D did not clear the rest): $(notif_count)"
 osascript -e 'tell application "System Events" to key code 53' >/dev/null
-log "ok — the native resume button opened comux's Ctrl-b R picker as a sheet with the fixture conversation"
+log "ok — the native center dismissed with d, stayed open, and D cleared the rest"
 
 # Closing copad releases the claim: comux draws its own sidebar again for the next client.
 kill "$APP_PID"; APP_PID=""

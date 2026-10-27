@@ -5,6 +5,8 @@
 //! carries the moment it began instead).
 
 use super::*;
+use crate::control::Resp;
+use crate::term::Snapshot;
 use copad_mux_proto as l0;
 
 /// A monotonic instant as UNIX seconds, for a host that renders its own "4m".
@@ -250,5 +252,169 @@ impl App {
             }
         }
         n
+    }
+}
+
+/// Largest preview a host may ask for: a big screen's pane, never a scrollback dump.
+const PREVIEW_MAX_ROWS: u16 = 200;
+const PREVIEW_MAX_COLS: u16 = 400;
+
+impl App {
+    /// `pane-preview` (decisions #180): what the TUI switcher previews, for a host to draw.
+    pub(super) fn pane_preview(&self, target: &str, rows: Option<u16>, cols: Option<u16>) -> Resp {
+        let Some(term) = self.resolve_pane_target(target) else {
+            return Resp::err_code("not_found", format!("unknown pane '{target}'"));
+        };
+        let Some(pt) = self.panes.get(&term) else {
+            return Resp::err("pane has no live terminal");
+        };
+        let snap = pt.snapshot();
+        let rows = rows.unwrap_or(snap.rows).clamp(1, PREVIEW_MAX_ROWS);
+        let cols = cols.unwrap_or(snap.cols).clamp(1, PREVIEW_MAX_COLS);
+        Resp {
+            preview: Some(l0::Preview {
+                pane: pt.pane_token().unwrap_or_default().to_string(),
+                header: self.preview_header(&term),
+                cols,
+                lines: preview_lines(&snap, rows as usize, cols as usize),
+            }),
+            ..Resp::ok()
+        }
+    }
+}
+
+fn run_color(c: CellColor) -> Option<l0::RunColor> {
+    match c {
+        CellColor::Default => None,
+        CellColor::Indexed(i) => Some(l0::RunColor::Indexed(i)),
+        CellColor::Rgb(r, g, b) => Some(l0::RunColor::Rgb(r, g, b)),
+    }
+}
+
+/// `snap` as styled runs: bottom-anchored on its last row with content (or the cursor) like
+/// the TUI preview, at most `rows` × `cols`. Equal-styled cells merge, wide-glyph spacers are
+/// skipped, a wide glyph whose second column would fall past `cols` is dropped, and trailing
+/// unstyled blanks are trimmed.
+pub(super) fn preview_lines(snap: &Snapshot, rows: usize, cols: usize) -> Vec<Vec<l0::Run>> {
+    let last_used = snap
+        .cells
+        .iter()
+        .rposition(|row| row.iter().any(|c| !c.spacer && c.sym.trim() != ""))
+        .unwrap_or(0)
+        .max(snap.cursor.1 as usize);
+    let end = (last_used + 1).min(snap.cells.len());
+    let start = end.saturating_sub(rows);
+    snap.cells[start..end]
+        .iter()
+        .map(|row| {
+            let mut runs: Vec<l0::Run> = Vec::new();
+            for (cx, cell) in row.iter().enumerate() {
+                if cx >= cols {
+                    break;
+                }
+                if cell.spacer {
+                    continue;
+                }
+                if cell.sym.width() >= 2 && cx + 1 >= cols {
+                    break;
+                }
+                let style = l0::Run {
+                    t: String::new(),
+                    fg: run_color(cell.fg),
+                    bg: run_color(cell.bg),
+                    bold: cell.bold,
+                    dim: cell.attrs.contains(Modifier::DIM),
+                    italic: cell.attrs.contains(Modifier::ITALIC),
+                    underline: cell.attrs.contains(Modifier::UNDERLINED),
+                    reverse: cell.reverse,
+                };
+                let sym = if cell.sym.is_empty() { " " } else { &cell.sym };
+                match runs.last_mut() {
+                    Some(r)
+                        if l0::Run {
+                            t: String::new(),
+                            ..r.clone()
+                        } == style =>
+                    {
+                        r.t.push_str(sym)
+                    }
+                    _ => runs.push(l0::Run {
+                        t: sym.to_string(),
+                        ..style
+                    }),
+                }
+            }
+            // Trailing blanks only show when something paints them.
+            while let Some(r) = runs.last_mut() {
+                if r.bg.is_some() || r.reverse || r.underline {
+                    break;
+                }
+                let kept = r.t.trim_end_matches(' ').len();
+                r.t.truncate(kept);
+                if !r.t.is_empty() {
+                    break;
+                }
+                runs.pop();
+            }
+            runs
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use alacritty_terminal::event::VoidListener;
+    use alacritty_terminal::term::test::TermSize;
+    use alacritty_terminal::term::{Config as AlacConfig, Term};
+    use alacritty_terminal::vte::ansi::Processor;
+
+    fn snap(cols: u16, rows: u16, bytes: &[u8]) -> Snapshot {
+        let mut t = Term::new(
+            AlacConfig::default(),
+            &TermSize::new(cols as usize, rows as usize),
+            VoidListener,
+        );
+        Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new().advance(&mut t, bytes);
+        crate::term::snapshot_grid(&t)
+    }
+
+    fn text(line: &[l0::Run]) -> String {
+        line.iter().map(|r| r.t.as_str()).collect()
+    }
+
+    #[test]
+    fn preview_runs_keep_colours_and_merge_equal_cells() {
+        let s = snap(20, 4, b"\x1b[31mab\x1b[1;38;2;1;2;3mc\x1b[0m d");
+        let lines = preview_lines(&s, 4, 20);
+        assert_eq!(lines.len(), 1, "bottom-anchored on the last used row");
+        let l = &lines[0];
+        assert_eq!(l[0].t, "ab");
+        assert_eq!(l[0].fg, Some(l0::RunColor::Indexed(1)));
+        assert_eq!(l[1].t, "c");
+        assert!(l[1].bold);
+        assert_eq!(l[1].fg, Some(l0::RunColor::Rgb(1, 2, 3)));
+        assert_eq!(text(l), "abc d", "trailing blanks trimmed");
+        let json = serde_json::to_string(&l[1]).unwrap();
+        assert!(json.contains("\"#010203\""), "{json}");
+        let back: l0::Run = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, l[1]);
+    }
+
+    #[test]
+    fn preview_takes_the_bottom_rows_and_crops_wide_glyphs() {
+        let s = snap(10, 6, "one\r\ntwo\r\nthree\r\nab漢".as_bytes());
+        let lines = preview_lines(&s, 2, 10);
+        assert_eq!(
+            lines.iter().map(|l| text(l)).collect::<Vec<_>>(),
+            ["three", "ab漢"],
+            "the newest rows, not the top of the screen"
+        );
+        // The wide glyph's second column would fall past the crop: it is dropped whole.
+        let lines = preview_lines(&s, 1, 3);
+        assert_eq!(text(&lines[0]), "ab");
+        // A painted background is content: its blanks stay.
+        let s = snap(10, 2, b"x\x1b[44m   \x1b[0m");
+        assert_eq!(text(&preview_lines(&s, 1, 10)[0]), "x   ");
     }
 }

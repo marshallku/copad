@@ -52,7 +52,9 @@ final class TabViewController: NSViewController {
     private var comuxFloatMonitor: Any?
     /// The delegated overlay this window is showing as a sheet, if any.
     private var comuxOverlayShown: UInt64?
-    private weak var comuxOverlaySheet: NSHostingController<ComuxOverlayView>?
+    /// The overlay layer over the content (decisions #180), and the monitor that keeps keys in it.
+    private var comuxOverlayLayer: NSView?
+    private var comuxOverlayMonitor: Any?
     private var comuxNotificationsOpen = false
     private var comuxObservation: AnyCancellable?
     private var comuxServeTimer: Timer?
@@ -493,6 +495,7 @@ final class TabViewController: NSViewController {
     /// write ~800ms later on the main run loop. No-op while restoring.
     deinit {
         if let m = comuxFloatMonitor { NSEvent.removeMonitor(m) }
+        if let m = comuxOverlayMonitor { NSEvent.removeMonitor(m) }
         for token in globalObservers {
             NotificationCenter.default.removeObserver(token)
         }
@@ -505,6 +508,7 @@ final class TabViewController: NSViewController {
 
     private func installComuxChrome() {
         let host = comuxWindow
+        host.consumer = ComuxHost.consumer(ObjectIdentifier(self))
         let settle: () -> Void = { [weak self] in self?.settleComuxInput() }
         let sidebar = NSHostingView(rootView: ComuxSidebar(host: host, settle: settle, toggleNotifications: { [weak self] in
             self?.comuxNotificationsOpen.toggle()
@@ -649,15 +653,11 @@ final class TabViewController: NSViewController {
         let host = comuxWindow
         let mine = host.state?.overlays.first { o in o.panel.map(comuxServed.contains) ?? false }
         if let shown = comuxOverlayShown, mine?.overlay != shown {
-            // Answered elsewhere, or comux closed it: drop our sheet.
-            if let sheet = comuxOverlaySheet { dismiss(sheet) }
-            comuxOverlayShown = nil
+            // Answered elsewhere, or comux closed it: drop our layer.
+            closeComuxOverlay()
         }
-        // The same overlay again = its rows landed (a directory listing): refresh in place.
-        if let o = mine, o.overlay == comuxOverlayShown, let sheet = comuxOverlaySheet,
-           sheet.rootView.overlay != o {
-            sheet.rootView = overlayView(o)
-        }
+        // The same overlay again (rows landed, a live re-send) updates in place: the layer reads
+        // the window's state itself.
         guard comuxOverlayShown == nil, let o = mine else { return }
         settleComuxInput()
         comuxOverlayShown = o.overlay
@@ -665,19 +665,41 @@ final class TabViewController: NSViewController {
             popUpComuxMenu(o.overlay, items: items)
             return
         }
-        let vc = NSHostingController(rootView: overlayView(o))
-        comuxOverlaySheet = vc
-        presentAsSheet(vc)
+        let layer = NSHostingView(rootView: ComuxOverlayHost(host: host, id: o.overlay) { [weak self] in
+            self?.closeComuxOverlay()
+        })
+        layer.translatesAutoresizingMaskIntoConstraints = false
+        contentArea.addSubview(layer)
+        NSLayoutConstraint.activate([
+            layer.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
+            layer.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
+            layer.topAnchor.constraint(equalTo: contentArea.topAnchor),
+            layer.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
+        ])
+        comuxOverlayLayer = layer
+        view.window?.makeFirstResponder(layer)
+        DispatchQueue.main.async { [weak self] in
+            if self?.comuxOverlayLayer === layer { self?.view.window?.makeFirstResponder(layer) }
+        }
+        // Keys stay in the overlay: if focus wandered out of it (a click that landed nowhere),
+        // the next key is routed back before it can reach a terminal.
+        comuxOverlayMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            guard let self, let layer = self.comuxOverlayLayer, e.window === self.view.window else { return e }
+            let inside = (e.window?.firstResponder as? NSView).map { $0.isDescendant(of: layer) } ?? false
+            if !inside { e.window?.makeFirstResponder(layer) }
+            return e
+        }
     }
 
-    private func overlayView(_ o: L0Overlay) -> ComuxOverlayView {
-        let host = comuxWindow
-        return ComuxOverlayView(overlay: o) { [weak self] choice, text in
-            host.answer(o.overlay, choice: choice, text: text)
-            if let self, let sheet = self.comuxOverlaySheet { self.dismiss(sheet) }
-            self?.comuxOverlayShown = nil
-            self?.refocusPane()
-        }
+    private func closeComuxOverlay() {
+        guard comuxOverlayShown != nil || comuxOverlayLayer != nil else { return }
+        if let m = comuxOverlayMonitor { NSEvent.removeMonitor(m) }
+        comuxOverlayMonitor = nil
+        comuxOverlayLayer?.removeFromSuperview()
+        comuxOverlayLayer = nil
+        comuxOverlayShown = nil
+        comuxWindow.preview(pane: nil, rows: 0, cols: 0)
+        refocusPane()
     }
 
     private func refocusPane() {

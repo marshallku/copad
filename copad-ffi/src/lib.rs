@@ -1621,6 +1621,46 @@ pub unsafe extern "C" fn copad_muxhost_command(h: *const MuxHostHandle, req_json
     }
 }
 
+/// Answer a delegated overlay with a STAYING choice: it stays shown until comux re-sends it.
+///
+/// # Safety
+/// `h` live; `choice` a valid string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_act(
+    h: *const MuxHostHandle,
+    overlay: u64,
+    choice: *const c_char,
+) {
+    // SAFETY: caller contract.
+    if let (Some(h), Some(c)) = (unsafe { h.as_ref() }, unsafe { cstr(choice) }) {
+        h.0.act(overlay, c.to_string());
+    }
+}
+
+/// Keep `consumer`'s preview of `pane` (`rows` × `cols`) fresh; `pane` NULL stops it
+/// (decisions #180). The result is in the state JSON under `previews.<consumer>`.
+///
+/// # Safety
+/// `h` live; `consumer` a valid string; `pane` NULL or a valid string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_preview(
+    h: *const MuxHostHandle,
+    consumer: *const c_char,
+    pane: *const c_char,
+    rows: u16,
+    cols: u16,
+) {
+    // SAFETY: caller contract.
+    if let (Some(h), Some(c)) = (unsafe { h.as_ref() }, unsafe { cstr(consumer) }) {
+        let req = unsafe { cstr(pane) }.map(|p| copad_core::muxhost::PreviewReq {
+            pane: p.to_string(),
+            rows,
+            cols,
+        });
+        h.0.preview(c, req);
+    }
+}
+
 /// Ask comux to open one of its overlays (`what`: `new-session`, `resume`, `rename-session`,
 /// …) for `panel`'s client; `target` NULL = the active session/tab (decisions #172).
 ///

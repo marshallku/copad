@@ -407,6 +407,16 @@ pub enum Req {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller: Option<String>,
     },
+    /// A pane's current viewport as styled runs, bottom-anchored to `rows` × `cols` — the
+    /// switcher preview a native host draws (decisions #180). Read-only and polled while a
+    /// host's picker shows a preview, so it stays out of `ctl_mutates`.
+    PanePreview {
+        target: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rows: Option<u16>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cols: Option<u16>,
+    },
     /// List AI-agent panes across every session (what the sidebar's `agents` half and the
     /// `Ctrl-f` switcher already show), optionally narrowed to one pane.
     ///
@@ -949,6 +959,9 @@ pub struct Resp {
     /// `capture-pane`: the pane's text, newest-last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// `pane-preview`: the pane's screen as styled runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<copad_mux_proto::Preview>,
     /// `capture-pane`: physical grid rows the text spans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_rows: Option<usize>,
@@ -1042,6 +1055,7 @@ impl Resp {
             closed: None,
             skipped: None,
             e2e: None,
+            preview: None,
         }
     }
 

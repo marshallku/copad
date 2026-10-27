@@ -35,6 +35,8 @@ final class MuxSession: ObservableObject, KeySink {
     @Published private(set) var overlays: [L0Overlay] = []
     /// Unknown host key awaiting the user's confirmation (TOFU).
     @Published var pendingHostKey: String?
+    /// The open picker's pane preview (decisions #180).
+    @Published private(set) var preview: L0PreviewState?
 
     /// The mirror grid. Not @Published: the terminal view redraws on `onGrid`, capped to the
     /// display — every frame is still APPLIED here (codex C3).
@@ -62,6 +64,22 @@ final class MuxSession: ObservableObject, KeySink {
     private var generation = 0
     /// The attachment to replace on the next connect (the phone reconnecting).
     private var previous: UInt64?
+    /// Overlays answered for good: a same-id update still on its way must not bring one back.
+    private var closedOverlays: Set<UInt64> = []
+    /// What the picker wants previewed, the one `pane-preview` in flight, and its cadence.
+    private var previewWant: PreviewWant?
+    private var previewInflight: (id: String, at: Date)?
+    private var previewLastSent: Date?
+    private var previewTimer: Timer?
+    /// The comux on this connection predates `pane-preview`.
+    private var previewUnsupported = false
+    private var nextL0Cmd = 1
+
+    private struct PreviewWant: Equatable {
+        var pane: String
+        var rows: Int
+        var cols: Int
+    }
 
     static let deadline: TimeInterval = 30
     static let features = ["sidebar", "status", "overlays"]
@@ -201,10 +219,74 @@ final class MuxSession: ObservableObject, KeySink {
     /// both nil to cancel. comux runs the action itself.
     func answerOverlay(_ id: UInt64, choice: String?, text: String?) {
         overlays.removeAll { $0.overlay == id }
+        closedOverlays.insert(id)
         var m: [String: Any] = ["t": "overlay-result", "overlay": id]
         if let choice { m["choice"] = choice }
         if let text { m["text"] = text }
         l0?.write(Self.line(m))
+    }
+
+    /// Answer with a staying choice (the center's dismiss): the overlay stays until comux
+    /// re-sends it under the same id.
+    func actOverlay(_ id: UInt64, choice: String) {
+        guard overlays.contains(where: { $0.overlay == id }) else { return }
+        l0?.write(Self.line(["t": "overlay-result", "overlay": id, "choice": choice]))
+    }
+
+    /// Keep the preview of `pane` (rows × cols) fresh while a picker shows it; nil stops it.
+    func setPreview(_ pane: String?, rows: Int, cols: Int) {
+        guard let pane else {
+            previewWant = nil
+            previewInflight = nil
+            previewTimer?.invalidate()
+            previewTimer = nil
+            preview = nil
+            return
+        }
+        let want = PreviewWant(pane: pane, rows: rows, cols: cols)
+        guard want != previewWant else { return }
+        if previewWant?.pane != pane {
+            preview = L0PreviewState(state: previewUnsupported ? "unsupported" : "loading", preview: nil)
+        }
+        previewWant = want
+        previewInflight = nil
+        previewLastSent = nil
+        if previewTimer == nil {
+            previewTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.pollPreview() }
+            }
+        }
+    }
+
+    /// One `pane-preview` in flight, every 0.7 s; a request unanswered for 3 s is sent again.
+    private func pollPreview() {
+        guard let w = previewWant, !previewUnsupported, let l0 else { return }
+        let now = Date()
+        if let f = previewInflight, now.timeIntervalSince(f.at) < 3 { return }
+        if let t = previewLastSent, now.timeIntervalSince(t) < 0.7 { return }
+        let id = "p\(nextL0Cmd)"
+        nextL0Cmd += 1
+        l0.write(Self.line(["t": "cmd", "id": id,
+                            "req": ["cmd": "pane-preview", "target": w.pane, "rows": w.rows, "cols": w.cols]]))
+        previewInflight = (id, now)
+        previewLastSent = now
+    }
+
+    /// A reply on the list channel: only the preview request still in flight counts.
+    private func onL0Reply(_ id: String?, _ resp: [String: Any]?) {
+        guard let id, id == previewInflight?.id, let resp, let pane = previewWant?.pane else { return }
+        previewInflight = nil
+        if (resp["ok"] as? Bool) == true {
+            let p = (resp["preview"] as? [String: Any])
+                .flatMap { try? JSONSerialization.data(withJSONObject: $0) }
+                .flatMap { try? JSONDecoder().decode(L0Preview.self, from: $0) }
+            if let p, p.pane == pane { preview = L0PreviewState(state: "ok", preview: p) }
+        } else if (resp["code"] as? String) == "not_found" {
+            preview = L0PreviewState(state: "gone", preview: nil)
+        } else {
+            previewUnsupported = true
+            preview = L0PreviewState(state: "unsupported", preview: nil)
+        }
     }
 
     /// Ask comux to open one of its overlays for our attachment (`new-session`, `resume`,
@@ -224,6 +306,13 @@ final class MuxSession: ObservableObject, KeySink {
         attachment = nil; claimed = false; gotFull = false; pushSent = nil
         overlays.removeAll()
         replies.removeAll()
+        closedOverlays.removeAll()
+        previewTimer?.invalidate()
+        previewTimer = nil
+        previewWant = nil
+        previewInflight = nil
+        previewUnsupported = false
+        preview = nil
         grid.reset()
         onGrid?()
         if let reason { phase = .failed(reason) }
@@ -273,6 +362,7 @@ final class MuxSession: ObservableObject, KeySink {
                     fail(gen, "comux speaks L0 protocol \(proto); this app speaks \(l0Proto). Update the older side.")
                     return
                 }
+                closedOverlays.removeAll() // ids restart with a new server
                 _ = model.apply(m)
             case "snapshot":
                 _ = model.apply(m)
@@ -293,7 +383,7 @@ final class MuxSession: ObservableObject, KeySink {
             case "overlay":
                 guard let data = try? JSONSerialization.data(withJSONObject: m),
                       let o = try? JSONDecoder().decode(L0Overlay.self, from: data),
-                      o.client == attachment else { break }
+                      o.client == attachment, !closedOverlays.contains(o.overlay) else { break }
                 // The same id again = its rows landed (decisions #172): replace in place.
                 if let i = overlays.firstIndex(where: { $0.overlay == o.overlay }) {
                     overlays[i] = o
@@ -303,6 +393,8 @@ final class MuxSession: ObservableObject, KeySink {
             case "overlay-closed":
                 let id = (m["overlay"] as? NSNumber)?.uint64Value
                 overlays.removeAll { $0.overlay == id }
+            case "reply":
+                onL0Reply(m["id"] as? String, m["resp"] as? [String: Any])
             case "error":
                 // A refused claim: the TUI chrome simply stays. Not fatal.
                 claimed = false

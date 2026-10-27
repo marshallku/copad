@@ -22,6 +22,13 @@ cleanup() {
   [[ -n "$CPID" ]] && kill "$CPID" 2>/dev/null || true
   [[ -n "$BPID" ]] && kill "$BPID" 2>/dev/null || true
   COPAD_MUX_SOCK=$W/s $COMUX kill-server >/dev/null 2>&1 || true
+  # The session bus's activated services (portal, at-spi) outlive dbus-run-session and keep
+  # copad's log open; one that ran away once kept a deleted 12 GB log alive in /tmp. Anything
+  # still holding a file under $W is this run's.
+  sleep 0.5
+  for f in /proc/[0-9]*/fd/*; do
+    case "$(readlink "$f" 2>/dev/null)" in "$W"/*) p=${f#/proc/}; echo "${p%%/*}" ;; esac
+  done 2>/dev/null | sort -u | xargs -r kill 2>/dev/null || true
   [[ "${KEEP:-}" == 1 ]] || rm -rf "$W"
 }
 trap cleanup EXIT

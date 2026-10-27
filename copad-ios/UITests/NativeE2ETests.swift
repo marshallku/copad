@@ -95,7 +95,7 @@ final class NativeE2ETests: XCTestCase {
         XCTAssertTrue(app.buttons["tab-2"].waitForExistence(timeout: 10), "^b c did not add a tab")
 
         // 5b. Overlays are native (decisions #170): ^b $ opens comux's rename prompt as a
-        //     SHEET (the TUI never draws it), and the answer renames the session.
+        //     native overlay (the TUI never draws it), and the answer renames the session.
         app.buttons["key-prefix"].tap()
         app.typeText("$")
         let field = app.textFields["overlayText"]
@@ -120,12 +120,12 @@ final class NativeE2ETests: XCTestCase {
         terminal.tap()
 
         // 5c. "New session…" asks comux to open Ctrl-b C for us (decisions #172): the directory
-        //     browser is a sheet filled once comux's listing lands; descending into proj and
+        //     browser is a native picker filled once comux's listing lands; descending into proj and
         //     "Create session here" lead to comux's seeded name prompt.
         app.buttons["sessionMenu"].tap()
         app.buttons["menuNewSession"].tap()
         let proj = app.buttons["overlayRow-d:2"]
-        XCTAssertTrue(proj.waitForExistence(timeout: 15), "the browser sheet never listed ~/proj")
+        XCTAssertTrue(proj.waitForExistence(timeout: 15), "the browser never listed ~/proj")
         snapshot("browser")
         proj.tap()
         let here = app.buttons["overlayRow-here"]

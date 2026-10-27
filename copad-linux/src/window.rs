@@ -592,7 +592,6 @@ impl CopadWindow {
         center.append(&comux.status);
         middle.append(&center);
         middle.append(&comux.notif_dock);
-        comux.mount(&window, &term_over);
         if config.statusbar.position == "top" {
             layout.append(&statusbar.container);
             layout.append(&middle);
@@ -616,6 +615,7 @@ impl CopadWindow {
         // rather than the picture's intrinsic size.
         root_overlay.set_measure_overlay(&layout, true);
         window.set_child(Some(&root_overlay));
+        comux.mount(&window, &term_over, &root_overlay);
 
         // Config hot-reload (also reloads triggers atomically)
         watch_config(

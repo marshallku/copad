@@ -11,6 +11,7 @@
 #   6. the claiming host disconnecting brings the TUI chrome back
 #   7. a subscriber that never reads does not stall rendering
 #   8. notifications: a notify event + unread count, notif-read clears it, jump with consume
+#      (18 also checks the switcher's preview target, ^R action and pane-preview)
 #      removes the pane's notifications and notif-dismiss the rest
 #   9. an outcome line (flash) reaches the host as an event
 #  10. `comux proxy --stdio` bridges the same server (same incarnation)
@@ -470,8 +471,19 @@ while time.time() < end and not pick:
         pick = m
 if not pick or pick["spec"]["kind"] != "picker" or [t["name"] for t in pick["spec"]["tabs"]] != ["sessions", "agents"]:
     fail(f"Ctrl-f was not delegated as a picker: {pick}")
+# A native switcher previews and renames like the TUI's (decisions #180).
+srow = pick["spec"]["tabs"][0]["rows"][0]
+if not srow.get("pane") or not srow.get("session"):
+    fail(f"a switcher session row names no pane to preview / session: {srow}")
+if not any(x.get("id") == "rename" and x.get("key") == "C-r" for x in pick["spec"].get("actions", [])):
+    fail(f"the switcher offers no ^R rename: {pick['spec'].get('actions')}")
+pv = oh.cmd({"cmd": "pane-preview", "target": srow["pane"], "rows": 6, "cols": 40})
+if not pv.get("ok") or pv["preview"]["pane"] != srow["pane"] or not pv["preview"]["lines"]:
+    fail(f"pane-preview: {pv}")
+if len(pv["preview"]["lines"]) > 6:
+    fail(f"pane-preview ignored its row budget: {len(pv['preview']['lines'])}")
 oh.send({"t": "overlay-result", "overlay": pick["overlay"]})  # cancel
-ok("overlays went to the claiming host: a prompt answered by it renamed the session; Ctrl-f arrived as a picker")
+ok("overlays went to the claiming host: a prompt answered by it renamed the session; Ctrl-f arrived as a picker with a pane preview")
 
 # 19. async overlays
 def next_overlay(pred=lambda m: True, timeout=8):
