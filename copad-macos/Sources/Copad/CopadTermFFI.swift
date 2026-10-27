@@ -327,6 +327,11 @@ enum CopadTermFFI {
             copad_term_set_kitty_keyboard(ptr, enabled)
         }
 
+        func setScrollback(_ lines: Int) {
+            guard let ptr else { return }
+            copad_term_set_scrollback(ptr, UInt32(clamping: max(0, lines)))
+        }
+
         enum KeyEncoding {
             /// Send the event's text the normal way (IME, insertText).
             case text

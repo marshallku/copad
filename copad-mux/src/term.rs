@@ -7,7 +7,7 @@
 
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 
@@ -775,6 +775,17 @@ impl PaneTerm {
         t.mode().contains(TermMode::ALT_SCREEN)
     }
 
+    /// Re-apply the pane configuration with the current [`history_limit`]. Lowering it drops
+    /// the oldest lines at once. The caller leaves copy mode FIRST (`App::exit_copy_mode`):
+    /// the vi cursor could otherwise point at a row that no longer exists.
+    pub fn apply_history_limit(&self, lines: usize) {
+        self.term.lock().set_options(Config {
+            scrolling_history: lines,
+            ..pane_config()
+        });
+        self.mark_dirty();
+    }
+
     /// Leave copy mode: no selection, vi mode off, back at the live bottom.
     pub fn copy_exit(&self) {
         let mut t = self.term.lock();
@@ -1255,11 +1266,22 @@ pub(crate) fn snapshot_with_search<L: EventListener>(
     }
 }
 
+/// `history_limit` from mux.toml. Process-wide because panes are spawned on many paths
+/// (splits, restore off the state lock, `spawn`), all of which read it here.
+static HISTORY_LIMIT: AtomicUsize = AtomicUsize::new(crate::config::DEFAULT_HISTORY_LIMIT);
+
+pub fn history_limit() -> usize {
+    HISTORY_LIMIT.load(Ordering::Relaxed)
+}
+
+pub fn set_history_limit(lines: usize) {
+    HISTORY_LIMIT.store(lines, Ordering::Relaxed);
+}
+
 /// The emulator configuration every pane runs with.
 fn pane_config() -> Config {
     Config {
-        // A generous scrollback so panes have history to scroll back through.
-        scrolling_history: 10_000,
+        scrolling_history: history_limit(),
         // Pin the parser-level OSC 52 policy to copy-only. This is alacritty's own
         // default today; pinning it means a future default change can never hand a pane
         // program the PASTE direction (reading the host clipboard) behind our back.

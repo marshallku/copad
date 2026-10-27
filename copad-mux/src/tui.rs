@@ -1115,6 +1115,8 @@ impl App {
         let mut state = State::new();
         let mut panes = HashMap::new();
         let client = ClientId(0);
+        // Before any pane exists, restored ones included.
+        term::set_history_limit(cfg.history_limit);
 
         // The whitelist a client may refresh. `config::from_raw` already keeps
         // `never_inherit` out of `update_environment`, but this is the list that decides what
@@ -4885,6 +4887,7 @@ impl App {
                 // a reload never yanks a sidebar the user toggled with Ctrl-b s.
                 let (cfg, warnings) = crate::config::MuxConfig::load();
                 self.cfg = cfg;
+                self.apply_history_limit();
                 Resp::message(reload_note(
                     &crate::config::MuxConfig::config_path(),
                     &warnings,
@@ -6508,6 +6511,24 @@ impl App {
                 .panes
                 .get(term)
                 .is_some_and(|p| !p.copy_has_selection())
+    }
+
+    /// Bring every live pane to `cfg.history_limit` (new panes read it at spawn).
+    fn apply_history_limit(&mut self) {
+        if term::history_limit() == self.cfg.history_limit {
+            return;
+        }
+        term::set_history_limit(self.cfg.history_limit);
+        self.resize_histories(self.cfg.history_limit);
+    }
+
+    fn resize_histories(&mut self, lines: usize) {
+        // Copy mode spans this App (`copy`, `scroll_pane`) and the pane's vi cursor; leave it
+        // through the one path that resets both, before any row it points at is dropped.
+        self.exit_copy_mode();
+        for pane in self.panes.values() {
+            pane.apply_history_limit(lines);
+        }
     }
 
     fn exit_copy_mode(&mut self) {
@@ -16425,6 +16446,31 @@ mod copy_mode {
             KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
             &mut prefix,
         );
+    }
+
+    #[test]
+    fn a_smaller_history_limit_leaves_copy_mode_and_drops_old_lines() {
+        let mut app = app_with_lines();
+        let term = app.focused_terminal().unwrap();
+        enter(&mut app);
+        // Deep in history, no selection — the case where nothing else would notice the stale
+        // cursor.
+        typ(&mut app, "?l5");
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(app.scroll_pane.is_some());
+        app.resize_histories(3);
+        assert!(app.scroll_pane.is_none() && app.copy.is_none());
+        let cap = app.panes[&term].capture(Some(10_000));
+        assert!(
+            !cap.text.contains("L5\n"),
+            "old lines dropped: {}",
+            cap.text
+        );
+        // Copy mode works again on the shorter history.
+        enter(&mut app);
+        typ(&mut app, "kkkkV");
+        press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+        assert!(app.take_key_copy().is_some());
     }
 
     #[test]

@@ -84,6 +84,33 @@ pub struct TerminalConfig {
     /// query unanswered, so programs keep the legacy key encoding.
     #[serde(default = "default_true")]
     pub kitty_keyboard: bool,
+
+    /// Lines of history each pane keeps. Every kept line costs its full width in memory on
+    /// macOS (alacritty stores cells: a 200-column line is ~4.8 KB), so this is the main lever
+    /// on a busy pane's footprint; VTE on Linux compresses history and pays far less. Any
+    /// integer is accepted and clamped to 0..=100 000. Lowering it on a running copad drops
+    /// the oldest lines for good.
+    #[serde(
+        default = "default_scrollback",
+        deserialize_with = "deserialize_scrollback"
+    )]
+    pub scrollback: usize,
+}
+
+/// The most scrollback a pane may keep.
+pub const MAX_SCROLLBACK: usize = 100_000;
+
+fn default_scrollback() -> usize {
+    10_000
+}
+
+/// Any integer, clamped — a negative or huge value means "none" / "as much as allowed", not a
+/// config error that would throw away every other setting.
+fn deserialize_scrollback<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<usize, D::Error> {
+    let n = i64::deserialize(d)?;
+    Ok(n.clamp(0, MAX_SCROLLBACK as i64) as usize)
 }
 
 impl Default for TerminalConfig {
@@ -94,6 +121,7 @@ impl Default for TerminalConfig {
             font_size: default_font_size(),
             close_on_exit: true,
             kitty_keyboard: true,
+            scrollback: default_scrollback(),
         }
     }
 }
@@ -623,6 +651,27 @@ mod tests {
         let cfg = CopadConfig::load_from(&path).expect("load");
         assert!(cfg.triggers.is_empty());
         std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn scrollback_is_clamped_not_rejected() {
+        let parse = |t: &str| toml::from_str::<CopadConfig>(t).map(|c| c.terminal);
+        assert_eq!(parse("").unwrap().scrollback, 10_000);
+        assert_eq!(
+            parse("[terminal]\nscrollback = 2000").unwrap().scrollback,
+            2_000
+        );
+        // Out of range clamps instead of failing the whole config (and losing the font).
+        let t = parse("[terminal]\nscrollback = -5\nfont_size = 17").unwrap();
+        assert_eq!((t.scrollback, t.font_size), (0, 17));
+        assert_eq!(
+            parse("[terminal]\nscrollback = 9999999")
+                .unwrap()
+                .scrollback,
+            MAX_SCROLLBACK
+        );
+        // Not an integer is a type error, like any other field.
+        assert!(parse("[terminal]\nscrollback = \"lots\"").is_err());
     }
 
     #[test]

@@ -364,6 +364,50 @@ pub struct CopadHandle {
     /// `search_next` succeeds. All three are owned by the same Mutex
     /// so the snapshot path can read them atomically.
     search_state: Mutex<SearchState>,
+    /// The settings that live in alacritty's `Config`, so one setter can never reset the
+    /// other — `set_options` takes the WHOLE config.
+    options: Mutex<TermOptions>,
+}
+
+/// The per-pane settings the GUI can change after creation.
+#[derive(Clone, Copy)]
+struct TermOptions {
+    kitty_keyboard: bool,
+    scrollback: usize,
+}
+
+impl Default for TermOptions {
+    fn default() -> Self {
+        Self {
+            kitty_keyboard: true,
+            scrollback: Config::default().scrolling_history,
+        }
+    }
+}
+
+impl TermOptions {
+    fn config(self) -> Config {
+        Config {
+            kitty_keyboard: self.kitty_keyboard,
+            scrolling_history: self.scrollback,
+            ..Config::default()
+        }
+    }
+}
+
+/// The most scrollback a pane may keep; `[terminal] scrollback` is clamped to it.
+pub const MAX_SCROLLBACK: usize = 100_000;
+
+/// Apply `change` to the handle's options and hand the whole config to the terminal.
+fn apply_options(h: &CopadHandle, change: impl FnOnce(&mut TermOptions)) {
+    let config = {
+        let Ok(mut o) = h.options.lock() else {
+            return;
+        };
+        change(&mut o);
+        o.config()
+    };
+    h.term.lock().set_options(config);
 }
 
 /// Per-handle search bookkeeping. `regex` is the compiled
@@ -538,10 +582,7 @@ pub unsafe extern "C" fn copad_term_create(
     let listener = CopadListener::new();
     // `kitty_keyboard` makes alacritty_terminal keep the per-screen flag stacks and answer
     // `CSI ? u`; the GUI encodes keys against those flags via `copad_term_encode_key`.
-    let config = Config {
-        kitty_keyboard: true,
-        ..Config::default()
-    };
+    let config = TermOptions::default().config();
     let term = Term::new(config, &term_size, listener.clone());
     let term = Arc::new(FairMutex::new(term));
 
@@ -569,6 +610,7 @@ pub unsafe extern "C" fn copad_term_create(
         last_display_offset: AtomicI32::new(0),
         last_selection_range: Mutex::new(CopadSelectionRange::default()),
         search_state: Mutex::new(SearchState::default()),
+        options: Mutex::new(TermOptions::default()),
     }))
 }
 
@@ -2475,12 +2517,24 @@ pub unsafe extern "C" fn copad_term_set_kitty_keyboard(handle: *mut CopadHandle,
     let Some(h) = (unsafe { handle.as_ref() }) else {
         return;
     };
-    let mut term = h.term.lock();
-    let config = Config {
-        kitty_keyboard: enabled,
-        ..Config::default()
+    apply_options(h, |o| o.kitty_keyboard = enabled);
+}
+
+/// How many lines of scrollback the pane keeps (`[terminal] scrollback`), clamped to
+/// [`MAX_SCROLLBACK`]. Every kept line costs its full width in cells (24 bytes each), so
+/// this is the main lever on a pane's memory. Lowering it drops the oldest lines for good;
+/// raising it later does not bring them back.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a valid pointer returned by
+/// `copad_term_create` and not yet destroyed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_set_scrollback(handle: *mut CopadHandle, lines: u32) {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return;
     };
-    term.set_options(config);
+    apply_options(h, |o| o.scrollback = (lines as usize).min(MAX_SCROLLBACK));
 }
 
 /// One macOS key event, as `copad_term_encode_key` needs it. Strings are UTF-8, not
@@ -2865,6 +2919,58 @@ mod history_tests {
             Handler::linefeed(term);
             Handler::carriage_return(term);
         }
+    }
+
+    #[test]
+    fn scrollback_option_caps_shrinks_and_survives_the_kitty_toggle() {
+        let opts = |kitty_keyboard, scrollback| TermOptions {
+            kitty_keyboard,
+            scrollback,
+        };
+        let mut term = Term::new(opts(true, 20).config(), &TermSize::new(4, 4), VoidListener);
+        push_lines(&mut term, 60);
+        assert_eq!(term.grid().history_size(), 20);
+        // Toggling the other option keeps the limit (it used to reset to alacritty's 10 000).
+        term.set_options(opts(false, 20).config());
+        push_lines(&mut term, 60);
+        assert_eq!(term.grid().history_size(), 20);
+        // Lowering drops the oldest lines at once; raising again does not bring them back.
+        term.set_options(opts(false, 5).config());
+        assert_eq!(term.grid().history_size(), 5);
+        term.set_options(opts(false, 30).config());
+        assert_eq!(term.grid().history_size(), 5);
+        push_lines(&mut term, 10);
+        assert_eq!(term.grid().history_size(), 15);
+        // Zero keeps nothing but the screen.
+        term.set_options(opts(false, 0).config());
+        push_lines(&mut term, 10);
+        assert_eq!(term.grid().history_size(), 0);
+    }
+
+    #[test]
+    fn scrollback_shrinks_the_primary_grid_while_the_alt_screen_is_up() {
+        let opts = TermOptions {
+            kitty_keyboard: true,
+            scrollback: 20,
+        };
+        let mut term = Term::new(opts.config(), &TermSize::new(4, 4), VoidListener);
+        push_lines(&mut term, 40);
+        Handler::set_private_mode(
+            &mut term,
+            alacritty_terminal::vte::ansi::NamedPrivateMode::SwapScreenAndSetRestoreCursor.into(),
+        );
+        term.set_options(
+            TermOptions {
+                scrollback: 3,
+                ..opts
+            }
+            .config(),
+        );
+        Handler::unset_private_mode(
+            &mut term,
+            alacritty_terminal::vte::ansi::NamedPrivateMode::SwapScreenAndSetRestoreCursor.into(),
+        );
+        assert_eq!(term.grid().history_size(), 3);
     }
 
     #[test]

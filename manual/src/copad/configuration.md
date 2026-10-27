@@ -20,6 +20,7 @@ copad --config-path     # print the resolved path
 | `font_size` | `14` | Points |
 | `close_on_exit` | `true` | `false` keeps the dead-PTY viewport visible; close the pane manually |
 | `kitty_keyboard` | `true` | Programs may turn on the [kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) — how Claude Code, Neovim and Helix tell Shift+Enter from Enter. `false` keeps every program on the classic key encoding |
+| `scrollback` | `10000` | Lines of history per pane, `0`–`100000`. On macOS every kept line costs its full width in memory (about 5 KB at 200 columns), so a busy pane at the default holds ~50 MB — lower it to make copad lighter. Linux (VTE) compresses history and pays far less. A change applies to open panes; lowering it drops their oldest lines for good |
 
 ```toml
 [terminal]

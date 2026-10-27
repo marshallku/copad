@@ -231,7 +231,7 @@ impl TerminalPanel {
 
         terminal.set_cursor_blink_mode(vte4::CursorBlinkMode::On);
         terminal.set_cursor_shape(vte4::CursorShape::Block);
-        terminal.set_scrollback_lines(10000);
+        terminal.set_scrollback_lines(config.terminal.scrollback as i64);
         terminal.set_hexpand(true);
         terminal.set_vexpand(true);
 
@@ -513,7 +513,20 @@ impl TerminalPanel {
             .unwrap_or_default()
     }
 
-    /// Read a specific range of terminal text (row/col are 0-based)
+    /// The absolute row of the screen's first line. VTE numbers rows from the start of its
+    /// buffer, not from the screen, so history is the rows just above this one — a negative
+    /// row is not "N lines up" but a row that does not exist (reads as blank).
+    pub fn screen_top_row(&self) -> i64 {
+        let rows = self.terminal.row_count();
+        // The adjustment's upper bound is the buffer's end — but only once the widget has been
+        // laid out; the cursor row is a floor for it that is always current.
+        let upper = self.terminal.vadjustment().map_or(0, |a| a.upper() as i64);
+        let (_, cursor_row) = self.terminal.cursor_position();
+        (upper.max(cursor_row + 1) - rows).max(0)
+    }
+
+    /// Read a specific range of terminal text (rows are VTE's absolute rows, see
+    /// [`Self::screen_top_row`]; cols are 0-based)
     pub fn read_range(&self, start_row: i64, start_col: i64, end_row: i64, end_col: i64) -> String {
         let (text, _len) = self.terminal.text_range_format(
             vte4::Format::Text,
@@ -570,6 +583,10 @@ impl TerminalPanel {
             config.terminal.font_family, config.terminal.font_size
         ));
         self.terminal.set_font(Some(&font_desc));
+        let lines = config.terminal.scrollback as i64;
+        if self.terminal.scrollback_lines() != lines {
+            self.terminal.set_scrollback_lines(lines);
+        }
     }
 }
 

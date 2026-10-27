@@ -97,6 +97,10 @@ struct CopadConfig {
     /// (`CSI > flags u`), which is how Claude Code receives Shift+Enter as a newline.
     /// Default `true`; `false` leaves the query unanswered so programs keep legacy keys.
     let kittyKeyboard: Bool
+    /// `[terminal] scrollback` — lines of history per pane, clamped to 0...100 000. Each kept
+    /// line costs its full width in cells, so this is the main lever on a busy pane's memory.
+    /// An integer only (a float is ignored like any other malformed field).
+    let scrollback: Int
     let themeName: String
     let backgroundPath: String?
     let backgroundTint: Double
@@ -256,6 +260,7 @@ struct CopadConfig {
             forceMetaKeys: tomlStringArray(terminal, "force_meta_keys") ?? d.forceMetaKeys,
             closeOnExit: tomlBool(terminal, "close_on_exit") ?? d.closeOnExit,
             kittyKeyboard: tomlBool(terminal, "kitty_keyboard") ?? d.kittyKeyboard,
+            scrollback: terminal?["scrollback"]?.int.map { min(max($0, 0), 100_000) } ?? d.scrollback,
             themeName: tomlString(theme, "name") ?? d.themeName,
             backgroundPath: bgPath,
             backgroundTint: clamp01(tomlDouble(background, "tint") ?? d.backgroundTint),
@@ -392,6 +397,7 @@ struct CopadConfig {
             forceMetaKeys: ["Return"],
             closeOnExit: true,
             kittyKeyboard: true,
+            scrollback: 10_000,
             themeName: "catppuccin-mocha",
             backgroundPath: nil,
             backgroundTint: 0.6,

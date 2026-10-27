@@ -31,6 +31,9 @@ pub const DEFAULT_SIDEBAR_WIDTH: u16 = 24;
 pub const DEFAULT_REPEAT_TIME: u64 = 500;
 pub const DEFAULT_SIDEBAR_MIN_COLS: u16 = 80;
 pub const DEFAULT_SCROLL_STEP: i32 = 3;
+/// Default and ceiling for `history_limit`.
+pub const DEFAULT_HISTORY_LIMIT: usize = 10_000;
+pub const MAX_HISTORY_LIMIT: usize = 100_000;
 /// Default periodic autosave interval (seconds) for session persistence.
 pub const DEFAULT_AUTOSAVE_SECS: u32 = 15;
 /// Default cells per progress bar for `usage = "bar"`.
@@ -1064,6 +1067,11 @@ pub struct MuxConfig {
     pub sidebar_width: u16,
     pub sidebar_min_cols: u16,
     pub scroll_step: i32,
+    /// Lines of history each pane keeps (tmux `history-limit`). Every kept line costs its full
+    /// width in cells — ~6 KB for a 250-column agent pane — so a busy pane at the default holds
+    /// ~60 MB; this is the main lever on the server's memory. Applies to live panes on
+    /// `comux reload`; lowering it drops their oldest lines for good.
+    pub history_limit: usize,
     /// Restore the saved session layout on server start (continuum-style autorestore).
     pub persist: bool,
     /// Periodic autosave interval in seconds; `0` disables periodic saves.
@@ -1164,6 +1172,7 @@ struct RawConfig {
     sidebar_width: Option<i64>,
     sidebar_min_cols: Option<i64>,
     scroll_step: Option<i64>,
+    history_limit: Option<i64>,
     persist: Option<bool>,
     autosave_secs: Option<i64>,
     restore_processes: Option<Vec<String>>,
@@ -1286,6 +1295,7 @@ impl MuxConfig {
             scroll_step: DEFAULT_SCROLL_STEP,
             persist: true,
             autosave_secs: DEFAULT_AUTOSAVE_SECS,
+            history_limit: DEFAULT_HISTORY_LIMIT,
             restore_processes: default_restore_processes(),
             restore_agent_sessions: true,
             sort_by: SortBy::Created,
@@ -1364,6 +1374,14 @@ impl MuxConfig {
             "scroll_step",
             &mut warnings,
         ) as i32;
+        let history_limit = clamp_field(
+            raw.history_limit,
+            DEFAULT_HISTORY_LIMIT as i64,
+            0,
+            MAX_HISTORY_LIMIT as i64,
+            "history_limit",
+            &mut warnings,
+        ) as usize;
         let repeat_time = clamp_field(
             raw.repeat_time,
             DEFAULT_REPEAT_TIME as i64,
@@ -1417,6 +1435,7 @@ impl MuxConfig {
                 sidebar_width,
                 sidebar_min_cols,
                 scroll_step,
+                history_limit,
                 persist: raw.persist.unwrap_or(true),
                 autosave_secs,
                 restore_processes: raw
@@ -2077,6 +2096,21 @@ pub(crate) mod tests {
         // Named keys have no case to carry it, so they keep the explicit `S-`.
         assert_eq!(label("C-S-Left"), "^S-Left");
         assert_eq!(label("M-C-Space"), "M-^Space");
+    }
+
+    #[test]
+    fn history_limit_defaults_and_clamps() {
+        assert_eq!(load_str("").0.history_limit, DEFAULT_HISTORY_LIMIT);
+        let (cfg, warns) = load_str("history_limit = 2000");
+        assert!(warns.is_empty());
+        assert_eq!(cfg.history_limit, 2000);
+        let (cfg, warns) = load_str("history_limit = -1\nscroll_step = 7");
+        assert_eq!((cfg.history_limit, cfg.scroll_step), (0, 7));
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert_eq!(
+            load_str("history_limit = 99999999").0.history_limit,
+            MAX_HISTORY_LIMIT
+        );
     }
 
     #[test]

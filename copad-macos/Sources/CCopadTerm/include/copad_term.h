@@ -245,6 +245,9 @@ bool copad_term_bracketed_paste_active(CopadHandle* handle);
 // copad_term_set_kitty_keyboard(false): the query goes unanswered and pushes are ignored.
 uint8_t copad_term_keyboard_flags(CopadHandle* handle);
 void copad_term_set_kitty_keyboard(CopadHandle* handle, bool enabled);
+// Lines of scrollback to keep (`[terminal] scrollback`), clamped to 100 000. Lowering it drops
+// the oldest lines for good.
+void copad_term_set_scrollback(CopadHandle* handle, uint32_t lines);
 
 typedef struct CopadKeyInput {
     uint16_t key_code;          // NSEvent.keyCode

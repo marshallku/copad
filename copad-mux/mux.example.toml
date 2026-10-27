@@ -43,6 +43,10 @@ sidebar_density = "comfortable"
                           #     half that would otherwise overflow
 scroll_step = 3           # lines per mouse-wheel notch (1..50; the wheel over the SIDEBAR
                           #   scrolls that half by one entry instead)
+history_limit = 10000     # lines of scrollback per pane (0..100000; tmux `history-limit`).
+                          #   Each kept line costs its full width in memory (~6 KB at 250
+                          #   columns), so a busy agent pane at 10000 holds ~60 MB. Applies to
+                          #   live panes on `comux reload`; lowering it drops their oldest lines.
 sidebar_git = true        # decorate each space's branch with git status: `*` dirty, ↑/↓
                           #   ahead/behind, +a −r vs HEAD, ⑂ = linked worktree. Read off-loop
                           #   every ~5s with no optional locks; false = branch only, no forks.

@@ -30,6 +30,7 @@ comux reload          # re-read mux.toml on the live server (alias: comux source
 | `sidebar_width` | `24` | `8`–`80` | Sidebar columns |
 | `sidebar_min_cols` | `80` | `40`–`400` (forced ≥ `sidebar_width + 20`) | Hide the sidebar below this terminal width |
 | `scroll_step` | `3` | `1`–`50` | Lines per mouse-wheel notch |
+| `history_limit` | `10000` | `0`–`100000` | Lines of scrollback per pane (tmux `history-limit`). Each kept line costs its full width in memory — a busy 250-column agent pane holds ~60 MB at the default — so this is the main lever on the server's footprint. `comux reload` applies it to open panes; lowering it drops their oldest lines for good |
 | `repeat_time` | `500` | `0`–`5000` ms (`0` = off) | How long the resize keys stay live after a press, so `Ctrl-b H H H` repeats (tmux `repeat-time`) |
 | `confirm_close` | `true` | bool | Ask `y/n` before `Ctrl-b x` closes a pane or `Ctrl-b &` a tab |
 | `set_titles` | `true` | bool | Set your terminal's title to the focused pane's title (or program) and the session; restored on detach (tmux `set-titles`) |

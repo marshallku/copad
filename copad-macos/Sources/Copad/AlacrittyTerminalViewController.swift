@@ -276,6 +276,7 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         // hot-reload — same code path keeps the two in sync.
         termHandle?.applyPaletteFromTheme(theme)
         termHandle?.setKittyKeyboard(config.kittyKeyboard)
+        termHandle?.setScrollback(config.scrollback)
         if let initialInput {
             termHandle?.input(Array(initialInput.utf8))
         }
@@ -292,6 +293,10 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
     /// running program negotiated (it gets legacy keys from then on).
     func applyKittyKeyboard(_ enabled: Bool) {
         termHandle?.setKittyKeyboard(enabled)
+    }
+
+    func applyScrollback(_ lines: Int) {
+        termHandle?.setScrollback(lines)
     }
 
     /// Config hot-reload: flip the OSC 52 policy on the live render
