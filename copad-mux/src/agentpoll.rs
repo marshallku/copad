@@ -591,20 +591,26 @@ pub(crate) fn tail_from(path: &Path, budget: u64) -> Option<(String, bool)> {
     f.seek(SeekFrom::Start(from)).ok()?;
     let mut buf = Vec::with_capacity(budget.min(len) as usize);
     f.take(budget).read_to_end(&mut buf).ok()?;
-    let text = String::from_utf8_lossy(&buf).into_owned();
-    if from == 0 {
-        return Some((text, false));
+    if from > 0 {
+        // Not at the start of the file, so the first line is a fragment. NO newline at all
+        // means the budget landed entirely inside one record — there is nothing complete to
+        // parse, but the read still SUCCEEDED. That distinction is load-bearing now that the
+        // caller uses `None` to mean "could not read, retry next tick": reporting a failure
+        // here would make an oversized record re-read its file on every single tick, forever.
+        //
+        // Cut in BYTES, before decoding: the cut usually lands inside a multi-byte character,
+        // which sent the whole buffer down the lossy (copying) path, and slicing off the
+        // fragment afterwards copied it again — 256 KiB twice per working agent per second.
+        let keep = buf
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(buf.len(), |i| i + 1);
+        buf.drain(..keep);
     }
-    // Not at the start of the file, so the first line is a fragment. NO newline at all means
-    // the budget landed entirely inside one record — there is nothing complete to parse, but
-    // the read still SUCCEEDED. That distinction is load-bearing now that the caller uses
-    // `None` to mean "could not read, retry next tick": reporting a failure here would make an
-    // oversized record re-read its file on every single tick, forever.
-    Some((
-        text.find('\n')
-            .map_or(String::new(), |i| text[i + 1..].to_string()),
-        true,
-    ))
+    // Whole lines are valid UTF-8 unless the file itself is not; only then is a copy made.
+    let text = String::from_utf8(buf)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    Some((text, from > 0))
 }
 
 /// One Claude transcript line → `"Bash: commit the fix"`, or `None` when it names no tool use.
@@ -764,6 +770,27 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tail_cut_inside_a_character_keeps_only_whole_lines() {
+        let path = std::env::temp_dir().join(format!("comux-tail-{}.jsonl", std::process::id()));
+        // 3-byte characters, so most cut points land mid-character.
+        let body = "가나다라마바사\n".repeat(50);
+        std::fs::write(&path, &body).unwrap();
+        for budget in [1u64, 5, 40, 41, 200] {
+            let (text, partial) = tail_from(&path, budget).unwrap();
+            assert!(partial);
+            assert!(!text.contains('\u{fffd}'), "budget {budget}: {text:?}");
+            assert!(
+                text.lines().all(|l| l == "가나다라마바사"),
+                "budget {budget}"
+            );
+            assert!(body.ends_with(&text));
+        }
+        // From the start: everything, unmarked.
+        assert_eq!(tail_from(&path, 1 << 20), Some((body.clone(), false)));
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn grok_and_agy_conversations_are_named_by_their_session_directory() {

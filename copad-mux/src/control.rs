@@ -2207,7 +2207,7 @@ pub fn run_client(args: &[String]) -> i32 {
         return 1;
     }
 
-    let resp = match round_trip(&req) {
+    let mut resp = match round_trip(&req) {
         Ok(r) => r,
         Err(e) => {
             if json_out {
@@ -2220,6 +2220,14 @@ pub fn run_client(args: &[String]) -> i32 {
             return 1;
         }
     };
+    // The host poller samples only while someone reads it, so the first `host` after a quiet
+    // spell wakes it with no CPU rate yet (a rate needs two samples): ask once more after one.
+    if matches!(req, Req::Host) && resp.host.as_ref().is_some_and(|h| h.cpu.is_none()) {
+        std::thread::sleep(crate::hostmetrics::TICK + Duration::from_millis(300));
+        if let Ok(r) = round_trip(&req) {
+            resp = r;
+        }
+    }
 
     // `kill-server` replies OK the instant the shutdown is *initiated*, but the server then
     // finishes its final save + removes the socket + exits over the next moment. Wait for it

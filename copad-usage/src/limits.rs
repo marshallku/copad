@@ -19,7 +19,9 @@
 use chrono::Local;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 /// How long a cached value may stand in for a live one. Bridges the minutes-to-
@@ -342,10 +344,18 @@ fn claude_limits(home: &str) -> Result<ClaudeLimits, String> {
         }
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(6))
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
+    // One client for the process: comux asks every minute, and building one each time
+    // reloaded the platform root certificates for every request.
+    static CLIENT: OnceLock<Result<reqwest::blocking::Client, String>> = OnceLock::new();
+    let client = CLIENT
+        .get_or_init(|| {
+            reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(6))
+                .build()
+                .map_err(|e| format!("http client: {e}"))
+        })
+        .as_ref()
+        .map_err(Clone::clone)?;
     let resp = client
         .get("https://api.anthropic.com/api/oauth/usage")
         .header("Authorization", format!("Bearer {token}"))
@@ -450,22 +460,46 @@ fn codex_limits(home: &str) -> Result<CodexLimits, String> {
     let root = Path::new(home).join(".codex/sessions");
     let newest = newest_rollout(&root)
         .ok_or_else(|| format!("no rollout files under {}", root.display()))?;
-    let bytes = std::fs::read(&newest).map_err(|e| format!("cannot read newest rollout: {e}"))?;
-    let text = String::from_utf8_lossy(&bytes);
-    // Reverse-scan for the LAST rate_limits snapshot; parse only that line
-    // rather than every line of a possibly-large rollout.
-    for line in text.lines().rev() {
-        if !line.contains("\"rate_limits\"") {
-            continue;
-        }
-        let Ok(v) = serde_json::from_str::<Value>(line) else {
-            continue;
+    let mut file =
+        std::fs::File::open(&newest).map_err(|e| format!("cannot read newest rollout: {e}"))?;
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    // The snapshot sits near the end of a rollout that can run to tens of MB, read every
+    // minute: look in a growing tail before ever reading the whole file.
+    let mut window = TAIL_START.min(len);
+    loop {
+        let mut buf = Vec::with_capacity(window as usize);
+        file.seek(SeekFrom::Start(len - window))
+            .and_then(|_| file.by_ref().take(window).read_to_end(&mut buf))
+            .map_err(|e| format!("cannot read newest rollout: {e}"))?;
+        // The window's first line is usually cut mid-way; only a whole line can be a snapshot.
+        let text = String::from_utf8_lossy(&buf);
+        let whole = if window < len {
+            text.split_once('\n').map_or("", |(_, rest)| rest)
+        } else {
+            &text
         };
-        if let Some(rl) = find_key(&v, "rate_limits") {
-            return Ok(parse_codex_rate_limits(rl));
+        if let Some(rl) = last_rate_limits(whole) {
+            return Ok(rl);
         }
+        if window >= len || window >= TAIL_MAX {
+            break;
+        }
+        window = (window * 2).min(len).min(TAIL_MAX);
     }
     Err("newest rollout has no rate_limits snapshot yet".into())
+}
+
+/// The first tail read of a rollout, and the most ever read.
+const TAIL_START: u64 = 256 * 1024;
+const TAIL_MAX: u64 = 8 * 1024 * 1024;
+
+/// The LAST rate_limits snapshot in `text`; only matching lines are parsed.
+fn last_rate_limits(text: &str) -> Option<CodexLimits> {
+    text.lines()
+        .rev()
+        .filter(|l| l.contains("\"rate_limits\""))
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find_map(|v| find_key(&v, "rate_limits").map(parse_codex_rate_limits))
 }
 
 /// The rollout file with the most recent mtime under `root` (recursive).
@@ -696,6 +730,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&missing);
         let err = load_claude_credentials(missing.to_str().unwrap()).unwrap_err();
         assert!(err.contains("cannot read"));
+    }
+
+    #[test]
+    fn codex_snapshot_is_found_in_the_tail_or_deeper() {
+        let home = std::env::temp_dir().join(format!("copad-usage-tail-{}", std::process::id()));
+        let dir = home.join(".codex/sessions/2026/10/28");
+        let _ = std::fs::create_dir_all(&dir);
+        let snap = |pct: f64| {
+            json!({"payload": {"rate_limits": {
+                "secondary": {"used_percent": pct, "window_minutes": 10080}
+            }}})
+            .to_string()
+        };
+        let filler = format!("{{\"t\":\"{}\"}}\n", "x".repeat(200)).repeat(3_000); // ~600 KB
+        let file = dir.join("rollout-a.jsonl");
+        // Snapshot at the very end of a large file: found in the first tail window.
+        std::fs::write(&file, format!("{}\n{filler}{}\n", snap(10.0), snap(42.0))).unwrap();
+        let h = home.to_str().unwrap();
+        assert_eq!(codex_limits(h).unwrap().weekly, Some(42.0));
+        // Only deeper than the first window: the window grows until it reaches it, and a
+        // line cut by the window edge is never mistaken for a snapshot.
+        std::fs::write(&file, format!("{}\n{filler}", snap(7.0))).unwrap();
+        assert_eq!(codex_limits(h).unwrap().weekly, Some(7.0));
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

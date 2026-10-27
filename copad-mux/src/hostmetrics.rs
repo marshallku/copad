@@ -432,28 +432,75 @@ pub fn parse_meminfo(text: &str) -> Option<(u64, u64)> {
 
 // ===== the poller ================================================================
 
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 /// How often the host is sampled. Also the CPU averaging window, since the percentage is the
 /// rate between consecutive samples.
-const TICK: Duration = Duration::from_secs(2);
+pub const TICK: Duration = Duration::from_secs(2);
 
 /// Sample the GPU every Nth tick. It is the only reading that costs a subprocess, and a GPU
 /// busy figure does not need 2-second resolution in a status bar.
 const GPU_EVERY: u32 = 5;
 
-pub type Shared = Arc<Mutex<HostMetrics>>;
+/// How long one read keeps the poller sampling. Its readers are the top bar (off by
+/// default; it reads on every frame it draws) and `comux host`; with neither, the poller
+/// sleeps instead of sampling — and forking `ioreg` — every two seconds for nobody.
+const WANTED_FOR: Duration = Duration::from_secs(30);
+
+pub struct Poll {
+    metrics: Mutex<HostMetrics>,
+    /// Until when someone wants readings. `None` = never asked.
+    wanted_until: Mutex<Option<Instant>>,
+    wake: Condvar,
+}
+
+pub type Shared = Arc<Poll>;
 
 /// A handle that never updates — the client, and any path with no server.
 pub fn idle() -> Shared {
-    Arc::new(Mutex::new(HostMetrics::default()))
+    Arc::new(Poll {
+        metrics: Mutex::new(HostMetrics::default()),
+        wanted_until: Mutex::new(None),
+        wake: Condvar::new(),
+    })
 }
 
-/// The latest reading. Poison-safe: a panicked poller degrades to "no reading", which every
-/// surface already handles, rather than taking the render loop down with it.
+/// The latest reading, and a request to keep sampling for a while. Poison-safe: a panicked
+/// poller degrades to "no reading", which every surface already handles, rather than taking
+/// the render loop down with it.
 pub fn read(shared: &Shared) -> HostMetrics {
-    shared.lock().map(|g| *g).unwrap_or_default()
+    if let Ok(mut w) = shared.wanted_until.lock() {
+        let was_idle = w.is_none_or(|t| t <= Instant::now());
+        *w = Some(Instant::now() + WANTED_FOR);
+        if was_idle {
+            // Whatever is cached is from before the poller went to sleep — possibly hours
+            // old. Drop it HERE, before answering, so this read already says "no reading"
+            // (and `comux host` waits for a fresh one) instead of passing it off as current.
+            if let Ok(mut m) = shared.metrics.lock() {
+                *m = HostMetrics::default();
+            }
+            shared.wake.notify_all();
+        }
+    }
+    shared.metrics.lock().map(|g| *g).unwrap_or_default()
+}
+
+/// Block until someone wants readings. Returns whether it had to wait (the counters are then
+/// a whole idle period old).
+fn wait_wanted(shared: &Poll) -> bool {
+    let Ok(mut w) = shared.wanted_until.lock() else {
+        return false;
+    };
+    let mut waited = false;
+    while w.is_none_or(|t| t <= Instant::now()) {
+        waited = true;
+        w = match shared.wake.wait(w) {
+            Ok(g) => g,
+            Err(_) => return waited,
+        };
+    }
+    waited
 }
 
 /// Start sampling on a dedicated thread. Never on the render loop: the GPU probe forks, and
@@ -466,14 +513,18 @@ pub fn spawn() -> Shared {
         .spawn(move || {
             let mut ticks = CpuTicks::default();
             let mut n: u32 = 0;
-            // Prime the CPU counters so the FIRST published reading is a real rate rather
-            // than a machine-lifetime average.
-            let _ = sample(&mut ticks, false);
             loop {
+                if wait_wanted(&out) || n == 0 {
+                    // Prime the CPU counters so the first reading after a wake is a real
+                    // rate rather than an average over however long nobody was asking (the
+                    // stale reading itself was dropped by the `read` that woke us).
+                    let _ = sample(&mut ticks, false);
+                    n = 0;
+                }
                 std::thread::sleep(TICK);
                 let want_gpu = n.is_multiple_of(GPU_EVERY);
                 let m = sample(&mut ticks, want_gpu);
-                if let Ok(mut g) = out.lock() {
+                if let Ok(mut g) = out.metrics.lock() {
                     // A skipped GPU tick must not ERASE the last GPU reading — absent means
                     // "could not read", and "we did not look this time" is not that.
                     let gpu = if want_gpu { m.gpu } else { g.gpu };
@@ -488,6 +539,23 @@ pub fn spawn() -> Shared {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_read_after_idle_never_returns_the_old_reading() {
+        let p = idle();
+        *p.metrics.lock().unwrap() = HostMetrics {
+            cpu: Some(55.0),
+            ..HostMetrics::default()
+        };
+        // Never asked before (= idle): the cached value is not passed off as current.
+        assert_eq!(read(&p).cpu, None);
+        // Asked recently: a reading the poller stored is returned as is.
+        p.metrics.lock().unwrap().cpu = Some(12.0);
+        assert_eq!(read(&p).cpu, Some(12.0));
+        // Lapsed again: dropped again.
+        *p.wanted_until.lock().unwrap() = Some(Instant::now());
+        assert_eq!(read(&p).cpu, None);
+    }
 
     /// The host port must be acquired ONCE however many samples are taken.
     ///

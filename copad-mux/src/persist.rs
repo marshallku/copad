@@ -207,8 +207,24 @@ impl Saver {
         let (tx, rx) = std::sync::mpsc::sync_channel::<PersistState>(1);
         let handle = std::thread::spawn(move || {
             let mut warned = false;
+            // The last successful write, minus its timestamp. An idle server's layout is the
+            // same every 15 s and each write is two fsyncs — skip the ones that would change
+            // nothing but `saved_at` (unless the file has gone missing).
+            let mut last: Option<Vec<u8>> = None;
             for state in rx {
-                if let Err(e) = write_durably(&path, &state)
+                let res = serialize(&PersistState {
+                    saved_at: 0,
+                    ..state.clone()
+                })
+                .and_then(|key| {
+                    if last.as_deref() == Some(key.as_slice()) && path.exists() {
+                        return Ok(());
+                    }
+                    write_durably(&path, &state)?;
+                    last = Some(key);
+                    Ok(())
+                });
+                if let Err(e) = res
                     && !warned
                 {
                     // Surface the first failure so persistence isn't silently broken.
@@ -307,11 +323,18 @@ static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new
 /// temp file is UNIQUE per write (`…json.<pid>.<seq>.tmp`) so concurrent writers don't
 /// collide; it is removed on any error so a failed write leaves no orphan.
 fn write_durably(path: &std::path::Path, state: &PersistState) -> std::io::Result<()> {
+    write_bytes_durably(path, &serialize(state)?)
+}
+
+fn serialize(state: &PersistState) -> std::io::Result<Vec<u8>> {
+    serde_json::to_vec_pretty(state).map_err(std::io::Error::other)
+}
+
+fn write_bytes_durably(path: &std::path::Path, json: &[u8]) -> std::io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| std::io::Error::other("state path has no parent dir"))?;
     std::fs::create_dir_all(parent)?;
-    let json = serde_json::to_vec_pretty(state).map_err(std::io::Error::other)?;
 
     let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = path.with_extension(format!("json.{}.{seq}.tmp", std::process::id()));
@@ -326,7 +349,7 @@ fn write_durably(path: &std::path::Path, state: &PersistState) -> std::io::Resul
             use std::os::unix::fs::PermissionsExt;
             let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
         }
-        f.write_all(&json)?;
+        f.write_all(json)?;
         f.sync_all()?; // the bytes are on disk before the rename
         drop(f);
         std::fs::rename(&tmp, path)?;
@@ -469,5 +492,43 @@ mod tests {
         write_durably(&p, &sample()).unwrap();
         assert_eq!(load_from(&p), Some(sample()));
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn an_unchanged_autosave_does_not_rewrite_the_file() {
+        let dir = std::env::temp_dir().join(format!("copad-mux-test-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let p = dir.join("state.json");
+        let saver = Saver::new(p.clone());
+        let settle = || std::thread::sleep(Duration::from_millis(200));
+        let inode = |p: &std::path::Path| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(p).map(|m| m.ino()).ok()
+        };
+        saver.request(sample());
+        settle();
+        let first = inode(&p).expect("first save lands");
+        // Same layout, later timestamp: no new temp-file + rename, so the same inode.
+        saver.request(PersistState {
+            saved_at: sample().saved_at + 15,
+            ..sample()
+        });
+        settle();
+        assert_eq!(inode(&p), Some(first));
+        // Gone from disk: written again even though nothing changed.
+        std::fs::remove_file(&p).unwrap();
+        saver.request(sample());
+        settle();
+        assert_eq!(load_from(&p), Some(sample()));
+        // A changed snapshot is written (a new inode from the rename).
+        let before = inode(&p);
+        let mut changed = sample();
+        changed.active_session += 1;
+        saver.request(changed.clone());
+        settle();
+        assert_ne!(inode(&p), before);
+        assert_eq!(load_from(&p), Some(changed));
+        drop(saver);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
