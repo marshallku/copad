@@ -683,8 +683,8 @@ fn on_event(inner: &Arc<Inner>, ev: LinkEvent, closed: &std::sync::mpsc::Sender<
                     s.error = None;
                 }
                 let tags = s.served_tags();
-                let model = s.model.clone();
-                let ops = s.claims.reconcile(&model, &tags);
+                let State { claims, model, .. } = &mut *s;
+                let ops = claims.reconcile(model, &tags);
                 send_ops_locked(inner, &s, ops);
             }
             LinkEvent::Closed(why) => {

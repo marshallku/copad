@@ -479,6 +479,9 @@ pub struct ComuxPanel {
     hosts: RefCell<Vec<(String, Rc<MuxHost>)>>,
     /// The one the visible panes host (the local one when none does).
     current: RefCell<Rc<MuxHost>>,
+    /// `state_json()` of `current` at one generation: a tick that sees a change reads the
+    /// state from half a dozen places, and each read used to rebuild the whole JSON.
+    state_cache: RefCell<Option<(*const MuxHost, u64, Rc<Value>)>>,
     socket: String,
     last_gen: Cell<u64>,
     last_serve: Cell<Option<Instant>>,
@@ -635,6 +638,7 @@ impl ComuxPanel {
             bell_count,
             hosts: RefCell::new(vec![(String::new(), local.clone())]),
             current: RefCell::new(local),
+            state_cache: RefCell::new(None),
             socket: copad_core::paths::gui_socket_path(std::process::id())
                 .display()
                 .to_string(),
@@ -932,8 +936,19 @@ impl ComuxPanel {
         self.fit_usage();
     }
 
-    fn state(&self) -> Value {
-        self.cur().state_json()
+    fn state(&self) -> Rc<Value> {
+        let host = self.cur();
+        let key = (Rc::as_ptr(&host), host.generation());
+        if let Some((h, g, v)) = self.state_cache.borrow().as_ref()
+            && (*h, *g) == key
+        {
+            return v.clone();
+        }
+        // Generation first: a change landing between the two reads then reads as stale next
+        // time rather than being cached under a generation that already includes it.
+        let v = Rc::new(host.state_json());
+        *self.state_cache.borrow_mut() = Some((key.0, key.1, v.clone()));
+        v
     }
 
     /// Place the sidebar's keyboard mark and row preview (decisions #181).
