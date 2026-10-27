@@ -34,14 +34,6 @@ pub struct CopadWindow {
     statusbar: Rc<StatusBar>,
     #[allow(dead_code)]
     background: Rc<BackgroundLayer>,
-    /// Hidden 1×1 zero-opacity WebView that loads a stub at window
-    /// construction time, warming WebKit's auxiliary services
-    /// (xdg-desktop-portal activation, bubblewrap sandbox, document-portal
-    /// D-Bus handshake) before the user opens their first plugin panel.
-    /// Without this, the first plugin panel's `load_uri()` hangs in
-    /// WebProcess startup on cold boot. Held to keep `WebContext` alive.
-    #[allow(dead_code)]
-    prewarm_webview: webkit6::WebView,
 }
 
 impl CopadWindow {
@@ -64,9 +56,8 @@ impl CopadWindow {
         // finds those daemons already running and avoids the
         // cold-boot hang where `load_uri()` sits silent until a
         // second copad process happens to wake them. See commit
-        // 78ebdb1 for the diagnostic instrumentation, and the
-        // `prewarm_webview` field on `CopadWindow` for the lifetime
-        // contract.
+        // 78ebdb1 for the diagnostic instrumentation, and the teardown
+        // where the view is parked for when it is dropped.
         //
         // The prewarm uses its own `WebContext` so it doesn't share
         // a sandbox / cookie jar with any plugin panel. Note that
@@ -80,9 +71,11 @@ impl CopadWindow {
         // plugin panels later traverse, including the portal-mediated
         // file read that is the most likely hang site.
         //
-        // Cost: one extra WebProcess + 100-byte temp file for the
-        // window's lifetime. Temp file is per-pid so concurrent copad
-        // instances don't collide; cleaned up on window destroy.
+        // Cost: a WebProcess + NetworkProcess (+ their bwrap/dbus-proxy
+        // helpers, ~35 MB together) only until the stub has loaded — the
+        // view is then dropped, since what it warmed lives outside this
+        // process (see the teardown below). Temp file is per-pid so
+        // concurrent copad instances don't collide; removed with the view.
         let prewarm_path =
             std::env::temp_dir().join(format!("copad-prewarm-{}.html", std::process::id()));
         // Surface the write failure rather than swallow it — if the
@@ -622,6 +615,39 @@ impl CopadWindow {
         // widget. `can_target=false` + opacity 0 + 1×1 size keeps
         // it inert and invisible.
         root_overlay.add_overlay(&prewarm_webview);
+        // Once the stub has loaded, the host-side services are up and stay
+        // up without us, and every plugin panel spawns its own WebContext
+        // anyway, so keeping the view for the window's lifetime only kept
+        // its WebProcess and NetworkProcess alive for nothing. A load that
+        // never finishes is dropped after a minute all the same.
+        {
+            let overlay = root_overlay.downgrade();
+            let path = prewarm_path.clone();
+            let done = Rc::new(Cell::new(false));
+            let drop_prewarm = Rc::new(move |wv: &webkit6::WebView| {
+                if done.replace(true) {
+                    return;
+                }
+                if let Some(o) = overlay.upgrade() {
+                    o.remove_overlay(wv);
+                }
+                let _ = std::fs::remove_file(&path);
+            });
+            let d = drop_prewarm.clone();
+            prewarm_webview.connect_load_changed(move |wv, ev| {
+                if ev == webkit6::LoadEvent::Finished {
+                    // Not from inside WebKit's own signal emission.
+                    let (wv, d) = (wv.clone(), d.clone());
+                    glib::idle_add_local_once(move || d(&wv));
+                }
+            });
+            let wv = prewarm_webview.downgrade();
+            glib::timeout_add_local_once(Duration::from_secs(60), move || {
+                if let Some(wv) = wv.upgrade() {
+                    drop_prewarm(&wv);
+                }
+            });
+        }
         // Use the layout's natural size to drive the overlay so the bg
         // image stretches/letterboxes against the real UI footprint
         // rather than the picture's intrinsic size.
@@ -880,7 +906,6 @@ impl CopadWindow {
             tab_manager,
             statusbar,
             background,
-            prewarm_webview,
         }
     }
 
