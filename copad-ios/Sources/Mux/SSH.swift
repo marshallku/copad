@@ -10,7 +10,7 @@ enum SSHError: LocalizedError {
     case unknownHostKey(String)
     /// The host presents a different key than the one confirmed before. Never auto-accepted.
     case changedHostKey(expected: String, got: String)
-    case authFailed
+    case authFailed(password: Bool)
     case execFailed(String)
     case closed(String)
 
@@ -18,7 +18,8 @@ enum SSHError: LocalizedError {
         switch self {
         case .unknownHostKey: return "Unknown host key — confirm it to continue."
         case .changedHostKey: return "The host key CHANGED. Refusing to connect."
-        case .authFailed: return "Authentication failed — is this device's key in authorized_keys?"
+        case .authFailed(password: false): return "Authentication failed — is this device's key in authorized_keys?"
+        case .authFailed(password: true): return "Authentication failed — check the user and password, and that the host allows password logins."
         case let .execFailed(m): return "Could not start comux on the host: \(m)"
         case let .closed(m): return m
         }
@@ -31,24 +32,24 @@ final class SSHConnection {
     private let group: MultiThreadedEventLoopGroup
     private let channel: Channel
     private let hostCheck: HostKeyCheck
-    private let auth: KeyAuth
+    private let auth: UserAuth
 
     private init(group: MultiThreadedEventLoopGroup, channel: Channel,
-                 hostCheck: HostKeyCheck, auth: KeyAuth) {
+                 hostCheck: HostKeyCheck, auth: UserAuth) {
         self.group = group
         self.channel = channel
         self.hostCheck = hostCheck
         self.auth = auth
     }
 
-    /// Connect and authenticate with `key`. `knownKey` is the OpenSSH host key the user
+    /// Connect and authenticate with `credential`. `knownKey` is the OpenSSH host key the user
     /// confirmed earlier (nil = first contact: the connection fails with `unknownHostKey`
     /// carrying the key to confirm).
     static func connect(host: String, port: Int, user: String,
-                        key: NIOSSHPrivateKey, knownKey: String?) async throws -> SSHConnection {
+                        credential: SSHCredential, knownKey: String?) async throws -> SSHConnection {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         let hostCheck = HostKeyCheck(known: knownKey)
-        let auth = KeyAuth(user: user, key: key)
+        let auth = UserAuth(user: user, credential: credential)
         let bootstrap = ClientBootstrap(group: group)
             .connectTimeout(.seconds(10))
             .channelOption(ChannelOptions.socketOption(.so_keepalive), value: 1)
@@ -110,7 +111,7 @@ final class SSHConnection {
             // Key exchange and auth run before the first channel can open, so their failures
             // land here; name them instead of a bare "channel closed".
             if let f = hostCheck.failure { throw f }
-            if auth.exhausted { throw SSHError.authFailed }
+            if auth.exhausted { throw SSHError.authFailed(password: auth.isPassword) }
             if let e = error as? SSHError { throw e }
             throw SSHError.execFailed("\(error)")
         }
@@ -216,32 +217,47 @@ private final class ExecHandler: ChannelDuplexHandler {
     }
 }
 
-/// Public-key user auth: offers the one key once.
-final class KeyAuth: NIOSSHClientUserAuthenticationDelegate {
+enum SSHCredential {
+    case key(NIOSSHPrivateKey)
+    case password(String)
+}
+
+/// User auth: offers the one credential once, if the server accepts that method.
+final class UserAuth: NIOSSHClientUserAuthenticationDelegate {
     private let user: String
-    private let key: NIOSSHPrivateKey
+    private let credential: SSHCredential
     private var offered = false
-    /// The key was offered and the server asked again: it was rejected.
+    /// Nothing (more) to offer: the credential was rejected, or the server takes no method we have.
     private(set) var exhausted = false
 
-    init(user: String, key: NIOSSHPrivateKey) { self.user = user; self.key = key }
+    init(user: String, credential: SSHCredential) { self.user = user; self.credential = credential }
+
+    var isPassword: Bool { if case .password = credential { true } else { false } }
 
     func nextAuthenticationType(availableMethods: NIOSSHAvailableUserAuthenticationMethods,
                                 nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>) {
-        guard !offered, availableMethods.contains(.publicKey) else {
+        let offer: NIOSSHUserAuthenticationOffer.Offer?
+        switch credential {
+        case let .key(k) where availableMethods.contains(.publicKey):
+            offer = .privateKey(.init(privateKey: k))
+        case let .password(p) where availableMethods.contains(.password):
+            offer = .password(.init(password: p))
+        default:
+            offer = nil
+        }
+        guard !offered, let offer else {
             exhausted = true
             nextChallengePromise.succeed(nil) // nothing else to offer: auth fails
             return
         }
         offered = true
-        nextChallengePromise.succeed(NIOSSHUserAuthenticationOffer(
-            username: user, serviceName: "", offer: .privateKey(.init(privateKey: key))))
+        nextChallengePromise.succeed(NIOSSHUserAuthenticationOffer(username: user, serviceName: "", offer: offer))
     }
 }
 
 /// NIOSSH reports a refused host key (and other connection errors) down the pipeline but leaves
 /// the connection open, so the channel the first exec is waiting for never opens or fails. Closing
-/// fails it at once and the caller reads the reason off `HostKeyCheck` / `KeyAuth`.
+/// fails it at once and the caller reads the reason off `HostKeyCheck` / `UserAuth`.
 final class CloseOnError: ChannelInboundHandler {
     typealias InboundIn = Any
 

@@ -3,8 +3,9 @@ import Foundation
 import NIOSSH
 import Security
 
-/// A machine running comux, reached over SSH. No password is ever stored: auth is this
-/// device's key, which the user adds to the host's `authorized_keys` once.
+/// A machine running comux, reached over SSH. Auth is this device's key, which the user adds to
+/// the host's `authorized_keys` once, or a password kept in the Keychain (`HostPassword`), never
+/// in this record.
 struct MuxHost: Codable, Equatable, Identifiable {
     var id = UUID()
     var name: String
@@ -16,8 +17,49 @@ struct MuxHost: Codable, Equatable, Identifiable {
     /// What runs on the host for each channel. The default goes through a login shell so a
     /// comux in `~/.local/bin` / `~/.cargo/bin` is found on a non-interactive exec channel.
     var command: String = MuxHost.defaultCommand
+    /// How to log in. Optional so hosts saved before passwords existed still decode (a missing
+    /// key fails the whole list otherwise); nil is the device key.
+    var auth: HostAuth?
+
+    var usesPassword: Bool { auth == .password }
 
     static let defaultCommand = "exec \"${SHELL:-/bin/sh}\" -lc 'exec comux proxy --stdio'"
+}
+
+enum HostAuth: String, Codable {
+    case key
+    case password
+}
+
+/// A host's password: in the Keychain under the host's id, this device only (not synced, not in
+/// backups), readable after the first unlock so a reconnect in the background still works.
+enum HostPassword {
+    private static let service = "com.marshall.copad.ios.password"
+
+    private static func query(_ host: UUID) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: service,
+         kSecAttrAccount as String: host.uuidString]
+    }
+
+    static func read(_ host: UUID) -> String? {
+        var q = query(host)
+        q[kSecReturnData as String] = true
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return nil }
+        return String(data: d, encoding: .utf8)
+    }
+
+    static func save(_ password: String, for host: UUID) throws {
+        delete(host)
+        var q = query(host)
+        q[kSecValueData as String] = Data(password.utf8)
+        q[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        let s = SecItemAdd(q as CFDictionary, nil)
+        guard s == errSecSuccess else { throw DeviceKey.KeyError.keychain(s) }
+    }
+
+    static func delete(_ host: UUID) { SecItemDelete(query(host) as CFDictionary) }
 }
 
 /// Saved hosts, in UserDefaults (no secrets in them).

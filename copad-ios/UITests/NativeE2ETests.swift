@@ -19,6 +19,7 @@ final class NativeE2ETests: XCTestCase {
             "-E2EUser", env["E2E_USER"] ?? "",
             "-E2EKeySeed", env["E2E_SEED"] ?? "",
             "-E2EKeyP256", env["E2E_P256"] ?? "",
+            "-E2EPassword", env["E2E_PASSWORD"] ?? "",
             // The enclave run meets the host key the way a user does: unknown, then trusted.
             "-E2EHostKey", enclave ? "" : env["E2E_HOSTKEY"] ?? "",
             "-E2ECommand", env["E2E_COMMAND"] ?? "",
@@ -301,6 +302,25 @@ final class NativeE2ETests: XCTestCase {
         app.keys["space"].tap()
         expect("가", "after Enter")
         snapshot("ko-after-enter")
+    }
+
+    /// The App Store review demo host (deploy/review-demo, `E2E_DEMO=1`): a password login, the
+    /// seeded layout, and typing reaching its shell.
+    func testReviewDemoPasswordLogin() throws {
+        guard ProcessInfo.processInfo.environment["E2E_DEMO"] == "1" else {
+            throw XCTSkip("run with E2E_DEMO=1")
+        }
+        XCTAssertTrue(app.buttons["tab-1"].waitForExistence(timeout: 30), "never went live")
+        let allow = springboard.buttons["Allow"]
+        if allow.waitForExistence(timeout: 5) { allow.tap() }
+        let active = app.staticTexts["activeSession"]
+        expectation(for: NSPredicate(format: "label == 'hello'"), evaluatedWith: active)
+        waitForExpectations(timeout: 10)
+        terminal.tap()
+        app.typeText("./hello.sh\n")
+        // The pane is narrow: the line wraps.
+        waitScreen("Hello from")
+        snapshot("demo")
     }
 
     private var springboard: XCUIApplication { XCUIApplication(bundleIdentifier: "com.apple.springboard") }

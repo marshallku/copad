@@ -173,9 +173,15 @@ final class MuxSession: ObservableObject, KeySink {
     }
 
     private func open(_ gen: Int) async throws {
-        let key = try DeviceKey.nioKey()
+        let credential: SSHCredential
+        if host.usesPassword {
+            guard let p = HostPassword.read(host.id) else { throw SSHError.closed("No password is saved for this host: edit it and enter one.") }
+            credential = .password(p)
+        } else {
+            credential = .key(try DeviceKey.nioKey())
+        }
         let conn = try await SSHConnection.connect(host: host.host, port: host.port, user: host.user,
-                                                   key: key, knownKey: host.hostKey)
+                                                   credential: credential, knownKey: host.hostKey)
         guard gen == generation else { conn.close(); return }
         ssh = conn
 

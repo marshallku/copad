@@ -1,0 +1,6 @@
+# The review demo: no pushes (no credentials are stored), nothing persisted (a restart is a reset).
+persist = false
+update_check = false
+usage = "off"
+[push]
+relay = "off"

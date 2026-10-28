@@ -1,0 +1,9 @@
+# Image builds (deploy/review-demo) need the Rust workspace only.
+target
+.git
+**/node_modules
+**/.build
+copad-ios
+copad-macos
+manual
+docs

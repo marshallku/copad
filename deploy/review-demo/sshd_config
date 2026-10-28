@@ -1,0 +1,26 @@
+# One password account, `review`, that can only run comux for the copad app.
+Port 22
+HostKey /keys/ssh_host_ed25519_key
+AllowUsers review
+PermitRootLogin no
+PasswordAuthentication yes
+PubkeyAuthentication no
+KbdInteractiveAuthentication no
+PermitEmptyPasswords no
+UsePAM no
+ForceCommand /usr/local/lib/review-demo/comux-only
+DisableForwarding yes
+PermitTTY no
+PermitUserRC no
+PermitUserEnvironment no
+AcceptEnv LANG
+# Unauthenticated floods: few at once, few per address.
+MaxStartups 4:50:16
+PerSourceMaxStartups 2
+LoginGraceTime 20
+MaxAuthTries 3
+# The app opens two channels per connection; comux-only caps connections in total.
+MaxSessions 4
+ClientAliveInterval 30
+ClientAliveCountMax 4
+LogLevel INFO

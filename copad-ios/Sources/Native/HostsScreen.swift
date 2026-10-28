@@ -34,6 +34,7 @@ struct HostsScreen: View {
                             Button("Edit") { editing = h }.tint(.blue)
                             Button("Delete", role: .destructive) {
                                 PushKeys.remove(host: h.id.uuidString)
+                                HostPassword.delete(h.id)
                                 save(hosts.filter { $0.id != h.id })
                             }
                         }
@@ -151,7 +152,10 @@ struct HostsScreen: View {
     private func applyE2EConfig() {
         let d = UserDefaults.standard
         guard let host = d.string(forKey: "E2EHost"), let user = d.string(forKey: "E2EUser") else { return }
-        if d.bool(forKey: "E2EKeyEnclave") {
+        let password = d.string(forKey: "E2EPassword").flatMap { $0.isEmpty ? nil : $0 }
+        if password != nil {
+            // Password login: no device key involved.
+        } else if d.bool(forKey: "E2EKeyEnclave") {
             // Fail loudly: falling back to a key left over from another run would let the e2e
             // pass without ever using the enclave.
             do { try DeviceKey.useNewSecureEnclaveKey() } catch { fatalError("e2e enclave key: \(error)") }
@@ -163,9 +167,13 @@ struct HostsScreen: View {
             return
         }
         var h = MuxHost(name: "e2e", host: host, port: d.integer(forKey: "E2EPort").nonZero ?? 22, user: user)
-        if let cmd = d.string(forKey: "E2ECommand") { h.command = cmd }
+        if let cmd = d.string(forKey: "E2ECommand"), !cmd.isEmpty { h.command = cmd }
         if let hk = d.string(forKey: "E2EHostKey"), !hk.isEmpty { h.hostKey = hk }
         if let old = hosts.first(where: { $0.name == "e2e" }) { h.id = old.id }
+        if let password {
+            h.auth = .password
+            try? HostPassword.save(password, for: h.id)
+        }
         save(hosts.filter { $0.name != "e2e" } + [h])
         if d.bool(forKey: "E2EAutoConnect") { open(h) }
     }
@@ -187,14 +195,24 @@ struct HostEditor: View {
     /// Typed as text: a number-bound field keeps the last valid value when cleared, so an empty
     /// field would save the old port.
     @State private var portText: String
+    /// A new password; empty keeps the saved one.
+    @State private var password = ""
+    @State private var passwordError = ""
+    private let hasPassword: Bool
 
     init(host: MuxHost, onSave: @escaping (MuxHost) -> Void) {
         _host = State(initialValue: host)
         _portText = State(initialValue: String(host.port))
+        hasPassword = HostPassword.read(host.id) != nil
         self.onSave = onSave
     }
 
     private var port: Int? { Int(portText).flatMap { (1...65535).contains($0) ? $0 : nil } }
+    private var usesPassword: Binding<Bool> {
+        Binding(get: { host.usesPassword }, set: { host.auth = $0 ? .password : nil })
+    }
+    /// A password host needs one saved or typed.
+    private var passwordReady: Bool { !host.usesPassword || hasPassword || !password.isEmpty }
 
     var body: some View {
         NavigationStack {
@@ -210,6 +228,26 @@ struct HostEditor: View {
                     TextField("22", text: $portText)
                         .keyboardType(.numberPad).multilineTextAlignment(.trailing)
                         .accessibilityIdentifier("hostPort")
+                }
+                Section {
+                    Picker("Log in with", selection: usesPassword) {
+                        Text("This device's key").tag(false)
+                        Text("Password").tag(true)
+                    }
+                    .accessibilityIdentifier("hostAuth")
+                    if host.usesPassword {
+                        SecureField(hasPassword ? "Saved — type to replace" : "Password", text: $password)
+                            // No password content type: iOS would offer to save it in Passwords
+                            // (synced), and this one stays on the device.
+                            .textContentType(.oneTimeCode)
+                            .accessibilityIdentifier("hostPassword")
+                    }
+                } footer: {
+                    if !passwordError.isEmpty {
+                        Text(passwordError).foregroundStyle(.red)
+                    } else if host.usesPassword {
+                        Text("Kept in this device's Keychain, never synced or backed up.")
+                    }
                 }
                 Section("advanced") {
                     TextField("Remote command", text: $host.command, axis: .vertical)
@@ -227,9 +265,19 @@ struct HostEditor: View {
                     Button("Save") {
                         guard let port else { return }
                         host.port = port
+                        do {
+                            if !host.usesPassword {
+                                HostPassword.delete(host.id)
+                            } else if !password.isEmpty {
+                                try HostPassword.save(password, for: host.id)
+                            }
+                        } catch {
+                            passwordError = "Could not save the password: \(error.localizedDescription)"
+                            return
+                        }
                         onSave(host)
                     }
-                        .disabled(host.name.isEmpty || host.host.isEmpty || host.user.isEmpty || port == nil)
+                        .disabled(host.name.isEmpty || host.host.isEmpty || host.user.isEmpty || port == nil || !passwordReady)
                         .accessibilityIdentifier("saveHost")
                 }
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }

@@ -1,0 +1,15 @@
+#!/bin/sh
+# sshd's ForceCommand for `review`: whatever the client asked for, run comux's stdio proxy —
+# after checking it asked for that (the app's default command does), so a stray `ssh demo ls`
+# gets an explanation instead of a silent proxy.
+case "${SSH_ORIGINAL_COMMAND:-}" in
+    *"comux proxy --stdio"*) ;;
+    *) echo "This demo account only serves the copad app (comux proxy --stdio)." >&2; exit 1 ;;
+esac
+# Two channels per app connection: room for a handful of reviewers' devices, no more.
+if [ "$(pgrep -u review -fc 'comux proxy --stdio' || true)" -gt 12 ]; then
+    echo "The demo host is busy; try again in a minute." >&2
+    exit 1
+fi
+. /usr/local/lib/review-demo/env.sh
+exec /usr/local/bin/comux proxy --stdio

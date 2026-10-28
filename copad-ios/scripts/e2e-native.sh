@@ -10,6 +10,8 @@
 #   KEEP=1 copad-ios/scripts/e2e-native.sh     # keep the work dir (sshd log, screenshots)
 #   E2E_KOREAN=1 copad-ios/scripts/e2e-native.sh  # type and delete on the REAL Korean keyboard,
 #                                                 # in a throwaway simulator whose only keyboard it is
+#   E2E_DEMO=1 copad-ios/scripts/e2e-native.sh    # log in with a password to the App Store review
+#                                                 # demo host (deploy/review-demo) in Docker
 set -euo pipefail
 cd "$(dirname "$0")/.."
 IOS="$PWD"
@@ -18,6 +20,43 @@ COMUX="$REPO/target/debug/comux"
 PORT="${E2E_SSH_PORT:-22422}"
 
 log() { printf '[e2e-native] %s\n' "$*" >&2; }
+
+if [[ "${E2E_DEMO:-}" == 1 ]]; then
+    # The review demo host, built from this tree and run on a loopback port with a random
+    # password: the app logs in the way App Review will, by password, and meets the seeded layout.
+    DPORT="${E2E_DEMO_PORT:-22424}"
+    NAME="copad-review-e2e-$$"
+    W="$(mktemp -d /tmp/cie.XXXX)"
+    cleanup() {
+        docker rm -f "$NAME" >/dev/null 2>&1 || true
+        [[ "${KEEP:-}" == 1 ]] && { log "kept $W"; return 0; }
+        rm -rf "$W"
+    }
+    trap cleanup EXIT
+    docker build -q -f "$REPO/deploy/review-demo/Dockerfile" -t copad-review-demo "$REPO" >/dev/null \
+        || { log "image build failed"; exit 2; }
+    PW="$(openssl rand -hex 16)"
+    docker run -d --name "$NAME" --hostname copad-demo -p "127.0.0.1:$DPORT:22" -e DEMO_PASSWORD="$PW" copad-review-demo >/dev/null
+    for _ in $(seq 1 50); do docker logs "$NAME" 2>&1 | grep -q "Server listening" && break; sleep 0.2; done
+    HOSTKEY="$(docker exec "$NAME" cut -d' ' -f1,2 /keys/ssh_host_ed25519_key.pub)"
+    xcodegen generate >/dev/null
+    log "running the UI test against the demo host"
+    set +e
+    TEST_RUNNER_E2E_HOST=127.0.0.1 TEST_RUNNER_E2E_PORT="$DPORT" TEST_RUNNER_E2E_USER=review \
+    TEST_RUNNER_E2E_PASSWORD="$PW" TEST_RUNNER_E2E_HOSTKEY="$HOSTKEY" TEST_RUNNER_E2E_DEMO=1 \
+    xcodebuild -project copad-ios.xcodeproj -scheme copad-ios -destination 'platform=iOS Simulator,name=iPhone 17' \
+        -derivedDataPath build -skipPackagePluginValidation -resultBundlePath "$W/e2e.xcresult" \
+        test -only-testing:copad-iosUITests/NativeE2ETests/testReviewDemoPasswordLogin >"$W/xcodebuild.log" 2>&1
+    rc=$?
+    set -e
+    grep -E "Test Case .*(passed|failed)|error:" "$W/xcodebuild.log" | head -10 >&2
+    # The demo really ran it, and logged the app in by password.
+    CAP="$(docker exec -u review "$NAME" sh -c '. /usr/local/lib/review-demo/env.sh; comux capture-pane --index 0 -S 50' 2>/dev/null || true)"
+    grep -q "Hello from comux on the copad demo host." <<<"$CAP" || { log "FAIL: hello.sh never ran in the demo pane"; rc=1; }
+    docker logs "$NAME" 2>&1 | grep -q "Accepted password for review" || { log "FAIL: sshd never accepted the password"; rc=1; }
+    [[ $rc == 0 ]] && log "PASS: password login to the review demo host" || log "FAIL (xcodebuild log: $W/xcodebuild.log)"
+    exit $rc
+fi
 
 (cd "$REPO" && cargo build -q -p copad-mux) || { log "comux build failed"; exit 2; }
 
