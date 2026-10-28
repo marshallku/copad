@@ -39,6 +39,13 @@ final class NativeE2ETests: XCTestCase {
         XCTAssertTrue(key.waitForExistence(timeout: 10))
         let line = key.label
         XCTAssertTrue(line.hasPrefix("ecdsa-sha2-nistp256 "), "not an enclave key: \(line)")
+        // Copying says so: the pasteboard itself gives no sign.
+        let copy = app.buttons["copyPublicKey"]
+        copy.tap()
+        XCTAssertTrue(copy.label.contains("Copied"), copy.label)
+        let back = expectation(for: NSPredicate(format: "label CONTAINS 'Copy public key'"),
+                               evaluatedWith: copy)
+        wait(for: [back], timeout: 4)
         let path = try XCTUnwrap(env["E2E_AUTHKEYS"])
         let h = try XCTUnwrap(FileHandle(forWritingAtPath: path))
         h.seekToEndOfFile()

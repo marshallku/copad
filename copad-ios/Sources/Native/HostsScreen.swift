@@ -8,6 +8,7 @@ struct HostsScreen: View {
     @State private var publicKey = ""
     @State private var keyError = ""
     @State private var confirmNewKey = false
+    @State private var copied = false
     @ObservedObject private var push = PushRegistry.shared
     var openWeb: () -> Void
 
@@ -40,7 +41,12 @@ struct HostsScreen: View {
                     Text(publicKey.isEmpty ? keyError : publicKey)
                         .font(.caption2.monospaced()).textSelection(.enabled)
                         .accessibilityIdentifier("devicePublicKey")
-                    Button("Copy public key") { UIPasteboard.general.string = publicKey }
+                    Button(action: copyKey) {
+                        Label(copied ? "Copied" : "Copy public key",
+                              systemImage: copied ? "checkmark" : "doc.on.doc")
+                    }
+                    .disabled(publicKey.isEmpty)
+                    .accessibilityIdentifier("copyPublicKey")
                     ForEach(push.status.sorted(by: { $0.key < $1.key }), id: \.key) { key, text in
                         let name = hosts.first { $0.id.uuidString == key }?.name
                         Label(name.map { "\($0): \(text)" } ?? text, systemImage: "bell.slash")
@@ -110,6 +116,16 @@ struct HostsScreen: View {
     }
 
     private func open(_ h: MuxHost) { session = MuxSession(host: h) }
+
+    /// The pasteboard gives no sign of its own, so the button says it worked for a moment.
+    private func copyKey() {
+        UIPasteboard.general.string = publicKey
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        withAnimation { copied = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            withAnimation { copied = false }
+        }
+    }
 
     private func save(_ list: [MuxHost]) {
         hosts = list
