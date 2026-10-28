@@ -15548,8 +15548,21 @@ mod key_help {
 
     #[test]
     fn the_prefix_hint_replaces_the_tab_chips_only_while_armed() {
+        // Wide enough that the host name on the right (a CI runner's is long)
+        // never truncates the hint.
+        let app_from = |toml: &str| {
+            let mut cfg = config::tests::config_from_str(toml);
+            cfg.persist = false;
+            App::new(200, 30, Vec::new(), Vec::new(), cfg).expect("app")
+        };
+        let bar = |app: &App| {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 200, 30));
+            app.render_to(&mut buf);
+            (0..200)
+                .map(|x| buf.cell(Position::new(x, 29)).unwrap().symbol().to_string())
+                .collect::<String>()
+        };
         let mut app = app_from("");
-        let bar = |app: &App| text(app)[29].clone();
         assert!(!bar(&app).contains("all keys"));
         app.set_prefix_armed(true);
         let armed = bar(&app);
