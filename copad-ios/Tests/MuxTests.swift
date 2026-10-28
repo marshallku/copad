@@ -184,6 +184,40 @@ final class InputProxyTests: XCTestCase {
         XCTAssertEqual(r.out, ["text:글", "key:Enter/"])
     }
 
+    /// The iPhone's Korean keyboard (no marked text): it replaces the last character in place.
+    func testTheKoreanKeyboardsInPlaceRewritesSendEachSyllableOnce() {
+        let p = InputProxy(), r = Recorder()
+        p.session = r
+        func type(_ c: String) { p.insertText(c); p.textViewDidChange(p) }
+        func rewriteLast(_ c: String) {
+            let end = p.endOfDocument
+            p.replace(p.textRange(from: p.position(from: end, offset: -1)!, to: end)!, withText: c)
+            p.textViewDidChange(p)
+        }
+        type("ㅎ"); rewriteLast("하"); rewriteLast("한")
+        XCTAssertEqual(r.out, [], "the syllable is still open")
+        type("ㄱ")
+        XCTAssertEqual(r.out, ["text:한"])
+        rewriteLast("그"); rewriteLast("글")
+        // 글 + ㅏ moves the final consonant: 그 + 라.
+        rewriteLast("그라")
+        XCTAssertEqual(r.out, ["text:한", "text:그"])
+        type(" ")
+        XCTAssertEqual(r.out, ["text:한", "text:그", "text:라 "])
+        type("ㅋ")
+        p.commitComposition()
+        XCTAssertEqual(r.out.last, "text:ㅋ", "a commit sends the held character")
+    }
+
+    func testArmingCtrlSendsTheHeldSyllableFirst() {
+        let p = InputProxy(), r = Recorder()
+        p.session = r
+        p.insertText("한"); p.textViewDidChange(p)
+        p.ctrlArmed = true
+        p.insertText("c"); p.textViewDidChange(p)
+        XCTAssertEqual(r.out, ["text:한", "key:[\"Char\": \"c\"]/CONTROL"])
+    }
+
     func testBackspaceOnAnEmptyFieldIsThePanes() {
         let p = InputProxy(), r = Recorder()
         p.session = r

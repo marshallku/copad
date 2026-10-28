@@ -19,7 +19,11 @@ final class InputProxy: UITextView, UITextViewDelegate {
     weak var session: KeySink?
     weak var terminal: TerminalView?
     /// Sticky Ctrl from the key bar: applies to the next typed character.
-    var ctrlArmed = false { didSet { bar.setCtrl(ctrlArmed) } }
+    /// Arming it sends a held syllable first, so Ctrl lands on the character typed next.
+    var ctrlArmed = false {
+        willSet { if newValue && !ctrlArmed { commitComposition() } }
+        didSet { bar.setCtrl(ctrlArmed) }
+    }
     private lazy var bar = KeyBar(proxy: self)
 
     init() {
@@ -53,7 +57,7 @@ final class InputProxy: UITextView, UITextViewDelegate {
             terminal?.marked = markedText
             return
         }
-        flush()
+        flush(holdingSyllable: true)
     }
 
     func textView(_ tv: UITextView, shouldChangeTextIn range: NSRange, replacementText t: String) -> Bool {
@@ -83,16 +87,32 @@ final class InputProxy: UITextView, UITextViewDelegate {
     /// Commit the IME's in-progress text (if any) and send everything committed.
     func commitComposition() {
         if markedTextRange != nil { unmarkText() }
-        flush()
+        flush(holdingSyllable: false)
     }
 
-    /// Send the committed text and empty the view.
-    private func flush() {
-        terminal?.marked = ""
-        let t = text ?? ""
+    /// Send the committed text and empty the view. The iPhone's Korean keyboard composes
+    /// WITHOUT marked text: it rewrites the last character in place (ㅎ → 하 → 한, and 한 + ㅏ →
+    /// 하나), so a trailing Hangul character is kept here, drawn like marked text, until the
+    /// next character, a key or a commit shows it is final. Sending it at once sent every stage.
+    private func flush(holdingSyllable: Bool) {
+        var t = text ?? ""
+        var held = ""
+        if holdingSyllable, let last = t.last, Self.isHangul(last) {
+            held = String(last)
+            t.removeLast()
+        }
+        terminal?.marked = held
         guard !t.isEmpty else { return }
-        text = ""
+        text = held
         emit(t)
+    }
+
+    /// Hangul syllables and jamo: what the Korean keyboard may still rewrite.
+    static func isHangul(_ c: Character) -> Bool {
+        c.unicodeScalars.contains { s in
+            (0xAC00...0xD7A3).contains(s.value) || (0x1100...0x11FF).contains(s.value)
+                || (0x3130...0x318F).contains(s.value)
+        }
     }
 
     private func emit(_ t: String) {
