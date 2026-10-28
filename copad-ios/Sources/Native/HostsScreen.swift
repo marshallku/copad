@@ -175,6 +175,17 @@ struct HostEditor: View {
     @State var host: MuxHost
     var onSave: (MuxHost) -> Void
     @Environment(\.dismiss) private var dismiss
+    /// Typed as text: a number-bound field keeps the last valid value when cleared, so an empty
+    /// field would save the old port.
+    @State private var portText: String
+
+    init(host: MuxHost, onSave: @escaping (MuxHost) -> Void) {
+        _host = State(initialValue: host)
+        _portText = State(initialValue: String(host.port))
+        self.onSave = onSave
+    }
+
+    private var port: Int? { Int(portText).flatMap { (1...65535).contains($0) ? $0 : nil } }
 
     var body: some View {
         NavigationStack {
@@ -186,7 +197,11 @@ struct HostEditor: View {
                 TextField("User", text: $host.user)
                     .textInputAutocapitalization(.never).autocorrectionDisabled()
                     .accessibilityIdentifier("hostUser")
-                Stepper("Port \(host.port)", value: $host.port, in: 1...65535)
+                LabeledContent("Port") {
+                    TextField("22", text: $portText)
+                        .keyboardType(.numberPad).multilineTextAlignment(.trailing)
+                        .accessibilityIdentifier("hostPort")
+                }
                 Section("advanced") {
                     TextField("Remote command", text: $host.command, axis: .vertical)
                         .font(.caption.monospaced())
@@ -200,8 +215,12 @@ struct HostEditor: View {
             .navigationTitle(host.name.isEmpty ? "New host" : host.name)
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") { onSave(host) }
-                        .disabled(host.name.isEmpty || host.host.isEmpty || host.user.isEmpty)
+                    Button("Save") {
+                        guard let port else { return }
+                        host.port = port
+                        onSave(host)
+                    }
+                        .disabled(host.name.isEmpty || host.host.isEmpty || host.user.isEmpty || port == nil)
                         .accessibilityIdentifier("saveHost")
                 }
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }

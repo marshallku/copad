@@ -27,6 +27,7 @@ enum SSHError: LocalizedError {
 
 /// An SSH client connection; each `exec` opens one channel (one `comux proxy --stdio`).
 final class SSHConnection {
+    static let setupTimeout = TimeAmount.seconds(20)
     private let group: MultiThreadedEventLoopGroup
     private let channel: Channel
     private let hostCheck: HostKeyCheck
@@ -78,6 +79,14 @@ final class SSHConnection {
               onClose: @escaping (String) -> Void) async throws -> ExecChannel {
         let promise = channel.eventLoop.makePromise(of: Channel.self)
         let handler = ExecHandler(command: command, onData: onData, onClose: onClose)
+        // Key exchange and auth happen before the first channel opens and have no deadline of
+        // their own: a host that accepts the TCP connection and then stalls would leave the
+        // app on "Connecting…" for good.
+        let deadline = channel.eventLoop.scheduleTask(in: Self.setupTimeout) { [channel] in
+            promise.fail(SSHError.closed("The host accepted the connection but SSH did not finish setting up within \(Self.setupTimeout.nanoseconds / 1_000_000_000) s."))
+            channel.close(promise: nil)
+        }
+        promise.futureResult.whenComplete { _ in deadline.cancel() }
         channel.eventLoop.execute {
             do {
                 let ssh = try self.channel.pipeline.syncOperations.handler(type: NIOSSHHandler.self)
@@ -101,6 +110,7 @@ final class SSHConnection {
             // land here; name them instead of a bare "channel closed".
             if let f = hostCheck.failure { throw f }
             if auth.exhausted { throw SSHError.authFailed }
+            if let e = error as? SSHError { throw e }
             throw SSHError.execFailed("\(error)")
         }
     }
