@@ -88,23 +88,45 @@ final class InputProxy: UITextView, UITextViewDelegate {
     func commitComposition() {
         if markedTextRange != nil { unmarkText() }
         flush(holdingSyllable: false)
+        clear()
     }
 
-    /// Send the committed text and empty the view. The iPhone's Korean keyboard composes
-    /// WITHOUT marked text: it rewrites the last character in place (ㅎ → 하 → 한, and 한 + ㅏ →
-    /// 하나), so a trailing Hangul character is kept here, drawn like marked text, until the
-    /// next character, a key or a commit shows it is final. Sending it at once sent every stage.
+    /// What of this view's text the pane already has. The view keeps the line typed since the
+    /// last commit rather than emptying as it sends: the Korean keyboard remembers what it
+    /// composed, and after the held character is deleted it rewrites the one before (한 → 하)
+    /// whether or not the view still has it, so emptying the view left a ghost syllable on
+    /// screen and the sent one in the pane.
+    private var sent = ""
+
+    /// Send what changed. The iPhone's Korean keyboard composes WITHOUT marked text: it rewrites
+    /// the last character in place (ㅎ → 하 → 한, and 한 + ㅏ → 하나), so a trailing Hangul
+    /// character is held, drawn like marked text, until the next character, a key or a commit
+    /// shows it is final. A rewrite of something already sent — a delete decomposing the
+    /// previous syllable — erases it in the pane with backspaces first.
     private func flush(holdingSyllable: Bool) {
-        var t = text ?? ""
+        var line = text ?? ""
         var held = ""
-        if holdingSyllable, let last = t.last, Self.isHangul(last) {
+        // A plain delete leaves what remains sent: nothing new to hold.
+        if holdingSyllable, !sent.hasPrefix(line), let last = line.last, Self.isHangul(last) {
             held = String(last)
-            t.removeLast()
+            line.removeLast()
         }
         terminal?.marked = held
-        guard !t.isEmpty else { return }
-        text = held
-        emit(t)
+        let common = zip(sent, line).prefix { $0 == $1 }.count
+        for _ in common..<sent.count { session?.sendKey(KeyEvent(code: .backspace)) }
+        let added = String(line.dropFirst(common))
+        sent = line
+        if !added.isEmpty { emit(added) }
+    }
+
+    /// Start a new line: the view empties and the keyboard is told, so it drops what it composed.
+    private func clear() {
+        sent = ""
+        terminal?.marked = ""
+        guard !(text ?? "").isEmpty else { return }
+        inputDelegate?.textWillChange(self)
+        text = ""
+        inputDelegate?.textDidChange(self)
     }
 
     /// Hangul syllables and jamo: what the Korean keyboard may still rewrite.
@@ -124,6 +146,8 @@ final class InputProxy: UITextView, UITextViewDelegate {
         session?.sendKey(.ctrl(Character(first.lowercased())))
         let rest = String(t.dropFirst())
         if !rest.isEmpty { session?.sendText(rest) }
+        // A control character is not text a later delete may take back.
+        clear()
     }
 
     /// Send a key from the bar or a hardware chord, after settling any composition.

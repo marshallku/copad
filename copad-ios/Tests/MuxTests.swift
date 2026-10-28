@@ -216,6 +216,49 @@ final class InputProxyTests: XCTestCase {
         XCTAssertEqual(r.out.last, "text:ㅋ", "a commit sends the held character")
     }
 
+    /// Deleting past the held syllable: the keyboard remembers what it composed and rewrites the
+    /// syllable before (한 → 하) in the view, which must erase it in the pane.
+    func testDeletingIntoASentSyllableErasesItInThePane() {
+        let p = InputProxy(), r = Recorder()
+        p.session = r
+        func rewriteLast(_ c: String) {
+            let end = p.endOfDocument
+            p.replace(p.textRange(from: p.position(from: end, offset: -1)!, to: end)!, withText: c)
+            p.textViewDidChange(p)
+        }
+        p.insertText("한"); p.textViewDidChange(p)
+        p.insertText("ㄱ"); p.textViewDidChange(p)
+        rewriteLast("그"); rewriteLast("글")
+        XCTAssertEqual(r.out, ["text:한"])
+        rewriteLast("그"); rewriteLast("ㄱ")
+        p.deleteBackward(); p.textViewDidChange(p)
+        XCTAssertEqual(r.out, ["text:한"], "only the held syllable went")
+        rewriteLast("하")
+        XCTAssertEqual(r.out, ["text:한", "key:Backspace/"])
+        rewriteLast("ㅎ")
+        p.deleteBackward(); p.textViewDidChange(p)
+        p.deleteBackward()
+        XCTAssertEqual(r.out, ["text:한", "key:Backspace/", "key:Backspace/"])
+    }
+
+    func testDeletingASpaceLeavesTheSyllableBeforeIt() {
+        let p = InputProxy(), r = Recorder()
+        p.session = r
+        p.insertText("한"); p.textViewDidChange(p)
+        p.insertText(" "); p.textViewDidChange(p)
+        p.deleteBackward(); p.textViewDidChange(p)
+        XCTAssertEqual(r.out, ["text:한 ", "key:Backspace/"])
+    }
+
+    func testDeletingSentLatinTextErasesItInThePane() {
+        let p = InputProxy(), r = Recorder()
+        p.session = r
+        p.insertText("ab"); p.textViewDidChange(p)
+        p.deleteBackward(); p.textViewDidChange(p)
+        p.insertText("c"); p.textViewDidChange(p)
+        XCTAssertEqual(r.out, ["text:ab", "key:Backspace/", "text:c"])
+    }
+
     func testArmingCtrlSendsTheHeldSyllableFirst() {
         let p = InputProxy(), r = Recorder()
         p.session = r

@@ -231,6 +231,78 @@ final class NativeE2ETests: XCTestCase {
         }
     }
 
+    /// The REAL iOS Korean keyboard, key by key (`E2E_KOREAN=1`: the script makes a simulator
+    /// whose only keyboard is Korean). It composes without marked text and remembers what it
+    /// composed, so deleting past the held syllable rewrites the one before — which used to
+    /// leave a ghost syllable drawn and the sent one in the pane.
+    func testKoreanKeyboardTypesAndDeletes() throws {
+        guard ProcessInfo.processInfo.environment["E2E_KOREAN"] == "1" else {
+            throw XCTSkip("run with E2E_KOREAN=1")
+        }
+        if enclave { try authorizeEnclaveKey() }
+        XCTAssertTrue(app.buttons["tab-1"].waitForExistence(timeout: 30), "never went live")
+        let allow = springboard.buttons["Allow"]
+        if allow.waitForExistence(timeout: 5) { allow.tap() }
+        XCTAssertTrue(terminal.waitForExistence(timeout: 5))
+        terminal.tap()
+        // A new device's first keyboard shows the slide-to-type tip over the keys.
+        let tip = app.buttons["Continue"]
+        if tip.waitForExistence(timeout: 3) { tip.tap() }
+        XCTAssertTrue(app.keys["ㅎ"].waitForExistence(timeout: 5), "no Korean keyboard")
+        let del = app.keys["delete"]
+        // What the pane has after the prompt (the held syllable is drawn, not in the grid).
+        func line() -> String {
+            // " % ": zsh marks a partial line with a "%" in column 0.
+            let row = screen().split(separator: "\n").last { $0.contains(" % ") } ?? ""
+            return row.components(separatedBy: "% ").last?.trimmingCharacters(in: .whitespaces) ?? "?"
+        }
+        func expect(_ want: String, _ what: String, file: StaticString = #filePath, line l: UInt = #line) {
+            let end = Date().addingTimeInterval(3)
+            while Date() < end, line() != want { Thread.sleep(forTimeInterval: 0.2) }
+            if line() != want { snapshot("ko-fail") }
+            XCTAssertEqual(line(), want, "\(what):\n\(screen())", file: file, line: l)
+        }
+        func type(_ keys: String) { for k in keys { app.keys[String(k)].tap() } }
+        func delete(_ n: Int) { for _ in 0..<n { del.tap() } }
+
+        // 1. 한 goes once the next syllable starts; 글 is held.
+        type("ㅎㅏㄴㄱㅡㄹ")
+        expect("한", "typing 한글")
+        snapshot("ko-typed")
+        // 2. 글 → 그 → ㄱ → gone: only the held syllable changes.
+        delete(3)
+        Thread.sleep(forTimeInterval: 0.5)
+        expect("한", "deleting the held 글")
+        // 3. The next delete decomposes 한 → 하: it leaves the pane.
+        delete(1)
+        expect("", "deleting into 한")
+        snapshot("ko-decomposed")
+        // 4. 하 → ㅎ → gone, then a delete is the pane's again: nothing is left behind.
+        delete(2)
+        type("ㄷㅏ")
+        delete(2)
+        Thread.sleep(forTimeInterval: 0.5)
+        expect("", "nothing left behind")
+        snapshot("ko-cleared")
+        // 5. Past a space and back.
+        type("ㅎㅏㄴ")
+        app.keys["space"].tap()
+        type("ㄱㅡㄹ")
+        expect("한", "typing 한 글")
+        delete(4)
+        expect("한", "back to the space")
+        delete(3)
+        expect("", "and through 한")
+        // 6. After Enter the line starts fresh: the keyboard does not resurrect the last syllable.
+        type("ㅎㅏㄴ")
+        app.keyboards.buttons["Return"].tap()
+        delete(1)
+        type("ㄱㅏ")
+        app.keys["space"].tap()
+        expect("가", "after Enter")
+        snapshot("ko-after-enter")
+    }
+
     private var springboard: XCUIApplication { XCUIApplication(bundleIdentifier: "com.apple.springboard") }
 
     private func snapshot(_ name: String) {

@@ -8,6 +8,8 @@
 #
 #   copad-ios/scripts/e2e-native.sh            # build comux + app, run the UI test
 #   KEEP=1 copad-ios/scripts/e2e-native.sh     # keep the work dir (sshd log, screenshots)
+#   E2E_KOREAN=1 copad-ios/scripts/e2e-native.sh  # type and delete on the REAL Korean keyboard,
+#                                                 # in a throwaway simulator whose only keyboard it is
 set -euo pipefail
 cd "$(dirname "$0")/.."
 IOS="$PWD"
@@ -22,7 +24,9 @@ log() { printf '[e2e-native] %s\n' "$*" >&2; }
 # Short: comux's socket path must fit SUN_LEN.
 W="$(mktemp -d /tmp/cie.XXXX)"
 SSHD_PID=""
+SIM=""
 cleanup() {
+    [[ -n "$SIM" ]] && xcrun simctl delete "$SIM" >/dev/null 2>&1 || true
     [[ -n "$SSHD_PID" ]] && kill "$SSHD_PID" 2>/dev/null || true
     COPAD_MUX_SOCK="$W/s" "$COMUX" kill-server >/dev/null 2>&1 || true
     [[ "${KEEP:-}" == 1 ]] && { log "kept $W"; return 0; }
@@ -137,15 +141,31 @@ REMOTE="env COPAD_MUX_SOCK=$W/s COPAD_MUX_STATE=$W/state.json COPAD_MUX_NOTIFY=0
 # --- the app ------------------------------------------------------------------------------
 xcodegen generate >/dev/null
 DEST='platform=iOS Simulator,name=iPhone 17'
+TEST=NativeE2ETests/testNativeSessionEndToEnd
+if [[ "${E2E_KOREAN:-}" == 1 ]]; then
+    # Its own device: the keyboard list is system-wide, and a shared simulator may have other
+    # apps (and their tests) coming to the front.
+    SIM="$(xcrun simctl create copad-e2e-korean "iPhone 17")"
+    xcrun simctl bootstatus "$SIM" -b >/dev/null
+    # A new device fills in its default keyboards a while after booting, over anything set
+    # before: wait for them, then replace them.
+    for _ in $(seq 1 120); do
+        xcrun simctl spawn "$SIM" defaults read -g AppleKeyboards 2>/dev/null | grep -q en_US && break
+        sleep 0.5
+    done
+    xcrun simctl spawn "$SIM" defaults write -g AppleKeyboards -array "ko_KR@sw=Korean;hw=Automatic"
+    DEST="platform=iOS Simulator,id=$SIM"
+    TEST=NativeE2ETests/testKoreanKeyboardTypesAndDeletes
+fi
 log "running the UI test"
 set +e
 TEST_RUNNER_E2E_HOST=127.0.0.1 TEST_RUNNER_E2E_PORT="$PORT" TEST_RUNNER_E2E_USER="$USER" \
 TEST_RUNNER_E2E_SEED="$SEED" TEST_RUNNER_E2E_P256="$P256" TEST_RUNNER_E2E_ENCLAVE="$ENCLAVE" TEST_RUNNER_E2E_AUTHKEYS="$W/authorized_keys" TEST_RUNNER_E2E_HOSTKEY="$(cut -d' ' -f1,2 "$W/hostkey.pub")" \
-TEST_RUNNER_E2E_COMMAND="$REMOTE" TEST_RUNNER_E2E_PUSH_DIR="$([[ $PUSH == 1 ]] && echo "$W")" \
+TEST_RUNNER_E2E_COMMAND="$REMOTE" TEST_RUNNER_E2E_KOREAN="${E2E_KOREAN:-}" TEST_RUNNER_E2E_PUSH_DIR="$([[ $PUSH == 1 ]] && echo "$W")" \
 xcodebuild -project copad-ios.xcodeproj -scheme copad-ios -destination "$DEST" \
     -derivedDataPath build -skipPackagePluginValidation \
     -resultBundlePath "$W/e2e.xcresult" \
-    test -only-testing:copad-iosUITests/NativeE2ETests >"$W/xcodebuild.log" 2>&1
+    test -only-testing:"copad-iosUITests/$TEST" >"$W/xcodebuild.log" 2>&1
 rc=$?
 set -e
 grep -E "Test Case .*(passed|failed)|error:|XCTAssert" "$W/xcodebuild.log" | head -20 >&2
@@ -153,9 +173,15 @@ grep -E "Test Case .*(passed|failed)|error:|XCTAssert" "$W/xcodebuild.log" | hea
 # --- what the server saw ------------------------------------------------------------------
 # The bytes really reached the PTY (not just the app's own mirror), in the pane they were typed.
 CAP="$(mux capture-pane "$TOK" -S 200 2>/dev/null || true)"
+if [[ "${E2E_KOREAN:-}" == 1 ]]; then
+    # Only the line typed after Enter: 한 ran once as a command, and nothing else did.
+    [[ "$(grep -c "command not found: 한" <<<"$CAP")" == 1 ]] || { log "FAIL: the pane did not run 한 exactly once"; rc=1; }
+    grep -q "% 가" <<<"$CAP" || { log "FAIL: the line after Enter never reached the pane"; rc=1; }
+else
 grep -q "NATIVE-42" <<<"$CAP" || { log "FAIL: NATIVE-42 never reached the pane"; rc=1; }
 grep -q "한글-확인" <<<"$CAP" || { log "FAIL: the Hangul line never reached the pane"; rc=1; }
 grep -q "BACK-2" <<<"$CAP" || { log "FAIL: input after resume never reached the pane"; rc=1; }
+fi
 # The registration carries the app's key, and the push went out sealed.
 if [[ $PUSH == 1 ]]; then
     grep -q '"key"' "$W/comux-push.json" 2>/dev/null || { log "FAIL: the app registered without a push key"; rc=1; }
