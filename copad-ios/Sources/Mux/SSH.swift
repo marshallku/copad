@@ -58,6 +58,7 @@ final class SSHConnection {
                         role: .client(.init(userAuthDelegate: auth, serverAuthDelegate: hostCheck)),
                         allocator: ch.allocator, inboundChildChannelInitializer: nil)
                     try ch.pipeline.syncOperations.addHandler(ssh)
+                    try ch.pipeline.syncOperations.addHandler(CloseOnError())
                 }
             }
         do {
@@ -235,6 +236,17 @@ final class KeyAuth: NIOSSHClientUserAuthenticationDelegate {
         offered = true
         nextChallengePromise.succeed(NIOSSHUserAuthenticationOffer(
             username: user, serviceName: "", offer: .privateKey(.init(privateKey: key))))
+    }
+}
+
+/// NIOSSH reports a refused host key (and other connection errors) down the pipeline but leaves
+/// the connection open, so the channel the first exec is waiting for never opens or fails. Closing
+/// fails it at once and the caller reads the reason off `HostKeyCheck` / `KeyAuth`.
+final class CloseOnError: ChannelInboundHandler {
+    typealias InboundIn = Any
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        context.close(promise: nil)
     }
 }
 

@@ -155,7 +155,7 @@ struct HostsScreen: View {
         }
         var h = MuxHost(name: "e2e", host: host, port: d.integer(forKey: "E2EPort").nonZero ?? 22, user: user)
         if let cmd = d.string(forKey: "E2ECommand") { h.command = cmd }
-        if let hk = d.string(forKey: "E2EHostKey") { h.hostKey = hk }
+        if let hk = d.string(forKey: "E2EHostKey"), !hk.isEmpty { h.hostKey = hk }
         if let old = hosts.first(where: { $0.name == "e2e" }) { h.id = old.id }
         save(hosts.filter { $0.name != "e2e" } + [h])
         if d.bool(forKey: "E2EAutoConnect") { open(h) }

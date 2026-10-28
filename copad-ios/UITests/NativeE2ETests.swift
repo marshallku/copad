@@ -19,7 +19,8 @@ final class NativeE2ETests: XCTestCase {
             "-E2EUser", env["E2E_USER"] ?? "",
             "-E2EKeySeed", env["E2E_SEED"] ?? "",
             "-E2EKeyP256", env["E2E_P256"] ?? "",
-            "-E2EHostKey", env["E2E_HOSTKEY"] ?? "",
+            // The enclave run meets the host key the way a user does: unknown, then trusted.
+            "-E2EHostKey", enclave ? "" : env["E2E_HOSTKEY"] ?? "",
             "-E2ECommand", env["E2E_COMMAND"] ?? "",
             "-E2EAutoConnect", enclave ? "NO" : "YES",
             "-E2EKeyEnclave", enclave ? "YES" : "NO",
@@ -52,6 +53,11 @@ final class NativeE2ETests: XCTestCase {
         h.write(Data((line + "\n").utf8))
         try h.close()
         app.buttons["host-e2e"].tap()
+        // First contact asks at once — a refused key used to leave the connection open until
+        // the 20 s setup deadline.
+        let trust = app.buttons["trustHostKey"].firstMatch
+        XCTAssertTrue(trust.waitForExistence(timeout: 8), "the host key prompt took too long")
+        trust.tap()
     }
 
     private var terminal: XCUIElement { app.otherElements["terminal"] }
