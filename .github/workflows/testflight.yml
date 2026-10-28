@@ -4,7 +4,11 @@ name: TestFlight
 # copad-ios/scripts/testflight.sh uploads from a Mac without spending Actions minutes; this is
 # the other way, started by `copad-ios/scripts/testflight.sh --ci` or by hand:
 #
-#   gh workflow run testflight.yml -f ref=master [-f version=0.2.0]
+#   gh workflow run testflight.yml -f ref=master [-f version=0.2.0] [-f mode=check|build]
+#
+# mode=check stops after importing the certificate and the key (a minute, nothing built), so a
+# re-entered secret can be tried without spending a build number; mode=build also signs an ipa
+# without uploading it.
 #
 # Secrets:
 #   IOS_DISTRIBUTION_CERTIFICATE_BASE64    the "Apple Distribution" certificate and key, .p12, base64
@@ -24,6 +28,12 @@ on:
         description: "Marketing version X.Y.Z (empty = project.yml's)"
         required: false
         default: ""
+      mode:
+        description: "upload, build (signed ipa, no upload) or check (certificate and key only)"
+        required: false
+        type: choice
+        options: [upload, build, check]
+        default: upload
 
 permissions:
   contents: read
@@ -45,6 +55,7 @@ jobs:
           xcode-version: latest-stable
 
       - name: Install xcodegen and fastlane
+        if: inputs.mode != 'check'
         run: |
           brew install xcodegen
           command -v fastlane >/dev/null || brew install fastlane
@@ -94,15 +105,16 @@ jobs:
 
       # Inputs go through env, never into the script text.
       - name: Build and upload
+        if: inputs.mode != 'check'
         env:
           VERSION: ${{ inputs.version }}
+          MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
-          if [[ -n "$VERSION" ]]; then
-            copad-ios/scripts/testflight.sh --version "$VERSION"
-          else
-            copad-ios/scripts/testflight.sh
-          fi
+          args=()
+          [[ "$MODE" == build ]] && args+=(--build-only)
+          [[ -n "$VERSION" ]] && args+=(--version "$VERSION")
+          copad-ios/scripts/testflight.sh ${args[@]+"${args[@]}"}
 
       - name: Keep the fastlane log
         if: failure()
