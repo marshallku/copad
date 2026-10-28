@@ -206,6 +206,7 @@ final class KeyBar: UIInputView {
             b.titleLabel?.font = .monospacedSystemFont(ofSize: 15, weight: .medium)
             b.contentEdgeInsets = UIEdgeInsets(top: 6, left: 10, bottom: 6, right: 10)
             b.backgroundColor = UIColor.secondarySystemBackground
+            b.tintColor = .label
             b.layer.cornerRadius = 6
             b.accessibilityIdentifier = id
             b.addAction(UIAction { _ in action() }, for: .touchUpInside)
@@ -214,11 +215,28 @@ final class KeyBar: UIInputView {
         }
         scroll.addSubview(stack)
         addSubview(scroll)
+        // Pinned outside the scrolling row so it is always one tap away. Tapping the terminal
+        // brings the keyboard back.
+        let hide = UIButton(type: .system)
+        hide.setImage(UIImage(systemName: "keyboard.chevron.compact.down"), for: .normal)
+        hide.tintColor = .secondaryLabel
+        hide.accessibilityIdentifier = "key-hide"
+        hide.accessibilityLabel = "Hide keyboard"
+        hide.addAction(UIAction { [weak self] _ in
+            self?.proxy?.commitComposition()
+            self?.proxy?.resignFirstResponder()
+        }, for: .touchUpInside)
+        addSubview(hide)
+        hide.translatesAutoresizingMaskIntoConstraints = false
         scroll.translatesAutoresizingMaskIntoConstraints = false
         stack.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
+            hide.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+            hide.centerYAnchor.constraint(equalTo: centerYAnchor),
+            hide.widthAnchor.constraint(equalToConstant: 44),
+            hide.heightAnchor.constraint(equalToConstant: 44),
             scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
-            scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: hide.leadingAnchor),
             scroll.topAnchor.constraint(equalTo: topAnchor),
             scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
             stack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 6),
@@ -234,7 +252,7 @@ final class KeyBar: UIInputView {
     private func ctrlButtonRef(_ b: UIButton) { ctrlRef = b }
 
     func setCtrl(_ on: Bool) {
-        ctrlRef?.backgroundColor = on ? UIColor.systemBlue.withAlphaComponent(0.5) : UIColor.secondarySystemBackground
+        ctrlRef?.backgroundColor = on ? UIColor.tertiaryLabel : UIColor.secondarySystemBackground
     }
 
     private func send(_ k: KeyEvent) { proxy?.key(k) }

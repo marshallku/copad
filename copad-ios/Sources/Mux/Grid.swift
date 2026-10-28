@@ -149,8 +149,10 @@ struct Grid {
             for x in 0..<cols {
                 let i = y * cols + x
                 if prevWide {
-                    cells[i].sym = " "
-                    cells[i].skip = true
+                    // The spacer is painted with its glyph: a wide glyph on a coloured
+                    // background (a highlighted prompt line) would otherwise show a gap.
+                    cells[i] = Cell(sym: " ", fg: cells[i - 1].fg, bg: cells[i - 1].bg,
+                                    mods: cells[i - 1].mods, skip: true)
                     prevWide = false
                 } else {
                     cells[i].skip = false

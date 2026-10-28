@@ -103,6 +103,12 @@ final class NativeE2ETests: XCTestCase {
         Thread.sleep(forTimeInterval: 1)
         snapshot("nerd-glyphs")
 
+        // 4b. The key bar folds the keyboard; tapping the terminal brings it back.
+        app.buttons["key-hide"].tap()
+        XCTAssertTrue(app.keyboards.element.waitForNonExistence(timeout: 5), "keyboard still up")
+        terminal.tap()
+        XCTAssertTrue(app.keyboards.element.waitForExistence(timeout: 5), "keyboard did not come back")
+
         // 5. The key bar: ^b c opens a tab, which the native tab strip shows.
         app.buttons["key-newtab"].tap()
         XCTAssertTrue(app.buttons["tab-2"].waitForExistence(timeout: 10), "^b c did not add a tab")

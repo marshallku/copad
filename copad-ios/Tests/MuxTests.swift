@@ -101,6 +101,13 @@ final class GridTests: XCTestCase {
         XCTAssertEqual(g.text(row: 0), "a글 ")
     }
 
+    func testAWideGlyphsSpacerTakesItsBackground() {
+        var g = Grid()
+        g.apply(frame(##"{"t":"frame","epoch":1,"cols":4,"rows":1,"full":true,"cells":[{"x":0,"y":0,"sym":"한","fg":"Reset","bg":"#313244","mods":""},{"x":2,"y":0,"sym":"a","fg":"Reset","bg":"#313244","mods":""}],"cursor":null}"##))
+        XCTAssertTrue(g[1, 0].skip)
+        XCTAssertEqual(g[1, 0].bg, g[0, 0].bg, "no gap in the highlighted run")
+    }
+
     func testCellWidths() {
         XCTAssertEqual(CellWidth.of("a"), 1)
         XCTAssertEqual(CellWidth.of("한"), 2)
