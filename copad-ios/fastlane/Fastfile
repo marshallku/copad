@@ -125,4 +125,36 @@ platform :ios do
       UI.message("#{b.pre_release_version&.version} (#{b.version}) => #{b.processing_state}  uploaded=#{b.uploaded_date}")
     end
   end
+
+  # The App Store listing from fastlane/metadata (text only until the screenshots exist). Never
+  # uploads a binary or submits. What must stay out of the repository comes from the
+  # environment: the review demo host and its password (deploy/review-demo) and the review
+  # contact.
+  #   DEMO_HOST=… DEMO_PASSWORD=… REVIEW_FIRST_NAME=… REVIEW_LAST_NAME=… REVIEW_EMAIL=… \
+  #   REVIEW_PHONE=… fastlane metadata
+  lane :metadata do |options|
+    asc_key
+    dir = File.expand_path("metadata", __dir__)
+    notes = File.read(File.join(dir, "review_information/notes.txt"))
+      .sub("(filled in at submission)", ENV.fetch("DEMO_HOST"))
+    deliver(
+      app_identifier: APP_ID,
+      app_version: options[:version] || "1.0",
+      metadata_path: dir,
+      skip_binary_upload: true,
+      skip_screenshots: true,
+      submit_for_review: false,
+      run_precheck_before_submit: false,
+      force: true,
+      app_review_information: {
+        first_name: ENV.fetch("REVIEW_FIRST_NAME"),
+        last_name: ENV.fetch("REVIEW_LAST_NAME"),
+        email_address: ENV.fetch("REVIEW_EMAIL"),
+        phone_number: ENV.fetch("REVIEW_PHONE"),
+        demo_user: "review",
+        demo_password: ENV.fetch("DEMO_PASSWORD"),
+        notes: notes,
+      },
+    )
+  end
 end

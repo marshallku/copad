@@ -1,0 +1,22 @@
+copad is the phone and tablet client for comux, the terminal multiplexer built for running AI coding agents. Connect to your own computer over SSH and everything comux shows — sessions, tabs, split panes, agents and their notifications — appears as a native app, not a squeezed-down terminal screen.
+
+SEE YOUR AGENTS
+• Every agent across your sessions, with what it is doing and how long it has been at it
+• Agents waiting for you stand out, one tap away
+• Notifications when an agent finishes or needs an answer, end-to-end encrypted: only your device can read them
+
+A REAL TERMINAL
+• Full-colour terminal with Nerd Font glyphs and scrollback
+• Korean and other input methods compose properly before anything is sent
+• A key bar for Esc, Ctrl, Tab, arrows and the comux prefix, and hardware keyboard shortcuts
+
+COMUX, NATIVELY
+• Switch sessions, open tabs, rename, jump between panes and agents from native menus
+• The session picker, directory browser and prompts are native sheets
+
+PRIVATE BY DESIGN
+• Your terminal connects straight to your machine over SSH; only encrypted notifications pass through our push relay
+• Log in with a key kept in your device's Secure Enclave, or a password kept in its Keychain
+• No account, no analytics, no ads
+
+copad needs a computer running comux (free and open source: https://copad.marshallku.dev) that your phone can reach, for example over Tailscale.

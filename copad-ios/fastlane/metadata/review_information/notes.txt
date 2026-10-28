@@ -1,0 +1,13 @@
+copad is a client for comux, a terminal multiplexer that runs on the user's own computer; the app connects to it over SSH. We run a demo host for review:
+
+  Host:      (filled in at submission)
+  Port:      22
+  User:      review
+  Password:  in the Sign-in information section
+
+To try it:
+1. Tap + (top right), enter any name, the host, port, user "review", choose "Log in with: Password" and enter the password. Save.
+2. Tap the host. Confirm "Trust" for the host key on first connect.
+3. The comux session "hello" opens: a shell on the left, a demo agent on the right. Type ./hello.sh and Return. Use the sidebar button (top left) to see sessions and agents, the bell for notifications, and the key bar above the keyboard for Esc/Ctrl/Tab/arrows.
+
+The demo account can only run comux; it has no internet access and is reset nightly. Push notifications need the user's own comux host and are not enabled on the demo host. No account or sign-in to our service exists; the app stores hosts on the device only.
