@@ -79,8 +79,17 @@ jobs:
           rm -f "$RUNNER_TEMP/certificate.p12"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain" >/dev/null
           security list-keychains -d user -s "$keychain" login.keychain-db
-          security find-identity -v -p codesigning "$keychain" | grep -q "Apple Distribution" \
-            || { echo "::error::the certificate isn't an Apple Distribution identity"; exit 1; }
+          # On failure, say what was imported: a .p12 exported from "Certificates" instead of "My
+          # Certificates" has no private key, and an identity whose chain is untrusted shows here
+          # with the reason. Names and public fingerprints only.
+          if ! security find-identity -v -p codesigning "$keychain" | grep -q "Apple Distribution"; then
+            echo "::error::no valid Apple Distribution identity in the .p12"
+            echo "identities (without -v, with the reason one is invalid):"
+            security find-identity -p codesigning "$keychain" || true
+            echo "certificates:"
+            security find-certificate -a "$keychain" | grep '"labl"' || true
+            exit 1
+          fi
 
       - name: Install the App Store Connect key
         env:
