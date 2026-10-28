@@ -35,3 +35,4 @@
 ---
 
 - [Troubleshooting](./troubleshooting.md)
+- [Privacy Policy (iOS app)](./privacy.md)

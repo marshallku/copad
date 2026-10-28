@@ -1,3 +1,5 @@
+// The web-bridge shell is a Debug-only mode (CopadApp): store builds do not carry it.
+#if DEBUG
 import Foundation
 import Security
 
@@ -56,3 +58,4 @@ enum TokenStore {
         return status == errSecSuccess || status == errSecItemNotFound
     }
 }
+#endif

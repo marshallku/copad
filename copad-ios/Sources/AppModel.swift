@@ -1,3 +1,5 @@
+// The web-bridge shell is a Debug-only mode (CopadApp): store builds do not carry it.
+#if DEBUG
 import Foundation
 import UserNotifications
 
@@ -112,3 +114,4 @@ final class AppModel: ObservableObject {
         await refreshNotifStatus()
     }
 }
+#endif

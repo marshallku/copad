@@ -4,13 +4,15 @@ import SwiftUI
 struct HostsScreen: View {
     @State private var hosts = HostStore.load()
     @State private var editing: MuxHost?
+    @State private var about = false
     @State private var session: MuxSession?
     @State private var publicKey = ""
     @State private var keyError = ""
     @State private var confirmNewKey = false
     @State private var copied = false
     @ObservedObject private var push = PushRegistry.shared
-    var openWeb: () -> Void
+    /// The web-bridge shell; nil in store builds.
+    var openWeb: (() -> Void)?
 
     var body: some View {
         NavigationStack {
@@ -72,9 +74,16 @@ struct HostsScreen: View {
                         .accessibilityIdentifier("addHost")
                 }
                 ToolbarItem(placement: .topBarLeading) {
-                    Button("Web") { openWeb() }
+                    Button { about = true } label: { Image(systemName: "info.circle") }
+                        .accessibilityIdentifier("about")
+                }
+                if let openWeb {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("Web") { openWeb() }
+                    }
                 }
             }
+            .sheet(isPresented: $about) { AboutScreen() }
             .sheet(item: $editing) { h in
                 HostEditor(host: h) { saved in
                     var list = hosts.filter { $0.id != saved.id }
