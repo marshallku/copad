@@ -226,7 +226,10 @@ impl Link {
         };
         let pfinish = finish.clone();
         let last_rx = Arc::new(AtomicU64::new(0));
-        link.send(&SubMsg::Subscribe { v: PROTO })?;
+        // A transport that already exited (ssh refusing the key) breaks this write. Not an
+        // error here: the reader still drains what it printed and closes with the reason,
+        // which says more than "Broken pipe".
+        let _ = link.send(&SubMsg::Subscribe { v: PROTO });
 
         // Reader: every line is one PubMsg. The FIRST line must be a welcome — anything else
         // is a remote shell talking before comux (a login banner, `command not found`).
