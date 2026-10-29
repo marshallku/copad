@@ -572,6 +572,10 @@ impl CopadWindow {
         let middle = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
         middle.set_vexpand(true);
         tab_manager.notebook.set_hexpand(true);
+        tab_manager.notebook.set_vexpand(true);
+        // The chrome lives INSIDE the visible notebook page, around that tab's content, so the
+        // order is tab column → comux sidebar → terminal → notifications like on macOS: the
+        // tabs are the window's, the comux chrome belongs to what the visible tab shows.
         // The sidebar and the rest share a split: its handle resizes the sidebar (#181).
         let split = gtk4::Paned::new(gtk4::Orientation::Horizontal);
         split.set_hexpand(true);
@@ -584,19 +588,18 @@ impl CopadWindow {
         rest.set_hexpand(true);
         let center = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         center.set_hexpand(true);
-        tab_manager.notebook.set_vexpand(true);
         // The notification panel floats over the terminal area when the window is too narrow
-        // to dock it (decisions #179).
+        // to dock it (decisions #179). Its child is the visible tab's content.
         let term_over = gtk4::Overlay::new();
-        term_over.set_child(Some(&tab_manager.notebook));
         term_over.set_vexpand(true);
         center.append(&term_over);
         center.append(&comux.status);
         rest.append(&center);
         rest.append(&comux.notif_dock);
         split.set_end_child(Some(&rest));
-        middle.append(&split);
+        middle.append(&tab_manager.notebook);
         comux.set_paned(&split);
+        host_comux_chrome(&tab_manager, &split, &term_over);
         if config.statusbar.position == "top" {
             layout.append(&statusbar.container);
             layout.append(&middle);
@@ -1185,6 +1188,49 @@ impl Default for TriggerSubscriptions {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Move the comux chrome (`chrome`, with `term_over` holding the tab content) into whichever
+/// notebook page is visible, putting the previous page's content back into its own page.
+fn host_comux_chrome(mgr: &Rc<TabManager>, chrome: &gtk4::Paned, term_over: &gtk4::Overlay) {
+    let hosted: Rc<RefCell<Option<(gtk4::Box, gtk4::Widget)>>> = Rc::new(RefCell::new(None));
+    let host = {
+        let (chrome, term_over, mgr) = (chrome.clone(), term_over.clone(), Rc::downgrade(mgr));
+        move |page: &gtk4::Widget| {
+            let Some(page) = page.downcast_ref::<gtk4::Box>() else {
+                return;
+            };
+            if hosted.borrow().as_ref().is_some_and(|(p, _)| p == page) {
+                return;
+            }
+            // The old page may already be out of the notebook (its tab closed); it is still
+            // ours, so the chrome is detached from it either way.
+            if let Some((old, content)) = hosted.borrow_mut().take() {
+                term_over.set_child(None::<&gtk4::Widget>);
+                old.remove(&chrome);
+                old.append(&content);
+            }
+            let Some(content) = page.first_child() else {
+                return;
+            };
+            page.remove(&content);
+            term_over.set_child(Some(&content));
+            page.append(&chrome);
+            *hosted.borrow_mut() = Some((page.clone(), content));
+            // Reparenting drops the keyboard focus the tab switch just gave the panel.
+            let mgr = mgr.clone();
+            glib::idle_add_local_once(move || {
+                if let Some(m) = mgr.upgrade() {
+                    m.refocus();
+                }
+            });
+        }
+    };
+    let nb = &mgr.notebook;
+    if let Some(page) = nb.current_page().and_then(|n| nb.nth_page(Some(n))) {
+        host(&page);
+    }
+    nb.connect_switch_page(move |_, page, _| host(page));
 }
 
 #[cfg(test)]

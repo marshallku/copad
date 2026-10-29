@@ -203,12 +203,11 @@ impl TabManager {
         let panel = self.create_panel(&config, window, cwd, initial_input);
 
         let tab_content = TabContent::new(panel.clone());
-        let tab_label = self.make_tab_label(&panel, &tab_content.container);
+        let tab_label = self.make_tab_label(&panel, &tab_content.page);
 
         self.notebook
-            .append_page(&tab_content.container, Some(&tab_label));
-        self.notebook
-            .set_tab_reorderable(&tab_content.container, true);
+            .append_page(&tab_content.page, Some(&tab_label));
+        self.notebook.set_tab_reorderable(&tab_content.page, true);
         self.tabs.borrow_mut().push(tab_content);
 
         let page_num = self.notebook.n_pages() - 1;
@@ -239,12 +238,11 @@ impl TabManager {
         let panel_id = panel.id().to_string();
 
         let tab_content = TabContent::new(panel.clone());
-        let tab_label = self.make_tab_label(&panel, &tab_content.container);
+        let tab_label = self.make_tab_label(&panel, &tab_content.page);
 
         self.notebook
-            .append_page(&tab_content.container, Some(&tab_label));
-        self.notebook
-            .set_tab_reorderable(&tab_content.container, true);
+            .append_page(&tab_content.page, Some(&tab_label));
+        self.notebook.set_tab_reorderable(&tab_content.page, true);
         self.tabs.borrow_mut().push(tab_content);
 
         let page_num = self.notebook.n_pages() - 1;
@@ -276,12 +274,11 @@ impl TabManager {
         let panel_id = panel.id().to_string();
 
         let tab_content = TabContent::new(panel.clone());
-        let tab_label = self.make_tab_label(&panel, &tab_content.container);
+        let tab_label = self.make_tab_label(&panel, &tab_content.page);
 
         self.notebook
-            .append_page(&tab_content.container, Some(&tab_label));
-        self.notebook
-            .set_tab_reorderable(&tab_content.container, true);
+            .append_page(&tab_content.page, Some(&tab_label));
+        self.notebook.set_tab_reorderable(&tab_content.page, true);
         self.tabs.borrow_mut().push(tab_content);
 
         let page_num = self.notebook.n_pages() - 1;
@@ -339,12 +336,11 @@ impl TabManager {
         let panel_id = panel.id().to_string();
 
         let tab_content = TabContent::new(panel.clone());
-        let tab_label = self.make_tab_label(&panel, &tab_content.container);
+        let tab_label = self.make_tab_label(&panel, &tab_content.page);
 
         self.notebook
-            .append_page(&tab_content.container, Some(&tab_label));
-        self.notebook
-            .set_tab_reorderable(&tab_content.container, true);
+            .append_page(&tab_content.page, Some(&tab_label));
+        self.notebook.set_tab_reorderable(&tab_content.page, true);
         self.tabs.borrow_mut().push(tab_content);
 
         let page_num = self.notebook.n_pages() - 1;
@@ -615,6 +611,15 @@ impl TabManager {
         true
     }
 
+    /// Give the keyboard back to the focused panel (after its widgets were reparented).
+    pub fn refocus(&self) {
+        // Not `if let` on the borrow: grabbing focus re-enters `track_focus`, which writes it.
+        let panel = self.focused.borrow().clone();
+        if let Some(panel) = panel {
+            panel.grab_focus();
+        }
+    }
+
     pub fn active_panel(&self) -> Option<Rc<PanelVariant>> {
         self.focused.borrow().clone()
     }
@@ -645,7 +650,7 @@ impl TabManager {
         // Show/hide label + close button on each tab
         let tabs = self.tabs.borrow();
         for tab in tabs.iter() {
-            if let Some(tab_label) = self.notebook.tab_label(&tab.container)
+            if let Some(tab_label) = self.notebook.tab_label(&tab.page)
                 && let Some(hbox) = tab_label.downcast_ref::<gtk4::Box>()
             {
                 // Children: [Icon, Label, CloseButton]
@@ -733,7 +738,7 @@ impl TabManager {
             tab.root.borrow().collect_panels(&mut panels);
             if panels.iter().any(|p| p.id() == panel_id) {
                 // Update the notebook tab label text
-                if let Some(tab_label) = self.notebook.tab_label(&tab.container)
+                if let Some(tab_label) = self.notebook.tab_label(&tab.page)
                     && let Some(icon) = tab_label.first_child()
                     && let Some(label_widget) = icon.next_sibling()
                     && let Some(label) = label_widget.downcast_ref::<gtk4::Label>()

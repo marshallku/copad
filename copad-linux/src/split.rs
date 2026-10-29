@@ -178,6 +178,10 @@ fn set_paned_position_deferred(paned: &gtk4::Paned, orientation: gtk4::Orientati
 
 /// A tab's content: stable container + split tree
 pub struct TabContent {
+    /// The notebook page. It holds `container` directly, or — while this is the visible tab —
+    /// the window's comux chrome with `container` inside it, so the chrome sits inside the
+    /// tab column rather than outside it (see `window.rs`).
+    pub page: gtk4::Box,
     pub container: gtk4::Box,
     pub root: Rc<RefCell<SplitNode>>,
 }
@@ -188,9 +192,17 @@ impl TabContent {
         container.set_hexpand(true);
         container.set_vexpand(true);
         container.append(panel.widget());
+        let page = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        page.set_hexpand(true);
+        page.set_vexpand(true);
+        page.append(&container);
 
         let root = Rc::new(RefCell::new(SplitNode::Leaf { panel }));
-        Self { container, root }
+        Self {
+            page,
+            container,
+            root,
+        }
     }
 
     /// Split the focused panel. Returns the sibling panels for focus fallback.
