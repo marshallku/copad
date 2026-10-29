@@ -502,7 +502,7 @@ fn build_prompt(card: &gtk4::Box, spec: &Value, h: &Handlers, (ww, _): (i32, i32
     card.append(&vb);
     let a = h.answer.clone();
     keys_controller(card, move |k| {
-        if k == "Esc" {
+        if k == "Esc" || k == "C-c" {
             a(None, None);
             return true;
         }

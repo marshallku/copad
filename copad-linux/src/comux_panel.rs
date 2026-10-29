@@ -344,15 +344,6 @@ enum Act {
     Cmd(Value),
 }
 
-fn heading(text: &str) -> gtk4::Label {
-    let l = gtk4::Label::new(Some(text));
-    l.set_xalign(0.0);
-    l.add_css_class("dim-label");
-    l.set_margin_start(10);
-    l.set_margin_top(6);
-    l
-}
-
 /// A label showing `markup`, left-aligned and ellipsized.
 fn markup(m: &str) -> gtk4::Label {
     let l = gtk4::Label::new(None);
@@ -465,6 +456,8 @@ pub struct ComuxPanel {
     /// The overlay shown over the window (decisions #180), and the window overlay it sits in.
     overlay_ui: RefCell<Option<crate::comux_overlay::OverlayUi>>,
     overlay_root: RefCell<Option<gtk4::Overlay>>,
+    /// copad's own prompt over the window (Open Remote comux), drawn like comux's overlays.
+    local_overlay: RefCell<Option<crate::comux_overlay::OverlayUi>>,
     /// `Ctrl-b e` keyboard mode and row previews on the sidebar (decisions #181).
     nav: Rc<crate::comux_nav::SidebarNav>,
     spaces: gtk4::ListBox,
@@ -628,6 +621,7 @@ impl ComuxPanel {
             status,
             overlay_ui: RefCell::new(None),
             overlay_root: RefCell::new(None),
+            local_overlay: RefCell::new(None),
             nav,
             spaces,
             spaces_scroll,
@@ -2030,6 +2024,61 @@ impl ComuxPanel {
         }
     }
 
+    /// A copad prompt in the same in-window card as comux's: `done` gets the entered text,
+    /// Esc / Ctrl-C / a click outside cancel. A second prompt replaces the first.
+    fn local_prompt(
+        self: &Rc<Self>,
+        window: &gtk4::ApplicationWindow,
+        title: &str,
+        initial: &str,
+        done: impl Fn(String) + 'static,
+    ) {
+        self.close_local_overlay();
+        let Some(root) = self.overlay_root.borrow().clone() else {
+            return;
+        };
+        let w = Rc::downgrade(self);
+        let answer: Rc<dyn Fn(Option<String>, Option<String>)> = Rc::new(move |_, text| {
+            if let Some(p) = w.upgrade() {
+                // Deferred removal: this runs inside one of the overlay's own handlers.
+                if let Some(ui) = p.local_overlay.borrow_mut().take() {
+                    let (root, layer) = (root.clone(), ui.layer.clone());
+                    gtk4::glib::idle_add_local_once(move || root.remove_overlay(&layer));
+                    ui.close();
+                }
+            }
+            if let Some(t) = text {
+                done(t);
+            }
+        });
+        let ui = crate::comux_overlay::OverlayUi::new(
+            0,
+            &json!({"kind": "prompt", "title": title, "initial": initial}),
+            &Value::Null,
+            &self.style.borrow(),
+            crate::comux_overlay::Handlers {
+                answer,
+                act: Rc::new(|_| {}),
+                preview: Rc::new(|_| {}),
+            },
+            window,
+        );
+        if let Some(root) = self.overlay_root.borrow().as_ref() {
+            root.add_overlay(&ui.layer);
+        }
+        ui.focus();
+        *self.local_overlay.borrow_mut() = Some(ui);
+    }
+
+    fn close_local_overlay(&self) {
+        if let Some(ui) = self.local_overlay.borrow_mut().take() {
+            if let Some(root) = self.overlay_root.borrow().as_ref() {
+                root.remove_overlay(&ui.layer);
+            }
+            ui.close();
+        }
+    }
+
     /// Send the user's answer and close the overlay (once: a close after an answer is not a
     /// second, cancelling answer).
     fn answer(&self, id: u64, choice: Option<String>, text: Option<String>) {
@@ -2138,44 +2187,36 @@ pub fn open_remote(
 
 /// Ask for the destination, then [`open_remote`].
 pub fn prompt_open_remote(mgr: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
-    let win = gtk4::Window::builder()
-        .transient_for(window)
-        .modal(true)
-        .title("Open Remote comux")
-        .default_width(360)
-        .build();
-    let vb = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-    vb.set_margin_top(12);
-    vb.set_margin_bottom(12);
-    vb.set_margin_start(12);
-    vb.set_margin_end(12);
-    vb.append(&heading(
-        "An ~/.ssh/config host or user@host (comux must be installed there)",
-    ));
-    let entry = gtk4::Entry::new();
-    entry.set_placeholder_text(Some("user@host"));
-    vb.append(&entry);
-    win.set_child(Some(&vb));
-    let (m, w2, win2) = (mgr.clone(), window.clone(), win.downgrade());
-    entry.connect_activate(move |e| {
-        let dest = e.text().trim().to_string();
-        if let Some(win) = win2.upgrade() {
-            win.close();
+    ask_remote(mgr, window, "", None);
+}
+
+/// The destination prompt; a refused or failed destination comes back to it with the reason in
+/// the title and the text kept, so it can be corrected in place.
+fn ask_remote(
+    mgr: &Rc<TabManager>,
+    window: &gtk4::ApplicationWindow,
+    initial: &str,
+    error: Option<&str>,
+) {
+    let Some(panel) = PANEL.with(|g| g.borrow().clone()) else {
+        log::warn!("comux.open_remote: no comux panel in this window");
+        return;
+    };
+    let title = match error {
+        Some(e) => format!("Open remote comux — {e}"),
+        None => "Open remote comux — an ~/.ssh/config host or user@host".to_string(),
+    };
+    let (m, w) = (mgr.clone(), window.clone());
+    panel.local_prompt(window, &title, initial, move |dest| {
+        let dest = dest.trim().to_string();
+        if dest.is_empty() {
+            return;
         }
-        if !dest.is_empty()
-            && let Err(err) = open_remote(&m, &w2, &dest, "comux")
-        {
+        if let Err(err) = open_remote(&m, &w, &dest, "comux") {
             log::warn!("comux.open_remote: {err}");
-            gtk4::AlertDialog::builder()
-                .modal(true)
-                .message("Could not open remote comux")
-                .detail(err)
-                .build()
-                .show(Some(&w2));
+            ask_remote(&m, &w, &dest, Some(&err));
         }
     });
-    win.present();
-    entry.grab_focus();
 }
 
 #[cfg(test)]
