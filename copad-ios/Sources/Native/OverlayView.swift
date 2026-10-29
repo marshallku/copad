@@ -68,6 +68,14 @@ struct OverlayContext {
     var preview: L0PreviewState?
     /// A phone held upright: the panel docks to the bottom and previews on long-press.
     var compact = false
+
+    /// The live tab a tab-overview row (`t:<session>/<tab>`) names.
+    func tab(for row: L0PickerRow) -> L0Tab? {
+        guard row.id.hasPrefix("t:") else { return nil }
+        let parts = row.id.dropFirst(2).split(separator: "/", maxSplits: 1).map(String.init)
+        guard parts.count == 2 else { return nil }
+        return sessions.first { $0.id == parts[0] }?.tabs.first { $0.id == parts[1] }
+    }
 }
 
 /// The host's side of an overlay.
@@ -291,6 +299,11 @@ private struct PickerOverlay: View {
     }
 
     private func statuses(_ r: L0PickerRow) -> Set<String> {
+        // A tab: every agent in any of its panes, not just the focused one the preview shows.
+        if let t = context.tab(for: r) {
+            let tokens = Set(t.panes.map(\.token))
+            return Set(context.agents.filter { tokens.contains($0.token) }.map(\.status))
+        }
         if let s = r.session, !s.isEmpty {
             return Set(context.agents.filter { $0.space_id == s }.map(\.status))
         }
@@ -535,6 +548,8 @@ private struct PickerCard: View {
             session(s)
         } else if row.id.hasPrefix("a:"), let a = context.agents.first(where: { $0.token == row.pane }) {
             agent(a)
+        } else if let t = context.tab(for: row) {
+            tab(t)
         } else {
             plain
         }
@@ -574,6 +589,33 @@ private struct PickerCard: View {
             }
             Text(a.detail.map { "\(place) — \($0)" } ?? place)
                 .foregroundStyle(look.dim).lineLimit(1).truncationMode(.tail).padding(.leading, 14)
+        }
+    }
+
+    /// A tab as its chip reads (`2 api`), with each pane's program and, for an agent, its
+    /// status as it is now.
+    private func tab(_ t: L0Tab) -> some View {
+        let agents = t.panes.compactMap { p in context.agents.first { $0.token == p.token } }
+        let glyph = t.bell ? ("!", look.red) : !agents.isEmpty ? ("●", look.yellow) : ("▪", t.active ? look.mauve : look.dim)
+        let panes = t.panes.map { p -> String in
+            let label = p.label.isEmpty ? "shell" : p.label
+            guard let a = context.agents.first(where: { $0.token == p.token }) else { return label }
+            return "\(label) \(a.status)"
+        }.joined(separator: " · ")
+        return VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(glyph.0).foregroundStyle(glyph.1)
+                Text("\(t.index + 1) \(t.title)").font(look.strong)
+                    .foregroundStyle(t.active ? look.mauve : look.text).lineLimit(1)
+                Spacer(minLength: 4)
+                HStack(spacing: 2) {
+                    ForEach(Array(agents.enumerated()), id: \.offset) { _, a in
+                        Text(look.status(a.status).glyph).foregroundStyle(look.status(a.status).color)
+                    }
+                }
+                if t.active { Text("here").foregroundStyle(look.dim) }
+            }
+            Text(panes).foregroundStyle(look.dim).lineLimit(1).truncationMode(.tail).padding(.leading, 14)
         }
     }
 

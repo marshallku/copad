@@ -470,6 +470,8 @@ enum PopupTarget {
     Session(WorkspaceId),
     /// Jump to this agent's pane (its session + tab + focus).
     Agent(TerminalId),
+    /// Select this tab of the attached session (`Ctrl-b f`, the tab overview).
+    Tab(WorkspaceId, TabId),
 }
 
 /// One rendered row of the `Ctrl-f` switcher (post-filter).
@@ -481,11 +483,38 @@ struct PopupRow {
     text: String,
 }
 
-/// Which list the `Ctrl-f` switcher is showing (Left/Right switches).
+/// Which list the `Ctrl-f` switcher is showing (Left/Right switches). The sidebar's keyboard
+/// focus reuses the first two; `Tabs` is the switcher's own.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PopupTab {
     Sessions,
     Agents,
+    /// The attached session's tabs, Alt-Tab style (`Ctrl-b f` opens on it).
+    Tabs,
+}
+
+impl PopupTab {
+    /// The switcher's lists in Left/Right order — also the order a host's picker shows.
+    const ALL: [PopupTab; 3] = [PopupTab::Sessions, PopupTab::Agents, PopupTab::Tabs];
+
+    /// The list's name, as the TUI's chips and a host's picker tabs show it.
+    fn name(self) -> &'static str {
+        match self {
+            PopupTab::Sessions => "sessions",
+            PopupTab::Agents => "agents",
+            PopupTab::Tabs => "tabs",
+        }
+    }
+
+    fn index(self) -> usize {
+        Self::ALL.iter().position(|t| *t == self).unwrap_or(0)
+    }
+
+    /// The list `delta` steps along, clamped at the ends like the old two-list Left/Right.
+    fn step(self, delta: i32) -> PopupTab {
+        let i = (self.index() as i32 + delta).clamp(0, Self::ALL.len() as i32 - 1);
+        Self::ALL[i as usize]
+    }
 }
 
 /// Which panes a `broadcast` goes to.
@@ -982,8 +1011,13 @@ pub struct App {
     /// whenever the attached session differs from the last one it saw, so EVERY path that
     /// moves the view counts — not just the ones that happen to call `switch_session`.
     session_activity: HashMap<WorkspaceId, u64>,
-    /// Monotonic tick source for `session_activity`.
+    /// Per-tab last-activated tick on the same clock: the tab overview's Alt-Tab preselection
+    /// (real recency — the nav history's back stack reorders on back/forward).
+    tab_activity: HashMap<TabId, u64>,
+    /// Monotonic tick source for `session_activity` and `tab_activity`.
     activity_clock: u64,
+    /// The tab `note_arrival` last saw active, so a tab is bumped once per arrival.
+    activity_tab: Option<TabId>,
     /// The session `track_nav` last saw attached, so it bumps `session_activity` once per
     /// arrival instead of on every input.
     activity_ws: Option<WorkspaceId>,
@@ -1242,6 +1276,8 @@ impl App {
             branches: HashMap::new(),
             next_session,
             session_activity: HashMap::new(),
+            tab_activity: HashMap::new(),
+            activity_tab: None,
             activity_clock: 0,
             activity_ws: None,
             nav: navhist::NavHistory::default(),
@@ -2395,6 +2431,12 @@ impl App {
     fn track_nav(&mut self) {
         let live: HashSet<WorkspaceId> = self.session_ids().into_iter().collect();
         self.session_activity.retain(|w, _| live.contains(w));
+        let tabs: HashSet<TabId> = live
+            .iter()
+            .filter_map(|w| self.state.workspace(w))
+            .flat_map(|w| w.tabs.iter().map(|t| t.id.clone()))
+            .collect();
+        self.tab_activity.retain(|t, _| tabs.contains(t));
         for m in self.marks.iter_mut() {
             if m.as_ref().is_some_and(|t| !self.panes.contains_key(t)) {
                 *m = None;
@@ -2552,8 +2594,16 @@ impl App {
             .is_some_and(|until| std::time::Instant::now() < until)
     }
 
-    /// Bump the attached session's recency, once per arrival.
+    /// Bump the attached session's recency, once per arrival — and the active tab's, once per
+    /// arrival there.
     fn note_arrival(&mut self) {
+        if let Some(tab) = self.active_tab_id()
+            && self.activity_tab.as_ref() != Some(&tab)
+        {
+            self.activity_clock += 1;
+            self.tab_activity.insert(tab.clone(), self.activity_clock);
+            self.activity_tab = Some(tab);
+        }
         if self.activity_ws.as_ref() == Some(&self.ws) {
             return;
         }
@@ -5566,8 +5616,8 @@ impl App {
                 KeyCode::Up => self.popup_move(-1),
                 KeyCode::Char('n') if ctrl => self.popup_move(1),
                 KeyCode::Char('p') if ctrl => self.popup_move(-1),
-                KeyCode::Left => self.popup_tab(PopupTab::Sessions),
-                KeyCode::Right => self.popup_tab(PopupTab::Agents),
+                KeyCode::Left => self.popup_step(-1),
+                KeyCode::Right => self.popup_step(1),
                 KeyCode::Enter => self.popup_select(),
                 // Ctrl-r / F2: rename the selected session inline.
                 KeyCode::Char('r') if ctrl => self.popup_rename(),
@@ -5758,6 +5808,7 @@ impl App {
             ResizeDown => self.resize_focused(Dir::Down, true),
             ResizeUp => self.resize_focused(Dir::Down, false),
             Popup => self.open_popup(),
+            TabPicker => self.open_popup_on(PopupTab::Tabs),
             ResumePicker => self.open_resume(),
             Redraw => return KeyAction::Redraw,
             FocusSidebar => self.open_sidebar_focus(),
@@ -6817,10 +6868,16 @@ impl App {
     /// Open the `Ctrl-f` fuzzy switcher on the Sessions tab with the PREVIOUS session
     /// selected, so `Ctrl-f Enter` toggles between two sessions like Alt-Tab.
     fn open_popup(&mut self) {
+        self.open_popup_on(PopupTab::Sessions);
+    }
+
+    /// Open the switcher on `tab`'s list, on that list's default row. `Ctrl-b f` opens it on
+    /// the attached session's tabs with the previously used tab selected.
+    fn open_popup_on(&mut self, tab: PopupTab) {
         self.popup = Some(PopupState {
-            tab: PopupTab::Sessions,
+            tab,
             filter: String::new(),
-            sel: self.popup_default_sel(PopupTab::Sessions, ""),
+            sel: self.popup_default_sel(tab, ""),
             pinned: None,
         });
         self.popup_pin();
@@ -6831,7 +6888,13 @@ impl App {
     /// a positional guess (row 1) lands on the current or an unrelated session under any
     /// order but `recent`. A filter means the user is searching: the best match, row 0.
     fn popup_default_sel(&self, tab: PopupTab, filter: &str) -> usize {
-        if tab != PopupTab::Sessions || !filter.is_empty() {
+        if !filter.is_empty() {
+            return 0;
+        }
+        if tab == PopupTab::Tabs {
+            return self.default_tab_row();
+        }
+        if tab != PopupTab::Sessions {
             return 0;
         }
         let Some(prev) = self.mru_sessions().into_iter().find(|w| *w != self.ws) else {
@@ -6841,6 +6904,65 @@ impl App {
             .iter()
             .position(|r| matches!(&r.target, PopupTarget::Session(w) if *w == prev))
             .unwrap_or(0)
+    }
+
+    /// Tabs: the most recently used OTHER tab of this session (Alt-Tab), else the one after
+    /// the active tab, so Enter always moves somewhere when there is anywhere to go.
+    fn default_tab_row(&self) -> usize {
+        let ids = self.tab_ids();
+        let Some(active) = self.active_tab_id() else {
+            return 0;
+        };
+        let at = ids.iter().position(|t| *t == active).unwrap_or(0);
+        ids.iter()
+            .enumerate()
+            .filter(|(_, t)| **t != active)
+            .filter_map(|(i, t)| self.tab_activity.get(t).map(|tick| (*tick, i)))
+            .max()
+            .map(|(_, i)| i)
+            .unwrap_or(if ids.len() > 1 {
+                (at + 1) % ids.len()
+            } else {
+                0
+            })
+    }
+
+    /// One Tabs row of the attached session: `n title` and what runs in its panes
+    /// (`claude working · zsh`), plus the agents' statuses for the `!`/`@`/`#` operators.
+    fn tab_row_parts(
+        &self,
+        index: usize,
+        tab: &crate::model::Tab,
+    ) -> (String, String, Vec<&'static str>) {
+        let title = match tab.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            Some(name) => clip_chip(name),
+            None => self
+                .tab_focus_label(&tab.id)
+                .unwrap_or_else(|| tab_display_title(None, index)),
+        };
+        let mut statuses = Vec::new();
+        let panes: Vec<String> = tab
+            .layout
+            .terminals()
+            .into_iter()
+            .map(|tid| {
+                let label = self.labels.get(tid).map(|l| l.text.trim()).unwrap_or("");
+                let label = label.strip_prefix('-').unwrap_or(label);
+                let label = if label.is_empty() { "shell" } else { label };
+                match self.agent_statuses.get(tid) {
+                    Some(st) => {
+                        statuses.push(st.status.label());
+                        format!("{label} {}", st.status.label())
+                    }
+                    None => label.to_string(),
+                }
+            })
+            .collect();
+        (
+            format!("{} {title}", index + 1),
+            panes.join(" · "),
+            statuses,
+        )
     }
 
     /// The switcher rows for `tab` matching `filter`: SESSIONS (name + git branch) or
@@ -6940,6 +7062,40 @@ impl App {
                     }
                 }
             }
+            PopupTab::Tabs => {
+                let Some(w) = self.state.workspace(&self.ws) else {
+                    return rows;
+                };
+                for (i, tab) in w.tabs.iter().enumerate() {
+                    let (head, panes, statuses) = self.tab_row_parts(i, tab);
+                    if op.is_some_and(|op| !statuses.iter().any(|s| op.contains(s))) {
+                        continue;
+                    }
+                    if !fuzzy_match(filter, &format!("{head} {panes}")) {
+                        continue;
+                    }
+                    let active = tab.id == w.active_tab;
+                    let (glyph, color) = if self.cfg.bell && self.tab_has_bell(&tab.id) {
+                        ("!", CAT_RED)
+                    } else if self.tab_has_agent(&tab.id) {
+                        ("●", CAT_YELLOW)
+                    } else if active {
+                        ("▪", CAT_MAUVE)
+                    } else {
+                        ("▪", CAT_OVERLAY)
+                    };
+                    rows.push(PopupRow {
+                        target: PopupTarget::Tab(self.ws.clone(), tab.id.clone()),
+                        glyph,
+                        color,
+                        text: if panes.is_empty() {
+                            head
+                        } else {
+                            format!("{head}  ({panes})")
+                        },
+                    });
+                }
+            }
         }
         rows
     }
@@ -7004,6 +7160,13 @@ impl App {
         self.popup_pin();
     }
 
+    /// Left/Right: the neighbouring list (sessions · agents · tabs).
+    fn popup_step(&mut self, delta: i32) {
+        if let Some(to) = self.popup.as_ref().map(|p| p.tab.step(delta)) {
+            self.popup_tab(to);
+        }
+    }
+
     /// Move the switcher selection by `delta`, wrapping over the filtered rows.
     fn popup_move(&mut self, delta: i32) {
         let Some(p) = self.popup.as_ref() else {
@@ -7062,7 +7225,24 @@ impl App {
         match target {
             PopupTarget::Session(wid) => self.switch_session(wid),
             PopupTarget::Agent(term) => self.jump_to_terminal(&term),
+            PopupTarget::Tab(ws, tab) => self.pick_tab(ws, tab),
         }
+    }
+
+    /// Go to `tab` of `ws` from the tab overview. Only a tab of the session still attached:
+    /// another client may have switched it while the list was up, and its tab ids are not
+    /// this list's.
+    fn pick_tab(&mut self, ws: WorkspaceId, tab: TabId) {
+        let live = ws == self.ws
+            && self
+                .state
+                .workspace(&ws)
+                .is_some_and(|w| w.tab(&tab).is_some());
+        if !live {
+            return self.flash("that tab is gone".into(), false);
+        }
+        self.select_tab(ws, tab);
+        self.sync_sizes();
     }
 
     /// Rename the SELECTED session from the switcher (Sessions tab): switch to it and open
@@ -7443,6 +7623,7 @@ impl App {
         match tab {
             PopupTab::Sessions => self.sorted_session_ids().len(),
             PopupTab::Agents => self.agent_rows().len(),
+            PopupTab::Tabs => 0, // the sidebar has no tabs list
         }
     }
 
@@ -7482,6 +7663,7 @@ impl App {
                     self.jump_to_terminal(&term);
                 }
             }
+            PopupTab::Tabs => {}
         }
     }
 
@@ -10088,38 +10270,26 @@ impl App {
             self.render_popup_preview(buf, target.as_ref(), px, y0 + 1, pw, h.saturating_sub(2));
         }
 
-        // Row 1: the two tabs (Left/Right switches), active one highlighted.
+        // Row 1: the lists (Left/Right switches), active one highlighted.
         let tab_hi = Style::default()
             .fg(Color::Black)
             .bg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
         let tab_lo = Style::default().fg(CAT_OVERLAY).bg(bg);
         let mut tx = inner_x;
-        put(
-            buf,
-            y0 + 1,
-            tx,
-            10,
-            " sessions ",
-            if p.tab == PopupTab::Sessions {
-                tab_hi
-            } else {
-                tab_lo
-            },
-        );
-        tx += 10;
-        put(
-            buf,
-            y0 + 1,
-            tx,
-            8,
-            " agents ",
-            if p.tab == PopupTab::Agents {
-                tab_hi
-            } else {
-                tab_lo
-            },
-        );
+        for t in PopupTab::ALL {
+            let label = format!(" {} ", t.name());
+            let lw = label.len() as u16;
+            put(
+                buf,
+                y0 + 1,
+                tx,
+                lw.min((inner_x + inner_w).saturating_sub(tx)),
+                &label,
+                if p.tab == t { tab_hi } else { tab_lo },
+            );
+            tx += lw;
+        }
 
         // Row 2: the fuzzy filter input with a block cursor.
         put(
@@ -10172,6 +10342,10 @@ impl App {
             PopupTarget::Session(wid) => {
                 let w = self.state.workspace(wid)?;
                 let tab = w.tab(&w.active_tab)?;
+                tab.layout.terminal_of(&tab.focused).cloned()
+            }
+            PopupTarget::Tab(wid, tid) => {
+                let tab = self.state.workspace(wid)?.tab(tid)?;
                 tab.layout.terminal_of(&tab.focused).cloned()
             }
         }
@@ -15116,7 +15290,7 @@ mod nav {
         let p = app.popup.as_ref().expect("open");
         match &app.popup_items(p.tab, &p.filter)[p.sel].target {
             PopupTarget::Session(w) => app.session_display_name(w),
-            PopupTarget::Agent(_) => panic!("agent row"),
+            PopupTarget::Agent(_) | PopupTarget::Tab(..) => panic!("not a session row"),
         }
     }
 
@@ -15785,7 +15959,7 @@ mod switcher_preview {
                 .into_iter()
                 .map(|r| match r.target {
                     PopupTarget::Agent(t) => t,
-                    PopupTarget::Session(_) => unreachable!(),
+                    PopupTarget::Session(_) | PopupTarget::Tab(..) => unreachable!(),
                 })
                 .collect()
         };
@@ -15838,7 +16012,7 @@ mod switcher_preview {
                 .into_iter()
                 .map(|r| match r.target {
                     PopupTarget::Session(w) => app.session_display_name(&w),
-                    PopupTarget::Agent(_) => unreachable!(),
+                    PopupTarget::Agent(_) | PopupTarget::Tab(..) => unreachable!(),
                 })
                 .collect()
         };
@@ -18712,5 +18886,236 @@ mod host_api {
         assert_eq!(f.len(), 2);
         assert!(f[1].error);
         assert!(app.take_flashes().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod tab_overview {
+    use super::*;
+    use crate::control::Req;
+    use copad_mux_proto as l0;
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        App::new(120, 40, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn new_tab(app: &mut App, name: &str) -> TabId {
+        app.handle_control(&Req::NewTab {
+            session: None,
+            from: None,
+            cwd: None,
+            name: Some(name.into()),
+            no_focus: false,
+            command: Vec::new(),
+            env: Vec::new(),
+            keep: false,
+            owner: None,
+        });
+        app.active_tab_id().unwrap()
+    }
+
+    fn press(app: &mut App, prefix: &mut Prefix, code: KeyCode, mods: KeyModifiers) {
+        app.feed_key(KeyEvent::new(code, mods), prefix);
+    }
+
+    fn prefixed(app: &mut App, c: char) {
+        let mut prefix = Prefix::default();
+        press(app, &mut prefix, KeyCode::Char('b'), KeyModifiers::CONTROL);
+        press(app, &mut prefix, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+
+    fn enter(app: &mut App) {
+        let mut prefix = Prefix::default();
+        press(app, &mut prefix, KeyCode::Enter, KeyModifiers::NONE);
+    }
+
+    /// Tabs 1..3, visited 1 → 2 → 3 → 1: the previous tab is 3.
+    fn three_tabs() -> (App, Vec<TabId>) {
+        let mut app = app();
+        let first = app.active_tab_id().unwrap();
+        let second = new_tab(&mut app, "api");
+        let third = new_tab(&mut app, "web");
+        prefixed(&mut app, '1');
+        assert_eq!(app.active_tab_id(), Some(first.clone()));
+        (app, vec![first, second, third])
+    }
+
+    #[test]
+    fn ctrl_b_f_selects_the_previous_tab_and_enter_toggles_like_alt_tab() {
+        let (mut app, tabs) = three_tabs();
+        prefixed(&mut app, 'f');
+        let p = app.popup.as_ref().expect("open");
+        assert!(p.tab == PopupTab::Tabs);
+        assert_eq!(p.sel, 2, "the tab used before this one, not the next one");
+        enter(&mut app);
+        assert_eq!(app.active_tab_id(), Some(tabs[2].clone()));
+        prefixed(&mut app, 'w'); // tmux choose-window opens the same list
+        enter(&mut app);
+        assert_eq!(app.active_tab_id(), Some(tabs[0].clone()));
+    }
+
+    #[test]
+    fn the_list_is_this_sessions_tabs_and_filters_on_names_and_status() {
+        let (mut app, _) = three_tabs();
+        app.handle_control(&Req::NewSession {
+            name: Some("other".into()),
+            cwd: None,
+            detached: true,
+        });
+        let rows = app.popup_items(PopupTab::Tabs, "");
+        assert_eq!(rows.len(), 3, "another session's tab is not listed");
+        assert!(rows[1].text.starts_with("2 api"), "{}", rows[1].text);
+        assert!(matches!(rows[0].target, PopupTarget::Tab(ref w, _) if *w == app.ws));
+        let hits = app.popup_items(PopupTab::Tabs, "web");
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].text.starts_with("3 web"));
+        assert!(
+            app.popup_items(PopupTab::Tabs, "@").is_empty(),
+            "no tab has a blocked agent"
+        );
+        // Left/Right walk the three lists and stop at the ends.
+        app.open_popup();
+        let mut prefix = Prefix::default();
+        press(&mut app, &mut prefix, KeyCode::Right, KeyModifiers::NONE);
+        press(&mut app, &mut prefix, KeyCode::Right, KeyModifiers::NONE);
+        press(&mut app, &mut prefix, KeyCode::Right, KeyModifiers::NONE);
+        assert!(app.popup.as_ref().unwrap().tab == PopupTab::Tabs);
+        press(&mut app, &mut prefix, KeyCode::Left, KeyModifiers::NONE);
+        assert!(app.popup.as_ref().unwrap().tab == PopupTab::Agents);
+    }
+
+    #[test]
+    fn the_tui_box_shows_three_lists_and_the_tab_rows() {
+        let (mut app, _) = three_tabs();
+        prefixed(&mut app, 'f');
+        let mut buf = Buffer::empty(ratatui::layout::Rect::new(0, 0, 120, 40));
+        app.render_to(&mut buf);
+        let text: String = (0..40)
+            .map(|y| {
+                (0..120)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(text.contains(" sessions  agents  tabs "), "{text}");
+        assert!(text.contains("2 api") && text.contains("3 web"), "{text}");
+    }
+
+    fn picker(spec: &l0::OverlaySpec) -> (usize, Vec<l0::PickerTab>, Option<String>) {
+        let l0::OverlaySpec::Picker {
+            tab,
+            tabs,
+            selected,
+            ..
+        } = spec
+        else {
+            panic!("not a picker")
+        };
+        (*tab, tabs.clone(), selected.clone())
+    }
+
+    /// Open the overview for a host and answer it with the row it preselected.
+    fn host_pick_default(app: &mut App) {
+        let marks = app.overlay_marks();
+        app.open_for_host("tabs", None).unwrap();
+        let (id, spec) = app.delegate_new_overlays(marks).remove(0);
+        let (_, _, selected) = picker(&spec);
+        assert!(app.overlay_result(id, selected, None).0);
+    }
+
+    #[test]
+    fn a_host_gets_the_tabs_list_and_its_picks_count_as_visits() {
+        let (mut app, tabs) = three_tabs();
+        let ws = app.ws.clone();
+        let marks = app.overlay_marks();
+        app.open_for_host("tabs", None).unwrap();
+        let (id, spec) = app.delegate_new_overlays(marks).remove(0);
+        let (open, lists, selected) = picker(&spec);
+        assert_eq!(open, 2, "opens on the tabs list");
+        assert_eq!(
+            lists.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            ["sessions", "agents", "tabs"]
+        );
+        assert_eq!(selected, Some(format!("t:{ws}/{}", tabs[2])));
+        assert!(
+            lists[2]
+                .rows
+                .iter()
+                .all(|r| !r.pane.is_empty() && r.no_actions)
+        );
+
+        // A live re-send stays on the tabs list and follows a new tab.
+        let fourth = new_tab(&mut app, "docs");
+        let (rid, again) = app.poll_delegated().remove(0);
+        assert_eq!(rid, id);
+        let (open, lists, _) = picker(&again);
+        assert_eq!(open, 2);
+        assert!(
+            lists[2]
+                .rows
+                .iter()
+                .any(|r| r.id == format!("t:{ws}/{fourth}"))
+        );
+
+        // Host picks alone (no keys in between) keep Alt-Tab honest: docs ↔ first.
+        assert!(
+            app.overlay_result(id, Some(format!("t:{ws}/{}", tabs[0])), None)
+                .0
+        );
+        assert_eq!(app.active_tab_id(), Some(tabs[0].clone()));
+        host_pick_default(&mut app);
+        assert_eq!(app.active_tab_id(), Some(fourth.clone()));
+        host_pick_default(&mut app);
+        assert_eq!(app.active_tab_id(), Some(tabs[0].clone()));
+    }
+
+    #[test]
+    fn a_stale_tab_row_moves_nothing() {
+        let (mut app, tabs) = three_tabs();
+        let ws = app.ws.clone();
+        let marks = app.overlay_marks();
+        app.open_for_host("tabs", None).unwrap();
+        let (id, _) = app.delegate_new_overlays(marks).remove(0);
+        // Another client moved this view to a different session meanwhile.
+        app.handle_control(&Req::NewSession {
+            name: Some("other".into()),
+            cwd: None,
+            detached: false,
+        });
+        let now = app.ws.clone();
+        assert_ne!(now, ws);
+        app.overlay_result(id, Some(format!("t:{ws}/{}", tabs[2])), None);
+        assert_eq!(
+            app.ws, now,
+            "a tab of the old session does not drag the view back"
+        );
+        let msg = app
+            .message
+            .as_ref()
+            .map(|m| m.text.clone())
+            .unwrap_or_default();
+        assert!(msg.contains("gone"), "{msg}");
+    }
+
+    #[test]
+    fn tab_picker_is_bindable_by_name() {
+        let cfg = config::tests::config_from_str("[keys]\ntab-picker = \"g\"\n");
+        let mut app = App::new(
+            120,
+            40,
+            Vec::new(),
+            Vec::new(),
+            MuxConfig {
+                persist: false,
+                ..cfg
+            },
+        )
+        .expect("app");
+        new_tab(&mut app, "api");
+        prefixed(&mut app, 'g');
+        assert!(app.popup.as_ref().is_some_and(|p| p.tab == PopupTab::Tabs));
     }
 }

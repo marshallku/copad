@@ -124,14 +124,17 @@ comux new-session api --cwd ~/dev/api -d   # starts in ~/dev/api, without switch
 
 ## The fuzzy switcher (`Ctrl-f`)
 
-`Ctrl-f` (prefix-less) opens a popup with two tabs — **Sessions** and **Agents**:
+`Ctrl-f` (prefix-less) opens a popup with three lists — **Sessions**, **Agents** and **Tabs**
+(the current session's tabs). `Ctrl-b f` (or `Ctrl-b w`, tmux's `choose-window`) opens it
+straight on **Tabs** with the tab you used before this one selected, so `Ctrl-b f Enter` flips
+between two tabs like Alt-Tab. A wide terminal previews the selected tab's focused pane.
 
 | Key | Action |
 | --- | --- |
-| `←` / `→` | Switch between the Sessions and Agents tabs |
+| `←` / `→` | Switch between the Sessions, Agents and Tabs lists |
 | `↑` / `↓`, or `Ctrl-p` / `Ctrl-n` | Move the selection |
 | type any text | Fuzzy-filter the list |
-| `Enter` | Switch to the session / jump to the agent |
+| `Enter` | Switch to the session / jump to the agent / go to the tab |
 | `Ctrl-r` or `F2` | Rename the selected session inline |
 | `Esc` or `Ctrl-f` | Close |
 

@@ -103,6 +103,15 @@ fn key(key: &str, choice: &str, stays: bool) -> l0::PickerKey {
 }
 
 /// `<prefix>:<i>` → `i`.
+/// The list a delegated switcher was opened on, from the spec last sent.
+fn opened_on(spec: &l0::OverlaySpec) -> PopupTab {
+    match spec {
+        l0::OverlaySpec::Picker { tab, .. } => PopupTab::ALL.get(*tab).copied(),
+        _ => None,
+    }
+    .unwrap_or(PopupTab::Sessions)
+}
+
 fn index_of(choice: &str, prefix: &str) -> Option<usize> {
     choice.strip_prefix(prefix)?.parse().ok()
 }
@@ -152,8 +161,10 @@ impl App {
             let spec = l0::OverlaySpec::Confirm { message };
             out.push(self.delegate(Delegated::Confirm(c.action), spec));
         }
-        if !before.0[2] && self.popup.take().is_some() {
-            let spec = self.switcher_spec();
+        if !before.0[2]
+            && let Some(p) = self.popup.take()
+        {
+            let spec = self.switcher_spec(p.tab);
             out.push(self.delegate(Delegated::Switcher(spec.clone()), spec));
         }
         if !before.0[3] && self.center.take().is_some() {
@@ -260,7 +271,8 @@ impl App {
             .collect();
         for id in live {
             let (now, last) = match self.delegated.get(&id) {
-                Some(Delegated::Switcher(last)) => (self.switcher_spec(), last),
+                // Re-sent on the list it was opened on, never back to the first.
+                Some(Delegated::Switcher(last)) => (self.switcher_spec(opened_on(last)), last),
                 Some(Delegated::Center(last)) => (self.center_spec(), last),
                 _ => continue,
             };
@@ -360,7 +372,7 @@ impl App {
             .unwrap_or_default()
     }
 
-    pub(super) fn switcher_spec(&self) -> l0::OverlaySpec {
+    pub(super) fn switcher_spec(&self, open: PopupTab) -> l0::OverlaySpec {
         let row = |r: &PopupRow| {
             let (id, current, session) = match &r.target {
                 PopupTarget::Session(w) => (format!("s:{w}"), *w == self.ws, w.to_string()),
@@ -369,10 +381,15 @@ impl App {
                     self.focused_terminal().as_ref() == Some(t),
                     String::new(),
                 ),
+                PopupTarget::Tab(w, t) => (
+                    format!("t:{w}/{t}"),
+                    self.active_tab_id().as_ref() == Some(t),
+                    String::new(),
+                ),
             };
             let badge = match &r.target {
                 PopupTarget::Agent(t) => self.agent_status(t).0.to_string(),
-                PopupTarget::Session(_) => String::new(),
+                PopupTarget::Session(_) | PopupTarget::Tab(..) => String::new(),
             };
             l0::PickerRow {
                 badge,
@@ -380,37 +397,26 @@ impl App {
                 session,
                 pane: self.preview_token(&r.target),
                 // Only a session is renamed from here (the TUI's ^R).
-                no_actions: matches!(r.target, PopupTarget::Agent(_)),
+                no_actions: !matches!(r.target, PopupTarget::Session(_)),
                 ..l0::PickerRow::new(id, r.text.clone(), String::new())
             }
         };
-        // The TUI's own default row (the previous session), so Ctrl-f Enter still toggles.
+        // The TUI's own default row (the previous session / tab), so Enter still toggles.
         let selected = self
-            .popup_items(PopupTab::Sessions, "")
-            .get(self.popup_default_sel(PopupTab::Sessions, ""))
+            .popup_items(open, "")
+            .get(self.popup_default_sel(open, ""))
             .map(|r| row(r).id);
         l0::OverlaySpec::Picker {
             selected,
             title: "Switch".into(),
-            tabs: vec![
-                l0::PickerTab {
-                    name: "sessions".into(),
-                    rows: self
-                        .popup_items(PopupTab::Sessions, "")
-                        .iter()
-                        .map(row)
-                        .collect(),
-                },
-                l0::PickerTab {
-                    name: "agents".into(),
-                    rows: self
-                        .popup_items(PopupTab::Agents, "")
-                        .iter()
-                        .map(row)
-                        .collect(),
-                },
-            ],
-            tab: 0,
+            tabs: PopupTab::ALL
+                .iter()
+                .map(|t| l0::PickerTab {
+                    name: t.name().into(),
+                    rows: self.popup_items(*t, "").iter().map(row).collect(),
+                })
+                .collect(),
+            tab: open.index(),
             actions: vec![action("rename", "Rename", "C-r", false)],
             loading: false,
             note: String::new(),
@@ -464,6 +470,19 @@ impl App {
     /// answer opened in the TUI (a menu item's rename prompt) are found by the caller's
     /// [`OverlayMarks`] diff instead.
     pub fn overlay_result(
+        &mut self,
+        id: u64,
+        choice: Option<String>,
+        text: Option<String>,
+    ) -> (bool, Vec<(u64, l0::OverlaySpec)>) {
+        let out = self.overlay_result_inner(id, choice, text);
+        // An answer can move the view (a session, an agent, a tab): observe it like a key,
+        // so recency and the nav history count a host's picks too.
+        self.track_nav();
+        out
+    }
+
+    fn overlay_result_inner(
         &mut self,
         id: u64,
         choice: Option<String>,
@@ -636,6 +655,18 @@ impl App {
                 return self.flash("that agent's pane is gone".into(), false);
             };
             self.jump_to_terminal(&term);
+        } else if let Some((w, t)) = c.strip_prefix("t:").and_then(|x| x.split_once('/')) {
+            // Only the attached session's tabs are listed; `pick_tab` refuses the rest.
+            let tab = self
+                .state
+                .workspace(&self.ws)
+                .filter(|ws| ws.id.to_string() == w)
+                .and_then(|ws| ws.tabs.iter().find(|x| x.id.to_string() == t))
+                .map(|x| x.id.clone());
+            match tab {
+                Some(tab) => self.pick_tab(self.ws.clone(), tab),
+                None => self.flash("that tab is gone".into(), false),
+            }
         }
     }
 
@@ -691,6 +722,13 @@ impl App {
             "switcher" => {
                 busy(self.popup.is_some())?;
                 self.open_popup();
+            }
+            "tabs" => {
+                busy(self.popup.is_some())?;
+                // Record where the view is first: a tab picked here last time must count as
+                // visited before this list picks its Alt-Tab default.
+                self.track_nav();
+                self.open_popup_on(PopupTab::Tabs);
             }
             "notifications" => {
                 busy(self.center.is_some())?;

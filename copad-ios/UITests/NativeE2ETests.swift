@@ -114,6 +114,22 @@ final class NativeE2ETests: XCTestCase {
         app.buttons["key-newtab"].tap()
         XCTAssertTrue(app.buttons["tab-2"].waitForExistence(timeout: 10), "^b c did not add a tab")
 
+        // 5a. The tab overview (comux's Ctrl-b f): the session's tabs as a list, kept live while
+        //     open — a tab made behind it shows up — and a tap goes there.
+        terminal.tap()
+        app.typeText("(sleep 4; \"$COPAD_E2E_COMUX\" new-tab --no-focus --name late >/dev/null) &\n")
+        app.buttons["tabOverview"].tap()
+        let tabRows = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH 'overlayRow-t:'"))
+        XCTAssertTrue(tabRows.firstMatch.waitForExistence(timeout: 10), "the overview was not delegated")
+        XCTAssertEqual(tabRows.count, 2, "not just this session's two tabs")
+        expectation(for: NSPredicate(format: "count == 3"), evaluatedWith: tabRows)
+        waitForExpectations(timeout: 15)
+        snapshot("tab-overview")
+        tabRows.element(boundBy: 0).tap()
+        expectation(for: NSPredicate(format: "isSelected == true"), evaluatedWith: app.buttons["tab-1"])
+        waitForExpectations(timeout: 10)
+        XCTAssertTrue(app.buttons["tab-3"].exists, "the late tab is missing from the strip")
+
         // 5b. Overlays are native (decisions #170): ^b $ opens comux's rename prompt as a
         //     native overlay (the TUI never draws it), and the answer renames the session.
         app.buttons["key-prefix"].tap()

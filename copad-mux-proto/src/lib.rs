@@ -129,7 +129,8 @@ pub enum SubMsg {
     /// Ask comux to open one of its overlays FOR `attachment` (decisions #172): what a key
     /// would open, delegated straight back to this host. Native buttons and context menus use
     /// it so a rename still gets comux's seeded prompt and a kill still asks comux's confirm.
-    /// `what` = `new-session` | `resume` | `switcher` | `notifications` | `new-worktree` |
+    /// `what` = `new-session` | `resume` | `switcher` | `tabs` (the switcher on the attached
+    /// session's tabs) | `notifications` | `new-worktree` |
     /// `rename-session` | `kill-session` | `rename-tab` | `close-tab`; `target` names the
     /// session (`<session id>`) or tab (`<session id>/<tab id>`), default = the active one.
     Open {

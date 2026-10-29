@@ -346,6 +346,9 @@ pub enum Action {
     ResizeUp,
     ResizeRight,
     Popup,
+    /// `Ctrl-b f` / `Ctrl-b w` (tmux `choose-window`): the switcher on the attached session's
+    /// tabs, the previously used one selected, so `Ctrl-b f Enter` toggles like Alt-Tab.
+    TabPicker,
     /// Force a full client repaint (`Ctrl-b r`, tmux `refresh-client`). The server re-sends
     /// a `full` frame and the client clears its terminal, wiping any drift/ghosting left by a
     /// resize, an alt-screen transition, or a nested emulator that lost a cell.
@@ -447,6 +450,7 @@ impl Action {
             ResizeUp => "make the pane shorter",
             ResizeRight => "widen the pane",
             Popup => "switch session / jump to agent (fuzzy)",
+            TabPicker => "this session's tabs with previews (fuzzy)",
             Redraw => "force a full repaint",
             FocusSidebar => "keyboard-focus the sidebar",
             ResumePicker => "resume a past agent conversation (Claude, Codex, grok, agy)",
@@ -496,6 +500,7 @@ impl Action {
             SplitDown => "split",
             Scrollback => "scroll",
             Popup => "find",
+            TabPicker => "tabs",
             ResumePicker => "resume",
             Detach => "detach",
             KeyHelp => "all keys",
@@ -788,6 +793,7 @@ fn action_from_name(name: &str) -> Option<Action> {
         "resize-up" => Action::ResizeUp,
         "resize-right" => Action::ResizeRight,
         "popup" => Action::Popup,
+        "tab-picker" | "choose-tab" => Action::TabPicker,
         "redraw" => Action::Redraw,
         "focus-sidebar" => Action::FocusSidebar,
         "resume-picker" => Action::ResumePicker,
@@ -862,6 +868,7 @@ fn default_bindings() -> Vec<(Action, Ctx, &'static [&'static str])> {
         (ToggleSidebar, Prefix, &["s"]),
         (Redraw, Prefix, &["r"]),
         (FocusSidebar, Prefix, &["e"]),
+        (TabPicker, Prefix, &["f", "w"]),
         (ResumePicker, Prefix, &["R"]),
         (NewTab, Prefix, &["c"]),
         (NextTab, Prefix, &["n"]),

@@ -373,6 +373,23 @@ struct TabStrip: View {
 
     var body: some View {
         let tabs = session.model.activeSession?.tabs ?? []
+        HStack(spacing: 6) {
+            // Every tab as a list with previews (comux's `Ctrl-b f`), instead of swiping the strip.
+            Button { session.openOverlay("tabs") } label: {
+                Image(systemName: "square.grid.2x2")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(ComuxLook.subtext)
+                    .frame(width: 32, height: 28)
+                    .background(RoundedRectangle(cornerRadius: 5).fill(ComuxLook.rule))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("All tabs")
+            .accessibilityIdentifier("tabOverview")
+            strip(tabs)
+        }
+    }
+
+    private func strip(_ tabs: [L0Tab]) -> some View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
@@ -390,6 +407,7 @@ struct TabStrip: View {
                             .background(RoundedRectangle(cornerRadius: 5).fill(tab.active ? ComuxLook.blue : ComuxLook.rule))
                         }
                         .id(tab.id)
+                        .accessibilityAddTraits(tab.active ? .isSelected : [])
                         .contextMenu {
                             if let sid = session.model.activeSession?.id {
                                 Button("Rename tab…") { session.openOverlay("rename-tab", target: "\(sid)/\(tab.id)") }

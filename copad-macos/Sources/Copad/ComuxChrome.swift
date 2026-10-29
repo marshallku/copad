@@ -883,6 +883,14 @@ struct ComuxStatusStrip: View {
         let session = s?.tree?.sessions.first { $0.active }
         HStack(spacing: 8) {
             if let session { pill(session, st) }
+            // Every tab as a list with previews (comux's `Ctrl-b f`).
+            Button { host.open("tabs") } label: {
+                Image(systemName: "square.grid.2x2").font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(st.subtext)
+            }
+            .buttonStyle(.plain)
+            .help("All tabs (Ctrl-b f)")
+            .accessibilityIdentifier("tabOverview")
             ScrollViewReader { proxy in
                 ScrollView(.horizontal) {
                     HStack(spacing: 4) {
@@ -966,6 +974,7 @@ struct ComuxStatusStrip: View {
             if let sid = session?.id {
                 Button("Rename Tab…") { host.open("rename-tab", target: "\(sid)/\(t.id)") }
                 Button("New Tab") { settle(); host.command(["cmd": "new-tab"]) }
+                Button("All Tabs…") { host.open("tabs") }
                 Divider()
                 Button("Close Tab…", role: .destructive) { host.open("close-tab", target: "\(sid)/\(t.id)") }
             }

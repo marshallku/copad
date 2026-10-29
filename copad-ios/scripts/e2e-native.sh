@@ -131,8 +131,10 @@ sleep 1
 kill -0 "$SSHD_PID" || { log "sshd did not start"; cat "$W/sshd.log"; exit 1; }
 
 # --- the comux server ---------------------------------------------------------------------
+# COPAD_E2E_COMUX: this build, for the panes' shells (the UI test types a `new-tab` into one).
 MUXENV=(COPAD_MUX_SOCK="$W/s" COPAD_MUX_STATE="$W/state.json" COPAD_MUX_NOTIFY=0
-        COPAD_MUX_USAGE=0 COPAD_MUX_UPDATE_CHECK=0 COPAD_MUX_QUIET_SSH=1 XDG_CONFIG_HOME="$W/cfg")
+        COPAD_MUX_USAGE=0 COPAD_MUX_UPDATE_CHECK=0 COPAD_MUX_QUIET_SSH=1 XDG_CONFIG_HOME="$W/cfg"
+        COPAD_E2E_COMUX="$COMUX")
 mkdir -p "$W/cfg/copad" "$W/bin"
 # Pushes (decisions #175, #177), against Apple's REAL sandbox: the UI test backgrounds the app,
 # a notification is raised, and the banner must show its DECRYPTED text (the relay and APNs only

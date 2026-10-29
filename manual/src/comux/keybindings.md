@@ -75,6 +75,7 @@ See [Layouts & Arranging Panes](./layouts.md).
 | Close tab (asks `y/n`) | `&` |
 | Rename tab (empty clears) | `,` |
 | Select tab 1–9 | `1` … `9` |
+| This session's tabs as a list with previews (the previous tab selected, so `Ctrl-b f Enter` toggles like Alt-Tab) | `f` / `w` |
 
 ### Sessions & navigation
 
@@ -148,7 +149,7 @@ A digit within two seconds focuses that pane; any other key just closes the numb
 
 ### Fuzzy switcher (`Ctrl-f`)
 
-`↑`/`Ctrl-p`, `↓`/`Ctrl-n` move · `←` Sessions tab · `→` Agents tab · `Enter` select/jump · `Ctrl-r`/`F2` rename selected session · `Esc`/`Ctrl-f` close · `Backspace` delete filter char · any printable char extends the filter.
+`↑`/`Ctrl-p`, `↓`/`Ctrl-n` move · `←`/`→` switch between the Sessions, Agents and Tabs lists · `Enter` select/jump · `Ctrl-r`/`F2` rename selected session · `Esc`/`Ctrl-f` close · `Backspace` delete filter char · any printable char extends the filter.
 
 ### Sidebar keyboard-focus (`Ctrl-b e`)
 
