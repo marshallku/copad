@@ -2071,6 +2071,11 @@ fn setup_shortcuts(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
                 crate::command_palette::open(&win, &mgr.actions, &mgr.dispatch_tx, &mgr);
                 glib::Propagation::Stop
             }
+            // Ctrl+Shift+R: open a remote comux (macOS: Shell ▸ Open Remote comux…)
+            gdk::Key::R => {
+                crate::comux_panel::prompt_open_remote(&mgr, &win);
+                glib::Propagation::Stop
+            }
             // Ctrl+Shift+Y: agent cockpit (macOS binds Cmd+Shift+Y)
             gdk::Key::Y => {
                 mgr.toggle_cockpit();
@@ -2192,6 +2197,17 @@ fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow)
     pop_box.append(&term_row);
     pop_box.append(&browser_row);
 
+    // A remote comux always opens as a new tab, so it gets one button rather than placements.
+    let remote_btn = gtk4::Button::new();
+    remote_btn.add_css_class("flat");
+    remote_btn.add_css_class("copad-add-row");
+    remote_btn.set_tooltip_text(Some("Open remote comux (Ctrl+Shift+R)"));
+    let remote_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    remote_box.append(&gtk4::Image::from_icon_name("network-server-symbolic"));
+    remote_box.append(&gtk4::Label::new(Some("Remote comux…")));
+    remote_btn.set_child(Some(&remote_box));
+    pop_box.append(&remote_btn);
+
     // Plugin entries — keep only the winner per duplicate name so the
     // picker matches what daemon dispatch / `plugin.open` would resolve.
     let mut seen_names = std::collections::HashSet::new();
@@ -2243,6 +2259,14 @@ fn setup_tab_actions(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow)
 
     popover.set_child(Some(&pop_box));
     add_btn.set_popover(Some(&popover));
+
+    let mgr = manager.clone();
+    let win = window.clone();
+    let pop = popover.clone();
+    remote_btn.connect_clicked(move |_| {
+        pop.popdown();
+        crate::comux_panel::prompt_open_remote(&mgr, &win);
+    });
 
     // Terminal placements
     let mgr = manager.clone();

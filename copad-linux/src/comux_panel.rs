@@ -2166,6 +2166,12 @@ pub fn prompt_open_remote(mgr: &Rc<TabManager>, window: &gtk4::ApplicationWindow
             && let Err(err) = open_remote(&m, &w2, &dest, "comux")
         {
             log::warn!("comux.open_remote: {err}");
+            gtk4::AlertDialog::builder()
+                .modal(true)
+                .message("Could not open remote comux")
+                .detail(err)
+                .build()
+                .show(Some(&w2));
         }
     });
     win.present();
