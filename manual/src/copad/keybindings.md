@@ -16,7 +16,7 @@ copad's desktop shortcuts use `Ctrl+Shift+…` on Linux and the `Cmd`-equivalent
 | Font size up / down / reset | `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | `Cmd+=` / `Cmd+-` / `Cmd+0` |
 | Command palette | `Ctrl+Shift+P` | `Cmd+Shift+P` |
 | Agent cockpit | `Ctrl+Shift+Y` | (`coctl call cockpit.open`) |
-| Open remote comux | `Ctrl+Shift+R` (or "+" popover ▸ Remote comux…) | Shell ▸ Open Remote comux… |
+| Open remote comux | `Ctrl+Shift+R` (or "+" popover ▸ Remote comux…) | `Cmd+Shift+R` (Shell ▸ Open Remote comux…) |
 
 > On Linux, `Ctrl+Shift+U` collides with IBus Unicode input. If you use IBus, rebind the web-tab shortcut (below) or open web tabs from the tab-bar "+" popover instead.
 

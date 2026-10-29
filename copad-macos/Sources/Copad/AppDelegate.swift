@@ -523,7 +523,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         closePaneItem.target = self
         shellMenu.addItem(closePaneItem)
 
-        let remoteItem = NSMenuItem(title: "Open Remote comux…", action: #selector(openRemoteComuxPrompt), keyEquivalent: "")
+        let remoteItem = NSMenuItem(title: "Open Remote comux…", action: #selector(openRemoteComuxPrompt), keyEquivalent: "r")
+        remoteItem.keyEquivalentModifierMask = [.command, .shift]
         remoteItem.target = self
         shellMenu.addItem(remoteItem)
 
