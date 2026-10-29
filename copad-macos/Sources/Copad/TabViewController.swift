@@ -716,7 +716,8 @@ final class TabViewController: NSViewController {
         }
         // The same overlay again (rows landed, a live re-send) updates in place: the layer reads
         // the window's state itself.
-        guard comuxOverlayShown == nil, let o = mine else { return }
+        // A host prompt of copad's own (Open remote comux) is up: comux's waits for it.
+        guard comuxOverlayShown == nil, comuxOverlayLayer == nil, let o = mine else { return }
         settleComuxInput()
         comuxOverlayShown = o.overlay
         if case let .menu(_, items) = o.spec {
@@ -726,6 +727,11 @@ final class TabViewController: NSViewController {
         let layer = NSHostingView(rootView: ComuxOverlayHost(host: host, id: o.overlay) { [weak self] in
             self?.closeComuxOverlay()
         })
+        mountComuxOverlay(layer)
+    }
+
+    /// Put an overlay layer over the content area and keep the keys in it until it closes.
+    private func mountComuxOverlay(_ layer: NSView) {
         layer.translatesAutoresizingMaskIntoConstraints = false
         contentArea.addSubview(layer)
         NSLayoutConstraint.activate([
@@ -796,6 +802,29 @@ final class TabViewController: NSViewController {
         }
         execCommand(cmd)
         return nil
+    }
+
+    /// Ask for an SSH destination in the window's own overlay card, the one comux's prompts use,
+    /// and open its comux; a refused or failed destination asks again with the reason.
+    func promptOpenRemoteComux(title: String = "Open remote comux", initial: String = "") {
+        guard comuxOverlayLayer == nil else { return }
+        let o = L0Overlay(overlay: 0, client: 0, panel: nil,
+                          spec: .prompt(title: title, initial: initial, placeholder: "user@host or an ~/.ssh/config host"))
+        let layer = NSHostingView(rootView: ComuxOverlayLayer(
+            overlay: o, look: comuxWindow.style.overlayLook, context: OverlayContext(),
+            handlers: OverlayHandlers(
+                answer: { [weak self] _, text in
+                    self?.closeComuxOverlay()
+                    let dest = (text ?? "").trimmingCharacters(in: .whitespaces)
+                    guard !dest.isEmpty else { return }
+                    // Not from inside the layer's own callback: it was just removed.
+                    DispatchQueue.main.async {
+                        guard let self, let err = self.openRemoteComux(dest: dest, comux: "comux") else { return }
+                        self.promptOpenRemoteComux(title: "Open remote comux — \(err)", initial: dest)
+                    }
+                },
+                act: { _ in }, preview: { _, _, _ in })))
+        mountComuxOverlay(layer)
     }
 
     /// Commit the focused terminal's IME composition before a panel click moves comux's view,

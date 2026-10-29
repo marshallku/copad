@@ -744,6 +744,12 @@ private struct PromptOverlay: View {
                     .focused($focused)
                     .onSubmit { answer(nil, text) }
                     .onKeyPress(.escape) { answer(nil, nil); return .handled }
+                    // The TUI's prompt cancels on ^C too.
+                    .onKeyPress(phases: .down) { press in
+                        guard comuxKeyName(press) == "C-c" else { return .ignored }
+                        answer(nil, nil)
+                        return .handled
+                    }
                     .accessibilityIdentifier("overlayText")
             }
             .padding(8)

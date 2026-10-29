@@ -629,26 +629,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Tab / Pane Actions
 
-    /// Ask for an SSH destination and open its comux in a new tab, natively hosted.
+    /// Ask for an SSH destination (in the window) and open its comux in a new tab, natively hosted.
     @objc private func openRemoteComuxPrompt() {
-        let alert = NSAlert()
-        alert.messageText = "Open Remote comux"
-        alert.informativeText = "An ~/.ssh/config host or user@host. comux must be installed there."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 280, height: 24))
-        field.placeholderString = "user@host"
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Open")
-        alert.addButton(withTitle: "Cancel")
-        alert.window.initialFirstResponder = field
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        let dest = field.stringValue.trimmingCharacters(in: .whitespaces)
-        guard !dest.isEmpty, let vc = tabVC else { return }
-        if let err = vc.openRemoteComux(dest: dest, comux: "comux") {
-            let e = NSAlert()
-            e.messageText = "Can't open \(dest)"
-            e.informativeText = err
-            e.runModal()
-        }
+        tabVC?.promptOpenRemoteComux()
     }
 
     @objc private func newTab() {
