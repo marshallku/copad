@@ -1069,6 +1069,8 @@ pub struct App {
     /// `mouse_at` can hit-test a click on the status bar / sidebar. Interior mutability
     /// because rendering is `&self`; only ever touched on the single main-loop thread.
     click_zones: RefCell<Vec<ClickZone>>,
+    /// The images the last composed frame shows (decisions #194), for graphics clients.
+    image_runs: RefCell<Vec<crate::images::ScreenRun>>,
     /// The open notification center as last drawn: its box `(x0, y0, x1, y1)` (inclusive) and
     /// `(row y, notification id)` per visible entry — what a click on it hits.
     center_hits: RefCell<CenterHits>,
@@ -1299,6 +1301,7 @@ impl App {
             sidebar_focus_request: false,
             cfg,
             click_zones: RefCell::new(Vec::new()),
+            image_runs: RefCell::new(Vec::new()),
             center_hits: RefCell::new(((0, 0, 0, 0), Vec::new())),
             // Idle until `start_usage_poll` (called by the server); tests that build an
             // App without a server never spawn the poller thread.
@@ -7905,6 +7908,18 @@ impl App {
     /// captures input). Rendering targets a plain `Buffer` — not a `Frame` — so the
     /// same code path serves both the local terminal and the (headless) server that
     /// ships cell diffs to a remote client.
+    /// Every pane tells its program the PTY size again (a graphics client brought pixels).
+    pub fn reannounce_pane_sizes(&self) {
+        for pt in self.panes.values() {
+            pt.reannounce_size();
+        }
+    }
+
+    /// The images the last [`render_to`](Self::render_to) left visible.
+    pub fn image_runs(&self) -> Vec<crate::images::ScreenRun> {
+        self.image_runs.borrow().clone()
+    }
+
     pub fn render_to(&self, buf: &mut Buffer) -> Option<Position> {
         self.cursor_look.set((true, 0));
         let area = buf.area;
@@ -7915,6 +7930,10 @@ impl App {
         // Rebuild clickable-chrome hit regions from scratch each frame (tab chips +
         // sidebar rows push into this as they render).
         self.click_zones.borrow_mut().clear();
+
+        // Images in the panes (decisions #194): their runs, and what the panes drew under them,
+        // so chrome drawn afterwards can be cut out of them.
+        let mut image_runs: Vec<crate::images::ScreenRun> = Vec::new();
 
         // Pane titles (decisions #146), placed against the SAME snapshot the pane is drawn
         // from so a blank-cell check can never see newer content than the frame shows.
@@ -8015,6 +8034,13 @@ impl App {
                     }
                 }
             }
+            image_runs.extend(crate::images::pane_runs(
+                pt.image_runs(),
+                rect.x,
+                rect.y,
+                rect.cols.min(area.width.saturating_sub(rect.x)),
+                rect.rows.min(area.height.saturating_sub(rect.y)),
+            ));
             if is_focused {
                 self.cursor_look
                     .set((snap.cursor_visible, snap.cursor_shape));
@@ -8027,6 +8053,8 @@ impl App {
                 }
             }
         }
+
+        let under_images = crate::images::remember(&image_runs, buf);
 
         // 2) dividers in the 1-cell gaps between panes; accent the focused pane's.
         let mut covered = vec![vec![false; area.width as usize]; area.height as usize];
@@ -8141,6 +8169,8 @@ impl App {
         if self.help.is_some() {
             self.render_help(buf);
         }
+        self.image_runs
+            .replace(crate::images::uncovered(image_runs, &under_images, buf));
         // Last, over everything every widget wrote: no cell may carry DIM and BOLD at once.
         resolve_dim_bold(buf);
 

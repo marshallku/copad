@@ -64,7 +64,8 @@ pub struct Shared {
 }
 
 impl Shared {
-    fn cell(&self) -> (u32, u32) {
+    /// The cell size images are laid out against (a fallback until the host reports one).
+    pub fn cell(&self) -> (u32, u32) {
         let (w, h) = (
             self.cell_width.load(Ordering::Relaxed),
             self.cell_height.load(Ordering::Relaxed),
@@ -91,6 +92,323 @@ struct Pending {
     cap: usize,
     error: Option<&'static str>,
 }
+
+/// A virtual placement (`U=1`): where Unicode placeholder cells (U+10EEEE) find their image.
+#[derive(Clone)]
+pub struct Virtual {
+    pub image: Arc<GraphicImage>,
+    pub cols: u32,
+    pub rows: u32,
+    pub z: i32,
+}
+
+/// `(image id, placement id)` -> its virtual placement; shared with the host, which hands it to
+/// [`collect`] (placeholders are text in the grid, so they are resolved when drawing).
+pub type Virtuals = Arc<std::sync::Mutex<HashMap<(u32, u32), Virtual>>>;
+
+/// The placeholder character of kitty's Unicode placeholders.
+pub const PLACEHOLDER: char = '\u{10EEEE}';
+
+/// kitty's row/column diacritics (gen/rowcolumn-diacritics.txt): the n-th means n.
+const DIACRITICS: [char; 297] = [
+    '\u{305}',
+    '\u{30D}',
+    '\u{30E}',
+    '\u{310}',
+    '\u{312}',
+    '\u{33D}',
+    '\u{33E}',
+    '\u{33F}',
+    '\u{346}',
+    '\u{34A}',
+    '\u{34B}',
+    '\u{34C}',
+    '\u{350}',
+    '\u{351}',
+    '\u{352}',
+    '\u{357}',
+    '\u{35B}',
+    '\u{363}',
+    '\u{364}',
+    '\u{365}',
+    '\u{366}',
+    '\u{367}',
+    '\u{368}',
+    '\u{369}',
+    '\u{36A}',
+    '\u{36B}',
+    '\u{36C}',
+    '\u{36D}',
+    '\u{36E}',
+    '\u{36F}',
+    '\u{483}',
+    '\u{484}',
+    '\u{485}',
+    '\u{486}',
+    '\u{487}',
+    '\u{592}',
+    '\u{593}',
+    '\u{594}',
+    '\u{595}',
+    '\u{597}',
+    '\u{598}',
+    '\u{599}',
+    '\u{59C}',
+    '\u{59D}',
+    '\u{59E}',
+    '\u{59F}',
+    '\u{5A0}',
+    '\u{5A1}',
+    '\u{5A8}',
+    '\u{5A9}',
+    '\u{5AB}',
+    '\u{5AC}',
+    '\u{5AF}',
+    '\u{5C4}',
+    '\u{610}',
+    '\u{611}',
+    '\u{612}',
+    '\u{613}',
+    '\u{614}',
+    '\u{615}',
+    '\u{616}',
+    '\u{617}',
+    '\u{657}',
+    '\u{658}',
+    '\u{659}',
+    '\u{65A}',
+    '\u{65B}',
+    '\u{65D}',
+    '\u{65E}',
+    '\u{6D6}',
+    '\u{6D7}',
+    '\u{6D8}',
+    '\u{6D9}',
+    '\u{6DA}',
+    '\u{6DB}',
+    '\u{6DC}',
+    '\u{6DF}',
+    '\u{6E0}',
+    '\u{6E1}',
+    '\u{6E2}',
+    '\u{6E4}',
+    '\u{6E7}',
+    '\u{6E8}',
+    '\u{6EB}',
+    '\u{6EC}',
+    '\u{730}',
+    '\u{732}',
+    '\u{733}',
+    '\u{735}',
+    '\u{736}',
+    '\u{73A}',
+    '\u{73D}',
+    '\u{73F}',
+    '\u{740}',
+    '\u{741}',
+    '\u{743}',
+    '\u{745}',
+    '\u{747}',
+    '\u{749}',
+    '\u{74A}',
+    '\u{7EB}',
+    '\u{7EC}',
+    '\u{7ED}',
+    '\u{7EE}',
+    '\u{7EF}',
+    '\u{7F0}',
+    '\u{7F1}',
+    '\u{7F3}',
+    '\u{816}',
+    '\u{817}',
+    '\u{818}',
+    '\u{819}',
+    '\u{81B}',
+    '\u{81C}',
+    '\u{81D}',
+    '\u{81E}',
+    '\u{81F}',
+    '\u{820}',
+    '\u{821}',
+    '\u{822}',
+    '\u{823}',
+    '\u{825}',
+    '\u{826}',
+    '\u{827}',
+    '\u{829}',
+    '\u{82A}',
+    '\u{82B}',
+    '\u{82C}',
+    '\u{82D}',
+    '\u{951}',
+    '\u{953}',
+    '\u{954}',
+    '\u{F82}',
+    '\u{F83}',
+    '\u{F86}',
+    '\u{F87}',
+    '\u{135D}',
+    '\u{135E}',
+    '\u{135F}',
+    '\u{17DD}',
+    '\u{193A}',
+    '\u{1A17}',
+    '\u{1A75}',
+    '\u{1A76}',
+    '\u{1A77}',
+    '\u{1A78}',
+    '\u{1A79}',
+    '\u{1A7A}',
+    '\u{1A7B}',
+    '\u{1A7C}',
+    '\u{1B6B}',
+    '\u{1B6D}',
+    '\u{1B6E}',
+    '\u{1B6F}',
+    '\u{1B70}',
+    '\u{1B71}',
+    '\u{1B72}',
+    '\u{1B73}',
+    '\u{1CD0}',
+    '\u{1CD1}',
+    '\u{1CD2}',
+    '\u{1CDA}',
+    '\u{1CDB}',
+    '\u{1CE0}',
+    '\u{1DC0}',
+    '\u{1DC1}',
+    '\u{1DC3}',
+    '\u{1DC4}',
+    '\u{1DC5}',
+    '\u{1DC6}',
+    '\u{1DC7}',
+    '\u{1DC8}',
+    '\u{1DC9}',
+    '\u{1DCB}',
+    '\u{1DCC}',
+    '\u{1DD1}',
+    '\u{1DD2}',
+    '\u{1DD3}',
+    '\u{1DD4}',
+    '\u{1DD5}',
+    '\u{1DD6}',
+    '\u{1DD7}',
+    '\u{1DD8}',
+    '\u{1DD9}',
+    '\u{1DDA}',
+    '\u{1DDB}',
+    '\u{1DDC}',
+    '\u{1DDD}',
+    '\u{1DDE}',
+    '\u{1DDF}',
+    '\u{1DE0}',
+    '\u{1DE1}',
+    '\u{1DE2}',
+    '\u{1DE3}',
+    '\u{1DE4}',
+    '\u{1DE5}',
+    '\u{1DE6}',
+    '\u{1DFE}',
+    '\u{20D0}',
+    '\u{20D1}',
+    '\u{20D4}',
+    '\u{20D5}',
+    '\u{20D6}',
+    '\u{20D7}',
+    '\u{20DB}',
+    '\u{20DC}',
+    '\u{20E1}',
+    '\u{20E7}',
+    '\u{20E9}',
+    '\u{20F0}',
+    '\u{2CEF}',
+    '\u{2CF0}',
+    '\u{2CF1}',
+    '\u{2DE0}',
+    '\u{2DE1}',
+    '\u{2DE2}',
+    '\u{2DE3}',
+    '\u{2DE4}',
+    '\u{2DE5}',
+    '\u{2DE6}',
+    '\u{2DE7}',
+    '\u{2DE8}',
+    '\u{2DE9}',
+    '\u{2DEA}',
+    '\u{2DEB}',
+    '\u{2DEC}',
+    '\u{2DED}',
+    '\u{2DEE}',
+    '\u{2DEF}',
+    '\u{2DF0}',
+    '\u{2DF1}',
+    '\u{2DF2}',
+    '\u{2DF3}',
+    '\u{2DF4}',
+    '\u{2DF5}',
+    '\u{2DF6}',
+    '\u{2DF7}',
+    '\u{2DF8}',
+    '\u{2DF9}',
+    '\u{2DFA}',
+    '\u{2DFB}',
+    '\u{2DFC}',
+    '\u{2DFD}',
+    '\u{2DFE}',
+    '\u{2DFF}',
+    '\u{A66F}',
+    '\u{A67C}',
+    '\u{A67D}',
+    '\u{A6F0}',
+    '\u{A6F1}',
+    '\u{A8E0}',
+    '\u{A8E1}',
+    '\u{A8E2}',
+    '\u{A8E3}',
+    '\u{A8E4}',
+    '\u{A8E5}',
+    '\u{A8E6}',
+    '\u{A8E7}',
+    '\u{A8E8}',
+    '\u{A8E9}',
+    '\u{A8EA}',
+    '\u{A8EB}',
+    '\u{A8EC}',
+    '\u{A8ED}',
+    '\u{A8EE}',
+    '\u{A8EF}',
+    '\u{A8F0}',
+    '\u{A8F1}',
+    '\u{AAB0}',
+    '\u{AAB2}',
+    '\u{AAB3}',
+    '\u{AAB7}',
+    '\u{AAB8}',
+    '\u{AABE}',
+    '\u{AABF}',
+    '\u{AAC1}',
+    '\u{FE20}',
+    '\u{FE21}',
+    '\u{FE22}',
+    '\u{FE23}',
+    '\u{FE24}',
+    '\u{FE25}',
+    '\u{FE26}',
+    '\u{10A0F}',
+    '\u{10A38}',
+    '\u{1D185}',
+    '\u{1D186}',
+    '\u{1D187}',
+    '\u{1D188}',
+    '\u{1D189}',
+    '\u{1D1AA}',
+    '\u{1D1AB}',
+    '\u{1D1AC}',
+    '\u{1D1AD}',
+    '\u{1D242}',
+    '\u{1D243}',
+    '\u{1D244}',
+];
 
 /// What a command did to the terminal besides its images: a host that mirrors the stream into a
 /// second terminal (copad-linux's relay feeds VTE) replays these there.
@@ -123,6 +441,7 @@ pub struct Graphics {
     effects: Effects,
     /// Bumped by every change to what is drawn (placement, delete, eviction).
     revision: u64,
+    virtuals: Virtuals,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -426,7 +745,28 @@ impl Graphics {
             pending: None,
             effects: Effects::default(),
             revision: 0,
+            virtuals: Virtuals::default(),
         }
+    }
+
+    /// The virtual placements, for [`collect`].
+    pub fn virtuals(&self) -> Virtuals {
+        self.virtuals.clone()
+    }
+
+    fn drop_virtuals(&mut self, mut matches: impl FnMut(u32) -> bool) {
+        let mut v = self.virtuals.lock().unwrap();
+        let before = v.len();
+        v.retain(|(id, _), _| !matches(*id));
+        if v.len() != before {
+            self.revision += 1;
+        }
+    }
+
+    /// Decoded bytes this terminal may hold (default [`QUOTA_BYTES`]); a host with many
+    /// terminals (comux) keeps each one smaller.
+    pub fn set_quota(&mut self, bytes: usize) {
+        self.quota = bytes;
     }
 
     /// Changes with every placement, delete or eviction: a host polls it to know when to redraw.
@@ -486,9 +826,6 @@ impl Graphics {
             b't' | b'T' | b'q' => {
                 if cmd.medium != b'd' {
                     return self.respond(&cmd, Err("ENOTSUPPORTED:only direct transmission (t=d)"));
-                }
-                if cmd.unicode {
-                    return self.respond(&cmd, Err("ENOTSUPPORTED:Unicode placeholders"));
                 }
                 let pending = match transmission_cap(&cmd) {
                     Ok(cap) => Pending {
@@ -575,6 +912,7 @@ impl Graphics {
         if self.images.contains_key(&id) {
             // Retransmitting an id replaces the image and drops what showed the old one.
             self.remove_placements(term, |g| g.image_id == id);
+            self.drop_virtuals(|v| v == id);
         }
         self.clock += 1;
         self.images.insert(
@@ -633,6 +971,9 @@ impl Graphics {
                 }
                 let key = stored.image.key;
                 self.images.remove(&id);
+                // Its virtual placements hold it too: they go with it, or its bytes would stay
+                // charged forever.
+                self.drop_virtuals(|v| v == id);
                 if !unreferenced {
                     self.revision += 1;
                     for grid in term.grids_mut() {
@@ -695,9 +1036,7 @@ impl Graphics {
         term: &mut Term<L>,
         cmd: &Cmd,
     ) -> Result<u32, &'static str> {
-        if cmd.unicode {
-            return Err("ENOTSUPPORTED:Unicode placeholders");
-        }
+        let unicode = cmd.unicode;
         let id = if cmd.id == 0 && cmd.number != 0 {
             self.images
                 .iter()
@@ -713,6 +1052,40 @@ impl Graphics {
         let stored = self.images.get_mut(&id).ok_or("ENOENT:no such image")?;
         stored.used = clock;
         let image = stored.image.clone();
+
+        if unicode {
+            // A virtual placement draws nothing itself: placeholder cells in the text show it.
+            // Its grid defaults to the image's natural size in cells, as in kitty.
+            let (cw, ch) = self.shared.cell();
+            let cols = if cmd.cols != 0 {
+                cmd.cols
+            } else {
+                image.width.div_ceil(cw)
+            }
+            .clamp(1, MAX_SPAN);
+            let rows = if cmd.rows != 0 {
+                cmd.rows
+            } else {
+                image.height.div_ceil(ch)
+            }
+            .clamp(1, MAX_SPAN);
+            let mut virtuals = self.virtuals.lock().unwrap();
+            if virtuals.len() >= MAX_PLACEMENTS && !virtuals.contains_key(&(id, cmd.placement)) {
+                return Err("ENOSPC:too many placements");
+            }
+            virtuals.insert(
+                (id, cmd.placement),
+                Virtual {
+                    image,
+                    cols,
+                    rows,
+                    z: cmd.z,
+                },
+            );
+            drop(virtuals);
+            self.revision += 1;
+            return Ok(id);
+        }
 
         if cmd.placement != 0
             && let Some(&old) = self.named.get(&(id, cmd.placement))
@@ -891,6 +1264,12 @@ impl Graphics {
             (None, b'i') => {
                 affected.insert(cmd.id);
                 let (id, p) = (cmd.id, cmd.placement);
+                if p == 0 {
+                    self.drop_virtuals(|v| v == id);
+                } else if self.virtuals.lock().unwrap().remove(&(id, p)).is_some() {
+                    self.revision += 1;
+                }
+                let (id, p) = (cmd.id, cmd.placement);
                 self.remove_placements(term, |g| {
                     g.image_id == id && (p == 0 || g.client_placement == p)
                 });
@@ -904,6 +1283,7 @@ impl Graphics {
                     .map(|(&id, _)| id);
                 if let Some(id) = newest {
                     affected.insert(id);
+                    self.drop_virtuals(|v| v == id);
                     let p = cmd.placement;
                     self.remove_placements(term, |g| {
                         g.image_id == id && (p == 0 || g.client_placement == p)
@@ -913,6 +1293,7 @@ impl Graphics {
             (None, b'r') => {
                 let (lo, hi) = (cmd.x, cmd.y);
                 affected.extend(self.images.keys().filter(|&&id| id >= lo && id <= hi));
+                self.drop_virtuals(|v| v >= lo && v <= hi);
                 self.remove_placements(term, |g| g.image_id >= lo && g.image_id <= hi);
             }
             // Animation frames (f/F) and anything unknown: nothing to delete.
@@ -1032,19 +1413,156 @@ pub struct CopadGraphic {
 
 const EPSILON: f32 = 1e-4;
 
+/// Unicode placeholders to resolve in [`collect`]: the terminal's virtual placements and its
+/// cell size in pixels.
+pub struct Placeholders<'a> {
+    pub virtuals: &'a HashMap<(u32, u32), Virtual>,
+    pub cell: (u32, u32),
+}
+
+/// Runs being built: fragments that continue each other on a row merge into one.
+struct Runs {
+    runs: Vec<((i32, u32, u64), usize, CopadGraphic)>,
+    images: Vec<Arc<GraphicImage>>,
+    image_index: HashMap<u64, u32>,
+    /// (image, z) -> the run it last extended on this row, and that run's last column.
+    /// Keyed by image rather than placement, so fragments that continue each other merge
+    /// even when a client placed every cell on its own (yazi does: one 1x1 placement per
+    /// cell, cut from one image) — a row of them is one run, not one per cell.
+    open: HashMap<(u64, i32), (usize, usize)>,
+}
+
+impl Runs {
+    #[allow(clippy::too_many_arguments)]
+    fn add(
+        &mut self,
+        image: &Arc<GraphicImage>,
+        order: (i32, u32, u64),
+        col: usize,
+        row: usize,
+        uv: [f32; 4],
+        dst: [f32; 4],
+    ) {
+        let (x, y) = (col as f32, row as f32);
+        let rect = [x + dst[0], y + dst[1], x + dst[2], y + dst[3]];
+        let key = (image.key, order.0);
+        if let Some(&(at, last)) = self.open.get(&key) {
+            let run = &mut self.runs[at].2;
+            if last + 1 == col
+                && (rect[0] - run.rect[2]).abs() < EPSILON
+                && (rect[1] - run.rect[1]).abs() < EPSILON
+                && (rect[3] - run.rect[3]).abs() < EPSILON
+                && (uv[0] - run.uv[2]).abs() < EPSILON
+                && (uv[1] - run.uv[1]).abs() < EPSILON
+                && (uv[3] - run.uv[3]).abs() < EPSILON
+            {
+                run.rect[2] = rect[2];
+                run.uv[2] = uv[2];
+                self.open.insert(key, (at, col));
+                return;
+            }
+        }
+        let next = self.images.len() as u32;
+        let images = &mut self.images;
+        let index = *self.image_index.entry(image.key).or_insert_with(|| {
+            images.push(image.clone());
+            next
+        });
+        self.runs.push((
+            order,
+            self.runs.len(),
+            CopadGraphic {
+                rect,
+                uv,
+                z: order.0,
+                image: index,
+            },
+        ));
+        self.open.insert(key, (self.runs.len() - 1, col));
+    }
+}
+
+/// A placeholder cell's image id and placement id, from its colours.
+fn placeholder_ids(cell: &Cell) -> Option<(u32, u32)> {
+    let id = |c: alacritty_terminal::vte::ansi::Color| match c {
+        alacritty_terminal::vte::ansi::Color::Spec(rgb) => {
+            Some(((rgb.r as u32) << 16) | ((rgb.g as u32) << 8) | rgb.b as u32)
+        }
+        alacritty_terminal::vte::ansi::Color::Indexed(n) => Some(n as u32),
+        alacritty_terminal::vte::ansi::Color::Named(_) => None,
+    };
+    Some((
+        id(cell.fg)?,
+        cell.underline_color().and_then(id).unwrap_or(0),
+    ))
+}
+
+/// Where one placeholder cell's part of a virtual placement lands: the image fit into the
+/// placement's `cols x rows` box, aspect kept and centred (kitty's rule), cut to the cell.
+fn placeholder_slice(
+    v: &Virtual,
+    row: u32,
+    col: u32,
+    (cw, ch): (u32, u32),
+) -> Option<([f32; 4], [f32; 4])> {
+    let (bw, bh) = ((v.cols * cw) as f32, (v.rows * ch) as f32);
+    let (iw, ih) = (v.image.width as f32, v.image.height as f32);
+    let scale = (bw / iw).min(bh / ih);
+    let (dw, dh) = (iw * scale, ih * scale);
+    let dest = [
+        (bw - dw) / 2.0,
+        (bh - dh) / 2.0,
+        (bw + dw) / 2.0,
+        (bh + dh) / 2.0,
+    ];
+    let cell = [
+        (col * cw) as f32,
+        (row * ch) as f32,
+        ((col + 1) * cw) as f32,
+        ((row + 1) * ch) as f32,
+    ];
+    let ix = [
+        dest[0].max(cell[0]),
+        dest[1].max(cell[1]),
+        dest[2].min(cell[2]),
+        dest[3].min(cell[3]),
+    ];
+    if ix[0] >= ix[2] || ix[1] >= ix[3] {
+        return None;
+    }
+    let uv = [
+        (ix[0] - dest[0]) / dw,
+        (ix[1] - dest[1]) / dh,
+        (ix[2] - dest[0]) / dw,
+        (ix[3] - dest[1]) / dh,
+    ];
+    let dst = [
+        (ix[0] - cell[0]) / cw as f32,
+        (ix[1] - cell[1]) / ch as f32,
+        (ix[2] - cell[0]) / cw as f32,
+        (ix[3] - cell[1]) / ch as f32,
+    ];
+    Some((uv, dst))
+}
+
 /// The visible fragments of `rows` viewport rows (`display_offset` into history), merged into
-/// per-row runs and sorted bottom-most first, plus the images they reference.
+/// per-row runs and sorted bottom-most first, plus the images they reference. With
+/// `placeholders`, Unicode placeholder cells show their virtual placements too.
 pub fn collect(
     grid: &Grid<Cell>,
     display_offset: i32,
     rows: usize,
+    placeholders: Option<&Placeholders>,
 ) -> (Vec<CopadGraphic>, Vec<Arc<GraphicImage>>) {
-    // (order, sequence) keys keep runs of equal stacking in reading order.
-    let mut runs: Vec<((i32, u32, u64), usize, CopadGraphic)> = Vec::new();
-    let mut images: Vec<Arc<GraphicImage>> = Vec::new();
-    let mut image_index: HashMap<u64, u32> = HashMap::new();
+    let mut out = Runs {
+        runs: Vec::new(),
+        images: Vec::new(),
+        image_index: HashMap::new(),
+        open: HashMap::new(),
+    };
     let columns = grid.columns();
     let (top, bottom) = (-(grid.history_size() as i32), grid.screen_lines() as i32);
+    let diacritic = |c: char| DIACRITICS.iter().position(|&d| d == c).map(|i| i as u32);
     for viewport_row in 0..rows {
         let line = Line(viewport_row as i32 - display_offset);
         // A viewport reaching above the retained history (a host scrolled further back than
@@ -1052,49 +1570,67 @@ pub fn collect(
         if line.0 < top || line.0 >= bottom {
             continue;
         }
-        // Placement -> the run it last extended on this row, and that run's last column.
-        let mut open: HashMap<u64, (usize, usize)> = HashMap::new();
+        out.open.clear();
+        // The previous placeholder on this row: (image id low bits, placement, row, col, msb).
+        let mut prev: Option<(u32, u32, u32, u32, u32)> = None;
         for col in 0..columns {
-            for g in grid[line][Column(col)].graphics() {
-                let (x, y) = (col as f32, viewport_row as f32);
-                let rect = [x + g.dst[0], y + g.dst[1], x + g.dst[2], y + g.dst[3]];
-                if let Some(&(at, last)) = open.get(&g.placement) {
-                    let run = &mut runs[at].2;
-                    if last + 1 == col
-                        && (rect[0] - run.rect[2]).abs() < EPSILON
-                        && (rect[1] - run.rect[1]).abs() < EPSILON
-                        && (rect[3] - run.rect[3]).abs() < EPSILON
-                        && (g.uv[0] - run.uv[2]).abs() < EPSILON
-                        && (g.uv[1] - run.uv[1]).abs() < EPSILON
-                        && (g.uv[3] - run.uv[3]).abs() < EPSILON
-                    {
-                        run.rect[2] = rect[2];
-                        run.uv[2] = g.uv[2];
-                        open.insert(g.placement, (at, col));
-                        continue;
-                    }
+            let cell = &grid[line][Column(col)];
+            for g in cell.graphics() {
+                out.add(&g.image, g.order(), col, viewport_row, g.uv, g.dst);
+            }
+            let Some(ph) = placeholders.filter(|_| cell.c == PLACEHOLDER) else {
+                prev = None;
+                continue;
+            };
+            let Some((low, pid)) = placeholder_ids(cell) else {
+                prev = None;
+                continue;
+            };
+            let marks: Vec<u32> = cell
+                .zerowidth()
+                .unwrap_or(&[])
+                .iter()
+                .filter_map(|&c| diacritic(c))
+                .collect();
+            // kitty's inheritance from the placeholder to the left.
+            let same = prev.filter(|p| p.0 == low && p.1 == pid);
+            let (row, pcol, msb) = match (marks.as_slice(), same) {
+                ([], Some(p)) => (p.2, p.3 + 1, p.4),
+                ([r], Some(p)) if p.2 == *r => (*r, p.3 + 1, p.4),
+                ([r, c], _) => (*r, *c, 0),
+                ([r, c, m, ..], _) => (*r, *c, *m),
+                _ => {
+                    prev = None;
+                    continue;
                 }
-                let next = images.len() as u32;
-                let image = *image_index.entry(g.image.key).or_insert_with(|| {
-                    images.push(g.image.clone());
-                    next
-                });
-                runs.push((
-                    g.order(),
-                    runs.len(),
-                    CopadGraphic {
-                        rect,
-                        uv: g.uv,
-                        z: g.z,
-                        image,
-                    },
-                ));
-                open.insert(g.placement, (runs.len() - 1, col));
+            };
+            prev = Some((low, pid, row, pcol, msb));
+            let id = (msb << 24) | (low & 0x00FF_FFFF);
+            let v = ph.virtuals.get(&(id, pid)).or_else(|| {
+                (pid == 0)
+                    .then(|| {
+                        ph.virtuals
+                            .iter()
+                            .filter(|((i, _), _)| *i == id)
+                            .map(|(_, v)| v)
+                            .next()
+                    })
+                    .flatten()
+            });
+            let Some(v) = v else { continue };
+            if row >= v.rows || pcol >= v.cols {
+                continue;
+            }
+            if let Some((uv, dst)) = placeholder_slice(v, row, pcol, ph.cell) {
+                out.add(&v.image, (v.z, id, 0), col, viewport_row, uv, dst);
             }
         }
     }
-    runs.sort_by_key(|&(order, seq, _)| (order, seq));
-    (runs.into_iter().map(|(_, _, run)| run).collect(), images)
+    out.runs.sort_by_key(|&(order, seq, _)| (order, seq));
+    (
+        out.runs.into_iter().map(|(_, _, run)| run).collect(),
+        out.images,
+    )
 }
 
 #[cfg(test)]

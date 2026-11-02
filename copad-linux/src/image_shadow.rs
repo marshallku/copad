@@ -323,8 +323,17 @@ impl Shadow {
         }
         let grid = self.term.grid();
         let history = grid.history_size();
-        let (runs, images) =
-            copad_graphics::collect(grid, history as i32, history + grid.screen_lines());
+        let virtuals = self.graphics.virtuals().lock().unwrap().clone();
+        let placeholders = copad_graphics::Placeholders {
+            virtuals: &virtuals,
+            cell: self.shared.graphics.cell(),
+        };
+        let (runs, images) = copad_graphics::collect(
+            grid,
+            history as i32,
+            history + grid.screen_lines(),
+            Some(&placeholders),
+        );
         self.seq += 1;
         self.published_revision = revision;
         self.published_any = !runs.is_empty();

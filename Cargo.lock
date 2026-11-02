@@ -863,9 +863,11 @@ version = "1.3.0"
 dependencies = [
  "alacritty_terminal",
  "base64 0.22.1",
+ "copad-graphics",
  "copad-mux-proto",
  "copad-usage",
  "crossterm",
+ "flate2",
  "libc",
  "proptest",
  "ratatui",

@@ -198,6 +198,9 @@ struct Client {
     heartbeat: bool,
     /// When it last sent anything.
     last_seen: Instant,
+    /// Its terminal draws kitty graphics (`ClientMsg::Graphics`): the images it holds and was
+    /// last told to show (decisions #194). `None` = frames carry no images for it.
+    images: Option<crate::images::ClientImages>,
     /// Replies / pongs waiting for the cap-1 frame channel, oldest first, and their size.
     /// Drained before frames; bounded by admission in [`handle_command`].
     replies: std::collections::VecDeque<ServerMsg>,
@@ -1235,6 +1238,7 @@ fn serve_client(
         incarnation: crate::term::incarnation().to_string(),
         attachment: id,
         commands: true,
+        graphics: true,
     };
     if writeln!(writer, "{}", json(&hello)).is_err() || writer.flush().is_err() {
         return;
@@ -1441,6 +1445,7 @@ fn handle_incoming(
                 last_title: None,
                 pending_title: None,
                 pending_bell: false,
+                images: None,
                 tag: None,
                 heartbeat,
                 last_seen: Instant::now(),
@@ -1481,6 +1486,22 @@ fn handle_incoming(
                 ClientMsg::Colors { fg, bg } => {
                     crate::term::set_outer_colors(fg, bg);
                     false
+                }
+                ClientMsg::Graphics {
+                    cell_width,
+                    cell_height,
+                } => {
+                    if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
+                        c.images = Some(crate::images::ClientImages::default());
+                    }
+                    // Panes report the cell of the terminal that can show their images; the
+                    // first such client sets it (one canonical size, like the shared view).
+                    let first = !crate::term::graphics_enabled();
+                    crate::term::set_graphics(true, first.then_some((cell_width, cell_height)));
+                    if first {
+                        app.reannounce_pane_sizes();
+                    }
+                    true
                 }
                 ClientMsg::Env {
                     vars,
@@ -1813,6 +1834,10 @@ fn reconcile_due(app: &App, clients: &[Client]) -> bool {
 /// attached client — each diffed against its OWN last-sent buffer, so a freshly
 /// attached client gets a full frame while up-to-date ones get small deltas. No-op
 /// with no clients (the server renders only for someone watching).
+/// Server-wide client ids for images (decisions #194).
+static IMAGE_IDS: std::sync::LazyLock<std::sync::Mutex<crate::images::ImageIds>> =
+    std::sync::LazyLock::new(Default::default);
+
 fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
     if clients.is_empty() {
         return;
@@ -1833,6 +1858,13 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
     let mut buf = Buffer::empty(area);
     let cursor = app.render_to(&mut buf).map(|p| (p.x, p.y));
     let look = app.cursor_look();
+    // Images (decisions #194): panes answer graphics queries only while some attached
+    // terminal can show the pictures.
+    crate::term::set_graphics(clients.iter().any(|c| c.images.is_some()), None);
+    let image_runs = app.image_runs();
+    let mut image_ids = IMAGE_IDS.lock().unwrap_or_else(|e| e.into_inner());
+    // Ids and encoded uploads are kept only for images on screen now.
+    image_ids.retain(&image_runs.iter().map(|r| r.image.key).collect());
 
     let mut dead = Vec::new();
     for c in clients.iter_mut() {
@@ -1865,6 +1897,12 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
             c.resync_at = now + RESYNC_PASS / u32::from(RESYNC_BANDS);
         }
         let changed = c.last.diff(&buf);
+        // This client's images for this frame; committed only if the frame is queued.
+        let mut images = c
+            .images
+            .as_ref()
+            .map(|ci| ci.prepare(&image_runs, &mut image_ids, crate::images::CLIENT_BUDGET));
+        let images_due = images.as_ref().is_some_and(|o| !o.is_empty());
         // Silent full repaint due? Three gates, each removing a case where it is pointless or
         // harmful:
         //   * behind a `full` frame, which already repaints everything;
@@ -1888,6 +1926,7 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
         if changed.is_empty()
             && !c.needs_full
             && !repaint
+            && !images_due
             && cursor == c.last_cursor
             && look == c.last_look
         {
@@ -1915,10 +1954,19 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
             cursor_visible: look.0,
             cursor_shape: look.1,
             repaint,
+            images: images.as_mut().and_then(|o| o.runs.take()),
+            uploads: images
+                .as_mut()
+                .map(|o| std::mem::take(&mut o.uploads))
+                .unwrap_or_default(),
+            drops: images.as_ref().map(|o| o.drops.clone()).unwrap_or_default(),
         };
         match c.out.try_send(ServerMsg::Frame(frame)) {
             // Advance this client's baseline only once it actually has the frame.
             Ok(()) => {
+                if let (Some(ci), Some(out)) = (c.images.as_mut(), images) {
+                    ci.commit(out);
+                }
                 c.last = buf.clone();
                 // Anything that put every cell on this client's screen restarts the repaint
                 // clock — a `full` frame no less than a `repaint` one.
@@ -2009,6 +2057,7 @@ mod tests {
             last_title: None,
             pending_title: None,
             pending_bell: false,
+            images: None,
             tag: None,
             heartbeat: false,
             last_seen: Instant::now(),

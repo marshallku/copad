@@ -345,7 +345,7 @@ fn image_numbers_get_an_id_assigned_and_reported() {
 fn uppercase_delete_frees_the_image_even_while_a_snapshot_holds_it() {
     let mut rig = Rig::new(10, 3);
     rig.apc("a=T,i=1,f=24,s=10,v=20,q=2,C=1", &rgb(10, 20));
-    let (_, held) = collect(rig.term.grid(), 0, 3);
+    let (_, held) = collect(rig.term.grid(), 0, 3, None);
     rig.feed(b"\x1b_Ga=d,d=I,i=1,q=2\x1b\\");
     assert_eq!(rig.images(), 0);
     rig.feed(b"\x1b_Ga=p,i=1\x1b\\");
@@ -383,7 +383,7 @@ fn snapshot_runs_merge_per_row_and_sort_by_stacking() {
     rig.apc("a=t,i=1,f=24,s=10,v=20,q=2", &rgb(10, 20));
     // A wide z=10 image, then a small z=0 one over its second column.
     rig.feed(b"\x1b_Ga=p,i=2,z=10,C=1,q=2\x1b\\\x1b[1;2H\x1b_Ga=p,i=1,C=1,q=2\x1b\\");
-    let (runs, images) = collect(rig.term.grid(), 0, 4);
+    let (runs, images) = collect(rig.term.grid(), 0, 4, None);
     assert_eq!(runs.len(), 2, "the 3-cell image is one run");
     assert_eq!(
         (runs[0].z, runs[1].z),
@@ -401,8 +401,8 @@ fn snapshot_runs_follow_the_viewport_into_history() {
     let mut rig = Rig::new(10, 2);
     rig.apc("a=T,i=1,f=24,s=10,v=20,q=2,C=1", &rgb(10, 20));
     rig.feed(b"\n\n\n");
-    assert!(collect(rig.term.grid(), 0, 2).0.is_empty());
-    let (runs, _) = collect(rig.term.grid(), 2, 2);
+    assert!(collect(rig.term.grid(), 0, 2, None).0.is_empty());
+    let (runs, _) = collect(rig.term.grid(), 2, 2, None);
     assert_eq!(runs[0].rect[1], 0.0);
 }
 
@@ -464,9 +464,9 @@ fn a_viewport_above_the_retained_history_is_clipped_not_shifted() {
     rig.feed(b"\n\n\n");
     let history = rig.term.grid().history_size() as i32;
     // A host scrolled 5 lines further back than this grid keeps.
-    let (runs, _) = collect(rig.term.grid(), history + 5, 2);
+    let (runs, _) = collect(rig.term.grid(), history + 5, 2, None);
     assert!(runs.is_empty());
-    let (runs, _) = collect(rig.term.grid(), 2, 2);
+    let (runs, _) = collect(rig.term.grid(), 2, 2, None);
     assert_eq!(runs.len(), 1);
 }
 
@@ -482,4 +482,102 @@ fn the_revision_moves_with_what_is_drawn() {
     assert!(r1 > r0);
     rig.feed(b"\x1b_Ga=d,d=a,q=2\x1b\\");
     assert!(rev(&rig) > r1);
+}
+
+#[test]
+fn per_cell_placements_of_one_image_merge_into_one_run_per_row() {
+    let mut rig = Rig::new(10, 4);
+    rig.apc("a=t,i=9,f=24,s=30,v=40,q=2", &rgb(30, 40)); // 3 x 2 cells
+    // yazi's KgpOld: one 1x1 placement per cell, each cut from the image.
+    for y in 0..2u32 {
+        for x in 0..3u32 {
+            rig.feed(
+                format!(
+                    "\x1b[{};{}H\x1b_Ga=p,i=9,p={},x={},y={},w=10,h=20,c=1,r=1,C=1,q=2\x1b\\",
+                    y + 1,
+                    x + 1,
+                    y * 3 + x + 1,
+                    x * 10,
+                    y * 20
+                )
+                .as_bytes(),
+            );
+        }
+    }
+    let (runs, _) = collect(rig.term.grid(), 0, 4, None);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].rect, [0.0, 0.0, 3.0, 1.0]);
+    assert_eq!(runs[0].uv, [0.0, 0.0, 1.0, 0.5]);
+}
+
+fn placeholders(rig: &Rig) -> (std::collections::HashMap<(u32, u32), Virtual>, (u32, u32)) {
+    let v = rig.graphics.lock().unwrap().virtuals();
+    let map = v.lock().unwrap().clone();
+    (map, rig.shared.cell())
+}
+
+#[test]
+fn unicode_placeholders_show_their_virtual_placement() {
+    let mut rig = Rig::new(10, 4);
+    // 20x40 image, virtual placement 2 x 2 cells (10x20 px each): exactly one cell per quarter.
+    rig.apc("a=T,U=1,i=42,c=2,r=2,f=24,s=20,v=40,q=2", &rgb(20, 40));
+    assert!(
+        collect(rig.term.grid(), 0, 4, None).0.is_empty(),
+        "a virtual placement draws nothing itself"
+    );
+    // kitty's example: explicit row/col on the first cell, the second inherits the column.
+    rig.feed("\x1b[38;5;42m\u{10EEEE}\u{305}\u{305}\u{10EEEE}\u{305}\x1b[39m\r\n".as_bytes());
+    rig.feed("\x1b[38;5;42m\u{10EEEE}\u{30D}\u{305}\u{10EEEE}\x1b[39m".as_bytes());
+    let (map, cell) = placeholders(&rig);
+    let ph = Placeholders {
+        virtuals: &map,
+        cell,
+    };
+    let (runs, images) = collect(rig.term.grid(), 0, 4, Some(&ph));
+    assert_eq!(runs.len(), 2, "one run per row");
+    assert_eq!(runs[0].rect, [0.0, 0.0, 2.0, 1.0]);
+    // The 20x40 image fit into a 20x40 box: rows split it in halves.
+    assert_eq!(runs[0].uv, [0.0, 0.0, 1.0, 0.5]);
+    assert_eq!(runs[1].uv, [0.0, 0.5, 1.0, 1.0]);
+    assert_eq!(images[0].width, 20);
+}
+
+#[test]
+fn placeholders_letterbox_and_a_missing_placement_shows_nothing() {
+    let mut rig = Rig::new(10, 4);
+    // 40x20 image into a 2x2-cell box (20x40 px): fit to width, centred vertically.
+    rig.apc("a=T,U=1,i=7,c=2,r=2,f=24,s=40,v=20,q=2", &rgb(40, 20));
+    rig.feed("\x1b[38;2;0;0;7m\u{10EEEE}\u{305}\u{305}\u{10EEEE}\u{305}\u{30D}\x1b[39m".as_bytes());
+    rig.feed("\x1b[2;1H\x1b[38;2;0;0;9m\u{10EEEE}\u{305}\u{305}\x1b[39m".as_bytes());
+    let (map, cell) = placeholders(&rig);
+    let ph = Placeholders {
+        virtuals: &map,
+        cell,
+    };
+    let (runs, _) = collect(rig.term.grid(), 0, 4, Some(&ph));
+    assert_eq!(runs.len(), 1, "image 9 has no placement");
+    // The image is 10 px tall in a 40 px box: rows 15..25 — the bottom 5 px of row 0.
+    assert_eq!(runs[0].rect, [0.0, 0.75, 2.0, 1.0]);
+    // Deleting the image takes its virtual placement with it.
+    rig.feed(b"\x1b_Ga=d,d=I,i=7,q=2\x1b\\");
+    assert!(placeholders(&rig).0.is_empty());
+}
+
+#[test]
+fn evicting_an_image_takes_its_virtual_placements_with_it() {
+    let mut rig = Rig::new(10, 3);
+    let size = 10 * 20 * 4;
+    rig.graphics.lock().unwrap().quota = size;
+    // Image 1 is held by a virtual placement only; image 2 needs its room.
+    rig.apc("a=T,U=1,i=1,f=24,s=10,v=20,q=2", &rgb(10, 20));
+    rig.apc("a=t,i=2,f=24,s=10,v=20,q=2", &rgb(10, 20));
+    assert!(
+        placeholders(&rig).0.is_empty(),
+        "image 1's virtual placement went with it"
+    );
+    assert_eq!(
+        rig.graphics.lock().unwrap().live_bytes(),
+        size,
+        "its bytes were freed for image 2"
+    );
 }

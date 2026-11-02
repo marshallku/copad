@@ -182,6 +182,8 @@ pub fn next_clipboard_seq() -> u64 {
 #[derive(Clone)]
 struct MuxListener {
     sender: Arc<std::sync::Mutex<Option<EventLoopSender>>>,
+    /// The pane's grid `(cols << 16) | rows`, for `CSI 14 t` (the PTY layer keeps its own).
+    grid: Arc<std::sync::atomic::AtomicU32>,
     child_exited: Arc<AtomicBool>,
     /// Set whenever the terminal's visible state changed (alacritty `Wakeup`, or a
     /// query reply that writes back). The render loop reads+clears it via
@@ -237,6 +239,43 @@ fn outer_color(index: usize) -> Option<alacritty_terminal::vte::ansi::Rgb> {
     Some(alacritty_terminal::vte::ansi::Rgb { r, g, b })
 }
 
+/// kitty graphics in panes (decisions #194), process-wide like the outer colours: whether some
+/// attached client's terminal draws images (panes answer graphics queries only then, so a
+/// program falls back to text when nobody could see its pictures) and that terminal's cell
+/// size, which panes report as their pixel size.
+static GRAPHICS: std::sync::LazyLock<Arc<copad_graphics::Shared>> =
+    std::sync::LazyLock::new(|| Arc::new(copad_graphics::Shared::default()));
+
+/// Decoded image bytes one pane may hold (a terminal's own default is 320 MiB; comux has many).
+const PANE_IMAGE_QUOTA: usize = 64 << 20;
+
+/// See [`GRAPHICS`].
+pub fn set_graphics(enabled: bool, cell: Option<(u16, u16)>) {
+    GRAPHICS.enabled.store(enabled, Ordering::Relaxed);
+    if let Some((w, h)) = cell.filter(|&(w, h)| w > 0 && h > 0) {
+        GRAPHICS.cell_width.store(w as u32, Ordering::Relaxed);
+        GRAPHICS.cell_height.store(h as u32, Ordering::Relaxed);
+    }
+}
+
+/// Whether some attached client's terminal shows images.
+pub fn graphics_enabled() -> bool {
+    GRAPHICS.enabled.load(Ordering::Relaxed)
+}
+
+/// A pane's PTY size: the grid, and the cell in pixels once a graphics client said it.
+fn window_size(cols: u16, rows: u16) -> WindowSize {
+    let px = |v: &std::sync::atomic::AtomicU32| {
+        (v.load(Ordering::Relaxed).clamp(1, u16::MAX as u32)) as u16
+    };
+    WindowSize {
+        num_lines: rows,
+        num_cols: cols,
+        cell_width: px(&GRAPHICS.cell_width),
+        cell_height: px(&GRAPHICS.cell_height),
+    }
+}
+
 /// Longest pane name kept, in characters.
 pub const MAX_PANE_NAME: usize = 48;
 
@@ -268,6 +307,7 @@ impl MuxListener {
     fn new() -> Self {
         Self {
             sender: Arc::new(std::sync::Mutex::new(None)),
+            grid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             child_exited: Arc::new(AtomicBool::new(false)),
             // Start dirty so the very first frame is composed.
             dirty: Arc::new(AtomicBool::new(true)),
@@ -337,6 +377,16 @@ impl EventListener for MuxListener {
             }
             Event::ResetTitle => {
                 *self.title.lock().unwrap() = None;
+            }
+            // `CSI 14 t` / `CSI 16 t`, once a graphics client gave the cell size.
+            Event::TextAreaSizeRequest(format)
+                if GRAPHICS.cell_width.load(Ordering::Relaxed) != 0 =>
+            {
+                if let Some(s) = self.sender.lock().unwrap().as_ref() {
+                    let grid = self.grid.load(Ordering::Relaxed);
+                    let reply = format(window_size((grid >> 16) as u16, grid as u16));
+                    let _ = s.send(Msg::Input(reply.into_bytes().into()));
+                }
             }
             // OSC 10/11/12 `?`: answered with the attached terminal's own colours when its
             // client reported them, so dark/light detection sees the real background.
@@ -410,6 +460,10 @@ pub struct PaneTerm {
     /// A name the user gave the pane (`Ctrl-b T`, `comux rename-pane`); beats the program on
     /// its title. Saved with the layout.
     name: std::sync::Mutex<Option<String>>,
+    /// The pane's kitty virtual placements, which Unicode placeholder cells show.
+    virtuals: copad_graphics::Virtuals,
+    /// The pane holds images or virtual placements at all: without, composing skips the scan.
+    has_images: Arc<AtomicBool>,
 }
 
 /// Turn a pane-spawn I/O error into a message worth showing a user.
@@ -534,12 +588,7 @@ impl PaneTerm {
             opts.env.insert(k.clone(), v.clone());
         }
 
-        let window = WindowSize {
-            num_lines: rows,
-            num_cols: cols,
-            cell_width: 1,
-            cell_height: 1,
-        };
+        let window = window_size(cols, rows);
         let pty = tty::new(&opts, window, 0).map_err(|e| describe_spawn_failure("pty", &e))?;
         // Capture the child pid + a dup of the master fd before the Pty is moved
         // into the EventLoop (the dup lets us query the foreground pgrp later).
@@ -553,8 +602,33 @@ impl PaneTerm {
 
         let term_size = TermSize::new(cols as usize, rows as usize);
         let listener = MuxListener::new();
+        listener
+            .grid
+            .store(((cols as u32) << 16) | rows as u32, Ordering::Relaxed);
         let config = pane_config();
-        let term = Term::new(config, &term_size, listener.clone());
+        let mut term = Term::new(config, &term_size, listener.clone());
+        let mut images = copad_graphics::Graphics::new(GRAPHICS.clone(), {
+            let listener = listener.clone();
+            Box::new(move |reply: String| {
+                if let Some(s) = listener.sender.lock().unwrap().as_ref() {
+                    let _ = s.send(Msg::Input(reply.into_bytes().into()));
+                }
+            })
+        });
+        images.set_quota(PANE_IMAGE_QUOTA);
+        let virtuals = images.virtuals();
+        let dirty = listener.dirty.clone();
+        let has_images = Arc::new(AtomicBool::new(false));
+        let has = has_images.clone();
+        term.set_apc_handler(Some(Box::new(move |term, data| {
+            let before = images.revision();
+            images.handle(term, data);
+            if images.revision() != before {
+                dirty.store(true, Ordering::Relaxed);
+            }
+            let any = images.has_images() || !images.virtuals().lock().unwrap().is_empty();
+            has.store(any, Ordering::Relaxed);
+        })));
         let term = Arc::new(FairMutex::new(term));
 
         let event_loop = EventLoop::new(Arc::clone(&term), listener.clone(), pty, false, false)
@@ -574,6 +648,8 @@ impl PaneTerm {
             pane_token,
             copy_query: std::sync::Mutex::new(None),
             name: std::sync::Mutex::new(None),
+            virtuals,
+            has_images,
         })
     }
 
@@ -616,17 +692,49 @@ impl PaneTerm {
     pub fn resize(&self, cols: u16, rows: u16) {
         let cols = cols.max(1);
         let rows = rows.max(1);
-        let window = WindowSize {
-            num_lines: rows,
-            num_cols: cols,
-            cell_width: 1,
-            cell_height: 1,
-        };
-        let _ = self.sender.send(Msg::Resize(window));
+        self.listener
+            .grid
+            .store(((cols as u32) << 16) | rows as u32, Ordering::Relaxed);
+        let _ = self.sender.send(Msg::Resize(window_size(cols, rows)));
         self.term
             .lock()
             .resize(TermSize::new(cols as usize, rows as usize));
         self.mark_dirty(); // a reflow changes the visible grid but may not Wakeup
+    }
+
+    /// Tell the child the PTY size again (now with the cell size a graphics client reported).
+    pub fn reannounce_size(&self) {
+        let (cols, rows) = {
+            let term = self.term.lock();
+            (term.columns() as u16, term.screen_lines() as u16)
+        };
+        let _ = self.sender.send(Msg::Resize(window_size(cols, rows)));
+    }
+
+    /// The images on this pane's screen as it is drawn (scrolled-back view included): per-row
+    /// runs in pane cells, bottom-most first, and the images they index.
+    pub fn image_runs(
+        &self,
+    ) -> (
+        Vec<copad_graphics::CopadGraphic>,
+        Vec<Arc<alacritty_terminal::term::cell::GraphicImage>>,
+    ) {
+        if !self.has_images.load(Ordering::Relaxed) {
+            return (Vec::new(), Vec::new());
+        }
+        let term = self.term.lock();
+        let grid = term.grid();
+        let virtuals = self.virtuals.lock().unwrap().clone();
+        let placeholders = copad_graphics::Placeholders {
+            virtuals: &virtuals,
+            cell: GRAPHICS.cell(),
+        };
+        copad_graphics::collect(
+            grid,
+            grid.display_offset() as i32,
+            grid.screen_lines(),
+            Some(&placeholders),
+        )
     }
 
     /// Has the child shell exited?
@@ -1193,11 +1301,16 @@ pub(crate) fn snapshot_with_search<L: EventListener>(
                 1
             };
 
-            // Grapheme = base char + any zero-width combining marks.
+            // Grapheme = base char + any zero-width combining marks. A kitty Unicode
+            // placeholder is drawn as its image (decisions #194), never as a character.
             let mut sym = String::new();
-            sym.push(cell.c);
-            if let Some(zw) = cell.zerowidth() {
-                sym.extend(zw.iter());
+            if cell.c == copad_graphics::PLACEHOLDER {
+                sym.push(' ');
+            } else {
+                sym.push(cell.c);
+                if let Some(zw) = cell.zerowidth() {
+                    sym.extend(zw.iter());
+                }
             }
             // ROOT FIX for wide-glyph ghosts: the whole render pipeline downstream (ratatui's
             // `Buffer::diff` omission, the client's `fix_wide_spacers`, and ratatui's cell emit)

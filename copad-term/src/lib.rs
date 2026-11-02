@@ -396,6 +396,8 @@ pub struct CopadHandle {
     /// The settings that live in alacritty's `Config`, so one setter can never reset the
     /// other — `set_options` takes the WHOLE config.
     options: Mutex<TermOptions>,
+    /// kitty virtual placements, which Unicode placeholder cells show (decisions #194).
+    virtuals: graphics::Virtuals,
 }
 
 /// The per-pane settings the GUI can change after creation.
@@ -633,6 +635,7 @@ pub unsafe extern "C" fn copad_term_create(
         let listener = listener.clone();
         Box::new(move |reply: String| listener.send_to_pty(reply.into_bytes()))
     });
+    let virtuals = images.virtuals();
     term.set_apc_handler(Some(Box::new(move |term, data| {
         images.handle(term, data);
     })));
@@ -663,6 +666,7 @@ pub unsafe extern "C" fn copad_term_create(
         last_selection_range: Mutex::new(CopadSelectionRange::default()),
         search_state: Mutex::new(SearchState::default()),
         options: Mutex::new(TermOptions::default()),
+        virtuals,
     }))
 }
 
@@ -1352,7 +1356,17 @@ pub unsafe extern "C" fn copad_term_snapshot(handle: *mut CopadHandle) -> *mut C
     };
 
     let selection = selection_range_for_ffi(&term);
-    let (graphics, graphic_images) = graphics::collect(grid, display_offset, rows_count as usize);
+    let virtuals = h.virtuals.lock().unwrap().clone();
+    let placeholders = graphics::Placeholders {
+        virtuals: &virtuals,
+        cell: h.listener.graphics.cell(),
+    };
+    let (graphics, graphic_images) = graphics::collect(
+        grid,
+        display_offset,
+        rows_count as usize,
+        Some(&placeholders),
+    );
 
     drop(term);
 
@@ -1534,12 +1548,17 @@ fn walk_row(
 
         let utf8_offset = utf8.len() as u32;
         let mut buf = [0u8; 4];
-        utf8.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
-        // Combining marks live in CellExtra.zerowidth — fold them
-        // into the same run's utf8 so CoreText shapes them with
-        // their base glyph.
-        for combine in cell.zerowidth().unwrap_or(&[]) {
-            utf8.extend_from_slice(combine.encode_utf8(&mut buf).as_bytes());
+        if cell.c == graphics::PLACEHOLDER {
+            // A kitty Unicode placeholder: the image is drawn there, not the character.
+            utf8.push(b' ');
+        } else {
+            utf8.extend_from_slice(cell.c.encode_utf8(&mut buf).as_bytes());
+            // Combining marks live in CellExtra.zerowidth — fold them
+            // into the same run's utf8 so CoreText shapes them with
+            // their base glyph.
+            for combine in cell.zerowidth().unwrap_or(&[]) {
+                utf8.extend_from_slice(combine.encode_utf8(&mut buf).as_bytes());
+            }
         }
         let utf8_len = utf8.len() as u32 - utf8_offset;
 

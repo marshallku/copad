@@ -398,6 +398,10 @@ struct TermGuard {
     /// Keys the user typed while the colour probe was reading stdin that could not be put
     /// back on the terminal's input queue; sent as keys once the server is listening.
     typed: Vec<KeyEvent>,
+    /// The terminal answered a kitty graphics query (decisions #194).
+    graphics: bool,
+    /// Images uploaded to the terminal, deleted from it on the way out.
+    images_held: std::collections::HashSet<u32>,
 }
 
 impl TermGuard {
@@ -405,7 +409,7 @@ impl TermGuard {
         enable_raw_mode()?;
         // First of all, while the terminal reports nothing on its own yet (focus reporting and
         // mouse capture come later) and before crossterm's reader exists: this reads stdin raw.
-        let (colors, typed) = probe_colors();
+        let (colors, typed, graphics) = probe_colors();
         // Focus reporting lets us re-probe the true terminal size when the window regains focus
         // (e.g. after the display woke from sleep) — the sanctioned recovery for a stale OS
         // winsize. Harmless on terminals that ignore it.
@@ -431,6 +435,8 @@ impl TermGuard {
             title_pushed: false,
             colors,
             typed,
+            graphics,
+            images_held: Default::default(),
         })
     }
 
@@ -460,6 +466,14 @@ impl TermGuard {
 
 impl Drop for TermGuard {
     fn drop(&mut self) {
+        // Images live in the terminal, not the alt screen: free what this client uploaded.
+        if !self.images_held.is_empty() {
+            let mut out = io::stdout();
+            for id in &self.images_held {
+                let _ = write!(out, "\u{1b}_Ga=d,d=I,i={id},q=2\u{1b}\\");
+            }
+            let _ = out.flush();
+        }
         let _ = disable_raw_mode();
         if self.mouse {
             let _ = execute!(io::stdout(), DisableMouseCapture);
@@ -489,16 +503,23 @@ impl Drop for TermGuard {
 fn probe_colors() -> (
     Option<(crate::proto::Rgb8, crate::proto::Rgb8)>,
     Vec<KeyEvent>,
+    bool,
 ) {
     use std::os::fd::AsRawFd;
     if std::env::var("COPAD_MUX_COLOR_PROBE").is_ok_and(|v| v == "0") {
-        return (None, Vec::new());
+        return (None, Vec::new(), false);
     }
     let mut out = io::stdout();
-    if write!(out, "\u{1b}]10;?\u{1b}\\\u{1b}]11;?\u{1b}\\\u{1b}[c").is_err()
+    // The kitty graphics query rides along too (decisions #194): a terminal that answers OK
+    // shows the images panes draw.
+    if write!(
+        out,
+        "\u{1b}]10;?\u{1b}\\\u{1b}]11;?\u{1b}\\{GRAPHICS_QUERY}\u{1b}[c"
+    )
+    .is_err()
         || out.flush().is_err()
     {
-        return (None, Vec::new());
+        return (None, Vec::new(), false);
     }
     let fd = io::stdin().as_raw_fd();
     let deadline = Instant::now() + Duration::from_millis(500);
@@ -560,6 +581,7 @@ fn probe_colors() -> (
         got.extend_from_slice(&chunk[..n as usize]);
     }
     let colors = osc_color(&got, b"10").zip(osc_color(&got, b"11"));
+    let graphics = got.windows(GRAPHICS_OK.len()).any(|w| w == GRAPHICS_OK);
     // Anything else read here is the user typing during the probe (the terminal reports
     // nothing unasked yet). It belongs to the event reader, which has not started: put it back
     // on the terminal's input queue (TIOCSTI — allowed for one's own controlling terminal on
@@ -574,7 +596,73 @@ fn probe_colors() -> (
         }
         pushed += 1;
     }
-    (colors, decode_typed(&rest[pushed..]))
+    (colors, decode_typed(&rest[pushed..]), graphics)
+}
+
+/// kitty graphics support probe: a 1x1 query, answered `OK` by a terminal that draws images.
+const GRAPHICS_QUERY: &str = "\u{1b}_Gi=4242,s=1,v=1,a=q,t=d,f=24;AAAA\u{1b}\\";
+const GRAPHICS_OK: &[u8] = b"\x1b_Gi=4242;OK";
+
+/// The terminal's cell size in pixels, from `TIOCGWINSZ` (zero when it does not say).
+fn cell_pixels() -> Option<(u16, u16)> {
+    use std::os::fd::AsRawFd;
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    // SAFETY: TIOCGWINSZ fills a winsize we own.
+    if unsafe { libc::ioctl(io::stdout().as_raw_fd(), libc::TIOCGWINSZ, &mut ws) } != 0 {
+        return None;
+    }
+    if ws.ws_col == 0 || ws.ws_row == 0 || ws.ws_xpixel == 0 || ws.ws_ypixel == 0 {
+        return None;
+    }
+    Some((ws.ws_xpixel / ws.ws_col, ws.ws_ypixel / ws.ws_row))
+}
+
+/// The kitty commands that upload an image (straight RGBA, zlib, base64 — `f=32,o=z`).
+fn upload_commands(up: &crate::proto::ImageUpload) -> Vec<u8> {
+    let mut out = Vec::with_capacity(up.data.len() + 64);
+    let chunks: Vec<&[u8]> = up.data.as_bytes().chunks(4096).collect();
+    for (i, chunk) in chunks.iter().enumerate() {
+        let more = (i + 1 < chunks.len()) as u8;
+        if i == 0 {
+            let _ = write!(
+                out,
+                "\u{1b}_Ga=t,f=32,o=z,i={},s={},v={},q=2,m={more};",
+                up.id, up.width, up.height
+            );
+        } else {
+            let _ = write!(out, "\u{1b}_Gm={more};");
+        }
+        out.extend_from_slice(chunk);
+        out.extend_from_slice(b"\x1b\\");
+    }
+    out
+}
+
+/// Place every run, after the cells are drawn: each frame starts from no placements, which also
+/// puts back images a terminal erased under text it just rewrote (copad does).
+fn place_images(
+    runs: &[crate::proto::ImageRun],
+    cols: u16,
+    rows: u16,
+    cell: (u16, u16),
+) -> Vec<u8> {
+    let mut out = b"\x1b_Ga=d,d=a,q=2\x1b\\".to_vec();
+    let (cw, ch) = (cell.0.max(1) as f32, cell.1.max(1) as f32);
+    for r in runs.iter().filter(|r| r.x < cols && r.y < rows) {
+        let cols_here = r.cols.min(cols - r.x);
+        let px = ((r.off[0] * cw) as u32).min(cw as u32 - 1);
+        let py = ((r.off[1] * ch) as u32).min(ch as u32 - 1);
+        let [sx, sy, sw, sh] = r.src;
+        let _ = write!(
+            out,
+            "\u{1b}[{};{}H\u{1b}_Ga=p,i={},x={sx},y={sy},w={sw},h={sh},c={cols_here},r=1,X={px},Y={py},z={},C=1,q=2\u{1b}\\",
+            r.y + 1,
+            r.x + 1,
+            r.id,
+            r.z
+        );
+    }
+    out
 }
 
 /// Decode raw keyboard bytes into key events. Complete for what a terminal can send at this
@@ -767,6 +855,15 @@ fn without_replies(buf: &[u8]) -> Vec<u8> {
                     _ => None,
                 })
                 .unwrap_or(rest.len());
+            i += end;
+            continue;
+        }
+        // A kitty graphics answer (`ESC _ G … ESC \`).
+        if rest.starts_with(b"\x1b_G") {
+            let end = rest
+                .windows(2)
+                .position(|w| w == b"\x1b\\")
+                .map_or(rest.len(), |k| k + 2);
             i += end;
             continue;
         }
@@ -1120,6 +1217,7 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     paste,
                     focus,
                     colors,
+                    graphics,
                     ..
                 }) => {
                     send_focus = focus;
@@ -1161,6 +1259,21 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     );
                     if colors && let Some((fg, bg)) = guard.colors {
                         let _ = send(&mut wr, &ClientMsg::Colors { fg, bg });
+                    }
+                    // Images (decisions #194): only a terminal that answered the graphics query
+                    // and says its cell size, under a server that can put images in frames.
+                    guard.graphics &= graphics;
+                    match cell_pixels() {
+                        Some((cell_width, cell_height)) if guard.graphics => {
+                            let _ = send(
+                                &mut wr,
+                                &ClientMsg::Graphics {
+                                    cell_width,
+                                    cell_height,
+                                },
+                            );
+                        }
+                        _ => guard.graphics = false,
                     }
                     for k in std::mem::take(&mut guard.typed) {
                         let _ = send(&mut wr, &ClientMsg::Key(k));
@@ -1238,6 +1351,11 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
     let mut cursor_shape: u8 = 0;
     // The shape we last told our terminal; `0` = its default, which is where we start.
     let mut shape_sent: u8 = 0;
+    // Images (decisions #194): the runs to place after every draw, commands to write before
+    // them (uploads, drops), and whether anything is placed now.
+    let mut image_runs: Vec<crate::proto::ImageRun> = Vec::new();
+    let mut image_commands: Vec<u8> = Vec::new();
+    let mut images_placed = false;
     // A resize has cleared the screen since the last paint (see `baseline_is_stale`).
     let mut resized = false;
     // Client-local silent-repaint period, DEFAULT OFF — additive to the cadence the server
@@ -1422,6 +1540,19 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     // cell after it (a narrow char vanishes / the row shifts). See term.rs
                     // `relay_fidelity_pure_delta_churn`.
                     fix_wide_spacers(&mut buf);
+                    // Uploads and drops keep their order even when frames are coalesced; the
+                    // runs are the latest frame's.
+                    for up in &f.uploads {
+                        image_commands.extend(upload_commands(up));
+                        guard.images_held.insert(up.id);
+                    }
+                    for id in &f.drops {
+                        let _ = write!(image_commands, "\u{1b}_Ga=d,d=I,i={id},q=2\u{1b}\\");
+                        guard.images_held.remove(id);
+                    }
+                    if let Some(runs) = f.images {
+                        image_runs = runs;
+                    }
                     cursor = f.cursor;
                     cursor_visible = f.cursor_visible;
                     cursor_shape = f.cursor_shape;
@@ -1515,6 +1646,19 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
             write!(terminal.backend_mut(), "\u{1b}[?2026h")?;
             emit_view(&mut terminal, baseline, &next, cursor)?;
             painted = next;
+            // Images over the cells just drawn, then the cursor back where `emit_view` left it.
+            if guard.graphics
+                && (!image_runs.is_empty() || images_placed || !image_commands.is_empty())
+            {
+                let out = terminal.backend_mut();
+                out.write_all(&std::mem::take(&mut image_commands))?;
+                let cell = cell_pixels().unwrap_or((10, 20));
+                out.write_all(&place_images(&image_runs, cols, rows, cell))?;
+                images_placed = !image_runs.is_empty();
+                if let Some((cx, cy)) = cursor.filter(|&(cx, cy)| cx < cols && cy < rows) {
+                    write!(out, "\u{1b}[{};{}H", cy + 1, cx + 1)?;
+                }
+            }
             // A hidden cursor is still PLACED (by `emit_view`): an IME opens its composition
             // window at the terminal cursor whether or not it is drawn.
             let want_cursor =

@@ -114,6 +114,46 @@ pub struct FrameMsg {
     /// holds), so the server sets it often. See `reconcile_secs`.
     #[serde(default)]
     pub repaint: bool,
+    /// The images to show (decisions #194), sent only to a client that said its terminal
+    /// draws them ([`ClientMsg::Graphics`]): `None` = unchanged since the last frame this
+    /// client got. The client places them over the cells after drawing every frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub images: Option<Vec<ImageRun>>,
+    /// Image data the runs need that this client does not hold yet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uploads: Vec<ImageUpload>,
+    /// Images this client may forget (it should delete them from its terminal).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drops: Vec<u32>,
+}
+
+/// One row-run of an image on the client's screen (decisions #194).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageRun {
+    /// The image (an [`ImageUpload::id`] the client holds).
+    pub id: u32,
+    /// The first cell, in frame coordinates.
+    pub x: u16,
+    pub y: u16,
+    /// Cells the run covers (a partly covered last cell counts).
+    pub cols: u16,
+    /// The part of the image shown, in image pixels: `[x, y, w, h]`.
+    pub src: [u32; 4],
+    /// Where in the first cell the image starts, as fractions of a cell (the client turns
+    /// them into its own pixels).
+    pub off: [f32; 2],
+    /// Stacking order (kitty's `z`).
+    pub z: i32,
+}
+
+/// An image a client must send its terminal before the runs naming it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ImageUpload {
+    pub id: u32,
+    pub width: u32,
+    pub height: u32,
+    /// Straight (not premultiplied) RGBA8, zlib-compressed, base64 — kitty's `f=32,o=z`.
+    pub data: String,
 }
 
 /// Which earlier attachment a reconnecting client replaces.
@@ -164,6 +204,9 @@ pub enum ServerMsg {
         /// connection (decisions #167). An older server says nothing and would drop both.
         #[serde(default)]
         commands: bool,
+        /// The server understands [`ClientMsg::Graphics`] and can put images in frames.
+        #[serde(default)]
+        graphics: bool,
     },
     /// The answer to a [`ClientMsg::Command`] (an opaque control `Resp`).
     Reply { id: String, resp: serde_json::Value },
@@ -287,6 +330,10 @@ pub enum ClientMsg {
     /// its background (dark/light detection in nvim, Claude Code, …) gets the real answer.
     /// Sent only when the server's `Hello` says `colors`.
     Colors { fg: Rgb8, bg: Rgb8 },
+    /// This client's terminal draws kitty graphics (probed at attach), and its cell size in
+    /// pixels: from now on frames carry images for it (decisions #194). Sent only to a server
+    /// whose `Hello` said `graphics`.
+    Graphics { cell_width: u16, cell_height: u16 },
     /// A forwarded mouse action at frame cell `(x, y)`.
     Mouse { x: u16, y: u16, kind: MouseKind },
     /// Run a control request (the `{"cmd":…}` object) IN ORDER with this connection's keys

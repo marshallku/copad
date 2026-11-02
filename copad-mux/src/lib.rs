@@ -28,6 +28,7 @@ pub mod gitinfo;
 pub mod gitpoll;
 pub mod hostapi;
 pub mod hostmetrics;
+pub mod images;
 pub mod keys;
 pub mod layoutfile;
 pub mod model;

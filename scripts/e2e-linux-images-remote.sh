@@ -19,7 +19,7 @@ log() { printf '[e2e-linux-img] %s\n' "$*" >&2; }
 fail() { log "FAIL: $*"; exit 1; }
 
 rsync -a --delete --exclude target --exclude .build --exclude .git "$REPO/" "$HOST:$COPY/"
-ssh "$HOST" "cd ~/$COPY && cargo build -q -p copad-linux -p copad-cli"
+ssh "$HOST" "cd ~/$COPY && cargo build -q -p copad-linux -p copad-cli -p copad-mux"
 
 W="$(mktemp -d /tmp/clim.XXXX)"
 STOP="/tmp/copad-img-stop.$$"
@@ -116,4 +116,22 @@ log "ok — moving back redrew it ($n)"
 feed "q"; sleep 1.5
 n="$(red yazi-quit)"; (( n < 50 )) || fail "quitting yazi left $n red pixels"
 log "ok — quitting yazi left nothing ($n)"
+
+# comux in that copad (decisions #194): an isolated comux server on the host (own socket and
+# state), its client in the copad tab, kitten icat in the comux PANE; the client places the
+# image in copad, whose shadow draws it.
+MUX="$HW/mux"
+ssh "$HOST" "mkdir -p $MUX && cd $MUX && COPAD_MUX_SOCK=$MUX/s COPAD_MUX_STATE=$MUX/st.json COPAD_MUX_NOTIFY=0 COPAD_MUX_USAGE=0 COPAD_MUX_UPDATE_CHECK=0 COPAD_MUX_QUIET_SSH=1 SHELL=/bin/sh setsid ~/$COPY/target/debug/comux server >$MUX/server.log 2>&1 < /dev/null &"
+sleep 2
+run "clear; env COPAD_MUX_SOCK=$MUX/s COPAD_MUX_QUIET_SSH=1 ~/$COPY/target/debug/comux"
+sleep 3
+run "clear; echo in-comux"
+wait_screen in-comux
+run "clear; $TOOLS/kitten icat --align left $FX/red.png; echo comux-icat"
+wait_screen comux-icat
+sleep 2
+n="$(red comux-icat)"
+ssh "$HOST" "COPAD_MUX_SOCK=$MUX/s ~/$COPY/target/debug/comux kill-server" >/dev/null 2>&1 || true
+(( n > 4000 )) || fail "icat in a comux pane inside copad: $n red pixels"
+log "ok — kitten icat in a comux pane drew through comux into copad ($n)"
 log "PASS"
