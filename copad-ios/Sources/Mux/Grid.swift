@@ -32,8 +32,18 @@ enum Palette {
         "LightBlue": 12, "LightMagenta": 13, "LightCyan": 14, "White": 15,
     ]
 
+    /// Resolved strings: a frame names the same few colours thousands of times.
+    private static var resolved: [String: RGB?] = [:]
+
     /// `nil` = `"Reset"` (the default for that layer).
     static func resolve(_ s: String) -> RGB? {
+        if let hit = resolved[s] { return hit }
+        let rgb = parse(s)
+        if resolved.count < 4096 { resolved[s] = rgb }
+        return rgb
+    }
+
+    private static func parse(_ s: String) -> RGB? {
         if s == "Reset" { return nil }
         if s.hasPrefix("#"), s.count == 7, let v = UInt32(s.dropFirst(), radix: 16) {
             return RGB(hex: v)
@@ -67,7 +77,17 @@ struct Mods: OptionSet, Hashable {
     static let hidden = Mods(rawValue: 1 << 7)
     static let crossedOut = Mods(rawValue: 1 << 8)
 
+    private static var parsed: [String: Mods] = [:]
+
     static func parse(_ s: String) -> Mods {
+        if s.isEmpty { return [] }
+        if let hit = parsed[s] { return hit }
+        let m = parseUncached(s)
+        if parsed.count < 1024 { parsed[s] = m }
+        return m
+    }
+
+    private static func parseUncached(_ s: String) -> Mods {
         var m: Mods = []
         for part in s.split(separator: "|") {
             switch part.trimmingCharacters(in: .whitespaces) {
@@ -108,6 +128,8 @@ struct Grid {
     var cursorVisible = true
     /// A `full` frame has been applied since the last reset; deltas before it are dropped.
     private(set) var hasBaseline = false
+    /// Rows changed since the view last took them (`takeDirtyRows`); `nil` = all of them.
+    private var dirtyRows: IndexSet? = nil
 
     subscript(x: Int, y: Int) -> Cell {
         get { cells[y * cols + x] }
@@ -117,15 +139,25 @@ struct Grid {
     /// Forget everything (reconnect): wait for a fresh `full` frame.
     mutating func reset() {
         cols = 0; rows = 0; cells = []; cursor = nil; hasBaseline = false
+        dirtyRows = nil
+    }
+
+    /// The rows to repaint since the last call — `nil` for everything — and start over.
+    mutating func takeDirtyRows() -> IndexSet? {
+        defer { dirtyRows = IndexSet() }
+        return dirtyRows
     }
 
     /// Apply one frame. Returns whether the grid changed.
     @discardableResult
     mutating func apply(_ f: FrameMsg) -> Bool {
+        var touched = IndexSet()
         if f.full {
             cols = max(f.cols, 1); rows = max(f.rows, 1)
             cells = Array(repeating: Cell(), count: cols * rows)
             hasBaseline = true
+            dirtyRows = nil
+            touched.insert(integersIn: 0 ..< rows)
         } else if !hasBaseline || f.cols != cols || f.rows != rows {
             // A delta for a size we don't hold yet — its `full` frame is coming.
             return false
@@ -133,18 +165,24 @@ struct Grid {
         for c in f.cells where c.x < cols && c.y < rows {
             self[c.x, c.y] = Cell(sym: c.sym, fg: Palette.resolve(c.fg), bg: Palette.resolve(c.bg),
                                   mods: Mods.parse(c.mods), skip: c.skip)
+            touched.insert(c.y)
         }
-        fixWideSpacers()
+        fixWideSpacers(rows: touched)
+        // The cursor's old and new rows repaint too.
+        if let old = cursor, old.y < rows { touched.insert(old.y) }
         if let cur = f.cursor, cur.count == 2 { cursor = (cur[0], cur[1]) } else { cursor = nil }
+        if let new = cursor, new.y >= 0, new.y < rows { touched.insert(new.y) }
+        if cursorVisible != f.cursorVisible { touched.insert(integersIn: 0 ..< rows) }
         cursorVisible = f.cursorVisible
+        dirtyRows?.formUnion(touched)
         return true
     }
 
     /// The wire omits the trailing spacer of a wide glyph (ratatui's diff drops the cell after
     /// it), so rebuild spacer structure from the glyphs — a port of comux's
     /// `client::fix_wide_spacers`, or a wide glyph that MOVED would leave its old spacer behind.
-    mutating func fixWideSpacers() {
-        for y in 0..<rows {
+    mutating func fixWideSpacers(rows touched: IndexSet? = nil) {
+        for y in touched ?? IndexSet(integersIn: 0 ..< rows) where y < rows {
             var prevWide = false
             for x in 0..<cols {
                 let i = y * cols + x
@@ -173,17 +211,20 @@ struct Grid {
 /// presentation, which is what decides a 2-column cell in comux's grid.
 enum CellWidth {
     static func of(_ s: String) -> Int {
+        // ASCII — nearly every cell — without touching Unicode properties.
+        if s.utf8.count == 1 { return 1 }
         guard let u = s.unicodeScalars.first else { return 1 }
         if s.unicodeScalars.contains(where: { $0.value == 0xFE0F }) { return 2 }
         if u.properties.isEmojiPresentation { return 2 }
         let v = u.value
-        let wide: [ClosedRange<UInt32>] = [
+        return wide.contains { $0.contains(v) } ? 2 : 1
+    }
+
+    private static let wide: [ClosedRange<UInt32>] = [
             0x1100...0x115F, 0x231A...0x231B, 0x2329...0x232A, 0x2E80...0x303E,
             0x3041...0x33FF, 0x3400...0x4DBF, 0x4E00...0x9FFF, 0xA000...0xA4CF,
             0xA960...0xA97F, 0xAC00...0xD7A3, 0xF900...0xFAFF, 0xFE10...0xFE19,
             0xFE30...0xFE6F, 0xFF00...0xFF60, 0xFFE0...0xFFE6, 0x1F300...0x1F64F,
             0x1F900...0x1F9FF, 0x20000...0x2FFFD, 0x30000...0x3FFFD,
-        ]
-        return wide.contains { $0.contains(v) } ? 2 : 1
-    }
+    ]
 }

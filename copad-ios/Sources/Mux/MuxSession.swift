@@ -45,6 +45,11 @@ final class MuxSession: ObservableObject, KeySink {
     /// display — every frame is still APPLIED here (codex C3).
     private(set) var grid = Grid()
     var onGrid: (() -> Void)?
+
+    /// Rows the view must repaint since it last asked; `nil` = all.
+    func takeDirtyRows() -> IndexSet? {
+        grid.takeDirtyRows()
+    }
     var onBell: (() -> Void)?
     var onCopy: ((String) -> Void)?
 
@@ -95,6 +100,15 @@ final class MuxSession: ObservableObject, KeySink {
         UserDefaults.standard.set(t, forKey: k)
         return t
     }
+
+    #if DEBUG
+    /// A disconnected session holding `grid`, for tests that draw it.
+    static func previewForTests(grid: Grid) -> MuxSession {
+        let session = MuxSession(host: MuxHost(name: "test", host: "localhost", user: "test"))
+        session.grid = grid
+        return session
+    }
+    #endif
 
     init(host: MuxHost) {
         self.host = host

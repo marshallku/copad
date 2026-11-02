@@ -67,8 +67,15 @@ final class TerminalView: UIView {
     @objc private func tick() {
         guard dirty else { return }
         dirty = false
-        setNeedsDisplay()
-        updateAccessibility()
+        // Only the rows the frames touched (a streaming agent changes a line or two a frame).
+        guard let rowsToPaint = session?.takeDirtyRows() else {
+            setNeedsDisplay()
+            return
+        }
+        for range in rowsToPaint.rangeView {
+            setNeedsDisplay(CGRect(x: 0, y: CGFloat(range.lowerBound) * cellH,
+                                   width: bounds.width, height: CGFloat(range.count) * cellH))
+        }
     }
 
     override func layoutSubviews() {
@@ -81,8 +88,8 @@ final class TerminalView: UIView {
 
     override func draw(_ rect: CGRect) {
         guard let ctx = UIGraphicsGetCurrentContext(), let g = session?.grid else { return }
-        ctx.setFillColor(UIColor(rgb: Palette.defaultBG).cgColor)
-        ctx.fill(bounds)
+        ctx.setFillColor(cgColor(Palette.defaultBG))
+        ctx.fill(rect)
         guard g.cols > 0 else { return }
         let firstRow = max(0, Int(rect.minY / cellH)), lastRow = min(g.rows - 1, Int(rect.maxY / cellH))
         guard firstRow <= lastRow else { return }
@@ -92,12 +99,44 @@ final class TerminalView: UIView {
         drawCursor(g, ctx)
     }
 
-    private func colors(_ c: Cell) -> (UIColor, UIColor) {
+    /// Resolved (foreground, background) of a cell, as RGB: comparing these costs nothing,
+    /// where building a UIColor per cell twice a frame did.
+    private func colors(_ c: Cell) -> (fg: RGB, bg: RGB) {
         var fg = c.fg ?? Palette.defaultFG, bg = c.bg ?? Palette.defaultBG
         if c.mods.contains(.reversed) { swap(&fg, &bg) }
-        var f = UIColor(rgb: fg)
-        if c.mods.contains(.dim) { f = f.withAlphaComponent(0.55) }
-        return (f, UIColor(rgb: bg))
+        return (fg, bg)
+    }
+
+    private var cgColors: [RGB: CGColor] = [:]
+    private var dimColors: [RGB: CGColor] = [:]
+
+    private func cgColor(_ rgb: RGB, dim: Bool = false) -> CGColor {
+        // True-colour gradients would otherwise grow these for the view's life.
+        if cgColors.count + dimColors.count > 4096 {
+            cgColors.removeAll(keepingCapacity: true)
+            dimColors.removeAll(keepingCapacity: true)
+        }
+        if dim {
+            if let hit = dimColors[rgb] { return hit }
+            let color = CGColor(srgbRed: rgb.r, green: rgb.g, blue: rgb.b, alpha: 0.55)
+            dimColors[rgb] = color
+            return color
+        }
+        if let hit = cgColors[rgb] { return hit }
+        let color = CGColor(srgbRed: rgb.r, green: rgb.g, blue: rgb.b, alpha: 1)
+        cgColors[rgb] = color
+        return color
+    }
+
+    /// Glyph ids for ASCII, per face: 0..<128, 0 = not in the font.
+    private lazy var asciiGlyphs = Self.glyphTable(font)
+    private lazy var asciiBoldGlyphs = Self.glyphTable(boldFont)
+
+    private static func glyphTable(_ font: UIFont) -> [CGGlyph] {
+        var chars = (0 ..< 128).map { UniChar($0) }
+        var glyphs = [CGGlyph](repeating: 0, count: 128)
+        CTFontGetGlyphsForCharacters(font as CTFont, &chars, &glyphs, 128)
+        return glyphs
     }
 
     private func drawRow(_ g: Grid, _ y: Int, _ ctx: CGContext) {
@@ -105,52 +144,134 @@ final class TerminalView: UIView {
         // Backgrounds first, merged into runs.
         var x = 0
         while x < g.cols {
-            let bg = colors(g[x, y]).1
+            let bg = colors(g[x, y]).bg
             var end = x + 1
-            while end < g.cols, colors(g[end, y]).1 == bg { end += 1 }
-            if bg != UIColor(rgb: Palette.defaultBG) {
-                ctx.setFillColor(bg.cgColor)
+            while end < g.cols, colors(g[end, y]).bg == bg { end += 1 }
+            if bg != Palette.defaultBG {
+                ctx.setFillColor(cgColor(bg))
                 ctx.fill(CGRect(x: CGFloat(x) * cellW, y: top, width: CGFloat(end - x) * cellW, height: cellH))
             }
             x = end
         }
-        // Glyphs: a run of plain ASCII with one style is one draw (monospace keeps it aligned);
-        // anything else is drawn in its own cell box.
+        // Glyphs: a run of plain ASCII with one style is one CTFontDrawGlyphs at the cells' own
+        // positions (no attributed string, no line layout); anything else is drawn in its own
+        // cell box.
         x = 0
+        var glyphs: [CGGlyph] = []
+        var positions: [CGPoint] = []
         while x < g.cols {
             let c = g[x, y]
             if c.skip || c.sym == " " || c.sym.isEmpty || c.mods.contains(.hidden) { x += 1; continue }
-            let attrs = attributes(c)
-            if c.sym.utf8.count == 1 {
-                var s = c.sym, end = x + 1
+            if c.sym.utf8.count == 1, let ascii = c.sym.utf8.first, ascii < 128 {
+                let bold = c.mods.contains(.bold)
+                let table = bold ? asciiBoldGlyphs : asciiGlyphs
+                glyphs.removeAll(keepingCapacity: true)
+                positions.removeAll(keepingCapacity: true)
+                var end = x
                 while end < g.cols {
                     let n = g[end, y]
-                    guard n.sym.utf8.count == 1, !n.skip, n.fg == c.fg, n.bg == c.bg, n.mods == c.mods else { break }
-                    s += n.sym; end += 1
+                    guard n.fg == c.fg, n.bg == c.bg, n.mods == c.mods, !n.skip,
+                          n.sym.utf8.count == 1, let b = n.sym.utf8.first, b < 128 else { break }
+                    if b != 0x20 {
+                        glyphs.append(table[Int(b)])
+                        positions.append(CGPoint(x: CGFloat(end) * cellW, y: 0))
+                    }
+                    end += 1
                 }
-                (s as NSString).draw(at: CGPoint(x: CGFloat(x) * cellW, y: top), withAttributes: attrs)
+                drawGlyphs(glyphs, positions, cell: c, from: x, to: end, top: top, ctx)
                 x = end
             } else {
+                let laid = laidOut(c)
                 let w = CGFloat(CellWidth.of(c.sym)) * cellW
-                let size = (c.sym as NSString).size(withAttributes: attrs)
-                let ox = CGFloat(x) * cellW + max(0, (w - size.width) / 2)
-                (c.sym as NSString).draw(at: CGPoint(x: ox, y: top), withAttributes: attrs)
+                let ox = CGFloat(x) * cellW + max(0, (w - laid.width) / 2)
+                ctx.saveGState()
+                ctx.textMatrix = textMatrix(italic: c.mods.contains(.italic))
+                ctx.textPosition = CGPoint(x: ox, y: top + laid.ascent)
+                CTLineDraw(laid.line, ctx)
+                ctx.restoreGState()
+                drawDecorations(c, from: x, to: x + max(1, CellWidth.of(c.sym)), top: top, ctx)
                 x += 1
             }
         }
     }
 
-    private func attributes(_ c: Cell) -> [NSAttributedString.Key: Any] {
-        var a: [NSAttributedString.Key: Any] = [
-            .font: c.mods.contains(.bold) ? boldFont : font,
-            .foregroundColor: colors(c).0,
-        ]
-        if c.mods.contains(.underlined) { a[.underlineStyle] = NSUnderlineStyle.single.rawValue }
-        if c.mods.contains(.crossedOut) { a[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
-        if c.mods.contains(.italic) {
-            a[.obliqueness] = 0.18
+    private struct LaidOutKey: Hashable {
+        let sym: String
+        let fg: RGB
+        let mods: Mods
+    }
+
+    /// A non-ASCII cell (CJK, emoji, Nerd icon) laid out once per glyph and style; laying it
+    /// out (and measuring it to centre it) on every draw was the bulk of a frame.
+    private var laidOutCache: [LaidOutKey: (line: CTLine, width: CGFloat, ascent: CGFloat)] = [:]
+
+    private func laidOut(_ c: Cell) -> (line: CTLine, width: CGFloat, ascent: CGFloat) {
+        let key = LaidOutKey(sym: c.sym, fg: colors(c).fg, mods: c.mods)
+        if let hit = laidOutCache[key] { return hit }
+        let attributed = NSAttributedString(string: c.sym, attributes: attributes(c))
+        let line = CTLineCreateWithAttributedString(attributed)
+        let width = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
+        // Same baseline as the ASCII runs: the base font's, not the fallback face's.
+        let entry = (line: line, width: width, ascent: (c.mods.contains(.bold) ? boldFont : font).ascender)
+        if laidOutCache.count > 2048 { laidOutCache.removeAll(keepingCapacity: true) }
+        laidOutCache[key] = entry
+        return entry
+    }
+
+    /// One style run of ASCII glyphs at their cell positions, plus its decorations.
+    private func drawGlyphs(
+        _ glyphs: [CGGlyph], _ positions: [CGPoint], cell c: Cell, from x0: Int, to x1: Int,
+        top: CGFloat, _ ctx: CGContext,
+    ) {
+        let face = c.mods.contains(.bold) ? boldFont : font
+        let color = cgColor(colors(c).fg, dim: c.mods.contains(.dim))
+        let baseline = top + face.ascender
+        if !glyphs.isEmpty {
+            ctx.saveGState()
+            ctx.setFillColor(color)
+            ctx.textMatrix = textMatrix(italic: c.mods.contains(.italic))
+            ctx.translateBy(x: 0, y: baseline)
+            positions.withUnsafeBufferPointer { p in
+                glyphs.withUnsafeBufferPointer { g in
+                    CTFontDrawGlyphs(face as CTFont, g.baseAddress!, p.baseAddress!, glyphs.count, ctx)
+                }
+            }
+            ctx.restoreGState()
         }
-        return a
+        drawDecorations(c, from: x0, to: x1, top: top, ctx)
+    }
+
+    /// UIKit's context is y-down; glyphs draw y-up. Italic is a shear (the bundled font has no
+    /// italic face).
+    private func textMatrix(italic: Bool) -> CGAffineTransform {
+        let flip = CGAffineTransform(scaleX: 1, y: -1)
+        return italic ? flip.concatenating(CGAffineTransform(a: 1, b: 0, c: -0.18, d: 1, tx: 0, ty: 0)) : flip
+    }
+
+    /// Underline and strike-through as rects: Core Text draws neither the way UIKit's string
+    /// drawing did, for ASCII runs and single cells alike.
+    private func drawDecorations(_ c: Cell, from x0: Int, to x1: Int, top: CGFloat, _ ctx: CGContext) {
+        guard c.mods.contains(.underlined) || c.mods.contains(.crossedOut) else { return }
+        let face = c.mods.contains(.bold) ? boldFont : font
+        let color = cgColor(colors(c).fg, dim: c.mods.contains(.dim))
+        let baseline = top + face.ascender
+        let lineWidth = max(1, face.lineHeight / 16)
+        if c.mods.contains(.underlined) {
+            ctx.setFillColor(color)
+            ctx.fill(CGRect(x: CGFloat(x0) * cellW, y: baseline + lineWidth, width: CGFloat(x1 - x0) * cellW, height: lineWidth))
+        }
+        if c.mods.contains(.crossedOut) {
+            ctx.setFillColor(color)
+            ctx.fill(CGRect(x: CGFloat(x0) * cellW, y: baseline - face.xHeight / 2, width: CGFloat(x1 - x0) * cellW, height: lineWidth))
+        }
+    }
+
+    /// Font and colour only: italic, underline and strike-through are drawn by `drawRow`.
+    private func attributes(_ c: Cell) -> [NSAttributedString.Key: Any] {
+        [
+            .font: c.mods.contains(.bold) ? boldFont : font,
+            .foregroundColor: UIColor(rgb: colors(c).fg).withAlphaComponent(c.mods.contains(.dim) ? 0.55 : 1),
+        ]
     }
 
     private func drawCursor(_ g: Grid, _ ctx: CGContext) {
@@ -171,9 +292,13 @@ final class TerminalView: UIView {
         ctx.fill(CGRect(x: origin.x, y: origin.y, width: cellW, height: cellH))
     }
 
-    private func updateAccessibility() {
-        guard let g = session?.grid else { return }
-        accessibilityValue = (0..<g.rows).map { g.text(row: $0) }.joined(separator: "\n")
+    /// The screen as text, built when assistive tech (or a UI test) asks — not every frame.
+    override var accessibilityValue: String? {
+        get {
+            guard let g = session?.grid else { return nil }
+            return (0..<g.rows).map { g.text(row: $0) }.joined(separator: "\n")
+        }
+        set {}
     }
 
     // MARK: touch

@@ -86,7 +86,15 @@ enum ServerMsg {
         var commands: Bool
     }
 
+    /// How every frame line starts (serde puts the tag first).
+    private static let framePrefix = Data(#"{"t":"frame""#.utf8)
+
     static func parse(_ line: Data) -> ServerMsg? {
+        // Frames are the hot path: decode them with Codable straight from the bytes, without a
+        // first JSONSerialization pass just to read the tag.
+        if line.starts(with: framePrefix) {
+            if let f = try? JSONDecoder().decode(FrameEnvelope.self, from: line) { return .frame(f.frame) }
+        }
         guard let obj = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
               let t = obj["t"] as? String else { return nil }
         switch t {
