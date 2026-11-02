@@ -278,7 +278,18 @@ final class MetalGridRenderer {
         let isColor: Bool
     }
 
-    init?(layer: CAMetalLayer, device: MTLDevice, fonts: Fonts, metrics: Metrics) {
+    /// What every renderer on one device can share: the queue and the compiled pipelines. Built
+    /// once per device instead of once per pane (decisions #190).
+    private struct DeviceState {
+        let queue: MTLCommandQueue
+        let pipeline: MTLRenderPipelineState
+        let linearPipeline: MTLRenderPipelineState
+    }
+
+    private static var deviceStates: [ObjectIdentifier: DeviceState] = [:]
+
+    private static func deviceState(_ device: MTLDevice) -> DeviceState? {
+        if let state = deviceStates[ObjectIdentifier(device)] { return state }
         guard let queue = device.makeCommandQueue() else { return nil }
         let library: MTLLibrary
         do {
@@ -310,30 +321,49 @@ final class MetalGridRenderer {
         }
 
         do {
-            pipeline = try makePipeline(.bgra8Unorm)
-            linearPipeline = try makePipeline(.bgra8Unorm_srgb)
+            let state = try DeviceState(
+                queue: queue,
+                pipeline: makePipeline(.bgra8Unorm),
+                linearPipeline: makePipeline(.bgra8Unorm_srgb),
+            )
+            deviceStates[ObjectIdentifier(device)] = state
+            return state
         } catch {
             FileHandle.standardError.write(Data("[copad] Metal pipeline create failed: \(error)\n".utf8))
             return nil
         }
+    }
 
-        guard let atlas = GlyphAtlas(device: device, scale: metrics.scale, smooth: metrics.smoothFonts)
+    init?(layer: CAMetalLayer, device: MTLDevice, fonts: Fonts, metrics: Metrics) {
+        guard let state = Self.deviceState(device),
+              let atlas = GlyphAtlas.shared(device: device, scale: metrics.scale, smooth: metrics.smoothFonts)
         else { return nil }
 
         self.device = device
-        self.queue = queue
+        queue = state.queue
+        pipeline = state.pipeline
+        linearPipeline = state.linearPipeline
         self.layer = layer
         self.fonts = fonts
         self.metrics = metrics
         self.atlas = atlas
     }
 
-    /// Font / zoom / backing-scale change: shaped positions and atlas
-    /// rasterizations are stale — rebuild lazily from the next frame.
+    /// Let go of the layer's full-size drawables (each a whole frame of pixels) while the view is
+    /// off screen: a new drawable size retires the pool. `render` sizes it back on the next frame.
+    func releaseDrawables() {
+        layer?.drawableSize = CGSize(width: 1, height: 1)
+    }
+
+    /// Font / zoom / backing-scale change: shaped positions are stale — rebuild lazily from the
+    /// next frame. Atlas entries are keyed by font, so only a new scale or smoothing moves this
+    /// renderer to another (shared) atlas; the old fonts' glyphs age out on overflow.
     func setFonts(_ newFonts: Fonts, metrics newMetrics: Metrics) {
         fonts = newFonts
         metrics = newMetrics
-        atlas.flush(scale: newMetrics.scale, smooth: newMetrics.smoothFonts)
+        if let atlas = GlyphAtlas.shared(device: device, scale: newMetrics.scale, smooth: newMetrics.smoothFonts) {
+            self.atlas = atlas
+        }
         shapeCache.removeAll(keepingCapacity: true)
         fallbackCache.removeAll(keepingCapacity: true)
     }
@@ -371,19 +401,19 @@ final class MetalGridRenderer {
             layer.drawableSize = drawableSize
         }
 
-        // Two attempts: an atlas overflow mid-build invalidates every
-        // uv already emitted this frame, so flush and rebuild once
-        // from the current working set (plan D4 overflow policy).
+        // An atlas overflow mid-build invalidates every uv already emitted this frame: the atlas
+        // grows (or, at its largest, flushes) and the frame is rebuilt from the current working
+        // set (plan D4 overflow policy).
         let buildStart = measure ? DispatchTime.now().uptimeNanoseconds : 0
         var instances: [QuadInstance] = []
         var backgroundEnd = 0
-        for attempt in 0 ..< 2 {
+        for attempt in 0 ..< 3 {
             instances.removeAll(keepingCapacity: true)
             if buildFrame(snap: snap, theme: theme, state: state, into: &instances, backgroundEnd: &backgroundEnd) {
                 break
             }
-            atlas.flush(scale: scale, smooth: metrics.smoothFonts)
-            if attempt == 1 {
+            atlas.makeRoom()
+            if attempt == 2 {
                 FileHandle.standardError.write(
                     Data("[copad] glyph atlas overflow persists after rebuild — frame may drop glyphs\n".utf8),
                 )
@@ -1036,6 +1066,33 @@ final class MetalGridRenderer {
 /// rasterize as-is and the shader samples them untinted.
 @MainActor
 private final class GlyphAtlas {
+    private struct RegistryKey: Hashable {
+        let device: ObjectIdentifier
+        let scale: CGFloat
+        let smooth: Bool
+    }
+
+    private final class Weak {
+        weak var atlas: GlyphAtlas?
+        init(_ atlas: GlyphAtlas) {
+            self.atlas = atlas
+        }
+    }
+
+    /// One atlas per device, backing scale and smoothing, shared by every pane's renderer: a
+    /// pane used to own a 16 MiB atlas of its own, mostly holding the same glyphs as every other
+    /// pane (decisions #190). Held weakly — it goes with the last renderer using it.
+    private static var registry: [RegistryKey: Weak] = [:]
+
+    static func shared(device: MTLDevice, scale: CGFloat, smooth: Bool) -> GlyphAtlas? {
+        let key = RegistryKey(device: ObjectIdentifier(device), scale: scale, smooth: smooth)
+        if let atlas = registry[key]?.atlas { return atlas }
+        registry = registry.filter { $0.value.atlas != nil }
+        guard let atlas = GlyphAtlas(device: device, scale: scale, smooth: smooth) else { return nil }
+        registry[key] = Weak(atlas)
+        return atlas
+    }
+
     struct Entry {
         let uvOrigin: SIMD2<Float>
         let uvSize: SIMD2<Float>
@@ -1074,9 +1131,14 @@ private final class GlyphAtlas {
         }
     }
 
-    static let size = 2048
+    /// Starting edge: 4 MiB covers a terminal's usual working set; it doubles on overflow up to
+    /// `maxSize` before it ever flushes.
+    static let initialSize = 1024
+    static let maxSize = 2048
 
-    let texture: MTLTexture
+    private let device: MTLDevice
+    private var size: Int
+    private(set) var texture: MTLTexture
     private var packer: AtlasShelfPacker
     private var entries: [Key: Entry] = [:]
     private var scale: CGFloat
@@ -1084,20 +1146,40 @@ private final class GlyphAtlas {
     /// cached bitmap, so changing it flushes the atlas like a scale change.
     private var smooth: Bool
 
-    init?(device: MTLDevice, scale: CGFloat, smooth: Bool) {
+    private init?(device: MTLDevice, scale: CGFloat, smooth: Bool) {
+        guard let texture = Self.makeTexture(device: device, size: Self.initialSize) else { return nil }
+        self.device = device
+        size = Self.initialSize
+        self.texture = texture
+        packer = AtlasShelfPacker(width: size, height: size, padding: 1)
+        self.scale = scale
+        self.smooth = smooth
+    }
+
+    private static func makeTexture(device: MTLDevice, size: Int) -> MTLTexture? {
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .rgba8Unorm,
-            width: Self.size,
-            height: Self.size,
+            width: size,
+            height: size,
             mipmapped: false,
         )
         desc.usage = .shaderRead
         desc.storageMode = .shared
-        guard let texture = device.makeTexture(descriptor: desc) else { return nil }
-        self.texture = texture
-        packer = AtlasShelfPacker(width: Self.size, height: Self.size, padding: 1)
-        self.scale = scale
-        self.smooth = smooth
+        return device.makeTexture(descriptor: desc)
+    }
+
+    /// Out of space: double the texture while it may grow, else start over. Either way every
+    /// entry is gone, so the caller rebuilds its frame. A frame still in flight keeps the old
+    /// texture alive until it completes.
+    func makeRoom() {
+        if size < Self.maxSize, let bigger = Self.makeTexture(device: device, size: size * 2) {
+            size *= 2
+            texture = bigger
+            packer = AtlasShelfPacker(width: size, height: size, padding: 1)
+            entries.removeAll(keepingCapacity: true)
+        } else {
+            flush(scale: scale, smooth: smooth)
+        }
     }
 
     /// Drop every entry and reset packing. Old texels stay in the
@@ -1190,7 +1272,7 @@ private final class GlyphAtlas {
             bytesPerRow: widthPx * 4,
         )
 
-        let atlasSize = Float(Self.size)
+        let atlasSize = Float(size)
         let entry = Entry(
             uvOrigin: SIMD2(Float(placement.x) / atlasSize, Float(placement.y) / atlasSize),
             uvSize: SIMD2(Float(widthPx) / atlasSize, Float(heightPx) / atlasSize),

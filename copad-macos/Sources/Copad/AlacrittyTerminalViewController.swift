@@ -1395,6 +1395,9 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             vsyncLink?.invalidate()
             vsyncLink = nil
             center.removeObserver(self)
+            // A pane off screen (a background tab) need not keep full-size drawables; the
+            // repaint on the way back in sizes them again.
+            metalRenderer?.releaseDrawables()
             return
         }
         if vsyncLink == nil {
