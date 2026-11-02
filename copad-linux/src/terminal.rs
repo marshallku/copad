@@ -120,6 +120,19 @@ pub(crate) fn normalize_osc7_uri(uri: &str) -> String {
         .unwrap_or_else(|| path.to_string())
 }
 
+/// `[terminal] images`: VTE ships sixel support but leaves it off, and only advertises sixel in
+/// DA1 while it is on, which is how yazi decides to send images at all. A libvte built without
+/// sixel ignores the switch, so say once why images stay off.
+fn apply_images(terminal: &Terminal, enabled: bool) {
+    terminal.set_enable_sixel(enabled);
+    if enabled && !terminal.enables_sixel() {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            log::warn!("[terminal] images: this VTE was built without sixel; images stay off");
+        });
+    }
+}
+
 const DEFAULT_FONT_SCALE: f64 = 1.0;
 const FONT_SCALE_STEP: f64 = 0.1;
 const MIN_FONT_SCALE: f64 = 0.3;
@@ -232,6 +245,7 @@ impl TerminalPanel {
         terminal.set_cursor_blink_mode(vte4::CursorBlinkMode::On);
         terminal.set_cursor_shape(vte4::CursorShape::Block);
         terminal.set_scrollback_lines(config.terminal.scrollback as i64);
+        apply_images(&terminal, config.terminal.images);
         terminal.set_hexpand(true);
         terminal.set_vexpand(true);
 
@@ -586,6 +600,9 @@ impl TerminalPanel {
         let lines = config.terminal.scrollback as i64;
         if self.terminal.scrollback_lines() != lines {
             self.terminal.set_scrollback_lines(lines);
+        }
+        if self.terminal.enables_sixel() != config.terminal.images {
+            apply_images(&self.terminal, config.terminal.images);
         }
     }
 }

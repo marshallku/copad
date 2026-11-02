@@ -95,6 +95,12 @@ pub struct TerminalConfig {
         deserialize_with = "deserialize_scrollback"
     )]
     pub scrollback: usize,
+
+    /// Let programs draw images in the terminal (sixel on Linux, the kitty graphics protocol on
+    /// macOS) — what yazi and `kitten icat` use for previews. `false` makes the terminal ignore
+    /// image sequences and stop advertising support, so programs fall back to text.
+    #[serde(default = "default_true")]
+    pub images: bool,
 }
 
 /// The most scrollback a pane may keep.
@@ -122,6 +128,7 @@ impl Default for TerminalConfig {
             close_on_exit: true,
             kitty_keyboard: true,
             scrollback: default_scrollback(),
+            images: true,
         }
     }
 }
@@ -672,6 +679,13 @@ mod tests {
         );
         // Not an integer is a type error, like any other field.
         assert!(parse("[terminal]\nscrollback = \"lots\"").is_err());
+    }
+
+    #[test]
+    fn images_default_on_and_can_be_turned_off() {
+        let parse = |t: &str| toml::from_str::<CopadConfig>(t).map(|c| c.terminal);
+        assert!(parse("").unwrap().images);
+        assert!(!parse("[terminal]\nimages = false").unwrap().images);
     }
 
     #[test]
