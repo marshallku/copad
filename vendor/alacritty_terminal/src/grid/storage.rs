@@ -10,7 +10,11 @@ use super::Row;
 use crate::index::Line;
 
 /// Maximum number of buffered lines outside of the grid for performance optimization.
-const MAX_CACHE_SIZE: usize = 1_000;
+/// Rows grown at once and kept spare after shrinking. copad patch: upstream's 1 000 made every
+/// grid that ever grew (the first resize after creation does) carry ~1 000 full-width rows of
+/// cells nobody used — ~3 MB per pane at 130 columns, on every pane, comux pane and Linux
+/// image shadow. 64 still amortizes growth one history line at a time (decisions #195).
+const MAX_CACHE_SIZE: usize = 64;
 
 /// A ring buffer for optimizing indexing and rotation.
 ///

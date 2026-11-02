@@ -27,5 +27,10 @@ empty title stack). Fixed upstream, unreleased.
 - `term/mod.rs`: DA1 answers `ESC [ ? 62 ; 22 c` (VT220 + ANSI colour, as ghostty and xterm) instead of `?6c`:
   kitten only accepts a DA1 reply longer than three bytes as the end of its graphics probe.
 
-The graphics logic itself lives in `copad-term/src/graphics.rs`. These patches are copad's own, so this
+## Smaller row cache (decisions #195)
+
+`grid/storage.rs`: `MAX_CACHE_SIZE` 1 000 → 64. Growing a grid (a resize after creation, history
+filling up) reserved at least 1 000 full-width rows and kept that many spare after shrinking.
+
+The graphics logic itself lives in `copad-graphics`. These patches are copad's own, so this
 directory stays when upstream releases the keyboard fix.

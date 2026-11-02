@@ -26,7 +26,9 @@ use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::Processor;
 use copad_graphics::{CopadGraphic, Effects, Graphics};
 
-/// History the shadow keeps: images further back in VTE's scrollback are not shown.
+/// History the shadow keeps while it holds images: images further back in VTE's scrollback
+/// are not shown. Without images it keeps none — the history only ever exists to carry images,
+/// and every pane has a shadow (measured: 2.2 MB per pane with it always on).
 const SHADOW_HISTORY: usize = 200;
 /// Largest APC body kept (the vendored parser's limit); a longer one is dropped.
 const MAX_APC: usize = 16 * 1024 * 1024;
@@ -228,12 +230,14 @@ pub struct Shadow {
     published_revision: u64,
     published_any: bool,
     fed: bool,
+    /// The history currently configured (0 or [`SHADOW_HISTORY`]).
+    history: usize,
 }
 
 impl Shadow {
     pub fn new(columns: usize, lines: usize, shared: Arc<ImageShared>) -> Self {
         let config = Config {
-            scrolling_history: SHADOW_HISTORY,
+            scrolling_history: 0,
             kitty_keyboard: false,
             ..Config::default()
         };
@@ -254,6 +258,7 @@ impl Shadow {
             published_revision: 0,
             published_any: false,
             fed: false,
+            history: 0,
         }
     }
 
@@ -274,14 +279,44 @@ impl Shadow {
         if self.parser.sync_bytes_count() > 0 {
             self.parser.stop_sync(&mut self.term);
         }
+        // Output can take the last image away (scrolled out of history, `clear`).
+        if self.history != 0 {
+            self.size_history();
+        }
         self.fed = true;
     }
 
     /// Run one graphics command; returns the bytes that make VTE do what it did to the cursor.
     pub fn run_apc(&mut self, body: &[u8]) -> Vec<u8> {
         // (The APC's empty stand-in already went through `feed`.)
+        // History on BEFORE the command: a placement can scroll (its first rows, its closing
+        // linefeed), and rows scrolled out with no history would be lost here while VTE keeps
+        // them. Afterwards it goes back off if no image came of it.
+        self.set_history(SHADOW_HISTORY);
         let effects = self.graphics.handle(&mut self.term, body);
+        self.size_history();
         self.effect_bytes(effects)
+    }
+
+    /// History only while images exist: grown when the first appears (from then on the
+    /// shadow's scrollback follows VTE's), dropped when the last is gone.
+    fn size_history(&mut self) {
+        self.set_history(if self.graphics.has_images() {
+            SHADOW_HISTORY
+        } else {
+            0
+        });
+    }
+
+    fn set_history(&mut self, want: usize) {
+        if want != self.history {
+            self.history = want;
+            self.term.set_options(Config {
+                scrolling_history: want,
+                kitty_keyboard: false,
+                ..Config::default()
+            });
+        }
     }
 
     /// Graphics replies for the program, oldest first.
@@ -458,6 +493,38 @@ mod tests {
         sh.feed(b"y");
         assert!(sh.publish().is_some());
         assert_eq!(marker_seq(&format!("{MARKER_PREFIX}17")), Some(17));
+    }
+
+    #[test]
+    fn the_shadow_keeps_history_only_while_it_holds_images() {
+        let mut sh = shadow(10, 4);
+        sh.feed(&b"line\r\n".repeat(50));
+        assert_eq!(sh.term.grid().history_size(), 0, "no images, no history");
+        transmit(&mut sh, "a=T,i=1,q=2", 10, 20);
+        sh.feed(&b"line\r\n".repeat(50));
+        assert_eq!(
+            sh.term.grid().history_size(),
+            50,
+            "the image scrolls into history and is kept"
+        );
+        sh.run_apc(b"Ga=d,d=I,i=1,q=2");
+        assert_eq!(
+            sh.term.grid().history_size(),
+            0,
+            "last image gone: history dropped"
+        );
+    }
+
+    #[test]
+    fn a_first_image_that_scrolls_keeps_its_top_row() {
+        let mut sh = shadow(10, 4);
+        // Full width and height: the closing linefeed scrolls the image's first row out.
+        transmit(&mut sh, "a=T,i=1,q=2", 100, 80);
+        assert_eq!(sh.term.grid().history_size(), 1);
+        let grid = sh.term.grid();
+        let first =
+            &grid[alacritty_terminal::index::Line(-1)][alacritty_terminal::index::Column(0)];
+        assert!(!first.graphics().is_empty());
     }
 
     #[test]
