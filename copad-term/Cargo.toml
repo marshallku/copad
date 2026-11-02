@@ -25,10 +25,8 @@ alacritty_terminal = "0.26"
 # The kitty keyboard protocol key encoder shared with copad-linux (decisions #164).
 copad-keys = { path = "../copad-keys" }
 
-# kitty graphics protocol (decisions #189): base64 payloads, `o=z` zlib, `f=100` PNG.
-base64 = "0.22"
-flate2 = "1"
-png = "0.17"
+# The kitty graphics protocol (decisions #189), shared with copad-linux's relay shadow.
+copad-graphics = { path = "../copad-graphics" }
 
 # macOS-only `proc_pidinfo` bindings for `copad_term_child_cwd`.
 # Already a transitive dep via alacritty_terminal; declared

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Linux e2e for `[terminal] images` (sixel through VTE): a REAL copad-linux on a headless GTK
+# Linux e2e for `[terminal] images` (VTE's sixel switch): a REAL copad-linux on a headless GTK
 # display (gtk4-broadwayd, so nothing appears on the live desktop) with its own config/state.
 # Asserts that the terminal advertises sixel in its DA1 reply only while `images` is on, that
 # turning it off on a running copad (config reload) withdraws it, and draws a sixel image so a
@@ -32,7 +32,8 @@ fail() { echo "FAIL: $*"; exit 1; }
 unset COPAD_MUX_PANE COPAD_MUX COPAD_SOCKET COPAD_PANEL_ID
 
 mkdir -p "$W/cfg/copad"
-printf '[terminal]\nimages = true\n' >"$W/cfg/copad/config.toml"
+# A plain shell: the user's rc files print and prompt in ways a test should not read.
+printf '[terminal]\nimages = true\nshell = "/bin/sh"\n' >"$W/cfg/copad/config.toml"
 
 # Writes the terminal's DA1 reply to $1, raw, read straight off the pane's tty.
 cat >"$W/da1.py" <<'PY'
@@ -70,6 +71,13 @@ done
 [[ -n "$GUI" ]] || { tail -20 "$W/copad.log"; fail "dev copad did not open its socket"; }
 echo "gui $GUI"
 sleep 2
+# HOLD_UNTIL=<file>: leave this copad up for a driver elsewhere (scripts/e2e-linux-images-remote.sh
+# runs kitten and yazi in it over ssh and screenshots the broadway page) until <file> exists.
+if [[ -n "${HOLD_UNTIL:-}" ]]; then
+    echo "ready $GUI $W"
+    while [[ ! -e "$HOLD_UNTIL" ]]; do sleep 0.3; done
+    exit 0
+fi
 
 da1() {
   rm -f "$W/da1.out"
@@ -90,12 +98,12 @@ if grep -q "built without sixel" "$W/copad.log"; then
 fi
 has_sixel "$r" || fail "sixel not advertised while images = true ($r)"
 
-printf '[terminal]\nimages = false\n' >"$W/cfg/copad/config.toml"
+printf '[terminal]\nimages = false\nshell = "/bin/sh"\n' >"$W/cfg/copad/config.toml"
 sleep 2
 r=$(da1); echo "DA1 after reload with images off: $r"
 has_sixel "$r" && fail "sixel still advertised after images = false ($r)"
 
-printf '[terminal]\nimages = true\n' >"$W/cfg/copad/config.toml"
+printf '[terminal]\nimages = true\nshell = "/bin/sh"\n' >"$W/cfg/copad/config.toml"
 sleep 2
 r=$(da1); echo "DA1 after reload with images on: $r"
 has_sixel "$r" || fail "sixel not re-advertised ($r)"

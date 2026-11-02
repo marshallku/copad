@@ -35,7 +35,9 @@ impl Rig {
             Box::new(move |r| sink.lock().unwrap().push(r)),
         )));
         let g = graphics.clone();
-        term.set_apc_handler(Some(Box::new(move |t, d| g.lock().unwrap().handle(t, d))));
+        term.set_apc_handler(Some(Box::new(move |t, d| {
+            g.lock().unwrap().handle(t, d);
+        })));
         Self {
             term,
             parser: Processor::new(),
@@ -436,4 +438,48 @@ fn timing_4k_upload() {
         stream.len() >> 20
     );
     assert!(!rig.at(0, 0).is_empty());
+}
+
+#[test]
+fn effects_describe_the_scroll_the_cursor_and_the_linefeed() {
+    let mut rig = Rig::new(10, 4);
+    rig.apc("a=t,i=1,f=24,s=100,v=60,q=2", &rgb(100, 60)); // 10 x 3 cells
+    rig.feed(b"\x1b[4;1H");
+    let g = rig.graphics.clone();
+    // Three rows from the last line: two lines of scroll, the cursor on the last image row, and
+    // the ten columns reach the edge, so a linefeed follows.
+    let e = g.lock().unwrap().handle(&mut rig.term, b"Ga=p,i=1,q=2");
+    assert_eq!(e.scrolled, 2);
+    assert_eq!(e.cursor, Some(Point::new(Line(3), Column(0))));
+    assert!(e.linefeed);
+    // C=1 moves nothing.
+    let e = g.lock().unwrap().handle(&mut rig.term, b"Ga=p,i=1,q=2,C=1");
+    assert_eq!(e, Effects::default());
+}
+
+#[test]
+fn a_viewport_above_the_retained_history_is_clipped_not_shifted() {
+    let mut rig = Rig::new(10, 2);
+    rig.apc("a=T,i=1,f=24,s=10,v=20,q=2,C=1", &rgb(10, 20));
+    rig.feed(b"\n\n\n");
+    let history = rig.term.grid().history_size() as i32;
+    // A host scrolled 5 lines further back than this grid keeps.
+    let (runs, _) = collect(rig.term.grid(), history + 5, 2);
+    assert!(runs.is_empty());
+    let (runs, _) = collect(rig.term.grid(), 2, 2);
+    assert_eq!(runs.len(), 1);
+}
+
+#[test]
+fn the_revision_moves_with_what_is_drawn() {
+    let mut rig = Rig::new(10, 2);
+    let rev = |rig: &Rig| rig.graphics.lock().unwrap().revision();
+    let r0 = rev(&rig);
+    rig.apc("a=t,i=1,f=24,s=10,v=20,q=2", &rgb(10, 20));
+    assert_eq!(rev(&rig), r0, "a transmission draws nothing");
+    rig.feed(b"\x1b_Ga=p,i=1,C=1,q=2\x1b\\");
+    let r1 = rev(&rig);
+    assert!(r1 > r0);
+    rig.feed(b"\x1b_Ga=d,d=a,q=2\x1b\\");
+    assert!(rev(&rig) > r1);
 }

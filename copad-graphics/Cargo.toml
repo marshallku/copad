@@ -1,0 +1,13 @@
+[package]
+name = "copad-graphics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The kitty graphics protocol on an alacritty_terminal grid (decisions #189): decode, store, place, delete, and the visible image runs a renderer draws. Shared by copad-term (macOS) and copad-linux's relay shadow."
+repository.workspace = true
+
+[dependencies]
+alacritty_terminal = "0.26"
+base64 = "0.22"
+flate2 = "1"
+png = "0.17"

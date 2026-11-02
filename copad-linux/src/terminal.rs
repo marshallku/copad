@@ -1,5 +1,6 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gtk4::gdk;
 use gtk4::glib;
@@ -10,7 +11,8 @@ use vte4::prelude::*;
 use copad_core::config::CopadConfig;
 use copad_core::theme::Theme;
 
-use crate::kitty_relay::{self, Relay};
+use crate::image_shadow::ImageShared;
+use crate::kitty_relay::{self, Relay, RelayOptions};
 use crate::panel::Panel;
 use crate::search::SearchBar;
 
@@ -152,6 +154,9 @@ pub struct TerminalPanel {
     /// behind one (`[terminal] kitty_keyboard`, decisions #164).
     relay: Rc<RefCell<Option<Relay>>>,
     exit: Rc<ExitLatch>,
+    /// The relay's shadow terminal for images and the layers drawing them, when the panel was
+    /// created with `[terminal] images` (decisions #190).
+    images: Option<(Arc<ImageShared>, crate::image_layers::ImageLayers)>,
 }
 
 /// A relayed panel's exit: VTE has consumed every byte (its `eof`) AND the shell's status is
@@ -192,20 +197,42 @@ impl Drop for TerminalPanel {
 fn prepare_relay(
     terminal: &Terminal,
     slot: &Rc<RefCell<Option<Relay>>>,
+    options: RelayOptions,
 ) -> std::io::Result<vte4::Pty> {
     let other = |e: glib::Error| std::io::Error::other(e.to_string());
     let (r_master, r_slave) = kitty_relay::open_raw_pty()?;
     let r_pty = vte4::Pty::foreign_sync(r_master, gtk4::gio::Cancellable::NONE).map_err(other)?;
     let p_pty = vte4::Pty::new_sync(vte4::PtyFlags::DEFAULT, gtk4::gio::Cancellable::NONE)
         .map_err(other)?;
-    let relay = Relay::start(p_pty.fd(), r_slave)?;
-    relay.set_size(
-        terminal.row_count().clamp(1, u16::MAX as i64) as u16,
-        terminal.column_count().clamp(1, u16::MAX as i64) as u16,
-    );
+    let images = options.images.clone();
+    let relay = Relay::start(p_pty.fd(), r_slave, options)?;
+    sync_relay_size(terminal, &relay, images.as_deref());
     terminal.set_pty(Some(&r_pty));
     *slot.borrow_mut() = Some(relay);
     Ok(p_pty)
+}
+
+/// Give the shell (and the image shadow) VTE's grid and cell size in device pixels.
+fn sync_relay_size(terminal: &Terminal, relay: &Relay, images: Option<&ImageShared>) {
+    let scale = terminal.scale_factor().max(1) as i64;
+    let px = |v: i64| (v * scale).clamp(0, u16::MAX as i64) as u16;
+    let (cw, ch) = (px(terminal.char_width()), px(terminal.char_height()));
+    if let Some(images) = images {
+        images
+            .graphics
+            .cell_width
+            .store(cw as u32, std::sync::atomic::Ordering::Relaxed);
+        images
+            .graphics
+            .cell_height
+            .store(ch as u32, std::sync::atomic::Ordering::Relaxed);
+    }
+    relay.set_size(
+        terminal.row_count().clamp(1, u16::MAX as i64) as u16,
+        terminal.column_count().clamp(1, u16::MAX as i64) as u16,
+        cw,
+        ch,
+    );
 }
 
 impl TerminalPanel {
@@ -385,20 +412,35 @@ impl TerminalPanel {
         let exit = Rc::new(ExitLatch::default());
         let argv = [shell.as_str()];
         let envv = [socket_env.as_str(), panel_id_env.as_str()];
-        // Behind a relay the panel speaks the kitty keyboard protocol; if the relay cannot
-        // be set up, the shell starts the way it always did.
-        let p_pty = if config.terminal.kitty_keyboard {
-            prepare_relay(&terminal, &relay)
-                .inspect_err(|e| {
-                    log::warn!("[copad] kitty keyboard relay unavailable ({e}); plain PTY")
-                })
+        // Behind a relay the panel speaks the kitty keyboard protocol and draws images; if the
+        // relay cannot be set up, the shell starts the way it always did.
+        let kitty = config.terminal.kitty_keyboard;
+        let image_shared = config.terminal.images.then(|| {
+            let shared = Arc::new(ImageShared::default());
+            shared
+                .graphics
+                .enabled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            shared
+        });
+        let p_pty = if kitty || image_shared.is_some() {
+            let options = RelayOptions {
+                kitty,
+                images: image_shared.clone(),
+            };
+            prepare_relay(&terminal, &relay, options)
+                .inspect_err(|e| log::warn!("[copad] terminal relay unavailable ({e}); plain PTY"))
                 .ok()
         } else {
             None
         };
+        // Without the relay there is no shadow to draw images from.
+        let image_shared = image_shared.filter(|_| p_pty.is_some());
         match p_pty {
             Some(p_pty) => {
-                crate::kitty_keys::attach(&terminal, relay.clone());
+                if kitty {
+                    crate::kitty_keys::attach(&terminal, relay.clone());
+                }
                 let exit_e = exit.clone();
                 terminal.connect_eof(move |t| {
                     exit_e.eof.set(true);
@@ -471,7 +513,21 @@ impl TerminalPanel {
         // level so every panel (terminals, plugins, webviews) sits over
         // the same image instead of each terminal owning its own copy.
         let overlay = gtk4::Overlay::new();
-        overlay.set_child(Some(&terminal));
+        let images = image_shared.map(|shared| {
+            let layers =
+                crate::image_layers::attach(&terminal, shared.clone(), Rc::downgrade(&relay));
+            // z < 0 images go under the (transparent) terminal, the rest over it.
+            let inner = gtk4::Overlay::new();
+            inner.set_child(Some(&layers.below));
+            inner.add_overlay(&terminal);
+            inner.set_measure_overlay(&terminal, true);
+            overlay.set_child(Some(&inner));
+            overlay.add_overlay(&layers.above);
+            (shared, layers)
+        });
+        if images.is_none() {
+            overlay.set_child(Some(&terminal));
+        }
         if relay.borrow().is_some() {
             // VTE sizes its own PTY (R) when it is allocated; the shell's (P) follows. An
             // invisible overlay child is allocated right after the terminal in the same
@@ -479,14 +535,12 @@ impl TerminalPanel {
             // resizing anything, hence the second hook.
             let sync = {
                 let (term, relay) = (terminal.downgrade(), Rc::downgrade(&relay));
+                let shared = images.as_ref().map(|(s, _)| s.clone());
                 move || {
                     if let (Some(t), Some(r)) = (term.upgrade(), relay.upgrade())
                         && let Some(r) = r.borrow().as_ref()
                     {
-                        r.set_size(
-                            t.row_count().clamp(1, u16::MAX as i64) as u16,
-                            t.column_count().clamp(1, u16::MAX as i64) as u16,
-                        );
+                        sync_relay_size(&t, r, shared.as_deref());
                     }
                 }
             };
@@ -516,6 +570,7 @@ impl TerminalPanel {
             last_cwd,
             relay,
             exit,
+            images,
         }
     }
 
@@ -603,6 +658,20 @@ impl TerminalPanel {
         }
         if self.terminal.enables_sixel() != config.terminal.images {
             apply_images(&self.terminal, config.terminal.images);
+        }
+        // Images are drawn from a shadow kept since the panel opened: turning them off stops
+        // drawing and answering at once; turning them on reaches panels opened afterwards.
+        if let Some((shared, layers)) = &self.images {
+            let on = config.terminal.images;
+            if shared
+                .graphics
+                .enabled
+                .swap(on, std::sync::atomic::Ordering::Relaxed)
+                != on
+            {
+                layers.below.queue_draw();
+                layers.above.queue_draw();
+            }
         }
     }
 }

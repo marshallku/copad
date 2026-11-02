@@ -8,6 +8,8 @@ all marked "copad patch" in the source:
   and handed to the new `Perform::apc_dispatch` when it ends with `ESC \`. CAN/SUB, or an ESC followed by
   anything but a backslash, cancels it; an oversized one is consumed to its terminator and dropped. SOS and
   PM are still ignored.
+- `lib.rs` / `ansi.rs`: `Parser::is_ground` / `Processor::is_ground` — between sequences and UTF-8
+  characters, where copad-linux's relay may splice its own sequences into the stream (decisions #190).
 - `ansi.rs`: `Handler::apc_dispatch` (forwarded from the Performer) and `Handler::cell_size_pixels` for
   `CSI 16 t`; both default to no-ops.
 

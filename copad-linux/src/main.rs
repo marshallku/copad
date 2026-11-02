@@ -8,6 +8,8 @@ mod comux_overlay;
 mod comux_panel;
 mod daemon_forward;
 mod gui_client;
+mod image_layers;
+mod image_shadow;
 mod kitty_keys;
 mod kitty_relay;
 mod panel;

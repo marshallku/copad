@@ -20,8 +20,7 @@
 //! lock briefly, copy out the visible rows, then release; renderers
 //! consume them without holding the lock.
 
-mod graphics;
-
+use copad_graphics as graphics;
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char};
 use std::hash::{Hash, Hasher};
@@ -634,7 +633,9 @@ pub unsafe extern "C" fn copad_term_create(
         let listener = listener.clone();
         Box::new(move |reply: String| listener.send_to_pty(reply.into_bytes()))
     });
-    term.set_apc_handler(Some(Box::new(move |term, data| images.handle(term, data))));
+    term.set_apc_handler(Some(Box::new(move |term, data| {
+        images.handle(term, data);
+    })));
     let term = Arc::new(FairMutex::new(term));
 
     let event_loop = match EventLoop::new(Arc::clone(&term), listener.clone(), pty, false, false) {

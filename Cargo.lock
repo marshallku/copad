@@ -818,6 +818,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "copad-graphics"
+version = "1.3.0"
+dependencies = [
+ "alacritty_terminal",
+ "base64 0.22.1",
+ "flate2",
+ "png",
+]
+
+[[package]]
 name = "copad-keys"
 version = "1.3.0"
 
@@ -825,8 +835,11 @@ version = "1.3.0"
 name = "copad-linux"
 version = "1.3.0"
 dependencies = [
+ "alacritty_terminal",
+ "base64 0.22.1",
  "copad-core",
  "copad-daemon",
+ "copad-graphics",
  "copad-keys",
  "copad-mux-proto",
  "dirs 6.0.0",
@@ -1049,11 +1062,9 @@ name = "copad-term"
 version = "1.3.0"
 dependencies = [
  "alacritty_terminal",
- "base64 0.22.1",
+ "copad-graphics",
  "copad-keys",
- "flate2",
  "libc",
- "png",
 ]
 
 [[package]]

@@ -1,4 +1,5 @@
-//! The kitty keyboard protocol for a VTE terminal (decisions #164).
+//! The kitty keyboard protocol for a VTE terminal (decisions #164), and the shadow terminal that
+//! gives it images (decisions #190, `image_shadow`).
 //!
 //! VTE does not implement the protocol (VTE issue #2601) and gives no hook into the output it
 //! parses, so copad puts a second PTY between the shell and the widget:
@@ -21,6 +22,8 @@
 //! shared pipe both workers watch, which stops them whatever they are waiting on.
 
 use std::collections::VecDeque;
+
+use crate::image_shadow::{ApcSplitter, ImageShared, Segment, Shadow};
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -48,6 +51,16 @@ struct Shared {
     /// Set by the output worker when it has delivered everything and closed its side of R.
     output_done: AtomicBool,
     replies: Mutex<VecDeque<u8>>,
+    /// The grid VTE laid out, for the shadow (columns, lines); taken by the output worker.
+    resize: Mutex<Option<(u16, u16)>>,
+}
+
+/// What a relay does besides carrying bytes.
+pub struct RelayOptions {
+    /// Speak the kitty keyboard protocol (`[terminal] kitty_keyboard`).
+    pub kitty: bool,
+    /// Keep a shadow terminal for images (`[terminal] images`).
+    pub images: Option<Arc<ImageShared>>,
 }
 
 pub struct Relay {
@@ -57,7 +70,7 @@ pub struct Relay {
     wake_output: OwnedFd,
     /// The shell's PTY, kept on the main thread for `TIOCSWINSZ`.
     p_master: OwnedFd,
-    size: std::cell::Cell<(u16, u16)>,
+    size: std::cell::Cell<(u16, u16, u16, u16)>,
 }
 
 /// A raw PTY pair for VTE: `(master for VtePty::foreign_sync, slave for the workers)`.
@@ -98,7 +111,11 @@ pub fn open_raw_pty() -> io::Result<(OwnedFd, OwnedFd)> {
 impl Relay {
     /// Start relaying between the shell's PTY master `p_master` and `r_slave`, the far end of
     /// the PTY VTE reads.
-    pub fn start(p_master: BorrowedFd, r_slave: OwnedFd) -> io::Result<Relay> {
+    pub fn start(
+        p_master: BorrowedFd,
+        r_slave: OwnedFd,
+        options: RelayOptions,
+    ) -> io::Result<Relay> {
         // A VtePty is opened in packet mode (TIOCPKT: every read starts with a status byte),
         // which only VTE's own reader expects. The relay reads plain bytes.
         let off: libc::c_int = 0;
@@ -132,6 +149,7 @@ impl Relay {
                     wake: wake_out_r,
                     wake_input: wake_in_w,
                     shared: sh,
+                    options,
                 })
             })?;
         let sh = shared.clone();
@@ -143,8 +161,13 @@ impl Relay {
             _stop: stop_w,
             wake_output: wake_out_w,
             p_master: p_main,
-            size: std::cell::Cell::new((0, 0)),
+            size: std::cell::Cell::new((0, 0, 0, 0)),
         })
+    }
+
+    /// Have the output worker look again (a publication was acknowledged, so another may go).
+    pub fn wake_output(&self) {
+        wake(self.wake_output.as_raw_fd());
     }
 
     /// The flags the program negotiated on the screen that is up.
@@ -164,20 +187,23 @@ impl Relay {
         wake(self.wake_output.as_raw_fd());
     }
 
-    /// Give the shell the size VTE laid out. No-op when unchanged.
-    pub fn set_size(&self, rows: u16, cols: u16) {
-        if rows == 0 || cols == 0 || self.size.get() == (rows, cols) {
+    /// Give the shell the size VTE laid out, with the cell size in device pixels (what image
+    /// tools size against; 0 when unknown). No-op when unchanged.
+    pub fn set_size(&self, rows: u16, cols: u16, cell_width: u16, cell_height: u16) {
+        if rows == 0 || cols == 0 || self.size.get() == (rows, cols, cell_width, cell_height) {
             return;
         }
-        self.size.set((rows, cols));
+        self.size.set((rows, cols, cell_width, cell_height));
         let ws = libc::winsize {
             ws_row: rows,
             ws_col: cols,
-            ws_xpixel: 0,
-            ws_ypixel: 0,
+            ws_xpixel: cols.saturating_mul(cell_width),
+            ws_ypixel: rows.saturating_mul(cell_height),
         };
         // SAFETY: TIOCSWINSZ reads a winsize from a valid pointer.
         unsafe { libc::ioctl(self.p_master.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
+        *self.shared.resize.lock().unwrap() = Some((cols, rows));
+        wake(self.wake_output.as_raw_fd());
     }
 }
 
@@ -288,12 +314,21 @@ struct OutputIo {
     wake: OwnedFd,
     wake_input: OwnedFd,
     shared: Arc<Shared>,
+    options: RelayOptions,
 }
 
-/// Shell output → tracker → VTE.
+/// Shell output → tracker → (shadow) → VTE.
 fn output_worker(io: OutputIo) {
     let mut tracker = copad_keys::Tracker::new();
-    let mut pending: Vec<u8> = Vec::new();
+    let mut shadow = io
+        .options
+        .images
+        .clone()
+        .map(|shared| Shadow::new(80, 24, shared));
+    let mut splitter = ApcSplitter::default();
+    // What VTE is still to get, in order.
+    let mut queue: VecDeque<Segment> = VecDeque::new();
+    let mut out: Vec<u8> = Vec::new();
     let mut replies = Vec::new();
     let mut buf = vec![0u8; 16 * 1024];
     let mut reading = true;
@@ -311,10 +346,15 @@ fn output_worker(io: OutputIo) {
         {
             reading = false;
         }
-        if !reading && pending.is_empty() {
+        if !reading && queue.is_empty() {
             break;
         }
-        let want_read = reading && pending.len() < BUFFER_CAP;
+        if let Some(sh) = shadow.as_mut()
+            && let Some((cols, rows)) = io.shared.resize.lock().unwrap().take()
+        {
+            sh.resize(cols as usize, rows as usize);
+        }
+        let want_read = reading && queued(&queue) < BUFFER_CAP;
         let mut fds = vec![
             poll_fd(io.stop.as_raw_fd(), libc::POLLIN),
             poll_fd(io.wake.as_raw_fd(), libc::POLLIN),
@@ -323,7 +363,7 @@ fn output_worker(io: OutputIo) {
             fds.push(poll_fd(p, libc::POLLIN));
             fds.len() - 1
         });
-        let r_at = (!pending.is_empty()).then(|| {
+        let r_at = (!queue.is_empty()).then(|| {
             fds.push(poll_fd(r, libc::POLLOUT));
             fds.len() - 1
         });
@@ -348,22 +388,23 @@ fn output_worker(io: OutputIo) {
         {
             match read_fd(p, &mut buf) {
                 Io::Done(n) => {
-                    tracker.feed(&buf[..n], &mut pending, &mut replies);
-                    io.shared.flags.store(tracker.flags(), Ordering::Release);
-                    io.shared
-                        .app_cursor
-                        .store(tracker.app_cursor(), Ordering::Release);
+                    if io.options.kitty {
+                        tracker.feed(&buf[..n], &mut out, &mut replies);
+                        io.shared.flags.store(tracker.flags(), Ordering::Release);
+                        io.shared
+                            .app_cursor
+                            .store(tracker.app_cursor(), Ordering::Release);
+                    } else {
+                        out.extend_from_slice(&buf[..n]);
+                    }
+                    if shadow.is_some() {
+                        splitter.split(&out, &mut queue);
+                        out.clear();
+                    } else if !out.is_empty() {
+                        queue.push_back(Segment::Feed(std::mem::take(&mut out)));
+                    }
                     if let Some((_, quiet)) = drain.as_mut() {
                         *quiet = DRAIN_QUIET;
-                    }
-                    if !replies.is_empty() {
-                        let mut q = io.shared.replies.lock().unwrap();
-                        if q.len() + replies.len() <= REPLY_CAP {
-                            q.extend(replies.iter());
-                        }
-                        replies.clear();
-                        drop(q);
-                        wake(io.wake_input.as_raw_fd());
                     }
                 }
                 Io::Again => {}
@@ -374,20 +415,95 @@ fn output_worker(io: OutputIo) {
         if let Some(i) = r_at
             && fds[i].revents != 0
         {
-            match write_fd(r, &pending) {
-                Io::Done(n) => {
-                    pending.drain(..n);
-                }
-                Io::Again => {}
-                // VTE dropped its side: nobody to deliver to.
-                Io::Closed => return,
+            match write_front(r, &mut queue, shadow.as_mut(), &mut replies) {
+                Io::Closed => return, // VTE dropped its side: nobody to deliver to.
+                Io::Done(_) | Io::Again => {}
             }
+        }
+        if let Some(sh) = shadow.as_mut() {
+            replies.extend(sh.take_replies());
+            // Between sequences, with the images on show changed: tell VTE where it is.
+            if can_mark(&queue)
+                && let Some(marker) = sh.publish()
+            {
+                queue.push_front(Segment::Raw(marker));
+            }
+        }
+        if !replies.is_empty() {
+            let mut q = io.shared.replies.lock().unwrap();
+            if q.len() + replies.len() <= REPLY_CAP {
+                q.extend(replies.iter());
+            }
+            replies.clear();
+            drop(q);
+            wake(io.wake_input.as_raw_fd());
         }
     }
     // Everything was delivered: let the input worker go, and close our side of R. VTE reads
     // EOF once the input worker's copy closes too.
     io.shared.output_done.store(true, Ordering::Release);
     wake(io.wake_input.as_raw_fd());
+}
+
+/// A marker may go in at the write point only when no replayed bytes (an APC's cursor moves or
+/// an earlier marker) are partly delivered there: those are always at the front, and splitting
+/// one would turn the rest into text.
+fn can_mark(queue: &VecDeque<Segment>) -> bool {
+    !matches!(queue.front(), Some(Segment::Raw(_)))
+}
+
+/// Bytes waiting for VTE (APC bodies count: they are held too).
+fn queued(queue: &VecDeque<Segment>) -> usize {
+    queue
+        .iter()
+        .map(|s| match s {
+            Segment::Feed(b) | Segment::Apc(b) | Segment::Raw(b) => b.len(),
+        })
+        .sum()
+}
+
+/// Write what is at the front of the queue to VTE. Graphics commands reaching the front run in
+/// the shadow first (everything before them is written and fed) and leave the bytes that repeat
+/// their cursor moves; written output is fed to the shadow.
+fn write_front(
+    r: RawFd,
+    queue: &mut VecDeque<Segment>,
+    mut shadow: Option<&mut Shadow>,
+    replies: &mut Vec<u8>,
+) -> Io {
+    while let Some(Segment::Apc(_)) = queue.front() {
+        let Some(Segment::Apc(body)) = queue.pop_front() else {
+            unreachable!()
+        };
+        if let Some(sh) = shadow.as_deref_mut() {
+            let effects = sh.run_apc(&body);
+            replies.extend(sh.take_replies());
+            if !effects.is_empty() {
+                queue.push_front(Segment::Raw(effects));
+            }
+        }
+    }
+    let Some(front) = queue.front_mut() else {
+        return Io::Again;
+    };
+    let (bytes, feeds) = match front {
+        Segment::Feed(b) => (b, true),
+        Segment::Raw(b) => (b, false),
+        Segment::Apc(_) => unreachable!(),
+    };
+    match write_fd(r, bytes) {
+        Io::Done(n) => {
+            if feeds && let Some(sh) = shadow {
+                sh.feed(&bytes[..n]);
+            }
+            bytes.drain(..n);
+            if bytes.is_empty() {
+                queue.pop_front();
+            }
+            Io::Done(n)
+        }
+        other => other,
+    }
 }
 
 /// VTE's writes and the tracker's answers → the shell.
@@ -452,6 +568,19 @@ fn input_worker(r: OwnedFd, p: OwnedFd, stop: OwnedFd, wake_r: OwnedFd, shared: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markers_wait_for_replayed_bytes_to_finish() {
+        let mut q = VecDeque::new();
+        assert!(can_mark(&q));
+        q.push_back(Segment::Feed(b"abc".to_vec()));
+        assert!(
+            can_mark(&q),
+            "the shadow was fed exactly what was written of output"
+        );
+        q.push_front(Segment::Raw(b"\x1b[4;1H".to_vec()));
+        assert!(!can_mark(&q), "a cursor replay, possibly half written");
+    }
     use std::os::fd::AsFd;
 
     /// A PTY pair standing in for the shell's: the test plays the shell on its slave.
@@ -494,7 +623,15 @@ mod tests {
         let one: libc::c_int = 1;
         unsafe { libc::ioctl(p_master.as_raw_fd(), libc::TIOCPKT, &one) };
         let (vte, r_slave) = open_raw_pty().unwrap();
-        let relay = Relay::start(p_master.as_fd(), r_slave).unwrap();
+        let relay = Relay::start(
+            p_master.as_fd(),
+            r_slave,
+            RelayOptions {
+                kitty: true,
+                images: None,
+            },
+        )
+        .unwrap();
         write_all(shell.as_raw_fd(), b"hi\x1b[>1u\x1b[?u\x1b[cthere");
         let seen = read_until(vte.as_raw_fd(), b"there", Duration::from_secs(2));
         assert_eq!(seen, b"hi\x1b[cthere");
@@ -511,8 +648,16 @@ mod tests {
     fn size_is_copied_to_the_shell() {
         let (p_master, shell) = shell_pty();
         let (_vte, r_slave) = open_raw_pty().unwrap();
-        let relay = Relay::start(p_master.as_fd(), r_slave).unwrap();
-        relay.set_size(40, 120);
+        let relay = Relay::start(
+            p_master.as_fd(),
+            r_slave,
+            RelayOptions {
+                kitty: true,
+                images: None,
+            },
+        )
+        .unwrap();
+        relay.set_size(40, 120, 0, 0);
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
         unsafe { libc::ioctl(shell.as_raw_fd(), libc::TIOCGWINSZ, &mut ws) };
         assert_eq!((ws.ws_row, ws.ws_col), (40, 120));
@@ -525,7 +670,15 @@ mod tests {
     fn exit_delivers_everything_before_closing() {
         let (p_master, shell) = shell_pty();
         let (vte, r_slave) = open_raw_pty().unwrap();
-        let relay = Relay::start(p_master.as_fd(), r_slave).unwrap();
+        let relay = Relay::start(
+            p_master.as_fd(),
+            r_slave,
+            RelayOptions {
+                kitty: true,
+                images: None,
+            },
+        )
+        .unwrap();
         let payload: Vec<u8> = (0..300_000u32).map(|i| b'a' + (i % 26) as u8).collect();
         let writer = {
             let shell = shell.try_clone().unwrap();
@@ -561,7 +714,15 @@ mod tests {
     fn dropping_the_relay_stops_both_workers_even_when_blocked() {
         let (p_master, shell) = shell_pty();
         let (vte, r_slave) = open_raw_pty().unwrap();
-        let relay = Relay::start(p_master.as_fd(), r_slave).unwrap();
+        let relay = Relay::start(
+            p_master.as_fd(),
+            r_slave,
+            RelayOptions {
+                kitty: true,
+                images: None,
+            },
+        )
+        .unwrap();
         // The test's own ends must not block while it fills the buffers.
         set_nonblocking(vte.as_raw_fd()).unwrap();
         set_nonblocking(shell.as_raw_fd()).unwrap();

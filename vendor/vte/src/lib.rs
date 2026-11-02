@@ -99,6 +99,12 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         Default::default()
     }
 
+    /// Between sequences: not inside an escape, a string or a UTF-8 character (copad patch — a
+    /// host may splice its own sequences into the stream only at such a point).
+    pub fn is_ground(&self) -> bool {
+        matches!(self.state, State::Ground) && self.partial_utf8_len == 0
+    }
+
     #[inline]
     fn params(&self) -> &Params {
         &self.params

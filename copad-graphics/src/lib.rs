@@ -92,6 +92,18 @@ struct Pending {
     error: Option<&'static str>,
 }
 
+/// What a command did to the terminal besides its images: a host that mirrors the stream into a
+/// second terminal (copad-linux's relay feeds VTE) replays these there.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Effects {
+    /// Lines the scroll region was scrolled up before placing (`Handler::scroll_up`).
+    pub scrolled: usize,
+    /// Where the placement left the cursor, BEFORE `linefeed`.
+    pub cursor: Option<Point>,
+    /// The placement ended with a linefeed (the cursor ran past the last column).
+    pub linefeed: bool,
+}
+
 pub struct Graphics {
     shared: Arc<Shared>,
     reply: Box<dyn FnMut(String) + Send>,
@@ -107,6 +119,10 @@ pub struct Graphics {
     /// `(image id, client placement id)` → internal placement, for the ones the client named.
     named: HashMap<(u32, u32), u64>,
     pending: Option<Pending>,
+    /// Filled by `put` while a command runs; returned by `handle`.
+    effects: Effects,
+    /// Bumped by every change to what is drawn (placement, delete, eviction).
+    revision: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -408,7 +424,19 @@ impl Graphics {
             live: HashMap::new(),
             named: HashMap::new(),
             pending: None,
+            effects: Effects::default(),
+            revision: 0,
         }
+    }
+
+    /// Changes with every placement, delete or eviction: a host polls it to know when to redraw.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Images are stored or still shown somewhere.
+    pub fn has_images(&self) -> bool {
+        !self.images.is_empty() || self.live_bytes() > 0
     }
 
     /// Decoded image bytes still alive anywhere (store, cells, snapshots).
@@ -416,8 +444,14 @@ impl Graphics {
         self.live_bytes.load(Ordering::Relaxed)
     }
 
-    /// One APC string from the parser.
-    pub fn handle<L: EventListener>(&mut self, term: &mut Term<L>, data: &[u8]) {
+    /// One APC string from the parser; returns what it did to the cursor and scroll region.
+    pub fn handle<L: EventListener>(&mut self, term: &mut Term<L>, data: &[u8]) -> Effects {
+        self.effects = Effects::default();
+        self.dispatch(term, data);
+        std::mem::take(&mut self.effects)
+    }
+
+    fn dispatch<L: EventListener>(&mut self, term: &mut Term<L>, data: &[u8]) {
         let Some(body) = data.strip_prefix(b"G") else {
             return;
         };
@@ -600,6 +634,7 @@ impl Graphics {
                 let key = stored.image.key;
                 self.images.remove(&id);
                 if !unreferenced {
+                    self.revision += 1;
                     for grid in term.grids_mut() {
                         for p in strip(grid, |g| g.image.key == key) {
                             self.forget(p);
@@ -630,6 +665,7 @@ impl Graphics {
     ) {
         let touched = strip(term.grid_mut(), matches);
         if !touched.is_empty() {
+            self.revision += 1;
             term.mark_fully_damaged();
         }
         for p in touched {
@@ -734,6 +770,7 @@ impl Graphics {
             let scroll = (r0 + rows - 1 - bottom).min(r0 - top);
             if scroll > 0 {
                 Handler::scroll_up(term, scroll as usize);
+                self.effects.scrolled = scroll as usize;
                 r0 -= scroll;
             }
         }
@@ -804,11 +841,16 @@ impl Graphics {
             grid.cursor.input_needs_wrap = false;
             if column >= columns {
                 grid.cursor.point = Point::new(Line(line), Column(0));
-                Handler::linefeed(term);
+                self.effects.linefeed = true;
             } else {
                 grid.cursor.point = Point::new(Line(line), Column(column as usize));
             }
+            self.effects.cursor = Some(grid.cursor.point);
+            if self.effects.linefeed {
+                Handler::linefeed(term);
+            }
         }
+        self.revision += 1;
         term.mark_fully_damaged();
         Ok(id)
     }
@@ -1002,8 +1044,14 @@ pub fn collect(
     let mut images: Vec<Arc<GraphicImage>> = Vec::new();
     let mut image_index: HashMap<u64, u32> = HashMap::new();
     let columns = grid.columns();
+    let (top, bottom) = (-(grid.history_size() as i32), grid.screen_lines() as i32);
     for viewport_row in 0..rows {
         let line = Line(viewport_row as i32 - display_offset);
+        // A viewport reaching above the retained history (a host scrolled further back than
+        // this grid keeps) shows nothing there, at the same rows.
+        if line.0 < top || line.0 >= bottom {
+            continue;
+        }
         // Placement -> the run it last extended on this row, and that run's last column.
         let mut open: HashMap<u64, (usize, usize)> = HashMap::new();
         for col in 0..columns {
@@ -1050,5 +1098,4 @@ pub fn collect(
 }
 
 #[cfg(test)]
-#[path = "graphics_tests.rs"]
 mod tests;

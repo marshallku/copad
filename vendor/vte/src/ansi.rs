@@ -367,6 +367,11 @@ impl<T: Timeout> Processor<T> {
         }
     }
 
+    /// See [`crate::Parser::is_ground`] (copad patch).
+    pub fn is_ground(&self) -> bool {
+        self.parser.is_ground()
+    }
+
     /// Number of bytes in the synchronization buffer.
     #[inline]
     pub fn sync_bytes_count(&self) -> usize {

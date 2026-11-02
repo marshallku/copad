@@ -9,6 +9,7 @@ members = [
     "copad-ffi",
     "copad-term",
     "copad-keys",
+    "copad-graphics",
     "copad-mux",
     "copad-mux-proto",
     "plugins/echo",

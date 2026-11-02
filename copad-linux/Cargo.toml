@@ -15,6 +15,9 @@ copad-core = { path = "../copad-core" }
 # comux L0 host API (decisions #169).
 copad-mux-proto = { path = "../copad-mux-proto" }
 copad-keys = { path = "../copad-keys" }
+# Images: the kitty graphics protocol on a shadow terminal in the relay (decisions #190).
+copad-graphics = { path = "../copad-graphics" }
+alacritty_terminal = "0.26"
 copad-daemon = { path = "../copad-daemon" }
 gtk4 = { version = "0.9", features = ["gnome_46"] }
 vte4 = { version = "0.8", features = ["v0_76"] }
@@ -29,3 +32,6 @@ log = "0.4"
 env_logger = "0.11"
 libc = "0.2"
 tempfile = "3"
+
+[dev-dependencies]
+base64 = "0.22"
