@@ -1486,13 +1486,7 @@ fn walk_row(
         // named palette color), so route it through the same encoder
         // as fg/bg instead of dropping non-Spec values.
         let underline_color = cell.underline_color().map(color_to_rgba).unwrap_or(0);
-        let underline_style = if cell.flags.intersects(CellFlags::ALL_UNDERLINES) {
-            // Phase 2 just exposes "1 = some underline"; richer
-            // undercurl/dotted decoding lands with the renderer.
-            1
-        } else {
-            0
-        };
+        let underline_style = underline_style(cell.flags);
         let hyperlink_id = cell
             .hyperlink()
             .map(|h| {
@@ -1567,6 +1561,24 @@ fn walk_row(
     }
 
     Row { utf8, runs }
+}
+
+/// `CopadRun.underline_style`: 0 none, 1 single, 2 double, 3 curly, 4 dotted, 5 dashed
+/// (SGR 4:0..4:5, which alacritty keeps as distinct flags).
+fn underline_style(f: CellFlags) -> u8 {
+    if f.contains(CellFlags::UNDERCURL) {
+        3
+    } else if f.contains(CellFlags::DOUBLE_UNDERLINE) {
+        2
+    } else if f.contains(CellFlags::DOTTED_UNDERLINE) {
+        4
+    } else if f.contains(CellFlags::DASHED_UNDERLINE) {
+        5
+    } else if f.intersects(CellFlags::ALL_UNDERLINES) {
+        1
+    } else {
+        0
+    }
 }
 
 fn cell_flags_to_ffi(f: CellFlags) -> u16 {
@@ -2884,6 +2896,32 @@ pub unsafe extern "C" fn copad_snapshot_graphic_image(
     true
 }
 
+/// The pane gained or lost keyboard focus. A program that asked for focus reports (`CSI ? 1004 h`
+/// — nvim, Claude Code, tmux) gets `CSI I` / `CSI O`; the terminal's own focus flag follows too.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_set_focused(handle: *mut CopadHandle, focused: bool) {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return;
+    };
+    let reports = {
+        let mut term = h.term.lock();
+        let changed = term.is_focused != focused;
+        term.is_focused = focused;
+        changed && term.mode().contains(TermMode::FOCUS_IN_OUT)
+    };
+    if reports {
+        h.listener.send_to_pty(if focused {
+            b"\x1b[I".to_vec()
+        } else {
+            b"\x1b[O".to_vec()
+        });
+    }
+}
+
 /// `[terminal] images`: whether programs may draw images (the kitty graphics protocol). Off,
 /// every graphics command is ignored without a reply, so programs see no support.
 ///
@@ -3031,6 +3069,47 @@ mod color_encoding_tests {
             color_to_rgba(AnsiColor::Named(NamedColor::Red)),
             TAG_INDEXED | 1,
         );
+    }
+
+    #[test]
+    fn underline_styles_reach_the_renderer() {
+        use alacritty_terminal::event::VoidListener;
+        use alacritty_terminal::term::Config;
+        use alacritty_terminal::vte::ansi::Processor;
+        let mut term = Term::new(Config::default(), &TermSize::new(12, 2), VoidListener);
+        Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new().advance(
+            &mut term,
+            b"\x1b[4ma\x1b[4:2mb\x1b[4:3mc\x1b[4:4md\x1b[4:5me\x1b[24mf",
+        );
+        let row = walk_row(
+            term.grid(),
+            Line(0),
+            12,
+            &mut Vec::new(),
+            &mut HashMap::new(),
+        );
+        let styles: Vec<u8> = row.runs.iter().take(6).map(|r| r.underline_style).collect();
+        assert_eq!(styles, vec![1, 2, 3, 4, 5, 0]);
+
+        // SGR 58 colours every style alike.
+        for style in 1..=5 {
+            let mut term = Term::new(Config::default(), &TermSize::new(12, 2), VoidListener);
+            let seq = format!("\x1b[58;2;255;0;0m\x1b[4:{style}mab");
+            Processor::<alacritty_terminal::vte::ansi::StdSyncHandler>::new()
+                .advance(&mut term, seq.as_bytes());
+            let row = walk_row(
+                term.grid(),
+                Line(0),
+                12,
+                &mut Vec::new(),
+                &mut HashMap::new(),
+            );
+            assert_eq!(
+                row.runs[0].underline_color_rgba,
+                TAG_DIRECT | 0xff0000,
+                "style {style}"
+            );
+        }
     }
 }
 

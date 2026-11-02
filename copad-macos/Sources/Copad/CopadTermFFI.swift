@@ -332,6 +332,11 @@ enum CopadTermFFI {
             copad_term_set_scrollback(ptr, UInt32(clamping: max(0, lines)))
         }
 
+        func setFocused(_ focused: Bool) {
+            guard let ptr else { return }
+            copad_term_set_focused(ptr, focused)
+        }
+
         func setImages(_ enabled: Bool) {
             guard let ptr else { return }
             copad_term_set_images(ptr, enabled)

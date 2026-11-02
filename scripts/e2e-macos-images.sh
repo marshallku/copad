@@ -27,10 +27,6 @@ scripts/codesign-dev.sh "$APP" >/dev/null 2>&1 || true
 W="$(mktemp -d /tmp/cimg.XXXX)"
 APP_PID=""
 CAF=""
-SESSION="$HOME/Library/Application Support/copad/session.json"
-SESSION_BAK="$(mktemp /tmp/copad-session.XXXX)"
-SESSION_EXISTED=""
-if [[ -f "$SESSION" ]]; then SESSION_EXISTED=1; cp "$SESSION" "$SESSION_BAK"; fi
 cleanup() {
     [[ -n "$CAF" ]] && kill "$CAF" 2>/dev/null || true
     if [[ -n "$APP_PID" ]]; then
@@ -38,8 +34,6 @@ cleanup() {
         for _ in $(seq 1 100); do kill -0 "$APP_PID" 2>/dev/null || break; sleep 0.1; done
         kill -9 "$APP_PID" 2>/dev/null || true
     fi
-    if [[ -n "$SESSION_EXISTED" ]]; then cp "$SESSION_BAK" "$SESSION"; else rm -f "$SESSION"; fi
-    rm -f "$SESSION_BAK"
     [[ "${KEEP:-}" == 1 ]] && { log "kept $W"; return 0; }
     rm -rf "$W"
 }
@@ -122,7 +116,7 @@ PY
 
 launch() {
     before="$(pgrep -x Copad || true)"
-    open -n --env XDG_CONFIG_HOME="$XDG_CONFIG_HOME" "$APP"
+    open -n --env XDG_CONFIG_HOME="$XDG_CONFIG_HOME" --env COPAD_STATE_DIR="$W/state" "$APP"
     for _ in $(seq 1 100); do
         APP_PID="$(comm -13 <(echo "$before" | sort) <(pgrep -x Copad | sort) | head -1)"
         [[ -n "$APP_PID" && -S "/tmp/copad-$APP_PID.sock" ]] && break

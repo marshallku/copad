@@ -108,6 +108,12 @@ pub fn gui_socket_path(pid: u32) -> PathBuf {
 /// Persistent state (handoffs, indices) — Linux `~/.local/state/copad/`,
 /// macOS `~/Library/Application Support/copad/`.
 pub fn state_dir() -> PathBuf {
+    // An explicit directory (tests run a second copad without touching the user's session).
+    if let Ok(dir) = env::var("COPAD_STATE_DIR")
+        && !dir.is_empty()
+    {
+        return PathBuf::from(dir);
+    }
     #[cfg(target_os = "linux")]
     {
         if let Ok(xdg) = env::var("XDG_STATE_HOME")

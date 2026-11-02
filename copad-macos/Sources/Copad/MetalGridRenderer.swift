@@ -39,7 +39,8 @@ final class MetalGridRenderer {
         float2 uvOrigin;
         float2 uvSize;
         float4 color;   // non-premultiplied
-        uint4  kindPad; // x: 0 = solid, 1 = mono glyph, 2 = color glyph, 3 = image
+        uint4  kindPad; // x: 0 = solid, 1 = mono glyph, 2 = color glyph, 3 = image,
+                        //    4 = underline pattern (y: style, z: line thickness px)
     };
 
     struct VSOut {
@@ -47,6 +48,8 @@ final class MetalGridRenderer {
         float2 uv;
         float4 color;
         uint kind [[flat]];
+        uint style [[flat]];
+        float thickness [[flat]];
     };
 
     vertex VSOut quad_vs(
@@ -65,6 +68,8 @@ final class MetalGridRenderer {
         out.uv = inst.uvOrigin + corner * inst.uvSize;
         out.color = inst.color;
         out.kind = inst.kindPad.x;
+        out.style = inst.kindPad.y;
+        out.thickness = float(inst.kindPad.z);
         return out;
     }
 
@@ -94,6 +99,34 @@ final class MetalGridRenderer {
             return float4(rgb * in.color.a, in.color.a);
         case 1: {
             float cov = atlas.sample(s, in.uv).a;
+            return float4(rgb * in.color.a * cov, in.color.a * cov);
+        }
+        case 4: {
+            // Underline pattern; uv is the position inside the band in px, the phase comes
+            // from the absolute x so neighbouring runs line up.
+            float t = max(in.thickness, 1.0);
+            float2 p = in.uv;
+            float cov = 1.0;
+            if (in.style == 2) {
+                // double: two lines one thickness apart
+                cov = (p.y < t || p.y >= 2.0 * t) ? 1.0 : 0.0;
+            } else if (in.style == 3) {
+                // curly: a sine wave filling the band
+                float band = 3.0 * t + 1.0;
+                float period = max(4.0 * band, 8.0);
+                float amp = max((band - t) * 0.5, 0.5);
+                float w = 6.2831853 / period;
+                float yc = band * 0.5 + amp * sin(in.pos.x * w);
+                float slope = amp * w * cos(in.pos.x * w);
+                float d = abs(p.y - yc) / sqrt(1.0 + slope * slope);
+                cov = clamp(t * 0.5 + 0.5 - d, 0.0, 1.0);
+            } else if (in.style == 4) {
+                // dotted: dots one thickness long
+                cov = fmod(in.pos.x, 2.0 * t) < t ? 1.0 : 0.0;
+            } else if (in.style == 5) {
+                // dashed
+                cov = fmod(in.pos.x, 5.0 * t) < 3.0 * t ? 1.0 : 0.0;
+            }
             return float4(rgb * in.color.a * cov, in.color.a * cov);
         }
         case 3: {
@@ -134,6 +167,7 @@ final class MetalGridRenderer {
         case monoGlyph = 1
         case colorGlyph = 2
         case image = 3
+        case underline = 4
     }
 
     /// Instances drawn with one texture, in order.
@@ -686,16 +720,32 @@ final class MetalGridRenderer {
                 ? fg
                 : GPUCellColor.resolve(run.underline_color_rgba, palette: theme.palette, defaultColor: fg)
             let thickness = max(1, Double(runFont.underlineThickness))
-            appendSolid(
-                &instances,
-                quad: GPUQuad(
-                    x: runX,
-                    y: baselineY - Double(runFont.underlinePosition) - thickness / 2,
-                    width: runWidth,
-                    height: thickness,
-                ),
-                rgba: ulColor,
-            )
+            let lineTop = baselineY - Double(runFont.underlinePosition) - thickness / 2
+            if run.underline_style == 1 {
+                appendSolid(
+                    &instances,
+                    quad: GPUQuad(x: runX, y: lineTop, width: runWidth, height: thickness),
+                    rgba: ulColor,
+                )
+            } else {
+                // double: two lines, the band 3 thicknesses tall; curly: the same band, centred on
+                // the underline (clamped inside the cell); dotted / dashed: one line.
+                let rowBottom = Double(row + 1) * metrics.cellHeight
+                let band = switch run.underline_style {
+                case 2: thickness * 3
+                case 3: thickness * 3 + 1 / metrics.scale
+                default: thickness
+                }
+                var top = run.underline_style == 3 ? lineTop + thickness / 2 - band / 2 : lineTop
+                top = min(top, rowBottom - band)
+                appendPattern(
+                    &instances,
+                    quad: GPUQuad(x: runX, y: top, width: runWidth, height: band),
+                    rgba: ulColor,
+                    style: UInt32(run.underline_style),
+                    thicknessPx: UInt32(max(1, (thickness * metrics.scale).rounded())),
+                )
+            }
         }
         if run.flags & CopadCellFlags.strike != 0 {
             let thickness = max(1, Double(runFont.underlineThickness))
@@ -874,6 +924,25 @@ final class MetalGridRenderer {
                 color: color,
             )
         }
+    }
+
+    private func appendPattern(
+        _ instances: inout [QuadInstance],
+        quad: GPUQuad,
+        rgba: UInt32,
+        style: UInt32,
+        thicknessPx: UInt32,
+    ) {
+        let s = Float(metrics.scale)
+        let size = SIMD2(Float(quad.width) * s, Float(quad.height) * s)
+        instances.append(QuadInstance(
+            origin: SIMD2(Float(quad.x) * s, Float(quad.y) * s),
+            size: size,
+            uvOrigin: .zero,
+            uvSize: size,
+            color: rgbaToFloat4(rgba),
+            kindPad: SIMD4(QuadKind.underline.rawValue, style, thicknessPx, 0),
+        ))
     }
 
     private func appendSolid(_ instances: inout [QuadInstance], quad: GPUQuad, rgba: UInt32) {

@@ -1277,16 +1277,8 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
                                       blue: CGFloat((fgRGBA >> 8) & 0xFF) / 255.0,
                                       alpha: CGFloat(fgRGBA & 0xFF) / 255.0),
         ]
-        let rawUnderline = UInt8(styleBits & 0xFF)
-        if rawUnderline != 0 {
-            attrs[.underlineStyle] = NSUnderlineStyle.single.rawValue
-            attrs[.underlineColor] = NSColor(
-                red: CGFloat((underlineRGBA >> 24) & 0xFF) / 255.0,
-                green: CGFloat((underlineRGBA >> 16) & 0xFF) / 255.0,
-                blue: CGFloat((underlineRGBA >> 8) & 0xFF) / 255.0,
-                alpha: CGFloat(underlineRGBA & 0xFF) / 255.0,
-            )
-        }
+        // Underlines are not Core Text attributes: Core Text breaks them at spaces and cannot
+        // draw a curly one, so `drawRow` strokes every SGR 4:x style itself (as the GPU path does).
         if styleBits & Self.styleBitStrike != 0 {
             attrs[.strikethroughStyle] = NSUnderlineStyle.single.rawValue
             attrs[.strikethroughColor] = NSColor(
@@ -1434,6 +1426,21 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         // safe (no snapshot churn) — we just invalidate the cached
         // bitmap so the next paint re-runs with the cached snapshot.
         requestRepaint()
+        reportFocus((window?.isKeyWindow ?? false) && window?.firstResponder === self)
+    }
+
+    /// Keyboard focus = the key window's first responder. The terminal turns it into focus
+    /// reports for programs that asked (`?1004`).
+    private func reportFocus(_ focused: Bool) {
+        termHandle?.setFocused(focused)
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let became = super.becomeFirstResponder()
+        if became {
+            reportFocus(window?.isKeyWindow ?? false)
+        }
+        return became
     }
 
     override var isFlipped: Bool {
@@ -2368,7 +2375,96 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             )
             ctx.textPosition = CGPoint(x: x, y: baselineY)
             CTLineDraw(line, ctx)
+            if run.underline_style != 0 {
+                strokeUnderline(
+                    ctx: ctx,
+                    style: run.underline_style,
+                    x: x,
+                    width: cellsWide * cellWidth,
+                    centerY: baselineY - runFont.underlinePosition,
+                    thickness: max(1, runFont.underlineThickness),
+                    color: ulRGBA,
+                )
+            }
         }
+    }
+
+    /// SGR 4:1..4:5 for the CPU painter, matching the GPU shader: lines snapped to device
+    /// pixels, patterns phased on the absolute x so neighbouring runs join up.
+    private func strokeUnderline(
+        ctx: CGContext,
+        style: UInt8,
+        x: CGFloat,
+        width: CGFloat,
+        centerY: CGFloat,
+        thickness: CGFloat,
+        color: UInt32,
+    ) {
+        if style == 3 {
+            strokeCurlyUnderline(ctx: ctx, x: x, width: width, centerY: centerY, thickness: thickness, color: color)
+            return
+        }
+        let scale = window?.backingScaleFactor ?? 2
+        let t = max(1, (thickness * scale).rounded()) / scale
+        let top = ((centerY - t / 2) * scale).rounded() / scale
+        ctx.saveGState()
+        ctx.clip(to: CGRect(x: x, y: top, width: width, height: t * 3))
+        ctx.setFillColor(Self.cgColor(color))
+        switch style {
+        case 2:
+            ctx.fill(CGRect(x: x, y: top, width: width, height: t))
+            ctx.fill(CGRect(x: x, y: top + 2 * t, width: width, height: t))
+        case 4, 5:
+            // dotted: t on, t off; dashed: 3t on, 2t off.
+            let (on, period) = style == 4 ? (t, 2 * t) : (3 * t, 5 * t)
+            var px = (x / period).rounded(.down) * period
+            while px < x + width {
+                ctx.fill(CGRect(x: px, y: top, width: on, height: t))
+                px += period
+            }
+        default:
+            ctx.fill(CGRect(x: x, y: top, width: width, height: t))
+        }
+        ctx.restoreGState()
+    }
+
+    private static func cgColor(_ rgba: UInt32) -> CGColor {
+        CGColor(
+            red: CGFloat((rgba >> 24) & 0xFF) / 255,
+            green: CGFloat((rgba >> 16) & 0xFF) / 255,
+            blue: CGFloat((rgba >> 8) & 0xFF) / 255,
+            alpha: CGFloat(rgba & 0xFF) / 255,
+        )
+    }
+
+    /// SGR 4:3: a wave one underline thick.
+    private func strokeCurlyUnderline(
+        ctx: CGContext,
+        x: CGFloat,
+        width: CGFloat,
+        centerY: CGFloat,
+        thickness: CGFloat,
+        color: UInt32,
+    ) {
+        let amplitude = thickness * 1.2
+        let half = max(2, amplitude * 4)
+        let path = CGMutablePath()
+        var px = (x / half).rounded(.down) * half
+        var up = Int((px / half).rounded()) % 2 == 0
+        path.move(to: CGPoint(x: px, y: centerY))
+        while px < x + width {
+            let mid = CGPoint(x: px + half / 2, y: centerY + (up ? -amplitude : amplitude) * 2)
+            path.addQuadCurve(to: CGPoint(x: px + half, y: centerY), control: mid)
+            px += half
+            up.toggle()
+        }
+        ctx.saveGState()
+        ctx.clip(to: CGRect(x: x, y: centerY - amplitude * 3, width: width, height: amplitude * 6))
+        ctx.addPath(path)
+        ctx.setStrokeColor(Self.cgColor(color))
+        ctx.setLineWidth(thickness)
+        ctx.strokePath()
+        ctx.restoreGState()
     }
 
     /// Cheap component-wise equality for the "is this cell's bg the
@@ -3258,7 +3354,11 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     override func resignFirstResponder() -> Bool {
         kittyPressed.removeAll()
         kittyPending = nil
-        return super.resignFirstResponder()
+        let resigned = super.resignFirstResponder()
+        if resigned {
+            reportFocus(false)
+        }
+        return resigned
     }
 
     /// Build the `ESC + utf8(base_char)` byte sequence for an

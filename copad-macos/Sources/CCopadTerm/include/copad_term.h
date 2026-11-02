@@ -333,6 +333,9 @@ uint32_t copad_snapshot_graphic_count(const CopadSnapshot* snap);
 bool copad_snapshot_graphic(const CopadSnapshot* snap, uint32_t index, CopadGraphic* out);
 bool copad_snapshot_graphic_image(const CopadSnapshot* snap, uint32_t index, CopadGraphicImage* out);
 
+// Keyboard focus changed: sends CSI I / CSI O when the program enabled focus reports (?1004).
+void copad_term_set_focused(CopadHandle* handle, bool focused);
+
 // `[terminal] images` — off ignores every graphics command without replying.
 void copad_term_set_images(CopadHandle* handle, bool enabled);
 // Cell size in device pixels (images, TIOCGWINSZ, CSI 14/16 t). Call on create and on every
