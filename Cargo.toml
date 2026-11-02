@@ -39,4 +39,8 @@ repository = "https://github.com/marshallku/copad"
 # title stack). Fixed upstream, unreleased: see vendor/alacritty_terminal/COPAD-PATCH.md.
 [patch.crates-io]
 alacritty_terminal = { path = "vendor/alacritty_terminal" }
+# vte 0.15 drops APC strings and CSI 16 t; the kitty graphics protocol needs both, IN stream order
+# (a synchronized update replays its bytes through the parser, so a parser-level hook keeps the
+# order a pre-scan could not). See vendor/vte/COPAD-PATCH.md.
+vte = { path = "vendor/vte" }
 

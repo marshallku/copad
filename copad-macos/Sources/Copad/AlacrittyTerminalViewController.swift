@@ -277,6 +277,7 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
         termHandle?.applyPaletteFromTheme(theme)
         termHandle?.setKittyKeyboard(config.kittyKeyboard)
         termHandle?.setScrollback(config.scrollback)
+        termHandle?.setImages(config.images)
         if let initialInput {
             termHandle?.input(Array(initialInput.utf8))
         }
@@ -297,6 +298,11 @@ final class AlacrittyTerminalViewController: NSViewController, CopadPanel, Zooma
 
     func applyScrollback(_ lines: Int) {
         termHandle?.setScrollback(lines)
+    }
+
+    /// Config hot-reload: `[terminal] images`. Images already on screen stay until erased.
+    func applyImages(_ enabled: Bool) {
+        termHandle?.setImages(enabled)
     }
 
     /// Config hot-reload: flip the OSC 52 policy on the live render
@@ -678,6 +684,8 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// Cached snapshot for the most recent paint. Refreshed only when
     /// `copad_term_take_damage` reports the grid changed.
     private var snapshotCache: CopadTermFFI.Snapshot?
+    /// CPU painter's decoded kitty-graphics images by key, trimmed to what the snapshot shows.
+    private var imageCache: [UInt64: CGImage] = [:]
 
     /// Panel identity stamped into every `terminal.output` event so
     /// consumers (AI agents, trigger conditions) can filter per pane.
@@ -1407,6 +1415,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         }
         // First window attach is when the real backingScaleFactor
         // becomes known — the init-time metrics assumed 2x.
+        reportCellPixels()
         if metalRenderer != nil {
             layer?.contentsScale = win.backingScaleFactor
             metalRenderer?.setFonts(gpuFonts(), metrics: gpuMetrics())
@@ -1441,6 +1450,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
     /// draw(_:) output itself).
     override func viewDidChangeBackingProperties() {
         super.viewDidChangeBackingProperties()
+        reportCellPixels()
         guard metalRenderer != nil else { return }
         layer?.contentsScale = window?.backingScaleFactor ?? 2
         metalRenderer?.setFonts(gpuFonts(), metrics: gpuMetrics())
@@ -1459,6 +1469,18 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
 
     func bind(handle: CopadTermFFI.Handle?) {
         termHandle = handle
+        reportCellPixels()
+    }
+
+    /// Tell the terminal how big a cell is in device pixels — what programs size images
+    /// against (kitty graphics, `TIOCGWINSZ`, `CSI 14/16 t`). The cell is drawn at
+    /// `cellWidth x cellHeight` points.
+    private func reportCellPixels() {
+        let scale = window?.backingScaleFactor ?? 2
+        termHandle?.setCellPixels(
+            width: Int((cellWidth * scale).rounded()),
+            height: Int((cellHeight * scale).rounded()),
+        )
     }
 
     func computeGrid() -> (cols: UInt16, rows: UInt16) {
@@ -1480,6 +1502,7 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         let leading = ceil(font.leading)
         cellHeight = ascent + descent + leading
         if cellHeight <= 0 { cellHeight = 16 }
+        reportCellPixels()
     }
 
     /// Display-link callback. Runs on the main runloop at vsync.
@@ -1752,22 +1775,33 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         // overlap the AppKit-supplied dirty rect. `cellHeight > 0`
         // guarded so the very first paint (pre-layout) still draws
         // every row.
+        let graphics = snap.graphics
         let snapRows = snap.rows
         let useDirtyClip = cellHeight > 0
-        for row in 0 ..< snapRows {
-            if useDirtyClip {
-                let rowRect = CGRect(
-                    x: 0,
-                    y: CGFloat(row) * cellHeight,
-                    width: bounds.width,
-                    height: cellHeight,
-                )
-                if !rowRect.intersects(dirtyRect) { continue }
+        let drawRows = { (pass: RowPass) in
+            for row in 0 ..< snapRows {
+                if useDirtyClip {
+                    let rowRect = CGRect(
+                        x: 0,
+                        y: CGFloat(row) * self.cellHeight,
+                        width: self.bounds.width,
+                        height: self.cellHeight,
+                    )
+                    if !rowRect.intersects(dirtyRect) { continue }
+                }
+                let runs = snap.rowRuns(row)
+                let utf8 = snap.rowUtf8(row)
+                guard runs.count > 0, utf8.count > 0 else { continue }
+                self.drawRow(row: row, runs: runs, utf8: utf8, ctx: ctx, pass: pass)
             }
-            let runs = snap.rowRuns(row)
-            let utf8 = snap.rowUtf8(row)
-            guard runs.count > 0, utf8.count > 0 else { continue }
-            drawRow(row: row, runs: runs, utf8: utf8, ctx: ctx)
+        }
+        if graphics.contains(where: { $0.z < 0 }) {
+            // Images under the text (z < 0) go over the cell backgrounds, as on the GPU path.
+            drawRows(.backgrounds)
+            paintImages(graphics, snap: snap, ctx: ctx, aboveText: false)
+            drawRows(.text)
+        } else {
+            drawRows(.all)
         }
 
         // Cursor on top of the glyph layer: nvim/htop/etc. paint the
@@ -1777,6 +1811,9 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         // theme.background so the character under the cursor stays
         // readable (xterm/iTerm2/Terminal.app convention).
         drawCursor(snap: snap, ctx: ctx)
+
+        paintImages(graphics, snap: snap, ctx: ctx, aboveText: true)
+        trimImageCache(graphics, snap: snap)
 
         // Selection highlight last so it tints OVER the text instead
         // of getting covered by per-cell bg fills. theme.surface2 at
@@ -1794,6 +1831,71 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         // Paints OVER everything else at the cursor cell — what the
         // user is composing, before any of it touches the PTY.
         paintMarkedText(snap.cursor, ctx: ctx)
+    }
+
+    /// kitty-graphics runs for the CPU painter: each run's slice of the image, clipped to the
+    /// run's rect (the GPU path does the same with texture coordinates).
+    private func paintImages(
+        _ graphics: [CopadGraphic],
+        snap: CopadTermFFI.Snapshot,
+        ctx: CGContext,
+        aboveText: Bool,
+    ) {
+        for g in graphics where (g.z >= 0) == aboveText {
+            guard let image = cgImage(g.image, snap: snap) else { continue }
+            let (uw, uh) = (CGFloat(g.uv.2 - g.uv.0), CGFloat(g.uv.3 - g.uv.1))
+            guard uw > 0, uh > 0 else { continue }
+            let dest = CGRect(
+                x: CGFloat(g.rect.0) * cellWidth,
+                y: CGFloat(g.rect.1) * cellHeight,
+                width: CGFloat(g.rect.2 - g.rect.0) * cellWidth,
+                height: CGFloat(g.rect.3 - g.rect.1) * cellHeight,
+            )
+            // Where the WHOLE image would land for this slice to fall on `dest`.
+            let full = CGRect(
+                x: dest.minX - CGFloat(g.uv.0) / uw * dest.width,
+                y: dest.minY - CGFloat(g.uv.1) / uh * dest.height,
+                width: dest.width / uw,
+                height: dest.height / uh,
+            )
+            ctx.saveGState()
+            ctx.clip(to: dest)
+            // The view is flipped; CGContext.draw expects y-up.
+            ctx.translateBy(x: 0, y: full.minY + full.maxY)
+            ctx.scaleBy(x: 1, y: -1)
+            ctx.draw(image, in: full)
+            ctx.restoreGState()
+        }
+    }
+
+    private func cgImage(_ index: UInt32, snap: CopadTermFFI.Snapshot) -> CGImage? {
+        guard let info = snap.graphicImage(index), let pixels = info.pixels else { return nil }
+        if let cached = imageCache[info.key] { return cached }
+        let (w, h) = (Int(info.width), Int(info.height))
+        let data = Data(bytes: pixels, count: w * h * 4)
+        guard let provider = CGDataProvider(data: data as CFData),
+              let image = CGImage(
+                  width: w,
+                  height: h,
+                  bitsPerComponent: 8,
+                  bitsPerPixel: 32,
+                  bytesPerRow: w * 4,
+                  space: CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB(),
+                  bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                  provider: provider,
+                  decode: nil,
+                  shouldInterpolate: true,
+                  intent: .defaultIntent,
+              )
+        else { return nil }
+        imageCache[info.key] = image
+        return image
+    }
+
+    private func trimImageCache(_ graphics: [CopadGraphic], snap: CopadTermFFI.Snapshot) {
+        guard !imageCache.isEmpty else { return }
+        let shown = Set(graphics.compactMap { snap.graphicImage($0.image)?.key })
+        imageCache = imageCache.filter { shown.contains($0.key) }
     }
 
     /// Paint the current find match. Single-row matches are a single
@@ -2138,11 +2240,18 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
         CTLineDraw(line, ctx)
     }
 
+    /// Which part of a row `drawRow` paints: both, or — when an image must go between them
+    /// (kitty z < 0) — the cell backgrounds and the text in separate passes.
+    private enum RowPass {
+        case all, backgrounds, text
+    }
+
     private func drawRow(
         row: UInt16,
         runs: UnsafeBufferPointer<CopadRun>,
         utf8: UnsafeBufferPointer<UInt8>,
         ctx: CGContext,
+        pass: RowPass = .all,
     ) {
         // Baseline in flipped coords: top of row + ascent.
         let baselineY = CGFloat(row) * cellHeight + ascent
@@ -2205,10 +2314,11 @@ private final class AlacrittyRenderView: NSView, @preconcurrency NSTextInputClie
             let skipFill = transparentMode
                 ? (bgIsDefault && !isInverse)
                 : cgColorsApproxEqual(bg, defaultBg)
-            if !skipFill {
+            if !skipFill, pass != .text {
                 ctx.setFillColor(bg)
                 ctx.fill(cellRect)
             }
+            if pass == .backgrounds { continue }
 
             // Text. Empty/whitespace skipped to save a CTLine alloc.
             let len = Int(run.utf8_len)

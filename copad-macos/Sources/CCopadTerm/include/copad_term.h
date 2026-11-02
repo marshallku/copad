@@ -311,6 +311,34 @@ const uint8_t* copad_snapshot_hyperlink_uri(const CopadSnapshot* snap,
                                               uint32_t hyperlink_id,
                                               size_t* out_len);
 
+// kitty graphics protocol (decisions #189). A snapshot lists the visible image runs in DRAW
+// order (bottom-most first; z < 0 belongs under the text, z >= 0 over it) and the images they
+// use. Pixels are premultiplied RGBA8, borrowed from the snapshot; `key` is unique per decoded
+// image for the process, so GPU uploads can be cached by it.
+typedef struct {
+    float    rect[4];   // left, top, right, bottom in cells from the viewport's top-left
+    float    uv[4];     // left, top, right, bottom in the image, 0..1
+    int32_t  z;
+    uint32_t image;     // index for copad_snapshot_graphic_image
+} CopadGraphic;
+
+typedef struct {
+    uint64_t       key;
+    uint32_t       width;
+    uint32_t       height;
+    const uint8_t* pixels;
+} CopadGraphicImage;
+
+uint32_t copad_snapshot_graphic_count(const CopadSnapshot* snap);
+bool copad_snapshot_graphic(const CopadSnapshot* snap, uint32_t index, CopadGraphic* out);
+bool copad_snapshot_graphic_image(const CopadSnapshot* snap, uint32_t index, CopadGraphicImage* out);
+
+// `[terminal] images` — off ignores every graphics command without replying.
+void copad_term_set_images(CopadHandle* handle, bool enabled);
+// Cell size in device pixels (images, TIOCGWINSZ, CSI 14/16 t). Call on create and on every
+// font / backing-scale change.
+void copad_term_set_cell_pixels(CopadHandle* handle, uint32_t width, uint32_t height);
+
 // Static string, no free required.
 const char* copad_term_version(void);
 

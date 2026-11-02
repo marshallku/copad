@@ -20,6 +20,8 @@
 //! lock briefly, copy out the visible rows, then release; renderers
 //! consume them without holding the lock.
 
+mod graphics;
+
 use std::collections::HashMap;
 use std::ffi::{CStr, c_char};
 use std::hash::{Hash, Hasher};
@@ -178,6 +180,11 @@ struct CopadListener {
     /// poll after the first returns false even though the underlying
     /// signal is permanent.
     child_exited: Arc<std::sync::atomic::AtomicBool>,
+    /// Image switch + cell pixel size, shared with the kitty graphics handler (decisions #189).
+    graphics: Arc<graphics::Shared>,
+    /// Grid size in cells, for `CSI 14 t` / `CSI 16 t` replies (alacritty hands us only a
+    /// formatter).
+    grid_size: Arc<Mutex<(u16, u16)>>,
 }
 
 /// Catppuccin Mocha defaults — same palette
@@ -226,6 +233,22 @@ impl CopadListener {
             sender: Arc::new(std::sync::Mutex::new(None)),
             palette: Arc::new(std::sync::Mutex::new(palette)),
             child_exited: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            graphics: Arc::new(graphics::Shared::default()),
+            grid_size: Arc::new(Mutex::new((1, 1))),
+        }
+    }
+
+    /// The PTY window size: the grid in cells plus the cell size the host reported (1x1 until
+    /// it has), which is what `TIOCGWINSZ` hands programs sizing images.
+    fn window_size(&self) -> WindowSize {
+        let (num_cols, num_lines) = *self.grid_size.lock().unwrap();
+        let w = self.graphics.cell_width.load(Ordering::Relaxed);
+        let h = self.graphics.cell_height.load(Ordering::Relaxed);
+        WindowSize {
+            num_lines,
+            num_cols,
+            cell_width: w.clamp(1, u16::MAX as u32) as u16,
+            cell_height: h.clamp(1, u16::MAX as u32) as u16,
         }
     }
 
@@ -261,7 +284,7 @@ impl EventListener for CopadListener {
             }
             Event::PtyWrite(reply) => {
                 // alacritty_terminal already formatted the reply
-                // (`\e[<row>;<col>R` for DSR 6n, `\e[?6c` for DA 0c,
+                // (`\e[<row>;<col>R` for DSR 6n, `\e[?62;22c` for DA 0c,
                 // etc.) — we just forward the bytes back to the child.
                 // Without this hop nvim logs `"Did not detect DSR
                 // response from terminal"` on startup and falls back
@@ -296,10 +319,17 @@ impl EventListener for CopadListener {
                 // ChildExit fires at most once per Term lifetime.
                 self.child_exited.store(true, Ordering::Relaxed);
             }
+            // `CSI 14 t` / `CSI 16 t`: image tools size their output with these. Only once the
+            // host has said how big a cell is — a 1x1 answer would be worse than none.
+            Event::TextAreaSizeRequest(format_reply)
+                if self.graphics.cell_width.load(Ordering::Relaxed) != 0 =>
+            {
+                self.send_to_pty(format_reply(self.window_size()).into_bytes());
+            }
             _ => {
-                // Title / Bell / MouseCursorDirty / TextAreaSizeRequest /
-                // CursorBlinkingChange / Wakeup / Exit — intentionally
-                // dropped; the renderer doesn't react to them today.
+                // Title / Bell / MouseCursorDirty / CursorBlinkingChange /
+                // Wakeup / Exit — intentionally dropped; the renderer
+                // doesn't react to them today.
             }
         }
     }
@@ -438,6 +468,21 @@ pub struct CopadSnapshot {
     /// Deduped by alacritty's `Hyperlink::id` so a hyperlink spanning
     /// many cells only stores its URI once.
     hyperlinks: Vec<String>,
+    /// Visible image runs in draw order, and the images they index (held so the pixel pointers
+    /// handed out stay valid until the snapshot is destroyed).
+    graphics: Vec<graphics::CopadGraphic>,
+    graphic_images: Vec<Arc<alacritty_terminal::term::cell::GraphicImage>>,
+}
+
+/// One image a snapshot's runs draw from. `pixels` is premultiplied RGBA8, `width * height * 4`
+/// bytes, borrowed from the snapshot. `key` is unique per decoded image for the process — cache
+/// GPU uploads by it.
+#[repr(C)]
+pub struct CopadGraphicImage {
+    pub key: u64,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: *const u8,
 }
 
 /// Create a terminal handle: spawn a PTY running the requested shell
@@ -506,6 +551,13 @@ pub unsafe extern "C" fn copad_term_create(
     // emulator we ship alongside (alacritty / iterm2 / Terminal.app)
     // exports by default.
     tty_opts.env.insert("TERM".into(), "xterm-256color".into());
+    // Who the pane is talking to, for programs that pick features by terminal name (yazi's
+    // image driver); the app removes any other terminal's identity it was started with.
+    tty_opts.env.insert("TERM_PROGRAM".into(), "copad".into());
+    tty_opts.env.insert(
+        "TERM_PROGRAM_VERSION".into(),
+        env!("CARGO_PKG_VERSION").into(),
+    );
     // Match Ghostty: inject a default UTF-8 locale into the PTY child
     // when none was inherited. Copad.app launched from Finder /
     // Spotlight / Dock comes up with launchd's environment, which has
@@ -556,16 +608,11 @@ pub unsafe extern "C" fn copad_term_create(
         tty_opts.working_directory = Some(PathBuf::from(s));
     }
 
-    let window_size = WindowSize {
-        num_lines: safe_rows,
-        num_cols: safe_cols,
-        // Cell pixel dims are only used by programs that query
-        // `TIOCGWINSZ` for pixel dimensions (mostly image protocols
-        // like sixel/kitty). 1×1 is safe for the headless scaffold;
-        // the renderer will resize with real values once it's drawing.
-        cell_width: 1,
-        cell_height: 1,
-    };
+    let listener = CopadListener::new();
+    *listener.grid_size.lock().unwrap() = (safe_cols, safe_rows);
+    listener.graphics.enabled.store(true, Ordering::Relaxed);
+    // Cell pixels stay 1x1 until the renderer reports them (`copad_term_set_cell_pixels`).
+    let window_size = listener.window_size();
 
     let pty = match tty::new(&tty_opts, window_size, 0) {
         Ok(p) => p,
@@ -579,11 +626,15 @@ pub unsafe extern "C" fn copad_term_create(
     let child_pid = pty.child().id() as i32;
 
     let term_size = TermSize::new(safe_cols as usize, safe_rows as usize);
-    let listener = CopadListener::new();
     // `kitty_keyboard` makes alacritty_terminal keep the per-screen flag stacks and answer
     // `CSI ? u`; the GUI encodes keys against those flags via `copad_term_encode_key`.
     let config = TermOptions::default().config();
-    let term = Term::new(config, &term_size, listener.clone());
+    let mut term = Term::new(config, &term_size, listener.clone());
+    let mut images = graphics::Graphics::new(listener.graphics.clone(), {
+        let listener = listener.clone();
+        Box::new(move |reply: String| listener.send_to_pty(reply.into_bytes()))
+    });
+    term.set_apc_handler(Some(Box::new(move |term, data| images.handle(term, data))));
     let term = Arc::new(FairMutex::new(term));
 
     let event_loop = match EventLoop::new(Arc::clone(&term), listener.clone(), pty, false, false) {
@@ -787,12 +838,8 @@ pub unsafe extern "C" fn copad_term_resize(handle: *mut CopadHandle, cols: u16, 
     let safe_cols = cols.max(1);
     let safe_rows = rows.max(1);
 
-    let ws = WindowSize {
-        num_lines: safe_rows,
-        num_cols: safe_cols,
-        cell_width: 1,
-        cell_height: 1,
-    };
+    *h.listener.grid_size.lock().unwrap() = (safe_cols, safe_rows);
+    let ws = h.listener.window_size();
     // `Msg::Resize` only forwards to `pty.on_resize` (so the child
     // process sees SIGWINCH). The Term grid is a separate resize and
     // must be done explicitly under the term lock — alacritty's own
@@ -1304,6 +1351,7 @@ pub unsafe extern "C" fn copad_term_snapshot(handle: *mut CopadHandle) -> *mut C
     };
 
     let selection = selection_range_for_ffi(&term);
+    let (graphics, graphic_images) = graphics::collect(grid, display_offset, rows_count as usize);
 
     drop(term);
 
@@ -1322,6 +1370,8 @@ pub unsafe extern "C" fn copad_term_snapshot(handle: *mut CopadHandle) -> *mut C
         selection,
         search_match,
         hyperlinks,
+        graphics,
+        graphic_images,
     }))
 }
 
@@ -2772,6 +2822,107 @@ pub unsafe extern "C" fn copad_snapshot_hyperlink_uri(
     };
     unsafe { *out_len = uri.len() };
     uri.as_ptr()
+}
+
+/// Image runs in the snapshot, in draw order.
+///
+/// # Safety
+///
+/// `snap` must be NULL or a live snapshot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_snapshot_graphic_count(snap: *const CopadSnapshot) -> u32 {
+    unsafe { snap.as_ref() }.map_or(0, |s| s.graphics.len() as u32)
+}
+
+/// Copy image run `index` into `out`; false when out of range.
+///
+/// # Safety
+///
+/// `snap` must be NULL or a live snapshot; `out` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_snapshot_graphic(
+    snap: *const CopadSnapshot,
+    index: u32,
+    out: *mut graphics::CopadGraphic,
+) -> bool {
+    let Some(g) = unsafe { snap.as_ref() }.and_then(|s| s.graphics.get(index as usize)) else {
+        return false;
+    };
+    if out.is_null() {
+        return false;
+    }
+    unsafe { *out = *g };
+    true
+}
+
+/// Image `index` of the snapshot (the `image` of a run). Pixels are borrowed from the snapshot.
+///
+/// # Safety
+///
+/// `snap` must be NULL or a live snapshot; `out` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_snapshot_graphic_image(
+    snap: *const CopadSnapshot,
+    index: u32,
+    out: *mut CopadGraphicImage,
+) -> bool {
+    let Some(image) = unsafe { snap.as_ref() }.and_then(|s| s.graphic_images.get(index as usize))
+    else {
+        return false;
+    };
+    if out.is_null() {
+        return false;
+    }
+    unsafe {
+        *out = CopadGraphicImage {
+            key: image.key,
+            width: image.width,
+            height: image.height,
+            pixels: image.rgba.as_ptr(),
+        }
+    };
+    true
+}
+
+/// `[terminal] images`: whether programs may draw images (the kitty graphics protocol). Off,
+/// every graphics command is ignored without a reply, so programs see no support.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_set_images(handle: *mut CopadHandle, enabled: bool) {
+    if let Some(h) = unsafe { handle.as_ref() } {
+        h.listener
+            .graphics
+            .enabled
+            .store(enabled, Ordering::Relaxed);
+    }
+}
+
+/// The cell size in device pixels: what images are sized against, what `TIOCGWINSZ` reports
+/// and what `CSI 14 t` / `CSI 16 t` answer. Call on creation and on every font / scale change.
+///
+/// # Safety
+///
+/// `handle` must be NULL or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_term_set_cell_pixels(
+    handle: *mut CopadHandle,
+    width: u32,
+    height: u32,
+) {
+    let Some(h) = (unsafe { handle.as_ref() }) else {
+        return;
+    };
+    let g = &h.listener.graphics;
+    let old_width = g.cell_width.swap(width, Ordering::Relaxed);
+    let old_height = g.cell_height.swap(height, Ordering::Relaxed);
+    if (old_width, old_height) == (width, height) {
+        return;
+    }
+    // The PTY learns the new pixel size (and the child a SIGWINCH) like on a resize.
+    let _ = h.sender.send(Msg::Resize(h.listener.window_size()));
 }
 
 #[unsafe(no_mangle)]

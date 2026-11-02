@@ -50,6 +50,27 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private var rotationTimer: DispatchSourceTimer?
     private var liveRotateInterval: UInt = 0
 
+    /// Another terminal's identity, inherited when Copad is started from it (`open` in Ghostty,
+    /// a shell in iTerm2). Left in the environment, every pane would claim to BE that terminal,
+    /// and programs that pick features by name (yazi's image driver) choose wrong ones. The pane
+    /// identifies itself as `TERM_PROGRAM=copad` instead (copad-term sets it).
+    private static let foreignTerminalVariables = [
+        "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "TERM_SESSION_ID", "LC_TERMINAL", "LC_TERMINAL_VERSION",
+        "GHOSTTY_RESOURCES_DIR", "GHOSTTY_BIN_DIR", "GHOSTTY_SHELL_FEATURES", "GHOSTTY_SHELL_INTEGRATION_NO_SUDO",
+        "KITTY_WINDOW_ID", "KITTY_PID", "KITTY_PUBLIC_KEY", "KITTY_INSTALLATION_DIR", "KITTY_LISTEN_ON",
+        "ITERM_SESSION_ID", "ITERM_PROFILE", "WEZTERM_EXECUTABLE", "WEZTERM_EXECUTABLE_DIR", "WEZTERM_PANE",
+        "WEZTERM_UNIX_SOCKET", "WEZTERM_CONFIG_DIR", "WEZTERM_CONFIG_FILE", "KONSOLE_VERSION", "WT_Session",
+        "WARP_HONOR_PS1", "VSCODE_INJECTION", "TABBY_CONFIG_DIRECTORY", "ALACRITTY_WINDOW_ID",
+        "ALACRITTY_SOCKET", "ALACRITTY_LOG", "TMUX", "TMUX_PANE", "STY", "WINDOW",
+    ]
+
+    func applicationWillFinishLaunching(_: Notification) {
+        // Before any pane (or thread reading the environment) exists.
+        for name in Self.foreignTerminalVariables {
+            unsetenv(name)
+        }
+    }
+
     func applicationDidFinishLaunching(_: Notification) {
         // PR 1 (Tier 2.1) FFI smoke test. Proves the Rust staticlib linked
         // correctly and a JSON round-trip survives the C-ABI boundary.

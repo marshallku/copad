@@ -101,6 +101,10 @@ struct CopadConfig {
     /// line costs its full width in cells, so this is the main lever on a busy pane's memory.
     /// An integer only (a float is ignored like any other malformed field).
     let scrollback: Int
+    /// `[terminal] images` — let programs draw images with the kitty graphics protocol (yazi
+    /// previews, `kitten icat`). `false` ignores image commands without replying, so programs
+    /// fall back to text. Default `true`.
+    let images: Bool
     let themeName: String
     let backgroundPath: String?
     let backgroundTint: Double
@@ -261,6 +265,7 @@ struct CopadConfig {
             closeOnExit: tomlBool(terminal, "close_on_exit") ?? d.closeOnExit,
             kittyKeyboard: tomlBool(terminal, "kitty_keyboard") ?? d.kittyKeyboard,
             scrollback: terminal?["scrollback"]?.int.map { min(max($0, 0), 100_000) } ?? d.scrollback,
+            images: tomlBool(terminal, "images") ?? d.images,
             themeName: tomlString(theme, "name") ?? d.themeName,
             backgroundPath: bgPath,
             backgroundTint: clamp01(tomlDouble(background, "tint") ?? d.backgroundTint),
@@ -398,6 +403,7 @@ struct CopadConfig {
             closeOnExit: true,
             kittyKeyboard: true,
             scrollback: 10_000,
+            images: true,
             themeName: "catppuccin-mocha",
             backgroundPath: nil,
             backgroundTint: 0.6,

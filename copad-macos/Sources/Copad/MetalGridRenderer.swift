@@ -39,7 +39,7 @@ final class MetalGridRenderer {
         float2 uvOrigin;
         float2 uvSize;
         float4 color;   // non-premultiplied
-        uint4  kindPad; // x: 0 = solid, 1 = mono glyph, 2 = color glyph
+        uint4  kindPad; // x: 0 = solid, 1 = mono glyph, 2 = color glyph, 3 = image
     };
 
     struct VSOut {
@@ -80,6 +80,9 @@ final class MetalGridRenderer {
     ) {
         constexpr sampler s(mag_filter::nearest, min_filter::nearest,
                             address::clamp_to_edge);
+        // Images are scaled to their cells, so they filter.
+        constexpr sampler smooth(mag_filter::linear, min_filter::linear,
+                                 address::clamp_to_edge);
         // Instance colors are sRGB-encoded. Into an `_srgb` drawable
         // (`alpha_blending = linear`) they go as linear light: the
         // hardware blends linearly and re-encodes on store.
@@ -92,6 +95,14 @@ final class MetalGridRenderer {
         case 1: {
             float cov = atlas.sample(s, in.uv).a;
             return float4(rgb * in.color.a * cov, in.color.a * cov);
+        }
+        case 3: {
+            // kitty graphics image: premultiplied sRGB texels, untinted.
+            float4 t = atlas.sample(smooth, in.uv);
+            if (linear != 0 && t.a > 0.0) {
+                t.rgb = srgb_to_linear(t.rgb / t.a) * t.a;
+            }
+            return t;
         }
         default: {
             // Color glyph (emoji): atlas texels are already
@@ -122,7 +133,18 @@ final class MetalGridRenderer {
         case solid = 0
         case monoGlyph = 1
         case colorGlyph = 2
+        case image = 3
     }
+
+    /// Instances drawn with one texture, in order.
+    private struct Segment {
+        let range: Range<Int>
+        let texture: MTLTexture
+    }
+
+    /// Uploaded kitty-graphics images by `CopadGraphicImage.key`. Only images the current frame
+    /// shows are kept, so GPU memory follows what is on screen (decisions #189).
+    private var imageTextures: [UInt64: MTLTexture] = [:]
 
     // MARK: - Inputs
 
@@ -320,9 +342,10 @@ final class MetalGridRenderer {
         // from the current working set (plan D4 overflow policy).
         let buildStart = measure ? DispatchTime.now().uptimeNanoseconds : 0
         var instances: [QuadInstance] = []
+        var backgroundEnd = 0
         for attempt in 0 ..< 2 {
             instances.removeAll(keepingCapacity: true)
-            if buildFrame(snap: snap, theme: theme, state: state, into: &instances) {
+            if buildFrame(snap: snap, theme: theme, state: state, into: &instances, backgroundEnd: &backgroundEnd) {
                 break
             }
             atlas.flush(scale: scale, smooth: metrics.smoothFonts)
@@ -332,6 +355,8 @@ final class MetalGridRenderer {
                 )
             }
         }
+        let textEnd = instances.count
+        let (below, above) = appendImages(&instances, snap: snap)
         let buildNanos = measure ? DispatchTime.now().uptimeNanoseconds - buildStart : 0
 
         // `nextDrawable` can park the main thread waiting for the
@@ -367,13 +392,21 @@ final class MetalGridRenderer {
             encoder.setFragmentBytes(&linearFlag, length: MemoryLayout<UInt32>.size, index: 0)
             encoder.setVertexBuffer(buffer, offset: 0, index: 0)
             encoder.setVertexBytes(&viewport, length: MemoryLayout<SIMD2<Float>>.size, index: 1)
-            encoder.setFragmentTexture(atlas.texture, index: 0)
-            encoder.drawPrimitives(
-                type: .triangleStrip,
-                vertexStart: 0,
-                vertexCount: 4,
-                instanceCount: instances.count,
-            )
+            // Backgrounds, images under the text, text and overlays, images over the text.
+            let atlasTexture = atlas.texture
+            let segments = [Segment(range: 0 ..< backgroundEnd, texture: atlasTexture)] + below
+                + [Segment(range: backgroundEnd ..< textEnd, texture: atlasTexture)] + above
+            let stride = MemoryLayout<QuadInstance>.stride
+            for segment in segments where !segment.range.isEmpty {
+                encoder.setVertexBufferOffset(segment.range.lowerBound * stride, index: 0)
+                encoder.setFragmentTexture(segment.texture, index: 0)
+                encoder.drawPrimitives(
+                    type: .triangleStrip,
+                    vertexStart: 0,
+                    vertexCount: 4,
+                    instanceCount: segment.range.count,
+                )
+            }
         }
         encoder.endEncoding()
         cmd.present(drawable)
@@ -384,6 +417,81 @@ final class MetalGridRenderer {
             lastEncodeNanos = buildNanos + (DispatchTime.now().uptimeNanoseconds - encodeStart)
         }
         return true
+    }
+
+    /// Append the snapshot's image runs (already in stacking order) and return the segments to
+    /// draw under the text (z < 0) and over it. Uploads images the cache lacks; drops the ones
+    /// this frame no longer shows.
+    private func appendImages(
+        _ instances: inout [QuadInstance],
+        snap: CopadTermFFI.Snapshot,
+    ) -> (below: [Segment], above: [Segment]) {
+        let graphics = snap.graphics
+        guard !graphics.isEmpty || !imageTextures.isEmpty else { return ([], []) }
+        var used: [UInt64: MTLTexture] = [:]
+        var textureByIndex: [UInt32: MTLTexture] = [:]
+        var below: [Segment] = []
+        var above: [Segment] = []
+        let sx = Float(metrics.cellWidth * metrics.scale)
+        let sy = Float(metrics.cellHeight * metrics.scale)
+        for g in graphics {
+            let texture: MTLTexture
+            if let t = textureByIndex[g.image] {
+                texture = t
+            } else {
+                guard let image = snap.graphicImage(g.image),
+                      let t = imageTextures[image.key] ?? makeTexture(image)
+                else { continue }
+                used[image.key] = t
+                textureByIndex[g.image] = t
+                texture = t
+            }
+            let start = instances.count
+            instances.append(QuadInstance(
+                origin: SIMD2(g.rect.0 * sx, g.rect.1 * sy),
+                size: SIMD2((g.rect.2 - g.rect.0) * sx, (g.rect.3 - g.rect.1) * sy),
+                uvOrigin: SIMD2(g.uv.0, g.uv.1),
+                uvSize: SIMD2(g.uv.2 - g.uv.0, g.uv.3 - g.uv.1),
+                color: SIMD4(1, 1, 1, 1),
+                kindPad: SIMD4(QuadKind.image.rawValue, 0, 0, 0),
+            ))
+            // Consecutive runs of one image share a draw.
+            if g.z < 0 {
+                Self.extend(&below, start, texture)
+            } else {
+                Self.extend(&above, start, texture)
+            }
+        }
+        imageTextures = used
+        return (below, above)
+    }
+
+    private static func extend(_ segments: inout [Segment], _ index: Int, _ texture: MTLTexture) {
+        if let last = segments.last, last.texture === texture, last.range.upperBound == index {
+            segments[segments.count - 1] = Segment(range: last.range.lowerBound ..< index + 1, texture: texture)
+        } else {
+            segments.append(Segment(range: index ..< index + 1, texture: texture))
+        }
+    }
+
+    private func makeTexture(_ image: CopadGraphicImage) -> MTLTexture? {
+        guard image.width > 0, image.height > 0, let pixels = image.pixels else { return nil }
+        let desc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .rgba8Unorm,
+            width: Int(image.width),
+            height: Int(image.height),
+            mipmapped: false,
+        )
+        desc.usage = .shaderRead
+        desc.storageMode = .shared
+        guard let texture = device.makeTexture(descriptor: desc) else { return nil }
+        texture.replace(
+            region: MTLRegionMake2D(0, 0, Int(image.width), Int(image.height)),
+            mipmapLevel: 0,
+            withBytes: pixels,
+            bytesPerRow: Int(image.width) * 4,
+        )
+        return texture
     }
 
     /// Transparent modes clear to alpha-0 so the layer background /
@@ -416,6 +524,7 @@ final class MetalGridRenderer {
         theme: ThemeColors,
         state: FrameState,
         into instances: inout [QuadInstance],
+        backgroundEnd: inout Int,
     ) -> Bool {
         let rows = snap.rows
         let cellW = metrics.cellWidth
@@ -449,6 +558,8 @@ final class MetalGridRenderer {
                 )
             }
         }
+
+        backgroundEnd = instances.count
 
         // 2. Glyphs + per-run decorations.
         for row in 0 ..< rows {

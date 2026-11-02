@@ -332,6 +332,17 @@ enum CopadTermFFI {
             copad_term_set_scrollback(ptr, UInt32(clamping: max(0, lines)))
         }
 
+        func setImages(_ enabled: Bool) {
+            guard let ptr else { return }
+            copad_term_set_images(ptr, enabled)
+        }
+
+        /// Cell size in device pixels — what programs size images against.
+        func setCellPixels(width: Int, height: Int) {
+            guard let ptr, width > 0, height > 0 else { return }
+            copad_term_set_cell_pixels(ptr, UInt32(clamping: width), UInt32(clamping: height))
+        }
+
         enum KeyEncoding {
             /// Send the event's text the normal way (IME, insertText).
             case text
@@ -519,6 +530,27 @@ enum CopadTermFFI {
         /// `CopadRun.hyperlink_id` carries). Returns nil for id == 0
         /// or an out-of-range id. Bytes are copied out before the
         /// snapshot's storage is reused.
+        /// Visible image runs in draw order (bottom-most first).
+        var graphics: [CopadGraphic] {
+            guard let ptr else { return [] }
+            let n = copad_snapshot_graphic_count(ptr)
+            guard n > 0 else { return [] }
+            var out: [CopadGraphic] = []
+            out.reserveCapacity(Int(n))
+            var g = CopadGraphic()
+            for i in 0 ..< n where copad_snapshot_graphic(ptr, i, &g) {
+                out.append(g)
+            }
+            return out
+        }
+
+        /// Image `index` of this snapshot; its pixels are valid while the snapshot lives.
+        func graphicImage(_ index: UInt32) -> CopadGraphicImage? {
+            guard let ptr else { return nil }
+            var out = CopadGraphicImage()
+            return copad_snapshot_graphic_image(ptr, index, &out) ? out : nil
+        }
+
         func hyperlinkURI(_ hyperlinkID: UInt32) -> String? {
             guard let ptr, hyperlinkID > 0 else { return nil }
             var len = 0

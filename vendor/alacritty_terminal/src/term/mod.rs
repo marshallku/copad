@@ -341,7 +341,14 @@ pub struct Term<T> {
 
     /// Config directly for the terminal.
     config: Config,
+
+    /// Receives every complete APC string, in stream order (copad patch: the kitty graphics
+    /// protocol). Taken out while it runs so it can borrow the terminal.
+    apc_handler: Option<ApcHandler<T>>,
 }
+
+/// See [`Term::set_apc_handler`] (copad patch).
+pub type ApcHandler<T> = Box<dyn FnMut(&mut Term<T>, &[u8]) + Send>;
 
 /// Configuration options for the [`Term`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,6 +453,7 @@ impl<T> Term<T> {
             event_proxy,
             damage,
             config,
+            apc_handler: None,
             grid,
             tabs,
             inactive_keyboard_mode_stack: Default::default(),
@@ -508,8 +516,9 @@ impl<T> Term<T> {
         self.damage.reset(self.columns());
     }
 
+    /// Public in copad's patch: image placements change cells outside the damage tracking.
     #[inline]
-    fn mark_fully_damaged(&mut self) {
+    pub fn mark_fully_damaged(&mut self) {
         self.damage.full = true;
     }
 
@@ -694,6 +703,27 @@ impl<T> Term<T> {
     /// Mutable access to the raw grid data structure.
     pub fn grid_mut(&mut self) -> &mut Grid<Cell> {
         &mut self.grid
+    }
+
+    /// The screen buffer not on display: the primary grid while the alternate screen is up, and
+    /// the other way round (copad patch).
+    pub fn inactive_grid_mut(&mut self) -> &mut Grid<Cell> {
+        &mut self.inactive_grid
+    }
+
+    /// Both screen buffers, active first (copad patch).
+    pub fn grids_mut(&mut self) -> [&mut Grid<Cell>; 2] {
+        [&mut self.grid, &mut self.inactive_grid]
+    }
+
+    /// The scroll region, top inclusive, bottom exclusive, in viewport lines (copad patch).
+    pub fn scroll_region(&self) -> Range<Line> {
+        self.scroll_region.clone()
+    }
+
+    /// Install what handles APC strings, or remove it with `None` (copad patch).
+    pub fn set_apc_handler(&mut self, handler: Option<ApcHandler<T>>) {
+        self.apc_handler = handler;
     }
 
     /// Resize terminal to new dimensions.
@@ -1361,7 +1391,10 @@ impl<T: EventListener> Handler for Term<T> {
         match intermediate {
             None => {
                 trace!("Reporting primary device attributes");
-                let text = String::from("\x1b[?6c");
+                // copad patch: VT220 + ANSI colour, as ghostty and xterm answer. alacritty's
+                // `?6c` (VT102) is too short for kitten, which only takes a DA1 reply with more
+                // than three bytes as the end of its graphics probe and otherwise times out.
+                let text = String::from("\x1b[?62;22c");
                 self.event_proxy.send_event(Event::PtyWrite(text));
             }
             Some('>') => {
@@ -2408,6 +2441,29 @@ impl<T: EventListener> Handler for Term<T> {
     fn text_area_size_chars(&mut self) {
         let text = format!("\x1b[8;{};{}t", self.screen_lines(), self.columns());
         self.event_proxy.send_event(Event::PtyWrite(text));
+    }
+
+    /// `CSI 16 t` (copad patch). Answered like `CSI 14 t`, by whoever knows the pixel size.
+    #[inline]
+    fn cell_size_pixels(&mut self) {
+        self.event_proxy
+            .send_event(Event::TextAreaSizeRequest(Arc::new(move |window_size| {
+                format!(
+                    "\x1b[6;{};{}t",
+                    window_size.cell_height, window_size.cell_width
+                )
+            })));
+    }
+
+    /// copad patch: see [`Term::set_apc_handler`].
+    fn apc_dispatch(&mut self, data: &[u8]) {
+        if let Some(mut handler) = self.apc_handler.take() {
+            handler(self, data);
+            // The handler may have installed a replacement; keep that one.
+            if self.apc_handler.is_none() {
+                self.apc_handler = Some(handler);
+            }
+        }
     }
 }
 

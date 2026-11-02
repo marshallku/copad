@@ -614,6 +614,7 @@ final class PaneManager {
     func applyConfig(_ newConfig: CopadConfig, theme newTheme: CopadTheme) {
         let oldKitty = config.kittyKeyboard
         let oldScrollback = config.scrollback
+        let oldImages = config.images
         config = newConfig
         theme = newTheme
         for pane in root.allLeaves() {
@@ -628,6 +629,9 @@ final class PaneManager {
                 }
                 if newConfig.scrollback != oldScrollback {
                     alac.applyScrollback(newConfig.scrollback)
+                }
+                if newConfig.images != oldImages {
+                    alac.applyImages(newConfig.images)
                 }
                 alac.applyWindowOpacity(newConfig.windowOpacity)
             }
