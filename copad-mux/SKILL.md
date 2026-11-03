@@ -285,6 +285,19 @@ consequential, tell them rather than assuming they are watching that pane.
 `wait-agent` addresses a **pane**, not a specific agent run: if the agent exits and another
 starts in that pane, they are indistinguishable.
 
+To see what another agent has been working ON — the files it read, edited and searched, its
+subagents, in order — read its work graph instead of scraping its screen:
+
+```bash
+comux graph                                # every live agent: totals + the files it touched most
+comux graph <token>                        # that agent's steps, newest last
+comux graph <token> --json --limit 50      # .graph.steps / .graph.files; --before SEQ pages back
+```
+
+Two agents editing the same file show the same `abs` path in both graphs. The graph is read
+from each agent's own transcript (Claude and Codex), so it lags by about a second and does not
+see edits made through shell commands.
+
 ## Hand work to a child and get the result back
 
 Mark the tabs you make as yours with `--owner`, and the child can report to you without

@@ -50,6 +50,7 @@ use crate::usagepoll::{self, UsagePart, UsageSnapshot};
 use crate::versionpoll::{self, VersionStatus};
 
 mod delegate;
+mod graph;
 mod host;
 pub use delegate::OverlayMarks;
 
@@ -1320,6 +1321,10 @@ pub struct App {
     /// Shared "what is each agent doing" readings, written by the `agentpoll` thread and
     /// read (never blocked on) when building agent rows.
     agent_poll: agentpoll::Shared,
+    /// The work graphs (decisions #204), read by the `graphpoll` thread.
+    graph_poll: crate::graphpoll::Shared,
+    /// The serialised `graph` topic, while nothing it depends on moved.
+    graph_cache: std::cell::RefCell<graph::GraphCache>,
     /// Working-tree state per repo for the sidebar subtitle (`gitpoll`); idle unless started.
     git_poll: gitpoll::Shared,
     /// Shared host CPU/memory/GPU/load reading, written by the `hostmetrics` poller.
@@ -1566,6 +1571,8 @@ impl App {
             // App without a server never spawn the poller thread.
             usage_poll: usagepoll::idle(),
             agent_poll: agentpoll::idle(),
+            graph_poll: crate::graphpoll::idle(),
+            graph_cache: Default::default(),
             git_poll: gitpoll::idle(),
             host_poll: hostmetrics::idle(),
             version_poll: versionpoll::idle(),
@@ -5300,6 +5307,7 @@ impl App {
                 let (cfg, warnings) = crate::config::MuxConfig::load();
                 self.cfg = cfg;
                 self.apply_history_limit();
+                self.push_graph_settings();
                 Resp::message(reload_note(
                     &crate::config::MuxConfig::config_path(),
                     &warnings,
@@ -5349,6 +5357,11 @@ impl App {
                 }
             }
             Req::PanePreview { target, rows, cols } => self.pane_preview(target, *rows, *cols),
+            Req::Graph {
+                target,
+                before,
+                limit,
+            } => self.graph_request(target.as_deref(), *before, *limit),
             Req::UsagePage { delta } => {
                 self.page_usage(*delta);
                 Resp::ok()
@@ -9176,6 +9189,7 @@ impl App {
         let mut worktrees: HashMap<TerminalId, PathBuf> = HashMap::new();
         let mut root_of: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
         let mut seq_counter = self.agent_seq;
+        let mut graph_agents: Vec<(u32, String, Option<PathBuf>)> = Vec::new();
         for (tid, pane) in &self.panes {
             let Some(label) = self.labels.get(tid) else {
                 continue;
@@ -9237,6 +9251,7 @@ impl App {
             let cwd = self.test_cwds.get(tid).cloned();
             #[cfg(not(test))]
             let cwd = procinfo::process_cwd(label.pid);
+            graph_agents.push((label.pid, label.text.clone(), cwd.clone()));
             if let Some(cwd) = cwd {
                 let root = root_of
                     .entry(cwd)
@@ -9286,6 +9301,7 @@ impl App {
         // Report a roll as a change.
         self.agent_seq = seq_counter;
         agentpoll::set_wanted(&self.agent_poll, wanted);
+        self.set_graph_wants(&graph_agents);
         let mut minutes = HashMap::with_capacity(next.len());
         let mut rolled = false;
         for (tid, st) in &next {

@@ -26,7 +26,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Reliable bytes a subscriber may have queued before it is cut off. Above the largest
-/// snapshot (five topics, each capped at [`TOPIC_CAP`]), so a healthy subscribe always fits.
+/// snapshot (six topics, each capped at [`TOPIC_CAP`]), so a healthy subscribe always fits.
 const RELIABLE_CAP: usize = 8 << 20;
 
 /// A single topic value larger than this is published as `unavailable` instead.

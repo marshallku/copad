@@ -27,6 +27,7 @@ pub mod fdlimit;
 pub mod fleet;
 pub mod gitinfo;
 pub mod gitpoll;
+pub mod graphpoll;
 pub mod hostapi;
 pub mod hostmetrics;
 pub mod images;
@@ -48,6 +49,7 @@ pub mod tui;
 pub mod usagepoll;
 pub mod versionpoll;
 pub mod winfocus;
+pub mod workgraph;
 pub mod worktree;
 
 pub use model::{

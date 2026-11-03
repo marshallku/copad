@@ -34,6 +34,8 @@ pub const DEFAULT_SCROLL_STEP: i32 = 3;
 /// Default and ceiling for `history_limit`.
 pub const DEFAULT_HISTORY_LIMIT: usize = 10_000;
 pub const MAX_HISTORY_LIMIT: usize = 100_000;
+/// How long saved work graphs are kept.
+pub const DEFAULT_GRAPH_RETAIN_DAYS: u32 = 30;
 /// Default periodic autosave interval (seconds) for session persistence.
 pub const DEFAULT_AUTOSAVE_SECS: u32 = 15;
 /// Default cells per progress bar for `usage = "bar"`.
@@ -1067,6 +1069,16 @@ pub struct MuxConfig {
     /// (dirty `*`, ahead/behind, `+a −r` against HEAD), read off-loop every few seconds.
     /// `false` keeps the fork-free branch name only. Read at server start.
     pub sidebar_git: bool,
+    /// Build each agent's work graph (decisions #204): the files it read, edited and searched,
+    /// its subagents and its steps, read off-loop from its own transcript and shown by copad's
+    /// native chrome. `false` reads nothing and publishes an empty `graph` topic. Live.
+    pub graph: bool,
+    /// Keep the work graphs on disk (`<state dir>/graphs/`), so they survive a server restart
+    /// and continue when the conversation is resumed. `false` writes nothing (and leaves files
+    /// already there alone). Live.
+    pub graph_persist: bool,
+    /// Saved work graphs older than this many days are deleted (checked hourly).
+    pub graph_retain_days: u32,
     /// Title each pane (`1:claude working`) when a tab shows two or more: on the divider above
     /// it, or right-aligned on its first row only where that row is blank. Never takes a row.
     pub pane_titles: bool,
@@ -1189,6 +1201,9 @@ struct RawConfig {
     set_titles: Option<bool>,
     bell_passthrough: Option<bool>,
     sidebar_git: Option<bool>,
+    graph: Option<bool>,
+    graph_persist: Option<bool>,
+    graph_retain_days: Option<i64>,
     pane_titles: Option<bool>,
     top_bar: Option<bool>,
     sidebar: Option<bool>,
@@ -1312,6 +1327,9 @@ impl MuxConfig {
             set_titles: true,
             bell_passthrough: true,
             sidebar_git: true,
+            graph: true,
+            graph_persist: true,
+            graph_retain_days: DEFAULT_GRAPH_RETAIN_DAYS,
             pane_titles: true,
             top_bar: false,
             sidebar: true,
@@ -1419,6 +1437,17 @@ impl MuxConfig {
         ) as u64;
         // autosave: 0 explicitly disables periodic saves; any other value is clamped to
         // a sane [5, 3600] s (a bad-but-nonzero value shouldn't hammer the disk).
+        let graph_retain_days = match raw.graph_retain_days {
+            None => DEFAULT_GRAPH_RETAIN_DAYS,
+            Some(v) if !(1..=3650).contains(&v) => {
+                let c = v.clamp(1, 3650);
+                warnings.push(format!(
+                    "graph_retain_days ({v}) out of range [1,3650] — clamped to {c}"
+                ));
+                c as u32
+            }
+            Some(v) => v as u32,
+        };
         let autosave_secs = match raw.autosave_secs {
             None => DEFAULT_AUTOSAVE_SECS,
             Some(0) => 0,
@@ -1456,6 +1485,9 @@ impl MuxConfig {
                 set_titles: raw.set_titles.unwrap_or(true),
                 bell_passthrough: raw.bell_passthrough.unwrap_or(true),
                 sidebar_git: raw.sidebar_git.unwrap_or(true),
+                graph: raw.graph.unwrap_or(true),
+                graph_persist: raw.graph_persist.unwrap_or(true),
+                graph_retain_days,
                 pane_titles: raw.pane_titles.unwrap_or(true),
                 top_bar: raw.top_bar.unwrap_or(false),
                 sidebar: raw.sidebar.unwrap_or(true),

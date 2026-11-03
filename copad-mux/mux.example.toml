@@ -55,6 +55,13 @@ sidebar_git = true        # decorate each space's branch with git status: `*` di
                           #   ahead/behind, +a −r vs HEAD, ⑂ = linked worktree. Read off-loop
                           #   every ~5s with no optional locks; false = branch only, no forks.
                           #   Turning it ON needs `comux server restart`.
+graph = true              # build each agent's work graph (files read/edited/searched, its
+                          #   subagents, its steps) from its own transcript, off-loop; copad
+                          #   draws it in a right panel; `comux graph` prints it. Live.
+graph_persist = true      # keep the graphs on disk beside the session state (graphs/,
+                          #   0600) so they survive a restart and continue on resume;
+                          #   false writes nothing and leaves existing files alone. Live.
+graph_retain_days = 30    # saved graphs older than this are deleted (checked hourly)
 pane_titles = true        # title panes (`1:claude working`) when a tab shows 2+: on the divider
                           #   above, or on a blank stretch of the first row — never over content
 prefix_hint = true        # while the prefix is armed, the status bar shows the next keys

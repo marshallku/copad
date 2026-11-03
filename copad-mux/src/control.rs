@@ -473,6 +473,18 @@ pub enum Req {
         #[serde(default)]
         target: Option<String>,
     },
+    /// The work graph (decisions #204): no `target` = every live agent's overview (the L0
+    /// `graph` topic's value); a `target` = a page of that agent's history, the newest
+    /// `limit` steps before `before`. Read-only, and polled by a host's graph panel, so it
+    /// stays out of `ctl_mutates`.
+    Graph {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        before: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<usize>,
+    },
     /// The whole mux as one tree — sessions, their tabs, their panes — or one `session`
     /// (a selector). Read-only.
     ListTree {
@@ -1019,6 +1031,10 @@ pub struct Resp {
     /// `pane-preview`: the pane's screen as styled runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<copad_mux_proto::Preview>,
+    /// `graph`: the overview (`copad_mux_proto::Graph`) or one agent's history page
+    /// (`copad_mux_proto::graph::GraphPage`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph: Option<serde_json::Value>,
     /// `capture-pane`: physical grid rows the text spans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_rows: Option<usize>,
@@ -1113,6 +1129,15 @@ impl Resp {
             skipped: None,
             e2e: None,
             preview: None,
+            graph: None,
+        }
+    }
+
+    /// A `graph` response.
+    pub fn graph(value: serde_json::Value) -> Self {
+        Self {
+            graph: Some(value),
+            ..Self::ok()
         }
     }
 
@@ -1298,7 +1323,7 @@ pub fn run_client(args: &[String]) -> i32 {
             );
         }
         eprintln!(
-            "usage: comux <list|split|resize|focus|close|send|capture-pane|wait-output|list-agents|wait-agent|agent-log|\
+            "usage: comux <list|split|resize|focus|close|send|capture-pane|wait-output|list-agents|wait-agent|agent-log|graph|\
              list-tabs|new-tab|spawn|select-tab|\
              close-tab|rename-tab [index] <name>|list-sessions|new-session [name]|\
              rename-session [index] <name>|select-session|kill-session|\
@@ -1777,6 +1802,42 @@ pub fn run_client(args: &[String]) -> i32 {
         "list-agents" | "agents" => {
             parsed!(cliargs::bare("usage: comux list-agents [--fleet] [--json]"));
             Req::ListAgents { target: None }
+        }
+        "graph" => {
+            let p = parsed!(GRAPH_SPEC);
+            let num = |flag: &str| -> Result<Option<u64>, i32> {
+                match p.value(flag) {
+                    None => Ok(None),
+                    Some(v) => v.parse::<u64>().map(Some).map_err(|_| {
+                        usage_error(
+                            json_out,
+                            &format!("comux graph: {flag} needs a number"),
+                            GRAPH_SPEC.usage,
+                        )
+                    }),
+                }
+            };
+            let before = match num("--before") {
+                Ok(v) => v,
+                Err(code) => return code,
+            };
+            let limit = match num("--limit") {
+                Ok(v) => v.map(|n| n as usize),
+                Err(code) => return code,
+            };
+            let target = p.positionals.first().cloned();
+            if target.is_none() && (before.is_some() || limit.is_some()) {
+                return usage_error(
+                    json_out,
+                    "comux graph: --before/--limit page one pane's history",
+                    GRAPH_SPEC.usage,
+                );
+            }
+            Req::Graph {
+                target,
+                before,
+                limit,
+            }
         }
         "new-session" => {
             let p = parsed!(NAME_SPEC_NEW_SESSION);
@@ -2755,6 +2816,13 @@ const SPAWN_SPEC: Spec = Spec {
     positionals: Positionals::Any,
 };
 
+const GRAPH_SPEC: Spec = Spec {
+    usage: "usage: comux graph [<pane-token|index>] [--before SEQ] [--limit N] [--json]\n\
+            no pane = every live agent's overview; a pane = that agent's history, newest last",
+    flags: &[opt(&["--before"]), opt(&["--limit"])],
+    positionals: Positionals::AtMost(1),
+};
+
 const CAPTURE_SPEC: Spec = Spec {
     usage: CAPTURE_USAGE,
     flags: &[
@@ -3527,6 +3595,95 @@ pub(crate) fn round_trip(req: &Req) -> Result<Resp, String> {
     serde_json::from_str(resp_line.trim()).map_err(|e| format!("bad response: {e}"))
 }
 
+/// `comux graph` for a person: per agent its totals and the files it touched most; for one
+/// pane, its steps.
+fn print_graph(page: bool, value: Option<&serde_json::Value>) {
+    use copad_mux_proto::graph::{Graph, GraphFile, GraphPage, GraphStep};
+    let file_line = |f: &GraphFile| {
+        format!(
+            "  {:>3}r {:>3}e {:>3}w {:>3}s  {}",
+            f.reads, f.edits, f.writes, f.searches, f.display
+        )
+    };
+    let step_line = |s: &GraphStep, files: &[GraphFile]| {
+        let what = s
+            .file
+            .and_then(|id| files.iter().find(|f| f.id == id))
+            .map(|f| f.display.as_str())
+            .unwrap_or(&s.label);
+        let kind = serde_json::to_value(s.kind)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let outcome = serde_json::to_value(s.outcome)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let by = if s.agent == 0 {
+            String::new()
+        } else {
+            format!(" [sub {}]", s.agent)
+        };
+        format!("  #{:<5} {:<7} {:<8} {what}{by}", s.seq, kind, outcome)
+    };
+    let Some(value) = value else {
+        println!("(no work graph)");
+        return;
+    };
+    if page {
+        let Ok(p) = serde_json::from_value::<GraphPage>(value.clone()) else {
+            return;
+        };
+        println!(
+            "{} {} · {} steps · {} files",
+            p.tool, p.conversation, p.counts.steps, p.counts.files
+        );
+        for s in &p.steps {
+            println!("{}", step_line(s, &p.files));
+        }
+        if let Some(b) = p.next_before {
+            println!("  … earlier: comux graph {} --before {b}", p.token);
+        }
+        return;
+    }
+    let Ok(g) = serde_json::from_value::<Graph>(value.clone()) else {
+        return;
+    };
+    if g.agents.is_empty() {
+        println!("(no work graphs — no Claude or Codex agent comux can read, or graph = false)");
+    }
+    for a in &g.agents {
+        let c = a.counts;
+        println!(
+            "{} {} — {} files · {} reads · {} edits · {} writes · {} searches · {} runs · {} subagents · {} failed",
+            a.token,
+            a.tool,
+            c.files,
+            c.reads,
+            c.edits,
+            c.writes,
+            c.searches,
+            c.runs,
+            c.subagents,
+            c.failed
+        );
+        let mut files = a.files.clone();
+        files.sort_by_key(|f| std::cmp::Reverse(f.reads + f.edits + f.writes + f.searches));
+        for f in files.iter().take(8) {
+            println!("{}", file_line(f));
+        }
+        for s in &a.subagents {
+            println!(
+                "  sub {} {} — {} ({})",
+                s.id, s.kind, s.description, s.status
+            );
+        }
+    }
+    if g.omitted_agents > 0 {
+        println!("(+{} agents left out)", g.omitted_agents);
+    }
+}
+
 fn print_human(req: &Req, resp: &Resp) {
     if !resp.ok {
         eprintln!(
@@ -3631,6 +3788,7 @@ fn print_human(req: &Req, resp: &Resp) {
                 }
             }
         }
+        Req::Graph { target, .. } => print_graph(target.is_some(), resp.graph.as_ref()),
         Req::ListAgents { .. } => {
             let agents = resp.agents.clone().unwrap_or_default();
             if agents.is_empty() {
@@ -4678,6 +4836,7 @@ mod verb_args_tests {
         "focus",
         "close",
         "capture-pane",
+        "graph",
         "jump",
         "notify",
         "agent-report",

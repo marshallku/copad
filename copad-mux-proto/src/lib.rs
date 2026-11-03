@@ -54,7 +54,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+pub mod graph;
 pub mod link;
+
+pub use graph::Graph;
 
 /// The L0 protocol version. A host refuses a server whose [`PubMsg::Welcome`] says otherwise.
 pub const PROTO: u32 = 1;
@@ -72,7 +75,9 @@ pub mod topic {
     pub const NOTIFICATIONS: &str = "notifications";
     pub const STATUS: &str = "status";
     pub const CLIENTS: &str = "clients";
-    pub const ALL: [&str; 5] = [TREE, AGENTS, NOTIFICATIONS, STATUS, CLIENTS];
+    /// The work graph (decisions #204). An older host ignores it (unknown topic).
+    pub const GRAPH: &str = "graph";
+    pub const ALL: [&str; 6] = [TREE, AGENTS, NOTIFICATIONS, STATUS, CLIENTS, GRAPH];
 }
 
 /// A piece of TUI chrome a host can take over.
@@ -685,6 +690,7 @@ pub struct Model {
     pub notifications: Option<Notifications>,
     pub status: Option<Status>,
     pub clients: Option<Clients>,
+    pub graph: Option<Graph>,
     revs: BTreeMap<String, u64>,
 }
 
@@ -743,6 +749,7 @@ impl Model {
                     topic::NOTIFICATIONS => self.notifications = None,
                     topic::STATUS => self.status = None,
                     topic::CLIENTS => self.clients = None,
+                    topic::GRAPH => self.graph = None,
                     _ => return Applied::Ignored,
                 }
                 Applied::Dropped(topic.clone())
@@ -763,6 +770,7 @@ impl Model {
             topic::NOTIFICATIONS => self.notifications.is_some(),
             topic::STATUS => self.status.is_some(),
             topic::CLIENTS => self.clients.is_some(),
+            topic::GRAPH => self.graph.is_some(),
             _ => false,
         }
     }
@@ -782,6 +790,7 @@ impl Model {
             topic::NOTIFICATIONS => self.notifications = de(data),
             topic::STATUS => self.status = de(data),
             topic::CLIENTS => self.clients = de(data),
+            topic::GRAPH => self.graph = de(data),
             _ => return false,
         }
         self.revs.insert(name.to_string(), rev);

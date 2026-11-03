@@ -413,6 +413,7 @@ pub fn run() -> io::Result<()> {
     // hint). Detached thread; `COPAD_MUX_UPDATE_CHECK=0` / `update_check = false`
     // disables it.
     app.start_agent_poll();
+    app.start_graph_poll();
     app.start_git_poll();
     app.start_host_poll();
     app.start_version_poll();
@@ -661,6 +662,7 @@ fn topic_values(
             l0::topic::CLIENTS,
             hostapi::ser(&hub.clients_topic(&attach_views(clients))),
         ),
+        (l0::topic::GRAPH, app.host_graph_json()),
     ]);
     (values, notifs)
 }
@@ -1339,6 +1341,8 @@ fn ctl_mutates(req: &control::Req) -> bool {
             // Also read-only and also polled (by `wait-agent`); it reads CACHED labels and
             // statuses, so it neither sweeps processes nor touches a PTY.
             | control::Req::ListAgents { .. }
+            // Polled by a host's graph panel; reads the poller's published graphs only.
+            | control::Req::Graph { .. }
             | control::Req::ListTree { .. }
             // Read-only, and pollable (`marks --json`).
             | control::Req::Marks

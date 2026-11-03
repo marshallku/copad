@@ -2381,6 +2381,81 @@ for a in json.load(sys.stdin)["agents"]:
     [[ "$(cat "$WORK/out")" == "{}" ]] || fail "near the window it must let it through: $(cat "$WORK/out")"
     ok "nothing asked → defer; comux compact → the next ask goes through once; cancel, no window, near the window behave"
 
+    echo "45h. the work graph: the agent's reads, edits, searches and subagent, kept on disk (opt-out)"
+    TP="$FH/.claude/projects/e2e/$FID.jsonl"
+    use() { # id name input-json
+        printf '{"type":"assistant","timestamp":"2026-11-04T00:00:0%s.000Z","message":{"content":[{"type":"tool_use","id":"%s","name":"%s","input":%s}]}}\n' "${#1}" "$1" "$2" "$3" >>"$TP"
+    }
+    res() { # id is_error
+        printf '{"type":"user","timestamp":"2026-11-04T00:00:05.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"%s","is_error":%s}]}}\n' "$1" "$2" >>"$TP"
+    }
+    printf '{"type":"user","timestamp":"2026-11-04T00:00:00.000Z","message":{"content":"Fix the parser"}}\n' >>"$TP"
+    use g1 Read '{"file_path":"/repo/src/parse.rs"}'; res g1 false
+    use g2 Edit '{"file_path":"/repo/src/parse.rs"}'; res g2 false
+    use g3 Edit '{"file_path":"/repo/src/lex.rs"}'; res g3 true
+    use g4 Grep '{"pattern":"fn parse","path":"/repo/src"}'; res g4 false
+    use g5 Agent '{"description":"Map the tests","subagent_type":"Explore"}'
+    SUBS="$FH/.claude/projects/e2e/$FID/subagents"; mkdir -p "$SUBS"
+    printf '{"agentType":"Explore","description":"Map the tests","toolUseId":"g5"}' >"$SUBS/agent-e2e1.meta.json"
+    printf '{"type":"assistant","isSidechain":true,"timestamp":"2026-11-04T00:00:03.000Z","message":{"content":[{"type":"tool_use","id":"s1","name":"Read","input":{"file_path":"/repo/tests/t.rs"}}]}}\n{"type":"user","isSidechain":true,"message":{"content":[{"type":"tool_result","tool_use_id":"s1"}]}}\n' >"$SUBS/agent-e2e1.jsonl"
+    gfield() { # python expression over the graph overview's agent `a` → stdout
+        t 5 fx graph --json 2>/dev/null >"$WORK/gjson" || true
+        python3 -c 'import json,sys
+d=json.load(open(sys.argv[1])).get("graph") or {}
+a=[x for x in d.get("agents",[]) if x["token"]==sys.argv[2]]
+a=a[0] if a else None
+f={x["id"]:x for x in (a or {}).get("files",[])}
+print(eval(sys.argv[3]) if a else "")' "$WORK/gjson" "$AG" "$1" 2>/dev/null
+    }
+    gwait() { # expr expected tries
+        local got=""
+        for _ in $(seq 1 "$3"); do got="$(gfield "$1")"; [[ "$got" == "$2" ]] && return 0; sleep 0.25; done
+        fail "graph: expected $1 == $2, got '$got': $(cat "$WORK/gjson")"
+    }
+    gwait 'a["counts"]["subagents"]' 1 120
+    gwait '(a["counts"]["reads"], a["counts"]["edits"], a["counts"]["searches"], a["counts"]["failed"], a["counts"]["prompts"])' "(2, 1, 1, 1, 1)" 60
+    [[ "$(gfield '[s["kind"] for s in a["subagents"]]')" == "['Explore']" ]] || fail "the subagent: $(cat "$WORK/gjson")"
+    [[ "$(gfield 'sorted(x["abs"] for x in a["files"])')" == "['/repo/src', '/repo/src/lex.rs', '/repo/src/parse.rs', '/repo/tests/t.rs']" ]] \
+        || fail "the files: $(cat "$WORK/gjson")"
+    [[ "$(gfield '[s["outcome"] for s in a["steps"] if s["kind"]=="edit"]')" == "['ok', 'failed']" ]] || fail "the failed edit should be marked"
+    [[ "$(gfield '[s["agent"] for s in a["steps"] if s["kind"]=="read"]')" == "[0, 1]" ]] || fail "the subagent's read is its own"
+    [[ "$(gfield 'a["pending"]')" == "[$(gfield '[s["seq"] for s in a["steps"] if s["kind"]=="spawn"][0]')]" ]] \
+        || fail "the spawn waits for its subagent: $(cat "$WORK/gjson")"
+    # One pane's history, page by page.
+    t 5 fx graph "$AG" --limit 3 --json >"$WORK/pjson" || fail "comux graph <pane> failed"
+    python3 -c 'import json,sys; p=json.load(open(sys.argv[1]))["graph"]; assert len(p["steps"])==3 and p["next_before"]==p["page_first_seq"], p' "$WORK/pjson" \
+        || fail "a 3-step page: $(cat "$WORK/pjson")"
+    t 5 fx graph "$AG" >"$WORK/out"; grep -q "parse.rs" "$WORK/out" || fail "the plain listing: $(cat "$WORK/out")"
+    # Kept on disk, beside the state file.
+    GFILE="$WORK/graphs/claude-$FID.json"
+    for _ in $(seq 1 40); do [[ -s "$GFILE" ]] && break; sleep 0.25; done
+    [[ -s "$GFILE" ]] || fail "the graph should be saved at $GFILE"
+    [[ "$(stat -f %Lp "$GFILE" 2>/dev/null || stat -c %a "$GFILE")" == 600 ]] || fail "the saved graph should be 0600"
+    grep -q '"/repo/src/parse.rs"' "$GFILE" || fail "the saved graph should hold the files"
+    # The subagent finishes in the background.
+    printf '{"type":"user","timestamp":"2026-11-04T00:00:09.000Z","message":{"content":"<task-notification>\\n<tool-use-id>g5</tool-use-id>\\n<status>completed</status>"}}\n' >>"$TP"
+    res g5 false
+    gwait '[s["status"] for s in a["subagents"]]' "['completed']" 60
+    # Opt out of keeping it: nothing new is written, nothing old is deleted by the toggle.
+    # The fork server reads the run's config dir (XDG_CONFIG_HOME); keep what is there.
+    MCFG="${XDG_CONFIG_HOME:-$FH/.config}/copad/mux.toml"; mkdir -p "$(dirname "$MCFG")"
+    MCFG_OLD="$(cat "$MCFG" 2>/dev/null || true)"
+    { printf '%s\n' "$MCFG_OLD"; printf 'graph_persist = false\n'; } >"$MCFG"
+    t 10 fx reload >"$WORK/reload.out" 2>&1 || fail "reload failed: $(cat "$WORK/reload.out")"
+    sleep 1.5 # let a poller pass that began before the reload finish
+    rm -f "$GFILE"
+    use g6 Read '{"file_path":"/repo/README.md"}'; res g6 false
+    gwait 'a["counts"]["reads"]' 3 60
+    sleep 6.5
+    [[ ! -e "$GFILE" ]] || fail "graph_persist = false must not write the graph (reload said: $(cat "$WORK/reload.out"); $(ls -la "$WORK/graphs"))"
+    # And off entirely: the topic empties.
+    { printf '%s\n' "$MCFG_OLD"; printf 'graph = false\n'; } >"$MCFG"
+    t 10 fx reload >/dev/null
+    for _ in $(seq 1 40); do [[ -z "$(gfield 'a["token"]')" ]] && break; sleep 0.25; done
+    [[ -z "$(gfield 'a["token"]')" ]] || fail "graph = false should empty the graph"
+    printf '%s\n' "$MCFG_OLD" >"$MCFG"; t 10 fx reload >/dev/null
+    ok "reads 2 / edits 1 (+1 failed) / searches 1 / 1 Explore subagent with its own read; paged; saved 0600; persist=false writes nothing; graph=false empties it"
+
     t 15 fx kill-server >/dev/null 2>&1 || kill -9 "$FPID" 2>/dev/null || true
     kill "$APID" 2>/dev/null || true
 fi
@@ -2391,4 +2466,4 @@ t 15 "$COMUX" kill-server >/dev/null || fail "kill-server failed"
 ok "healthy, then stopped"
 
 echo
-echo "PASS — comux close-tab / kill-session / notify / jump / capture-pane / wait-output / agents verified end to end"
+echo "PASS — comux close-tab / kill-session / notify / jump / capture-pane / wait-output / agents / graph verified end to end"

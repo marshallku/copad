@@ -227,8 +227,10 @@ snap = a.recv(5)
 if not snap or snap["t"] != "snapshot":
     fail(f"second line is not a snapshot: {snap}")
 topics = sorted(snap["topics"])
-if topics != ["agents", "clients", "notifications", "status", "tree"]:
+if topics != ["agents", "clients", "graph", "notifications", "status", "tree"]:
     fail(f"snapshot topics: {topics}")
+if snap["topics"]["graph"]["data"].get("agents") != []:
+    fail(f"with no agent the graph topic is empty: {snap['topics']['graph']}")
 if len(a.model["tree"]["sessions"]) != 1:
     fail("expected one session")
 INC = w["incarnation"]
