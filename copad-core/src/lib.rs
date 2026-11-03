@@ -9,6 +9,7 @@ pub mod design_grab;
 pub mod error;
 pub mod event_bus;
 pub mod fs_atomic;
+pub mod graph_bridge;
 pub mod muxhost;
 pub mod notifier;
 pub mod paths;

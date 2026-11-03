@@ -42,6 +42,7 @@ defaults delete com.marshall.copad comuxGraphWidth 2>/dev/null || true
 cleanup() {
     [[ -n "$APP_PID" ]] && kill "$APP_PID" 2>/dev/null || true
     [[ -n "$CAF" ]] && kill "$CAF" 2>/dev/null || true
+    [[ -n "${APID:-}" ]] && kill "$APID" 2>/dev/null || true
     COPAD_MUX_SOCK="$W/s" "$COMUX" kill-server >/dev/null 2>&1 || true
     # Only after the app has EXITED (it saves its session on the way out).
     if [[ -n "$DEV_PID" ]]; then
@@ -451,7 +452,8 @@ printf '{"type":"assistant","isSidechain":true,"timestamp":"2026-11-04T00:00:06.
     >"$W/home/.claude/projects/e2e/$FID/subagents/agent-m1.jsonl"
 "$COMUX" spawn --keep -- "$W/bin/claude" 600 >/dev/null || fail "spawning the fake agent failed"
 APID=""
-for _ in $(seq 1 50); do
+# The pane's login shell starts first (an interactive zsh can take seconds).
+for _ in $(seq 1 300); do
     ps -Ao pid=,args= >"$W/ps.txt"
     APID="$(awk -v p="$W/bin/claude" '$2==p {print $1; exit}' "$W/ps.txt")"
     [[ -n "$APID" ]] && break; sleep 0.1

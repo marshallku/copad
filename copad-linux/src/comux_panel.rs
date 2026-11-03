@@ -119,7 +119,11 @@ impl Style {
 #comux-status scrolledwindow, #comux-status viewport {{ background: transparent; box-shadow: none; }}
 #comux-sidebar {{ border-right: 1px solid {rule}; }}
 #comux-notifications {{ background: transparent; border-left: 1px solid {rule}; }}
-#comux-notifications.floating {{ background: {base}; box-shadow: -4px 0 12px alpha(black, 0.35); }}
+#comux-notifications.floating {{ background: {base}; border: 1px solid {rule}; border-radius: 8px; box-shadow: 0 4px 12px alpha(black, 0.35); }}
+#comux-top, #comux-top * {{ font-family: "{family}"; font-size: {size}pt; color: {subtext}; }}
+#comux-top {{ border-bottom: 1px solid {rule}; padding: 2px 6px; }}
+#comux-top .comux-flat.active image {{ color: {blue}; }}
+#comux-graph {{ background: transparent; }}
 #comux-sidebar row, #comux-notifications row {{ padding: 0; min-height: 0; border-radius: 4px; }}
 #comux-sidebar row:hover, #comux-notifications row:hover {{ background: alpha({hover}, 0.8); }}
 #comux-sidebar row:selected, #comux-notifications row:selected {{ background: transparent; }}
@@ -503,9 +507,19 @@ fn flat_button(icon: &str, tip: &str, name: &str) -> gtk4::Button {
 
 pub struct ComuxPanel {
     pub sidebar: gtk4::Box,
-    /// Where the notification panel docks (beside the terminal); while it floats over a narrow
-    /// window it lives in the overlay [`mount`](Self::mount) was given instead.
-    pub notif_dock: gtk4::Box,
+    /// The top bar over the terminal (decisions #204): where the view is on the left; the
+    /// all-sessions view, the work graph and the bell on the right.
+    pub top: gtk4::Box,
+    top_where: gtk4::Label,
+    graph_btn: gtk4::Button,
+    all_btn: gtk4::Button,
+    top_sig: Cell<u64>,
+    /// The right dock: the work-graph panel, slid in and out.
+    pub right_dock: gtk4::Revealer,
+    graph: Rc<crate::comux_graph::GraphPanel>,
+    graph_state: RefCell<crate::comux_graph::Remembered>,
+    /// A drag on the dock's left edge: (pointer x at the start, the width then).
+    graph_drag: Cell<Option<(f64, i32)>>,
     notifications: gtk4::Box,
     /// comux's status bar, natively (decisions #170): under the notebook.
     pub status: gtk4::Box,
@@ -608,6 +622,28 @@ impl ComuxPanel {
             "comux-resume",
         );
         head.append(&resume);
+        sidebar.append(&head);
+
+        // The top bar (decisions #204): the bell moved here from the sidebar's head.
+        let top = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+        top.set_widget_name("comux-top");
+        let top_where = gtk4::Label::new(None);
+        top_where.set_hexpand(true);
+        top_where.set_xalign(0.0);
+        top_where.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        top.append(&top_where);
+        let all_btn = flat_button(
+            "view-app-grid-symbolic",
+            "Every agent's work, across sessions",
+            "comux-graph-all",
+        );
+        top.append(&all_btn);
+        let graph_btn = flat_button(
+            "network-workgroup-symbolic",
+            "Work graph (Ctrl+Shift+G)",
+            "comux-graph-toggle",
+        );
+        top.append(&graph_btn);
         let bell = gtk4::Button::new();
         bell.add_css_class("comux-flat");
         bell.set_tooltip_text(Some("Notifications (Ctrl-b a)"));
@@ -619,8 +655,14 @@ impl ComuxPanel {
         let bell_count = gtk4::Label::new(None);
         bell_box.append(&bell_count);
         bell.set_child(Some(&bell_box));
-        head.append(&bell);
-        sidebar.append(&head);
+        top.append(&bell);
+        top.set_visible(false);
+        let graph = crate::comux_graph::GraphPanel::new();
+        let right_dock = gtk4::Revealer::new();
+        right_dock.set_transition_type(gtk4::RevealerTransitionType::SlideLeft);
+        right_dock.set_transition_duration(180);
+        right_dock.set_child(Some(&graph.root));
+        right_dock.set_reveal_child(false);
 
         let spaces_head = header_row(&bold(span(&style.dim, "spaces")), None);
         sidebar.append(&spaces_head);
@@ -659,10 +701,7 @@ impl ComuxPanel {
         nscroll.set_vexpand(true);
         nscroll.set_child(Some(&notif_list));
         notifications.append(&nscroll);
-        let notif_dock = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        notif_dock.append(&notifications);
         sidebar.set_visible(false);
-        notif_dock.set_visible(false);
         notifications.set_visible(false);
         let status = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
         status.set_widget_name("comux-status");
@@ -672,7 +711,15 @@ impl ComuxPanel {
         let nav = crate::comux_nav::SidebarNav::new(&sidebar);
         let this = Rc::new(Self {
             sidebar,
-            notif_dock,
+            top,
+            top_where,
+            graph_btn,
+            all_btn,
+            top_sig: Cell::new(0),
+            right_dock,
+            graph,
+            graph_state: RefCell::new(crate::comux_graph::load_remembered()),
+            graph_drag: Cell::new(None),
             notifications,
             status,
             overlay_ui: RefCell::new(None),
@@ -732,6 +779,41 @@ impl ComuxPanel {
                 p.cur().command(json!({"cmd": "notif-dismiss"}));
             }
         });
+        for (b, mode) in [(&this.graph_btn, "agent"), (&this.all_btn, "all")] {
+            let w = Rc::downgrade(&this);
+            b.connect_clicked(move |_| {
+                if let Some(p) = w.upgrade() {
+                    p.toggle_graph(mode);
+                }
+            });
+        }
+        // The dock's left edge resizes it.
+        let drag = gtk4::GestureDrag::new();
+        let w = Rc::downgrade(&this);
+        drag.connect_drag_begin(move |g, x, _| {
+            let Some(p) = w.upgrade() else { return };
+            if x <= 6.0 {
+                p.graph_drag.set(Some((x, p.graph.root.width())));
+            } else {
+                g.set_state(gtk4::EventSequenceState::Denied);
+            }
+        });
+        let w = Rc::downgrade(&this);
+        drag.connect_drag_update(move |_, dx, _| {
+            let Some(p) = w.upgrade() else { return };
+            if let Some((_, width)) = p.graph_drag.get() {
+                p.graph_state.borrow_mut().width = Some((width as f64 - dx).max(260.0) as i32);
+                p.relayout(false);
+            }
+        });
+        let w = Rc::downgrade(&this);
+        drag.connect_drag_end(move |_, _, _| {
+            let Some(p) = w.upgrade() else { return };
+            if p.graph_drag.take().is_some() {
+                crate::comux_graph::save_remembered(&p.graph_state.borrow());
+            }
+        });
+        this.graph.root.add_controller(drag);
         let w = Rc::downgrade(&this);
         bell.connect_clicked(move |_| {
             if let Some(p) = w.upgrade() {
@@ -984,6 +1066,7 @@ impl ComuxPanel {
             self.relayout(false);
         }
         self.fit_usage();
+        self.service_graph();
     }
 
     fn state(&self) -> Rc<Value> {
@@ -1049,8 +1132,40 @@ impl ComuxPanel {
         let notif = (38 * adv).max(260).min(pct(35).max(220));
         let open = on && self.notif_open.get();
         // Always over the terminal, never beside it (#183): opening it must not reflow the panes,
-        // and opening a notification closes it anyway.
+        // and opening a notification closes it anyway. It hangs under the top bar's bell (#204).
         let floating = open;
+        // One width budget (decisions #204): the terminal keeps 40 columns.
+        let remembered = self.graph_state.borrow().clone();
+        let graph_wanted = if on && remembered.open {
+            remembered
+                .width
+                .unwrap_or_else(|| (42 * adv).max(300).min(pct(45)))
+        } else {
+            0
+        };
+        let (side, graph) = crate::comux_graph::fit_widths(
+            width,
+            if on { side } else { 0 },
+            graph_wanted,
+            (40 * adv).max(320),
+        );
+        self.graph.root.set_width_request(graph.max(1));
+        self.right_dock.set_visible(on);
+        if self.right_dock.reveals_child() != (graph > 0) {
+            self.right_dock.set_reveal_child(graph > 0);
+        }
+        self.top.set_visible(on);
+        let rows = self.notif_list.observe_children().n_items().max(1) as i32;
+        let line = self
+            .sidebar
+            .create_pango_layout(Some("M"))
+            .pixel_size()
+            .1
+            .max(8);
+        let fits = line + 14 + rows * (2 * line + 14) + 8;
+        let tall = self.float_in.borrow().as_ref().map_or(400, |o| o.height());
+        self.notifications
+            .set_height_request(fits.min((tall * 6 / 10).max(120)));
         match self.paned.borrow().as_ref() {
             Some(paned) => {
                 // The split decides the width; the request is only its floor.
@@ -1068,7 +1183,6 @@ impl ComuxPanel {
         self.status.set_visible(on);
         self.place_notifications(floating);
         self.notifications.set_visible(open);
-        self.notif_dock.set_visible(open && !floating);
         let _ = force_visibility;
         self.split();
     }
@@ -1081,16 +1195,16 @@ impl ComuxPanel {
             return;
         }
         self.floating.set(floating);
+        // A dropdown under the top bar's bell (decisions #204), only there while open.
         if floating {
-            self.notif_dock.remove(&self.notifications);
             self.notifications.set_halign(gtk4::Align::End);
+            self.notifications.set_valign(gtk4::Align::Start);
+            self.notifications.set_margin_top(4);
+            self.notifications.set_margin_end(6);
             self.notifications.add_css_class("floating");
             over.add_overlay(&self.notifications);
         } else {
             over.remove_overlay(&self.notifications);
-            self.notifications.set_halign(gtk4::Align::Fill);
-            self.notifications.remove_css_class("floating");
-            self.notif_dock.append(&self.notifications);
         }
     }
 
@@ -1122,6 +1236,7 @@ impl ComuxPanel {
         let s = self.state();
         let st = self.style.borrow().clone();
         let minute = now_unix() / 60;
+        self.rebuild_top(&s, &st);
         let status_sig = sig(&[&s["status"], &s["tree"], &s["claimed"], &json!(minute)]);
         if status_sig != self.status_sig.get() {
             self.status_sig.set(status_sig);
@@ -1422,6 +1537,201 @@ impl ComuxPanel {
             String::new()
         });
         self.relayout(false);
+    }
+
+    /// The top bar's left side: session › tab › the focused agent and what it is doing.
+    fn rebuild_top(&self, s: &Value, st: &Style) {
+        let g = self.graph_state.borrow().clone();
+        let top_sig = sig(&[&s["tree"], &s["agents"], &json!([g.open, g.mode])]);
+        if top_sig == self.top_sig.get() {
+            return;
+        }
+        self.top_sig.set(top_sig);
+        let session = s["tree"]["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|x| x["active"] == true);
+        let mut m = String::new();
+        if let Some(session) = session {
+            m.push_str(&bold(span(
+                &st.mauve,
+                session["name"].as_str().unwrap_or_default(),
+            )));
+            if let Some(tab) = session["tabs"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|t| t["active"] == true)
+            {
+                m.push_str(&span(&st.dim, " › "));
+                m.push_str(&span(
+                    &st.subtext,
+                    tab["title"].as_str().unwrap_or_default(),
+                ));
+            }
+        }
+        if let Some(a) = s["agents"]["agents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|a| a["focused"] == true)
+        {
+            let (glyph, color) = st.agent(a);
+            m.push_str(&span(&st.dim, " › "));
+            m.push_str(&span(color, glyph));
+            m.push(' ');
+            m.push_str(&span(&st.text, a["tool"].as_str().unwrap_or_default()));
+            if let Some(d) = a["detail"].as_str().filter(|d| !d.is_empty()) {
+                m.push_str(&span(&st.dim, &format!("  {d}")));
+            }
+        }
+        self.top_where.set_markup(&m);
+        for (b, mode) in [(&self.graph_btn, "agent"), (&self.all_btn, "all")] {
+            if g.open && g.mode == mode {
+                b.add_css_class("active");
+            } else {
+                b.remove_css_class("active");
+            }
+        }
+    }
+
+    /// The window's current comux link's key (`""` = local).
+    fn cur_key(&self) -> String {
+        let cur = self.cur();
+        self.hosts
+            .borrow()
+            .iter()
+            .find(|(_, h)| Rc::ptr_eq(h, &cur))
+            .map(|(k, _)| k.clone())
+            .unwrap_or_default()
+    }
+
+    /// The window's graph page's consumer name at its comux.
+    fn graph_consumer(&self) -> String {
+        format!("{OVERLAY_CONSUMER}-graph")
+    }
+
+    /// Open the work-graph panel on `mode`, or close it when it already shows that.
+    pub fn toggle_graph(&self, mode: &str) {
+        let g = self.graph_state.borrow().clone();
+        self.set_graph(Some(!(g.open && g.mode == mode)), Some(mode));
+    }
+
+    pub fn set_graph(&self, open: Option<bool>, mode: Option<&str>) {
+        {
+            let mut g = self.graph_state.borrow_mut();
+            if let Some(m) = mode.filter(|m| (*m == "agent" || *m == "all") && g.mode != *m) {
+                g.mode = m.to_string();
+                self.graph.set_mode(m);
+            }
+            if let Some(o) = open {
+                g.open = o;
+            }
+            crate::comux_graph::save_remembered(&g);
+        }
+        self.top_sig.set(0);
+        let s = self.state();
+        let st = self.style.borrow().clone();
+        self.rebuild_top(&s, &st);
+        self.relayout(false);
+        self.feed_graph();
+    }
+
+    /// Act on what the graph page asked for, then bring it up to date.
+    fn service_graph(&self) {
+        let s = self.state();
+        let current = match s["graph"]["epoch"]
+            .as_u64()
+            .filter(|_| s["connected"] == true)
+        {
+            Some(e) => format!("{}#{e}", self.cur_key()),
+            None => String::new(),
+        };
+        for m in self.graph.drain(&current) {
+            use copad_core::graph_bridge::GraphMsg;
+            match m {
+                GraphMsg::Ready => {
+                    let mode = self.graph_state.borrow().mode.clone();
+                    self.graph.set_mode(&mode);
+                }
+                GraphMsg::Jump { token } => {
+                    self.cur().command(json!({"cmd": "jump", "target": token}));
+                }
+                GraphMsg::Open { path } => {
+                    // Only a file on THIS machine: a remote comux's paths name another disk.
+                    if self.cur_key().is_empty()
+                        && let Some(real) = copad_core::graph_bridge::openable_file(&path)
+                    {
+                        let uri = gtk4::gio::File::for_path(real).uri();
+                        let _ = gtk4::gio::AppInfo::launch_default_for_uri(
+                            &uri,
+                            gtk4::gio::AppLaunchContext::NONE,
+                        );
+                    }
+                }
+                GraphMsg::History {
+                    token,
+                    before,
+                    limit,
+                } => {
+                    self.cur()
+                        .graph_history(&self.graph_consumer(), &token, before, limit);
+                }
+                GraphMsg::Mode(mode) => {
+                    let mut g = self.graph_state.borrow_mut();
+                    g.mode = mode;
+                    crate::comux_graph::save_remembered(&g);
+                    self.top_sig.set(0);
+                }
+                GraphMsg::Agent { .. } => {}
+            }
+        }
+        self.feed_graph();
+    }
+
+    fn feed_graph(&self) {
+        if !self.right_dock.reveals_child() {
+            return;
+        }
+        let s = self.state();
+        let st = self.style.borrow().clone();
+        self.graph.feed(
+            &self.cur(),
+            &self.cur_key(),
+            &s,
+            &st,
+            &self.graph_consumer(),
+        );
+    }
+
+    /// `comux.graph` for the e2e: the panel's state, and the page's own read-out.
+    pub fn graph_status(&self, done: impl FnOnce(Value) + 'static) {
+        let g = self.graph_state.borrow().clone();
+        let out = json!({
+            "open": g.open, "mode": g.mode, "shown": self.right_dock.reveals_child(),
+            "width": self.graph.root.width(), "loaded": self.graph.loaded(),
+            "terminal_width": self.float_in.borrow().as_ref().map_or(0, |o| o.width()),
+        });
+        self.graph.page_state(move |page| {
+            let mut out = out;
+            out["page"] = page.unwrap_or(Value::Null);
+            done(out);
+        });
+    }
+
+    /// `comux.notifications` for the e2e.
+    pub fn set_notifications(&self, open: Option<bool>) -> Value {
+        if let Some(o) = open {
+            self.notif_open.set(o);
+            self.relayout(true);
+        }
+        json!({
+            "shown": self.notifications.is_visible() && self.notif_open.get(),
+            "halign_end": self.notifications.halign() == gtk4::Align::End,
+            "valign_start": self.notifications.valign() == gtk4::Align::Start,
+            "height_request": self.notifications.height_request(),
+        })
     }
 
     fn set_agents_badge(&self, st: &Style, blocked: usize) {
@@ -2246,6 +2556,45 @@ const OVERLAY_CONSUMER: &str = "overlay";
 
 pub fn set_global(p: &Rc<ComuxPanel>) {
     PANEL.with(|g| *g.borrow_mut() = Some(p.clone()));
+}
+
+/// Ctrl+Shift+G: the work-graph panel (decisions #204).
+pub fn toggle_graph_global(mode: &str) {
+    if let Some(p) = PANEL.with(|g| g.borrow().clone()) {
+        p.toggle_graph(mode);
+    }
+}
+
+/// `comux.graph` (decisions #204): `open` / `mode` set the panel; `done` gets its state with the
+/// page's own read-out under `page`.
+pub fn graph_global(
+    open: Option<bool>,
+    mode: Option<String>,
+    width: Option<i32>,
+    done: impl FnOnce(Value) + 'static,
+) {
+    match PANEL.with(|g| g.borrow().clone()) {
+        Some(p) => {
+            if let Some(w) = width {
+                // As a drag on the dock's edge would leave it.
+                p.graph_state.borrow_mut().width = Some(w.max(260));
+            }
+            if open.is_some() || mode.is_some() || width.is_some() {
+                p.set_graph(open, mode.as_deref());
+            }
+            p.graph_status(done);
+        }
+        None => done(json!({"error": "no comux panel"})),
+    }
+}
+
+/// `comux.notifications` (decisions #204).
+pub fn notifications_global(open: Option<bool>) -> Value {
+    PANEL
+        .with(|g| g.borrow().clone())
+        .map_or(json!({"error": "no comux panel"}), |p| {
+            p.set_notifications(open)
+        })
 }
 
 /// Config hot-reload: restyle the window's comux chrome (font, theme).

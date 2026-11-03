@@ -592,10 +592,14 @@ impl CopadWindow {
         // to dock it (decisions #179). Its child is the visible tab's content.
         let term_over = gtk4::Overlay::new();
         term_over.set_vexpand(true);
+        // The top bar over the terminal (decisions #204); its bell's dropdown hangs into
+        // `term_over` just under it.
+        center.append(&comux.top);
         center.append(&term_over);
         center.append(&comux.status);
         rest.append(&center);
-        rest.append(&comux.notif_dock);
+        // The work-graph panel docks on the right (decisions #204).
+        rest.append(&comux.right_dock);
         split.set_end_child(Some(&rest));
         middle.append(&tab_manager.notebook);
         comux.set_paned(&split);

@@ -26,6 +26,7 @@ cleanup() {
     rm -f "$XDG_RUNTIME_DIR/copad/gui-$APP.sock" "/tmp/copad-prewarm-$APP.html"
   fi
   [[ -n "$CPID" ]] && kill "$CPID" 2>/dev/null || true
+  [[ -n "${APID:-}" ]] && kill "$APID" 2>/dev/null || true
   [[ -n "$BPID" ]] && kill "$BPID" 2>/dev/null || true
   COPAD_MUX_SOCK=$W/s $COMUX kill-server >/dev/null 2>&1 || true
   # The session bus's activated services (portal, at-spi) outlive dbus-run-session and keep
@@ -44,7 +45,14 @@ export COPAD_MUX_SOCK=$W/s COPAD_MUX_STATE=$W/st.json COPAD_MUX_NOTIFY=0 COPAD_M
 unset COPAD_MUX_PANE COPAD_MUX COPAD_SOCKET COPAD_PANEL_ID
 # The server's HOME is a fixture: Ctrl-b C browses it (decisions #172).
 mkdir -p $W/home/proj/sub
-HOME=$W/home $COMUX server >$W/server.log 2>&1 &
+# Panes the server spawns run under a stand-in shell that reads no profile: a login zsh with
+# this empty HOME took ~40 s to start on thinkarch (the work-graph step spawns one). `-i` keeps
+# job control on, so a spawned program is the pane's FOREGROUND process (what the label sweep
+# reads), as in a real interactive shell.
+mkdir -p $W/fastshell
+printf '#!/bin/sh\nwhile [ $# -gt 0 ] && [ "$1" != "-c" ]; do shift; done\nif [ "$1" = "-c" ]; then shift; script="$1"; shift; exec /bin/sh -i -c "$script" "$@"; fi\nexec /bin/sh -i\n' >$W/fastshell/sh
+chmod +x $W/fastshell/sh
+HOME=$W/home SHELL=$W/fastshell/sh $COMUX server >$W/server.log 2>&1 &
 for _ in $(seq 1 50); do $COMUX list-sessions >/dev/null 2>&1 && break; sleep 0.1; done
 $COMUX new-session --detached linux-two >/dev/null
 
@@ -115,6 +123,80 @@ PY
   dirs | grep -q "browsed=.*/proj" || fail "the native browser never created a session in proj: $(dirs)"
   echo "ok — Ctrl-b C was a native GTK browser: descending into proj and creating there made the session"
 fi
+# The work graph (decisions #204): a (fake) claude agent's transcript, drawn in the right panel
+# (a WebKitGTK page: under Broadway it never draws a frame, and its state is a function of time
+# for exactly that reason).
+graph() {
+  local p="${1:-}"; [[ -n "$p" ]] || p='{}'
+  $COCTL --socket "$GUI" call comux.graph --params "$p" --json
+}
+gq() { graph "${2:-}" | python3 -c 'import json,sys; d=json.load(sys.stdin); d=d.get("result",d); print(eval(sys.argv[1]))' "$1" 2>/dev/null; }
+gwait() {
+  local got=""
+  for _ in $(seq 1 "$3"); do got="$(gq "$1")"; [[ "$got" == "$2" ]] && return 0; sleep 0.5; done
+  fail "graph panel: expected $1 == $2, got '$got': $(graph)"
+}
+FID="0f0f0f0f-1234-4abc-8def-0123456789ab"
+mkdir -p $W/bin $W/home/.claude/sessions $W/home/.claude/projects/e2e/$FID/subagents
+ln -sf "$(command -v sleep)" $W/bin/claude
+TP=$W/home/.claude/projects/e2e/$FID.jsonl
+use() { printf '{"type":"assistant","timestamp":"2026-11-04T00:00:%02d.000Z","message":{"content":[{"type":"tool_use","id":"%s","name":"%s","input":%s}]}}\n' "$4" "$1" "$2" "$3" >>"$TP"; }
+res() { printf '{"type":"user","timestamp":"2026-11-04T00:00:%02d.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"%s","is_error":%s}]}}\n' "$3" "$1" "$2" >>"$TP"; }
+printf '{"type":"user","timestamp":"2026-11-04T00:00:00.000Z","message":{"content":"Fix the parser"}}\n' >"$TP"
+for i in $(seq 1 30); do use "r$i" Read "{\"file_path\":\"/repo/src/m$i.rs\"}" 1; res "r$i" false 1; done
+use g1 Edit '{"file_path":"/repo/src/parse.rs"}' 2; res g1 false 3
+use g2 Grep '{"pattern":"fn parse","path":"/repo/src"}' 4; res g2 false 4
+use g3 Agent '{"description":"Map the tests","subagent_type":"Explore"}' 5
+printf '{"agentType":"Explore","description":"Map the tests","toolUseId":"g3"}' >$W/home/.claude/projects/e2e/$FID/subagents/agent-m1.meta.json
+printf '{"type":"assistant","isSidechain":true,"timestamp":"2026-11-04T00:00:06.000Z","message":{"content":[{"type":"tool_use","id":"s1","name":"Read","input":{"file_path":"/repo/tests/t.rs"}}]}}\n' \
+  >$W/home/.claude/projects/e2e/$FID/subagents/agent-m1.jsonl
+$COMUX spawn --keep -- $W/bin/claude 600 >/dev/null || fail "spawning the fake agent failed"
+APID=""
+# The pane's login shell starts first (an interactive zsh can take seconds).
+for _ in $(seq 1 300); do
+  APID="$(ps -Ao pid=,args= | awk -v p="$W/bin/claude" '$2==p {print $1; exit}')"
+  [[ -n "$APID" ]] && break; sleep 0.1
+done
+[[ -n "$APID" ]] || fail "no fake agent pid"
+printf '{"pid":%s,"sessionId":"%s","status":"busy"}\n' "$APID" "$FID" >$W/home/.claude/sessions/$APID.json
+[[ "$(gq 'd["open"]' '{"open":true,"mode":"agent"}')" == True ]] || fail "comux.graph would not open: $(graph)"
+gwait 'd["shown"] and d["loaded"]' True 40
+gwait '(d["page"] or {}).get("agents")' 1 60
+gwait '(d["page"]["subagents"], d["page"]["summary"].split(" · ")[0])' "(1, '33 files')" 60
+gwait 'd["page"]["steps"]' 35 60
+echo "ok — the right panel shows the agent's 33 files, its Explore subagent and all 35 steps (paged)"
+use g4 Write '{"file_path":"/repo/src/new.rs"}' 7; res g4 false 7
+gwait 'd["page"]["seq"]' 36 40
+echo "ok — a step appended to the transcript reached the panel live (#36)"
+[[ "$(gq 'd["mode"]' '{"open":true,"mode":"all"}')" == all ]] || fail "mode all"
+gwait '(d["page"]["mode"], d["page"]["agents"])' "('all', 1)" 20
+if [[ -n "${SHOT_WAIT:-}" ]]; then echo "GRAPH_SHOT"; sleep "$SHOT_WAIT"; fi
+# Measured right before closing: a broadway client (a screenshot) can resize the window, and a
+# window too narrow for the dock hides it (the width budget) — then there is nothing to give back.
+TOPW="$(gq 'd["terminal_width"]')"
+WAS_SHOWN="$(gq 'd["shown"]')"
+[[ "$(gq 'd["shown"]' '{"open":false}')" == False ]] || fail "the panel should close"
+sleep 1
+if [[ "$WAS_SHOWN" == True ]]; then
+  [[ "$(gq 'd["terminal_width"] > '"$TOPW")" == True ]] || fail "closing the panel should give the terminal its width back: $(graph)"
+fi
+echo "ok — all-sessions view lists the agent; closing the panel gives the terminal back its width"
+# A remembered panel wider than the window can spare: the terminal keeps its minimum.
+graph '{"open":true,"mode":"agent","width":5000}' >/dev/null
+sleep 1
+[[ "$(gq 'd["terminal_width"] >= 320 and d["shown"]')" == True ]] || fail "the terminal must keep its minimum: $(graph)"
+echo "ok — with a remembered 5000 px panel the terminal kept $(gq 'd["terminal_width"]') px"
+graph '{"open":false}' >/dev/null
+$COMUX notify --pane "$($COMUX list --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["panes"][0]["token"])')" --kind done "graph e2e" >/dev/null
+sleep 1.5
+N="$($COCTL --socket "$GUI" call comux.notifications --params '{"open":true}' --json)"
+python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d=d.get("result",d); sys.exit(0 if d["shown"] and d["halign_end"] and d["valign_start"] else 1)' "$N" \
+  || fail "the bell's dropdown did not open under the top bar: $N"
+if [[ -n "${SHOT_WAIT:-}" ]]; then echo "NOTIF_SHOT"; sleep "$SHOT_WAIT"; fi
+$COCTL --socket "$GUI" call comux.notifications --params '{"open":false}' --json >/dev/null
+echo "ok — the notifications drop down under the top bar's bell"
+kill "$APID" 2>/dev/null || true
+
 sleep 2
 echo "BROADWAY http://127.0.0.1:8097/  W=$W"
 if [[ -n "${SHOT_WAIT:-}" ]]; then sleep "$SHOT_WAIT"; fi

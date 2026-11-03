@@ -295,6 +295,34 @@ pub fn dispatch(
                 .send(Response::success(req.id.clone(), json!({ "status": "ok" })));
         }
 
+        // The work-graph panel (decisions #204): `open` / `mode` set it; the answer is its
+        // state, with the page's own read-out under `page` (read asynchronously).
+        "comux.graph" => {
+            let open = req.params.get("open").and_then(|v| v.as_bool());
+            let mode = req
+                .params
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let width = req
+                .params
+                .get("width")
+                .and_then(|v| v.as_i64())
+                .map(|w| w as i32);
+            let reply = cmd.reply.clone();
+            let id = req.id.clone();
+            crate::comux_panel::graph_global(open, mode, width, move |v| {
+                let _ = reply.send(Response::success(id, v));
+            });
+        }
+
+        // The notification dropdown under the top bar's bell (decisions #204).
+        "comux.notifications" => {
+            let open = req.params.get("open").and_then(|v| v.as_bool());
+            let v = crate::comux_panel::notifications_global(open);
+            let _ = cmd.reply.send(Response::success(req.id.clone(), v));
+        }
+
         // Open a remote comux natively (decisions #171). No `dest` = ask for it.
         "comux.open_remote" => {
             let comux = req

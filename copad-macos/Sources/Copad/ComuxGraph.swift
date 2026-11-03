@@ -182,7 +182,11 @@ final class ComuxGraphPanel: NSView, WKNavigationDelegate {
             if (message.body as? [String: Any])?["type"] as? String == "ready" { ready() }
             return
         }
-        guard let m = ComuxGraphMessage.parse(message.body, epoch: fedEpoch) else { return }
+        // Validated against the window's connection NOW, not the one the page was last fed: a
+        // message queued for a connection the window has since left (a remote comux's `open`)
+        // is dropped, also before the page has been fed the new one.
+        let current = host.state?.graph.map { "\(key)#\($0.epoch)" } ?? ""
+        guard let m = ComuxGraphMessage.parse(message.body, epoch: current == fedEpoch ? current : "") else { return }
         switch m {
         case .ready:
             ready()

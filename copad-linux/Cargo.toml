@@ -25,6 +25,7 @@ serde_json = "1"
 dirs = "6"
 uuid = { version = "1", features = ["v4"] }
 webkit6 = "0.4"
+copad-graph-web = { path = "../copad-graph-web" }
 javascriptcore6 = "0.4"
 serde = { version = "1", features = ["derive"] }
 shellexpand = "3"

@@ -2086,6 +2086,11 @@ fn setup_shortcuts(manager: &Rc<TabManager>, window: &gtk4::ApplicationWindow) {
                 mgr.toggle_cockpit();
                 glib::Propagation::Stop
             }
+            // Ctrl+Shift+G: the comux work-graph panel (decisions #204; macOS Cmd+Shift+G)
+            gdk::Key::G => {
+                crate::comux_panel::toggle_graph_global("agent");
+                glib::Propagation::Stop
+            }
             // Ctrl+Shift+Tab: next tab
             gdk::Key::ISO_Left_Tab => {
                 let nb = &mgr.notebook;
