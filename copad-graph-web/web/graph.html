@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:">
+<title>comux work graph</title>
+<style>
+/*COPAD_GRAPH_CSS*/
+</style>
+</head>
+<body>
+<div class="bar">
+  <div class="modes" role="tablist">
+    <button id="mode-agent" class="on" type="button" role="tab" title="The agent you are looking at">Agent</button>
+    <button id="mode-all" type="button" role="tab" title="Every agent in every session">All sessions</button>
+  </div>
+  <select id="agent" aria-label="Agent"></select>
+  <input id="search" type="search" placeholder="Filter files" autocomplete="off" spellcheck="false">
+  <span id="count" class="count"></span>
+</div>
+<div id="stage" class="stage">
+  <canvas id="graph"></canvas>
+  <div id="empty" class="empty" hidden></div>
+  <div id="tip" class="tip" hidden></div>
+</div>
+<section class="trace">
+  <div id="card" class="card" aria-live="polite"></div>
+  <canvas id="timeline" class="timeline" title="Steps — drag to scrub"></canvas>
+  <div class="controls">
+    <button id="play" type="button" title="Replay from the start">▶</button>
+    <button id="live" class="on" type="button" title="Follow the newest step">Live</button>
+    <span id="summary" class="summary"></span>
+  </div>
+</section>
+<script>
+//COPAD_GRAPH_JS
+</script>
+</body>
+</html>

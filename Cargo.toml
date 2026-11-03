@@ -12,6 +12,7 @@ members = [
     "copad-graphics",
     "copad-mux",
     "copad-mux-proto",
+    "copad-graph-web",
     "plugins/echo",
     "plugins/kb",
     "plugins/calendar",

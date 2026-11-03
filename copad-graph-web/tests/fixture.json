@@ -1,0 +1,54 @@
+{
+  "graph": {
+    "agents": [
+      {
+        "token": "n1-1", "tool": "claude", "conversation": "c1", "gen": "g1", "cwd": "/repo", "space_id": "s1", "tab_id": "s1:t1",
+        "started_ms": 1793750400000, "updated_ms": 1793750412000,
+        "counts": {"files": 5, "reads": 4, "edits": 2, "writes": 1, "searches": 1, "runs": 1, "prompts": 1, "subagents": 1, "failed": 1, "steps": 11},
+        "files": [
+          {"id": 0, "abs": "/repo/src/parse.rs", "display": "src/parse.rs", "reads": 2, "edits": 2, "writes": 0, "searches": 0, "first_ms": 1793750401000, "last_ms": 1793750409000},
+          {"id": 1, "abs": "/repo/src/lex.rs", "display": "src/lex.rs", "reads": 1, "edits": 0, "writes": 0, "searches": 0, "first_ms": 1793750402000, "last_ms": 1793750402000},
+          {"id": 2, "abs": "/repo/src", "display": "src", "reads": 0, "edits": 0, "writes": 0, "searches": 1, "first_ms": 1793750403000, "last_ms": 1793750403000},
+          {"id": 3, "abs": "/repo/tests/t.rs", "display": "tests/t.rs", "reads": 1, "edits": 0, "writes": 0, "searches": 0, "first_ms": 1793750405000, "last_ms": 1793750405000},
+          {"id": 4, "abs": "/repo/src/new.rs", "display": "src/new.rs", "reads": 0, "edits": 0, "writes": 1, "searches": 0, "first_ms": 1793750410000, "last_ms": 1793750410000}
+        ],
+        "subagents": [{"id": 1, "kind": "Explore", "description": "Map the tests", "parent": 0, "started_ms": 1793750404000, "status": "running"}],
+        "steps": [
+          {"seq": 1, "at_ms": 1793750400000, "kind": "prompt", "label": "Fix the parser", "outcome": "ok"},
+          {"seq": 2, "at_ms": 1793750401000, "kind": "read", "file": 0, "outcome": "ok"},
+          {"seq": 3, "at_ms": 1793750402000, "kind": "read", "file": 1, "outcome": "ok"},
+          {"seq": 4, "at_ms": 1793750403000, "kind": "search", "file": 2, "label": "fn parse", "outcome": "ok"},
+          {"seq": 5, "at_ms": 1793750404000, "kind": "spawn", "label": "Map the tests", "spawned": 1, "outcome": "ok"},
+          {"seq": 6, "at_ms": 1793750405000, "kind": "read", "agent": 1, "file": 3, "outcome": "ok"},
+          {"seq": 7, "at_ms": 1793750406000, "kind": "edit", "file": 0, "outcome": "ok"},
+          {"seq": 8, "at_ms": 1793750407000, "kind": "run", "label": "cargo test", "outcome": "failed"},
+          {"seq": 9, "at_ms": 1793750409000, "kind": "edit", "file": 0, "outcome": "ok"},
+          {"seq": 10, "at_ms": 1793750410000, "kind": "write", "file": 4, "outcome": "ok"},
+          {"seq": 11, "at_ms": 1793750412000, "kind": "read", "file": 0, "outcome": "pending"}
+        ],
+        "pending": [11], "settled": [], "oldest_seq": 1
+      },
+      {
+        "token": "n1-2", "tool": "codex", "conversation": "x9", "gen": "g7", "cwd": "/repo", "space_id": "s2", "tab_id": "s2:t1",
+        "started_ms": 1793750300000, "updated_ms": 1793750350000,
+        "counts": {"files": 2, "reads": 2, "edits": 1, "writes": 0, "searches": 0, "runs": 0, "prompts": 1, "subagents": 0, "failed": 0, "steps": 4},
+        "files": [
+          {"id": 0, "abs": "/repo/src/parse.rs", "display": "src/parse.rs", "reads": 1, "edits": 1, "writes": 0, "searches": 0, "first_ms": 1793750310000, "last_ms": 1793750340000},
+          {"id": 1, "abs": "/repo/README.md", "display": "README.md", "reads": 1, "edits": 0, "writes": 0, "searches": 0, "first_ms": 1793750320000, "last_ms": 1793750320000}
+        ],
+        "subagents": [],
+        "steps": [
+          {"seq": 1, "at_ms": 1793750300000, "kind": "prompt", "label": "Review", "outcome": "ok"},
+          {"seq": 2, "at_ms": 1793750310000, "kind": "read", "file": 0, "outcome": "ok"},
+          {"seq": 3, "at_ms": 1793750320000, "kind": "read", "file": 1, "outcome": "ok"},
+          {"seq": 4, "at_ms": 1793750340000, "kind": "edit", "file": 0, "outcome": "ok"}
+        ],
+        "oldest_seq": 1
+      }
+    ]
+  },
+  "agents": [
+    {"token": "n1-1", "space": "work", "space_id": "s1", "title": "tab 1", "tool": "claude", "status": "working", "focused": true},
+    {"token": "n1-2", "space": "review", "space_id": "s2", "title": "tab 1", "tool": "codex", "status": "ready"}
+  ]
+}

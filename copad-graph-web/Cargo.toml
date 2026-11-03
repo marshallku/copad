@@ -1,0 +1,9 @@
+[package]
+name = "copad-graph-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The comux work-graph page (one self-contained HTML document) that copad's macOS, Linux and iOS chrome load in a web view"
+repository.workspace = true
+
+[dependencies]
