@@ -54,6 +54,7 @@ fn print_usage() {
          \x20 comux notify <body...>      raise an agent toast for this pane (--kind done|blocked)\n\
          \x20 comux notify --to owner ... leave a message in the inbox of the pane that owns your tab\n\
          \x20 comux agent-report         relay Claude's statusline JSON (stdin): context window + cost\n\
+         \x20 comux hook pre-compact     Claude PreCompact hook: defer auto-compaction until work is committed\n\
          \x20 comux inbox [--wait]       read (and acknowledge) the messages left for your pane\n\
          \x20 comux worktree create <br>  git worktree + a session in it (also list|rm)\n\
          \x20 comux reload                re-read mux.toml on the live server (tmux source-file)\n\

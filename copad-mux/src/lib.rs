@@ -17,6 +17,7 @@ pub mod agentstate;
 pub mod cliargs;
 pub mod client;
 pub mod codexdaemon;
+pub mod compactgate;
 pub mod config;
 pub mod control;
 pub mod copadlink;

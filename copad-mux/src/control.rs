@@ -1301,6 +1301,23 @@ pub fn run_client(args: &[String]) -> i32 {
     // `wait-output` owns its own exit codes (124 on deadline) and issues MANY requests,
     // so it short-circuits the one-request-one-response path below rather than producing a
     // `Req` for it.
+    if cmd == "hook" {
+        let p = parsed!(HOOK_SPEC);
+        if p.positionals.first().map(String::as_str) != Some("pre-compact") {
+            return usage_error(json_out, "comux hook: unknown hook", HOOK_SPEC.usage);
+        }
+        let num = |flag: &str| p.value(flag).map(str::parse::<u64>);
+        let (Ok(headroom), Ok(max)) = (
+            num("--headroom").unwrap_or(Ok(crate::compactgate::DEFAULT_HEADROOM)),
+            num("--max-deferrals").unwrap_or(Ok(crate::compactgate::DEFAULT_MAX_DEFERRALS as u64)),
+        ) else {
+            return usage_error(json_out, "comux hook: not a number", HOOK_SPEC.usage);
+        };
+        return crate::compactgate::run(crate::compactgate::Limits {
+            headroom,
+            max_deferrals: max.min(u32::MAX as u64) as u32,
+        });
+    }
     if cmd == "skill" {
         parsed!(cliargs::bare(
             "usage: comux skill   (prints the agent-facing SKILL.md)"
@@ -2723,6 +2740,32 @@ const NOTIFY_SPEC: Spec = Spec {
     ],
     positionals: Positionals::Any,
 };
+
+const HOOK_SPEC: Spec = Spec {
+    usage: "usage: comux hook pre-compact [--headroom TOKENS] [--max-deferrals N]   (stdin: the hook input)\n\
+            \x20      a Claude Code PreCompact hook: defers an AUTOMATIC compaction while the work tree has\n\
+            \x20      uncommitted tracked changes, until fewer than --headroom tokens (60000) are left or it\n\
+            \x20      has deferred --max-deferrals (40) times; lets everything else through",
+    flags: &[opt(&["--headroom"]), opt(&["--max-deferrals"])],
+    positionals: Positionals::AtMost(1),
+};
+
+/// The context fill comux has for the agent in the calling pane (`$COPAD_MUX_PANE`), as
+/// `(used, window)` — only when that agent is in conversation `session_id` and its window is
+/// known. Anything unavailable within `deadline` is `None`.
+pub(crate) fn agent_fill(session_id: &str, deadline: Instant) -> Option<(u64, u64)> {
+    let pane = caller_pane()?;
+    let mut conn = WaitConn::connect(Some(deadline)).ok()?;
+    let resp = conn
+        .request(&Req::ListAgents { target: Some(pane) }, Some(deadline))
+        .ok()?;
+    let agent = resp
+        .agents?
+        .into_iter()
+        .find(|a| a.agent_session_id.as_deref() == Some(session_id))?;
+    let c = agent.context?;
+    Some((c.used, c.window?))
+}
 
 const AGENT_REPORT_SPEC: Spec = Spec {
     usage: "usage: comux agent-report [--pane <token>] < statusline.json\n\
@@ -4555,6 +4598,7 @@ mod verb_args_tests {
         "jump",
         "notify",
         "agent-report",
+        "hook",
         "resize",
         "send",
         "skill",

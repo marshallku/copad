@@ -2327,6 +2327,30 @@ for a in json.load(sys.stdin)["agents"]:
     [[ "$(agent_field context.window)" == 200000 ]] || fail "the refused report changed the window"
     ok "the transcript gives used=50002, the statusline report adds window 200000 and \$1.5/h; a foreign session is refused"
 
+    echo "45f. the PreCompact hook defers an automatic compaction while tracked work is uncommitted"
+    REPO="$WORK/gate-repo"; mkdir -p "$REPO"
+    g() { git -C "$REPO" -c user.name=t -c user.email=t@t -c commit.gpgsign=false "$@" >/dev/null 2>&1; }
+    g init -q; echo 1 >"$REPO/a"; g add a; g commit -q -m a
+    gate() { # trigger → the hook's stdout
+        printf '{"session_id":"%s","cwd":"%s","hook_event_name":"PreCompact","trigger":"%s"}' "$FID" "$REPO" "$1" \
+            | t 10 env COPAD_MUX_PANE="$AG" HOME="$FH" COPAD_MUX_SOCK="$F_SOCK" COPAD_MUX_STATE="$WORK/fstate.json" \
+                "$COMUX" hook pre-compact "${@:2}"
+    }
+    [[ "$(gate auto)" == "{}" ]] || fail "a committed tree should let it compact: $(gate auto)"
+    echo 2 >"$REPO/a"
+    gate auto | grep -q '"decision":"block"' || fail "uncommitted work should defer it: $(gate auto)"
+    [[ "$(cat "$WORK/compact-gate/$FID")" == 1 ]] || fail "the deferral should be counted"
+    [[ "$(gate manual)" == "{}" ]] || fail "a /compact by hand is never deferred"
+    [[ -e "$WORK/compact-gate/$FID" ]] && fail "a manual compaction should end the streak"
+    # 50002 of 200000 used: a 160000 headroom is not there, so it goes through.
+    [[ "$(gate auto --headroom 160000)" == "{}" ]] || fail "too close to the window, it must not defer"
+    gate auto --max-deferrals 1 >/dev/null
+    [[ "$(gate auto --max-deferrals 1)" == "{}" ]] || fail "past --max-deferrals it must let it through"
+    # Outside a pane comux knows nothing about the window: never defer.
+    out="$(printf '{"session_id":"%s","cwd":"%s","trigger":"auto"}' "$FID" "$REPO" | t 10 env -u COPAD_MUX_PANE COPAD_MUX_SOCK="$F_SOCK" "$COMUX" hook pre-compact)"
+    [[ "$out" == "{}" ]] || fail "with no pane it must not defer: $out"
+    ok "committed → allow, dirty → block (counted), manual/near-window/over-budget/no-pane → allow"
+
     t 15 fx kill-server >/dev/null 2>&1 || kill -9 "$FPID" 2>/dev/null || true
     kill "$APID" 2>/dev/null || true
 fi
