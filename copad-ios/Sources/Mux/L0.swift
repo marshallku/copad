@@ -64,8 +64,12 @@ struct L0Agent: Codable, Equatable, Identifiable {
     var since_unix: Int64
     var detail: String?
     var focused: Bool
+    /// `ready` after a turn finish nobody has looked at (absent from older servers).
+    var unseen: Bool?
 
     var id: String { token }
+    /// The status word to show: an unseen finish reads `done`, as in the TUI.
+    var shownStatus: String { unseen == true && status == "ready" ? "done" : status }
 }
 
 struct L0Notifications: Codable, Equatable {

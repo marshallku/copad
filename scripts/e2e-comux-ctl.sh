@@ -2266,6 +2266,26 @@ print("" if v is None else v)' "$AG" "$1" <"$WORK/json"
     grep -q "approve Bash: git status" "$WORK/out" || fail "the plain listing should show the wait: $(cat "$WORK/out")"
     ok "a waiting session file reaches list-agents as wait.kind=approval with 'approve Bash: git status'"
 
+    echo "45c. a finished turn stays unseen until someone goes to it"
+    # Nobody is attached, so the sweep runs on the detached 5 s cadence: poll generously.
+    wait_field() { # field value tries
+        local got=""
+        for _ in $(seq 1 "$3"); do
+            t 5 fx list-agents --json >"$WORK/json" 2>/dev/null || true
+            got="$(agent_field "$1")"; [[ "$got" == "$2" ]] && return 0; sleep 0.25
+        done
+        fail "expected $1=$2, got '$got': $(cat "$WORK/json")"
+    }
+    printf '{"pid":%s,"sessionId":"%s","status":"busy"}\n' "$APID" "$FID" >"$FH/.claude/sessions/$APID.json"
+    wait_field status working 80
+    printf '{"pid":%s,"sessionId":"%s","status":"idle"}\n' "$APID" "$FID" >"$FH/.claude/sessions/$APID.json"
+    wait_field status ready 80
+    [[ "$(agent_field unseen)" == True ]] || fail "a turn that finished unwatched should be unseen: $(cat "$WORK/json")"
+    t 10 fx jump "$AG" --no-raise >/dev/null || fail "jump failed"
+    t 5 fx list-agents --json >"$WORK/json"
+    [[ -z "$(agent_field unseen)" ]] || fail "jumping to the pane should acknowledge the finish: $(cat "$WORK/json")"
+    ok "busy -> idle reads ready + unseen; a jump to the pane clears it"
+
     t 15 fx kill-server >/dev/null 2>&1 || kill -9 "$FPID" 2>/dev/null || true
     kill "$APID" 2>/dev/null || true
 fi

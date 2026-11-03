@@ -29,6 +29,7 @@ enum ComuxLook {
     static func status(_ s: String) -> (glyph: String, color: Color) {
         switch s {
         case "working": return ("●", green)
+        case "done": return ("✓", green)
         case "ready": return ("◐", blue)
         case "blocked": return ("▲", yellow)
         default: return ("○", dim)
@@ -246,7 +247,7 @@ struct SpacesDrawer: View {
     }
 
     private func agent(_ a: L0Agent, grouped: Bool) -> some View {
-        let (glyph, color) = ComuxLook.status(a.status)
+        let (glyph, color) = ComuxLook.status(a.shownStatus)
         return Button { act { session.jump(a.token) } } label: {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
@@ -255,7 +256,7 @@ struct SpacesDrawer: View {
                         .font(a.focused ? ComuxLook.strong : ComuxLook.body)
                         .foregroundStyle(a.focused ? ComuxLook.text : ComuxLook.subtext).lineLimit(1)
                     Spacer(minLength: 4)
-                    ElapsedText(since: a.since_unix, prefix: a.status).foregroundStyle(color).lineLimit(1)
+                    ElapsedText(since: a.since_unix, prefix: a.shownStatus).foregroundStyle(color).lineLimit(1)
                 }
                 Text(a.detail ?? a.tool).foregroundStyle(ComuxLook.dim).lineLimit(1).padding(.leading, 16)
             }

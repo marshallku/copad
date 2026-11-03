@@ -34,7 +34,7 @@ struct OverlayLook {
         case "working": return ("●", green)
         case "ready": return ("◐", blue)
         case "blocked": return ("▲", yellow)
-        case "done": return ("●", green)
+        case "done": return ("✓", green)
         default: return ("○", dim)
         }
     }
@@ -567,7 +567,7 @@ private struct PickerCard: View {
                 Spacer(minLength: 4)
                 HStack(spacing: 2) {
                     ForEach(Array(agents.enumerated()), id: \.offset) { _, a in
-                        Text(look.status(a.status).glyph).foregroundStyle(look.status(a.status).color)
+                        Text(look.status(a.shownStatus).glyph).foregroundStyle(look.status(a.shownStatus).color)
                     }
                 }
             }
@@ -576,14 +576,14 @@ private struct PickerCard: View {
     }
 
     private func agent(_ a: L0Agent) -> some View {
-        let st = look.status(a.status)
+        let st = look.status(a.shownStatus)
         let since = elapsedLabel(since: a.since_unix, now: now)
         let place = a.title == a.space ? a.space : "\(a.space) · \(a.title)"
         return VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
                 Text(st.glyph).foregroundStyle(st.color)
                 Text(a.tool).font(look.strong).lineLimit(1)
-                Text(since.isEmpty ? a.status : "\(a.status) \(since)").foregroundStyle(st.color).lineLimit(1)
+                Text(since.isEmpty ? a.shownStatus : "\(a.shownStatus) \(since)").foregroundStyle(st.color).lineLimit(1)
                 Spacer(minLength: 4)
                 if a.focused { Text("here").foregroundStyle(look.dim) }
             }
@@ -600,7 +600,7 @@ private struct PickerCard: View {
         let panes = t.panes.map { p -> String in
             let label = p.label.isEmpty ? "shell" : p.label
             guard let a = context.agents.first(where: { $0.token == p.token }) else { return label }
-            return "\(label) \(a.status)"
+            return "\(label) \(a.shownStatus)"
         }.joined(separator: " · ")
         return VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
@@ -610,7 +610,7 @@ private struct PickerCard: View {
                 Spacer(minLength: 4)
                 HStack(spacing: 2) {
                     ForEach(Array(agents.enumerated()), id: \.offset) { _, a in
-                        Text(look.status(a.status).glyph).foregroundStyle(look.status(a.status).color)
+                        Text(look.status(a.shownStatus).glyph).foregroundStyle(look.status(a.shownStatus).color)
                     }
                 }
                 if t.active { Text("here").foregroundStyle(look.dim) }

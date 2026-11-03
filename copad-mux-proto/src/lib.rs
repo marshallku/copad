@@ -498,6 +498,10 @@ pub struct Agent {
     /// carries it as text; this is for a host that styles approvals apart from questions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<AgentWait>,
+    /// `ready` after a turn finish nobody has looked at since (no key, click or jump on the
+    /// pane, no read of that turn's notification). The TUI shows it as `✓ done`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unseen: bool,
     /// The pane is the focused pane of the active tab.
     #[serde(default)]
     pub focused: bool,

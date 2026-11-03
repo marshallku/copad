@@ -1063,7 +1063,7 @@ impl PickerUi {
             let glyphs: String = mine
                 .iter()
                 .map(|a| {
-                    let (g, c) = s.status(a["status"].as_str().unwrap_or_default());
+                    let (g, c) = s.agent(a);
                     span(c, g)
                 })
                 .collect();
@@ -1091,7 +1091,7 @@ impl PickerUi {
                 span(&s.dim, &format!("  {sub}")),
             )
         } else if let Some(a) = agent {
-            let status = a["status"].as_str().unwrap_or_default();
+            let status = crate::comux_panel::agent_status(a);
             let (g, c) = s.status(status);
             let since = a["since_unix"].as_i64().map(elapsed).unwrap_or_default();
             let space = a["space"].as_str().unwrap_or_default();

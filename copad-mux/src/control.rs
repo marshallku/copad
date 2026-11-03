@@ -805,6 +805,9 @@ pub struct AgentInfo {
     /// carries the same thing as text (`approve Bash: git status`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<copad_mux_proto::AgentWait>,
+    /// `ready` after a turn finish nobody has looked at since (`✓ done` in the sidebar).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unseen: bool,
     /// The tab the agent lives in: its STABLE id (`s4:t13`, a tab selector), its custom name
     /// (empty when unnamed — `title` then shows `tab <n>`), and its index in the session.
     #[serde(default)]
@@ -6126,6 +6129,7 @@ mod list_agents_proto_tests {
             seq: 7,
             detail: None,
             wait: None,
+            unseen: false,
             tab_id: "s1:t0".into(),
             tab_name: String::new(),
             tab_index: 0,

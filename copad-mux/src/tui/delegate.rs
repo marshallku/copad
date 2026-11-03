@@ -388,6 +388,8 @@ impl App {
                 ),
             };
             let badge = match &r.target {
+                // An unseen finish reads `done`, as the TUI row does.
+                PopupTarget::Agent(t) if self.unseen_done(t) => "done".to_string(),
                 PopupTarget::Agent(t) => self.agent_status(t).0.to_string(),
                 PopupTarget::Session(_) | PopupTarget::Tab(..) => String::new(),
             };

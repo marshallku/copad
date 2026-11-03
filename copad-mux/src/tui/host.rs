@@ -110,6 +110,7 @@ impl App {
                     since_unix: self.agent_statuses.get(&r.term).map_or(0, |s| s.since_unix),
                     detail: r.detail,
                     wait: self.agent_wait(&r.term),
+                    unseen: r.unseen,
                     focused: focused.as_ref() == Some(&r.term),
                 }
             })
@@ -205,11 +206,19 @@ impl App {
     }
 
     pub(super) fn notif_read(&mut self, id: Option<u64>) -> usize {
-        let mut n = 0;
+        let mut acks = Vec::new();
         for x in self.notifications.iter_mut() {
             if !x.read && id.is_none_or(|i| i == x.id) {
                 x.read = true;
-                n += 1;
+                acks.push((x.terminal.clone(), x.seq));
+            }
+        }
+        let n = acks.len();
+        // Reading a notification acknowledges the episode it reports on — not the pane's
+        // current one, which may be a newer turn the reader has not seen.
+        for (term, seq) in acks {
+            if let Some(seq) = seq {
+                self.ack_agent(&term, seq);
             }
         }
         n

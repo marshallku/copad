@@ -357,6 +357,7 @@ struct ComuxStyle: Equatable {
     func status(_ s: String) -> (glyph: String, color: Color) {
         switch s {
         case "working": return ("●", green)
+        case "done": return ("✓", green)
         case "ready": return ("◐", blue)
         case "blocked": return ("▲", yellow)
         default: return ("○", dim)
@@ -736,7 +737,7 @@ struct ComuxSidebar: View {
     }
 
     private func agent(_ a: L0Agent, grouped: Bool, _ st: ComuxStyle) -> some View {
-        let (glyph, color) = st.status(a.status)
+        let (glyph, color) = st.status(a.shownStatus)
         return Button { jump(a) } label: {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
@@ -745,7 +746,7 @@ struct ComuxSidebar: View {
                         .font(a.focused ? st.strong : st.body)
                         .foregroundStyle(a.focused ? st.text : st.subtext).lineLimit(1)
                     Spacer(minLength: 4)
-                    ElapsedText(since: a.since_unix, prefix: a.status).foregroundStyle(color).lineLimit(1)
+                    ElapsedText(since: a.since_unix, prefix: a.shownStatus).foregroundStyle(color).lineLimit(1)
                 }
                 Text(a.detail ?? a.tool).foregroundStyle(st.dim).lineLimit(1)
                     .padding(.leading, st.advance * 2)

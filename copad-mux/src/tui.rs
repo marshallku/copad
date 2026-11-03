@@ -83,6 +83,11 @@ struct Notification {
     /// Seen: by the same evidence that acknowledges a bell (a key or click while that pane
     /// is focused), or by jumping to it. Drives the `✉ N` chip and `Ctrl-b u`.
     read: bool,
+    /// The agent episode (`AgentState::seq`) it reports on, when one could be named: the
+    /// pane's current episode, if its status matches the kind (`done` ↔ ready, `blocked` ↔
+    /// blocked). Reading the notification acknowledges up to this episode and no further, so
+    /// an old notification can never acknowledge a newer turn. `None` acknowledges nothing.
+    seq: Option<u64>,
 }
 
 /// A tab's display title: its custom name when it has a meaningful one, else its 1-based
@@ -356,6 +361,27 @@ struct AgentRow {
     for_secs: u64,
     /// The pane's terminal, so the row is clickable (jump to its pane).
     term: TerminalId,
+    /// `ready` after a turn finish nobody has looked at yet ([`App::unseen_done`]).
+    unseen: bool,
+}
+
+impl AgentRow {
+    /// The status word to SHOW: an unseen finish reads `done`, as against a `ready` agent
+    /// you have already looked at. The wire keeps `ready` plus an `unseen` flag.
+    fn shown_status(&self) -> &'static str {
+        if self.unseen { "done" } else { self.status }
+    }
+
+    /// The tmx-style glyph + colour for the row (all width-1 shapes).
+    fn glyph(&self) -> (&'static str, Color) {
+        match self.shown_status() {
+            "working" => ("●", CAT_GREEN),
+            "done" => ("✓", CAT_GREEN),
+            "ready" => ("◐", CAT_BLUE),
+            "blocked" => ("▲", CAT_YELLOW),
+            _ => ("○", CAT_OVERLAY), // idle
+        }
+    }
 }
 
 /// Outcome of [`App::create_worktree_session`]: a human status line and a non-fatal
@@ -992,6 +1018,21 @@ pub struct App {
     /// What each BLOCKED Claude agent waits for (its session file's `waitingFor`), from the
     /// last sweep. Shown in place of the activity detail while blocked (`agent_rows`).
     agent_waits: HashMap<TerminalId, agentstate::Wait>,
+    /// Per pane, the [`Self::agent_seq`] value at its last ACKNOWLEDGEMENT: a key or click on
+    /// it, a jump to it, or reading one of its notifications (up to that notification's
+    /// episode). An agent episode — `(pane, AgentState::seq)` — has been seen iff this is at
+    /// least its seq. Only ever raised, so dismissing or evicting a notification can never
+    /// make anything unseen again. All writes go through [`Self::ack_agent`].
+    agent_ack: HashMap<TerminalId, u64>,
+    /// Panes whose CURRENT `ready` episode began as an observed turn finish (Working → Ready
+    /// under the same agent pid), keyed to that episode's seq. Unseen = this and no ack since.
+    done_episode: HashMap<TerminalId, u64>,
+    /// [`Self::unseen_done`] panes as last reported to the render loop (an ack moves no other
+    /// compared value).
+    unseen_reported: std::collections::HashSet<TerminalId>,
+    /// Tests: the reading the sweep takes for a pane instead of its session file and screen.
+    #[cfg(test)]
+    test_readings: HashMap<TerminalId, agentstate::Reading>,
     /// Panes with an UNACKNOWLEDGED bell, as last reported to the render loop. Same reason
     /// as `agent_details`: `bell()` / `bell_count()` are live reads that drive the `!`
     /// markers and the mux-wide `! N`, and a bell rung in a hidden pane is precisely the
@@ -1277,6 +1318,11 @@ impl App {
             agent_minutes: HashMap::new(),
             agent_details: HashMap::new(),
             agent_waits: HashMap::new(),
+            agent_ack: HashMap::new(),
+            done_episode: HashMap::new(),
+            unseen_reported: std::collections::HashSet::new(),
+            #[cfg(test)]
+            test_readings: HashMap::new(),
             bells_reported: std::collections::HashSet::new(),
             host_reported: Vec::new(),
             branches: HashMap::new(),
@@ -4834,6 +4880,10 @@ impl App {
                 // Claim FIRST: it re-sweeps the process table, so the label read below
                 // names the agent that is actually running rather than a stale one.
                 self.claim_hook_kind(&term, kind);
+                // Then read the statuses, so the notification can name the episode the hook
+                // is reporting (the cached reading may be a sweep behind it). After the claim,
+                // so this sweep does not toast the same event a second time.
+                self.refresh_agent_statuses();
                 let tool = self
                     .labels
                     .get(&term)
@@ -5040,6 +5090,7 @@ impl App {
                         seq: self.agent_statuses.get(&r.term).map_or(0, |s| s.seq),
                         detail: r.detail,
                         wait: self.agent_wait(&r.term),
+                        unseen: r.unseen,
                         tab_id: loc.as_ref().map(|l| l.0.to_string()).unwrap_or_default(),
                         tab_name: loc.as_ref().map(|l| l.1.clone()).unwrap_or_default(),
                         tab_index: loc.as_ref().map_or(0, |l| l.2),
@@ -5391,6 +5442,7 @@ impl App {
         if let Some(count) = self.panes.get(&tid).map(|p| p.bell_count()) {
             self.bell_seen.insert(tid.clone(), count);
         }
+        self.ack_agent(&tid, self.agent_seq);
         // A notification from the pane being acted on has been seen, for the same reason.
         for n in self.notifications.iter_mut().filter(|n| n.terminal == tid) {
             n.read = true;
@@ -5400,6 +5452,36 @@ impl App {
         if self.bell_seen.len() > self.panes.len() {
             self.bell_seen.retain(|tid, _| self.panes.contains_key(tid));
         }
+    }
+
+    /// Acknowledge `term`'s agent episodes up to `upto` (see [`Self::agent_ack`]).
+    fn ack_agent(&mut self, term: &TerminalId, upto: u64) {
+        let e = self.agent_ack.entry(term.clone()).or_insert(0);
+        *e = (*e).max(upto);
+        if self.agent_ack.len() > self.panes.len() {
+            let panes = &self.panes;
+            self.agent_ack.retain(|tid, _| panes.contains_key(tid));
+        }
+    }
+
+    /// The episode a `kind` notification for `term` reports on: the current one, if its status
+    /// is the one the kind names. Anything else is ambiguous and stays unbound.
+    fn episode_for(&self, term: &TerminalId, kind: &str) -> Option<u64> {
+        let st = self.agent_statuses.get(term)?;
+        let pid = self.labels.get(term).map(|l| l.pid)?;
+        let matches = match kind {
+            "done" => st.status == agentstate::AgentStatus::Ready,
+            "blocked" => st.status == agentstate::AgentStatus::Blocked,
+            _ => false,
+        };
+        (matches && st.pid == pid).then_some(st.seq)
+    }
+
+    /// Has `term`'s agent finished a turn nobody has looked at since?
+    pub fn unseen_done(&self, term: &TerminalId) -> bool {
+        self.done_episode
+            .get(term)
+            .is_some_and(|seq| self.agent_ack.get(term).copied().unwrap_or(0) < *seq)
     }
 
     /// How many panes anywhere in the mux have an unacknowledged bell.
@@ -6322,6 +6404,8 @@ impl App {
     /// Switch to a specific agent/pane by terminal id: its session, then its tab, then
     /// focus it. Shared with sidebar agent-row clicks (cf. [`Self::jump_to_attention`]).
     fn jump_to_terminal(&mut self, term: &TerminalId) {
+        // Going to a pane is looking at it.
+        self.ack_agent(term, self.agent_seq);
         if let Some((wid, tab, pane)) = self.locate_terminal(term) {
             self.switch_session(wid.clone());
             self.select_tab(wid, tab);
@@ -7026,12 +7110,7 @@ impl App {
                     if op.is_some_and(|op| !op.contains(&row.status)) {
                         continue;
                     }
-                    let (glyph, color) = match row.status {
-                        "working" => ("●", CAT_GREEN),
-                        "ready" => ("◐", CAT_BLUE),
-                        "blocked" => ("▲", CAT_YELLOW),
-                        _ => ("○", CAT_OVERLAY),
-                    };
+                    let (glyph, color) = row.glyph();
                     // With a custom tab name the title differs from the space — show both
                     // (the switcher is wide enough), and let the filter match either.
                     let place = if row.title == row.space {
@@ -7054,6 +7133,7 @@ impl App {
                         ),
                     ) {
                         let badge = self.slot_badge(&row.term);
+                        let shown = row.shown_status();
                         rows.push(PopupRow {
                             target: PopupTarget::Agent(row.term),
                             glyph,
@@ -7061,7 +7141,7 @@ impl App {
                             text: badge
                                 + &agent_popup_text(
                                     &row.tool,
-                                    row.status,
+                                    shown,
                                     row.for_secs,
                                     row.detail.as_deref(),
                                     &place,
@@ -8482,7 +8562,8 @@ impl App {
             let e = self.refresh_version();
             let f = self.refresh_bells();
             let g = self.refresh_host_metrics();
-            a || b || c || d || e || f || g
+            let h = self.refresh_unseen();
+            a || b || c || d || e || f || g || h
         } else {
             false
         }
@@ -8507,6 +8588,20 @@ impl App {
             .collect();
         let changed = next != self.bells_reported;
         self.bells_reported = next;
+        changed
+    }
+
+    /// Report whether the set of finished-but-unseen agents has moved — an acknowledgement
+    /// (a key, a click, a jump) changes it without touching any agent status.
+    fn refresh_unseen(&mut self) -> bool {
+        let next: std::collections::HashSet<TerminalId> = self
+            .done_episode
+            .keys()
+            .filter(|tid| self.unseen_done(tid))
+            .cloned()
+            .collect();
+        let changed = next != self.unseen_reported;
+        self.unseen_reported = next;
         changed
     }
 
@@ -8749,10 +8844,21 @@ impl App {
             if let Some(a) = agentpoll::activity(&self.agent_poll, label.pid) {
                 details.insert(tid.clone(), a.detail);
             }
+            #[cfg(test)]
+            let reading = match self.test_readings.get(tid) {
+                Some(r) => r.clone(),
+                None => agentstate::read_with(&label.text, Some(label.pid), || pane.snapshot()),
+            };
+            #[cfg(not(test))]
             let reading = agentstate::read_with(&label.text, Some(label.pid), || pane.snapshot());
             let status = reading.status;
             let prev = self.agent_statuses.get(tid).copied();
-            let event = match (prev.map(|p| p.status), status) {
+            // A different agent pid in the pane is a replacement, never a transition: the old
+            // agent's last status says nothing about how the new one got where it is.
+            let event = match (
+                prev.filter(|p| p.pid == label.pid).map(|p| p.status),
+                status,
+            ) {
                 // turn just finished (was running, now parked at the prompt)
                 (Some(AgentStatus::Working), AgentStatus::Ready) => {
                     Some(("done", "turn finished".to_string()))
@@ -8764,6 +8870,7 @@ impl App {
                 }
                 _ => None,
             };
+            let finished = matches!(event, Some(("done", _)));
             if let Some((kind, body)) = event {
                 events.push((tid.clone(), label.text.clone(), kind, body));
             }
@@ -8775,11 +8882,18 @@ impl App {
             // is also what keeps `changed` honest: an unchanged pass reproduces the map
             // exactly, so the equality check below still means "a status moved" and the
             // render loop's idle-skip survives.
-            let (since, since_unix) =
-                status_since(prev, status, (std::time::Instant::now(), unix_now()));
+            let (since, since_unix) = status_since(
+                prev,
+                label.pid,
+                status,
+                (std::time::Instant::now(), unix_now()),
+            );
             // A NEW status — including the first one seen for this pane, so an agent that
             // reappears after losing its classification is a change — takes the next number.
             let seq = status_seq(prev, label.pid, status, &mut seq_counter);
+            if finished {
+                self.done_episode.insert(tid.clone(), seq);
+            }
             next.insert(
                 tid.clone(),
                 AgentState {
@@ -8814,6 +8928,13 @@ impl App {
         self.agent_statuses = next;
         self.agent_details = details;
         self.agent_waits = waits;
+        // The marker lives exactly as long as the episode it was recorded for.
+        let statuses = &self.agent_statuses;
+        self.done_episode.retain(|tid, seq| {
+            statuses
+                .get(tid)
+                .is_some_and(|st| st.status == AgentStatus::Ready && st.seq == *seq)
+        });
 
         // Fire desktop toasts (best-effort, non-blocking) — the server does this, so
         // they arrive even while detached. Replaces the retired `~/.claude` notify hooks.
@@ -8913,6 +9034,7 @@ impl App {
             space,
             tab,
             body,
+            seq: self.episode_for(&term, kind),
             terminal: term,
             read: false,
         });
@@ -9073,6 +9195,7 @@ impl App {
                             tool: label.text.clone(),
                             status,
                             for_secs,
+                            unseen: self.unseen_done(tid),
                             term: tid.clone(),
                         });
                     }
@@ -9527,13 +9650,7 @@ impl App {
             let is_focused = agent_focus == Some(ai);
             // The active pane's agent — highlighted like the active `spaces` row.
             let is_active = active_agent_term.as_ref() == Some(&row.term);
-            // tmx-style glyph + colour per status (all width-1 geometric shapes).
-            let (dot, scolor) = match row.status {
-                "working" => ("●", CAT_GREEN),
-                "ready" => ("◐", CAT_BLUE),
-                "blocked" => ("▲", CAT_YELLOW),
-                _ => ("○", CAT_OVERLAY), // idle
-            };
+            let (dot, scolor) = row.glyph();
             let mut x = 1u16;
             // Keep the status colour on the dot; bold it for the focused agent so the
             // icon reads as "selected" (mirrors the active space's brighter dot).
@@ -9573,9 +9690,9 @@ impl App {
             let waited = fmt_elapsed(row.for_secs);
             if entry_ag > 1 {
                 let sub = if waited.is_empty() {
-                    format!("{} · {}", row.status, row.tool)
+                    format!("{} · {}", row.shown_status(), row.tool)
                 } else {
-                    format!("{} {} · {}", row.status, waited, row.tool)
+                    format!("{} {} · {}", row.shown_status(), waited, row.tool)
                 };
                 let mut sx = 4u16;
                 put(buf, &mut sx, y + 1, &sub, sub_style);
@@ -9583,9 +9700,9 @@ impl App {
                 // One row: the tool name is the first thing to go — the tab chip already
                 // carries it, while the status and how long it has held are the point.
                 let sub = if waited.is_empty() {
-                    row.status.to_string()
+                    row.shown_status().to_string()
                 } else {
-                    format!("{} {}", row.status, waited)
+                    format!("{} {}", row.shown_status(), waited)
                 };
                 put_trailing(buf, x, y, &sub, sub_style);
             }
@@ -12370,11 +12487,14 @@ fn blocked_body(wait: Option<&agentstate::Wait>) -> String {
 
 fn status_since(
     prev: Option<AgentState>,
+    pid: u32,
     status: agentstate::AgentStatus,
     now: (std::time::Instant, i64),
 ) -> (std::time::Instant, i64) {
+    // A replacement agent starts its own clock, like `status_seq` starts its own episode — a
+    // new agent must not inherit "blocked 40m" from the one before it.
     match prev {
-        Some(p) if p.status == status => (p.since, p.since_unix),
+        Some(p) if p.status == status && p.pid == pid => (p.since, p.since_unix),
         _ => now,
     }
 }
@@ -13191,6 +13311,7 @@ mod tests {
             tool: "claude".to_string(),
             status: "ready",
             term: tid(title),
+            unseen: false,
         }
     }
 
@@ -13379,13 +13500,15 @@ mod tests {
         // Same status → keep the original stamp (still "blocked for 5 minutes"), and the
         // wall-clock half with it: re-deriving it each pass made it flap between two seconds.
         assert_eq!(
-            status_since(Some(prev), AgentStatus::Blocked, now),
+            status_since(Some(prev), 1, AgentStatus::Blocked, now),
             (then, 1_000)
         );
         // Moved → restart the clock.
-        assert_eq!(status_since(Some(prev), AgentStatus::Ready, now), now);
+        assert_eq!(status_since(Some(prev), 1, AgentStatus::Ready, now), now);
         // First sighting → start now.
-        assert_eq!(status_since(None, AgentStatus::Working, now), now);
+        assert_eq!(status_since(None, 1, AgentStatus::Working, now), now);
+        // A replacement agent in the same status starts its own clock.
+        assert_eq!(status_since(Some(prev), 2, AgentStatus::Blocked, now), now);
     }
 
     #[test]
@@ -15916,6 +16039,172 @@ mod mode_hints {
         app.feed_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut prefix);
         app.open_new_session_prompt();
         assert!(rows(&app).iter().any(|r| r.contains("esc cancel")));
+    }
+}
+
+#[cfg(test)]
+mod agent_attention {
+    use super::*;
+    use crate::control::Req;
+    use agentstate::{AgentStatus, Reading};
+
+    fn app() -> App {
+        let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
+        cfg.persist = false; // never restore (or save over) the user's real sessions
+        cfg.notify = false; // the in-app center still logs; no desktop toast from a test
+        App::new(120, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    /// One sweep in which `term` runs agent `pid` and reads `status`.
+    fn sweep(app: &mut App, term: &TerminalId, pid: u32, status: AgentStatus) {
+        app.labels.insert(
+            term.clone(),
+            procinfo::Label {
+                text: "claude".into(),
+                kind: procinfo::Kind::Agent,
+                pid,
+            },
+        );
+        app.test_readings
+            .insert(term.clone(), Reading { status, wait: None });
+        app.refresh_agent_statuses();
+    }
+
+    fn new_session(app: &mut App, name: &str) -> TerminalId {
+        assert!(
+            app.handle_control(&Req::NewSession {
+                name: Some(name.into()),
+                cwd: None,
+                detached: false,
+            })
+            .ok
+        );
+        app.focused_terminal().unwrap()
+    }
+
+    fn newest_notification(app: &App) -> u64 {
+        app.notifications
+            .front()
+            .map(|n| n.id)
+            .expect("a notification")
+    }
+
+    #[test]
+    fn a_finished_turn_is_unseen_until_its_pane_is_acted_on() {
+        let mut app = app();
+        let t = app.focused_terminal().unwrap();
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        assert!(!app.unseen_done(&t));
+        sweep(&mut app, &t, 7, AgentStatus::Ready);
+        assert!(app.unseen_done(&t));
+        let row = &app.agent_rows()[0];
+        assert_eq!(
+            (row.status, row.shown_status(), row.glyph().0),
+            ("ready", "done", "✓")
+        );
+        let wire = &app.host_agents().agents[0];
+        assert_eq!((wire.status.as_str(), wire.unseen), ("ready", true));
+        // A key or click on the focused pane is the evidence (the bell rule, #108).
+        app.ack_focused_bell();
+        assert!(!app.unseen_done(&t));
+        assert_eq!(app.agent_rows()[0].shown_status(), "ready");
+        assert!(!app.host_agents().agents[0].unseen);
+    }
+
+    #[test]
+    fn only_an_observed_finish_by_the_same_agent_counts() {
+        let mut app = app();
+        let t = app.focused_terminal().unwrap();
+        // First sighting already ready (a server restart): nothing finished that we saw.
+        sweep(&mut app, &t, 7, AgentStatus::Ready);
+        assert!(!app.unseen_done(&t));
+        // Agent 7 working, then a DIFFERENT agent reads ready: a replacement, not a finish —
+        // no marker and no "turn finished" notification.
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        let before = app.notifications.len();
+        sweep(&mut app, &t, 8, AgentStatus::Ready);
+        assert!(!app.unseen_done(&t));
+        assert_eq!(
+            app.notifications.len(),
+            before,
+            "a pid replacement must not toast"
+        );
+    }
+
+    #[test]
+    fn the_marker_lives_exactly_as_long_as_its_episode() {
+        let mut app = app();
+        let t = app.focused_terminal().unwrap();
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        sweep(&mut app, &t, 7, AgentStatus::Ready);
+        assert!(app.unseen_done(&t));
+        // Back to work: the finish it marked is over.
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        assert!(!app.unseen_done(&t));
+        // The next finish is a new episode, unseen again even though the pane was not acked.
+        sweep(&mut app, &t, 7, AgentStatus::Ready);
+        assert!(app.unseen_done(&t));
+        app.ack_focused_bell();
+        // An ack covers what has happened, not what happens next.
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        sweep(&mut app, &t, 7, AgentStatus::Ready);
+        assert!(app.unseen_done(&t));
+    }
+
+    #[test]
+    fn acting_on_another_pane_does_not_ack_but_jumping_there_does() {
+        let mut app = app();
+        let t = app.focused_terminal().unwrap();
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        sweep(&mut app, &t, 7, AgentStatus::Ready);
+        let other = new_session(&mut app, "other");
+        assert_ne!(other, t);
+        app.ack_focused_bell();
+        assert!(
+            app.unseen_done(&t),
+            "a key in another pane is not a look at this one"
+        );
+        app.jump_to_terminal(&t);
+        assert!(!app.unseen_done(&t));
+    }
+
+    #[test]
+    fn reading_a_notification_acks_only_the_turn_it_reports() {
+        let mut app = app();
+        let t = app.focused_terminal().unwrap();
+        // Move the view away so no key/jump acks the pane during the test.
+        new_session(&mut app, "elsewhere");
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        sweep(&mut app, &t, 7, AgentStatus::Ready);
+        let first = newest_notification(&app);
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        sweep(&mut app, &t, 7, AgentStatus::Ready);
+        let second = newest_notification(&app);
+        assert_ne!(first, second);
+        // The old turn's notification says nothing about the new turn.
+        assert_eq!(app.notif_read(Some(first)), 1);
+        assert!(app.unseen_done(&t));
+        assert_eq!(app.notif_read(Some(second)), 1);
+        assert!(!app.unseen_done(&t));
+        // Dismissing it afterwards cannot make the turn unseen again.
+        app.notifications.clear();
+        assert!(!app.unseen_done(&t));
+    }
+
+    #[test]
+    fn a_replacement_agent_starts_its_own_blocked_clock() {
+        let mut app = app();
+        let t = app.focused_terminal().unwrap();
+        sweep(&mut app, &t, 7, AgentStatus::Blocked);
+        let first = app.agent_statuses[&t];
+        std::thread::sleep(Duration::from_millis(20));
+        sweep(&mut app, &t, 8, AgentStatus::Blocked);
+        let second = app.agent_statuses[&t];
+        assert!(
+            second.since > first.since,
+            "the new agent must not inherit the old wait"
+        );
+        assert_ne!(second.seq, first.seq);
     }
 }
 

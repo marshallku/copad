@@ -469,7 +469,7 @@ while time.time() < end and not pick:
     m = oh.recv(0.5)
     if m and m["t"] == "overlay":
         pick = m
-if not pick or pick["spec"]["kind"] != "picker" or [t["name"] for t in pick["spec"]["tabs"]] != ["sessions", "agents"]:
+if not pick or pick["spec"]["kind"] != "picker" or [t["name"] for t in pick["spec"]["tabs"]] != ["sessions", "agents", "tabs"]:
     fail(f"Ctrl-f was not delegated as a picker: {pick}")
 # A native switcher previews and renames like the TUI's (decisions #180).
 srow = pick["spec"]["tabs"][0]["rows"][0]

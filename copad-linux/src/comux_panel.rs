@@ -140,9 +140,14 @@ impl Style {
         )
     }
 
+    /// An agent's glyph by [`agent_status`], the word it shows.
+    pub(crate) fn agent(&self, a: &Value) -> (&'static str, &str) {
+        self.status(agent_status(a))
+    }
+
     pub(crate) fn status(&self, s: &str) -> (&'static str, &str) {
         match s {
-            "done" => ("●", &self.green),
+            "done" => ("✓", &self.green),
             "working" => ("●", &self.green),
             "ready" => ("◐", &self.blue),
             "blocked" => ("▲", &self.yellow),
@@ -420,6 +425,17 @@ fn clear(list: &gtk4::ListBox) {
     // By row: a non-row child (a popover) is never removed and `first_child` would spin.
     while let Some(r) = list.row_at_index(0) {
         list.remove(&r);
+    }
+}
+
+/// The status word an agent row shows: an unseen finish (`unseen`, on a `ready` agent) reads
+/// `done`, as the TUI row does.
+pub(crate) fn agent_status(a: &Value) -> &str {
+    let status = a["status"].as_str().unwrap_or_default();
+    if status == "ready" && a["unseen"] == true {
+        "done"
+    } else {
+        status
     }
 }
 
@@ -1201,7 +1217,7 @@ impl ComuxPanel {
                 }
                 AgentRow::Agent(i) => {
                     let a = &agents[i];
-                    let status = a["status"].as_str().unwrap_or_default();
+                    let status = agent_status(a);
                     let (glyph, color) = st.status(status);
                     let title = a["title"].as_str().unwrap_or_default();
                     let name = if grouped {
