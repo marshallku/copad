@@ -311,6 +311,13 @@ int copad_muxhost_take_focus(const MuxHostHandle *h, const char *panel);
 void copad_muxhost_preview(const MuxHostHandle *h, const char *consumer, const char *pane, unsigned short rows, unsigned short cols);
 /// Free with copad_ffi_free_string.
 char *copad_muxhost_copad_tag(const char *panel, const char *socket);
+/// The work graph (decisions #204): {rev, epoch, data: {graph, agents}, page, page_seq} for consumer.
+/// Free with copad_ffi_free_string.
+char *copad_muxhost_graph_json(const MuxHostHandle *h, const char *consumer);
+/// Ask for a page of token's history: before < 0 = the newest, limit <= 0 = comux's default.
+void copad_muxhost_graph_history(const MuxHostHandle *h, const char *consumer, const char *token, long long before, long long limit);
+/// The work-graph page as one HTML document. Free with copad_ffi_free_string.
+char *copad_graph_page(void);
 
 #ifdef __cplusplus
 }

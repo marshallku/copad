@@ -148,5 +148,29 @@ run history '
 [[ "$(q history '(d["before"], d["state"]["seq"])')" == "(10, 10)" ]] || fail "older history must not move the cursor off its step: $(q history '(d["before"], d["state"])')"
 ok "asked for history before #7, merged 6 older steps (the cursor stayed on #10), ignored a page of another gen"
 
+echo "7. connection identity and failed history"
+run conn '
+  G.setHost({ local: true, epoch: "k1#1" });
+  const f = JSON.parse(JSON.stringify(FIX));
+  f.graph.agents[0].steps = f.graph.agents[0].steps.slice(6);
+  G.setData(f);
+  await sleep(50);
+  out.stamped = window.__posts.filter((p) => p.type === "history").map((p) => p.epoch);
+  G.historyFailed({ code: "unsupported" });
+  window.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft" }));
+  G.setData(f);
+  await sleep(50);
+  out.after = window.__posts.filter((p) => p.type === "history").length;
+  out.unsupported = G.state().historyUnsupported;
+  G.reset();
+  G.setHost({ local: false, epoch: "k2#1" });
+  out.reset = G.state();
+'
+[[ "$(q conn 'd["stamped"]')" == "['k1#1']" ]] || fail "messages should carry the host epoch: $(q conn 'd["stamped"]')"
+[[ "$(q conn '(d["after"], d["unsupported"])')" == "(1, True)" ]] || fail "an unsupported comux must not be asked again: $(q conn '(d["after"], d["unsupported"])')"
+[[ "$(q conn '(d["reset"]["resets"], d["reset"]["agents"], d["reset"]["steps"], d["reset"]["historyUnsupported"], d["reset"]["local"])')" == "(1, 0, 0, False, False)" ]] \
+    || fail "reset should drop everything of the old connection: $(q conn 'd["reset"]')"
+ok "posts carry the epoch; unsupported stops history; reset() empties the page for a new connection"
+
 echo
 echo "PASS — the work-graph page; screenshots in $OUT"

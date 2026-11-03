@@ -48,6 +48,16 @@ struct PreviewWant {
     gone: bool,
 }
 
+/// One window's work-graph history requests (decisions #204): the `graph` command in flight
+/// and the newest answer, counted so the window can tell a new one arrived.
+#[derive(Default)]
+struct GraphWant {
+    inflight: Option<String>,
+    /// `{"ok":true,"page":…}` or `{"ok":false,"code":…}`.
+    result: Option<Value>,
+    seq: u64,
+}
+
 /// What a desktop host takes over: the sidebar, the status bar (every field it carries has a
 /// native replacement in the window's comux status strip) and the overlays (`Ctrl-f`,
 /// `Ctrl-b a`, prompts, confirms — decisions #170).
@@ -187,6 +197,15 @@ struct State {
     /// Attachments whose user pressed `Ctrl-b e` (decisions #181), until a GUI takes it. A set,
     /// so two windows' requests before one read are both delivered.
     focus_pending: BTreeSet<u64>,
+    /// Bumped whenever the `graph` / `agents` topic changes (or goes), so a window feeds its
+    /// graph page only then — the graph itself stays out of `state_json`.
+    graph_rev: u64,
+    agents_rev: u64,
+    /// Bumped on every welcome: a window resets its graph page whenever this moves, even when
+    /// it is the same server again (its incarnation would not change).
+    conn_epoch: u64,
+    /// Work-graph history requests, by consumer.
+    graphs: BTreeMap<String, GraphWant>,
 }
 
 impl State {
@@ -387,6 +406,55 @@ impl MuxHost {
         }
     }
 
+    /// Ask for a page of `token`'s work-graph history for `consumer` (a GUI window): the steps
+    /// before `before`, at most `limit`. The answer lands in [`Self::graph_json`]; a newer
+    /// request from the same consumer replaces one still in flight.
+    pub fn graph_history(
+        &self,
+        consumer: &str,
+        token: &str,
+        before: Option<u64>,
+        limit: Option<usize>,
+    ) {
+        let Some(link) = self.inner.link.lock().ok().and_then(|l| l.clone()) else {
+            return;
+        };
+        let mut req = json!({ "cmd": "graph", "target": token });
+        if let Some(b) = before {
+            req["before"] = json!(b);
+        }
+        if let Some(l) = limit {
+            req["limit"] = json!(l);
+        }
+        // Send and register under the state lock (as `poll_previews` does): the reader thread
+        // takes the same lock to match a reply, so a fast reply cannot arrive unregistered.
+        let Ok(mut s) = self.inner.state.lock() else {
+            return;
+        };
+        if let Ok(id) = link.cmd(req) {
+            s.graphs.entry(consumer.to_string()).or_default().inflight = Some(id);
+        }
+    }
+
+    /// What a window's graph page needs: the `graph` and `agents` topics, the connection epoch,
+    /// and the newest history answer for `consumer` with its count.
+    pub fn graph_json(&self, consumer: &str) -> Value {
+        let Ok(s) = self.inner.state.lock() else {
+            return json!({ "rev": 0 });
+        };
+        let want = s.graphs.get(consumer);
+        json!({
+            "rev": s.graph_rev,
+            "epoch": s.conn_epoch,
+            "data": {
+                "graph": s.model.graph,
+                "agents": s.model.agents.as_ref().map(|a| a.agents.clone()).unwrap_or_default(),
+            },
+            "page": want.and_then(|w| w.result.clone()),
+            "page_seq": want.map_or(0, |w| w.seq),
+        })
+    }
+
     /// Run a control request (`{"cmd":"select-session",…}`).
     pub fn command(&self, req: Value) {
         if let Some(l) = self.inner.link.lock().ok().and_then(|l| l.clone()) {
@@ -428,7 +496,18 @@ impl MuxHost {
                 (c.clone(), json!({ "state": state, "preview": w.result }))
             })
             .collect();
+        let pages: serde_json::Map<String, Value> = s
+            .graphs
+            .iter()
+            .map(|(c, w)| (c.clone(), json!(w.seq)))
+            .collect();
         json!({
+            "graph": {
+                "rev": s.graph_rev,
+                "agents_rev": s.agents_rev,
+                "epoch": s.conn_epoch,
+                "pages": pages,
+            },
             "previews": previews,
             "overlays": overlays,
             "connected": s.connected,
@@ -598,6 +677,33 @@ fn poll_previews(inner: Arc<Inner>) {
 /// A `pane-preview` reply: stored only if it answers the request still in flight for that
 /// consumer (a late one, or one for a pane no longer wanted, is dropped). Returns whether it
 /// was one.
+/// A `graph` reply: stored for the consumer whose request it answers. Returns whether it was
+/// one.
+fn take_graph_reply(s: &mut State, id: &str, resp: &Value) -> bool {
+    let Some(w) = s
+        .graphs
+        .values_mut()
+        .find(|w| w.inflight.as_deref() == Some(id))
+    else {
+        return false;
+    };
+    w.inflight = None;
+    w.seq += 1;
+    w.result = Some(if resp["ok"] == true {
+        json!({ "ok": true, "page": resp["graph"] })
+    } else {
+        let error = resp["error"].as_str().unwrap_or_default();
+        // An older comux: `bad request: unknown variant graph`.
+        let code = if error.contains("unknown variant") {
+            "unsupported"
+        } else {
+            resp["code"].as_str().unwrap_or("error")
+        };
+        json!({ "ok": false, "code": code })
+    });
+    true
+}
+
 fn take_preview_reply(s: &mut State, id: &str, resp: &Value) -> bool {
     let Some(w) = s
         .previews
@@ -627,6 +733,13 @@ fn reset_connection(s: &mut State) {
     s.closed_overlays.clear();
     s.focus_pending.clear();
     s.preview_unsupported = false;
+    for w in s.graphs.values_mut() {
+        w.inflight = None;
+        w.result = None;
+        w.seq += 1;
+    }
+    s.graph_rev += 1;
+    s.agents_rev += 1;
     for w in s.previews.values_mut() {
         w.inflight = None;
         w.last_sent = None;
@@ -651,7 +764,7 @@ fn on_event(inner: &Arc<Inner>, ev: LinkEvent, closed: &std::sync::mpsc::Sender<
                 }
             }
             LinkEvent::Msg(PubMsg::Reply { id, resp }) => {
-                if !take_preview_reply(&mut s, id, resp) {
+                if !take_preview_reply(&mut s, id, resp) && !take_graph_reply(&mut s, id, resp) {
                     return;
                 }
             }
@@ -675,12 +788,32 @@ fn on_event(inner: &Arc<Inner>, ev: LinkEvent, closed: &std::sync::mpsc::Sender<
                 s.overlays.retain(|o| o.0 != *overlay);
             }
             LinkEvent::Msg(m) => {
-                if s.model.apply(m) == Applied::Welcome {
-                    // A new server: every attachment id and claim we held is meaningless.
-                    s.claims = Claims::default();
-                    reset_connection(&mut s);
-                    s.connected = true;
-                    s.error = None;
+                match s.model.apply(m) {
+                    Applied::Welcome => {
+                        // A new server: every attachment id and claim we held is meaningless.
+                        s.claims = Claims::default();
+                        reset_connection(&mut s);
+                        s.conn_epoch += 1;
+                        s.connected = true;
+                        s.error = None;
+                    }
+                    Applied::Topics(names) => {
+                        let has = |t: &str| names.iter().any(|n| n == t);
+                        if has(copad_mux_proto::topic::GRAPH) {
+                            s.graph_rev += 1;
+                        }
+                        if has(copad_mux_proto::topic::AGENTS) {
+                            s.agents_rev += 1;
+                        }
+                    }
+                    Applied::Dropped(name) => {
+                        if name == copad_mux_proto::topic::GRAPH {
+                            s.graph_rev += 1;
+                        } else if name == copad_mux_proto::topic::AGENTS {
+                            s.agents_rev += 1;
+                        }
+                    }
+                    Applied::Ignored => {}
                 }
                 let tags = s.served_tags();
                 let State { claims, model, .. } = &mut *s;
@@ -748,6 +881,42 @@ mod tests {
 
     fn tags(t: &[&str]) -> BTreeSet<String> {
         t.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_graph_reply_lands_for_its_consumer_and_says_why_it_failed() {
+        let mut s = State::default();
+        s.graphs.entry("w1".into()).or_default().inflight = Some("c4".into());
+        assert!(!take_graph_reply(&mut s, "c9", &json!({"ok": true})));
+        assert!(take_graph_reply(
+            &mut s,
+            "c4",
+            &json!({"ok": true, "graph": {"steps": []}})
+        ));
+        let w = &s.graphs["w1"];
+        assert_eq!(
+            (w.seq, w.result.as_ref().unwrap()["ok"].clone()),
+            (1, json!(true))
+        );
+        s.graphs.get_mut("w1").unwrap().inflight = Some("c5".into());
+        take_graph_reply(
+            &mut s,
+            "c5",
+            &json!({"ok": false, "error": "bad request: unknown variant `graph`"}),
+        );
+        assert_eq!(
+            s.graphs["w1"].result.as_ref().unwrap()["code"],
+            "unsupported"
+        );
+        s.graphs.get_mut("w1").unwrap().inflight = Some("c6".into());
+        take_graph_reply(&mut s, "c6", &json!({"ok": false, "code": "not_found"}));
+        assert_eq!(s.graphs["w1"].result.as_ref().unwrap()["code"], "not_found");
+        // A new connection forgets the answer but moves the count, so the window looks again.
+        reset_connection(&mut s);
+        assert_eq!(
+            (s.graphs["w1"].seq, s.graphs["w1"].result.is_none()),
+            (4, true)
+        );
     }
 
     #[test]

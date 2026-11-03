@@ -34,6 +34,11 @@ SESSION_BAK="$(mktemp /tmp/copad-session.XXXX)"
 SESSION_EXISTED=""
 if [[ -f "$SESSION" ]]; then SESSION_EXISTED=1; cp "$SESSION" "$SESSION_BAK"; fi
 DEV_PID="" # the dev instance's pid, kept until it has really exited
+for k in comuxGraphOpen comuxGraphMode comuxGraphWidth; do
+    eval "DEF_$k=\"\$(defaults read com.marshall.copad $k 2>/dev/null || true)\""
+done
+defaults delete com.marshall.copad comuxGraphOpen 2>/dev/null || true
+defaults delete com.marshall.copad comuxGraphWidth 2>/dev/null || true
 cleanup() {
     [[ -n "$APP_PID" ]] && kill "$APP_PID" 2>/dev/null || true
     [[ -n "$CAF" ]] && kill "$CAF" 2>/dev/null || true
@@ -46,6 +51,11 @@ cleanup() {
         for _ in $(seq 1 50); do kill -0 "$DEV_PID" 2>/dev/null || break; sleep 0.1; done
     fi
     if [[ -n "$SESSION_EXISTED" ]]; then cp "$SESSION_BAK" "$SESSION"; else rm -f "$SESSION"; fi
+    # The dev instance shares the real app's defaults: put the graph panel's keys back.
+    for k in comuxGraphOpen comuxGraphMode comuxGraphWidth; do
+        v="$(eval echo "\${DEF_$k:-}")"
+        if [[ -n "$v" ]]; then defaults write com.marshall.copad "$k" "$v"; else defaults delete com.marshall.copad "$k" 2>/dev/null || true; fi
+    done
     rm -f "$SESSION_BAK"
     [[ "${KEEP:-}" == 1 ]] && { log "kept $W"; return 0; }
     rm -rf "$W"
@@ -138,6 +148,15 @@ if [[ -n "$WID" ]]; then
     screencapture -o -x -l"$WID" "$W/native-sidebar.png" && log "screenshot: $W/native-sidebar.png"
 fi
 
+# Everything from here to the work graph drives the window with synthesized keys and clicks,
+# which need this terminal to have Accessibility. Without it those steps are SKIPPED loudly
+# rather than failing on the permission; the graph and top-bar steps below need none.
+INPUT=1
+if ! osascript -e 'tell application "System Events" to key code 63' >/dev/null 2>&1; then
+    INPUT=""
+    log "SKIP — no Accessibility for synthesized input here: the key/click-driven steps (overlays, center, sidebar keys, preview card) did not run"
+fi
+if [[ -n "$INPUT" ]]; then
 # An overlay is delegated: Ctrl-b $ in the tab opens comux's rename prompt natively (an overlay layer)
 # in this window; typing a name there renames the session.
 session_names() { python3 - <<'PY'
@@ -194,7 +213,7 @@ import sys, time, Quartz
 for w in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID):
     if w.get("kCGWindowOwnerPID") == int(sys.argv[1]) and w["kCGWindowBounds"]["Width"] > 200:
         b = w["kCGWindowBounds"]; break
-pt = (b["X"] + 219, b["Y"] + 82)
+pt = (b["X"] + 245, b["Y"] + 82)  # resume: the bell left the sidebar's toolbar (decisions #204)
 for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
     e = Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft)
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, e)
@@ -287,7 +306,14 @@ log "ok — the native center dismissed with d, stayed open, and D cleared the r
 PANE_TOK="$("$COMUX" list --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["panes"][0]["token"])')"
 "$COMUX" notify --pane "$PANE_TOK" --kind done "panel probe" >/dev/null
 for _ in $(seq 1 20); do [[ "$(notif_count)" == 1 ]] && break; sleep 0.5; done
-click_at 245 82 # the sidebar's bell
+WW="$(python3 - "$APP_PID" <<'PY'
+import sys, Quartz
+for w in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID):
+    if w.get("kCGWindowOwnerPID") == int(sys.argv[1]) and w["kCGWindowBounds"]["Width"] > 200:
+        print(int(w["kCGWindowBounds"]["Width"])); break
+PY
+)"
+click_at $((WW - 22)) 82 # the top bar's bell, at its right end (decisions #204)
 sleep 1.5
 [[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/notif-panel.png" && log "screenshot: $W/notif-panel.png"
 WW="$(python3 - "$APP_PID" <<'PY'
@@ -297,12 +323,12 @@ for w in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnl
         print(int(w["kCGWindowBounds"]["Width"])); break
 PY
 )"
-click_at $((WW - 200)) 112 # the first notification row
+click_at $((WW - 200)) 140 # the first notification row, in the dropdown under the bell
 for _ in $(seq 1 20); do [[ "$(notif_count)" == 0 ]] && break; sleep 0.5; done
 [[ "$(notif_count)" == 0 ]] || fail "clicking the notification did not open it"
 sleep 1
 [[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/notif-closed.png" && log "screenshot: $W/notif-closed.png"
-log "ok — the notification panel opened over the terminal and opening a notification consumed it"
+log "ok — the top bar's bell dropped the notifications down over the terminal and opening one consumed it"
 
 # The chrome never takes the keys (#183): after a click on the status bar's tab chip, typing
 # still goes to the terminal.
@@ -391,6 +417,90 @@ osascript -e 'tell application "System Events" to key code 36' >/dev/null
 for _ in $(seq 1 20); do [[ "$(tabs_total)" -gt "$BEFORE" ]] && break; sleep 0.5; done
 [[ "$(tabs_total)" -gt "$BEFORE" ]] || fail "a click on the sidebar with the preview card up did not land"
 log "ok — with the preview card up, the sidebar's resume button still took the first click"
+fi
+
+
+# The work graph (decisions #204): a (fake) claude agent's transcript, drawn in the right panel.
+graph() {
+    local p="${1:-}"
+    [[ -n "$p" ]] || p='{}'
+    "$COCTL" --socket "$GUI" call comux.graph --params "$p" --json
+}
+gq() { # python expression over `d` (the panel's state) → stdout
+    graph "${2:-}" | python3 -c 'import json,sys; d=json.load(sys.stdin); d=d.get("result",d); print(eval(sys.argv[1]))' "$1" 2>/dev/null
+}
+gwait() { # expr expected tries
+    local got=""
+    for _ in $(seq 1 "$3"); do got="$(gq "$1")"; [[ "$got" == "$2" ]] && return 0; sleep 0.5; done
+    fail "graph panel: expected $1 == $2, got '$got': $(graph)"
+}
+FID="0f0f0f0f-1234-4abc-8def-0123456789ab"
+mkdir -p "$W/bin" "$W/home/.claude/sessions" "$W/home/.claude/projects/e2e/$FID/subagents"
+ln -sf /bin/sleep "$W/bin/claude"
+TP="$W/home/.claude/projects/e2e/$FID.jsonl"
+use() { printf '{"type":"assistant","timestamp":"2026-11-04T00:00:%02d.000Z","message":{"content":[{"type":"tool_use","id":"%s","name":"%s","input":%s}]}}\n' "$4" "$1" "$2" "$3" >>"$TP"; }
+res() { printf '{"type":"user","timestamp":"2026-11-04T00:00:%02d.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"%s","is_error":%s}]}}\n' "$3" "$1" "$2" >>"$TP"; }
+printf '{"type":"user","timestamp":"2026-11-04T00:00:00.000Z","message":{"content":"Fix the parser"}}\n' >"$TP"
+# 30 reads first, so the overview (24 newest steps) cannot hold them all: the panel must page.
+for i in $(seq 1 30); do use "r$i" Read "{\"file_path\":\"/repo/src/m$i.rs\"}" 1; res "r$i" false 1; done
+use g1 Edit '{"file_path":"/repo/src/parse.rs"}' 2; res g1 false 3
+use g2 Grep '{"pattern":"fn parse","path":"/repo/src"}' 4; res g2 false 4
+use g3 Agent '{"description":"Map the tests","subagent_type":"Explore"}' 5
+printf '{"agentType":"Explore","description":"Map the tests","toolUseId":"g3"}' >"$W/home/.claude/projects/e2e/$FID/subagents/agent-m1.meta.json"
+printf '{"type":"assistant","isSidechain":true,"timestamp":"2026-11-04T00:00:06.000Z","message":{"content":[{"type":"tool_use","id":"s1","name":"Read","input":{"file_path":"/repo/tests/t.rs"}}]}}\n' \
+    >"$W/home/.claude/projects/e2e/$FID/subagents/agent-m1.jsonl"
+"$COMUX" spawn --keep -- "$W/bin/claude" 600 >/dev/null || fail "spawning the fake agent failed"
+APID=""
+for _ in $(seq 1 50); do
+    ps -Ao pid=,args= >"$W/ps.txt"
+    APID="$(awk -v p="$W/bin/claude" '$2==p {print $1; exit}' "$W/ps.txt")"
+    [[ -n "$APID" ]] && break; sleep 0.1
+done
+[[ -n "$APID" ]] || fail "no fake agent pid"
+printf '{"pid":%s,"sessionId":"%s","status":"busy"}\n' "$APID" "$FID" >"$W/home/.claude/sessions/$APID.json"
+[[ "$(gq 'd["open"]' '{"open":true,"mode":"agent"}')" == True ]] || fail "comux.graph would not open: $(graph)"
+gwait 'd["shown"] and d["loaded"]' True 20
+gwait '(d["page"] or {}).get("agents")' 1 60
+gwait '(d["page"]["subagents"], d["page"]["summary"].split(" · ")[0])' "(1, '33 files')" 60
+# The prompt + 30 reads + edit + grep + spawn + the subagent's read = 35 steps: the newest 24
+# came with the topic, the rest by paging through MuxHost.
+gwait 'd["page"]["steps"]' 35 60
+log "ok — the right panel shows the agent's 33 files, its Explore subagent and all 35 steps (paged)"
+[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/graph-agent.png" && log "screenshot: $W/graph-agent.png"
+TOPW="$(gq 'd["terminal_width"]')"
+# Live: a new step reaches the open panel.
+use g4 Write '{"file_path":"/repo/src/new.rs"}' 7; res g4 false 7
+gwait 'd["page"]["seq"]' 36 40
+gwait 'd["page"]["card"].startswith("Wrote /repo/src/new.rs") or d["page"]["card"]' True 20
+log "ok — a step appended to the transcript reached the panel live (#36 Wrote /repo/src/new.rs)"
+# All sessions, then closed: the terminal gets its width back.
+[[ "$(gq 'd["mode"]' '{"open":true,"mode":"all"}')" == all ]] || fail "mode all"
+gwait '(d["page"]["mode"], d["page"]["agents"])' "('all', 1)" 20
+[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/graph-all.png" && log "screenshot: $W/graph-all.png"
+[[ "$(gq 'd["shown"]' '{"open":false}')" == False ]] || fail "the panel should close"
+sleep 1
+[[ "$(gq 'd["terminal_width"] > '"$TOPW")" == True ]] || fail "closing the panel should give the terminal its width back"
+log "ok — all-sessions view lists the agent; closing the panel gives the terminal back its width"
+# A remembered panel wider than the window can spare: the terminal keeps its minimum.
+defaults write com.marshall.copad comuxGraphWidth -float 5000
+graph '{"open":true,"mode":"agent"}' >/dev/null
+sleep 1.5
+[[ "$(gq 'd["terminal_width"] >= 320 and d["shown"]')" == True ]] || fail "a 5000 pt remembered panel must leave the terminal usable: $(graph)"
+log "ok — with a remembered 5000 pt panel the terminal kept $(gq 'int(d["terminal_width"])') pt (panel $(gq 'int(d["width"])') pt)"
+graph '{"open":false}' >/dev/null
+defaults delete com.marshall.copad comuxGraphWidth 2>/dev/null || true
+# The notifications now drop down from the top bar's bell (opened here through the socket, so it
+# needs no synthesized click).
+"$COMUX" notify --pane "$("$COMUX" list --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["panes"][0]["token"])')" --kind done "graph e2e" >/dev/null
+sleep 1
+"$COCTL" --socket "$GUI" call comux.notifications --params '{"open":true}' --json >"$W/notif.json"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); d=d.get("result",d); sys.exit(0 if d["shown"] and d["frame"][1] > 0 else 1)' "$W/notif.json" \
+    || fail "the bell's dropdown did not open under the top bar: $(cat "$W/notif.json")"
+sleep 1
+[[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/notif-dropdown.png" && log "screenshot: $W/notif-dropdown.png"
+"$COCTL" --socket "$GUI" call comux.notifications --params '{"open":false}' --json >/dev/null
+log "ok — the notifications drop down under the top bar's bell: $(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("result",d)["frame"])' "$W/notif.json")"
+kill "$APID" 2>/dev/null || true
 
 # Closing copad releases the claim: comux draws its own sidebar again for the next client.
 kill "$APP_PID"; APP_PID=""

@@ -1678,6 +1678,55 @@ pub unsafe extern "C" fn copad_muxhost_preview(
     }
 }
 
+/// What a window's work-graph page needs (`MuxHost::graph_json`, decisions #204) for
+/// `consumer`. Free with `copad_ffi_free_string`.
+///
+/// # Safety
+/// `h` live; `consumer` a valid string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_graph_json(
+    h: *const MuxHostHandle,
+    consumer: *const c_char,
+) -> *mut c_char {
+    // SAFETY: caller contract.
+    match (unsafe { h.as_ref() }, unsafe { cstr(consumer) }) {
+        (Some(h), Some(c)) => into_c(h.0.graph_json(c).to_string()),
+        _ => ptr::null_mut(),
+    }
+}
+
+/// Ask for a page of `token`'s work-graph history for `consumer`: the steps before `before`
+/// (negative = the newest), at most `limit` (0 or negative = comux's default).
+///
+/// # Safety
+/// `h` live; `consumer`, `token` valid strings.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn copad_muxhost_graph_history(
+    h: *const MuxHostHandle,
+    consumer: *const c_char,
+    token: *const c_char,
+    before: i64,
+    limit: i64,
+) {
+    // SAFETY: caller contract.
+    if let (Some(h), Some(c), Some(t)) =
+        (unsafe { h.as_ref() }, unsafe { cstr(consumer) }, unsafe {
+            cstr(token)
+        })
+    {
+        let before = u64::try_from(before).ok();
+        let limit = usize::try_from(limit).ok().filter(|l| *l > 0);
+        h.0.graph_history(c, t, before, limit);
+    }
+}
+
+/// The work-graph page, one self-contained HTML document (`copad_graph_web::page`). Free with
+/// `copad_ffi_free_string`.
+#[unsafe(no_mangle)]
+pub extern "C" fn copad_graph_page() -> *mut c_char {
+    into_c(copad_graph_web::page())
+}
+
 /// Ask comux to open one of its overlays (`what`: `new-session`, `resume`, `rename-session`,
 /// …) for `panel`'s client; `target` NULL = the active session/tab (decisions #172).
 ///

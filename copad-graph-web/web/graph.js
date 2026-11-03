@@ -31,7 +31,10 @@
 
     // ---- the bridge -----------------------------------------------------------------------
 
+    /** Every message carries the host's epoch (`setHost`), so the host can drop one that was
+     * queued for a connection it has since left. */
     const post = (message) => {
+        message = { ...message, epoch: host.epoch ?? null };
         const w = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.comux;
         if (w) w.postMessage(message);
         else if (window.parent !== window) window.parent.postMessage({ comuxGraph: message }, "*");
@@ -74,6 +77,11 @@
     let lastSeqByKey = new Map();
     let hovered = null;
     let inflight = null;
+    /** A retry after a failed history request, and whether this connection's comux has no
+     * `graph` command at all. */
+    let retryTimer = 0;
+    let historyUnsupported = false;
+    let resets = 0;
 
     // ---- colours --------------------------------------------------------------------------
 
@@ -131,6 +139,7 @@
 
     function addHistory(page) {
         if (!page) return;
+        clearTimeout(retryTimer);
         const asked = inflight && inflight.token === page.token ? inflight.before : null;
         inflight = null;
         const c = caches.get(page.token);
@@ -144,7 +153,7 @@
         // A host that never answered (a dropped reply) must not stall loading for good.
         if (inflight && performance.now() - inflight.t < 5000) return;
         inflight = null;
-        if (mode !== "agent" || !selected) return;
+        if (historyUnsupported || mode !== "agent" || !selected) return;
         const c = caches.get(selected);
         if (!c) return;
         // Nothing held yet but the agent has steps: the newest page first.
@@ -159,6 +168,54 @@
             inflight = { token: selected, before: stale + 1, t: performance.now() };
             post({ type: "history", token: selected, before: stale + 1, limit: 1 });
         }
+    }
+
+    /** A history request failed: `unsupported` (this comux has no `graph` command) stops asking
+     * for this connection; `not_found`/`no-graph` gives that hole up; anything else is retried
+     * after a pause, by a timer, since nothing else may come along to ask again. */
+    function historyFailed(f) {
+        const asked = inflight;
+        inflight = null;
+        clearTimeout(retryTimer);
+        const code = (f && f.code) || "";
+        if (code === "unsupported") {
+            historyUnsupported = true;
+            return;
+        }
+        const c = asked ? caches.get(asked.token) : null;
+        if ((code === "not_found" || code === "no-graph") && c && asked.before != null) {
+            c.exhausted.add(asked.before);
+            askHistory();
+            return;
+        }
+        retryTimer = setTimeout(askHistory, 5000);
+    }
+
+    /** Everything this page holds belongs to one connection: drop it (another comux, or the
+     * same one reconnected). */
+    function reset() {
+        resets++;
+        clearTimeout(retryTimer);
+        clearInterval(playTimer);
+        caches.clear();
+        lastSeqByKey = new Map();
+        flares.clear();
+        points.clear();
+        topic = { agents: [] };
+        agentsInfo = [];
+        selected = null;
+        selectedFile = null;
+        inflight = null;
+        historyUnsupported = false;
+        shapeKey = "";
+        viewTouched = false;
+        live = true;
+        playing = false;
+        prevSteps = [];
+        fillPicker();
+        rebuild();
+        drawCard();
+        kick();
     }
 
     function fillPicker() {
@@ -555,6 +612,7 @@
             }
         }
         // Nodes.
+        const labels = [];
         ctx.font = `${fontSize}px ${font}`;
         ctx.textAlign = "center";
         ctx.textBaseline = "top";
@@ -629,19 +687,36 @@
                 ctx.strokeStyle = roles.red;
                 ctx.stroke();
             }
-            const showLabel = n.kind === "agent" || n.kind === "space" || n.kind === "sub" || hovered === n || lit || (n.kind === "file" && (r > 7 || transform.k > 1.6)) || (n.kind === "dir" && transform.k > 2.2) || (query && !dimmed);
-            if (showLabel) {
-                const s = 1 / Math.max(transform.k, 0.6);
-                ctx.save();
-                ctx.translate(p.x, p.y + r + 3);
-                ctx.scale(s, s);
-                ctx.fillStyle = n.kind === "dir" ? roles.dim : n.kind === "file" ? roles.subtext : roles.text;
-                ctx.fillText(n.label, 0, 0);
-                ctx.restore();
-            }
+            // Labels are placed after every node, most important first, so they never pile up.
+            let priority = 0;
+            if (n.kind === "agent" || n.kind === "space") priority = 5;
+            else if (hovered === n) priority = 6;
+            else if (lit && lit.flare > 0) priority = 4;
+            else if (n.kind === "sub") priority = 3;
+            else if (lit || (query && !dimmed)) priority = 2;
+            else if (n.kind === "file") priority = 1 + Math.min(n.touches || 0, 50) / 100;
+            else if (n.kind === "dir" && transform.k > 1.4) priority = 0.5;
+            if (priority > 0) labels.push({ p, n, r, priority, dimmed });
         }
         ctx.globalAlpha = 1;
         ctx.restore();
+        // Screen space: skip a label that would overlap one already drawn.
+        labels.sort((a, b) => b.priority - a.priority);
+        const placed = [];
+        ctx.font = `${fontSize}px ${font}`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        for (const l of labels) {
+            const at = toScreen(l.p);
+            const w = ctx.measureText(l.n.label).width;
+            const box = { x: at.x - w / 2 - 2, y: at.y + l.r * transform.k + 2, w: w + 4, h: fontSize + 2 };
+            if (placed.some((b) => box.x < b.x + b.w && b.x < box.x + box.w && box.y < b.y + b.h && b.y < box.y + box.h)) continue;
+            placed.push(box);
+            ctx.globalAlpha = l.dimmed ? 0.25 : 1;
+            ctx.fillStyle = l.n.kind === "dir" ? roles.dim : l.n.kind === "file" ? roles.subtext : roles.text;
+            ctx.fillText(l.n.label, at.x, box.y + 1);
+        }
+        ctx.globalAlpha = 1;
         drawStrip();
         return liveLit.size > 0 || (f && (now - cursorSince < M.FLARE)) || pendingFiles.size > 0 || view.nodes.some((n) => n.kind === "sub" && n.status === "running");
     }
@@ -938,6 +1013,7 @@
         selectedFile = null;
         flares.clear();
         inflight = null;
+        clearTimeout(retryTimer);
         fillPicker();
         rebuild();
         askHistory();
@@ -980,12 +1056,18 @@
             lit: f ? [...f.lit.keys()] : [],
             summary: summary.textContent,
             settled: alpha === 0,
+            resets,
+            local: !!host.local,
+            epoch: host.epoch ?? null,
+            historyUnsupported,
         };
     }
 
     window.comuxGraph = {
         setData,
         addHistory,
+        historyFailed,
+        reset,
         setTheme,
         setHost: (h) => {
             host = { ...host, ...(h || {}) };

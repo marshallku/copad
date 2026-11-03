@@ -47,6 +47,7 @@ input {
 
 .bar {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 6px;
     padding: 6px 8px;
@@ -83,12 +84,15 @@ input[type="search"] {
     padding: 2px 6px;
 }
 
+/* A narrow panel wraps the picker and the filter onto a second row instead of crushing them. */
 select {
-    flex: 1 1 40%;
+    flex: 1 1 150px;
+    min-width: 120px;
 }
 
 input[type="search"] {
-    flex: 1 1 30%;
+    flex: 1 1 110px;
+    min-width: 90px;
 }
 
 .count {

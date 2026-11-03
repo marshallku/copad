@@ -631,6 +631,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         cockpitItem.target = self
         viewMenu.addItem(cockpitItem)
 
+        let graphItem = NSMenuItem(title: "Work Graph", action: #selector(toggleWorkGraph), keyEquivalent: "g")
+        graphItem.keyEquivalentModifierMask = [.command, .shift]
+        graphItem.target = self
+        viewMenu.addItem(graphItem)
+
         viewMenu.addItem(.separator())
 
         let zoomIn = NSMenuItem(title: "Zoom In", action: #selector(zoomIn), keyEquivalent: "=")
@@ -691,6 +696,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func toggleTabBar() {
         tabVC?.toggleTabBar(userInitiated: true)
+    }
+
+    /// The comux work-graph panel of the front window (decisions #204).
+    @objc func toggleWorkGraph() {
+        tabVC?.toggleComuxGraph(mode: "agent")
     }
 
     // MARK: - Agent cockpit
@@ -1348,6 +1358,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case "tab.new":
             vc.newTab()
             completion(["ok": true])
+
+        // The work-graph panel (decisions #204): `open` / `mode` set it; the answer is its
+        // state, with the page's own read-out under `page`.
+        case "comux.graph":
+            if params["open"] != nil || params["mode"] != nil {
+                let open = (params["open"] as? Bool) ?? true
+                vc.setComuxGraph(open: open, mode: params["mode"] as? String, animated: false)
+            }
+            vc.comuxGraphStatus { completion($0) }
+
+        // The notification dropdown under the top bar's bell (decisions #204).
+        case "comux.notifications":
+            if let open = params["open"] as? Bool { vc.setComuxNotifications(open: open) }
+            completion(vc.comuxNotificationsStatus())
 
         // Open a remote comux natively (decisions #171). No `dest` = ask for it.
         case "comux.open_remote":

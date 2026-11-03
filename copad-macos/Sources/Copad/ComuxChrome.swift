@@ -26,6 +26,20 @@ final class ComuxHost: ObservableObject {
         var overlays: [L0Overlay]
         /// Pane previews by consumer (a window), decisions #180.
         var previews: [String: L0PreviewState]?
+        /// When the work graph moved (decisions #204); the graph itself is read on demand.
+        var graph: GraphMeta?
+    }
+
+    struct GraphMeta: Decodable, Equatable {
+        var rev: UInt64
+        var agentsRev: UInt64
+        var epoch: UInt64
+        var pages: [String: UInt64]
+
+        enum CodingKeys: String, CodingKey {
+            case rev, epoch, pages
+            case agentsRev = "agents_rev"
+        }
     }
 
     /// One comux this app hosts: the local one (key `""`) or a remote one copad opened over SSH
@@ -161,6 +175,19 @@ final class ComuxHost: ObservableObject {
         copad_muxhost_preview(link.handle, consumer, pane, UInt16(clamping: rows), UInt16(clamping: cols))
     }
 
+    /// What `consumer`'s graph page needs (decisions #204), as the raw JSON.
+    func graphJSON(key: String, consumer: String) -> String? {
+        guard let link = links[key], let p = copad_muxhost_graph_json(link.handle, consumer) else { return nil }
+        defer { copad_ffi_free_string(p) }
+        return String(cString: p)
+    }
+
+    /// Ask for a page of `token`'s work-graph history for `consumer`.
+    func graphHistory(key: String, consumer: String, token: String, before: Int64, limit: Int64) {
+        guard let link = links[key] else { return }
+        copad_muxhost_graph_history(link.handle, consumer, token, before, limit)
+    }
+
     func command(key: String, _ req: [String: Any]) {
         guard let link = links[key], let d = try? JSONSerialization.data(withJSONObject: req),
               let s = String(data: d, encoding: .utf8) else { return }
@@ -175,8 +202,11 @@ final class ComuxWindow: ObservableObject {
     @Published private(set) var state: ComuxHost.State?
     /// The window's terminal font and theme, so the chrome reads like the TUI it replaces.
     @Published var style = ComuxStyle.make(config: .defaults, theme: .default)
-    /// The notification panel floats over the terminal (a narrow window) instead of docking.
-    @Published var notificationsFloating = false
+    /// The work-graph panel is open, and what it shows (`agent` / `all`), decisions #204.
+    @Published var graphOpen = false
+    @Published var graphMode = "agent"
+    /// The notification dropdown under the top bar's bell is open.
+    @Published var notificationsShown = false
     private(set) var key: String?
     /// This window's name for its pane preview (decisions #180).
     var consumer = ""
@@ -523,7 +553,6 @@ private struct SectionHeader: View {
 struct ComuxSidebar: View {
     @ObservedObject var host: ComuxWindow
     var settle: () -> Void
-    var toggleNotifications: () -> Void
     @FocusState private var keyboard: Bool
 
     var body: some View {
@@ -648,16 +677,6 @@ struct ComuxSidebar: View {
             Button { host.open("resume") } label: { Image(systemName: "clock.arrow.circlepath") }
                 .help("Resume a conversation… (Ctrl-b R)")
                 .accessibilityIdentifier("comuxResume")
-            Button(action: toggleNotifications) {
-                HStack(spacing: 2) {
-                    Image(systemName: "bell")
-                    if let n = host.state?.notifications?.unread, n > 0 {
-                        Text("\(n)").font(st.strong).foregroundStyle(st.yellow)
-                    }
-                }
-            }
-            .help("Notifications (Ctrl-b a)")
-            .accessibilityIdentifier("comuxNotificationsToggle")
         }
         .buttonStyle(.borderless)
         .foregroundStyle(st.subtext)
@@ -797,8 +816,9 @@ struct ComuxSidebar: View {
     }
 }
 
-/// The right panel: the notification center, newest first. A click opens the notification —
-/// its pane comes up and that pane's notifications leave the list; ✕ dismisses one.
+/// The notification center, newest first, dropping down from the top bar's bell (decisions
+/// #204; it was a right panel). A click opens the notification — its pane comes up and that
+/// pane's notifications leave the list; ✕ dismisses one.
 struct ComuxNotifications: View {
     @ObservedObject var host: ComuxWindow
     var settle: () -> Void
@@ -830,9 +850,10 @@ struct ComuxNotifications: View {
                 }
             }
         }
-        .background(host.notificationsFloating ? st.base.opacity(0.97) : .clear)
-        .overlay(alignment: .leading) { Rectangle().fill(st.rule).frame(width: 1) }
-        .shadow(color: .black.opacity(host.notificationsFloating ? 0.35 : 0), radius: 12, x: -4)
+        .background(st.base.opacity(0.97))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .overlay { RoundedRectangle(cornerRadius: 8).stroke(st.rule, lineWidth: 1) }
+        .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
         .accessibilityIdentifier("comuxNotifications")
     }
 

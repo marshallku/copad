@@ -44,11 +44,19 @@ final class TabViewController: NSViewController {
     private var comuxNotificationsWidth: NSLayoutConstraint!
     private var comuxStatus: NSView!
     private var comuxStatusHeight: NSLayoutConstraint!
-    /// Where the docked notification panel takes room from the terminal; zero while it floats
-    /// over the terminal instead (a window too narrow for both panels and 40 columns).
+    /// The right dock: where the work-graph panel takes room from the terminal (decisions
+    /// #204); zero wide while it is closed.
     private var comuxNotifSlot: NSView!
     private var comuxNotifSlotWidth: NSLayoutConstraint!
-    /// Closes the floating notification panel on Esc or a click outside it.
+    /// The notification dropdown's height (it hangs under the top bar's bell).
+    private var comuxNotificationsHeight: NSLayoutConstraint!
+    /// The top bar over the terminal (decisions #204).
+    private var comuxTopBar: NSView!
+    private var comuxTopHeight: NSLayoutConstraint!
+    /// The work-graph panel in the right dock, and the grip on its left edge.
+    private var comuxGraph: ComuxGraphPanel!
+    private weak var comuxGraphGrip: NSView?
+    /// Closes the notification dropdown on Esc or a click outside it.
     private var comuxFloatMonitor: Any?
     /// The delegated overlay this window is showing as a sheet, if any.
     private var comuxOverlayShown: UInt64?
@@ -516,10 +524,28 @@ final class TabViewController: NSViewController {
         let settle: () -> Void = { [weak self] in self?.settleComuxInput() }
         // The chrome never takes the keys from the terminal (it has no text field): a click on a
         // chip or a row acts and the pane keeps typing. Only `Ctrl-b e` hands the sidebar the keys.
-        let sidebar = ChromeHostingView(rootView: ComuxSidebar(host: host, settle: settle, toggleNotifications: { [weak self] in
-            self?.comuxNotificationsOpen.toggle()
-            self?.refreshComuxChrome()
+        let sidebar = ChromeHostingView(rootView: ComuxSidebar(host: host, settle: settle))
+        let topBar = ChromeHostingView(rootView: ComuxTopBar(host: host, settle: settle, toggleGraph: { [weak self] mode in
+            self?.toggleComuxGraph(mode: mode)
+        }, toggleNotifications: { [weak self] in
+            guard let self else { return }
+            self.comuxNotificationsOpen.toggle()
+            self.refreshComuxChrome()
         }))
+        let graph = ComuxGraphPanel(host: host)
+        graph.refocusPane = { [weak self] in self?.refocusPane() }
+        graph.modeChanged = { [weak self] mode in
+            guard let self, self.comuxWindow.graphMode != mode else { return }
+            self.comuxWindow.graphMode = mode
+            UserDefaults.standard.set(mode, forKey: Self.comuxGraphModeKey)
+        }
+        let graphGrip = ComuxResizeGrip()
+        graphGrip.direction = -1
+        graphGrip.onDrag = { [weak self] width in
+            UserDefaults.standard.set(width, forKey: Self.comuxGraphWidthKey)
+            self?.layoutComuxChrome()
+        }
+        graphGrip.currentWidth = { [weak self] in self?.comuxGraph.frame.width ?? 0 }
         sidebar.takesKeys = { [weak host] in host?.sidebarFocus != nil }
         let notifications = ChromeHostingView(rootView: ComuxNotifications(host: host, settle: settle, close: { [weak self] in
             self?.closeComuxNotifications()
@@ -543,15 +569,22 @@ final class TabViewController: NSViewController {
         comuxCardObservation = host.$hoverCard.sink { [weak card] c in
             DispatchQueue.main.async { card?.isHidden = c == nil }
         }
-        for v in [slot, sidebar, notifications, status, card, grip] as [NSView] {
+        for v in [slot, graph, topBar, sidebar, notifications, status, card, grip, graphGrip] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             contentArea.addSubview(v)
         }
         comuxSidebar = sidebar
+        comuxTopBar = topBar
+        comuxGraph = graph
+        comuxGraphGrip = graphGrip
+        comuxWindow.graphOpen = UserDefaults.standard.bool(forKey: Self.comuxGraphOpenKey)
+        comuxWindow.graphMode = UserDefaults.standard.string(forKey: Self.comuxGraphModeKey) ?? "agent"
         comuxNotifications = notifications
         comuxStatus = status
         comuxNotifSlot = slot
         comuxStatusHeight = status.heightAnchor.constraint(equalToConstant: 0)
+        comuxTopHeight = topBar.heightAnchor.constraint(equalToConstant: 0)
+        comuxNotificationsHeight = notifications.heightAnchor.constraint(equalToConstant: 0)
         comuxSidebarWidth = sidebar.widthAnchor.constraint(equalToConstant: 0)
         comuxNotificationsWidth = notifications.widthAnchor.constraint(equalToConstant: 0)
         comuxNotifSlotWidth = slot.widthAnchor.constraint(equalToConstant: 0)
@@ -564,10 +597,24 @@ final class TabViewController: NSViewController {
             status.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
             status.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
             comuxStatusHeight,
-            notifications.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
-            notifications.topAnchor.constraint(equalTo: contentArea.topAnchor),
-            notifications.bottomAnchor.constraint(equalTo: status.topAnchor),
+            // The top bar spans the terminal's column, between the sidebar and the graph dock.
+            topBar.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            topBar.trailingAnchor.constraint(equalTo: slot.leadingAnchor),
+            topBar.topAnchor.constraint(equalTo: contentArea.topAnchor),
+            comuxTopHeight,
+            // The notifications hang under the bell, at the top bar's right end.
+            notifications.trailingAnchor.constraint(equalTo: topBar.trailingAnchor, constant: -6),
+            notifications.topAnchor.constraint(equalTo: topBar.bottomAnchor, constant: 4),
+            comuxNotificationsHeight,
             comuxNotificationsWidth,
+            graph.leadingAnchor.constraint(equalTo: slot.leadingAnchor),
+            graph.trailingAnchor.constraint(equalTo: slot.trailingAnchor),
+            graph.topAnchor.constraint(equalTo: slot.topAnchor),
+            graph.bottomAnchor.constraint(equalTo: slot.bottomAnchor),
+            graphGrip.centerXAnchor.constraint(equalTo: graph.leadingAnchor),
+            graphGrip.widthAnchor.constraint(equalToConstant: 6),
+            graphGrip.topAnchor.constraint(equalTo: graph.topAnchor),
+            graphGrip.bottomAnchor.constraint(equalTo: graph.bottomAnchor),
             grip.centerXAnchor.constraint(equalTo: sidebar.trailingAnchor),
             grip.widthAnchor.constraint(equalToConstant: 6),
             grip.topAnchor.constraint(equalTo: sidebar.topAnchor),
@@ -585,6 +632,9 @@ final class TabViewController: NSViewController {
         sidebar.isHidden = true
         notifications.isHidden = true
         status.isHidden = true
+        topBar.isHidden = true
+        graph.isHidden = true
+        graphGrip.isHidden = true
         comuxObservation = ComuxHost.shared.$states.sink { [weak self] _ in
             DispatchQueue.main.async { self?.refreshComuxChrome() }
         }
@@ -623,13 +673,78 @@ final class TabViewController: NSViewController {
         comuxSidebar.isHidden = !on
         comuxGrip?.isHidden = !on
         comuxStatus.isHidden = !on
+        comuxTopBar.isHidden = !on
+        if comuxWindow.notificationsShown != (on && comuxNotificationsOpen) {
+            comuxWindow.notificationsShown = on && comuxNotificationsOpen
+        }
         layoutComuxChrome()
         presentComuxOverlay()
+        if !comuxGraph.isHidden { comuxGraph.feed() }
     }
 
-    /// Panel sizes follow the terminal font (decisions #178) within a budget of the window: the
-    /// sidebar takes at most 30% of it, the notification panel 35%, and when the two would
-    /// leave the terminal under 40 columns the notification panel floats over it instead.
+    /// Open the work-graph panel on `mode`, or close it when it already shows that (the top
+    /// bar's two buttons, ⌘⇧G = `agent`).
+    func toggleComuxGraph(mode: String) {
+        let w = comuxWindow
+        let open = !(w.graphOpen && w.graphMode == mode)
+        setComuxGraph(open: open, mode: mode, animated: true)
+    }
+
+    func setComuxGraph(open: Bool, mode: String?, animated: Bool) {
+        let w = comuxWindow
+        if let mode, mode != w.graphMode {
+            w.graphMode = mode
+            UserDefaults.standard.set(mode, forKey: Self.comuxGraphModeKey)
+            comuxGraph.setMode(mode)
+        }
+        guard open != w.graphOpen else { return }
+        w.graphOpen = open
+        UserDefaults.standard.set(open, forKey: Self.comuxGraphOpenKey)
+        comuxGraphAnimated = animated && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        layoutComuxChrome()
+        comuxGraphAnimated = false
+        if open { comuxGraph.feed() }
+    }
+
+    /// The e2e's view of the panel: open, mode, and the page's own read-out.
+    func comuxGraphStatus(_ done: @escaping ([String: Any]) -> Void) {
+        let w = comuxWindow
+        var out: [String: Any] = ["open": w.graphOpen, "mode": w.graphMode, "shown": !comuxGraph.isHidden,
+                                  "width": comuxGraph.frame.width, "loaded": comuxGraph.loaded,
+                                  "terminal_width": activePaneManager?.containerView.frame.width ?? 0]
+        comuxGraph.pageState { s in
+            out["page"] = s ?? NSNull()
+            done(out)
+        }
+    }
+
+    func setComuxNotifications(open: Bool) {
+        comuxNotificationsOpen = open
+        refreshComuxChrome()
+        view.layoutSubtreeIfNeeded()
+    }
+
+    /// The dropdown's state for the e2e: shown, and its frame (x, y from the content's top,
+    /// width, height) beside the top bar's.
+    func comuxNotificationsStatus() -> [String: Any] {
+        let f = comuxNotifications.frame
+        let top = contentArea.bounds.height
+        let bar = comuxTopBar.frame
+        return ["shown": !comuxNotifications.isHidden,
+                "frame": [f.minX, top - f.maxY, f.width, f.height],
+                "top_bar": [bar.minX, top - bar.maxY, bar.width, bar.height]]
+    }
+
+    private var comuxGraphAnimated = false
+    static let comuxGraphOpenKey = "comuxGraphOpen"
+    static let comuxGraphModeKey = "comuxGraphMode"
+    static let comuxGraphWidthKey = "comuxGraphWidth"
+
+    /// Panel sizes follow the terminal font (decisions #178) within ONE budget of the window
+    /// (decisions #204): the terminal keeps at least 40 columns (and 320 pt); past that the
+    /// work-graph dock gives way first (to its 260 pt floor), then the sidebar (to 160 pt), and
+    /// if that is still too much the dock is hidden — not closed: it comes back when the window
+    /// grows. Restored and dragged widths go through the same budget.
     private func layoutComuxChrome() {
         guard comuxSidebar != nil else { return }
         let on = comuxWindow.state != nil
@@ -638,20 +753,40 @@ final class TabViewController: NSViewController {
         let natural = min(max(30 * st.advance, 200), max(0.3 * width, 160))
         // A width the user dragged to (decisions #181) wins, within what leaves the terminal usable.
         let dragged = UserDefaults.standard.double(forKey: Self.comuxSidebarWidthKey)
-        let side = on ? (dragged > 0 ? min(max(dragged, 160), max(0.6 * width, 160)) : natural).rounded() : 0
-        let notifOpen = on && comuxNotificationsOpen
-        let notif = notifOpen ? min(max(38 * st.advance, 260), max(0.35 * width, 220)).rounded() : 0
-        // Always over the terminal, never beside it: opening it must not reflow the panes, and
-        // opening a notification closes it anyway.
-        let floating = notifOpen
+        var side = on ? (dragged > 0 ? min(max(dragged, 160), max(0.6 * width, 160)) : natural).rounded() : 0
+        let graphWanted = on && comuxWindow.graphOpen
+        let draggedGraph = UserDefaults.standard.double(forKey: Self.comuxGraphWidthKey)
+        var graph = graphWanted
+            ? (draggedGraph > 0 ? max(draggedGraph, 260) : min(max(42 * st.advance, 300), 0.45 * width)).rounded() : 0
+        let budget = width - max(40 * st.advance, 320)
+        if side + graph > budget, graph > 0 { graph = max(260, budget - side) }
+        if side + graph > budget, on { side = max(160, budget - graph) }
+        if side + graph > budget { graph = 0 }
         set(comuxSidebarWidth, side)
         set(comuxCardWidth, on ? (72 * st.advance + 40).rounded() : 0)
         set(comuxStatusHeight, on ? st.statusHeight : 0)
+        set(comuxTopHeight, on ? st.statusHeight : 0)
+        if comuxGraphAnimated {
+            NSAnimationContext.runAnimationGroup { ctx in
+                ctx.duration = 0.18
+                ctx.allowsImplicitAnimation = true
+                comuxNotifSlotWidth.animator().constant = graph
+                contentArea.layoutSubtreeIfNeeded()
+            }
+        } else {
+            set(comuxNotifSlotWidth, graph)
+        }
+        comuxGraph.isHidden = graph == 0
+        comuxGraphGrip?.isHidden = graph == 0
+        let notifOpen = on && comuxNotificationsOpen
+        let notif = notifOpen ? min(max(38 * st.advance, 260), max(0.35 * width, 220)).rounded() : 0
         set(comuxNotificationsWidth, notif)
-        set(comuxNotifSlotWidth, floating ? 0 : notif)
+        // As tall as its rows (a header, then two lines per notification), within 60% of the window.
+        let rows = CGFloat(max(comuxWindow.state?.notifications?.items.count ?? 0, 1))
+        let fits = st.oneLineHeight + 7 + rows * (st.lineHeight * 2 + 14) + 8
+        set(comuxNotificationsHeight, notifOpen ? min(fits, max(0.6 * contentArea.bounds.height, 120)).rounded() : 0)
         comuxNotifications.isHidden = !notifOpen
-        if comuxWindow.notificationsFloating != floating { comuxWindow.notificationsFloating = floating }
-        watchFloatingNotifications(floating)
+        watchFloatingNotifications(notifOpen)
     }
 
     private func set(_ c: NSLayoutConstraint, _ v: CGFloat) {
@@ -673,9 +808,9 @@ final class TabViewController: NSViewController {
                 return nil
             }
             if e.type == .leftMouseDown {
-                // The sidebar (whose bell toggles this panel) is not "outside": closing here
+                // The top bar (whose bell toggles this dropdown) is not "outside": closing here
                 // and then running the bell's toggle would reopen it.
-                let inside = [self.comuxNotifications, self.comuxSidebar].contains { v in
+                let inside = [self.comuxNotifications, self.comuxTopBar].contains { v in
                     v.map { $0.bounds.contains($0.convert(e.locationInWindow, from: nil)) } ?? false
                 }
                 if !inside { self.closeComuxNotifications() }
@@ -1062,7 +1197,7 @@ final class TabViewController: NSViewController {
         // Under the comux chrome, so a floating notification panel stays on top of it.
         contentArea.addSubview(manager.containerView, positioned: .below, relativeTo: comuxNotifSlot)
         NSLayoutConstraint.activate([
-            manager.containerView.topAnchor.constraint(equalTo: contentArea.topAnchor),
+            manager.containerView.topAnchor.constraint(equalTo: comuxTopBar.bottomAnchor),
             // Between the comux panels, which are zero-width unless this window hosts a comux.
             manager.containerView.leadingAnchor.constraint(equalTo: comuxSidebar.trailingAnchor),
             manager.containerView.trailingAnchor.constraint(equalTo: comuxNotifSlot.leadingAnchor),
@@ -1511,6 +1646,8 @@ private final class ComuxMenuPicker: NSObject {
 /// the sidebar's width (decisions #181).
 final class ComuxResizeGrip: NSView {
     var onDrag: ((CGFloat) -> Void)?
+    /// 1 = dragging right widens (a left panel's grip), −1 = dragging left does (a right one's).
+    var direction: CGFloat = 1
     var currentWidth: (() -> CGFloat)?
     private var start: (x: CGFloat, width: CGFloat)?
 
@@ -1524,7 +1661,7 @@ final class ComuxResizeGrip: NSView {
 
     override func mouseDragged(with e: NSEvent) {
         guard let start else { return }
-        onDrag?(max(120, start.width + e.locationInWindow.x - start.x))
+        onDrag?(max(120, start.width + (e.locationInWindow.x - start.x) * direction))
     }
 
     override func mouseUp(with e: NSEvent) {

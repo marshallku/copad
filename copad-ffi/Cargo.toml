@@ -19,3 +19,4 @@ serde_json = "1"
 # build wires both crates without duplication.
 copad-core = { path = "../copad-core" }
 copad-mux-proto = { path = "../copad-mux-proto" }
+copad-graph-web = { path = "../copad-graph-web" }
