@@ -69,8 +69,12 @@ run agent '
   G.setData(FIX);
   await sleep(1500);
   out.state = G.state();
+  G.render();
+  const px = document.getElementById("graph").getContext("2d").getImageData(0, 0, 300, 300).data;
+  out.painted = px.some((v, i) => i % 4 === 3 && v > 0);
 '
-[[ "$(q agent 'd.get("error","")')" == "" ]] || fail "the page threw: $(q agent 'd["error"]')"
+[[ "$(q agent 'd.get("error","")')" == "" ]]
+[[ "$(q agent 'd["painted"]')" == True ]] || fail "render() should paint the canvas" || fail "the page threw: $(q agent 'd["error"]')"
 [[ "$(q agent 'd["posts"][0]["type"]')" == ready ]] || fail "no ready under the production CSP: $(cat "$WORK/agent.json")"
 [[ "$(q agent 'd["state"]["agent"]')" == "n1-1" ]] || fail "the focused agent should be shown"
 [[ "$(q agent '(d["state"]["files"], d["state"]["subagents"], d["state"]["steps"])')" == "(5, 1, 11)" ]] \

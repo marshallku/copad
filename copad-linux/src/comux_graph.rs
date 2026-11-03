@@ -274,11 +274,37 @@ impl GraphPanel {
     /// screenshots of a web view are not trustworthy.
     pub fn snapshot(&self, path: &str, done: impl FnOnce(bool) + 'static) {
         let path = path.to_string();
-        self.web.snapshot(
-            webkit6::SnapshotRegion::Visible,
-            webkit6::SnapshotOptions::NONE,
+        // The snapshot leaves out the GPU canvas, so the graph's own pixels are saved beside it
+        // (`<path>.canvas.png`), as WebKit drew them. `done` hears success only when BOTH files
+        // were written: the canvas first, then the snapshot.
+        let canvas = format!("{path}.canvas.png");
+        let web = self.web.clone();
+        self.web.evaluate_javascript(
+            "comuxGraph.render(); document.getElementById('graph').toDataURL('image/png')",
+            None,
+            None,
             gtk4::gio::Cancellable::NONE,
-            move |r| done(r.ok().is_some_and(|t| t.save_to_png(&path).is_ok())),
+            move |r| {
+                let wrote = r
+                    .ok()
+                    .and_then(|v| {
+                        v.to_str()
+                            .strip_prefix("data:image/png;base64,")
+                            .map(str::to_string)
+                    })
+                    .is_some_and(|b64| {
+                        std::fs::write(&canvas, gtk4::glib::base64_decode(&b64)).is_ok()
+                    });
+                if !wrote {
+                    return done(false);
+                }
+                web.snapshot(
+                    webkit6::SnapshotRegion::Visible,
+                    webkit6::SnapshotOptions::NONE,
+                    gtk4::gio::Cancellable::NONE,
+                    move |r| done(r.ok().is_some_and(|t| t.save_to_png(&path).is_ok())),
+                );
+            },
         );
     }
 

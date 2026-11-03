@@ -172,7 +172,8 @@ gwait 'd["page"]["seq"]' 36 40
 echo "ok — a step appended to the transcript reached the panel live (#36)"
 # WebKit's own render of the panel (Broadway's screenshots of a web view are not trustworthy).
 [[ "$(gq 'd["snapshot"]' '{"snapshot":"'"$W"'/graph-webkit.png"}')" == True ]] || fail "no WebKit snapshot"
-echo "ok — WebKit rendered the panel: $W/graph-webkit.png"
+[[ -s "$W/graph-webkit.png.canvas.png" ]] || fail "no canvas render of the graph"
+echo "ok — WebKit rendered the panel: $W/graph-webkit.png (+ the graph canvas: .canvas.png)"
 [[ "$(gq 'd["mode"]' '{"open":true,"mode":"all"}')" == all ]] || fail "mode all"
 gwait '(d["page"]["mode"], d["page"]["agents"])' "('all', 1)" 20
 if [[ -n "${SHOT_WAIT:-}" ]]; then echo "GRAPH_SHOT"; sleep "$SHOT_WAIT"; fi

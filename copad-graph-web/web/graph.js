@@ -1079,12 +1079,18 @@
             kick();
         },
         state,
+        // Draw now, without waiting for a frame (a host with no display schedules none): what a
+        // capture of the canvas needs.
+        render: () => {
+            while (alpha > 0) tick();
+            draw(performance.now());
+        },
     };
 
     // A parent frame (the web client) drives it the same way.
     window.addEventListener("message", (e) => {
         const m = e.data && e.data.comuxGraphCall;
-        if (!m || typeof window.comuxGraph[m.fn] !== "function" || m.fn === "state") return;
+        if (!m || typeof window.comuxGraph[m.fn] !== "function" || m.fn === "state" || m.fn === "render") return;
         window.comuxGraph[m.fn](m.arg);
     });
 
