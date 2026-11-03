@@ -156,7 +156,7 @@ impl Style {
     }
 
     /// green < 70% ≤ yellow < 90% ≤ red, like the TUI's gauges.
-    fn usage(&self, pct: f64) -> &str {
+    pub(crate) fn usage(&self, pct: f64) -> &str {
         if pct >= 90.0 {
             &self.red
         } else if pct >= 70.0 {
@@ -444,6 +444,38 @@ pub(crate) fn shared_marker(a: &Value) -> String {
     match a["worktree_peers"].as_u64() {
         Some(n) if n > 0 => format!("⇄{}", n + 1),
         _ => String::new(),
+    }
+}
+
+/// An agent's context reading (`context` on the L0 agent): its fill in percent when the window
+/// is known, the short label (`62%`, else `131k`) and the long one (`124k/200k · $1.20 · $3.40/h`),
+/// all as the TUI words them.
+pub(crate) fn agent_context(a: &Value) -> Option<(Option<f64>, String, String)> {
+    let c = a.get("context").filter(|c| c.is_object())?;
+    let used = c["used"].as_u64()?;
+    let window = c["window"].as_u64().filter(|w| *w > 0);
+    let pct = window.map(|w| used as f64 * 100.0 / w as f64);
+    let short = pct.map_or_else(|| tokens(used), |p| format!("{p:.0}%"));
+    let mut long = match window {
+        Some(w) => format!("{}/{}", tokens(used), tokens(w)),
+        None => format!("{} tokens", tokens(used)),
+    };
+    if let Some(cost) = c["cost_usd"].as_f64() {
+        long.push_str(&format!(" · ${cost:.2}"));
+    }
+    if let Some(rate) = c["cost_per_hour"].as_f64() {
+        long.push_str(&format!(" · ${rate:.2}/h"));
+    }
+    Some((pct, short, long))
+}
+
+fn tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
     }
 }
 
@@ -1259,15 +1291,25 @@ impl ComuxPanel {
                         .as_str()
                         .or(a["tool"].as_str())
                         .unwrap_or_default();
-                    let row = list_row(
-                        &entry(
-                            &left,
-                            &right,
-                            Some(&span(&st.dim, detail)),
-                            2 * self.advance(),
-                        ),
-                        true,
-                    );
+                    // The second line: what it is doing, with its context gauge flush right.
+                    let body = entry(&left, &right, None, 0);
+                    let sub = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+                    sub.set_margin_start(2 * self.advance());
+                    let what = markup(&span(&st.dim, detail));
+                    what.set_hexpand(true);
+                    sub.append(&what);
+                    if let Some((pct, short, long)) = agent_context(a) {
+                        let gauge = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+                        let tone = pct.map_or(st.dim.as_str(), |p| st.usage(p));
+                        if let Some(p) = pct {
+                            gauge.append(&gauge_widget(p, &st.rule, tone, self.advance()));
+                        }
+                        gauge.append(&markup(&span(tone, &short)));
+                        gauge.set_tooltip_text(Some(&long));
+                        sub.append(&gauge);
+                    }
+                    body.append(&sub);
+                    let row = list_row(&body, true);
                     let tab = format!(
                         "{}/{}",
                         a["space_id"].as_str().unwrap_or_default(),
@@ -2262,6 +2304,18 @@ mod tests {
 
     /// Every row the agents list shows has its action at the same index: headers and the
     /// band's rule shift the rows (codex C2).
+    #[test]
+    fn agent_context_words_it_as_the_tui() {
+        let a = json!({"context": {"used": 124000, "window": 200000, "cost_usd": 1.2, "cost_per_hour": 3.4}});
+        let (pct, short, long) = agent_context(&a).unwrap();
+        assert_eq!(pct.map(|p| p.round()), Some(62.0));
+        assert_eq!(short, "62%");
+        assert_eq!(long, "124k/200k · $1.20 · $3.40/h");
+        let bare = json!({"context": {"used": 131000}});
+        assert_eq!(agent_context(&bare).unwrap().1, "131k");
+        assert!(agent_context(&json!({"status": "ready"})).is_none());
+    }
+
     #[test]
     fn agent_rows_put_the_band_first_and_group_by_space() {
         let agents = vec![

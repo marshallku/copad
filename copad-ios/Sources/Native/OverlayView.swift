@@ -340,7 +340,8 @@ private struct PickerOverlay: View {
                     list.frame(width: showsPreview ? max(geo.size.width * 0.4, min(30 * look.advance, geo.size.width)) : geo.size.width)
                     if showsPreview {
                         Rectangle().fill(look.rule).frame(width: 1)
-                        PanePreview(pane: current?.pane, look: look, state: context.preview, handlers: handlers)
+                        PanePreview(pane: current?.pane, look: look, state: context.preview, handlers: handlers,
+                                    agent: context.agents.first { $0.token == current?.pane })
                     }
                 }
             }
@@ -477,7 +478,8 @@ private struct PickerOverlay: View {
                 rowActions(r)
             } preview: {
                 if let pane = r.pane, !pane.isEmpty {
-                    PanePreview(pane: pane, look: look, state: context.preview, handlers: handlers)
+                    PanePreview(pane: pane, look: look, state: context.preview, handlers: handlers,
+                                agent: context.agents.first { $0.token == pane })
                         .frame(width: 360, height: 300)
                         .background(look.base)
                 } else {
@@ -590,6 +592,10 @@ private struct PickerCard: View {
                 Text(a.tool).font(look.strong).lineLimit(1)
                 Text(since.isEmpty ? a.shownStatus : "\(a.shownStatus) \(since)").foregroundStyle(st.color).lineLimit(1)
                 Spacer(minLength: 4)
+                if let c = a.context {
+                    ComuxContextGauge(context: c, track: look.rule, dim: look.dim, tone: look.usage,
+                                      width: look.advance * 4, height: max(4, look.lineHeight * 0.32))
+                }
                 if a.focused { Text("here").foregroundStyle(look.dim) }
             }
             Text(a.detail.map { "\(place) — \($0)" } ?? place)
@@ -656,10 +662,17 @@ struct PanePreview: View {
     let look: OverlayLook
     let state: L0PreviewState?
     let handlers: OverlayHandlers
+    /// The previewed pane's agent, whose readout goes under the header as in the TUI.
+    var agent: L0Agent? = nil
+
+    /// Lines the agent readout takes: the context gauge, and what it is doing.
+    private var readoutLines: Int {
+        (agent?.context == nil ? 0 : 1) + ((agent?.detail ?? "").isEmpty ? 0 : 1)
+    }
 
     var body: some View {
         GeometryReader { geo in
-            let rows = max(Int(geo.size.height / look.lineHeight) - 1, 1)
+            let rows = max(Int(geo.size.height / look.lineHeight) - 1 - readoutLines, 1)
             let cols = max(Int((geo.size.width - 20) / look.advance), 1)
             VStack(alignment: .leading, spacing: 0) {
                 content(rows: rows)
@@ -685,6 +698,18 @@ struct PanePreview: View {
         } else if let p {
             Text(p.header ?? "").font(look.strong).foregroundStyle(look.subtext).lineLimit(1)
                 .frame(height: look.lineHeight)
+            if let c = agent?.context {
+                HStack(spacing: 6) {
+                    Text("ctx").foregroundStyle(look.dim)
+                    ComuxContextGauge(context: c, track: look.rule, dim: look.dim, tone: look.usage,
+                                      width: look.advance * 20, height: max(4, look.lineHeight * 0.32),
+                                      suffix: "· \(c.long)")
+                }
+                .frame(height: look.lineHeight)
+            }
+            if let d = agent?.detail, !d.isEmpty {
+                Text(d).foregroundStyle(look.subtext).lineLimit(1).frame(height: look.lineHeight)
+            }
             Spacer(minLength: 0)
             ForEach(Array(p.lines.suffix(rows).enumerated()), id: \.offset) { _, line in
                 Text(attributed(line)).lineLimit(1).fixedSize(horizontal: true, vertical: false)
@@ -881,6 +906,41 @@ private func isSubsequence(_ needle: String, of hay: String) -> Bool {
         if !found { return false }
     }
     return true
+}
+
+// MARK: - agent context gauge
+
+/// An agent's context fill as the usage readout draws a window: a capsule bar coloured green /
+/// yellow / red at 70% / 90%, then the percentage. Without a known window there is nothing to
+/// fill, so it shows the raw token count instead.
+struct ComuxContextGauge: View {
+    var context: L0AgentContext
+    var track: Color
+    var dim: Color
+    var tone: (Double) -> Color
+    var width: CGFloat = 40
+    var height: CGFloat = 4
+    /// Extra text after the percentage (`· $1.20`).
+    var suffix: String = ""
+
+    var body: some View {
+        HStack(spacing: 4) {
+            if let pct = context.pct {
+                ZStack(alignment: .leading) {
+                    Capsule().fill(track)
+                    Capsule().fill(tone(pct)).frame(width: width * min(max(pct, 0), 100) / 100)
+                }
+                .frame(width: width, height: height)
+                Text(context.short).foregroundStyle(tone(pct))
+            } else {
+                Text(context.short).foregroundStyle(dim)
+            }
+            if !suffix.isEmpty { Text(suffix).foregroundStyle(dim) }
+        }
+        .lineLimit(1)
+        .fixedSize()
+        .help(context.long)
+    }
 }
 
 // MARK: - usage readout (decisions #179, #182)

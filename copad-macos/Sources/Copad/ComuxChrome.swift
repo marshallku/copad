@@ -749,8 +749,15 @@ struct ComuxSidebar: View {
                     Spacer(minLength: 4)
                     ElapsedText(since: a.since_unix, prefix: a.shownStatus).foregroundStyle(color).lineLimit(1)
                 }
-                Text(a.detail ?? a.tool).foregroundStyle(st.dim).lineLimit(1)
-                    .padding(.leading, st.advance * 2)
+                HStack(spacing: 6) {
+                    Text(a.detail ?? a.tool).foregroundStyle(st.dim).lineLimit(1)
+                    if let c = a.context {
+                        Spacer(minLength: 4)
+                        ComuxContextGauge(context: c, track: st.rule, dim: st.dim, tone: st.usage,
+                                          width: st.advance * 6, height: max(4, st.lineHeight * 0.32))
+                    }
+                }
+                .padding(.leading, st.advance * 2)
             }
             .font(st.body)
             .padding(.horizontal, 8)

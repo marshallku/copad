@@ -1103,9 +1103,16 @@ impl PickerUi {
                 .as_str()
                 .map(|d| format!("{place} — {d}"))
                 .unwrap_or(place);
+            // The fill on the row; the whole readout goes above the preview, as in the TUI.
+            let ctx = crate::comux_panel::agent_context(a)
+                .map(|(pct, short, _)| {
+                    let tone = pct.map_or(s.dim.as_str(), |p| s.usage(p));
+                    format!("  {}", bold(span(tone, &short)))
+                })
+                .unwrap_or_default();
             (
                 format!(
-                    "{} {} {}",
+                    "{} {} {}{ctx}",
                     span(c, g),
                     bold(span(&s.text, a["tool"].as_str().unwrap_or_default())),
                     span(c, &format!("{status} {since}"))
@@ -1182,9 +1189,20 @@ impl PickerUi {
             .current()
             .and_then(|r| r["pane"].as_str().map(str::to_string))
             .filter(|p| !p.is_empty());
+        // The agent readout under the header takes rows from the pane's text.
+        let readout = pane
+            .as_deref()
+            .and_then(|p| {
+                self.state.borrow()["agents"]["agents"]
+                    .as_array()
+                    .and_then(|v| v.iter().find(|a| a["token"] == p))
+                    .map(|a| agent_readout(&self.style, a))
+            })
+            .unwrap_or_default();
+        let extra = readout.matches('\n').count() as i32;
         let (w, h) = (pv.width(), pv.height());
         let rows = if h > 0 {
-            (h / self.cell.1 - 1).max(1)
+            (h / self.cell.1 - 1 - extra).max(1)
         } else {
             30
         } as u16;
@@ -1212,7 +1230,7 @@ impl PickerUi {
             }
             _ => match serde_json::from_value::<l0::Preview>(st["preview"].clone()) {
                 Ok(p) if p.pane == pane => {
-                    head.set_markup(&bold(span(&s.subtext, &p.header)));
+                    head.set_markup(&(bold(span(&s.subtext, &p.header)) + &readout));
                     let lines: Vec<String> = p
                         .lines
                         .iter()
@@ -1345,6 +1363,31 @@ fn short_dir(d: &str) -> String {
         Ok(h) if !h.is_empty() && d.starts_with(&h) => format!("~{}", &d[h.len()..]),
         _ => d.to_string(),
     }
+}
+
+/// What the switcher preview adds under its header for an agent, as the TUI does: the context
+/// gauge drawn in box-drawing glyphs (`━━━━━━╌╌╌ 62% · 124k/200k · $1.20 · $3.40/h`), then what
+/// it is doing or waiting for. Each line starts with a newline; empty for no reading.
+fn agent_readout(s: &crate::comux_panel::Style, a: &serde_json::Value) -> String {
+    let mut out = String::new();
+    if let Some((pct, short, long)) = crate::comux_panel::agent_context(a) {
+        out.push('\n');
+        out.push_str(&span(&s.dim, "ctx "));
+        if let Some(p) = pct {
+            let filled = ((p / 100.0) * 20.0).round().clamp(0.0, 20.0) as usize;
+            let bar = format!("{}{} ", "━".repeat(filled), "╌".repeat(20 - filled));
+            out.push_str(&span(s.usage(p), &bar));
+            out.push_str(&bold(span(s.usage(p), &short)));
+            out.push_str(&span(&s.dim, &format!(" · {long}")));
+        } else {
+            out.push_str(&span(&s.dim, &long));
+        }
+    }
+    if let Some(d) = a["detail"].as_str().filter(|d| !d.is_empty()) {
+        out.push('\n');
+        out.push_str(&span(&s.subtext, d));
+    }
+    out
 }
 
 #[cfg(test)]

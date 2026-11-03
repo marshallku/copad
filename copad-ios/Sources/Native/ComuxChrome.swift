@@ -259,7 +259,15 @@ struct SpacesDrawer: View {
                     Spacer(minLength: 4)
                     ElapsedText(since: a.since_unix, prefix: a.shownStatus).foregroundStyle(color).lineLimit(1)
                 }
-                Text(a.detail ?? a.tool).foregroundStyle(ComuxLook.dim).lineLimit(1).padding(.leading, 16)
+                HStack(spacing: 6) {
+                    Text(a.detail ?? a.tool).foregroundStyle(ComuxLook.dim).lineLimit(1)
+                    if let c = a.context {
+                        Spacer(minLength: 4)
+                        ComuxContextGauge(context: c, track: ComuxLook.rule, dim: ComuxLook.dim,
+                                          tone: ComuxLook.usage, width: 40, height: 4)
+                    }
+                }
+                .padding(.leading, 16)
             }
             .font(ComuxLook.body)
             .padding(.horizontal, 12)

@@ -68,12 +68,43 @@ struct L0Agent: Codable, Equatable, Identifiable {
     var unseen: Bool?
     /// Other agents in the same git worktree (absent when none).
     var worktree_peers: Int?
+    /// Context fill and spend (absent without a reading, and from older servers).
+    var context: L0AgentContext?
 
     var id: String { token }
     /// `⇄2` when the agent shares its worktree (the count includes it), as in the TUI.
     var sharedMarker: String { (worktree_peers ?? 0) > 0 ? "⇄\((worktree_peers ?? 0) + 1)" : "" }
     /// The status word to show: an unseen finish reads `done`, as in the TUI.
     var shownStatus: String { unseen == true && status == "ready" ? "done" : status }
+}
+
+/// An agent's context window fill and spend, drawn as a gauge like the usage readout.
+struct L0AgentContext: Codable, Equatable {
+    var used: Int64
+    var window: Int64?
+    var cost_usd: Double?
+    var cost_per_hour: Double?
+
+    /// Fill in percent, when the window is known (Claude's comes only from its statusline).
+    var pct: Double? {
+        guard let w = window, w > 0 else { return nil }
+        return Double(used) * 100 / Double(w)
+    }
+    /// `62%`, else the raw `131k` — as the TUI row.
+    var short: String { pct.map { "\(Int($0.rounded()))%" } ?? L0AgentContext.tokens(used) }
+    /// `124k/200k · $1.20 · $3.40/h`, as the TUI switcher preview.
+    var long: String {
+        var out = window.map { "\(L0AgentContext.tokens(used))/\(L0AgentContext.tokens($0))" }
+            ?? "\(L0AgentContext.tokens(used)) tokens"
+        if let c = cost_usd { out += String(format: " · $%.2f", c) }
+        if let r = cost_per_hour { out += String(format: " · $%.2f/h", r) }
+        return out
+    }
+
+    static func tokens(_ n: Int64) -> String {
+        n >= 1_000_000 ? String(format: "%.1fM", Double(n) / 1_000_000)
+            : n >= 1_000 ? "\(n / 1_000)k" : "\(n)"
+    }
 }
 
 struct L0Notifications: Codable, Equatable {
