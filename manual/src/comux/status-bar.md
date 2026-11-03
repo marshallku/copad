@@ -25,6 +25,11 @@ The server watches each agent's status **transitions** and fires a native deskto
 - The `⚑N` indicator counts agents needing attention.
 - `Ctrl-b !` jumps to a blocked agent.
 - `Ctrl-b a` opens a **notification center** listing logged turn events (jump / dismiss).
+- A blocked **Claude** agent says what it waits for: `needs approval · Bash: git status` for a permission, `asks · …` for a question. comux reads this from undocumented fields of Claude's session file, so it can be missing.
+- A finished turn that comux **detects itself** is announced only after it has held for `notify_settle_secs` (3 s). A `comux notify --kind done` from an agent's own hook is announced at once — the hook knows the real moment. Hooks that block a stop — a verification gate, `/goal` — make an agent go idle and busy again within seconds, and that is not a finish. comux polls, so a flap entirely between two checks (every 5 s while nobody is attached) still slips through.
+- An agent blocked for `notify_remind_mins` (10) with nobody having looked gets **one** `still waiting 10m` reminder per block.
+
+"Looked" means: a key or click on that pane, a jump to it (toast click, sidebar, `Ctrl-b u`, `comux jump`), or reading that turn's notification. Reading an older notification does not count for a newer turn.
 
 Disable toasts with `notify = false` in `mux.toml`, or `COPAD_MUX_NOTIFY=0` (the env var wins).
 

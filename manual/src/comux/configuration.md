@@ -12,7 +12,7 @@ Most settings apply on the running server without a restart:
 comux reload          # re-read mux.toml on the live server (alias: comux source-file)
 ```
 
-`reload` re-reads the file, swaps the config in place, and prints the config path plus any parse warnings — it never breaks the running mux. Keybindings, mouse, `osc52`, `sidebar_width`, all `usage_*`, `tab_labels`, `notify`, `reconcile_secs`, and worktree settings apply on the next frame.
+`reload` re-reads the file, swaps the config in place, and prints the config path plus any parse warnings — it never breaks the running mux. Keybindings, mouse, `osc52`, `sidebar_width`, all `usage_*`, `tab_labels`, `notify`, `notify_settle_secs`, `notify_remind_mins`, `reconcile_secs`, and worktree settings apply on the next frame.
 
 **Four settings are fixed at server boot** and need `comux server restart` instead: `persist`, `autosave_secs`, `update_environment`, and `never_inherit`. (`restore_processes` / `restore_agent_sessions` are read at save time, so `reload` does update them for the next save.)
 
@@ -26,6 +26,8 @@ comux reload          # re-read mux.toml on the live server (alias: comux source
 | `mouse` | `true` | bool | Wheel-scroll, click-to-focus, click chrome to navigate |
 | `osc52` | `true` | bool | Relay a pane program's OSC 52 clipboard write to the attached clients (tmux `set-clipboard`). Clipboard *reads* are never answered |
 | `notify` | `true` | bool | Agent turn-completion desktop toasts (`COPAD_MUX_NOTIFY` wins) |
+| `notify_settle_secs` | `3` | `0`–`60` (`0` = at once) | A finished turn comux detects must hold this long before it is announced — a stop hook that sends the agent straight back to work is not a finish. Hook pushes (`comux notify`) are never delayed |
+| `notify_remind_mins` | `10` | `0`–`1440` (`0` = never) | Remind once about an agent still blocked, with nobody having looked, after this many minutes |
 | `sidebar` | `true` | bool | Show the spaces+agents sidebar by default |
 | `sidebar_width` | `24` | `8`–`80` | Sidebar columns |
 | `sidebar_min_cols` | `80` | `40`–`400` (forced ≥ `sidebar_width + 20`) | Hide the sidebar below this terminal width |

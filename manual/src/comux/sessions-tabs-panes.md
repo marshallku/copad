@@ -147,7 +147,7 @@ This is the fastest way to hop between many sessions or straight to whichever ag
 An always-on left sidebar (toggle with `Ctrl-b s`) shows two groups:
 
 - **spaces** — your sessions, each with its **git-branch subtitle** read live from `.git/HEAD`. When they overflow, it windows around the active one with a `+N more · Ctrl-f` hint.
-- **agents** — every agent pane across all sessions, with `status · tool` (e.g. `working · Edit`).
+- **agents** — every agent pane across all sessions, with `status · tool` (e.g. `working · Edit`). A green `✓ done` is a turn that finished while nobody was looking; it turns back into `◐ ready` once you act on that pane, jump to it, or read its notification. A yellow `⇄2` after the title means two agents are running in the same git checkout (by their working directory) — the classic way two agents overwrite each other's edits. A linked worktree (`comux worktree create`) counts as its own checkout.
 
 Make the sidebar keyboard-navigable with `Ctrl-b e`: `↑↓`/`jk` move, `←→`/`hl` switch between the spaces and agents groups, `Enter` selects, `Esc` exits.
 
