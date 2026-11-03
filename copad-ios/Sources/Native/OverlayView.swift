@@ -104,7 +104,7 @@ struct ComuxOverlayLayer: View {
                     .contentShape(Rectangle())
                     .onTapGesture { handlers.answer(nil, nil) }
                 ComuxOverlayView(overlay: overlay, look: look, context: context, handlers: handlers,
-                                 wide: size.width >= 700)
+                                 wide: !context.compact && Self.large(geo.size))
                     .frame(width: size.width, height: size.height)
                     .background(RoundedRectangle(cornerRadius: 8).fill(look.base.opacity(0.97)))
                     .overlay(RoundedRectangle(cornerRadius: 8).stroke(look.accent.opacity(0.9), lineWidth: 1))
@@ -116,7 +116,11 @@ struct ComuxOverlayLayer: View {
         }
     }
 
-    /// The TUI's rule: a picker with a preview takes most of the frame, the rest stay small.
+    /// A frame big enough for the large picker card, which splits into list and preview.
+    private static func large(_ s: CGSize) -> Bool { s.width >= 820 && s.height >= 420 }
+
+    /// A picker takes most of a wide frame whatever its rows are, so loading, filtering or
+    /// switching tabs never resizes it; the rest stay small.
     private func cardSize(_ s: CGSize) -> CGSize {
         if context.compact {
             let h: CGFloat
@@ -128,9 +132,8 @@ struct ComuxOverlayLayer: View {
             return CGSize(width: s.width - 16, height: h)
         }
         switch overlay.spec {
-        case let .picker(p):
-            let previews = p.tabs.contains { t in t.rows.contains { !($0.pane ?? "").isEmpty } }
-            if previews && s.width >= 820 && s.height >= 420 {
+        case .picker:
+            if Self.large(s) {
                 return CGSize(width: s.width * 0.9, height: s.height * 0.8)
             }
             return CGSize(width: min(max(s.width * 0.6, 420), s.width - 32), height: min(max(s.height * 0.6, 320), s.height - 32))
@@ -319,7 +322,8 @@ private struct PickerOverlay: View {
     }
 
     private var showsPreview: Bool {
-        wide && !context.compact && rows.contains { !($0.pane ?? "").isEmpty }
+        // Fixed per frame, not per row: a row without a pane shows "nothing to preview".
+        wide && !context.compact
     }
 
     var body: some View {

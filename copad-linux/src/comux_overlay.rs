@@ -979,13 +979,7 @@ impl PickerUi {
             .cloned()
             .collect();
         *self.shown.borrow_mut() = shown.clone();
-        self.size_card(spec["tabs"].as_array().into_iter().flatten().any(|t| {
-            t["rows"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|r| r["pane"].as_str().is_some_and(|p| !p.is_empty()))
-        }));
+        self.size_card();
         let cur = self
             .current()
             .and_then(|r| r["id"].as_str().map(str::to_string));
@@ -1149,11 +1143,11 @@ impl PickerUi {
         b
     }
 
-    /// The TUI's sizes: a picker with panes to preview takes most of the window and splits,
-    /// the rest stay small.
-    fn size_card(&self, previews: bool) {
+    /// One size for every picker: on a wide window it takes most of it and splits into list and
+    /// preview whatever the rows are, so loading, filtering or switching tabs never resizes it.
+    fn size_card(&self) {
         let (ww, wh) = self.window;
-        let on = previews && self.preview.is_some();
+        let on = self.preview.is_some();
         if let Some((pv, _, _)) = &self.preview {
             pv.set_visible(on);
             if let Some(sep) = pv.prev_sibling() {
