@@ -66,8 +66,12 @@ struct L0Agent: Codable, Equatable, Identifiable {
     var focused: Bool
     /// `ready` after a turn finish nobody has looked at (absent from older servers).
     var unseen: Bool?
+    /// Other agents in the same git worktree (absent when none).
+    var worktree_peers: Int?
 
     var id: String { token }
+    /// `⇄2` when the agent shares its worktree (the count includes it), as in the TUI.
+    var sharedMarker: String { (worktree_peers ?? 0) > 0 ? "⇄\((worktree_peers ?? 0) + 1)" : "" }
     /// The status word to show: an unseen finish reads `done`, as in the TUI.
     var shownStatus: String { unseen == true && status == "ready" ? "done" : status }
 }

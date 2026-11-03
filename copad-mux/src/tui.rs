@@ -372,6 +372,8 @@ struct AgentRow {
     term: TerminalId,
     /// `ready` after a turn finish nobody has looked at yet ([`App::unseen_done`]).
     unseen: bool,
+    /// Other agents in the same worktree ([`App::agent_peers`]).
+    peers: u32,
 }
 
 impl AgentRow {
@@ -379,6 +381,16 @@ impl AgentRow {
     /// you have already looked at. The wire keeps `ready` plus an `unseen` flag.
     fn shown_status(&self) -> &'static str {
         if self.unseen { "done" } else { self.status }
+    }
+
+    /// `⇄2` when the row's agent shares its worktree (the count includes it), else empty —
+    /// two agents editing one checkout is the classic parallel-agent footgun.
+    fn shared_marker(&self) -> String {
+        if self.peers == 0 {
+            String::new()
+        } else {
+            format!("⇄{}", self.peers + 1)
+        }
     }
 
     /// The tmx-style glyph + colour for the row (all width-1 shapes).
@@ -1039,6 +1051,12 @@ pub struct App {
     /// [`Self::unseen_done`] panes as last reported to the render loop (an ack moves no other
     /// compared value).
     unseen_reported: std::collections::HashSet<TerminalId>,
+    /// How many OTHER agent panes run in the same git worktree as this one (by process cwd),
+    /// from the last sweep. Only panes with at least one peer are listed.
+    agent_peers: HashMap<TerminalId, u32>,
+    /// Tests: an agent pane's cwd instead of its process's.
+    #[cfg(test)]
+    test_cwds: HashMap<TerminalId, PathBuf>,
     /// Turn finishes waiting out `notify_settle_secs` before they are announced.
     pending_done: HashMap<TerminalId, PendingDone>,
     /// The blocked episode each pane was last reminded about (one reminder per episode).
@@ -1334,6 +1352,9 @@ impl App {
             agent_ack: HashMap::new(),
             done_episode: HashMap::new(),
             unseen_reported: std::collections::HashSet::new(),
+            agent_peers: HashMap::new(),
+            #[cfg(test)]
+            test_cwds: HashMap::new(),
             pending_done: HashMap::new(),
             reminded: HashMap::new(),
             #[cfg(test)]
@@ -5106,6 +5127,7 @@ impl App {
                         detail: r.detail,
                         wait: self.agent_wait(&r.term),
                         unseen: r.unseen,
+                        worktree_peers: r.peers,
                         tab_id: loc.as_ref().map(|l| l.0.to_string()).unwrap_or_default(),
                         tab_name: loc.as_ref().map(|l| l.1.clone()).unwrap_or_default(),
                         tab_index: loc.as_ref().map_or(0, |l| l.2),
@@ -7128,11 +7150,15 @@ impl App {
                     let (glyph, color) = row.glyph();
                     // With a custom tab name the title differs from the space — show both
                     // (the switcher is wide enough), and let the filter match either.
-                    let place = if row.title == row.space {
+                    let mut place = if row.title == row.space {
                         row.space.clone()
                     } else {
                         format!("{} · {}", row.space, row.title)
                     };
+                    let shared = row.shared_marker();
+                    if !shared.is_empty() {
+                        place = format!("{place} {shared}");
+                    }
                     // The detail is part of the haystack: "which pane is running webpack"
                     // is the question the switcher is opened to answer, and the tool name
                     // and status alone cannot answer it.
@@ -8847,6 +8873,10 @@ impl App {
         // reports `changed` — see `App::agent_details`.
         let mut details: HashMap<TerminalId, String> = HashMap::new();
         let mut waits: HashMap<TerminalId, agentstate::Wait> = HashMap::new();
+        // Each agent's worktree, by its process cwd. Resolved every sweep — an agent can `cd`
+        // — and memoised within it, since several agents usually share a directory.
+        let mut worktrees: HashMap<TerminalId, PathBuf> = HashMap::new();
+        let mut root_of: HashMap<PathBuf, Option<PathBuf>> = HashMap::new();
         let mut seq_counter = self.agent_seq;
         for (tid, pane) in &self.panes {
             let Some(label) = self.labels.get(tid) else {
@@ -8892,6 +8922,23 @@ impl App {
             if let Some(w) = reading.wait {
                 waits.insert(tid.clone(), w);
             }
+            #[cfg(test)]
+            let cwd = self.test_cwds.get(tid).cloned();
+            #[cfg(not(test))]
+            let cwd = procinfo::process_cwd(label.pid);
+            if let Some(cwd) = cwd {
+                let root = root_of
+                    .entry(cwd)
+                    .or_insert_with_key(|cwd| {
+                        // Canonical, so two spellings of one checkout (a symlinked path)
+                        // still count as the same worktree.
+                        gitinfo::repo(cwd).map(|r| std::fs::canonicalize(&r.root).unwrap_or(r.root))
+                    })
+                    .clone();
+                if let Some(root) = root {
+                    worktrees.insert(tid.clone(), root);
+                }
+            }
             // Carry the stamp forward while the status HOLDS — rebuilding the map each
             // pass must not reset "how long has this been blocked" twice a second. This
             // is also what keeps `changed` honest: an unchanged pass reproduces the map
@@ -8936,10 +8983,13 @@ impl App {
             minutes.insert(tid.clone(), m);
         }
         self.agent_minutes = minutes;
+        let peers = worktree_peers(&worktrees);
         let changed = next != self.agent_statuses
             || rolled
             || details != self.agent_details
-            || waits != self.agent_waits;
+            || waits != self.agent_waits
+            || peers != self.agent_peers;
+        self.agent_peers = peers;
         self.agent_statuses = next;
         self.agent_details = details;
         self.agent_waits = waits;
@@ -9291,6 +9341,7 @@ impl App {
                             status,
                             for_secs,
                             unseen: self.unseen_done(tid),
+                            peers: self.agent_peers.get(tid).copied().unwrap_or(0),
                             term: tid.clone(),
                         });
                     }
@@ -9779,9 +9830,25 @@ impl App {
                 Style::default().fg(CAT_SUBTEXT).bg(panel_bg)
             };
             put(buf, &mut x, y, " ", name_style);
-            let budget = sidebar_w.saturating_sub(x) as usize;
+            let shared = row.shared_marker();
+            let marker_w = if shared.is_empty() {
+                0
+            } else {
+                shared.width() + 1
+            };
+            let budget = (sidebar_w.saturating_sub(x) as usize).saturating_sub(marker_w);
             let titled = format!("{}{}", self.slot_badge(&row.term), row.title);
             put(buf, &mut x, y, &clip_width(&titled, budget), name_style);
+            if !shared.is_empty() {
+                put(buf, &mut x, y, " ", name_style);
+                put(
+                    buf,
+                    &mut x,
+                    y,
+                    &shared,
+                    Style::default().fg(CAT_YELLOW).bg(panel_bg),
+                );
+            }
             let waited = fmt_elapsed(row.for_secs);
             if entry_ag > 1 {
                 let sub = if waited.is_empty() {
@@ -12559,6 +12626,23 @@ fn unix_now() -> i64 {
 /// When the pane entered `status`, as (monotonic, UNIX seconds): the previous stamp while the
 /// status HOLDS — both halves, so the published wall-clock value never moves on its own —
 /// else `now`.
+/// For each pane, how many OTHER panes share its worktree; panes alone in theirs are left out.
+/// A linked worktree (`git worktree add`) is its own root, so agents split across the main
+/// checkout and a worktree of the same repo do not count as sharing.
+fn worktree_peers(worktrees: &HashMap<TerminalId, PathBuf>) -> HashMap<TerminalId, u32> {
+    let mut per_root: HashMap<&PathBuf, u32> = HashMap::new();
+    for root in worktrees.values() {
+        *per_root.entry(root).or_default() += 1;
+    }
+    worktrees
+        .iter()
+        .filter_map(|(tid, root)| {
+            let n = per_root[root];
+            (n > 1).then(|| (tid.clone(), n - 1))
+        })
+        .collect()
+}
+
 /// A blocked agent's wait as a one-line detail: `approve Bash: git status`, `asks: pick a db`.
 fn wait_text(w: &agentstate::Wait) -> String {
     match w.kind {
@@ -13407,6 +13491,7 @@ mod tests {
             status: "ready",
             term: tid(title),
             unseen: false,
+            peers: 0,
         }
     }
 
@@ -16172,6 +16257,80 @@ mod agent_attention {
 
     fn count(app: &App, kind: &str) -> usize {
         app.notifications.iter().filter(|n| n.kind == kind).count()
+    }
+
+    #[test]
+    fn agents_sharing_a_worktree_are_marked_and_a_linked_worktree_is_its_own() {
+        let dir = std::env::temp_dir().join(format!("comux-peers-{}", std::process::id()));
+        let main = dir.join("repo");
+        let linked = dir.join("repo-feature");
+        std::fs::create_dir_all(main.join(".git/worktrees/repo-feature")).unwrap();
+        std::fs::create_dir_all(main.join("src")).unwrap();
+        std::fs::create_dir_all(&linked).unwrap();
+        std::fs::write(
+            linked.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                main.join(".git/worktrees/repo-feature").display()
+            ),
+        )
+        .unwrap();
+        let mut app = app();
+        let a = app.focused_terminal().unwrap();
+        let b = new_session(&mut app, "b");
+        let c = new_session(&mut app, "c");
+        app.test_cwds.insert(a.clone(), main.clone());
+        app.test_cwds.insert(b.clone(), main.join("src")); // a subdirectory is the same checkout
+        app.test_cwds.insert(c.clone(), linked.clone());
+        for (t, pid) in [(&a, 1), (&b, 2), (&c, 3)] {
+            sweep(&mut app, t, pid, AgentStatus::Working);
+        }
+        assert_eq!(app.agent_peers.get(&a), Some(&1));
+        assert_eq!(app.agent_peers.get(&b), Some(&1));
+        assert_eq!(
+            app.agent_peers.get(&c),
+            None,
+            "a linked worktree is a separate checkout"
+        );
+        let wire = app.host_agents().agents;
+        let peers = |t: &TerminalId| {
+            let tok = app.token_of(t).unwrap();
+            wire.iter().find(|x| x.token == tok).unwrap().worktree_peers
+        };
+        assert_eq!((peers(&a), peers(&b), peers(&c)), (1, 1, 0));
+        let rows = app.agent_rows();
+        let row = rows.iter().find(|r| r.term == a).unwrap();
+        assert_eq!(row.shared_marker(), "⇄2");
+        // One agent moves out: nobody shares any more.
+        app.test_cwds.insert(b.clone(), dir.clone());
+        sweep(&mut app, &b, 2, AgentStatus::Working);
+        assert!(app.agent_peers.is_empty(), "{:?}", app.agent_peers);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sidebar_draws_an_unseen_finish_and_a_shared_worktree() {
+        use ratatui::layout::Rect;
+        let mut app = app();
+        let t = app.focused_terminal().unwrap();
+        new_session(&mut app, "elsewhere");
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        sweep(&mut app, &t, 7, AgentStatus::Ready);
+        app.agent_peers.insert(t.clone(), 1);
+        let (cols, rows) = app.size();
+        let mut buf = Buffer::empty(Rect::new(0, 0, cols, rows));
+        app.render_to(&mut buf);
+        let screen: String = (0..rows)
+            .map(|y| {
+                (0..cols)
+                    .map(|x| buf.cell(Position::new(x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect();
+        assert!(screen.contains("✓"), "{screen}");
+        assert!(screen.contains("done"), "{screen}");
+        assert!(screen.contains("⇄2"), "{screen}");
     }
 
     #[test]

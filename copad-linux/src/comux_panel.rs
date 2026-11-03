@@ -439,6 +439,14 @@ pub(crate) fn agent_status(a: &Value) -> &str {
     }
 }
 
+/// `⇄2` when the agent shares its git worktree (the count includes it), as in the TUI.
+pub(crate) fn shared_marker(a: &Value) -> String {
+    match a["worktree_peers"].as_u64() {
+        Some(n) if n > 0 => format!("⇄{}", n + 1),
+        _ => String::new(),
+    }
+}
+
 /// Time in status, bucketed like the TUI's `fmt_elapsed` (nothing under a minute, then whole
 /// minutes), so the rows change once a minute and not every second.
 pub(crate) fn elapsed(since: i64) -> String {
@@ -1230,7 +1238,16 @@ impl ComuxPanel {
                     } else {
                         span(&st.subtext, &name)
                     };
-                    let left = format!("{} {name_m}", span(color, glyph));
+                    let shared = shared_marker(a);
+                    let left = if shared.is_empty() {
+                        format!("{} {name_m}", span(color, glyph))
+                    } else {
+                        format!(
+                            "{} {name_m} {}",
+                            span(color, glyph),
+                            span(&st.yellow, &shared)
+                        )
+                    };
                     let right = span(
                         color,
                         &format!(

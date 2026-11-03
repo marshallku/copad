@@ -111,6 +111,7 @@ impl App {
                     detail: r.detail,
                     wait: self.agent_wait(&r.term),
                     unseen: r.unseen,
+                    worktree_peers: r.peers,
                     focused: focused.as_ref() == Some(&r.term),
                 }
             })

@@ -2286,6 +2286,28 @@ print("" if v is None else v)' "$AG" "$1" <"$WORK/json"
     [[ -z "$(agent_field unseen)" ]] || fail "jumping to the pane should acknowledge the finish: $(cat "$WORK/json")"
     ok "busy -> idle reads ready + unseen; a jump to the pane clears it"
 
+    echo "45d. two agents in one worktree are flagged"
+    # Two more fake agents, launched in the same (fake) git checkout. The first fake agent
+    # runs elsewhere, so only these two may be flagged — one peer each.
+    mkdir -p "$WORK/shared-repo/.git" "$WORK/shared-repo/sub"
+    t 10 fx spawn --keep --json --cwd "$WORK/shared-repo" -- "$FA/claude" 601 >"$WORK/json" || fail "spawn 1 failed"
+    S1="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+    t 10 fx spawn --keep --json --cwd "$WORK/shared-repo/sub" -- "$FA/claude" 602 >"$WORK/json" || fail "spawn 2 failed"
+    S2="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["pane"])' <"$WORK/json")"
+    peers_of() {
+        python3 -c 'import json,sys
+for a in json.load(sys.stdin)["agents"]:
+    if a["token"]==sys.argv[1]: print(a.get("worktree_peers",0))' "$1" <"$WORK/json"
+    }
+    got=""
+    for _ in $(seq 1 80); do
+        t 5 fx list-agents --json >"$WORK/json" 2>/dev/null || true
+        got="$(peers_of "$S1") $(peers_of "$S2") $(peers_of "$AG")"
+        [[ "$got" == "1 1 0" ]] && break; sleep 0.25
+    done
+    [[ "$got" == "1 1 0" ]] || fail "expected peers '1 1 0' (shared, shared, alone), got '$got': $(cat "$WORK/json")"
+    ok "two agents in one checkout read worktree_peers=1, the one elsewhere 0"
+
     t 15 fx kill-server >/dev/null 2>&1 || kill -9 "$FPID" 2>/dev/null || true
     kill "$APID" 2>/dev/null || true
 fi

@@ -255,6 +255,7 @@ struct SpacesDrawer: View {
                     Text(grouped ? a.title : "\(a.space)/\(a.title)")
                         .font(a.focused ? ComuxLook.strong : ComuxLook.body)
                         .foregroundStyle(a.focused ? ComuxLook.text : ComuxLook.subtext).lineLimit(1)
+                    if !a.sharedMarker.isEmpty { Text(a.sharedMarker).foregroundStyle(ComuxLook.yellow) }
                     Spacer(minLength: 4)
                     ElapsedText(since: a.since_unix, prefix: a.shownStatus).foregroundStyle(color).lineLimit(1)
                 }

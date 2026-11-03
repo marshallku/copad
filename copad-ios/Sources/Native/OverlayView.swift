@@ -578,7 +578,8 @@ private struct PickerCard: View {
     private func agent(_ a: L0Agent) -> some View {
         let st = look.status(a.shownStatus)
         let since = elapsedLabel(since: a.since_unix, now: now)
-        let place = a.title == a.space ? a.space : "\(a.space) · \(a.title)"
+        let place = (a.title == a.space ? a.space : "\(a.space) · \(a.title)")
+            + (a.sharedMarker.isEmpty ? "" : " \(a.sharedMarker)")
         return VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
                 Text(st.glyph).foregroundStyle(st.color)

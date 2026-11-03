@@ -752,6 +752,10 @@ pub struct SessionInfo {
     pub dir: String,
 }
 
+fn is_zero_u32(n: &u32) -> bool {
+    *n == 0
+}
+
 /// One AI-agent pane in a `list-agents` response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentInfo {
@@ -808,6 +812,9 @@ pub struct AgentInfo {
     /// `ready` after a turn finish nobody has looked at since (`✓ done` in the sidebar).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unseen: bool,
+    /// How many OTHER agents run in the same git worktree (`⇄N` in the sidebar).
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub worktree_peers: u32,
     /// The tab the agent lives in: its STABLE id (`s4:t13`, a tab selector), its custom name
     /// (empty when unnamed — `title` then shows `tab <n>`), and its index in the session.
     #[serde(default)]
@@ -6130,6 +6137,7 @@ mod list_agents_proto_tests {
             detail: None,
             wait: None,
             unseen: false,
+            worktree_peers: 0,
             tab_id: "s1:t0".into(),
             tab_name: String::new(),
             tab_index: 0,

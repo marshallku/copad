@@ -745,6 +745,7 @@ struct ComuxSidebar: View {
                     Text(grouped ? a.title : "\(a.space)/\(a.title)")
                         .font(a.focused ? st.strong : st.body)
                         .foregroundStyle(a.focused ? st.text : st.subtext).lineLimit(1)
+                    if !a.sharedMarker.isEmpty { Text(a.sharedMarker).foregroundStyle(st.yellow) }
                     Spacer(minLength: 4)
                     ElapsedText(since: a.since_unix, prefix: a.shownStatus).foregroundStyle(color).lineLimit(1)
                 }

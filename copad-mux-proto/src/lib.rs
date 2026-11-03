@@ -502,12 +502,20 @@ pub struct Agent {
     /// pane, no read of that turn's notification). The TUI shows it as `✓ done`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unseen: bool,
+    /// How many OTHER agents run in the same git worktree (by process cwd). The TUI marks
+    /// such rows `⇄N`, N counting this one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub worktree_peers: u32,
     /// The pane is the focused pane of the active tab.
     #[serde(default)]
     pub focused: bool,
 }
 
 /// `notifications`: the notification center (`Ctrl-b a`), newest first.
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
 /// What a blocked agent waits for.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentWait {

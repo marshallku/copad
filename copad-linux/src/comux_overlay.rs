@@ -1096,11 +1096,15 @@ impl PickerUi {
             let since = a["since_unix"].as_i64().map(elapsed).unwrap_or_default();
             let space = a["space"].as_str().unwrap_or_default();
             let title = a["title"].as_str().unwrap_or_default();
-            let place = if title == space {
+            let mut place = if title == space {
                 space.to_string()
             } else {
                 format!("{space} · {title}")
             };
+            let shared = crate::comux_panel::shared_marker(a);
+            if !shared.is_empty() {
+                place = format!("{place} {shared}");
+            }
             let detail = a["detail"]
                 .as_str()
                 .map(|d| format!("{place} — {d}"))
