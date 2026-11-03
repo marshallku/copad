@@ -240,6 +240,11 @@ own log. It is ABSENT, not empty, when there is no reading — a tool whose log 
 read, one that has run no tools yet, or a format that has moved. Never branch on its absence;
 it is a hint for a human scanning a list.
 
+While a Claude agent is `blocked`, `detail` says what it waits for instead (`approve Bash: git
+status`, `asks: pick a database`), and `wait` carries the same as `{"kind", "what"}` —
+`kind` is `approval`, `question`, or `other` for a form comux does not recognise. It comes from
+undocumented fields of Claude's session file, so it can be absent on a blocked agent.
+
 `transcript_path` (with `agent_session_id`) is the file the agent logs its conversation to —
 Claude's `~/.claude/projects/…/<id>.jsonl`, Codex's rollout, grok's `chat_history.jsonl`, agy's
 `brain/<id>/…/transcript.jsonl`. Reading it is a better way to follow another agent's progress

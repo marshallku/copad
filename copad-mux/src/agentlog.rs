@@ -444,7 +444,7 @@ fn flatten(v: &serde_json::Value) -> String {
 }
 
 /// At most `max` chars (0 = no limit), with an ellipsis when cut.
-fn cut(s: &str, max: usize) -> String {
+pub(crate) fn cut(s: &str, max: usize) -> String {
     if max == 0 || s.chars().count() <= max {
         return s.to_string();
     }

@@ -801,6 +801,10 @@ pub struct AgentInfo {
     /// not branch on its absence; it is a hint for a human scanning a list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// While `blocked`: what the agent waits for, when it says (Claude only). `detail` then
+    /// carries the same thing as text (`approve Bash: git status`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<copad_mux_proto::AgentWait>,
     /// The tab the agent lives in: its STABLE id (`s4:t13`, a tab selector), its custom name
     /// (empty when unnamed — `title` then shows `tab <n>`), and its index in the session.
     #[serde(default)]
@@ -6121,6 +6125,7 @@ mod list_agents_proto_tests {
             for_secs: 42,
             seq: 7,
             detail: None,
+            wait: None,
             tab_id: "s1:t0".into(),
             tab_name: String::new(),
             tab_index: 0,

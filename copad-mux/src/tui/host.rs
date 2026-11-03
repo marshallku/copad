@@ -109,6 +109,7 @@ impl App {
                     status: r.status.to_string(),
                     since_unix: self.agent_statuses.get(&r.term).map_or(0, |s| s.since_unix),
                     detail: r.detail,
+                    wait: self.agent_wait(&r.term),
                     focused: focused.as_ref() == Some(&r.term),
                 }
             })

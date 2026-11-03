@@ -2239,9 +2239,35 @@ else
     SH="$(python3 -c 'import json,sys; p=json.load(sys.stdin)["panes"]; print(p[0]["token"])' <"$WORK/json")"
     rc=0; t 10 fx fork "$SH" >/dev/null 2>&1 || rc=$?
     [[ "$rc" == 1 ]] || fail "forking a shell pane should be refused, got $rc"
+    ok "a live (fake) claude pane forks into a tab running 'claude --resume <id> --fork-session'; a shell pane is refused"
+
+    echo "45b. a blocked claude says what it waits for"
+    # The same fake agent, now blocked on a permission the way Claude writes it to its session
+    # file. The sweep must carry it to the wire as both text and a structured kind.
+    printf '{"pid":%s,"sessionId":"%s","status":"waiting","waitingFor":"approve Bash: git status"}\n' \
+        "$APID" "$FID" >"$FH/.claude/sessions/$APID.json"
+    agent_field() {
+        python3 -c 'import json,sys
+a=[x for x in json.load(sys.stdin)["agents"] if x["token"]==sys.argv[1]]
+v=a[0] if a else {}
+for k in sys.argv[2].split("."): v=(v or {}).get(k) if isinstance(v,dict) else None
+print("" if v is None else v)' "$AG" "$1" <"$WORK/json"
+    }
+    got=""
+    for _ in $(seq 1 50); do
+        t 5 fx list-agents --json >"$WORK/json" 2>/dev/null || true
+        got="$(agent_field wait.kind)"; [[ "$got" == approval ]] && break; sleep 0.2
+    done
+    [[ "$got" == approval ]] || fail "a blocked claude's wait should reach list-agents as approval: $(cat "$WORK/json")"
+    [[ "$(agent_field status)" == blocked ]] || fail "the agent should read blocked"
+    [[ "$(agent_field detail)" == "approve Bash: git status" ]] \
+        || fail "detail should say what to approve, got '$(agent_field detail)'"
+    t 10 fx list-agents >"$WORK/out"
+    grep -q "approve Bash: git status" "$WORK/out" || fail "the plain listing should show the wait: $(cat "$WORK/out")"
+    ok "a waiting session file reaches list-agents as wait.kind=approval with 'approve Bash: git status'"
+
     t 15 fx kill-server >/dev/null 2>&1 || kill -9 "$FPID" 2>/dev/null || true
     kill "$APID" 2>/dev/null || true
-    ok "a live (fake) claude pane forks into a tab running 'claude --resume <id> --fork-session'; a shell pane is refused"
 fi
 
 echo "46. the server is still responsive and shuts down cleanly"

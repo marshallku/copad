@@ -494,12 +494,26 @@ pub struct Agent {
     pub since_unix: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// While `blocked`: what the agent waits for, when it says (Claude only). `detail` already
+    /// carries it as text; this is for a host that styles approvals apart from questions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait: Option<AgentWait>,
     /// The pane is the focused pane of the active tab.
     #[serde(default)]
     pub focused: bool,
 }
 
 /// `notifications`: the notification center (`Ctrl-b a`), newest first.
+/// What a blocked agent waits for.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentWait {
+    /// `approval` (a permission it cannot continue without), `question` (a question or
+    /// dialog), or `other` (a form comux does not recognise — show the text, claim neither).
+    pub kind: String,
+    /// What to approve or answer: `Bash: git status`, `choose: allow or deny …`.
+    pub what: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Notifications {
     pub items: Vec<Notification>,

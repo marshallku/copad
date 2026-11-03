@@ -34,21 +34,67 @@ impl AgentStatus {
     }
 }
 
+/// What a BLOCKED agent is waiting for. Only Claude says (its session file's `waitingFor` /
+/// `needs`); every other agent's blocked state carries no wait.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Wait {
+    pub kind: WaitKind,
+    /// What to approve or answer (`Bash: git status`, `choose: allow or deny …`). Program
+    /// text: control characters neutralised and cut to [`WAIT_MAX_CHARS`].
+    pub what: String,
+}
+
+/// Loud (a permission the agent can't continue without) vs quiet (a question or dialog).
+/// `Other` is an unrecognised `waitingFor`: shown as text, never presented as either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitKind {
+    Approval,
+    Question,
+    Other,
+}
+
+impl WaitKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            WaitKind::Approval => "approval",
+            WaitKind::Question => "question",
+            WaitKind::Other => "other",
+        }
+    }
+}
+
+/// The longest wait text kept — a sidebar subtitle, not a transcript.
+pub const WAIT_MAX_CHARS: usize = 80;
+
+/// One reading of an agent: its status, plus the wait when it is blocked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reading {
+    pub status: AgentStatus,
+    pub wait: Option<Wait>,
+}
+
 /// Resolve an agent pane's status: Claude session file first (accurate, pid-keyed),
 /// else the screen-text fallback for `tool` (the pane's agent basename).
 pub fn resolve(tool: &str, pid: Option<u32>, snap: &Snapshot) -> AgentStatus {
     session_first(pid).unwrap_or_else(|| screen_status_for(tool, snap))
 }
 
-/// [`resolve`], but the screen snapshot is only taken IF the fallback is reached.
+/// [`resolve`] plus what a blocked Claude agent waits for (the session file is read once for
+/// both), and the screen snapshot is only taken IF the fallback is reached.
 ///
 /// The session file answers for every Claude pane, and `PaneTerm::snapshot` copies the whole
 /// viewport — a `String` allocated per cell, under the terminal lock — so passing one eagerly
 /// meant building and discarding a screen copy per agent per sweep (2 Hz attached, every
 /// agent in every session). The closure defers that to the panes that actually need it:
 /// codex, and anything with no session file.
-pub fn resolve_with(tool: &str, pid: Option<u32>, snap: impl FnOnce() -> Snapshot) -> AgentStatus {
-    session_first(pid).unwrap_or_else(|| screen_status_for(tool, &snap()))
+pub fn read_with(tool: &str, pid: Option<u32>, snap: impl FnOnce() -> Snapshot) -> Reading {
+    if let Some(r) = pid.and_then(claude_session) {
+        return r;
+    }
+    Reading {
+        status: screen_status_for(tool, &snap()),
+        wait: None,
+    }
 }
 
 /// The screen-text classifier for one agent. agy and grok draw UIs that share almost no
@@ -112,13 +158,59 @@ pub fn is_session_uuid(s: &str) -> bool {
 /// Parse Claude's session JSON → status. `None` on malformed JSON or an unrecognized
 /// status (reject rather than guess — tmx does the same); tolerates extra fields.
 fn parse_session_status(json: &str) -> Option<AgentStatus> {
+    parse_session(json).map(|r| r.status)
+}
+
+/// Read `~/.claude/sessions/<pid>.json` → status + wait. `None` exactly when
+/// [`claude_session_status`] is.
+fn claude_session(pid: u32) -> Option<Reading> {
+    parse_session(&std::fs::read_to_string(claude_session_file(pid)?).ok()?)
+}
+
+/// Parse Claude's session JSON → status, and for `waiting` the wait it names.
+fn parse_session(json: &str) -> Option<Reading> {
     let v: serde_json::Value = serde_json::from_str(json).ok()?;
-    match v.get("status").and_then(|s| s.as_str())? {
-        "busy" => Some(AgentStatus::Working),
-        "idle" => Some(AgentStatus::Ready),
-        "waiting" => Some(AgentStatus::Blocked),
-        _ => None,
+    let status = match v.get("status").and_then(|s| s.as_str())? {
+        "busy" => AgentStatus::Working,
+        "idle" => AgentStatus::Ready,
+        "waiting" => AgentStatus::Blocked,
+        _ => return None,
+    };
+    // `waitingFor` outlives the wait in some versions; only a blocked reading carries it.
+    let wait = (status == AgentStatus::Blocked)
+        .then(|| v.get("waitingFor").and_then(|s| s.as_str()))
+        .flatten()
+        .and_then(|w| classify_wait(w, v.get("needs").and_then(|s| s.as_str())));
+    Some(Reading { status, wait })
+}
+
+/// Classify Claude's `waitingFor` (undocumented; the forms below are the ones Claude Code
+/// 2.1.309 writes) and pick the text to show. `needs` is Claude's own sentence for what it
+/// wants, preferred whenever the `waitingFor` form is generic.
+fn classify_wait(waiting_for: &str, needs: Option<&str>) -> Option<Wait> {
+    let wf = waiting_for.trim();
+    if wf.is_empty() {
+        return None;
     }
+    let needs = needs.map(str::trim).filter(|n| !n.is_empty());
+    let (kind, what) = if let Some(rest) = wf.strip_prefix("approve ") {
+        // `approve <Tool>`, `approve <Tool>: <summary>`, `approve plan from: <x>`.
+        let tool = rest.split([':', ' ']).next().unwrap_or("");
+        if tool == "AskUserQuestion" {
+            (WaitKind::Question, needs.unwrap_or("question"))
+        } else {
+            (WaitKind::Approval, rest.trim())
+        }
+    } else {
+        let kind = match wf {
+            "sandbox request" | "worker request" => WaitKind::Approval,
+            "input needed" | "dialog open" | "goal proposal" => WaitKind::Question,
+            _ => WaitKind::Other,
+        };
+        (kind, needs.unwrap_or(wf))
+    };
+    let what = crate::agentlog::cut(&crate::agentlog::inert(what, false), WAIT_MAX_CHARS);
+    Some(Wait { kind, what })
 }
 
 /// Substrings that indicate a blocking permission / selection dialog (highest
@@ -1538,6 +1630,99 @@ mod tests {
     fn plain_shell_is_idle() {
         let s = snap_from(&["~/dev/copad $ ls", "Cargo.toml  src"]);
         assert_eq!(screen_status(&s), AgentStatus::Idle);
+    }
+
+    fn wait_of(json: &str) -> Option<(WaitKind, String)> {
+        parse_session(json)
+            .and_then(|r| r.wait)
+            .map(|w| (w.kind, w.what))
+    }
+
+    #[test]
+    fn waiting_for_forms_classify_as_approval_question_or_other() {
+        let w = |wf: &str, needs: &str| {
+            wait_of(&format!(
+                r#"{{"status":"waiting","waitingFor":{},"needs":{}}}"#,
+                serde_json::json!(wf),
+                serde_json::json!(needs)
+            ))
+        };
+        use WaitKind::*;
+        assert_eq!(
+            w("approve Bash: git status", ""),
+            Some((Approval, "Bash: git status".into()))
+        );
+        assert_eq!(w("approve Edit", ""), Some((Approval, "Edit".into())));
+        assert_eq!(
+            w("approve plan from: lead", ""),
+            Some((Approval, "plan from: lead".into()))
+        );
+        assert_eq!(
+            w("sandbox request", "allow network"),
+            Some((Approval, "allow network".into()))
+        );
+        assert_eq!(
+            w("worker request", ""),
+            Some((Approval, "worker request".into()))
+        );
+        // AskUserQuestion is a question even though it rides the approve form.
+        assert_eq!(
+            w("approve AskUserQuestion", "pick a db"),
+            Some((Question, "pick a db".into()))
+        );
+        assert_eq!(
+            w("approve AskUserQuestion: x", ""),
+            Some((Question, "question".into()))
+        );
+        assert_eq!(
+            w(
+                "input needed",
+                "choose: allow or deny the computer-use action"
+            ),
+            Some((
+                Question,
+                "choose: allow or deny the computer-use action".into()
+            ))
+        );
+        assert_eq!(w("dialog open", ""), Some((Question, "dialog open".into())));
+        assert_eq!(
+            w("goal proposal", ""),
+            Some((Question, "goal proposal".into()))
+        );
+        // A form we have never seen is shown, but never claimed to be a question.
+        assert_eq!(
+            w("teleport pending", ""),
+            Some((Other, "teleport pending".into()))
+        );
+        assert_eq!(w("  ", "x"), None);
+    }
+
+    #[test]
+    fn wait_is_only_read_while_blocked_and_is_made_inert() {
+        assert_eq!(
+            wait_of(r#"{"status":"busy","waitingFor":"approve Bash"}"#),
+            None
+        );
+        assert_eq!(
+            wait_of(r#"{"status":"idle","waitingFor":"input needed"}"#),
+            None
+        );
+        assert_eq!(wait_of(r#"{"status":"waiting"}"#), None);
+        assert_eq!(wait_of(r#"{"status":"waiting","waitingFor":42}"#), None);
+        // Still blocked even when the wait is unusable.
+        assert_eq!(
+            parse_session(r#"{"status":"waiting","waitingFor":42}"#).map(|r| r.status),
+            Some(AgentStatus::Blocked)
+        );
+        let (_, what) =
+            wait_of(r#"{"status":"waiting","waitingFor":"approve Bash: a\u001b[2Jb"}"#).unwrap();
+        assert!(!what.chars().any(char::is_control), "{what:?}");
+        let long = "x".repeat(300);
+        let (_, what) = wait_of(&format!(
+            r#"{{"status":"waiting","waitingFor":"input needed","needs":"{long}"}}"#
+        ))
+        .unwrap();
+        assert_eq!(what.chars().count(), WAIT_MAX_CHARS);
     }
 
     #[test]

@@ -989,6 +989,9 @@ pub struct App {
     /// compared value, so without this its sidebar detail would freeze once
     /// `drain_pane_dirty` stopped repainting for hidden panes.
     agent_details: HashMap<TerminalId, String>,
+    /// What each BLOCKED Claude agent waits for (its session file's `waitingFor`), from the
+    /// last sweep. Shown in place of the activity detail while blocked (`agent_rows`).
+    agent_waits: HashMap<TerminalId, agentstate::Wait>,
     /// Panes with an UNACKNOWLEDGED bell, as last reported to the render loop. Same reason
     /// as `agent_details`: `bell()` / `bell_count()` are live reads that drive the `!`
     /// markers and the mux-wide `! N`, and a bell rung in a hidden pane is precisely the
@@ -1273,6 +1276,7 @@ impl App {
             inboxes: HashMap::new(),
             agent_minutes: HashMap::new(),
             agent_details: HashMap::new(),
+            agent_waits: HashMap::new(),
             bells_reported: std::collections::HashSet::new(),
             host_reported: Vec::new(),
             branches: HashMap::new(),
@@ -5035,6 +5039,7 @@ impl App {
                         for_secs: r.for_secs,
                         seq: self.agent_statuses.get(&r.term).map_or(0, |s| s.seq),
                         detail: r.detail,
+                        wait: self.agent_wait(&r.term),
                         tab_id: loc.as_ref().map(|l| l.0.to_string()).unwrap_or_default(),
                         tab_name: loc.as_ref().map(|l| l.1.clone()).unwrap_or_default(),
                         tab_index: loc.as_ref().map_or(0, |l| l.2),
@@ -8723,7 +8728,7 @@ impl App {
         use agentstate::AgentStatus;
         let mut next = HashMap::new();
         // Meaningful status TRANSITIONS to notify on (fired after the borrow ends).
-        let mut events: Vec<(TerminalId, String, &'static str)> = Vec::new();
+        let mut events: Vec<(TerminalId, String, &'static str, String)> = Vec::new();
         // The activity poller is told which agents exist from HERE rather than sweeping the
         // process table itself: this loop already walks exactly the agent panes and holds
         // their labels, so `procinfo` keeps a single writer (#88).
@@ -8731,6 +8736,7 @@ impl App {
         // What each agent is DOING. Read here rather than only at render time so a change
         // reports `changed` — see `App::agent_details`.
         let mut details: HashMap<TerminalId, String> = HashMap::new();
+        let mut waits: HashMap<TerminalId, agentstate::Wait> = HashMap::new();
         let mut seq_counter = self.agent_seq;
         for (tid, pane) in &self.panes {
             let Some(label) = self.labels.get(tid) else {
@@ -8743,20 +8749,26 @@ impl App {
             if let Some(a) = agentpoll::activity(&self.agent_poll, label.pid) {
                 details.insert(tid.clone(), a.detail);
             }
-            let status = agentstate::resolve_with(&label.text, Some(label.pid), || pane.snapshot());
+            let reading = agentstate::read_with(&label.text, Some(label.pid), || pane.snapshot());
+            let status = reading.status;
             let prev = self.agent_statuses.get(tid).copied();
-            let body = match (prev.map(|p| p.status), status) {
+            let event = match (prev.map(|p| p.status), status) {
                 // turn just finished (was running, now parked at the prompt)
-                (Some(AgentStatus::Working), AgentStatus::Ready) => Some("turn finished"),
+                (Some(AgentStatus::Working), AgentStatus::Ready) => {
+                    Some(("done", "turn finished".to_string()))
+                }
                 // just started blocking — only a real transition (require a KNOWN old
                 // status, so a server restart that first observes `Blocked` is silent).
                 (Some(old), AgentStatus::Blocked) if old != AgentStatus::Blocked => {
-                    Some("awaiting input")
+                    Some(("blocked", blocked_body(reading.wait.as_ref())))
                 }
                 _ => None,
             };
-            if let Some(body) = body {
-                events.push((tid.clone(), label.text.clone(), body));
+            if let Some((kind, body)) = event {
+                events.push((tid.clone(), label.text.clone(), kind, body));
+            }
+            if let Some(w) = reading.wait {
+                waits.insert(tid.clone(), w);
             }
             // Carry the stamp forward while the status HOLDS — rebuilding the map each
             // pass must not reset "how long has this been blocked" twice a second. This
@@ -8795,18 +8807,17 @@ impl App {
             minutes.insert(tid.clone(), m);
         }
         self.agent_minutes = minutes;
-        let changed = next != self.agent_statuses || rolled || details != self.agent_details;
+        let changed = next != self.agent_statuses
+            || rolled
+            || details != self.agent_details
+            || waits != self.agent_waits;
         self.agent_statuses = next;
         self.agent_details = details;
+        self.agent_waits = waits;
 
         // Fire desktop toasts (best-effort, non-blocking) — the server does this, so
         // they arrive even while detached. Replaces the retired `~/.claude` notify hooks.
-        for (tid, tool, body) in events {
-            let kind = if body == "awaiting input" {
-                "blocked"
-            } else {
-                "done"
-            };
+        for (tid, tool, kind, body) in events {
             // An agent whose own hooks push this event kind (`comux notify`) owns it: the
             // hook knows the real moment, the sweep only infers it ~2 Hz later, and both
             // firing would double every toast. Ownership is per (pane, agent pid, kind), so
@@ -8941,6 +8952,16 @@ impl App {
         }
     }
 
+    /// A blocked agent's wait, as the wire carries it.
+    fn agent_wait(&self, tid: &TerminalId) -> Option<copad_mux_proto::AgentWait> {
+        self.agent_waits
+            .get(tid)
+            .map(|w| copad_mux_proto::AgentWait {
+                kind: w.kind.label().to_string(),
+                what: w.what.clone(),
+            })
+    }
+
     /// Number of agent panes currently BLOCKED (awaiting input) — the status-bar
     /// attention count (`⚑N`), replacing the retired tmux `⚑N` chip.
     fn attention_count(&self) -> usize {
@@ -9042,8 +9063,11 @@ impl App {
                         let (status, for_secs) = self.agent_status(tid);
                         out.push(AgentRow {
                             title: tab_title.clone(),
-                            detail: agentpoll::activity(&self.agent_poll, label.pid)
-                                .map(|a| a.detail),
+                            // A blocked agent's wait says what it needs from you, which
+                            // beats what it was last doing.
+                            detail: self.agent_waits.get(tid).map(wait_text).or_else(|| {
+                                agentpoll::activity(&self.agent_poll, label.pid).map(|a| a.detail)
+                            }),
                             space: space.clone(),
                             space_id: wid.clone(),
                             tool: label.text.clone(),
@@ -12323,6 +12347,27 @@ fn unix_now() -> i64 {
 /// When the pane entered `status`, as (monotonic, UNIX seconds): the previous stamp while the
 /// status HOLDS — both halves, so the published wall-clock value never moves on its own —
 /// else `now`.
+/// A blocked agent's wait as a one-line detail: `approve Bash: git status`, `asks: pick a db`.
+fn wait_text(w: &agentstate::Wait) -> String {
+    match w.kind {
+        agentstate::WaitKind::Approval => format!("approve {}", w.what),
+        agentstate::WaitKind::Question => format!("asks: {}", w.what),
+        agentstate::WaitKind::Other => w.what.clone(),
+    }
+}
+
+/// The toast body for a block: loud for a permission, quiet for a question.
+fn blocked_body(wait: Option<&agentstate::Wait>) -> String {
+    match wait {
+        Some(w) if w.kind == agentstate::WaitKind::Approval => {
+            format!("needs approval · {}", w.what)
+        }
+        Some(w) if w.kind == agentstate::WaitKind::Question => format!("asks · {}", w.what),
+        Some(w) => format!("awaiting input · {}", w.what),
+        None => "awaiting input".to_string(),
+    }
+}
+
 fn status_since(
     prev: Option<AgentState>,
     status: agentstate::AgentStatus,
@@ -15920,6 +15965,59 @@ mod switcher_preview {
                 seq: 0,
                 pid: 1,
             },
+        );
+    }
+
+    #[test]
+    fn a_blocked_agents_wait_replaces_its_detail_everywhere() {
+        let mut app = app(120, 30);
+        let t = app.focused_terminal().unwrap();
+        fake_agent(&mut app, &t, AgentStatus::Blocked);
+        app.agent_waits.insert(
+            t.clone(),
+            agentstate::Wait {
+                kind: agentstate::WaitKind::Approval,
+                what: "Bash: git status".into(),
+            },
+        );
+        assert_eq!(
+            app.agent_rows()[0].detail.as_deref(),
+            Some("approve Bash: git status")
+        );
+        let wire = &app.host_agents().agents[0];
+        assert_eq!(wire.detail.as_deref(), Some("approve Bash: git status"));
+        let wait = wire.wait.as_ref().unwrap();
+        assert_eq!(
+            (wait.kind.as_str(), wait.what.as_str()),
+            ("approval", "Bash: git status")
+        );
+        app.agent_waits.clear();
+        assert!(app.host_agents().agents[0].wait.is_none());
+    }
+
+    #[test]
+    fn block_toasts_say_whether_it_is_a_permission_or_a_question() {
+        use agentstate::{Wait, WaitKind};
+        let w = |kind, what: &str| Wait {
+            kind,
+            what: what.into(),
+        };
+        assert_eq!(blocked_body(None), "awaiting input");
+        assert_eq!(
+            blocked_body(Some(&w(WaitKind::Approval, "Bash: rm -rf build"))),
+            "needs approval · Bash: rm -rf build"
+        );
+        assert_eq!(
+            blocked_body(Some(&w(WaitKind::Question, "pick a db"))),
+            "asks · pick a db"
+        );
+        assert_eq!(
+            blocked_body(Some(&w(WaitKind::Other, "teleport"))),
+            "awaiting input · teleport"
+        );
+        assert_eq!(
+            wait_text(&w(WaitKind::Question, "pick a db")),
+            "asks: pick a db"
         );
     }
 
