@@ -43,6 +43,12 @@ pub const DEFAULT_USAGE_BAR_WIDTH: u16 = 8;
 /// flicker of staleness rather than something you have to fix by hand, and — because the
 /// repaint ships no cells, only a flag — costs the wire nothing at any cadence.
 pub const DEFAULT_RECONCILE_SECS: u32 = 3;
+
+/// Default [`MuxConfig::notify_settle_secs`].
+pub const DEFAULT_NOTIFY_SETTLE_SECS: u32 = 3;
+/// Default [`MuxConfig::notify_remind_mins`].
+pub const DEFAULT_NOTIFY_REMIND_MINS: u32 = 10;
+
 /// Minimum pane-content width kept to the right of the sidebar; `sidebar_min_cols`
 /// is forced to at least `sidebar_width + this` so a visible sidebar can never eat
 /// the whole viewport.
@@ -1130,6 +1136,16 @@ pub struct MuxConfig {
     /// cost, is why it could not be left on. Dropping the clear makes it invisible, so it is
     /// on by default. The cadence is the worst-case time a user stares at residue.
     pub reconcile_secs: u32,
+    /// Seconds a sweep-detected turn finish must HOLD before its notification is raised.
+    /// Stop hooks that block a stop (the owner's verification and review gates, `/goal`)
+    /// make an agent go idle and busy again within seconds; without this each of those is a
+    /// "turn finished" toast for a turn that did not finish. `0` = notify at once. Settling
+    /// proves only OBSERVED stability: a whole flap between two sweeps (5 s apart while
+    /// detached) cannot be seen by polling.
+    pub notify_settle_secs: u32,
+    /// Minutes an agent may stay blocked, unacknowledged, before ONE reminder notification
+    /// (`still waiting 10m · …`). `0` = never remind.
+    pub notify_remind_mins: u32,
     /// What each status-bar tab chip shows (number / process name / both).
     pub tab_labels: TabLabels,
     /// Check GitHub releases in the background and show a `⬆ x.y.z` hint in the
@@ -1194,6 +1210,8 @@ struct RawConfig {
     usage_reset: Option<String>,
     usage_rotate_secs: Option<i64>,
     reconcile_secs: Option<i64>,
+    notify_settle_secs: Option<i64>,
+    notify_remind_mins: Option<i64>,
     tab_labels: Option<String>,
     update_check: Option<bool>,
     update_environment: Option<Vec<String>>,
@@ -1315,6 +1333,8 @@ impl MuxConfig {
             usage_reset: crate::usagepoll::ResetStyle::Relative,
             usage_rotate_secs: 0,
             reconcile_secs: DEFAULT_RECONCILE_SECS,
+            notify_settle_secs: DEFAULT_NOTIFY_SETTLE_SECS,
+            notify_remind_mins: DEFAULT_NOTIFY_REMIND_MINS,
             tab_labels: TabLabels::Number,
             update_check: true,
             update_environment: default_update_environment(),
@@ -1526,6 +1546,22 @@ impl MuxConfig {
                     0,
                     3600,
                     "reconcile_secs",
+                    &mut warnings,
+                ) as u32,
+                notify_settle_secs: clamp_field(
+                    raw.notify_settle_secs,
+                    DEFAULT_NOTIFY_SETTLE_SECS as i64,
+                    0,
+                    60,
+                    "notify_settle_secs",
+                    &mut warnings,
+                ) as u32,
+                notify_remind_mins: clamp_field(
+                    raw.notify_remind_mins,
+                    DEFAULT_NOTIFY_REMIND_MINS as i64,
+                    0,
+                    1440,
+                    "notify_remind_mins",
                     &mut warnings,
                 ) as u32,
                 tab_labels: match raw.tab_labels.as_deref() {
@@ -2470,5 +2506,17 @@ pub(crate) mod tests {
     fn prefix_hint_parses_and_defaults_on() {
         assert!(MuxConfig::default().prefix_hint);
         assert!(!load_str("prefix_hint = false").0.prefix_hint);
+    }
+
+    #[test]
+    fn notify_settle_and_remind_default_parse_and_clamp() {
+        let d = MuxConfig::default();
+        assert_eq!((d.notify_settle_secs, d.notify_remind_mins), (3, 10));
+        let (cfg, warns) = load_str("notify_settle_secs = 0\nnotify_remind_mins = 0");
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!((cfg.notify_settle_secs, cfg.notify_remind_mins), (0, 0));
+        let (cfg, warns) = load_str("notify_settle_secs = 999\nnotify_remind_mins = -1");
+        assert_eq!((cfg.notify_settle_secs, cfg.notify_remind_mins), (60, 0));
+        assert_eq!(warns.len(), 2, "{warns:?}");
     }
 }

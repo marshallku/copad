@@ -24,6 +24,10 @@ mouse = true              # mouse: wheel-scroll, click-to-focus, click chrome to
 osc52 = true              # let a pane's program set the clipboard via OSC 52 (tmux set-clipboard).
                           # false stops a background pane clobbering it; reads are never answered.
 notify = true             # agent turn-completion desktop toasts (env COPAD_MUX_NOTIFY wins)
+notify_settle_secs = 3    # a finished turn must hold this long before it is announced — a
+                          # stop hook that sends the agent straight back to work is not a finish
+notify_remind_mins = 10   # remind once about an agent still blocked, unacknowledged, after
+                          # this many minutes (0 = never)
 # A one-row bar along the TOP of the mux showing how the HOST machine is doing:
 #   cpu 12%  mem 59%  gpu 2%  load 2.36
 # Deliberately a different question from the bottom status bar, which is about the MUX

@@ -338,6 +338,15 @@ struct AgentState {
     pid: u32,
 }
 
+/// A turn finish waiting to be announced: the episode it belongs to and when it began.
+#[derive(Debug)]
+struct PendingDone {
+    seq: u64,
+    at: std::time::Instant,
+    tool: String,
+    body: String,
+}
+
 /// One sidebar/switcher agent row: where the agent pane lives + what it runs.
 struct AgentRow {
     /// Display title: the pane's TAB custom name when set (so multiple agents in one
@@ -1030,6 +1039,10 @@ pub struct App {
     /// [`Self::unseen_done`] panes as last reported to the render loop (an ack moves no other
     /// compared value).
     unseen_reported: std::collections::HashSet<TerminalId>,
+    /// Turn finishes waiting out `notify_settle_secs` before they are announced.
+    pending_done: HashMap<TerminalId, PendingDone>,
+    /// The blocked episode each pane was last reminded about (one reminder per episode).
+    reminded: HashMap<TerminalId, u64>,
     /// Tests: the reading the sweep takes for a pane instead of its session file and screen.
     #[cfg(test)]
     test_readings: HashMap<TerminalId, agentstate::Reading>,
@@ -1321,6 +1334,8 @@ impl App {
             agent_ack: HashMap::new(),
             done_episode: HashMap::new(),
             unseen_reported: std::collections::HashSet::new(),
+            pending_done: HashMap::new(),
+            reminded: HashMap::new(),
             #[cfg(test)]
             test_readings: HashMap::new(),
             bells_reported: std::collections::HashSet::new(),
@@ -5481,7 +5496,7 @@ impl App {
     pub fn unseen_done(&self, term: &TerminalId) -> bool {
         self.done_episode
             .get(term)
-            .is_some_and(|seq| self.agent_ack.get(term).copied().unwrap_or(0) < *seq)
+            .is_some_and(|seq| !self.acked(term, *seq))
     }
 
     /// How many panes anywhere in the mux have an unacknowledged bell.
@@ -8947,9 +8962,89 @@ impl App {
             if self.hook_owns(&tid, kind) {
                 continue;
             }
+            // A finish is announced only once it has HELD (`notify_settle_secs`); see
+            // [`Self::raise_due_notifications`].
+            if kind == "done" && self.cfg.notify_settle_secs > 0 {
+                if let Some(seq) = self.agent_statuses.get(&tid).map(|s| s.seq) {
+                    self.pending_done.insert(
+                        tid,
+                        PendingDone {
+                            seq,
+                            at: std::time::Instant::now(),
+                            tool,
+                            body,
+                        },
+                    );
+                }
+                continue;
+            }
             self.raise_notification(tid, tool, kind, body.to_string());
         }
-        changed
+        let raised = self.raise_due_notifications();
+        changed || raised
+    }
+
+    /// Raise the notifications whose time has come: settled turn finishes, and reminders for
+    /// agents blocked too long. Both are bound to the agent EPISODE they were scheduled for,
+    /// so a status that moved, a replacement agent, or an acknowledgement (a key or click on
+    /// the pane, a jump to it, reading its notification) cancels them. Returns whether any
+    /// was raised (the center's unread chip must repaint).
+    fn raise_due_notifications(&mut self) -> bool {
+        let mut raised = false;
+        let settle = Duration::from_secs(self.cfg.notify_settle_secs.into());
+        let pending = std::mem::take(&mut self.pending_done);
+        for (tid, p) in pending {
+            let current = self
+                .agent_statuses
+                .get(&tid)
+                .is_some_and(|s| s.seq == p.seq);
+            if !current || self.acked(&tid, p.seq) || self.hook_owns(&tid, "done") {
+                continue;
+            }
+            if p.at.elapsed() < settle {
+                self.pending_done.insert(tid, p);
+                continue;
+            }
+            self.raise_notification(tid, p.tool, "done", p.body);
+            raised = true;
+        }
+        let remind = self.cfg.notify_remind_mins;
+        if remind > 0 {
+            let due: Vec<(TerminalId, u64)> = self
+                .agent_statuses
+                .iter()
+                .filter(|(tid, st)| {
+                    st.status == agentstate::AgentStatus::Blocked
+                        && st.since.elapsed() >= Duration::from_secs(u64::from(remind) * 60)
+                        && !self.acked(tid, st.seq)
+                        && self.reminded.get(*tid) != Some(&st.seq)
+                })
+                .map(|(tid, st)| (tid.clone(), st.seq))
+                .collect();
+            for (tid, seq) in due {
+                self.reminded.insert(tid.clone(), seq);
+                let tool = self
+                    .labels
+                    .get(&tid)
+                    .map(|l| l.text.clone())
+                    .unwrap_or_else(|| "agent".to_string());
+                let body = match self.agent_waits.get(&tid) {
+                    Some(w) => format!("still waiting {remind}m · {}", wait_text(w)),
+                    None => format!("still waiting {remind}m"),
+                };
+                self.raise_notification(tid, tool, "blocked", body);
+                raised = true;
+            }
+        }
+        let statuses = &self.agent_statuses;
+        self.reminded
+            .retain(|tid, seq| statuses.get(tid).is_some_and(|s| s.seq == *seq));
+        raised
+    }
+
+    /// Has `term`'s episode `seq` been acknowledged (see [`Self::agent_ack`])?
+    fn acked(&self, term: &TerminalId, seq: u64) -> bool {
+        self.agent_ack.get(term).copied().unwrap_or(0) >= seq
     }
 
     /// Is this (pane, live agent pid, kind) already served by the agent's own hook?
@@ -16052,7 +16147,146 @@ mod agent_attention {
         let (mut cfg, _) = MuxConfig::load_from(Path::new("/nonexistent/mux.toml"));
         cfg.persist = false; // never restore (or save over) the user's real sessions
         cfg.notify = false; // the in-app center still logs; no desktop toast from a test
+        cfg.notify_settle_secs = 0; // announce at once unless a test is about settling
         App::new(120, 30, Vec::new(), Vec::new(), cfg).expect("app")
+    }
+
+    fn settling_app(secs: u32) -> App {
+        let mut app = app();
+        app.cfg.notify_settle_secs = secs;
+        app
+    }
+
+    /// Pretend every pending finish began `secs` ago.
+    fn age_pending(app: &mut App, secs: u64) {
+        for p in app.pending_done.values_mut() {
+            p.at -= Duration::from_secs(secs);
+        }
+    }
+
+    /// Pretend `term` entered its current status `secs` ago.
+    fn age_status(app: &mut App, term: &TerminalId, secs: u64) {
+        let st = app.agent_statuses.get_mut(term).unwrap();
+        st.since -= Duration::from_secs(secs);
+    }
+
+    fn count(app: &App, kind: &str) -> usize {
+        app.notifications.iter().filter(|n| n.kind == kind).count()
+    }
+
+    #[test]
+    fn a_finish_is_announced_only_once_it_has_held() {
+        let mut app = settling_app(3);
+        let t = app.focused_terminal().unwrap();
+        new_session(&mut app, "elsewhere"); // nobody is looking at `t`
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        sweep(&mut app, &t, 7, AgentStatus::Ready);
+        assert_eq!(count(&app, "done"), 0, "announced before it settled");
+        // The unseen marker does not wait: a flap clears it by itself.
+        assert!(app.unseen_done(&t));
+        age_pending(&mut app, 5);
+        sweep(&mut app, &t, 7, AgentStatus::Ready);
+        assert_eq!(count(&app, "done"), 1);
+        sweep(&mut app, &t, 7, AgentStatus::Ready);
+        assert_eq!(count(&app, "done"), 1, "announced twice");
+    }
+
+    #[test]
+    fn a_stop_hook_flap_is_never_announced() {
+        let mut app = settling_app(3);
+        let t = app.focused_terminal().unwrap();
+        new_session(&mut app, "elsewhere");
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        sweep(&mut app, &t, 7, AgentStatus::Ready);
+        // A Stop hook blocked the stop: straight back to work.
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        age_pending(&mut app, 5);
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        assert_eq!(count(&app, "done"), 0);
+        assert!(app.pending_done.is_empty());
+        assert!(!app.unseen_done(&t));
+    }
+
+    #[test]
+    fn looking_or_a_new_agent_cancels_a_pending_finish() {
+        // Acknowledged while settling: the user already saw it.
+        let mut app = settling_app(3);
+        let t = app.focused_terminal().unwrap();
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        sweep(&mut app, &t, 7, AgentStatus::Ready);
+        app.ack_focused_bell();
+        age_pending(&mut app, 5);
+        sweep(&mut app, &t, 7, AgentStatus::Ready);
+        assert_eq!(
+            count(&app, "done"),
+            0,
+            "announced a finish the user acknowledged"
+        );
+        // A replacement agent in the pane: the episode is gone.
+        let mut app = settling_app(3);
+        let t = app.focused_terminal().unwrap();
+        new_session(&mut app, "elsewhere");
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        sweep(&mut app, &t, 7, AgentStatus::Ready);
+        age_pending(&mut app, 5);
+        sweep(&mut app, &t, 8, AgentStatus::Ready);
+        assert_eq!(
+            count(&app, "done"),
+            0,
+            "announced the previous agent's finish"
+        );
+    }
+
+    #[test]
+    fn a_long_block_is_reminded_once_per_episode_unless_acknowledged() {
+        let mut app = app();
+        app.cfg.notify_remind_mins = 10;
+        let t = app.focused_terminal().unwrap();
+        new_session(&mut app, "elsewhere");
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        sweep(&mut app, &t, 7, AgentStatus::Blocked);
+        assert_eq!(count(&app, "blocked"), 1, "the block itself");
+        age_status(&mut app, &t, 9 * 60);
+        sweep(&mut app, &t, 7, AgentStatus::Blocked);
+        assert_eq!(count(&app, "blocked"), 1, "reminded early");
+        age_status(&mut app, &t, 2 * 60);
+        sweep(&mut app, &t, 7, AgentStatus::Blocked);
+        assert_eq!(count(&app, "blocked"), 2);
+        assert!(
+            app.notifications
+                .front()
+                .unwrap()
+                .body
+                .starts_with("still waiting 10m")
+        );
+        sweep(&mut app, &t, 7, AgentStatus::Blocked);
+        assert_eq!(count(&app, "blocked"), 2, "one reminder per episode");
+        // A NEW block is a new episode and is reminded again.
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        sweep(&mut app, &t, 7, AgentStatus::Blocked);
+        age_status(&mut app, &t, 11 * 60);
+        sweep(&mut app, &t, 7, AgentStatus::Blocked);
+        assert_eq!(count(&app, "blocked"), 4);
+        // An acknowledged block is not.
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        sweep(&mut app, &t, 7, AgentStatus::Blocked);
+        app.jump_to_terminal(&t);
+        age_status(&mut app, &t, 11 * 60);
+        sweep(&mut app, &t, 7, AgentStatus::Blocked);
+        assert_eq!(
+            count(&app, "blocked"),
+            5,
+            "reminded about a block the user went to"
+        );
+        // And `0` turns reminders off.
+        let mut app = self::app();
+        app.cfg.notify_remind_mins = 0;
+        let t = app.focused_terminal().unwrap();
+        new_session(&mut app, "elsewhere");
+        sweep(&mut app, &t, 7, AgentStatus::Blocked);
+        age_status(&mut app, &t, 3600);
+        sweep(&mut app, &t, 7, AgentStatus::Blocked);
+        assert_eq!(count(&app, "blocked"), 0);
     }
 
     /// One sweep in which `term` runs agent `pid` and reads `status`.
