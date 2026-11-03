@@ -844,6 +844,7 @@ dependencies = [
  "base64 0.22.1",
  "copad-core",
  "copad-daemon",
+ "copad-graph-web",
  "copad-graphics",
  "copad-keys",
  "copad-mux-proto",
