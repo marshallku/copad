@@ -506,6 +506,10 @@ pub struct Agent {
     /// such rows `⇄N`, N counting this one.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub worktree_peers: u32,
+    /// How full the agent's context window is, and what the session has cost. Absent when
+    /// comux has no reading (an agent whose log it cannot read, or before the first response).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<AgentContext>,
     /// The pane is the focused pane of the active tab.
     #[serde(default)]
     pub focused: bool,
@@ -524,6 +528,24 @@ pub struct AgentWait {
     pub kind: String,
     /// What to approve or answer: `Bash: git status`, `choose: allow or deny …`.
     pub what: String,
+}
+
+/// An agent's context fill and spend. A host draws `used / window` as a gauge coloured like the
+/// usage gauge (green < 70% ≤ yellow < 90% ≤ red), and only the raw count without `window`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct AgentContext {
+    /// Tokens in the window at the agent's last response (its input side).
+    pub used: u64,
+    /// The window's size, when known: Codex logs it; Claude reports it only through its
+    /// statusline (`comux agent-report`), since its log does not tell a 200k model from 1M.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<u64>,
+    /// The session's estimated cost so far, USD (Claude's statusline, list prices).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// `cost_usd` over the session's wall time, USD per hour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_per_hour: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]

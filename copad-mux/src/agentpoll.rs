@@ -88,6 +88,27 @@ pub struct Activity {
     pub detail: String,
 }
 
+/// How full an agent's context window was at its last model response.
+///
+/// `used` is the INPUT side of that response — fresh input plus cache reads and writes —
+/// which is what the next request starts from and what Claude's own statusline calls
+/// `used_percentage`. `window` is known only where the log says it (Codex's
+/// `model_context_window`); Claude's transcript never names its window (200k and 1M models
+/// share ids), so it comes from the statusline push instead, never from a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Context {
+    pub used: u64,
+    pub window: Option<u64>,
+}
+
+/// What one log line says about the context, newest first: nothing, a reading, or that a
+/// compaction reset it (to the post-compaction size, when the log records one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mark {
+    Used(Context),
+    Reset(Option<u64>),
+}
+
 #[derive(Default)]
 pub struct Inner {
     /// Agent panes the render loop wants tracked: `(pid, tool basename)`.
@@ -97,6 +118,8 @@ pub struct Inner {
     /// The log each pid was resolved to, published whether or not it has yielded a detail
     /// yet — a fresh conversation that has run no tool still HAS a conversation.
     sources: HashMap<u32, PathBuf>,
+    /// The last context reading per pid ([`Context`]).
+    contexts: HashMap<u32, Context>,
 }
 
 pub type Shared = Arc<Mutex<Inner>>;
@@ -150,6 +173,11 @@ pub fn activity(shared: &Shared, pid: u32) -> Option<Activity> {
     shared.lock().ok()?.seen.get(&pid).cloned()
 }
 
+/// The context fill last read for `pid`, if any.
+pub fn context(shared: &Shared, pid: u32) -> Option<Context> {
+    shared.lock().ok()?.contexts.get(&pid).copied()
+}
+
 /// What we know about one tracked pid between ticks.
 struct Entry {
     tool: String,
@@ -166,6 +194,11 @@ struct Entry {
     /// gets republished, so the distinction from a FAILED read matters and is why
     /// [`read_detail`] returns a nested `Option`.
     last: Option<Activity>,
+    /// The newest context reading in this source. Unlike `last` it is KEPT across a read whose
+    /// tail holds no usage record — a turn of big tool output can push the last response out
+    /// of the tail, and that says nothing about the context having emptied. Only a source
+    /// change or a compaction marker clears it.
+    ctx: Option<Context>,
     /// When resolution last produced no path, for [`RESOLVE_RETRY`].
     failed_at: Option<Instant>,
     /// When a source that costs a FORK to resolve was last re-resolved, for
@@ -223,15 +256,21 @@ pub fn spawn() -> Shared {
                         .iter()
                         .filter_map(|(pid, e)| Some((*pid, e.path.clone()?)))
                         .collect();
+                    let contexts = cache
+                        .iter()
+                        .filter_map(|(pid, e)| Some((*pid, e.ctx?)))
+                        .collect();
                     if let Ok(mut g) = out.lock() {
                         g.seen = seen;
                         g.sources = sources;
+                        g.contexts = contexts;
                     }
                 } else if !cache.is_empty() {
                     cache.clear();
                     if let Ok(mut g) = out.lock() {
                         g.seen.clear();
                         g.sources.clear();
+                        g.contexts.clear();
                     }
                 }
                 std::thread::sleep(TICK);
@@ -267,6 +306,7 @@ fn sweep(
             path: None,
             stamp: None,
             last: None,
+            ctx: None,
             failed_at: None,
             checked_at: None,
         });
@@ -284,6 +324,7 @@ fn sweep(
             e.path = None;
             e.stamp = None;
             e.last = None;
+            e.ctx = None;
         }
         // The cheap oracle, for the tool that has one. codex has none, so it is the timer in
         // `want` that decides for it and this stays `false`.
@@ -299,6 +340,7 @@ fn sweep(
                     e.path = None;
                     e.stamp = None;
                     e.last = None;
+                    e.ctx = None;
                     true
                 }
             };
@@ -329,6 +371,7 @@ fn sweep(
                         e.path = found;
                         e.stamp = None;
                         e.last = None;
+                        e.ctx = None;
                     }
                 }
             }
@@ -354,9 +397,19 @@ fn sweep(
         // readability without its mtime or length changing would never re-stamp. What we
         // already had is republished below rather than blanking the row over a transient
         // failure.
-        if let Some(detail) = read_detail(&path, tool) {
+        if let Some((detail, mark)) = read_log(&path, tool) {
             e.stamp = now;
             e.last = detail;
+            match mark {
+                Some(Mark::Used(c)) => e.ctx = Some(c),
+                Some(Mark::Reset(Some(used))) => {
+                    // The window outlives a compaction; only the fill changed.
+                    let window = e.ctx.and_then(|c| c.window);
+                    e.ctx = Some(Context { used, window });
+                }
+                Some(Mark::Reset(None)) => e.ctx = None,
+                None => {}
+            }
         }
         if let Some(a) = e.last.clone() {
             out.insert(*pid, a);
@@ -556,7 +609,14 @@ fn project_slug(cwd: &str) -> String {
 ///   forever once the file became readable again without its mtime/len changing.
 /// * `Some(None)` — read fine, but the tail held nothing parseable. A real, cacheable
 ///   reading of "no activity".
+#[cfg(test)]
 fn read_detail(path: &Path, tool: &str) -> Option<Option<Activity>> {
+    read_log(path, tool).map(|(a, _)| a)
+}
+
+/// One read of the log's tail: the activity (as [`read_detail`]) and the NEWEST context
+/// mark in it, `None` when the tail holds none.
+fn read_log(path: &Path, tool: &str) -> Option<(Option<Activity>, Option<Mark>)> {
     let (budget, parse): (u64, fn(&str) -> Option<String>) = match tool {
         "claude" => (CLAUDE_TAIL, claude_line_detail),
         "codex" => (CODEX_TAIL, codex_line_detail),
@@ -564,10 +624,65 @@ fn read_detail(path: &Path, tool: &str) -> Option<Option<Activity>> {
         "agy" => (AGY_TAIL, agy_line_detail),
         _ => return None,
     };
+    let mark: fn(&str) -> Option<Mark> = match tool {
+        "claude" => claude_line_context,
+        "codex" => codex_line_context,
+        _ => |_| None,
+    };
     let text = tail(path, budget)?;
-    Some(text.lines().rev().find_map(parse).map(|detail| Activity {
+    let detail = text.lines().rev().find_map(parse).map(|detail| Activity {
         detail: truncate(&detail, MAX_DETAIL),
-    }))
+    });
+    Some((detail, text.lines().rev().find_map(mark)))
+}
+
+/// One Claude transcript line → its context mark: an assistant response's input-side usage,
+/// or a `compact_boundary`. Subagent (sidechain) responses run in their own context and
+/// synthetic messages carry zeroed usage, so neither counts.
+fn claude_line_context(line: &str) -> Option<Mark> {
+    if line.contains("\"compact_boundary\"") {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        if v.get("subtype").and_then(|t| t.as_str()) == Some("compact_boundary") {
+            return Some(Mark::Reset(
+                v.pointer("/compactMetadata/postTokens")
+                    .and_then(|n| n.as_u64()),
+            ));
+        }
+        return None;
+    }
+    if !line.contains("\"usage\"") || !line.contains("\"assistant\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("assistant")
+        || v.get("isSidechain").and_then(|b| b.as_bool()) == Some(true)
+        || v.pointer("/message/model").and_then(|m| m.as_str()) == Some("<synthetic>")
+    {
+        return None;
+    }
+    let u = v.pointer("/message/usage")?;
+    let n = |k: &str| u.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+    let used = n("input_tokens") + n("cache_creation_input_tokens") + n("cache_read_input_tokens");
+    (used > 0).then_some(Mark::Used(Context { used, window: None }))
+}
+
+/// One codex rollout line → its context mark, from a `token_count` event: the last
+/// response's input tokens (cached ones are a subset of them) against the model's window.
+fn codex_line_context(line: &str) -> Option<Mark> {
+    if !line.contains("\"token_count\"") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    if v.pointer("/payload/type").and_then(|t| t.as_str()) != Some("token_count") {
+        return None;
+    }
+    let info = v.pointer("/payload/info")?;
+    let used = info.pointer("/last_token_usage/input_tokens")?.as_u64()?;
+    let window = info
+        .get("model_context_window")
+        .and_then(|w| w.as_u64())
+        .filter(|w| *w > 0);
+    Some(Mark::Used(Context { used, window }))
 }
 
 /// The last `budget` bytes of `path` as UTF-8, with a leading PARTIAL line discarded.
@@ -907,6 +1022,7 @@ mod tests {
             path: Some(path.to_path_buf()),
             stamp: None,
             last: None,
+            ctx: None,
             failed_at: None,
             checked_at: None,
         }
@@ -1145,6 +1261,7 @@ mod tests {
             path,
             stamp: None,
             last: None,
+            ctx: None,
             // Old enough that [`RESOLVE_RETRY`] never gates these tests: the point is to
             // isolate the SOURCE_RECHECK timer.
             failed_at: Instant::now().checked_sub(Duration::from_secs(3600)),
@@ -1413,6 +1530,84 @@ mod tests {
     fn a_slug_guess_is_only_ever_a_guess() {
         assert_eq!(project_slug("/Users/me/dev/copad"), "-Users-me-dev-copad");
         assert_eq!(project_slug("/private/tmp"), "-private-tmp");
+    }
+
+    #[test]
+    fn claude_context_is_the_last_responses_input_side() {
+        let used = |line: &str| match claude_line_context(line) {
+            Some(Mark::Used(c)) => Some(c),
+            _ => None,
+        };
+        let line = r#"{"type":"assistant","message":{"model":"claude-opus-5-5","usage":{"input_tokens":2,"cache_creation_input_tokens":1038,"cache_read_input_tokens":130167,"output_tokens":662}}}"#;
+        assert_eq!(
+            used(line),
+            Some(Context {
+                used: 131207,
+                window: None
+            })
+        );
+        // A subagent's response runs in its own window.
+        let side = line.replace(
+            r#""type":"assistant","#,
+            r#""type":"assistant","isSidechain":true,"#,
+        );
+        assert_eq!(used(&side), None);
+        let synthetic = line.replace("claude-opus-5-5", "<synthetic>");
+        assert_eq!(used(&synthetic), None);
+        let boundary = r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"auto","preTokens":43977,"postTokens":9516}}"#;
+        assert_eq!(claude_line_context(boundary), Some(Mark::Reset(Some(9516))));
+        let bare = r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"manual"}}"#;
+        assert_eq!(claude_line_context(bare), Some(Mark::Reset(None)));
+    }
+
+    #[test]
+    fn codex_context_carries_its_window() {
+        let line = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":233780},"last_token_usage":{"input_tokens":33649,"cached_input_tokens":33280,"output_tokens":57},"model_context_window":475000}}}"#;
+        assert_eq!(
+            codex_line_context(line),
+            Some(Mark::Used(Context {
+                used: 33649,
+                window: Some(475000)
+            }))
+        );
+        // Codex emits token_count with a null info before the first response.
+        let empty = r#"{"type":"event_msg","payload":{"type":"token_count","info":null}}"#;
+        assert_eq!(codex_line_context(empty), None);
+    }
+
+    #[test]
+    fn a_tail_without_usage_keeps_the_last_reading_and_a_compaction_resets_it() {
+        let dir = std::env::temp_dir().join(format!("agentpoll-ctx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("t.jsonl");
+        let usage = |n: u64| {
+            format!(
+                "{{\"type\":\"assistant\",\"message\":{{\"model\":\"m\",\"usage\":{{\"input_tokens\":{n}}}}}}}\n"
+            )
+        };
+        std::fs::write(&f, usage(5000)).unwrap();
+        let mut cache = HashMap::from([(1, entry_for(&f))]);
+        let wanted = vec![(1u32, "claude".to_string())];
+        let mut cursor = 0;
+        sweep(&wanted, &mut cache, no_home(), &mut cursor);
+        assert_eq!(
+            cache[&1].ctx,
+            Some(Context {
+                used: 5000,
+                window: None
+            })
+        );
+        // Growth with no response in it: the reading stands.
+        let mut text = usage(5000);
+        text.push_str("{\"type\":\"user\",\"message\":{\"content\":\"x\"}}\n");
+        std::fs::write(&f, &text).unwrap();
+        sweep(&wanted, &mut cache, no_home(), &mut cursor);
+        assert_eq!(cache[&1].ctx.map(|c| c.used), Some(5000));
+        text.push_str("{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"postTokens\":900}}\n");
+        std::fs::write(&f, &text).unwrap();
+        sweep(&wanted, &mut cache, no_home(), &mut cursor);
+        assert_eq!(cache[&1].ctx.map(|c| c.used), Some(900));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

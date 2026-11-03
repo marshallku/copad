@@ -2308,6 +2308,25 @@ for a in json.load(sys.stdin)["agents"]:
     [[ "$got" == "1 1 0" ]] || fail "expected peers '1 1 0' (shared, shared, alone), got '$got': $(cat "$WORK/json")"
     ok "two agents in one checkout read worktree_peers=1, the one elsewhere 0"
 
+    echo "45e. an agent's context fill, and its statusline report, reach list-agents"
+    # The transcript says how full the context is; only the statusline says the window and cost.
+    mkdir -p "$FH/.claude/projects/e2e"
+    printf '{"type":"assistant","message":{"model":"m","usage":{"input_tokens":2,"cache_creation_input_tokens":1000,"cache_read_input_tokens":49000,"output_tokens":5}}}\n' \
+        >"$FH/.claude/projects/e2e/$FID.jsonl"
+    wait_field context.used 50002 120
+    [[ -z "$(agent_field context.window)" ]] || fail "a Claude transcript alone must not claim a window"
+    printf '{"session_id":"%s","context_window":{"context_window_size":200000,"total_input_tokens":50002},"cost":{"total_cost_usd":1.5,"total_duration_ms":3600000}}' "$FID" \
+        | t 10 fx agent-report --pane "$AG" >/dev/null || fail "agent-report was refused"
+    wait_field context.window 200000 80
+    [[ "$(agent_field context.cost_per_hour)" == 1.5 ]] || fail "cost per hour: $(cat "$WORK/json")"
+    rc=0
+    printf '{"session_id":"not-this-one","context_window":{"context_window_size":1000000}}' \
+        | t 10 fx agent-report --pane "$AG" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" != 0 ]] || fail "a report for another conversation must be refused"
+    t 5 fx list-agents --json >"$WORK/json"
+    [[ "$(agent_field context.window)" == 200000 ]] || fail "the refused report changed the window"
+    ok "the transcript gives used=50002, the statusline report adds window 200000 and \$1.5/h; a foreign session is refused"
+
     t 15 fx kill-server >/dev/null 2>&1 || kill -9 "$FPID" 2>/dev/null || true
     kill "$APID" 2>/dev/null || true
 fi

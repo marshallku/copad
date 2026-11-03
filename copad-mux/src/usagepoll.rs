@@ -461,7 +461,7 @@ impl UsagePart {
 }
 
 /// `filled`/`empty` glyphs proportional to `pct` (0–100) over `width` cells.
-fn bar_glyphs(pct: f64, width: u16) -> String {
+pub(crate) fn bar_glyphs(pct: f64, width: u16) -> String {
     let w = width as usize;
     let filled = ((pct / 100.0) * width as f64)
         .round()

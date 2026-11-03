@@ -112,6 +112,7 @@ impl App {
                     wait: self.agent_wait(&r.term),
                     unseen: r.unseen,
                     worktree_peers: r.peers,
+                    context: r.context.map(AgentCtx::wire),
                     focused: focused.as_ref() == Some(&r.term),
                 }
             })

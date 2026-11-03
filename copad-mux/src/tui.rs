@@ -374,6 +374,114 @@ struct AgentRow {
     unseen: bool,
     /// Other agents in the same worktree ([`App::agent_peers`]).
     peers: u32,
+    /// Context fill and spend, when there is a reading ([`App::agent_contexts`]).
+    context: Option<AgentCtx>,
+}
+
+/// Claude's statusline as relayed by `comux agent-report`, kept per pane and only for the
+/// agent pid and conversation it was accepted for.
+#[derive(Debug, Clone, PartialEq)]
+struct PushedUsage {
+    pid: u32,
+    session: String,
+    window: Option<u64>,
+    used: Option<u64>,
+    cost: Option<f64>,
+    duration_ms: Option<u64>,
+}
+
+/// An agent's context fill and spend as the chrome shows it: the transcript's reading,
+/// completed by the statusline push where the transcript is silent (Claude's window, cost).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct AgentCtx {
+    used: u64,
+    window: Option<u64>,
+    cost: Option<f64>,
+    per_hour: Option<f64>,
+}
+
+impl AgentCtx {
+    /// The transcript's reading wins on `used`: its records are in the order they happened,
+    /// where a push is only as fresh as the statusline's last refresh. The push supplies what
+    /// the transcript cannot say. Either alone is enough for a row.
+    fn merge(poll: Option<agentpoll::Context>, push: Option<&PushedUsage>) -> Option<Self> {
+        let used = poll.map(|c| c.used).or(push.and_then(|p| p.used))?;
+        let cost = push.and_then(|p| p.cost);
+        // Under a minute of wall time is too short for a rate to mean anything.
+        let per_hour = cost
+            .zip(push.and_then(|p| p.duration_ms))
+            .and_then(|(c, ms)| (ms >= 60_000).then(|| c / (ms as f64 / 3_600_000.0)));
+        Some(Self {
+            used,
+            window: poll.and_then(|c| c.window).or(push.and_then(|p| p.window)),
+            cost,
+            per_hour,
+        })
+    }
+
+    /// Fill in percent, when the window is known.
+    fn pct(&self) -> Option<f64> {
+        self.window
+            .filter(|w| *w > 0)
+            .map(|w| self.used as f64 * 100.0 / w as f64)
+    }
+
+    /// `62%` with a window, else the raw `131k`.
+    fn short(&self) -> String {
+        match self.pct() {
+            Some(p) => format!("{p:.0}%"),
+            None => fmt_tokens(self.used),
+        }
+    }
+
+    /// `124k/200k · $1.20 · $3.40/h` — what the switcher's preview adds after the gauge.
+    fn long(&self) -> String {
+        let mut out = match self.window {
+            Some(w) => format!("{}/{}", fmt_tokens(self.used), fmt_tokens(w)),
+            None => format!("{} tokens", fmt_tokens(self.used)),
+        };
+        if let Some(c) = self.cost {
+            out.push_str(&format!(" · ${c:.2}"));
+        }
+        if let Some(r) = self.per_hour {
+            out.push_str(&format!(" · ${r:.2}/h"));
+        }
+        out
+    }
+
+    fn wire(self) -> copad_mux_proto::AgentContext {
+        copad_mux_proto::AgentContext {
+            used: self.used,
+            window: self.window,
+            cost_usd: self.cost,
+            cost_per_hour: self.per_hour,
+        }
+    }
+}
+
+/// Store `new` over `old`. Statusline runs can finish out of order, and a session's cost only
+/// grows, so within one agent and conversation the cost never goes back down; everything else
+/// is the newest report's.
+fn accept_report(old: Option<&PushedUsage>, mut new: PushedUsage) -> PushedUsage {
+    if let Some(old) = old.filter(|o| o.pid == new.pid && o.session == new.session) {
+        new.cost = match (old.cost, new.cost) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => b.or(a),
+        };
+        new.duration_ms = new.duration_ms.max(old.duration_ms);
+    }
+    new
+}
+
+/// `950`, `131k`, `1.2M`.
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        n.to_string()
+    }
 }
 
 impl AgentRow {
@@ -528,6 +636,9 @@ struct PopupRow {
     color: Color,
     /// The matchable + displayed text (`name  branch` / `tool · status  (space)`).
     text: String,
+    /// Drawn flush right in its own colour, outside the matched text: an agent's context
+    /// fill (`62%`).
+    trail: Option<(String, Color)>,
 }
 
 /// Which list the `Ctrl-f` switcher is showing (Left/Right switches). The sidebar's keyboard
@@ -853,6 +964,33 @@ fn usage_threshold_color(pct: f64) -> Color {
     }
 }
 
+/// An agent's context as a gauge that fits in `room` cells: `━━━━╌╌ 62%` coloured like the usage
+/// gauge, or just the label when there is no room for a bar (or no window to fill it against).
+/// `None` when even the label does not fit.
+fn ctx_gauge(c: &AgentCtx, room: usize) -> Option<(String, String, Color)> {
+    let label = c.short();
+    let lw = label.width();
+    if lw > room {
+        return None;
+    }
+    let Some(pct) = c.pct() else {
+        return Some((String::new(), label, CAT_OVERLAY));
+    };
+    let bar_w = room.saturating_sub(lw + 1).min(CTX_BAR_MAX);
+    let bar = if bar_w >= CTX_BAR_MIN {
+        usagepoll::bar_glyphs(pct, bar_w as u16)
+    } else {
+        String::new()
+    };
+    Some((bar, label, usage_threshold_color(pct)))
+}
+
+/// Widest / narrowest context bar a row draws; below the minimum it shows only the label.
+const CTX_BAR_MAX: usize = 8;
+const CTX_BAR_MIN: usize = 3;
+/// The switcher preview's bar, which has the width the sidebar lacks.
+const CTX_BAR_PREVIEW: usize = 20;
+
 /// An in-progress mouse drag-selection (tmux-style copy). Lives only between button-down and
 /// button-up. Coordinates are PANE-RELATIVE viewport cells; `owner` is the client connection
 /// that started it, so a concurrent client's Drag/Up can't hijack it (input is multi-client).
@@ -1054,9 +1192,16 @@ pub struct App {
     /// How many OTHER agent panes run in the same git worktree as this one (by process cwd),
     /// from the last sweep. Only panes with at least one peer are listed.
     agent_peers: HashMap<TerminalId, u32>,
+    /// Claude statusline reports per pane (`comux agent-report`), see [`PushedUsage`].
+    agent_reports: HashMap<TerminalId, PushedUsage>,
+    /// Each agent's context fill and spend from the last sweep ([`AgentCtx::merge`]).
+    agent_contexts: HashMap<TerminalId, AgentCtx>,
     /// Tests: an agent pane's cwd instead of its process's.
     #[cfg(test)]
     test_cwds: HashMap<TerminalId, PathBuf>,
+    /// Test seam: the transcript context reading per pane, in place of the poller's.
+    #[cfg(test)]
+    test_contexts: HashMap<TerminalId, agentpoll::Context>,
     /// Turn finishes waiting out `notify_settle_secs` before they are announced.
     pending_done: HashMap<TerminalId, PendingDone>,
     /// The blocked episode each pane was last reminded about (one reminder per episode).
@@ -1353,8 +1498,12 @@ impl App {
             done_episode: HashMap::new(),
             unseen_reported: std::collections::HashSet::new(),
             agent_peers: HashMap::new(),
+            agent_reports: HashMap::new(),
+            agent_contexts: HashMap::new(),
             #[cfg(test)]
             test_cwds: HashMap::new(),
+            #[cfg(test)]
+            test_contexts: HashMap::new(),
             pending_done: HashMap::new(),
             reminded: HashMap::new(),
             #[cfg(test)]
@@ -4899,6 +5048,45 @@ impl App {
                 }
                 None => Resp::err_code("not_found", format!("unknown pane: {target}")),
             },
+            Req::AgentReport {
+                target,
+                session_id,
+                window,
+                used,
+                cost_usd,
+                duration_ms,
+            } => {
+                let Some(term) = self.resolve_pane_target(target) else {
+                    return Resp::err_code("not_found", format!("unknown pane: {target}"));
+                };
+                let Some(pid) = self
+                    .labels
+                    .get(&term)
+                    .filter(|l| l.kind == procinfo::Kind::Agent)
+                    .map(|l| l.pid)
+                else {
+                    return Resp::err_code("invalid", "no agent in that pane");
+                };
+                // Identity is checked against the agent's OWN record of its conversation; a
+                // report whose identity cannot be observed is refused, not trusted.
+                if agentstate::claude_session_id(pid).as_deref() != Some(session_id.as_str()) {
+                    return Resp::err_code(
+                        "invalid",
+                        "that session is not the conversation of the pane's agent",
+                    );
+                }
+                let report = PushedUsage {
+                    pid,
+                    session: session_id.clone(),
+                    window: *window,
+                    used: *used,
+                    cost: *cost_usd,
+                    duration_ms: *duration_ms,
+                };
+                let merged = accept_report(self.agent_reports.get(&term), report);
+                self.agent_reports.insert(term, merged);
+                Resp::ok()
+            }
             Req::Notify { target, kind, body } => {
                 let kind = match kind.as_str() {
                     "done" => "done",
@@ -5128,6 +5316,7 @@ impl App {
                         wait: self.agent_wait(&r.term),
                         unseen: r.unseen,
                         worktree_peers: r.peers,
+                        context: r.context.map(AgentCtx::wire),
                         tab_id: loc.as_ref().map(|l| l.0.to_string()).unwrap_or_default(),
                         tab_name: loc.as_ref().map(|l| l.1.clone()).unwrap_or_default(),
                         tab_index: loc.as_ref().map_or(0, |l| l.2),
@@ -7136,6 +7325,7 @@ impl App {
                             glyph: "▪",
                             color,
                             text,
+                            trail: None,
                         });
                     }
                 }
@@ -7175,7 +7365,14 @@ impl App {
                     ) {
                         let badge = self.slot_badge(&row.term);
                         let shown = row.shown_status();
+                        let trail = row.context.as_ref().map(|c| {
+                            (
+                                c.short(),
+                                c.pct().map_or(CAT_OVERLAY, usage_threshold_color),
+                            )
+                        });
                         rows.push(PopupRow {
+                            trail,
                             target: PopupTarget::Agent(row.term),
                             glyph,
                             color,
@@ -7214,6 +7411,7 @@ impl App {
                         ("▪", CAT_OVERLAY)
                     };
                     rows.push(PopupRow {
+                        trail: None,
                         target: PopupTarget::Tab(self.ws.clone(), tab.id.clone()),
                         glyph,
                         color,
@@ -8873,6 +9071,7 @@ impl App {
         // reports `changed` — see `App::agent_details`.
         let mut details: HashMap<TerminalId, String> = HashMap::new();
         let mut waits: HashMap<TerminalId, agentstate::Wait> = HashMap::new();
+        let mut contexts: HashMap<TerminalId, AgentCtx> = HashMap::new();
         // Each agent's worktree, by its process cwd. Resolved every sweep — an agent can `cd`
         // — and memoised within it, since several agents usually share a directory.
         let mut worktrees: HashMap<TerminalId, PathBuf> = HashMap::new();
@@ -8888,6 +9087,19 @@ impl App {
             wanted.push((label.pid, label.text.clone()));
             if let Some(a) = agentpoll::activity(&self.agent_poll, label.pid) {
                 details.insert(tid.clone(), a.detail);
+            }
+            // A push counts only while it still names this agent and the conversation it is
+            // in now: a `/clear` or a replacement agent makes it someone else's numbers.
+            let conversation = agentpoll::conversation(&self.agent_poll, label.pid).map(|c| c.0);
+            let push = self.agent_reports.get(tid).filter(|r| {
+                r.pid == label.pid && conversation.as_deref() == Some(r.session.as_str())
+            });
+            #[cfg(test)]
+            let poll = self.test_contexts.get(tid).copied();
+            #[cfg(not(test))]
+            let poll = agentpoll::context(&self.agent_poll, label.pid);
+            if let Some(c) = AgentCtx::merge(poll, push) {
+                contexts.insert(tid.clone(), c);
             }
             #[cfg(test)]
             let reading = match self.test_readings.get(tid) {
@@ -8988,8 +9200,13 @@ impl App {
             || rolled
             || details != self.agent_details
             || waits != self.agent_waits
-            || peers != self.agent_peers;
+            || peers != self.agent_peers
+            || contexts != self.agent_contexts;
         self.agent_peers = peers;
+        self.agent_contexts = contexts;
+        // A report outlives neither its pane nor its agent.
+        self.agent_reports
+            .retain(|tid, r| next.get(tid).is_some_and(|st| st.pid == r.pid));
         self.agent_statuses = next;
         self.agent_details = details;
         self.agent_waits = waits;
@@ -9342,6 +9559,7 @@ impl App {
                             for_secs,
                             unseen: self.unseen_done(tid),
                             peers: self.agent_peers.get(tid).copied().unwrap_or(0),
+                            context: self.agent_contexts.get(tid).copied(),
                             term: tid.clone(),
                         });
                     }
@@ -9850,21 +10068,45 @@ impl App {
                 );
             }
             let waited = fmt_elapsed(row.for_secs);
+            let status_part = if waited.is_empty() {
+                row.shown_status().to_string()
+            } else {
+                format!("{} {}", row.shown_status(), waited)
+            };
             if entry_ag > 1 {
-                let sub = if waited.is_empty() {
-                    format!("{} · {}", row.shown_status(), row.tool)
+                // `ready 3m · claude      ━━━━╌╌ 62%`: the gauge sits flush right, and the
+                // tool name (which the tab chip already carries) is what gives way first.
+                let avail = sidebar_w.saturating_sub(5) as usize;
+                let gauge = row
+                    .context
+                    .as_ref()
+                    .and_then(|c| ctx_gauge(c, avail.saturating_sub(status_part.width() + 1)));
+                let with_tool = format!("{status_part} · {}", row.tool);
+                let gauge_w = gauge.as_ref().map_or(0, |(bar, label, _)| {
+                    bar.width() + usize::from(!bar.is_empty()) + label.width()
+                });
+                let sub = if gauge.is_none() || with_tool.width() + 1 + gauge_w <= avail {
+                    with_tool
                 } else {
-                    format!("{} {} · {}", row.shown_status(), waited, row.tool)
+                    status_part
                 };
                 let mut sx = 4u16;
                 put(buf, &mut sx, y + 1, &sub, sub_style);
+                if let Some((bar, label, color)) = gauge {
+                    let mut gx = 4 + (avail - gauge_w) as u16;
+                    let tone = Style::default().fg(color).bg(panel_bg);
+                    if !bar.is_empty() {
+                        put(buf, &mut gx, y + 1, &bar, tone);
+                        put(buf, &mut gx, y + 1, " ", sub_style);
+                    }
+                    put(buf, &mut gx, y + 1, &label, tone);
+                }
             } else {
                 // One row: the tool name is the first thing to go — the tab chip already
                 // carries it, while the status and how long it has held are the point.
-                let sub = if waited.is_empty() {
-                    row.shown_status().to_string()
-                } else {
-                    format!("{} {}", row.shown_status(), waited)
+                let sub = match &row.context {
+                    Some(c) => format!("{status_part} {}", c.short()),
+                    None => status_part,
                 };
                 put_trailing(buf, x, y, &sub, sub_style);
             }
@@ -10654,7 +10896,6 @@ impl App {
             let selected = row_i == sel;
             let arrow = if selected { "▸" } else { " " };
             let text = format!("{arrow} {} {}", item.glyph, item.text);
-            let padded = pad_width(&text, inner_w as usize);
             let st = if selected {
                 Style::default()
                     .fg(Color::Black)
@@ -10663,7 +10904,35 @@ impl App {
             } else {
                 Style::default().fg(item.color).bg(bg)
             };
-            put(buf, y, inner_x, inner_w, &padded, st);
+            // The trail keeps its cells only when the text leaves room for it and a gap.
+            let trail = item
+                .trail
+                .as_ref()
+                .filter(|(t, _)| text.width() + 2 + t.width() <= inner_w as usize);
+            let text_w = inner_w - trail.map_or(0, |(t, _)| t.width() as u16 + 1);
+            put(
+                buf,
+                y,
+                inner_x,
+                text_w,
+                &pad_width(&text, text_w as usize),
+                st,
+            );
+            if let Some((t, color)) = trail {
+                let tone = if selected {
+                    st
+                } else {
+                    Style::default().fg(*color).bg(bg)
+                };
+                put(
+                    buf,
+                    y,
+                    inner_x + text_w,
+                    inner_w - text_w,
+                    &pad_width(&format!(" {t}"), (inner_w - text_w) as usize),
+                    tone,
+                );
+            }
         }
     }
 
@@ -10693,6 +10962,45 @@ impl App {
         }
         let items = self.popup_items(p.tab, &p.filter);
         self.preview_terminal(&items.get(pinned_sel(p, &items))?.target)
+    }
+
+    /// The agent readout under the switcher preview's header, as styled spans: the context
+    /// gauge with its counts and spend, then what the agent is doing or waiting for. Empty for
+    /// a pane with no agent reading.
+    fn preview_agent_lines(&self, term: &TerminalId, w: usize) -> Vec<Vec<(String, Style)>> {
+        let dim = Style::default().fg(CAT_OVERLAY);
+        let mut out = Vec::new();
+        if let Some(c) = self.agent_contexts.get(term) {
+            let (label, long) = (c.short(), c.long());
+            let mut line = vec![("ctx ".to_string(), dim)];
+            if let Some(pct) = c.pct() {
+                let tone = Style::default().fg(usage_threshold_color(pct));
+                // `ctx ` + bar + ` ` + label + ` · ` + long
+                let bar_w = w
+                    .saturating_sub(4 + 1 + label.width() + 3 + long.width())
+                    .min(CTX_BAR_PREVIEW);
+                if bar_w >= CTX_BAR_MIN {
+                    line.push((
+                        format!("{} ", usagepoll::bar_glyphs(pct, bar_w as u16)),
+                        tone,
+                    ));
+                }
+                line.push((label, tone.add_modifier(Modifier::BOLD)));
+                line.push((format!(" · {long}"), dim));
+            } else {
+                line.push((long, dim));
+            }
+            out.push(line);
+        }
+        let doing = self
+            .agent_waits
+            .get(term)
+            .map(wait_text)
+            .or_else(|| self.agent_details.get(term).cloned());
+        if let Some(d) = doing.filter(|d| !d.is_empty()) {
+            out.push(vec![(d, Style::default().fg(CAT_SUBTEXT))]);
+        }
+        out
     }
 
     /// The line above a preview: `space/tab · label status`.
@@ -10761,6 +11069,15 @@ impl App {
                 .fg(CAT_SUBTEXT)
                 .add_modifier(Modifier::BOLD),
         );
+        let info = self.preview_agent_lines(&term, w as usize);
+        for (i, line) in info.iter().enumerate().take(h.saturating_sub(2) as usize) {
+            let mut xx = x;
+            for (text, style) in line {
+                xx = put_str(buf, xx, y + 1 + i as u16, x + w, text, *style);
+            }
+        }
+        let y = y + info.len().min(h.saturating_sub(2) as usize) as u16;
+        let h = h - info.len().min(h.saturating_sub(2) as usize) as u16;
         let Some(pt) = self.panes.get(&term) else {
             return;
         };
@@ -13492,6 +13809,7 @@ mod tests {
             term: tid(title),
             unseen: false,
             peers: 0,
+            context: None,
         }
     }
 
@@ -16449,6 +16767,111 @@ mod agent_attention {
     }
 
     /// One sweep in which `term` runs agent `pid` and reads `status`.
+    fn screen(app: &App) -> String {
+        use ratatui::layout::Rect;
+        let (cols, rows) = app.size();
+        let mut buf = Buffer::empty(Rect::new(0, 0, cols, rows));
+        app.render_to(&mut buf);
+        (0..rows)
+            .map(|y| {
+                (0..cols)
+                    .map(|x| buf.cell(Position::new(x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+                    + "\n"
+            })
+            .collect()
+    }
+
+    fn push(pid: u32, session: &str, cost: Option<f64>, duration_ms: Option<u64>) -> PushedUsage {
+        PushedUsage {
+            pid,
+            session: session.into(),
+            window: Some(1_000_000),
+            used: Some(90_000),
+            cost,
+            duration_ms,
+        }
+    }
+
+    #[test]
+    fn the_transcript_gives_the_fill_and_the_push_what_it_cannot_say() {
+        let poll = agentpoll::Context {
+            used: 124_000,
+            window: None,
+        };
+        let p = push(1, "s", Some(2.0), Some(1_800_000));
+        let both = AgentCtx::merge(Some(poll), Some(&p)).unwrap();
+        assert_eq!((both.used, both.window), (124_000, Some(1_000_000)));
+        assert_eq!(both.per_hour, Some(4.0));
+        assert_eq!(both.short(), "12%");
+        assert_eq!(both.long(), "124k/1.0M · $2.00 · $4.00/h");
+        // The push alone is enough for a row; the transcript alone shows the raw count.
+        assert_eq!(AgentCtx::merge(None, Some(&p)).unwrap().used, 90_000);
+        let bare = AgentCtx::merge(Some(poll), None).unwrap();
+        assert_eq!((bare.short(), bare.pct()), ("124k".to_string(), None));
+        assert_eq!(AgentCtx::merge(None, None), None);
+        // Under a minute there is no rate.
+        let early = push(1, "s", Some(0.1), Some(20_000));
+        assert_eq!(AgentCtx::merge(None, Some(&early)).unwrap().per_hour, None);
+    }
+
+    #[test]
+    fn an_out_of_order_report_never_lowers_the_cost() {
+        let newer = accept_report(None, push(1, "s", Some(3.0), Some(600_000)));
+        let late = accept_report(Some(&newer), push(1, "s", Some(2.5), Some(500_000)));
+        assert_eq!((late.cost, late.duration_ms), (Some(3.0), Some(600_000)));
+        // A new conversation starts over.
+        let fresh = accept_report(Some(&newer), push(1, "other", Some(0.2), Some(1_000)));
+        assert_eq!(fresh.cost, Some(0.2));
+    }
+
+    #[test]
+    fn context_reaches_the_wire_the_sidebar_and_the_switcher() {
+        let mut app = app();
+        let t = app.focused_terminal().unwrap();
+        app.test_contexts.insert(
+            t.clone(),
+            agentpoll::Context {
+                used: 124_000,
+                window: Some(200_000),
+            },
+        );
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        let wire = app.host_agents().agents;
+        let ctx = wire[0].context.clone().unwrap();
+        assert_eq!((ctx.used, ctx.window), (124_000, Some(200_000)));
+        let screen = screen(&app);
+        assert!(screen.contains("62%"), "{screen}");
+        assert!(screen.contains("━"), "{screen}");
+        let lines = app.preview_agent_lines(&t, 60);
+        let first: String = lines[0].iter().map(|(t, _)| t.as_str()).collect();
+        assert!(
+            first.contains("62%") && first.contains("124k/200k"),
+            "{first}"
+        );
+        // The switcher row carries the fill flush right.
+        let rows = app.popup_items(PopupTab::Agents, "");
+        assert_eq!(rows[0].trail.as_ref().map(|t| t.0.as_str()), Some("62%"));
+    }
+
+    #[test]
+    fn a_report_does_not_outlive_its_agent() {
+        let mut app = app();
+        let t = app.focused_terminal().unwrap();
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        app.agent_reports
+            .insert(t.clone(), push(7, "s", Some(1.0), None));
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        assert!(app.agent_reports.contains_key(&t));
+        // Without a resolved conversation to match, it is held but not shown.
+        assert!(!app.agent_contexts.contains_key(&t));
+        sweep(&mut app, &t, 8, AgentStatus::Working);
+        assert!(
+            app.agent_reports.is_empty(),
+            "a replacement agent dropped it"
+        );
+    }
+
     fn sweep(app: &mut App, term: &TerminalId, pid: u32, status: AgentStatus) {
         app.labels.insert(
             term.clone(),

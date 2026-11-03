@@ -341,6 +341,23 @@ pub enum Req {
         /// Toast body. The title is composed server-side from the agent + session.
         body: String,
     },
+    /// Claude's statusline, relayed for a pane's agent (`comux agent-report`, piped from a
+    /// `statusLine` command). Its transcript says how many tokens the context holds but not
+    /// how big the window is, nor what the session cost; the statusline says both. Accepted
+    /// only when `session_id` is the conversation the pane's agent is in, so a report from a
+    /// different process or an earlier conversation can never land on this row.
+    AgentReport {
+        target: String,
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        used: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
+    },
     /// Kill the session at `index` (as printed by `list-sessions`): drop its tabs and
     /// reap every shell in them, switching to a survivor when it was the active one.
     /// Refused when it is the LAST session (the mux keeps ≥1). Unlike the TUI's
@@ -815,6 +832,9 @@ pub struct AgentInfo {
     /// How many OTHER agents run in the same git worktree (`⇄N` in the sidebar).
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub worktree_peers: u32,
+    /// Context fill and spend, when comux has a reading (see `copad_mux_proto::AgentContext`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<copad_mux_proto::AgentContext>,
     /// The tab the agent lives in: its STABLE id (`s4:t13`, a tab selector), its custom name
     /// (empty when unnamed — `title` then shows `tab <n>`), and its index in the session.
     #[serde(default)]
@@ -2131,6 +2151,26 @@ pub fn run_client(args: &[String]) -> i32 {
                 }
             }
         }
+        "agent-report" => {
+            let p = parsed!(AGENT_REPORT_SPEC);
+            let Some(target) = p.value("--pane").map(str::to_string).or_else(caller_pane) else {
+                return usage_error(
+                    json_out,
+                    "comux agent-report: no pane given and $COPAD_MUX_PANE is unset",
+                    AGENT_REPORT_SPEC.usage,
+                );
+            };
+            match read_agent_report(target) {
+                Ok(req) => req,
+                Err(e) => {
+                    return usage_error(
+                        json_out,
+                        &format!("comux agent-report: {e}"),
+                        AGENT_REPORT_SPEC.usage,
+                    );
+                }
+            }
+        }
         "resize" => {
             let p = parsed!(RESIZE_SPEC);
             let idx = p.positionals.first().and_then(|s| s.parse::<usize>().ok());
@@ -2683,6 +2723,52 @@ const NOTIFY_SPEC: Spec = Spec {
     ],
     positionals: Positionals::Any,
 };
+
+const AGENT_REPORT_SPEC: Spec = Spec {
+    usage: "usage: comux agent-report [--pane <token>] < statusline.json\n\
+            \x20      relay Claude Code's statusLine JSON (stdin) for the agent in your pane, so the\n\
+            \x20      sidebar knows its context window and cost. In a statusLine command:\n\
+            \x20      [ -n \"$COPAD_MUX_PANE\" ] && printf '%s' \"$input\" | comux agent-report >/dev/null 2>&1",
+    flags: &[opt(&["--pane"])],
+    positionals: Positionals::AtMost(0),
+};
+
+/// The statusline JSON on stdin → an [`Req::AgentReport`]. Only documented fields are read
+/// (`session_id`, `context_window.context_window_size` / `total_input_tokens`,
+/// `cost.total_cost_usd` / `total_duration_ms`); anything else may move under us.
+fn read_agent_report(target: String) -> Result<Req, String> {
+    use std::io::{IsTerminal, Read};
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        return Err("expects Claude Code's statusline JSON on stdin".into());
+    }
+    let mut raw = Vec::new();
+    stdin
+        .lock()
+        .take(1 << 20)
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("reading stdin: {e}"))?;
+    agent_report_from(target, &raw)
+}
+
+fn agent_report_from(target: String, raw: &[u8]) -> Result<Req, String> {
+    let v: serde_json::Value = serde_json::from_slice(raw).map_err(|e| format!("not JSON: {e}"))?;
+    let session_id = v
+        .get("session_id")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("no session_id")?
+        .to_string();
+    let u = |ptr: &str| v.pointer(ptr).and_then(|n| n.as_u64());
+    Ok(Req::AgentReport {
+        target,
+        session_id,
+        window: u("/context_window/context_window_size").filter(|w| *w > 0),
+        used: u("/context_window/total_input_tokens"),
+        cost_usd: v.pointer("/cost/total_cost_usd").and_then(|n| n.as_f64()),
+        duration_ms: u("/cost/total_duration_ms"),
+    })
+}
 
 const RENAME_PANE_SPEC: Spec = Spec {
     usage: "usage: comux rename-pane [<pane-token>] <name...>   name a pane (yours by default);\n\
@@ -4468,12 +4554,48 @@ mod verb_args_tests {
         "capture-pane",
         "jump",
         "notify",
+        "agent-report",
         "resize",
         "send",
         "skill",
         "wait-output",
         "wait-agent",
     ];
+
+    #[test]
+    fn agent_report_reads_only_the_documented_statusline_fields() {
+        let raw = br#"{"session_id":"abc","model":{"id":"claude-opus-5-5"},"context_window":{"used_percentage":12.4,"context_window_size":1000000,"total_input_tokens":124000},"cost":{"total_cost_usd":1.25,"total_duration_ms":90000}}"#;
+        match agent_report_from("p-1".into(), raw).unwrap() {
+            Req::AgentReport {
+                target,
+                session_id,
+                window,
+                used,
+                cost_usd,
+                duration_ms,
+            } => {
+                assert_eq!((target.as_str(), session_id.as_str()), ("p-1", "abc"));
+                assert_eq!((window, used), (Some(1_000_000), Some(124_000)));
+                assert_eq!((cost_usd, duration_ms), (Some(1.25), Some(90_000)));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Early in a session the window fields can be null; the report still carries cost.
+        let early = br#"{"session_id":"abc","context_window":{"context_window_size":null},"cost":{"total_cost_usd":0}}"#;
+        assert!(matches!(
+            agent_report_from("p".into(), early).unwrap(),
+            Req::AgentReport {
+                window: None,
+                used: None,
+                ..
+            }
+        ));
+        assert!(
+            agent_report_from("p".into(), b"{}").is_err(),
+            "no session_id"
+        );
+        assert!(agent_report_from("p".into(), b"not json").is_err());
+    }
 
     #[test]
     fn help_exits_zero_without_a_request() {
@@ -6138,6 +6260,7 @@ mod list_agents_proto_tests {
             wait: None,
             unseen: false,
             worktree_peers: 0,
+            context: None,
             tab_id: "s1:t0".into(),
             tab_name: String::new(),
             tab_index: 0,

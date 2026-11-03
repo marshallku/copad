@@ -1345,6 +1345,9 @@ fn ctl_mutates(req: &control::Req) -> bool {
             // Inbox traffic is polled by `inbox --wait` and draws nothing.
             | control::Req::Inbox { .. }
             | control::Req::Deliver { .. }
+            // Sent on every statusline refresh. What it changes reaches the screen through
+            // the agent sweep's own change detection, like any other agent reading.
+            | control::Req::AgentReport { .. }
             // Push registrations draw nothing.
             | control::Req::PushRegister { .. }
             | control::Req::PushUnregister { .. }
