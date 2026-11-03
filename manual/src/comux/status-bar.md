@@ -67,6 +67,51 @@ If neither `--pane` nor `$COPAD_MUX_PANE` is set, `comux notify` is a usage erro
 
 > After upgrading the comux binary, run `comux server restart` before these verbs work: the *running* server is what handles them.
 
+## Agent context and spend
+
+Each agent row in the sidebar shows how full the agent's context window is, as a gauge on its second line: `ready 3m · claude   ━━━━━╌╌╌ 62%`. It uses the usage gauge's colours (green under 70%, yellow under 90%, red from 90%). When the sidebar is narrow, the tool name goes first, then the bar, and the percentage goes last. The status bar is unchanged.
+
+`Ctrl-f` → **agents** shows the percentage on each row. Above the preview of the selected agent it shows the full readout: `ctx ━━━━━━━━━━━━╌╌╌╌╌╌╌╌ 62% · 124k/200k · $1.20 · $3.40/h`, followed by what the agent is doing or waiting for. The copad sidebars on macOS, Linux and iOS draw the same readout as a bar.
+
+Where the numbers come from:
+
+- **Fill**: comux reads it from the agent's own log. For Claude, that is the input side of the last response in the transcript. For Codex, it is the rollout's `token_count`, which also gives the window size.
+- **Claude's window and cost**: Claude's log names neither, and 200k and 1M models share model ids. So until Claude reports them, a Claude row shows the raw count (`124k`) with no gauge. To report them, relay Claude Code's statusline to comux. Add this to your `statusLine` command:
+
+  ```bash
+  input=$(cat)
+  [ -n "$COPAD_MUX_PANE" ] && printf '%s' "$input" | comux agent-report >/dev/null 2>&1
+  # …then render your statusline from "$input" as before
+  ```
+
+  comux accepts a report only for the conversation the pane's agent is in right now. Cost is Claude's own estimate at list prices; per hour is that cost divided by the session's wall time. Codex rows show no cost.
+
+### Compacting at a better moment
+
+Claude compacts its context automatically once it fills up, wherever that happens to be in a task. `comux hook pre-compact` moves an automatic compaction to after your next commit:
+
+```jsonc
+// ~/.claude/settings.json
+{
+  "env": { "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "60" },   // start asking at 60% of the window
+  "hooks": {
+    "PreCompact": [{ "hooks": [{ "type": "command", "command": "comux hook pre-compact" }] }]
+  }
+}
+```
+
+Once the context is past the threshold, Claude asks the hook before every request, including mid-turn and inside a `/goal` loop. The hook blocks the compaction while the agent's git work tree has uncommitted changes to tracked files, and lets it through once they are committed. Nothing is typed into the pane.
+
+The hook only ever defers, and it lets the compaction through whenever it cannot be sure:
+
+- you ran `/compact` yourself;
+- comux doesn't know the window, because the statusline relay above isn't set up, or the agent isn't in a comux pane;
+- fewer than `--headroom` tokens (default 60000) are left in the window;
+- it has deferred `--max-deferrals` times in a row (default 40);
+- `git` fails or takes longer than 1.5 s.
+
+A clean tracked tree is a **preference**, not a detector of finished work. A turn that only creates new files, or only reads, also looks clean. Blocking cannot make one oversized request fit, which is why the headroom exists.
+
 ---
 
 ## The usage / limits readout
