@@ -35,6 +35,7 @@ pub struct Ask {
     pub trigger: String,
     pub session_id: String,
     pub cwd: String,
+    pub transcript_path: String,
 }
 
 /// The tracked work tree, as `git status` saw it.
@@ -61,7 +62,24 @@ pub struct Facts {
 pub struct Limits {
     pub headroom: u64,
     pub max_deferrals: u32,
+    pub when: When,
 }
+
+/// What an automatic compaction waits for besides a `comux compact` request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum When {
+    /// The work tree to be committed (the default).
+    Commit,
+    /// Nothing: only a request (or running out of room) lets it through.
+    Request,
+}
+
+/// How long a compaction allowed because the context could NOT be measured blocks the next
+/// such allowance — a persistently unreadable transcript must not compact on every request.
+const UNKNOWN_COOLDOWN_SECS: u64 = 600;
+
+/// The transcript tail the request mode reads for its own estimate.
+const TRANSCRIPT_TAIL: u64 = 4 << 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -111,6 +129,7 @@ pub fn parse_ask(raw: &[u8]) -> Option<Ask> {
         trigger: s("trigger"),
         session_id: s("session_id"),
         cwd: s("cwd"),
+        transcript_path: s("transcript_path"),
     })
 }
 
@@ -135,13 +154,141 @@ pub fn run(limits: Limits) -> i32 {
 }
 
 fn judge(ask: &Ask, limits: Limits, deadline: Instant) -> Verdict {
+    // Minted once per hook process: a retried claim is recognised as this one's, and no other
+    // ask can claim the same request again.
+    let nonce = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    );
+    let take = || crate::control::take_compact(&ask.session_id, &nonce, deadline) == Some(true);
     if ask.trigger != "auto" {
-        // A manual compaction ends any streak.
+        // A compaction by hand answers a queued request too, and ends any streak.
+        let _ = take();
         if let Some(p) = counter_path(&ask.session_id) {
             let _ = std::fs::remove_file(p);
         }
         return Verdict::Allow("asked for by hand");
     }
+    let verdict = match limits.when {
+        When::Commit => judge_commit(ask, limits, deadline),
+        When::Request => {
+            if take() {
+                return Verdict::Allow("requested");
+            }
+            judge_request(ask, limits)
+        }
+    };
+    match verdict {
+        // A queued request is what the user wanted at THIS ask, so a deferral gives way to it.
+        Verdict::Block(_) if limits.when == When::Commit && take() => Verdict::Allow("requested"),
+        // Compacting anyway answers any queued request too; left queued it would fire again
+        // right after.
+        Verdict::Allow(why) => {
+            let _ = take();
+            Verdict::Allow(why)
+        }
+        v => v,
+    }
+}
+
+/// `--when request`: block unless the window is nearly full. Measured from the transcript
+/// itself, so it holds with no comux server at all.
+fn judge_request(ask: &Ask, limits: Limits) -> Verdict {
+    // Without an auto-compact window Claude asks only at its own limit: never stand in the way.
+    let Some(window) = std::env::var("CLAUDE_CODE_AUTO_COMPACT_WINDOW")
+        .ok()
+        .and_then(|w| w.trim().parse::<u64>().ok())
+        .filter(|w| *w > 0)
+    else {
+        return Verdict::Allow("no auto-compact window");
+    };
+    match estimate(Path::new(&ask.transcript_path)) {
+        Some(used) if window.saturating_sub(used) < limits.headroom => {
+            Verdict::Allow("near the window")
+        }
+        Some(used) => Verdict::Block(format!(
+            "comux: compacting when you ask (comux compact), {}k/{}k",
+            used / 1000,
+            window / 1000
+        )),
+        None if unknown_allowance(&ask.session_id) => Verdict::Allow("context unknown"),
+        None => Verdict::Block("comux: context unknown, compacted recently".into()),
+    }
+}
+
+/// The context the NEXT request will carry, over-estimated: the newest response's input side
+/// plus its own output, or a compaction's post size, plus every byte written since at two
+/// bytes a token. `None` when the tail holds neither, or a compaction left no size.
+fn estimate(path: &Path) -> Option<u64> {
+    use crate::agentpoll::Mark;
+    let (text, _) = crate::agentpoll::tail_from(path, TRANSCRIPT_TAIL)?;
+    let mut after = 0u64;
+    for line in text.lines().rev() {
+        match crate::agentpoll::claude_line_context(line) {
+            Some(Mark::Used(c)) => return Some(c.used + output_tokens(line) + after / 2),
+            Some(Mark::Reset(Some(post))) => return Some(post + after / 2),
+            Some(Mark::Reset(None)) => return None,
+            None => after += line.len() as u64 + 1,
+        }
+    }
+    None
+}
+
+fn output_tokens(line: &str) -> u64 {
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .and_then(|v| v.pointer("/message/usage/output_tokens")?.as_u64())
+        .unwrap_or(0)
+}
+
+/// May a compaction go through although the context could not be measured? At most once per
+/// [`UNKNOWN_COOLDOWN_SECS`] per conversation, decided under a lock so two hooks cannot both
+/// see an expired stamp. Anything that cannot be locked or stamped says no.
+fn unknown_allowance(session_id: &str) -> bool {
+    use std::os::fd::AsRawFd;
+    let Some(base) = counter_path(session_id) else {
+        return false;
+    };
+    let stamp = base.with_extension("unknown");
+    let Some(dir) = stamp.parent() else {
+        return false;
+    };
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let Ok(lock) = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(base.with_extension("lock"))
+    else {
+        return false;
+    };
+    // SAFETY: a plain flock on a descriptor we own; released when `lock` is dropped.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return false;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let last = match std::fs::read_to_string(&stamp) {
+        Ok(s) => s.trim().parse::<u64>().ok(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(0),
+        Err(_) => None,
+    };
+    match last {
+        Some(t) if now.saturating_sub(t) >= UNKNOWN_COOLDOWN_SECS => {
+            write_count_str(&stamp, &now.to_string()).is_ok()
+        }
+        _ => false,
+    }
+}
+
+/// The git-preference judgement ([`decide`]) with its streak counter.
+fn judge_commit(ask: &Ask, limits: Limits, deadline: Instant) -> Verdict {
     let fill = crate::control::agent_fill(&ask.session_id, deadline);
     let counter = counter_path(&ask.session_id);
     // An unusable counter lets it through rather than deferring without a bound.
@@ -201,11 +348,15 @@ fn read_count(p: &Path) -> Option<u32> {
 /// number. Two hooks for one session cannot run at once: Claude awaits the hook before the
 /// request it guards.
 fn write_count(p: &Path, n: u32) -> std::io::Result<()> {
+    write_count_str(p, &n.to_string())
+}
+
+fn write_count_str(p: &Path, text: &str) -> std::io::Result<()> {
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = p.with_extension(format!("tmp{}", std::process::id()));
-    std::fs::write(&tmp, n.to_string())?;
+    std::fs::write(&tmp, text)?;
     std::fs::rename(&tmp, p)
 }
 
@@ -270,6 +421,7 @@ mod tests {
     const LIMITS: Limits = Limits {
         headroom: DEFAULT_HEADROOM,
         max_deferrals: DEFAULT_MAX_DEFERRALS,
+        when: When::Commit,
     };
 
     fn ask(trigger: &str) -> Ask {
@@ -277,6 +429,7 @@ mod tests {
             trigger: trigger.into(),
             session_id: "11111111-1111-4111-8111-111111111111".into(),
             cwd: "/x".into(),
+            transcript_path: String::new(),
         }
     }
 
@@ -378,6 +531,36 @@ mod tests {
         std::fs::write(dir.join("a"), "2").unwrap();
         assert_eq!(work_tree(&dir, far), Tree::Dirty);
         assert_eq!(work_tree(&dir.join("missing"), far), Tree::Unknown);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_estimate_over_counts_what_the_model_has_not_seen_yet() {
+        let dir = std::env::temp_dir().join(format!("compactgate-est-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("t.jsonl");
+        let usage = r#"{"type":"assistant","message":{"model":"m","usage":{"input_tokens":100000,"output_tokens":500}}}"#;
+        let result = format!(
+            r#"{{"type":"user","message":{{"content":"{}"}}}}"#,
+            "x".repeat(9_000)
+        );
+        std::fs::write(&f, format!("{usage}\n{result}\n")).unwrap();
+        let e = estimate(&f).unwrap();
+        // 100000 in + 500 out + at least 9000 bytes / 2.
+        assert!(e >= 100_500 + 4_500, "{e}");
+        std::fs::write(&f, format!("{usage}\n{{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{{\"postTokens\":9000}}}}\n")).unwrap();
+        assert_eq!(estimate(&f), Some(9000));
+        std::fs::write(
+            &f,
+            "{\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{}}\n",
+        )
+        .unwrap();
+        assert_eq!(
+            estimate(&f),
+            None,
+            "a compaction with no size leaves it unknown"
+        );
+        assert_eq!(estimate(&dir.join("missing")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

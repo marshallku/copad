@@ -112,6 +112,30 @@ The hook only ever defers, and it lets the compaction through whenever it cannot
 
 A clean tracked tree is a **preference**, not a detector of finished work. A turn that only creates new files, or only reads, also looks clean. Blocking cannot make one oversized request fit, which is why the headroom exists.
 
+### Compacting when you say so
+
+With `--when request`, the hook defers **every** automatic compaction until you ask for one. Ask from the sidebar or `Ctrl-f` (right-click a Claude agent, then **compact at next step**), or with `comux compact [pane]`. The compaction happens at that agent's next model request: mid-turn, and also inside `/goal`, where Claude never goes idle and there is otherwise no moment to step in. Nothing is typed into the pane. A queued request shows as `⇣` before the percentage, and `--cancel` (or the same menu) withdraws it.
+
+```jsonc
+// ~/.claude/settings.json
+{
+  "env": {
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000",   // your model's window; required
+    "CLAUDE_AUTOCOMPACT_PCT_OVERRIDE": "5"          // ask the hook at almost every request
+  },
+  "hooks": {
+    "PreCompact": [{ "hooks": [{ "type": "command", "command": "comux hook pre-compact --when request" }] }]
+  }
+}
+```
+
+Claude asks the hook only when an auto-compact window is set: the override alone does nothing. Set the window to your model's own limit.
+
+- A request is used once. If the compaction then fails, or another PreCompact hook blocks it, the `⇣` is gone and the context stays where it was. Ask again.
+- The hook still lets a compaction through when fewer than `--headroom` tokens are left. In request mode it measures this from the transcript itself, so it holds even without a comux server.
+- If it cannot measure the context at all, it allows at most one compaction per 10 minutes and blocks the rest.
+- Every PreCompact hook you have now runs before almost every request. Anything slow or noisy in them (writing snapshots, for example) belongs in `PostCompact` instead.
+
 ---
 
 ## The usage / limits readout

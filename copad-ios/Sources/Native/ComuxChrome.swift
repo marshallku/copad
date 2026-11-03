@@ -264,7 +264,8 @@ struct SpacesDrawer: View {
                     if let c = a.context {
                         Spacer(minLength: 4)
                         ComuxContextGauge(context: c, track: ComuxLook.rule, dim: ComuxLook.dim,
-                                          tone: ComuxLook.usage, width: 40, height: 4)
+                                          tone: ComuxLook.usage, width: 40, height: 4,
+                                          queued: a.compactQueued)
                     }
                 }
                 .padding(.leading, 16)
@@ -278,6 +279,11 @@ struct SpacesDrawer: View {
         .contextMenu {
             Button("Jump to pane") { act { session.jump(a.token) } }
             Button("Rename tab…") { act { session.openOverlay("rename-tab", target: "\(a.space_id)/\(a.tab_id)") } }
+            if a.tool == "claude" {
+                Button(a.compactQueued ? "Cancel compaction" : "Compact at next step") {
+                    act { session.command(["cmd": "compact", "target": a.token, "cancel": a.compactQueued]) }
+                }
+            }
         } preview: {
             DrawerPreview(session: session, pane: a.token)
         }

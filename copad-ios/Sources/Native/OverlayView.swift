@@ -594,7 +594,8 @@ private struct PickerCard: View {
                 Spacer(minLength: 4)
                 if let c = a.context {
                     ComuxContextGauge(context: c, track: look.rule, dim: look.dim, tone: look.usage,
-                                      width: look.advance * 4, height: max(4, look.lineHeight * 0.32))
+                                      width: look.advance * 4, height: max(4, look.lineHeight * 0.32),
+                                      queued: a.compactQueued)
                 }
                 if a.focused { Text("here").foregroundStyle(look.dim) }
             }
@@ -667,7 +668,8 @@ struct PanePreview: View {
 
     /// Lines the agent readout takes: the context gauge, and what it is doing.
     private var readoutLines: Int {
-        (agent?.context == nil ? 0 : 1) + ((agent?.detail ?? "").isEmpty ? 0 : 1)
+        (agent?.context == nil ? 0 : 1) + (agent?.compactQueued == true ? 1 : 0)
+            + ((agent?.detail ?? "").isEmpty ? 0 : 1)
     }
 
     var body: some View {
@@ -706,6 +708,10 @@ struct PanePreview: View {
                                       suffix: "· \(c.long)")
                 }
                 .frame(height: look.lineHeight)
+            }
+            if agent?.compactQueued == true {
+                Text("⇣ compaction queued for its next model request").foregroundStyle(look.yellow)
+                    .lineLimit(1).frame(height: look.lineHeight)
             }
             if let d = agent?.detail, !d.isEmpty {
                 Text(d).foregroundStyle(look.subtext).lineLimit(1).frame(height: look.lineHeight)
@@ -922,6 +928,8 @@ struct ComuxContextGauge: View {
     var height: CGFloat = 4
     /// Extra text after the percentage (`· $1.20`).
     var suffix: String = ""
+    /// A compaction is queued: `⇣` leads the label.
+    var queued: Bool = false
 
     var body: some View {
         HStack(spacing: 4) {
@@ -931,9 +939,9 @@ struct ComuxContextGauge: View {
                     Capsule().fill(tone(pct)).frame(width: width * min(max(pct, 0), 100) / 100)
                 }
                 .frame(width: width, height: height)
-                Text(context.short).foregroundStyle(tone(pct))
+                Text((queued ? "⇣" : "") + context.short).foregroundStyle(tone(pct))
             } else {
-                Text(context.short).foregroundStyle(dim)
+                Text((queued ? "⇣" : "") + context.short).foregroundStyle(dim)
             }
             if !suffix.isEmpty { Text(suffix).foregroundStyle(dim) }
         }

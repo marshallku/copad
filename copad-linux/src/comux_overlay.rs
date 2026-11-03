@@ -1383,6 +1383,13 @@ fn agent_readout(s: &crate::comux_panel::Style, a: &serde_json::Value) -> String
             out.push_str(&span(&s.dim, &long));
         }
     }
+    if a["compact_requested"] == true {
+        out.push('\n');
+        out.push_str(&span(
+            &s.yellow,
+            "⇣ compaction queued for its next model request",
+        ));
+    }
     if let Some(d) = a["detail"].as_str().filter(|d| !d.is_empty()) {
         out.push('\n');
         out.push_str(&span(&s.subtext, d));

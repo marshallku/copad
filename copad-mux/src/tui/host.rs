@@ -113,6 +113,7 @@ impl App {
                     unseen: r.unseen,
                     worktree_peers: r.peers,
                     context: r.context.map(AgentCtx::wire),
+                    compact_requested: r.compact,
                     focused: focused.as_ref() == Some(&r.term),
                 }
             })

@@ -70,12 +70,15 @@ struct L0Agent: Codable, Equatable, Identifiable {
     var worktree_peers: Int?
     /// Context fill and spend (absent without a reading, and from older servers).
     var context: L0AgentContext?
+    /// A `comux compact` is queued for its next model request (absent when not).
+    var compact_requested: Bool?
 
     var id: String { token }
     /// `⇄2` when the agent shares its worktree (the count includes it), as in the TUI.
     var sharedMarker: String { (worktree_peers ?? 0) > 0 ? "⇄\((worktree_peers ?? 0) + 1)" : "" }
     /// The status word to show: an unseen finish reads `done`, as in the TUI.
     var shownStatus: String { unseen == true && status == "ready" ? "done" : status }
+    var compactQueued: Bool { compact_requested == true }
 }
 
 /// An agent's context window fill and spend, drawn as a gauge like the usage readout.

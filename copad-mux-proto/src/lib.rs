@@ -510,6 +510,10 @@ pub struct Agent {
     /// comux has no reading (an agent whose log it cannot read, or before the first response).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<AgentContext>,
+    /// A compaction is queued for the agent's next model request (`comux compact`). A host
+    /// marks the row `⇣` and offers to withdraw it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compact_requested: bool,
     /// The pane is the focused pane of the active tab.
     #[serde(default)]
     pub focused: bool,

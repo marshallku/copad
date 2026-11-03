@@ -376,6 +376,16 @@ struct AgentRow {
     peers: u32,
     /// Context fill and spend, when there is a reading ([`App::agent_contexts`]).
     context: Option<AgentCtx>,
+    /// A `comux compact` is queued for it ([`App::compact_asks`]).
+    compact: bool,
+}
+
+/// A queued `comux compact` for a pane's agent: who it was asked for, so a replacement agent
+/// or a `/clear`ed conversation never inherits it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompactAsk {
+    pid: u32,
+    session: String,
 }
 
 /// Claude's statusline as relayed by `comux agent-report`, kept per pane and only for the
@@ -548,6 +558,8 @@ enum MenuAction {
     KillSession(WorkspaceId),
     /// Jump to this agent's pane (session + tab + focus).
     JumpAgent(TerminalId),
+    /// Queue (or, with `true`, withdraw) a compaction at the agent's next model request.
+    Compact(TerminalId, bool),
 }
 
 /// A tmux `display-menu`-style context menu, opened by a RIGHT-click on chrome (tab
@@ -1196,12 +1208,20 @@ pub struct App {
     agent_reports: HashMap<TerminalId, PushedUsage>,
     /// Each agent's context fill and spend from the last sweep ([`AgentCtx::merge`]).
     agent_contexts: HashMap<TerminalId, AgentCtx>,
+    /// Compactions asked for and not yet claimed by the agent's PreCompact hook.
+    compact_asks: HashMap<TerminalId, CompactAsk>,
+    /// The last claim per pane, with the claiming hook's nonce, so that hook's retry is
+    /// answered the same and nobody else's is.
+    compact_taken: HashMap<TerminalId, (CompactAsk, String)>,
     /// Tests: an agent pane's cwd instead of its process's.
     #[cfg(test)]
     test_cwds: HashMap<TerminalId, PathBuf>,
     /// Test seam: the transcript context reading per pane, in place of the poller's.
     #[cfg(test)]
     test_contexts: HashMap<TerminalId, agentpoll::Context>,
+    /// Test seam: an agent pid's conversation id, in place of its session file.
+    #[cfg(test)]
+    test_sessions: HashMap<u32, String>,
     /// Turn finishes waiting out `notify_settle_secs` before they are announced.
     pending_done: HashMap<TerminalId, PendingDone>,
     /// The blocked episode each pane was last reminded about (one reminder per episode).
@@ -1500,10 +1520,14 @@ impl App {
             agent_peers: HashMap::new(),
             agent_reports: HashMap::new(),
             agent_contexts: HashMap::new(),
+            compact_asks: HashMap::new(),
+            compact_taken: HashMap::new(),
             #[cfg(test)]
             test_cwds: HashMap::new(),
             #[cfg(test)]
             test_contexts: HashMap::new(),
+            #[cfg(test)]
+            test_sessions: HashMap::new(),
             pending_done: HashMap::new(),
             reminded: HashMap::new(),
             #[cfg(test)]
@@ -5048,6 +5072,63 @@ impl App {
                 }
                 None => Resp::err_code("not_found", format!("unknown pane: {target}")),
             },
+            Req::Compact { target, cancel } => {
+                let Some(term) = self.resolve_pane_target(target) else {
+                    return Resp::err_code("not_found", format!("unknown pane: {target}"));
+                };
+                let Some(pid) = self
+                    .labels
+                    .get(&term)
+                    .filter(|l| l.kind == procinfo::Kind::Agent && l.text == "claude")
+                    .map(|l| l.pid)
+                else {
+                    return Resp::err_code("invalid", "compaction on request is for Claude agents");
+                };
+                if *cancel {
+                    return Resp::message(match self.compact_asks.remove(&term) {
+                        Some(_) => "compaction request withdrawn",
+                        None => "no compaction was queued",
+                    });
+                }
+                #[cfg(test)]
+                let session = self.test_sessions.get(&pid).cloned();
+                // The live session file first: right after a `/clear` the poller's cached
+                // conversation is still the old one, and a request bound to it could never be
+                // claimed.
+                #[cfg(not(test))]
+                let session = agentstate::claude_session_id(pid)
+                    .or_else(|| agentpoll::conversation(&self.agent_poll, pid).map(|c| c.0));
+                let Some(session) = session else {
+                    return Resp::err_code("invalid", "that agent has no conversation yet");
+                };
+                self.compact_asks.insert(term, CompactAsk { pid, session });
+                Resp::message("compaction queued for the agent's next model request")
+            }
+            Req::CompactTake {
+                target,
+                session_id,
+                nonce,
+            } => {
+                let Some(term) = self.resolve_pane_target(target) else {
+                    return Resp::err_code("not_found", format!("unknown pane: {target}"));
+                };
+                let pid = self.labels.get(&term).map(|l| l.pid);
+                if let Some((ask, n)) = self.compact_taken.get(&term)
+                    && n == nonce
+                    && Some(ask.pid) == pid
+                    && ask.session == *session_id
+                {
+                    return Resp::message("taken");
+                }
+                match self.compact_asks.get(&term) {
+                    Some(ask) if Some(ask.pid) == pid && ask.session == *session_id => {
+                        let ask = self.compact_asks.remove(&term).expect("just matched");
+                        self.compact_taken.insert(term, (ask, nonce.clone()));
+                        Resp::message("taken")
+                    }
+                    _ => Resp::err_code("not_found", "no compaction is queued for that agent"),
+                }
+            }
             Req::AgentReport {
                 target,
                 session_id,
@@ -5317,6 +5398,7 @@ impl App {
                         unseen: r.unseen,
                         worktree_peers: r.peers,
                         context: r.context.map(AgentCtx::wire),
+                        compact_requested: r.compact,
                         tab_id: loc.as_ref().map(|l| l.0.to_string()).unwrap_or_default(),
                         tab_name: loc.as_ref().map(|l| l.1.clone()).unwrap_or_default(),
                         tab_index: loc.as_ref().map_or(0, |l| l.2),
@@ -6757,6 +6839,16 @@ impl App {
                 if let Some((wid, tab, _)) = self.locate_terminal(&term) {
                     items.push(("rename tab", MenuAction::RenameTab(wid, tab)));
                 }
+                if title == "claude" {
+                    items.push(if self.compact_asks.contains_key(&term) {
+                        ("cancel compaction", MenuAction::Compact(term.clone(), true))
+                    } else {
+                        (
+                            "compact at next step",
+                            MenuAction::Compact(term.clone(), false),
+                        )
+                    });
+                }
                 (title, items)
             }
         };
@@ -6800,6 +6892,12 @@ impl App {
             MenuAction::NewSession => self.open_new_session_prompt(),
             MenuAction::KillSession(ws) => self.open_kill_session_confirm_for(ws),
             MenuAction::JumpAgent(term) => self.jump_to_terminal(&term),
+            MenuAction::Compact(term, cancel) => {
+                let target = term.to_string();
+                let resp = self.handle_control(&control::Req::Compact { target, cancel });
+                let ok = resp.ok;
+                self.flash(resp.message.or(resp.error).unwrap_or_default(), !ok);
+            }
         }
     }
 
@@ -7365,9 +7463,10 @@ impl App {
                     ) {
                         let badge = self.slot_badge(&row.term);
                         let shown = row.shown_status();
+                        let mark = if row.compact { "⇣" } else { "" };
                         let trail = row.context.as_ref().map(|c| {
                             (
-                                c.short(),
+                                format!("{mark}{}", c.short()),
                                 c.pct().map_or(CAT_OVERLAY, usage_threshold_color),
                             )
                         });
@@ -9207,6 +9306,38 @@ impl App {
         // A report outlives neither its pane nor its agent.
         self.agent_reports
             .retain(|tid, r| next.get(tid).is_some_and(|st| st.pid == r.pid));
+        // Nor does a queued compaction — but only a CONFIRMED change drops it: an unreadable
+        // session record mid-rewrite is not a different conversation.
+        // Checked against the LIVE session file, like the request was bound: the poller's
+        // cache lags a `/clear`. Only agents with a request pay the read.
+        #[cfg(test)]
+        let live = |pid: u32| self.test_sessions.get(&pid).cloned();
+        #[cfg(not(test))]
+        let live = agentstate::claude_session_id;
+        let alive = |tid: &TerminalId, a: &CompactAsk| {
+            next.get(tid).is_some_and(|st| st.pid == a.pid)
+                && live(a.pid).is_none_or(|s| s == a.session)
+        };
+        // Each map on its own: a stale claim from an earlier conversation says nothing about
+        // a request queued since.
+        let dead_asks: Vec<TerminalId> = self
+            .compact_asks
+            .iter()
+            .filter(|(tid, a)| !alive(tid, a))
+            .map(|(tid, _)| tid.clone())
+            .collect();
+        let dead_taken: Vec<TerminalId> = self
+            .compact_taken
+            .iter()
+            .filter(|(tid, (a, _))| !alive(tid, a))
+            .map(|(tid, _)| tid.clone())
+            .collect();
+        for tid in dead_asks {
+            self.compact_asks.remove(&tid);
+        }
+        for tid in dead_taken {
+            self.compact_taken.remove(&tid);
+        }
         self.agent_statuses = next;
         self.agent_details = details;
         self.agent_waits = waits;
@@ -9560,6 +9691,7 @@ impl App {
                             unseen: self.unseen_done(tid),
                             peers: self.agent_peers.get(tid).copied().unwrap_or(0),
                             context: self.agent_contexts.get(tid).copied(),
+                            compact: self.compact_asks.contains_key(tid),
                             term: tid.clone(),
                         });
                     }
@@ -10077,11 +10209,23 @@ impl App {
                 // `ready 3m · claude      ━━━━╌╌ 62%`: the gauge sits flush right, and the
                 // tool name (which the tab chip already carries) is what gives way first.
                 let avail = sidebar_w.saturating_sub(5) as usize;
+                // A queued compaction leads the gauge's label: `⇣62%`.
+                let mark = if row.compact { "⇣" } else { "" };
                 let gauge = row
                     .context
                     .as_ref()
-                    .and_then(|c| ctx_gauge(c, avail.saturating_sub(status_part.width() + 1)));
-                let with_tool = format!("{status_part} · {}", row.tool);
+                    .and_then(|c| {
+                        ctx_gauge(
+                            c,
+                            avail.saturating_sub(status_part.width() + 1 + mark.width()),
+                        )
+                    })
+                    .map(|(bar, label, color)| (bar, format!("{mark}{label}"), color));
+                let with_tool = if gauge.is_none() && row.compact {
+                    format!("{status_part} · {} ⇣", row.tool)
+                } else {
+                    format!("{status_part} · {}", row.tool)
+                };
                 let gauge_w = gauge.as_ref().map_or(0, |(bar, label, _)| {
                     bar.width() + usize::from(!bar.is_empty()) + label.width()
                 });
@@ -10104,10 +10248,13 @@ impl App {
             } else {
                 // One row: the tool name is the first thing to go — the tab chip already
                 // carries it, while the status and how long it has held are the point.
-                let sub = match &row.context {
+                let mut sub = match &row.context {
                     Some(c) => format!("{status_part} {}", c.short()),
                     None => status_part,
                 };
+                if row.compact {
+                    sub.push_str(" ⇣");
+                }
                 put_trailing(buf, x, y, &sub, sub_style);
             }
             // The whole entry clicks to jump to this agent's pane.
@@ -10991,6 +11138,12 @@ impl App {
                 line.push((long, dim));
             }
             out.push(line);
+        }
+        if self.compact_asks.contains_key(term) {
+            out.push(vec![(
+                "⇣ compaction queued for its next model request".to_string(),
+                Style::default().fg(CAT_YELLOW),
+            )]);
         }
         let doing = self
             .agent_waits
@@ -13810,6 +13963,7 @@ mod tests {
             unseen: false,
             peers: 0,
             context: None,
+            compact: false,
         }
     }
 
@@ -16870,6 +17024,109 @@ mod agent_attention {
             app.agent_reports.is_empty(),
             "a replacement agent dropped it"
         );
+    }
+
+    #[test]
+    fn a_compaction_request_is_claimed_once_by_its_own_agent() {
+        let mut app = app();
+        let t = app.focused_terminal().unwrap();
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        app.test_sessions.insert(7, "s1".into());
+        let target = t.to_string();
+        let take = |app: &mut App, session: &str, nonce: &str| {
+            app.handle_control(&Req::CompactTake {
+                target: target.clone(),
+                session_id: session.into(),
+                nonce: nonce.into(),
+            })
+            .ok
+        };
+        assert!(!take(&mut app, "s1", "a"), "nothing queued yet");
+        assert!(
+            app.handle_control(&Req::Compact {
+                target: target.clone(),
+                cancel: false
+            })
+            .ok
+        );
+        assert!(app.agent_rows()[0].compact);
+        assert!(app.host_agents().agents[0].compact_requested);
+        assert!(
+            !take(&mut app, "other", "a"),
+            "another conversation cannot claim it"
+        );
+        assert!(take(&mut app, "s1", "a"));
+        assert!(
+            take(&mut app, "s1", "a"),
+            "a retry of the same claim gets the same answer"
+        );
+        assert!(
+            !take(&mut app, "s1", "b"),
+            "single-use: a new ask finds nothing"
+        );
+        assert!(!app.agent_rows()[0].compact);
+        // Withdrawn before it is claimed.
+        app.handle_control(&Req::Compact {
+            target: target.clone(),
+            cancel: false,
+        });
+        app.handle_control(&Req::Compact {
+            target: target.clone(),
+            cancel: true,
+        });
+        assert!(!take(&mut app, "s1", "c"));
+        // A confirmed new conversation drops it; an unreadable record does not.
+        app.handle_control(&Req::Compact {
+            target: target.clone(),
+            cancel: false,
+        });
+        app.test_sessions.remove(&7);
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        assert!(!app.compact_asks.is_empty(), "unknown is not a change");
+        app.test_sessions.insert(7, "s2".into());
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        assert!(app.compact_asks.is_empty(), "a /clear drops it");
+        app.test_sessions.insert(7, "s1".into());
+        // A claim from an earlier conversation does not take a newer request down with it.
+        app.handle_control(&Req::Compact {
+            target: target.clone(),
+            cancel: false,
+        });
+        assert!(take(&mut app, "s1", "d"));
+        app.test_sessions.insert(7, "s3".into());
+        app.handle_control(&Req::Compact {
+            target: target.clone(),
+            cancel: false,
+        });
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        assert!(
+            app.compact_asks.contains_key(&t),
+            "the new request survives the old claim"
+        );
+        assert!(!app.compact_taken.contains_key(&t));
+        assert!(take(&mut app, "s3", "e"));
+        app.test_sessions.insert(7, "s1".into());
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        // A replacement agent drops a queued request.
+        app.handle_control(&Req::Compact {
+            target: target.clone(),
+            cancel: false,
+        });
+        sweep(&mut app, &t, 8, AgentStatus::Working);
+        assert!(app.compact_asks.is_empty());
+    }
+
+    #[test]
+    fn only_a_claude_agent_can_be_asked_to_compact() {
+        let mut app = app();
+        let t = app.focused_terminal().unwrap();
+        sweep(&mut app, &t, 7, AgentStatus::Working);
+        app.labels.get_mut(&t).unwrap().text = "codex".into();
+        let r = app.handle_control(&Req::Compact {
+            target: t.to_string(),
+            cancel: false,
+        });
+        assert!(!r.ok);
     }
 
     fn sweep(app: &mut App, term: &TerminalId, pid: u32, status: AgentStatus) {

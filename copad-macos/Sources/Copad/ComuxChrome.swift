@@ -754,7 +754,8 @@ struct ComuxSidebar: View {
                     if let c = a.context {
                         Spacer(minLength: 4)
                         ComuxContextGauge(context: c, track: st.rule, dim: st.dim, tone: st.usage,
-                                          width: st.advance * 6, height: max(4, st.lineHeight * 0.32))
+                                          width: st.advance * 6, height: max(4, st.lineHeight * 0.32),
+                                          queued: a.compactQueued)
                     }
                 }
                 .padding(.leading, st.advance * 2)
@@ -768,6 +769,11 @@ struct ComuxSidebar: View {
         .contextMenu {
             Button("Jump to Pane") { jump(a) }
             Button("Rename Tab…") { host.open("rename-tab", target: "\(a.space_id)/\(a.tab_id)") }
+            if a.tool == "claude" {
+                Button(a.compactQueued ? "Cancel Compaction" : "Compact at Next Step") {
+                    host.command(["cmd": "compact", "target": a.token, "cancel": a.compactQueued])
+                }
+            }
         }
     }
 

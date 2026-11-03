@@ -1304,7 +1304,12 @@ impl ComuxPanel {
                         if let Some(p) = pct {
                             gauge.append(&gauge_widget(p, &st.rule, tone, self.advance()));
                         }
-                        gauge.append(&markup(&span(tone, &short)));
+                        let mark = if a["compact_requested"] == true {
+                            "⇣"
+                        } else {
+                            ""
+                        };
+                        gauge.append(&markup(&span(tone, &format!("{mark}{short}"))));
                         gauge.set_tooltip_text(Some(&long));
                         sub.append(&gauge);
                     }
@@ -1315,16 +1320,28 @@ impl ComuxPanel {
                         a["space_id"].as_str().unwrap_or_default(),
                         a["tab_id"].as_str().unwrap_or_default()
                     );
-                    self.context_menu(
-                        &row,
-                        vec![
-                            (
-                                "Jump to pane",
-                                Act::Cmd(json!({"cmd": "jump", "target": a["token"]})),
+                    let mut menu = vec![
+                        (
+                            "Jump to pane",
+                            Act::Cmd(json!({"cmd": "jump", "target": a["token"]})),
+                        ),
+                        ("Rename tab…", Act::Open("rename-tab", Some(tab))),
+                    ];
+                    // Compaction on request is Claude's (`comux compact`).
+                    if a["tool"] == "claude" {
+                        let queued = a["compact_requested"] == true;
+                        menu.push((
+                            if queued {
+                                "Cancel compaction"
+                            } else {
+                                "Compact at next step"
+                            },
+                            Act::Cmd(
+                                json!({"cmd": "compact", "target": a["token"], "cancel": queued}),
                             ),
-                            ("Rename tab…", Act::Open("rename-tab", Some(tab))),
-                        ],
-                    );
+                        ));
+                    }
+                    self.context_menu(&row, menu);
                     let token = a["token"].as_str().map(str::to_string);
                     self.nav.add(true, &row, token.clone(), token);
                     (row, vec![json!({"cmd": "jump", "target": a["token"]})])

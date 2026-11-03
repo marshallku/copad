@@ -2351,6 +2351,36 @@ for a in json.load(sys.stdin)["agents"]:
     [[ "$out" == "{}" ]] || fail "with no pane it must not defer: $out"
     ok "committed → allow, dirty → block (counted), manual/near-window/over-budget/no-pane → allow"
 
+    echo "45g. comux compact: the user picks the moment, the hook in request mode carries it out"
+    TP="$FH/.claude/projects/e2e/$FID.jsonl"
+    rgate() { # extra env... → the hook's stdout, in request mode
+        printf '{"session_id":"%s","transcript_path":"%s","cwd":"%s","trigger":"auto"}' "$FID" "$TP" "$REPO" \
+            | t 10 env COPAD_MUX_PANE="$AG" HOME="$FH" COPAD_MUX_SOCK="$F_SOCK" COPAD_MUX_STATE="$WORK/fstate.json" \
+                CLAUDE_CODE_AUTO_COMPACT_WINDOW=200000 "$@" "$COMUX" hook pre-compact --when request
+    }
+    rgate | grep -q '"decision":"block"' || fail "with nothing asked, request mode should defer: $(rgate)"
+    t 10 fx compact "$AG" >/dev/null || fail "comux compact was refused"
+    t 5 fx list-agents --json >"$WORK/json"
+    [[ "$(agent_field compact_requested)" == True ]] || fail "the request should show on the agent: $(cat "$WORK/json")"
+    [[ "$(rgate)" == "{}" ]] || fail "a queued request should let the next ask through"
+    t 5 fx list-agents --json >"$WORK/json"
+    [[ -z "$(agent_field compact_requested)" ]] || fail "the request is single-use"
+    rgate | grep -q '"decision":"block"' || fail "after the request was used, it should defer again"
+    t 10 fx compact "$AG" >/dev/null; t 10 fx compact "$AG" --cancel >/dev/null
+    rgate | grep -q '"decision":"block"' || fail "a withdrawn request must not fire"
+    # A /compact by hand answers a queued request: it must not fire again right after.
+    t 10 fx compact "$AG" >/dev/null
+    printf '{"session_id":"%s","transcript_path":"%s","trigger":"manual"}' "$FID" "$TP" \
+        | t 10 env COPAD_MUX_PANE="$AG" COPAD_MUX_SOCK="$F_SOCK" COPAD_MUX_STATE="$WORK/fstate.json" \
+            "$COMUX" hook pre-compact --when request >/dev/null
+    rgate | grep -q '"decision":"block"' || fail "a manual compaction should have used up the request"
+    [[ "$(rgate env -u CLAUDE_CODE_AUTO_COMPACT_WINDOW)" == "{}" ]] || fail "without a window it must not stand in the way"
+    printf '{"session_id":"%s","transcript_path":"%s","trigger":"auto"}' "$FID" "$TP" \
+        | t 10 env COPAD_MUX_PANE="$AG" COPAD_MUX_SOCK="$F_SOCK" COPAD_MUX_STATE="$WORK/fstate.json" \
+            CLAUDE_CODE_AUTO_COMPACT_WINDOW=60000 "$COMUX" hook pre-compact --when request >"$WORK/out"
+    [[ "$(cat "$WORK/out")" == "{}" ]] || fail "near the window it must let it through: $(cat "$WORK/out")"
+    ok "nothing asked → defer; comux compact → the next ask goes through once; cancel, no window, near the window behave"
+
     t 15 fx kill-server >/dev/null 2>&1 || kill -9 "$FPID" 2>/dev/null || true
     kill "$APID" 2>/dev/null || true
 fi

@@ -341,6 +341,23 @@ pub enum Req {
         /// Toast body. The title is composed server-side from the agent + session.
         body: String,
     },
+    /// Ask for the pane's Claude agent to compact at its NEXT model request (`comux compact`),
+    /// or withdraw that request. Carried out by `comux hook pre-compact` letting Claude's next
+    /// automatic compaction attempt through; comux never types into the pane.
+    Compact {
+        target: String,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        cancel: bool,
+    },
+    /// The PreCompact hook claiming the pending [`Req::Compact`] for `target`, single-use.
+    /// `nonce` is minted once per hook process: a retry of the same claim (its reply was lost)
+    /// gets the same answer, and no other hook can claim it again. Ok = claimed; `not_found` =
+    /// nothing is queued for that agent and conversation.
+    CompactTake {
+        target: String,
+        session_id: String,
+        nonce: String,
+    },
     /// Claude's statusline, relayed for a pane's agent (`comux agent-report`, piped from a
     /// `statusLine` command). Its transcript says how many tokens the context holds but not
     /// how big the window is, nor what the session cost; the statusline says both. Accepted
@@ -835,6 +852,9 @@ pub struct AgentInfo {
     /// Context fill and spend, when comux has a reading (see `copad_mux_proto::AgentContext`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<copad_mux_proto::AgentContext>,
+    /// A `comux compact` is queued for the agent's next model request.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compact_requested: bool,
     /// The tab the agent lives in: its STABLE id (`s4:t13`, a tab selector), its custom name
     /// (empty when unnamed — `title` then shows `tab <n>`), and its index in the session.
     #[serde(default)]
@@ -1313,9 +1333,21 @@ pub fn run_client(args: &[String]) -> i32 {
         ) else {
             return usage_error(json_out, "comux hook: not a number", HOOK_SPEC.usage);
         };
+        let when = match p.value("--when").unwrap_or("commit") {
+            "commit" => crate::compactgate::When::Commit,
+            "request" => crate::compactgate::When::Request,
+            _ => {
+                return usage_error(
+                    json_out,
+                    "comux hook: --when commit|request",
+                    HOOK_SPEC.usage,
+                );
+            }
+        };
         return crate::compactgate::run(crate::compactgate::Limits {
             headroom,
             max_deferrals: max.min(u32::MAX as u64) as u32,
+            when,
         });
     }
     if cmd == "skill" {
@@ -2168,6 +2200,20 @@ pub fn run_client(args: &[String]) -> i32 {
                 }
             }
         }
+        "compact" => {
+            let p = parsed!(COMPACT_SPEC);
+            let Some(target) = p.positionals.first().cloned().or_else(caller_pane) else {
+                return usage_error(
+                    json_out,
+                    "comux compact: name a pane (outside a pane $COPAD_MUX_PANE is unset)",
+                    COMPACT_SPEC.usage,
+                );
+            };
+            Req::Compact {
+                target,
+                cancel: p.has("--cancel"),
+            }
+        }
         "agent-report" => {
             let p = parsed!(AGENT_REPORT_SPEC);
             let Some(target) = p.value("--pane").map(str::to_string).or_else(caller_pane) else {
@@ -2741,12 +2787,27 @@ const NOTIFY_SPEC: Spec = Spec {
     positionals: Positionals::Any,
 };
 
+const COMPACT_SPEC: Spec = Spec {
+    usage: "usage: comux compact [<pane-token>] [--cancel]\n\
+            \x20      ask that pane's Claude agent (yours by default) to compact at its next model\n\
+            \x20      request, mid-turn and inside /goal too. Carried out by `comux hook pre-compact`\n\
+            \x20      in Claude's PreCompact hooks; nothing is typed into the pane",
+    flags: &[flag(&["--cancel"])],
+    positionals: Positionals::AtMost(1),
+};
+
 const HOOK_SPEC: Spec = Spec {
     usage: "usage: comux hook pre-compact [--headroom TOKENS] [--max-deferrals N]   (stdin: the hook input)\n\
             \x20      a Claude Code PreCompact hook: defers an AUTOMATIC compaction while the work tree has\n\
             \x20      uncommitted tracked changes, until fewer than --headroom tokens (60000) are left or it\n\
-            \x20      has deferred --max-deferrals (40) times; lets everything else through",
-    flags: &[opt(&["--headroom"]), opt(&["--max-deferrals"])],
+            \x20      has deferred --max-deferrals (40) times; lets everything else through.\n\
+            \x20      --when request: defer every automatic compaction until `comux compact` asks for\n\
+            \x20      one (or fewer than --headroom tokens are left); needs CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+    flags: &[
+        opt(&["--headroom"]),
+        opt(&["--max-deferrals"]),
+        opt(&["--when"]),
+    ],
     positionals: Positionals::AtMost(1),
 };
 
@@ -2765,6 +2826,28 @@ pub(crate) fn agent_fill(session_id: &str, deadline: Instant) -> Option<(u64, u6
         .find(|a| a.agent_session_id.as_deref() == Some(session_id))?;
     let c = agent.context?;
     Some((c.used, c.window?))
+}
+
+/// Claim the `comux compact` request for the agent in the calling pane, in conversation
+/// `session_id`. `Some(true)` = claimed (now or by an earlier try with the same `nonce`),
+/// `Some(false)` = none queued, `None` = could not find out in time. One retry with the same
+/// nonce, since a lost reply is exactly what the nonce makes safe to ask again.
+pub(crate) fn take_compact(session_id: &str, nonce: &str, deadline: Instant) -> Option<bool> {
+    let pane = caller_pane()?;
+    let req = Req::CompactTake {
+        target: pane,
+        session_id: session_id.to_string(),
+        nonce: nonce.to_string(),
+    };
+    for _ in 0..2 {
+        let Ok(mut conn) = WaitConn::connect(Some(deadline)) else {
+            continue;
+        };
+        if let Ok(resp) = conn.request(&req, Some(deadline)) {
+            return Some(resp.ok);
+        }
+    }
+    None
 }
 
 const AGENT_REPORT_SPEC: Spec = Spec {
@@ -4599,6 +4682,7 @@ mod verb_args_tests {
         "notify",
         "agent-report",
         "hook",
+        "compact",
         "resize",
         "send",
         "skill",
@@ -6305,6 +6389,7 @@ mod list_agents_proto_tests {
             unseen: false,
             worktree_peers: 0,
             context: None,
+            compact_requested: false,
             tab_id: "s1:t0".into(),
             tab_name: String::new(),
             tab_index: 0,

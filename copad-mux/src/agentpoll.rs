@@ -104,7 +104,7 @@ pub struct Context {
 /// What one log line says about the context, newest first: nothing, a reading, or that a
 /// compaction reset it (to the post-compaction size, when the log records one).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mark {
+pub(crate) enum Mark {
     Used(Context),
     Reset(Option<u64>),
 }
@@ -639,7 +639,7 @@ fn read_log(path: &Path, tool: &str) -> Option<(Option<Activity>, Option<Mark>)>
 /// One Claude transcript line → its context mark: an assistant response's input-side usage,
 /// or a `compact_boundary`. Subagent (sidechain) responses run in their own context and
 /// synthetic messages carry zeroed usage, so neither counts.
-fn claude_line_context(line: &str) -> Option<Mark> {
+pub(crate) fn claude_line_context(line: &str) -> Option<Mark> {
     if line.contains("\"compact_boundary\"") {
         let v: serde_json::Value = serde_json::from_str(line).ok()?;
         if v.get("subtype").and_then(|t| t.as_str()) == Some("compact_boundary") {
