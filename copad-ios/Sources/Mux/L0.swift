@@ -194,6 +194,9 @@ struct L0Model: Equatable {
     var notifications: L0Notifications?
     var status: L0Status?
     var clients: L0Clients?
+    /// The work graph (decisions #204), kept as the JSON it came in: copad hands it to the
+    /// graph page verbatim, so it is never decoded here.
+    var graph: Data?
     private var revs: [String: UInt64] = [:]
 
     enum Applied: Equatable {
@@ -241,6 +244,7 @@ struct L0Model: Equatable {
         case "notifications": notifications = nil
         case "status": status = nil
         case "clients": clients = nil
+        case "graph": graph = nil
         default: break
         }
     }
@@ -257,6 +261,7 @@ struct L0Model: Equatable {
         case "notifications": notifications = try? d.decode(L0Notifications.self, from: bytes)
         case "status": status = try? d.decode(L0Status.self, from: bytes)
         case "clients": clients = try? d.decode(L0Clients.self, from: bytes)
+        case "graph": graph = bytes
         default: return false
         }
         revs[name] = rev

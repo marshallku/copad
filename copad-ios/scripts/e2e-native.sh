@@ -65,6 +65,7 @@ W="$(mktemp -d /tmp/cie.XXXX)"
 SSHD_PID=""
 SIM=""
 cleanup() {
+    [[ -n "${APID:-}" ]] && kill "$APID" 2>/dev/null || true
     [[ -n "$SIM" ]] && xcrun simctl delete "$SIM" >/dev/null 2>&1 || true
     [[ -n "$SSHD_PID" ]] && kill "$SSHD_PID" 2>/dev/null || true
     COPAD_MUX_SOCK="$W/s" "$COMUX" kill-server >/dev/null 2>&1 || true
@@ -175,6 +176,31 @@ if [[ $PUSH == 1 ]]; then
 fi
 # In the OTHER session, so the pane the test types into keeps its focus.
 mux split --from "$(tok 1)" -- "$W/bin/claude" 1000 >/dev/null
+# Its work graph (decisions #204): a session file naming a transcript of reads, an edit, a search
+# and a subagent with a read of its own.
+APID=""
+for _ in $(seq 1 300); do
+    # Through a file: awk exiting early would SIGPIPE ps, and pipefail + set -e end the run.
+    ps -Ao pid=,args= >"$W/ps.txt"
+    APID="$(awk -v p="$W/bin/claude" '$2==p {print $1; exit}' "$W/ps.txt")"
+    [[ -n "$APID" ]] && break; sleep 0.1
+done
+FID="0f0f0f0f-1234-4abc-8def-0123456789ab"
+mkdir -p "$W/home/.claude/sessions" "$W/home/.claude/projects/e2e/$FID/subagents"
+printf '{"pid":%s,"sessionId":"%s","status":"busy"}\n' "$APID" "$FID" >"$W/home/.claude/sessions/$APID.json"
+TP="$W/home/.claude/projects/e2e/$FID.jsonl"
+{
+    printf '{"type":"user","timestamp":"2026-11-04T00:00:00.000Z","message":{"content":"Fix the parser"}}\n'
+    for c in 'g1|Read|{"file_path":"/repo/src/a.rs"}' 'g2|Edit|{"file_path":"/repo/src/b.rs"}' 'g3|Grep|{"pattern":"fn","path":"/repo/src"}' \
+             'g4|Agent|{"description":"Map the tests","subagent_type":"Explore"}'; do
+        IFS='|' read -r id name input <<<"$c"
+        printf '{"type":"assistant","timestamp":"2026-11-04T00:00:01.000Z","message":{"content":[{"type":"tool_use","id":"%s","name":"%s","input":%s}]}}\n' "$id" "$name" "$input"
+        [[ "$id" == g4 ]] || printf '{"type":"user","timestamp":"2026-11-04T00:00:02.000Z","message":{"content":[{"type":"tool_result","tool_use_id":"%s","is_error":false}]}}\n' "$id"
+    done
+} >"$TP"
+printf '{"agentType":"Explore","description":"Map the tests","toolUseId":"g4"}' >"$W/home/.claude/projects/e2e/$FID/subagents/agent-i1.meta.json"
+printf '{"type":"assistant","isSidechain":true,"timestamp":"2026-11-04T00:00:03.000Z","message":{"content":[{"type":"tool_use","id":"s1","name":"Read","input":{"file_path":"/repo/tests/t.rs"}}]}}\n' \
+    >"$W/home/.claude/projects/e2e/$FID/subagents/agent-i1.jsonl"
 mux notify --pane "$TOK" --kind done "e2e notification" >/dev/null
 # What the app runs per SSH channel: this build of comux on this isolated socket.
 REMOTE="env COPAD_MUX_SOCK=$W/s COPAD_MUX_STATE=$W/state.json COPAD_MUX_NOTIFY=0 COPAD_MUX_USAGE=0 COPAD_MUX_UPDATE_CHECK=0 COPAD_MUX_QUIET_SSH=1 XDG_CONFIG_HOME=$W/cfg $COMUX proxy --stdio"

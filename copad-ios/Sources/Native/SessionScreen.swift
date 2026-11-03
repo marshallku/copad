@@ -9,6 +9,8 @@ struct SessionScreen: View {
     @StateObject private var term: TerminalController
     @State private var leftOpen = false
     @State private var rightOpen = false
+    /// The work graph (decisions #204), in a sheet over the session.
+    @State private var graphOpen = false
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.horizontalSizeClass) private var hSize
     @Environment(\.verticalSizeClass) private var vSize
@@ -69,6 +71,11 @@ struct SessionScreen: View {
         .onChange(of: session.phase) { _, p in if p == .live { term.focus() } }
         // `Ctrl-b e` (decisions #181): the TUI focuses its sidebar; here that is the drawer.
         .onChange(of: session.focusSidebarSeq) { _, _ in open(left: true) }
+        .sheet(isPresented: $graphOpen) {
+            GraphSheet(session: session) { graphOpen = false }
+                .presentationDetents([.medium, .large])
+                .presentationBackground(ComuxLook.base)
+        }
         .alert("Trust this host?", isPresented: Binding(
             get: { session.pendingHostKey != nil }, set: { if !$0 { session.pendingHostKey = nil } })) {
             Button("Trust") {
@@ -95,6 +102,14 @@ struct SessionScreen: View {
             TabStrip(session: session) { tab in
                 navigate { session.selectTab(tab.id) }
             }
+            // The work graph sits beside the bell, like the desktop top bar's (decisions #204).
+            Button {
+                term.settleInput()
+                graphOpen = true
+            } label: {
+                Image(systemName: "point.3.connected.trianglepath.dotted").padding(6)
+            }
+            .accessibilityIdentifier("openGraph")
             Button { open(left: false) } label: {
                 ZStack(alignment: .topTrailing) {
                     Image(systemName: "bell").padding(6)

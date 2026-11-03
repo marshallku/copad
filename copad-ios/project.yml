@@ -39,6 +39,13 @@ targets:
     sources:
       - Sources
       - Shared
+      # The work-graph page's message check, shared with macOS (decisions #204).
+      - path: ../copad-macos/Sources/CopadCore/ComuxGraphBridge.swift
+      # The work-graph page itself (copad-graph-web), assembled by GraphSheet.swift.
+      - path: ../copad-graph-web/web
+        buildPhase: resources
+        excludes:
+          - "*.test.js"
       # JetBrains Mono Nerd Font Mono (OFL, Resources/Fonts/OFL.txt): powerline + Nerd icons in
       # the terminal, one cell wide (decisions #174).
       - path: Resources

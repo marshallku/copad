@@ -40,6 +40,9 @@ final class MuxSession: ObservableObject, KeySink {
     @Published private(set) var previews: [String: L0PreviewState] = [:]
     /// Bumped when this app's comux client pressed `Ctrl-b e`: show the spaces drawer (#181).
     @Published private(set) var focusSidebarSeq = 0
+    /// Bumped on every welcome: what the work-graph page keys its connection by (decisions
+    /// #204) — the same server again keeps its incarnation, but not its ids.
+    @Published private(set) var welcomes = 0
 
     /// The mirror grid. Not @Published: the terminal view redraws on `onGrid`, capped to the
     /// display — every frame is still APPLIED here (codex C3).
@@ -410,6 +413,7 @@ final class MuxSession: ObservableObject, KeySink {
                 }
                 closedOverlays.removeAll() // ids restart with a new server
                 _ = model.apply(m)
+                welcomes += 1
             case "snapshot":
                 _ = model.apply(m)
                 if render == nil { Task { await openRender(gen) } }

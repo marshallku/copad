@@ -209,6 +209,16 @@ final class NativeE2ETests: XCTestCase {
         expectation(for: back, evaluatedWith: active)
         waitForExpectations(timeout: 10)
 
+        // 7b. The work graph (decisions #204): the button beside the bell opens it in a sheet;
+        //     the page reads out the fake agent's 4 files, its Explore subagent and 6 steps.
+        app.buttons["openGraph"].tap()
+        let graph = app.descendants(matching: .any)["graphState"]
+        let drawn = NSPredicate(format: "label CONTAINS '\"files\":4' AND label CONTAINS '\"subagents\":1' AND label CONTAINS '\"steps\":6'")
+        expectation(for: drawn, evaluatedWith: graph)
+        waitForExpectations(timeout: 30)
+        snapshot("graph")
+        app.buttons["closeGraph"].tap()
+
         // 8. Background and return: the session reconnects (replacing its attachment).
         XCUIDevice.shared.press(.home)
         Thread.sleep(forTimeInterval: 2)

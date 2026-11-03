@@ -154,7 +154,9 @@ $COMUX spawn --keep -- $W/bin/claude 600 >/dev/null || fail "spawning the fake a
 APID=""
 # The pane's login shell starts first (an interactive zsh can take seconds).
 for _ in $(seq 1 300); do
-  APID="$(ps -Ao pid=,args= | awk -v p="$W/bin/claude" '$2==p {print $1; exit}')"
+  # Through a file: awk exiting early would SIGPIPE ps, and pipefail + set -e end the run.
+  ps -Ao pid=,args= >$W/ps.txt
+  APID="$(awk -v p="$W/bin/claude" '$2==p {print $1; exit}' $W/ps.txt)"
   [[ -n "$APID" ]] && break; sleep 0.1
 done
 [[ -n "$APID" ]] || fail "no fake agent pid"
