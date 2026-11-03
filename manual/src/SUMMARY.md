@@ -13,6 +13,7 @@
 - [Git Worktrees](./comux/worktrees.md)
 - [Persistence & Agent Resume](./comux/persistence.md)
 - [The Status Bar](./comux/status-bar.md)
+- [The Work Graph](./comux/work-graph.md)
 - [Configuration (`mux.toml`)](./comux/configuration.md)
 - [Environment Variables](./comux/environment.md)
 

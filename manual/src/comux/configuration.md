@@ -37,6 +37,9 @@ comux reload          # re-read mux.toml on the live server (alias: comux source
 | `confirm_close` | `true` | bool | Ask `y/n` before `Ctrl-b x` closes a pane or `Ctrl-b &` a tab |
 | `set_titles` | `true` | bool | Set your terminal's title to the focused pane's title (or program) and the session; restored on detach (tmux `set-titles`) |
 | `bell_passthrough` | `true` | bool | A pane's bell rings your terminal too, at most once a second (tmux `bell-action any`) |
+| `graph` | `true` | bool | Build each agent's [work graph](./work-graph.md) from its transcript. Live |
+| `graph_persist` | `true` | bool | Save work graphs under the state dir's `graphs/`; `false` writes nothing (and deletes nothing). Live |
+| `graph_retain_days` | `30` | `1`–`3650` | Saved work graphs older than this are deleted |
 | `sort_by` | `"created"` | `created` / `alphabetical` / `recent` / `activity` | Session order in sidebar, switcher, and `)(`/cycle |
 | `tab_labels` | `"number"` | `number` / `name` / `both` | What each status-bar tab chip shows |
 | `reconcile_secs` | `3` | `0`–`3600` (`0` disables) | How often each client silently repaints its whole screen — the render-residue self-heal (see below) |
