@@ -170,6 +170,9 @@ echo "ok — the right panel shows the agent's 33 files, its Explore subagent an
 use g4 Write '{"file_path":"/repo/src/new.rs"}' 7; res g4 false 7
 gwait 'd["page"]["seq"]' 36 40
 echo "ok — a step appended to the transcript reached the panel live (#36)"
+# WebKit's own render of the panel (Broadway's screenshots of a web view are not trustworthy).
+[[ "$(gq 'd["snapshot"]' '{"snapshot":"'"$W"'/graph-webkit.png"}')" == True ]] || fail "no WebKit snapshot"
+echo "ok — WebKit rendered the panel: $W/graph-webkit.png"
 [[ "$(gq 'd["mode"]' '{"open":true,"mode":"all"}')" == all ]] || fail "mode all"
 gwait '(d["page"]["mode"], d["page"]["agents"])' "('all', 1)" 20
 if [[ -n "${SHOT_WAIT:-}" ]]; then echo "GRAPH_SHOT"; sleep "$SHOT_WAIT"; fi

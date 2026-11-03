@@ -2430,7 +2430,8 @@ print(eval(sys.argv[3]) if a else "")' "$WORK/gjson" "$AG" "$1" 2>/dev/null
     GFILE="$WORK/graphs/claude-$FID.json"
     for _ in $(seq 1 40); do [[ -s "$GFILE" ]] && break; sleep 0.25; done
     [[ -s "$GFILE" ]] || fail "the graph should be saved at $GFILE"
-    [[ "$(stat -f %Lp "$GFILE" 2>/dev/null || stat -c %a "$GFILE")" == 600 ]] || fail "the saved graph should be 0600"
+    # GNU first: on Linux `stat -f` is filesystem status and "succeeds" with the wrong answer.
+    [[ "$(stat -c %a "$GFILE" 2>/dev/null || stat -f %Lp "$GFILE")" == 600 ]] || fail "the saved graph should be 0600"
     grep -q '"/repo/src/parse.rs"' "$GFILE" || fail "the saved graph should hold the files"
     # The subagent finishes in the background.
     printf '{"type":"user","timestamp":"2026-11-04T00:00:09.000Z","message":{"content":"<task-notification>\\n<tool-use-id>g5</tool-use-id>\\n<status>completed</status>"}}\n' >>"$TP"

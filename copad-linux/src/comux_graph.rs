@@ -270,6 +270,18 @@ impl GraphPanel {
         );
     }
 
+    /// Render the page as WebKit draws it into `path` (PNG), for the e2e: Broadway's own
+    /// screenshots of a web view are not trustworthy.
+    pub fn snapshot(&self, path: &str, done: impl FnOnce(bool) + 'static) {
+        let path = path.to_string();
+        self.web.snapshot(
+            webkit6::SnapshotRegion::Visible,
+            webkit6::SnapshotOptions::NONE,
+            gtk4::gio::Cancellable::NONE,
+            move |r| done(r.ok().is_some_and(|t| t.save_to_png(&path).is_ok())),
+        );
+    }
+
     fn js(&self, source: &str) {
         self.web
             .evaluate_javascript(source, None, None, gtk4::gio::Cancellable::NONE, |_| {});

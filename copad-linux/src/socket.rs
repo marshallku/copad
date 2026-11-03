@@ -311,7 +311,12 @@ pub fn dispatch(
                 .map(|w| w as i32);
             let reply = cmd.reply.clone();
             let id = req.id.clone();
-            crate::comux_panel::graph_global(open, mode, width, move |v| {
+            let snapshot = req
+                .params
+                .get("snapshot")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            crate::comux_panel::graph_global(open, mode, width, snapshot, move |v| {
                 let _ = reply.send(Response::success(id, v));
             });
         }

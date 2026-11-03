@@ -1706,6 +1706,12 @@ impl ComuxPanel {
     }
 
     /// `comux.graph` for the e2e: the panel's state, and the page's own read-out.
+    /// `comux.graph` with `snapshot`: WebKit's own render of the page into that PNG path.
+    pub fn graph_snapshot(&self, path: &str, done: impl FnOnce(Value) + 'static) {
+        self.graph
+            .snapshot(path, move |ok| done(json!({"snapshot": ok})));
+    }
+
     pub fn graph_status(&self, done: impl FnOnce(Value) + 'static) {
         let g = self.graph_state.borrow().clone();
         let out = json!({
@@ -2571,6 +2577,7 @@ pub fn graph_global(
     open: Option<bool>,
     mode: Option<String>,
     width: Option<i32>,
+    snapshot: Option<String>,
     done: impl FnOnce(Value) + 'static,
 ) {
     match PANEL.with(|g| g.borrow().clone()) {
@@ -2582,7 +2589,10 @@ pub fn graph_global(
             if open.is_some() || mode.is_some() || width.is_some() {
                 p.set_graph(open, mode.as_deref());
             }
-            p.graph_status(done);
+            match snapshot {
+                Some(path) => p.graph_snapshot(&path, done),
+                None => p.graph_status(done),
+            }
         }
         None => done(json!({"error": "no comux panel"})),
     }
