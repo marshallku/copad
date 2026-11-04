@@ -73,12 +73,27 @@ Opt out in `mux.toml` (both apply on `comux reload`):
 | `graph_persist` | `true` | `false` keeps graphs in memory only; files already saved are left alone (delete `graphs/` yourself) |
 | `graph_retain_days` | `30` | Saved graphs older than this are deleted |
 
+## Shell commands
+
+Agents read and change files through the shell as often as through their own tools, so the
+command of a Claude `Bash` call or a Codex command is read too. Each file it reads (`cat`,
+`head`, `tail`, `sed -n`, `nl`, `wc`, `bat`, `diff`), searches (`grep`, `rg`, `find`, `ls`),
+edits (`sed -i`, `>>`, `tee -a`), writes (`>`, `tee`) or deletes (`rm`) becomes its own step, and
+a `run` step remains only for the parts that were not understood.
+
+Only what is certain is taken: a path has to be written out literally (no `$VAR`, globs or
+`$(…)`), an unfamiliar option leaves the command alone, and `cd dir && …` is followed but a
+directory change the graph cannot be sure of drops the relative paths after it. A step a
+command's exit status does not vouch for — an earlier stage of a pipeline, a line before the
+last, anything around a `||` — is drawn but not counted.
+
 ## What it does not see
 
-- Edits an agent makes through shell commands (`sed -i`, `cat >`), and Codex patches applied
-  from inside a script — only Claude's edit tools and Codex's `apply_patch` tool count.
+- Files touched inside scripts (`python3 …`, `cargo`, `git`), and shell constructs such as
+  loops, subshells and `xargs`.
 - Codex subagents (Claude subagents are shown).
 - Agents other than Claude Code and Codex.
 
-It lags the agent by about a second, and a step counts only once its result is in: a read that
-failed is shown as failed, not as a read.
+A step appears as soon as the agent writes the call to its transcript (Claude does before the
+command runs, Codex once it has finished) — about a second later on screen — and it counts only
+once its result is in: a read that failed is shown as failed, not as a read.

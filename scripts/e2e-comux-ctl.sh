@@ -2437,6 +2437,13 @@ print(eval(sys.argv[3]) if a else "")' "$WORK/gjson" "$AG" "$1" 2>/dev/null
     printf '{"type":"user","timestamp":"2026-11-04T00:00:09.000Z","message":{"content":"<task-notification>\\n<tool-use-id>g5</tool-use-id>\\n<status>completed</status>"}}\n' >>"$TP"
     res g5 false
     gwait '[s["status"] for s in a["subagents"]]' "['completed']" 60
+    # A shell command is a step per file it touched, drawn the moment the call is written
+    # (pending), counted once its result says it succeeded. The record's cwd is the shell's.
+    printf '{"type":"assistant","timestamp":"2026-11-04T00:00:10.000Z","cwd":"/repo","message":{"content":[{"type":"tool_use","id":"g7","name":"Bash","input":{"command":"sed -n 1,40p src/cfg.rs && sed -i %s %s src/lex.rs","description":"tweak the lexer"}}]}}\n' "''" "'s/a/b/'" >>"$TP"
+    gwait '[(s["kind"], s["outcome"], f[s["file"]]["abs"]) for s in a["steps"] if s["seq"] in a.get("pending", []) and s.get("file") is not None]' \
+        "[('read', 'pending', '/repo/src/cfg.rs'), ('edit', 'pending', '/repo/src/lex.rs')]" 60
+    res g7 false
+    gwait '(a["counts"]["reads"], a["counts"]["edits"], a["counts"]["runs"])' "(3, 2, 0)" 60
     # Opt out of keeping it: nothing new is written, nothing old is deleted by the toggle.
     # The fork server reads the run's config dir (XDG_CONFIG_HOME); keep what is there.
     MCFG="${XDG_CONFIG_HOME:-$FH/.config}/copad/mux.toml"; mkdir -p "$(dirname "$MCFG")"
@@ -2446,7 +2453,7 @@ print(eval(sys.argv[3]) if a else "")' "$WORK/gjson" "$AG" "$1" 2>/dev/null
     sleep 1.5 # let a poller pass that began before the reload finish
     rm -f "$GFILE"
     use g6 Read '{"file_path":"/repo/README.md"}'; res g6 false
-    gwait 'a["counts"]["reads"]' 3 60
+    gwait 'a["counts"]["reads"]' 4 60
     sleep 6.5
     [[ ! -e "$GFILE" ]] || fail "graph_persist = false must not write the graph (reload said: $(cat "$WORK/reload.out"); $(ls -la "$WORK/graphs"))"
     # And off entirely: the topic empties.
@@ -2455,7 +2462,7 @@ print(eval(sys.argv[3]) if a else "")' "$WORK/gjson" "$AG" "$1" 2>/dev/null
     for _ in $(seq 1 40); do [[ -z "$(gfield 'a["token"]')" ]] && break; sleep 0.25; done
     [[ -z "$(gfield 'a["token"]')" ]] || fail "graph = false should empty the graph"
     printf '%s\n' "$MCFG_OLD" >"$MCFG"; t 10 fx reload >/dev/null
-    ok "reads 2 / edits 1 (+1 failed) / searches 1 / 1 Explore subagent with its own read; paged; saved 0600; persist=false writes nothing; graph=false empties it"
+    ok "reads 2 / edits 1 (+1 failed) / searches 1 / 1 Explore subagent with its own read; a Bash sed read + sed -i edit pending then counted; paged; saved 0600; persist=false writes nothing; graph=false empties it"
 
     t 15 fx kill-server >/dev/null 2>&1 || kill -9 "$FPID" 2>/dev/null || true
     kill "$APID" 2>/dev/null || true

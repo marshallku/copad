@@ -43,6 +43,7 @@ pub mod proto;
 pub mod push;
 pub mod selector;
 pub mod server;
+pub mod shellcmd;
 pub mod state;
 pub mod term;
 pub mod tui;

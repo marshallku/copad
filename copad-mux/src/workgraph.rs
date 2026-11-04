@@ -8,8 +8,12 @@
 //! `<session>/subagents/agent-*.jsonl`, found by its `.meta.json` (`toolUseId` names the
 //! spawning call). Codex: the rollout's completed `CommandExecution` items (`parsed_cmd` says
 //! which reads and searches a command was), the results of `apply_patch` tool calls (`Success. Updated the
-//! following files:`), `UserMessage` and `task_complete`. Codex subagents and edits made
-//! through shell commands are not seen.
+//! following files:`), `UserMessage` and `task_complete`. Codex subagents are not seen.
+//!
+//! **Shell commands.** A Claude `Bash` call, and a Codex command whose `parsed_cmd` gives up or
+//! that writes, is read by [`crate::shellcmd`]: one step per file it read, searched, edited,
+//! wrote or deleted, plus a `Run` step when part of it was not understood. A part its exit
+//! status does not vouch for settles `unknown` (drawn, never counted).
 //!
 //! **Only outcomes count.** A Claude call is a PENDING step until its result arrives; only an
 //! ok result adds to the file's counters, a failed one marks the step failed. Codex records
@@ -60,7 +64,9 @@ const MAX_PATH: usize = 1024;
 /// How much of the file before a committed offset its hash covers.
 const HASH_SPAN: u64 = 4096;
 /// The on-disk format.
-const FORMAT: u32 = 1;
+const FORMAT: u32 = 2;
+/// File effects one shell command contributes; the rest are counted as omitted.
+const MAX_SHELL_EFFECTS: usize = 16;
 
 /// One transcript a graph reads.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -225,10 +231,20 @@ fn fnv(bytes: &[u8]) -> u64 {
 /// A call waiting for its result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct PendingCall {
+    /// Every step the call made (a shell command can make several), with what settling it
+    /// needs kept here rather than read back from the step, which may be gone by then.
+    effects: Vec<PendingEffect>,
+    spawned: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct PendingEffect {
     seq: u64,
     kind: StepKind,
     file: Option<u32>,
-    spawned: Option<u32>,
+    /// The step's outcome when the call succeeds: `Unknown` for a part of a shell command its
+    /// exit status does not vouch for ([`crate::shellcmd`]).
+    on_ok: Outcome,
 }
 
 /// A result that arrived before what it settles.
@@ -381,7 +397,12 @@ impl ConvGraph {
                     let id = b.get("id").and_then(Value::as_str).unwrap_or_default();
                     let name = b.get("name").and_then(Value::as_str).unwrap_or_default();
                     let input = b.get("input").unwrap_or(&Value::Null);
-                    self.claude_call(id, name, input, at, agent);
+                    if name == "Bash" {
+                        let cwd = v.get("cwd").and_then(Value::as_str).unwrap_or_default();
+                        self.claude_bash(id, input, cwd, at, agent);
+                    } else {
+                        self.claude_call(id, name, input, at, agent);
+                    }
                 }
             }
             Some("user") => {
@@ -433,7 +454,6 @@ impl ConvGraph {
             "NotebookEdit" => (StepKind::Edit, s("notebook_path"), None),
             "Write" => (StepKind::Write, s("file_path"), None),
             "Grep" | "Glob" => (StepKind::Search, s("path"), s("pattern")),
-            "Bash" => (StepKind::Run, None, s("description").or(s("command"))),
             "WebFetch" => (StepKind::Web, None, s("url")),
             "WebSearch" => (StepKind::Web, None, s("query")),
             "Agent" | "Task" => (StepKind::Spawn, None, s("description")),
@@ -461,11 +481,83 @@ impl ConvGraph {
             self.omitted_files += 1;
         }
         let call = PendingCall {
-            seq,
-            kind,
-            file,
+            effects: vec![PendingEffect {
+                seq,
+                kind,
+                file,
+                on_ok: Outcome::Ok,
+            }],
             spawned: spawned.flatten(),
         };
+        self.track(id, call);
+    }
+
+    /// A `Bash` call: a step per file effect its command has ([`crate::shellcmd`]), plus a
+    /// `Run` step when part of it is not understood (or it touches no file).
+    fn claude_bash(&mut self, id: &str, input: &Value, cwd: &str, at: i64, agent: u32) {
+        let s = |k: &str| input.get(k).and_then(Value::as_str);
+        let command = s("command").unwrap_or_default();
+        let background = input.get("run_in_background").and_then(Value::as_bool) == Some(true);
+        let cwd = if cwd.is_empty() {
+            self.cwd.clone()
+        } else {
+            cwd.to_string()
+        };
+        let found = crate::shellcmd::analyze(command, &cwd, &self.home, background);
+        let mut effects = Vec::new();
+        if found.opaque || found.effects.is_empty() {
+            let label = cut(s("description").unwrap_or(command));
+            let seq = self.push_step(GraphStep {
+                at_ms: at,
+                kind: StepKind::Run,
+                agent,
+                label,
+                outcome: Outcome::Pending,
+                ..Default::default()
+            });
+            effects.push(PendingEffect {
+                seq,
+                kind: StepKind::Run,
+                file: None,
+                on_ok: Outcome::Ok,
+            });
+        }
+        for (i, e) in found.effects.iter().enumerate() {
+            if i >= MAX_SHELL_EFFECTS {
+                self.omitted_files += 1;
+                continue;
+            }
+            let file = self.file_for(&e.path, at);
+            if file.is_none() {
+                self.omitted_files += 1;
+            }
+            let seq = self.push_step(GraphStep {
+                at_ms: at,
+                kind: e.kind,
+                agent,
+                file,
+                label: cut(e.label.as_deref().unwrap_or_default()),
+                outcome: Outcome::Pending,
+                ..Default::default()
+            });
+            effects.push(PendingEffect {
+                seq,
+                kind: e.kind,
+                file,
+                on_ok: e.on_ok,
+            });
+        }
+        self.track(
+            id,
+            PendingCall {
+                effects,
+                spawned: None,
+            },
+        );
+    }
+
+    /// Wait for the result of call `id`.
+    fn track(&mut self, id: &str, call: PendingCall) {
         if id.is_empty() {
             return;
         }
@@ -490,7 +582,9 @@ impl ConvGraph {
                 break;
             };
             if let Some(p) = self.pending.remove(&old) {
-                self.set_outcome(p.seq, Outcome::Unknown);
+                for e in &p.effects {
+                    self.set_outcome(e.seq, Outcome::Unknown);
+                }
             }
         }
     }
@@ -653,9 +747,16 @@ impl ConvGraph {
             }
             return;
         };
-        self.set_outcome(p.seq, outcome);
-        if outcome == Outcome::Ok {
-            self.apply(p.kind, p.file, at);
+        for e in &p.effects {
+            let outcome = if outcome == Outcome::Ok {
+                e.on_ok
+            } else {
+                outcome
+            };
+            self.set_outcome(e.seq, outcome);
+            if outcome == Outcome::Ok {
+                self.apply(e.kind, e.file, at);
+            }
         }
         if let Some(sub) = p.spawned
             && !launched
@@ -829,6 +930,47 @@ impl ConvGraph {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        // `parsed_cmd` knows reads and searches only; where it gives up, or the command also
+        // writes, the command's own analysis is the one source for it.
+        let script = item
+            .get("command")
+            .and_then(Value::as_array)
+            .filter(|a| a.len() == 3 && matches!(a[1].as_str(), Some("-lc" | "-c")))
+            .and_then(|a| a[2].as_str());
+        if let Some(script) = script {
+            let found = crate::shellcmd::analyze(script, &base, &self.home, false);
+            let gave_up = parsed.is_empty()
+                || parsed
+                    .iter()
+                    .any(|c| c.get("type").and_then(Value::as_str) == Some("unknown"));
+            let writes = found
+                .effects
+                .iter()
+                .any(|e| matches!(e.kind, StepKind::Edit | StepKind::Write | StepKind::Delete));
+            if gave_up || writes {
+                if found.opaque || found.effects.is_empty() {
+                    self.push_settled(StepKind::Run, None, script, outcome, at);
+                }
+                for (i, e) in found.effects.iter().enumerate() {
+                    if i >= MAX_SHELL_EFFECTS {
+                        self.omitted_files += 1;
+                        continue;
+                    }
+                    let file = self.file_for(&e.path, at);
+                    if file.is_none() {
+                        self.omitted_files += 1;
+                    }
+                    let outcome = if outcome == Outcome::Ok {
+                        e.on_ok
+                    } else {
+                        outcome
+                    };
+                    let label = e.label.as_deref().unwrap_or_default();
+                    self.push_settled(e.kind, file, label, outcome, at);
+                }
+                return;
+            }
+        }
         let mut any = false;
         for c in &parsed {
             let s = |k: &str| c.get(k).and_then(Value::as_str);
@@ -963,7 +1105,11 @@ impl ConvGraph {
     pub fn overview(&self, files: usize, steps: usize, subs: usize) -> AgentGraph {
         let chosen: Vec<GraphStep> = self.steps.iter().rev().take(steps).rev().cloned().collect();
         let (files, subs) = self.referenced(&chosen, files, subs);
-        let mut pending: Vec<u64> = self.pending.values().map(|p| p.seq).collect();
+        let mut pending: Vec<u64> = self
+            .pending
+            .values()
+            .flat_map(|p| p.effects.iter().map(|e| e.seq))
+            .collect();
         pending.sort_unstable();
         let pending = pending.split_off(pending.len().saturating_sub(32));
         AgentGraph {
@@ -1692,6 +1838,190 @@ mod tests {
         assert!(!o.files.iter().any(|f| f.abs.ends_with("quoted.rs")));
         assert_eq!((o.files[0].reads, o.files[0].edits), (1, 1));
         assert_eq!(o.steps[3].label, "cargo test");
+    }
+
+    fn bash(id: &str, command: &str, cwd: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "timestamp": T0,
+            "cwd": cwd,
+            "message": {"content": [{
+                "type": "tool_use", "id": id, "name": "Bash",
+                "input": {"command": command, "description": "look around"},
+            }]},
+        })
+        .to_string()
+    }
+
+    fn kinds(g: &ConvGraph) -> Vec<(StepKind, Outcome, String)> {
+        let o = g.overview(64, 64, 8);
+        o.steps
+            .iter()
+            .map(|s| {
+                let f = s.file.and_then(|i| o.files.iter().find(|f| f.id == i));
+                (
+                    s.kind,
+                    s.outcome,
+                    f.map(|f| f.display.clone()).unwrap_or_default(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_bash_call_is_a_step_per_file_it_touched() {
+        let mut g = claude("/r");
+        // The record's cwd is where Claude's shell was, not where the conversation began.
+        g.ingest(
+            &bash(
+                "b1",
+                "sed -n 1,60p src/a.rs && sed -i '' 's/x/y/' src/b.rs",
+                "/r/sub",
+            ),
+            0,
+        );
+        assert_eq!(
+            kinds(&g),
+            vec![
+                (StepKind::Read, Outcome::Pending, "sub/src/a.rs".into()),
+                (StepKind::Edit, Outcome::Pending, "sub/src/b.rs".into()),
+            ],
+            "every part understood: no Run step"
+        );
+        assert_eq!(g.overview(64, 64, 8).pending, vec![1, 2]);
+        g.ingest(&result("b1", false, T1), 0);
+        assert_eq!(
+            kinds(&g).iter().map(|k| k.1).collect::<Vec<_>>(),
+            vec![Outcome::Ok, Outcome::Ok]
+        );
+        let o = g.overview(64, 64, 8);
+        assert_eq!((o.counts.reads, o.counts.edits, o.counts.runs), (1, 1, 0));
+        assert!(o.pending.is_empty());
+    }
+
+    #[test]
+    fn a_bash_part_its_exit_does_not_vouch_for_is_unknown() {
+        let mut g = claude("/r");
+        g.ingest(&bash("b1", "cat a.rs | head -5; git status", "/r"), 0);
+        g.ingest(&result("b1", false, T1), 0);
+        assert_eq!(
+            kinds(&g),
+            vec![
+                (StepKind::Run, Outcome::Ok, String::new()),
+                (StepKind::Read, Outcome::Unknown, "a.rs".into()),
+            ]
+        );
+        let o = g.overview(64, 64, 8);
+        assert_eq!(o.steps[0].label, "look around");
+        assert_eq!(
+            (o.counts.reads, o.counts.runs),
+            (0, 1),
+            "shown, not counted"
+        );
+        // A failed call fails every part.
+        g.ingest(&bash("b2", "cat b.rs && rm c.rs", "/r"), 0);
+        g.ingest(&result("b2", true, T1), 0);
+        let k = kinds(&g);
+        assert_eq!(
+            &k[2..],
+            &[
+                (StepKind::Read, Outcome::Failed, "b.rs".into()),
+                (StepKind::Delete, Outcome::Failed, "c.rs".into()),
+            ]
+        );
+        assert_eq!(g.overview(64, 64, 8).counts.edits, 0);
+    }
+
+    #[test]
+    fn a_bash_call_settles_after_its_steps_left_the_history() {
+        let mut g = claude("/r");
+        g.ingest(&bash("slow", "sed -i 's/a/b/' f.rs", "/r"), 0);
+        for i in 0..MAX_STEPS + 10 {
+            g.ingest(
+                &call(&format!("t{i}"), "Read", r#"{"file_path":"/r/x"}"#, T0),
+                0,
+            );
+            g.ingest(&result(&format!("t{i}"), false, T0), 0);
+        }
+        assert!(
+            g.steps.front().unwrap().seq > 1,
+            "the edit step was dropped"
+        );
+        g.ingest(&result("slow", false, T1), 0);
+        let o = g.overview(64, 1, 8);
+        assert_eq!(o.counts.edits, 1, "it still counts");
+        let f = g.files.iter().find(|f| f.abs == "/r/f.rs").unwrap();
+        assert_eq!(f.edits, 1);
+    }
+
+    #[test]
+    fn evicting_a_pending_bash_call_settles_every_part() {
+        let mut g = claude("/r");
+        g.ingest(&bash("old", "cat a && cat b", "/r"), 0);
+        for i in 0..MAX_PENDING {
+            g.ingest(
+                &call(&format!("t{i}"), "Read", r#"{"file_path":"/r/x"}"#, T0),
+                0,
+            );
+        }
+        let first: Vec<_> = g.steps.iter().take(2).map(|s| (s.seq, s.outcome)).collect();
+        assert_eq!(first, vec![(1, Outcome::Unknown), (2, Outcome::Unknown)]);
+        assert!(!g.overview(64, 64, 8).pending.contains(&2));
+    }
+
+    #[test]
+    fn a_pending_bash_call_survives_a_restart() {
+        let dir = tmpdir("bash-resume");
+        let t = dir.join("c1.jsonl");
+        std::fs::write(&t, format!("{}\n", bash("b1", "cat a && cat b", "/r"))).unwrap();
+        let mut g = ConvGraph::new("claude", "c1", "/r", t.clone());
+        let Read_::Lines(lines, _) = g.sources[0].read(1 << 20).unwrap() else {
+            panic!()
+        };
+        for l in &lines {
+            g.ingest(l, 0);
+        }
+        let store = dir.join("graphs");
+        g.save(&store).unwrap();
+        let mut back = ConvGraph::load(&store, "claude", "c1", &t).expect("resumes");
+        back.ingest(&result("b1", false, T1), 0);
+        assert_eq!(back.overview(64, 64, 8).counts.reads, 2);
+    }
+
+    #[test]
+    fn codex_shell_writes_and_what_parsed_cmd_gave_up_on() {
+        let mut g = ConvGraph::new("codex", "x", "/r", PathBuf::from("/nonexistent"));
+        let item = |cmd: &str, types: &[(&str, &str)]| {
+            let parsed: Vec<Value> = types
+                .iter()
+                .map(|(t, p)| serde_json::json!({"type": t, "cmd": cmd, "path": p}))
+                .collect();
+            serde_json::json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"CommandExecution","cwd":"file:///r","exit_code":0,
+                "command":["/bin/zsh","-lc",cmd],"parsed_cmd":parsed}}})
+            .to_string()
+        };
+        // Codex calls this a read; it also writes `b`.
+        g.ingest(&item("cat a > b", &[("read", "a")]), 0);
+        // Codex gave up on the pipeline.
+        g.ingest(&item("sed -n 1,9p c | head -3", &[("unknown", "")]), 0);
+        // Fully understood by parsed_cmd: used as before.
+        g.ingest(&item("sed -n 1,9p d", &[("read", "d")]), 0);
+        g.ingest(
+            &item("sed -i '' 's/a/b/' e && cargo test", &[("unknown", "")]),
+            0,
+        );
+        assert_eq!(
+            kinds(&g),
+            vec![
+                (StepKind::Read, Outcome::Ok, "a".into()),
+                (StepKind::Write, Outcome::Ok, "b".into()),
+                (StepKind::Read, Outcome::Unknown, "c".into()),
+                (StepKind::Read, Outcome::Ok, "d".into()),
+                (StepKind::Run, Outcome::Ok, String::new()),
+                (StepKind::Edit, Outcome::Ok, "e".into()),
+            ]
+        );
     }
 
     #[test]
