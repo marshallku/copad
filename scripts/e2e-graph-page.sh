@@ -10,11 +10,18 @@
 #   6. it asks the host for history it lacks, and merges the page it gets
 #
 # Screenshots land in $OUT (default: a temp dir) — look at them.
+#
+#   ENGINE=webkit scripts/e2e-graph-page.sh   # the same scenarios in a real WKWebView (macOS; the
+#                                             # engine copad's macOS and iOS hosts use), with a real
+#                                             # `comux` message handler (scripts/lib/webkit-page-runner.swift)
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
+ENGINE="${ENGINE:-chrome}"
 CHROME="${CHROME:-/Applications/Google Chrome.app/Contents/MacOS/Google Chrome}"
-command -v "$CHROME" >/dev/null 2>&1 || [[ -x "$CHROME" ]] || CHROME="$(command -v chromium || command -v google-chrome || true)"
-[[ -n "$CHROME" ]] || { echo "SKIP: no Chrome/Chromium"; exit 0; }
+if [[ "$ENGINE" == chrome ]]; then
+    command -v "$CHROME" >/dev/null 2>&1 || [[ -x "$CHROME" ]] || CHROME="$(command -v chromium || command -v google-chrome || true)"
+    [[ -n "$CHROME" ]] || { echo "SKIP: no Chrome/Chromium"; exit 0; }
+fi
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/graph-page-e2e.XXXXXX")"
 OUT="${OUT:-$WORK}"
 trap 'rm -rf "$WORK/profile"' EXIT
@@ -36,7 +43,15 @@ driver = """
 <pre id="e2e-out"></pre>
 <script>
 window.__posts = [];
-window.webkit = { messageHandlers: { comux: { postMessage: (m) => window.__posts.push(m) } } };
+// In WebKit the real handler exists (the runner collects its messages); elsewhere, a stand-in.
+if (!(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.comux)) {
+  window.webkit = { messageHandlers: { comux: { postMessage: (m) => window.__posts.push(m) } } };
+} else {
+  // Mirror what reaches the real handler, so a scenario can read it as it goes.
+  const h = window.webkit.messageHandlers.comux;
+  const send = h.postMessage.bind(h);
+  h.postMessage = (m) => { window.__posts.push(m); send(m); };
+}
 </script>
 """
 runner = """
@@ -54,6 +69,11 @@ runner = """
 html = html.replace("<body>", "<body>" + driver, 1).replace("</body>", runner + "</body>", 1)
 open(out, "w").write(html)
 PY
+    if [[ "$ENGINE" == webkit ]]; then
+        swift "$REPO/scripts/lib/webkit-page-runner.swift" "$WORK/$name.html" "$OUT/$name-webkit.png" >"$WORK/$name.json" \
+            || echo '{}' >"$WORK/$name.json"
+        return
+    fi
     "$CHROME" --headless=new --disable-gpu --no-first-run --user-data-dir="$WORK/profile" \
         --window-size=900,640 --virtual-time-budget=10000 --dump-dom "file://$WORK/$name.html" 2>/dev/null \
         | python3 -c 'import sys,re; m=re.search(r"@@OUT@@(.*?)@@END@@", sys.stdin.read(), re.S); print(m.group(1) if m else "{}")' >"$WORK/$name.json"
@@ -70,7 +90,8 @@ run agent '
   await sleep(1500);
   out.state = G.state();
   G.render();
-  const px = document.getElementById("graph").getContext("2d").getImageData(0, 0, 300, 300).data;
+  const cv = document.getElementById("graph");
+  const px = cv.getContext("2d").getImageData(0, 0, cv.width, cv.height).data;
   out.painted = px.some((v, i) => i % 4 === 3 && v > 0);
 '
 [[ "$(q agent 'd.get("error","")')" == "" ]]
@@ -177,4 +198,4 @@ run conn '
 ok "posts carry the epoch; unsupported stops history; reset() empties the page for a new connection"
 
 echo
-echo "PASS — the work-graph page; screenshots in $OUT"
+echo "PASS — the work-graph page ($ENGINE); screenshots in $OUT"

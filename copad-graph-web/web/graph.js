@@ -1082,7 +1082,10 @@
         // Draw now, without waiting for a frame (a host with no display schedules none): what a
         // capture of the canvas needs.
         render: () => {
+            // A view that has had no layout pass yet has no canvas size either.
+            resize();
             while (alpha > 0) tick();
+            if (!viewTouched) fit();
             draw(performance.now());
         },
     };
