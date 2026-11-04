@@ -14,6 +14,11 @@
 #   ENGINE=webkit scripts/e2e-graph-page.sh   # the same scenarios in a real WKWebView (macOS; the
 #                                             # engine copad's macOS and iOS hosts use), with a real
 #                                             # `comux` message handler (scripts/lib/webkit-page-runner.swift)
+#   ENGINE=webkitgtk scripts/e2e-graph-page.sh  # the same in WebKitGTK (Linux; copad-linux's engine),
+#                                               # through copad-linux's graph_page_runner example. Needs
+#                                               # a display: GDK_BACKEND=broadway BROADWAY_DISPLAY=:N works
+#   ENGINE=ios scripts/e2e-graph-page.sh        # the same in the iOS simulator's WKWebView, through the
+#                                               # copad-iosTests GraphPageScenarioTests unit test
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 ENGINE="${ENGINE:-chrome}"
@@ -29,6 +34,14 @@ fail() { echo "FAIL: $*"; exit 1; }
 ok() { echo "  ok — $*"; }
 
 (cd "$REPO" && cargo run -q -p copad-graph-web --example dump) >"$WORK/page.html"
+if [[ "$ENGINE" == webkitgtk ]]; then
+    (cd "$REPO" && cargo build -q -p copad-linux --example graph_page_runner) || { echo "runner build failed"; exit 2; }
+fi
+if [[ "$ENGINE" == ios ]]; then
+    (cd "$REPO/copad-ios" && xcodegen generate >/dev/null && xcodebuild -project copad-ios.xcodeproj -scheme copad-ios \
+        -destination 'platform=iOS Simulator,name=iPhone 17' -derivedDataPath build -skipPackagePluginValidation \
+        build-for-testing >"$WORK/ios-build.log" 2>&1) || { echo "iOS build failed: $WORK/ios-build.log"; exit 2; }
+fi
 FIXTURE="$(cat "$REPO/copad-graph-web/tests/fixture.json")"
 
 # The page plus a driver that runs the scenario and writes every check's state into the DOM;
@@ -69,6 +82,20 @@ runner = """
 html = html.replace("<body>", "<body>" + driver, 1).replace("</body>", runner + "</body>", 1)
 open(out, "w").write(html)
 PY
+    if [[ "$ENGINE" == ios ]]; then
+        rm -f "$WORK/$name.json"
+        (cd "$REPO/copad-ios" && TEST_RUNNER_GRAPH_SCENARIO="$WORK/$name.html" TEST_RUNNER_GRAPH_OUT="$WORK/$name.json" \
+            xcodebuild -project copad-ios.xcodeproj -scheme copad-ios -destination 'platform=iOS Simulator,name=iPhone 17' \
+            -derivedDataPath build -skipPackagePluginValidation test-without-building \
+            -only-testing:copad-iosTests/GraphPageScenarioTests >"$WORK/$name-ios.log" 2>&1) || true
+        [[ -s "$WORK/$name.json" ]] || echo '{}' >"$WORK/$name.json"
+        return
+    fi
+    if [[ "$ENGINE" == webkitgtk ]]; then
+        "$REPO/target/debug/examples/graph_page_runner" "$WORK/$name.html" 2>/dev/null | tail -1 >"$WORK/$name.json"
+        [[ -s "$WORK/$name.json" ]] || echo '{}' >"$WORK/$name.json"
+        return
+    fi
     if [[ "$ENGINE" == webkit ]]; then
         swift "$REPO/scripts/lib/webkit-page-runner.swift" "$WORK/$name.html" "$OUT/$name-webkit.png" >"$WORK/$name.json" \
             || echo '{}' >"$WORK/$name.json"
