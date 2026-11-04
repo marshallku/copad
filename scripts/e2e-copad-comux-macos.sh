@@ -16,6 +16,7 @@ COMUX="$REPO/target/debug/comux"
 COCTL="$REPO/target/release/coctl"
 APP="$REPO/copad-macos/.build/debug/Copad.app"
 log() { printf '[e2e-macos] %s\n' "$*" >&2; }
+mi() { python3 "$REPO/scripts/lib/macinput.py" "$@" >/dev/null; }
 fail() { log "FAIL: $*"; exit 1; }
 
 cargo build -q -p copad-mux
@@ -154,11 +155,12 @@ if [[ -n "$WID" ]]; then
     screencapture -o -x -l"$WID" "$W/native-sidebar.png" && log "screenshot: $W/native-sidebar.png"
 fi
 
-# Everything from here to the work graph drives the window with synthesized keys and clicks,
-# which need this terminal to have Accessibility. Without it those steps are SKIPPED loudly
+# Everything from here to the work graph drives the window with synthesized keys and clicks
+# (HID events through Quartz, scripts/lib/macinput.py), which need this process to be trusted
+# for Accessibility — run it from a terminal app that is (a Copad window is). Without it those steps are SKIPPED loudly
 # rather than failing on the permission; the graph and top-bar steps below need none.
 INPUT=1
-if ! osascript -e 'tell application "System Events" to key code 63' >/dev/null 2>&1; then
+if ! mi trusted; then
     INPUT=""
     log "SKIP — no Accessibility for synthesized input here: the key/click-driven steps (overlays, center, sidebar keys, preview card) did not run"
 fi
@@ -175,9 +177,7 @@ PY
 "$COCTL" --socket "$GUI" terminal feed $'\x02$' >/dev/null
 sleep 2
 [[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/overlay-prompt.png" && log "screenshot: $W/overlay-prompt.png"
-osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" \
-          -e 'tell application "System Events" to keystroke "macrenamed"' \
-          -e 'tell application "System Events" to key code 36' >/dev/null
+mi front "$APP_PID"; mi type "macrenamed"; mi key 36
 for _ in $(seq 1 20); do session_names | grep -q macrenamed && break; sleep 0.5; done
 session_names | grep -q macrenamed || fail "the delegated prompt did not rename the session: $(session_names)"
 log "ok — Ctrl-b \$ was drawn natively and its answer renamed the session"
@@ -187,9 +187,7 @@ grep -q "rename session" <<<"$SCREEN" && fail "the TUI drew the prompt as well"
 
 # Ctrl-b C (decisions #172): the directory browser is drawn natively, filled once comux's
 # listing lands; picking "proj" descends, "Create session here" leads to comux's name prompt.
-keys() { osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" \
-                   -e "tell application \"System Events\" to keystroke \"$1\"" \
-                   -e 'tell application "System Events" to key code 36' >/dev/null; }
+keys() { mi front "$APP_PID"; mi type "$1"; mi key 36; }
 session_dirs() { python3 - <<'PY'
 import json, os, socket
 s = socket.socket(socket.AF_UNIX); s.connect(os.environ["COPAD_MUX_SOCK"])
@@ -212,7 +210,7 @@ log "ok — Ctrl-b C was drawn natively: descending into proj and 'Create sessio
 # lists the fixture transcript.
 # Click it where it is drawn (the sidebar header, left of the bell; the sidebar is 30 columns
 # of the default 14pt font wide): a real pointer event.
-osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" >/dev/null
+mi front "$APP_PID"
 sleep 1 # the previous overlay's dismissal, and the window becoming key again
 python3 - "$APP_PID" <<'PY'
 import sys, time, Quartz
@@ -238,8 +236,7 @@ PY
 BEFORE="$(tabs_total)"
 sleep 3 # the transcript scan
 [[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/resume-overlay.png" && log "screenshot: $W/resume-overlay.png"
-osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" \
-          -e 'tell application "System Events" to key code 36' >/dev/null
+mi front "$APP_PID"; mi key 36
 for _ in $(seq 1 20); do [[ "$(tabs_total)" -gt "$BEFORE" ]] && break; sleep 0.5; done
 [[ "$(tabs_total)" -gt "$BEFORE" ]] || fail "Enter on the native resume picker did not resume the fixture conversation"
 log "ok — the native resume button opened comux's Ctrl-b R picker over the window and Enter resumed the conversation"
@@ -258,11 +255,10 @@ sleep 1
 "$COCTL" --socket "$GUI" terminal feed $'\x06' >/dev/null
 sleep 3 # the overlay, then the preview's first refresh
 [[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/switcher.png" && log "screenshot: $W/switcher.png"
-osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" \
-          -e 'tell application "System Events" to key code 124' >/dev/null
+mi front "$APP_PID"; mi key 124
 sleep 1
 [[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/switcher-agents.png" && log "screenshot: $W/switcher-agents.png"
-osascript -e 'tell application "System Events" to key code 123' >/dev/null
+mi key 123
 keys macos-two
 for _ in $(seq 1 20); do [[ "$(active_session)" == macos-two ]] && break; sleep 0.5; done
 [[ "$(active_session)" == macos-two ]] || fail "Ctrl-f, typing and Enter did not switch the session: $(active_session)"
@@ -297,15 +293,14 @@ sleep 1
 "$COCTL" --socket "$GUI" terminal feed $'\x02a' >/dev/null
 sleep 2
 [[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/center.png" && log "screenshot: $W/center.png"
-osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" \
-          -e 'tell application "System Events" to keystroke "d"' >/dev/null
+mi front "$APP_PID"; mi type "d"
 for _ in $(seq 1 20); do [[ "$(notif_count)" == 2 ]] && break; sleep 0.5; done
 [[ "$(notif_count)" == 2 ]] || fail "d in the native center did not dismiss one notification: $(notif_count)"
 sleep 1
-osascript -e 'tell application "System Events" to keystroke "D"' >/dev/null
+mi type "D"
 for _ in $(seq 1 20); do [[ "$(notif_count)" == 0 ]] && break; sleep 0.5; done
 [[ "$(notif_count)" == 0 ]] || fail "the center closed after d (D did not clear the rest): $(notif_count)"
-osascript -e 'tell application "System Events" to key code 53' >/dev/null
+mi key 53
 log "ok — the native center dismissed with d, stayed open, and D cleared the rest"
 
 # The notification panel opens OVER the terminal (#183) and opening a notification closes it.
@@ -338,15 +333,15 @@ log "ok — the top bar's bell dropped the notifications down over the terminal 
 
 # The chrome never takes the keys (#183): after a click on the status bar's tab chip, typing
 # still goes to the terminal.
-osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" >/dev/null
+mi front "$APP_PID"
 sleep 0.5
 click_at 140 -40 # the "1 zsh" tab chip
 sleep 1
-osascript -e 'tell application "System Events" to keystroke "echo kept-"' -e 'tell application "System Events" to keystroke "focus"' >/dev/null
+mi type "echo kept-"; mi type "focus"
 sleep 1
 "$COCTL" --socket "$GUI" terminal read 2>/dev/null | grep -q "echo kept-focus" \
     || fail "a click on the native status bar took the keys from the terminal"
-osascript -e 'tell application "System Events" to key code 51' -e 'tell application "System Events" to keystroke "u" using control down' >/dev/null
+mi key 51; mi key 32 ctrl
 log "ok — clicking the native status bar left the keys with the terminal"
 
 # Ctrl-b e (decisions #181): the native sidebar takes the keys like the TUI's — it starts on the
@@ -363,11 +358,10 @@ PY
 )"
 "$COCTL" --socket "$GUI" terminal feed $'\x02e' >/dev/null
 sleep 1.5
-osascript -e "tell application \"System Events\" to set frontmost of (first process whose unix id is $APP_PID) to true" \
-          -e 'tell application "System Events" to key code 125' >/dev/null
+mi front "$APP_PID"; mi key 125
 sleep 1.5 # the selected row's preview popover
 [[ -n "$WID" ]] && screencapture -o -x -l"$WID" "$W/sidebar-keys.png" && log "screenshot: $W/sidebar-keys.png"
-osascript -e 'tell application "System Events" to key code 36' >/dev/null
+mi key 36
 for _ in $(seq 1 20); do [[ "$(active_session)" == "$NEXT" ]] && break; sleep 0.5; done
 [[ "$(active_session)" == "$NEXT" ]] || fail "Ctrl-b e, Down, Enter did not move to $NEXT: $(active_session)"
 log "ok — Ctrl-b e focused the native sidebar; Down + Enter switched to $NEXT"
@@ -375,6 +369,9 @@ log "ok — Ctrl-b e focused the native sidebar; Down + Enter switched to $NEXT"
 # Resting the pointer on a sidebar row previews its pane in a card beside the sidebar (drawn in
 # the window, so it takes no click). Synthetic pointer moves do not always reach the tracking
 # areas, so the row is entered a few times until the area beside it changes.
+# Hover tracking needs the window active (another app — the terminal running this — may be
+# in front by now).
+mi front "$APP_PID"
 python3 - "$APP_PID" "$W" <<'PY' || fail "resting the pointer on a sidebar row showed no preview card"
 import sys, time, subprocess, Quartz
 from PIL import Image, ImageChops, ImageStat
@@ -413,13 +410,13 @@ import sys, time, Quartz
 for w in Quartz.CGWindowListCopyWindowInfo(Quartz.kCGWindowListOptionOnScreenOnly, Quartz.kCGNullWindowID):
     if w.get("kCGWindowOwnerPID") == int(sys.argv[1]) and w["kCGWindowBounds"]["Width"] > 200:
         b = w["kCGWindowBounds"]; break
-pt = (b["X"] + 219, b["Y"] + 82)
+pt = (b["X"] + 245, b["Y"] + 82)  # resume (the bell left the sidebar toolbar, decisions #204)
 for kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
     Quartz.CGEventPost(Quartz.kCGHIDEventTap, Quartz.CGEventCreateMouseEvent(None, kind, pt, Quartz.kCGMouseButtonLeft))
     time.sleep(0.05)
 PY
 sleep 3
-osascript -e 'tell application "System Events" to key code 36' >/dev/null
+mi key 36
 for _ in $(seq 1 20); do [[ "$(tabs_total)" -gt "$BEFORE" ]] && break; sleep 0.5; done
 [[ "$(tabs_total)" -gt "$BEFORE" ]] || fail "a click on the sidebar with the preview card up did not land"
 log "ok — with the preview card up, the sidebar's resume button still took the first click"
