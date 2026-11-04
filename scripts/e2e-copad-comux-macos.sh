@@ -120,7 +120,12 @@ done
 log "ok — copad found its tab's comux client by tag and claimed sidebar, status and overlays"
 
 # comux no longer draws its sidebar in that tab: the screen has no `spaces` header.
-SCREEN="$("$COCTL" --socket "$GUI" terminal read 2>/dev/null || true)"
+# The claim lands before comux's next frame: give the pane a moment to redraw without it.
+for _ in $(seq 1 20); do
+    SCREEN="$("$COCTL" --socket "$GUI" terminal read 2>/dev/null || true)"
+    grep -q "spaces" <<<"$SCREEN" || break
+    sleep 0.5
+done
 grep -q "spaces" <<<"$SCREEN" && fail "the TUI sidebar is still drawn:
 $SCREEN"
 log "ok — the comux frame in the copad tab has no TUI sidebar"
