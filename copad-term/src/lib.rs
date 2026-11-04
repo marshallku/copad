@@ -359,7 +359,6 @@ pub struct CopadHandle {
     /// without having to thread the Pty handle out of the alacritty
     /// EventLoop. Falls stale if the shell exits — `proc_pidinfo`
     /// returns an error in that case and the FFI returns NULL.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     child_pid: i32,
     /// Last observed hash of the cursor row's renderable content plus
     /// cursor metadata (style/blink/show). Used by
@@ -759,8 +758,65 @@ pub unsafe extern "C" fn copad_term_destroy(handle: *mut CopadHandle) {
     // Best-effort shutdown — if the reader already exited (e.g. PTY
     // child died), the send fails but join still cleans up.
     let _ = handle.sender.send(Msg::Shutdown);
+    // The join runs on a detached thread, never on the caller (the main
+    // thread, from the view controller's deinit). Joining hands back
+    // alacritty's `EventLoop`, whose `Pty::drop` SIGHUPs the shell and
+    // then `waitpid`s with NO timeout, so a shell that survives the
+    // SIGHUP (a `zsh -l` still sourcing its rc files) froze the whole
+    // app until it exited. Same fix as comux's `PaneTerm::drop`.
     if let Some(jh) = handle.io_thread.take() {
-        let _ = jh.join();
+        let pid = handle.child_pid;
+        std::thread::spawn(move || reap(jh, pid));
+    }
+}
+
+/// How long a closed terminal's shell gets to exit on SIGHUP before
+/// it is SIGKILLed.
+const REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Join the io-thread, then SIGHUP the shell and SIGKILL it after
+/// [`REAP_GRACE`] if it is still running, before the `Pty` (whose
+/// drop `waitpid`s) goes. Signals go out only after the join and only
+/// while the shell is un-reaped: alacritty reaps a shell that exits on
+/// its own (the event loop's `try_wait`), and once the io-thread has
+/// returned nothing but this thread can reap it, so the pid cannot be
+/// recycled under us. Mirrors comux's `term::reap`.
+fn reap<T>(io_thread: JoinHandle<T>, pid: i32) {
+    let joined = io_thread.join();
+    #[cfg(target_os = "macos")]
+    if pid > 1 && unreaped(pid) {
+        // SAFETY: plain signal syscalls against our own un-reaped child.
+        unsafe { libc::kill(pid, libc::SIGHUP) };
+        let deadline = std::time::Instant::now() + REAP_GRACE;
+        while unreaped(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if unreaped(pid) {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (pid, REAP_GRACE);
+    drop(joined);
+}
+
+/// Whether our child `pid` is still running and un-reaped, without
+/// reaping it (`WNOWAIT`): an exited child is a zombie with its status
+/// pending, a reaped one is `ECHILD`.
+#[cfg(target_os = "macos")]
+fn unreaped(pid: i32) -> bool {
+    // SAFETY: a zeroed siginfo_t is a valid out-buffer; with `WNOHANG`
+    // and no state change it stays zeroed, so `si_signo` tells
+    // "still running" from "exited".
+    unsafe {
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let rc = libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        );
+        rc == 0 && info.si_signo == 0
     }
 }
 

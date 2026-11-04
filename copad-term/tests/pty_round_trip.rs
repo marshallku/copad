@@ -134,3 +134,60 @@ fn null_destroy_no_op() {
         copad_snapshot_destroy(std::ptr::null_mut());
     }
 }
+
+/// Closing a terminal must not wait for its shell: a shell that
+/// survives the SIGHUP (here it ignores it) used to block
+/// `copad_term_destroy` in `waitpid`, which froze the whole app since
+/// the view controller's deinit calls it on the main thread.
+#[test]
+fn destroy_does_not_wait_for_a_shell_that_ignores_sighup() {
+    let shell = CString::new("/bin/sh").unwrap();
+    let handle = unsafe {
+        copad_term_create(
+            80,
+            24,
+            shell.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    };
+    assert!(!handle.is_null(), "shell spawn failed");
+
+    let cmd = b"trap '' HUP; clear; printf 'hup-''ignored %s.' $$\n";
+    unsafe { copad_term_input(handle, cmd.as_ptr(), cmd.len()) };
+    let row =
+        wait_for(handle, |row| row.contains("hup-ignored"), 5_000).expect("snapshot returned NULL");
+    assert!(row.contains("hup-ignored"), "trap never ran; got: {row:?}");
+
+    let start = Instant::now();
+    unsafe { copad_term_destroy(handle) };
+    let took = start.elapsed();
+    assert!(
+        took < Duration::from_millis(500),
+        "destroy blocked for {took:?}"
+    );
+
+    // ...and the shell does not outlive its terminal: it is killed once
+    // the grace is up, then reaped.
+    let pid = row
+        .split("hup-ignored ")
+        .nth(1)
+        .and_then(|rest| rest.split('.').next())
+        .expect("shell pid")
+        .trim()
+        .to_string();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::process::Command::new("/bin/kill")
+        .args(["-0", &pid])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        assert!(
+            Instant::now() < deadline,
+            "shell {pid} survived its terminal"
+        );
+        sleep(Duration::from_millis(50));
+    }
+}

@@ -1672,7 +1672,8 @@ fn capture_text<L: EventListener>(term: &Term<L>, want_rows: usize) -> Capture {
 /// How long a closed pane's shell gets to honour its `SIGHUP` before it is killed.
 const REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Make sure `pid` is dead before the reaper thread drops the `Pty` that will `waitpid` for it.
+/// Join a closed pane's io-thread, then make sure its shell is dead before the `Pty` that
+/// will `waitpid` for it is dropped.
 ///
 /// Detaching the wait keeps the loop alive, but on its own it would only trade a wedged
 /// server for a leak: a shell that ignores `SIGHUP` outlives its pane forever, holding the
@@ -1682,27 +1683,48 @@ const REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 ///
 /// Two things here are deliberate and easy to "fix" wrongly:
 ///
-/// * **It must run on the thread that is about to do the wait, and before it.** An
-///   un-`wait`ed child keeps its pid reserved — it turns into a zombie, not a free slot —
-///   so no signal from here can land on an unrelated process that recycled the number. An
-///   escalation racing the wait from a second thread would have no such guarantee. (For the
-///   same reason we never `waitpid` here ourselves: `Pty::drop` sends its OWN `SIGHUP`
-///   afterwards, which would then be aimed at a freed pid.)
-/// * **There is no liveness poll.** For exactly the reason above, `kill(pid, 0)` succeeds
-///   just as well for the zombie of a shell that already obeyed the `SIGHUP`, so polling it
-///   would return "alive" every time and buy nothing. We sleep the grace out and then send a
-///   `SIGKILL` that a zombie simply discards.
-fn reap_child(pid: Option<u32>) {
+/// * **Signals go out only after the join, and only while the shell is un-reaped.** alacritty
+///   reaps the shell itself when it exits on its own (the event loop's `try_wait` on
+///   `SIGCHLD`), which is the ordinary way a pane closes; a pid signalled after that may
+///   already belong to another process. Once the io-thread has returned, the `Pty` is ours
+///   alone, so nothing can reap the child between [`unreaped`]'s check and the signal.
+/// * **[`unreaped`] peeks with `WNOWAIT`.** It must not reap — `Pty::drop` still sends its
+///   own `SIGHUP` and then `wait`s — and a `kill(pid, 0)` poll would buy nothing, since it
+///   succeeds for a zombie too.
+fn reap<T>(io_thread: std::thread::JoinHandle<T>, pid: Option<u32>) {
+    let joined = io_thread.join();
     // pid 1 / 0 are not ours to signal; treat an unknown pid as nothing to do.
-    let Some(pid) = pid.filter(|p| *p > 1).map(|p| p as libc::pid_t) else {
-        return;
-    };
-    // SAFETY: plain signal syscalls against a child pid this thread is about to reap, so
-    // the pid cannot have been recycled.
+    if let Some(pid) = pid.filter(|p| *p > 1).map(|p| p as libc::pid_t)
+        && unreaped(pid)
+    {
+        // SAFETY: plain signal syscalls against our own child, which only this thread can
+        // reap now and has not, so the pid cannot have been recycled.
+        unsafe { libc::kill(pid, libc::SIGHUP) };
+        let deadline = std::time::Instant::now() + REAP_GRACE;
+        while unreaped(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        if unreaped(pid) {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+    drop(joined);
+}
+
+/// Whether our child `pid` is still running and un-reaped, without reaping it (`WNOWAIT`).
+/// An exited child is a zombie with its status pending; a reaped one is `ECHILD`.
+fn unreaped(pid: libc::pid_t) -> bool {
+    // SAFETY: a zeroed siginfo_t is a valid out-buffer. With `WNOHANG` and no state change
+    // the kernel leaves it zeroed, so `si_signo` tells "still running" from "exited".
     unsafe {
-        libc::kill(pid, libc::SIGHUP);
-        std::thread::sleep(REAP_GRACE);
-        libc::kill(pid, libc::SIGKILL);
+        let mut info: libc::siginfo_t = std::mem::zeroed();
+        let rc = libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        );
+        rc == 0 && info.si_signo == 0
     }
 }
 
@@ -1722,13 +1744,7 @@ impl Drop for PaneTerm {
         // frames, no control requests, flock held, fixable only with an external SIGKILL.
         if let Some(jh) = self.io_thread.take() {
             let pid = self.child_pid;
-            std::thread::spawn(move || {
-                // Escalate BEFORE the join, not after: killing the shell EOFs the PTY, which
-                // is also what frees an io-thread that never acted on `Shutdown` — otherwise
-                // the join below could hang and nothing would ever reap the child.
-                reap_child(pid);
-                drop(jh.join());
-            });
+            std::thread::spawn(move || reap(jh, pid));
         }
     }
 }
