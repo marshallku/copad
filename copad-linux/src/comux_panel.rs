@@ -663,6 +663,9 @@ impl ComuxPanel {
         right_dock.set_transition_duration(180);
         right_dock.set_child(Some(&graph.root));
         right_dock.set_reveal_child(false);
+        // A closed revealer still took ~12 px beside the terminal: it is hidden while closed
+        // and shown only to open (`relayout`).
+        right_dock.set_visible(false);
 
         let spaces_head = header_row(&bold(span(&style.dim, "spaces")), None);
         sidebar.append(&spaces_head);
@@ -1150,9 +1153,22 @@ impl ComuxPanel {
             (40 * adv).max(320),
         );
         self.graph.root.set_width_request(graph.max(1));
-        self.right_dock.set_visible(on);
+        if !on || graph > 0 {
+            self.right_dock.set_visible(on);
+        }
         if self.right_dock.reveals_child() != (graph > 0) {
             self.right_dock.set_reveal_child(graph > 0);
+            if graph == 0 {
+                // Hidden once the slide is over. On a timer, not on `child-revealed`: a view
+                // that draws no frames (minimized, headless) never finishes the transition.
+                let dock = self.right_dock.clone();
+                let slide = u64::from(dock.transition_duration()) + 120;
+                gtk4::glib::timeout_add_local_once(Duration::from_millis(slide), move || {
+                    if !dock.reveals_child() {
+                        dock.set_visible(false);
+                    }
+                });
+            }
         }
         self.top.set_visible(on);
         let rows = self.notif_list.observe_children().n_items().max(1) as i32;
@@ -1717,6 +1733,7 @@ impl ComuxPanel {
         let out = json!({
             "open": g.open, "mode": g.mode, "shown": self.right_dock.reveals_child(),
             "width": self.graph.root.width(), "loaded": self.graph.loaded(),
+            "dock_width": if self.right_dock.is_visible() { self.right_dock.width() } else { 0 },
             "terminal_width": self.float_in.borrow().as_ref().map_or(0, |o| o.width()),
         });
         self.graph.page_state(move |page| {

@@ -161,6 +161,7 @@ for _ in $(seq 1 300); do
 done
 [[ -n "$APID" ]] || fail "no fake agent pid"
 printf '{"pid":%s,"sessionId":"%s","status":"busy"}\n' "$APID" "$FID" >$W/home/.claude/sessions/$APID.json
+[[ "$(gq 'd["dock_width"]')" == 0 ]] || fail "the never-opened panel takes room: $(graph)"
 [[ "$(gq 'd["open"]' '{"open":true,"mode":"agent"}')" == True ]] || fail "comux.graph would not open: $(graph)"
 gwait 'd["shown"] and d["loaded"]' True 40
 gwait '(d["page"] or {}).get("agents")' 1 60
@@ -183,6 +184,8 @@ TOPW="$(gq 'd["terminal_width"]')"
 WAS_SHOWN="$(gq 'd["shown"]')"
 [[ "$(gq 'd["shown"]' '{"open":false}')" == False ]] || fail "the panel should close"
 sleep 1
+# A closed revealer used to keep ~12 px beside the terminal.
+[[ "$(gq 'd["dock_width"]')" == 0 ]] || fail "the closed panel still takes room: $(graph)"
 if [[ "$WAS_SHOWN" == True ]]; then
   [[ "$(gq 'd["terminal_width"] > '"$TOPW")" == True ]] || fail "closing the panel should give the terminal its width back: $(graph)"
 fi
