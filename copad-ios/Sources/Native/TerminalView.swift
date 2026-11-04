@@ -27,6 +27,8 @@ final class TerminalView: UIView {
     private var velocity: CGFloat = 0
     private var inertiaLink: CADisplayLink?
     private var panCell = (x: 0, y: 0)
+    /// The long-press menu (Paste): the terminal is not a text view, so iOS offers none itself.
+    private lazy var editMenu = UIEditMenuInteraction(delegate: self)
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -44,6 +46,8 @@ final class TerminalView: UIView {
         let pan = UIPanGestureRecognizer(target: self, action: #selector(onPan(_:)))
         pan.maximumNumberOfTouches = 1
         addGestureRecognizer(pan)
+        addGestureRecognizer(UILongPressGestureRecognizer(target: self, action: #selector(onLongPress(_:))))
+        addInteraction(editMenu)
         accessibilityIdentifier = "terminal"
         isAccessibilityElement = true
     }
@@ -320,6 +324,20 @@ final class TerminalView: UIView {
         session?.send(.mouse(x: x, y: y, kind: .up))
     }
 
+    @objc private func onLongPress(_ r: UILongPressGestureRecognizer) {
+        guard r.state == .began else { return }
+        stopInertia()
+        editMenu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: r.location(in: self)))
+    }
+
+    // The menu's Paste is the system command, resolved from this view: as the system's own it
+    // reads the pasteboard without a paste prompt, and the input view sends it as a paste.
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        action == #selector(paste(_:)) ? UIPasteboard.general.hasStrings : super.canPerformAction(action, withSender: sender)
+    }
+
+    override func paste(_ sender: Any?) { input.paste(sender) }
+
     @objc private func onPan(_ r: UIPanGestureRecognizer) {
         switch r.state {
         case .began:
@@ -368,6 +386,23 @@ final class TerminalView: UIView {
         inertiaLink?.invalidate()
         inertiaLink = nil
         velocity = 0
+    }
+}
+
+extension TerminalView: UIEditMenuInteractionDelegate {
+    func editMenuInteraction(_ interaction: UIEditMenuInteraction, menuFor configuration: UIEditMenuConfiguration,
+                             suggestedActions: [UIMenuElement]) -> UIMenu? {
+        // Only Paste: Select All, Look Up and the rest act on the invisible input view.
+        // An empty menu, not nil, when there is nothing to paste: nil means the system's default.
+        UIMenu(children: Self.find(#selector(UIResponderStandardEditActions.paste(_:)), in: suggestedActions).map { [$0] } ?? [])
+    }
+
+    private static func find(_ action: Selector, in elements: [UIMenuElement]) -> UIMenuElement? {
+        for e in elements {
+            if let c = e as? UICommand, c.action == action { return c }
+            if let m = e as? UIMenu, let c = find(action, in: m.children) { return c }
+        }
+        return nil
     }
 }
 

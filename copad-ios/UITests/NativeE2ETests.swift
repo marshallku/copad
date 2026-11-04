@@ -1,3 +1,4 @@
+import UIKit
 import XCTest
 
 /// End-to-end on the simulator against a REAL comux over a REAL SSH connection: a throwaway
@@ -103,6 +104,17 @@ final class NativeE2ETests: XCTestCase {
         waitScreen("END")
         Thread.sleep(forTimeInterval: 1)
         snapshot("nerd-glyphs")
+
+        // 4a. A long press on the terminal offers Paste, and the text reaches the shell.
+        UIPasteboard.general.string = "echo PASTED-$((7*6))"
+        terminal.press(forDuration: 1.0)
+        let paste = app.menuItems["Paste"]
+        XCTAssertTrue(paste.waitForExistence(timeout: 5), "no Paste on a long press")
+        paste.tap()
+        // The system's Paste: no "Allow Paste" prompt.
+        XCTAssertFalse(springboard.buttons["Allow Paste"].waitForExistence(timeout: 2), "Paste asked for permission")
+        app.typeText("\n")
+        waitScreen("PASTED-42")
 
         // 4b. The key bar folds the keyboard; tapping the terminal brings it back.
         app.buttons["key-hide"].tap()
