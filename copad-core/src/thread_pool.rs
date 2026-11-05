@@ -1,15 +1,9 @@
 //! Bounded worker pool for blocking action handlers.
 //!
-//! Jobs implement `Cancelable` so the pool can hand them back unchanged when
-//! the bounded queue is full — the caller invokes `cancel` on the rejected
-//! job synchronously (on the caller's thread), which gives time-critical
-//! callers an immediate path to synthesize an error response without ever
-//! blocking on the channel.
-//!
-//! Lifecycle: workers exit when the sender is dropped (sees `RecvError`).
-//! `shutdown()` is idempotent and only closes the sender; `Drop` then joins.
-//! Explicit `shutdown()` matters because the registry may hold the pool inside
-//! a handler-capture cycle that prevents automatic drop.
+//! A job rejected by the full queue is handed back so the caller can `cancel` it synchronously
+//! without blocking. `shutdown()` is idempotent and only closes the sender; `Drop` joins. The
+//! explicit `shutdown()` matters because the registry may hold the pool in a handler-capture
+//! cycle that prevents automatic drop.
 
 use crossbeam_channel::{Sender, TrySendError, bounded};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -18,11 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 pub trait Cancelable: Send + 'static {
-    /// Runs on a worker thread. Consumes the job.
     fn run(self: Box<Self>);
-    /// Runs on the caller's thread when the queue rejects the job. Same
-    /// completion contract as `run` (responder fires, completion events
-    /// publish) but with an overload-flavored error.
+    /// Runs on the caller's thread when the queue rejects the job; same completion contract as
+    /// `run` but with an overload error.
     fn cancel(self: Box<Self>);
 }
 
@@ -68,9 +60,6 @@ impl ThreadPool {
         })
     }
 
-    /// Non-blocking. Returns the job back on Full so the caller can `cancel`
-    /// it synchronously. Returns `Err(job)` after `shutdown()` so callers
-    /// during teardown still get a defined cancellation path.
     pub fn try_execute(&self, job: Job) -> Result<(), Job> {
         let guard = self.tx.lock().unwrap();
         let Some(tx) = guard.as_ref() else {
@@ -98,8 +87,6 @@ impl ThreadPool {
         }
     }
 
-    /// Idempotent. Closes the sender so workers exit after draining the
-    /// queue. Does NOT join — `Drop` does that.
     pub fn shutdown(&self) {
         drop(self.tx.lock().unwrap().take());
     }
@@ -109,10 +96,9 @@ impl Drop for ThreadPool {
     fn drop(&mut self) {
         self.shutdown();
         let handles = std::mem::take(&mut *self.workers.lock().unwrap());
-        // Drop can fire from within a worker thread if a running job
-        // releases the last `Arc<ThreadPool>`. Joining the current thread
-        // would deadlock; detach it instead — `shutdown()` already closed
-        // the sender, so it will exit naturally on the next `recv`.
+        // Drop can run on a worker thread when a job releases the last `Arc<ThreadPool>`; joining
+        // the current thread would deadlock, so detach it. `shutdown()` already closed the
+        // sender, so it exits on its next `recv`.
         let current = thread::current().id();
         for h in handles {
             if h.thread().id() == current {
@@ -126,10 +112,9 @@ impl Drop for ThreadPool {
 fn worker_loop(rx: crossbeam_channel::Receiver<Job>, active: Arc<AtomicUsize>) {
     while let Ok(job) = rx.recv() {
         active.fetch_add(1, Ordering::SeqCst);
-        // catch_unwind keeps the worker alive across a panicking handler.
-        // We honor the existing "panic = no responder fires" contract by
-        // not synthesizing a fallback response here; the lost responder is
-        // a known, documented gap (see action_registry.rs module preamble).
+        // catch_unwind keeps the worker alive across a panicking handler. No fallback response
+        // is synthesized, so the panicked job's responder is lost (see the action_registry.rs
+        // module preamble).
         let _ = catch_unwind(AssertUnwindSafe(|| job.run()));
         active.fetch_sub(1, Ordering::SeqCst);
     }
@@ -186,21 +171,16 @@ mod tests {
 
     #[test]
     fn saturation_returns_job_back() {
-        // 1 worker, 1 queue slot. Once the worker has picked up the first
-        // job and the queue slot holds the second, the third try_execute
-        // must bounce back so the caller can `cancel` it.
+        // 1 worker, 1 queue slot: the third try_execute must bounce back.
         let pool = ThreadPool::new(1, 1);
         let counter = Arc::new(AtomicUsize::new(0));
-        // Long-held jobs (1s) so timing slack doesn't free a slot mid-test.
         pool.try_execute(Box::new(SleepJob(Duration::from_secs(1), counter.clone())))
             .ok()
             .unwrap();
-        // Let the worker pull job #1 out of the queue so slot frees up for #2.
         thread::sleep(Duration::from_millis(80));
         pool.try_execute(Box::new(SleepJob(Duration::from_secs(1), counter.clone())))
             .ok()
             .unwrap();
-        // Worker still busy, slot still occupied → third must come back.
         let third = pool.try_execute(Box::new(SleepJob(Duration::from_secs(1), counter.clone())));
         assert!(third.is_err(), "third job should have been rejected");
     }
@@ -216,7 +196,6 @@ mod tests {
         }
         let pool = ThreadPool::new(1, 4);
         pool.try_execute(Box::new(PanicJob)).ok().unwrap();
-        // Sibling job after the panic should still execute.
         let ran = Arc::new(AtomicBool::new(false));
         let canceled = Arc::new(AtomicBool::new(false));
         thread::sleep(Duration::from_millis(20));
@@ -252,7 +231,6 @@ mod tests {
         }
         pool.shutdown();
         pool.shutdown(); // second call must not panic
-        // After try_execute is shut, jobs come back via Err.
         let ran = Arc::new(AtomicBool::new(false));
         let canceled = Arc::new(AtomicBool::new(false));
         let rejected = pool.try_execute(Box::new(NoopJob {
@@ -260,7 +238,6 @@ mod tests {
             canceled: canceled.clone(),
         }));
         assert!(rejected.is_err());
-        // Existing queued jobs still complete (drain).
         drop(pool); // joins
         assert_eq!(counter.load(Ordering::SeqCst), 3, "queued jobs must drain");
     }

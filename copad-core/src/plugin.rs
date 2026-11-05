@@ -56,51 +56,33 @@ pub struct PluginModuleDef {
     /// Shell command. stdout becomes module text — or, if it's JSON with a
     /// `text` field, that value is used (with optional `tooltip`).
     pub exec: String,
-    /// Execution interval in seconds
     #[serde(default = "default_module_interval")]
     pub interval: u64,
-    /// Position in the status bar: "left", "center", "right"
     #[serde(default = "default_module_position")]
     pub position: String,
-    /// Sort order within position section (lower = first)
     #[serde(default = "default_module_order")]
     pub order: i32,
-    /// CSS class name applied to this module's container element
     #[serde(default)]
     pub class: Option<String>,
 }
 
-/// Supervised stdio-RPC subprocess. `provides`/`subscribes` are the
-/// pre-spawn conflict-resolution + init-reply-subset check inputs;
-/// see `service_supervisor`'s module preamble.
+/// Supervised stdio-RPC subprocess; `provides`/`subscribes` feed the pre-spawn conflict
+/// resolution and init-reply checks (see `service_supervisor`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PluginServiceDef {
-    /// Service identifier within the plugin (a single plugin may host
-    /// multiple services, though one is the common case).
     pub name: String,
-    /// Path or PATH-resolvable binary launched by the supervisor. Resolved
-    /// against the plugin directory if relative.
     pub exec: String,
-    /// Optional argv tail passed to `exec`. Useful for shared binaries that
-    /// dispatch on a subcommand.
     #[serde(default)]
     pub args: Vec<String>,
-    /// When the supervisor should spawn the process. Parsed from a string
-    /// like `"onStartup"`, `"onAction:kb.*"`, `"onEvent:slack.*"`.
     #[serde(
         default = "default_activation",
         deserialize_with = "deserialize_activation"
     )]
     pub activation: Activation,
-    /// Restart behavior for unexpected exits. Defaults to `on-crash`.
     #[serde(default = "default_restart", deserialize_with = "deserialize_restart")]
     pub restart: RestartPolicy,
-    /// Pre-spawn conflict resolution: lexical-name winner takes a
-    /// contested action; loser skips just that entry.
     #[serde(default)]
     pub provides: Vec<String>,
-    /// Bus event-kind globs the service wants forwarded via
-    /// `event.dispatch`. Same asymmetric validation rule as `provides`.
     #[serde(default)]
     pub subscribes: Vec<String>,
 }
@@ -178,11 +160,8 @@ pub fn parse_restart(raw: &str) -> Result<RestartPolicy, String> {
     }
 }
 
-// The Activation / RestartPolicy enums round-trip through TOML as the raw
-// `"onAction:kb.*"` / `"on-crash"` strings, not as serde's auto-derived
-// `{ type: "OnAction", ... }`. Custom Serialize impls keep the round-trip
-// shape stable so an FFI consumer (currently macOS) reads back the same
-// string the user wrote in `plugin.toml`.
+// Activation / RestartPolicy serialize as the raw `"onAction:kb.*"` / `"on-crash"` strings so an
+// FFI consumer (macOS) reads back what the user wrote in `plugin.toml`.
 impl Serialize for Activation {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let raw = match self {
@@ -204,18 +183,14 @@ impl Serialize for RestartPolicy {
     }
 }
 
-/// Parse + validate a `plugin.toml` from disk. Returns the manifest on
-/// success, or a one-line error string on IO / parse failure. Used by
-/// both the Linux discovery loop and the macOS FFI bridge so the
-/// validation rules — including enum string syntax — only exist in core.
+/// Parse and validate a `plugin.toml`; shared by Linux discovery and the macOS FFI bridge so the
+/// validation rules, including enum string syntax, exist only in core.
 pub fn validate_toml(path: &Path) -> Result<PluginManifest, String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     validate_toml_str(&contents)
 }
 
-/// String-taking variant of `validate_toml`. Used in tests and by FFI
-/// callers that already have the manifest body in memory.
 pub fn validate_toml_str(toml_str: &str) -> Result<PluginManifest, String> {
     toml::from_str(toml_str).map_err(|e| e.to_string())
 }
@@ -264,11 +239,8 @@ pub fn discover_plugins() -> Vec<LoadedPlugin> {
     plugins
 }
 
-/// Discovery + canonical sort: by `manifest.plugin.name` then by `dir` as
-/// the stable tiebreaker for duplicates. Use this everywhere a plugin
-/// name needs to resolve to a single manifest, so daemon dispatch and
-/// GUI panel/command resolution pick the same winner under duplicate
-/// names.
+/// Discovery sorted by `manifest.plugin.name`, then `dir` as tiebreaker, so daemon dispatch and
+/// GUI resolution pick the same winner under duplicate names.
 pub fn discover_sorted_plugins() -> Vec<LoadedPlugin> {
     let mut plugins = discover_plugins();
     plugins.sort_by(|a, b| {
@@ -281,10 +253,8 @@ pub fn discover_sorted_plugins() -> Vec<LoadedPlugin> {
     plugins
 }
 
-/// On a `discover_sorted_plugins` slice, returns the duplicate winner
-/// for `name` (sorted-last entry). Callers that resolve a plugin by
-/// name (panel open, command dispatch, module exec) must consume a
-/// sorted slice for results to agree across daemon and GUI.
+/// The duplicate winner for `name` (the sorted-last entry) in a `discover_sorted_plugins` slice;
+/// resolve through a sorted slice so daemon and GUI agree.
 pub fn resolve_by_name<'a>(plugins: &'a [LoadedPlugin], name: &str) -> Option<&'a LoadedPlugin> {
     plugins
         .iter()
@@ -316,10 +286,6 @@ mod tests {
 
     #[test]
     fn resolve_by_name_returns_sorted_last_entry_under_duplicates() {
-        // Caller is expected to pass a sorted slice (same shape as
-        // `discover_sorted_plugins`'s output). The last entry with a
-        // matching name wins — matches daemon dispatch's HashMap
-        // last-write-wins ordering.
         let plugins = vec![
             mk_loaded("dup", "/plugins/a"),
             mk_loaded("dup", "/plugins/b"),
@@ -439,9 +405,6 @@ mod tests {
 
     #[test]
     fn activation_json_round_trip_preserves_raw_string() {
-        // Custom Serialize must produce the same string parse_activation
-        // accepts, so a manifest serialized for the macOS FFI consumer
-        // round-trips through serde unchanged.
         for raw in ["onStartup", "onAction:kb.*", "onEvent:slack.*"] {
             let a = parse_activation(raw).unwrap();
             let json = serde_json::to_string(&a).unwrap();

@@ -115,7 +115,6 @@ impl TestServer {
             }
         });
 
-        // Wait for server to be ready
         thread::sleep(Duration::from_millis(100));
 
         Self {

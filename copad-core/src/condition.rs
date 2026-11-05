@@ -1,12 +1,6 @@
-//! Boolean expression DSL for trigger `condition` clauses.
-//!
-//! Evaluated against the firing `Event` payload + the current
-//! `Context`. Exists for patterns the positive-only payload-match in
-//! `WhenSpec` cannot express:
-//! - "skip if I declined": `event.my_response_status != "declined"`
-//! - "skip the weekly 1:1": `event.recurring_id != "weekly-1on1"`
-//! - "only physical-location meetings": `event.location != null`
-//! - combined: `event.my_response_status != "declined" && event.recurring_id != "x"`
+//! Boolean expression DSL for trigger `condition` clauses, evaluated against the firing `Event`
+//! payload and the current `Context`. It covers what the positive-only payload match in
+//! `WhenSpec` cannot, e.g. `event.my_response_status != "declined" && event.recurring_id != "x"`.
 //!
 //! Grammar (recursive descent, left-associative for `&&` / `||`):
 //! ```text
@@ -20,26 +14,15 @@
 //! CMPOP    = '==' | '!=' | '<' | '<=' | '>' | '>='
 //! ```
 //!
-//! Eval semantics:
-//! - `==` / `!=` are type-tolerant (`serde_json::Value` equality —
-//!   `event.x == 1` matches both `1` and `1.0`; `event.x == "1"` does
-//!   not match a numeric `1`).
-//! - Ordering ops (`<`, `<=`, `>`, `>=`) require both sides to be
-//!   numbers; non-numeric operands return an evaluation error which
-//!   the caller (TriggerEngine) treats as "trigger does not match"
-//!   plus a `log::warn`.
-//! - `event.X.Y` traverses the JSON payload by key. A missing path
-//!   resolves to `null` (so `event.missing_field == "x"` is `false`,
-//!   not an error).
-//! - `context.active_panel` / `context.active_cwd` / `context.presence`
-//!   are the supported context paths (no nesting; matches the
-//!   `{context.X}` interpolation surface). `context.presence` resolves
-//!   to the string `"active"` or `"away"`.
-//! - `&&` / `||` short-circuit; both sides must produce bool when
-//!   actually evaluated, else error.
-//! - `!` negates a bool, else error.
-//! - A bare ref / literal at the top level must produce a bool
-//!   (`event.is_priority`, or `true` / `false`).
+//! - `==` / `!=` compare `serde_json::Value`s through `values_eq`, which normalizes numbers
+//!   (`1` matches `1.0`); `"1"` does not match `1`.
+//! - Ordering ops need two numbers; otherwise evaluation errors, which `TriggerEngine` treats as
+//!   "trigger does not match" plus a `log::warn`.
+//! - `event.X.Y` walks the payload by key; a missing path is `null`, not an error.
+//! - Context paths are `context.active_panel`, `context.active_cwd` and `context.presence`
+//!   (`"active"` or `"away"`), matching the `{context.X}` interpolation surface.
+//! - `&&` / `||` short-circuit; operands that are evaluated must be bool. `!` needs a bool.
+//! - A top-level bare ref or literal must produce a bool.
 
 use crate::context::Context;
 use crate::event_bus::Event;
@@ -51,7 +34,6 @@ pub enum Expr {
     And(Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
     Cmp(CmpOp, Atom, Atom),
-    /// Bare atom — must evaluate to a bool at runtime.
     Atom(Atom),
 }
 
@@ -67,21 +49,14 @@ pub enum CmpOp {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Atom {
-    /// Dotted path: first segment is `event` or `context`, remainder
-    /// is the key path inside the event payload or the context.
     Ref(Vec<String>),
     Str(String),
     Num(f64),
     Bool(bool),
     Null,
-    /// `(...)` — overrides default `&&`-tighter-than-`||` precedence.
     Group(Box<Expr>),
 }
 
-// -- Public API --------------------------------------------------------
-
-/// Parse a condition source string into an AST. Errors carry a
-/// human-readable message suitable for `log::warn` output.
 pub fn parse(src: &str) -> Result<Expr, String> {
     let tokens = lex(src)?;
     let mut p = Parser { tokens, pos: 0 };
@@ -95,8 +70,6 @@ pub fn parse(src: &str) -> Result<Expr, String> {
     Ok(expr)
 }
 
-/// `Err` is treated as "condition not satisfied" by the caller (after
-/// logging) — see `TriggerEngine::dispatch`.
 pub fn eval(expr: &Expr, event: &Event, context: Option<&Context>) -> Result<bool, String> {
     let v = eval_expr(expr, event, context)?;
     match v {
@@ -107,8 +80,6 @@ pub fn eval(expr: &Expr, event: &Event, context: Option<&Context>) -> Result<boo
     }
 }
 
-// -- Lexer -------------------------------------------------------------
-
 #[derive(Debug, Clone, PartialEq)]
 enum Token {
     Ident(String),
@@ -117,15 +88,15 @@ enum Token {
     True,
     False,
     Null,
-    Eq,  // ==
-    Neq, // !=
-    Lt,  // <
-    Le,  // <=
-    Gt,  // >
-    Ge,  // >=
-    And, // &&
-    Or,  // ||
-    Not, // !
+    Eq,
+    Neq,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    And,
+    Or,
+    Not,
     Dot, // .
     LParen,
     RParen,
@@ -239,16 +210,10 @@ fn lex(src: &str) -> Result<Vec<Token>, String> {
 
 fn lex_string(bytes: &[u8]) -> Result<(String, usize), String> {
     debug_assert_eq!(bytes[0], b'"');
-    // Collect raw bytes (NOT chars) so multi-byte UTF-8 sequences
-    // pass through intact. The previous implementation pushed each
-    // byte as `as char`, which mangled non-ASCII content like emoji
-    // — `"📝"` (4 bytes) became 4 garbage replacement chars, so
-    // `event.emoji_name == "📝"` never matched. Final conversion
-    // via `String::from_utf8` is infallible whenever the source
-    // string was valid UTF-8 (which it always is — `lex` takes
-    // `&str`), but we surface the error path defensively.
+    // Collect raw bytes (not chars) so multi-byte UTF-8 passes through intact; pushing each byte
+    // `as char` mangled `"📝"` into four garbage chars.
     let mut out: Vec<u8> = Vec::new();
-    let mut i = 1; // skip opening quote
+    let mut i = 1;
     while i < bytes.len() {
         match bytes[i] {
             b'"' => {
@@ -321,8 +286,6 @@ fn lex_ident(bytes: &[u8]) -> (String, usize) {
         i,
     )
 }
-
-// -- Parser ------------------------------------------------------------
 
 struct Parser {
     tokens: Vec<Token>,
@@ -406,11 +369,8 @@ impl Parser {
                 }
             }
             Some(Token::Ident(first)) => {
-                // Must be followed by `.<ident>` at least once. We do
-                // NOT support bare top-level identifiers (`foo` by
-                // itself) so a typo like `recurring_id` instead of
-                // `event.recurring_id` errors loudly instead of being
-                // silently treated as an unbound name.
+                // Must be followed by `.<ident>`: bare identifiers are rejected so a typo like
+                // `recurring_id` for `event.recurring_id` errors instead of being an unbound name.
                 let mut path = vec![first];
                 let mut had_dot = false;
                 while matches!(self.peek(), Some(Token::Dot)) {
@@ -443,8 +403,6 @@ impl Parser {
         }
     }
 }
-
-// -- Evaluator ---------------------------------------------------------
 
 fn eval_expr(expr: &Expr, event: &Event, context: Option<&Context>) -> Result<Value, String> {
     match expr {
@@ -514,10 +472,7 @@ fn resolve_ref(path: &[String], event: &Event, context: Option<&Context>) -> Val
             let Some(ctx) = context else {
                 return Value::Null;
             };
-            // We keep the surface narrow — only the existing
-            // `{context.X}` interpolation fields are supported.
-            // Nesting is not — `context.active_panel.something`
-            // resolves to Null.
+            // Only the `{context.X}` interpolation fields are supported; nesting resolves to Null.
             if path.len() != 2 {
                 return Value::Null;
             }
@@ -560,9 +515,8 @@ fn eval_cmp(op: CmpOp, lhs: &Value, rhs: &Value) -> Result<bool, String> {
     }
 }
 
-/// `serde_json::Value::PartialEq` returns false for `1 == 1.0`. Trigger
-/// authors expect integer-vs-float to compare equal, so we normalize
-/// both to `f64` for the numeric case.
+/// `serde_json::Value` says `1 != 1.0`; trigger authors expect them equal, so numbers compare as
+/// `f64`.
 fn values_eq(a: &Value, b: &Value) -> bool {
     if let (Some(an), Some(bn)) = (a.as_f64(), b.as_f64()) {
         return an == bn;
@@ -604,8 +558,6 @@ mod tests {
         let expr = parse(src)?;
         eval(&expr, event, context)
     }
-
-    // -- Parser --
 
     #[test]
     fn parses_simple_eq() {
@@ -650,8 +602,6 @@ mod tests {
         assert!(err.contains("unterminated"));
     }
 
-    // -- Eval: equality --
-
     #[test]
     fn eq_matches_string() {
         let e = evt(json!({"name": "alice"}));
@@ -669,10 +619,8 @@ mod tests {
 
     #[test]
     fn missing_path_resolves_to_null() {
-        // event.absent == "x"  →  null == "x"  →  false (no error)
         let e = evt(json!({"present": 1}));
         assert!(!p_eval(r#"event.absent == "x""#, &e, None).unwrap());
-        // event.absent == null  →  true
         assert!(p_eval(r#"event.absent == null"#, &e, None).unwrap());
     }
 
@@ -682,8 +630,6 @@ mod tests {
         assert!(p_eval(r#"event.organizer.email == "x@y.com""#, &e, None).unwrap());
         assert!(!p_eval(r#"event.organizer.email == "z@y.com""#, &e, None).unwrap());
     }
-
-    // -- Eval: ordering --
 
     #[test]
     fn ordering_on_numbers() {
@@ -701,15 +647,10 @@ mod tests {
         assert!(err.contains("ordering op"), "got {err}");
     }
 
-    // -- Eval: logical --
-
     #[test]
     fn and_short_circuits_false() {
-        // If lhs is false, rhs is not evaluated. We test this by
-        // making rhs an expression that would error if evaluated
-        // (ordering on non-numeric).
+        // lhs false means rhs is never reached; rhs would error (ordering on non-numeric).
         let e = evt(json!({"x": 1, "s": "a"}));
-        // lhs false → and-result false, rhs (which would error) is never reached
         let result = p_eval(r#"event.x == 99 && event.s > "b""#, &e, None).unwrap();
         assert!(!result);
     }
@@ -717,7 +658,6 @@ mod tests {
     #[test]
     fn or_short_circuits_true() {
         let e = evt(json!({"x": 1, "s": "a"}));
-        // lhs true → or-result true; rhs (would error) skipped.
         let result = p_eval(r#"event.x == 1 || event.s > "b""#, &e, None).unwrap();
         assert!(result);
     }
@@ -732,13 +672,9 @@ mod tests {
     #[test]
     fn parens_group_correctly() {
         let e = evt(json!({"a": 1, "b": 2, "c": 3}));
-        // Without parens: a==1 && b==99 || c==3 → (a==1 && b==99) || c==3 → false || true → true
         assert!(p_eval("event.a == 1 && event.b == 99 || event.c == 3", &e, None).unwrap());
-        // With parens forcing other association:
         assert!(!p_eval("event.a == 1 && (event.b == 99 || event.c == 99)", &e, None).unwrap());
     }
-
-    // -- Eval: context --
 
     #[test]
     fn context_active_panel_resolves() {
@@ -784,14 +720,10 @@ mod tests {
         assert!(p_eval("context.active_panel == null", &e, None).unwrap());
     }
 
-    // -- Eval: top-level type --
-
     #[test]
     fn bare_atom_must_be_bool() {
-        // event.flag is bool — fine
         let e = evt(json!({"flag": true, "n": 5}));
         assert!(p_eval("event.flag", &e, None).unwrap());
-        // bare number → error
         let err = p_eval("event.n", &e, None).unwrap_err();
         assert!(err.contains("must produce a bool"), "got {err}");
     }
@@ -803,11 +735,8 @@ mod tests {
         assert!(!p_eval("false", &e, None).unwrap());
     }
 
-    // -- Real-world usage patterns --
-
     #[test]
     fn skip_declined_pattern() {
-        // Trigger should NOT fire when my_response_status is declined.
         let e1 = evt(json!({"my_response_status": "declined"}));
         let e2 = evt(json!({"my_response_status": "accepted"}));
         let cond = r#"event.my_response_status != "declined""#;
@@ -828,7 +757,6 @@ mod tests {
     fn combined_skip_declined_and_skip_1on1() {
         let cond =
             r#"event.my_response_status != "declined" && event.recurring_id != "weekly-1on1""#;
-        // accepted, not 1on1 → fire
         assert!(
             p_eval(
                 cond,
@@ -837,7 +765,6 @@ mod tests {
             )
             .unwrap()
         );
-        // declined, not 1on1 → skip
         assert!(
             !p_eval(
                 cond,
@@ -846,7 +773,6 @@ mod tests {
             )
             .unwrap()
         );
-        // accepted, IS 1on1 → skip
         assert!(
             !p_eval(
                 cond,
@@ -857,16 +783,8 @@ mod tests {
         );
     }
 
-    // -- Eval: unicode string literals (regression for the
-    // `event.emoji_name == "📝"` reaction-trigger case where the
-    // byte-level lexer mangled multi-byte UTF-8 into per-byte
-    // garbage chars). --
-
     #[test]
     fn string_literal_preserves_multibyte_utf8() {
-        // 📝 is U+1F4DD = 4 bytes in UTF-8 (F0 9F 93 9D). Before the
-        // fix the lexer would tokenize that as 4 separate chars and
-        // never equal the single-codepoint payload value.
         let e = evt(json!({"emoji_name": "📝"}));
         assert!(p_eval(r#"event.emoji_name == "📝""#, &e, None).unwrap());
         let e2 = evt(json!({"emoji_name": "🔥"}));
@@ -875,15 +793,12 @@ mod tests {
 
     #[test]
     fn string_literal_preserves_korean_text() {
-        // Hangul syllables are 3-byte UTF-8 — same lexer bug would
-        // hit them. Smoke-test the general case.
         let e = evt(json!({"label": "안녕"}));
         assert!(p_eval(r#"event.label == "안녕""#, &e, None).unwrap());
     }
 
     #[test]
     fn string_literal_with_escape_then_unicode() {
-        // Escape handling and unicode pass-through must compose.
         let e = evt(json!({"text": "\"📝\""}));
         assert!(p_eval(r#"event.text == "\"📝\"""#, &e, None).unwrap());
     }

@@ -1,16 +1,7 @@
-//! Desktop notification surface for the `notify.show` action.
-//!
-//! The trait is cross-platform; concrete impls shell out per-OS:
-//! `notify-send` on Linux, `osascript` on macOS. Subprocess is
-//! synchronous (we wait for exit) so failures surface as errors
-//! rather than vanishing into a zombie. At human-driven trigger
-//! rates the ~10 ms cost is irrelevant; the action handler runs on
-//! the blocking thread pool so the trigger pump never stalls.
-//!
-//! macOS keeps an AppleScript wrapper with `on run argv` to avoid
-//! quote/backslash injection from arbitrary trigger payloads —
-//! title/body cross the boundary as `osascript` argv values, never
-//! spliced into the script source.
+//! Desktop notification surface for `notify.show`: `notify-send` on Linux, `osascript` on macOS.
+//! The subprocess is waited on so failures surface as errors. macOS uses an `on run argv`
+//! wrapper so title/body cross as argv values and are never spliced into script source, which
+//! avoids quote/backslash injection from trigger payloads.
 
 use std::fmt;
 use std::process::{Command, ExitStatus};
@@ -18,9 +9,8 @@ use std::sync::Mutex;
 
 use serde::Deserialize;
 
-/// Notification severity. Default is `Info`. Maps to `notify-send`'s
-/// `--urgency` and (today) is ignored by the macOS impl since
-/// `display notification` has no built-in severity slot.
+/// Maps to `notify-send --urgency`; ignored on macOS, whose `display notification` has no
+/// severity slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Level {
@@ -31,8 +21,6 @@ pub enum Level {
 }
 
 impl Level {
-    /// libnotify urgency token. `Warn` maps to `normal` (libnotify has
-    /// `low|normal|critical` only); `Error` raises to `critical`.
     pub fn urgency(self) -> &'static str {
         match self {
             Self::Info => "low",
@@ -65,10 +53,8 @@ pub trait Notifier: Send + Sync {
     fn notify(&self, title: &str, body: &str, level: Level) -> Result<(), NotifyError>;
 }
 
-/// Cap on payload size before the subprocess sees it — AppleScript's
-/// `-e` source argument and notify-send's IPC frame both have implicit
-/// limits well above this, but a runaway trigger that interpolates a
-/// 50 KB Slack body has no business as a toast. Hard truncate.
+/// Cap on payload size before the subprocess sees it; a runaway trigger interpolating a large
+/// body has no business as a toast. Hard truncate.
 const MAX_BODY_BYTES: usize = 4096;
 const MAX_TITLE_BYTES: usize = 256;
 
@@ -104,9 +90,8 @@ pub struct OsascriptNotifier;
 #[cfg(target_os = "macos")]
 impl Notifier for OsascriptNotifier {
     fn notify(&self, title: &str, body: &str, _level: Level) -> Result<(), NotifyError> {
-        // `on run argv` wrapper keeps title/body OUT of the script
-        // source — `osascript` passes them as AppleScript values, so
-        // no quote/backslash escape is needed regardless of payload.
+        // `on run argv` keeps title/body out of the script source, so no quote/backslash escaping
+        // is needed whatever the payload.
         const SCRIPT: &str = "on run argv\n\
             display notification (item 2 of argv) with title (item 1 of argv)\n\
         end run";
@@ -133,9 +118,7 @@ fn run_command(cmd: &mut Command) -> Result<(), NotifyError> {
     }
 }
 
-/// Test double: records every `notify` call instead of touching the
-/// desktop. Public so daemon/integration tests can wire it in place
-/// of the platform notifier.
+/// Test double that records every `notify` call; public so daemon/integration tests can use it.
 #[derive(Default)]
 pub struct NoopNotifier {
     pub captured: Mutex<Vec<(String, String, Level)>>,
@@ -151,9 +134,6 @@ impl Notifier for NoopNotifier {
     }
 }
 
-/// Platform Notifier factory. Used by the daemon + GUI in-process
-/// registries at startup; returns `None` on platforms that have no
-/// concrete impl yet (the action becomes a no-op handler in that case).
 pub fn platform_notifier() -> Option<Box<dyn Notifier>> {
     #[cfg(target_os = "linux")]
     {
@@ -209,17 +189,13 @@ mod tests {
     #[test]
     fn truncate_appends_ellipsis_at_cap() {
         let s = truncate("abcdefghij", 5);
-        // First 5 ASCII bytes preserved, ellipsis appended.
         assert_eq!(s, "abcde…");
     }
 
     #[test]
     fn truncate_respects_utf8_boundary() {
-        // "한글" is 6 bytes; cap=4 would land mid-char without the
-        // char-boundary scan and panic the slice.
         let s = truncate("한글한글", 4);
         assert!(s.ends_with('…'));
-        // Must start with the first whole char (3 bytes).
         assert!(s.starts_with('한'));
     }
 
@@ -237,9 +213,6 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn libnotify_argv_shape_against_dummy_binary() {
-        // We can't assert against the real notify-send (would actually
-        // pop a toast on the dev box). Verify only that the platform
-        // factory returns a non-None Notifier on Linux.
         let n = platform_notifier();
         assert!(n.is_some());
     }

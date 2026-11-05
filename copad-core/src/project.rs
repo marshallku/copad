@@ -3,9 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// A project entry from `~/.config/copad/config.toml` `[[projects]]` block.
-/// `git_remote` is a canonical `owner/repo` string; `None` means uninfered (the
-/// registry shells `git remote get-url origin` once at startup and caches).
+/// A `[[projects]]` entry from `~/.config/copad/config.toml`. `git_remote` is a canonical
+/// `owner/repo`; `None` means not yet inferred (the registry shells out once at startup).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Project {
     pub name: String,
@@ -21,7 +20,6 @@ pub struct Project {
 }
 
 impl Project {
-    /// `path` joined with `subpath` (if set) — the cwd a workflow opens its tab at.
     pub fn workspace_path(&self) -> PathBuf {
         match &self.subpath {
             Some(sub) => self.path.join(sub),
@@ -29,15 +27,12 @@ impl Project {
         }
     }
 
-    /// Does `name_or_alias` match this project's canonical name or any alias?
     pub fn matches_name(&self, name_or_alias: &str) -> bool {
         self.name == name_or_alias || self.aliases.iter().any(|a| a == name_or_alias)
     }
 }
 
-/// In-process registry of configured projects. Small N (<100) — linear scan
-/// for resolution. Daemon holds one of these at startup; reload requires
-/// restart for now (matches existing config-reload semantics in copad-core::config).
+/// In-process registry of configured projects (small N, linear scan). Reload requires a restart.
 #[derive(Debug, Clone, Default)]
 pub struct ProjectRegistry {
     projects: Vec<Project>,
@@ -48,9 +43,8 @@ impl ProjectRegistry {
         Self { projects }
     }
 
-    /// For each project whose `git_remote` is `None`, shell `git remote get-url origin`
-    /// once and cache the canonicalized `owner/repo` form. Failure stays as `None`
-    /// (no error). Idempotent — safe to call multiple times.
+    /// Shells `git remote get-url origin` once for each project with no `git_remote` and caches
+    /// the canonical `owner/repo`. Failure stays `None`.
     pub fn refresh_git_remotes(&mut self) {
         for p in &mut self.projects {
             if p.git_remote.is_none() {
@@ -73,7 +67,6 @@ impl ProjectRegistry {
         self.projects.iter().find(|p| p.matches_name(name_or_alias))
     }
 
-    /// Walks ancestor chain of `cwd` until any project's `path` matches (longest match wins).
     pub fn resolve_by_cwd(&self, cwd: &Path) -> Option<&Project> {
         let mut best: Option<&Project> = None;
         for p in &self.projects {
@@ -86,10 +79,9 @@ impl ProjectRegistry {
         best
     }
 
-    /// Resolution order for `workflow.run`'s active-project fallback:
-    /// 1. `ctx.pane_context.git_remote` (Phase 22.1 signal)
-    /// 2. `ctx.active_cwd` (terminal.cwd_changed signal)
-    /// 3. None — caller decides whether to require_project-error or fall back to active_cwd as workspace
+    /// Resolution order for `workflow.run`'s active-project fallback: `ctx.pane_context.git_remote`,
+    /// then `ctx.active_cwd`, then `None` (the caller decides whether that is a `require_project`
+    /// error or falls back to the active cwd as workspace).
     pub fn resolve_active(&self, ctx: &Context) -> Option<&Project> {
         if let Some(pc) = ctx.pane_context.as_ref()
             && !pc.git_remote.is_empty()
@@ -106,8 +98,6 @@ impl ProjectRegistry {
     }
 }
 
-/// Run `git remote get-url origin` in `path` and extract canonical `owner/repo`.
-/// Returns `None` if the path isn't a git repo or has no origin remote.
 fn infer_git_remote(path: &Path) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
@@ -124,14 +114,10 @@ fn infer_git_remote(path: &Path) -> Option<String> {
     canonicalize_remote_url(url.trim())
 }
 
-/// `git@github.com:owner/repo.git` / `https://github.com/owner/repo.git` /
-/// `https://github.com/owner/repo` → `owner/repo`. Mirrors the regex in
-/// `examples/shell/copad-context.zsh`.
-///
-/// **Codex 22.2 retro-review I1**: trim trailing slashes AND `.git`
-/// suffix repeatedly so URLs like `owner/repo.git/` (trailing slash
-/// after the suffix) and `owner/repo/` (trailing slash, no suffix)
-/// both normalize correctly.
+/// `git@github.com:owner/repo.git`, `https://github.com/owner/repo.git` and
+/// `https://github.com/owner/repo` all become `owner/repo`; mirrors the regex in
+/// `examples/shell/copad-context.zsh`. Trailing slashes and `.git` are trimmed repeatedly so
+/// `owner/repo.git/` normalizes too.
 fn canonicalize_remote_url(url: &str) -> Option<String> {
     let mut trimmed = url;
     loop {
@@ -305,10 +291,6 @@ mod tests {
 
     #[test]
     fn canonicalize_remote_url_handles_trailing_slash_with_git_suffix_round1_i1() {
-        // Codex 22.2 retro-review I1: previously `https://github.com/
-        // owner/repo.git/` failed because `.git` was stripped before
-        // trailing-slash normalization. Fix: loop until neither
-        // operation changes the string.
         assert_eq!(
             canonicalize_remote_url("https://github.com/owner/repo.git/"),
             Some("owner/repo".into()),

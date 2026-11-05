@@ -7,28 +7,20 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_SUBSCRIBER_BUFFER: usize = 256;
 
-/// Monotonic per-process counter for bridge crossings. Each
-/// `_bus.publish` ingest (daemon side) and each daemon→GUI receive
-/// (GUI side) calls [`next_bridge_id`] to stamp the event; the
-/// symmetric outgoing forwarder skips events whose `bridge_id` is
-/// `Some`. Starts at 1 so `Some(0)` stays available for tests.
+/// Monotonic per-process counter for bridge crossings: each `_bus.publish` ingest (daemon) and
+/// daemon-to-GUI receive (GUI) stamps the event via [`next_bridge_id`]; the opposite forwarder
+/// skips events with a `bridge_id`. Starts at 1 so `Some(0)` stays available for tests.
 static NEXT_BRIDGE_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Issue a fresh bridge id. Wraparound takes ~10⁹ years at any
-/// realistic event rate; not worth a leak-safe variant.
 pub fn next_bridge_id() -> u64 {
     NEXT_BRIDGE_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Provenance of a bus event. Consulted by `TriggerEngine` fan-out to
-/// decide whether a trigger may fire on it. `Internal` covers everything
-/// the daemon itself produces (plugin stdio publishes, action completion
-/// events, time-based wakeups, bridge-relayed events from another local
-/// bus). `External` covers events that entered via socket
-/// `events.publish` — i.e. arbitrary same-UID processes including
-/// SSH-forwarded hook callers. See `docs/harness-integration.md`
-/// § "Trust boundary" and the trigger `[security] accept_external`
-/// opt-in.
+/// Provenance of a bus event, consulted by `TriggerEngine` fan-out. `Internal` is everything the
+/// daemon produces (plugin publishes, action completions, timers, bridge-relayed events);
+/// `External` is anything that entered via socket `events.publish`, i.e. any same-UID process
+/// including SSH-forwarded hooks. See `docs/harness-integration.md` "Trust boundary" and the
+/// trigger `[security] accept_external` opt-in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Origin {
@@ -43,19 +35,14 @@ pub struct Event {
     pub source: String,
     pub timestamp_ms: u64,
     pub payload: Value,
-    /// Local-only marker — set when this event was lifted off a bridge
-    /// crossing (daemon→GUI or GUI→daemon) and re-published on the
-    /// destination bus. `#[serde(skip)]` keeps it out of every wire
-    /// frame so plugins/clients never see it. Forwarders skip events
-    /// with `Some(_)` so an event that already crossed once cannot
-    /// loop back through the other direction's forwarder.
+    /// Local-only marker set when an event was lifted off a bridge crossing and re-published on
+    /// the destination bus. `#[serde(skip)]` keeps it off the wire; forwarders skip `Some(_)` so
+    /// an event cannot loop back through the other direction.
     #[serde(skip, default)]
     pub bridge_id: Option<u64>,
-    /// Trust-boundary provenance. Serde default = `Internal` so that
-    /// older wire formats deserialize as the safe default (treated as
-    /// trusted), and constructors that don't explicitly set it stay
-    /// trusted. The single chokepoint that flips this to `External`
-    /// is the daemon's `events.publish` handler.
+    /// Trust-boundary provenance. Serde default `Internal` so older wire formats deserialize as
+    /// trusted; the daemon's `events.publish` handler is the single chokepoint that sets
+    /// `External`.
     #[serde(default)]
     pub origin: Origin,
 }
@@ -94,9 +81,8 @@ pub struct EventReceiver {
     inner: Receiver<Event>,
 }
 
-/// Lets consumers (e.g. the service supervisor's subscribe-forwarder)
-/// break out of a blocking recv periodically without busy-spinning, so
-/// an external stop flag can drive teardown.
+/// Lets consumers (e.g. the service supervisor's subscribe-forwarder) break out of a blocking
+/// recv periodically so an external stop flag can drive teardown.
 #[derive(Debug, Clone)]
 pub enum RecvOutcome {
     Event(Event),
@@ -113,9 +99,6 @@ impl EventReceiver {
         self.inner.recv().ok()
     }
 
-    /// Distinguishes "got an event", "timed out", and "bus dropped this
-    /// subscriber" so callers can check an external stop flag between
-    /// waits without losing events that arrived during the wait.
     pub fn recv_timeout(&self, timeout: std::time::Duration) -> RecvOutcome {
         match self.inner.recv_timeout(timeout) {
             Ok(e) => RecvOutcome::Event(e),
@@ -153,9 +136,8 @@ enum DeliveryResult {
 }
 
 struct Subscriber {
-    /// Matches if ANY pattern matches — overlapping patterns still deliver
-    /// once. Multi-pattern subscribers exist so a consumer whose event kinds
-    /// don't commute gets ONE ordered stream (see `subscribe_many`).
+    /// Matches if ANY pattern matches (overlapping patterns still deliver once). Multi-pattern
+    /// subscribers give consumers with non-commuting kinds ONE ordered stream (`subscribe_many`).
     patterns: Vec<String>,
     sender: SubscriberSender,
 }
@@ -169,12 +151,8 @@ impl Subscriber {
 pub struct EventBus {
     subscribers: Mutex<Vec<Subscriber>>,
     default_buffer: usize,
-    /// Bounded ring buffer of recent events. Powers the `event.history`
-    /// socket action ("what just happened?" — useful for catching up
-    /// AFK without keeping a live subscription open). Mutex is separate
-    /// from `subscribers` so a publishing thread that has the
-    /// subscribers lock isn't blocked by a history reader, and vice
-    /// versa.
+    /// Bounded ring of recent events backing `event.history`. Separate mutex from `subscribers`
+    /// so a history reader and a publisher holding the subscribers lock don't block each other.
     history: Mutex<std::collections::VecDeque<Event>>,
     history_cap: usize,
 }
@@ -213,16 +191,11 @@ impl EventBus {
         self.subscribe_many_with_buffer([pattern], buffer)
     }
 
-    /// Subscribe to several patterns through ONE receiver, preserving
-    /// cross-kind arrival order.
-    ///
-    /// A consumer whose kinds don't commute cannot use one receiver per kind:
-    /// draining receiver-by-receiver applies events in kind order, not bus
-    /// order. The agent cockpit is the motivating case — `panel.focused` then
-    /// `claude.awaiting_input` must end Awaiting, while the reverse must end
-    /// Idle, and per-kind receivers collapse both to whichever drains first.
-    /// `subscribe("*")` is ordered too but shares its buffer with
-    /// high-frequency kinds like `terminal.output`.
+    /// Subscribe to several patterns through ONE receiver, preserving cross-kind arrival order.
+    /// Per-kind receivers drain in kind order, not bus order, which breaks consumers whose kinds
+    /// don't commute: the agent cockpit needs `panel.focused` then `claude.awaiting_input` to
+    /// end Awaiting and the reverse to end Idle. `subscribe("*")` is ordered too but shares its
+    /// buffer with high-frequency kinds like `terminal.output`.
     pub fn subscribe_many(
         &self,
         patterns: impl IntoIterator<Item = impl Into<String>>,
@@ -243,8 +216,8 @@ impl EventBus {
         EventReceiver { inner: rx }
     }
 
-    /// Unbounded — for external wire streams (socket `event.subscribe`
-    /// projection) where loss violates the client contract. Caller drains.
+    /// Unbounded, for external wire streams (socket `event.subscribe`) where loss violates the
+    /// client contract. The caller drains.
     pub fn subscribe_unbounded(&self, pattern: impl Into<String>) -> EventReceiver {
         let (tx, rx) = channel();
         self.subscribers.lock().unwrap().push(Subscriber {
@@ -254,19 +227,15 @@ impl EventBus {
         EventReceiver { inner: rx }
     }
 
-    /// Publish an event whose `bridge_id` is already set by the caller.
-    /// Used by bridge-receive paths (daemon's `_bus.publish` handler and
-    /// the GUI's daemon-bridge reader) so the symmetric outgoing
-    /// forwarder can recognize this event as "already crossed once" and
-    /// not re-forward it.
+    /// Publish an event whose `bridge_id` the caller already set (bridge-receive paths), so the
+    /// opposite forwarder recognises it as already crossed and does not re-forward it.
     pub fn publish_bridged(&self, event: Event, bridge_id: u64) {
         self.publish(event.with_bridge_id(bridge_id));
     }
 
     pub fn publish(&self, event: Event) {
-        // Push to history BEFORE distributing — a subscriber callback
-        // could re-publish synchronously and we want the source event
-        // recorded first.
+        // Record in history BEFORE distributing: a subscriber callback may re-publish
+        // synchronously and the source event must be recorded first.
         {
             let mut h = self.history.lock().unwrap();
             if h.len() >= self.history_cap {
@@ -298,11 +267,8 @@ impl EventBus {
         self.subscribers.lock().unwrap().len()
     }
 
-    /// Recent events in arrival order (oldest first). `since_ms`
-    /// filters to events with `timestamp_ms >= since_ms`; `kind_glob`
-    /// filters by event-kind glob (same matcher as `subscribe`).
-    /// Returns a snapshot — callers don't see live updates after this
-    /// call.
+    /// Recent events, oldest first, optionally filtered by `timestamp_ms >= since_ms` and an
+    /// event-kind glob (same matcher as `subscribe`). A snapshot, not a live view.
     pub fn history(&self, since_ms: Option<u64>, kind_glob: Option<&str>) -> Vec<Event> {
         let h = self.history.lock().unwrap();
         h.iter()
@@ -323,10 +289,9 @@ impl Default for EventBus {
     }
 }
 
-/// Single source of truth for `event_kind` matching (shared with
-/// `trigger::Trigger`). Rules: `*` matches everything; `foo.*` matches
-/// any deeper kind starting with `foo.` (`foo.bar.baz` matches; bare
-/// `foo` does not); otherwise exact equality.
+/// Single source of truth for `event_kind` matching (shared with `trigger::Trigger`): `*`
+/// matches everything, `foo.*` any deeper kind starting with `foo.` (not bare `foo`), otherwise
+/// exact equality.
 pub fn pattern_matches(pattern: &str, kind: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -372,8 +337,6 @@ mod tests {
 
     #[test]
     fn subscribe_many_preserves_cross_pattern_order() {
-        // The whole point of subscribe_many: a consumer whose kinds don't
-        // commute (agent cockpit) must see bus order, not per-kind order.
         let bus = EventBus::new();
         let rx = bus.subscribe_many(["claude.*", "panel.focused"]);
         bus.publish(mk("panel.focused"));
@@ -446,8 +409,6 @@ mod tests {
             RecvOutcome::Timeout => {}
             other => panic!("expected Timeout, got {other:?}"),
         }
-        // Bus is still alive; the channel is still connected — sanity check
-        // that another event can still arrive after a timeout.
         bus.publish(mk("k"));
         match rx.recv_timeout(std::time::Duration::from_millis(50)) {
             RecvOutcome::Event(_) => {}
@@ -461,7 +422,6 @@ mod tests {
             let bus = EventBus::new();
             bus.subscribe("k")
         };
-        // Bus is dropped; sender side gone.
         match rx.recv_timeout(std::time::Duration::from_millis(50)) {
             RecvOutcome::Disconnected => {}
             other => panic!("expected Disconnected, got {other:?}"),
@@ -541,7 +501,6 @@ mod tests {
         bus.publish(mk("a"));
         bus.publish(mk("b"));
         bus.publish(mk("c"));
-        // Unbounded got all three; bounded kept only first two.
         assert_eq!(rx_u.try_recv().unwrap().kind, "a");
         assert_eq!(rx_u.try_recv().unwrap().kind, "b");
         assert_eq!(rx_u.try_recv().unwrap().kind, "c");
@@ -628,7 +587,6 @@ mod tests {
             .first()
             .map(|e| e.timestamp_ms)
             .unwrap();
-        // Sleep enough that b's timestamp_ms is strictly greater than a's.
         std::thread::sleep(std::time::Duration::from_millis(5));
         bus.publish(mk("b"));
         let after_a_filtered = bus.history(Some(after_a + 1), None);
@@ -669,8 +627,6 @@ mod tests {
 
     #[test]
     fn origin_deserializes_as_internal_when_missing() {
-        // Forward-compat with older serialized payloads that don't
-        // carry the field at all.
         let raw = r#"{"kind":"k","source":"s","timestamp_ms":0,"payload":null}"#;
         let e: Event = serde_json::from_str(raw).unwrap();
         assert_eq!(e.origin, Origin::Internal);

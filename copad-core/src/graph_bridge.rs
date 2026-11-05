@@ -64,13 +64,11 @@ pub fn parse(body: &Value, epoch: &str) -> Option<GraphMsg> {
     }
 }
 
-/// A pane token: short, printable ASCII.
 fn token(v: Option<&Value>) -> Option<String> {
     let t = v?.as_str()?;
     ((1..=128).contains(&t.len()) && t.bytes().all(|b| b > 0x20 && b < 0x7f)).then(|| t.to_string())
 }
 
-/// An optional whole number in `0..=max`: `Some(None)` when absent or null, `None` when bad.
 fn number(v: Option<&Value>, max: u64) -> Option<Option<u64>> {
     match v {
         None | Some(Value::Null) => Some(None),

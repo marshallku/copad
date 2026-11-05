@@ -2,17 +2,9 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-// ============================================================================
-// v3 session model (decision #64 — SSH-first / Model 1 simplification).
-//
-// A flat tab list; each tab is a split tree of TYPED panes. Persistence is
-// LAYOUT-ONLY: tab list + split layout (orientation + normalized ratio) + each
-// terminal's cwd. Terminals restore as FRESH shells — process/scrollback
-// persistence is the user's own tmux, not copad's (decision #63). This replaces
-// the v1 (terminal-only) and v2 (workspace → sub-tab → pane, tmux-backed) models,
-// both deleted. Old v1/v2 files are rejected by the loader and a fresh session
-// starts — the accepted wipe-fresh transition.
-// ============================================================================
+// Session model (decisions #64): a flat tab list, each tab a split tree of typed panes. Only the
+// layout and each terminal's cwd persist; terminals restore as fresh shells (decisions #63).
+// Older v1/v2 files are rejected by the loader and a fresh session starts.
 
 pub const SESSION_VERSION: u32 = 3;
 
@@ -30,9 +22,6 @@ pub struct TabSnap {
     pub root: SplitSnap,
 }
 
-/// A split tree: a typed leaf pane, or a branch of two subtrees. `ratio` is a
-/// normalized 0..1 divider position (never platform pixels) so a split's size
-/// restores faithfully across Linux and macOS.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SplitSnap {
@@ -47,8 +36,6 @@ pub enum SplitSnap {
     },
 }
 
-/// Typed pane content. Non-terminal panes are copad-native (tmux never backs
-/// them). A terminal persists only its cwd — it restores as a fresh shell.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PaneContent {
@@ -57,32 +44,24 @@ pub enum PaneContent {
         cwd: Option<String>,
     },
     Webview {
-        /// The pane's URL under the active `[browser] restore` policy. Under the
-        /// default `origin` policy this is the canonical origin only — never the
-        /// live URL (creds / OAuth codes / signed URLs). Under the opt-in `url` /
-        /// `full` policies it carries more; see `browser::restore`.
+        /// The pane's URL under the active `[browser] restore` policy: by default the canonical
+        /// origin only, never the live URL (credentials, OAuth codes, signed URLs); see
+        /// `browser::restore`.
         url: String,
-        /// Full browser state for this pane: tab list, active index, profile.
-        /// Additive and `#[serde(default)]`, so v3 files written before the
-        /// Browser Workbench keep loading and `SESSION_VERSION` does not move.
-        ///
-        /// **Downgrade is lossy but never corrupt** (codex plan r2-I4): an older
-        /// binary round-trips the file and drops this field, degrading the pane
-        /// to today's single-URL restore. That is the accepted behaviour — the
-        /// alternative (a version bump) would wipe every user's whole layout.
+        /// Full browser state: tab list, active index, profile. `#[serde(default)]` so v3 files
+        /// written before the Browser Workbench keep loading without a version bump. An older
+        /// binary drops this field and degrades to single-URL restore (lossy, not corrupt); a
+        /// version bump would wipe every user's layout.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pane: Option<crate::browser::BrowserPaneSnap>,
     },
     Plugin {
         name: String,
-        /// The specific panel within a multi-panel plugin, so restore targets
-        /// the original panel rather than the plugin's default.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         panel_name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         version: Option<String>,
     },
-    /// The agent-status cockpit pane (Linux). No persisted state beyond its kind.
     Cockpit,
 }
 
@@ -93,8 +72,7 @@ pub enum SplitOrientation {
     Vertical,
 }
 
-/// Divider-ratio clamp band so a persisted extreme / corrupt value can't
-/// collapse a pane below usability.
+/// Divider-ratio clamp band: a persisted extreme value must not collapse a pane.
 pub const MIN_RATIO: f32 = 0.05;
 pub const MAX_RATIO: f32 = 0.95;
 
@@ -106,8 +84,6 @@ pub fn clamp_ratio(r: f32) -> f32 {
     }
 }
 
-/// Clamp every divider ratio in a tree (defense against hand-edited / corrupt
-/// files) so downstream layout never sees an out-of-band value.
 pub fn normalize_ratios(snap: &mut SplitSnap) {
     if let SplitSnap::Branch {
         ratio,
@@ -131,10 +107,8 @@ pub fn load() -> Option<Session> {
     parse_session(&raw)
 }
 
-/// Parse + validate a session document. Split from `load` so it is unit-testable
-/// without the filesystem. Rejects unknown versions outright (a best-effort parse
-/// of a foreign schema risks a half-restored state worse than starting fresh) —
-/// this is what makes old v1/v2 files fall back to a fresh session (wipe-fresh).
+/// Parse and validate a session document. Rejects unknown versions outright: a best-effort parse
+/// of a foreign schema risks a half-restored state worse than a fresh start (old v1/v2 files).
 pub fn parse_session(raw: &str) -> Option<Session> {
     let mut session: Session = serde_json::from_str(raw)
         .map_err(|e| eprintln!("[copad] session parse failed: {e}"))
@@ -155,8 +129,6 @@ pub fn parse_session(raw: &str) -> Option<Session> {
     Some(session)
 }
 
-/// Remove any persisted session file. Called when the closing window has no
-/// panels left so a stale snapshot doesn't restore on next launch.
 pub fn clear() {
     let path = session_path();
     if let Err(e) = std::fs::remove_file(&path)
@@ -194,10 +166,8 @@ pub fn save(session: &Session) {
     }
 }
 
-/// Walk a `SplitSnap` and return the cwd of the leftmost (DFS pre-order)
-/// TERMINAL leaf, skipping non-terminal (webview / plugin / cockpit) leaves so a
-/// non-terminal-first tree still seeds a later terminal's cwd. Used at restore:
-/// the cwd of the first terminal seeds the panel that opens the tab.
+/// Leftmost (DFS pre-order) TERMINAL leaf's cwd, skipping webview/plugin/cockpit leaves; seeds
+/// the panel that opens the tab on restore.
 pub fn leftmost_cwd(snap: &SplitSnap) -> Option<String> {
     match snap {
         SplitSnap::Leaf {
@@ -281,7 +251,6 @@ mod tests {
 
     #[test]
     fn parse_rejects_old_and_unknown_versions() {
-        // v1 doc (version 1) and v2 doc (version 2) both fall back to fresh.
         let v1 = r#"{"version":1,"tabs":[{"custom_title":null,"root":{"type":"terminal","cwd":"/x"}}],"current_tab":0}"#;
         assert!(parse_session(v1).is_none(), "old v1 file rejected → fresh");
         let v2 = r#"{"version":2,"sessions":[]}"#;
@@ -316,7 +285,6 @@ mod tests {
 
     #[test]
     fn leftmost_cwd_skips_non_terminal_leaves() {
-        // A webview-first branch must still find the terminal's cwd in `second`.
         let s = branch(
             SplitOrientation::Horizontal,
             0.5,
@@ -324,7 +292,6 @@ mod tests {
             term("/deep"),
         );
         assert_eq!(leftmost_cwd(&s), Some("/deep".to_string()));
-        // Nested: leftmost terminal wins.
         let s = branch(
             SplitOrientation::Horizontal,
             0.5,
@@ -367,12 +334,10 @@ mod tests {
         assert_eq!(s, back);
     }
 
-    // ---- Browser Workbench: the additive `pane` field (plan B1) ----
-
     #[test]
     fn a_pre_workbench_v3_webview_pane_still_loads() {
-        // The whole reason `pane` is `#[serde(default)]` rather than a version
-        // bump: every existing user's layout file lacks the field.
+        // `pane` is `#[serde(default)]` rather than a version bump because every existing layout
+        // file lacks the field.
         let raw = r#"{
             "version": 3,
             "current_tab": 0,
@@ -396,9 +361,8 @@ mod tests {
 
     #[test]
     fn a_pane_without_browser_state_serializes_exactly_as_before() {
-        // `skip_serializing_if` keeps the on-disk shape byte-identical for
-        // users who never open a second browser tab, so an older binary reading
-        // the file sees nothing new at all.
+        // `skip_serializing_if` keeps the on-disk shape byte-identical for users who never open
+        // a second browser tab.
         let json = serde_json::to_string(&PaneContent::Webview {
             url: "https://e.com".into(),
             pane: None,
@@ -438,9 +402,8 @@ mod tests {
 
     #[test]
     fn an_older_binary_downgrades_a_browser_pane_lossily_but_not_corruptly() {
-        // codex plan r2-I4. Simulate the old binary by parsing into a shape that
-        // has no `pane` field and re-serializing: the layout survives, the tab
-        // list is dropped, and nothing about the document becomes invalid.
+        // Simulate the old binary by parsing into a shape with no `pane` field and re-serializing:
+        // the layout survives, the tab list is dropped, the document stays valid.
         use crate::browser::{BrowserPaneSnap, BrowserTabSnap};
 
         let with_tabs = PaneContent::Webview {
@@ -453,7 +416,6 @@ mod tests {
         };
         let json = serde_json::to_string(&with_tabs).unwrap();
 
-        // An old binary's view of the same variant.
         #[derive(serde::Serialize, serde::Deserialize)]
         #[serde(tag = "kind", rename_all = "snake_case")]
         enum OldPaneContent {
@@ -462,7 +424,6 @@ mod tests {
         let old: OldPaneContent = serde_json::from_str(&json).expect("old binary still parses");
         let rewritten = serde_json::to_string(&old).unwrap();
 
-        // Re-read with the current model: valid, and degraded to a single URL.
         let back: PaneContent = serde_json::from_str(&rewritten).unwrap();
         assert_eq!(
             back,

@@ -1,48 +1,34 @@
-//! The one gate both GUIs call before any browser RPC reaches a platform handler.
+//! The one gate both GUIs call before any browser RPC reaches a platform handler. The decision
+//! is made here, not re-derived per platform, so Linux cannot ship a weaker credential boundary.
 //!
-//! This is what makes the credential boundary un-forkable: Linux cannot ship a
-//! weaker version of it, because the decision is made here and both dispatchers
-//! call [`authorize`] rather than re-deriving the rule.
-//!
-//! Two properties are easy to get wrong and are therefore encoded rather than
-//! documented:
-//!
-//! - **Protection freezes the PROFILE, not the tab** (codex plan r3-C1). A
-//!   concurrent tab on the same profile is just another window onto the same
-//!   shared storage, so while any tab of a profile is protected, no agent read
-//!   against any tab of that profile is served.
-//! - **Authorization is re-checked at result-delivery time**, not only at
-//!   dispatch (r2-I1). Both GUIs answer these calls from callbacks; a read that
-//!   was already in flight when the tab entered `Protected` must be suppressed,
-//!   not answered with a stale value.
+//! - Protection freezes the PROFILE, not the tab: while any tab of a profile is protected, no
+//!   agent read against any tab of that profile is served.
+//! - Authorization is re-checked at result-delivery time, not only dispatch: both GUIs answer
+//!   from callbacks, and a read already in flight when the tab became `Protected` must be
+//!   suppressed, not answered with a stale value.
 
 use crate::protocol::ResponseError;
 
 use super::secrets::TabMode;
 
-/// What a browser method does, which is what decides whether protection blocks it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodClass {
-    /// Returns page content or pixels. Blocked under protection — these are the
-    /// only calls that can carry a secret back out.
+    /// Returns page content or pixels. Blocked under protection: the only calls that can carry a
+    /// secret back out.
     Read,
     /// Acts on the page but returns nothing readable. Allowed under protection,
     /// so "fill the password, then click submit" still works.
     Write,
     /// Credential handling. Requires protection.
     Secret,
-    /// Tab/profile bookkeeping. Never blocked — an agent must always be able to
-    /// discover that a tab is protected, and to close a tab.
+    /// Tab/profile bookkeeping. Never blocked: an agent must always be able to discover that a
+    /// tab is protected and close it.
     Meta,
 }
 
-/// Classify a browser RPC method name. Unknown methods return `None` and the
-/// caller falls through to its normal unknown-method handling.
-///
-/// New read-shaped methods MUST be added to the `Read` arm. The default for an
-/// unrecognised `webview.*` name is deliberately `None` rather than `Write`, so
-/// a forgotten entry surfaces as "unknown method" during development instead of
-/// silently becoming an unguarded read in production.
+/// Classify a browser RPC method name; `None` for unknown methods. New read-shaped methods MUST
+/// go in the `Read` arm. An unrecognised `webview.*` name is `None` rather than `Write` so a
+/// forgotten entry shows up as "unknown method" instead of becoming an unguarded read.
 pub fn classify(method: &str) -> Option<MethodClass> {
     use MethodClass::*;
     Some(match method {
@@ -55,15 +41,13 @@ pub fn classify(method: &str) -> Option<MethodClass> {
         | "webview.screenshot"
         | "webview.net"
         | "webview.console"
-        // Viewport-mode `webview.scroll` returns the page's live scrollX/scrollY
-        // on both platforms, so it is value-returning however write-shaped its
-        // name looks. Losing scroll on a protected page is the right trade: the
-        // human is driving that page anyway (codex review r3-C1).
+        // Viewport-mode `webview.scroll` returns the live scrollX/scrollY on both platforms, so
+        // it is value-returning despite its name. Losing scroll on a protected page is the right
+        // trade.
         | "webview.scroll"
-        // Both GUIs' `webview.state` handlers return the LIVE url + page title,
-        // so it discloses exactly what the origin-only restore policy exists to
-        // keep off disk (an OAuth code, a reset token). It is a read, not
-        // bookkeeping, however metadata-shaped its name looks.
+        // Both GUIs' `webview.state` returns the LIVE url + title, which discloses what the
+        // origin-only restore policy keeps off disk (an OAuth code, a reset token). It is a read,
+        // not bookkeeping.
         | "webview.state" => Read,
 
         "webview.navigate" | "webview.back" | "webview.forward" | "webview.reload"
@@ -87,13 +71,10 @@ pub fn classify(method: &str) -> Option<MethodClass> {
     })
 }
 
-/// Decide whether a browser RPC may proceed.
-///
-/// `profile_protected` is true when **any** tab in the target tab's profile is
-/// in [`TabMode::Protected`]; `target_mode` is the target tab's own mode.
-///
-/// Call this at dispatch AND again before delivering a result, so a read that
-/// was in flight when protection began is suppressed rather than answered.
+/// Decide whether a browser RPC may proceed. `profile_protected` is true when any tab in the
+/// target tab's profile is in [`TabMode::Protected`]; `target_mode` is the target tab's own mode.
+/// Call at dispatch and again before delivering a result, so a read in flight when protection
+/// began is suppressed.
 pub fn authorize(
     method: &str,
     target_mode: TabMode,
@@ -135,19 +116,13 @@ pub fn authorize(
 
 /// Must a permitted write's result be replaced with a page-independent one?
 ///
-/// `click` reports "ok" vs "not found" on both platforms, which is a **selector
-/// oracle**: an agent can probe `input[name=csrf][value^="a"]`, then `^="ab"`,
-/// and read a protected page's DOM one character at a time through nothing but
-/// allowed writes (codex review C1). Protection would be a boundary with a
-/// keyhole in it.
+/// `click` reports "ok" vs "not found", a selector oracle: probing `input[name=csrf][value^="a"]`,
+/// then `^="ab"`, reads a protected page's DOM one character at a time through allowed writes.
+/// The action still happens (so fill-then-submit works) but the caller learns nothing.
 ///
-/// The action still happens — that is what keeps "fill the password, then click
-/// submit" working — but the caller learns nothing about the page from it.
-///
-/// **Platform contract:** when this returns true, discard the handler's real
-/// result and return [`opaque_write_response`]. Re-evaluate it at delivery time,
-/// not only at dispatch, so a write that was in flight when protection began is
-/// also collapsed.
+/// When this returns true, discard the handler's real result and return
+/// [`opaque_write_response`]. Re-evaluate at delivery time too, so a write in flight when
+/// protection began is also collapsed.
 pub fn redacts_write_result(method: &str, target_mode: TabMode, profile_protected: bool) -> bool {
     matches!(classify(method), Some(MethodClass::Write))
         && (profile_protected || target_mode == TabMode::Protected)
@@ -158,13 +133,8 @@ pub fn opaque_write_response() -> serde_json::Value {
     serde_json::json!({ "status": "ok", "protected": true })
 }
 
-/// The response a platform returns for a method it has wired but not yet
-/// implemented (codex plan r1-C6).
-///
-/// Registering every new method on Linux immediately — answering
-/// `unsupported_capability` until B7 lands — means a `coctl` script gets a
-/// truthful, machine-readable answer instead of `unknown_method`, and the Linux
-/// port becomes leaf-filling rather than surface design.
+/// Response for a method a platform has wired but not implemented, so a `coctl` script gets a
+/// machine-readable `unsupported_capability` instead of `unknown_method`.
 pub fn unsupported_capability(method: &str, platform: &str) -> ResponseError {
     ResponseError {
         code: "unsupported_capability".into(),
@@ -195,7 +165,6 @@ mod tests {
 
     #[test]
     fn protection_blocks_reads_but_not_the_submit_click() {
-        // The whole point of the Write class: fill, then click submit.
         assert!(authorize("webview.click", TabMode::Protected, true).is_ok());
         assert!(authorize("webview.navigate", TabMode::Protected, true).is_ok());
         assert_eq!(
@@ -214,8 +183,8 @@ mod tests {
 
     #[test]
     fn a_sibling_tab_in_a_protected_profile_is_frozen_too() {
-        // r3-C1: a concurrent same-profile tab is another window onto the same
-        // storage, so its own mode being Automation is not enough.
+        // A concurrent same-profile tab shares storage, so its own mode being Automation is not
+        // enough.
         assert_eq!(
             authorize("webview.get_content", TabMode::Automation, true)
                 .unwrap_err()
@@ -249,7 +218,6 @@ mod tests {
 
     #[test]
     fn a_protected_write_returns_nothing_the_page_could_have_influenced() {
-        // codex review C1: `click`'s ok/not-found result is a selector oracle.
         assert!(redacts_write_result(
             "webview.click",
             TabMode::Protected,
@@ -277,7 +245,6 @@ mod tests {
 
     #[test]
     fn reads_and_meta_are_not_routed_through_the_opaque_write_response() {
-        // Reads are refused outright; meta is genuinely page-independent.
         assert!(!redacts_write_result(
             "webview.get_content",
             TabMode::Protected,

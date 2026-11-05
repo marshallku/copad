@@ -1,14 +1,7 @@
-//! Phase 2 acceptance test: spawn a real shell, type a printf, wait
-//! for output to land in the grid, snapshot, assert the row contains
-//! the expected bytes. Resize round-trip too.
+//! Spawns `/bin/sh -c` rather than `$SHELL` so the test is reproducible.
 //!
-//! Runs `/bin/sh` (POSIX-mandated path) with a controlled command via
-//! the `-c` shell mechanism. Avoids depending on the user's `$SHELL`
-//! so the test is reproducible across machines.
-//!
-//! Marked `#[ignore]` by default because it actually spawns a child
-//! process and blocks on PTY I/O — too costly for `cargo test` happy
-//! path. Run explicitly with `cargo test -p copad-term -- --ignored`.
+//! `#[ignore]`d because it spawns a child and blocks on PTY I/O. Run with
+//! `cargo test -p copad-term -- --ignored`.
 
 use std::ffi::CString;
 use std::thread::sleep;
@@ -16,9 +9,6 @@ use std::time::{Duration, Instant};
 
 use copad_term::*;
 
-/// Drive the PTY until `predicate` returns true OR the deadline
-/// expires. Snapshots in a tight-ish loop (10ms) so the test stays
-/// fast when output arrives quickly but doesn't busy-spin.
 fn wait_for<F: Fn(&str) -> bool>(
     handle: *mut CopadHandle,
     predicate: F,
@@ -97,7 +87,6 @@ fn resize_round_trip() {
     };
     assert!(!handle.is_null());
 
-    // Initial geometry visible in snapshot.
     let snap = unsafe { copad_term_snapshot(handle) };
     assert_eq!(unsafe { copad_snapshot_cols(snap) }, 80);
     assert_eq!(unsafe { copad_snapshot_rows(snap) }, 24);
@@ -105,8 +94,6 @@ fn resize_round_trip() {
 
     unsafe { copad_term_resize(handle, 100, 40) };
 
-    // The reader thread processes the Resize message asynchronously;
-    // poll briefly for the snapshot to reflect the new dims.
     let deadline = Instant::now() + Duration::from_millis(1_000);
     let (cols, rows) = loop {
         let snap = unsafe { copad_term_snapshot(handle) };
@@ -135,10 +122,8 @@ fn null_destroy_no_op() {
     }
 }
 
-/// Closing a terminal must not wait for its shell: a shell that
-/// survives the SIGHUP (here it ignores it) used to block
-/// `copad_term_destroy` in `waitpid`, which froze the whole app since
-/// the view controller's deinit calls it on the main thread.
+/// A shell that ignores SIGHUP must not block `copad_term_destroy` in `waitpid`: the app calls it
+/// on the main thread.
 #[test]
 fn destroy_does_not_wait_for_a_shell_that_ignores_sighup() {
     let shell = CString::new("/bin/sh").unwrap();
@@ -168,8 +153,6 @@ fn destroy_does_not_wait_for_a_shell_that_ignores_sighup() {
         "destroy blocked for {took:?}"
     );
 
-    // ...and the shell does not outlive its terminal: it is killed once
-    // the grace is up, then reaped.
     let pid = row
         .split("hup-ignored ")
         .nth(1)

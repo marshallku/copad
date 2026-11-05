@@ -1,7 +1,5 @@
-//! Verifies that the workflow seed YAMLs at `examples/workflows/`
-//! all parse under `WorkflowRegistry::load_from_dir` — Phase 22.2
-//! Step 7. If a seed gains a load-bearing field that the schema
-//! doesn't carry, this test fails.
+//! Every seed workflow YAML in `examples/workflows/` must parse under
+//! `WorkflowRegistry::load_from_dir`.
 
 use copad_core::workflow::WorkflowRegistry;
 use std::path::PathBuf;

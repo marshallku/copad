@@ -4,13 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// A pre-defined workflow that the user can dispatch via the projects panel
-/// or `coctl workflow run`. v1: dispatcher resolves the spec, substitutes
-/// `prompt` with form values + project context, then calls `claude.start`.
-/// `default_team` / `default_model` are inert spec passthrough — the
-/// pipeline router + Brain dispatcher that would have consumed them were
-/// removed in Phase 24.7 (decision #51); the fields stay for schema
-/// compatibility with existing workflow YAMLs.
+/// A pre-defined workflow dispatched from the projects panel or `coctl workflow run`: the
+/// dispatcher substitutes `prompt` with form values and project context, then calls
+/// `claude.start`. `default_team` / `default_model` are inert, kept for schema compatibility
+/// with existing workflow YAMLs (decisions #51).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WorkflowSpec {
     pub id: String,
@@ -26,14 +23,12 @@ pub struct WorkflowSpec {
     #[serde(default)]
     pub default_model: Option<String>,
     pub prompt: String,
-    /// Caps total wall-clock for the spawned claude turn. v1 emits a
-    /// `workflow.timed_out` event when crossed — does NOT kill the subprocess
-    /// (hard kill lands in Phase 22.6 with runledger).
+    /// Caps wall-clock for the spawned claude turn. Crossing it emits `workflow.timed_out` but
+    /// does not kill the subprocess.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
-    /// Mirrors life-assistant's `ship` contract — side-effecting flows force
-    /// a fresh claude session, never attach/resume. Passed through to
-    /// `claude.start` as the `fresh_session` param.
+    /// Side-effecting flows force a fresh claude session (never attach/resume); passed to
+    /// `claude.start` as `fresh_session`.
     #[serde(default)]
     pub fresh_session: bool,
     #[serde(default = "default_schema_version")]
@@ -58,10 +53,9 @@ pub struct FormField {
     pub default: Option<String>,
     #[serde(default)]
     pub options: Vec<String>,
-    /// Regex constraint (mirrors life-assistant's `verify` URL field).
+    /// Regex constraint.
     #[serde(default)]
     pub pattern: Option<String>,
-    /// Length cap.
     #[serde(default)]
     pub max_length: Option<usize>,
 }
@@ -74,8 +68,8 @@ pub enum FieldKind {
     Select,
 }
 
-/// In-process map of `id → spec`. Loaded once at daemon startup from
-/// `~/.config/copad/workflows/*.yaml`; restart required for reload.
+/// In-process `id -> spec` map loaded once at daemon startup from
+/// `~/.config/copad/workflows/*.yaml`.
 #[derive(Debug, Clone, Default)]
 pub struct WorkflowRegistry {
     specs: HashMap<String, WorkflowSpec>,
@@ -86,9 +80,8 @@ impl WorkflowRegistry {
         Self::default()
     }
 
-    /// Walk `dir` for `*.yaml` / `*.yml`, parse each, drop on parse error with a
-    /// `log::warn!`. Files whose `id` collides with an existing entry log a warning
-    /// and the first-loaded wins.
+    /// Parses every `*.yaml` / `*.yml` in `dir`; parse errors are dropped with a `log::warn!`, and
+    /// on an `id` collision the first loaded wins.
     pub fn load_from_dir(dir: &Path) -> Self {
         let mut specs = HashMap::new();
         let read = match std::fs::read_dir(dir) {
@@ -160,11 +153,8 @@ fn parse_spec_file(path: &Path) -> Result<WorkflowSpec, String> {
     Ok(spec)
 }
 
-/// Validate `values` against `spec.form_fields`. Errors:
-/// - missing required field
-/// - unknown field (not in form_fields)
-/// - value violates `pattern` (if set)
-/// - value exceeds `max_length` (if set)
+/// Errors on a missing required field, an unknown field, a `pattern` violation or a `max_length`
+/// overrun.
 pub fn validate_values(
     spec: &WorkflowSpec,
     values: &HashMap<String, String>,
@@ -235,15 +225,9 @@ pub enum ValidationError {
     },
 }
 
-/// Substitute `{name}` placeholders in `template`. Recognized names:
-/// - `field_name` → matching form-value (empty string if missing + optional)
-/// - `project` → `project.name` (empty if no project)
-/// - `project.path` → absolute path string (empty if no project)
-/// - `project.subpath` → subpath string (empty if no project or no subpath)
-/// - `workspace_path` → caller-resolved workspace string (always provided)
-///
-/// Unknown placeholder names error rather than silently leaving them in —
-/// caller should treat this as a spec authoring bug.
+/// Substitute `{name}` placeholders: form field names (empty if missing and optional),
+/// `project`, `project.path`, `project.subpath` (empty without a project) and `workspace_path`.
+/// An unknown name is an error, since it means a spec authoring bug.
 pub fn substitute(
     template: &str,
     values: &HashMap<String, String>,

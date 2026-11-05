@@ -21,11 +21,10 @@ impl Presence {
     }
 }
 
-/// Per-pane context payload published by the local shell's precmd hook via
-/// `coctl event publish pane.context_changed '<json>'`. Trust note: events
-/// stamped `Origin::External` by the daemon socket (see decision #46) — any
-/// same-UID process can publish, so callers downstream of `ContextService`
-/// must treat this as best-effort display data.
+/// Per-pane context published by the shell's precmd hook via
+/// `coctl event publish pane.context_changed '<json>'`. The daemon stamps these
+/// `Origin::External` (decisions #46): any same-UID process can publish, so downstream users
+/// must treat it as best-effort display data.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PaneContext {
     #[serde(default)]
@@ -48,12 +47,10 @@ pub struct PaneContext {
     pub v: u32,
 }
 
-/// Phase 22.3 — active nvim document signal published from the shell's
-/// preexec hook (when `nvim <path>` is invoked) via
-/// `coctl event publish doc.opened '<json>'`. `path` is relative to the
-/// KB root (`COPAD_KB_ROOT` / `COPAD_DOCS_ROOT` / `~/docs`), so it can be
-/// passed directly to `kb.read { id }`. Same Origin::External trust note
-/// as PaneContext.
+/// Active nvim document signal published by the shell's preexec hook via
+/// `coctl event publish doc.opened '<json>'`. `path` is relative to the KB root
+/// (`COPAD_KB_ROOT` / `COPAD_DOCS_ROOT` / `~/docs`), so it can go straight to `kb.read { id }`.
+/// Same `Origin::External` trust note as `PaneContext`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActiveDoc {
     #[serde(default)]
@@ -66,8 +63,7 @@ pub struct ActiveDoc {
     pub v: u32,
 }
 
-/// "What the user is currently doing" — v1 carries only the two fields
-/// with confirmed event-stream sources. See `docs/workflow-runtime.md`.
+/// What the user is currently doing; see `docs/workflow-runtime.md`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Context {
     pub active_panel: Option<String>,
@@ -88,7 +84,6 @@ struct Inner {
     presence: Presence,
 }
 
-/// Caller drains an `EventBus` subscription into `apply_event`.
 pub struct ContextService {
     inner: RwLock<Inner>,
 }
@@ -179,8 +174,8 @@ impl ContextService {
         self.inner.read().unwrap().presence
     }
 
-    /// Returns the previous presence so callers can decide whether to
-    /// broadcast a `presence.changed` event (avoid emitting on no-op).
+    /// Returns the previous presence so callers can skip broadcasting `presence.changed` on a
+    /// no-op.
     pub fn set_presence(&self, presence: Presence) -> Presence {
         let mut inner = self.inner.write().unwrap();
         let prev = inner.presence;
@@ -195,12 +190,9 @@ impl ContextService {
                     self.inner.write().unwrap().active_panel = Some(panel_id);
                 }
             }
-            // `panel.exited` is the only cross-platform-reliable panel-death
-            // signal that carries `panel_id` — both copad-linux/tabs.rs and
-            // copad-macos/TerminalViewController emit it on shell exit. We
-            // intentionally do NOT consume `tab.closed`: its payload is
-            // contracted as `{index}` (see docs/architecture.md), and the
-            // Linux superset that includes `panel_id` is incidental.
+            // `panel.exited` is the only cross-platform-reliable panel-death signal carrying
+            // `panel_id` (both GUIs emit it on shell exit). `tab.closed` is deliberately not
+            // consumed: its contracted payload is `{index}` (docs/architecture.md).
             "panel.exited" => {
                 if let Some(panel_id) = panel_id_of(event) {
                     let mut inner = self.inner.write().unwrap();
@@ -356,7 +348,6 @@ mod tests {
             "terminal.cwd_changed",
             json!({"panel_id": "p1", "cwd": "/x/y"}),
         ));
-        // No active panel yet → active_cwd is None even though we cached cwd
         assert!(ctx.active_cwd().is_none());
         ctx.apply_event(&evt("panel.focused", json!({"panel_id": "p1"})));
         assert_eq!(ctx.active_cwd().unwrap(), PathBuf::from("/x/y"));
@@ -411,11 +402,8 @@ mod tests {
 
     #[test]
     fn tab_closed_alone_does_not_clean_up() {
-        // `tab.closed` is contracted as `{index}` (see docs/architecture.md)
-        // and is intentionally NOT a cleanup trigger here. Cleanup happens
-        // when the shell process exits and emits `panel.exited`. This test
-        // pins that semantic so a future "let's also handle tab.closed"
-        // change forces a re-discussion of the cross-platform contract.
+        // `tab.closed` is contracted as `{index}` and is not a cleanup trigger; cleanup happens on
+        // `panel.exited`. Pins that so adding `tab.closed` handling forces a contract discussion.
         let ctx = ContextService::new();
         ctx.apply_event(&evt(
             "terminal.cwd_changed",
@@ -423,10 +411,8 @@ mod tests {
         ));
         ctx.apply_event(&evt("panel.focused", json!({"panel_id": "p1"})));
         ctx.apply_event(&evt("tab.closed", json!({"panel_id": "p1", "tab": 0})));
-        // tab.closed alone is a no-op:
         assert_eq!(ctx.active_panel().unwrap(), "p1");
         assert_eq!(ctx.active_cwd().unwrap(), PathBuf::from("/x"));
-        // Cleanup only happens on panel.exited:
         ctx.apply_event(&evt("panel.exited", json!({"panel_id": "p1"})));
         assert!(ctx.active_panel().is_none());
         assert!(ctx.active_cwd().is_none());
@@ -514,7 +500,6 @@ mod tests {
             serde_json::to_value(&pc).unwrap(),
         ));
         assert_eq!(ctx.pane_context("p1").unwrap(), pc);
-        // Other panels unaffected
         assert!(ctx.pane_context("p2").is_none());
     }
 
@@ -546,11 +531,9 @@ mod tests {
             "pane.context_changed",
             serde_json::to_value(&pc).unwrap(),
         ));
-        // No active panel yet
         assert!(ctx.active_pane_context().is_none());
         ctx.apply_event(&evt("panel.focused", json!({"panel_id": "p1"})));
         assert_eq!(ctx.active_pane_context().unwrap(), pc);
-        // Snapshot mirrors the active query
         assert_eq!(ctx.snapshot().pane_context.unwrap(), pc);
     }
 
@@ -576,7 +559,6 @@ mod tests {
             "pane.context_changed",
             serde_json::to_value(&pc).unwrap(),
         ));
-        // Nothing recorded
         assert!(ctx.pane_context("").is_none());
         assert!(ctx.active_pane_context().is_none());
     }

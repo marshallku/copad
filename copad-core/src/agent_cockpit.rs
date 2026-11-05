@@ -1,27 +1,17 @@
-//! Agent cockpit state — per-pane AI-agent status derived from `claude.*` bus
-//! events, rendered by the desktop GUI cockpit panel (`tmx agents`-style
-//! attention dashboard).
+//! Per-pane AI-agent status derived from `claude.*` bus events, shown by the GUI cockpit panel
+//! (`docs/agent-cockpit.md`). One instance lives for the whole GUI process, fed by a single
+//! event pump.
 //!
-//! This is the data half of the agent-lifecycle feature's Slice 2 (Slice 1 was
-//! the notification-only toast). It lives at **app-lifetime** in each GUI
-//! process (one instance, updated by a single event pump); the cockpit panel is
-//! a view/observer over it. See `docs/agent-cockpit.md`.
-//!
-//! Design constraints (from the plan's codex review):
-//! - **Arrival-order, last-write-wins, best-effort.** Perfect stale-event
-//!   rejection would need a causal sequence the hooks don't emit. For LOCAL
-//!   panes, `coctl event publish` fires synchronously from each hook in causal
-//!   order over the local socket, so arrival order == causal order. SSH agents
-//!   carry `panel_id == ""` and are skipped. `session` is recorded for display
-//!   only; it does not gate transitions.
-//! - **No hydration.** The model captures events from process startup; a manual
-//!   `reset()` clears stale overlays after a daemon restart.
+//! Arrival-order, last-write-wins, best-effort: the hooks emit no causal sequence, but for local
+//! panes `coctl event publish` fires synchronously in causal order, so arrival order is causal
+//! order. SSH agents carry `panel_id == ""` and are skipped. `session` is display-only and never
+//! gates transitions. Nothing is hydrated at startup; `reset()` clears stale overlays after a
+//! daemon restart.
 
 use std::collections::HashMap;
 
 use serde_json::Value;
 
-/// Per-pane agent state. `Idle` is the default (no agent / acknowledged).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentState {
     #[default]
@@ -32,12 +22,10 @@ pub enum AgentState {
 }
 
 impl AgentState {
-    /// True when the agent is waiting on the user — these sort to the top.
     pub fn needs_attention(self) -> bool {
         matches!(self, Self::Awaiting | Self::Done)
     }
 
-    /// Attention-first sort rank (lower = higher in the cockpit list).
     pub fn rank(self) -> u8 {
         match self {
             Self::Awaiting => 0,
@@ -47,7 +35,6 @@ impl AgentState {
         }
     }
 
-    /// Stable lowercase tag for the wire / CSS classes / tests.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Idle => "idle",
@@ -57,9 +44,6 @@ impl AgentState {
         }
     }
 
-    /// Human-readable text for a cockpit row. Deliberately separate from
-    /// `as_str()`: that tag is a stable wire/CSS identifier, this is prose and
-    /// may be reworded. Mirrors the Swift port's `AgentState.label`.
     pub fn label(self) -> &'static str {
         match self {
             Self::Idle => "idle",
@@ -70,14 +54,12 @@ impl AgentState {
     }
 }
 
-/// One pane's tracked agent. `session` is display-only (see module docs).
 #[derive(Debug, Clone, Default)]
 pub struct PaneAgent {
     pub session: Option<String>,
     pub state: AgentState,
 }
 
-/// The app-lifetime agent-status map, keyed by `panel_id`.
 #[derive(Debug, Default)]
 pub struct AgentCockpit {
     panes: HashMap<String, PaneAgent>,
@@ -88,9 +70,8 @@ impl AgentCockpit {
         Self::default()
     }
 
-    /// Apply one `claude.*` agent event. Returns `true` iff a pane's state
-    /// actually changed (so observer views rebuild only on real change).
-    /// Ignores non-agent kinds, empty/missing `panel_id`, and malformed payloads.
+    /// Applies one `claude.*` agent event; true iff a pane's state changed, so views rebuild only
+    /// on real change. Non-agent kinds, empty `panel_id` and malformed payloads are ignored.
     pub fn observe(&mut self, kind: &str, payload: &Value) -> bool {
         let new_state = match kind {
             "claude.working" => AgentState::Working,
@@ -102,7 +83,6 @@ impl AgentCockpit {
             Some(id) if !id.is_empty() => id,
             _ => return false, // SSH agents (panel_id == "") + malformed are skipped
         };
-        // Empty session normalizes to None (display-only, never gates).
         let session = payload
             .get("session")
             .and_then(Value::as_str)
@@ -110,16 +90,15 @@ impl AgentCockpit {
             .map(String::from);
 
         let entry = self.panes.entry(panel_id.to_string()).or_default();
-        // Session is display-visible, so a session-only change must also mark the
-        // view dirty (else the row keeps showing the previous session).
+        // Session is display-visible, so a session-only change must also dirty the view.
         let changed = entry.state != new_state || entry.session != session;
         entry.state = new_state;
         entry.session = session;
         changed
     }
 
-    /// Clear attention on a pane the user acted on (cockpit click, or a
-    /// `panel.focused` event). Awaiting/Done → Idle. Returns `true` iff changed.
+    /// Clears attention on a pane the user acted on (cockpit click, `panel.focused`):
+    /// Awaiting/Done become Idle. True iff changed.
     pub fn acknowledge(&mut self, panel_id: &str) -> bool {
         if let Some(entry) = self.panes.get_mut(panel_id)
             && entry.state.needs_attention()
@@ -130,33 +109,25 @@ impl AgentCockpit {
         false
     }
 
-    /// Evict a pane's tracked state (on `panel.exited`). Returns `true` iff present.
     pub fn forget(&mut self, panel_id: &str) -> bool {
         self.panes.remove(panel_id).is_some()
     }
 
-    /// Drop tracked panes that no longer exist, keeping those `keep` accepts.
-    /// Returns `true` iff anything was evicted.
-    ///
-    /// `forget()` handles the precise case (`panel.exited` names its pane), but
-    /// closing a tab publishes only `tab.closed`, whose payload carries a single
-    /// `panel_id` even when the tab held several split panes — so eviction there
-    /// can't be per-id. The GUI reconciles against its live pane set instead.
+    /// Drops tracked panes `keep` rejects; true iff anything was evicted. `forget()` cannot cover
+    /// a closed tab: `tab.closed` carries a single `panel_id` even when the tab held several
+    /// split panes, so the GUI reconciles against its live pane set instead.
     pub fn retain(&mut self, keep: impl Fn(&str) -> bool) -> bool {
         let before = self.panes.len();
         self.panes.retain(|id, _| keep(id));
         self.panes.len() != before
     }
 
-    /// Reset every pane to Idle — the manual "Reset" that drops stale overlays
-    /// after a daemon restart. Real states re-arrive on the next events.
     pub fn reset(&mut self) {
         for entry in self.panes.values_mut() {
             entry.state = AgentState::Idle;
         }
     }
 
-    /// Current state for a pane (default `Idle` if untracked).
     pub fn state(&self, panel_id: &str) -> AgentState {
         self.panes
             .get(panel_id)
@@ -164,12 +135,10 @@ impl AgentCockpit {
             .unwrap_or_default()
     }
 
-    /// Current display session for a pane, if any.
     pub fn session(&self, panel_id: &str) -> Option<&str> {
         self.panes.get(panel_id).and_then(|e| e.session.as_deref())
     }
 
-    /// How many tracked panes currently need attention (for a badge/count).
     pub fn attention_count(&self) -> usize {
         self.panes
             .values()
@@ -203,8 +172,6 @@ mod tests {
         let mut c = AgentCockpit::new();
         assert!(c.observe("claude.working", &ev("p", "s1"))); // idle→working
         assert!(!c.observe("claude.working", &ev("p", "s1"))); // same state + session = no change
-        // A session-only change (new turn, still working) must mark dirty so the
-        // displayed session updates.
         assert!(c.observe("claude.working", &ev("p", "s2")));
     }
 
@@ -252,12 +219,10 @@ mod tests {
 
     #[test]
     fn label_matches_the_swift_port() {
-        // Parity with copad-macos AgentCockpitModel.swift `AgentState.label`.
         assert_eq!(AgentState::Idle.label(), "idle");
         assert_eq!(AgentState::Working.label(), "working");
         assert_eq!(AgentState::Awaiting.label(), "needs input");
         assert_eq!(AgentState::Done.label(), "done");
-        // The wire/CSS tag stays machine-stable even where prose differs.
         assert_eq!(AgentState::Awaiting.as_str(), "awaiting");
     }
 
@@ -268,7 +233,6 @@ mod tests {
         c.observe("claude.session_stopped", &ev("dead", "s2"));
         assert_eq!(c.attention_count(), 2);
 
-        // A tab holding "dead" was closed; only "live" remains on screen.
         assert!(c.retain(|id| id == "live"));
         assert_eq!(c.state("dead"), AgentState::Idle); // untracked reads as Idle
         assert_eq!(c.state("live"), AgentState::Awaiting);
@@ -282,7 +246,6 @@ mod tests {
         let mut c = AgentCockpit::new();
         c.observe("claude.working", &ev("p", "sess-123"));
         assert_eq!(c.session("p"), Some("sess-123"));
-        // empty session normalizes to None
         c.observe("claude.awaiting_input", &ev("p", ""));
         assert_eq!(c.session("p"), None);
     }

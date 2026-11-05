@@ -1,30 +1,17 @@
-//! Cross-platform atomic-create-or-fail primitive.
+//! Atomic create-or-fail rename: the loser of a race sees `AlreadyExists` instead of overwriting
+//! the winner's bytes (used by the KB-shape plugins storing one record per file).
 //!
-//! Used by KB-shape plugins (`copad-plugin-kb`, `copad-plugin-todo`,
-//! `copad-plugin-bookmark`) that store one logical record per file and need
-//! exactly-one-creator semantics: the loser of a race must observe
-//! `AlreadyExists` rather than silently overwriting the winner's bytes.
-//!
-//! POSIX `rename(2)` alone replaces atomically — there is no portable flag
-//! for "fail if destination exists." Each Unix flavor exposes its own
-//! syscall:
-//! - Linux: `renameat2(AT_FDCWD, from, AT_FDCWD, to, RENAME_NOREPLACE)`
-//! - macOS: `renamex_np(from, to, RENAME_EXCL)` (also on iOS, watchOS)
-//!
-//! Other Unixes (FreeBSD, OpenBSD, NetBSD, …) would need their own
-//! backend; we hard-fail at compile time rather than fall back to a
-//! racy `stat` + `rename` because the whole point of this primitive is
-//! the kernel-level guarantee.
+//! Plain `rename(2)` replaces, and there is no portable no-replace flag: Linux uses `renameat2`
+//! with `RENAME_NOREPLACE`, macOS `renamex_np` with `RENAME_EXCL`. Other Unixes fail to compile
+//! on purpose rather than fall back to a racy `stat` + `rename`.
 
 use std::ffi::CString;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
-/// `EEXIST` (`AlreadyExists`) when `to` is taken — `from` left for the
-/// caller to clean up. Other syscall errors pass through. Bypasses
-/// `std::fs::rename` because that maps to plain `rename(2)` which
-/// silently replaces on Unix.
+/// `AlreadyExists` when `to` is taken, leaving `from` for the caller to clean up. Not
+/// `std::fs::rename`, which silently replaces on Unix.
 pub fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     let from_c = path_to_cstring(from)?;
     let to_c = path_to_cstring(to)?;
@@ -61,9 +48,6 @@ unsafe fn rename_no_replace_raw(from: *const libc::c_char, to: *const libc::c_ch
 
 #[cfg(target_os = "macos")]
 unsafe fn rename_no_replace_raw(from: *const libc::c_char, to: *const libc::c_char) -> libc::c_int {
-    // `renamex_np` is the Darwin equivalent — `RENAME_EXCL` matches the
-    // semantics of Linux's `RENAME_NOREPLACE` (errno EEXIST when target
-    // already exists, leaving the source intact).
     // SAFETY: caller guarantees from/to point to valid NUL-terminated paths.
     unsafe { libc::renamex_np(from, to, libc::RENAME_EXCL) }
 }

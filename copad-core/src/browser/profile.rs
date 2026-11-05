@@ -1,19 +1,10 @@
-//! Browser profiles — the identity a set of tabs shares its cookies with.
-//!
-//! One rule dominates this file and it is a migration hazard, not an aesthetic
-//! preference (codex plan r1-C5): **the `default` profile must map onto the
-//! platform's DEFAULT website data store**, not onto a store named "default".
-//! On macOS `WKWebsiteDataStore(forIdentifier:)` creates a store that is
-//! *distinct* from `WKWebsiteDataStore.default()`; adopting a named store for
-//! existing users would silently sign them out of every site they are logged
-//! into, with no migration path back. Named stores are therefore only ever used
-//! for additional profiles the user explicitly created, and such a profile
-//! starts logged out by design.
+//! Browser profiles. The `default` profile must map onto the platform's default website data
+//! store, not a store named "default": on macOS `WKWebsiteDataStore(forIdentifier:)` is distinct
+//! from `WKWebsiteDataStore.default()`, so adopting a named store would sign existing users out
+//! of every site. Named stores are only for profiles the user creates, which start logged out.
 
 use serde::{Deserialize, Serialize};
 
-/// The profile every pane uses unless told otherwise. Maps to the platform's
-/// default (pre-existing) data store — see the module note.
 pub const DEFAULT_PROFILE: &str = "default";
 
 /// Upper bound on a profile id, so an id can be used as a single path segment
@@ -25,7 +16,6 @@ pub struct BrowserProfile {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
-    /// False for a throwaway profile whose storage is dropped on close.
     #[serde(default = "default_true")]
     pub persistent: bool,
 }
@@ -43,8 +33,6 @@ impl BrowserProfile {
         }
     }
 
-    /// True when this profile must be backed by the platform's pre-existing
-    /// default store rather than a freshly identified one.
     pub fn is_platform_default(&self) -> bool {
         self.id == DEFAULT_PROFILE
     }
@@ -81,8 +69,6 @@ mod tests {
 
     #[test]
     fn default_profile_is_flagged_as_the_platform_default_store() {
-        // The r1-C5 guard: whatever else changes, `default` must never be
-        // handed to an "identified store" constructor.
         assert!(BrowserProfile::default_profile().is_platform_default());
         assert!(profile_data_dir(DEFAULT_PROFILE).is_none());
     }

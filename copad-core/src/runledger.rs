@@ -1,17 +1,9 @@
-//! Phase 22.6 — Runledger persistence.
+//! Durable monthly JSONL ledger of bus events (`~/.local/state/copad/runledger/<YYYY-MM>.jsonl`,
+//! one line per event, append-only) for replay and audit; the in-memory ring buffer stays the
+//! realtime layer.
 //!
-//! Monthly JSONL ledger of bus events for replay + audit. The
-//! existing ring buffer (in-memory, last N) stays as the realtime
-//! query layer; the runledger is the durable record.
-//!
-//! Path: `~/.local/state/copad/runledger/<YYYY-MM>.jsonl`. One line
-//! per event. Append-only, file-per-month so a month can be
-//! tar+compressed independently after rotation.
-//!
-//! Concurrency: a single background thread owns the open file
-//! handle. Other threads drain a bus subscription and pipe events
-//! through a bounded channel — append + `flush` per event because
-//! audit logs need to survive a SIGKILL.
+//! One background thread owns the open file; other threads feed it through a bounded channel.
+//! Each event is flushed on append because the audit log must survive a SIGKILL.
 
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -37,8 +29,6 @@ pub struct LedgerEntry {
 #[derive(Debug)]
 pub struct Runledger {
     root: PathBuf,
-    /// Lock protects (file handle, current YYYY-MM). Rotation
-    /// re-opens at month boundary; concurrent writers serialize.
     state: Mutex<State>,
 }
 
@@ -60,10 +50,8 @@ impl Runledger {
         }
     }
 
-    /// Append one event to the current-month file. Rotates if the
-    /// month changed since the last append. Errors are NOT fatal —
-    /// audit log loss is logged + accumulated, the caller's bus
-    /// emit path doesn't unwind.
+    /// Append to the current-month file, rotating when the month changes. Errors are not fatal:
+    /// the loss is logged and the caller's bus emit path does not unwind.
     pub fn append(&self, event: &BusEvent) -> Result<(), String> {
         let ts_ms = event_ts_ms(event);
         let month = ymd_month(ts_ms);
@@ -94,17 +82,9 @@ impl Runledger {
         Ok(())
     }
 
-    /// Replay entries from disk. `since_ms`: lower bound (inclusive)
-    /// on `ts_ms`. `kinds`: optional inclusion list. `limit`: caps
-    /// the returned vector (most recent first). Reads ALL ledger
-    /// files newer than or equal to the month of `since_ms` —
-    /// month boundaries don't bite for v1 because users mostly
-    /// query "last hour" / "last day."
-    /// Returns `(entries, total_matched)`. `total_matched` is the count
-    /// **before** `limit` truncation — callers paginating need this to
-    /// know whether more matches exist. Codex round-2 I1: the action
-    /// handler was previously reporting `entries.len()` AFTER truncate,
-    /// which made `total` equal to the page size.
+    /// Returns `(entries, total_matched)`, newest first. `total_matched` is counted before
+    /// `limit` truncation so paginating callers know whether more matches exist. Reads every
+    /// ledger file from the month of `since_ms` onward.
     pub fn replay(
         &self,
         since_ms: i64,
@@ -145,7 +125,6 @@ impl Runledger {
                 entries.push(entry);
             }
         }
-        // Newest first.
         entries.sort_by_key(|e| std::cmp::Reverse(e.ts_ms));
         let total_matched = entries.len();
         if let Some(n) = limit {
@@ -160,10 +139,8 @@ impl Runledger {
 }
 
 fn event_ts_ms(event: &BusEvent) -> i64 {
-    // EventBus stamps `Event::new` with `SystemTime::now()` already
-    // (the `timestamp_ms` field). The runledger trusts that stamp so
-    // a replay matches the ring buffer's ordering. Fall back to wall
-    // clock only if the event somehow arrived without a stamp.
+    // Trust the bus's stamp so replay matches the ring buffer's ordering; fall back to the wall
+    // clock only if an event arrived without one.
     if event.timestamp_ms != 0 {
         event.timestamp_ms as i64
     } else {
@@ -175,17 +152,13 @@ fn event_ts_ms(event: &BusEvent) -> i64 {
 }
 
 fn ymd_month(ts_ms: i64) -> String {
-    // Naive: SystemTime-based UTC year/month. Avoiding chrono to keep
-    // the dependency tree slim — the ledger only needs YYYY-MM for
-    // file naming.
+    // UTC year/month without chrono; the ledger only needs YYYY-MM for file naming.
     if ts_ms <= 0 {
         return "0000-00".into();
     }
     let secs = ts_ms / 1000;
     let days = secs / 86_400;
-    // Civil-from-days algorithm (Hinnant 2014) — gregorian, valid for
-    // -32768 ≤ year ≤ 32767. Avoids the Y2038 wraparound that hits
-    // 32-bit time_t.
+    // Civil-from-days (Hinnant 2014); avoids the Y2038 wraparound of 32-bit time_t.
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
@@ -198,7 +171,6 @@ fn ymd_month(ts_ms: i64) -> String {
     format!("{:04}-{:02}", y_final, m)
 }
 
-/// Glob matcher — supports `*` suffix wildcard only (e.g. `mission.*`).
 fn matches_glob(pattern: &str, kind: &str) -> bool {
     match pattern.strip_suffix('*') {
         Some(prefix) => kind.starts_with(prefix),
@@ -251,9 +223,8 @@ mod tests {
             serde_json::json!({"timestamp_ms": 1_000}),
         ))
         .unwrap();
-        // Don't fall behind the wall clock — `event_ts_ms` uses the max
-        // of payload + wall clock so the durable record matches the
-        // bus's view; we just assert there's at least one entry.
+        // `event_ts_ms` uses the event's own timestamp when nonzero, else the clock; just assert
+        // one entry exists.
         let (entries, _) = r.replay(0, None, None).unwrap();
         assert!(!entries.is_empty());
         let _ = fs::remove_dir_all(&r.root);
@@ -288,9 +259,7 @@ mod tests {
 
     #[test]
     fn ymd_month_correct_for_known_dates() {
-        // 2024-01-01 00:00:00 UTC = 1704067200 secs
         assert_eq!(ymd_month(1_704_067_200_000), "2024-01");
-        // 2026-05-29 ≈ now during ship; should be at least 2026-05.
         assert_eq!(ymd_month(1_748_500_000_000), "2025-05");
     }
 
