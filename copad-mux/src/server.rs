@@ -1,17 +1,13 @@
-//! The headless mux **server**: owns the [`App`] (authoritative `State` + PTYs),
-//! binds the shared socket, serves both one-shot `ctl` requests and streaming client
-//! attachments, and keeps running across client detaches so shells survive the
-//! terminal that launched them. Started implicitly by [`crate::client`] or explicitly
-//! via `copad-mux server`.
+//! The headless mux server: owns the [`App`] (authoritative `State` + PTYs), binds the shared
+//! socket, serves one-shot `ctl` requests and streaming client attachments, and keeps running
+//! across client detaches so shells survive the terminal that launched them.
 //!
-//! Ownership is atomic: a would-be server takes an exclusive `flock` on
-//! `<runtime>/lock`; only the lock holder may unlink a stale socket + bind (no
-//! TOCTOU race between competing starts). Same-uid peers only (`getpeereid`).
+//! Ownership is atomic: a would-be server takes an exclusive `flock` on `<runtime>/lock`; only
+//! the lock holder may unlink a stale socket and bind. Same-uid peers only (`getpeereid`).
 //!
-//! Multiple clients may attach at once (tmux-style shared view): the app is sized to
-//! the SMALLEST attached client so all of them see the whole thing, one composite is
-//! broadcast to every client (each diffed against its own baseline), and all share
-//! input. Detach (`Ctrl-b d`) removes only the client that pressed it.
+//! Several clients may attach at once (tmux-style shared view): the app is sized to the SMALLEST
+//! one, one composite is broadcast (each client diffed against its own baseline), and input is
+//! shared. Detach (`Ctrl-b d`) removes only the client that pressed it.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -33,23 +29,15 @@ use crate::proto::{ClientMsg, FrameMsg, Replaces, ServerMsg, WireCell};
 use crate::tui::{App, KeyAction};
 use copad_mux_proto::{self as l0, Feature, PubMsg, SubMsg};
 
-/// ~30 Hz max frame cadence: the loop wakes at least this often to check for changes,
-/// but only COMPOSES a frame when a dirty signal fired since the last render (PTY
-/// `Wakeup`, input, chrome-data change, clock rollover) — an idle attached session
-/// composes nothing. The per-client buffer diff then keeps the wire delta minimal.
+/// ~30 Hz max frame cadence: the loop wakes this often but only COMPOSES a frame when a dirty
+/// signal fired since the last render, so an idle attached session composes nothing.
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 /// The fastest the attached terminals' bell is rung on a pane's behalf.
 const BELL_INTERVAL: Duration = Duration::from_secs(1);
 
-/// Loop cadence while **no client is attached**. With nobody watching there is no
-/// frame to compose, so waking 30 times a second only pays for the loop body itself —
-/// which a detached server does for as long as it lives (days, for a server whose
-/// panes outlive the terminal that launched them). Slowing to this interval keeps the
-/// server responsive to the things that still matter while detached — a client
-/// attaching, a `ctl` request, a pane exiting, and the agent-status sweep that drives
-/// turn notifications (itself already throttled to 500 ms) — because each of those
-/// arrives as a channel message that wakes `recv_timeout` immediately rather than
-/// waiting out the tick.
+/// Loop cadence while **no client is attached**: nothing to compose, so waking 30 times a second
+/// only pays for the loop body. What still matters while detached (an attach, a `ctl` request, a
+/// pane exiting) arrives as a channel message that wakes `recv_timeout` immediately.
 const IDLE_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How often the chrome/label sweep runs while a client is attached. It enumerates
@@ -57,22 +45,15 @@ const IDLE_INTERVAL: Duration = Duration::from_millis(500);
 /// server — measured at ~1.5% of a core on its own.
 const LABEL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// The same sweep while **detached**. Nothing renders the labels it produces; its one
-/// remaining consumer is the agent-turn notifier, for which a couple of seconds of
-/// extra latency on a desktop toast is imperceptible. This is what keeps a server
-/// that sits detached for days from burning a CPU percent the whole time.
+/// The same sweep while **detached**: its one remaining consumer is the agent-turn notifier,
+/// for which a couple of seconds of extra latency is imperceptible.
 const IDLE_LABEL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// How long a full **baseline resync** pass takes: the walk that re-establishes, band by
-/// band, what the server believes each client holds. Far slower than the silent repaint
-/// (`reconcile_secs`) because the two cost wildly different amounts. A repaint ships a flag
-/// and the client re-emits cells it already has; a resync band ships every cell in those rows
-/// as ndjson with full per-cell style — tens of kilobytes for a large screen. So the cheap
-/// signal runs on the user-visible cadence and the expensive one trickles.
-///
-/// It exists because the two failure modes live on opposite sides of the client's buffer: a
-/// repaint fixes a buffer-vs-screen divergence but would faithfully re-emit a buffer that is
-/// itself wrong, which is what a resync fixes.
+/// How long a full **baseline resync** pass takes: the walk that re-establishes, band by band,
+/// what the server believes each client holds. Far slower than the silent repaint
+/// (`reconcile_secs`): a repaint ships a flag, a resync band ships every cell in its rows as
+/// ndjson with full style. A repaint fixes a buffer-vs-screen divergence but would faithfully
+/// re-emit a buffer that is itself wrong, which is what a resync fixes.
 const RESYNC_PASS: Duration = Duration::from_secs(60);
 
 /// Silence after which a client that opted into heartbeats is detached (decisions #167).
@@ -91,14 +72,11 @@ const REPLY_HARD: usize = REPLY_QUEUE * 2;
 /// Bands a [`RESYNC_PASS`] is split into, so no single frame carries a whole screen.
 const RESYNC_BANDS: u16 = 8;
 
-/// A message funneled to the single-writer main loop from a connection thread.
 enum Incoming {
-    /// A one-shot control request + its reply channel.
     Ctl {
         req: control::Req,
         reply: Sender<control::Resp>,
     },
-    /// A streaming client opened (its first line was `attach`).
     Attach {
         id: u64,
         cols: u16,
@@ -113,32 +91,35 @@ enum Incoming {
         heartbeat: bool,
         replaces: Option<Replaces>,
     },
-    /// A forwarded message from an attached client.
-    Client { id: u64, msg: ClientMsg },
-    /// A client connection closed.
-    Disconnect { id: u64 },
-    /// An L0 host API subscriber connected (decisions #166).
+    Client {
+        id: u64,
+        msg: ClientMsg,
+    },
+    Disconnect {
+        id: u64,
+    },
     Subscribe {
         id: u64,
         outbox: std::sync::Arc<hostapi::Outbox>,
         conn: UnixStream,
     },
-    /// A line from a subscriber.
-    Sub { id: u64, msg: SubMsg },
-    /// A subscriber's connection ended (EOF, write failure, or stall).
-    SubGone { id: u64 },
+    Sub {
+        id: u64,
+        msg: SubMsg,
+    },
+    SubGone {
+        id: u64,
+    },
 }
 
-/// The currently-attached streaming client (v1: at most one at a time).
 struct Client {
     id: u64,
     out: SyncSender<ServerMsg>,
     /// A clone of the socket, shut down on detach so the client (and the server's
     /// own reader thread) unblock even if `Bye` couldn't be queued.
     conn: UnixStream,
-    /// The buffer the client is known to hold (diff baseline). Advanced only when a
-    /// frame is actually enqueued, so a dropped (channel-full) frame re-diffs and
-    /// catches up without desync.
+    /// The buffer the client is known to hold (diff baseline), advanced only when a frame is
+    /// actually enqueued, so a dropped frame re-diffs and catches up.
     last: Buffer,
     /// The next frame must be a `full` baseline repaint (set on attach + resize). MUST
     /// be paired with `last = empty` so the diff yields every cell.
@@ -151,7 +132,6 @@ struct Client {
     /// The cursor position the client last received, so a cursor-only move (no cell
     /// change) still gets shipped instead of leaving a stale cursor.
     last_cursor: Option<(u16, u16)>,
-    /// The cursor `(visible, shape)` that frame carried.
     last_look: (bool, u8),
     /// This client's OWN `Ctrl-b` prefix state — per-connection so a chord can't span
     /// clients when input is shared.
@@ -159,44 +139,28 @@ struct Client {
     epoch: u64,
     cols: u16,
     rows: u16,
-    /// When this client is next due a silent full repaint (`reconcile_secs`). Set forward
-    /// on every repaint AND on every baseline reset, so a `full` frame — which already puts
-    /// every cell on screen — doesn't get a redundant repaint right behind it.
+    /// When this client is next due a silent full repaint (`reconcile_secs`); set forward on
+    /// every repaint AND baseline reset, since a `full` frame already puts every cell on screen.
     repaint_at: Instant,
-    /// When this client's next baseline-resync band is due (see [`RESYNC_PASS`]).
     resync_at: Instant,
-    /// Which band the resync walk is on; wraps at the bottom of the screen.
     resync_band: u16,
-    /// This client process's pid, when advertised at attach — the walk-up start for
-    /// raising its terminal window after a notification jump.
     pid: Option<u32>,
     /// This client's refreshed session vars (tmux `update-environment`), sent right after
     /// attach via [`ClientMsg::Env`]. Adopted as the pane-spawn env source when this client's
     /// input is dispatched, so a pane it creates inherits ITS live SSH/display session.
     env: Vec<(String, String)>,
-    /// Text awaiting delivery to this client as a `Copy` (OSC 52) — from its own drag-selection
-    /// or from a pane program's OSC 52 write. Held here and retried each loop because the frame
-    /// channel is cap-1: a drag redraw may be queued when the copy is ready, so `try_send` can
-    /// transiently fail.
-    ///
-    /// The `u64` is a clipboard sequence ([`term::next_clipboard_seq`]) and BOTH sources draw
-    /// from it, so latest-wins is decided by when the copy was actually produced. Without it, a
-    /// pane that writes the clipboard every tick would overwrite — and with backpressure, starve
-    /// — an undelivered drag copy that happened later.
+    /// Text awaiting delivery as a `Copy` (OSC 52), from a drag-selection or a pane program's OSC
+    /// 52 write; retried each loop because the frame channel is cap-1. The `u64` is a clipboard
+    /// sequence ([`term::next_clipboard_seq`]) both sources draw from, so latest-wins is decided
+    /// by when the copy was produced; otherwise a pane writing every tick would starve a later,
+    /// undelivered drag copy.
     pending_copy: Option<(u64, String)>,
-    /// Whether this client's terminal has focus (assumed until it says otherwise).
     focused: bool,
-    /// The title last sent to this client, and one waiting out channel backpressure.
     last_title: Option<String>,
     pending_title: Option<String>,
-    /// A bell waiting to be rung on this client's terminal.
     pending_bell: bool,
-    /// The binding tag it reported (`ClientMsg::Env::host_tag`): how a host UI finds this
-    /// attachment in the L0 `clients` topic (decisions #166).
     tag: Option<String>,
-    /// It pings; detach it after [`HEARTBEAT_EXPIRY`] of silence (decisions #167).
     heartbeat: bool,
-    /// When it last sent anything.
     last_seen: Instant,
     /// Its terminal draws kitty graphics (`ClientMsg::Graphics`): the images it holds and was
     /// last told to show (decisions #194). `None` = frames carry no images for it.
@@ -205,27 +169,21 @@ struct Client {
     /// Drained before frames; bounded by admission in [`handle_command`].
     replies: std::collections::VecDeque<ServerMsg>,
     reply_bytes: usize,
-    /// The reply queue hit [`REPLY_HARD`]: pruned on the next drain.
     overflowed: bool,
 }
 
-/// What a client's `attach` line said about itself: its id (server-minted), the terminal
-/// size to open at, and its own pid (for window raising). Grouped so the per-connection
-/// thread takes one parameter for the connection's identity rather than four.
+/// What a client's `attach` line said about itself: its id (server-minted), the size to open at,
+/// and its pid (for window raising).
 struct AttachInfo {
     id: u64,
     cols: u16,
     rows: u16,
     pid: Option<u32>,
-    /// Refuse before registering unless the server is this incarnation (decisions #166).
     expect_incarnation: Option<String>,
     heartbeat: bool,
     replaces: Option<Replaces>,
 }
 
-/// Per-connection handshake config threaded from [`run`] to each attaching client: the
-/// server's authoritative mouse setting plus the `update_environment` variable names
-/// advertised in `Hello` (tmux `update-environment`). Cheap to clone (one `bool` + an `Arc`).
 #[derive(Clone)]
 struct AttachCfg {
     mouse: bool,
@@ -263,8 +221,6 @@ fn peer_uid(stream: &UnixStream) -> Option<u32> {
     (rc == 0).then_some(uid)
 }
 
-/// Take the exclusive server lock (held for the process lifetime). `Err(AddrInUse)`
-/// when another server already holds it — the caller should exit quietly.
 fn acquire_lock(path: &Path) -> io::Result<File> {
     // The lock file is a pure flock anchor — never read/written, so don't truncate.
     let f = OpenOptions::new()
@@ -282,8 +238,6 @@ fn acquire_lock(path: &Path) -> io::Result<File> {
     Ok(f)
 }
 
-/// Prepare the private runtime dir (0700) unless the caller manages the socket path
-/// via `$COPAD_MUX_SOCK`; returns `(socket_path, lock_path)`.
 fn prepare_paths() -> io::Result<(PathBuf, PathBuf)> {
     let sock = socket_path();
     if std::env::var_os("COPAD_MUX_SOCK").is_none() {
@@ -295,23 +249,18 @@ fn prepare_paths() -> io::Result<(PathBuf, PathBuf)> {
     Ok((sock, lock))
 }
 
-/// Try to take the server's exclusive flock WITHOUT starting a server. `Some(guard)`
-/// means no server is running (and none can start while the returned file is held);
-/// `None` means a server currently owns it. Used by `comux worktree rm` to remove a
-/// worktree locally, race-free, when there's no server — without leaving one behind.
+/// Try to take the server's exclusive flock WITHOUT starting a server: `Some(guard)` = no server
+/// is running and none can start while it is held. Used by `comux worktree rm` to remove a
+/// worktree race-free.
 pub fn try_acquire_lock() -> Option<File> {
     let (_sock, lock_path) = prepare_paths().ok()?;
     acquire_lock(&lock_path).ok()
 }
 
-/// Run the server to completion (exits when its last shell exits, on `kill-server`,
-/// or if another server already owns the lock).
 pub fn run() -> io::Result<()> {
-    // Before anything opens a descriptor: lift the soft fd limit. A server inherits it
-    // from whatever spawned it, and macOS still defaults to 256 — which at ~5
-    // descriptors per pane wedges the server at ~48 panes, every later new-tab /
-    // new-session / split failing to spawn its shell. Best-effort by design: a kernel
-    // that refuses the raise still runs, just with fewer panes.
+    // Before anything opens a descriptor: lift the soft fd limit. A server inherits it from
+    // whatever spawned it and macOS defaults to 256, which at ~5 descriptors per pane wedges the
+    // server at ~48 panes. Best-effort.
     match crate::fdlimit::raise() {
         Ok((before, after)) if after > before => {
             eprintln!("comux: raised fd limit {before} -> {after}");
@@ -320,13 +269,11 @@ pub fn run() -> io::Result<()> {
         Err(e) => eprintln!("comux: could not raise fd limit: {e}"),
     }
     let (sock, lock_path) = prepare_paths()?;
-    // Atomic ownership: only the flock holder may touch the socket file.
     let _lock = match acquire_lock(&lock_path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => return Ok(()), // lost the race
         Err(e) => return Err(e),
     };
-    // Safe to clear a stale socket now — the lock guarantees we are the only server.
     let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock)?;
     let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
@@ -336,35 +283,27 @@ pub fn run() -> io::Result<()> {
             "COPAD_MUX_SOCK".to_string(),
             sock.to_string_lossy().to_string(),
         ),
-        // A tmux-`$TMUX`-style marker: set ONLY in shells spawned as comux panes, so a
-        // command run inside the mux (e.g. `comux worktree create`) can tell it is already
-        // attached and must not spawn a nested client. Distinct from `COPAD_MUX_SOCK`, which
-        // doubles as a user-facing socket override and so can't imply "inside comux".
+        // A `$TMUX`-style marker, set ONLY in comux panes, so a command run inside the mux (e.g.
+        // `comux worktree create`) knows it is attached and must not spawn a nested client.
+        // `COPAD_MUX_SOCK` can't serve: it doubles as a user-facing override.
         ("COPAD_MUX".to_string(), "1".to_string()),
     ];
-    // Load user config (~/.config/copad/mux.toml); surface any warnings to stderr
-    // (a foreground `copad-mux server` shows them — an auto-spawned server's stderr is
-    // /dev/null, so the client prints its own copy of the diagnostics too).
+    // Load user config; surface warnings to stderr (an auto-spawned server's stderr is /dev/null,
+    // so the client prints its own copy).
     let (cfg, warnings) = crate::config::MuxConfig::load();
     for w in &warnings {
         eprintln!("comux config: {w}");
     }
     let mouse = cfg.mouse;
-    // The variable names the server refreshes from each attaching client (tmux
-    // `update-environment`), advertised in every `Hello`. Shared read-only across
-    // connection threads.
     let env_names = std::sync::Arc::new(cfg.update_environment.clone());
-    // Capture the daemon's OWN (birth) values for those names, then scrub them from the
-    // daemon's environment. The snapshot seeds the first pane (so it's unchanged from
-    // today); the scrub means every LATER pane starts without the session the server was
-    // born in, receiving refreshed values only from the attaching client. This runs while
-    // still single-threaded — before `App::new` spawns PTY event-loop threads and before
-    // the accept/poll threads below — so mutating the process environment here is sound.
+    // Capture the daemon's OWN (birth) values for those names, then scrub them from its
+    // environment: the snapshot seeds the first pane, the scrub means every LATER pane gets
+    // refreshed values only from the attaching client. Runs while single-threaded (before
+    // `App::new` spawns PTY threads), so mutating the environment is sound.
     let mut boot_env: Vec<(String, String)> = Vec::new();
     for name in &cfg.update_environment {
-        // A non-UTF-8 value can't ride the String-typed pane env nor the client handshake,
-        // so it could never be refreshed anyway: skip it here, which ALSO skips the scrub
-        // below — leaving it in the daemon env (inherited as-is) so the boot pane keeps it.
+        // A non-UTF-8 value can't ride the String-typed pane env or the client handshake: skip
+        // it, which also skips the scrub so the boot pane keeps it.
         if let Some(val) = std::env::var_os(name)
             && let Ok(s) = val.into_string()
         {
@@ -376,16 +315,13 @@ pub fn run() -> io::Result<()> {
             }
         }
     }
-    // Second scrub, different contract: `never_inherit` names are agent SESSION markers
-    // (`CLAUDE_CODE_CHILD_SESSION` & co). They are removed from the daemon env and NOT
-    // recorded into `boot_env`, so unlike `update_environment` they don't seed the first /
-    // restored pane either — a server born inside a Claude Code session would otherwise mark
-    // every `claude` in every pane as a nested child, and Claude Code silently drops those
-    // transcripts (no `--resume` entry). Nothing re-injects them: `config::from_raw` keeps
-    // them out of `update_environment`, which is the only list a client can refresh.
-    // This is the AUTHORITATIVE scrub — it covers every launch path (auto-spawned server and
-    // a hand-run `comux server` alike) and runs before anything is spawned, so `spawn_server`
-    // deliberately does not filter its own child env.
+    // Second scrub: `never_inherit` names are agent SESSION markers (`CLAUDE_CODE_CHILD_SESSION`
+    // & co), removed from the daemon env and NOT recorded into `boot_env`. A server born inside a
+    // Claude Code session would otherwise mark every `claude` in every pane as a nested child,
+    // and Claude Code silently drops those transcripts. Nothing re-injects them
+    // (`config::from_raw` keeps them out of `update_environment`). This is the AUTHORITATIVE
+    // scrub, covering every launch path, so `spawn_server` deliberately does not filter its own
+    // child env.
     for name in &cfg.never_inherit {
         if std::env::var_os(name).is_some() {
             // SAFETY: single-threaded at this point — same ordering guarantee as above.
@@ -394,24 +330,13 @@ pub fn run() -> io::Result<()> {
             }
         }
     }
-    // Session persistence (continuum-style): a background writer autosaves the layout so a
-    // reboot/crash can restore it (App::new already restored on boot). Disabled when
-    // `persist = false` or `autosave_secs = 0`.
     let persist_enabled = cfg.persist;
     let autosave_on = cfg.autosave_secs > 0;
     let state_path = crate::persist::state_path();
-    // The writer exists whenever persistence is on (it also does the final save on
-    // kill-server); periodic autosaves only fire when `autosave_secs > 0`.
     let saver = persist_enabled.then(|| crate::persist::Saver::new(state_path.clone()));
     let autosave = Duration::from_secs(cfg.autosave_secs.max(1) as u64);
-    // Headless default size until the first client attaches (then reflowed).
     let mut app = App::new(80, 24, sock_env, boot_env, cfg)?;
-    // Kick off the background usage/limits poller (Claude 5h+weekly · Codex weekly)
-    // that feeds the status bar. Detached thread; `COPAD_MUX_USAGE=0` disables it.
     app.start_usage_poll();
-    // And the background GitHub-release update checker (status-bar `⬆ x.y.z`
-    // hint). Detached thread; `COPAD_MUX_UPDATE_CHECK=0` / `update_check = false`
-    // disables it.
     app.start_agent_poll();
     app.start_graph_poll();
     app.start_git_poll();
@@ -421,31 +346,23 @@ pub fn run() -> io::Result<()> {
     let (tx, rx) = mpsc::channel::<Incoming>();
     spawn_accept_loop(listener, tx, AttachCfg { mouse, env_names });
 
-    // Multiple clients may attach at once (tmux-style shared view). The app is sized
-    // to the SMALLEST attached client so everyone sees the whole thing; the same
-    // composite is broadcast to all (each with its own diff baseline).
     let mut clients: Vec<Client> = Vec::new();
-    // L0 host API subscribers + their chrome claims (decisions #166).
     let mut hub = Hub::default();
     let mut kill = false;
     let mut last_frame = Instant::now();
     let mut last_bell = Instant::now() - BELL_INTERVAL;
     let mut last_min = app.clock_minute();
     let mut last_save = Instant::now();
-    // Idle-skip: only compose+diff a frame when something that affects it changed since
-    // the last render (tmx-style). Start dirty so the first frame is always drawn.
+    // Idle-skip: only compose when something that affects the frame changed. Start dirty so the
+    // first frame is drawn.
     let mut dirty = true;
-    // Whether a client was attached on the previous iteration, so the detached -> attached
-    // edge can force a label sweep (see IDLE_LABEL_INTERVAL).
     let mut was_attached = false;
 
     loop {
-        // Detached (no clients) → idle cadence; anything that needs prompt handling
-        // still arrives as a message and interrupts the wait. L0 subscribers alone do not
-        // count as attached: copad's host and web-bridge stay subscribed for good, which
-        // kept a server nobody was looking at on the 100 ms tick and the 500 ms process
-        // sweep around the clock. Native chrome needs an attached client to claim, so with
-        // none attached a subscriber is a status board, for which a 500 ms publish is plenty.
+        // Detached (no clients) → idle cadence; anything needing prompt handling arrives as a
+        // message and interrupts the wait. L0 subscribers alone do not count as attached: copad's
+        // host and web-bridge stay subscribed for good, which kept a nobody-watching server on
+        // the 100 ms tick around the clock.
         let tick = if clients.is_empty() {
             IDLE_INTERVAL
         } else {
@@ -454,8 +371,6 @@ pub fn run() -> io::Result<()> {
         match rx.recv_timeout(tick) {
             Ok(msg) => {
                 dirty |= handle_incoming(msg, &mut app, &mut clients, &mut hub, &mut kill);
-                // Bound the drain so a key/ctl flood can't starve rendering, PTY
-                // reaping, or shutdown — fall back to the frame tick after a batch.
                 let mut budget = 256u32;
                 while budget > 0
                     && let Ok(m) = rx.try_recv()
@@ -473,8 +388,6 @@ pub fn run() -> io::Result<()> {
             flush_before_shutdown(&mut app, &mut clients);
             break;
         }
-        // Chrome a host draws: re-derive what the shared frame hides from who is attached
-        // and who claims them, BEFORE any frame is composed this pass (decisions #166).
         dirty |= hub.expire();
         dirty |= sync_host_chrome(&mut app, &mut clients, &mut hub);
         app.forget_overlays(&hub.prune_overlays());
@@ -484,28 +397,23 @@ pub fn run() -> io::Result<()> {
         if app.is_empty() {
             break;
         }
-        // Collect every dirty signal (err toward rendering; missing one shows stale).
         dirty |= reaped; // a reaped pane changed the layout
         dirty |= app.reconcile_popup();
         dirty |= app.reconcile_center();
         dirty |= app.reconcile_copy(); // copy mode's pane went away or swapped screens
-        // A client just attached after a detached stretch: the sweep has been running on
-        // the wide idle interval, so force one now instead of letting the first frame
-        // show tab labels and agent statuses that are seconds stale.
+        // A client just attached after a detached stretch: force a label sweep now instead of
+        // showing tab labels and agent statuses seconds stale.
         let attached = !clients.is_empty();
         app.set_attached(attached);
         if attached && !was_attached {
             app.invalidate_labels();
         }
         was_attached = attached;
-        // Sidebar/status data actually changed. Swept far less often while detached —
-        // see IDLE_LABEL_INTERVAL.
         dirty |= app.maybe_refresh_labels(if clients.is_empty() {
             IDLE_LABEL_INTERVAL
         } else {
             LABEL_INTERVAL
         });
-        // Again after the sweep: it can re-sort the switcher's agents under the selection.
         dirty |= app.reconcile_popup();
         dirty |= app.maybe_auto_roll_usage(); // usage carousel auto-advance (usage_rotate_secs)
         dirty |= app.maybe_expire_message(); // a status-bar message timed out
@@ -516,14 +424,11 @@ pub fn run() -> io::Result<()> {
         app.maybe_probe_session_dirs(); // re-check session start dirs off-loop (Ctrl-b c)
         let pane_dirty = app.drain_pane_dirty(); // a VISIBLE pane's screen advanced (PTY output)
         dirty |= pane_dirty;
-        // A full-screen app (nvim/less/htop/…) just ENTERED or LEFT the alternate screen:
-        // force a full repaint for every client so both the app's first screen and the
-        // restored primary screen are clean. Either grid swap is where incremental-diff
-        // residue shows (the client's unicode-width render desyncs from alacritty's grid on
-        // wide graphemes during the app's life) and is also a large wholesale change an outer
-        // terminal (Windows Terminal over SSH, a nested emulator) can drop cells on; a full
-        // frame is the proven residue-clear (same path as Ctrl-b r). Gated on `pane_dirty` so
-        // the per-pane alt-screen poll only runs when a pane actually advanced.
+        // A full-screen app just ENTERED or LEFT the alternate screen: force a full repaint for
+        // every client. Either grid swap is where incremental-diff residue shows and a large
+        // wholesale change an outer terminal can drop cells on; a full frame is the proven
+        // residue-clear (as Ctrl-b r). Gated on `pane_dirty` so the poll runs only when a pane
+        // advanced.
         if pane_dirty && app.take_alt_screen_transition() {
             for c in clients.iter_mut() {
                 c.needs_full = true;
@@ -533,22 +438,15 @@ pub fn run() -> io::Result<()> {
         }
         let min = app.clock_minute();
         dirty |= min != last_min; // status-bar HH:MM rolled over
-        // A frame dropped under backpressure (or a fresh attach) leaves the client
-        // behind; reschedule a render to catch it up.
         dirty |= clients.iter().any(|c| c.needs_full || c.pending);
         // A self-heal signal is due (silent repaint / resync band). This is the one dirty
         // source that fires with nothing on screen having changed — deliberately, since
         // residue is only visible when nothing is changing.
         dirty |= reconcile_due(&app, &clients);
-        // Deliver any pending drag-selection clipboard copies (OSC 52) BEFORE frames, so a
-        // one-shot copy takes priority for the cap-1 channel slot and can't be perpetually
-        // starved by sustained frame output. Non-blocking (a suspended client can't stall us):
-        // on `Full` it retries next loop; a delivered copy just delays that client's frame by
-        // one tick (which then re-sends as a normal delta).
-        // A pane program's OSC 52 write (nvim yank, a `yank` helper) goes to EVERY attached
-        // client, which re-emits it to its own terminal — tmux `set-clipboard` semantics.
-        // Unlike a drag-copy there is no originating client to target: the write came from
-        // inside the mux, so every viewer's clipboard is an equally valid destination.
+        // Deliver pending drag-selection copies (OSC 52) BEFORE frames so a one-shot copy gets the
+        // cap-1 channel slot and can't be starved by frame output. Non-blocking: on `Full` it
+        // retries next loop. A pane program's OSC 52 write goes to EVERY attached client (tmux
+        // `set-clipboard`): there is no originating client to target.
         if let Some((seq, text)) = app.drain_pane_clipboard() {
             for c in clients.iter_mut() {
                 queue_copy(c, seq, &text);
@@ -557,9 +455,6 @@ pub fn run() -> io::Result<()> {
         dirty |= expire_silent_clients(&mut app, &mut clients);
         drain_pending_replies(&mut app, &mut clients);
         drain_pending_copies(&mut app, &mut clients);
-        // tmux `bell-action any` + `set-titles`: ring every attached terminal when a pane
-        // rings (at most once a second — a `yes $'\a'` must not machine-gun the dock), and keep
-        // its title on the focused pane's.
         if app.take_new_bells() && last_bell.elapsed() >= BELL_INTERVAL {
             last_bell = Instant::now();
             for c in clients.iter_mut() {
@@ -574,11 +469,7 @@ pub fn run() -> io::Result<()> {
             }
         }
         drain_pending_notices(&mut app, &mut clients);
-        // Focus follows membership too: a client attaching (assumed focused), detaching or
-        // being pruned changes "is any terminal showing this focused" as surely as a focus
-        // event does. No clients = nobody looking = unfocused. Cheap when nothing changed.
         app.set_outer_focus(clients.iter().any(|c| c.focused));
-        // L0 publication: changed topics into every subscriber's slots, plus events.
         if hub.due() {
             let (values, notifs) = topic_values(&app, &hub, &clients);
             let flashes = app.take_flashes();
@@ -596,9 +487,8 @@ pub fn run() -> io::Result<()> {
             push_frames(&mut app, &mut clients);
             dirty = false;
         }
-        // Periodic autosave: hand a fresh snapshot to the off-loop writer. Reset the timer
-        // from now (not fixed cadence) so a delayed loop can't trigger catch-up bursts.
-        // Read-only, so it does NOT set `dirty` (never defeats the idle-skip).
+        // Periodic autosave: hand a fresh snapshot to the off-loop writer, timer reset from now
+        // so a delayed loop can't trigger catch-up bursts. Read-only: does NOT set `dirty`.
         if autosave_on
             && let Some(saver) = &saver
             && last_save.elapsed() >= autosave
@@ -608,12 +498,10 @@ pub fn run() -> io::Result<()> {
         }
     }
 
-    // Persist on shutdown. On an explicit `kill-server` (not a last-shell exit, which empties
-    // the app) the latest layout is pushed as the writer's LAST item and the writer is joined
-    // — one writer, so renames are serialized and the newest snapshot wins (no race with a
-    // separate save). Bounded (3s total) so a hung/networked filesystem can't strand the
-    // process holding its flock; on that pathology we exit and rely on the last autosave.
-    // Otherwise just stop the writer.
+    // Persist on shutdown. On an explicit `kill-server` the latest layout is the writer's LAST
+    // item and the writer is joined (one writer: renames are serialized, newest wins). Bounded
+    // (3s) so a hung filesystem can't strand the process holding its flock; then we rely on the
+    // last autosave. Otherwise just stop the writer.
     match saver {
         Some(s) if kill && persist_enabled && !app.is_empty() => {
             s.finish(app.snapshot(), Duration::from_secs(3));
@@ -625,14 +513,12 @@ pub fn run() -> io::Result<()> {
         detach_client(c);
     }
     let _ = std::fs::remove_file(&sock);
-    // Exit NOW instead of returning (which would drop `app` → every `PaneTerm::drop` joins
-    // its PTY io-thread; a single wedged shell would then hang teardown forever, leaving a
-    // live process + held flock + no socket — blocking restart). The save + socket removal
-    // are done; the OS reaps the threads/PTYs and releases the flock on exit.
+    // Exit NOW instead of returning: dropping `app` joins every PTY io-thread, and one wedged
+    // shell would hang teardown forever, leaving a live process + held flock + no socket. The
+    // save and socket removal are done.
     std::process::exit(0);
 }
 
-/// The render attachments as the host API sees them.
 fn attach_views(clients: &[Client]) -> Vec<hostapi::AttachView> {
     clients
         .iter()
@@ -645,8 +531,6 @@ fn attach_views(clients: &[Client]) -> Vec<hostapi::AttachView> {
         .collect()
 }
 
-/// Every L0 topic, freshly computed and serialized (plus the notifications value itself,
-/// which the publisher also reads for `notify` events).
 fn topic_values(
     app: &App,
     hub: &Hub,
@@ -750,7 +634,6 @@ fn handle_command(
     mutates
 }
 
-/// Deliver queued replies ahead of frames, without blocking; a vanished client is pruned.
 fn drain_pending_replies(app: &mut App, clients: &mut Vec<Client>) {
     let mut dead: Vec<u64> = clients
         .iter()
@@ -800,8 +683,6 @@ fn flush_before_shutdown(app: &mut App, clients: &mut Vec<Client>) {
     }
 }
 
-/// Detach clients that promised heartbeats and went silent (a suspended phone). Returns
-/// whether any went.
 fn expire_silent_clients(app: &mut App, clients: &mut Vec<Client>) -> bool {
     let silent: Vec<u64> = clients
         .iter()
@@ -811,8 +692,6 @@ fn expire_silent_clients(app: &mut App, clients: &mut Vec<Client>) -> bool {
     prune_dead_clients(app, clients, &silent)
 }
 
-/// If `client`'s host draws overlays, hand it every overlay `client`'s input just opened
-/// (decisions #170); they never reach the shared frame.
 fn delegate_overlays(app: &mut App, hub: &mut Hub, client: u64, before: crate::tui::OverlayMarks) {
     // `Ctrl-b e` from a client whose sidebar its host draws: that host focuses it (#181).
     if app.take_sidebar_focus_request()
@@ -839,8 +718,6 @@ fn delegate_overlays(app: &mut App, hub: &mut Hub, client: u64, before: crate::t
     }
 }
 
-/// Hand overlays an answer opened straight to subscriber `sub` (no marks diff: they never
-/// were TUI state).
 fn send_overlays(
     app: &mut App,
     hub: &mut Hub,
@@ -857,8 +734,6 @@ fn send_overlays(
     }
 }
 
-/// Re-send each host-drawn overlay whose off-loop data landed (decisions #172), under its
-/// own id, to the host showing it.
 fn resend_delegated(app: &mut App, hub: &mut Hub) {
     for (ov, spec) in app.poll_delegated() {
         if let Some((sub, client)) = hub.overlay_owner(ov)
@@ -882,7 +757,6 @@ fn adopt_client_env(app: &mut App, clients: &[Client], client: u64) {
     }
 }
 
-/// One line from a subscriber. Returns whether it may have changed what is rendered.
 fn handle_sub(
     id: u64,
     msg: SubMsg,
@@ -950,7 +824,6 @@ fn handle_sub(
             choice,
             text,
         } => {
-            // Only the host the overlay was handed to may answer it.
             match hub.take_overlay(id, overlay, &attach_views(clients)) {
                 Some((true, client)) => {
                     adopt_client_env(app, clients, client);
@@ -967,7 +840,6 @@ fn handle_sub(
                     app.forget_overlays(&[overlay]);
                     false
                 }
-                // Not this subscriber's overlay: someone else's stays untouched.
                 None => false,
             }
         }
@@ -976,7 +848,6 @@ fn handle_sub(
             what,
             target,
         } => {
-            // Only the host that draws this attachment's overlays may open them for it.
             let attached = clients.iter().any(|c| c.id == attachment);
             let res = if attached && hub.host_of(attachment, Feature::Overlays) == Some(id) {
                 adopt_client_env(app, clients, attachment);
@@ -1000,10 +871,9 @@ fn handle_sub(
     }
 }
 
-/// Re-derive the shared viewport = the SMALLEST attached client (min cols, min rows),
-/// resize the app to it, and — if the size changed — force a full repaint to every
-/// client. With no clients attached the size freezes (G3). Returns nothing; callers
-/// push frames afterwards.
+/// Re-derive the shared viewport = the SMALLEST attached client (min cols, min rows), resize the
+/// app to it, and force a full repaint to every client if the size changed. With no clients the
+/// size freezes.
 fn recompute_viewport(app: &mut App, clients: &mut [Client]) {
     if clients.is_empty() {
         return; // detached: freeze at the last size
@@ -1020,8 +890,6 @@ fn recompute_viewport(app: &mut App, clients: &mut [Client]) {
     }
 }
 
-/// Accept connections forever, assigning each a unique (never-reused) id and a
-/// handler thread that funnels into `tx`.
 fn spawn_accept_loop(listener: UnixListener, tx: Sender<Incoming>, cfg: AttachCfg) {
     std::thread::spawn(move || {
         let next_id = AtomicU64::new(1);
@@ -1034,8 +902,6 @@ fn spawn_accept_loop(listener: UnixListener, tx: Sender<Incoming>, cfg: AttachCf
     });
 }
 
-/// Read a connection's first line to select its role: `ctl` (one-shot request/reply)
-/// or `attach` (streaming client). Rejects cross-uid peers.
 fn handle_conn(stream: UnixStream, id: u64, tx: Sender<Incoming>, cfg: AttachCfg) {
     // Fail CLOSED: reject cross-uid peers AND peers whose credentials can't be
     // established (this socket permits input injection, takeover, and shutdown).
@@ -1053,7 +919,6 @@ fn handle_conn(stream: UnixStream, id: u64, tx: Sender<Incoming>, cfg: AttachCfg
     if first.is_empty() {
         return;
     }
-    // A `{"cmd":…}` line is a control request; a `{"t":"attach",…}` opens a stream.
     if let Ok(req) = serde_json::from_str::<control::Req>(&first) {
         serve_ctl(Some(req), reader, stream, tx);
     } else if let Ok(ClientMsg::Attach {
@@ -1092,9 +957,9 @@ fn handle_conn(stream: UnixStream, id: u64, tx: Sender<Incoming>, cfg: AttachCfg
     }
 }
 
-/// An L0 host API subscriber (decisions #166): register an outbox with the main loop, run
-/// its writer on its own thread, and forward every line it sends. The main loop queues the
-/// welcome + snapshot before the subscriber can receive anything else.
+/// An L0 host API subscriber (decisions #166): register an outbox with the main loop, run its
+/// writer on its own thread, and forward every line it sends. The main loop queues the welcome
+/// and snapshot before the subscriber can receive anything else.
 fn serve_sub(id: u64, mut reader: BufReader<UnixStream>, stream: UnixStream, tx: Sender<Incoming>) {
     let Ok(conn) = stream.try_clone() else { return };
     let outbox = hostapi::Outbox::new();
@@ -1138,14 +1003,12 @@ fn serve_sub(id: u64, mut reader: BufReader<UnixStream>, stream: UnixStream, tx:
     let _ = tx.send(Incoming::SubGone { id });
 }
 
-/// The longest line a subscriber may send (a `cmd` carrying a `send --paste` is the big one).
 const MAX_SUB_LINE: usize = 4 << 20;
 
 fn json<T: serde::Serialize>(v: T) -> String {
     serde_json::to_string(&v).unwrap_or_else(|_| "{\"ok\":false}".to_string())
 }
 
-/// One-shot control loop: for each request line, round-trip through the main loop.
 fn serve_ctl(
     mut pending: Option<control::Req>,
     mut reader: BufReader<UnixStream>,
@@ -1193,8 +1056,6 @@ fn serve_ctl(
     }
 }
 
-/// Streaming client session: register, spawn a writer thread draining frames to the
-/// socket, and forward every subsequent `ClientMsg` to the main loop.
 fn serve_client(
     info: AttachInfo,
     mut reader: BufReader<UnixStream>,
@@ -1226,11 +1087,7 @@ fn serve_client(
         let _ = writeln!(writer, "{}", json(&refused));
         return;
     }
-    // A clone the main loop can shut down to force-detach this client reliably.
     let Ok(conn) = writer.try_clone() else { return };
-    // Server-authoritative handshake FIRST (before any frame): tell the client whether
-    // to enable mouse capture (the server owns the effective setting) and which env vars
-    // to send back (tmux `update-environment`).
     let hello = ServerMsg::Hello {
         mouse: cfg.mouse,
         update_environment: (*cfg.env_names).clone(),
@@ -1301,13 +1158,9 @@ fn serve_client(
     let _ = writer_handle.join();
 }
 
-/// Drop a departing client's pid from the window-raise candidates.
-///
-/// Called on EVERY removal path (key detach, explicit detach, disconnect, dead-client
-/// prune) — not just disconnect. A client removed by one of the other paths never reaches
-/// the `Disconnect` arm's bookkeeping (its late `Disconnect` finds no client and no-ops),
-/// so its exited pid would otherwise stay the newest candidate forever and shadow the
-/// client that is still attached.
+/// Drop a departing client's pid from the window-raise candidates. Called on EVERY removal path:
+/// a client removed by a path other than disconnect never reaches the `Disconnect` bookkeeping,
+/// so its exited pid would stay the newest candidate and shadow the client still attached.
 fn forget_client(app: &mut App, c: &Client) {
     if let Some(p) = c.pid {
         app.forget_client_pid(p);
@@ -1332,34 +1185,26 @@ fn ctl_mutates(req: &control::Req) -> bool {
             | control::Req::ListSessions
             | control::Req::Health
             | control::Req::Host
-            // Read-only, and the one verb callers POLL. Treating it as a mutation would
-            // mark the render dirty on every poll and defeat the loop's idle skip — the
-            // detached-CPU throttle exists precisely to stop that kind of busy-work.
+            // Read-only, and the one verb callers POLL: marking it a mutation would dirty the
+            // render on every poll and defeat the idle skip.
             | control::Req::CapturePane { .. }
-            // Polled by a host's switcher preview.
             | control::Req::PanePreview { .. }
             // Also read-only and also polled (by `wait-agent`); it reads CACHED labels and
             // statuses, so it neither sweeps processes nor touches a PTY.
             | control::Req::ListAgents { .. }
-            // Polled by a host's graph panel; reads the poller's published graphs only.
             | control::Req::Graph { .. }
             | control::Req::ListTree { .. }
-            // Read-only, and pollable (`marks --json`).
             | control::Req::Marks
-            // Inbox traffic is polled by `inbox --wait` and draws nothing.
             | control::Req::Inbox { .. }
             | control::Req::Deliver { .. }
             // Sent on every statusline refresh. What it changes reaches the screen through
             // the agent sweep's own change detection, like any other agent reading.
             | control::Req::AgentReport { .. }
-            // Push registrations draw nothing.
             | control::Req::PushRegister { .. }
             | control::Req::PushUnregister { .. }
     )
 }
 
-/// Apply one funneled message to the app / clients on the single-writer loop. Returns
-/// whether it changed anything the render depends on (so the loop composes a frame).
 fn handle_incoming(
     msg: Incoming,
     app: &mut App,
@@ -1369,8 +1214,6 @@ fn handle_incoming(
 ) -> bool {
     match msg {
         Incoming::Subscribe { id, outbox, conn } => {
-            // Someone is about to look at the agents list: don't hand them a sweep that is
-            // seconds old because the server was idle.
             app.invalidate_labels();
             let (values, _) = topic_values(app, hub, clients);
             hub.add(
@@ -1425,7 +1268,6 @@ fn handle_incoming(
             {
                 prune_dead_clients(app, clients, &[attachment]);
             }
-            // Shared attach: ADD the client (no takeover), then re-fit to the smallest.
             clients.push(Client {
                 id,
                 out,
@@ -1467,7 +1309,6 @@ fn handle_incoming(
             true // a new client needs a (full) frame
         }
         Incoming::Client { id, msg } => {
-            // Only accept from a currently-attached client (ignore stale ids).
             let Some(c) = clients.iter_mut().find(|c| c.id == id) else {
                 return false;
             };
@@ -1518,8 +1359,6 @@ fn handle_incoming(
                     if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
                         c.tag = host_tag.filter(|t| !t.is_empty());
                     }
-                    // tmux update-environment: store this client's session vars and adopt
-                    // them now, so the next pane it spawns inherits its live SSH/display env.
                     let pid = clients.iter().find(|c| c.id == id).and_then(|c| c.pid);
                     if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
                         c.env = vars.clone();
@@ -1533,25 +1372,21 @@ fn handle_incoming(
                     false
                 }
                 ClientMsg::Key(k) => {
-                    // Any key input ends an in-progress drag-selection (the user moved on).
                     app.clear_selection();
                     // A pane spawned by THIS client's key must inherit THIS client's env
                     // (not whichever client attached last) — adopt it before dispatch (C4).
                     if let Some(e) = clients.iter().find(|c| c.id == id).map(|c| c.env.clone()) {
                         app.set_client_env(e);
                     }
-                    // All attached clients share input (tmux-style), but each carries
-                    // its OWN prefix state so a `Ctrl-b` from one client can't be
-                    // completed by another's key. Detach removes ONLY the client that
-                    // pressed the chord; the others keep going.
+                    // All attached clients share input, but each carries its OWN prefix state so
+                    // a `Ctrl-b` from one cannot be completed by another's key. Detach removes
+                    // ONLY the client that pressed the chord.
                     let mut action = KeyAction::Continue;
                     let marks = app.overlay_marks();
                     app.set_key_client_native_sidebar(hub.host_of(id, Feature::Sidebar).is_some());
                     if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
                         action = app.feed_key(k, &mut c.prefix);
                         app.set_key_client_native_sidebar(false);
-                        // A copy-mode yank goes to the client whose key it was, exactly like
-                        // the text a drag-release returns.
                         if let Some(text) = app.take_key_copy() {
                             queue_copy(c, crate::term::next_clipboard_seq(), &text);
                         }
@@ -1563,17 +1398,13 @@ fn handle_incoming(
                                 let gone = clients.remove(pos);
                                 forget_client(app, &gone);
                                 detach_client(gone);
-                                // Reap the departing client's owned overlays (a menu it
-                                // opened must not linger capturing others' input).
                                 app.clear_selection_of(ClientId(id));
                                 app.close_menu_of(ClientId(id));
                                 recompute_viewport(app, clients);
                             }
                         }
-                        // Force a full repaint to the client that asked: clear its diff
-                        // baseline so the next frame carries EVERY cell and is flagged
-                        // `full` (the client then clears its terminal). Fixes drift/ghosts
-                        // from a resize, alt-screen transition, or a nested emulator.
+                        // Force a full repaint to the client that asked: clear its diff baseline so
+                        // the next frame carries EVERY cell, flagged `full`.
                         KeyAction::Redraw => {
                             if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
                                 c.needs_full = true;
@@ -1598,7 +1429,6 @@ fn handle_incoming(
                     if let Some(c) = clients.iter_mut().find(|c| c.id == id) {
                         action = app.feed_paste(&text, &mut c.prefix);
                         app.set_key_client_native_sidebar(false);
-                        // Replayed keys can yank in copy mode; the copy is this client's.
                         if let Some(text) = app.take_key_copy() {
                             queue_copy(c, crate::term::next_clipboard_seq(), &text);
                         }
@@ -1617,16 +1447,14 @@ fn handle_incoming(
                     true
                 }
                 ClientMsg::Mouse { x, y, kind } => {
-                    // Scroll the pane under the cursor / click-to-focus / drag-select — shared,
-                    // so any client's wheel drives the one composite. A drag-release returns the
-                    // selected pane text, which we hand back to THIS client to copy (OSC 52).
+                    // Scroll / click-to-focus / drag-select on the shared composite. A
+                    // drag-release returns the selected pane text, handed back to THIS client (OSC 52).
                     let marks = app.overlay_marks();
                     if let Some(text) = app.mouse_at(ClientId(id), x, y, kind)
                         && let Some(c) = clients.iter_mut().find(|c| c.id == id)
                     {
                         queue_copy(c, crate::term::next_clipboard_seq(), &text);
                     }
-                    // A context-menu item can open a prompt (rename tab/session).
                     delegate_overlays(app, hub, id, marks);
                     true
                 }
@@ -1643,7 +1471,6 @@ fn handle_incoming(
                         let gone = clients.remove(pos);
                         forget_client(app, &gone);
                         detach_client(gone);
-                        // Same overlay reaping as the key-detach / disconnect paths.
                         app.clear_selection_of(ClientId(id));
                         app.close_menu_of(ClientId(id));
                         recompute_viewport(app, clients);
@@ -1667,8 +1494,6 @@ fn handle_incoming(
             if let Some(pos) = clients.iter().position(|c| c.id == id) {
                 let gone = clients.remove(pos);
                 forget_client(app, &gone);
-                // Drop a drag-selection / context menu the departing client owned (no
-                // live owner to finish them).
                 app.clear_selection_of(ClientId(id));
                 app.close_menu_of(ClientId(id));
                 recompute_viewport(app, clients);
@@ -1681,30 +1506,22 @@ fn handle_incoming(
 /// Remove clients whose writer thread has gone away (their `out` channel reported
 /// `Disconnected`), clean up any overlays they still owned, and re-fit the viewport.
 ///
-/// This is the recovery for a HALF-DEAD connection: when a client's socket dies such
-/// that writes fail but the reader thread stays blocked in `read_line` (no EOF), the
-/// `Disconnect` message from `serve_client` never arrives. Without this, the dead client
-/// lingers in `clients` and its (often smaller) size permanently pins `recompute_viewport`'s
-/// `min()`, so the shared view can never grow past the stale client — the very bug this fixes.
-/// A `Disconnected` sender is an unambiguous signal: the writer thread only ends on a write
-/// failure or after sending `Bye` (a clean detach, which already removed the client), so
-/// pruning here is always correct.
+/// Recovery for a HALF-DEAD connection: writes fail but the reader stays blocked in `read_line`
+/// (no EOF), so no `Disconnect` arrives and the dead client's (often smaller) size would pin
+/// `recompute_viewport`'s `min()` forever. The writer only ends on a write failure or after
+/// `Bye` (a clean detach, already removed), so pruning here is always correct.
 fn prune_dead_clients(app: &mut App, clients: &mut Vec<Client>, dead: &[u64]) -> bool {
     if dead.is_empty() {
         return false;
     }
-    // Tear each dead client DOWN via `detach_client` (socket `shutdown`), not a bare drop:
-    // the matching reader thread in `serve_client` holds its OWN dup of the socket, so
-    // dropping only the server's `conn` clone leaves it blocked forever in `read_line` on
-    // the half-dead fd (a thread leak). `shutdown(Both)` unblocks it so it exits — its late
-    // `Disconnect` then finds no client and is a harmless no-op. The `Bye` try_send inside
-    // `detach_client` also just fails (the channel is already `Disconnected`), which is fine.
+    // Tear each dead client DOWN via `detach_client` (socket `shutdown`), not a bare drop: the
+    // reader thread in `serve_client` holds its OWN dup of the socket and would block forever in
+    // `read_line` on the half-dead fd (a thread leak). Its late `Disconnect` then no-ops.
     let mut i = 0;
     while i < clients.len() {
         if dead.contains(&clients[i].id) {
             let c = clients.remove(i);
             forget_client(app, &c);
-            // Drop any drag-selection / context menu the departing client owned.
             app.clear_selection_of(ClientId(c.id));
             app.close_menu_of(ClientId(c.id));
             detach_client(c);
@@ -1713,15 +1530,11 @@ fn prune_dead_clients(app: &mut App, clients: &mut Vec<Client>, dead: &[u64]) ->
         }
     }
     recompute_viewport(app, clients);
-    // A prune can turn a frame that was ALREADY SENT into a lie. The status bar's `^b` is
-    // composed from "some attached client is mid-chord", so pruning the client that held the
-    // prefix leaves every survivor painted with an indicator belonging to nobody — and both
-    // prune sites run at points where `dirty` has already been decided, so nothing would
-    // repaint it. `App::prefix_armed` is what the last composed frame said; when it no longer
-    // matches the pruned list, flag the survivors so the loop composes one more frame
-    // (`dirty |= clients.iter().any(|c| c.needs_full || c.pending)`). Terminating: each prune
-    // strictly shrinks `clients`. Centralized here rather than at the call sites so a future
-    // prune path cannot reintroduce the stuck indicator.
+    // A prune can turn an already-SENT frame into a lie: the status bar's `^b` is composed from
+    // "some attached client is mid-chord", so pruning the prefix holder leaves every survivor
+    // painted with an indicator belonging to nobody, and `dirty` was already decided. When
+    // `App::prefix_armed` no longer matches the pruned list, flag the survivors so the loop
+    // composes one more frame. Centralized here so a new prune path cannot reintroduce it.
     if app.prefix_armed() != clients.iter().any(|c| c.prefix.is_armed()) {
         for c in clients.iter_mut() {
             c.pending = true;
@@ -1730,9 +1543,6 @@ fn prune_dead_clients(app: &mut App, clients: &mut Vec<Client>, dead: &[u64]) ->
     true
 }
 
-/// Try to deliver each client's pending drag-selection copy (OSC 52) without blocking. The
-/// frame channel is cap-1 and shared with frames, so a `Copy` can transiently fail to enqueue;
-/// leave it pending (retry next tick) on `Full`, prune the client on `Disconnected`.
 fn drain_pending_copies(app: &mut App, clients: &mut Vec<Client>) {
     let mut dead = Vec::new();
     for c in clients.iter_mut() {
@@ -1750,8 +1560,6 @@ fn drain_pending_copies(app: &mut App, clients: &mut Vec<Client>) {
     prune_dead_clients(app, clients, &dead);
 }
 
-/// Deliver pending bells and titles like copies: non-blocking, retried while the cap-1
-/// channel is full, a vanished client pruned.
 fn drain_pending_notices(app: &mut App, clients: &mut Vec<Client>) {
     let mut dead = Vec::new();
     for c in clients.iter_mut() {
@@ -1774,23 +1582,18 @@ fn drain_pending_notices(app: &mut App, clients: &mut Vec<Client>) {
 }
 
 /// Queue `text` for delivery to `c` as an OSC 52 copy, keeping only the LATEST by clipboard
-/// sequence. The clipboard has one slot, so an older copy must never displace a newer one —
-/// which is exactly what an unguarded assignment does when a pane writes the clipboard on
-/// the same tick a drag copy is still waiting out channel backpressure.
+/// sequence: an older copy must never displace a newer one (an unguarded assignment does when a
+/// pane writes the clipboard on the tick a drag copy is waiting out backpressure).
 fn queue_copy(c: &mut Client, seq: u64, text: &str) {
     if c.pending_copy.as_ref().is_none_or(|(prev, _)| seq > *prev) {
         c.pending_copy = Some((seq, text.to_string()));
     }
 }
 
-/// A cell value no compose path can produce, used to mark part of a client's baseline
-/// "unknown" so the next diff re-sends every cell there — **including the blanks**.
-///
-/// Wiping the band to `Buffer::empty` instead would defeat the whole point: an empty cell
-/// equals the blank a compose produces, so the diff would skip exactly the position whose
-/// stale glyph we are trying to clear — and "a cell that should be blank keeps showing its
-/// old glyph" is the reported symptom. A NUL symbol can't collide with real content:
-/// `snapshot_grid` coerces pane graphemes and the chrome writes printable text.
+/// A cell value no compose path can produce, marking part of a client's baseline "unknown" so
+/// the next diff re-sends every cell there, including blanks. Wiping the band to `Buffer::empty`
+/// would skip exactly the position whose stale glyph we are clearing, since an empty cell equals
+/// the blank a compose produces. A NUL symbol can't collide with real content.
 fn unknown_cell() -> Cell {
     let mut c = Cell::EMPTY;
     c.set_symbol("\u{0}");
@@ -1812,7 +1615,6 @@ fn resync_band_rows(rows: u16, i: u16) -> Option<(u16, u16)> {
     Some((y0, h.min(rows - y0)))
 }
 
-/// Mark `h` rows of `last` unknown from `y0` down (see [`unknown_cell`]).
 fn invalidate_band(last: &mut Buffer, y0: u16, h: u16) {
     for y in y0..y0.saturating_add(h) {
         for x in 0..last.area.width {
@@ -1837,26 +1639,21 @@ fn reconcile_due(app: &App, clients: &[Client]) -> bool {
         .any(|c| now >= c.repaint_at || now >= c.resync_at)
 }
 
-/// Render the app ONCE and broadcast the changed cells (or a full baseline) to every
-/// attached client — each diffed against its OWN last-sent buffer, so a freshly
-/// attached client gets a full frame while up-to-date ones get small deltas. No-op
-/// with no clients (the server renders only for someone watching).
-/// Server-wide client ids for images (decisions #194).
 static IMAGE_IDS: std::sync::LazyLock<std::sync::Mutex<crate::images::ImageIds>> =
     std::sync::LazyLock::new(Default::default);
 
+/// Render the app ONCE and broadcast the changed cells (or a full baseline) to every attached
+/// client, each diffed against its OWN last-sent buffer. No-op with no clients.
 fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
     if clients.is_empty() {
         return;
     }
-    // The prefix is per-client state, but the composed frame is shared, so the status
-    // bar's `^b` indicator shows whether ANY client is mid-chord. Recomputed here rather
-    // than pushed from the key path because a client can also leave the prefix armed and
-    // then detach — reading the live client list each frame can't go stale.
+    // The prefix is per-client but the composed frame is shared, so the status bar's `^b` shows
+    // whether ANY client is mid-chord. Recomputed from the live list each frame so a client that
+    // armed it and detached cannot leave it stuck.
     let armed = clients.iter().any(|c| c.prefix.is_armed());
     app.set_prefix_armed(armed);
 
-    // Self-heal cadence, read live so `comux reload` changes it on the running server.
     let period = app.repaint_period();
     let now = Instant::now();
 
@@ -1870,7 +1667,6 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
     crate::term::set_graphics(clients.iter().any(|c| c.images.is_some()), None);
     let image_runs = app.image_runs();
     let mut image_ids = IMAGE_IDS.lock().unwrap_or_else(|e| e.into_inner());
-    // Ids and encoded uploads are kept only for images on screen now.
     image_ids.retain(&image_runs.iter().map(|r| r.image.key).collect());
 
     let mut dead = Vec::new();
@@ -1879,24 +1675,19 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
             c.last = Buffer::empty(area);
             c.needs_full = true;
         }
-        // `comux reload` can shorten `reconcile_secs` under a client already waiting on a
-        // deadline computed from the OLD value, so cap it: going from an hour to 3s must not
-        // leave every attached client waiting out the hour. Growing the period just lets one
-        // already-due repaint fire early, after which the new cadence applies.
+        // `comux reload` can shorten `reconcile_secs` under a client waiting on a deadline from
+        // the OLD value, so cap it (hour -> 3s must not leave clients waiting out the hour).
         if let Some(p) = period {
             let cap = now + p;
             if c.repaint_at > cap {
                 c.repaint_at = cap;
             }
         }
-        // Baseline resync: forget what this client is believed to hold for one band of rows,
-        // so the diff below re-ships every cell in them. Skipped when a `full` frame is
-        // already pending — that re-ships the entire screen anyway.
+        // Baseline resync: forget what this client is believed to hold for one band of rows so
+        // the diff re-ships them. Skipped when a `full` frame is pending.
         if period.is_some() && !c.needs_full && !c.pending && now >= c.resync_at {
             let (band, next) = match resync_band_rows(rows, c.resync_band) {
                 Some(b) => (b, c.resync_band.saturating_add(1)),
-                // Past the bottom: wrap and take band 0 on this same tick, so the walk never
-                // spends an interval doing nothing.
                 None => (resync_band_rows(rows, 0).unwrap_or((0, 0)), 1),
             };
             invalidate_band(&mut c.last, band.0, band.1);
@@ -1904,32 +1695,24 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
             c.resync_at = now + RESYNC_PASS / u32::from(RESYNC_BANDS);
         }
         let changed = c.last.diff(&buf);
-        // This client's images for this frame; committed only if the frame is queued.
         let mut images = c
             .images
             .as_ref()
             .map(|ci| ci.prepare(&image_runs, &mut image_ids, crate::images::CLIENT_BUDGET));
         let images_due = images.as_ref().is_some_and(|o| !o.is_empty());
-        // Silent full repaint due? Three gates, each removing a case where it is pointless or
-        // harmful:
-        //   * behind a `full` frame, which already repaints everything;
-        //   * to a client that did not get the LAST frame (`pending`) — it is already behind, and
-        //     a self-heal is a luxury, never something to pile onto a struggling client;
-        //   * on a frame that carries changed cells at all. A repaint exists for residue you are
-        //     LOOKING at, and while content is flowing the delta is already overwriting cells. It
-        //     also keeps a screenful of escapes out of a busy stream: the client writes to its
-        //     terminal synchronously, so padding an active stream is how one on a slow link ends
-        //     up blocked in `write` and late to forward the user's input.
-        // An idle attached screen has an empty delta most ticks, so this still heals within a
-        // second of anything pausing.
+        // Silent full repaint due? Gates: not behind a `full` frame (which repaints everything);
+        // not to a client that missed the LAST frame (`pending`: never pile onto a struggling
+        // client); and not on a frame carrying changed cells, since a repaint exists for residue
+        // you are LOOKING at and padding an active stream can block a client on a slow link in
+        // `write`, late to forward input. An idle screen has an empty delta most ticks, so it
+        // still heals within a second of anything pausing.
         let repaint = period.is_some()
             && !c.needs_full
             && !c.pending
             && changed.is_empty()
             && now >= c.repaint_at;
-        // Send when cells changed, a baseline is due, a repaint is due, OR the cursor moved.
-        // A repaint alone is a ~60-byte line carrying no cells, which is the point: it asks
-        // the client to re-emit what it already holds.
+        // Send when cells changed, a baseline is due, a repaint is due, OR the cursor moved. A
+        // repaint alone is a ~60-byte line carrying no cells: it asks the client to re-emit.
         if changed.is_empty()
             && !c.needs_full
             && !repaint
@@ -1937,13 +1720,10 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
             && cursor == c.last_cursor
             && look == c.last_look
         {
-            // Nothing to say — and that also settles a client marked `pending`. `pending` means
-            // it did not receive the LAST frame, but `c.last` was never advanced for that frame,
-            // so an empty diff against it proves the client's content is already current: the
-            // dropped frame was superseded. Leaving the flag set would be a live-lock, because
-            // `dirty |= any(pending)` keeps the loop composing every tick while the repaint and
-            // resync gates (both `!c.pending`) guarantee nothing is ever sent to clear it. A
-            // dropped EMPTY repaint frame is exactly that case.
+            // Nothing to say, which also settles a client marked `pending`: `c.last` was never
+            // advanced for the dropped frame, so an empty diff against it proves the client is
+            // current. Leaving the flag set would live-lock, since `dirty |= any(pending)` keeps
+            // composing while the repaint and resync gates (`!c.pending`) never send to clear it.
             c.pending = false;
             continue;
         }
@@ -1969,7 +1749,6 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
             drops: images.as_ref().map(|o| o.drops.clone()).unwrap_or_default(),
         };
         match c.out.try_send(ServerMsg::Frame(frame)) {
-            // Advance this client's baseline only once it actually has the frame.
             Ok(()) => {
                 if let (Some(ci), Some(out)) = (c.images.as_mut(), images) {
                     ci.commit(out);
@@ -1987,11 +1766,9 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
                 c.last_cursor = cursor;
                 c.last_look = look;
             }
-            // Coalesced under backpressure: the client did NOT get this frame. Leave
-            // `last` un-advanced (so the next diff is the delta that catches it up) and
-            // just flag it pending so the main loop reschedules a render. Do NOT set
-            // needs_full — that would send a `full` frame carrying only a delta and wipe
-            // the client's buffer.
+            // Coalesced under backpressure: the client did NOT get this frame. Leave `last`
+            // un-advanced (the next diff is the delta that catches it up) and flag it pending.
+            // Do NOT set needs_full: that would send a `full` frame carrying only a delta.
             Err(TrySendError::Full(_)) => {
                 c.pending = true;
                 // A self-heal is best-effort: charge a failed repaint to the clock so a client
@@ -2002,15 +1779,13 @@ fn push_frames(app: &mut App, clients: &mut Vec<Client>) {
                     c.repaint_at = now + p;
                 }
             }
-            // The writer thread is gone: the socket died with writes failing while the
-            // reader thread stayed blocked (no `Disconnect` will arrive). Prune it below so
-            // its size stops pinning the shared viewport.
+            // The writer thread is gone (no `Disconnect` will arrive): prune below so its size
+            // stops pinning the shared viewport.
             Err(TrySendError::Disconnected(_)) => dead.push(c.id),
         }
     }
-    // Pruning here also re-checks the just-sent frame against the surviving clients: this
-    // loop only discovers a half-dead client DURING delivery, i.e. after composing from a
-    // list that still contained it. See `prune_dead_clients`.
+    // Pruning here also re-checks the just-sent frame against the survivors: a half-dead client is
+    // only discovered DURING delivery. See `prune_dead_clients`.
     prune_dead_clients(app, clients, &dead);
 }
 
@@ -2027,17 +1802,13 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    /// Keeps the peer ends of a test client's channel + socket alive: while held the frame
-    /// sender stays connected, so a client is "live"; dropping the guard closes the receiver
-    /// and its `out` sender reports `Disconnected` on the next send — a half-dead connection
-    /// whose writer thread has gone away.
+    /// Keeps the peer ends of a test client's channel + socket alive. Dropping the guard closes
+    /// the receiver so the client's `out` sender reports `Disconnected`: a half-dead connection.
     struct ClientGuard {
         _rx: mpsc::Receiver<ServerMsg>,
         _peer: UnixStream,
     }
 
-    /// Build a minimal `Client` at `(cols, rows)` plus its liveness guard. Drop the guard
-    /// to simulate the writer thread dying (frame receiver gone) without an EOF/`Disconnect`.
     fn test_client(id: u64, cols: u16, rows: u16) -> (Client, ClientGuard) {
         let (out, rx) = mpsc::sync_channel::<ServerMsg>(1);
         let (conn, peer) = UnixStream::pair().expect("socketpair");
@@ -2108,7 +1879,6 @@ mod tests {
         }
         let sessions = app.host_tree().sessions.len();
         assert_eq!(sessions, 1 + super::REPLY_QUEUE);
-        // The client has not read a single reply: the next one is refused, not run.
         super::handle_command(
             1,
             "over".into(),
@@ -2128,7 +1898,6 @@ mod tests {
         };
         assert_eq!(id, "over");
         assert_eq!(resp["code"], "busy");
-        // Draining delivers the oldest first.
         super::drain_pending_replies(&mut app, &mut clients);
         let first = guard._rx.try_recv().unwrap();
         assert!(
@@ -2182,7 +1951,6 @@ mod tests {
             Some("drag selection")
         );
 
-        // A genuinely later write does win — the clipboard has one slot.
         super::queue_copy(&mut c, 6, "later pane write");
         assert_eq!(
             c.pending_copy.as_ref().map(|(_, t)| t.as_str()),
@@ -2193,7 +1961,6 @@ mod tests {
     #[test]
     fn a_backpressured_copy_stays_pending_and_keeps_its_sequence() {
         let (mut c, guard) = test_client(1, 80, 24);
-        // Fill the cap-1 channel so the copy's `try_send` reports `Full`.
         c.out
             .try_send(ServerMsg::Copy {
                 text: "occupant".into(),
@@ -2223,7 +1990,6 @@ mod tests {
         drop(guard);
     }
 
-    /// The rendered status bar (the frame's last row) as a plain string.
     fn status_row(app: &App) -> String {
         let (cols, rows) = app.size();
         let mut buf = Buffer::empty(RRect::new(0, 0, cols, rows));
@@ -2237,9 +2003,8 @@ mod tests {
 
     #[test]
     fn the_status_bar_flags_an_armed_prefix_and_clears_it_again() {
-        // The prefix is per-CLIENT state that the shared frame cannot see, so `push_frames`
-        // has to fold it into the App each tick. Without that the `^b` mode indicator would
-        // never appear — and, worse, could stick after the client that armed it went away.
+        // The prefix is per-CLIENT state the shared frame cannot see, so `push_frames` folds it
+        // into the App each tick; otherwise `^b` would never appear, or stick after the client left.
         let (mut cfg, _) = MuxConfig::load_from(std::path::Path::new("/nonexistent/mux.toml"));
         cfg.persist = false;
         let mut app = App::new(80, 24, Vec::new(), Vec::new(), cfg).expect("app");
@@ -2256,7 +2021,6 @@ mod tests {
             status_row(&app)
         );
 
-        // The chord completed (or the key was not bound): the flag must go with it.
         clients[1].prefix = crate::tui::Prefix::default();
         push_frames(&mut app, &mut clients);
         assert!(
@@ -2265,8 +2029,6 @@ mod tests {
             status_row(&app)
         );
 
-        // Armed again, then that client vanishes without ever resolving the chord — the
-        // indicator is recomputed from the live client list, so it cannot outlive them.
         clients[1].prefix = crate::tui::Prefix::armed();
         push_frames(&mut app, &mut clients);
         assert!(status_row(&app).contains("^b"));
@@ -2279,10 +2041,9 @@ mod tests {
         );
     }
 
-    /// A client removed by the dead-client PRUNE never reaches the `Disconnect` arm (its
-    /// late `Disconnect` finds no client and no-ops), so if the prune didn't clear its pid
-    /// the exited terminal would stay the newest raise candidate and shadow the client that
-    /// is still attached — notification clicks would stop raising anything.
+    /// A client removed by the dead-client PRUNE never reaches the `Disconnect` arm, so if the
+    /// prune didn't clear its pid the exited terminal would stay the newest raise candidate and
+    /// shadow the client still attached: notification clicks would stop raising anything.
     #[test]
     fn pruning_a_dead_client_drops_its_raise_candidate() {
         let (mut cfg, _) = MuxConfig::load_from(std::path::Path::new("/nonexistent/mux.toml"));
@@ -2309,11 +2070,9 @@ mod tests {
 
     #[test]
     fn pruning_the_client_that_held_the_prefix_reschedules_a_frame() {
-        // The nastier version of the same stuck-indicator risk: a client is only discovered
-        // to be half-dead (writer gone, no `Disconnect`) DURING delivery, which is after the
-        // frame was composed from a list that still contained it. If that client held the
-        // prefix, every survivor has just been painted a `^b` belonging to nobody — and with
-        // the loop about to clear `dirty`, nothing would ever repaint it.
+        // A client is only discovered to be half-dead DURING delivery, after the frame was
+        // composed from a list that still contained it. If it held the prefix, every survivor was
+        // just painted a `^b` belonging to nobody, and nothing would repaint it.
         let (mut cfg, _) = MuxConfig::load_from(std::path::Path::new("/nonexistent/mux.toml"));
         cfg.persist = false;
         let mut app = App::new(80, 24, Vec::new(), Vec::new(), cfg).expect("app");
@@ -2332,7 +2091,6 @@ mod tests {
              the prune just invalidated"
         );
 
-        // That rescheduled frame is what actually clears it.
         push_frames(&mut app, &mut clients);
         assert!(
             !status_row(&app).contains("^b"),
@@ -2343,10 +2101,6 @@ mod tests {
 
     #[test]
     fn the_clipboard_delivery_path_also_unsticks_the_prefix() {
-        // `drain_pending_copies` is the OTHER place a half-dead client is discovered, and it
-        // runs AFTER the loop has already decided `dirty` — so pruning the prefix-holder
-        // there is just as capable of stranding a lit `^b` on the survivors. Hence the
-        // invalidation lives in `prune_dead_clients`, not at one call site.
         let (mut cfg, _) = MuxConfig::load_from(std::path::Path::new("/nonexistent/mux.toml"));
         cfg.persist = false;
         let mut app = App::new(80, 24, Vec::new(), Vec::new(), cfg).expect("app");
@@ -2370,18 +2124,14 @@ mod tests {
 
     #[test]
     fn dead_client_is_pruned_so_the_viewport_can_grow() {
-        // Regression: a half-dead client (writer gone, no `Disconnect`) used to linger in
-        // the client list and pin `recompute_viewport`'s `min()` at its small size forever,
-        // so the shared view could never grow. `push_frames` must now prune it on the
-        // `Disconnected` send and re-fit to the remaining (larger) client.
-        // A non-existent path yields the built-in defaults (the private `default()` isn't
-        // reachable here); persistence off so we boot a fresh workspace and never restore
-        // the user's saved sessions.
+        // Regression: a half-dead client (writer gone, no `Disconnect`) lingered in the client list
+        // and pinned `recompute_viewport`'s `min()` at its small size forever. `push_frames` must
+        // prune it on the `Disconnected` send and re-fit. A non-existent config path yields the
+        // defaults, and persistence is off so the user's saved sessions are never restored.
         let (mut cfg, _) = MuxConfig::load_from(std::path::Path::new("/nonexistent/mux.toml"));
         cfg.persist = false;
         let mut app = App::new(80, 24, Vec::new(), Vec::new(), cfg).expect("app");
 
-        // A live client that wants a big view, and a dead one stuck at a small size.
         let (big, _big_guard) = test_client(1, 200, 60);
         let (small, small_guard) = test_client(2, 80, 24);
         drop(small_guard); // the small client's writer is gone — it's now half-dead
@@ -2452,7 +2202,6 @@ mod tests {
         App::new(80, 24, Vec::new(), Vec::new(), cfg).expect("app")
     }
 
-    /// Drain whatever `push_frames` enqueued for a client, newest last.
     fn drain(rx: &mpsc::Receiver<ServerMsg>) -> Vec<crate::proto::FrameMsg> {
         let mut out = Vec::new();
         while let Ok(m) = rx.try_recv() {
@@ -2482,7 +2231,6 @@ mod tests {
                 "rows={rows} not tiled exactly once: {covered:?}"
             );
             assert!(i <= super::RESYNC_BANDS, "rows={rows} used {i} bands");
-            // Past the last band the walk reports exhaustion so the caller wraps to 0.
             assert!(super::resync_band_rows(rows, i).is_none());
         }
         assert_eq!(
@@ -2494,10 +2242,9 @@ mod tests {
 
     #[test]
     fn a_resync_band_resends_cells_that_are_blank() {
-        // THE point of the sentinel. The reported symptom is a stale glyph sitting where the
-        // truth is a BLANK, so a resync that only re-sends non-blank cells would walk right
-        // past it. Wiping the band to `Buffer::empty` instead of `unknown_cell` does exactly
-        // that, because an empty cell equals the blank the compose produces.
+        // THE point of the sentinel: a stale glyph sitting where the truth is a BLANK. Wiping the
+        // band to `Buffer::empty` instead of `unknown_cell` would skip it, because an empty cell
+        // equals the blank the compose produces.
         let area = RRect::new(0, 0, 4, 2);
         let blank = Buffer::empty(area); // what the server composed: all blanks
         let mut baseline = blank.clone(); // what the client is believed to hold: same
@@ -2532,12 +2279,10 @@ mod tests {
         c.last = Buffer::empty(RRect::new(0, 0, 80, 24));
         let mut clients = vec![c];
 
-        // Bring the client fully up to date first (its baseline is empty, the app is not).
         push_frames(&mut app, &mut clients);
         let _ = drain(&guard._rx);
         assert!(!clients[0].needs_full, "the catch-up frame landed");
 
-        // Nothing changed, but the repaint clock is due.
         clients[0].repaint_at = Instant::now() - Duration::from_secs(1);
         push_frames(&mut app, &mut clients);
         let frames = drain(&guard._rx);
@@ -2586,11 +2331,9 @@ mod tests {
     #[test]
     fn a_dropped_repaint_does_not_live_lock_the_render_loop() {
         // `pending` means the client missed the LAST frame, and `dirty |= any(pending)` keeps the
-        // loop composing until it is cleared. But the repaint and resync gates are both
-        // `!c.pending`, and an up-to-date client's diff is empty — so nothing would ever be sent
-        // to clear it and the server would recompose at the frame rate forever. A dropped EMPTY
-        // repaint frame walks straight into that, which is why the nothing-to-say path settles
-        // the flag: an empty diff against an un-advanced baseline PROVES the client is current.
+        // loop composing until it is cleared. The repaint and resync gates are both `!c.pending`
+        // and an up-to-date client's diff is empty, so only the nothing-to-say path can settle it:
+        // an empty diff against an un-advanced baseline PROVES the client is current.
         let mut app = test_app(3);
         let (mut c, guard) = test_client(1, 80, 24);
         c.needs_full = false;
@@ -2599,7 +2342,6 @@ mod tests {
         push_frames(&mut app, &mut clients); // catch the client up
         let _ = drain(&guard._rx);
 
-        // A repaint comes due while the client's cap-1 queue is already occupied.
         clients[0].repaint_at = Instant::now() - Duration::from_secs(1);
         clients[0]
             .out
@@ -2612,7 +2354,6 @@ mod tests {
             "a failed repaint is charged to the clock, so a stuck client is retried next              interval rather than every tick"
         );
 
-        // The queue drains; nothing on screen changed.
         let _ = drain(&guard._rx);
         push_frames(&mut app, &mut clients);
         assert!(
@@ -2627,10 +2368,9 @@ mod tests {
 
     #[test]
     fn the_self_heal_never_ticks_when_it_is_switched_off_or_nobody_is_watching() {
-        // `reconcile_due` is the only dirty source that fires with the screen unchanged, so it
-        // is also the only one that could keep an idle server composing forever. Both guards
-        // matter: `reconcile_secs = 0` (user opted out) and no clients (detached, which the
-        // CPU throttle depends on).
+        // `reconcile_due` is the only dirty source that fires with the screen unchanged, so it is
+        // the only one that could keep an idle server composing forever: both `reconcile_secs = 0`
+        // and no clients (the detached CPU throttle) must keep it false.
         let off = test_app(0);
         let (mut c, _g) = test_client(1, 80, 24);
         c.repaint_at = Instant::now() - Duration::from_secs(60);

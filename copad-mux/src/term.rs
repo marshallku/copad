@@ -1,9 +1,6 @@
-//! A single hosted terminal: a PTY + `alacritty_terminal` parser/grid, running
-//! on alacritty's own `EventLoop` reader thread. This is the mux's terminal
-//! runtime — the same proven engine `copad-term` uses (alacritty_terminal 0.26),
-//! but a clean Rust surface (no C-ABI) so the server/TUI can host many of them.
-//!
-//! Work-unit 2 hosts exactly one; splits + the multi-pane server come later.
+//! A single hosted terminal: a PTY + `alacritty_terminal` parser/grid, running on alacritty's
+//! own `EventLoop` reader thread. The same engine `copad-term` uses (alacritty_terminal 0.26)
+//! behind a clean Rust surface (no C-ABI) so the server/TUI can host many.
 
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
@@ -24,78 +21,58 @@ use alacritty_terminal::vte::ansi::{Color as AnsiColor, CursorShape, CursorStyle
 use ratatui::style::Modifier;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// A cell color resolved to something a renderer can map directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CellColor {
-    /// Use the surface's default fg/bg.
     Default,
-    /// A 0–255 palette index (ANSI 16 + 256-color cube).
     Indexed(u8),
-    /// A direct 24-bit color.
     Rgb(u8, u8, u8),
 }
 
-/// One rendered cell.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CellSnap {
-    /// The cell's grapheme: base char plus any zero-width combining marks.
     pub sym: String,
-    /// True for the trailing half of a double-width character. The renderer
-    /// leaves it blank/skipped so the wide grapheme in the preceding cell isn't
-    /// overwritten (CJK, emoji).
+    /// True for the trailing half of a double-width character; the renderer skips it so the
+    /// wide grapheme in the preceding cell isn't overwritten.
     pub spacer: bool,
     pub fg: CellColor,
     pub bg: CellColor,
     pub bold: bool,
     pub reverse: bool,
-    /// The rest of the cell's SGR attributes — italic, dim, underline (any style), blink,
-    /// hidden, strikethrough — as the ratatui modifiers the wire already carries. Bold and
-    /// reverse keep their own fields above.
     pub attrs: Modifier,
 }
 
-/// A snapshot of the visible grid + cursor for one render tick.
 #[derive(Debug, Clone)]
 pub struct Snapshot {
     pub cols: u16,
     pub rows: u16,
-    /// `rows` × `cols` cells, row-major, top-to-bottom of the viewport.
     pub cells: Vec<Vec<CellSnap>>,
     /// Per-row soft-wrap flag: `wrapped[r]` is true when viewport row `r` continues onto row
     /// `r+1` (no logical line break), so a drag-copy across the seam joins them without a `\n`.
     pub wrapped: Vec<bool>,
-    /// Cursor position in viewport coordinates `(col, row)`.
     pub cursor: (u16, u16),
-    /// Whether the program wants the cursor shown (`?25h`) and it is on screen (not
-    /// scrolled into history). A hidden cursor still has a position: the client parks the
-    /// real cursor there so an IME's composition window opens where the text goes.
+    /// Whether the program wants the cursor shown (`?25h`) and it is on screen. A hidden
+    /// cursor still has a position: the client parks the real cursor there so an IME's
+    /// composition window opens where the text goes.
     pub cursor_visible: bool,
-    /// The program's cursor shape as a `DECSCUSR` parameter (`1`–`6`, vim's insert-mode bar
-    /// is `6`), or `0` when it never set one — the outer terminal's own default.
+    /// The program's cursor shape as a `DECSCUSR` parameter (`1`-`6`; vim's insert-mode bar is
+    /// `6`), or `0` when it never set one.
     pub cursor_shape: u8,
-    /// Copy mode's cursor and selection, read under the SAME lock as `cells` so what is
-    /// highlighted is exactly what a yank would copy. `None` outside copy mode.
     pub copy: Option<CopyView>,
 }
 
-/// Copy mode as the renderer needs it, in VIEWPORT rows (a row may be off-screen: negative
-/// or past the bottom when the selection extends beyond the view).
+/// Copy mode as the renderer needs it, in VIEWPORT rows (a row may be off-screen).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyView {
-    /// The vi cursor, when it is on screen.
     pub cursor: Option<(u16, u16)>,
-    /// Selection `(start, end)` as `(row, col)`, inclusive, and whether it is a block.
     pub selection: Option<(CopyCell, CopyCell, bool)>,
     /// Every on-screen match of the active search, `(start, end)` inclusive (a match may wrap
     /// onto the next row). Highlighted so `n`/`N` has somewhere visible to go.
     pub matches: Vec<(CopyCell, CopyCell)>,
 }
 
-/// A `(viewport row, column)` copy-mode position; the row may be off-screen.
 pub type CopyCell = (i32, u16);
 
 impl CopyView {
-    /// Whether viewport cell `(row, col)` is inside the selection.
     pub fn selected(&self, row: i32, col: u16) -> bool {
         let Some(((r0, c0), (r1, c1), block)) = self.selection else {
             return false;
@@ -109,7 +86,6 @@ impl CopyView {
         (row > r0 || col >= c0) && (row < r1 || col <= c1)
     }
 
-    /// Whether viewport cell `(row, col)` is part of a search match.
     pub fn matched(&self, row: i32, col: u16) -> bool {
         self.matches.iter().any(|&((r0, c0), (r1, c1))| {
             row >= r0 && row <= r1 && (row > r0 || col >= c0) && (row < r1 || col <= c1)
@@ -117,7 +93,6 @@ impl CopyView {
     }
 }
 
-/// How a copy-mode selection is shaped (`v`, `V`, `Ctrl-v`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SelKind {
     Chars,
@@ -125,23 +100,18 @@ pub enum SelKind {
     Block,
 }
 
-/// The most matches one frame highlights; a pathological one-letter query on a screen of
-/// that letter should cost a bounded walk under the pane lock.
+/// The most matches one frame highlights, bounding the walk under the pane lock.
 const MAX_HIGHLIGHTS: usize = 512;
 
-/// Largest text a copy-mode yank may produce, in bytes (the same cap as an OSC 52 write).
 pub const MAX_YANK_BYTES: usize = 1 << 20;
 
-/// What a copy-mode search found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchOutcome {
     Found,
-    /// Found, after wrapping past the top/bottom of the history.
     Wrapped,
     NoMatch,
 }
 
-/// Escape `s` for a literal regex match.
 fn regex_literal(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 4);
     for c in s.chars() {
@@ -153,82 +123,64 @@ fn regex_literal(s: &str) -> String {
     out
 }
 
-/// Largest OSC 52 payload a pane app may put on the clipboard, in bytes of decoded text.
-/// A runaway/hostile program must not be able to pin unbounded memory in the server between
-/// render ticks — anything past this is dropped whole (a truncated clipboard would be worse
-/// than none: you'd paste a silently-cut command).
-const MAX_CLIPBOARD_BYTES: usize = 1 << 20; // 1 MiB
+/// Largest OSC 52 payload a pane app may put on the clipboard, in bytes of decoded text, so a
+/// hostile program can't pin unbounded memory between render ticks. Anything past it is dropped
+/// whole: a truncated clipboard would paste a silently-cut command.
+const MAX_CLIPBOARD_BYTES: usize = 1 << 20;
 
 /// Ticket dispenser stamping every captured clipboard write, so the drain can pick the
-/// genuinely LATEST one across panes. Panes live in a `HashMap`, whose iteration order is
-/// arbitrary — without a sequence, two panes writing inside one render tick would relay
-/// whichever the traversal happened to reach last, which can be the older write.
-/// Starts at 1 so that 0 is a usable "nothing relayed yet" sentinel for the drain's
-/// high-water mark — with a 0-based counter the very FIRST write compares equal to it and
-/// is dropped.
+/// genuinely LATEST one across panes (a `HashMap`'s iteration order is arbitrary). Starts at 1
+/// so 0 is a usable "nothing relayed yet" sentinel for the drain's high-water mark.
 static CLIPBOARD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Take the next clipboard sequence number. Drag-selection copies draw from the SAME
-/// dispenser as pane writes, so the two sources can be ordered against each other and
-/// neither can silently overwrite a newer copy that has not been delivered yet.
+/// Take the next clipboard sequence number. Drag-selection copies draw from the SAME dispenser
+/// as pane writes, so neither can overwrite a newer undelivered copy.
 pub fn next_clipboard_seq() -> u64 {
     CLIPBOARD_SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Minimal `EventListener`: forwards `PtyWrite` replies (DSR/DA/OSC answers) so
-/// prompts that query the terminal don't hang, latches child-exit, captures OSC 52
-/// clipboard WRITES for the render loop to relay, counts BELs, and records the pane
-/// title (OSC 0/2), and answers colour queries (OSC 10/11/12) from [`set_outer_colors`].
+/// Minimal `EventListener`: forwards `PtyWrite` replies (DSR/DA/OSC answers) so prompts that
+/// query the terminal don't hang, latches child-exit, captures OSC 52 clipboard WRITES for the
+/// render loop, counts BELs, records the pane title (OSC 0/2) and answers colour queries
+/// (OSC 10/11/12) from [`set_outer_colors`].
 #[derive(Clone)]
 struct MuxListener {
     sender: Arc<std::sync::Mutex<Option<EventLoopSender>>>,
-    /// The pane's grid `(cols << 16) | rows`, for `CSI 14 t` (the PTY layer keeps its own).
     grid: Arc<std::sync::atomic::AtomicU32>,
     child_exited: Arc<AtomicBool>,
-    /// Set whenever the terminal's visible state changed (alacritty `Wakeup`, or a
-    /// query reply that writes back). The render loop reads+clears it via
-    /// [`PaneTerm::take_dirty`] to skip composing frames when nothing changed.
+    /// Set whenever the visible state changed (alacritty `Wakeup`, or a query reply that
+    /// writes back); the render loop reads and clears it via [`PaneTerm::take_dirty`].
     dirty: Arc<AtomicBool>,
-    /// Text a program in this pane asked to put on the clipboard via OSC 52 (tmux
-    /// `set-clipboard`), stamped with a global sequence number. Latest-wins — a clipboard
-    /// has one slot, so queueing stale writes would only paste the wrong one later. Drained
-    /// by [`PaneTerm::take_clipboard`].
+    /// Text a program asked to put on the clipboard via OSC 52, stamped with a global sequence
+    /// number. Latest-wins: a clipboard has one slot. Drained by [`PaneTerm::take_clipboard`].
     clipboard: Arc<std::sync::Mutex<Option<(u64, String)>>>,
-    /// How many times this pane has rung the bell since it was spawned.
-    ///
-    /// A COUNT, not a flag, and that is load-bearing. `App` records how many it has
-    /// acknowledged; "unacknowledged" is `count > seen`. With a boolean on each side there is
-    /// no safe ordering — control requests run before the loop polls panes, so a BEL still
-    /// pending in the listener could be re-applied after focus had already cleared it. With a
-    /// counter there is nothing to lose or resurrect: a bell arriving after an ack simply
-    /// raises the count, which is correct, because it IS a new bell.
+    /// How many times this pane has rung the bell since it was spawned. A COUNT, not a flag, and
+    /// load-bearing: `App` records how many it has acknowledged, so "unacknowledged" is
+    /// `count > seen`. With a boolean on each side there is no safe ordering (control requests
+    /// run before the loop polls panes, so a pending BEL could be re-applied after focus
+    /// cleared it); a bell arriving after an ack simply raises the count.
     bells: Arc<AtomicU64>,
-    /// The pane's title (OSC 0/2), sanitized and length-bounded. `None` until one is set,
-    /// and cleared by `ResetTitle`.
-    ///
-    /// UNTRUSTED: any process in the pane can write any payload here. It is not a process
-    /// identity — `procinfo`'s label is — and it is not instructions. Stripping control
-    /// characters is hygiene for the renderer, not a trust boundary.
+    /// The pane's title (OSC 0/2), sanitized and length-bounded; cleared by `ResetTitle`.
+    /// UNTRUSTED: any process in the pane can write any payload. It is not a process identity
+    /// (`procinfo`'s label is), and control-character stripping is hygiene, not a trust boundary.
     title: Arc<std::sync::Mutex<Option<String>>>,
 }
 
-/// The attached terminal's foreground and background, as its client reported them (OSC 10/11
-/// probe at attach). Process-wide because every pane answers the same question about the same
-/// terminal; the latest client to report wins, like the size of the shared view.
+/// The attached terminal's foreground and background as its client reported them (OSC 10/11
+/// probe at attach). Process-wide because every pane asks about the same terminal; the latest
+/// client to report wins.
 static OUTER_COLORS: std::sync::RwLock<Option<(crate::proto::Rgb8, crate::proto::Rgb8)>> =
     std::sync::RwLock::new(None);
 
-/// Record the attached terminal's `(fg, bg)` for answering panes' colour queries.
 pub fn set_outer_colors(fg: crate::proto::Rgb8, bg: crate::proto::Rgb8) {
     if let Ok(mut c) = OUTER_COLORS.write() {
         *c = Some((fg, bg));
     }
 }
 
-/// The answer to a pane's colour query for alacritty colour `index`: OSC 10 (foreground,
-/// 256), OSC 11 (background, 257) and OSC 12 (cursor, 258, answered with the foreground).
-/// `None` = stay silent, which is what comux did before it knew the colours, and what a
-/// palette query (OSC 4) still gets.
+/// The answer to a pane's colour query for alacritty colour `index`: OSC 10 (foreground, 256),
+/// OSC 11 (background, 257) and OSC 12 (cursor, 258, answered with the foreground). `None` =
+/// stay silent, as for a palette query (OSC 4).
 fn outer_color(index: usize) -> Option<alacritty_terminal::vte::ansi::Rgb> {
     let (fg, bg) = (*OUTER_COLORS.read().ok()?)?;
     let (r, g, b) = match index {
@@ -241,15 +193,14 @@ fn outer_color(index: usize) -> Option<alacritty_terminal::vte::ansi::Rgb> {
 
 /// kitty graphics in panes (decisions #194), process-wide like the outer colours: whether some
 /// attached client's terminal draws images (panes answer graphics queries only then, so a
-/// program falls back to text when nobody could see its pictures) and that terminal's cell
-/// size, which panes report as their pixel size.
+/// program falls back to text) and that terminal's cell size, which panes report as their
+/// pixel size.
 static GRAPHICS: std::sync::LazyLock<Arc<copad_graphics::Shared>> =
     std::sync::LazyLock::new(|| Arc::new(copad_graphics::Shared::default()));
 
 /// Decoded image bytes one pane may hold (a terminal's own default is 320 MiB; comux has many).
 const PANE_IMAGE_QUOTA: usize = 64 << 20;
 
-/// See [`GRAPHICS`].
 pub fn set_graphics(enabled: bool, cell: Option<(u16, u16)>) {
     GRAPHICS.enabled.store(enabled, Ordering::Relaxed);
     if let Some((w, h)) = cell.filter(|&(w, h)| w > 0 && h > 0) {
@@ -258,12 +209,10 @@ pub fn set_graphics(enabled: bool, cell: Option<(u16, u16)>) {
     }
 }
 
-/// Whether some attached client's terminal shows images.
 pub fn graphics_enabled() -> bool {
     GRAPHICS.enabled.load(Ordering::Relaxed)
 }
 
-/// A pane's PTY size: the grid, and the cell in pixels once a graphics client said it.
 fn window_size(cols: u16, rows: u16) -> WindowSize {
     let px = |v: &std::sync::atomic::AtomicU32| {
         (v.load(Ordering::Relaxed).clamp(1, u16::MAX as u32)) as u16
@@ -276,17 +225,15 @@ fn window_size(cols: u16, rows: u16) -> WindowSize {
     }
 }
 
-/// Longest pane name kept, in characters.
 pub const MAX_PANE_NAME: usize = 48;
 
 /// Longest pane title retained. A title is redrawn on every shell prompt and a hostile pane
 /// could stream megabytes of it; nothing displays more than a few columns anyway.
 const MAX_TITLE_BYTES: usize = 256;
 
-/// Strip control characters and bound the length of a title before it is stored.
-///
-/// Runs on the reader thread OUTSIDE the title lock — sanitizing under the lock would hold
-/// it for the length of a hostile payload while the render loop waits behind it.
+/// Strip control characters and bound the length of a title. Runs on the reader thread OUTSIDE
+/// the title lock: sanitizing under it would hold it for the length of a hostile payload while
+/// the render loop waits.
 fn sanitize_title(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len().min(MAX_TITLE_BYTES));
     for c in raw.chars() {
@@ -296,7 +243,7 @@ fn sanitize_title(raw: &str) -> String {
             continue;
         }
         if out.len() + c.len_utf8() > MAX_TITLE_BYTES {
-            break; // cut on a char boundary, never mid-scalar
+            break;
         }
         out.push(c);
     }
@@ -309,7 +256,6 @@ impl MuxListener {
             sender: Arc::new(std::sync::Mutex::new(None)),
             grid: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             child_exited: Arc::new(AtomicBool::new(false)),
-            // Start dirty so the very first frame is composed.
             dirty: Arc::new(AtomicBool::new(true)),
             clipboard: Arc::new(std::sync::Mutex::new(None)),
             bells: Arc::new(AtomicU64::new(0)),
@@ -324,7 +270,6 @@ impl MuxListener {
 impl EventListener for MuxListener {
     fn send_event(&self, event: Event) {
         match event {
-            // The terminal processed output and wants a redraw — mark this pane dirty.
             Event::Wakeup => {
                 self.dirty.store(true, Ordering::Relaxed);
             }
@@ -337,13 +282,11 @@ impl EventListener for MuxListener {
             Event::ChildExit(_status) => {
                 self.child_exited.store(true, Ordering::Relaxed);
             }
-            // A program in the pane wrote the clipboard (`ESC ] 52 ; c ; <base64> BEL`).
-            // Stash it for the render loop to relay to the attached clients, which re-emit
-            // it as their OWN OSC 52 — so it lands on the clipboard of the machine you are
-            // SITTING AT, not the server's. Deliberately does NOT mark the pane dirty:
-            // nothing on screen changed.
-            // An EMPTY payload is a legitimate request to CLEAR the clipboard, not a no-op,
-            // so it is captured like any other write.
+            // A program in the pane wrote the clipboard (`ESC ] 52 ; c ; <base64> BEL`). Stashed
+            // for the render loop to relay to the attached clients, which re-emit it as their
+            // OWN OSC 52 so it lands on the clipboard of the machine you are sitting at. Does
+            // NOT mark the pane dirty. An EMPTY payload is a legitimate request to CLEAR the
+            // clipboard, so it is captured like any other write.
             Event::ClipboardStore(ClipboardType::Clipboard, text)
                 if text.len() <= MAX_CLIPBOARD_BYTES =>
             {
@@ -352,21 +295,19 @@ impl EventListener for MuxListener {
                 let mut slot = self.clipboard.lock().unwrap();
                 *slot = Some((next_clipboard_seq(), text));
             }
-            // Over the cap. Dropped WHOLE rather than truncated — half a clipboard silently
-            // replacing what you copied is worse than the write not landing at all.
+            // Over the cap: dropped WHOLE, since a half-written clipboard silently replacing
+            // what you copied is worse than the write not landing.
             Event::ClipboardStore(ClipboardType::Clipboard, _) => {}
-            // The X11 PRIMARY selection (OSC 52 selector `p`/`s`). comux has no notion of it
-            // (and macOS has none at all), so it is dropped rather than silently aliased onto
-            // the real clipboard — an app asking for PRIMARY does not expect a Cmd-V clobber.
+            // The X11 PRIMARY selection (OSC 52 selector `p`/`s`): dropped rather than aliased
+            // onto the real clipboard, since an app asking for PRIMARY does not expect a Cmd-V
+            // clobber.
             Event::ClipboardStore(ClipboardType::Selection, _) => {}
-            // OSC 52 clipboard READ (`ESC ] 52 ; c ; ? BEL`). Never answered: replying would
-            // hand the host's clipboard contents to any program running in a pane. Dropping
-            // it is also what VTE and (by default) most terminals do.
+            // OSC 52 clipboard READ (`ESC ] 52 ; c ; ? BEL`): never answered, since replying
+            // would hand the host's clipboard to any program in a pane.
             Event::ClipboardLoad(..) => {}
-            // A BEL. Counted, never toasted: interactive shells ring for ambiguous
-            // tab-completion, the end of history, the end of a pager — wiring that to a
-            // desktop notification would bury the agent toasts (#102) in noise. Does not mark
-            // the pane dirty on its own; the marker rides the next frame.
+            // A BEL: counted, never toasted. Shells ring for tab-completion, end of history and
+            // end of a pager, which would bury the agent toasts (#102). Does not mark the pane
+            // dirty; the marker rides the next frame.
             Event::Bell => {
                 self.bells.fetch_add(1, Ordering::Relaxed);
             }
@@ -378,7 +319,6 @@ impl EventListener for MuxListener {
             Event::ResetTitle => {
                 *self.title.lock().unwrap() = None;
             }
-            // `CSI 14 t` / `CSI 16 t`, once a graphics client gave the cell size.
             Event::TextAreaSizeRequest(format)
                 if GRAPHICS.cell_width.load(Ordering::Relaxed) != 0 =>
             {
@@ -388,8 +328,8 @@ impl EventListener for MuxListener {
                     let _ = s.send(Msg::Input(reply.into_bytes().into()));
                 }
             }
-            // OSC 10/11/12 `?`: answered with the attached terminal's own colours when its
-            // client reported them, so dark/light detection sees the real background.
+            // OSC 10/11/12 `?`: answered with the attached terminal's own colours when its client
+            // reported them, so dark/light detection sees the real background.
             Event::ColorRequest(index, format) => {
                 if let Some(rgb) = outer_color(index)
                     && let Some(s) = self.sender.lock().unwrap().as_ref()
@@ -402,28 +342,24 @@ impl EventListener for MuxListener {
     }
 }
 
-/// A hosted terminal pane.
-/// The environment variable naming a pane's identity inside its own shell — the
-/// `$TMUX_PANE` analogue. A hook running inside a pane reads it to tell comux WHICH
-/// pane raised a notification (`comux notify --pane "$COPAD_MUX_PANE"`).
+/// Names a pane's identity inside its own shell (the `$TMUX_PANE` analogue), so a hook running
+/// in a pane can tell comux WHICH pane raised a notification
+/// (`comux notify --pane "$COPAD_MUX_PANE"`).
 pub const PANE_TOKEN_ENV: &str = "COPAD_MUX_PANE";
 
 /// Mint a fresh pane token, unique across this server's lifetime AND across restarts.
-///
-/// The cross-restart part is why this is not just a counter: `TerminalId`s (and any
-/// naive counter) restart at zero with the server, so a toast left on screen from a
-/// previous incarnation would resolve against a DIFFERENT pane and jump somewhere
-/// wrong. Qualifying every token with a per-process nonce (pid + boot second) makes a
-/// stale click resolve to nothing, which reports "unknown pane" instead.
+/// `TerminalId`s restart at zero with the server, so a toast left from a previous incarnation
+/// would resolve against a DIFFERENT pane; the per-process nonce (pid + boot second) makes a
+/// stale click report "unknown pane" instead.
 pub fn next_pane_token() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("{}-{n}", incarnation())
 }
 
-/// This server process's identity (pid + boot second, hex) — the nonce every pane token is
-/// qualified by, and the `incarnation` the L0 host API and the render `Hello` announce, so a
-/// host can tell a restarted server from the one whose ids it holds (decisions #166).
+/// This server process's identity (pid + boot second, hex): the nonce every pane token is
+/// qualified by, and the `incarnation` the L0 host API and render `Hello` announce, so a host
+/// can tell a restarted server from the one whose ids it holds (decisions #166).
 pub fn incarnation() -> &'static str {
     static NONCE: OnceLock<String> = OnceLock::new();
     NONCE.get_or_init(|| {
@@ -440,47 +376,35 @@ pub struct PaneTerm {
     sender: EventLoopSender,
     listener: MuxListener,
     io_thread: Option<JoinHandle<(EventLoop<Pty, MuxListener>, State)>>,
-    /// The child shell's pid, captured at spawn. Used to find the pane's
-    /// foreground process (agent/command label). `None` if unavailable.
+    /// The child shell's pid, captured at spawn.
     child_pid: Option<u32>,
-    /// A dup of the PTY master fd, kept so we can query the terminal's foreground
-    /// process group (`tcgetpgrp`) — the actual foreground process, not a guess.
+    /// A dup of the PTY master fd, kept to query the foreground process group (`tcgetpgrp`).
     /// Closed on drop.
     fg_fd: Option<RawFd>,
-    /// The directory the shell was spawned in. A stable fallback for liveness checks
-    /// (e.g. worktree-removal safety) when the live `process_cwd` is momentarily
-    /// unreadable — a pane never spawns "below" its initial cwd without our knowing.
+    /// The directory the shell was spawned in: a stable fallback for liveness checks (e.g.
+    /// worktree-removal safety) when the live `process_cwd` is momentarily unreadable.
     spawn_cwd: Option<PathBuf>,
-    /// The pane identity handed to the shell as `COPAD_MUX_PANE` (see
-    /// [`next_pane_token`]) — read back out of the spawn env rather than passed
-    /// separately, so every spawn path that builds a pane env gets it for free.
+    /// The pane identity handed to the shell as `COPAD_MUX_PANE`, read back out of the spawn
+    /// env so every spawn path that builds a pane env gets it.
     pane_token: Option<String>,
-    /// The copy-mode search to highlight (the literal query), while one is active.
     copy_query: std::sync::Mutex<Option<String>>,
     /// A name the user gave the pane (`Ctrl-b T`, `comux rename-pane`); beats the program on
     /// its title. Saved with the layout.
     name: std::sync::Mutex<Option<String>>,
-    /// The pane's kitty virtual placements, which Unicode placeholder cells show.
     virtuals: copad_graphics::Virtuals,
-    /// The pane holds images or virtual placements at all: without, composing skips the scan.
+    /// The pane holds images or virtual placements at all; without, composing skips the scan.
     has_images: Arc<AtomicBool>,
 }
 
-/// Turn a pane-spawn I/O error into a message worth showing a user.
-///
-/// Descriptor exhaustion gets its own wording because it is the one failure that is
-/// both self-inflicted and fixable: the raw `EMFILE` text ("too many open files")
-/// reads like a system problem, when the actual answer is that this server's soft
-/// limit is too low for the number of panes it hosts. Pointing at `comux health`
-/// turns a dead keypress into a diagnosis.
+/// Turn a pane-spawn I/O error into a message worth showing a user. Descriptor exhaustion gets
+/// its own wording: the raw `EMFILE` text reads like a system problem when this server's soft
+/// limit is too low for its pane count, and pointing at `comux health` turns a dead keypress
+/// into a diagnosis.
 fn describe_spawn_failure(stage: &str, err: &std::io::Error) -> String {
     let budget = crate::fdlimit::snapshot().ok();
-    // EMFILE = this process is out of descriptors; ENFILE = the system-wide table is.
-    // Detected primarily from our OWN budget rather than the error: the PTY layer
-    // formats the errno into a message string, so `raw_os_error` is routinely `None`
-    // by the time the failure reaches us. A spawn that failed with less than a pane's
-    // worth of descriptors left is exhaustion whatever the text says — and the errno
-    // check still catches the case where the budget is unreadable.
+    // EMFILE = this process is out of descriptors; ENFILE = the system-wide table is. Detected
+    // from our OWN budget first: the PTY layer formats the errno into a message string, so
+    // `raw_os_error` is routinely `None`. The errno check still covers an unreadable budget.
     let no_room = budget
         .and_then(|b| b.panes_remaining())
         .is_some_and(|room| room < 2);
@@ -500,8 +424,6 @@ fn describe_spawn_failure(stage: &str, err: &std::io::Error) -> String {
 }
 
 impl PaneTerm {
-    /// Spawn a shell in a PTY sized `cols`×`rows`. `shell` defaults to `$SHELL`
-    /// (then the system default); `cwd` to the process cwd.
     pub fn spawn(
         cols: u16,
         rows: u16,
@@ -511,16 +433,12 @@ impl PaneTerm {
         Self::spawn_with_env(cols, rows, shell, cwd, &[])
     }
 
-    /// Like [`spawn`](Self::spawn) but injects extra environment variables into
-    /// the child shell (e.g. `COPAD_MUX_SOCK` so a shell inside a pane can drive
-    /// its own mux via `copad-mux ctl`).
+    /// Like [`spawn`](Self::spawn) but injects extra environment variables into the child shell
+    /// (e.g. `COPAD_MUX_SOCK`).
     ///
-    /// Returns the failure REASON rather than a bare `None`: the callers that create
-    /// panes on a keypress (new tab / new session / split) roll the just-created
-    /// tab or session back when the shell can't spawn, so without a reason the whole
-    /// failure is invisible — the key simply appears to do nothing. Descriptor
-    /// exhaustion in particular (see [`crate::fdlimit`]) is undiagnosable from the
-    /// UI without it.
+    /// Returns the failure REASON: callers that create panes on a keypress roll the new
+    /// tab/session back when the shell can't spawn, so without a reason the key just appears to
+    /// do nothing (descriptor exhaustion, see [`crate::fdlimit`], is undiagnosable otherwise).
     pub fn spawn_with_env(
         cols: u16,
         rows: u16,
@@ -528,7 +446,6 @@ impl PaneTerm {
         cwd: Option<PathBuf>,
         env: &[(String, String)],
     ) -> Result<Self, String> {
-        // Login shell so PATH / profile are set up as in a normal terminal.
         let program = shell
             .or_else(|| std::env::var("SHELL").ok())
             .map(|sh| Shell::new(sh, vec!["-l".to_string()]));
@@ -573,11 +490,10 @@ impl PaneTerm {
         if let Some(dir) = cwd {
             opts.working_directory = Some(dir);
         }
-        // A pane is comux's terminal, not the one the server happened to be born in: without
-        // this a server started from Ghostty hands every pane `TERM=xterm-ghostty` (features
-        // comux's emulator does not have, and a terminfo an SSH host may lack), and one started
-        // by launchd hands it no TERM at all. tmux does the same with `default-terminal`. An
-        // explicit `--env` below still wins.
+        // A pane is comux's terminal, not the one the server was born in: a server started from
+        // Ghostty would hand every pane `TERM=xterm-ghostty` (features comux lacks, a terminfo an
+        // SSH host may lack) and one started by launchd no TERM at all. An explicit `--env`
+        // below still wins.
         opts.env.insert("TERM".into(), "xterm-256color".into());
         opts.env.insert("COLORTERM".into(), "truecolor".into());
         let mut pane_token = None;
@@ -590,8 +506,8 @@ impl PaneTerm {
 
         let window = window_size(cols, rows);
         let pty = tty::new(&opts, window, 0).map_err(|e| describe_spawn_failure("pty", &e))?;
-        // Capture the child pid + a dup of the master fd before the Pty is moved
-        // into the EventLoop (the dup lets us query the foreground pgrp later).
+        // Capture the child pid and a dup of the master fd before the Pty moves into the
+        // EventLoop.
         let child_pid = Some(pty.child().id());
         let fg_fd = {
             let raw = pty.file().as_raw_fd();
@@ -653,26 +569,21 @@ impl PaneTerm {
         })
     }
 
-    /// The child shell's pid (fallback label when no foreground group is set).
     pub fn pid(&self) -> Option<u32> {
         self.child_pid
     }
 
-    /// This pane's `COPAD_MUX_PANE` identity, if its spawn env carried one. What a
-    /// notification's click action and `comux notify --pane` address.
+    /// This pane's `COPAD_MUX_PANE` identity, if its spawn env carried one.
     pub fn pane_token(&self) -> Option<&str> {
         self.pane_token.as_deref()
     }
 
-    /// The directory the shell was spawned in (liveness fallback when the live
-    /// `process_cwd` can't be read).
     pub fn spawn_cwd(&self) -> Option<&PathBuf> {
         self.spawn_cwd.as_ref()
     }
 
-    /// The pid of the terminal's foreground process GROUP leader — the process
-    /// actually running in the foreground (`sleep`, `claude`, `nvim`, …), via
-    /// `tcgetpgrp` on the PTY master. `None` if unavailable.
+    /// The pid of the terminal's foreground process GROUP leader, via `tcgetpgrp` on the PTY
+    /// master. `None` if unavailable.
     pub fn foreground_pgid(&self) -> Option<u32> {
         let fd = self.fg_fd?;
         // SAFETY: `fd` is our own dup of the master, valid until drop.
@@ -680,7 +591,6 @@ impl PaneTerm {
         (pgid > 0).then_some(pgid as u32)
     }
 
-    /// Feed input bytes to the child shell.
     pub fn input(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -688,7 +598,6 @@ impl PaneTerm {
         let _ = self.sender.send(Msg::Input(bytes.to_vec().into()));
     }
 
-    /// Resize the PTY (SIGWINCH to the child) + the Term grid.
     pub fn resize(&self, cols: u16, rows: u16) {
         let cols = cols.max(1);
         let rows = rows.max(1);
@@ -699,10 +608,9 @@ impl PaneTerm {
         self.term
             .lock()
             .resize(TermSize::new(cols as usize, rows as usize));
-        self.mark_dirty(); // a reflow changes the visible grid but may not Wakeup
+        self.mark_dirty();
     }
 
-    /// Tell the child the PTY size again (now with the cell size a graphics client reported).
     pub fn reannounce_size(&self) {
         let (cols, rows) = {
             let term = self.term.lock();
@@ -711,8 +619,8 @@ impl PaneTerm {
         let _ = self.sender.send(Msg::Resize(window_size(cols, rows)));
     }
 
-    /// The images on this pane's screen as it is drawn (scrolled-back view included): per-row
-    /// runs in pane cells, bottom-most first, and the images they index.
+    /// The images on this pane's screen as drawn (scrolled-back view included): per-row runs in
+    /// pane cells, bottom-most first, and the images they index.
     pub fn image_runs(
         &self,
     ) -> (
@@ -737,28 +645,25 @@ impl PaneTerm {
         )
     }
 
-    /// Has the child shell exited?
     pub fn has_exited(&self) -> bool {
         self.listener.child_exited.load(Ordering::Relaxed)
     }
 
-    /// Read AND clear this pane's dirty flag (set by the io-thread on any screen change).
-    /// The render loop ORs this across panes to decide whether a frame needs composing.
+    /// Read AND clear the dirty flag; the render loop ORs it across panes to decide whether a
+    /// frame needs composing.
     pub fn take_dirty(&self) -> bool {
         self.listener.dirty.swap(false, Ordering::Relaxed)
     }
 
-    /// Take any text a program in this pane asked to put on the clipboard via OSC 52,
-    /// clearing the slot. `None` when nothing was written since the last call; the `u64`
-    /// orders writes across panes. An empty string is a real value — "clear the clipboard".
+    /// Take any text a program asked to put on the clipboard via OSC 52, clearing the slot; the
+    /// `u64` orders writes across panes. An empty string is a real value: "clear the clipboard".
     pub fn take_clipboard(&self) -> Option<(u64, String)> {
         self.listener.clipboard.lock().unwrap().take()
     }
 
-    /// Feed raw bytes straight into this pane's terminal, bypassing the PTY — the injection
-    /// point for the render-fidelity harness, which needs to put *chosen* content on a pane's
-    /// grid without depending on a shell to echo it. The caller owns the VTE `Processor` so
-    /// escape sequences can be split across calls exactly as a real read would split them.
+    /// Feed raw bytes straight into this pane's terminal, bypassing the PTY: lets the
+    /// render-fidelity harness put *chosen* content on the grid. The caller owns the VTE
+    /// `Processor` so escape sequences can be split across calls as a real read would.
     #[cfg(test)]
     pub(crate) fn feed_test_bytes(
         &self,
@@ -769,14 +674,11 @@ impl PaneTerm {
         self.mark_dirty();
     }
 
-    /// Force this pane dirty (e.g. after a resize/scroll that changes what's visible but
-    /// may not emit a `Wakeup`).
     pub fn mark_dirty(&self) {
         self.listener.dirty.store(true, Ordering::Relaxed);
     }
 
-    /// Scroll the viewport through scrollback: positive `lines` = UP (older),
-    /// negative = DOWN (newer). `snapshot` then renders at the new offset.
+    /// Scroll the viewport through scrollback: positive `lines` = UP (older), negative = DOWN.
     pub fn scroll(&self, lines: i32) {
         if lines != 0 {
             self.term.lock().scroll_display(Scroll::Delta(lines));
@@ -784,41 +686,34 @@ impl PaneTerm {
         }
     }
 
-    /// Jump the viewport back to the live bottom (offset 0).
     pub fn scroll_to_bottom(&self) {
         self.term.lock().scroll_display(Scroll::Bottom);
         self.mark_dirty();
     }
 
-    /// How many lines the viewport is scrolled up from the live bottom (0 = live).
     pub fn scroll_offset(&self) -> usize {
         self.term.lock().grid().display_offset()
     }
 
-    /// Lines of scrollback above the screen — the ceiling for [`Self::scroll_offset`].
     pub fn history_len(&self) -> usize {
         self.term.lock().grid().history_size()
     }
 
-    /// Bytes to feed the child for ONE wheel notch, honoring the app's active input mode
-    /// (tmux-style), or `None` if the app wants no wheel input — then the caller scrolls
-    /// the pane's OWN scrollback instead. `col`/`row` are 1-based cell coords WITHIN the
-    /// pane; `up` = wheel toward older content.
+    /// Bytes to feed the child for ONE wheel notch, honoring the app's input mode, or `None` if
+    /// the app wants no wheel input (the caller then scrolls comux's own scrollback). `col`/`row`
+    /// are 1-based pane cells; `up` = toward older content.
     ///
-    /// - App has mouse reporting on (Claude Code, nvim `set mouse`): send an xterm wheel
-    ///   button report (64 = up, 65 = down), SGR-encoded if the app negotiated SGR else the
-    ///   legacy `ESC [ M` form.
-    /// - Alt-screen app WITHOUT mouse reporting but WITH alternate-scroll (less, man, git
-    ///   log): xterm turns the wheel into cursor-key presses so it pages as expected
-    ///   (application-cursor-keys mode picks `ESC O A/B` vs `ESC [ A/B`).
-    /// - Otherwise: `None` — the app isn't listening, so comux scrolls its scrollback.
+    /// - Mouse reporting on (Claude Code, nvim `set mouse`): an xterm wheel button report
+    ///   (64 up, 65 down), SGR-encoded if negotiated else legacy `ESC [ M`.
+    /// - Alt-screen app without mouse reporting but with alternate-scroll (less, man): cursor-key
+    ///   presses (`ESC O A/B` or `ESC [ A/B` per application-cursor-keys mode).
     pub fn wheel_bytes(&self, up: bool, col: u16, row: u16) -> Option<Vec<u8>> {
         wheel_bytes_for_mode(*self.term.lock().mode(), up, col, row)
     }
 
-    /// Bytes for a plain left click at `col`/`row` (1-based, pane-relative), or `None` if
-    /// the app isn't listening for the mouse (a shell) or the pane is scrolled back into
-    /// comux's scrollback, where the click would land on a cell the app isn't showing.
+    /// Bytes for a plain left click at `col`/`row` (1-based, pane-relative), or `None` if the
+    /// app isn't listening for the mouse or the pane is scrolled back, where the click would
+    /// land on a cell the app isn't showing.
     pub fn click_bytes(&self, col: u16, row: u16) -> Option<Vec<u8>> {
         let term = self.term.lock();
         if term.grid().display_offset() != 0 {
@@ -827,13 +722,10 @@ impl PaneTerm {
         click_bytes_for_mode(*term.mode(), col, row)
     }
 
-    /// Whether the pane's program asked for bracketed paste (`?2004h`).
     pub fn bracketed_paste(&self) -> bool {
         self.term.lock().mode().contains(TermMode::BRACKETED_PASTE)
     }
 
-    /// Tell the program its pane gained or lost focus (`ESC [ I` / `ESC [ O`), if it asked
-    /// for focus reports (`?1004h`). Returns whether it did.
     pub fn report_focus(&self, gained: bool) -> bool {
         if !self.term.lock().mode().contains(TermMode::FOCUS_IN_OUT) {
             return false;
@@ -842,7 +734,6 @@ impl PaneTerm {
         true
     }
 
-    /// The input modes the pane's program asked for, which decide how a key is encoded.
     pub fn key_modes(&self) -> crate::keys::KeyModes {
         let term = self.term.lock();
         let mode = term.mode();
@@ -853,27 +744,24 @@ impl PaneTerm {
         }
     }
 
-    /// Whether the pane is currently on the ALTERNATE screen (`?1049h`) — i.e. a
-    /// full-screen app (nvim, less, htop, …) is running. The render loop polls this to
-    /// notice when such an app EXITS (alt → primary), so it can force a full repaint and
-    /// wipe any incremental-diff residue the alt→primary grid swap left behind.
+    /// Whether the pane is on the ALTERNATE screen (`?1049h`). The render loop polls this to
+    /// notice a full-screen app EXITING, so it can force a repaint and wipe incremental-diff
+    /// residue left by the alt-to-primary swap.
     pub fn in_alt_screen(&self) -> bool {
         self.term.lock().mode().contains(TermMode::ALT_SCREEN)
     }
 
-    /// Snapshot the visible viewport for rendering. Keeps the term lock only for
-    /// the copy so the reader thread isn't starved.
+    /// Snapshot the visible viewport. Holds the term lock only for the copy so the reader
+    /// thread isn't starved.
     pub fn snapshot(&self) -> Snapshot {
         let query = self.copy_query.lock().ok().and_then(|q| q.clone());
         snapshot_with_search(&self.term.lock(), query.as_deref())
     }
 
-    // --- copy mode (decisions #147): alacritty's own vi mode, every op under ONE lock ---
-
-    /// Enter copy mode: the vi cursor starts on the terminal cursor (or the viewport's top
-    /// when that is scrolled out of view). Returns whether the alternate screen is up, which
-    /// the caller remembers — a swap clears the selection but NOT the vi cursor, so copy mode
-    /// is cancelled when it changes.
+    /// Enter copy mode: the vi cursor starts on the terminal cursor (or the viewport's top when
+    /// that is out of view). Returns whether the alternate screen is up, which the caller
+    /// remembers: a swap clears the selection but NOT the vi cursor, so copy mode is cancelled
+    /// when it changes.
     pub fn copy_enter(&self) -> bool {
         let mut t = self.term.lock();
         if !t.mode().contains(TermMode::VI) {
@@ -883,9 +771,9 @@ impl PaneTerm {
         t.mode().contains(TermMode::ALT_SCREEN)
     }
 
-    /// Re-apply the pane configuration with the current [`history_limit`]. Lowering it drops
-    /// the oldest lines at once. The caller leaves copy mode FIRST (`App::exit_copy_mode`):
-    /// the vi cursor could otherwise point at a row that no longer exists.
+    /// Re-apply the pane configuration with the current history limit; lowering it drops the
+    /// oldest lines at once. The caller leaves copy mode FIRST (`App::exit_copy_mode`): the vi
+    /// cursor could otherwise point at a row that no longer exists.
     pub fn apply_history_limit(&self, lines: usize) {
         self.term.lock().set_options(Config {
             scrolling_history: lines,
@@ -894,7 +782,6 @@ impl PaneTerm {
         self.mark_dirty();
     }
 
-    /// Leave copy mode: no selection, vi mode off, back at the live bottom.
     pub fn copy_exit(&self) {
         let mut t = self.term.lock();
         t.selection = None;
@@ -914,12 +801,11 @@ impl PaneTerm {
         self.mark_dirty();
     }
 
-    /// Scroll the view by `lines` (positive = into history) and carry the vi cursor with it,
-    /// the way alacritty's own vi mode pages.
+    /// Scroll the view by `lines` (positive = into history), carrying the vi cursor with it.
     pub fn copy_scroll(&self, lines: i32) {
         let mut t = self.term.lock();
         // Target first: `scroll_display` already clamps the vi cursor into the new view, and
-        // moving that clamped cursor by `lines` again would page twice as far.
+        // moving it by `lines` again would page twice as far.
         let target = t.vi_mode_cursor.scroll(&t, lines);
         t.scroll_display(Scroll::Delta(lines));
         t.vi_goto_point(target.point);
@@ -927,7 +813,6 @@ impl PaneTerm {
         self.mark_dirty();
     }
 
-    /// The top of the history (`g`).
     pub fn copy_top(&self) {
         let mut t = self.term.lock();
         let top = Point::new(t.topmost_line(), Column(0));
@@ -936,9 +821,9 @@ impl PaneTerm {
         self.mark_dirty();
     }
 
-    /// Toggle a selection of `ty` at the vi cursor (`v` / `V`); the same key again clears it.
-    /// Returns whether a selection is up afterwards — read under the same lock, so a swap the
-    /// PTY thread processes right after cannot make the caller believe there never was one.
+    /// Toggle a selection of `ty` at the vi cursor; the same key again clears it. Returns
+    /// whether a selection is up afterwards, read under the same lock so a swap the PTY thread
+    /// processes right after can't make the caller believe there never was one.
     pub fn copy_toggle_selection(&self, kind: SelKind) -> bool {
         use alacritty_terminal::index::Side;
         use alacritty_terminal::selection::{Selection, SelectionType};
@@ -951,15 +836,15 @@ impl PaneTerm {
         if t.selection.as_ref().is_some_and(|s| s.ty == ty) {
             t.selection = None;
         } else if let Some(sel) = t.selection.as_mut() {
-            // Another shape is up: reshape it in place, keeping its anchor (vim's `v` → `V`
-            // → `Ctrl-v`), rather than starting over at the cursor.
+            // Another shape is up: reshape it in place, keeping its anchor (vim's `v`, `V`,
+            // `Ctrl-v`), rather than starting over at the cursor.
             sel.ty = ty;
             sel.include_all();
         } else {
             let at = t.vi_mode_cursor.point;
             let mut sel = Selection::new(ty, at, Side::Left);
-            // A fresh selection's endpoints coincide, and alacritty never extends an EMPTY
-            // selection along with the cursor — include the cursor cell so it can grow.
+            // A fresh selection's endpoints coincide and alacritty never extends an EMPTY
+            // selection with the cursor, so include the cursor cell so it can grow.
             sel.include_all();
             t.selection = Some(sel);
             t.vi_goto_point(at);
@@ -970,8 +855,6 @@ impl PaneTerm {
         up
     }
 
-    /// Move the cursor to the selection's OTHER end (tmux `other-end`, vim `o`), which
-    /// becomes the end that moves. Returns whether there was a selection.
     pub fn copy_other_end(&self) -> bool {
         use alacritty_terminal::index::Side;
         use alacritty_terminal::selection::{Selection, SelectionType};
@@ -984,8 +867,6 @@ impl PaneTerm {
             return false;
         };
         let at = t.vi_mode_cursor.point;
-        // The anchor is whichever end the cursor is not on; for lines and blocks, the opposite
-        // row (and, for a block, the opposite column) of the cursor.
         let other_line = if at.line == range.start.line {
             range.end.line
         } else {
@@ -1014,16 +895,14 @@ impl PaneTerm {
         true
     }
 
-    /// `f`/`F`/`t`/`T`: jump to the next `ch` on the cursor's (wrapped) line, forward or
-    /// back, landing ON it or one cell short (`till`). Returns whether it was found.
     pub fn copy_jump(&self, ch: char, forward: bool, till: bool, repeat: bool) -> bool {
         use alacritty_terminal::index::Boundary;
         let mut t = self.term.lock();
         let at = t.vi_mode_cursor.point;
         let needle = ch.to_string();
         // alacritty's inline search starts AFTER the given point, so the cursor itself is
-        // passed. Only a REPEATED `t` (`;`) starts one cell further: it is sitting just short
-        // of the last match and would otherwise find it again and never move.
+        // passed. Only a REPEATED `t` (`;`) starts one cell further: it sits just short of the
+        // last match and would otherwise find it again and never move.
         let skip = till && repeat;
         let hit = if forward {
             let from = if skip {
@@ -1061,7 +940,6 @@ impl PaneTerm {
         true
     }
 
-    /// The word under the copy cursor (vim's `*`), if it is on one.
     pub fn copy_word_at_cursor(&self) -> Option<String> {
         let t = self.term.lock();
         let at = t.vi_mode_cursor.point;
@@ -1072,13 +950,12 @@ impl PaneTerm {
         (!word.is_empty() && !word.contains(char::is_whitespace)).then(|| word.to_string())
     }
 
-    /// The pane's user-given name, if it has one.
     pub fn name(&self) -> Option<String> {
         self.name.lock().ok().and_then(|n| n.clone())
     }
 
     /// Name the pane (`None` or blank clears). Control characters are dropped and the name is
-    /// bounded, like a title: it is drawn into the chrome.
+    /// bounded, since it is drawn into the chrome.
     pub fn set_name(&self, name: Option<&str>) {
         let clean = name
             .map(|n| {
@@ -1094,7 +971,6 @@ impl PaneTerm {
         self.mark_dirty();
     }
 
-    /// Highlight `query` on screen while copy mode shows it (`None` clears).
     pub fn copy_set_query(&self, query: Option<String>) {
         if let Ok(mut q) = self.copy_query.lock() {
             *q = query;
@@ -1102,20 +978,16 @@ impl PaneTerm {
         self.mark_dirty();
     }
 
-    /// Whether a selection is up.
     pub fn copy_has_selection(&self) -> bool {
         self.term.lock().selection.is_some()
     }
 
-    /// Clear the selection, keeping copy mode. Returns whether there was one.
     pub fn copy_clear_selection(&self) -> bool {
         let had = self.term.lock().selection.take().is_some();
         self.mark_dirty();
         had
     }
 
-    /// Search for `query` (a literal, case-insensitive) from the vi cursor, older (`up`) or
-    /// newer, wrapping at the ends of the history, and move the cursor to the match start.
     pub fn copy_search(&self, query: &str, up: bool) -> SearchOutcome {
         use alacritty_terminal::index::{Boundary, Direction, Side};
         use alacritty_terminal::term::search::RegexSearch;
@@ -1128,7 +1000,7 @@ impl PaneTerm {
         let mut t = self.term.lock();
         let at = t.vi_mode_cursor.point;
         // EXCLUSIVE start: one cell past the cursor in the search direction, so `n` moves on
-        // from the match it is sitting on rather than finding it again.
+        // from the match it sits on.
         let (origin, dir) = if up {
             (at.sub(&*t, Boundary::None, 1), Direction::Left)
         } else {
@@ -1150,13 +1022,13 @@ impl PaneTerm {
     }
 
     /// The selected text (the cursor's line when nothing is selected), via alacritty's own
-    /// extractor — wrapped-row seams and combining marks handled as alacritty handles them.
-    /// Refused BEFORE extraction when it would exceed [`MAX_YANK_BYTES`]: the extractor appends
-    /// every stored scalar with no budget, under the lock the PTY reader also needs.
+    /// extractor. Refused BEFORE extraction when it would exceed [`MAX_YANK_BYTES`]: the
+    /// extractor appends every stored scalar with no budget, under the lock the PTY reader also
+    /// needs.
     ///
-    /// `expect_selection`: the caller believes a selection is up. If it is gone — cleared by a
-    /// screen swap the PTY thread processed since the caller last looked — this refuses under
-    /// the SAME lock it would extract with, instead of falling back to the cursor's line.
+    /// `expect_selection`: the caller believes a selection is up. If it is gone (cleared by a
+    /// screen swap the PTY thread processed since), this refuses under the SAME lock it would
+    /// extract with, instead of falling back to the cursor's line.
     pub fn copy_yank(&self, expect_selection: bool) -> Result<String, &'static str> {
         use alacritty_terminal::index::Side;
         use alacritty_terminal::selection::{Selection, SelectionType};
@@ -1201,27 +1073,19 @@ impl PaneTerm {
         Ok(text)
     }
 
-    /// How many times this pane has rung the bell since it was spawned. Monotonic; the
-    /// caller compares it against how many it has acknowledged.
     pub fn bell_count(&self) -> u64 {
         self.listener.bells.load(Ordering::Relaxed)
     }
 
-    /// The pane's title (OSC 0/2), if it has set one. UNTRUSTED program output — see
-    /// [`MuxListener::title`].
     pub fn title(&self) -> Option<String> {
         self.listener.title.lock().unwrap().clone()
     }
 
-    /// Capture this pane's text for read-back (`comux capture-pane`).
-    ///
-    /// `want_rows` counts PHYSICAL grid rows ending at the live screen bottom, reaching
-    /// back into scrollback; `None` means the visible screen's worth. See [`capture_rows`]
-    /// for why this does not reuse the render snapshot and why it ignores the scroll
-    /// position.
-    ///
-    /// The lock is scoped to the harvest so the concatenation — which touches every
-    /// retained byte — cannot starve the PTY reader thread.
+    /// Capture this pane's text for read-back (`comux capture-pane`). `want_rows` counts
+    /// PHYSICAL grid rows ending at the live screen bottom, reaching into scrollback; `None`
+    /// means the visible screen's worth. See [`capture_rows`] for why this does not reuse the
+    /// render snapshot. The lock is scoped to the harvest so the concatenation cannot starve
+    /// the PTY reader thread.
     pub fn capture(&self, want_rows: Option<usize>) -> Capture {
         let harvest = {
             let term = self.term.lock();
@@ -1232,16 +1096,14 @@ impl PaneTerm {
     }
 }
 
-/// Snapshot the visible viewport of any `Term` into renderer-ready [`Snapshot`]. Split
-/// out of [`PaneTerm::snapshot`] so tests can drive a bare `Term` (via the VTE parser)
-/// deterministically — no PTY, no shell, no timing. `pub(crate)` so the render-fidelity
-/// harness in `tui.rs` can read a REFERENCE emulator's screen too.
+/// Snapshot the visible viewport of any `Term` into a [`Snapshot`]. Split out of
+/// [`PaneTerm::snapshot`] so tests can drive a bare `Term` via the VTE parser, and `pub(crate)`
+/// so the render-fidelity harness in `tui.rs` can read a REFERENCE emulator's screen too.
 #[cfg(test)]
 pub(crate) fn snapshot_grid<L: EventListener>(term: &Term<L>) -> Snapshot {
     snapshot_with_search(term, None)
 }
 
-/// [`snapshot_grid`], highlighting copy mode's `query` (a literal) on screen.
 pub(crate) fn snapshot_with_search<L: EventListener>(
     term: &Term<L>,
     query: Option<&str>,
@@ -1256,39 +1118,32 @@ pub(crate) fn snapshot_with_search<L: EventListener>(
     for r in 0..rows as i32 {
         let line = Line(r - display_offset);
         let mut row = Vec::with_capacity(cols);
-        // Does the cell we just emitted occupy TWO columns? This single carry is what makes the
-        // spacer marking and the emitted grapheme widths consistent BY CONSTRUCTION — see below.
+        // Does the cell we just emitted occupy TWO columns? This single carry keeps the spacer
+        // marking and emitted grapheme widths consistent BY CONSTRUCTION (see below).
         let mut prev_spans_two = false;
         for c in 0..cols {
             let cell = &grid[Point::new(line, Column(c))];
             let flags = cell.flags;
 
-            // THE INVARIANT: a cell is a render spacer exactly when the cell before it occupies
-            // two columns. Nothing else. The client's `fix_wide_spacers` rebuilds spacer
-            // structure with literally this predicate ("is the previous symbol two columns
-            // wide?"), because the wire delta cannot carry a `skip` cell — `Buffer::diff` drops
-            // them. Deriving it here the same way is what stops the two from ever disagreeing.
+            // INVARIANT: a cell is a render spacer exactly when the cell before it occupies two
+            // columns. The client's `fix_wide_spacers` rebuilds spacer structure with this same
+            // predicate, because the wire delta cannot carry a `skip` cell (`Buffer::diff` drops
+            // them); deriving it the same way keeps the two from disagreeing.
             //
-            // Reading alacritty's flags directly instead is what caused two distinct residue
-            // bugs, because a `*_SPACER` flag does NOT imply a covering wide glyph:
-            //
-            //  * `LEADING_WIDE_CHAR_SPACER` is the filler alacritty leaves in the LAST column
-            //    when a wide glyph did not fit and wrapped to the next row. Nothing precedes it
-            //    and nothing covers it — alacritty's own renderer paints it as a blank.
-            //  * `WIDE_CHAR_SPACER` can also appear with NO `WIDE_CHAR` cell before it (a ZWJ
-            //    sequence collapsing into the preceding cell will do it).
-            //
-            // In both cases the server composed a `skip` cell, the delta therefore never shipped
-            // that position, and the client — correctly seeing no wide glyph before it — cleared
-            // `skip` and emitted whatever stale glyph and background the cell still held. The
-            // server's baseline had already recorded the position as delivered, so no later delta
-            // could correct it: a coloured blank or a leftover glyph frozen into a pane's edge
-            // until something happened to overwrite it. Both were found by
-            // `tui::app_render_fidelity` and are guarded by `a_spacer_always_follows_a_wide_cell`.
+            // Reading alacritty's flags directly caused residue bugs, because a `*_SPACER` flag
+            // does NOT imply a covering wide glyph:
+            //  * `LEADING_WIDE_CHAR_SPACER` is the filler left in the LAST column when a wide
+            //    glyph wrapped to the next row; nothing covers it.
+            //  * `WIDE_CHAR_SPACER` can appear with NO `WIDE_CHAR` cell before it (a ZWJ
+            //    sequence collapsing into the preceding cell).
+            // The server then composed a `skip` cell the delta never shipped, the client saw no
+            // wide glyph before it and emitted a stale glyph/background, and the server's
+            // baseline already counted the position as delivered, so nothing corrected it.
+            // Guarded by `a_spacer_always_follows_a_wide_cell` (`tui::app_render_fidelity`).
             let spacer = prev_spans_two;
 
-            // How many columns does THIS cell occupy? The authoritative signal is that alacritty
-            // RESERVED the next column for it, not the `WIDE_CHAR` flag on its own (see above).
+            // How many columns does THIS cell occupy? Authoritative is that alacritty RESERVED
+            // the next column for it, not the `WIDE_CHAR` flag alone (see above).
             let span = if !spacer
                 && flags.contains(Flags::WIDE_CHAR)
                 && c + 1 < cols
@@ -1301,15 +1156,12 @@ pub(crate) fn snapshot_with_search<L: EventListener>(
                 1
             };
 
-            // Grapheme = base char + any zero-width combining marks. A kitty Unicode
-            // placeholder is drawn as its image (decisions #194), never as a character.
+            // Grapheme = base char + any zero-width combining marks. A kitty Unicode placeholder
+            // is drawn as its image (decisions #194), never as a character.
             //
-            // A TAB is a blank too. alacritty's `put_tab` stores '\t' in the cell it starts from
-            // (for its selection text), so a `git status` line holds a real control character
-            // here. Passed on, it reaches the client's emit, where a full repaint prints a row as
-            // one run: the outer terminal jumps to its next tab stop and everything after that
-            // cell lands up to 7 columns right. `clear` then only blanks the columns the row was
-            // supposed to occupy, leaving the shifted tail behind.
+            // A TAB is a blank too: alacritty's `put_tab` stores '\t' in the cell it starts from,
+            // and passed on, the outer terminal jumps to its next tab stop on a full repaint and
+            // everything after lands up to 7 columns right, with `clear` leaving the shifted tail.
             let mut sym = String::new();
             if cell.c == copad_graphics::PLACEHOLDER || cell.c == '\t' {
                 sym.push(' ');
@@ -1319,33 +1171,30 @@ pub(crate) fn snapshot_with_search<L: EventListener>(
                     sym.extend(zw.iter());
                 }
             }
-            // ROOT FIX for wide-glyph ghosts: the whole render pipeline downstream (ratatui's
-            // `Buffer::diff` omission, the client's `fix_wide_spacers`, and ratatui's cell emit)
-            // measures width via `unicode-width`, but alacritty lays the grid out with its OWN
-            // width table. When they disagree on a grapheme — a VS16 emoji like "❤\u{fe0f}" that
-            // alacritty gives 1 column but unicode-width calls 2, or a ZWJ sequence — the client
-            // desyncs from the server's grid and a cell the diff wrongly deems unchanged is never
-            // re-sent → residue. Force the emitted grapheme's unicode-width to equal the number of
-            // columns alacritty allotted it, so every stage agrees. Width-inflating marks (VS/ZWJ)
-            // are dropped to the base scalar; ordinary zero-width combining marks (accents) don't
-            // change width and are kept. Together with `span` above this is what the invariant
-            // rests on: a cell with `span == 2` always emits a symbol `unicode-width` calls 2.
+            // ROOT FIX for wide-glyph ghosts: the render pipeline downstream (ratatui's
+            // `Buffer::diff`, the client's `fix_wide_spacers`, ratatui's cell emit) measures width
+            // via `unicode-width`, but alacritty uses its OWN width table. Where they disagree (a
+            // VS16 emoji like "❤\u{fe0f}", a ZWJ sequence) the client desyncs and a cell the diff
+            // deems unchanged is never re-sent. So force the emitted grapheme's unicode-width to
+            // equal the columns alacritty allotted it: width-inflating marks (VS/ZWJ) are dropped
+            // to the base scalar, ordinary combining marks (accents) are kept. With `span` this
+            // is what the invariant rests on: `span == 2` always emits a symbol `unicode-width`
+            // calls 2.
             if spacer {
-                // Never painted (the glyph before it covers this column), so its symbol is
-                // unobservable — but it must still MEASURE one column, or the client would read
-                // it as a wide cell and mark the NEXT position a spacer the server didn't. The
-                // invariant has to hold in both directions.
+                // Never painted (the glyph before it covers this column), but it must still
+                // MEASURE one column, or the client would read it as wide and mark the NEXT
+                // position a spacer the server didn't. The invariant holds both ways.
                 sym = " ".to_string();
             } else if UnicodeWidthStr::width(sym.as_str()) != span {
                 sym = if UnicodeWidthChar::width(cell.c).unwrap_or(0) == span {
                     cell.c.to_string()
                 } else {
-                    " ".repeat(span) // unrepresentable at this width — blank the leading cell
+                    " ".repeat(span)
                 };
             }
-            // Concealed text (`SGR 8`, a typed password) is blanked HERE rather than sent with
-            // a hidden attribute: ratatui's crossterm emit has no `Hidden`, so the attribute
-            // alone would put the secret on screen. Same width, so the invariant above holds.
+            // Concealed text (`SGR 8`, a typed password) is blanked HERE: ratatui's crossterm
+            // emit has no `Hidden`, so the attribute alone would put the secret on screen.
+            // Same width, so the invariant above holds.
             if flags.contains(Flags::HIDDEN) && !spacer {
                 sym = " ".repeat(span);
             }
@@ -1360,8 +1209,8 @@ pub(crate) fn snapshot_with_search<L: EventListener>(
             });
             prev_spans_two = span == 2;
         }
-        // alacritty marks the LAST cell of a soft-wrapped row with `WRAPLINE` (the row
-        // continues onto the next). Used by drag-copy to avoid a spurious newline at the seam.
+        // The LAST cell of a soft-wrapped row carries `WRAPLINE`; drag-copy uses it to avoid a
+        // spurious newline at the seam.
         let last_wrapped = cols > 0
             && grid[Point::new(line, Column(cols - 1))]
                 .flags
@@ -1398,17 +1247,15 @@ pub fn set_history_limit(lines: usize) {
     HISTORY_LIMIT.store(lines, Ordering::Relaxed);
 }
 
-/// The emulator configuration every pane runs with.
 fn pane_config() -> Config {
     Config {
         scrolling_history: history_limit(),
-        // Pin the parser-level OSC 52 policy to copy-only. This is alacritty's own
-        // default today; pinning it means a future default change can never hand a pane
-        // program the PASTE direction (reading the host clipboard) behind our back.
+        // Pin the OSC 52 policy to copy-only (alacritty's current default) so a future default
+        // change can't hand a pane program the PASTE direction (reading the host clipboard).
         osc52: alacritty_terminal::term::Osc52::OnlyCopy,
-        // Answer `CSI ? u` and track `CSI > flags u`, so a program can ask for the kitty
-        // keyboard protocol — Claude Code and nvim then get Shift+Enter, Ctrl+Enter, … as
-        // distinct keys. The encoding side is `crate::keys`, fed by `key_modes`.
+        // Answer `CSI ? u` and track `CSI > flags u`, so Claude Code and nvim get Shift+Enter,
+        // Ctrl+Enter, ... as distinct keys. The encoding side is `crate::keys`, fed by
+        // `key_modes`.
         kitty_keyboard: true,
         // See `decscusr`: the "never set" marker.
         default_cursor_style: CursorStyle {
@@ -1419,9 +1266,8 @@ fn pane_config() -> Config {
     }
 }
 
-/// alacritty's cell flags → the ratatui modifiers for everything but bold and reverse.
-/// Every underline style (curly, double, dotted, dashed) becomes a plain underline: ratatui
-/// has no styles to carry them, and an underline in the wrong style beats none at all.
+/// alacritty's cell flags to the ratatui modifiers for everything but bold and reverse. Every
+/// underline style becomes a plain underline: ratatui has no styles to carry them.
 fn cell_attrs(flags: Flags) -> Modifier {
     let mut m = Modifier::empty();
     if flags.contains(Flags::DIM) {
@@ -1442,10 +1288,9 @@ fn cell_attrs(flags: Flags) -> Modifier {
     m
 }
 
-/// The cursor style as a `DECSCUSR` parameter. A pane's default style is `HollowBlock`
-/// (set in `spawn_with_env`), which no `DECSCUSR` can select, so it reliably means "the
-/// program never chose one" → `0`, the outer terminal's own default — forcing a block
-/// on someone whose terminal draws a beam would be a regression nobody asked for.
+/// The cursor style as a `DECSCUSR` parameter. A pane's default style is `HollowBlock` (set in
+/// `spawn_with_env`), which no `DECSCUSR` can select, so it reliably means "the program never
+/// chose one" and maps to `0`, the outer terminal's own default.
 fn decscusr(style: CursorStyle) -> u8 {
     let blink = |on: u8, off: u8| if style.blinking { on } else { off };
     match style.shape {
@@ -1456,7 +1301,6 @@ fn decscusr(style: CursorStyle) -> u8 {
     }
 }
 
-/// Copy mode's cursor + selection in viewport rows, or `None` when vi mode is off.
 fn copy_view<L: EventListener>(
     term: &Term<L>,
     display_offset: i32,
@@ -1492,7 +1336,6 @@ fn copy_view<L: EventListener>(
     })
 }
 
-/// The on-screen matches of a literal, case-insensitive `query`, in viewport rows.
 fn visible_matches<L: EventListener>(
     term: &Term<L>,
     display_offset: i32,
@@ -1522,64 +1365,48 @@ fn visible_matches<L: EventListener>(
         .collect()
 }
 
-/// Server-owned traversal budgets for [`capture_text`]. These bound the WORK, not merely
-/// the output: the walk runs on the single-writer main loop while holding the pane's
-/// `term` lock, so a caller must not be able to make it traverse an unbounded grid.
+/// Server-owned traversal budgets for [`capture_text`]. They bound the WORK, not just the
+/// output: the walk runs on the single-writer main loop while holding the pane's `term` lock.
 ///
-/// Why three of them, none redundant:
-/// - `CAPTURE_MAX_ROWS` — the same order as the configured scrollback, so `--lines`
-///   cannot ask for more history than exists to begin with.
-/// - `CAPTURE_MAX_BYTES` — same order as [`MAX_CLIPBOARD_BYTES`]; caps the retained text.
-/// - `CAPTURE_MAX_CELLS` — neither of the other two bounds a history of BLANK rows: those
-///   trim to nothing, so the byte budget never trips while the walk still visits
-///   `rows × cols` cells. Zero-width combining marks are charged against it too, because
-///   alacritty stores them in an UNCAPPED `Vec<char>` per cell — without that, a single
-///   cell could blow the byte budget on its own and be copied in full before anyone noticed.
+/// - `CAPTURE_MAX_ROWS`: same order as the configured scrollback.
+/// - `CAPTURE_MAX_BYTES`: same order as [`MAX_CLIPBOARD_BYTES`]; caps the retained text.
+/// - `CAPTURE_MAX_CELLS`: neither of the others bounds a history of BLANK rows (they trim to
+///   nothing, so the byte budget never trips). Zero-width combining marks are charged too,
+///   because alacritty stores them in an UNCAPPED `Vec<char>` per cell.
 pub const CAPTURE_MAX_ROWS: usize = 10_000;
-pub const CAPTURE_MAX_BYTES: usize = 1 << 20; // 1 MiB of retained text
+pub const CAPTURE_MAX_BYTES: usize = 1 << 20;
 pub const CAPTURE_MAX_CELLS: usize = 2_000_000;
 
-/// The text of a pane's grid, newest-last. See [`capture_text`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct Capture {
-    /// The captured text. Rows are joined with `\n` except at a soft-wrap seam; there is
-    /// no trailing newline (matching the drag-copy extractor).
+    /// The captured text. Rows are joined with `\n` except at a soft-wrap seam; no trailing
+    /// newline (matching the drag-copy extractor).
     pub text: String,
-    /// Physical grid rows actually included.
     pub rows: usize,
-    /// Older output exists that this capture could NOT include — a budget cut the walk
-    /// short, or the request was clamped to [`CAPTURE_MAX_ROWS`]. Deliberately NOT set
-    /// when the caller simply asked for fewer rows than exist and got exactly that:
-    /// "I hit a limit" and "you are missing output" are different claims, and only the
-    /// second is worth waking a caller up about.
+    /// Older output exists that this capture could NOT include (a budget cut the walk short, or
+    /// the request was clamped to [`CAPTURE_MAX_ROWS`]). NOT set when the caller asked for fewer
+    /// rows than exist: "I hit a limit" and "you are missing output" are different claims.
     pub truncated: bool,
 }
 
-/// Rows harvested bottom-up by [`capture_rows`], before assembly. `wanted` is how many
-/// rows the caller could legitimately have received, so the truncation verdict can be
-/// formed without re-reading the grid (and therefore without re-taking the lock).
+/// Rows harvested bottom-up by [`capture_rows`], before assembly. `wanted` is how many rows the
+/// caller could legitimately have received, so truncation is decided without re-taking the lock.
 struct CaptureRows {
-    /// `(row text, does this row soft-wrap into the one below it)`, BOTTOM-UP.
     rows: Vec<(String, bool)>,
     wanted: usize,
 }
 
-/// Harvest up to `want_rows` physical grid rows ending at the **live screen bottom**,
-/// walking backward into scrollback history.
+/// Harvest up to `want_rows` physical grid rows ending at the live screen bottom, walking back
+/// into scrollback.
 ///
-/// Deliberately NOT built on [`snapshot_grid`]: that path coerces each grapheme's
-/// unicode-width to the column span alacritty allotted it, which drops VS16/ZWJ marks and
-/// blanks unrepresentable graphemes (`❤️` → `❤`). That is the right trade for rendering —
-/// it is the root fix for wide-glyph ghosting — and it is silent corruption for read-back.
-/// This walker emits the stored scalars verbatim, except a tab's first cell, read as the blank
-/// the screen shows there.
+/// Deliberately NOT built on [`snapshot_grid`]: that path coerces each grapheme's unicode-width
+/// to the column span, dropping VS16/ZWJ marks (`❤️` -> `❤`), which is right for rendering and
+/// silent corruption for read-back. This walker emits the stored scalars verbatim, except a
+/// tab's first cell, read as the blank the screen shows there.
 ///
-/// Anchored at the LIVE bottom rather than the displayed viewport, so a human scrolling in
-/// copy-mode cannot change what a scripted reader sees.
-///
-/// `want_rows` counts PHYSICAL grid rows, not logical lines — a soft-wrapped logical line
-/// spans several rows. In the alternate screen there is no history, so at most the alt
-/// screen itself is available.
+/// Anchored at the LIVE bottom, not the displayed viewport, so a human scrolling in copy-mode
+/// cannot change what a scripted reader sees. `want_rows` counts PHYSICAL rows, not logical
+/// lines. The alternate screen has no history.
 fn capture_rows<L: EventListener>(term: &Term<L>, want_rows: usize) -> CaptureRows {
     let cols = term.columns();
     let screen = term.screen_lines();
@@ -1590,8 +1417,8 @@ fn capture_rows<L: EventListener>(term: &Term<L>, want_rows: usize) -> CaptureRo
     let walk = wanted.min(CAPTURE_MAX_ROWS);
 
     let mut rows: Vec<(String, bool)> = Vec::new();
-    // Bytes already committed, charging each row the `\n` it may need (a history of blank
-    // rows still costs one separator byte each — that is the whole byte budget otherwise).
+    // Bytes already committed, charging each row the `\n` it may need (a history of blank rows
+    // still costs one separator byte each).
     let mut retained = 0usize;
     let mut cells = 0usize;
     'walk: for k in 0..walk {
@@ -1612,8 +1439,8 @@ fn capture_rows<L: EventListener>(term: &Term<L>, want_rows: usize) -> CaptureRo
             if retained + text.len() + cell.c.len_utf8() + 1 > CAPTURE_MAX_BYTES {
                 break 'walk;
             }
-            // alacritty keeps '\t' in the tab's first cell and blanks in the rest, so a verbatim
-            // copy would be a tab PLUS the blanks. The screen shows blanks; so does read-back.
+            // alacritty keeps '\t' in the tab's first cell and blanks in the rest; the screen
+            // shows blanks, so read-back does too.
             text.push(if cell.c == '\t' { ' ' } else { cell.c });
             if let Some(zw) = cell.zerowidth() {
                 for ch in zw {
@@ -1628,8 +1455,8 @@ fn capture_rows<L: EventListener>(term: &Term<L>, want_rows: usize) -> CaptureRo
                 }
             }
         }
-        // alacritty marks the LAST cell of a soft-wrapped row `WRAPLINE`: the row continues
-        // onto the next one, so the seam must not become a newline.
+        // The LAST cell of a soft-wrapped row carries `WRAPLINE`: the seam must not become a
+        // newline.
         let wraps = cols > 0
             && grid[Point::new(line, Column(cols - 1))]
                 .flags
@@ -1640,9 +1467,8 @@ fn capture_rows<L: EventListener>(term: &Term<L>, want_rows: usize) -> CaptureRo
     CaptureRows { rows, wanted }
 }
 
-/// Join harvested rows top-down. Split from [`capture_rows`] so the concatenation — which
-/// touches every retained byte — runs with the pane's `term` lock RELEASED, keeping the
-/// PTY reader thread unblocked.
+/// Join harvested rows top-down. Split from [`capture_rows`] so the concatenation, which
+/// touches every retained byte, runs with the pane's `term` lock RELEASED.
 fn assemble_capture(harvest: CaptureRows) -> Capture {
     let CaptureRows { mut rows, wanted } = harvest;
     rows.reverse();
@@ -1650,14 +1476,13 @@ fn assemble_capture(harvest: CaptureRows) -> Capture {
     for (i, (row, wraps)) in rows.iter().enumerate() {
         let last = i + 1 == rows.len();
         if *wraps && !last {
-            // Soft-wrap seam: the same logical line continues, so keep the trailing spaces
-            // (trimming would fuse "word " + "next" into "wordnext") and emit no newline.
+            // Soft-wrap seam: keep the trailing spaces (trimming would fuse "word " + "next")
+            // and emit no newline.
             text.push_str(row);
         } else {
-            // Trim ONLY the ASCII space a terminal pads empty cells with. `trim_end()`
-            // would also strip Unicode whitespace the program actually WROTE — a trailing
-            // U+00A0 is content, not padding — and read-back has to be lossless or the
-            // caller acts on text that never existed.
+            // Trim ONLY the ASCII space a terminal pads empty cells with: `trim_end()` would
+            // also strip Unicode whitespace the program WROTE (a trailing U+00A0 is content), and
+            // read-back has to be lossless.
             text.push_str(row.trim_end_matches(' '));
             if !last {
                 text.push('\n');
@@ -1671,44 +1496,36 @@ fn assemble_capture(harvest: CaptureRows) -> Capture {
     }
 }
 
-/// Capture pane text from a bare `Term` — the composition of [`capture_rows`] and
-/// [`assemble_capture`]. Used by tests (no PTY, no shell, deterministic); production goes
-/// through [`PaneTerm::capture`], which scopes the lock to the harvest.
+/// Capture pane text from a bare `Term` (test-only; production goes through
+/// [`PaneTerm::capture`], which scopes the lock to the harvest).
 #[cfg(test)]
 fn capture_text<L: EventListener>(term: &Term<L>, want_rows: usize) -> Capture {
     assemble_capture(capture_rows(term, want_rows))
 }
 
-/// How long a closed pane's shell gets to honour its `SIGHUP` before it is killed.
 const REAP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Join a closed pane's io-thread, then make sure its shell is dead before the `Pty` that
-/// will `waitpid` for it is dropped.
+/// Join a closed pane's io-thread, then make sure its shell is dead before the `Pty` that will
+/// `waitpid` for it is dropped. Detaching alone would trade a wedged server for a shell that
+/// ignores `SIGHUP` outliving its pane, so escalate: `SIGHUP` first (what `Pty::drop` sends, so
+/// a well-behaved shell takes its normal exit), then `SIGKILL` once the grace is up.
 ///
-/// Detaching the wait keeps the loop alive, but on its own it would only trade a wedged
-/// server for a leak: a shell that ignores `SIGHUP` outlives its pane forever, holding the
-/// PTY's descriptors and the reaper thread with it. So escalate — `SIGHUP` first (the same
-/// signal `Pty::drop` will send, so a well-behaved shell still takes its normal exit path),
-/// then `SIGKILL` once the grace is up.
+/// Easy to "fix" wrongly:
 ///
-/// Two things here are deliberate and easy to "fix" wrongly:
-///
-/// * **Signals go out only after the join, and only while the shell is un-reaped.** alacritty
-///   reaps the shell itself when it exits on its own (the event loop's `try_wait` on
-///   `SIGCHLD`), which is the ordinary way a pane closes; a pid signalled after that may
-///   already belong to another process. Once the io-thread has returned, the `Pty` is ours
-///   alone, so nothing can reap the child between [`unreaped`]'s check and the signal.
-/// * **[`unreaped`] peeks with `WNOWAIT`.** It must not reap — `Pty::drop` still sends its
-///   own `SIGHUP` and then `wait`s — and a `kill(pid, 0)` poll would buy nothing, since it
-///   succeeds for a zombie too.
+/// * Signals go out only after the join, and only while the shell is un-reaped. alacritty reaps
+///   the shell itself when it exits on its own, and a pid signalled after that may belong to
+///   another process. Once the io-thread has returned, the `Pty` is ours alone, so nothing can
+///   reap the child between [`unreaped`]'s check and the signal.
+/// * [`unreaped`] peeks with `WNOWAIT`: it must not reap (`Pty::drop` still sends its own
+///   `SIGHUP` and `wait`s), and a `kill(pid, 0)` poll succeeds for a zombie too.
 fn reap<T>(io_thread: std::thread::JoinHandle<T>, pid: Option<u32>) {
     let joined = io_thread.join();
-    // pid 1 / 0 are not ours to signal; treat an unknown pid as nothing to do.
+    // pid 1 / 0 are not ours to signal.
     if let Some(pid) = pid.filter(|p| *p > 1).map(|p| p as libc::pid_t)
         && unreaped(pid)
     {
-        // SAFETY: plain signal syscalls against our own child, which only this thread can
-        // reap now and has not, so the pid cannot have been recycled.
+        // SAFETY: signals against our own child, which only this thread can reap and has not,
+        // so the pid cannot have been recycled.
         unsafe { libc::kill(pid, libc::SIGHUP) };
         let deadline = std::time::Instant::now() + REAP_GRACE;
         while unreaped(pid) && std::time::Instant::now() < deadline {
@@ -1721,11 +1538,9 @@ fn reap<T>(io_thread: std::thread::JoinHandle<T>, pid: Option<u32>) {
     drop(joined);
 }
 
-/// Whether our child `pid` is still running and un-reaped, without reaping it (`WNOWAIT`).
-/// An exited child is a zombie with its status pending; a reaped one is `ECHILD`.
 fn unreaped(pid: libc::pid_t) -> bool {
-    // SAFETY: a zeroed siginfo_t is a valid out-buffer. With `WNOHANG` and no state change
-    // the kernel leaves it zeroed, so `si_signo` tells "still running" from "exited".
+    // SAFETY: a zeroed siginfo_t is a valid out-buffer; with `WNOHANG` and no state change it
+    // stays zeroed, so `si_signo` tells "still running" from "exited".
     unsafe {
         let mut info: libc::siginfo_t = std::mem::zeroed();
         let rc = libc::waitid(
@@ -1745,13 +1560,11 @@ impl Drop for PaneTerm {
             unsafe { libc::close(fd) };
         }
         let _ = self.sender.send(Msg::Shutdown);
-        // Everything past this point happens on a DETACHED thread, and teardown never blocks
-        // the caller. It can't: joining the io-thread hands back alacritty's `EventLoop`,
-        // which owns the `Pty`, and `Pty::drop` SIGHUPs the shell and then `waitpid`s for it
-        // with NO timeout. A shell that doesn't die on that SIGHUP — a `zsh -l` still sourcing
-        // its rc files loses that race often enough to hit on an ordinary close — would block
-        // whoever dropped the pane, and on the server that is the single-writer main loop: no
-        // frames, no control requests, flock held, fixable only with an external SIGKILL.
+        // Everything past this point runs on a DETACHED thread: joining the io-thread hands
+        // back alacritty's `EventLoop`, which owns the `Pty`, and `Pty::drop` SIGHUPs the shell
+        // then `waitpid`s with NO timeout. A shell that survives that SIGHUP (a `zsh -l` still
+        // sourcing its rc files) would block whoever dropped the pane, and on the server that is
+        // the single-writer main loop: no frames, no control requests, flock held.
         if let Some(jh) = self.io_thread.take() {
             let pid = self.child_pid;
             std::thread::spawn(move || reap(jh, pid));
@@ -1759,8 +1572,6 @@ impl Drop for PaneTerm {
     }
 }
 
-/// The pure mode→wheel-bytes mapping behind [`PaneTerm::wheel_bytes`] (split out so the
-/// encoding is unit-testable without a PTY). See that method for the tmux-style policy.
 fn wheel_bytes_for_mode(mode: TermMode, up: bool, col: u16, row: u16) -> Option<Vec<u8>> {
     if reports_mouse(mode) {
         let button: u16 = if up { 64 } else { 65 };
@@ -1778,14 +1589,10 @@ fn wheel_bytes_for_mode(mode: TermMode, up: bool, col: u16, row: u16) -> Option<
     None
 }
 
-/// Whether the app turned on any xterm mouse reporting (1000/1002/1003).
 fn reports_mouse(mode: TermMode) -> bool {
     mode.intersects(TermMode::MOUSE_REPORT_CLICK | TermMode::MOUSE_DRAG | TermMode::MOUSE_MOTION)
 }
 
-/// The pure mode→click-bytes mapping behind [`PaneTerm::click_bytes`]: a left press +
-/// release at `(col, row)` (1-based, pane-relative) in the app's negotiated encoding, or
-/// `None` when the app isn't reporting the mouse.
 fn click_bytes_for_mode(mode: TermMode, col: u16, row: u16) -> Option<Vec<u8>> {
     if !reports_mouse(mode) {
         return None;
@@ -1804,9 +1611,8 @@ fn encode_mouse(mode: TermMode, button: u16, col: u16, row: u16, release: bool) 
     }
     let button = if release { 3 } else { button };
     if mode.contains(TermMode::UTF8_MOUSE) {
-        // xterm 1005: `ESC [ M` then Cb,Cx,Cy each as a UTF-8 char = 32 + value. Unlike
-        // legacy this expresses coords past 223 (up to the 2-byte UTF-8 ceiling, 0x7ff),
-        // so wide panes report the right cell.
+        // xterm 1005: `ESC [ M` then Cb,Cx,Cy each as a UTF-8 char = 32 + value, expressing
+        // coords past 223 (up to 0x7ff) so wide panes report the right cell.
         let mut out = vec![0x1b, b'[', b'M'];
         for v in [button, col, row] {
             let cp = (v as u32 + 32).min(0x7ff);
@@ -1820,15 +1626,14 @@ fn encode_mouse(mode: TermMode, button: u16, col: u16, row: u16, release: bool) 
         }
         return out;
     }
-    // Legacy `ESC [ M Cb Cx Cy`: each value offset by 32, clamped to the single-byte
-    // range (coords past 223 can't be expressed and are pinned there, as in xterm).
+    // Legacy `ESC [ M Cb Cx Cy`: each value offset by 32 and clamped to a byte (coords past 223
+    // are pinned there, as in xterm).
     let enc = |v: u16| (v.saturating_add(32)).min(255) as u8;
     vec![0x1b, b'[', b'M', enc(button), enc(col), enc(row)]
 }
 
-/// Map an alacritty cell color to a renderer-friendly `CellColor`. Named ANSI
-/// 0–15 become palette indices; the semantic Foreground/Background/Cursor/Dim*
-/// names fall back to the surface default.
+/// Map an alacritty cell color to a `CellColor`. Named ANSI 0-15 become palette indices; the
+/// semantic Foreground/Background/Cursor/Dim* names fall back to the surface default.
 fn ansi_to_cell(color: AnsiColor) -> CellColor {
     match color {
         AnsiColor::Spec(rgb) => CellColor::Rgb(rgb.r, rgb.g, rgb.b),
@@ -1859,8 +1664,8 @@ fn ansi_to_cell(color: AnsiColor) -> CellColor {
 mod token_tests {
     use super::next_pane_token;
 
-    /// Tokens must be unique within a run AND carry a per-incarnation prefix, so a token
-    /// minted by a PREVIOUS server (a toast that outlived a restart) cannot resolve here.
+    /// Tokens must be unique within a run AND carry a per-incarnation prefix, so a token minted
+    /// by a PREVIOUS server cannot resolve here.
     #[test]
     fn tokens_are_unique_and_incarnation_qualified() {
         let a = next_pane_token();
@@ -1877,8 +1682,8 @@ mod token_tests {
 
 #[cfg(test)]
 mod clipboard {
-    //! OSC 52 capture policy on the pane listener (tmux `set-clipboard`). No PTY needed —
-    //! the listener is fed the same `Event`s alacritty's parser would emit.
+    //! OSC 52 capture policy on the pane listener. No PTY needed: the listener is fed the same
+    //! `Event`s alacritty's parser would emit.
     use super::*;
 
     fn store(kind: ClipboardType, text: &str) -> Option<String> {
@@ -1898,21 +1703,18 @@ mod clipboard {
 
     #[test]
     fn captures_an_empty_write_as_a_clear() {
-        // OSC 52 with no payload means "clear the clipboard" — a real request, not a no-op.
         assert_eq!(store(ClipboardType::Clipboard, ""), Some(String::new()));
     }
 
     #[test]
     fn sequences_start_above_the_not_yet_relayed_sentinel() {
-        // Regression: with a 0-based dispenser the FIRST clipboard write in the server's life
-        // compared equal to the drain's `last_clipboard_seq = 0` and was silently dropped —
-        // the passthrough relayed nothing at all until a second write happened.
+        // Regression: with a 0-based dispenser the FIRST write compared equal to the drain's
+        // `last_clipboard_seq = 0` and was silently dropped.
         assert!(next_clipboard_seq() > 0);
     }
 
     #[test]
     fn writes_are_sequenced_across_panes() {
-        // The drain picks the max sequence, because pane iteration order is arbitrary.
         let (a, b) = (MuxListener::new(), MuxListener::new());
         a.send_event(Event::ClipboardStore(
             ClipboardType::Clipboard,
@@ -1929,14 +1731,12 @@ mod clipboard {
 
     #[test]
     fn ignores_the_primary_selection() {
-        // No PRIMARY on macOS and no notion of it in comux — must NOT alias onto Cmd-V.
         assert_eq!(store(ClipboardType::Selection, "yanked"), None);
     }
 
     #[test]
     fn drops_an_oversize_payload_whole() {
         let big = "x".repeat(MAX_CLIPBOARD_BYTES + 1);
-        // Dropped, not truncated: pasting a silently-cut command is worse than pasting nothing.
         assert_eq!(store(ClipboardType::Clipboard, &big), None);
         assert!(store(ClipboardType::Clipboard, &"x".repeat(MAX_CLIPBOARD_BYTES)).is_some());
     }
@@ -1964,13 +1764,11 @@ mod clipboard {
             ClipboardType::Clipboard,
             "yanked".into(),
         ));
-        // Nothing on screen changed — dirtying here would cost a frame per yank.
         assert!(!l.dirty.load(Ordering::Relaxed));
     }
 
     #[test]
     fn a_clipboard_read_is_never_answered() {
-        // Replying would hand the host's clipboard to any program in a pane.
         let l = MuxListener::new();
         l.dirty.store(false, Ordering::Relaxed);
         l.send_event(Event::ClipboardLoad(
@@ -1984,11 +1782,10 @@ mod clipboard {
 
 #[cfg(test)]
 mod render_repro {
-    //! Deterministic reproduction of the mux render pipeline WITHOUT a PTY: feed raw
-    //! bytes straight into an alacritty `Term` via the VTE parser, snapshot it, then run
-    //! the exact server→wire→client double-diff and render the client's result into a
-    //! ratatui `TestBackend`. The client's screen must match a direct render of the
-    //! server buffer — any divergence is a transport/compose bug (ghosts, blanks).
+    //! Deterministic reproduction of the mux render pipeline WITHOUT a PTY: feed raw bytes into
+    //! an alacritty `Term`, snapshot it, run the server-to-wire-to-client double-diff and render
+    //! the result into a ratatui `TestBackend`. It must match a direct render of the server
+    //! buffer; any divergence is a transport/compose bug.
     use super::*;
     use alacritty_terminal::event::VoidListener;
     use alacritty_terminal::term::test::TermSize;
@@ -2014,10 +1811,9 @@ mod render_repro {
         p.advance(t, bytes);
     }
 
-    /// Compose a snapshot into a ratatui `Buffer` the same way `App::render_to` composes a
-    /// pane: real glyph + FULL style (fg/bg/bold/reverse, mirroring `tui::to_color`) for content
-    /// cells, `skip` on wide-char spacers. Carrying the style is what lets the relay test emit
-    /// real SGR and validate colour/attribute fidelity, not just glyphs.
+    /// Compose a snapshot into a ratatui `Buffer` the way `App::render_to` composes a pane:
+    /// glyph + FULL style for content cells, `skip` on wide-char spacers, so the relay test can
+    /// validate colour/attribute fidelity.
     fn compose(snap: &Snapshot) -> Buffer {
         let to_color = |c: CellColor| match c {
             CellColor::Default => ratatui::style::Color::Reset,
@@ -2049,9 +1845,8 @@ mod render_repro {
         buf
     }
 
-    /// A style-aware comparable view of a snapshot for the relay test: content cells carry
-    /// `(sym, fg, bg, bold, reverse)`; spacer cells collapse to a sentinel (their own colour is
-    /// irrelevant — the wide glyph before them covers those columns and is never emitted).
+    /// A style-aware comparable view of a snapshot: content cells carry
+    /// `(sym, fg, bg, bold, reverse)`; spacer cells collapse to a sentinel.
     #[allow(clippy::type_complexity)]
     fn cells_norm(snap: &Snapshot) -> Vec<Vec<(String, CellColor, CellColor, bool, bool)>> {
         snap.cells
@@ -2076,9 +1871,8 @@ mod render_repro {
             .collect()
     }
 
-    /// One tick of the server→client pipeline. `last` = the client's known baseline
-    /// (advanced here); returns the client buffer AFTER applying the wire delta, exactly
-    /// as `client::run_attached` does (`full` clears then applies; delta applies in place).
+    /// One tick of the server-to-client pipeline: applies the wire delta to the client buffer
+    /// as `client::run_attached` does (`full` clears then applies).
     fn roundtrip(server: &Buffer, last: &mut Buffer, client: &mut Buffer, full: bool) {
         if full {
             *last = Buffer::empty(server.area);
@@ -2087,8 +1881,8 @@ mod render_repro {
         let changed = last.diff(server);
         for (x, y, cell) in &changed {
             // Through the real wire type, NOT `set_style`: a `Style` read back off a cell has an
-            // empty `sub_modifier`, so `set_style` only ever ADDS modifier bits and would make
-            // BOLD/DIM/REVERSED stick forever — a harness bug that flatters the pipeline.
+            // empty `sub_modifier`, so `set_style` only ADDS modifier bits and would make
+            // BOLD/DIM/REVERSED stick forever.
             let wire = crate::proto::WireCell::of(*x, *y, cell);
             if let Some(bc) = client.cell_mut(Position::new(wire.x, wire.y)) {
                 wire.apply_to(bc);
@@ -2097,8 +1891,6 @@ mod render_repro {
         *last = server.clone();
     }
 
-    /// Render a client buffer through a real ratatui `Terminal<TestBackend>` (its own
-    /// diff + wide-char flush) and return the visible screen text, row by row.
     fn screen(term: &mut Terminal<TestBackend>, src: &Buffer) -> Vec<String> {
         term.draw(|frame| {
             let out = frame.buffer_mut();
@@ -2138,22 +1930,16 @@ mod render_repro {
     }
 
     /// Rewrite an emitted byte stream so the reference terminal measures one glyph DIFFERENTLY
-    /// than the emitter did: every `U+E0B0` (a Powerline separator — Private Use Area, one column
-    /// by `unicode-width`) becomes `가`, which every terminal agrees is two.
-    ///
-    /// This models the one failure comux cannot see from the inside. A Nerd Font icon's width
-    /// lives in the OUTER terminal's font, not in any table we can read, so the fidelity fuzz
-    /// cannot catch it — its reference emulator shares alacritty's width table and therefore
-    /// agrees with us by construction. Substituting in the byte stream makes the reference
-    /// advance two columns where the emitter assumed one, which is exactly what the owner sees.
+    /// than the emitter did: every `U+E0B0` (Powerline separator, one column by `unicode-width`)
+    /// becomes `가`, which every terminal agrees is two. This models the failure comux cannot
+    /// see from the inside: a Nerd Font icon's width lives in the OUTER terminal's font, and the
+    /// fidelity fuzz's reference emulator shares alacritty's width table.
     fn widen_sentinel(bytes: &[u8]) -> Vec<u8> {
         String::from_utf8_lossy(bytes)
             .replace('\u{e0b0}', "가")
             .into_bytes()
     }
 
-    /// Paint `cur` over `prev` through the PRODUCTION emitter and report what a width-disagreeing
-    /// terminal ends up showing.
     fn paint_into_widening_terminal(
         t: &mut Term<VoidListener>,
         p: &mut Processor,
@@ -2178,18 +1964,14 @@ mod render_repro {
 
     #[test]
     fn a_glyph_the_terminal_measures_wider_does_not_skew_its_row_or_jump_on_repaint() {
-        // THE reported symptom, reproduced: "ls나 git status를 하면 글자가 떴다가 확 오른쪽으로
-        // 움직여". Output lands, then the self-heal repaint snaps it sideways.
+        // Reproduces "output lands, then the self-heal repaint snaps it sideways". The outer
+        // terminal draws a glyph wider than `unicode-width` says; before the emitter
+        // re-anchored, a row went out as ONE run positioned by the terminal's own cursor
+        // advance, so that glyph pushed everything after it right, and the anchored repaint put
+        // it back.
         //
-        // The cause is a glyph the outer terminal draws wider than `unicode-width` says. Before
-        // the emitter re-anchored, a row went out as ONE run positioned entirely by the
-        // terminal's own cursor advance, so that one glyph pushed everything after it right —
-        // and the repaint, which did anchor, put it back. Two renderers, one visible jump.
-        //
-        // Asserted here: the cells after the wide-measured glyph land on their true columns, and
-        // a full repaint over the result changes NOTHING. Convergence is the property; the glyph
-        // itself is collateral (printing its neighbour overwrites its second half, which
-        // alacritty answers by blanking the pair) and that is the bounded damage by design.
+        // Asserted: cells after the wide-measured glyph land on their true columns, and a full
+        // repaint changes NOTHING. Convergence is the property; the glyph itself is collateral.
         let (cols, rows) = (8usize, 1usize);
         let (mut t, mut p) = term(cols, rows);
         let area = Rect::new(0, 0, cols as u16, rows as u16);
@@ -2199,16 +1981,13 @@ mod render_repro {
         let mut cur = Buffer::empty(area);
         crate::client::blit_view(&frame, &mut cur);
 
-        // One ordinary delta from a blank screen.
         let empty = Buffer::empty(area);
         paint_into_widening_terminal(&mut t, &mut p, Some(&empty), &cur, cols, rows);
         let after_delta = snap_text(&snapshot_grid(&t));
 
-        // Everything after the mismeasured glyph is on its TRUE COLUMN — no skew.
-        //
-        // Asserted per column off the grid, never off `snap_text`: that collapses a wide glyph's
-        // spacer to an empty string, so a row shifted one column right still reads `ab가cdef`
-        // and the skew — the whole bug — hides inside the text.
+        // Everything after the mismeasured glyph is on its TRUE COLUMN. Asserted per column off
+        // the grid, never `snap_text`, which collapses a wide glyph's spacer so a row shifted one
+        // column right still reads `ab가cdef`.
         let cells = &snapshot_grid(&t).cells[0];
         let at = |x: usize| -> String {
             if cells[x].spacer {
@@ -2229,8 +2008,7 @@ mod render_repro {
             );
         }
 
-        // Now the self-heal repaint, over the same content. It must change NOTHING — that
-        // equality is the absence of the jump.
+        // The self-heal repaint over the same content must change NOTHING.
         paint_into_widening_terminal(&mut t, &mut p, None, &cur, cols, rows);
         let after_repaint = snap_text(&snapshot_grid(&t));
         assert_eq!(
@@ -2239,8 +2017,8 @@ mod render_repro {
         );
     }
 
-    /// The heart of it: after feeding a SEQUENCE of byte-batches (each = one server
-    /// render tick), the client's on-screen text must equal the final snapshot's text."""
+    /// After feeding a SEQUENCE of byte-batches (each one server render tick), the client's
+    /// on-screen text must equal the final snapshot's text.
     fn assert_pipeline(cols: usize, rows: usize, batches: &[&[u8]]) {
         let (mut t, mut p) = term(cols, rows);
         let backend = TestBackend::new(cols as u16, rows as u16);
@@ -2267,8 +2045,8 @@ mod render_repro {
         );
     }
 
-    /// A `Write` sink shared with the caller so we can read back the exact escape-sequence
-    /// bytes ratatui's `CrosstermBackend` emits (its `writer_mut` is feature-gated).
+    /// A `Write` sink shared with the caller to read back the escape bytes ratatui's
+    /// `CrosstermBackend` emits.
     #[derive(Clone)]
     struct SharedBytes(Rc<RefCell<Vec<u8>>>);
     impl std::io::Write for SharedBytes {
@@ -2281,13 +2059,11 @@ mod render_repro {
         }
     }
 
-    /// END-TO-END FIDELITY: does comux faithfully relay one alacritty screen to another THROUGH
-    /// the real emit path? Feed app bytes to a SOURCE `Term`; each tick compose → wire delta →
-    /// client buffer → drive a real ratatui `Terminal<CrosstermBackend>` (its own diff + escape
-    /// output) → replay the EMITTED BYTES into a spec-correct REFERENCE `Term`. If the reference
-    /// screen matches the source, comux's emitted escape stream is correct — so any on-screen
-    /// drift the owner sees is the OUTER emulator (copad) mis-rendering that stream, NOT comux.
-    /// (`refresh_at` forces a full repaint before those ticks, exercising the clear+repaint path.)
+    /// END-TO-END FIDELITY: does comux faithfully relay one alacritty screen to another through
+    /// the real emit path? Each tick: compose, wire delta, client buffer, a real ratatui
+    /// `Terminal<CrosstermBackend>`, then replay the EMITTED BYTES into a spec-correct REFERENCE
+    /// `Term`. If the reference matches the source, any on-screen drift is the OUTER emulator
+    /// mis-rendering the stream. (`refresh_at` forces a full repaint before those ticks.)
     fn assert_relay_fidelity(cols: usize, rows: usize, batches: &[&[u8]], refresh_at: &[usize]) {
         let (mut src_t, mut src_p) = term(cols, rows);
         let (mut ref_t, mut ref_p) = term(cols, rows);
@@ -2305,12 +2081,12 @@ mod render_repro {
             feed(&mut src_t, &mut src_p, batch);
             let snap = snapshot_grid(&src_t);
             let server = compose(&snap);
-            // First tick = full baseline; a `refresh_at` tick forces a clear+full repaint
-            // (the self-heal / Ctrl-b r path); everything else is an incremental delta.
+            // First tick = full baseline; a `refresh_at` tick forces a clear+full repaint (the
+            // self-heal / Ctrl-b r path); everything else is a delta.
             let full = i == 0 || refresh_at.contains(&i);
             deliver(&server, &mut client, full);
-            // The real client reconstructs wide-char spacers after applying each frame so its
-            // buffer matches the server's (the wire omits them); model that here.
+            // The real client reconstructs wide-char spacers after each frame (the wire omits
+            // them); model that here.
             crate::client::fix_wide_spacers(&mut client);
             if full {
                 cterm.clear().unwrap();
@@ -2336,8 +2112,7 @@ mod render_repro {
         }
         let src_snap = snapshot_grid(&src_t);
         let ref_snap = snapshot_grid(&ref_t);
-        // Full-style comparison (glyph + fg/bg/bold/reverse), so a lost colour or attribute
-        // fails too — not just a wrong glyph. The `snap_text` lines make the message readable.
+        // Full-style comparison, so a lost colour or attribute fails too, not just a glyph.
         assert_eq!(
             cells_norm(&ref_snap),
             cells_norm(&src_snap),
@@ -2349,14 +2124,10 @@ mod render_repro {
     }
 
     /// Production-accurate relay (mirrors `server::push_frames` + `client::run_attached`).
-    ///
-    /// The difference from [`assert_relay_fidelity`]: that harness's `deliver` re-derives the
-    /// wire delta from the client's ALREADY-normalized buffer (`client.clone().diff(frame)`),
-    /// which silently models the server as diffing against the client's post-`fix_wide_spacers`
-    /// buffer. Production does NOT: `push_frames` keeps `c.last = <raw composed buffer>` and diffs
-    /// the next raw compose against THAT. This harness keeps that independent RAW baseline, so it
-    /// exposes any ghost caused by the server's baseline disagreeing with the client's normalized
-    /// buffer (the trailing-spacer width-oracle asymmetry).
+    /// Unlike [`assert_relay_fidelity`], whose `deliver` diffs against the client's
+    /// already-normalized buffer, this keeps an independent RAW baseline as `push_frames` does
+    /// (`c.last = <raw composed buffer>`), exposing any ghost caused by the server's baseline
+    /// disagreeing with the client's normalized buffer.
     fn assert_relay_fidelity_prod(
         cols: usize,
         rows: usize,
@@ -2374,28 +2145,25 @@ mod render_repro {
             },
         )
         .unwrap();
-        let mut server_last = Buffer::empty(area); // the server's `c.last` (RAW composed buffer)
+        let mut server_last = Buffer::empty(area);
         let mut client = Buffer::empty(area);
         for (i, batch) in batches.iter().enumerate() {
             feed(&mut src_t, &mut src_p, batch);
             let snap = snapshot_grid(&src_t);
-            let server = compose(&snap); // RAW composed, exactly like `App::render_to`
+            let server = compose(&snap);
             let full = i == 0 || refresh_at.contains(&i);
             if full {
                 server_last = Buffer::empty(area);
                 client = Buffer::empty(area);
             }
-            // `push_frames`: diff the raw compose against the raw baseline, ship changed cells.
             let changed = server_last.diff(&server);
             for (x, y, cell) in &changed {
-                // See `roundtrip`: the wire type, never `set_style`.
                 let wire = crate::proto::WireCell::of(*x, *y, cell);
                 if let Some(bc) = client.cell_mut(Position::new(wire.x, wire.y)) {
                     wire.apply_to(bc);
                 }
             }
-            server_last = server.clone(); // advance the RAW baseline (production semantics)
-            // `run_attached`: normalize spacers, then emit through a real ratatui terminal.
+            server_last = server.clone();
             crate::client::fix_wide_spacers(&mut client);
             if full {
                 cterm.clear().unwrap();
@@ -2433,9 +2201,9 @@ mod render_repro {
     #[test]
     fn a_tab_is_blank_cells_and_never_reaches_the_terminal() {
         // `git status` indents with a tab. alacritty stores '\t' in the tab's first cell; if that
-        // reaches the emit, a full repaint (one run per row) makes the outer terminal jump to its
-        // own tab stop and shifts the rest of the row. The shape of the output that showed it:
-        // a tab at column 0, mid-line tabs, a tab over a coloured background, a tab after CJK.
+        // reaches the emit, a full repaint makes the outer terminal jump to its own tab stop and
+        // shift the rest of the row. Covers a tab at column 0, mid-line, over a coloured
+        // background, and after CJK.
         let (mut t, mut p) = term(40, 6);
         feed(
             &mut t,
@@ -2460,7 +2228,6 @@ mod render_repro {
         );
         assert!(texts[1].starts_with("a       b       c"), "{texts:?}");
 
-        // Through the real paint path, a from-scratch repaint lands every cell where it was.
         let area = Rect::new(0, 0, 40, 6);
         let sink = SharedBytes(Rc::new(RefCell::new(Vec::new())));
         let mut cterm = Terminal::with_options(
@@ -2478,8 +2245,8 @@ mod render_repro {
 
     #[test]
     fn capture_reads_a_tab_as_the_blanks_it_left() {
-        // Read-back has to show the columns the screen shows: a tab plus the blanks after it
-        // would be read as 15 columns of indent by anything that expands it.
+        // A tab plus the blanks after it would be read as 15 columns of indent by anything that
+        // expands it.
         let (mut t, mut p) = term(30, 2);
         feed(&mut t, &mut p, b"\tx\ty");
         let text = assemble_capture(capture_rows(&t, 2)).text;
@@ -2488,24 +2255,22 @@ mod render_repro {
 
     #[test]
     fn a_spacer_always_follows_a_wide_cell() {
-        // THE invariant the whole wide-glyph path rests on, asserted directly: a cell is marked
-        // a spacer exactly when the cell before it emits a two-column symbol. The client's
-        // `fix_wide_spacers` rebuilds spacer structure from that same predicate and CANNOT check
-        // it — the wire delta never carries a `skip` cell — so if the two ever disagree the
-        // client paints a stale cell the server believes it delivered, which no later delta can
-        // correct. Both directions matter: a spacer with no wide cell before it (alacritty's
-        // line-end filler, and a `WIDE_CHAR_SPACER` orphaned by a ZWJ sequence), and a wide
-        // symbol whose following cell is NOT marked.
+        // The invariant the wide-glyph path rests on: a cell is a spacer exactly when the cell
+        // before it emits a two-column symbol. The client's `fix_wide_spacers` rebuilds spacers
+        // from that predicate and CANNOT check it (the wire delta never carries a `skip` cell),
+        // so a disagreement paints a stale cell no later delta corrects. Both directions: a spacer
+        // with no wide cell before it (alacritty's line-end filler, a `WIDE_CHAR_SPACER` orphaned
+        // by a ZWJ sequence), and a wide symbol whose following cell is NOT marked.
         //
-        // Widths 8..11 × three paddings put a wide glyph at both column parities and straddling
-        // the right edge, which is where alacritty leaves the line-end filler.
+        // Widths 8..11 with three paddings put a wide glyph at both column parities and
+        // straddling the right edge, where alacritty leaves the line-end filler.
         for cols in [8usize, 9, 10, 11] {
             for pad in 0..3 {
                 let (mut t, mut p) = term(cols, 4);
                 let mut input = "x".repeat(pad);
                 input.push_str(&"가".repeat(cols));
-                // A ZWJ sequence and a VS16 emoji too: both make alacritty's flags and
-                // unicode-width disagree, which is how the orphaned spacer arises.
+                // A ZWJ sequence and a VS16 emoji make alacritty's flags and unicode-width
+                // disagree, which is how the orphaned spacer arises.
                 input.push_str("👨\u{200d}👩\u{200d}👧❤\u{fe0f}가");
                 feed(&mut t, &mut p, input.as_bytes());
                 let snap = snapshot_grid(&t);
@@ -2525,8 +2290,8 @@ mod render_repro {
                                 .map(|c| (&c.sym, c.spacer)),
                             row.iter().map(|c| (&c.sym, c.spacer)).collect::<Vec<_>>(),
                         );
-                        // And every non-spacer symbol measures 1 or 2 columns — never 0, which
-                        // would desync the client's left-to-right walk.
+                        // Every non-spacer symbol measures 1 or 2 columns, never 0, which would
+                        // desync the client's left-to-right walk.
                         if !cell.spacer {
                             let w = UnicodeWidthStr::width(cell.sym.as_str());
                             assert!(
@@ -2543,13 +2308,11 @@ mod render_repro {
 
     #[test]
     fn a_line_end_wide_char_filler_is_a_blank_not_a_spacer() {
-        // The concrete case behind the invariant above: a wide glyph that does not fit in the
-        // last column makes alacritty leave a `LEADING_WIDE_CHAR_SPACER` filler there and wrap
-        // the glyph to the next row. Nothing covers that filler, so it must be composed as an
-        // ordinary blank — marking it `skip` froze whatever the cell previously held into the
-        // pane's last column, because a `skip` cell is never shipped.
+        // A wide glyph that does not fit in the last column makes alacritty leave a
+        // `LEADING_WIDE_CHAR_SPACER` filler and wrap the glyph. Nothing covers that filler, so it
+        // must be an ordinary blank: marking it `skip` froze its old content into the pane's last
+        // column, because a `skip` cell is never shipped.
         let (mut t, mut p) = term(5, 3);
-        // Odd offset so the 5th column can only hold half of a wide glyph.
         feed(&mut t, &mut p, "ab가가".as_bytes());
         let snap = snapshot_grid(&t);
         let row0 = &snap.cells[0];
@@ -2565,31 +2328,26 @@ mod render_repro {
             "col 4 is the line-end filler — a blank, NOT a spacer: {:?}",
             row0.iter().map(|c| (&c.sym, c.spacer)).collect::<Vec<_>>()
         );
-        // And the glyph that did not fit wrapped to the next row.
         assert_eq!(&snap.cells[1][0].sym, "가");
     }
 
     #[test]
     fn snapshot_coerces_grapheme_width_to_alacritty_span() {
-        // The root fix: a grapheme whose unicode-width disagrees with alacritty's column span is
-        // coerced so the two agree (VS16 ❤️ → ❤, width 1). CJK is untouched (both models say 2).
+        // A grapheme whose unicode-width disagrees with alacritty's column span is coerced so
+        // the two agree (VS16 ❤️ -> ❤, width 1). CJK is untouched (both models say 2).
         let (mut t, mut p) = term(10, 1);
         feed(&mut t, &mut p, "❤\u{fe0f}가X".as_bytes());
         let row = &snapshot_grid(&t).cells[0];
-        // ❤️ occupies 1 alacritty column → the VS16 is dropped so the sym is the width-1 base.
         assert_eq!(row[0].sym, "❤");
         assert!(!row[0].spacer);
-        // 가 is genuinely wide (2 cols) → unchanged, with a trailing spacer at col 2.
         assert_eq!(row[1].sym, "가");
         assert!(row[2].spacer);
-        // X sits at col 3 (right after 가's spacer), proving ❤️ consumed exactly ONE column.
         assert_eq!(row[3].sym, "X");
     }
 
     #[test]
     fn prod_relay_passes_on_normal_content() {
-        // Sanity: the production-accurate harness (independent raw baseline) relays ordinary
-        // wide-CJK + colored content faithfully — same script as the claude-code-like session.
+        // Sanity: the production-accurate harness relays ordinary wide-CJK + colored content.
         assert_relay_fidelity_prod(
             24,
             6,
@@ -2612,12 +2370,10 @@ mod render_repro {
 
     #[test]
     fn prod_relay_wide_char_desync_is_fixed() {
-        // A pure-delta emoji/CJK churn: mixes VS16 ❤️ (alacritty width 1, unicode-width 2) with
-        // 가 (both 2) and X. This USED to diverge through the production-accurate baseline — a 가
-        // that replaced an ❤️ was never re-sent, leaving a stale ❤️ ghost (the root of the user's
-        // "sometimes ghost"). Now `snapshot_grid` coerces each grapheme's unicode-width to match
-        // alacritty's column span (❤️ → ❤, width 1), so every pipeline stage agrees and the relay
-        // stays faithful with deltas alone — no forced repaint needed. This test now PASSES.
+        // Pure-delta emoji/CJK churn mixing VS16 ❤️ (alacritty width 1, unicode-width 2) with 가
+        // (both 2). It once diverged: a 가 replacing a ❤️ was never re-sent, leaving a stale ❤️
+        // ghost. `snapshot_grid` now coerces widths so every stage agrees and deltas alone stay
+        // faithful.
         let batches: Vec<Vec<u8>> = (0..20)
             .map(|i| {
                 let mut s = String::from("\x1b[H");
@@ -2645,14 +2401,10 @@ mod render_repro {
 
     #[test]
     fn full_frame_on_alt_exit_clears_wide_char_residue() {
-        // The shipped fix's MECHANISM: a full repaint forced at the alt-screen EXIT wipes any
-        // wide-char desync residue accumulated during the app's life, so the restored primary
-        // (shell) screen is clean. Ticks 0-2 accumulate VS16/emoji desync on the alt screen;
-        // tick 3 leaves the alt screen (`?1049l`) and `refresh_at: [3]` models the server forcing
-        // `needs_full` on THAT exit transition (the production edge); tick 4 draws the ASCII shell
-        // prompt. The restored primary screen (width-agreement content) must match the source
-        // exactly — no residue. (Without the forced full — see `prod_relay_known_wide_char_desync`
-        // — the stale alt-screen cells the incremental diff wrongly deems unchanged would linger.)
+        // A full repaint forced at the alt-screen EXIT wipes wide-char desync residue accumulated
+        // during the app's life. Ticks 0-2 build desync on the alt screen, tick 3 leaves it
+        // (`?1049l`) with `refresh_at: [3]` modelling the server forcing `needs_full` on that
+        // edge, tick 4 draws an ASCII prompt; the restored primary screen must match the source.
         assert_relay_fidelity_prod(
             20,
             4,
@@ -2669,8 +2421,6 @@ mod render_repro {
 
     #[test]
     fn alt_screen_bit_tracks_enter_exit() {
-        // The signal the fix polls: `?1049h` sets `ALT_SCREEN`, `?1049l` clears it. This is what
-        // `PaneTerm::in_alt_screen` reads and the render loop watches for the true->false edge.
         let (mut t, mut p) = term(10, 3);
         assert!(!t.mode().contains(TermMode::ALT_SCREEN));
         feed(&mut t, &mut p, b"\x1b[?1049h");
@@ -2681,10 +2431,9 @@ mod render_repro {
 
     #[test]
     fn relay_fidelity_claude_code_like_session() {
-        // A Claude-Code-ish full-screen session: alt-screen enter, a box with a wide-char
-        // title, colored text, cursor jumps, PARTIAL interior redraws, a wide→narrow swap, a
-        // mid-region clear, and a forced refresh — fed as many small server ticks so the
-        // incremental-diff path is heavily exercised.
+        // A Claude-Code-ish full-screen session: alt-screen enter, a box with a wide-char title,
+        // colored text, cursor jumps, PARTIAL interior redraws, a wide-to-narrow swap, a
+        // mid-region clear and a forced refresh, as many small ticks.
         assert_relay_fidelity(
             24,
             6,
@@ -2707,15 +2456,13 @@ mod render_repro {
 
     #[test]
     fn relay_fidelity_pure_delta_churn() {
-        // Heavy PURE-INCREMENTAL path (no refresh): a scrolling/progress-style redraw that
-        // rewrites the whole screen every tick with shifting wide+narrow content — the exact
-        // churn where drift would accumulate. Fidelity must hold with deltas alone.
+        // Pure-incremental path (no refresh): a progress-style redraw rewriting the whole screen
+        // every tick with shifting wide+narrow content, where drift would accumulate.
         let batches: Vec<Vec<u8>> = (0..20)
             .map(|i| {
                 let mut s = String::from("\x1b[H");
                 for row in 1..=5 {
                     let n = (i + row) % 7;
-                    // Mix wide CJK, ASCII, and a moving colored marker per row.
                     s.push_str(&format!("\x1b[{row};1H\x1b[2K"));
                     for c in 0..6 {
                         if (c + n) % 3 == 0 {
@@ -2735,7 +2482,6 @@ mod render_repro {
 
     #[test]
     fn clear_after_full_screen_leaves_no_ghost() {
-        // Fill the screen, then clear it — the classic ghost-after-clear case.
         assert_pipeline(
             10,
             3,
@@ -2745,7 +2491,6 @@ mod render_repro {
 
     #[test]
     fn wide_chars_then_clear_leaves_no_ghost() {
-        // CJK fills each row with wide glyph + spacer; clearing must wipe both halves.
         assert_pipeline(
             10,
             2,
@@ -2755,16 +2500,14 @@ mod render_repro {
 
     #[test]
     fn wide_char_replaced_by_narrow() {
-        // A wide glyph overwritten by a narrow one at the same origin: the spacer half
-        // must not linger as a ghost.
+        // A wide glyph overwritten by a narrow one: the spacer half must not linger as a ghost.
         assert_pipeline(6, 1, &[b"\x1b[H\xea\xb0\x80", b"\x1b[H", b"\x1b[Hxy"]);
     }
 
-    /// Like [`assert_pipeline`] but models the real server's `sync_channel(1)` coalescing:
-    /// the client only drains a frame every `drain_every` ticks. On a "drop" tick the frame
-    /// is NOT delivered and `last` is NOT advanced (server semantics); the main loop keeps
-    /// re-composing (pending) until the client drains, so the delta must catch up. After the
-    /// last batch we flush all pending deliveries. Final screen must equal the final snapshot.
+    /// Like [`assert_pipeline`] but models the server's `sync_channel(1)` coalescing: the client
+    /// drains a frame only every `drain_every` ticks. On a drop tick the frame is NOT delivered
+    /// and `last` is NOT advanced, so the delta must catch up; pending deliveries are flushed
+    /// after the last batch.
     fn assert_pipeline_backpressure(
         cols: usize,
         rows: usize,
@@ -2774,9 +2517,9 @@ mod render_repro {
         let (mut t, mut p) = term(cols, rows);
         let mut cterm = Terminal::new(TestBackend::new(cols as u16, rows as u16)).unwrap();
         let area = Rect::new(0, 0, cols as u16, rows as u16);
-        let mut last = Buffer::empty(area); // server's view of the client baseline
-        let mut client = Buffer::empty(area); // client's actual buffer
-        let mut queued: Option<Buffer> = None; // the 1-slot channel (holds a composed frame)
+        let mut last = Buffer::empty(area);
+        let mut client = Buffer::empty(area);
+        let mut queued: Option<Buffer> = None;
         let mut first = true;
         let mut final_snap = None;
         let mut tick = 0usize;
@@ -2785,15 +2528,13 @@ mod render_repro {
             let snap = snapshot_grid(&t);
             final_snap = Some(snap.clone());
             let server = compose(&snap);
-            // Server tick: diff vs last; try to enqueue. Channel full (queued Some) => drop.
             let changed = last.diff(&server);
-            // Enqueue if there's something to send AND the 1-slot channel is free; a full
-            // channel drops the frame (last stays put — a real loop re-composes via pending).
+            // Enqueue if there is something to send AND the 1-slot channel is free; a full
+            // channel drops the frame (last stays put).
             if (!changed.is_empty() || first) && queued.is_none() {
                 queued = Some(server.clone());
-                last = server.clone(); // advance only on successful enqueue
+                last = server.clone();
             }
-            // Client drains on some ticks only.
             tick += 1;
             if tick.is_multiple_of(drain_every)
                 && let Some(frame) = queued.take()
@@ -2803,7 +2544,6 @@ mod render_repro {
                 first = false;
             }
         }
-        // Drain whatever is left, plus force a final catch-up compose (models `pending`).
         if let Some(frame) = queued.take() {
             deliver(&frame, &mut client, first);
             screen(&mut cterm, &client);
@@ -2824,22 +2564,18 @@ mod render_repro {
         );
     }
 
-    /// Apply one wire frame to the client buffer (full = clear+apply, delta = apply in place).
     fn deliver(frame: &Buffer, client: &mut Buffer, full: bool) {
         if full {
             *client = Buffer::empty(frame.area);
         }
-        // The wire is the diff the server computed vs ITS last; but here `frame` is the full
-        // composed server buffer, so re-derive the changed set against an empty baseline for
-        // full, or trust the caller advanced last. We instead just copy non-skip cells that
-        // differ — equivalent to applying the delta the server would have sent.
+        // `frame` is the full composed server buffer, so just copy the non-skip cells that
+        // differ: equivalent to applying the delta the server would have sent.
         let base = if full {
             Buffer::empty(frame.area)
         } else {
             client.clone()
         };
         for (x, y, cell) in base.diff(frame) {
-            // See `roundtrip`: the wire type, never `set_style`.
             let wire = crate::proto::WireCell::of(x, y, cell);
             if let Some(bc) = client.cell_mut(Position::new(wire.x, wire.y)) {
                 wire.apply_to(bc);
@@ -2849,8 +2585,7 @@ mod render_repro {
 
     #[test]
     fn backpressure_coalescing_converges() {
-        // Rapid full-screen churn with a client that drains 1-in-3 frames: the coalesced
-        // deltas must still converge to the final screen (no lingering blanks/ghosts).
+        // Rapid full-screen churn with a client that drains 1-in-3 frames must still converge.
         assert_pipeline_backpressure(
             8,
             3,
@@ -2867,7 +2602,6 @@ mod render_repro {
 
     #[test]
     fn wheel_sgr_mouse_mode() {
-        // App negotiated SGR mouse reporting → SGR wheel button (64 up / 65 down) at coords.
         let m = TermMode::MOUSE_REPORT_CLICK | TermMode::SGR_MOUSE;
         assert_eq!(
             wheel_bytes_for_mode(m, true, 5, 9).unwrap(),
@@ -2881,7 +2615,6 @@ mod render_repro {
 
     #[test]
     fn wheel_legacy_mouse_mode() {
-        // Mouse reporting without SGR → legacy ESC [ M Cb Cx Cy (each offset by 32).
         let m = TermMode::MOUSE_REPORT_CLICK;
         assert_eq!(
             wheel_bytes_for_mode(m, true, 1, 1).unwrap(),
@@ -2891,15 +2624,13 @@ mod render_repro {
 
     #[test]
     fn wheel_utf8_mouse_mode_encodes_wide_coords() {
-        // Mode 1005 (UTF8) without SGR: small coords are 1-byte; a coord past 223 becomes a
+        // Mode 1005 (UTF8) without SGR: small coords are 1 byte; a coord past 223 becomes a
         // 2-byte UTF-8 char rather than clamping to a wrong cell.
         let m = TermMode::MOUSE_REPORT_CLICK | TermMode::UTF8_MOUSE;
-        // col=1,row=1 → Cb=96, Cx=33, Cy=33 (all 1-byte, same as legacy here).
         assert_eq!(
             wheel_bytes_for_mode(m, true, 1, 1).unwrap(),
             vec![0x1b, b'[', b'M', 96, 33, 33]
         );
-        // col=300 → 300+32=332 = U+014C, a 2-byte UTF-8 sequence (0xC5 0x8C).
         let got = wheel_bytes_for_mode(m, true, 300, 1).unwrap();
         let mut want = vec![0x1b, b'[', b'M', 96u8];
         want.extend_from_slice('\u{14c}'.to_string().as_bytes());
@@ -2927,7 +2658,6 @@ mod render_repro {
 
     #[test]
     fn click_without_mouse_reporting_is_not_forwarded() {
-        // A shell, or an alt-screen pager with only alternate-scroll: comux keeps the click.
         assert!(click_bytes_for_mode(TermMode::empty(), 1, 1).is_none());
         let pager = TermMode::ALTERNATE_SCROLL | TermMode::ALT_SCREEN;
         assert!(click_bytes_for_mode(pager, 1, 1).is_none());
@@ -2935,7 +2665,6 @@ mod render_repro {
 
     #[test]
     fn wheel_alternate_scroll_sends_arrows() {
-        // Alt-screen pager (less/man) without mouse mode → cursor keys; app-cursor picks SS3.
         let base = TermMode::ALTERNATE_SCROLL | TermMode::ALT_SCREEN;
         assert_eq!(wheel_bytes_for_mode(base, true, 1, 1).unwrap(), b"\x1b[A");
         assert_eq!(wheel_bytes_for_mode(base, false, 1, 1).unwrap(), b"\x1b[B");
@@ -2945,9 +2674,7 @@ mod render_repro {
 
     #[test]
     fn wheel_no_mouse_app_yields_none() {
-        // A plain shell (no mouse, no alternate-scroll) → None → caller scrolls scrollback.
         assert_eq!(wheel_bytes_for_mode(TermMode::empty(), true, 1, 1), None);
-        // Alternate-scroll but NOT on the alt screen (a normal prompt) also declines.
         assert_eq!(
             wheel_bytes_for_mode(TermMode::ALTERNATE_SCROLL, true, 1, 1),
             None
@@ -2956,8 +2683,6 @@ mod render_repro {
 
     #[test]
     fn box_drawing_partial_redraw() {
-        // Mimic a TUI (Claude Code-like) drawing a box, then redrawing only its interior —
-        // exercises partial deltas over previously-painted cells.
         assert_pipeline(
             8,
             3,
@@ -2971,8 +2696,7 @@ mod render_repro {
 
 #[cfg(test)]
 mod capture_tests {
-    //! Read-back (`comux capture-pane`) driven against a bare `Term` through the VTE
-    //! parser — no PTY, no shell, deterministic.
+    //! Read-back (`comux capture-pane`) driven against a bare `Term` through the VTE parser.
     use super::*;
     use alacritty_terminal::event::VoidListener;
     use alacritty_terminal::term::test::TermSize;
@@ -2998,18 +2722,15 @@ mod capture_tests {
         let cap = capture_text(&t, 4);
         assert_eq!(cap.text, "alpha\nbeta\ngamma\n");
         assert_eq!(cap.rows, 4);
-        // Everything available was returned, so this is NOT truncation.
         assert!(!cap.truncated);
     }
 
     #[test]
     fn reaches_back_into_scrollback() {
         let (mut t, mut p) = term(20, 3);
-        // 6 lines through a 3-row screen: the first three scroll into history.
         for i in 1..=6 {
             feed(&mut t, &mut p, &format!("line{i}\r\n"));
         }
-        // The visible screen alone cannot see line1.
         assert!(!capture_text(&t, 3).text.contains("line1"));
         let deep = capture_text(&t, 9);
         assert!(
@@ -3017,7 +2738,6 @@ mod capture_tests {
             "scrollback capture missed rows: {:?}",
             deep.text
         );
-        // Order is oldest-first, newest-last.
         let first = deep.text.find("line1").unwrap();
         let last = deep.text.find("line6").unwrap();
         assert!(first < last, "capture is not in display order");
@@ -3025,20 +2745,18 @@ mod capture_tests {
 
     #[test]
     fn clamps_past_the_top_of_history() {
-        // Indexing `Line(-n)` past `history_size` panics in alacritty, so an over-long
-        // request must clamp rather than reach.
+        // Indexing `Line(-n)` past `history_size` panics in alacritty, so an over-long request
+        // must clamp.
         let (mut t, mut p) = term(20, 3);
         feed(&mut t, &mut p, "only\r\n");
         let cap = capture_text(&t, 50_000);
         assert!(cap.text.contains("only"));
-        // Nothing older exists, so asking for more is not "missing output".
         assert!(!cap.truncated);
     }
 
     #[test]
     fn zero_rows_is_empty_not_a_panic() {
-        // The server refuses `--lines 0` at the boundary; the walker must still be safe,
-        // because a clamp/index slip here is an out-of-bounds panic on the main loop.
+        // The server refuses `--lines 0`, but a clamp/index slip here would panic the main loop.
         let (mut t, mut p) = term(20, 3);
         feed(&mut t, &mut p, "x");
         let cap = capture_text(&t, 0);
@@ -3049,7 +2767,6 @@ mod capture_tests {
 
     #[test]
     fn joins_a_softwrap_seam_without_a_newline() {
-        // 6 columns: "abcdefgh" soft-wraps, and the seam is the SAME logical line.
         let (mut t, mut p) = term(6, 3);
         feed(&mut t, &mut p, "abcdefgh");
         let cap = capture_text(&t, 3);
@@ -3062,8 +2779,8 @@ mod capture_tests {
 
     #[test]
     fn a_hard_line_break_stays_a_newline() {
-        // Capture counts rows UP from the live bottom, so a 3-row screen needs all 3 to
-        // reach "one" — asking for 2 legitimately starts at "two".
+        // Capture counts rows UP from the live bottom, so a 3-row screen needs all 3 to reach
+        // "one"; asking for 2 starts at "two".
         let (mut t, mut p) = term(20, 3);
         feed(&mut t, &mut p, "one\r\ntwo");
         assert!(capture_text(&t, 3).text.starts_with("one\ntwo"));
@@ -3072,7 +2789,6 @@ mod capture_tests {
 
     #[test]
     fn a_wide_glyph_is_captured_once() {
-        // The trailing spacer cell must be skipped, or every CJK glyph doubles.
         let (mut t, mut p) = term(10, 1);
         feed(&mut t, &mut p, "가나");
         assert_eq!(capture_text(&t, 1).text, "가나");
@@ -3080,10 +2796,9 @@ mod capture_tests {
 
     #[test]
     fn preserves_vs16_that_the_render_snapshot_drops() {
-        // THE regression test for the reason this walker exists. `snapshot_grid` coerces a
-        // grapheme's unicode-width to alacritty's column span, which turns ❤️ into ❤ (see
-        // `snapshot_coerces_grapheme_width_to_alacritty_span`). That is right for rendering
-        // and silent corruption for read-back, so capture must NOT go through it.
+        // Regression test for why this walker exists: `snapshot_grid` coerces ❤️ to ❤ (see
+        // `snapshot_coerces_grapheme_width_to_alacritty_span`), which is right for rendering and
+        // silent corruption for read-back, so capture must NOT go through it.
         let (mut t, mut p) = term(10, 1);
         feed(&mut t, &mut p, "❤\u{fe0f}");
         let captured = capture_text(&t, 1).text;
@@ -3097,10 +2812,8 @@ mod capture_tests {
 
     #[test]
     fn keeps_unicode_whitespace_the_program_wrote() {
-        // Read-back must be lossless, which makes the trailing-trim rule load-bearing. A
-        // trailing U+00A0 is CONTENT, not padding: `trim_end()` (Unicode White_Space) would
-        // delete it and still report `truncated: false` — a lie the caller cannot detect.
-        // Only the ASCII space the grid pads empty cells with is safe to strip.
+        // A trailing U+00A0 is CONTENT, not padding: `trim_end()` would delete it and still
+        // report `truncated: false`. Only the ASCII space the grid pads with is safe to strip.
         let (mut t, mut p) = term(10, 1);
         feed(&mut t, &mut p, "x\u{00A0}");
         assert_eq!(capture_text(&t, 1).text, "x\u{00A0}");
@@ -3115,8 +2828,8 @@ mod capture_tests {
 
     #[test]
     fn row_budget_keeps_the_newest_and_flags_truncation() {
-        // alacritty's default history is 10_000 rows, so a full screen plus full history
-        // exceeds CAPTURE_MAX_ROWS and the clamp becomes real missing output.
+        // alacritty's default history is 10_000 rows, so a full screen plus full history exceeds
+        // CAPTURE_MAX_ROWS and the clamp becomes real missing output.
         let (mut t, mut p) = term(20, 5);
         for i in 0..10_200 {
             feed(&mut t, &mut p, &format!("r{i}\r\n"));
@@ -3129,13 +2842,11 @@ mod capture_tests {
         let cap = capture_text(&t, available);
         assert_eq!(cap.rows, CAPTURE_MAX_ROWS);
         assert!(cap.truncated, "a clamped request IS missing output");
-        // The newest rows are the ones kept.
         assert!(cap.text.contains("r10199"));
     }
 
     #[test]
     fn byte_budget_keeps_the_newest_and_flags_truncation() {
-        // Wide rows so the byte budget trips before the row budget does.
         let (mut t, mut p) = term(200, 5);
         let wide = "x".repeat(199);
         for i in 0..8_000 {
@@ -3149,7 +2860,6 @@ mod capture_tests {
             cap.text.len(),
             CAPTURE_MAX_BYTES
         );
-        // Newest suffix, cut on a row boundary — the last line must be the last written.
         let last = cap.text.lines().next_back().unwrap_or_default();
         assert!(
             last.starts_with("007999"),
@@ -3159,8 +2869,7 @@ mod capture_tests {
 
     #[test]
     fn is_unaffected_by_the_scroll_position() {
-        // Capture anchors at the LIVE screen bottom, so a human scrolling in copy-mode
-        // cannot change what a scripted reader sees.
+        // Anchored at the LIVE bottom: scrolling in copy-mode must not change what a script reads.
         let (mut t, mut p) = term(20, 3);
         for i in 1..=9 {
             feed(&mut t, &mut p, &format!("row{i}\r\n"));
@@ -3176,13 +2885,12 @@ mod capture_tests {
 
     #[test]
     fn alt_screen_has_no_history_to_reach_into() {
-        // Documented contract: in the alternate screen a deep request returns at most the
-        // alt screen itself — and must not index past it.
+        // In the alternate screen a deep request returns at most the alt screen itself.
         let (mut t, mut p) = term(20, 3);
         for i in 1..=9 {
             feed(&mut t, &mut p, &format!("scroll{i}\r\n"));
         }
-        feed(&mut t, &mut p, "\x1b[?1049h"); // enter alt screen
+        feed(&mut t, &mut p, "\x1b[?1049h");
         feed(&mut t, &mut p, "alt-only");
         let cap = capture_text(&t, 500);
         assert!(cap.text.contains("alt-only"));
@@ -3196,8 +2904,8 @@ mod capture_tests {
 
 #[cfg(test)]
 mod bell_title_tests {
-    //! The two pane events comux used to throw away, driven through the VTE parser against a
-    //! bare `Term` — no PTY, no shell.
+    //! BEL and title, driven through the VTE parser
+    //! against a bare `Term`.
     use super::*;
     use alacritty_terminal::term::test::TermSize;
     use alacritty_terminal::term::{Config, Term};
@@ -3219,8 +2927,8 @@ mod bell_title_tests {
 
     #[test]
     fn a_bel_is_counted_not_flagged() {
-        // A COUNT is what removes the ordering hazard between the socket thread clearing a
-        // flag and the render loop re-reading a still-pending one. Three bells must be three.
+        // A COUNT removes the ordering hazard between the socket thread clearing a flag and the
+        // render loop re-reading a still-pending one. Three bells must be three.
         let (mut t, mut p, l) = term();
         assert_eq!(l.bells.load(Ordering::Relaxed), 0);
         feed(&mut t, &mut p, "\x07\x07\x07");
@@ -3229,8 +2937,7 @@ mod bell_title_tests {
 
     #[test]
     fn a_bell_after_an_ack_is_a_new_bell() {
-        // The ack model: `unacknowledged = count > seen`. Acknowledging cannot swallow a
-        // bell that arrives afterwards, which a boolean pair could.
+        // `unacknowledged = count > seen`: acknowledging cannot swallow a later bell.
         let (mut t, mut p, l) = term();
         feed(&mut t, &mut p, "\x07");
         let seen = l.bells.load(Ordering::Relaxed);
@@ -3258,8 +2965,8 @@ mod bell_title_tests {
 
     #[test]
     fn control_characters_are_stripped_from_a_title() {
-        // A title is rendered into the chrome. Left raw, it could move the cursor or recolour
-        // the status bar from inside a pane.
+        // A title is rendered into the chrome; raw, it could move the cursor or recolour the
+        // status bar from inside a pane.
         assert_eq!(sanitize_title("a\x1b[31mb\x07c\n"), "a[31mbc");
         assert!(!sanitize_title("x\x1by").contains('\x1b'));
     }
@@ -3269,13 +2976,11 @@ mod bell_title_tests {
         let long = "가".repeat(1000);
         let out = sanitize_title(&long);
         assert!(out.len() <= MAX_TITLE_BYTES, "{} bytes", out.len());
-        // Cutting mid-scalar would make the stored string invalid to slice later.
         assert!(out.chars().all(|c| c == '가'));
     }
 
     #[test]
     fn an_empty_title_is_stored_not_ignored() {
-        // `printf '\033]0;\007'` is a deliberate "clear my title", not a no-op.
         let (mut t, mut p, l) = term();
         feed(&mut t, &mut p, "\x1b]0;x\x07");
         feed(&mut t, &mut p, "\x1b]0;\x07");
@@ -3285,33 +2990,11 @@ mod bell_title_tests {
 
 /// Capability probe for the desktop-notification OSC sequences (`OSC 9`, `OSC 777`, `OSC 99`).
 ///
-/// comux does NOT capture these, and this module exists to say so with evidence rather than in
-/// a comment, and to notice the day that changes.
-///
-/// **Why not.** The bytes reach `vte::ansi::Processor`, which owns the OSC dispatch table. In
-/// vte 0.15 that table handles `0`, `2`, `4`, `8`, `10`–`12`, `22`, `50`, `52`, `104`, `110`–
-/// `112`; everything else — including all three notification codes — falls to its private
-/// `unhandled()` and is logged at debug level and dropped. There is no `Handler` method for an
-/// unrecognised OSC, so `Term` never learns about it and neither does our `EventListener`.
-///
-/// **What capturing them would cost.** Only two options, both structural:
-/// 1. Fork or patch `vte` to add an unknown-OSC hook. Owning a fork of the parser under the
-///    terminal we do not otherwise touch is a large, permanent maintenance surface.
-/// 2. Run our own PTY read loop so the bytes can be tee'd into a second `vte::Parser` before
-///    alacritty's sees them. `alacritty_terminal::tty::{EventedPty, EventedReadWrite}` are both
-///    public, but `EventedReadWrite::reader()` hands back `&mut Self::Reader` — a wrapper would
-///    have to OWN the inner reader, and `tty::Pty` exposes no way to take it. So this means
-///    reimplementing the tty module (openpty, child spawn, poll registration, race-free exit),
-///    which is exactly the "own read loop" the competitive analysis predicted.
-///
-/// Neither is worth it for a feature comux already covers by a better route: `comux notify
-/// --pane` is a PUSH that carries the pane identity, and a pushed notification is jumpable
-/// (#102, #115) where an OSC one would not be — an OSC 9 says only "something happened", and
-/// the pane it came from would still have to be inferred.
-///
-/// These tests pin the current behaviour in both directions. If a future vte routes any of
-/// these codes to a `Handler` method, the "nothing observable happens" assertions here are what
-/// will notice.
+/// comux does NOT capture these: vte's OSC dispatch routes them to a private `unhandled()` and
+/// no `Handler` method exists for an unrecognised OSC, so neither `Term` nor our
+/// `EventListener` learns about them (decisions.md has the full rationale). These tests pin
+/// that behaviour in both directions, so a future vte that routes any of these codes to a
+/// `Handler` method fails the "nothing observable happens" assertions.
 #[cfg(test)]
 mod osc_notification_probe {
     use super::*;
@@ -3319,15 +3002,10 @@ mod osc_notification_probe {
     use alacritty_terminal::term::{Config, Term};
     use alacritty_terminal::vte::ansi::Processor;
 
-    /// Every desktop-notification OSC in the wild, as a program would emit it.
     const SEQUENCES: &[(&str, &str)] = &[
-        // iTerm2 / ConEmu growl notification.
         ("OSC 9", "\x1b]9;build finished\x07"),
-        // rxvt-unicode extension, also supported by wezterm/foot: title + body.
         ("OSC 777", "\x1b]777;notify;comux;build finished\x07"),
-        // kitty's desktop notification protocol (chunked; this is a whole one-shot message).
         ("OSC 99", "\x1b]99;i=1:d=0;build finished\x1b\\"),
-        // String-terminator forms, in case the bell terminator is what is being ignored.
         ("OSC 9 (ST)", "\x1b]9;build finished\x1b\\"),
         ("OSC 777 (ST)", "\x1b]777;notify;comux;build finished\x1b\\"),
     ];
@@ -3348,8 +3026,7 @@ mod osc_notification_probe {
             let (mut t, mut p, l) = term();
             p.advance(&mut t, seq.as_bytes());
 
-            // Nothing is drawn. This is the half that matters for `capture-pane` and the
-            // status heuristics: the sequence must not leak into the grid as text either.
+            // Nothing is drawn: the sequence must not leak into the grid as text either.
             let text: String = t
                 .grid()
                 .display_iter()
@@ -3361,9 +3038,9 @@ mod osc_notification_probe {
                 "{name} leaked into the grid as {text:?} — the parser did not consume it"
             );
 
-            // And nothing reaches us. `set_title` is checked explicitly because OSC 9 differs
-            // from OSC 0/2 by one character, and a parser that lumped them together would
-            // silently rename the pane on every notification.
+            // Nothing reaches us. `set_title` is checked because OSC 9 differs from OSC 0/2 by
+            // one character, and a parser lumping them would rename the pane on every
+            // notification.
             assert_eq!(
                 l.title.lock().unwrap().clone(),
                 None,
@@ -3379,46 +3056,38 @@ mod osc_notification_probe {
 
     #[test]
     fn the_bell_terminator_of_a_notification_is_not_a_bell() {
-        // `\x07` ends an OSC string; it must be consumed as the terminator, not delivered as
-        // BEL. If it were, every notification would light the `!` marker (#108) — a
-        // plausible-looking wrong behaviour, since the marker WOULD appear.
+        // `\x07` ends an OSC string and must be consumed as the terminator, not delivered as
+        // BEL, or every notification would light the `!` marker (#108).
         let (mut t, mut p, l) = term();
         let bells = || l.bells.load(std::sync::atomic::Ordering::Relaxed);
         p.advance(&mut t, b"\x1b]9;hello\x07");
         assert_eq!(bells(), 0);
-        // A real BEL still counts, so the assertion above is not vacuous.
         p.advance(&mut t, b"\x07");
         assert_eq!(bells(), 1);
     }
 
     #[test]
     fn osc_0_still_sets_the_title_beside_them() {
-        // Guards the probe itself: if the listener stopped observing titles, every assertion
-        // above would pass for the wrong reason.
+        // Guards the probe: if the listener stopped observing titles, the assertions above
+        // would pass for the wrong reason.
         let (mut t, mut p, l) = term();
         p.advance(&mut t, b"\x1b]0;real title\x07");
         assert_eq!(l.title.lock().unwrap().as_deref(), Some("real title"));
     }
 }
 
-/// The bytes a PASTE of `text` sends, the way a terminal pastes: wrapped in `ESC[200~` /
-/// `ESC[201~` when the program enabled bracketed paste, so a multi-line paste is taken as
-/// text instead of being executed line by line.
-///
-/// Any paste delimiter already inside `text` is removed first — in both the 7-bit (`ESC [`)
-/// and the 8-bit C1 (`U+009B`) CSI spellings, repeatedly, since removing one can splice two
-/// halves into another — or the text could close the bracket early and run what follows.
-/// Line breaks become `\r`, which is what Enter sends.
-///
-/// Without bracketed paste there is nothing to wrap in, and every line break in the text
-/// still submits a line: that is what a paste into such a program does too.
+/// The bytes a PASTE of `text` sends: wrapped in `ESC[200~` / `ESC[201~` when the program
+/// enabled bracketed paste, so a multi-line paste is taken as text instead of executed line by
+/// line. Any paste delimiter already inside `text` is removed first (7-bit `ESC [` and 8-bit C1
+/// `U+009B` spellings, repeatedly, since removing one can splice two halves into another), or
+/// the text could close the bracket early and run what follows. Line breaks become `\r`.
 pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     const MARKERS: [&str; 4] = ["\x1b[200~", "\x1b[201~", "\u{9b}200~", "\u{9b}201~"];
     let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
     // One pass, as a stack: after each char, drop a marker the output now ENDS with. Removing
-    // one exposes what came before it, and the chars still to come can complete another with
-    // it — exactly the splice a repeated `replace` would need a pass per layer for (quadratic
-    // on a crafted 1 MiB paste, and this runs on the server's single-writer loop).
+    // one exposes what came before it and later chars can complete another, which a repeated
+    // `replace` would need a pass per layer for (quadratic on a crafted 1 MiB paste, on the
+    // server's single-writer loop).
     let mut clean = String::with_capacity(normalized.len());
     for ch in normalized.chars() {
         clean.push(ch);

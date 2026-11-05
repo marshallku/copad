@@ -14,18 +14,12 @@ use crate::model::{
 /// terminal; only positions and the tree around them change.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Rearrange {
-    /// Trade places with the pane `delta` slots away in DFS order, wrapping (tmux
-    /// `swap-pane`: `{` is `-1`, `}` is `+1`).
     Swap(i32),
-    /// Every pane moves one slot (tmux `rotate-window`; `true` = up, its default).
     Rotate(bool),
-    /// Rebuild in a preset shape (tmux `select-layout`).
     Preset(LayoutPreset),
-    /// Keep the shape, even out every split (tmux `select-layout -E`).
     Spread,
 }
 
-/// One tab to restore: its name, split-layout shape, and whether it was the active tab.
 pub struct RestoredTab {
     pub name: Option<String>,
     pub layout: LayoutSpec,
@@ -58,7 +52,6 @@ pub enum Command {
     Detach {
         client: ClientId,
     },
-    /// Controller-only: set the viewport, re-derive terminal geometry (G2/G3).
     Resize {
         client: ClientId,
         cols: u16,
@@ -71,12 +64,10 @@ pub enum Command {
         client: ClientId,
         pane: PaneId,
     },
-    /// Toggle the zoom of the active tab's focused pane (tmux `resize-pane -Z`).
     ToggleZoom {
         origin: Origin,
         workspace: WorkspaceId,
     },
-    /// Controller-only: change the focused pane of the active tab.
     FocusPane {
         client: ClientId,
         pane: PaneId,
@@ -106,7 +97,6 @@ pub enum Command {
         pane: PaneId,
         if_rev: Option<u64>,
     },
-    /// Create a new single-pane tab, making it active when `activate`. Controller/API only.
     NewTab {
         origin: Origin,
         workspace: WorkspaceId,
@@ -164,8 +154,6 @@ pub enum Command {
         workspace: WorkspaceId,
         pane: PaneId,
     },
-    /// Move `tab` to position `to` in the workspace's tab order (tmux `move-window` /
-    /// `swap-window`), clamped to the ends.
     MoveTab {
         origin: Origin,
         workspace: WorkspaceId,
@@ -174,8 +162,6 @@ pub enum Command {
     },
 }
 
-/// A terminal's derived geometry + its new revision, carried in `Resized` so a
-/// consumer observes both the size and the entity revision (M3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TermGeom {
     pub id: TerminalId,
@@ -248,13 +234,10 @@ pub enum Event {
         terminal: TerminalId,
         workspace_rev: u64,
     },
-    /// The workspace's tabs changed ORDER (no geometry moved).
     TabsReordered {
         workspace: WorkspaceId,
         workspace_rev: u64,
     },
-    /// The active tab changed (geometry of the newly-active tab is re-derived and
-    /// carried in the accompanying `Resized`).
     TabSelected {
         workspace: WorkspaceId,
         tab: TabId,
@@ -332,27 +315,23 @@ impl State {
         }
     }
 
-    // --- read helpers (for callers + tests) ---
     pub fn workspace(&self, id: &WorkspaceId) -> Option<&Workspace> {
         self.workspaces.iter().find(|w| &w.id == id)
     }
-    /// All workspace (session) ids in creation order.
     pub fn workspace_ids(&self) -> Vec<WorkspaceId> {
         self.workspaces.iter().map(|w| w.id.clone()).collect()
     }
     pub fn workspace_count(&self) -> usize {
         self.workspaces.len()
     }
-    /// Set (or clear, with `None`) a workspace's display name (tmux-style session
-    /// rename). No-op if the id is unknown. Server-level metadata, not a `Command`.
+    /// Server-level metadata, not a `Command`.
     pub fn set_workspace_name(&mut self, id: &WorkspaceId, name: Option<String>) {
         if let Some(w) = self.workspaces.iter_mut().find(|w| &w.id == id) {
             w.name = name;
         }
     }
-    /// Set (or clear, with `None`) a tab's display name (tmux-style window rename).
-    /// A custom name takes display precedence over the tab's foreground-process
-    /// label. No-op if either id is unknown. Server-level metadata, not a `Command`.
+    /// A custom name takes display precedence over the tab's foreground-process label.
+    /// Server-level metadata, not a `Command`.
     pub fn set_tab_name(&mut self, ws: &WorkspaceId, tab: &TabId, name: Option<String>) {
         if let Some(w) = self.workspaces.iter_mut().find(|w| &w.id == ws)
             && let Some(t) = w.tab_mut(tab)
@@ -378,8 +357,7 @@ impl State {
         }
     }
 
-    /// Seed a workspace with one full-viewport terminal pane. Returns the ids so
-    /// tests/servers can address them. (Server bootstrap; not a `Command`.)
+    /// Server bootstrap, not a `Command`.
     pub fn create_workspace(
         &mut self,
         id: WorkspaceId,
@@ -432,7 +410,6 @@ impl State {
                 }
             }
         }
-        // Any client attached to the removed workspace is now detached.
         self.clients.retain(|_, a| a.workspace != *id);
         Some(terms)
     }
@@ -494,8 +471,6 @@ impl State {
         per_tab_terms
     }
 
-    /// Recursively build a `SplitTree` from a `LayoutSpec`, minting a pane+terminal per
-    /// leaf (collected in DFS pre-order into `out_terms`) and clamping branch ratios.
     fn build_tree(
         &mut self,
         spec: &LayoutSpec,
@@ -555,7 +530,6 @@ impl State {
             .ok_or(MuxError::NoSuchWorkspace)
     }
 
-    /// The one entry point. Serial by construction (`&mut self`).
     pub fn apply(&mut self, cmd: Command) -> Result<Vec<Event>, MuxError> {
         match cmd {
             Command::Attach {
@@ -571,8 +545,6 @@ impl State {
             Command::Input { client, pane } => {
                 let ws_id = self.require_controller_of_attached(client)?;
                 let idx = self.ws_index(&ws_id)?;
-                // The routing target must be a live pane in the ACTIVE tab —
-                // reject input to a nonexistent / closed / background / foreign pane.
                 let active = self.workspaces[idx].active_tab.clone();
                 let ok = self.workspaces[idx]
                     .tab(&active)
@@ -651,7 +623,6 @@ impl State {
         }
     }
 
-    // --- lease (spec §2) ---
     fn attach(
         &mut self,
         client: ClientId,
@@ -667,8 +638,6 @@ impl State {
             rows: rows.max(1),
         };
 
-        // Idempotent controller re-attach of the same workspace: refresh the
-        // viewport + reflow, keep the lease.
         if role == Role::Controller && self.workspaces[idx].controller == Some(client) {
             if let Some(a) = self.clients.get_mut(&client) {
                 a.viewport = vp;
@@ -721,13 +690,11 @@ impl State {
             return Ok(evs);
         }
 
-        // role == Controller, guaranteed grantable (workspace vacant, or takeover).
         let prev = self.workspaces[idx].controller;
-        if let Some(existing) = prev {
-            // takeover: demote the incumbent to observer (keeps its viewport).
-            if let Some(a) = self.clients.get_mut(&existing) {
-                a.role = Role::Observer;
-            }
+        if let Some(existing) = prev
+            && let Some(a) = self.clients.get_mut(&existing)
+        {
+            a.role = Role::Observer;
         }
         self.workspaces[idx].controller = Some(client);
         self.workspaces[idx].viewport = vp;
@@ -741,7 +708,6 @@ impl State {
                 viewport: vp,
             },
         );
-        // Reflow from the NEW controller's viewport (grant and takeover alike).
         let terms = self.recompute_sizes(idx);
         let mut evs = Vec::new();
         evs.extend(released);
@@ -784,10 +750,8 @@ impl State {
         Ok(evs)
     }
 
-    /// If `client` currently holds the control lease of its attached workspace,
-    /// release it (controller → None, bump rev) and return a `ControlReleased`
-    /// event for that workspace. Returns `None` if the client held no lease.
-    /// Idempotent; leaves client role/attach as-is otherwise.
+    /// Release `client`'s control lease if it holds one, returning the `ControlReleased` event.
+    /// Idempotent.
     fn release_lease_if_held(&mut self, client: ClientId) -> Option<Event> {
         let att = self.clients.get(&client)?;
         let ws = att.workspace.clone();
@@ -805,7 +769,6 @@ impl State {
         }
     }
 
-    // --- geometry (spec §2) ---
     fn resize(&mut self, client: ClientId, cols: u16, rows: u16) -> Result<Vec<Event>, MuxError> {
         let ws_id = self.require_controller_of_attached(client)?;
         let vp = Rect {
@@ -829,12 +792,9 @@ impl State {
         }])
     }
 
-    /// Re-derive the active tab's terminal sizes from the workspace viewport and
-    /// write them back (G2), returning each terminal's new geometry + revision.
-    /// Non-active tabs keep their last sizes. Called on every viewport change
-    /// (controller resize) AND every active-tab layout change (split/close) — a
-    /// terminal's size therefore always equals its derived share of
-    /// (viewport, layout).
+    /// Re-derive the active tab's terminal sizes from the workspace viewport and write them
+    /// back (G2). Non-active tabs keep their last sizes. Called on every viewport change and
+    /// every active-tab layout change, so a terminal's size always equals its derived share.
     fn recompute_sizes(&mut self, idx: usize) -> Vec<TermGeom> {
         let ws = &self.workspaces[idx];
         let area = ws.viewport;
@@ -843,7 +803,6 @@ impl State {
         };
         let mut derived = Vec::new();
         match tab.zoom().and_then(|z| tab.layout.terminal_of(z)) {
-            // Zoomed: that terminal gets the whole viewport; the hidden ones keep their sizes.
             Some(t) => derived.push((t.clone(), area.cols, area.rows)),
             None => tab.layout.derive_sizes(area, &mut derived),
         }
@@ -866,7 +825,6 @@ impl State {
         out
     }
 
-    // --- focus (controller-only) ---
     fn focus(&mut self, client: ClientId, pane: PaneId) -> Result<Vec<Event>, MuxError> {
         let ws_id = self.require_controller_of_attached(client)?;
         let idx = self.ws_index(&ws_id)?;
@@ -877,7 +835,6 @@ impl State {
         if !tab.layout.contains(&pane) {
             return Err(MuxError::NoSuchPane);
         }
-        // Focusing another pane unzooms (tmux); re-focusing the zoomed one keeps it.
         let unzoomed = tab.zoomed.as_ref().is_some_and(|z| *z != pane);
         if unzoomed {
             tab.zoomed = None;
@@ -932,7 +889,6 @@ impl State {
         Ok(evs)
     }
 
-    /// The `Resized` event for re-deriving the active tab of `idx` (e.g. after a zoom change).
     fn resized_event(&mut self, idx: usize, workspace: WorkspaceId) -> Option<Event> {
         self.workspaces[idx].rev += 1;
         let ws_rev = self.workspaces[idx].rev;
@@ -971,7 +927,6 @@ impl State {
         Ok(self.resized_event(idx, workspace).into_iter().collect())
     }
 
-    // --- mutations (spec §4a) ---
     fn authorize_mutation(&self, origin: &Origin, ws: &WorkspaceId) -> Result<(), MuxError> {
         match origin {
             Origin::Api => Ok(()),
@@ -1003,7 +958,6 @@ impl State {
             .map(|t| t.id.clone())
             .ok_or(MuxError::NoSuchPane)?;
 
-        // M2: optimistic concurrency against the tab rev.
         let cur_rev = self.workspaces[idx].tab(&tab_id).unwrap().rev;
         if let Some(exp) = if_rev
             && exp != cur_rev
@@ -1034,8 +988,6 @@ impl State {
             tab_rev,
             workspace_rev: ws_rev,
         }];
-        // A layout change redistributes terminal sizes within the current
-        // viewport; emit the reflow so the geometry change is observable (M3).
         if self.workspaces[idx].active_tab == tab_id {
             let terms = self.recompute_sizes(idx);
             let vp = self.workspaces[idx].viewport;
@@ -1082,7 +1034,6 @@ impl State {
         let tab = self.workspaces[idx].tab_mut(&tab_id).unwrap();
         let term = tab.layout.remove_leaf(&pane).ok_or(MuxError::NoSuchPane)?;
         tab.zoomed = None;
-        // Refocus if we closed the focused pane.
         if tab.focused == pane {
             tab.focused = tab.layout.leftmost_pane();
         }
@@ -1113,8 +1064,6 @@ impl State {
         }
         Ok(evs)
     }
-
-    // --- tabs (spec §1: multiple layouts per workspace) ---
 
     fn new_tab(
         &mut self,
@@ -1178,15 +1127,12 @@ impl State {
         if self.workspaces[idx].tab(&tab).is_none() {
             return Err(MuxError::NoSuchTab);
         }
-        // Selecting the already-active tab is a no-op (no rev bump, no events).
         if self.workspaces[idx].active_tab == tab {
             return Ok(vec![]);
         }
         self.workspaces[idx].active_tab = tab.clone();
         self.workspaces[idx].rev += 1;
         let ws_rev = self.workspaces[idx].rev;
-        // Re-derive the newly-active tab's geometry from the (unchanged) viewport,
-        // so a tab created/reflowed under a different size catches up (G2).
         let terms = self.recompute_sizes(idx);
         let vp = self.workspaces[idx].viewport;
         Ok(vec![
@@ -1289,7 +1235,6 @@ impl State {
         self.workspaces[idx].rev += 1;
         let ws_rev = self.workspaces[idx].rev;
         let mut evs = Vec::new();
-        // A ratio change redistributes sizes within the current viewport.
         if self.workspaces[idx].active_tab == tab_id {
             let terms = self.recompute_sizes(idx);
             let vp = self.workspaces[idx].viewport;
@@ -1459,8 +1404,6 @@ impl State {
         }])
     }
 
-    /// The `Resized` event for a geometry change in `tab`, when `tab` is the one on screen
-    /// (a background tab keeps its frozen sizes until it is selected).
     fn resized_if_active(
         &mut self,
         idx: usize,
@@ -1487,22 +1430,16 @@ impl State {
         if att.role != Role::Controller {
             return Err(MuxError::NotController);
         }
-        // Belt-and-braces: the workspace must still name this client.
         if self.controller_of(&att.workspace) != Some(client) {
             return Err(MuxError::NotController);
         }
         Ok(att.workspace.clone())
     }
 
-    // --- invariant checks (used by tests; cheap enough to expose) ---
-
-    /// Invariant G1: at most one controller per workspace, and the workspace's
-    /// named controller is attached with `Role::Controller`.
     pub fn check_g1(&self) -> bool {
         for w in &self.workspaces {
             match w.controller {
                 None => {
-                    // No client may claim controller of a leaseless workspace.
                     if self
                         .clients
                         .iter()
@@ -1527,8 +1464,6 @@ impl State {
         true
     }
 
-    /// Structural invariant: every leaf terminal exists in the terminal table
-    /// and no orphan terminals remain.
     pub fn check_tree_consistency(&self) -> bool {
         let mut referenced = std::collections::HashSet::new();
         for w in &self.workspaces {
@@ -1541,12 +1476,10 @@ impl State {
                         _ => return false,
                     }
                 }
-                // focused pane must exist
                 if !t.layout.contains(&t.focused) {
                     return false;
                 }
             }
-            // active tab must exist
             if w.tab(&w.active_tab).is_none() {
                 return false;
             }
@@ -1577,7 +1510,6 @@ mod tests {
     fn install_restored_session_builds_tree_and_returns_leaves_in_dfs_order() {
         use crate::model::LayoutSpec;
         let mut s = State::new();
-        // A tab: Branch(Right, [Leaf, Branch(Down, [Leaf, Leaf])]) → 3 leaves.
         let layout = LayoutSpec::Branch {
             dir: Dir::Right,
             ratio: 0.5,
@@ -1610,13 +1542,10 @@ mod tests {
         let w = s.workspace(&WorkspaceId::new("local")).unwrap();
         assert_eq!(w.name.as_deref(), Some("proj"));
         assert_eq!(w.tabs.len(), 2);
-        // The active tab is the one flagged `active` (the second), by identity.
         assert_eq!(w.active_tab, w.tabs[1].id);
         assert_eq!(w.tabs[1].name.as_deref(), Some("work"));
-        // Per-tab leaf counts + DFS order: tab 0 has 1 leaf, tab 1 has 3.
         assert_eq!(per_tab[0].len(), 1);
         assert_eq!(per_tab[1].len(), 3);
-        // Every returned terminal id is registered in State.
         for tab_terms in &per_tab {
             for tid in tab_terms {
                 assert!(
@@ -1625,7 +1554,6 @@ mod tests {
                 );
             }
         }
-        // The tree's own panes match the returned leaf count.
         assert_eq!(w.tabs[1].layout.panes().len(), 3);
         assert!(s.check_g1());
     }
@@ -1659,7 +1587,6 @@ mod tests {
     #[test]
     fn new_tab_after_restore_mints_unique_id_not_colliding_with_restored_tabs() {
         use crate::model::LayoutSpec;
-        // Restore a 3-tab session: ids `local:t0`, `local:t1`, `local:t2` minted directly.
         let mut s = State::new();
         let ws = WorkspaceId::new("local");
         let tabs = (0..3)
@@ -1683,16 +1610,13 @@ mod tests {
 
         let w = s.workspace(&ws).unwrap();
         assert_eq!(w.tabs.len(), 4);
-        // Every tab id is distinct (no collision).
         let ids: std::collections::HashSet<_> = w.tabs.iter().map(|t| &t.id).collect();
         assert_eq!(
             ids.len(),
             4,
             "tab ids must be unique after restore + new_tab"
         );
-        // `active_tab` resolves to the freshly pushed tab, not a stale restored one.
         assert_eq!(w.active_tab, w.tabs[3].id);
-        // …and that tab owns a terminal distinct from every restored tab's.
         let new_term = w.tabs[3].layout.terminal_of(&w.tabs[3].focused).unwrap();
         for old in &w.tabs[..3] {
             let old_term = old.layout.terminal_of(&old.focused).unwrap();
@@ -1710,10 +1634,8 @@ mod tests {
         assert_eq!(s.workspace(&ws).unwrap().name, None);
         s.set_workspace_name(&ws, Some("api".to_string()));
         assert_eq!(s.workspace(&ws).unwrap().name.as_deref(), Some("api"));
-        // Clearing reverts to the id-shown state.
         s.set_workspace_name(&ws, None);
         assert_eq!(s.workspace(&ws).unwrap().name, None);
-        // Unknown id is a silent no-op (no panic).
         s.set_workspace_name(&WorkspaceId::new("nope"), Some("x".to_string()));
     }
 
@@ -1727,10 +1649,8 @@ mod tests {
             s.workspace(&ws).unwrap().tab(&tab).unwrap().name.as_deref(),
             Some("build")
         );
-        // Clearing reverts to the default (process/index) label.
         s.set_tab_name(&ws, &tab, None);
         assert_eq!(s.workspace(&ws).unwrap().tab(&tab).unwrap().name, None);
-        // Unknown workspace or tab id is a silent no-op (no panic).
         s.set_tab_name(&WorkspaceId::new("nope"), &tab, Some("x".to_string()));
         s.set_tab_name(&ws, &TabId::new("nope"), Some("x".to_string()));
         assert_eq!(s.workspace(&ws).unwrap().tab(&tab).unwrap().name, None);
@@ -1875,7 +1795,6 @@ mod tests {
             rows: 24,
         })
         .unwrap();
-        // split so there are two terminals sharing the width
         s.apply(Command::SplitPane {
             origin: Origin::Client(c),
             workspace: ws.clone(),
@@ -1890,7 +1809,6 @@ mod tests {
             rows: 30,
         })
         .unwrap();
-        // two terminals, each roughly half of (100-1) cols, full 30 rows
         let sizes: Vec<_> = {
             let w = s.workspace(&ws).unwrap();
             let tab = w.tab(&w.active_tab).unwrap();
@@ -1922,7 +1840,6 @@ mod tests {
             rows: 24,
         })
         .unwrap();
-        // tab rev starts at 0; split with correct if_rev succeeds and bumps to 1
         s.apply(Command::SplitPane {
             origin: Origin::Api,
             workspace: ws.clone(),
@@ -1931,7 +1848,6 @@ mod tests {
             if_rev: Some(0),
         })
         .unwrap();
-        // a second split with the now-stale if_rev=0 must be rejected
         let err = s
             .apply(Command::SplitPane {
                 origin: Origin::Api,
@@ -1971,7 +1887,6 @@ mod tests {
         };
         let new_pane = new_pane.clone();
         assert!(s.check_tree_consistency());
-        // close the original; tree collapses back to a single leaf (the new pane)
         s.apply(Command::ClosePane {
             origin: Origin::Client(c),
             workspace: ws.clone(),
@@ -2217,7 +2132,6 @@ mod tests {
         .unwrap();
         s.apply(Command::Detach { client: c }).unwrap();
         assert_eq!(s.controller_of(&ws), None);
-        // a detached client can no longer resize (no controller ⇒ frozen, G3)
         assert_eq!(
             s.apply(Command::Resize {
                 client: c,
@@ -2333,7 +2247,6 @@ mod tests {
             .is_empty(),
             "refocusing the focused pane is a no-op"
         );
-        // An unattached client may not reach in.
         assert!(
             s.apply(Command::FocusPaneIn {
                 origin: Origin::Client(ClientId(9)),
@@ -2365,7 +2278,6 @@ mod tests {
             activate: true,
         })
         .unwrap();
-        // switch back to the original tab
         let ev = s
             .apply(Command::SelectTab {
                 origin: Origin::Client(c),
@@ -2375,7 +2287,6 @@ mod tests {
             .unwrap();
         assert_eq!(s.workspace(&ws).unwrap().active_tab, first);
         assert!(matches!(ev[0], Event::TabSelected { .. }));
-        // re-selecting the active tab is a no-op (empty event stream, no rev bump)
         let rev = s.workspace(&ws).unwrap().rev;
         let ev = s
             .apply(Command::SelectTab {
@@ -2433,7 +2344,6 @@ mod tests {
     #[test]
     fn remove_workspace_drops_terminals_and_refuses_the_last() {
         let (mut s, ws, _p) = seed();
-        // a second session
         let ws2 = WorkspaceId::new("w2");
         let (_t, _p2, term2) = s.create_workspace(ws2.clone(), None, Rect { cols: 80, rows: 24 });
         assert_eq!(s.workspace_count(), 2);
@@ -2448,7 +2358,6 @@ mod tests {
         assert!(s.workspace(&ws2).is_none());
         assert!(s.check_tree_consistency());
 
-        // the last remaining workspace cannot be removed
         assert!(s.remove_workspace(&ws).is_none());
         assert_eq!(s.workspace_count(), 1);
     }
@@ -2485,7 +2394,6 @@ mod proptests {
     use crate::model::Rect;
     use proptest::prelude::*;
 
-    /// A small operation universe over a fixed 3-client, 1-workspace world.
     #[derive(Debug, Clone)]
     enum Op {
         Attach(u64, bool, bool, u16, u16), // client, controller?, takeover?, cols, rows
@@ -2645,13 +2553,11 @@ mod proptests {
                     }
                 }
 
-                // --- invariants after every step ---
                 prop_assert!(s.check_g1(), "G1 violated");
                 prop_assert!(s.check_tree_consistency(), "tree consistency violated");
 
                 let w = s.workspace(&ws).unwrap();
                 let active = w.tab(&w.active_tab).unwrap();
-                // G2 (conservation): the active tab's geometry tiles the viewport exactly.
                 prop_assert_eq!(active.layout.footprint(w.viewport), w.viewport, "G2: geometry does not conserve the viewport");
                 // G2 (strong): every terminal's ACTUAL size equals its derived share of
                 // (viewport, layout) — catches stale/unreflowed geometry, not just conservation.
@@ -2662,11 +2568,9 @@ mod proptests {
                     prop_assert_eq!((t.cols, t.rows), (*c, *r), "G2: terminal size != derived geometry");
                 }
 
-                // workspace rev monotonic
                 prop_assert!(w.rev >= last_ws_rev, "workspace rev decreased");
                 last_ws_rev = w.rev;
 
-                // every terminal's rev is monotonic
                 for p in panes(&s, &ws) {
                     let tabs = &s.workspace(&ws).unwrap().tabs;
                     if let Some(tid) = tabs.iter().find_map(|t| t.layout.terminal_of(&p)) {

@@ -1,11 +1,9 @@
-//! Past agent conversations on disk — the data source behind the `Ctrl-b R` resume
-//! picker (decision #99).
+//! Past agent conversations on disk: the data source behind the `Ctrl-b R` resume picker
+//! (decision #99).
 //!
 //! [`agentstate`](crate::agentstate) answers "what is the agent in THIS pane doing"; this
-//! module answers the opposite question: "which conversations exist that no pane is running
-//! any more?" Both CLIs keep every transcript, so closing a pane never loses the session —
-//! it only loses the id, and neither `claude --resume` (per-cwd) nor `codex resume` is
-//! reachable from the mux. We enumerate the transcripts ourselves.
+//! module answers "which conversations exist that no pane is running". Closing a pane loses
+//! the id but not the transcript, so we enumerate transcripts ourselves.
 //!
 //! - Claude: `~/.claude/projects/<cwd-slug>/<uuid>.jsonl`. Records carry `cwd`, `timestamp`
 //!   and `entrypoint`; the first `type: "user"` record whose `message.content` is a plain
@@ -14,7 +12,6 @@
 //! - Codex: `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<uuid>.jsonl`. Line 1 is a
 //!   `session_meta` record with `session_id` / `cwd` / `originator`; the first user prompt is
 //!   much deeper (a multi-KB developer preamble precedes it).
-//!
 //! - grok: `$GROK_HOME/sessions/<percent-encoded cwd>/<uuid>/summary.json` carries `info.cwd`
 //!   and a `generated_title`; when the title is missing the first `prompt_index` user record
 //!   of the sibling `chat_history.jsonl` (its `<user_query>` unwrapped) stands in.
@@ -23,20 +20,15 @@
 //!   binary rather than a linked SQLite (see [`agy_entries`]); sub-agent conversations
 //!   (`nesting_depth > 0`) are not resumable on their own and are skipped.
 //!
-//! `~/.claude/history.jsonl` looks like a cheaper index and is NOT used: on the owner's
-//! machine only 59 of its 223 session ids still have a transcript, and 638 transcripts are
-//! absent from it entirely — it is a prompt log with its own retention, not a session index.
-//!
-//! Everything here is bounded: transcripts are unbounded append-only logs written by another
-//! program, so every read is capped per file AND across the scan, only regular files are
-//! opened (a symlinked FIFO would otherwise block the scanner thread forever), and the
-//! scan itself always runs off the render loop (see [`spawn_scan`]).
+//! Everything here is bounded: transcripts are unbounded logs written by another program, so
+//! every read is capped per file AND across the scan, only regular files are opened (a
+//! symlinked FIFO would block the scanner thread forever), and the scan runs off the render
+//! loop (see [`spawn_scan`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-/// Which CLI wrote a transcript — decides the resume command and the row's badge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     Claude,
@@ -46,7 +38,6 @@ pub enum Tool {
 }
 
 impl Tool {
-    /// The binary name, which is also the label shown in the picker.
     pub fn bin(self) -> &'static str {
         match self {
             Tool::Claude => "claude",
@@ -57,87 +48,73 @@ impl Tool {
     }
 }
 
-/// One resumable conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub tool: Tool,
     /// The conversation id passed to `--resume` / `resume`. Always a validated UUID.
     pub id: String,
-    /// Where the conversation ran. `None` when the transcript never recorded one.
     pub cwd: Option<PathBuf>,
     /// The first user prompt, collapsed to one line. Empty when none was found within the
     /// read budget (the row then shows the path alone rather than a wrong title).
     pub title: String,
-    /// Last write to the transcript — the recency the picker sorts on.
     pub mtime: SystemTime,
     /// A non-interactive run (`claude -p` / SDK, `codex exec`, an agent driving another
     /// agent). Hidden by default; `Ctrl-a` in the picker reveals them.
     pub headless: bool,
 }
 
-/// A completed scan. `req` matches the request that asked for it, so a slow scan that
-/// lands after a newer one can be dropped instead of overwriting it (`gen` is a reserved
-/// keyword in edition 2024).
+/// A completed scan. `req` matches the request that asked for it, so a slow scan landing after
+/// a newer one can be dropped (`gen` is a reserved keyword in edition 2024).
 #[derive(Debug, Clone)]
 pub struct Scan {
     pub req: u64,
     pub entries: Vec<Entry>,
 }
 
-/// Newest transcripts kept. Applied AFTER the mtime sort, so the cap drops the oldest
-/// conversations rather than an arbitrary directory-order slice.
+/// Newest transcripts kept. Applied AFTER the mtime sort, so the cap drops the oldest.
 const MAX_ENTRIES: usize = 4000;
-/// Bytes read per transcript while looking for the title. Generous because the prompt sits
-/// near the top of a Claude transcript but up to several hundred KB into a Codex one (the
-/// developer preamble precedes it), and because a Codex `session_meta` line alone embeds the
-/// model's base instructions (~22 KB observed).
+/// Bytes read per transcript while looking for the title. The prompt sits near the top of a
+/// Claude transcript but up to several hundred KB into a Codex one (the developer preamble
+/// precedes it); a Codex `session_meta` line alone embeds ~22 KB of base instructions.
 const MAX_FILE_SCAN: u64 = 1024 * 1024;
-/// Bytes read across the whole scan while hunting for TITLES. Past this, remaining rows fall
-/// back to the metadata budget below and lose only their title.
+/// Bytes read across the whole scan while hunting for TITLES. Past this, rows fall back to the
+/// metadata budget below and lose only their title.
 const MAX_TOTAL_SCAN: u64 = 256 * 1024 * 1024;
 /// Bytes read per transcript, and across the scan, once the title budget is spent. Metadata
 /// (`cwd` + interactive-vs-headless) has its OWN budget because it decides whether a row is
-/// even LISTED by default and which space it opens in — degrading it would quietly show
-/// automation as interactive and resume it in the wrong directory, which looks like a correct
-/// list. Both signals sit in the first records of either format, so this cap is generous.
+/// listed by default and which space it opens in; degrading it would show automation as
+/// interactive and resume it in the wrong directory.
 const META_FILE_SCAN: u64 = 128 * 1024;
 const MAX_TOTAL_META_SCAN: u64 = 128 * 1024 * 1024;
-/// A user record big enough that it is almost certainly a tool result, not a prompt. Such a
-/// line is only JSON-parsed when it carries `promptSource` (which tool results do not), so a
-/// multi-MB tool result never costs a full deserialize.
+/// A user record this big is almost certainly a tool result, not a prompt. Such a line is only
+/// JSON-parsed when it carries `promptSource`, so a multi-MB tool result never costs a full
+/// deserialize.
 const BIG_LINE: usize = 64 * 1024;
-/// Chars kept from a prompt for the row label.
 const MAX_TITLE: usize = 200;
-/// Directory-walk budget for `~/.codex/sessions` (`YYYY/MM/DD` is 3 levels).
 const MAX_DEPTH: usize = 4;
-/// Directories visited by the Codex walk, and transcripts kept per tool.
 const MAX_DIRS: usize = 4000;
 const MAX_FILES: usize = 20_000;
-/// Directory entries LOOKED AT per tool, whether or not they turn out to be transcripts.
-/// `MAX_FILES` alone bounds only what is accepted, so a directory stuffed with junk would
-/// still be walked in full — and this runs on a thread the mux never waits for.
+/// Directory entries LOOKED AT per tool, whether or not they are transcripts. `MAX_FILES` only
+/// bounds what is accepted, so a directory stuffed with junk would still be walked in full.
 const MAX_VISITS: usize = 200_000;
 
 /// Non-interactive Claude `entrypoint` values. A DENYLIST on purpose (decision #98's
-/// precedent): an entrypoint we have never seen counts as interactive, so a rename upstream
-/// makes sessions appear in the default view rather than silently vanish from it.
+/// precedent): an unknown entrypoint counts as interactive, so an upstream rename shows
+/// sessions in the default view rather than hiding them.
 const CLAUDE_HEADLESS: &[&str] = &["sdk-cli", "sdk-ts", "sdk-py", "print"];
-/// Non-interactive Codex `originator` values: `codex_exec` is `codex exec`, and
-/// `Claude Code` is Codex driven by a Claude Code integration.
+/// Non-interactive Codex `originator` values: `codex_exec` is `codex exec`, and `Claude Code`
+/// is Codex driven by a Claude Code integration.
 pub(crate) const CODEX_HEADLESS: &[&str] = &["codex_exec", "Claude Code"];
 
-/// The handle the picker reads. `None` = no scan has completed yet ("scanning…").
 pub type Shared = Arc<Mutex<Option<Scan>>>;
 
-/// An empty handle with no scanner behind it (the default before the first open, and in
-/// tests that build an `App` without one).
+/// An empty handle with no scanner behind it.
 pub fn idle() -> Shared {
     Arc::new(Mutex::new(None))
 }
 
-/// Run one scan on a detached thread and publish it into `out` under `req`. The scan walks
-/// two directory trees and reads up to [`MAX_TOTAL_SCAN`] bytes, so it must never run on the
-/// server's render loop. A result is dropped if a newer generation already landed.
+/// Run one scan on a detached thread and publish it into `out` under `req`; it must never run
+/// on the server's render loop. A result is dropped if a newer generation already landed.
 pub fn spawn_scan(out: Shared, req: u64, home: PathBuf, deep: bool) {
     let _ = std::thread::Builder::new()
         .name("agent-session-scan".into())
@@ -145,7 +122,7 @@ pub fn spawn_scan(out: Shared, req: u64, home: PathBuf, deep: bool) {
             let entries = scan(&home, deep);
             if let Ok(mut g) = out.lock() {
                 if g.as_ref().is_some_and(|prev| prev.req > req) {
-                    return; // a newer scan already published — this one is stale
+                    return;
                 }
                 *g = Some(Scan { req, entries });
             }
@@ -154,11 +131,10 @@ pub fn spawn_scan(out: Shared, req: u64, home: PathBuf, deep: bool) {
 
 /// Every resumable conversation under `home`, newest first.
 ///
-/// `deep` also reads a TITLE for headless transcripts. It is off for the picker's default
-/// view because those rows are hidden there, and they are the overwhelming majority (1534 of
-/// 1595 on the owner's machine) — their prompts sit hundreds of KB into the file, so skipping
-/// them is the difference between ~0.3 s and ~2.6 s of background I/O. Every row is still
-/// listed either way; only the title of a hidden row waits for the `Ctrl-a` rescan.
+/// `deep` also reads a TITLE for headless transcripts. It is off for the picker's default view
+/// because those rows are hidden there and are the overwhelming majority (1534 of 1595 on the
+/// owner's machine); their prompts sit hundreds of KB into the file, so skipping them is the
+/// difference between ~0.3 s and ~2.6 s of background I/O. Every row is still listed.
 pub fn scan(home: &Path, deep: bool) -> Vec<Entry> {
     let mut found: Vec<(Tool, PathBuf, String, SystemTime)> = claude_files(home);
     found.extend(codex_files(home));
@@ -170,7 +146,7 @@ pub fn scan(home: &Path, deep: bool) -> Vec<Entry> {
         agy.insert(id, meta);
     }
     // Sort BEFORE truncating so the cap drops the oldest, and parse in the same order so the
-    // read budget is spent on the transcripts the user is most likely looking for.
+    // read budget goes to the newest transcripts.
     found.sort_by_key(|f| std::cmp::Reverse(f.3));
     found.truncate(MAX_ENTRIES);
 
@@ -199,25 +175,24 @@ pub fn scan(home: &Path, deep: bool) -> Vec<Entry> {
         .collect()
 }
 
-/// The scan's two read allowances. They are separate so that exhausting the title budget on a
-/// pathological directory costs titles only — never a row's classification or directory.
+/// The scan's two read allowances. They are separate so that exhausting the title budget costs
+/// titles only, never a row's classification or directory.
 struct Budget {
     titles: u64,
     meta: u64,
 }
 
 impl Budget {
-    /// Whether the title allowance still has enough left to be worth using. The threshold is a
-    /// WHOLE metadata read, not zero: a file handed the last few KB of the title budget could
-    /// run out before reaching its `entrypoint`/`session_meta` record and come back
-    /// unclassified, which is exactly the degradation the reserve exists to prevent.
+    /// Whether the title allowance has enough left to be worth using. The threshold is a WHOLE
+    /// metadata read, not zero: a file handed the last few KB could run out before its
+    /// `entrypoint`/`session_meta` record and come back unclassified.
     fn on_titles(&self) -> bool {
         self.titles >= META_FILE_SCAN
     }
 
     /// What this transcript may read. The choice is made ONCE per file and carried in the
     /// grant, so a long title read that drains `titles` mid-file cannot start eating the
-    /// metadata reserve — the reserve has to survive for the transcripts that come after.
+    /// metadata reserve.
     fn allow(&self) -> Grant {
         if self.on_titles() {
             Grant {
@@ -234,7 +209,6 @@ impl Budget {
         }
     }
 
-    /// Charge `n` bytes actually read to the allowance `allow` handed out.
     fn charge(&mut self, from_titles: bool, n: u64) {
         if from_titles {
             self.titles = self.titles.saturating_sub(n);
@@ -244,19 +218,15 @@ impl Budget {
     }
 }
 
-/// One transcript's read allowance: how many bytes, whether a title is worth looking for, and
-/// which budget pays for it.
 struct Grant {
     cap: u64,
     want_title: bool,
     from_titles: bool,
 }
 
-/// A reader that charges the scan budget for every byte it hands over.
-///
-/// Charging per decoded LINE instead would leak: `lines()` stops at the first non-UTF-8 record
-/// and the bytes consumed getting there are never billed, so a directory of binary junk could
-/// read its per-file cap thousands of times over inside a "bounded" scan.
+/// A reader that charges the scan budget for every byte it hands over. Charging per decoded
+/// LINE would leak: `lines()` stops at the first non-UTF-8 record and the bytes consumed
+/// getting there are never billed.
 struct Metered<'a, R> {
     inner: R,
     budget: &'a mut Budget,
@@ -271,7 +241,6 @@ impl<R: std::io::Read> std::io::Read for Metered<'_, R> {
     }
 }
 
-/// What a transcript's contents tell us beyond its path.
 #[derive(Default)]
 struct Meta {
     cwd: Option<PathBuf>,
@@ -279,26 +248,24 @@ struct Meta {
     headless: bool,
 }
 
-/// `~/.claude/projects/<slug>/<uuid>.jsonl`. One level only — a subdirectory under a project
-/// holds subagent transcripts, which are not separately resumable.
+/// `~/.claude/projects/<slug>/<uuid>.jsonl`. One level only: a subdirectory holds subagent
+/// transcripts, which are not separately resumable.
 fn claude_files(home: &Path) -> Vec<(Tool, PathBuf, String, SystemTime)> {
     let mut out = Vec::new();
     let mut visits = 0usize;
     let Ok(projects) = std::fs::read_dir(home.join(".claude").join("projects")) else {
         return out;
     };
-    // Count every entry the iterator yields, INCLUDING errors: a concurrently mutated or
-    // hostile tree can produce unbounded `ReadDir` errors, and `.flatten()` would drop them
-    // before they were ever metered.
+    // Count every entry the iterator yields, INCLUDING errors: a hostile tree can produce
+    // unbounded `ReadDir` errors, and `.flatten()` would drop them before they were metered.
     for project in projects {
         visits += 1;
         if out.len() >= MAX_FILES || visits >= MAX_VISITS {
             break;
         }
         let Ok(project) = project else { continue };
-        // Only descend into a REAL directory: a symlink under `projects/` would otherwise
-        // redirect the walk out of the transcript tree (onto a network mount, say), and this
-        // runs on a thread the mux never waits for. Same rule as the Codex walk.
+        // Only descend into a REAL directory: a symlink under `projects/` would redirect the
+        // walk out of the transcript tree (onto a network mount, say).
         let path = project.path();
         if !std::fs::symlink_metadata(&path).is_ok_and(|md| md.is_dir()) {
             continue;
@@ -325,9 +292,8 @@ fn claude_files(home: &Path) -> Vec<(Tool, PathBuf, String, SystemTime)> {
     out
 }
 
-/// `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<uuid>.jsonl`, walked depth-first with an
-/// explicit depth/dir budget (an unbounded walk of a user-writable tree is a hang waiting to
-/// happen).
+/// `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-<ts>-<uuid>.jsonl`, walked with an explicit
+/// depth/dir budget (an unbounded walk of a user-writable tree is a hang waiting to happen).
 fn codex_files(home: &Path) -> Vec<(Tool, PathBuf, String, SystemTime)> {
     let mut out = Vec::new();
     let mut stack = vec![(home.join(".codex").join("sessions"), 0usize)];
@@ -348,13 +314,12 @@ fn codex_files(home: &Path) -> Vec<(Tool, PathBuf, String, SystemTime)> {
             }
             let Ok(f) = f else { continue };
             let path = f.path();
-            // `symlink_metadata`: never descend through a symlink, and never open one.
             let Ok(md) = std::fs::symlink_metadata(&path) else {
                 continue;
             };
             if md.is_dir() {
-                // Bound the QUEUE as well: pushing every directory first would let a wide tree
-                // grow the stack without limit before the `MAX_DIRS` check ever refuses one.
+                // Bound the QUEUE too: pushing every directory first would let a wide tree grow
+                // the stack before the `MAX_DIRS` check refuses one.
                 if dirs + stack.len() < MAX_DIRS {
                     stack.push((path, depth + 1));
                 }
@@ -373,16 +338,14 @@ fn codex_files(home: &Path) -> Vec<(Tool, PathBuf, String, SystemTime)> {
     out
 }
 
-/// grok's data directory for the scan: `$GROK_HOME` (what the server, and so a resumed grok,
-/// would use), else `<home>/.grok`.
 fn grok_root(home: &Path) -> PathBuf {
     std::env::var_os("GROK_HOME")
         .filter(|h| !h.is_empty())
         .map_or_else(|| home.join(".grok"), PathBuf::from)
 }
 
-/// `<grok>/sessions/<encoded cwd>/<uuid>/summary.json` — two directory levels, walked with the
-/// same no-symlink, visit-budgeted rules as the other tools.
+/// `<grok>/sessions/<encoded cwd>/<uuid>/summary.json`, walked under the same no-symlink,
+/// visit-budgeted rules as the other tools.
 fn grok_files(root: &Path) -> Vec<(Tool, PathBuf, String, SystemTime)> {
     let mut out = Vec::new();
     let mut visits = 0usize;
@@ -415,7 +378,7 @@ fn grok_files(root: &Path) -> Vec<(Tool, PathBuf, String, SystemTime)> {
                 .filter(|n| crate::agentstate::is_session_uuid(n))
                 .map(str::to_string)
             else {
-                continue; // `prompt_history.jsonl` and friends live beside the session dirs
+                continue;
             };
             if !std::fs::symlink_metadata(&dir).is_ok_and(|md| md.is_dir()) {
                 continue;
@@ -430,9 +393,9 @@ fn grok_files(root: &Path) -> Vec<(Tool, PathBuf, String, SystemTime)> {
     out
 }
 
-/// grok `summary.json` → cwd + title; the first typed prompt from `chat_history.jsonl` when
-/// grok has not generated a title yet. grok writes no headless marker we have seen, so every
-/// session counts as interactive (the denylist rule: unknown stays visible).
+/// grok `summary.json` to cwd + title; the first typed prompt from `chat_history.jsonl` when
+/// grok has not generated a title yet. grok writes no headless marker, so every session counts
+/// as interactive.
 fn parse_grok(path: &Path, budget: &mut Budget) -> Meta {
     let mut meta = Meta::default();
     let grant = budget.allow();
@@ -463,9 +426,9 @@ fn parse_grok(path: &Path, budget: &mut Budget) -> Meta {
         return meta;
     };
     for line in lines {
-        // A typed prompt carries `prompt_index`; injected context (`synthetic_reason`) and the
-        // `<user_info>` preamble do not. Cheap pre-filter before the parse — the system record
-        // that opens the file is the whole system prompt.
+        // A typed prompt carries `prompt_index`; injected context and the `<user_info>`
+        // preamble do not. Cheap pre-filter: the system record opening the file is the whole
+        // system prompt.
         if !line.contains("\"prompt_index\"") {
             continue;
         }
@@ -484,8 +447,6 @@ fn parse_grok(path: &Path, budget: &mut Budget) -> Meta {
     meta
 }
 
-/// A grok user record's typed text: its `content[].text`, with the `<user_query>` wrapper grok
-/// puts around what the user typed removed.
 pub(crate) fn grok_user_text(v: &serde_json::Value) -> String {
     let text = v
         .get("content")
@@ -501,25 +462,21 @@ pub(crate) fn grok_user_text(v: &serde_json::Value) -> String {
     tag_value(&text, "user_query").unwrap_or(text)
 }
 
-/// Rows read from agy's index at most. The query also sorts newest first, so this keeps the
-/// newest conversations.
 const AGY_MAX_ROWS: usize = MAX_ENTRIES;
-/// Bytes of `sqlite3` output accepted. A row is a uuid, a title, a URI list and a time.
+/// Bytes of `sqlite3` output accepted.
 const AGY_MAX_OUTPUT: u64 = 8 * 1024 * 1024;
-/// How long the `sqlite3` child may run before it is killed.
 const AGY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// agy's conversations out of its own SQLite index, newest first.
 ///
 /// Through the system `sqlite3` binary on purpose: linking SQLite would put a C library in a
-/// binary that installs standalone for one optional reader, and this already runs on the scan
-/// thread, which exists to absorb I/O. The child is bounded like every other read here — capped
-/// output, a deadline after which it is killed AND reaped, arguments passed directly (no
-/// shell), stderr discarded. Missing `sqlite3` or any failure → no agy rows, nothing worse.
+/// binary that installs standalone for one optional reader. The child is bounded like every
+/// other read here: capped output, a deadline after which it is killed AND reaped, arguments
+/// passed directly (no shell), stderr discarded. Any failure yields no agy rows.
 ///
-/// Opened `mode=ro`, never writable: a read-write connection that turned out to be the last one
-/// could checkpoint agy's WAL on close. `mode=ro` cannot open a WAL database whose `-shm` is
-/// absent (agy not running), and `immutable=1` is exactly right then — there is no WAL to miss.
+/// Opened `mode=ro`, never writable: a read-write connection that was the last one could
+/// checkpoint agy's WAL on close. `mode=ro` cannot open a WAL database whose `-shm` is absent
+/// (agy not running), where `immutable=1` is right since there is no WAL to miss.
 fn agy_entries(home: &Path) -> Vec<(String, SystemTime, Meta)> {
     let db = home
         .join(".gemini")
@@ -539,8 +496,8 @@ fn agy_entries(home: &Path) -> Vec<(String, SystemTime, Meta)> {
         .unwrap_or_default()
 }
 
-/// `path` percent-encoded for a `file:` URI: a home directory containing `?`, `#` or `%` would
-/// otherwise be read as URI syntax and open some other file (or none).
+/// `path` percent-encoded for a `file:` URI: a home containing `?`, `#` or `%` would otherwise
+/// be read as URI syntax.
 fn uri_path(path: &Path) -> String {
     use std::os::unix::ffi::OsStrExt;
     let mut out = String::new();
@@ -554,7 +511,6 @@ fn uri_path(path: &Path) -> String {
     out
 }
 
-/// Run one `sqlite3 -json` query, bounded. `None` on any failure, including a nonzero exit.
 fn sqlite_json(uri: &str, query: &str) -> Option<String> {
     use std::io::Read;
     let mut child = std::process::Command::new("sqlite3")
@@ -590,8 +546,6 @@ fn sqlite_json(uri: &str, query: &str) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out).into_owned())
 }
 
-/// `sqlite3 -json` output → rows. An empty result prints NOTHING (not `[]`), which is an
-/// empty list, not a failure.
 fn parse_agy_rows(json: &str) -> Vec<(String, SystemTime, Meta)> {
     if json.trim().is_empty() {
         return Vec::new();
@@ -629,7 +583,6 @@ fn parse_agy_rows(json: &str) -> Vec<(String, SystemTime, Meta)> {
         .collect()
 }
 
-/// `file:///a/b%20c` → `/a/b c`. `None` for any other scheme or a non-UTF-8 decode.
 fn file_uri_path(uri: &str) -> Option<PathBuf> {
     let raw = uri.strip_prefix("file://")?;
     if !raw.starts_with('/') {
@@ -655,15 +608,14 @@ fn file_uri_path(uri: &str) -> Option<PathBuf> {
     String::from_utf8(out).ok().map(PathBuf::from)
 }
 
-/// The conversation id from a transcript filename: the stem with `prefix` stripped, and for
-/// Codex the trailing UUID of `rollout-<timestamp>-<uuid>`. `None` unless the result is a
-/// real UUID — an id lands on a command line, so it is validated, never guessed.
+/// The conversation id from a transcript filename (for Codex the trailing UUID of
+/// `rollout-<timestamp>-<uuid>`). `None` unless it is a real UUID: an id lands on a command
+/// line, so it is validated, never guessed.
 fn transcript_id(path: &Path, prefix: &str) -> Option<String> {
     if path.extension()? != "jsonl" {
         return None;
     }
     let stem = path.file_stem()?.to_str()?.strip_prefix(prefix)?;
-    // `rollout-2026-09-06T23-07-50-<uuid>` → the last 5 dash-groups.
     let parts: Vec<&str> = stem.split('-').collect();
     let id = if parts.len() >= 5 {
         parts[parts.len() - 5..].join("-")
@@ -673,9 +625,9 @@ fn transcript_id(path: &Path, prefix: &str) -> Option<String> {
     crate::agentstate::is_session_uuid(&id).then_some(id)
 }
 
-/// `mtime` of `path` when it is a REGULAR file — never a symlink, FIFO or device. This is the
-/// enumeration filter; the read itself re-checks the type on its own descriptor
-/// (see [`bounded_lines`]), since a path check can be raced.
+/// `mtime` of `path` when it is a REGULAR file (never a symlink, FIFO or device). The read
+/// re-checks the type on its own descriptor (see [`bounded_lines`]), since a path check can be
+/// raced.
 fn regular_file_mtime(path: &Path) -> Option<SystemTime> {
     let md = std::fs::symlink_metadata(path).ok()?;
     md.is_file().then(|| md.modified().ok()).flatten()
@@ -683,14 +635,12 @@ fn regular_file_mtime(path: &Path) -> Option<SystemTime> {
 
 /// A bounded line reader over a transcript: at most `cap` bytes from a REGULAR file.
 ///
-/// `budget` is charged by the bytes ACTUALLY read (see [`Metered`]), not by the per-file cap —
-/// charging the cap up front exhausts the allowance after a few hundred files and silently
-/// degrades every later row (each transcript is parsed lazily and most stop short of its cap).
+/// `budget` is charged by the bytes ACTUALLY read (see [`Metered`]), not the per-file cap:
+/// charging the cap up front exhausts the allowance after a few hundred files.
 ///
-/// The open is `O_NOFOLLOW | O_NONBLOCK` and the file type is re-checked on the DESCRIPTOR, not
-/// on the path: a `symlink_metadata` check followed by a plain open is a race a hostile tree
-/// can win by swapping the file for a FIFO in between, and opening a FIFO blocks forever on a
-/// thread nobody joins.
+/// The open is `O_NOFOLLOW | O_NONBLOCK` and the file type is re-checked on the DESCRIPTOR: a
+/// path check followed by a plain open can be raced by swapping in a FIFO, and opening a FIFO
+/// blocks forever on a thread nobody joins.
 fn bounded_lines<'a>(
     path: &Path,
     grant: &Grant,
@@ -721,8 +671,6 @@ fn bounded_lines<'a>(
     )
 }
 
-/// Claude transcript → cwd + title + interactivity. Bails as soon as both the `entrypoint`
-/// (which decides `headless`) and a title are known.
 fn parse_claude(path: &Path, budget: &mut Budget, deep: bool) -> Meta {
     let mut meta = Meta::default();
     let mut origin_known = false;
@@ -732,8 +680,7 @@ fn parse_claude(path: &Path, budget: &mut Budget, deep: bool) -> Meta {
         return meta;
     };
     for line in lines {
-        // Every record that carries `cwd` carries `entrypoint` too, so one parse settles
-        // both; after that only user records can still add anything.
+        // Every record that carries `cwd` carries `entrypoint` too, so one parse settles both.
         if !origin_known
             && line.contains("\"entrypoint\"")
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
@@ -753,21 +700,19 @@ fn parse_claude(path: &Path, budget: &mut Budget, deep: bool) -> Meta {
         if want_title
             && meta.title.is_empty()
             && line.contains("\"type\":\"user\"")
-            // A prompt record carries `promptSource`; a tool-result record does not. Skipping
-            // big lines without it keeps a multi-MB tool result from being deserialized.
+            // A prompt record carries `promptSource`, a tool result does not: skipping big
+            // lines without it avoids deserializing multi-MB tool results.
             && (line.len() < BIG_LINE || line.contains("\"promptSource\""))
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
             && v.get("type").and_then(|t| t.as_str()) == Some("user")
             && v.get("isSidechain").and_then(|s| s.as_bool()) != Some(true)
-            // Only a plain-string content is a typed prompt; an array is a tool result.
             && let Some(text) = v.pointer("/message/content").and_then(|c| c.as_str())
             && let Some(title) = prompt_title(text)
         {
             meta.title = title;
         }
-        // Everything known — or the title isn't wanted at all (the transcript turned out to be
-        // headless and `deep` is off, or the title budget is spent), so classification and cwd
-        // are all that is left to find.
+        // Everything known, or the title is not wanted (headless with `deep` off, or the title
+        // budget is spent): only classification and cwd were left to find.
         if origin_known && (!meta.title.is_empty() || !want_title || (meta.headless && !deep)) {
             break;
         }
@@ -775,8 +720,8 @@ fn parse_claude(path: &Path, budget: &mut Budget, deep: bool) -> Meta {
     meta
 }
 
-/// Codex rollout → cwd + title + interactivity. Line 1 (`session_meta`) has the metadata;
-/// the first real user prompt follows the developer preamble further down.
+/// Codex rollout to cwd + title + interactivity. Line 1 (`session_meta`) has the metadata; the
+/// first real user prompt sits below the developer preamble.
 fn parse_codex(path: &Path, budget: &mut Budget, deep: bool) -> Meta {
     let mut meta = Meta::default();
     let grant = budget.allow();
@@ -792,14 +737,13 @@ fn parse_codex(path: &Path, budget: &mut Budget, deep: bool) -> Meta {
             .and_then(|c| c.as_str())
             .filter(|c| !c.is_empty())
             .map(PathBuf::from);
-        // An originator we don't know is treated as interactive (see CODEX_HEADLESS).
         meta.headless = v
             .pointer("/payload/originator")
             .and_then(|o| o.as_str())
             .is_some_and(|o| CODEX_HEADLESS.contains(&o));
     }
     if !want_title || (meta.headless && !deep) {
-        return meta; // hidden row — don't pay for a prompt buried under the preamble
+        return meta;
     }
     for line in lines {
         if !line.contains("\"role\":\"user\"") {
@@ -824,7 +768,6 @@ fn parse_codex(path: &Path, budget: &mut Budget, deep: bool) -> Meta {
                     .join(" ")
             })
             .unwrap_or_default();
-        // Codex injects context as tag blocks (`<environment_context>…`) in the user role.
         if let Some(title) = prompt_title(&text) {
             meta.title = title;
             break;
@@ -833,13 +776,10 @@ fn parse_codex(path: &Path, budget: &mut Budget, deep: bool) -> Meta {
     meta
 }
 
-/// A user record's text as a row title, or `None` when it is not the user's own words and
-/// the caller should keep looking.
-///
+/// A user record's text as a row title, or `None` when it is not the user's own words.
 /// Both CLIs put machine-generated context in the user role, wrapped in a tag block
-/// (`<environment_context>`, `<local-command-caveat>`, …). Those are skipped — except a slash
-/// command, whose `<command-name>` IS what the user typed (`/catchup`), so it becomes the
-/// title instead of the caveat that follows it.
+/// (`<environment_context>`, `<local-command-caveat>`, ...); those are skipped, except a slash
+/// command, whose `<command-name>` IS what the user typed and becomes the title.
 fn prompt_title(text: &str) -> Option<String> {
     if is_tag_block(text) {
         let cmd = tag_value(text, "command-name")?;
@@ -848,7 +788,6 @@ fn prompt_title(text: &str) -> Option<String> {
     Some(clean_title(text)).filter(|t| !t.is_empty())
 }
 
-/// The contents of the first `<name>…</name>` element in `text`, if present.
 fn tag_value(text: &str, name: &str) -> Option<String> {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
@@ -857,8 +796,6 @@ fn tag_value(text: &str, name: &str) -> Option<String> {
     Some(text[start..end].to_string())
 }
 
-/// Whether `text` is an injected tag block rather than a prompt: it opens with `<` and its
-/// first line closes that tag.
 fn is_tag_block(text: &str) -> bool {
     let t = text.trim_start();
     t.starts_with('<')
@@ -867,8 +804,6 @@ fn is_tag_block(text: &str) -> bool {
             .is_some_and(|l| l.trim_end().ends_with('>'))
 }
 
-/// Collapse a prompt to one bounded line: whitespace runs (including newlines) become single
-/// spaces, and the result is cut to [`MAX_TITLE`] chars.
 fn clean_title(text: &str) -> String {
     let mut out = String::new();
     for word in text.split_whitespace() {
@@ -883,8 +818,6 @@ fn clean_title(text: &str) -> String {
     out.chars().take(MAX_TITLE).collect()
 }
 
-/// Age as a compact, stable label (`now` / `12m` / `3h` / `2d` / `5w`). Buckets coarsely on
-/// purpose: the picker's frame must not recompose every second.
 pub fn fmt_age(secs: u64) -> String {
     match secs {
         0..60 => "now".into(),
@@ -895,16 +828,15 @@ pub fn fmt_age(secs: u64) -> String {
     }
 }
 
-/// The argv that resumes conversation `id` in a fresh shell. The per-tool command shape
-/// (`claude --resume <id>` vs `codex resume <id>`) lives in [`crate::agentstate`], shared
-/// with the persisted-restore path.
+/// The argv that resumes conversation `id` in a fresh shell. The per-tool command shape lives
+/// in [`crate::agentstate`], shared with the persisted-restore path.
 pub fn resume_argv(tool: Tool, id: &str) -> Vec<String> {
     crate::agentstate::resume_argv(tool.bin(), &[tool.bin().to_string()], id)
 }
 
-/// The command that FORKS conversation `id` into a new one (decisions #150): history kept, a
-/// new session id, the original untouched. `None` for an id that is not a UUID — never splice
-/// an unvalidated value onto a command line — and for agy, which has no fork.
+/// The command that FORKS conversation `id` into a new one (decisions #150). `None` for an id
+/// that is not a UUID (never splice an unvalidated value onto a command line) and for agy,
+/// which has no fork.
 pub fn fork_argv(tool: Tool, id: &str) -> Option<Vec<String>> {
     if !crate::agentstate::is_session_uuid(id) {
         return None;
@@ -919,7 +851,7 @@ pub fn fork_argv(tool: Tool, id: &str) -> Option<Vec<String>> {
 }
 
 impl Tool {
-    /// The tool a pane's foreground label names, when it is one comux knows conversations of.
+    /// The tool a pane's foreground label names, when comux knows its conversations.
     pub fn from_label(label: &str) -> Option<Tool> {
         match label.to_ascii_lowercase().as_str() {
             "claude" => Some(Tool::Claude),
@@ -974,7 +906,6 @@ mod tests {
         assert_eq!(transcript_id(&claude, "").as_deref(), Some(CID));
         let codex = PathBuf::from(format!("/s/rollout-2026-09-06T23-07-50-{CID}.jsonl"));
         assert_eq!(transcript_id(&codex, "rollout-").as_deref(), Some(CID));
-        // Not a UUID / wrong extension / wrong prefix → rejected rather than guessed.
         assert_eq!(transcript_id(Path::new("/p/notes.jsonl"), ""), None);
         assert_eq!(transcript_id(&claude, "rollout-"), None);
         assert_eq!(
@@ -1006,7 +937,6 @@ mod tests {
         assert_eq!(e[0].tool, Tool::Claude);
         assert_eq!(e[0].id, CID);
         assert_eq!(e[0].cwd.as_deref(), Some(Path::new("/Users/me/dev/copad")));
-        // Newlines collapsed, FIRST prompt wins (it is the conversation's identity).
         assert_eq!(e[0].title, "세션 목록 만들어줘");
         assert!(!e[0].headless);
     }
@@ -1029,7 +959,6 @@ mod tests {
         let e = scan(&home, true);
         assert_eq!(e.len(), 1);
         assert!(e[0].headless);
-        // An array content (tool result) and a sidechain record are both skipped.
         assert_eq!(e[0].title, "run the loop");
     }
 
@@ -1085,7 +1014,6 @@ mod tests {
         assert_eq!(e.len(), 2);
         let by_id = |id: &str| e.iter().find(|x| x.id == id).unwrap();
         assert!(by_id(CID).headless);
-        // Unknown originator → treated as interactive, so it can never silently disappear.
         assert!(!by_id(other).headless);
     }
 
@@ -1103,8 +1031,7 @@ mod tests {
             ),
         );
         // Titles spent, metadata reserve intact: the row must still be classified headless and
-        // keep its directory — those decide whether it is listed at all and where Enter opens
-        // it, so degrading them would look like a correct list while behaving wrongly.
+        // keep its directory, which decide whether it is listed and where Enter opens it.
         let mut spent = Budget {
             titles: 0,
             meta: MAX_TOTAL_META_SCAN,
@@ -1113,9 +1040,7 @@ mod tests {
         assert!(meta.headless);
         assert_eq!(meta.cwd.as_deref(), Some(Path::new("/Users/me/bots")));
         assert_eq!(meta.title, "");
-        // The SAME degradation must apply at the boundary, not only at exactly zero: a file
-        // handed the last few KB of the title budget could run out before its `entrypoint`
-        // record and come back unclassified.
+        // The same degradation must apply near the boundary, not only at exactly zero.
         let mut nearly = Budget {
             titles: 1024,
             meta: MAX_TOTAL_META_SCAN,
@@ -1128,8 +1053,8 @@ mod tests {
             "the reserve paid, not the title budget"
         );
 
-        // And the choice is sticky per file: a title read that drains `titles` mid-file must
-        // not spill into the reserve that LATER transcripts depend on.
+        // The choice is sticky per file: a title read that drains `titles` mid-file must not
+        // spill into the reserve that LATER transcripts depend on.
         let mut draining = Budget {
             titles: META_FILE_SCAN + 8,
             meta: MAX_TOTAL_META_SCAN,
@@ -1137,7 +1062,6 @@ mod tests {
         parse_claude(&f, &mut draining, true);
         assert_eq!(draining.meta, MAX_TOTAL_META_SCAN);
 
-        // With both budgets alive the title comes back.
         let mut full = Budget {
             titles: MAX_TOTAL_SCAN,
             meta: MAX_TOTAL_META_SCAN,
@@ -1157,8 +1081,8 @@ mod tests {
         let projects = home.join(".claude/projects");
         std::fs::create_dir_all(&projects).unwrap();
         std::os::unix::fs::symlink(&real, projects.join("-p")).unwrap();
-        // Following it would let a hostile tree redirect the walk anywhere (a network mount
-        // that blocks, for instance) on a thread nobody joins.
+        // Following it would let a hostile tree redirect the walk anywhere (a blocking network
+        // mount, say).
         assert!(scan(&home, true).is_empty());
     }
 
@@ -1169,17 +1093,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let fifo = dir.join(format!("{CID}.jsonl"));
         let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        // SAFETY: a plain libc call on a path inside this test's own temp dir.
         assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
         let mut budget = Budget {
             titles: MAX_TOTAL_SCAN,
             meta: MAX_TOTAL_META_SCAN,
         };
-        // Opening a FIFO for reading blocks until a writer appears; there is none, so a scan
-        // that reached this file would hang forever on a thread nobody joins.
+        // Opening a FIFO for reading blocks until a writer appears; a scan that reached this
+        // file would hang forever.
         let grant = budget.allow();
         assert!(bounded_lines(&fifo, &grant, &mut budget).is_none());
-        // And it never reaches the reader anyway — enumeration drops non-regular files.
         assert!(scan(&home, true).is_empty());
     }
 
@@ -1210,14 +1132,12 @@ mod tests {
     fn grok_sessions_list_with_their_title_and_cwd() {
         let home = tmpdir("grok");
         let dir = home.join(format!(".grok/sessions/%2Fp%2Fq/{GID}"));
-        // Verbatim-shaped summary.json (grok 1.0.70), trimmed.
         write(
             &dir.join("summary.json"),
             &format!(
                 r#"{{"info":{{"id":"{GID}","cwd":"/p/q"}},"session_summary":"","generated_title":"Touch grok-probe then choose red or blue","num_messages":36}}"#
             ),
         );
-        // Not a session dir: lives beside them.
         write(
             &home.join(".grok/sessions/%2Fp%2Fq/prompt_history.jsonl"),
             "{}\n",
@@ -1240,8 +1160,6 @@ mod tests {
             &dir.join("summary.json"),
             &format!(r#"{{"info":{{"id":"{GID}","cwd":"/p"}},"session_summary":""}}"#),
         );
-        // chat_history.jsonl record shapes as grok writes them: the injected preamble and
-        // synthetic reminders carry no `prompt_index`; the typed prompt is wrapped.
         write(
             &dir.join("chat_history.jsonl"),
             concat!(
@@ -1273,7 +1191,6 @@ mod tests {
 
     #[test]
     fn agy_rows_parse_out_of_sqlite_json() {
-        // `sqlite3 -json` output shape for the picker query.
         let json = format!(
             r#"[{{"id":"{CID}","title":"Executing Shell Command File Creation","ws":"[\"file:///private/tmp/a%20b\"]","mtime":1792846986}},
 {{"id":"not-a-uuid","title":"x","ws":"[]","mtime":1}},
@@ -1297,11 +1214,10 @@ mod tests {
     }
 
     /// End to end through the real `sqlite3` binary, against a WAL database like agy's with no
-    /// `-shm` beside it (agy closed) — the case `mode=ro` cannot open and `immutable=1` must.
-    /// Skipped where `sqlite3` is not installed, which is exactly the case that yields no rows.
+    /// `-shm` beside it (agy closed): the case `mode=ro` cannot open and `immutable=1` must.
+    /// Skipped where `sqlite3` is not installed.
     #[test]
     fn agy_index_is_read_through_sqlite3_without_writing_it() {
-        // URI metacharacters in the home path must survive into the `file:` URI.
         let home = tmpdir("agy").join("odd ?#%41 home");
         let dir = home.join(".gemini/antigravity-cli");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1348,7 +1264,6 @@ mod tests {
         assert!(scan(&home, true).is_empty());
         write(&home.join(".claude/projects/-p/README.md"), "hi\n");
         write(&home.join(".claude/projects/-p/not-a-uuid.jsonl"), "{}\n");
-        // A subagent transcript under a session directory is not separately resumable.
         write(
             &home.join(format!(".claude/projects/-p/{CID}/{CID}.jsonl")),
             "{}\n",
@@ -1366,7 +1281,6 @@ mod tests {
 
     #[test]
     fn prompt_title_skips_wrappers_but_keeps_a_slash_command() {
-        // An injected context block is not the user's words → keep looking.
         assert_eq!(
             prompt_title("<environment_context>\ncwd=/x\n</environment_context>"),
             None
@@ -1377,7 +1291,6 @@ mod tests {
             ),
             None
         );
-        // A slash command's own name IS the prompt.
         assert_eq!(
             prompt_title(
                 "<command-message>catchup</command-message>\n<command-name>/catchup</command-name>"
@@ -1398,7 +1311,6 @@ mod tests {
             "<environment_context>\nfoo\n</environment_context>"
         ));
         assert!(is_tag_block("  <user_instructions>\nx"));
-        // A prompt that merely starts with `<` is a prompt.
         assert!(!is_tag_block("<- this arrow means something"));
         assert!(!is_tag_block("fix the deploy"));
     }

@@ -1,23 +1,18 @@
 //! User configuration for copad-mux: `~/.config/copad/mux.toml`.
 //!
-//! Mirrors the owner's own `tmx` config conventions (copad-mux already ports tmx's
-//! agent-status parser): TOML, overlay-merge onto built-in defaults (a partial config
-//! keeps every unspecified default), warn-once on an invalid file/binding, and
-//! action→chord key tables where an override REPLACES that action's default chord set.
+//! TOML, overlay-merged onto built-in defaults (a partial config keeps every unspecified
+//! default), warn-once on an invalid file/binding, and action->chord key tables where an
+//! override REPLACES that action's default chord set.
 //!
-//! Zero-config users get behavior IDENTICAL to the previous hardcoded bindings — every
-//! default here reproduces what `feed_key` used to match literally.
-//!
-//! Design notes (from the codex plan review, decisions #67):
-//! - Bindings are **action → many chords** so aliases survive (`detach = d | q`,
-//!   `focus-left = h | Left`, prefix `1..9` + global `M-1..9`).
+//! - Bindings are action -> many chords so aliases survive (`detach = d | q`,
+//!   `focus-left = h | Left`, prefix `1..9` + global `M-1..9`) (decisions #67).
 //! - A live `KeyEvent` and a parsed config token are canonicalized the SAME way
-//!   ([`chord_of`] / [`parse_chord`]) so they compare equal. Raw control bytes
-//!   (`\u{2}` = `C-b`, `\u{6}` = `C-f`) are mapped to `ctrl`+letter FIRST.
-//! - Collisions resolve by declaration order (deterministic) and emit a warning; a
-//!   global binding equal to the prefix chord is dropped so prefix entry always wins.
-//! - `load()` returns structured diagnostics (`Vec<String>`) rather than only touching
-//!   stderr, so warnings are testable and the foreground client can print them.
+//!   ([`chord_of`] / [`parse_chord`]) so they compare equal. Raw control bytes (`\u{2}` =
+//!   `C-b`, `\u{6}` = `C-f`) are mapped to `ctrl`+letter FIRST.
+//! - Collisions resolve by declaration order and emit a warning; a global binding equal to the
+//!   prefix chord is dropped so prefix entry always wins.
+//! - `load()` returns diagnostics (`Vec<String>`) rather than only touching stderr, so
+//!   warnings are testable and the foreground client can print them.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -25,46 +20,35 @@ use std::path::PathBuf;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde::Deserialize;
 
-// ---- default constants (the config clamps toward / falls back to these) ----
 pub const DEFAULT_SIDEBAR_WIDTH: u16 = 24;
-/// tmux's `repeat-time` default.
 pub const DEFAULT_REPEAT_TIME: u64 = 500;
 pub const DEFAULT_SIDEBAR_MIN_COLS: u16 = 80;
 pub const DEFAULT_SCROLL_STEP: i32 = 3;
-/// Default and ceiling for `history_limit`.
 pub const DEFAULT_HISTORY_LIMIT: usize = 10_000;
 pub const MAX_HISTORY_LIMIT: usize = 100_000;
-/// How long saved work graphs are kept.
 pub const DEFAULT_GRAPH_RETAIN_DAYS: u32 = 30;
-/// Default periodic autosave interval (seconds) for session persistence.
 pub const DEFAULT_AUTOSAVE_SECS: u32 = 15;
-/// Default cells per progress bar for `usage = "bar"`.
 pub const DEFAULT_USAGE_BAR_WIDTH: u16 = 8;
 /// Default period (seconds) of the silent full repaint that heals render residue
-/// (`MuxConfig::reconcile_secs`). Three seconds is short enough that residue reads as a
-/// flicker of staleness rather than something you have to fix by hand, and — because the
-/// repaint ships no cells, only a flag — costs the wire nothing at any cadence.
+/// (`MuxConfig::reconcile_secs`). The repaint ships no cells, only a flag, so it costs the
+/// wire nothing at any cadence.
 pub const DEFAULT_RECONCILE_SECS: u32 = 3;
 
-/// Default [`MuxConfig::notify_settle_secs`].
 pub const DEFAULT_NOTIFY_SETTLE_SECS: u32 = 3;
-/// Default [`MuxConfig::notify_remind_mins`].
 pub const DEFAULT_NOTIFY_REMIND_MINS: u32 = 10;
 
-/// Minimum pane-content width kept to the right of the sidebar; `sidebar_min_cols`
-/// is forced to at least `sidebar_width + this` so a visible sidebar can never eat
-/// the whole viewport.
+/// Minimum pane-content width kept right of the sidebar: `sidebar_min_cols` is forced to at
+/// least `sidebar_width + this` so a visible sidebar can never eat the whole viewport.
 const MIN_CONTENT_COLS: u16 = 20;
 
-/// Non-agent programs re-run on restore by default — tmux-resurrect's default list. Each is
-/// safe to re-execute from its argv: editors, pagers and monitors only read, and an editor
-/// re-opened on a file with unsaved changes offers its own swap-file recovery.
+/// Non-agent programs re-run on restore by default (tmux-resurrect's list). Each is safe to
+/// re-execute from its argv; an editor re-opened on a file with unsaved changes offers its own
+/// swap-file recovery.
 const RESTORE_PROGRAMS: &[&str] = &[
     "vi", "vim", "nvim", "emacs", "man", "less", "more", "tail", "top", "htop", "irssi", "weechat",
     "mutt",
 ];
 
-/// The default `restore_processes` whitelist: the built-in AI agents plus [`RESTORE_PROGRAMS`].
 fn default_restore_processes() -> Vec<String> {
     crate::procinfo::agent_basenames()
         .iter()
@@ -73,12 +57,11 @@ fn default_restore_processes() -> Vec<String> {
         .collect()
 }
 
-/// The default `update_environment` list — the volatile per-login-session variables
-/// that a persistent server must refresh from the attaching client (tmux
-/// `update-environment` plus the modern-desktop set). Deliberately excludes anything
-/// load-bearing for a shell (see [`ENV_UPDATE_BLOCKLIST`]); these names are both
-/// scrubbed from the daemon at startup and re-injected per-pane from the latest client,
-/// so a pane never inherits a stale SSH/display session from wherever the server was born.
+/// The default `update_environment` list: volatile per-login-session variables a persistent
+/// server must refresh from the attaching client (tmux `update-environment` plus the
+/// modern-desktop set). Excludes anything load-bearing for a shell (see
+/// [`ENV_UPDATE_BLOCKLIST`]). These are scrubbed from the daemon at startup and re-injected
+/// per-pane from the latest client.
 pub fn default_update_environment() -> Vec<String> {
     [
         "DISPLAY",
@@ -95,8 +78,8 @@ pub fn default_update_environment() -> Vec<String> {
         "WINDOWID",
         "KRB5CCNAME",
         "TERM_PROGRAM",
-        // The compositor instance a window-raise (notification jump) talks to. A server
-        // that outlives a Hyprland session would otherwise keep addressing the dead one.
+        // The compositor instance a window-raise (notification jump) talks to; a server that
+        // outlives a Hyprland session would otherwise address the dead one.
         "HYPRLAND_INSTANCE_SIGNATURE",
     ]
     .iter()
@@ -104,25 +87,20 @@ pub fn default_update_environment() -> Vec<String> {
     .collect()
 }
 
-/// The built-in `never_inherit` denylist — agent session markers that a long-lived server
-/// must NEVER hand to a pane, whether from its own birth environment or from an attaching
-/// client. Distinct from [`default_update_environment`] on purpose: those names are
-/// scrubbed AND re-injected from the latest client, which for a session marker would just
-/// reintroduce the leak the moment you attach from inside an agent session.
+/// The built-in `never_inherit` denylist: agent session markers a long-lived server must NEVER
+/// hand to a pane, from its own birth environment or from an attaching client. Distinct from
+/// [`default_update_environment`]: those names are scrubbed AND re-injected from the latest
+/// client, which would reintroduce the leak when attaching from inside an agent session.
 ///
 /// `CLAUDE_CODE_CHILD_SESSION=1` marks a subprocess Claude Code launched; an interactive
-/// `claude` carrying it is classified as a nested session, so its transcript is never
-/// written and it never appears in `--resume` (upstream issue #3 — a server born inside
-/// Claude Code silently ate every conversation started in its panes). The rest are
-/// per-session identity for that same dead session; a pane inheriting them reports a
-/// session that no longer exists. Deliberately limited to Claude Code's own namespaced
-/// session variables: third-party markers stay untouched, and externally-enforced
-/// sandbox variables (`CODEX_SANDBOX*`) are NOT scrubbed — hiding a sandbox from the
-/// process inside it would make it misjudge what it is allowed to do.
+/// `claude` carrying it is treated as a nested session, so its transcript is never written and
+/// it never appears in `--resume` (upstream issue #3). The rest are per-session identity for
+/// that same dead session. Limited to Claude Code's own session variables: externally enforced
+/// sandbox variables (`CODEX_SANDBOX*`) are NOT scrubbed, since hiding a sandbox from the
+/// process inside it would make it misjudge what it may do.
 ///
-/// Always applied; a configured `never_inherit` list ADDS to this (see
-/// [`build_never_inherit`]) rather than replacing it, so adding one marker of your own
-/// can't silently re-enable the leak.
+/// A configured `never_inherit` list ADDS to this (see [`build_never_inherit`]), so adding one
+/// marker can't silently re-enable the leak.
 const NEVER_INHERIT_DEFAULTS: &[&str] = &[
     "CLAUDE_CODE_CHILD_SESSION",
     "CLAUDECODE",
@@ -131,7 +109,6 @@ const NEVER_INHERIT_DEFAULTS: &[&str] = &[
     "CLAUDE_CODE_ENTRYPOINT",
 ];
 
-/// [`NEVER_INHERIT_DEFAULTS`] as owned strings (the built-in denylist with no user additions).
 pub fn default_never_inherit() -> Vec<String> {
     NEVER_INHERIT_DEFAULTS
         .iter()
@@ -139,10 +116,9 @@ pub fn default_never_inherit() -> Vec<String> {
         .collect()
 }
 
-/// Names refused in `update_environment`: load-bearing shell/process variables whose
-/// removal (daemon scrub) or client-driven override would break PATH lookup, the login
-/// shell, the home dir, or comux's own pane markers. A configured entry matching this
-/// list is dropped with a warning rather than silently honored.
+/// Names refused in `update_environment`: load-bearing shell/process variables whose scrub or
+/// override would break PATH lookup, the login shell, the home dir, or comux's pane markers.
+/// A configured entry matching this list is dropped with a warning.
 const ENV_UPDATE_BLOCKLIST: &[&str] = &[
     "PATH",
     "HOME",
@@ -156,34 +132,23 @@ const ENV_UPDATE_BLOCKLIST: &[&str] = &[
     "_",
     "COPAD_MUX",
     "COPAD_MUX_SOCK",
-    // Per-pane identity, minted at spawn: a client-supplied value would make two panes
-    // answer to the same token and send a notification jump to the wrong one.
+    // Per-pane identity minted at spawn: a client-supplied value would make two panes answer
+    // to the same token and send a notification jump to the wrong one.
     "COPAD_MUX_PANE",
 ];
 
-/// How sessions are ordered in the sidebar + `Ctrl-f` switcher + `)`/`(` cycling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortBy {
-    /// Creation order (default; new sessions append).
     Created,
-    /// By name, case-insensitive (like `tmx`).
     Alphabetical,
-    /// Most-recently-switched-to first (MRU).
     Recent,
-    /// Sessions with an active (working/blocked) agent first.
     Activity,
 }
 
-/// How many rows one sidebar entry (a session, an agent) occupies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Density {
-    /// Two rows: name + subtitle. The original layout.
     Comfortable,
-    /// One row: name with its subtitle trailing, right-aligned. Doubles how many entries
-    /// fit, which past a certain count beats reading the subtitle of each.
     Compact,
-    /// Comfortable per half, dropping to compact only for a half that would overflow —
-    /// so a workspace pays the density cost exactly where it has too much to show.
     Auto,
 }
 
@@ -197,7 +162,6 @@ impl Density {
         })
     }
 
-    /// Rows per entry, given whether this half would overflow at the comfortable size.
     pub fn entry_rows(self, would_overflow: bool) -> u16 {
         match self {
             Density::Comfortable => 2,
@@ -225,12 +189,9 @@ impl SortBy {
     }
 }
 
-/// How the status-bar usage/limits readout is rendered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageStyle {
-    /// Hidden entirely (equivalent to `COPAD_MUX_USAGE=0`).
     Off,
-    /// Percentages only: `claude 5h 5% wk 34% · codex wk 60%`.
     Text,
     /// A progress bar per window on wide terminals (`5h ━━━╌╌╌╌╌ 34%`),
     /// falling back to `Text` when the terminal is too narrow for the bars.
@@ -248,14 +209,9 @@ impl UsageStyle {
     }
 }
 
-/// Whether the usage/limits readout is a paged carousel or the legacy inline row.
-/// `UsageStyle` above still selects the gauge (bar/text/off) WITHIN either layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UsageLayout {
-    /// One window (or provider) per page with a reset countdown, wheel-scrollable
-    /// and click-paged. The default — the only layout that shows reset times.
     Paged,
-    /// The historical single row with every window inline (no room for resets).
     Inline,
 }
 
@@ -269,7 +225,6 @@ impl UsageLayout {
     }
 }
 
-/// Config-string → [`crate::usagepoll::PageUnit`] (carousel page granularity).
 fn parse_page_unit(s: &str) -> Option<crate::usagepoll::PageUnit> {
     use crate::usagepoll::PageUnit;
     Some(match s.trim().to_ascii_lowercase().as_str() {
@@ -280,7 +235,6 @@ fn parse_page_unit(s: &str) -> Option<crate::usagepoll::PageUnit> {
     })
 }
 
-/// Config-string → [`crate::usagepoll::ResetStyle`] (how the reset time is shown).
 fn parse_reset_style(s: &str) -> Option<crate::usagepoll::ResetStyle> {
     use crate::usagepoll::ResetStyle;
     Some(match s.trim().to_ascii_lowercase().as_str() {
@@ -291,16 +245,10 @@ fn parse_reset_style(s: &str) -> Option<crate::usagepoll::ResetStyle> {
     })
 }
 
-/// What each status-bar tab chip shows. Zero-config default is [`TabLabels::Number`]
-/// (identical to the historical `1`/`2`/`3` chips); the other styles surface the tab's
-/// focused-pane foreground command (e.g. `claude` / `nvim`) so tabs read at a glance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabLabels {
-    /// Just the 1-based index: ` 1 ` (the original behavior).
     Number,
-    /// Just the process name: ` claude ` (index dropped).
     Name,
-    /// Index + process name: ` 1:claude ` (keeps the `Ctrl-b <n>` mapping visible).
     Both,
 }
 
@@ -315,7 +263,6 @@ impl TabLabels {
     }
 }
 
-/// Every user-bindable action (each current binding, plus `KillSession`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Action {
     SplitRight,
@@ -324,10 +271,7 @@ pub enum Action {
     NextTab,
     PrevTab,
     CloseTab,
-    /// Jump to tab index `0..=8` (`Ctrl-b 1`..`9`, `Alt-1`..`9`).
     SelectTab(u8),
-    /// `Ctrl-b ,` (tmux rename-window): give the active tab a custom name that takes
-    /// display precedence over its foreground-process label (empty → clear).
     RenameTab,
     NewSession,
     /// `Ctrl-b W`: create a git worktree + a session in it (name prompt).
@@ -357,11 +301,7 @@ pub enum Action {
     /// `Ctrl-b f` / `Ctrl-b w` (tmux `choose-window`): the switcher on the attached session's
     /// tabs, the previously used one selected, so `Ctrl-b f Enter` toggles like Alt-Tab.
     TabPicker,
-    /// Force a full client repaint (`Ctrl-b r`, tmux `refresh-client`). The server re-sends
-    /// a `full` frame and the client clears its terminal, wiping any drift/ghosting left by a
-    /// resize, an alt-screen transition, or a nested emulator that lost a cell.
     Redraw,
-    /// Focus the always-on left sidebar for keyboard navigation (nvim-explorer-style).
     FocusSidebar,
     /// `Ctrl-b R`: open the resume picker — past Claude/Codex conversations on disk,
     /// newest first, fuzzy-filtered (decision #99).
@@ -379,8 +319,6 @@ pub enum Action {
     Mark,
     /// `Ctrl-b '` then 1–9: go to the pane pinned in that slot, wherever it is.
     GotoMark,
-    /// Arm the prefix (`Ctrl-b`). A global-table action like any other, but prefix
-    /// entry always wins over a colliding user binding.
     EnterPrefix,
     /// `Ctrl-b {` / `}` (tmux `swap-pane -U`/`-D`): trade places with the previous / next
     /// pane; focus stays on the pane that moved.
@@ -416,14 +354,12 @@ pub enum Action {
     /// `Ctrl-b S-Left` / `S-Right`: move the active tab one place along the tab bar.
     MoveTabLeft,
     MoveTabRight,
-    /// `Ctrl-b Ctrl-b` (tmux `send-prefix`): type the prefix key itself into the pane, for
-    /// a nested tmux/comux or readline's back-char. Bound to the prefix chord by default,
-    /// whatever `prefix` is set to.
+    /// `Ctrl-b Ctrl-b` (tmux `send-prefix`): type the prefix key itself into the pane. Bound to
+    /// the prefix chord by default, whatever `prefix` is set to.
     SendPrefix,
 }
 
 impl Action {
-    /// One line on what the action does, for the `Ctrl-b ?` help.
     pub fn describe(self) -> &'static str {
         use Action::*;
         match self {
@@ -494,8 +430,6 @@ impl Action {
         }
     }
 
-    /// A short noun for the hint the status bar shows while the prefix is armed — only the
-    /// handful worth a glance; the rest are one `?` away.
     pub fn short(self) -> Option<&'static str> {
         use Action::*;
         Some(match self {
@@ -517,16 +451,14 @@ impl Action {
     }
 
     /// Whether the action keeps the prefix table live for `repeat_time` afterwards (tmux
-    /// `bind -r`), so `Ctrl-b H H H` nudges three times. Only actions you press in bursts and
-    /// whose keys mean nothing urgent to a shell: a burst of focus moves would eat the next
-    /// letters you type into vim.
+    /// `bind -r`). Only for burst actions: a burst of focus moves would eat the next letters
+    /// typed into vim.
     pub fn repeatable(self) -> bool {
         use Action::*;
         matches!(self, ResizeLeft | ResizeDown | ResizeUp | ResizeRight)
     }
 }
 
-/// A canonical key on the pane keyboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Key {
     Char(char),
@@ -545,12 +477,9 @@ pub enum Key {
     PageDown,
     Insert,
     Delete,
-    /// A function key, `F1`–`F24`.
     F(u8),
 }
 
-/// A fully-canonicalized chord: modifier bits + one key. Two chords are equal iff a
-/// live `KeyEvent` and a config token canonicalize to the same value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Chord {
     pub ctrl: bool,
@@ -560,10 +489,8 @@ pub struct Chord {
 }
 
 impl Chord {
-    /// A short label for showing the chord to the user: `C-b` → `^b`, `M-1` → `M-1`,
-    /// `C-S-Left` → `^S-Left`. Terminal caret convention rather than the config
-    /// spelling, because this is read at a glance in the status bar — and the prefix
-    /// indicator there must show the ACTUAL prefix, which `prefix = "C-a"` in
+    /// A short label for the user: `C-b` -> `^b`, `M-1` -> `M-1`, `C-S-Left` -> `^S-Left`.
+    /// The status-bar prefix indicator must show the ACTUAL prefix, which `prefix = "C-a"` in
     /// `mux.toml` can change.
     pub fn label(&self) -> String {
         let mut s = String::new();
@@ -574,8 +501,6 @@ impl Chord {
             s.push('^');
         }
         match self.key {
-            // An alphabetic key folds its shift into the letter's case (that is how
-            // `chord_of`/`parse_chord` canonicalize it), so `S-` would be redundant.
             Key::Char(c) if c.is_ascii_alphabetic() => {
                 if self.shift {
                     s.push(c.to_ascii_uppercase());
@@ -768,7 +693,6 @@ fn parse_key(tok: &str, shift: &mut bool) -> Option<Key> {
     }
 }
 
-/// Map a config action name (`"next-tab"`, `"tab-1"`) to an [`Action`].
 fn action_from_name(name: &str) -> Option<Action> {
     Some(match name {
         "split-right" => Action::SplitRight,
@@ -833,7 +757,6 @@ fn action_from_name(name: &str) -> Option<Action> {
             &name["layout-".len()..],
         )?),
         _ => {
-            // tab-1 .. tab-9
             let n = name.strip_prefix("tab-")?.parse::<u8>().ok()?;
             if (1..=9).contains(&n) {
                 Action::SelectTab(n - 1)
@@ -850,7 +773,6 @@ fn default_bindings() -> Vec<(Action, Ctx, &'static [&'static str])> {
     use Action::*;
     use Ctx::*;
     vec![
-        // ---- global (prefix-less) ----
         (EnterPrefix, Global, &["C-b"]),
         (Popup, Global, &["C-f"]),
         (SelectTab(0), Global, &["M-1"]),
@@ -866,7 +788,6 @@ fn default_bindings() -> Vec<(Action, Ctx, &'static [&'static str])> {
         (FocusDown, Global, &["C-S-j", "C-S-Down"]),
         (FocusUp, Global, &["C-S-k", "C-S-Up"]),
         (FocusRight, Global, &["C-S-l", "C-S-Right"]),
-        // ---- prefix table ----
         (SplitRight, Prefix, &["%"]),
         (SplitDown, Prefix, &["\""]),
         (NotificationCenter, Prefix, &["a"]),
@@ -957,7 +878,6 @@ fn default_bindings() -> Vec<(Action, Ctx, &'static [&'static str])> {
     ]
 }
 
-/// The resolved keymap: two chord→action lookup tables plus the prefix chord.
 #[derive(Debug, Clone)]
 pub struct Keymap {
     pub prefix_chord: Chord,
@@ -966,17 +886,15 @@ pub struct Keymap {
 }
 
 impl Keymap {
-    /// Resolve a prefix-table chord (after the prefix was armed).
     pub fn prefix_action(&self, chord: &Chord) -> Option<Action> {
         self.prefix_map.get(chord).copied()
     }
-    /// Resolve a prefix-less chord.
     pub fn global_action(&self, chord: &Chord) -> Option<Action> {
         self.global_map.get(chord).copied()
     }
 
-    /// Every binding, `(is_prefix_table, chord, action)`, in the built-in declaration order
-    /// of the actions and then by chord label — stable, so the help reads the same each time.
+    /// Every binding `(is_prefix_table, chord, action)`, in declaration order of the actions
+    /// then by chord label, so the help reads the same each time.
     pub fn bindings(&self) -> Vec<(bool, Chord, Action)> {
         let order: Vec<Action> = {
             let mut seen = Vec::new();
@@ -994,12 +912,10 @@ impl Keymap {
             .map(|(c, a)| (true, *c, *a))
             .chain(self.global_map.iter().map(|(c, a)| (false, *c, *a)))
             .collect();
-        // The prefix table first: it is where nearly everything lives.
         out.sort_by_key(|(p, c, a)| (!*p, rank(a), c.label()));
         out
     }
 
-    /// The chords that run `action` in the prefix table (`true`) or the global one.
     pub fn chords_for(&self, prefix: bool, action: Action) -> Vec<Chord> {
         self.bindings()
             .into_iter()
@@ -1009,51 +925,40 @@ impl Keymap {
     }
 }
 
-/// `[worktree]` configuration for `comux worktree create` (mirrors `tmx`'s
-/// `[worktree]`): the directory-naming pattern and per-repo post-create hooks.
 #[derive(Debug, Clone)]
 pub struct WorktreeConfig {
-    /// Directory naming pattern; tokens `{repo}` / `{branch}` (default
-    /// `{repo}-{branch}`). See [`crate::worktree::render_naming`].
     pub naming: String,
-    /// Per-repo post-create hook: canonical main-worktree path → shell command run via
-    /// `bash -c` (cwd = new worktree, `WORKTREE_PATH` exported). Keys are `~`-expanded
-    /// then canonicalized so a linked-worktree caller still matches.
+    /// Per-repo post-create hook: canonical main-worktree path -> shell command run via
+    /// `bash -c` (cwd = new worktree, `WORKTREE_PATH` exported). Keys are `~`-expanded then
+    /// canonicalized so a linked-worktree caller still matches.
     pub scripts: HashMap<PathBuf, String>,
 }
 
 impl WorktreeConfig {
-    /// The post-create hook for `main_root`, if any (canonical-path keyed).
     pub fn script_for(&self, main_root: &std::path::Path) -> Option<&str> {
         let key = crate::worktree::canonical_or_lexical(main_root);
         self.scripts.get(&key).map(|s| s.as_str())
     }
 }
 
-/// Effective configuration.
 #[derive(Debug, Clone)]
 pub struct MuxConfig {
     pub keymap: Keymap,
     pub mouse: bool,
     /// Relay a pane program's OSC 52 clipboard write out to the attached clients (tmux
-    /// `set-clipboard`). On by default, matching tmux — comux hosts your own shells, and
-    /// without it nothing inside a pane (nvim's osc52 provider, a `yank` helper) can reach
-    /// the clipboard. Set `false` to keep a background pane from clobbering it. Clipboard
-    /// READS are never answered regardless (see `term.rs`).
+    /// `set-clipboard`). `false` keeps a background pane from clobbering the clipboard.
+    /// Clipboard READS are never answered (see `term.rs`).
     pub osc52: bool,
     pub notify: bool,
-    /// Show a marker when a pane rings the bell (tab chip, sidebar space row, and a
-    /// mux-wide `! N` count in the status bar). PRESENTATION ONLY: `comux list --json`
-    /// reports `bell` either way, so a script's behaviour never depends on a display
-    /// preference. There is deliberately no desktop toast — shells ring for ambiguous
-    /// tab-completion, end of history and end of pager, which would bury the agent toasts.
+    /// Show a marker when a pane rings the bell (tab chip, sidebar space row, mux-wide `! N`).
+    /// PRESENTATION ONLY: `comux list --json` reports `bell` either way. No desktop toast on
+    /// purpose: shells ring for tab-completion and end of history, which would bury agent toasts.
     pub bell: bool,
     /// While the prefix is armed, show the most useful next keys (from the live keymap) in
     /// the status bar in place of the tab chips. Presentation only; on by default.
     pub prefix_hint: bool,
-    /// Set the attached terminal's title (tmux `set-titles`) to the focused pane's title —
-    /// what Claude Code, vim, a shell's prompt put there — or its program, then the session.
-    /// The old title is pushed on attach and restored on detach.
+    /// Set the attached terminal's title (tmux `set-titles`) to the focused pane's title or
+    /// program, then the session. The old title is pushed on attach and restored on detach.
     pub set_titles: bool,
     /// Ring the attached terminal's bell when any pane rings (tmux `bell-action any`), so the
     /// dock bounces / the tab marks itself as it would without a multiplexer. At most once a
@@ -1073,20 +978,17 @@ pub struct MuxConfig {
     /// its subagents and its steps, read off-loop from its own transcript and shown by copad's
     /// native chrome. `false` reads nothing and publishes an empty `graph` topic. Live.
     pub graph: bool,
-    /// Keep the work graphs on disk (`<state dir>/graphs/`), so they survive a server restart
-    /// and continue when the conversation is resumed. `false` writes nothing (and leaves files
-    /// already there alone). Live.
+    /// Keep the work graphs on disk (`<state dir>/graphs/`) so they survive a server restart
+    /// and continue when the conversation is resumed. `false` writes nothing (and leaves
+    /// existing files alone). Live.
     pub graph_persist: bool,
-    /// Saved work graphs older than this many days are deleted (checked hourly).
     pub graph_retain_days: u32,
     /// Title each pane (`1:claude working`) when a tab shows two or more: on the divider above
     /// it, or right-aligned on its first row only where that row is blank. Never takes a row.
     pub pane_titles: bool,
-    /// Show a one-row bar along the TOP of the mux (host CPU/memory/GPU/load).
-    ///
-    /// Off by default: it costs a row of the pane grid, and an existing user's layout should
-    /// not shrink because they upgraded. It is also suppressed outright on a terminal too
-    /// short to spare the row — see `App::top_h`.
+    /// Show a one-row bar along the TOP of the mux (host CPU/memory/GPU/load). Off by default:
+    /// it costs a row of the pane grid. Suppressed on a terminal too short to spare the row
+    /// (see `App::top_h`).
     pub top_bar: bool,
     pub sidebar: bool,
     pub sidebar_width: u16,
@@ -1097,94 +999,67 @@ pub struct MuxConfig {
     /// ~60 MB; this is the main lever on the server's memory. Applies to live panes on
     /// `comux reload`; lowering it drops their oldest lines for good.
     pub history_limit: usize,
-    /// Restore the saved session layout on server start (continuum-style autorestore).
     pub persist: bool,
-    /// Periodic autosave interval in seconds; `0` disables periodic saves.
     pub autosave_secs: u32,
-    /// Process basenames whose running command is saved and RE-RUN on restore (tmux
-    /// -resurrect's process whitelist). Default = the built-in AI agents + resurrect's
-    /// editors/pagers/monitors (`vim`, `nvim`, `less`, `htop`, …); an empty list
-    /// disables program re-execution (panes restore as bare shells).
+    /// Process basenames whose running command is saved and RE-RUN on restore (tmux-resurrect's
+    /// whitelist). An empty list restores bare shells.
     pub restore_processes: Vec<String>,
-    /// When re-running a restored agent (`restore_processes`), resume its live conversation
-    /// instead of starting fresh — `claude --resume <id>` / `codex resume <id>`, using the
-    /// session the process was actually in. Default on; set false to always restart cleanly.
+    /// When re-running a restored agent, resume its live conversation (`claude --resume <id>` /
+    /// `codex resume <id>`) instead of starting fresh.
     pub restore_agent_sessions: bool,
-    /// Session ordering in the sidebar / switcher / cycle.
     pub sort_by: SortBy,
-    /// Rows per sidebar entry (`comfortable` | `compact` | `auto`).
     pub sidebar_density: Density,
-    /// How the status-bar usage/limits readout is rendered (off/text/bar).
     pub usage: UsageStyle,
-    /// Which rate-limit windows the readout shows (config `usage_windows`); a window
-    /// renders only if both available and enabled. Default = all (Claude 5h + weekly,
-    /// Codex weekly).
+    /// Which rate-limit windows the readout shows (`usage_windows`); a window renders only if
+    /// both available and enabled.
     pub usage_windows: crate::usagepoll::UsageWindows,
-    /// Width in cells of each progress bar when `usage = "bar"`.
     pub usage_bar_width: u16,
-    /// Paged carousel (default) vs the legacy inline row for the usage readout.
     pub usage_layout: UsageLayout,
-    /// Carousel page granularity: one window per page (default) or one provider.
     pub usage_page_unit: crate::usagepoll::PageUnit,
-    /// How the carousel shows a window's reset time (relative / absolute / off).
     pub usage_reset: crate::usagepoll::ResetStyle,
-    /// Auto-advance the carousel every N seconds (0 = off, manual paging only). A
-    /// manual wheel/click resets the timer so it doesn't jump right after you page.
+    /// Auto-advance the carousel every N seconds (0 = off). A manual wheel/click resets the
+    /// timer.
     pub usage_rotate_secs: u32,
-    /// How often (seconds) the server tells each attached client to SILENTLY repaint its
-    /// whole screen — re-emit every cell it already holds, with no `Clear`, so nothing
-    /// flickers. `0` disables it.
+    /// How often (seconds) the server tells each attached client to SILENTLY repaint its whole
+    /// screen: re-emit every cell it already holds, with no `Clear`, so nothing flickers. `0`
+    /// disables it.
     ///
-    /// This is the self-heal for render residue that no amount of correctness in the delta
-    /// pipeline can prevent: the client paints through ratatui's incremental diff, and that
-    /// diff's cached previous-buffer can drift from what the terminal actually shows — an
-    /// outer emulator with its own damage tracking, a lossy link, or ratatui's own
-    /// wide-glyph suppression leaking across a row/pane boundary in its flat buffer. Once
-    /// drifted, the stale cell is deemed "unchanged" forever and only a full repaint clears
-    /// it (`Ctrl-b r`, by hand, after the user notices). At this cadence it clears itself.
-    ///
-    /// Its predecessor (`COPAD_MUX_REDRAW_MS`, default OFF) did the same thing with a
-    /// `Clear(All)` first, which flashed a blank frame every tick — that flicker, not the
-    /// cost, is why it could not be left on. Dropping the clear makes it invisible, so it is
-    /// on by default. The cadence is the worst-case time a user stares at residue.
+    /// Self-heal for render residue: ratatui's cached previous-buffer can drift from what the
+    /// terminal shows (an outer emulator with its own damage tracking, a lossy link, wide-glyph
+    /// suppression leaking across a pane boundary), and a drifted cell is deemed "unchanged"
+    /// forever until a full repaint. The old `COPAD_MUX_REDRAW_MS` did a `Clear(All)` first,
+    /// which flashed a blank frame every tick; without the clear it is invisible, so it is on
+    /// by default.
     pub reconcile_secs: u32,
-    /// Seconds a sweep-detected turn finish must HOLD before its notification is raised.
-    /// Stop hooks that block a stop (the owner's verification and review gates, `/goal`)
-    /// make an agent go idle and busy again within seconds; without this each of those is a
-    /// "turn finished" toast for a turn that did not finish. `0` = notify at once. Settling
-    /// proves only OBSERVED stability: a whole flap between two sweeps (5 s apart while
-    /// detached) cannot be seen by polling.
+    /// Seconds a sweep-detected turn finish must HOLD before its notification is raised: stop
+    /// hooks that block a stop make an agent go idle and busy again within seconds, and each
+    /// would otherwise toast a turn that did not finish. `0` = notify at once. A whole flap
+    /// between two sweeps (5 s apart while detached) cannot be seen by polling.
     pub notify_settle_secs: u32,
     /// Minutes an agent may stay blocked, unacknowledged, before ONE reminder notification
     /// (`still waiting 10m · …`). `0` = never remind.
     pub notify_remind_mins: u32,
-    /// What each status-bar tab chip shows (number / process name / both).
     pub tab_labels: TabLabels,
     /// Check GitHub releases in the background and show a `⬆ x.y.z` hint in the
     /// status bar when a newer version exists (equivalent to
     /// `COPAD_MUX_UPDATE_CHECK=0` when false).
     pub update_check: bool,
-    /// Environment variables refreshed from the attaching client into new panes
-    /// (tmux `update-environment`). Scrubbed from the daemon at startup so a pane
-    /// never inherits the session the server was born in; re-injected per-pane from
-    /// the latest client. Empty list = no refresh (panes inherit the daemon env as-is).
+    /// Variables refreshed from the attaching client into new panes (tmux
+    /// `update-environment`); scrubbed from the daemon at startup so a pane never inherits the
+    /// session the server was born in. Empty = panes inherit the daemon env as-is.
     pub update_environment: Vec<String>,
-    /// Environment variables scrubbed from the daemon at startup and NEVER re-injected
-    /// into a pane — not from the birth environment (unlike `update_environment`, these
-    /// don't seed the boot pane either) and not from an attaching client. Agent session
-    /// markers ([`NEVER_INHERIT_DEFAULTS`]) plus anything the user adds.
+    /// Variables scrubbed from the daemon at startup and NEVER re-injected into a pane: unlike
+    /// `update_environment` they don't seed the boot pane, and an attaching client can't
+    /// supply them. Agent session markers ([`NEVER_INHERIT_DEFAULTS`]) plus the user's.
     pub never_inherit: Vec<String>,
-    /// `comux worktree create` naming + post-create hooks.
     pub worktree: WorktreeConfig,
     /// `[push]` — how this server pushes agent notifications to the copad iOS app (decisions
     /// #175, #177): through the push relay by default, straight to APNs with the team's own key,
     /// or not at all.
     pub push: crate::push::PushMode,
-    /// `[machines.<name>]` — the SSH fleet, in configured (alphabetical) order.
-    ///
-    /// DECLARATIVE, like `~/.ssh/config`: there is deliberately no `comux machine add` that
-    /// edits this file. comux has never written to `mux.toml`, and a rewriter would have to
-    /// either preserve the user's comments and ordering or silently destroy them.
+    /// `[machines.<name>]`: the SSH fleet, in configured (alphabetical) order. DECLARATIVE, like
+    /// `~/.ssh/config`: there is no `comux machine add`, since a rewriter of `mux.toml` would
+    /// have to preserve the user's comments and ordering or silently destroy them.
     pub machines: Vec<crate::fleet::Machine>,
 }
 
@@ -1258,7 +1133,6 @@ struct RawWorktree {
     scripts: Option<HashMap<String, String>>,
 }
 
-/// A binding value: one chord or a list of chords.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum ChordSpec {
@@ -1276,14 +1150,10 @@ impl ChordSpec {
 }
 
 impl MuxConfig {
-    /// The config path: `$XDG_CONFIG_HOME/copad/mux.toml`, else macOS `~/.config`,
-    /// else the platform config dir.
     pub fn config_path() -> PathBuf {
         config_dir().join("copad").join("mux.toml")
     }
 
-    /// Load the effective config, returning any warnings (bad bindings, out-of-range
-    /// numbers, collisions). A missing file yields the default config and no warnings.
     pub fn load() -> (MuxConfig, Vec<String>) {
         Self::load_from(&Self::config_path())
     }
@@ -1369,10 +1239,8 @@ impl MuxConfig {
     fn from_raw(raw: RawConfig) -> (MuxConfig, Vec<String>) {
         let mut warnings = Vec::new();
 
-        // Key overrides: action name → chords (bad names/chords warn + skip).
         let prefix_over = collect_overrides(raw.keys.as_ref(), &mut warnings, "keys");
         let mut global_over = collect_overrides(raw.global.as_ref(), &mut warnings, "global");
-        // A custom prefix key is just the EnterPrefix global binding.
         if let Some(p) = raw.prefix.as_deref() {
             match parse_chord(p) {
                 Ok(c) => {
@@ -1385,7 +1253,6 @@ impl MuxConfig {
         let (keymap, kw) = build_keymap(&prefix_over, &global_over);
         warnings.extend(kw);
 
-        // Numeric fields with per-field clamp + warn.
         let sidebar_width = clamp_field(
             raw.sidebar_width,
             DEFAULT_SIDEBAR_WIDTH as i64,
@@ -1402,7 +1269,7 @@ impl MuxConfig {
             "sidebar_min_cols",
             &mut warnings,
         ) as u16;
-        // Relational: a visible sidebar must leave room for content [codex C3].
+        // Relational: a visible sidebar must leave room for content.
         let floor = sidebar_width + MIN_CONTENT_COLS;
         if sidebar_min_cols < floor {
             warnings.push(format!(
@@ -1435,8 +1302,6 @@ impl MuxConfig {
             "repeat_time",
             &mut warnings,
         ) as u64;
-        // autosave: 0 explicitly disables periodic saves; any other value is clamped to
-        // a sane [5, 3600] s (a bad-but-nonzero value shouldn't hammer the disk).
         let graph_retain_days = match raw.graph_retain_days {
             None => DEFAULT_GRAPH_RETAIN_DAYS,
             Some(v) if !(1..=3650).contains(&v) => {
@@ -1448,6 +1313,7 @@ impl MuxConfig {
             }
             Some(v) => v as u32,
         };
+        // 0 explicitly disables periodic saves; any other value is clamped to [5, 3600] s.
         let autosave_secs = match raw.autosave_secs {
             None => DEFAULT_AUTOSAVE_SECS,
             Some(0) => 0,
@@ -1617,11 +1483,9 @@ impl MuxConfig {
     }
 }
 
-/// Resolve `usage_windows`: default (all windows) when absent, else the configured
-/// list of window ids (`claude-5h` / `claude-wk` / `codex-wk`) turned into an enabled
-/// set. Unknown ids warn and are ignored; an explicit empty list hides every window
-/// (the readout disappears, like `usage = "off"` but per-window). Aliases: `claude`
-/// enables both Claude windows, `codex` the Codex weekly one.
+/// Resolve `usage_windows`: all windows when absent, else the configured ids (`claude-5h` /
+/// `claude-wk` / `codex-wk`; `claude` enables both Claude windows, `codex` the Codex weekly).
+/// Unknown ids warn and are ignored; an explicit empty list hides every window.
 fn build_usage_windows(
     raw: Option<Vec<String>>,
     warnings: &mut Vec<String>,
@@ -1651,9 +1515,6 @@ fn build_usage_windows(
     sel
 }
 
-/// Resolve `update_environment`: default when absent, else the configured list with
-/// load-bearing names ([`ENV_UPDATE_BLOCKLIST`]) dropped + warned and duplicates removed
-/// (order preserved). An explicit empty list is honored (disables env refresh).
 fn build_update_environment(raw: Option<Vec<String>>, warnings: &mut Vec<String>) -> Vec<String> {
     let Some(list) = raw else {
         return default_update_environment();
@@ -1669,11 +1530,10 @@ fn build_update_environment(raw: Option<Vec<String>>, warnings: &mut Vec<String>
     out
 }
 
-/// Resolve `never_inherit`: the built-in agent-marker denylist ([`default_never_inherit`])
-/// plus any configured additions, validated like `update_environment`. ADDITIVE on purpose —
-/// with replace semantics, `never_inherit = ["MY_MARKER"]` would quietly drop
-/// `CLAUDE_CODE_CHILD_SESSION` and bring the transcript-eating leak back. A pane that
-/// genuinely wants one of these values can re-export it from its shell rc.
+/// Resolve `never_inherit`: the built-in agent-marker denylist plus configured additions,
+/// validated like `update_environment`. ADDITIVE on purpose: with replace semantics,
+/// `never_inherit = ["MY_MARKER"]` would drop `CLAUDE_CODE_CHILD_SESSION` and bring the
+/// transcript-eating leak back. A pane that wants one of these can re-export it from its rc.
 fn build_never_inherit(raw: Option<Vec<String>>, warnings: &mut Vec<String>) -> Vec<String> {
     let mut out = default_never_inherit();
     for name in raw.unwrap_or_default() {
@@ -1686,9 +1546,8 @@ fn build_never_inherit(raw: Option<Vec<String>>, warnings: &mut Vec<String>) -> 
     out
 }
 
-/// `update_environment` with every [`build_never_inherit`] name removed (warning on each).
-/// Keeps the invariant the attach handshake depends on: a name the server scrubs for good
-/// is never in the whitelist it asks clients to refresh.
+/// `update_environment` with every [`build_never_inherit`] name removed (warning on each), so a
+/// name the server scrubs for good is never in the whitelist it asks clients to refresh.
 fn subtract_never_inherit(
     update_environment: Vec<String>,
     never_inherit: &[String],
@@ -1709,16 +1568,13 @@ fn subtract_never_inherit(
         .collect()
 }
 
-/// Validate one configured environment-variable name for [`build_update_environment`] /
-/// [`build_never_inherit`]. Returns the trimmed name, or `None` (with a `field`-tagged
-/// warning) for a blank, malformed, or load-bearing entry.
 fn check_env_name(name: &str, field: &str, warnings: &mut Vec<String>) -> Option<String> {
     let name = name.trim();
     if name.is_empty() {
         return None;
     }
-    // A name with `=` or a NUL byte would panic `std::env::remove_var` when the server
-    // scrubs it at startup — reject it here so a config typo can never crash the daemon.
+    // A name with `=` or a NUL byte would panic `std::env::remove_var` at startup scrub;
+    // reject it so a config typo can never crash the daemon.
     if name.contains('=') || name.contains('\0') {
         warnings.push(format!(
             "{field}: '{name}' is not a valid variable name — ignoring"
@@ -1737,14 +1593,9 @@ fn check_env_name(name: &str, field: &str, warnings: &mut Vec<String>) -> Option
     Some(name.to_string())
 }
 
-/// Build the `[worktree]` config: naming (empty → default) and per-repo hooks whose
-/// path keys are `~`-expanded then canonicalized (so a linked-worktree caller matches
-/// the same repo hook). Duplicate canonical keys are last-wins with a warning.
-/// `[machines.<name>]` → the fleet, dropping entries that cannot be used and SAYING so.
-///
-/// A machine with no `ssh` destination is skipped with a warning rather than defaulting to its
-/// own name: a silent default would query the wrong host, and a fleet readout that quietly
-/// omits a machine is exactly the failure this feature exists to prevent.
+/// `[machines.<name>]` to the fleet, dropping unusable entries and SAYING so. A machine with no
+/// `ssh` destination is skipped with a warning rather than defaulting to its own name: a silent
+/// default would query the wrong host.
 fn build_machines(
     raw: Option<std::collections::BTreeMap<String, RawMachine>>,
     warnings: &mut Vec<String>,
@@ -1772,10 +1623,9 @@ fn build_machines(
     out
 }
 
-/// `[push]`: the team's APNs key (all three `apns_*` keys; it wins over the relay), else `relay`
-/// (`"off"` turns pushes off; a bad URL warns and keeps the default relay), else the default
-/// relay. A partial key section warns and falls back to the relay. A leading `~/` in `apns_key`
-/// is the home directory.
+/// `[push]`: the team's APNs key (all three `apns_*` keys; wins over the relay), else `relay`
+/// (`"off"` turns pushes off; a bad URL warns and keeps the default), else the default relay. A
+/// partial key section warns and falls back to the relay. A leading `~/` in `apns_key` is home.
 fn build_push(raw: Option<RawPush>, warnings: &mut Vec<String>) -> crate::push::PushMode {
     use crate::push::PushMode;
     let Some(raw) = raw else {
@@ -1833,7 +1683,6 @@ fn build_worktree(raw: Option<RawWorktree>, warnings: &mut Vec<String>) -> Workt
     WorktreeConfig { naming, scripts }
 }
 
-/// Expand a leading `~` / `~/` to `$HOME` (config keys are written with `~`).
 fn expand_tilde(p: &str) -> PathBuf {
     if (p == "~" || p.starts_with("~/"))
         && let Ok(home) = std::env::var("HOME")
@@ -1895,11 +1744,9 @@ fn clamp_field(
 
 /// Build the two lookup tables from defaults overlaid with per-action overrides.
 ///
-/// Priority (deterministic): a USER override beats a DEFAULT, and within each tier
-/// declaration order breaks ties (first to claim a chord wins; later duplicates warn).
-/// So rebinding `focus-right = "n"` steals `n` from the default `next-tab`, not the
-/// other way round. A global binding left on the prefix chord is then reclaimed for
-/// prefix entry so the prefix always works.
+/// A USER override beats a DEFAULT, and within each tier declaration order breaks ties (first
+/// to claim a chord wins; later duplicates warn), so `focus-right = "n"` steals `n` from the
+/// default `next-tab`. A global binding left on the prefix chord is reclaimed for prefix entry.
 fn build_keymap(
     prefix_over: &HashMap<Action, Vec<Chord>>,
     global_over: &HashMap<Action, Vec<Chord>>,
@@ -1909,8 +1756,6 @@ fn build_keymap(
     let mut global_map: HashMap<Chord, Action> = HashMap::new();
 
     let defaults = default_bindings();
-    // Two passes over the SAME declaration order: user-overridden actions first (so they
-    // win chord collisions against defaults), then the rest at their default chords.
     for user_pass in [true, false] {
         for &(action, ctx, default_chords) in &defaults {
             let (over, map, ctx_name) = match ctx {
@@ -1943,7 +1788,6 @@ fn build_keymap(
         }
     }
 
-    // Determine the prefix chord (EnterPrefix's global binding) and protect it.
     let prefix_chord = global_map
         .iter()
         .find(|(_, a)| **a == Action::EnterPrefix)
@@ -1954,7 +1798,6 @@ fn build_keymap(
             shift: false,
             key: Key::Char('b'),
         });
-    // Any OTHER global binding on the prefix chord would block prefix entry.
     if let Some(a) = global_map.get(&prefix_chord).copied()
         && a != Action::EnterPrefix
     {
@@ -1963,8 +1806,6 @@ fn build_keymap(
         ));
         global_map.insert(prefix_chord, Action::EnterPrefix);
     }
-    // `send-prefix` defaults to the prefix pressed twice, tracking a changed `prefix`. A user
-    // binding for it, or anything already on that chord, wins.
     if !prefix_over.contains_key(&Action::SendPrefix) {
         prefix_map.entry(prefix_chord).or_insert(Action::SendPrefix);
     }
@@ -1979,8 +1820,8 @@ fn build_keymap(
     )
 }
 
-/// `$XDG_CONFIG_HOME`, else `$HOME/.config` (both macOS and Linux — matches copad's own
-/// convention and keeps copad-mux free of a `dirs` dependency), else a relative fallback.
+/// `$XDG_CONFIG_HOME`, else `$HOME/.config` (on both macOS and Linux, matching copad's own
+/// convention and keeping copad-mux free of a `dirs` dependency).
 fn config_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
         && !xdg.is_empty()
@@ -2005,7 +1846,6 @@ pub(crate) mod tests {
 
     #[test]
     fn parse_and_event_agree_on_letters_and_case() {
-        // `H` (config) == Char('H') (live) == Char('h')+SHIFT.
         let cfg = parse_chord("H").unwrap();
         assert_eq!(
             chord_of(&ev(KeyCode::Char('H'), KeyModifiers::NONE)),
@@ -2035,7 +1875,6 @@ pub(crate) mod tests {
 
     #[test]
     fn raw_control_byte_folds_to_ctrl_letter() {
-        // `\u{2}` with no modifier == `C-b`.
         let cb = parse_chord("C-b").unwrap();
         assert_eq!(
             chord_of(&ev(KeyCode::Char('\u{2}'), KeyModifiers::NONE)),
@@ -2054,8 +1893,8 @@ pub(crate) mod tests {
             chord_of(&ev(KeyCode::Char('1'), KeyModifiers::ALT)),
             Some(parse_chord("M-1").unwrap())
         );
-        // `%` is not shifted from the app's view — and a terminal that reports it WITH
-        // a SHIFT modifier (enhanced keyboard protocol) still matches the config `%`.
+        // `%` is not shifted from the app's view, and a terminal reporting it WITH a SHIFT
+        // modifier (enhanced keyboard protocol) must still match the config `%`.
         assert_eq!(
             chord_of(&ev(KeyCode::Char('%'), KeyModifiers::NONE)),
             Some(parse_chord("%").unwrap())
@@ -2064,7 +1903,6 @@ pub(crate) mod tests {
             chord_of(&ev(KeyCode::Char('%'), KeyModifiers::SHIFT)),
             Some(parse_chord("%").unwrap())
         );
-        // Same for the other shifted-punctuation defaults.
         for s in ['"', '&', '$', '(', ')', '!'] {
             assert_eq!(
                 chord_of(&ev(KeyCode::Char(s), KeyModifiers::SHIFT)),
@@ -2078,7 +1916,6 @@ pub(crate) mod tests {
     fn default_keymap_reproduces_core_bindings() {
         let cfg = MuxConfig::default();
         let km = &cfg.keymap;
-        // prefix table
         assert_eq!(
             km.prefix_action(&parse_chord("%").unwrap()),
             Some(Action::SplitRight)
@@ -2087,7 +1924,6 @@ pub(crate) mod tests {
             km.prefix_action(&parse_chord("d").unwrap()),
             Some(Action::Detach)
         );
-        // tmux's `q`: number the panes (it used to be a second detach chord).
         assert_eq!(
             km.prefix_action(&parse_chord("q").unwrap()),
             Some(Action::DisplayPanes)
@@ -2108,7 +1944,6 @@ pub(crate) mod tests {
             km.prefix_action(&parse_chord(",").unwrap()),
             Some(Action::RenameTab)
         );
-        // global table
         assert_eq!(
             km.global_action(&parse_chord("M-1").unwrap()),
             Some(Action::SelectTab(0))
@@ -2133,19 +1968,15 @@ pub(crate) mod tests {
             km.prefix_action(&parse_chord("l").unwrap()),
             Some(Action::NextTab)
         );
-        // `n` was next-tab's only default chord, replaced → now unbound.
         assert_eq!(km.prefix_action(&parse_chord("n").unwrap()), None);
         assert_eq!(
             km.prefix_action(&parse_chord("e").unwrap()),
             Some(Action::Detach)
         );
-        // `q` belongs to display-panes, untouched by rebinding detach.
         assert_eq!(
             km.prefix_action(&parse_chord("q").unwrap()),
             Some(Action::DisplayPanes)
         );
-        // User's next-tab=l steals `l` from the default focus-right (user beats default),
-        // which is warned; focus-right is still reachable via its arrow alias.
         assert_eq!(
             km.prefix_action(&parse_chord("Right").unwrap()),
             Some(Action::FocusRight)
@@ -2158,17 +1989,14 @@ pub(crate) mod tests {
 
     #[test]
     fn chord_labels_use_the_terminal_caret_convention() {
-        // What the status bar shows while the prefix is armed. The default prefix must
-        // read as `^b`; a user who set `prefix = "C-a"` must see THEIR key, not `^b`.
+        // The default prefix must read as `^b`; a user who set `prefix = "C-a"` must see theirs.
         let label = |s: &str| parse_chord(s).unwrap().label();
         assert_eq!(label("C-b"), "^b");
         assert_eq!(label("C-a"), "^a");
         assert_eq!(label("M-1"), "M-1");
         assert_eq!(label("%"), "%");
-        // Shift on a letter lives in the letter's case (that is how both a live event and
-        // a config token canonicalize), so an `S-` prefix would double it up.
+        // Shift on a letter lives in the letter's case, so an `S-` prefix would double it up.
         assert_eq!(label("C-S-h"), "^H");
-        // Named keys have no case to carry it, so they keep the explicit `S-`.
         assert_eq!(label("C-S-Left"), "^S-Left");
         assert_eq!(label("M-C-Space"), "M-^Space");
     }
@@ -2211,7 +2039,6 @@ pub(crate) mod tests {
         let (cfg, warns) = load_str(toml);
         assert_eq!(cfg.scroll_step, 50); // clamped
         assert_eq!(cfg.sidebar_width, 8); // clamped up
-        // next-tab kept its default since the override was invalid.
         assert_eq!(
             cfg.keymap.prefix_action(&parse_chord("n").unwrap()),
             Some(Action::NextTab)
@@ -2233,7 +2060,6 @@ pub(crate) mod tests {
 
     #[test]
     fn global_binding_cannot_shadow_prefix() {
-        // Bind popup to C-b (the prefix) — prefix entry must still win.
         let toml = r#"
             [global]
             popup = "C-b"
@@ -2256,11 +2082,9 @@ pub(crate) mod tests {
         assert_eq!(load_str("usage = \"text\"").0.usage, UsageStyle::Text);
         assert_eq!(load_str("usage = \"off\"").0.usage, UsageStyle::Off);
         assert_eq!(load_str("usage = \"bar\"").0.usage, UsageStyle::Bar);
-        // unknown → warns, falls back to bar
         let (cfg, warns) = load_str("usage = \"bogus\"");
         assert_eq!(cfg.usage, UsageStyle::Bar);
         assert!(warns.iter().any(|w| w.contains("usage")));
-        // bar width clamps into [3,30]
         assert_eq!(load_str("usage_bar_width = 12").0.usage_bar_width, 12);
         let (cfg, warns) = load_str("usage_bar_width = 999");
         assert_eq!(cfg.usage_bar_width, 30);
@@ -2282,7 +2106,6 @@ pub(crate) mod tests {
             load_str("tab_labels = \"number\"").0.tab_labels,
             TabLabels::Number
         );
-        // Unknown → default + warning.
         let (cfg, warns) = load_str("tab_labels = \"bogus\"");
         assert_eq!(cfg.tab_labels, TabLabels::Number);
         assert!(warns.iter().any(|w| w.contains("tab_labels")));
@@ -2290,21 +2113,16 @@ pub(crate) mod tests {
 
     #[test]
     fn usage_windows_parse_default_and_filter() {
-        // Absent → all windows enabled (historical readout).
         let def = MuxConfig::default().usage_windows;
         assert!(def.claude_5h && def.claude_wk && def.codex_wk);
-        // Selecting only the weekly windows.
         let sel = load_str(r#"usage_windows = ["claude-wk", "codex-wk"]"#)
             .0
             .usage_windows;
         assert!(!sel.claude_5h && sel.claude_wk && sel.codex_wk);
-        // `claude` alias enables both Claude windows.
         let sel = load_str(r#"usage_windows = ["claude"]"#).0.usage_windows;
         assert!(sel.claude_5h && sel.claude_wk && !sel.codex_wk);
-        // Empty list hides every window.
         let sel = load_str("usage_windows = []").0.usage_windows;
         assert!(!sel.claude_5h && !sel.claude_wk && !sel.codex_wk);
-        // Unknown id warns and is ignored (others still take).
         let (cfg, warns) = load_str(r#"usage_windows = ["bogus", "codex-wk"]"#);
         assert!(!cfg.usage_windows.claude_5h && cfg.usage_windows.codex_wk);
         assert!(warns.iter().any(|w| w.contains("usage_windows")));
@@ -2315,16 +2133,13 @@ pub(crate) mod tests {
         let cfg = MuxConfig::default();
         assert!(cfg.persist);
         assert_eq!(cfg.autosave_secs, DEFAULT_AUTOSAVE_SECS);
-        // restore_processes defaults to the built-in agents (claude et al.).
         assert!(cfg.restore_processes.iter().any(|p| p == "claude"));
-        // ...plus tmux-resurrect's editors/pagers, but nothing with side effects.
         assert!(cfg.restore_processes.iter().any(|p| p == "nvim"));
         assert!(
             !cfg.restore_processes
                 .iter()
                 .any(|p| p == "cargo" || p == "zsh")
         );
-        // Resuming the live agent conversation on restore is on by default.
         assert!(cfg.restore_agent_sessions);
         assert!(
             !load_str("restore_agent_sessions = false")
@@ -2344,14 +2159,12 @@ pub(crate) mod tests {
             load_str("sidebar_density = \"auto\"").0.sidebar_density,
             Density::Auto
         );
-        // Unknown values warn and fall back rather than breaking the mux.
         let (cfg, warns) = load_str("sidebar_density = \"tiny\"");
         assert_eq!(cfg.sidebar_density, Density::Comfortable);
         assert!(warns.iter().any(|w| w.contains("sidebar_density")));
     }
 
     #[test]
-    /// `auto` is the only mode that consults the overflow flag; the other two are fixed.
     fn density_entry_rows_only_varies_for_auto() {
         assert_eq!(Density::Comfortable.entry_rows(true), 2);
         assert_eq!(Density::Compact.entry_rows(false), 1);
@@ -2371,7 +2184,6 @@ pub(crate) mod tests {
             load_str("sort_by = \"activity\"").0.sort_by,
             SortBy::Activity
         );
-        // Unknown → default + warning.
         let (cfg, warns) = load_str("sort_by = \"bogus\"");
         assert_eq!(cfg.sort_by, SortBy::Created);
         assert!(warns.iter().any(|w| w.contains("sort_by")));
@@ -2381,14 +2193,13 @@ pub(crate) mod tests {
     fn restore_processes_override_replaces_default() {
         let (cfg, _) = load_str(r#"restore_processes = ["nvim", "python"]"#);
         assert_eq!(cfg.restore_processes, vec!["nvim", "python"]);
-        // Empty list disables program re-execution.
         let (off, _) = load_str("restore_processes = []");
         assert!(off.restore_processes.is_empty());
     }
 
-    /// The transcript-eating leak from upstream issue #3: a server born inside a Claude Code
-    /// session used to hand `CLAUDE_CODE_CHILD_SESSION=1` to every pane, so every `claude`
-    /// started there was classified as a nested child — no transcript, no `--resume` entry.
+    /// Upstream issue #3: a server born inside a Claude Code session handed
+    /// `CLAUDE_CODE_CHILD_SESSION=1` to every pane, so every `claude` started there was treated
+    /// as a nested child (no transcript, no `--resume` entry).
     #[test]
     fn never_inherit_defaults_are_always_present_and_additive() {
         let (def, _) = load_str("");
@@ -2398,12 +2209,10 @@ pub(crate) mod tests {
                 .any(|v| v == "CLAUDE_CODE_CHILD_SESSION")
         );
         assert!(def.never_inherit.iter().any(|v| v == "CLAUDECODE"));
-        // Externally-enforced sandbox markers are NOT scrubbed (the process inside a sandbox
-        // must be able to see it).
+        // Externally enforced sandbox markers are NOT scrubbed.
         assert!(!def.never_inherit.iter().any(|v| v.starts_with("CODEX_")));
 
-        // A user list ADDS to the defaults — replace semantics would let `["MY_MARKER"]`
-        // silently drop the confirmed trigger and bring the leak back.
+        // A user list ADDS to the defaults: replace semantics would drop the confirmed trigger.
         let (cfg, _) = load_str(r#"never_inherit = ["MY_MARKER", "MY_MARKER"]"#);
         assert!(
             cfg.never_inherit
@@ -2417,7 +2226,6 @@ pub(crate) mod tests {
                 .count(),
             1
         );
-        // …and an empty list adds nothing rather than disabling the defaults.
         let (empty, _) = load_str("never_inherit = []");
         assert_eq!(empty.never_inherit, default_never_inherit());
     }
@@ -2456,7 +2264,6 @@ pub(crate) mod tests {
                 .iter()
                 .any(|w| w.contains("never_inherit") && w.contains("CLAUDE_CODE_CHILD_SESSION"))
         );
-        // A user-added marker is subtracted too, not just the built-in ones.
         let (user, _) = load_str(
             r#"
             update_environment = ["DISPLAY", "MY_MARKER"]
@@ -2468,23 +2275,18 @@ pub(crate) mod tests {
 
     #[test]
     fn update_environment_default_override_and_blocklist() {
-        // Default (no key) carries the volatile session vars, incl. the SSH_* set.
         let (def, _) = load_str("");
         assert!(def.update_environment.iter().any(|v| v == "SSH_CONNECTION"));
         assert!(def.update_environment.iter().any(|v| v == "DISPLAY"));
-        // Explicit override replaces the default.
         let (cfg, _) = load_str(r#"update_environment = ["FOO", "BAR"]"#);
         assert_eq!(cfg.update_environment, vec!["FOO", "BAR"]);
-        // Empty list is honored (disables env refresh).
         let (off, _) = load_str("update_environment = []");
         assert!(off.update_environment.is_empty());
-        // Load-bearing names are dropped + warned; duplicates collapse.
         let (guarded, warns) =
             load_str(r#"update_environment = ["PATH", "HOME", "DISPLAY", "DISPLAY"]"#);
         assert_eq!(guarded.update_environment, vec!["DISPLAY"]);
         assert!(warns.iter().any(|w| w.contains("PATH")));
         assert!(warns.iter().any(|w| w.contains("HOME")));
-        // Invalid names (`=`) are dropped + warned — they would panic env::remove_var.
         let (bad, badwarn) = load_str(r#"update_environment = ["BAD=NAME", "OK"]"#);
         assert_eq!(bad.update_environment, vec!["OK"]);
         assert!(badwarn.iter().any(|w| w.contains("valid variable name")));
@@ -2506,7 +2308,6 @@ pub(crate) mod tests {
         MuxConfig::from_raw(raw)
     }
 
-    /// The test-only door for other modules' tests: a config from TOML text.
     pub(crate) fn config_from_str(toml: &str) -> MuxConfig {
         load_str(toml).0
     }
@@ -2527,7 +2328,6 @@ pub(crate) mod tests {
         assert!(warns.is_empty(), "{warns:?}");
         assert_eq!(labels(&cfg, Action::NewTab), ["t"]);
         assert_eq!(labels(&cfg, Action::KeyHelp), ["/"]);
-        // The prefix table lists before the global one.
         let b = cfg.keymap.bindings();
         let first_global = b.iter().position(|(p, _, _)| !p).unwrap();
         assert!(b[..first_global].iter().all(|(p, _, _)| *p));

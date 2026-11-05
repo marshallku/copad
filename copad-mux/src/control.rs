@@ -1,8 +1,6 @@
-//! The control API: a Unix-socket protocol that lets `comux ctl <cmd>` drive
-//! a running TUI (like `tmux`/`tmx`). This module holds the wire types, the socket
-//! path resolution, and the CLI client. The server side lives in [`crate::tui`]
-//! and honors the single-writer rule (spec §1): the socket thread never touches
-//! `State` — it hands requests to the main loop over an mpsc channel.
+//! The control API: wire types, socket path resolution and the CLI client for `comux ctl <cmd>`.
+//! The server side lives in [`crate::tui`] and honors the single-writer rule (spec §1): the socket
+//! thread never touches `State`, it hands requests to the main loop over an mpsc channel.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
@@ -19,7 +17,6 @@ use crate::picker;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "kebab-case")]
 pub enum Req {
-    /// List panes of the active tab, or of the caller's tab (see `caller`).
     List {
         /// The CALLER's pane token. An index then counts in the caller's tab, wherever it is,
         /// instead of the tab on screen — so `list` and the index verbs agree for an agent in a
@@ -29,14 +26,10 @@ pub enum Req {
     },
     /// Split a pane. `dir` = `"right"` (side by side) | `"down"` (stacked).
     ///
-    /// `from` names the pane to split, by TOKEN, in any tab of any session. Without it
-    /// the FOCUSED pane is split — fine for a human pressing a key, a race for a script:
-    /// focus is mutable, and the new pane also inherits the split source's cwd, so a focus
-    /// change between listing and splitting silently puts the pane in the wrong directory.
-    /// An agent should always pass `from`.
-    ///
-    /// The response carries the created pane's token in `Resp.pane`, so a caller never has
-    /// to infer which pane appeared.
+    /// `from` names the pane to split, by TOKEN, in any tab of any session. Without it the FOCUSED
+    /// pane is split: a race for a script, since focus is mutable and the new pane inherits the
+    /// source's cwd. An agent should always pass `from`. The response carries the created pane's
+    /// token in `Resp.pane`.
     Split {
         dir: String,
         #[serde(default)]
@@ -44,7 +37,6 @@ pub enum Req {
         /// Leave focus where it is. A split in a tab nobody is looking at never moves focus.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         no_focus: bool,
-        /// Start the new pane here instead of in the split source's cwd.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<String>,
         /// `comux split … -- argv`: run this as the new pane's program (as `spawn` does for a
@@ -52,7 +44,6 @@ pub enum Req {
         /// shell. Closes with the program unless `keep`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         command: Vec<String>,
-        /// `KEY=VALUE` pairs added to the new pane's environment.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         env: Vec<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -63,42 +54,34 @@ pub enum Req {
     ResizePane {
         index: usize,
         dir: String,
-        /// The CALLER's pane token. An index then counts in the caller's tab, wherever it is,
-        /// instead of the tab on screen — so `list` and the index verbs agree for an agent in a
-        /// background tab. Absent = the active tab, as before.
+        /// The CALLER's pane token; see `List::caller`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller: Option<String>,
     },
-    /// Focus the pane at `index` (as printed by `list`).
     Focus {
         index: usize,
-        /// The CALLER's pane token. An index then counts in the caller's tab, wherever it is,
-        /// instead of the tab on screen — so `list` and the index verbs agree for an agent in a
-        /// background tab. Absent = the active tab, as before.
+        /// The CALLER's pane token; see `List::caller`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller: Option<String>,
     },
-    /// Close the pane at `index`.
     Close {
         index: usize,
-        /// The CALLER's pane token. An index then counts in the caller's tab, wherever it is,
-        /// instead of the tab on screen — so `list` and the index verbs agree for an agent in a
-        /// background tab. Absent = the active tab, as before.
+        /// The CALLER's pane token; see `List::caller`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller: Option<String>,
     },
     /// Inject `text` as input bytes into a pane (like `tmux send-keys`).
     ///
-    /// `target` is a pane TOKEN and resolves anywhere in the mux; `index` is a position in
-    /// the ACTIVE TAB. Exactly one must be given — a write must never default to the focused
-    /// pane, and an index silently retargets when the user switches tabs.
+    /// `target` is a pane TOKEN and resolves anywhere in the mux; `index` is a position in the
+    /// ACTIVE TAB. Exactly one must be given: a write must never default to the focused pane, and
+    /// an index silently retargets when the user switches tabs.
     ///
-    /// Deliberately token-only, unlike the read verbs which also accept a raw terminal id:
-    /// terminal ids restart at `term0` every server incarnation, so a recorded one can
-    /// address an unrelated pane after a restart. Tolerable for a read, not for a write.
+    /// Token-only, unlike the read verbs which also accept a raw terminal id: terminal ids restart
+    /// at `term0` every server incarnation, so a recorded one can address an unrelated pane after a
+    /// restart.
     ///
-    /// `index` keeps its old wire shape (`{"cmd":"send-keys","index":0,"text":"…"}`), so a
-    /// request from an older client still parses and behaves identically.
+    /// `index` keeps its old wire shape (`{"cmd":"send-keys","index":0,"text":"…"}`), so an older
+    /// client still parses.
     SendKeys {
         #[serde(default)]
         target: Option<String>,
@@ -109,30 +92,23 @@ pub enum Req {
         /// it, delimiters inside the text stripped) rather than as typed bytes.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         paste: bool,
-        /// Press Enter after the text.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         enter: bool,
-        /// The CALLER's pane token. An index then counts in the caller's tab, wherever it is,
-        /// instead of the tab on screen — so `list` and the index verbs agree for an agent in a
-        /// background tab. Absent = the active tab, as before.
+        /// The CALLER's pane token; see `List::caller`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller: Option<String>,
     },
-    /// List a session's tabs — the active one, or `session` (a selector).
     ListTabs {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<String>,
     },
-    /// Create a new tab. With every field empty (an older client's shape) it is created in
-    /// the session on screen and made active — the `Ctrl-b c` behavior.
+    /// Create a new tab. With every field empty (an older client's shape) it is created in the
+    /// session on screen and made active, like `Ctrl-b c`.
     ///
-    /// `session` (a selector) creates it there instead, and `no_focus` creates it without
-    /// selecting it: either way NOTHING anyone is looking at moves — not the user's session,
-    /// not that session's active tab. A `no_focus` tab with no `session` lands in the
-    /// caller's (`from`'s) session, beside the pane that asked for it.
-    ///
-    /// The shell starts in `cwd`, else in the caller's (`from`, a pane token) directory, else
-    /// in the focused pane's. `name` names the tab.
+    /// `session` (a selector) creates it there instead, and `no_focus` creates it without selecting
+    /// it: either way nothing anyone is looking at moves. A `no_focus` tab with no `session` lands
+    /// in the caller's (`from`'s) session. The shell starts in `cwd`, else in the caller's (`from`,
+    /// a pane token) directory, else in the focused pane's.
     NewTab {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<String>,
@@ -149,7 +125,6 @@ pub enum Req {
         /// into one, and the pane closes when it exits — unless `keep`, which leaves a shell.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         command: Vec<String>,
-        /// `KEY=VALUE` pairs added to the new pane's environment.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         env: Vec<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -159,7 +134,6 @@ pub enum Req {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner: Option<String>,
     },
-    /// Make the tab at `index` (as printed by `list-tabs`) active.
     SelectTab {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         index: Option<usize>,
@@ -194,7 +168,6 @@ pub enum Req {
         target: Option<String>,
         name: String,
     },
-    /// List the sessions (workspaces).
     ListSessions,
     /// Create a new session and switch to it. `name` is the tmux-style display name
     /// (`None` → shown by its generated `sN` id); `cwd` is the directory to start its
@@ -224,7 +197,6 @@ pub enum Req {
         target: Option<String>,
         name: String,
     },
-    /// Make the session at `index` (as printed by `list-sessions`) active.
     SelectSession {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         index: Option<usize>,
@@ -232,15 +204,12 @@ pub enum Req {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<String>,
     },
-    /// Jump to a pane ANYWHERE in the mux by identity rather than by position: switch to
-    /// its session, select its tab, focus it. `target` is a pane token (the
-    /// `$COPAD_MUX_PANE` a pane's own shell carries) or a raw terminal id.
-    ///
-    /// This is what a desktop notification's click action runs. The response carries the
-    /// pid of the terminal emulator hosting an attached client (`raise_pid`), which the
-    /// CLI — not the server — then activates: the server's environment has been scrubbed
-    /// of the session variables a GUI command needs, and a long-lived daemon is the wrong
-    /// process to attribute macOS automation permission to.
+    /// Jump to a pane ANYWHERE in the mux by identity rather than position: switch to its session,
+    /// select its tab, focus it. `target` is a pane token or a raw terminal id. A desktop
+    /// notification's click runs this. The response carries the pid of the terminal emulator
+    /// hosting an attached client (`raise_pid`), which the CLI, not the server, then activates: the
+    /// server's environment has been scrubbed of the session variables a GUI command needs, and a
+    /// long-lived daemon is the wrong process to attribute macOS automation permission to.
     Jump {
         target: String,
         /// Also remove that pane's notifications from the center: the user is going to look at
@@ -251,11 +220,14 @@ pub enum Req {
     },
     /// Move the shared view along the navigation history (decisions #140): `back`/`forward`
     /// walk it like a browser, `last` toggles to the previous place like Alt-Tab.
-    Nav { dir: NavDir },
-    /// Toggle the zoom of the active tab's focused pane (`Ctrl-b z`). Moves the shared view.
+    Nav {
+        dir: NavDir,
+    },
     Zoom,
-    /// Name a pane by its token (`Ctrl-b T`); an empty name clears it.
-    RenamePane { target: String, name: String },
+    RenamePane {
+        target: String,
+        name: String,
+    },
     /// Rearrange the tab holding the caller's pane (or the focused one): `op` is a preset
     /// (`even-horizontal`, `even-vertical`, `main-horizontal`, `main-vertical`, `tiled`),
     /// `next`, `spread`, `swap-up`/`swap-down`, or `rotate`/`rotate-back` (decisions #158).
@@ -264,24 +236,20 @@ pub enum Req {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller: Option<String>,
     },
-    /// Move the caller's pane (or the focused one) into a new tab of its own (`break-pane`).
     BreakPane {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller: Option<String>,
     },
-    /// Move the caller's tab (or the active one) to position `to` (0-based).
     MoveTab {
         to: usize,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller: Option<String>,
     },
-    /// Fork a live agent pane's conversation into a new tab of its session (decisions #150).
     Fork {
         target: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         no_focus: bool,
     },
-    /// Pin `target` (a pane token) to `slot` 1–9, or empty the slot with `clear`.
     Mark {
         slot: u8,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -289,7 +257,6 @@ pub enum Req {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         clear: bool,
     },
-    /// The pinned slots. Read-only.
     Marks,
     /// Register an app install for APNs pushes of agent notifications (decisions #175, #177):
     /// what the copad iOS app sends once it has a device token. Refused when pushes are off here
@@ -306,7 +273,6 @@ pub enum Req {
         #[serde(default)]
         key: String,
     },
-    /// Stop pushing to `token` (for one host entry, or all).
     PushUnregister {
         token: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -326,8 +292,9 @@ pub enum Req {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         same_pane: bool,
     },
-    /// Go to the pane pinned in `slot`. Moves the shared view.
-    GotoMark { slot: u8 },
+    GotoMark {
+        slot: u8,
+    },
     /// Raise an agent notification on behalf of a pane: a desktop toast whose click jumps
     /// back to it, plus an entry in the in-app notification center. The entry point for
     /// agent hooks (Claude `Stop`/`Notification`, Codex turn-complete), which know the
@@ -336,9 +303,7 @@ pub enum Req {
         /// Pane token / terminal id to attribute it to. Never defaulted to the active
         /// pane — a misattributed jump is worse than a rejected notification.
         target: String,
-        /// `done` (turn finished) or `blocked` (awaiting input).
         kind: String,
-        /// Toast body. The title is composed server-side from the agent + session.
         body: String,
     },
     /// Ask for the pane's Claude agent to compact at its NEXT model request (`comux compact`),
@@ -396,8 +361,6 @@ pub enum Req {
         #[serde(default)]
         cwd: Option<String>,
     },
-    /// List the git worktrees of the repo containing `cwd`, flagging which ones a comux
-    /// session is currently inside (`live`).
     WorktreeList {
         #[serde(default)]
         cwd: Option<String>,
@@ -414,20 +377,16 @@ pub enum Req {
         #[serde(default)]
         cwd: Option<String>,
     },
-    /// Read a pane's text back (`comux capture-pane`) — the counterpart to
-    /// [`Req::SendKeys`], and the primitive an agent needs to observe a sibling pane.
+    /// Read a pane's text back (`comux capture-pane`), the counterpart to [`Req::SendKeys`].
     ///
-    /// Addressing precedence: `target` (a pane token / terminal id, resolvable ANYWHERE in
-    /// the mux) > `index` (into the active tab, as printed by `list`) > the focused pane.
-    /// Supplying both `target` and `index` is a usage error rather than a silent
-    /// precedence win — a capture of the wrong pane is a wrong ANSWER, and answers get
-    /// acted on.
+    /// Addressing precedence: `target` (a pane token / terminal id, resolvable ANYWHERE) > `index`
+    /// (into the active tab) > the focused pane. Supplying both is a usage error: a capture of the
+    /// wrong pane is a wrong ANSWER, and answers get acted on.
     ///
-    /// `lines` counts PHYSICAL grid rows ending at the LIVE screen bottom (not the
-    /// displayed viewport, so a human scrolling in copy-mode cannot change what a script
-    /// reads), reaching back into scrollback. `None` = the visible screen's worth. `0` is
-    /// refused. Read-only: it must stay out of `ctl_mutates`, since this is a verb callers
-    /// poll.
+    /// `lines` counts PHYSICAL grid rows ending at the LIVE screen bottom (not the displayed
+    /// viewport, so a human scrolling in copy-mode cannot change what a script reads), reaching
+    /// into scrollback. `None` = the visible screen. `0` is refused. Read-only: it must stay out of
+    /// `ctl_mutates`, since callers poll it.
     CapturePane {
         #[serde(default)]
         target: Option<String>,
@@ -435,15 +394,15 @@ pub enum Req {
         index: Option<usize>,
         #[serde(default)]
         lines: Option<usize>,
-        /// The CALLER's pane token. An index then counts in the caller's tab, wherever it is,
-        /// instead of the tab on screen — so `list` and the index verbs agree for an agent in a
-        /// background tab. Absent = the active tab, as before.
+        /// The CALLER's pane token; see `List::caller`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller: Option<String>,
     },
     /// Page the status bar's usage carousel by `delta` (a native status bar's click or wheel,
     /// decisions #182); the TUI's wheel over the readout does the same.
-    UsagePage { delta: i32 },
+    UsagePage {
+        delta: i32,
+    },
     /// A pane's current viewport as styled runs, bottom-anchored to `rows` × `cols` — the
     /// switcher preview a native host draws (decisions #180). Read-only and polled while a
     /// host's picker shows a preview, so it stays out of `ctl_mutates`.
@@ -454,21 +413,21 @@ pub enum Req {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cols: Option<u16>,
     },
-    /// List AI-agent panes across every session (what the sidebar's `agents` half and the
-    /// `Ctrl-f` switcher already show), optionally narrowed to one pane.
+    /// List AI-agent panes across every session (what the sidebar's `agents` half and the `Ctrl-f`
+    /// switcher show), optionally narrowed to one pane.
     ///
-    /// `target` is what makes `wait-agent` implementable: a parameterless listing cannot
-    /// tell a pane that does NOT EXIST from a pane that exists but is not classified as an
-    /// agent yet, and those need opposite handling (fail vs keep waiting — classification is
-    /// cached and refreshed only every 500ms attached / 5s detached). With a target the
-    /// server resolves it against the live pane set on EVERY request — so a pane closing
-    /// mid-wait is caught — and answers:
-    /// - unknown pane -> `ok = false`
-    /// - pane present, not an agent -> `agents = Some([])`
-    /// - pane present and an agent -> `agents = Some([info])`
+    /// `target` is what makes `wait-agent` implementable: a pane that does NOT EXIST must fail
+    /// while a pane that exists but is not classified as an agent yet must keep waiting
+    /// (classification is cached, refreshed every 500ms attached / 5s detached). With a target the
+    /// server resolves it against the live pane set on EVERY request, so a pane closing mid-wait is
+    /// caught:
     ///
-    /// Read-only, and reads CACHED state only (no process sweep, no PTY snapshot), so it is
-    /// safe to poll and must stay out of `ctl_mutates`.
+    /// * unknown pane -> `ok = false`
+    /// * pane present, not an agent -> `agents = Some([])`
+    /// * pane present and an agent -> `agents = Some([info])`
+    ///
+    /// Reads CACHED state only (no process sweep, no PTY snapshot), so it is safe to poll and must
+    /// stay out of `ctl_mutates`.
     ListAgents {
         #[serde(default)]
         target: Option<String>,
@@ -494,8 +453,6 @@ pub enum Req {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner: Option<String>,
     },
-    /// Close every tab `owner` (a pane token) owns. `dry_run` only reports them. Refused as a
-    /// whole when one of them holds `caller`, so a cleanup can never close the pane running it.
     /// Type the same input into many panes (decisions #145): a session's or the whole mux's,
     /// optionally only agents / agents in one status. Every target is resolved and checked
     /// BEFORE any byte is written; writes are queued to each pane like `send-keys`, with no
@@ -520,6 +477,8 @@ pub enum Req {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         caller: Option<String>,
     },
+    /// Refused as a whole when one of the tabs holds `caller`, so a cleanup can never close the
+    /// pane running it.
     CloseOwned {
         owner: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -567,29 +526,24 @@ pub enum Req {
     KillServer,
 }
 
-/// Runtime counters from a live server (`health`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthInfo {
-    /// Panes the server currently hosts.
     pub panes: usize,
     /// How many of those have a resolved foreground-process label. A shortfall that
     /// persists means the sweep can see the pane's shell but not classify it.
     pub labeled: usize,
     /// Process sweeps that failed OUTRIGHT since server start. Non-zero means labels
-    /// were carried forward rather than refreshed — the condition that used to show
-    /// up only as tab names and the sidebar agents list blinking out together.
+    /// were carried forward rather than refreshed.
     pub label_sweeps_failed: u64,
     /// The server's soft `RLIMIT_NOFILE`. Every pane costs about
     /// [`crate::fdlimit::FDS_PER_PANE`] descriptors, so this is the real ceiling on
-    /// how many panes the server can host — and the one that used to make new-tab /
-    /// new-session fail with no visible reason.
+    /// how many panes the server can host.
     ///
     /// `serde(default)` on the fd fields: a server started from an OLDER binary
     /// answers `health` without them, and a hard parse failure there would turn a
     /// working (if outdated) server into "health probe failed".
     #[serde(default)]
     pub fd_soft: Option<u64>,
-    /// Descriptors the server currently holds open, when countable.
     #[serde(default)]
     pub fd_open: Option<usize>,
     /// Request semantics this server implements beyond the original wire, so a newer CLI
@@ -658,7 +612,6 @@ pub const CAP_SPLIT_SPAWN: &str = "split-spawn";
 /// not something to type into a shell.
 const SEND_FILE_CAP: u64 = 1024 * 1024;
 
-/// One pinned slot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MarkInfo {
     pub slot: u8,
@@ -669,7 +622,6 @@ pub struct MarkInfo {
     pub label: String,
 }
 
-/// Capability: `fork`.
 pub const CAP_FORK: &str = "fork";
 
 /// Capability: `select-layout` / `swap-pane` / `rotate-window` / `break-pane` / `move-tab`.
@@ -678,24 +630,19 @@ pub const CAP_ARRANGE: &str = "arrange";
 /// Capability: `mark` / `marks` / `goto`.
 pub const CAP_MARKS: &str = "marks";
 
-/// One pane a `broadcast` reached.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BroadcastTarget {
     pub pane: String,
     pub session: String,
     pub tab: String,
-    /// Its foreground program, as last swept.
     #[serde(default)]
     pub label: String,
-    /// The agent's cached status, for agent panes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
 }
 
-/// Capability: `broadcast` exists.
 pub const CAP_BROADCAST: &str = "broadcast";
 
-/// Which way `Req::Nav` moves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum NavDir {
@@ -704,24 +651,20 @@ pub enum NavDir {
     Last,
 }
 
-/// A session or tab a mutating verb created or acted on: its stable id and display name.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct NodeRef {
     pub id: String,
-    /// Empty when unnamed.
     #[serde(default)]
     pub name: String,
 }
 
 impl HealthInfo {
-    /// Panes that still fit in the descriptor budget, when both numbers are known.
     pub fn panes_remaining(&self) -> Option<usize> {
         let (soft, open) = (self.fd_soft?, self.fd_open?);
         Some((soft.saturating_sub(open as u64) as usize) / crate::fdlimit::FDS_PER_PANE)
     }
 }
 
-/// One pane in a `list` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaneInfo {
     pub index: usize,
@@ -739,8 +682,6 @@ pub struct PaneInfo {
     /// Classification of `label`: `"agent"`, `"shell"`, or `"other"`.
     #[serde(default)]
     pub kind: String,
-    /// For agent panes: rolled-up status `working`/`ready`/`blocked`/`idle` (empty
-    /// otherwise).
     #[serde(default)]
     pub status: String,
     /// The pane's title (OSC 0/2), or empty if it has never set one.
@@ -762,36 +703,26 @@ pub struct PaneInfo {
     pub name: Option<String>,
 }
 
-/// One tab in a `list-tabs` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TabInfo {
     pub index: usize,
     pub id: String,
     pub active: bool,
-    /// The custom display name (tmux-style window name), or empty when unnamed
-    /// (shown by its process/index label instead).
     #[serde(default)]
     pub name: String,
-    /// Number of panes in the tab.
     pub panes: usize,
-    /// Number of those panes running a classified AI agent.
     pub agents: usize,
 }
 
-/// One session (workspace) in a `list-sessions` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub index: usize,
     pub id: String,
-    /// The tmux-style display name, or empty when unnamed (shown by `id`).
     #[serde(default)]
     pub name: String,
     pub active: bool,
-    /// Number of tabs in the session.
     pub tabs: usize,
-    /// Number of panes across all its tabs.
     pub panes: usize,
-    /// Number of those panes running a classified AI agent.
     pub agents: usize,
     /// The session's start directory — where `new-tab` opens by default. Empty if unknown.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -802,7 +733,6 @@ fn is_zero_u32(n: &u32) -> bool {
     *n == 0
 }
 
-/// One AI-agent pane in a `list-agents` response.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentInfo {
     /// The pane's `$COPAD_MUX_PANE` identity — what `jump` / `capture-pane` / `wait-agent`
@@ -810,7 +740,6 @@ pub struct AgentInfo {
     /// `terminal` is kept as an addressable fallback.
     #[serde(default)]
     pub token: String,
-    /// The pane's terminal id.
     pub terminal: String,
     /// The session (space) the agent lives in — its DISPLAY name, which is what the sidebar
     /// shows and what a rename changes.
@@ -826,17 +755,13 @@ pub struct AgentInfo {
     /// The tab's custom name, else `tab <n>` — what the sidebar titles the row with.
     #[serde(default)]
     pub title: String,
-    /// The agent's foreground command (`claude`, `codex`, …).
     #[serde(default)]
     pub tool: String,
-    /// Rolled-up status: `working` / `ready` / `blocked` / `idle`.
-    ///
-    /// CACHED AND INFERRED. Claude's comes from `~/.claude/sessions/<pid>.json`; everything
-    /// else falls back to matching substrings on the pane's screen, so ordinary output that
-    /// happens to contain a prompt-like phrase can read as `blocked`. `idle` additionally
-    /// means "no recognized UI", which is also what an unresolved reading looks like.
+    /// Rolled-up status: `working` / `ready` / `blocked` / `idle`. CACHED AND INFERRED: Claude's
+    /// comes from `~/.claude/sessions/<pid>.json`, everything else from matching substrings on the
+    /// pane's screen, so ordinary output containing a prompt-like phrase can read as `blocked`.
+    /// `idle` also means "no recognized UI", which is what an unresolved reading looks like.
     pub status: String,
-    /// Whole seconds the agent has held `status`.
     pub for_secs: u64,
     /// Bumped on every observed status change, mux-wide and never reused within a server's
     /// life: `wait-agent --after-seq <seq>` waits for a change NEWER than this reading. Only
@@ -858,13 +783,10 @@ pub struct AgentInfo {
     /// `ready` after a turn finish nobody has looked at since (`✓ done` in the sidebar).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unseen: bool,
-    /// How many OTHER agents run in the same git worktree (`⇄N` in the sidebar).
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub worktree_peers: u32,
-    /// Context fill and spend, when comux has a reading (see `copad_mux_proto::AgentContext`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<copad_mux_proto::AgentContext>,
-    /// A `comux compact` is queued for the agent's next model request.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub compact_requested: bool,
     /// The tab the agent lives in: its STABLE id (`s4:t13`, a tab selector), its custom name
@@ -875,7 +797,6 @@ pub struct AgentInfo {
     pub tab_name: String,
     #[serde(default)]
     pub tab_index: usize,
-    /// The pane's index within its tab, in `list` order.
     #[serde(default)]
     pub pane_index: usize,
     /// The agent's OWN conversation id (Claude's session uuid, Codex's rollout uuid) — not a
@@ -889,49 +810,39 @@ pub struct AgentInfo {
     pub transcript_path: Option<String>,
 }
 
-/// One session in a `list-tree` response, with its tabs and their panes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TreeSession {
     pub index: usize,
     pub id: String,
     #[serde(default)]
     pub name: String,
-    /// The session the user is looking at.
     pub active: bool,
     pub tabs: Vec<TreeTab>,
 }
 
-/// One tab in a `list-tree` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TreeTab {
     pub index: usize,
     pub id: String,
     #[serde(default)]
     pub name: String,
-    /// Its session's active tab.
     pub active: bool,
-    /// The token of the pane that owns this tab, while that pane is alive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<String>,
     pub panes: Vec<TreePane>,
 }
 
-/// One pane in a `list-tree` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TreePane {
     pub index: usize,
-    /// The `$COPAD_MUX_PANE` identity — the address to use.
     #[serde(default)]
     pub token: String,
     pub terminal: String,
-    /// Its tab's focused pane.
     pub focused: bool,
     #[serde(default)]
     pub label: String,
-    /// `agent` / `shell` / `other`, as in `list`.
     #[serde(default)]
     pub kind: String,
-    /// Agents only: `working` / `ready` / `blocked` / `idle`.
     #[serde(default)]
     pub status: String,
 }
@@ -954,18 +865,13 @@ pub struct HostInfo {
     pub load1: Option<f64>,
 }
 
-/// One git worktree in a `worktree list` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeInfo {
     pub path: String,
-    /// Short branch name, or empty when detached.
     #[serde(default)]
     pub branch: String,
-    /// The main worktree (never a removal target).
     pub is_main: bool,
-    /// A comux session currently has a pane inside this worktree.
     pub live: bool,
-    /// `git worktree lock`ed.
     #[serde(default)]
     pub locked: bool,
 }
@@ -982,13 +888,10 @@ pub struct Resp {
     /// never reach the server; the CLI prints `usage` itself.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
-    /// `new-session` / `new-tab` / `split`: the session the result lives in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<NodeRef>,
-    /// `new-session` / `new-tab` / `split`: the tab the result lives in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tab: Option<NodeRef>,
-    /// Human-readable outcome for a mutating verb (e.g. the created worktree path).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1025,17 +928,14 @@ pub struct Resp {
     /// cannot express; it falls back to `raise_pid` when this is absent or the call fails.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copad_host: Option<(String, String)>,
-    /// `capture-pane`: the pane's text, newest-last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
-    /// `pane-preview`: the pane's screen as styled runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<copad_mux_proto::Preview>,
     /// `graph`: the overview (`copad_mux_proto::Graph`) or one agent's history page
     /// (`copad_mux_proto::graph::GraphPage`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graph: Option<serde_json::Value>,
-    /// `capture-pane`: physical grid rows the text spans.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_rows: Option<usize>,
     /// `capture-pane`: older output exists that the capture could not include.
@@ -1045,7 +945,6 @@ pub struct Resp {
     /// targeted pane that is not an agent); `None` means this response is not a listing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agents: Option<Vec<AgentInfo>>,
-    /// `list-tree`: sessions → tabs → panes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tree: Option<Vec<TreeSession>>,
     /// `capture-pane`: the token of the pane actually read. Echoed so a caller that let
@@ -1054,16 +953,13 @@ pub struct Resp {
     /// correct one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pane: Option<String>,
-    /// `inbox`: the messages waiting, oldest first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub messages: Option<Vec<InboxMsg>>,
     /// `inbox`: messages dropped because the inbox was full, since it was last read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dropped: Option<u64>,
-    /// `marks`: the pinned slots, lowest first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub marks: Option<Vec<MarkInfo>>,
-    /// `broadcast`: the panes written to (or, dry-run, that would be).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub targets: Option<Vec<BroadcastTarget>>,
     /// `close-tab --owned-by`: the tabs closed (or, dry-run, that would be).
@@ -1082,9 +978,7 @@ pub struct Resp {
 pub struct InboxMsg {
     /// Increases per pane; acknowledge with it, deduplicate by it.
     pub seq: u64,
-    /// Unix seconds when it arrived.
     pub ts: u64,
-    /// The sender's pane token, when it sent from a pane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     pub kind: String,
@@ -1133,7 +1027,6 @@ impl Resp {
         }
     }
 
-    /// A `graph` response.
     pub fn graph(value: serde_json::Value) -> Self {
         Self {
             graph: Some(value),
@@ -1141,7 +1034,6 @@ impl Resp {
         }
     }
 
-    /// A `list-agents` response.
     pub fn agents(agents: Vec<AgentInfo>) -> Self {
         Self {
             agents: Some(agents),
@@ -1157,7 +1049,6 @@ impl Resp {
         }
     }
 
-    /// A `capture-pane` response.
     pub fn capture(cap: crate::term::Capture, pane: String) -> Self {
         Self {
             text: Some(cap.text),
@@ -1168,7 +1059,6 @@ impl Resp {
         }
     }
 
-    /// A `jump` response: optionally naming a terminal-emulator process to activate.
     pub fn jump(raise: Option<(u32, String)>, copad_host: Option<(String, String)>) -> Self {
         let (pid, comm) = match raise {
             Some((p, c)) => (Some(p), Some(c)),
@@ -1182,7 +1072,6 @@ impl Resp {
         }
     }
 
-    /// A `health` response.
     pub fn health(health: HealthInfo) -> Self {
         Self {
             health: Some(health),
@@ -1190,7 +1079,6 @@ impl Resp {
         }
     }
 
-    /// An `ok` response carrying a human-readable outcome message.
     pub fn message(msg: impl Into<String>) -> Self {
         Self {
             message: Some(msg.into()),
@@ -1198,7 +1086,6 @@ impl Resp {
         }
     }
 
-    /// A `worktree list` response.
     pub fn worktree_list(worktrees: Vec<WorktreeInfo>) -> Self {
         Self {
             worktrees: Some(worktrees),
@@ -1209,7 +1096,6 @@ impl Resp {
         Self::err_code("error", msg)
     }
 
-    /// A failure with a machine-readable `code` (see [`Resp::code`]).
     pub fn err_code(code: &str, msg: impl Into<String>) -> Self {
         Self {
             ok: false,
@@ -1219,7 +1105,6 @@ impl Resp {
         }
     }
 
-    /// A response naming what a create verb made: its session, tab, and pane token.
     pub fn created(session: NodeRef, tab: NodeRef, pane: String) -> Self {
         Self {
             session: Some(session),
@@ -1251,11 +1136,10 @@ impl Resp {
     }
 }
 
-/// The per-user private runtime directory holding the server socket + lock. Prefer
-/// `$XDG_RUNTIME_DIR` (already 0700 on Linux), else `$TMPDIR` (per-user on macOS),
-/// else `/tmp`; the `copad-mux-<user>` component is created 0700 by the server so
-/// the socket is not world-reachable (the socket accepts input injection + takeover,
-/// so it must be a private boundary — `$USER` alone is not one).
+/// The per-user private runtime directory holding the server socket + lock: `$XDG_RUNTIME_DIR`
+/// (already 0700 on Linux), else `$TMPDIR` (per-user on macOS), else `/tmp`. The `copad-mux-<user>`
+/// component is created 0700 by the server because the socket accepts input injection and takeover,
+/// so it must be a private boundary (`$USER` alone is not one).
 pub fn runtime_dir() -> PathBuf {
     let base = std::env::var("XDG_RUNTIME_DIR")
         .ok()
@@ -1266,14 +1150,11 @@ pub fn runtime_dir() -> PathBuf {
     PathBuf::from(base.trim_end_matches('/')).join(format!("copad-mux-{user}"))
 }
 
-/// The control/attach socket path: `$COPAD_MUX_SOCK` if set (caller-managed, e.g.
-/// tests), else `<runtime_dir>/sock`.
 pub fn socket_path() -> PathBuf {
-    // A unit test must never reach the user's LIVE server. Ignoring an unset variable is not
-    // enough: every comux pane EXPORTS `COPAD_MUX_SOCK`, so `cargo test` run from inside one
-    // read the real socket and a parse test's `split -h` split the owner's tab (three stray
-    // shells, 2026-10-23). Test builds read only their own variable, set by the tests that
-    // want a specific dead socket, and otherwise a path nothing listens on.
+    // A unit test must never reach the user's LIVE server. Every comux pane EXPORTS
+    // `COPAD_MUX_SOCK`, so ignoring an unset variable is not enough: `cargo test` run from inside a
+    // pane read the real socket, and a parse test's `split -h` split the owner's tab. Test builds
+    // read only their own variable.
     if cfg!(test) {
         return std::env::var("COPAD_MUX_TEST_SOCK").map_or_else(
             |_| std::env::temp_dir().join("copad-mux-unit-tests-no-listener.sock"),
@@ -1286,10 +1167,7 @@ pub fn socket_path() -> PathBuf {
     runtime_dir().join("sock")
 }
 
-/// The `comux ctl ...` CLI client: parse args, round-trip one request over the
-/// socket, print the response. Returns a process exit code.
 pub fn run_client(args: &[String]) -> i32 {
-    // `apply-layout` composes many requests client-side (decisions #162).
     if args.first().map(|s| s.as_str()) == Some("apply-layout") {
         return apply_layout_client(&args[1..]);
     }
@@ -1305,10 +1183,8 @@ pub fn run_client(args: &[String]) -> i32 {
         }
         return json_usage(json, "worktree", run_worktree_client(&args[1..]));
     }
-    // Fleet verbs are answered ENTIRELY client-side: they read the local config and run `ssh`,
-    // and never touch this machine's server. Handled before a request is built so
-    // `comux machines` works with no server running at all — which is exactly when you want to
-    // ask where your agents are.
+    // Fleet verbs are answered ENTIRELY client-side (local config + `ssh`) and never touch this
+    // machine's server, so `comux machines` works with no server running.
     if let Some(code) = fleet_verb(args) {
         return code;
     }
@@ -1343,9 +1219,6 @@ pub fn run_client(args: &[String]) -> i32 {
         };
     }
 
-    // `wait-output` owns its own exit codes (124 on deadline) and issues MANY requests,
-    // so it short-circuits the one-request-one-response path below rather than producing a
-    // `Req` for it.
     if cmd == "hook" {
         let p = parsed!(HOOK_SPEC);
         if p.positionals.first().map(String::as_str) != Some("pre-compact") {
@@ -1582,7 +1455,6 @@ pub fn run_client(args: &[String]) -> i32 {
         }
         "rename-pane" => {
             let p = parsed!(RENAME_PANE_SPEC);
-            // `rename-pane <token> <name…>`, or just `<name…>` for the calling pane.
             let (target, words) = match p.positionals.first() {
                 Some(first) if matches!(classify_pane_arg(first), Some(PaneArg::Token(_))) => {
                     (Some(first.clone()), &p.positionals[1..])
@@ -1774,7 +1646,6 @@ pub fn run_client(args: &[String]) -> i32 {
                 from: caller_pane(),
                 cwd,
                 name: p.value("--name").map(str::to_string),
-                // A spawned worker never moves anyone's view.
                 no_focus: true,
                 command: p.positionals.clone(),
                 env,
@@ -1841,11 +1712,9 @@ pub fn run_client(args: &[String]) -> i32 {
         }
         "new-session" => {
             let p = parsed!(NAME_SPEC_NEW_SESSION);
-            // Optional name: every positional, space-joined (tmux `new -s`).
             let name = p.positionals.join(" ");
             let cwd = match p.value("--cwd").map(absolute_dir).transpose() {
                 Ok(Some(c)) => Some(c),
-                // Start the session's shell where the CLI was invoked (like `tmx $name`).
                 Ok(None) => std::env::current_dir()
                     .ok()
                     .and_then(|p| p.to_str().map(|s| s.to_string())),
@@ -2048,7 +1917,6 @@ pub fn run_client(args: &[String]) -> i32 {
                     _ => {}
                 }
             }
-            // Before `--`: at most a direction. After it: the program to run.
             let split_at = p.literal_at.unwrap_or(p.positionals.len());
             let (head, tail) = p.positionals.split_at(split_at);
             let command = tail.to_vec();
@@ -2174,7 +2042,6 @@ pub fn run_client(args: &[String]) -> i32 {
                     CAPTURE_USAGE,
                 );
             }
-            // Only an index is counted in a tab; a target names its pane anywhere.
             let caller = match index {
                 Some(_) => match index_caller(p.has("--active"), cmd, json_out) {
                     Ok(c) => c,
@@ -2376,8 +2243,6 @@ pub fn run_client(args: &[String]) -> i32 {
         }
     };
 
-    // `new-session` starts the server if it isn't running yet (like tmux `new-session`),
-    // so `cd dir; comux new-session name` works from a cold start.
     if matches!(req, Req::NewSession { .. })
         && let Err(e) = crate::client::ensure_running(&socket_path())
     {
@@ -2422,11 +2287,6 @@ pub fn run_client(args: &[String]) -> i32 {
         return 1;
     }
 
-    // A jump exists to put the pane in front of the user, which a state switch alone
-    // does not do when the terminal is behind another window. The RAISE runs here, in
-    // this short-lived process, rather than in the server: the daemon's environment was
-    // scrubbed of the session vars a GUI command needs, and it is the wrong process for
-    // macOS to attribute automation permission to. Opt out with `--no-raise`.
     if matches!(req, Req::Jump { .. }) && resp.ok && !args.iter().any(|a| a == "--no-raise") {
         maybe_raise(&resp);
     }
@@ -2437,10 +2297,9 @@ pub fn run_client(args: &[String]) -> i32 {
         print_human(&req, &resp);
     }
     // A `split` whose response carries no pane token is NOT a success a script can use: the
-    // documented recipe is `pane=$(comux split --from …)`, and an empty capture with exit 0
-    // reads as "it worked" right up until the token is used to address a pane. An older
-    // server (before decision #107) answers exactly that way, and `--json` would otherwise
-    // not even print the warning.
+    // documented recipe is `pane=$(comux split --from …)`, and an empty capture with exit 0 reads
+    // as "it worked". An older server answers exactly that way, and `--json` would not even print
+    // the warning.
     if matches!(req, Req::Split { .. })
         && resp.ok
         && resp.pane.as_deref().unwrap_or_default().is_empty()
@@ -2450,15 +2309,12 @@ pub fn run_client(args: &[String]) -> i32 {
     if resp.ok {
         0
     } else if resp.code.as_deref() == Some("ambiguous") {
-        // An ambiguous NAME is the caller's to fix, like any other malformed argument.
         2
     } else {
         1
     }
 }
 
-/// Parse a verb's arguments (`rest[0]` is the verb) against its grammar. `Err` is the exit
-/// code to return: 0 after printing `--help`, 2 after a usage error.
 fn verb_args(spec: &Spec, rest: &[&String], json: bool) -> Result<cliargs::Parsed, i32> {
     let verb = rest.first().map(|s| s.as_str()).unwrap_or("");
     let args: Vec<&str> = rest.iter().skip(1).map(|s| s.as_str()).collect();
@@ -2519,14 +2375,12 @@ fn read_send_file(path: &str) -> Result<String, String> {
     String::from_utf8(buf).map_err(|_| format!("{path} is not UTF-8 text"))
 }
 
-/// `-h`/`--help` before any `--`, for the verbs with their own parsers.
 fn wants_help(args: &[String]) -> bool {
     args.iter()
         .take_while(|a| *a != "--")
         .any(|a| a == "-h" || a == "--help")
 }
 
-/// `--help` under `--json`: the usage as a JSON answer, exit 0.
 fn json_help(usage: &str) -> i32 {
     println!("{}", serde_json::json!({ "ok": true, "usage": usage }));
     0
@@ -2548,7 +2402,6 @@ fn json_usage(json: bool, verb: &str, code: i32) -> i32 {
     code
 }
 
-/// The calling pane's token (`$COPAD_MUX_PANE`), when the CLI runs inside a comux pane.
 fn caller_pane() -> Option<String> {
     std::env::var("COPAD_MUX_PANE")
         .ok()
@@ -2592,7 +2445,6 @@ pub fn env_pair(kv: &str) -> Result<(&str, &str), String> {
     Ok((k, v))
 }
 
-/// One `spawn` argument: anything but a NUL, which no argv can carry.
 pub fn spawn_arg(a: &str) -> Result<(), String> {
     if a.contains('\0') {
         return Err("an argument contains a NUL byte".to_string());
@@ -2707,8 +2559,6 @@ fn rename_args(p: &cliargs::Parsed) -> Option<(Option<usize>, String)> {
     parse_rename(&p.positionals)
 }
 
-/// Where an index-less `rename-*` points: an explicit `--target` selector, else the caller's
-/// pane. Returns the `pane` field to send.
 fn rename_target(
     index: Option<usize>,
     target: Option<&str>,
@@ -3071,7 +2921,6 @@ const INBOX_SPEC: Spec = Spec {
     positionals: Positionals::AtMost(1),
 };
 
-/// `close-tab --owned-by …` is a different verb from `close-tab [index]` (no picker, no index).
 fn owned_by_form(rest: &[&String]) -> bool {
     rest.iter()
         .take_while(|a| a.as_str() != "--")
@@ -3092,7 +2941,6 @@ fn result_path(path: &str) -> Result<String, String> {
         .ok_or_else(|| format!("--result {path}: not a UTF-8 path"))
 }
 
-/// `--active`: count an index in the tab on screen rather than the caller's.
 const ACTIVE_FLAG: &[cliargs::Flag] = &[flag(&["--active"])];
 
 const LIST_SPEC: Spec = Spec {
@@ -3150,12 +2998,10 @@ fn maybe_raise(resp: &Resp) {
     }
 }
 
-/// Whether the generic application-level raise should still run after the copad attempt.
-///
-/// One line, extracted only so it can be TESTED: an end-to-end harness can watch comux dial
-/// copad, but it cannot watch a window come forward, so the fall-through is exactly the piece
-/// no e2e can pin. Treating a refusal as success — the plausible mistake — leaves the user
-/// looking at whatever was already frontmost, with nothing anywhere reporting a problem.
+/// Whether the generic application-level raise should still run after the copad attempt. Extracted
+/// only so it can be TESTED: an e2e can watch comux dial copad but not a window come forward.
+/// Treating a refusal as success would leave the user looking at whatever was already frontmost,
+/// with nothing reporting a problem.
 fn fall_back_after_copad(copad: crate::copadlink::FocusOutcome) -> bool {
     // Focusing the tab is not the same as being LOOKED at. GTK under Wayland does the first and
     // cannot do the second, so a copad that switched the tab but could not raise itself still
@@ -3169,7 +3015,6 @@ fn fall_back_after_copad(copad: crate::copadlink::FocusOutcome) -> bool {
 /// `comux skill > ~/.claude/skills/comux/SKILL.md`.
 const SKILL_MD: &str = include_str!("../SKILL.md");
 
-/// How a positional pane argument was understood.
 enum PaneArg {
     Index(usize),
     Token(String),
@@ -3210,16 +3055,14 @@ const SEND_USAGE: &str = "usage: comux send <pane-token|index> [--enter] [--past
      \x20                instead of the arguments\n\
      \x20      text starting with `-` goes after `--`";
 
-/// Exit code for "the user cancelled the picker" — fzf's (and SIGINT's) convention, so a
-/// shell wrapper can tell a deliberate abort apart from a real failure.
-/// Usage for `capture-pane`. A const because three argument-error paths print it.
+/// Usage for `capture-pane`; three argument-error paths print it.
 const CAPTURE_USAGE: &str = "usage: comux capture-pane [<pane-token|terminal-id>] [--index N] [-S|--lines N] [--json]\n\
      \x20      no target = the focused pane; -S counts PHYSICAL grid rows back from the\n\
      \x20      live screen bottom (not the scrolled view), reaching into scrollback";
 
+/// fzf's and SIGINT's convention, so a shell wrapper can tell a deliberate abort from a failure.
 const EXIT_CANCELLED: i32 = 130;
 
-/// Which live listing an omitted argument should be fuzzy-picked from.
 #[derive(Clone, Copy)]
 enum Target {
     Session,
@@ -3244,7 +3087,6 @@ impl Target {
         }
     }
 
-    /// Session/tab verbs also accept a selector; pane verbs take only an index.
     fn takes_selector(self) -> bool {
         !matches!(self, Target::PaneFocus | Target::PaneClose)
     }
@@ -3397,7 +3239,6 @@ fn prompt_ok(json: bool, usage: &str) -> Result<(), i32> {
     Ok(())
 }
 
-/// Run the picker over `rows` and return the chosen row's value.
 fn choose<T>(title: &str, empty: &str, rows: Vec<(picker::Item, T)>) -> Result<T, i32> {
     if rows.is_empty() {
         eprintln!("comux: {empty}");
@@ -3414,8 +3255,6 @@ fn choose<T>(title: &str, empty: &str, rows: Vec<(picker::Item, T)>) -> Result<T
     }
 }
 
-/// One round trip for a picker's listing, mapping a transport error or a server refusal
-/// to an exit code (the picker can't run without the listing).
 fn query(req: &Req) -> Result<Resp, i32> {
     match round_trip(req) {
         Ok(r) if r.ok => Ok(r),
@@ -3430,16 +3269,12 @@ fn query(req: &Req) -> Result<Resp, i32> {
     }
 }
 
-/// `comux server <start|stop|restart|status>` — manage the persistent server's lifecycle
-/// so users don't have to hand-roll `kill-server` + a re-attach. `restart` leans on session
-/// persistence: the
-/// server saves its layout on shutdown and the fresh one restores it, so a restart brings
-/// the workspace back (whitelisted agents even resume). Returns a process exit code.
+/// `comux server <start|stop|restart|status>`: manage the persistent server's lifecycle. `restart`
+/// leans on session persistence: the server saves its layout on shutdown and the fresh one restores
+/// it, so the workspace comes back (whitelisted agents even resume). Returns a process exit code.
 pub fn run_server_admin(action: &str) -> i32 {
     let sock = socket_path();
     match action {
-        // `status` is a point-in-time query — a connect probe is exactly right (there's no
-        // action whose correctness a later state change could invalidate).
         "status" => {
             if UnixStream::connect(&sock).is_ok() {
                 println!("comux server: running ({})", sock.display());
@@ -3517,11 +3352,10 @@ pub fn run_server_admin(action: &str) -> i32 {
     }
 }
 
-/// Ensure no server is listening on `sock`: if one is up, send `KillServer` and block until
-/// it has fully exited (final save done, socket removed, flock released) so a following
-/// start/restart can't race the dying server. Idempotent — a connect refusal (nothing there,
-/// including one that vanished mid-request) is success, since the desired end state (stopped)
-/// already holds. `Err(code)` only on a real request/protocol failure or a stuck shutdown.
+/// Ensure no server is listening on `sock`: if one is up, send `KillServer` and block until it has
+/// fully exited (final save done, socket removed, flock released) so a following start/restart
+/// can't race it. Idempotent: a connect refusal counts as success. `Err(code)` only on a real
+/// request/protocol failure or a stuck shutdown.
 fn ensure_server_stopped(sock: &Path) -> Result<(), i32> {
     if UnixStream::connect(sock).is_err() {
         return Ok(()); // nothing listening — already stopped
@@ -3595,8 +3429,6 @@ pub(crate) fn round_trip(req: &Req) -> Result<Resp, String> {
     serde_json::from_str(resp_line.trim()).map_err(|e| format!("bad response: {e}"))
 }
 
-/// `comux graph` for a person: per agent its totals and the files it touched most; for one
-/// pane, its steps.
 fn print_graph(page: bool, value: Option<&serde_json::Value>) {
     use copad_mux_proto::graph::{Graph, GraphFile, GraphPage, GraphStep};
     let file_line = |f: &GraphFile| {
@@ -3706,7 +3538,6 @@ fn print_human(req: &Req, resp: &Resp) {
                     None => println!("fds             ?/{soft}"),
                 }
             }
-            // The number that actually answers "why won't a new tab open?".
             if let Some(room) = h.panes_remaining() {
                 println!("panes headroom  {room}");
             }
@@ -3756,7 +3587,6 @@ fn print_human(req: &Req, resp: &Resp) {
                 ),
             }
         }
-        // `spawn` prints its pane like `split` does: the token is what the caller came for.
         Req::NewTab { command, .. } if !command.is_empty() => {
             println!("{}", resp.pane.as_deref().unwrap_or_default());
         }
@@ -3921,8 +3751,6 @@ fn print_human(req: &Req, resp: &Resp) {
                 );
             }
         }
-        // Message-carrying verbs (e.g. `reload`) print their outcome; everything else
-        // just confirms with `ok`.
         _ => match &resp.message {
             Some(m) => println!("{m}"),
             None => println!("ok"),
@@ -3951,14 +3779,12 @@ fn parse_rename(args: &[String]) -> Option<(Option<usize>, String)> {
     Some((index, name.trim().to_string()))
 }
 
-/// The caller's cwd as a wire string (the repo is resolved from it server-side).
 fn caller_cwd() -> Option<String> {
     std::env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(|s| s.to_string()))
 }
 
-/// Is a comux server currently accepting on the control socket?
 fn server_running() -> bool {
     UnixStream::connect(socket_path()).is_ok()
 }
@@ -3977,7 +3803,6 @@ const WORKTREE_USAGE: &str = "usage:\n\
          \n\
          omitting the `rm` target opens a fuzzy picker over the repo's worktrees.";
 
-/// `comux worktree <sub> …` — a nested grammar parsed independently of the flat client.
 fn run_worktree_client(args: &[String]) -> i32 {
     let Some(sub) = args.first().map(|s| s.as_str()) else {
         print_worktree_usage();
@@ -4011,7 +3836,6 @@ fn run_worktree_client(args: &[String]) -> i32 {
     }
 }
 
-/// Print a mutating-verb response (`--json` → raw Resp; else the message / error).
 fn print_worktree_result(resp: &Resp, json: bool) -> i32 {
     if json {
         println!("{}", serde_json::to_string(resp).unwrap_or_default());
@@ -4054,8 +3878,6 @@ fn worktree_create_client(rest: &[String]) -> i32 {
                     }
                 }
                 "--json" => json = true,
-                // tmx `twt --keep-current`: create the session but stay in the current
-                // shell (don't drop into it) — implied by `--json` (scripting) too.
                 "--no-attach" | "--keep-current" => no_attach = true,
                 _ => {
                     eprintln!("comux worktree create: unknown flag '{a}'");
@@ -4079,7 +3901,6 @@ fn worktree_create_client(rest: &[String]) -> i32 {
         from: (!from.is_empty()).then(|| from.clone()),
         cwd: caller_cwd(),
     };
-    // Create opens a session, so it needs a server — start one if none is running.
     if let Err(e) = crate::client::ensure_running(&socket_path()) {
         eprintln!("comux: could not start server: {e}");
         return 1;
@@ -4188,7 +4009,6 @@ fn apply_layout_client(rest: &[String]) -> i32 {
                 eprintln!("comux: {e}");
                 return 1;
             }
-            // Like `worktree create`: from a plain shell, drop into the new session.
             if std::env::var_os("COPAD_MUX").is_none()
                 && let Err(e) = crate::client::run()
             {
@@ -4279,7 +4099,6 @@ fn build_layout(plan: &crate::layoutfile::Plan) -> Result<String, String> {
                 &Req::NewTab {
                     session: Some(session.clone()),
                     from: None,
-                    // Its first pane's directory: the tab's shell starts there, no `cd` needed.
                     cwd: Some(path(&tab.panes[0].cwd)),
                     name: tab.name.clone(),
                     no_focus: true,
@@ -4539,7 +4358,6 @@ fn worktree_land_client(rest: &[String]) -> i32 {
             ),
         );
     }
-    // Removal through the server when one runs (it owns liveness), else under its flock.
     let path = plan.worktree.display().to_string();
     let removed = if server_running() {
         let req = Req::WorktreeRm {
@@ -4615,8 +4433,6 @@ fn worktree_rm_client(rest: &[String]) -> i32 {
         }
         i += 1;
     }
-    // No target → fuzzy-pick one from the repo's worktrees instead of failing with a
-    // usage line (the whole point: you rarely remember the sibling path by heart).
     let target: String = match target {
         Some(t) => t.to_string(),
         None => match pick_worktree(json) {
@@ -4867,7 +4683,6 @@ mod verb_args_tests {
             }
             other => panic!("{other:?}"),
         }
-        // Early in a session the window fields can be null; the report still carries cost.
         let early = br#"{"session_id":"abc","context_window":{"context_window_size":null},"cost":{"total_cost_usd":0}}"#;
         assert!(matches!(
             agent_report_from("p".into(), early).unwrap(),
@@ -4925,7 +4740,6 @@ mod verb_args_tests {
 
     #[test]
     fn fleet_verbs_parse_before_any_sweep() {
-        // Help and bad flags must answer without reading config or running ssh.
         assert_eq!(exit(&["machines", "--help"]), 0);
         assert_eq!(exit(&["machines", "--bogus"]), 2);
         assert_eq!(exit(&["machines", "extra"]), 2);
@@ -5002,7 +4816,6 @@ mod verb_args_tests {
     #[test]
     fn a_value_flag_does_not_eat_help() {
         assert_eq!(exit(&["split", "--from", "--help"]), 0);
-        // `split` owns `-h`, so there it is a missing value, not help.
         assert_eq!(exit(&["split", "--from", "-h"]), 2);
         assert_eq!(
             exit(&["notify", "--pane", "a-1", "--kind", "--bogus", "x"]),
@@ -5036,14 +4849,12 @@ mod verb_args_tests {
 
     #[test]
     fn split_keeps_dash_h_as_horizontal() {
-        // Parses (then fails on the dead socket) — `-h` is the split direction, not help.
         assert_eq!(exit(&["split", "-h"]), 1);
         assert_eq!(exit(&["split", "--help"]), 0);
     }
 
     #[test]
     fn a_body_after_the_separator_may_start_with_a_dash() {
-        // Parses, so it reaches (and fails on) the dead socket.
         assert_eq!(exit(&["send", "a1-1", "--", "--json"]), 1);
         assert_eq!(exit(&["send", "a1-1", "--json-ish"]), 2);
     }
@@ -5057,7 +4868,6 @@ mod server_admin_tests {
     /// deterministically — the branches that don't spawn a server (status/stop/unknown) are
     /// the ones safe to assert on in a unit test.
     fn with_dead_socket<T>(f: impl FnOnce() -> T) -> T {
-        // Unique-ish per test via the thread name so parallel tests don't collide.
         let name = std::thread::current()
             .name()
             .unwrap_or("t")
@@ -5086,7 +4896,6 @@ mod server_admin_tests {
         with_dead_socket(|| assert_eq!(run_server_admin("frobnicate"), 2));
     }
 
-    /// Build the positional shape `run_client` passes to `parse_rename`.
     fn rename_args(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
     }
@@ -5101,16 +4910,12 @@ mod server_admin_tests {
                 "args: {args:?}"
             );
         };
-        // Plain name → the ACTIVE tab/session.
         check(&["rename-tab", "build"], Some((None, "build")));
-        // Leading integer + name → index form, name space-joined.
         check(
             &["rename-tab", "2", "build", "tools"],
             Some((Some(2), "build tools")),
         );
-        // A lone integer is a NAME (no name follows it), not a missing-name error.
         check(&["rename-tab", "2"], Some((None, "2")));
-        // An explicit empty name clears (Some with empty string), no args is usage.
         check(&["rename-tab", ""], Some((None, "")));
         check(&["rename-tab"], None);
     }
@@ -5224,8 +5029,6 @@ mod capture_proto_tests {
         }
     }
 
-    /// The response carries the RESOLVED pane token, so a caller that let the target
-    /// default to the focused pane can tell which pane actually answered.
     #[test]
     fn response_carries_text_rows_and_resolved_pane() {
         let resp = Resp::capture(
@@ -5264,10 +5067,6 @@ mod capture_proto_tests {
     }
 }
 
-// ---------------------------------------------------------------------------
-// `wait-output` — block until a pane's text matches (WU2, decision #104).
-// ---------------------------------------------------------------------------
-
 /// Exit code for "the wait timed out". `timeout(1)`'s convention, so a shell can tell a
 /// deadline from a real failure. Distinct from [`EXIT_CANCELLED`] (130).
 const EXIT_TIMEOUT: i32 = 124;
@@ -5294,7 +5093,6 @@ const WAIT_USAGE: &str = "usage: comux wait-output [<pane-token|terminal-id>] <p
      \x20 comux send 0 $'\\n'\n\
      \x20 comux wait-output --index 0 \"MARK-$id\"";
 
-/// Everything `wait-output` parsed off the command line.
 #[derive(Debug, PartialEq)]
 struct WaitArgs {
     target: Option<String>,
@@ -5303,7 +5101,6 @@ struct WaitArgs {
     /// capabilities inside the wait's deadline, not before it.
     caller: Option<String>,
     pattern: String,
-    /// `None` = wait forever (`--timeout 0`).
     timeout: Option<Duration>,
     lines: usize,
     interval: Duration,
@@ -5319,7 +5116,6 @@ fn last_match<'a>(text: &'a str, pattern: &str) -> Option<&'a str> {
     text.lines().rfind(|l| l.contains(pattern))
 }
 
-/// Parse `wait-output`'s arguments. `Err(code)` is the process exit code to use.
 fn parse_wait_args(rest: &[&String]) -> Result<WaitArgs, i32> {
     let mut target: Option<String> = None;
     let mut index: Option<usize> = None;
@@ -5329,8 +5125,6 @@ fn parse_wait_args(rest: &[&String]) -> Result<WaitArgs, i32> {
     let mut lines: usize = 200;
     let mut interval_ms: u64 = 250;
 
-    // Index-based rather than an iterator: each flag consumes the NEXT argument, and a
-    // borrowed iterator cannot be handed to a helper closure without naming its type.
     let mut i = 1;
     let num = |what: &str, v: Option<&&String>| -> Result<u64, i32> {
         match v.map(|v| v.parse::<u64>()) {
@@ -5343,7 +5137,6 @@ fn parse_wait_args(rest: &[&String]) -> Result<WaitArgs, i32> {
     };
     while i < rest.len() {
         let a = rest[i].as_str();
-        // `--` ends flag parsing, so a pattern that starts with `-` can be waited on.
         if a == "--" {
             positional.extend(rest[i + 1..].iter().map(|s| s.to_string()));
             break;
@@ -5374,7 +5167,6 @@ fn parse_wait_args(rest: &[&String]) -> Result<WaitArgs, i32> {
         i += if takes_value { 2 } else { 1 };
     }
 
-    // `<target> <pattern>`, or just `<pattern>`.
     let pattern = match positional.len() {
         1 => positional.remove(0),
         2 => {
@@ -5438,22 +5230,17 @@ fn parse_wait_args(rest: &[&String]) -> Result<WaitArgs, i32> {
     })
 }
 
-/// Run `wait-output`: poll `capture-pane` until the pattern shows up, the deadline passes,
-/// or the pane goes away.
+/// How a wait ended. Printed ONCE by [`WaitOutcome::finish`], as text or, under `--json`, as one
+/// JSON object, so a caller parsing stdout gets an answer for every ending, timeouts included.
 ///
-/// **Best-effort by construction.** It matches the pane's CURRENT text; it is not a
-/// guarantee that no matching output was missed. `\r` overwrites, `\x1b[2K` line erasure
-/// and alternate-screen redraws can all remove a match without producing a single new row,
-/// and the alternate screen has no scrollback to fall back on. Raising `--lines` does not
-/// change that. A caller needing a guarantee must write a durable marker somewhere the
-/// caller itself can check.
+/// `wait-output` is best-effort by construction: it matches the pane's CURRENT text, so `\r`
+/// overwrites, `\x1b[2K` line erasure and alternate-screen redraws can remove a match without
+/// producing a new row (the alternate screen has no scrollback), and raising `--lines` does not
+/// change that. A caller needing a guarantee must write a durable marker somewhere it can check.
 ///
-/// The pane is PINNED to the token the first response echoes. A default / `--index` target
-/// re-resolves against the live focus and active tab on every request, so without pinning a
-/// user switching panes mid-wait could make the wait succeed on an unrelated pane.
-/// How a wait ended. Printed ONCE by [`WaitOutcome::finish`], as text or — under `--json` —
-/// as one JSON object, so a caller parsing stdout gets an answer for every ending, timeouts
-/// included.
+/// The pane is PINNED to the token the first response echoes: a default / `--index` target
+/// re-resolves against the live focus on every request, so a user switching panes mid-wait could
+/// make the wait succeed on an unrelated pane.
 enum WaitOutcome {
     Matched {
         human: String,
@@ -5481,7 +5268,6 @@ impl WaitOutcome {
         )
     }
 
-    /// Print and return the exit code: 0 matched, [`EXIT_TIMEOUT`] timed out, 1 failed.
     fn finish(self, verb: &str, json: bool) -> i32 {
         match self {
             WaitOutcome::Matched { human, json: j } => {
@@ -5515,7 +5301,6 @@ impl WaitOutcome {
     }
 }
 
-/// How long a plain (non-waiting) `inbox` gives the server.
 const INBOX_IO_BUDGET: Duration = Duration::from_secs(10);
 
 /// `comux inbox`: read a pane's messages, print them, and only then acknowledge them, so a
@@ -5579,7 +5364,6 @@ fn run_inbox(pane: &str, wait: bool, timeout: Option<Duration>, peek: bool, json
     };
     let messages = resp.messages.unwrap_or_default();
     let dropped = resp.dropped.unwrap_or(0);
-    // A response carries one size-bounded batch; the rest wait for the next read.
     let more = resp.truncated == Some(true);
     if json {
         println!(
@@ -5636,7 +5420,6 @@ fn render_inbox(m: &InboxMsg) -> String {
     line
 }
 
-/// `comux agent-log`: find the agent's transcript through the server, then read its tail here.
 fn agent_log(pane: &str, last: usize, max_chars: usize) -> WaitOutcome {
     let resp = match round_trip(&Req::ListAgents {
         target: Some(pane.to_string()),
@@ -5783,14 +5566,11 @@ fn wait_output(args: WaitArgs) -> WaitOutcome {
     }
 }
 
-/// Why a deadline-bounded exchange gave up.
 enum WaitErr {
     TimedOut,
     Failed(String),
 }
 
-/// The remaining budget, or [`WaitErr::TimedOut`] if it is already gone. `None` = no
-/// deadline at all (`--timeout 0`).
 fn remaining(deadline: Option<Instant>) -> Result<Option<Duration>, WaitErr> {
     match deadline {
         None => Ok(None),
@@ -5857,7 +5637,6 @@ impl WaitConn {
         })
     }
 
-    /// Send one request and read its response, all within `deadline`.
     fn request(&mut self, req: &Req, deadline: Option<Instant>) -> Result<Resp, WaitErr> {
         let line = serde_json::to_string(req).map_err(|e| WaitErr::Failed(e.to_string()))?;
         self.write_all_by(format!("{line}\n").as_bytes(), deadline)?;
@@ -5939,7 +5718,7 @@ impl WaitConn {
 /// Hard ceiling on a single control response the wait path will buffer. `capture-pane`
 /// already caps its text server-side; this guards the client against a hostile or broken
 /// peer streaming forever instead of sending a newline.
-const MAX_RESP_BYTES: usize = 8 << 20; // 8 MiB
+const MAX_RESP_BYTES: usize = 8 << 20;
 
 #[cfg(test)]
 mod wait_output_tests {
@@ -5956,9 +5735,6 @@ mod wait_output_tests {
 
     #[test]
     fn picks_the_last_matching_logical_line() {
-        // "Last" = last in the CAPTURED TEXT. Not necessarily newest in wall-clock terms
-        // (cursor movement can rewrite an earlier row after a later one), which is why the
-        // contract is worded that way rather than "most recent".
         let text = "build DONE\nnoise\nrerun DONE now\ntail";
         assert_eq!(last_match(text, "DONE"), Some("rerun DONE now"));
     }
@@ -6067,8 +5843,8 @@ mod wait_output_tests {
 mod wait_bounds_tests {
     use super::*;
 
-    /// A `--timeout` too large for `Instant + Duration` must be a USAGE error. Before this
-    /// check it panicked (exit 101): `Instant::add` overflows rather than saturating.
+    /// A `--timeout` too large for `Instant + Duration` must be a USAGE error: `Instant::add`
+    /// overflows rather than saturating.
     #[test]
     fn an_unrepresentable_timeout_is_refused_not_a_panic() {
         let owned: Vec<String> = ["wait-output", "--timeout", &u64::MAX.to_string(), "X"]
@@ -6079,7 +5855,6 @@ mod wait_bounds_tests {
         assert_eq!(parse_wait_args(&refs), Err(2));
     }
 
-    /// A timeout a user might plausibly type must still be accepted.
     #[test]
     fn a_long_but_representable_timeout_is_accepted() {
         let owned: Vec<String> = ["wait-output", "--timeout", "86400", "X"]
@@ -6093,10 +5868,9 @@ mod wait_bounds_tests {
         );
     }
 
-    /// The recipe is printed for a human to PASTE, so it must survive Rust's string
-    /// escaping. An earlier version rendered `$'\\n'` (a literal backslash-n, which never
-    /// submits the line) and `[\"panes\"]` (a Python SyntaxError). Assert the RENDERED
-    /// text, not the source — that is where the bug lived.
+    /// The recipe is printed for a human to PASTE, so assert the RENDERED text, not the source: it
+    /// must survive Rust's string escaping (`$'\n'` must stay a real newline, `["panes"]` must not
+    /// gain backslashes).
     #[test]
     fn the_help_recipe_renders_as_runnable_shell() {
         assert!(
@@ -6113,7 +5887,6 @@ mod wait_bounds_tests {
             WAIT_USAGE.contains(r"comux send 0 $'\n'"),
             "recipe never submits the command"
         );
-        // The wait must address the SAME pane the recipe sent to.
         assert!(
             WAIT_USAGE.contains("comux send 0 ") && WAIT_USAGE.contains("wait-output --index 0"),
             "recipe sends to one pane and waits on another"
@@ -6152,10 +5925,6 @@ mod wait_bounds_tests {
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// `wait-agent` — block until an agent pane reaches a status (WU3, decision #105).
-// ---------------------------------------------------------------------------
 
 /// Statuses a WAIT may ask for. `idle` is deliberately absent: per `agentstate.rs` it means
 /// "no recognized UI", which is also what an unresolved reading looks like — waiting on it
@@ -6196,18 +5965,15 @@ const WAIT_AGENT_USAGE: &str = "usage: comux wait-agent <pane-token|terminal-id>
      For real turn completion, have the agent's own hook run `comux notify`, or print a\n\
      fresh marker and use `comux wait-output`.";
 
-/// Everything `wait-agent` parsed off the command line.
 #[derive(Debug, PartialEq)]
 struct WaitAgentArgs {
     target: String,
     status: String,
     timeout: Option<Duration>,
     interval: Duration,
-    /// `--after-seq N`: match only a status reached by a transition NEWER than `N`.
     after_seq: Option<u64>,
 }
 
-/// Parse `wait-agent`'s arguments. `Err(code)` is the process exit code.
 fn parse_wait_agent_args(rest: &[&String]) -> Result<WaitAgentArgs, i32> {
     let mut target: Option<String> = None;
     let mut status: Option<String> = None;
@@ -6217,7 +5983,6 @@ fn parse_wait_agent_args(rest: &[&String]) -> Result<WaitAgentArgs, i32> {
     let mut i = 1;
     while i < rest.len() {
         let a = rest[i].as_str();
-        // `--` ends flag parsing: what follows is the target.
         if a == "--" {
             for t in &rest[i + 1..] {
                 if target.replace(t.to_string()).is_some() {
@@ -6330,7 +6095,6 @@ fn parse_wait_agent_args(rest: &[&String]) -> Result<WaitAgentArgs, i32> {
     })
 }
 
-/// Run `wait-agent`. Shares [`WaitConn`] and the deadline machinery with `wait-output`.
 fn run_wait_agent(args: WaitAgentArgs, json: bool) -> i32 {
     wait_agent(args).finish("wait-agent", json)
 }
@@ -6441,8 +6205,6 @@ mod wait_agent_tests {
 
     #[test]
     fn requires_a_target_and_a_status() {
-        // No focused-pane default here, unlike `wait-output`: with several agents running,
-        // waiting on whichever pane happens to be focused is a wrong answer that looks right.
         assert_eq!(parse(&["wait-agent", "--status", "ready"]), Err(2));
         assert_eq!(parse(&["wait-agent", "ab12-3"]), Err(2));
         assert!(parse(&["wait-agent", "ab12-3", "--status", "ready"]).is_ok());
@@ -6647,7 +6409,6 @@ mod skill_tests {
             raised: false,
         };
         assert!(super::fall_back_after_copad(miss));
-        // No copad at all is the same as a copad that did not focus.
         assert!(super::fall_back_after_copad(FocusOutcome {
             focused: false,
             raised: true
@@ -6671,8 +6432,6 @@ mod skill_tests {
     }
     use super::*;
 
-    /// Quoted string literals in `s`. Dispatch arms contain no escaped quotes, so a plain
-    /// scan is enough and avoids a regex dependency for one test.
     fn quoted(s: &str) -> Vec<String> {
         let b = s.as_bytes();
         let (mut out, mut i) = (Vec::new(), 0);
@@ -6725,17 +6484,14 @@ mod skill_tests {
             + arm_start;
 
         let mut out = std::collections::BTreeSet::new();
-        // Verbs short-circuited before the match (`skill`, the waits, `worktree`).
         for line in CTL[fn_start..arm_start].lines() {
             if line.contains("cmd == \"") || line.contains("== Some(\"") {
                 out.extend(quoted(line));
             }
         }
-        // The match arms themselves.
         for line in CTL[arm_start..arm_end].lines().filter(|l| is_top_arm(l)) {
             out.extend(quoted(line.split("=>").next().unwrap_or("")));
         }
-        // Verbs the BINARY routes before ever reaching the control client.
         let bin_start = BIN.find("match args.first()").expect(fail);
         for line in BIN[bin_start..].lines().filter(|l| is_top_arm(l)) {
             out.extend(quoted(line.split("=>").next().unwrap_or("")));
@@ -6868,13 +6624,11 @@ mod skill_tests {
         }
     }
 
-    /// The pane you just created must come from the SPLIT RESPONSE, not from inference.
-    ///
-    /// Two earlier versions of this guide got it wrong: `panes[focused]` is racy (the user
-    /// can move focus between the split and the listing), and so is set-difference on
-    /// listings (a concurrent tab switch can make exactly one unfamiliar token appear).
-    /// Both failures pass every downstream check, because the pane they name really is live
-    /// and really is in the active tab.
+    /// The pane you just created must come from the SPLIT RESPONSE, not from inference:
+    /// `panes[focused]` is racy (the user can move focus between the split and the listing), and so
+    /// is set-difference on listings (a concurrent tab switch can make exactly one unfamiliar token
+    /// appear). Both failures pass every downstream check, because the pane they name really is
+    /// live and really is in the active tab.
     #[test]
     fn the_skill_takes_the_new_pane_from_the_split_response() {
         assert!(
@@ -6921,7 +6675,6 @@ mod skill_tests {
             SKILL_MD.contains("never send to your own pane"),
             "the skill must keep the self-send prohibition"
         );
-        // Token addressing reaches panes the user is not looking at — say so.
         assert!(
             SKILL_MD.contains("the user may not see it happen"),
             "the skill must note that a token-addressed write is invisible to the user"
@@ -6935,8 +6688,6 @@ mod pane_arg_tests {
 
     #[test]
     fn plain_integers_stay_indexes() {
-        // Every invocation that works today must keep working identically — including the
-        // leading `+` that Rust's usize parser accepts.
         for (arg, want) in [("0", 0usize), ("12", 12), ("+0", 0)] {
             match classify_pane_arg(arg) {
                 Some(PaneArg::Index(i)) => assert_eq!(i, want, "{arg}"),
@@ -7031,7 +6782,6 @@ mod send_split_proto_tests {
             caller: None,
         };
         let line = serde_json::to_string(&req).unwrap();
-        // Unset flags stay off the wire, so an older server sees exactly the shape it knows.
         assert!(!line.contains("paste") && !line.contains("enter"), "{line}");
         match serde_json::from_str::<Req>(&line).unwrap() {
             Req::SendKeys { target, index, .. } => {
@@ -7088,7 +6838,6 @@ mod split_exit_tests {
                 "fixture is wrong: {missing:?}"
             );
         }
-        // And a real one is usable.
         assert!(
             !Resp::split("ab12-4".into())
                 .pane
@@ -7099,8 +6848,6 @@ mod split_exit_tests {
     }
 }
 
-/// `comux machines` / `comux list-agents --fleet`, or `None` when this is not a fleet verb.
-/// Returns an exit code the caller passes straight back.
 fn fleet_verb(args: &[String]) -> Option<i32> {
     const MACHINES: Spec = cliargs::bare("usage: comux machines [--json]");
     const AGENTS: Spec = Spec {
@@ -7152,7 +6899,6 @@ fn print_machines(json: bool) -> i32 {
         return 0;
     }
     if machines.is_empty() {
-        // Not an error: one machine is the normal case. Say where they would go.
         println!("(no machines configured — add a [machines.<name>] table to mux.toml)");
         return 0;
     }
