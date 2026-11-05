@@ -1,14 +1,9 @@
 import AppKit
 import CopadCore
 
-/// NSSplitView subclass that distributes all subviews equally on the first resize pass.
-/// Works for any number of subviews (N panes → each gets 1/N of available space).
-/// After the initial layout the user can freely drag dividers to any position.
-///
-/// Using NSSplitViewDelegate.splitView(_:resizeSubviewsWithOldSize:) rather than
-/// layout() because NSSplitView sets subview frames via resizeSubviews, which runs
-/// *before* layout(). By the time layout() fires, the (wrong) frames are already
-/// committed. The delegate method intercepts at exactly the right moment.
+/// NSSplitView that distributes subviews equally on the first resize pass; afterwards the user
+/// can drag dividers freely. Done in the delegate's `resizeSubviewsWithOldSize` because
+/// NSSplitView sets frames in resizeSubviews, before `layout()` runs.
 private class EqualSplitView: NSSplitView, NSSplitViewDelegate {
     private var initialSizeSet = false
 
@@ -30,7 +25,6 @@ private class EqualSplitView: NSSplitView, NSSplitViewDelegate {
         }
 
         if initialSizeSet {
-            // After initial sizing: let NSSplitView handle normal proportional resize.
             splitView.adjustSubviews()
             return
         }
@@ -56,60 +50,47 @@ private class EqualSplitView: NSSplitView, NSSplitViewDelegate {
 
 enum InitialPanel {
     case terminal
-    /// PR 8 — terminal seeded with a specific cwd and/or initial PTY
-    /// input. Used by `claude.start` to land the user in a worktree
-    /// directory and feed the `tmux new-session` command. Separate
-    /// case (rather than associated values on `.terminal`) so existing
-    /// `.terminal` callers stay unchanged.
+    /// Terminal seeded with a cwd and/or initial PTY input (used by `claude.start`); separate from
+    /// `.terminal` so existing callers stay unchanged.
     case terminalSeed(cwd: String?, initialInput: String?)
     case webview(url: URL?)
-    /// Tier 4.1 — pre-constructed plugin panel. Caller (TabViewController)
-    /// builds the PluginPanelController itself because it needs the registry
-    /// + event bus references; PaneManager just embeds it.
+    /// Pre-constructed plugin panel; TabViewController builds it because it needs the registry
+    /// and event bus.
     case pluginPanel(any CopadPanel)
 }
 
-/// Manages the split-pane tree for a single tab.
-/// TabViewController embeds `containerView` once; PaneManager rebuilds its
-/// contents on every split/close using fresh NSSplitView instances.
+/// Manages the split-pane tree for a single tab, rebuilding `containerView`'s contents on every
+/// split/close.
 @MainActor
 final class PaneManager {
-    /// Mutable so split-spawned panes after a config hot-reload pick up the new values
-    /// (theme/font/security). `applyTheme` / `applyFont` / `applyOSC52Policy` already
-    /// fan out to existing panes; updating the snapshot here keeps new splits in step.
+    /// Mutable so panes split after a config hot-reload get the new values; `applyTheme` /
+    /// `applyFont` / `applyOSC52Policy` already update existing panes.
     private var config: CopadConfig
     private var theme: CopadTheme
 
     private(set) var root: SplitNode
     private(set) var activePane: any CopadPanel
 
-    /// Stable container — TabViewController pins this to contentArea once and never re-embeds.
+    /// Stable container, pinned to contentArea once by TabViewController.
     let containerView: NSView
 
     var onLastPaneClosed: (() -> Void)?
-    /// Fires after any new pane is added to this tab (split, webview
-    /// split, plugin split). TabViewController uses it to fan
-    /// runtime-applied state (window-level background, …) onto the
-    /// new pane — the pane was constructed from `self.config`, which
-    /// only carries load-time bg state, so without this hook a split
-    /// after a `background.set` socket call would render the new
-    /// pane opaque and cover the wallpaper.
+    /// Fires after any new pane is added. The pane was built from `self.config`, which carries
+    /// only load-time background state, so TabViewController uses this to apply runtime state
+    /// (e.g. after `background.set`) or the new pane would cover the wallpaper.
     var onPaneAdded: ((any CopadPanel) -> Void)?
     var onActivePaneChanged: (() -> Void)?
-    /// Fires whenever the split tree changes shape (a pane closes) even if the
-    /// active pane is unchanged — e.g. a background terminal exiting via
-    /// `close_on_exit`. TabViewController uses it to schedule a session save so
-    /// non-active-pane closes aren't lost on crash (decision #61 C4).
+    /// Fires when the split tree changes shape (e.g. a background terminal exiting via
+    /// `close_on_exit`) even if the active pane is unchanged, so TabViewController can save the
+    /// session (decision #61 C4).
     var onLayoutChanged: (() -> Void)?
 
-    /// Propagated from AppDelegate so all panels can emit events.
     weak var eventBus: EventBus? {
         didSet { propagateEventBus() }
     }
 
     private nonisolated(unsafe) var clickMonitor: Any?
-    /// Tracks the fill constraints added to containerView so they can be
-    /// deactivated before the next rebuild.
+    /// Fill constraints on containerView, deactivated before the next rebuild.
     private var rootConstraints: [NSLayoutConstraint] = []
 
     // MARK: - Init
@@ -157,20 +138,14 @@ final class PaneManager {
 
         setActive(newTermVC)
         newTermVC.startIfNeeded()
-        // Notify TabViewController so it can fan runtime state
-        // (window-level background, …) onto the new pane.
+        // Lets TabViewController fan runtime state (window-level background) onto the new pane.
         onPaneAdded?(newTermVC)
-        // Target the panel's `focusTarget` (the inner keyboard view)
-        // rather than `view` — alacritty panes wrap the render view in
-        // a layout container that doesn't accept first-responder, so
-        // targeting `view` silently fails.
+        // Target `focusTarget`: alacritty panes wrap the render view in a container that does
+        // not accept first-responder.
         newTermVC.view.window?.makeFirstResponder(newTermVC.focusTarget)
     }
 
-    /// Factory: construct the terminal renderer. Phase 10b removed
-    /// the SwiftTerm fallback — alacritty is the only macOS backend
-    /// now. A stale `[renderer] backend = "swiftterm"` config key is
-    /// simply never read by `CopadConfig.parse`, so it's tolerated.
+    /// Factory for the terminal renderer (alacritty is the only backend).
     static func makeTerminalPanel(
         config: CopadConfig,
         theme: CopadTheme,
@@ -180,19 +155,15 @@ final class PaneManager {
         AlacrittyTerminalViewController(config: config, theme: theme, cwd: cwd, initialInput: initialInput)
     }
 
-    /// `background: true` adds the pane WITHOUT focusing it — the shape an
-    /// agent asks for. Previously `--background` was silently ignored here, so
-    /// `webview.open --background --mode split_h` still moved the user's focus.
+    /// `background: true` adds the pane without focusing it, as an agent asks for.
     func splitActiveWithWebView(
         url: URL? = nil,
         orientation: SplitOrientation = .horizontal,
         background: Bool = false,
     ) {
         let previouslyActive = activePane
-        // The RESPONDER, not just the pane. Restoring the pane and calling
-        // `makeFirstResponder(focusTarget)` would still evict a field editor —
-        // if the user was mid-edit in the URL bar, their caret and selection
-        // would be gone even though the "focused pane" looked unchanged.
+        // Save the responder, not just the pane: refocusing the pane would evict a field editor
+        // and lose the caret if the user was mid-edit in the URL bar.
         let previousWindow = activePane.view.window
         let previousResponder = previousWindow?.firstResponder
         let webVC = WebViewController(url: url)
@@ -207,8 +178,7 @@ final class PaneManager {
         webVC.startIfNeeded()
         onPaneAdded?(webVC)
         if background {
-            // The new pane still has to be started (above) so it loads and can
-            // be driven; only the focus move is skipped.
+            // The pane is still started so it loads; only the focus move is skipped.
             setActive(previouslyActive)
             if let previousResponder, let previousWindow {
                 previousWindow.makeFirstResponder(previousResponder)
@@ -220,9 +190,7 @@ final class PaneManager {
         }
     }
 
-    /// Tier 4.1 — split with a pre-built plugin panel. Caller assembles the
-    /// PluginPanelController (registry + eventBus deps) and hands us the
-    /// CopadPanel to embed; PaneManager doesn't reach into AppDelegate state.
+    /// Split with a pre-built plugin panel, so PaneManager need not reach into AppDelegate state.
     func splitActiveWithPluginPanel(_ panel: any CopadPanel, orientation: SplitOrientation = .horizontal) {
         assignEventBus(to: panel)
         wirePanel(panel)
@@ -241,13 +209,8 @@ final class PaneManager {
         closePanel(activePane)
     }
 
-    /// Close a specific pane (Cmd+W via `closeActive`, or auto-close
-    /// from `[terminal] close_on_exit` when a shell terminates in any
-    /// pane — not necessarily the active one). When the closed pane
-    /// was the last leaf, fires `onLastPaneClosed` so TabViewController
-    /// can drop the tab (and the window if it was the last tab).
-    /// When a non-active pane closes, the active pane keeps focus —
-    /// only an active-pane close transfers focus to a sibling.
+    /// Close a specific pane (Cmd+W, or `close_on_exit` in any pane). Closing the last leaf fires
+    /// `onLastPaneClosed`. Only an active-pane close moves focus to a sibling.
     func closePanel(_ closing: any CopadPanel) {
         let closingActive = ObjectIdentifier(closing as AnyObject) == ObjectIdentifier(activePane as AnyObject)
         guard let newRoot = root.removing(closing) else {
@@ -269,9 +232,8 @@ final class PaneManager {
         } else {
             activePane.view.window?.makeFirstResponder(activePane.focusTarget)
         }
-        // The tree changed shape regardless of whether the active pane moved,
-        // so persist it (an active close already notified via setActive, but a
-        // duplicate is harmless — the save is debounced).
+        // The tree changed shape even if the active pane did not move; the save is debounced, so
+        // a duplicate notification is harmless.
         onLayoutChanged?()
     }
 
@@ -297,35 +259,27 @@ final class PaneManager {
         root.allLeaves()
     }
 
-    /// Tier 1.1 — pane focus navigation. Cycle the active pane forward (`+1`)
-    /// or backward (`-1`) over the DFS order of leaves under `root`. Wraps
-    /// at both ends. No-op when the tab has only one pane. Used by the
-    /// Cmd+Shift+] / Cmd+Shift+[ menu items in `AppDelegate`.
+    /// Cycle the active pane forward (`+1`) or backward (`-1`) over the DFS leaf order, wrapping.
+    /// Used by the Cmd+Shift+] / [ menu items.
     func focusNextPane(direction: Int = 1) {
         let leaves = root.allLeaves()
         guard leaves.count > 1 else { return }
         let currentIdx = leaves.firstIndex { ObjectIdentifier($0 as AnyObject) == ObjectIdentifier(activePane as AnyObject) }
         guard let idx = currentIdx else { return }
         let count = leaves.count
-        // Modulo handles both directions including negative wrap.
         let nextIdx = ((idx + direction) % count + count) % count
         let next = leaves[nextIdx]
         setActive(next)
         next.view.window?.makeFirstResponder(next.focusTarget)
     }
 
-    /// All terminal panels in DFS leaf order. Returns the
-    /// backend-agnostic `TerminalCapable` interface — alacritty is
-    /// the only conformer today but the protocol keeps call sites
-    /// free of backend identity.
+    /// All terminal panels in DFS leaf order.
     func allTerminals() -> [any TerminalCapable] {
         root.allLeaves().compactMap { $0 as? TerminalCapable }
     }
 
-    /// Active terminal-typed accessor used by socket `terminal.*`
-    /// dispatch. Returns nil if the focused pane is non-terminal
-    /// (webview / plugin), which AppDelegate surfaces as
-    /// `wrong_panel_type`.
+    /// Active terminal for socket `terminal.*` dispatch; nil for webview/plugin panes
+    /// (`wrong_panel_type`).
     func activeTerminalPanel() -> (any TerminalCapable)? {
         activePane as? TerminalCapable
     }
@@ -340,14 +294,8 @@ final class PaneManager {
 
     // MARK: - Session persistence
 
-    /// Build a wire snapshot of this tab's split tree. Returns nil
-    /// when no terminal panel survived the walk (webview-only or
-    /// plugin-only tabs are skipped to keep parity with Linux —
-    /// `panel.as_terminal()` filter in `tabs.rs::snapshot_session`).
-    /// Build a v3 wire snapshot of this tab's split tree: typed leaves
-    /// (terminal cwd / webview url / plugin ref / cockpit) + normalized divider
-    /// ratios captured from the LIVE split views. Walks the model tree and the
-    /// parallel NSSplitView tree together so `ratio` reflects real sizes.
+    /// Typed leaves plus divider ratios captured from the live split views, walking the model
+    /// and NSSplitView trees together so `ratio` reflects real sizes.
     func snapshotTree() -> Session.SplitSnap? {
         buildSnapV3(node: root, view: containerView.subviews.first)
     }
@@ -359,9 +307,8 @@ final class PaneManager {
         case let .branch(orientation, children):
             let wire: Session.SplitOrientation = (orientation == .horizontal) ? .horizontal : .vertical
             let sv = view as? NSSplitView
-            // A `.horizontal` SplitNode renders as a vertical NSSplitView
-            // (panes side-by-side), so its split axis is width; `.vertical`
-            // stacks top/bottom, axis is height.
+            // A `.horizontal` SplitNode is a vertical NSSplitView (side-by-side), so its axis is
+            // width; `.vertical` stacks top/bottom.
             let axisIsWidth = (orientation == .horizontal)
             var pairs: [(Session.SplitSnap, CGFloat)] = []
             for (i, child) in children.enumerated() {
@@ -376,8 +323,7 @@ final class PaneManager {
 
     private func paneContent(_ panel: any CopadPanel) -> Session.PaneContent {
         if let t = panel as? AlacrittyTerminalViewController {
-            // An unavailable-plugin placeholder re-captures as its plugin so the
-            // reference isn't lost on re-save (decision #61 C5).
+            // An unavailable-plugin placeholder re-captures as its plugin (decision #61 C5).
             if let pluginRef = t.unavailablePluginRef {
                 return .plugin(name: pluginRef, panelName: nil, version: nil)
             }
@@ -385,11 +331,9 @@ final class PaneManager {
         }
         if let w = panel as? WebViewController {
             let policy = config.browserRestore
-            // One source for both fields, so the pane's `url` and its tab's
-            // `url` cannot disagree about which page this is. `snapshotSourceURL`
-            // (not `currentURL`) because a pane still loading has no live URL
-            // yet and `currentURL` would report "" — autosave would then erase
-            // the pane before it finished opening.
+            // One source for both fields so the pane `url` and its tab `url` agree.
+            // `snapshotSourceURL`, not `currentURL`: a pane still loading has no live URL, and
+            // autosave would erase it.
             return .webview(
                 url: BrowserFFI.canonicalize(w.snapshotSourceURL, policy: policy).url,
                 pane: w.snapshotPane(policy: policy),
@@ -401,7 +345,7 @@ final class PaneManager {
         if panel is CockpitViewController {
             return .cockpit
         }
-        // Unknown panel type — persist as a fresh terminal (harmless on restore).
+        // Unknown panel type: persist as a fresh terminal.
         return .terminal(cwd: nil)
     }
 
@@ -413,10 +357,8 @@ final class PaneManager {
         return min(max(r, minRatio), maxRatio)
     }
 
-    /// Fold an n-ary branch (with each child's live size along the split axis)
-    /// into a right-leaning binary tree, computing each divider's real ratio
-    /// from the cumulative sizes. Falls back to 0.5 when sizes are unknown
-    /// (tab never displayed).
+    /// Fold an n-ary branch into a right-leaning binary tree, computing each divider's ratio from
+    /// the cumulative live sizes along the split axis; 0.5 when sizes are unknown.
     private static func foldBinary(
         orientation: Session.SplitOrientation,
         pairs: [(Session.SplitSnap, CGFloat)],
@@ -431,20 +373,14 @@ final class PaneManager {
         return .branch(orientation: orientation, ratio: ratio, first: head.0, second: restSnap)
     }
 
-    /// Factory for reopening a plugin panel on restore. Injected by
-    /// TabViewController (which gets it from AppDelegate's registry) because
-    /// plugin construction needs the manifest store + action registry PaneManager
-    /// can't reach. `panelName` selects the specific panel of a multi-panel
-    /// plugin. Returns nil when the plugin is uninstalled → placeholder.
+    /// Factory for reopening a plugin panel on restore, injected because construction needs the
+    /// manifest store and action registry PaneManager cannot reach. `panelName` selects one panel
+    /// of a multi-panel plugin. Nil (plugin uninstalled) gives a placeholder.
     var pluginFactory: ((_ name: String, _ panelName: String?) -> (any CopadPanel)?)?
 
-    /// Factory for reopening the agent cockpit pane on restore (a `.cockpit`
-    /// leaf). Injected by AppDelegate, which owns the cockpit model. nil →
-    /// placeholder terminal.
+    /// Factory for reopening the agent cockpit pane on restore; nil gives a placeholder terminal.
     var cockpitFactory: (() -> (any CopadPanel)?)?
 
-    /// Build a live panel from persisted v3 pane content. Used to seed a
-    /// restored tab's first pane and each split leaf.
     static func makePanel(
         from content: Session.PaneContent,
         config: CopadConfig,
@@ -456,32 +392,28 @@ final class PaneManager {
         case let .terminal(cwd):
             return AlacrittyTerminalViewController(config: config, theme: theme, cwd: cwd, initialInput: nil)
         case let .webview(url, pane):
-            // An untrusted snapshot goes through the core normalizer before it
-            // reaches a controller. A rule that could not be consulted yields
-            // nil, and the pane falls back to single-URL restore rather than
-            // trusting unvalidated data.
+            // An untrusted snapshot goes through the core normalizer; if the rule cannot be
+            // consulted the pane falls back to single-URL restore.
             let checked = pane.flatMap { BrowserFFI.normalize($0) }
             return WebViewController(url: URL(string: url), pane: checked)
         case let .plugin(name, panelName, _):
             if let factory = pluginFactory, let panel = factory(name, panelName) {
                 return panel
             }
-            // Plugin uninstalled / no factory: a placeholder terminal tagged with
-            // the plugin ref so the next snapshot re-captures it AS the plugin
-            // (the ref survives re-saves until the plugin returns — decision #61
-            // C5). The name is NOT interpolated into shell input.
+            // Plugin uninstalled or no factory: a placeholder terminal tagged with the plugin ref,
+            // so re-saves keep the ref until the plugin returns (decision #61 C5). The name is not
+            // interpolated into shell input.
             let placeholder = AlacrittyTerminalViewController(config: config, theme: theme)
             placeholder.unavailablePluginRef = name
             return placeholder
         case .cockpit:
             if let factory = cockpitFactory, let panel = factory() { return panel }
-            // Cockpit model unavailable → placeholder terminal keeps the layout.
+            // No cockpit model: a placeholder terminal keeps the layout.
             return AlacrittyTerminalViewController(config: config, theme: theme)
         }
     }
 
-    /// Content of the leftmost (DFS pre-order) leaf — seeds the panel that opens
-    /// a restored tab / split subtree.
+    /// Content of the leftmost (DFS pre-order) leaf, which seeds a restored tab or subtree.
     static func leftmostContent(_ snap: Session.SplitSnap) -> Session.PaneContent {
         switch snap {
         case let .leaf(content): return content
@@ -490,10 +422,7 @@ final class PaneManager {
     }
 
 
-    /// First non-nil custom title in DFS order. Mirrors Linux's
-    /// per-tab custom-title lookup (collect panels, find_map). Returns
-    /// nil if no panel has a custom title — restored tab falls back to
-    /// the live title (cwd / process name) on reopen.
+    /// First non-nil custom title in DFS order, mirroring Linux; nil falls back to the live title.
     func customTabTitle() -> String? {
         for panel in allPanels() {
             if let t = panel as? TerminalCapable, let title = t.customTitle {
@@ -503,12 +432,9 @@ final class PaneManager {
         return nil
     }
 
-    /// Replay a saved v3 snap onto an existing leaf panel. Walks the snap
-    /// depth-first: every Branch turns into one new typed panel (seeded from the
-    /// leftmost content of `second`), pushed into the live tree via the same
-    /// `SplitNode.splitting` the interactive split path uses. Leaf snaps are
-    /// no-ops — the target leaf already represents that cell. Divider ratios are
-    /// applied separately by `applyPendingRatios` once the views are sized.
+    /// Replay a saved snap onto an existing leaf: each Branch becomes one new typed panel (seeded
+    /// from the leftmost content of `second`) via `SplitNode.splitting`. Leaf snaps are no-ops.
+    /// Ratios are applied later by `applyPendingRatios`.
     func restoreTree(into target: any CopadPanel, from snap: Session.SplitSnap) {
         guard case let .branch(orientation, _, first, second) = snap else { return }
         let newPanel = Self.makePanel(
@@ -530,21 +456,18 @@ final class PaneManager {
 
     // MARK: - Divider-ratio restore
 
-    /// The persisted layout for this tab, held after restore so divider ratios
-    /// can be applied once the split views have a real (non-zero) size — they're
-    /// zero until the tab is displayed. Applied + cleared by `applyPendingRatios`.
+    /// The persisted layout, held until the split views have a non-zero size (they are zero until
+    /// the tab is displayed).
     private var pendingRatioLayout: Session.SplitSnap?
 
-    /// Record the restored layout and start trying to apply its divider ratios.
     func setPendingRatioLayout(_ snap: Session.SplitSnap) {
         pendingRatioLayout = snap
         scheduleApplyRatios()
     }
 
-    /// Apply persisted divider ratios to the live split views if they are sized;
-    /// no-op (leaves the layout pending) while the tab is still zero-sized.
-    /// Called from `setPendingRatioLayout` (active tab) and `TabViewController.
-    /// switchTab` (when an off-screen tab is first shown).
+    /// Apply persisted divider ratios once the split views are sized; otherwise leave the layout
+    /// pending. Also called from `TabViewController.switchTab` when an off-screen tab is first
+    /// shown.
     func applyPendingRatios() {
         guard let snap = pendingRatioLayout, let rootView = containerView.subviews.first else { return }
         containerView.layoutSubtreeIfNeeded()
@@ -558,18 +481,17 @@ final class PaneManager {
         DispatchQueue.main.async { [weak self] in
             guard let self, pendingRatioLayout != nil else { return }
             applyPendingRatios()
-            // Retry a bounded number of times while the active tab lays out; if
-            // still pending (off-screen tab), switchTab applies it on display.
+            // Bounded retry while the active tab lays out; an off-screen tab is handled by
+            // `switchTab`.
             if pendingRatioLayout != nil, attempt < 20 {
                 scheduleApplyRatios(attempt: attempt + 1)
             }
         }
     }
 
-    /// Walk the persisted snap alongside the live split-view tree, setting each
-    /// divider to its persisted ratio. The restored tree is binary (each restore
-    /// step creates a 2-child branch), so `first` ↔ subview 0 and `second` ↔
-    /// subview 1, matching `restoreTree`.
+    /// Walk the persisted snap alongside the live split views, setting each divider's ratio. The
+    /// restored tree is binary, so `first` is subview 0 and `second` is subview 1, as in
+    /// `restoreTree`.
     private static func applyRatios(snap: Session.SplitSnap, view: NSView) {
         guard case let .branch(_, ratio, first, second) = snap,
               let sv = view as? NSSplitView, sv.subviews.count >= 2 else { return }
@@ -582,11 +504,8 @@ final class PaneManager {
         applyRatios(snap: second, view: sv.subviews[1])
     }
 
-    /// Fan a background-applied notification to every pane's render
-    /// view so default-bg cells flip transparent. Image + tint are
-    /// now drawn at the window level (TabViewController owns the
-    /// NSImageView / tint overlay) — these per-pane calls just
-    /// update renderer state. Kept for new-tab inheritance.
+    /// Flip default-bg cells transparent in every pane's renderer; the image and tint are drawn
+    /// at the window level by TabViewController. Kept for new-tab inheritance.
     func applyBackground(path: String, tint: Double, opacity: Double) {
         allPanels().forEach { $0.applyBackground(path: path, tint: tint, opacity: opacity) }
     }
@@ -599,18 +518,13 @@ final class PaneManager {
         allPanels().forEach { $0.setTint(alpha) }
     }
 
-    /// Expose the live `window.opacity` for TabViewController's
-    /// window-level bg / tint alpha calc. Held on the per-pane config
-    /// snapshot; PaneManager.applyConfig keeps it fresh.
+    /// The live `window.opacity` for TabViewController's window-level background alpha.
     func configWindowOpacity() -> Double {
         config.windowOpacity
     }
 
-    /// Single hot-reload entry: snapshot the new config/theme so
-    /// split-spawned panes pick them up, then fan out to live alacritty
-    /// terminals. Methods called here are alacritty-specific (not on
-    /// the `TerminalCapable` protocol — the protocol covers the
-    /// socket-facing surface, not internal config hooks).
+    /// Single hot-reload entry: snapshot the config/theme for future splits, then fan out to live
+    /// alacritty terminals. These hooks are alacritty-specific, not on `TerminalCapable`.
     func applyConfig(_ newConfig: CopadConfig, theme newTheme: CopadTheme) {
         let oldKitty = config.kittyKeyboard
         let oldScrollback = config.scrollback
@@ -640,8 +554,8 @@ final class PaneManager {
 
     // MARK: - View Hierarchy
 
-    /// Rebuilds the entire view hierarchy from the SplitNode tree.
-    /// This is called on every split/close, creating fresh EqualSplitViews each time.
+    /// Rebuilds the view hierarchy from the SplitNode tree with fresh EqualSplitViews on every
+    /// split/close.
     private func rebuildViewHierarchy() {
         NSLayoutConstraint.deactivate(rootConstraints)
         rootConstraints = []
@@ -661,8 +575,8 @@ final class PaneManager {
         rootConstraints = constraints
     }
 
-    /// Recursively builds the view tree. NSSplitView manages subview sizing,
-    /// so direct children use translatesAutoresizingMaskIntoConstraints = true.
+    /// NSSplitView sizes its subviews, so direct children keep
+    /// `translatesAutoresizingMaskIntoConstraints = true`.
     private func buildView(from node: SplitNode) -> NSView {
         switch node {
         case let .leaf(panel):
@@ -702,20 +616,9 @@ final class PaneManager {
 
     // MARK: - Panel Wiring
 
-    /// Wire lifecycle callbacks on a newly-created panel. Today the
-    /// only hook is alacritty's child-exit close cascade, gated on
-    /// `[terminal] close_on_exit` — when the user's shell exits
-    /// (Ctrl+D, `exit`, killed parent), we close the owning pane;
-    /// PaneManager's `closePanel` cascades up to TabViewController's
-    /// `onLastPaneClosed` if it was the last leaf, mirroring Linux's
-    /// `tab.close_panel` → `notebook.remove_page` chain in
-    /// `copad-linux/src/tabs.rs::handle_panel_exit`. Webview /
-    /// plugin panels are no-ops here (no PTY child).
-    ///
-    /// The gate is checked at fire time (not at wiring time) so a
-    /// hot-reload of `close_on_exit` applies to already-open panes —
-    /// matches Linux's live read of `self.config.borrow().terminal.
-    /// close_on_exit` inside `handle_panel_exit`.
+    /// Wires alacritty's child-exit close cascade, gated on `[terminal] close_on_exit`, mirroring
+    /// `copad-linux/src/tabs.rs::handle_panel_exit`. The gate is read at fire time so a hot-reload
+    /// applies to already-open panes. Webview and plugin panels have no PTY child.
     private func wirePanel(_ panel: any CopadPanel) {
         guard let alac = panel as? AlacrittyTerminalViewController else { return }
         alac.onChildExited = { [weak self] panel in

@@ -10,28 +10,22 @@ final class TabViewController: NSViewController {
     /// Mutable so config hot-reload affects panes spawned AFTER the reload (theme/font/security).
     /// Existing panes are updated separately via `applyConfig` fan-out.
     private var config: CopadConfig
-    /// `private(set)` so AppDelegate's plugin-panel construction path can
-    /// pass the active theme into PluginPanelController without piping it
-    /// through every call site.
     private(set) var theme: CopadTheme
 
     private var tabBar: TabBarView!
-    /// The tab bar's primary size constraint — height for horizontal
-    /// (top/bottom) bars, width for vertical (left/right) bars. Held so
-    /// collapse/expand can shrink a vertical bar to icon-only width.
+    /// The tab bar's primary size constraint (height for horizontal bars, width for vertical),
+    /// held so collapse/expand can shrink a vertical bar to icon-only width.
     private var tabBarSizeConstraint: NSLayoutConstraint?
 
-    /// Debounced v2 session persistence (decision #61 C4). Coalesces rapid
-    /// structural mutations into one atomic write so a crash / forced kill
-    /// loses at most the debounce window, not the whole session — the old
-    /// path only saved on orderly `applicationWillTerminate`. This VC is the
-    /// single writer. Suppressed during restore so replay doesn't re-save.
+    /// Debounced session persistence (decision #61 C4). Coalesces structural mutations into one
+    /// atomic write so a crash loses at most the debounce window. This VC is the single writer;
+    /// suppressed during restore so replay doesn't re-save.
     private var sessionSaveTimer: Timer?
     /// Removal tokens for the controller-scoped notification observers.
     private var globalObservers: [any NSObjectProtocol] = []
     private var suppressSessionSave = false
 
-    /// Reopens a plugin panel by name on session restore (decision #61 slice 6).
+    /// Reopens a plugin panel by name on session restore (decision #61).
     /// Set by AppDelegate, which owns the manifest store + action registry that
     /// plugin construction needs. nil-returning name → unavailable placeholder.
     var pluginFactory: ((_ name: String, _ panelName: String?) -> (any CopadPanel)?)?
@@ -73,28 +67,17 @@ final class TabViewController: NSViewController {
     private var comuxServed: [String] = []
     /// What this window's comux chrome shows (the comux its visible panes host).
     private let comuxWindow = ComuxWindow()
-    /// Window-level background image (Phase 10b follow-up). One image
-    /// fills the entire `contentArea` so splits share the same
-    /// wallpaper instead of each pane duplicating it. Lazily created
-    /// on first `applyBackground`. z-order: inserted below the
-    /// PaneManager containerView so panes (with transparent
-    /// default-bg cells via `setImageBackgroundActive`) overlay it.
-    /// Layer-backed plain NSView (not `NSImageView`). `NSImageView`'s
-    /// `imageScaling` doesn't include a CSS `cover`-equivalent mode —
-    /// `.scaleAxesIndependently` (stretch) distorts the image,
-    /// `.scaleProportionallyUpOrDown` (CSS `contain`) leaves letterbox
-    /// bars. We want fill-and-crop. CALayer's `contentsGravity =
-    /// .resizeAspectFill` is the exact equivalent of CSS `background-
-    /// size: cover` — image scales up until it fully covers the view
-    /// while preserving aspect ratio, overflow is clipped. Matches
-    /// Linux's `gtk4::Picture::set_content_fit(ContentFit::Cover)`.
+    /// Window-level background image: one image fills the whole `contentArea` so splits share a
+    /// wallpaper. Created lazily, inserted below the PaneManager containerView so panes with
+    /// transparent default-bg cells overlay it. A layer-backed plain NSView with
+    /// `contentsGravity = .resizeAspectFill` (CSS `cover`, like Linux's `ContentFit::Cover`):
+    /// `NSImageView` has no fill-and-crop scaling mode.
     private var backgroundView: NSView?
     private var tintView: NSView?
-    /// Monotonic load token guards against a slow `NSImage(contentsOfFile:)`
-    /// decode landing after a newer applyBackground/clearBackground
-    /// took ownership of the visual state.
+    /// Monotonic load token: drops a slow decode that lands after a newer
+    /// applyBackground/clearBackground.
     private var backgroundLoadToken: UInt64 = 0
-    /// Tier 4.2 — status bar at the bottom of the window. nil when
+    /// Status bar at the bottom of the window. nil when
     /// `[statusbar] enabled = false`. Public so AppDelegate can wire
     /// it up post-launch (load modules from discovered plugin manifests
     /// + handle statusbar.show/hide/toggle socket commands).
@@ -106,24 +89,20 @@ final class TabViewController: NSViewController {
     /// AppDelegate, which owns the cockpit model. nil → placeholder terminal.
     var cockpitFactory: (() -> (any CopadPanel)?)?
 
-    /// Number of tabs. Exposed so the `cmd+shift+N` numeric jump only swallows the
-    /// key when that tab actually exists — otherwise `cmd+shift+5` with 3 tabs
-    /// should fall through as a normal keystroke.
+    /// Number of tabs, so the `cmd+shift+N` jump only swallows the key when that tab exists.
     var tabCount: Int { paneManagers.count }
 
     // Retained so new tabs inherit the current background state
     private(set) var currentBackgroundPath: String?
     private(set) var currentBackgroundTint: Double = 0.6
     private(set) var currentBackgroundOpacity: Double = 1.0
-    // Whether `currentBackgroundPath` was picked from the wallpaper list
-    // (rotation / `background.next` / `toggle`) rather than set manually or
-    // via `[background] image`. `background.delete_current` only ever
-    // deletes a list-picked image — matches Linux's `current.1` flag.
+    // Whether `currentBackgroundPath` was picked from the wallpaper list rather than set
+    // manually or via `[background] image`; `background.delete_current` only deletes a
+    // list-picked image (Linux's `current.1` flag).
     private(set) var currentBackgroundFromList = false
 
-    // Tab bar collapsed state.
-    // Default: collapsed (icon-only). Auto-expands on 1→2 tab transition
-    // unless the user has manually toggled the bar.
+    // Tab bar collapsed state. Default collapsed (icon-only); auto-expands on 1->2 tabs unless
+    // the user toggled the bar manually.
     private var isBarCollapsed: Bool = true
     private var userToggledBar: Bool = false
 
@@ -132,13 +111,10 @@ final class TabViewController: NSViewController {
         didSet { paneManagers.forEach { $0.eventBus = eventBus } }
     }
 
-    /// Invoked when the "+" popover's plugin-panel row is clicked. Kept
-    /// as a callback (set by AppDelegate at launch) so TabViewController
-    /// stays free of `ActionRegistry` / `EventBus` dependencies for
-    /// plugin construction — AppDelegate owns those and runs the same
-    /// path the `plugin.open` RPC takes. Closure is called on the main
-    /// actor (the popover dispatch lives there). Mode mirrors the RPC's
-    /// `mode` param ("tab" / "split_h" / "split_v").
+    /// Invoked when the "+" popover's plugin-panel row is clicked. A callback so
+    /// TabViewController stays free of `ActionRegistry` / `EventBus` dependencies; AppDelegate
+    /// runs the same path as the `plugin.open` RPC. Called on the main actor; mode mirrors the
+    /// RPC's `mode` ("tab" / "split_h" / "split_v").
     var onOpenPlugin: ((_ name: String, _ panelName: String, _ mode: AddPanelMode) -> Void)?
 
     var isTabBarCollapsed: Bool {
@@ -149,10 +125,6 @@ final class TabViewController: NSViewController {
         paneManagers.indices.contains(activeIndex) ? paneManagers[activeIndex] : nil
     }
 
-    /// Backend-agnostic terminal accessor — returns the active
-    /// alacritty controller via the `TerminalCapable` protocol, or
-    /// nil for webview / plugin panes. Used by socket `terminal.*`
-    /// dispatch.
     var activeTerminalPanel: (any TerminalCapable)? {
         activePaneManager?.activeTerminalPanel()
     }
@@ -161,16 +133,11 @@ final class TabViewController: NSViewController {
         activePaneManager?.activeWebView()
     }
 
-    /// Polymorphic zoom dispatch — works for any pane that conforms
-    /// to `Zoomable`. Returns nil for non-zoomable panes (webview,
-    /// plugin) so the View → Zoom menu items become no-ops there.
     var activeZoomable: (any Zoomable)? {
         activePaneManager?.activePane as? Zoomable
     }
 
-    /// Cross-tab panel lookup by stable UUID. Used by socket commands that take an
-    /// `id` param (parity with Linux's `find_panel_by_id`). Walks every tab's split
-    /// tree — O(N panels) but N is small in practice.
+    /// Cross-tab panel lookup by stable UUID (Linux `find_panel_by_id`).
     func panel(id: String) -> (any CopadPanel)? {
         for manager in paneManagers {
             if let p = manager.allPanels().first(where: { $0.panelID == id }) {
@@ -180,11 +147,8 @@ final class TabViewController: NSViewController {
         return nil
     }
 
-    /// Per-pane snapshot for the agent cockpit — terminal panes only (agents run
-    /// there; excludes webview/plugin/cockpit panels). `paneManagers` is private,
-    /// so this is the public enumeration entry point. macOS has no
-    /// `terminal.cwd_changed` event, so cwd is pulled from `reportedCwd` here at
-    /// each refresh rather than tracked incrementally.
+    /// Per-pane snapshot for the agent cockpit, terminal panes only. macOS has no
+    /// `terminal.cwd_changed` event, so cwd is pulled from `reportedCwd` at each refresh.
     func terminalPaneSnapshot() -> [(panelID: String, title: String, cwd: String, tabIndex: Int)] {
         var rows: [(panelID: String, title: String, cwd: String, tabIndex: Int)] = []
         for (i, manager) in paneManagers.enumerated() {
@@ -197,9 +161,8 @@ final class TabViewController: NSViewController {
         return rows
     }
 
-    /// Focus a pane by id from anywhere (cockpit click): switch to its tab, make
-    /// it the active pane, and give it keyboard focus. Composes the primitives —
-    /// there is no single such method otherwise.
+    /// Focus a pane by id from anywhere (cockpit click): switch to its tab, make it active, and
+    /// give it keyboard focus.
     @discardableResult
     func activatePanel(id: String) -> Bool {
         for (i, manager) in paneManagers.enumerated() {
@@ -213,10 +176,8 @@ final class TabViewController: NSViewController {
         return false
     }
 
-    /// First terminal panel across all tabs in DFS order — matches
-    /// Linux's `TabManager::find_first_terminal`. Used by
-    /// `resolveTerminalPanel` as the last-resort fallback when the
-    /// caller passed no id and the active pane isn't a terminal.
+    /// First terminal panel across all tabs in DFS order (Linux `find_first_terminal`), the
+    /// last-resort fallback of `resolveTerminalPanel`.
     func firstTerminalPanel() -> (any TerminalCapable)? {
         for manager in paneManagers {
             for panel in manager.allPanels() {
@@ -228,10 +189,8 @@ final class TabViewController: NSViewController {
         return nil
     }
 
-    /// Push a shell-reported cwd onto the matching terminal panel.
-    /// Returns true when the panel was found and updated; false for
-    /// unknown id or non-terminal target. Called from the
-    /// `panel.report_cwd` registry handler.
+    /// Push a shell-reported cwd onto the matching terminal panel (the `panel.report_cwd`
+    /// handler). False for an unknown id or non-terminal target.
     @discardableResult
     func applyReportedCwd(panelID: String, cwd: String) -> Bool {
         guard let p = panel(id: panelID) else { return false }
@@ -242,19 +201,10 @@ final class TabViewController: NSViewController {
         return false
     }
 
-    /// Panel id of the focused pane in the active tab, for diagnostics and the
-    /// focus audit.
     var activePaneID: String? {
         activePaneManager?.activePane.panelID
     }
 
-    /// True when ANY webview in this window is in protected mode.
-    ///
-    /// Protection freezes the whole profile, not one tab: a concurrent tab on
-    /// the same profile is another window onto the same shared storage, so
-    /// freezing one while its sibling stays scriptable would be a boundary with
-    /// a door in it. Panes are single-profile until work unit B3, so "this
-    /// window" and "this profile" are the same set today.
     func webView(id: String) -> WebViewController? {
         panel(id: id) as? WebViewController
     }
@@ -275,12 +225,8 @@ final class TabViewController: NSViewController {
     override func loadView() {
         let root = NSView()
         root.wantsLayer = true
-        // When `[window] opacity < 1.0`, leave the root view's layer bg
-        // clear so the non-opaque window's backgroundColor + blur view
-        // (installed under contentView by AppDelegate) show through.
-        // An opaque root would cover both, defeating the entire
-        // window-transparency feature. Hot-reload handled in
-        // `applyConfig`.
+        // With `[window] opacity < 1.0` leave the root layer bg clear so the translucent window
+        // and blur view show through. Hot-reload is in `applyConfig`.
         root.layer?.backgroundColor = Self.rootBg(theme: theme, opacity: config.windowOpacity)
 
         tabBar = TabBarView(theme: theme, windowOpacity: config.windowOpacity, position: config.tabsPosition)
@@ -293,9 +239,8 @@ final class TabViewController: NSViewController {
         tabBar.onRenameTab = { [weak self] index, title in
             guard let self else { return }
             renameTab(at: index, title: title)  // schedules the save itself
-            // Restore focus to the active pane's keyboard view after
-            // the tab bar field resigns. `panel.focusTarget` returns
-            // the inner input view rather than the layout container.
+            // Restore focus to the active pane's input view (`panel.focusTarget`) after the tab
+            // bar field resigns.
             if let activePanel = activePaneManager?.activePane {
                 view.window?.makeFirstResponder(activePanel.focusTarget)
             }
@@ -316,10 +261,9 @@ final class TabViewController: NSViewController {
                 case .splitV: splitActivePaneWithWebView(orientation: .vertical)
                 }
             case let .plugin(name, panelName, _, _):
-                // Construction (PluginPanelController) and registry/eventBus
-                // wiring live in AppDelegate where `openPluginPanel` mirrors
-                // the `plugin.open` RPC handler. Errors are logged inside
-                // that helper — popover dispatch stays fire-and-forget.
+                // Construction and registry/eventBus wiring live in AppDelegate's
+                // `openPluginPanel`, which mirrors the `plugin.open` handler; errors are logged
+                // there, so this is fire-and-forget.
                 onOpenPlugin?(name, panelName, mode)
             }
         }
@@ -330,13 +274,9 @@ final class TabViewController: NSViewController {
         root.addSubview(contentArea)
         installComuxChrome()
 
-        // Tier 4.2 — status bar pinned to either the top or bottom of
-        // the root view, depending on `[statusbar] position`. Tab bar
-        // + content area then anchor against whichever edge of the
-        // status bar faces inward (so they never overlap the bar).
-        // Linux supports the same two values. left/right deferred —
-        // status bar is currently a horizontal NSStackView so vertical
-        // would need a separate layout pass.
+        // Status bar pinned to the top or bottom per `[statusbar] position`; tab bar and content
+        // anchor against its inward edge. left/right is unsupported (the bar is a horizontal
+        // NSStackView).
         var topEdge: NSLayoutYAxisAnchor = root.topAnchor
         var bottomEdge: NSLayoutYAxisAnchor = root.bottomAnchor
         let statusOnTop = config.statusBar.position.lowercased() == "top"
@@ -359,11 +299,9 @@ final class TabViewController: NSViewController {
             NSLayoutConstraint.activate(barConstraints)
         }
 
-        // Tier 1.4 — tabs position. Horizontal (top/bottom): a full-width
-        // bar with a fixed height, content fills the rest vertically.
-        // Vertical (left/right): a full-height bar with a fixed width
-        // (`[tabs] width`, shrunk to icon-only when collapsed) pinned to
-        // the leading/trailing edge, content fills the rest horizontally.
+        // Tabs position. Horizontal (top/bottom): a full-width bar of fixed height, content
+        // fills the rest. Vertical (left/right): a full-height bar of fixed width (`[tabs]
+        // width`, icon-only when collapsed) at the leading/trailing edge.
         var constraints: [NSLayoutConstraint] = []
         if config.tabsPosition.isVertical {
             let barWidth = isBarCollapsed ? TabBarView.collapsedBarWidth : CGFloat(config.tabsWidth)
@@ -418,7 +356,6 @@ final class TabViewController: NSViewController {
         }
         NSLayoutConstraint.activate(constraints)
 
-        // Sync view to controller's initial state (single source of truth: isBarCollapsed)
         tabBar.setCollapsed(isBarCollapsed)
 
         view = root
@@ -434,9 +371,7 @@ final class TabViewController: NSViewController {
 
     // MARK: - Session persistence
 
-    /// Build a wire snapshot of every live tab (v3 — decision #64): the tab list
-    /// plus each tab's split tree of typed panes with normalized divider ratios.
-    /// Terminals carry only their cwd; process/scrollback is the user's own tmux.
+    /// Wire snapshot of every live tab (v3, decision #64). Terminals carry only their cwd.
     func snapshotSession() -> Session.Snapshot {
         var tabs: [Session.TabSnap] = []
         for manager in paneManagers {
@@ -447,12 +382,10 @@ final class TabViewController: NSViewController {
         return Session.Snapshot(version: Session.version, tabs: tabs, currentTab: clamped)
     }
 
-    /// Reclaim history blobs no longer referenced by a COMMITTED snapshot.
-    ///
-    /// Called only after `Session.save` returns. Running it against a set
-    /// gathered before the write would delete the very blob the new session
-    /// document points at — the reason blob generations are immutable in the
-    /// first place is that these two writes are not atomic together.
+    /// Reclaim history blobs no longer referenced by a COMMITTED snapshot. Call only after
+    /// `Session.save` returns: against a set gathered before the write it would delete the blob
+    /// the new session document points at (blob generations are immutable because these two
+    /// writes are not atomic together).
     static func gcHistoryBlobs(after snap: Session.Snapshot) {
         let panes = snap.tabs.flatMap { browserPanes(in: $0.root) }
         BrowserFFI.gcHistory(live: BrowserSnapshot.liveGenerations(panes))
@@ -468,9 +401,8 @@ final class TabViewController: NSViewController {
         }
     }
 
-    /// Build tabs + splits to mirror `snap` (v3). Restored panels start fresh —
-    /// only cwd + layout + split ratios are replayed, not process/scrollback.
-    /// Caller falls back to `openInitialTab` if `snap` has zero tabs.
+    /// Build tabs + splits to mirror `snap` (v3). Only cwd, layout and split ratios are replayed.
+    /// The caller falls back to `openInitialTab` if `snap` has zero tabs.
     func restoreSession(_ snap: Session.Snapshot) {
         suppressSessionSave = true
         defer {
@@ -502,9 +434,6 @@ final class TabViewController: NSViewController {
         }
     }
 
-    /// Debounced persistence trigger (v3) — call after any structural mutation
-    /// (new/close/switch tab, split, rename). Coalesces bursts into one atomic
-    /// write ~800ms later on the main run loop. No-op while restoring.
     deinit {
         if let m = comuxFloatMonitor { NSEvent.removeMonitor(m) }
         if let m = comuxOverlayMonitor { NSEvent.removeMonitor(m) }
@@ -971,13 +900,10 @@ final class TabViewController: NSViewController {
         }
     }
 
-    /// Notification observers that are per-CONTROLLER, not per-tab.
-    ///
-    /// These used to be registered inside `addTab`, which meant one extra
-    /// observer for every tab ever opened — none of them removed when a tab
-    /// closed. Every navigation then enqueued a growing number of main-actor
-    /// tasks and timer resets, quietly making the app slower the longer it ran.
-    /// Registered once here, with the tokens kept so `deinit` can remove them.
+    /// Notification observers that are per-CONTROLLER, not per-tab. They must not be registered
+    /// in `addTab`: that added one observer per tab ever opened, never removed on close, so every
+    /// navigation enqueued more main-actor tasks and timer resets. Tokens are kept so `deinit`
+    /// can remove them.
     private func registerGlobalObserversIfNeeded() {
         guard globalObservers.isEmpty else { return }
         globalObservers = [
@@ -986,12 +912,9 @@ final class TabViewController: NSViewController {
             ) { [weak self] _ in
                 Task { @MainActor in self?.refreshTabBar() }
             },
-            // A browser pane's URL is part of the persisted layout, so a
-            // navigation must schedule a save the same way a split or a tab
-            // switch does. Without this, the only URL that ever reached disk
-            // was whatever the pane happened to show at the next structural
-            // change — and a pane opened blank and then navigated persisted
-            // nothing at all.
+            // A browser pane's URL is part of the persisted layout, so a navigation must
+            // schedule a save like a split or tab switch; otherwise only the URL at the next
+            // structural change reached disk.
             NotificationCenter.default.addObserver(
                 forName: .webviewStateChanged, object: nil, queue: .main,
             ) { [weak self] _ in
@@ -1009,22 +932,20 @@ final class TabViewController: NSViewController {
         ]
     }
 
+    /// Call after any structural mutation. Coalesces bursts into one atomic write ~800ms later.
+    /// No-op while restoring.
     func scheduleSessionSave() {
         guard !suppressSessionSave else { return }
         sessionSaveTimer?.invalidate()
         sessionSaveTimer = Timer.scheduledTimer(withTimeInterval: 0.8, repeats: false) { [weak self] _ in
-            // The timer fires on the main run loop, so the main-actor snapshot
-            // is safe; assumeIsolated makes that explicit for the checker.
             MainActor.assumeIsolated {
                 guard let self else { return }
                 let snap = self.snapshotSession()
                 if snap.tabs.isEmpty {
                     Session.clear()
                 } else if Session.save(snap) {
-                    // Only after a save that COMMITTED. Reclaiming against a
-                    // snapshot that never reached disk would delete the
-                    // generations the previously committed session still points
-                    // at — turning a failed write into lost history.
+                    // Only after a save that COMMITTED: reclaiming against a snapshot that never
+                    // reached disk would delete generations the committed session still points at.
                     Self.gcHistoryBlobs(after: snap)
                 }
             }
@@ -1037,11 +958,8 @@ final class TabViewController: NSViewController {
         addTab(manager: makeTerminalManager())
     }
 
-    /// PR 8 — terminal tab seeded with cwd + initial-input. Used by
-    /// `claude.start` so the user lands in a worktree directory with
-    /// `tmux new-session …` already running. Returns `(panel_id, tab)`
-    /// so the socket reply can include both — same shape as Linux's
-    /// `add_tab_with_cwd_and_initial_input` return tuple.
+    /// Terminal tab seeded with cwd + initial input (used by `claude.start`). Returns
+    /// `(panel_id, tab)` like Linux's `add_tab_with_cwd_and_initial_input`.
     @discardableResult
     func newTerminalTab(cwd: String?, initialInput: String?) -> (panelID: String, tab: Int) {
         let manager = PaneManager(
@@ -1061,11 +979,6 @@ final class TabViewController: NSViewController {
         addTab(manager: manager, background: background)
     }
 
-    /// Tier 4.1 — open a pre-built plugin panel as a new tab. Caller is
-    /// AppDelegate's `plugin.open` handler, which has the registry + event
-    /// bus references PluginPanelController needs at construction time.
-    /// Returns the panel id so the caller can include it in the socket
-    /// response for trigger/automation use cases.
     @discardableResult
     func newPluginPanelTab(_ panel: any CopadPanel) -> String {
         let manager = PaneManager(config: config, theme: theme, initialPanel: .pluginPanel(panel))
@@ -1073,9 +986,6 @@ final class TabViewController: NSViewController {
         return panel.panelID
     }
 
-    /// Tier 4.1 — split active pane with a plugin panel. Same construction
-    /// pattern as `newPluginPanelTab`; routes through PaneManager's
-    /// `splitActiveWithPluginPanel`.
     @discardableResult
     func splitActivePaneWithPluginPanel(_ panel: any CopadPanel, orientation: SplitOrientation = .horizontal) -> String? {
         guard let manager = activePaneManager else { return nil }
@@ -1099,11 +1009,8 @@ final class TabViewController: NSViewController {
             self?.scheduleSessionSave()  // split / focus changes alter the tree
         }
         manager.onPaneAdded = { [weak self] panel in
-            // Fan window-level state onto the new pane. Right now
-            // that's just background-active gate so default-bg cells
-            // stay transparent and the shared wallpaper shows
-            // through. Future runtime state (per-pane theme, etc.)
-            // would route through here too.
+            // Fan window-level state onto the new pane: the background-active gate, so
+            // default-bg cells stay transparent and the shared wallpaper shows through.
             guard let self else { return }
             if currentBackgroundPath != nil {
                 panel.applyBackground(path: "", tint: 0, opacity: 0)
@@ -1120,7 +1027,6 @@ final class TabViewController: NSViewController {
         paneManagers.append(manager)
         let tabIndex = paneManagers.count - 1
 
-        // Auto-expand when going from 1 to 2 tabs (unless user manually toggled)
         if paneManagers.count == 2, isBarCollapsed, !userToggledBar {
             isBarCollapsed = false
             tabBar.setCollapsed(false)
@@ -1128,11 +1034,9 @@ final class TabViewController: NSViewController {
         }
 
         if background {
-            // `switchTab` is what STARTS a tab's panes, so skipping it left a
-            // background browser pane with an empty tab array: page commands
-            // answered `tab_closed` and autosave persisted an empty URL instead
-            // of the destination that was asked for. Start it here without
-            // selecting it — which is the whole point of `background`.
+            // `switchTab` is what STARTS a tab's panes; skipping it left a background browser
+            // pane with an empty tab array (page commands answered `tab_closed`, autosave
+            // persisted an empty URL). Start it here without selecting it.
             manager.allPanels().forEach { $0.startIfNeeded() }
         } else {
             switchTab(to: tabIndex)
@@ -1166,7 +1070,6 @@ final class TabViewController: NSViewController {
         switchTab(to: nextIndex)
     }
 
-    /// Called from tab bar close button — closes all panes in the tab.
     private func closeTabByButton(at index: Int) {
         guard paneManagers.indices.contains(index) else { return }
         let manager = paneManagers[index]
@@ -1205,8 +1108,8 @@ final class TabViewController: NSViewController {
         ])
 
         view.layoutSubtreeIfNeeded()
-        // The tab's split views now have a real size — apply any persisted
-        // divider ratios that couldn't be set while the tab was off-screen.
+        // The split views now have a real size: apply persisted divider ratios that couldn't be
+        // set while the tab was off-screen.
         manager.applyPendingRatios()
         manager.allPanels().forEach { $0.startIfNeeded() }
         manager.activePane.view.window?.makeFirstResponder(manager.activePane.focusTarget)
@@ -1221,8 +1124,6 @@ final class TabViewController: NSViewController {
         activePaneManager?.splitActive(orientation: orientation)
     }
 
-    /// Tier 1.1 — proxy to active tab's PaneManager.focusNextPane. No-op
-    /// when no tab is active (no panes to cycle).
     func focusNextPane(direction: Int = 1) {
         activePaneManager?.focusNextPane(direction: direction)
     }
@@ -1252,11 +1153,9 @@ final class TabViewController: NSViewController {
         eventBus?.broadcast(event: "tab.bar_toggled", data: ["collapsed": isBarCollapsed])
     }
 
-    /// Vertical (left/right) bars carry their collapsed/expanded state in
-    /// the bar *width* (horizontal bars keep a fixed height and only swap
-    /// tab-pill widths, handled inside `TabBarView`). Re-point the stored
-    /// width constraint whenever `isBarCollapsed` changes. No-op for
-    /// horizontal bars.
+    /// Vertical bars carry their collapsed state in the bar WIDTH (horizontal bars only swap
+    /// tab-pill widths inside `TabBarView`): re-point the width constraint whenever
+    /// `isBarCollapsed` changes. No-op for horizontal bars.
     private func syncVerticalBarWidth() {
         guard config.tabsPosition.isVertical, let sizeConstraint = tabBarSizeConstraint else { return }
         sizeConstraint.constant = isBarCollapsed ? TabBarView.collapsedBarWidth : CGFloat(config.tabsWidth)
@@ -1272,63 +1171,50 @@ final class TabViewController: NSViewController {
 
     // MARK: - Config Hot-Reload
 
-    /// Called when the config file changes at runtime. Applies theme and font to all
-    /// running terminals. Background is re-applied only if the path/tint changed.
-    /// Shell changes do not affect existing terminals — only new ones pick them up.
+    /// Called when the config file changes. Applies theme and font to running terminals; the
+    /// background is re-applied only if the path/tint changed. Shell changes only affect new
+    /// terminals.
     func applyConfig(_ newConfig: CopadConfig, theme: CopadTheme) {
-        // Update stored config/theme so tabs spawned AFTER hot-reload pick up the new values.
         config = newConfig
         self.theme = theme
 
-        // Root view bg follows window opacity — opaque blocks both the
-        // semi-transparent window backgroundColor and the blur view
-        // installed beneath it. Same conditional as initial loadView.
+        // Root view bg follows window opacity: an opaque root blocks both the translucent window
+        // backgroundColor and the blur view beneath it. Same conditional as `loadView`.
         view.layer?.backgroundColor = Self.rootBg(theme: theme, opacity: newConfig.windowOpacity)
 
-        // Chrome: rebuild bg colors for new theme + window opacity.
-        // Pills stay opaque (read inside their own draw paths); only the
+        // Chrome: rebuild bg colors for the new theme + opacity. Pills stay opaque; only the
         // outer bar bgs pick up the alpha.
         tabBar?.applyWindowOpacity(newConfig.windowOpacity, theme: theme)
         statusBar?.applyWindowOpacity(newConfig.windowOpacity, theme: theme)
         comuxWindow.style = ComuxStyle.make(config: newConfig, theme: theme)
         layoutComuxChrome()
 
-        // Fan out to existing pane trees (theme/font/security; current zoom preserved).
         for paneManager in paneManagers {
             paneManager.applyConfig(newConfig, theme: theme)
         }
 
-        // Re-scale the window-level bg / tint alpha against the new
-        // window.opacity. Pane-level applyWindowOpacity used to do
-        // this per-pane; image is window-owned now.
+        // Re-scale the window-level bg / tint alpha against the new window.opacity.
         refreshBackgroundForWindowOpacity()
 
-        // Background: apply/clear based on new config
         if let path = newConfig.backgroundPath {
             applyBackground(path: path, tint: newConfig.backgroundTint, opacity: newConfig.backgroundOpacity)
         } else if currentBackgroundPath != nil, !currentBackgroundFromList {
             clearBackground()
         } else {
-            // No config image, or a rotated wallpaper we must preserve (a
-            // reload that only touched tint/opacity/interval must not wipe
-            // a rotation pick — matches Linux apply_config's showing_list_
-            // image guard). Only the tint knob may have changed.
+            // No config image, or a rotated wallpaper to preserve (a reload touching only
+            // tint/opacity/interval must not wipe a rotation pick, as Linux's
+            // `showing_list_image` guard). Only the tint knob may have changed.
             setTint(newConfig.backgroundTint)
         }
 
-        // Update window background to match new theme
         view.window?.backgroundColor = theme.background.nsColor
     }
 
     // MARK: - Background
 
-    /// Window-level background. Renders one image across the whole
-    /// `contentArea` (under all splits within the active tab) so
-    /// splits no longer duplicate the wallpaper. Async decode +
-    /// monotonic load token to drop stale loads on a fast
-    /// path-change. Image alpha + tint alpha are scaled by the
-    /// configured `window.opacity` so the desktop bleeds through
-    /// when the user opts into window transparency.
+    /// Window-level background: one image across the whole `contentArea` (under all splits).
+    /// Decoded async with a monotonic load token to drop stale loads; image and tint alpha are
+    /// scaled by `window.opacity` so the desktop bleeds through when transparent.
     func applyBackground(path: String, tint: Double, opacity: Double = 1.0, fromList: Bool = false) {
         currentBackgroundPath = path
         currentBackgroundTint = tint
@@ -1344,11 +1230,9 @@ final class TabViewController: NSViewController {
             let cgImage = Self.decodeBackground(path: path, envelope: envelope)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                // Stale: newer applyBackground / clearBackground won
-                // the race; drop this decode.
+                // Stale: a newer applyBackground / clearBackground won the race.
                 guard token == backgroundLoadToken else { return }
-                // Skip the assignment if the decode failed — we don't want to wipe a
-                // previously-good image.
+                // A failed decode must not wipe a previously-good image.
                 guard let cgImage else { return }
                 let windowOpacity = currentWindowOpacity()
                 backgroundView?.layer?.contents = cgImage
@@ -1384,20 +1268,13 @@ final class TabViewController: NSViewController {
     }
 
     /// Decode `path` at the smallest size that still fully covers `envelope` under
-    /// `.resizeAspectFill`.
+    /// `.resizeAspectFill`. Decoding at the image's NATURAL size cost ~96 MB of RGBA per
+    /// 6000x4000 camera JPEG, far more than any screen could show.
     ///
-    /// The old path was `NSImage(contentsOfFile:)` + `cgImage(forProposedRect: nil)`, which
-    /// hands CoreAnimation the image at its NATURAL size and lets the layer scale it. That is
-    /// correct, and it is also why a wallpaper directory of 6000x4000 camera JPEGs cost ~96 MB
-    /// of RGBA each once resident — the dominant term in this process's memory. Nothing leaked
-    /// (one `backgroundView` per window, and replacing `contents` releases the old image); the
-    /// bitmap was simply far larger than any screen could show.
-    ///
-    /// Sizing is aspect-fill-aware, NOT a plain longest-side cap. Capping the long side of a
-    /// 4000x6000 portrait at a 3440-wide screen yields 2293x3440, and filling a 3440x1440 view
-    /// with that upscales it — despite the source having pixels to spare. So the scale is
-    /// computed the way the layer will actually use it (`max(W/Iw, H/Ih)`, clamped to 1 so a
-    /// small image is never enlarged) and only then turned back into a longest-side bound.
+    /// Sizing is aspect-fill-aware, NOT a plain longest-side cap: capping the long side of a
+    /// 4000x6000 portrait at a 3440-wide screen yields 2293x3440, which upscales when filling
+    /// 3440x1440. So the scale is computed as the layer will use it (`max(W/Iw, H/Ih)`, clamped
+    /// to 1 so a small image is never enlarged) and then turned into a longest-side bound.
     private static func decodeBackground(path: String, envelope: [CGSize]) -> CGImage? {
         let url = URL(fileURLWithPath: path)
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
@@ -1425,8 +1302,7 @@ final class TabViewController: NSViewController {
             // Scale the real image. Without this a file carrying a small embedded EXIF
             // thumbnail would hand us THAT, and the wallpaper would render as mush.
             kCGImageSourceCreateThumbnailFromImageAlways: true,
-            // Apply EXIF orientation. `NSImage` used to do this for us; dropping it would
-            // silently rotate every photo shot in portrait.
+            // Without EXIF orientation every photo shot in portrait comes out rotated.
             kCGImageSourceCreateThumbnailWithTransform: true,
             // Decode HERE, on the background queue, rather than lazily on the main thread at
             // first draw.
@@ -1476,9 +1352,7 @@ final class TabViewController: NSViewController {
             .withAlphaComponent(CGFloat(alpha * windowOpacity)).cgColor
     }
 
-    /// `window.opacity` hot-reload (called from AppDelegate config
-    /// watcher path). Re-scales image + tint alpha so the user-knob
-    /// stays load-bearing on top of an active background image.
+    /// `window.opacity` hot-reload: re-scales image + tint alpha.
     func refreshBackgroundForWindowOpacity() {
         let windowOpacity = currentWindowOpacity()
         backgroundView?.alphaValue = CGFloat(currentBackgroundOpacity * windowOpacity)
@@ -1486,19 +1360,12 @@ final class TabViewController: NSViewController {
             .withAlphaComponent(CGFloat(currentBackgroundTint * windowOpacity)).cgColor
     }
 
-    /// Lazily insert the bg + tint views under `contentArea`. Both
-    /// pinned to the contentArea edges so they fill the entire pane
-    /// area regardless of split layout.
     private func ensureBackgroundViews() {
         if backgroundView != nil { return }
-        // Use autoresizing (not Auto Layout). NSImageView reported its
-        // intrinsic content size as the image's pixel dimensions even
-        // with explicit edge constraints, and that fittingSize
-        // propagated up to the window. Switching to a plain layer-
-        // backed NSView side-steps the issue entirely — plain NSView
-        // has no intrinsic size. The aspect-fill rendering moves to
-        // the layer (`contentsGravity = .resizeAspectFill`, set
-        // below), matching Linux's `gtk4::Picture` Cover content fit.
+        // Autoresizing, not Auto Layout: NSImageView reported its intrinsic size as the image's
+        // pixel dimensions even with edge constraints, and that fittingSize propagated up to the
+        // window. A plain layer-backed NSView has no intrinsic size; aspect-fill moves to the
+        // layer (`contentsGravity = .resizeAspectFill`, set below), like Linux's Cover fit.
         let bg = NSView(frame: contentArea.bounds)
         bg.wantsLayer = true
         bg.isHidden = true
@@ -1526,9 +1393,8 @@ final class TabViewController: NSViewController {
         tintView = tint
     }
 
-    /// Walk every pane in every tab and flip its renderer's
-    /// transparent-default-bg gate. Called when the window-level
-    /// background image appears / disappears.
+    /// Flip every pane's renderer transparent-default-bg gate when the window-level background
+    /// image appears or disappears.
     private func fanSetImageBackgroundActive(_ active: Bool) {
         for manager in paneManagers {
             for panel in manager.allPanels() {
@@ -1541,10 +1407,8 @@ final class TabViewController: NSViewController {
         }
     }
 
-    /// Read the current `window.opacity` from the live config. The
-    /// active config lives on each PaneManager (since it gets hot-
-    /// reloaded there) — any pane's value is authoritative because
-    /// they all share it.
+    /// Read `window.opacity` from the live config, which lives on each PaneManager (hot-reloaded
+    /// there); any pane's value is authoritative.
     private func currentWindowOpacity() -> Double {
         paneManagers.first?.configWindowOpacity() ?? 1.0
     }
@@ -1552,11 +1416,9 @@ final class TabViewController: NSViewController {
     // MARK: - Socket Commands
 
     //
-    // These dispatch through `activeTerminalPanel`.
-    // AppDelegate's `resolveTerminalPanel` is the preferred path for
-    // any caller that needs id-based panel lookup or Linux-style error
-    // reporting; these are thin convenience wrappers for the "active
-    // terminal, no id-resolution, no error reporting" case.
+    // Thin wrappers over `activeTerminalPanel` for the "active terminal, no id-resolution, no
+    // error reporting" case; AppDelegate's `resolveTerminalPanel` is the path for id-based
+    // lookup and Linux-style errors.
 
     func execCommand(_ command: String) {
         activeTerminalPanel?.execCommand(command)
@@ -1628,9 +1490,6 @@ final class TabViewController: NSViewController {
         ]
     }
 
-    /// Pick the root view layer bg. `.clear` when opacity < 1.0 so the
-    /// non-opaque window's backgroundColor and any blur view installed
-    /// by AppDelegate show through; otherwise opaque theme.background.
     private static func rootBg(theme: CopadTheme, opacity: Double) -> CGColor {
         opacity < 1.0 ? NSColor.clear.cgColor : theme.background.nsColor.cgColor
     }

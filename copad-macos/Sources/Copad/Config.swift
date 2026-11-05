@@ -3,44 +3,28 @@ import Foundation
 import TOMLKit
 
 /// Policy for OSC 52 clipboard writes from the PTY.
+/// Policy for OSC 52 clipboard writes from the PTY, applied via `drainClipboardRequests`.
 ///
-/// Background: SwiftTerm's `LocalProcessTerminalView` writes to `NSPasteboard.general`
-/// unconditionally on OSC 52. That lets any program in the terminal silently overwrite
-/// the user's clipboard. We intercept (now on the alacritty path, via
-/// `drainClipboardRequests`) so the write goes through this policy instead.
-///
-/// Default is `allow`, matching every terminal copad is actually used next to
-/// (ghostty/kitty/wezterm/alacritty all write-by-default; iTerm2 has an opt-in). The
-/// original `deny` default took VTE as the reference, but VTE is a widget library, not
-/// a terminal a user picks — and deny silently breaks the whole class of tools that
-/// copy BY emitting OSC 52: comux's drag-to-copy, nvim's osc52 provider, tmux
-/// `set-clipboard`, any `yank`-over-SSH helper. Those failures are invisible (the
-/// warning goes to a stderr a Finder-launched .app has nowhere to print), so the
-/// hardened default cost more than it bought. `deny` remains one line away for anyone
-/// who wants it. Clipboard READS are never answered under either policy — that is the
-/// exfiltration path, and it stays shut.
+/// Default `allow`, as in ghostty/kitty/wezterm/alacritty. `deny` silently breaks tools that copy
+/// by emitting OSC 52 (comux drag-to-copy, nvim's osc52 provider, tmux `set-clipboard`, yank over
+/// SSH), and the warning has nowhere to print for a Finder-launched .app. Clipboard reads are
+/// never answered under either policy; that is the exfiltration path.
 enum OSC52Policy: String, Decodable {
     case deny
     case allow
 }
 
-/// Where the tab bar sits relative to the content area. Linux supports
-/// `top`/`bottom`/`left`/`right`; macOS now implements all four — the
-/// vertical orientations (`left`/`right`) run the bar down one side with
-/// a fixed width (`[tabs] width`), the horizontal ones across top/bottom.
+/// Where the tab bar sits: `top`/`bottom` (fixed height) or `left`/`right` (fixed `[tabs] width`).
 enum TabsPosition: String, Decodable {
     case top
     case bottom
     case left
     case right
 
-    /// True for the vertical orientations (`left`/`right`), where the tab
-    /// bar runs down one side of the window with a fixed width instead of
-    /// across the top/bottom with a fixed height.
+    /// True for `left`/`right`, where the bar runs down one side at a fixed width.
     var isVertical: Bool { self == .left || self == .right }
 
-    /// Decode permissively: an unrecognized value falls back to `.top`
-    /// with a stderr warning rather than crashing.
+    /// Unrecognized values fall back to `.top` with a stderr warning.
     static func parse(_ raw: String) -> TabsPosition {
         if let p = TabsPosition(rawValue: raw.lowercased()) { return p }
         let msg = "[copad] [tabs] position '\(raw)' unrecognized — using 'top'\n"
@@ -49,9 +33,7 @@ enum TabsPosition: String, Decodable {
     }
 }
 
-/// `[statusbar]` config: enable + position + height. Same shape as Linux.
-/// Position support is limited to `bottom` on macOS today (top deferred —
-/// requires layout reshuffle around tab bar position).
+/// `[statusbar]` config. Only `bottom` is supported on macOS.
 struct StatusBarConfig {
     let enabled: Bool
     let position: String
@@ -64,122 +46,73 @@ struct CopadConfig {
     let shell: String
     let fontFamily: String
     let fontSize: Int
-    /// `[terminal] font_thicken` — see [`FontThicken`].
     let fontThicken: FontThicken
-    /// `[terminal] alpha_blending` — see [`AlphaBlending`].
     let alphaBlending: AlphaBlending
-    /// macOS-only: when true, Option+key sends `ESC + key` to the PTY
-    /// instead of routing through the system IME (which produces
-    /// `¡™£¢`-style special chars on Option+1/2/3/4). Required for
-    /// tmux/zsh/readline Meta bindings to fire. Default `true` because
-    /// this is a dev terminal — users who need Option for diacritics
-    /// can set `option_as_alt = false`.
+    /// macOS only: Option+key sends `ESC + key` instead of going through the IME (which turns
+    /// Option+1 into `¡`), so tmux/zsh/readline Meta bindings fire. Default `true`.
     let optionAsAlt: Bool
-    /// macOS-only: control-character keys that should bypass the
-    /// `optionAsAlt` printable-only filter and send `ESC + <byte>` when
-    /// pressed with Option (independent of `option_as_alt`). Default
-    /// `["Return"]` so Opt+Return delivers `ESC + CR` — the sequence
-    /// Claude Code, Python REPL, ipython, etc. accept as newline-in-
-    /// prompt. Recognized names (case-insensitive): `Return`/`Enter`,
-    /// `Escape`/`Esc`. Unknown names are ignored with a stderr warning.
-    /// Arrows / Delete are intentionally NOT supported — they rely on
-    /// Cocoa's `moveWordLeft:` / `deleteWordBackward:` key bindings
-    /// translating Opt+← / Opt+⌫ to readline byte sequences, and a
-    /// force-Meta override would steal those keystrokes.
+    /// macOS only: control-character keys that send `ESC + <byte>` with Option regardless of
+    /// `option_as_alt` (default `["Return"]`: the newline sequence Claude Code and Python REPLs
+    /// accept). Names, case-insensitive: `Return`/`Enter`, `Escape`/`Esc`; unknown ones warn on
+    /// stderr. Arrows and Delete are excluded: they rely on Cocoa's `moveWordLeft:` /
+    /// `deleteWordBackward:` bindings, which a force-Meta would steal.
     let forceMetaKeys: [String]
-    /// `[terminal] close_on_exit` — close the pane when the PTY child
-    /// (shell) exits. Cascades: last pane in tab → close tab; last
-    /// tab in window → close window. `false` keeps the dead viewport
-    /// so the user can read the exit message. Default `true` matches
-    /// Linux's long-standing behavior.
+    /// `[terminal] close_on_exit`: close the pane when the shell exits, cascading to the tab and
+    /// window. `false` keeps the dead viewport so the exit message can be read.
     let closeOnExit: Bool
-    /// `[terminal] kitty_keyboard` — let programs negotiate the kitty keyboard protocol
-    /// (`CSI > flags u`), which is how Claude Code receives Shift+Enter as a newline.
-    /// Default `true`; `false` leaves the query unanswered so programs keep legacy keys.
+    /// `[terminal] kitty_keyboard`: kitty keyboard protocol negotiation (`CSI > flags u`), how
+    /// Claude Code receives Shift+Enter. `false` leaves the query unanswered.
     let kittyKeyboard: Bool
-    /// `[terminal] scrollback` — lines of history per pane, clamped to 0...100 000. Each kept
-    /// line costs its full width in cells, so this is the main lever on a busy pane's memory.
-    /// An integer only (a float is ignored like any other malformed field).
+    /// `[terminal] scrollback`: lines per pane, clamped to 0...100 000. Each kept line costs its
+    /// full width in cells. Integers only.
     let scrollback: Int
-    /// `[terminal] images` — let programs draw images with the kitty graphics protocol (yazi
-    /// previews, `kitten icat`). `false` ignores image commands without replying, so programs
-    /// fall back to text. Default `true`.
+    /// `[terminal] images`: kitty graphics protocol (yazi previews, `kitten icat`). `false`
+    /// ignores image commands without replying so programs fall back to text.
     let images: Bool
     let themeName: String
     let backgroundPath: String?
     let backgroundTint: Double
-    /// Opacity of the background image layer itself (0.0 = invisible, 1.0 = fully visible).
-    /// Distinct from `backgroundTint`, which darkens the image via an overlay.
+    /// Opacity of the background image layer; `backgroundTint` darkens it via an overlay instead.
     let backgroundOpacity: Double
-    /// `[background] rotate_interval` — seconds between random wallpapers
-    /// from the platform list file. 0 (default) disables the in-process
-    /// rotation timer; `coctl background next` keeps working either way.
-    /// Mirrors `copad_core::config::BackgroundConfig::rotate_interval`.
+    /// `[background] rotate_interval`: seconds between random wallpapers; 0 disables the timer
+    /// (`coctl background next` still works). Mirrors `BackgroundConfig::rotate_interval`.
     let rotateInterval: UInt
     let osc52: OSC52Policy
-    /// `[renderer] transparent_default_bg = true` makes default-bg cells
-    /// transparent so a configured background image shows through blank
-    /// cells. Off by default — cursor visibility against image
-    /// backgrounds wins over aesthetic transparency. Cells with explicit
-    /// ANSI bg colors and reverse-video cells still materialize opaquely
-    /// (Zed pattern).
+    /// `[renderer] transparent_default_bg = true` makes default-bg cells transparent so a
+    /// background image shows through. Off by default so the cursor stays visible. Explicit ANSI
+    /// bg and reverse-video cells stay opaque.
     let transparentDefaultBg: Bool
-    /// `[renderer] gpu` — Metal render path. **Default on** since the
-    /// slice-3 flip (docs/macos-gpu-renderer-plan.md): measured ~5.5×
-    /// cheaper main-thread render than the CoreText painter, split
-    /// coexistence + IME/selection/copy verified. Set `gpu = false` to
-    /// opt back into the CoreText painter (kept as the fallback —
-    /// 10a/10b pattern). Read at pane creation: existing panes keep
-    /// their painter across config hot-reloads (the layer class is
-    /// committed at view init), new panes pick up the new value. Falls
-    /// back to CoreText automatically when no Metal device is available.
+    /// `[renderer] gpu`: Metal render path, default on (about 5.5x cheaper main-thread render
+    /// than CoreText; docs/macos-gpu-renderer-plan.md). `gpu = false` selects the CoreText
+    /// painter. Read at pane creation, so existing panes keep their painter across hot-reloads.
+    /// Falls back to CoreText when no Metal device exists.
     let rendererGPU: Bool
-    /// `[window] opacity` (0.0 = fully transparent, 1.0 = fully opaque,
-    /// default 1.0). Controls the window itself + terminal default-bg
-    /// cells (Ghostty model). Distinct from `backgroundOpacity` which
-    /// only affects the optional background-image layer.
+    /// `[window] opacity`, 0.0...1.0: the window and terminal default-bg cells. Distinct from
+    /// `backgroundOpacity`, which only affects the background-image layer.
     let windowOpacity: Double
-    /// `[window] blur = true`. macOS-only — when `windowOpacity < 1.0`
-    /// the AppDelegate installs an `NSVisualEffectView` behind the
-    /// content view so the desktop is blurred (Ghostty
-    /// `background-blur-radius`). No effect when opacity = 1.0.
+    /// `[window] blur = true` (macOS only): with `windowOpacity < 1.0`, AppDelegate puts an
+    /// `NSVisualEffectView` behind the content to blur the desktop.
     let windowBlur: Bool
-    /// Tier 1.4 — `[tabs] position` (top/bottom/left/right).
     let tabsPosition: TabsPosition
-    /// `[tabs] width` — width in points of the vertical (`left`/`right`)
-    /// tab bar. Ignored for `top`/`bottom`. Mirrors the Linux `width = 200`.
+    /// `[tabs] width`: points for the vertical tab bar; ignored for `top`/`bottom`.
     let tabsWidth: Int
-    /// Tier 4.2 — `[statusbar]` config (enabled/position/height). Modules
-    /// themselves come from plugin manifests' `[[modules]]` declarations.
+    /// `[statusbar]` config; modules come from plugin manifests' `[[modules]]`.
     let statusBar: StatusBarConfig
-    /// Tier 1.2 — `[keybindings]` flat dict: combo string → command string.
-    /// Compiled to `Keybindings.Binding` at AppDelegate init time and
-    /// matched in the NSEvent local monitor. Empty when no `[keybindings]`
-    /// section is present.
+    /// `[keybindings]` combo to command, compiled to `Keybindings.Binding` at AppDelegate init.
     let keybindings: [String: String]
-    /// `[browser] restore` — how much of a live webview URL may be persisted:
-    /// `origin` (default) | `url` | `full`. Passed verbatim to the Rust
-    /// canonicaliser via `BrowserFFI`, which is the only place it is
-    /// interpreted; an unknown value falls back to `origin` THERE, so this
-    /// string is never validated twice (and cannot be validated differently)
-    /// on the two platforms. See decision #100.
+    /// `[browser] restore`: how much of a live webview URL may be persisted (`origin` default |
+    /// `url` | `full`). Passed verbatim to the Rust canonicaliser via `BrowserFFI`, the only
+    /// place it is interpreted (unknown falls back to `origin` there). Decision #100.
     let browserRestore: String
-    /// `[browser] capture_bodies` — include request/response bodies in the
-    /// captured network log. Off by default: bodies are the likeliest place for
-    /// a secret to end up in a file the agent can read.
+    /// `[browser] capture_bodies`: include bodies in the network log. Off by default; bodies are
+    /// the likeliest place for a secret to end up in a file the agent can read.
     let browserCaptureBodies: Bool
-    /// PR 5c — raw `[[triggers]]` array from config.toml, walked from the
-    /// TOMLKit table tree into JSON-friendly `[[String: Any]]` so it can be
-    /// JSON-encoded and shipped to the Rust trigger engine via FFI. We don't
-    /// type each trigger statically because the schema allows arbitrary
-    /// nested values under `params` / `when.payload_match` / `await.payload_match`,
-    /// and the Rust side already has the canonical Deserialize impl.
+    /// Raw `[[triggers]]` array as JSON-friendly values for the Rust trigger engine, which owns the
+    /// schema (arbitrary nested values under `params` / `payload_match`).
     let triggers: [[String: Any]]
 
-    /// `$XDG_CONFIG_HOME/copad/config.toml`, else `~/.config/copad/
-    /// config.toml`. Mirrors `copad_core::config::CopadConfig::
-    /// config_path()` so Swift renderer, Rust daemon, and coctl all
-    /// agree on the canonical location.
+    /// `$XDG_CONFIG_HOME/copad/config.toml`, else `~/.config/copad/config.toml`; mirrors
+    /// `copad_core::config::CopadConfig::config_path()`.
     static func configPath() -> URL {
         let env = ProcessInfo.processInfo.environment["XDG_CONFIG_HOME"]
         let base: URL = if let env, !env.isEmpty {
@@ -193,12 +126,8 @@ struct CopadConfig {
             .appendingPathComponent("config.toml")
     }
 
-    /// Read + parse `~/.config/copad/config.toml`. Returns `.defaults`
-    /// when the file is absent (first run) — matches the Linux
-    /// `CopadConfig::load_from` contract. Throws on parse failure so
-    /// the caller can decide whether to start with defaults (initial
-    /// launch) or preserve the previously rendered live config (hot
-    /// reload).
+    /// Read + parse `~/.config/copad/config.toml`. Returns `.defaults` when absent. Throws on parse
+    /// failure so the caller can start with defaults (launch) or keep the live config (reload).
     static func load() throws -> CopadConfig {
         let configURL = configPath()
         guard let contents = try? String(contentsOf: configURL, encoding: .utf8) else {
@@ -207,27 +136,16 @@ struct CopadConfig {
         return try parse(contents)
     }
 
-    /// Decode a TOML config string into CopadConfig. Throws only on a genuine
-    /// TOML *syntax* error (an unparseable file); the error is written to stderr
-    /// so the user sees the line/column. Unknown sections (e.g. `[[triggers]]`,
-    /// `[keybindings]` from the Linux schema) are tolerated — we only read the
-    /// fields the macOS app currently uses, and the rest stay intact for future
-    /// parity work.
+    /// Decode a TOML config string. Throws only on a TOML syntax error, which is written to
+    /// stderr. Unknown sections are tolerated.
     ///
-    /// Fields are read directly off the raw `TOMLTable` rather than strict-decoded
-    /// into a Codable struct. This is deliberate, and both reasons were learned
-    /// the hard way:
-    ///   1. **Type coercion.** TOMLKit's strict decoder rejects an integer literal
-    ///      for a `Double` field (`tint = 0` instead of `0.0`) and throws. That
-    ///      throw USED to discard the ENTIRE config and silently fall back to
-    ///      defaults — whose font is a non-Nerd family, so every glyph icon
-    ///      rendered as tofu. Linux/serde coerces int→float, so a shared dotfiles
-    ///      config that worked on Linux broke only on macOS. `tomlDouble`/`tomlInt`
-    ///      coerce across TOML's number types the same way serde does.
-    ///   2. **Graceful degradation.** Strict decoding is all-or-nothing: one bad
-    ///      field nuked every other setting. Per-field reads fall back to that
-    ///      field's own default and preserve the rest of the config.
-    /// If you must diagnose a config, `comux doctor` lints these exact issues.
+    /// Fields are read off the raw `TOMLTable` instead of strict-decoded, for two reasons:
+    ///   1. TOMLKit's strict decoder rejects an integer literal for a `Double` field (`tint = 0`).
+    ///      That throw discarded the entire config and fell back to defaults (a non-Nerd font, so
+    ///      glyph icons rendered as tofu), while Linux/serde coerces int to float.
+    ///      `tomlDouble`/`tomlInt` coerce the same way.
+    ///   2. Strict decoding is all-or-nothing; per-field reads fall back to that field's default.
+    /// `comux doctor` lints these issues.
     static func parse(_ contents: String) throws -> CopadConfig {
         let table: TOMLTable
         do {
@@ -273,23 +191,17 @@ struct CopadConfig {
             rotateInterval: tomlInt(background, "rotate_interval").map { UInt(max(0, $0)) }
                 ?? d.rotateInterval,
             osc52: osc52 ?? d.osc52,
-            // Smart default: a wallpaper config implies the user wants
-            // to see the wallpaper, so default to transparent-default-
-            // bg unless they explicitly say otherwise. Without this the
-            // alacritty backend's opaque-default-fill design means the
-            // wallpaper is invisible to anyone who didn't separately
-            // know to set `[renderer] transparent_default_bg = true`.
+            // A wallpaper config implies the user wants to see it; without this the opaque
+            // default fill hides it until `[renderer] transparent_default_bg = true` is set.
             transparentDefaultBg: tomlBool(renderer, "transparent_default_bg")
                 ?? (bgPath != nil ? true : d.transparentDefaultBg),
             rendererGPU: tomlBool(renderer, "gpu") ?? d.rendererGPU,
             windowOpacity: clamp01(tomlDouble(window, "opacity") ?? d.windowOpacity),
             windowBlur: tomlBool(window, "blur") ?? d.windowBlur,
             tabsPosition: tomlString(tabs, "position").map(TabsPosition.parse) ?? d.tabsPosition,
-            // Clamp the layout boundary: a vertical tab pill is `barWidth - 8`
-            // wide, so a width below the 8px inset yields a negative
-            // (unsatisfiable) constraint, and anything under `collapsedBarWidth`
-            // (44) makes the expanded bar narrower than its collapsed state.
-            // Floor to the minimum usable width (matches the horizontal min pill).
+            // Clamp: a vertical tab pill is `barWidth - 8` wide, so a smaller width gives a
+            // negative constraint, and under `collapsedBarWidth` (44) the expanded bar would be
+            // narrower than the collapsed one.
             tabsWidth: max(CopadConfig.minTabsWidth, tomlInt(tabs, "width") ?? d.tabsWidth),
             statusBar: StatusBarConfig(
                 enabled: tomlBool(statusbar, "enabled") ?? d.statusBar.enabled,
@@ -304,19 +216,15 @@ struct CopadConfig {
     }
 
     // MARK: - Lenient TOML field reads
-    //
-    // Read a single field off a section table, coercing across TOML's number
-    // types the way serde does on Linux, so a shared config behaves identically
-    // on both platforms. A missing OR wrong-typed field returns nil, letting the
-    // caller fall back to that field's own default instead of aborting the whole
-    // parse. See `parse(_:)` for why this replaced strict Codable decoding.
+    // Reads one field off a section table, coercing across TOML number types as serde does on
+    // Linux. A missing or wrong-typed field returns nil so the caller falls back to that field's
+    // own default. See `parse(_:)`.
 
     private static func tomlString(_ table: TOMLTable?, _ key: String) -> String? {
         table?[key]?.string
     }
 
-    /// `[terminal] font_thicken`, warning (once per load) on a value it
-    /// cannot read rather than silently treating it as the default.
+    /// `[terminal] font_thicken`, warning (once per load) on a value it cannot read.
     private static func fontThicken(_ table: TOMLTable?) -> FontThicken? {
         guard let raw = table?["font_thicken"] else { return nil }
         if let parsed = FontThicken.parse(bool: raw.bool, string: raw.string) { return parsed }
@@ -326,7 +234,6 @@ struct CopadConfig {
         return nil
     }
 
-    /// `[terminal] alpha_blending`, warning (once per load) on a value it cannot read.
     private static func alphaBlending(_ table: TOMLTable?) -> AlphaBlending? {
         guard let raw = table?["alpha_blending"] else { return nil }
         if let parsed = AlphaBlending.parse(raw.string) { return parsed }
@@ -340,11 +247,8 @@ struct CopadConfig {
         table?[key]?.bool
     }
 
-    /// Prefer an integer; tolerate a float literal (`font_size = 14.0`) by
-    /// truncating. TOMLKit reports exactly one of `.int`/`.double` per value.
-    /// `Int(exactly:)` (not `Int(_:)`) is deliberate: a raw `Int(dbl)` traps on
-    /// `nan`/`inf`/out-of-range floats — all representable in TOML — which would
-    /// turn one malformed field into a crash instead of a per-field fallback.
+    /// Prefer an integer; truncate a float literal (`font_size = 14.0`). `Int(exactly:)` because a
+    /// raw `Int(dbl)` traps on `nan`/`inf`/out-of-range values, which TOML can represent.
     private static func tomlInt(_ table: TOMLTable?, _ key: String) -> Int? {
         guard let v = table?[key] else { return nil }
         if let i = v.int { return i }
@@ -352,8 +256,8 @@ struct CopadConfig {
         return nil
     }
 
-    /// Prefer a float; tolerate an integer literal (`tint = 0`) by widening —
-    /// this is the coercion whose absence broke the whole config on macOS.
+    /// Prefer a float; widen an integer literal (`tint = 0`), whose rejection once broke the
+    /// whole config on macOS.
     private static func tomlDouble(_ table: TOMLTable?, _ key: String) -> Double? {
         guard let v = table?[key] else { return nil }
         if let dbl = v.double { return dbl }
@@ -361,11 +265,9 @@ struct CopadConfig {
         return nil
     }
 
-    /// A homogeneous string array, or nil. If ANY element is not a string the
-    /// whole field is treated as malformed and returns nil (→ the caller's
-    /// default) rather than silently dropping bad elements — otherwise
-    /// `force_meta_keys = [1]` would collapse to `[]` and disable the default
-    /// binding instead of falling back to it. An explicit `[]` is honored.
+    /// A homogeneous string array, or nil. Any non-string element makes the whole field nil (the
+    /// caller's default), so `force_meta_keys = [1]` does not collapse to `[]` and disable the
+    /// default binding. An explicit `[]` is honored.
     private static func tomlStringArray(_ table: TOMLTable?, _ key: String) -> [String]? {
         guard let arr = table?[key]?.array else { return nil }
         var result: [String] = []
@@ -376,19 +278,13 @@ struct CopadConfig {
         return result
     }
 
-    /// JSON-friendly trigger list ready to ship through `CopadEngine.setTriggers`.
-    /// Just exposes the parsed `[[triggers]]` array; kept as a static helper
-    /// (rather than an instance method) so AppDelegate doesn't have to know
-    /// the encoding rules.
     static func triggersJSON(from config: CopadConfig) -> [[String: Any]] {
         config.triggers
     }
 
-    /// Minimum usable width for a vertical (`left`/`right`) tab bar. Below
-    /// this the full-width tab pills would clip or, past the 8px inset, hit
-    /// unsatisfiable Auto Layout constraints. Comfortably above
-    /// `TabBarView.collapsedBarWidth` (44) so expanded is never narrower
-    /// than collapsed. Matches the horizontal min pill width.
+    /// Minimum usable width for a vertical tab bar: below it the pills clip or hit unsatisfiable
+    /// Auto Layout constraints past the 8px inset. Above `TabBarView.collapsedBarWidth` (44) so
+    /// expanded is never narrower than collapsed.
     static let minTabsWidth = 80
 
     static var defaults: CopadConfig {
@@ -434,12 +330,9 @@ struct CopadConfig {
         return home + path.dropFirst()
     }
 
-    /// Walk the TOML `[[triggers]]` array into JSON-friendly `[[String: Any]]`.
-    /// We can't use a plain Decodable struct because trigger entries contain
-    /// arbitrary nested values (`params`, `payload_match`) that we don't want
-    /// to type statically — Rust's `serde_json::Value` round-trips the same
-    /// tree losslessly. Walks via `TOMLTable` opaque API so the values flow
-    /// straight into `JSONSerialization`-compatible types.
+    /// Walk the TOML `[[triggers]]` array into JSON-friendly values. Entries hold arbitrary nested
+    /// values (`params`, `payload_match`) that are not typed statically; Rust's `serde_json::Value`
+    /// round-trips the same tree.
     private static func parseTriggersArray(from contents: String) -> [[String: Any]] {
         guard let table = try? TOMLTable(string: contents),
               let arr = table["triggers"]?.array
@@ -466,9 +359,7 @@ struct CopadConfig {
         return dict
     }
 
-    /// Walk the `[keybindings]` table into a `[combo: command]` dict. Same
-    /// rationale as triggers — the schema is a flat string-to-string dict
-    /// and we don't want a separate Decodable struct just for that.
+    /// Walk the `[keybindings]` table into a `[combo: command]` dict.
     private static func parseKeybindings(from contents: String) -> [String: String] {
         guard let table = try? TOMLTable(string: contents),
               let kb = table["keybindings"]?.table
@@ -485,8 +376,7 @@ struct CopadConfig {
     }
 
     private static func tomlValueToAny(_ v: TOMLValueConvertible) -> Any? {
-        // Order matters: check leaf types before composites because TOMLValue
-        // may report multiple accessors as non-nil for ambiguous cases.
+        // Leaf types before composites: TOMLValue can report several accessors non-nil.
         if let s = v.string { return s }
         if let i = v.int { return i }
         if let d = v.double { return d }
@@ -506,11 +396,3 @@ struct CopadConfig {
         return nil
     }
 }
-
-// Note: the former private `RawConfig`/`*Section` Codable shadow structs were
-// removed when `parse(_:)` switched to lenient per-field `TOMLTable` reads. A
-// single field with the wrong TOML number type (e.g. `tint = 0` for a Double)
-// made the strict decoder throw and discard the entire config; the per-field
-// reader coerces and degrades gracefully instead. `OSC52Policy` and
-// `TabsPosition` remain as `Decodable` enums but are now decoded from a raw
-// string via their `init(rawValue:)` / `parse(_:)` helpers, not a struct.

@@ -10,50 +10,38 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     private let socketServer = SocketServer()
     private let eventBus = EventBus()
     private let actionRegistry = ActionRegistry()
-    /// PR 9 / parity-plan Tier 2.2 — tracks active panel + per-panel cwd
-    /// for `{context.active_panel}` / `{context.active_cwd}` trigger
-    /// interpolation. Updated synchronously inside `eventBus.onBroadcast`
-    /// before each dispatch; see comment near the wire-up below for the
-    /// "apply-before-dispatch" ordering rationale (matches Linux's
-    /// `Pump::pump_all` pattern).
+    /// Tracks active panel + per-panel cwd for `{context.active_panel}` /
+    /// `{context.active_cwd}` interpolation. Updated synchronously in `eventBus.onBroadcast`
+    /// before each dispatch (apply-before-dispatch; see the wire-up below).
     private let contextService = ContextService()
     /// App-lifetime agent-status model behind the cockpit panel. One pump feeds
     /// it (`startAgentCockpitPump`); cockpit views observe it. See
     /// `docs/agent-cockpit.md`.
     private let agentCockpit = AgentCockpitModel()
     private weak var cockpitPanel: CockpitViewController?
-    /// PR 5c — Rust trigger engine via FFI. Lazy because the underlying
-    /// copad_engine_create() must run AFTER process startup; constructing it
-    /// at property-init time risks a cold-launch race. Created the first
-    /// time `applicationDidFinishLaunching` references it.
+    /// Rust trigger engine via FFI. Lazy because `copad_engine_create()` must run AFTER process
+    /// startup; creating it at property-init risks a cold-launch race.
     private lazy var copadEngine = CopadEngine()
     private var configWatcher: ConfigWatcher?
-    /// Tier 1.2 — compiled keybindings + the active NSEvent monitor token.
-    /// Hot-reload swaps `keybindings` in place; the monitor closure reads
-    /// the latest snapshot via `self`.
+    /// Compiled keybindings + the NSEvent monitor token. Hot-reload swaps `keybindings` in
+    /// place; the monitor reads the latest via `self`.
     private var keybindings: [Keybindings.Binding] = []
     private var keybindingMonitor: Any?
-    /// Cmd+Shift+P palette controller. Held for the sheet's lifetime —
-    /// `NSTableView` data source / delegate are unowned references, so a
-    /// transient stack-only controller would deallocate the moment `open`
-    /// returns and the table would go blank. Cleared from `endSheet`
-    /// completion in `CommandPaletteController.open`.
+    /// Cmd+Shift+P palette controller, held for the sheet's lifetime: `NSTableView` data
+    /// source / delegate are unowned, so a transient controller would deallocate on `open`
+    /// return and blank the table. Cleared from `endSheet` completion.
     private var commandPaletteController: CommandPaletteController?
-    /// Constructed inside `applicationDidFinishLaunching`. Background
-    /// reconnect loop is owned by the client.
     private var daemonClient: DaemonClient?
-    /// Native wallpaper rotation (parity with Linux's glib timer in
-    /// `copad-linux/src/background.rs`). `rotationTimer` ticks every
-    /// `liveRotateInterval` seconds; `armRotation` (re)builds it. The live
-    /// interval is tracked separately so manual `set`/`next`/`toggle` can
-    /// restart the countdown without re-reading config.
+    /// Native wallpaper rotation (parity with `copad-linux/src/background.rs`). `armRotation`
+    /// (re)builds `rotationTimer`; the live interval is tracked separately so manual
+    /// `set`/`next`/`toggle` can restart the countdown without re-reading config.
     private var rotationTimer: DispatchSourceTimer?
     private var liveRotateInterval: UInt = 0
 
     /// Another terminal's identity, inherited when Copad is started from it (`open` in Ghostty,
-    /// a shell in iTerm2). Left in the environment, every pane would claim to BE that terminal,
-    /// and programs that pick features by name (yazi's image driver) choose wrong ones. The pane
-    /// identifies itself as `TERM_PROGRAM=copad` instead (copad-term sets it).
+    /// a shell in iTerm2). Left in the environment, every pane would claim to BE that terminal
+    /// and programs that pick features by name (yazi's image driver) choose wrong. The pane
+    /// identifies itself as `TERM_PROGRAM=copad` (copad-term sets it).
     private static let foreignTerminalVariables = [
         "TERM_PROGRAM", "TERM_PROGRAM_VERSION", "TERM_SESSION_ID", "LC_TERMINAL", "LC_TERMINAL_VERSION",
         "GHOSTTY_RESOURCES_DIR", "GHOSTTY_BIN_DIR", "GHOSTTY_SHELL_FEATURES", "GHOSTTY_SHELL_INTEGRATION_NO_SUDO",
@@ -72,42 +60,28 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_: Notification) {
-        // PR 1 (Tier 2.1) FFI smoke test. Proves the Rust staticlib linked
-        // correctly and a JSON round-trip survives the C-ABI boundary.
-        // Remove once Tier 2.4 (TriggerEngine via FFI) replaces it with real
-        // engine startup.
         CopadFFI.runSmokeTest()
-        // Phase 1 (renderer migration) — sibling staticlib smoke. Proves
-        // libcopad_term.a links alongside libcopad_ffi.a and the
-        // handle/snapshot ABI round-trips. Real PTY + grid lands in Phase 2.
         CopadTermFFI.runSmokeTest()
 
-        // PR 7 — wire the registry's completion fan-out bus BEFORE anything
-        // registers an action handler. This way the very first dispatch
-        // (whether from a coctl that races the socket startup or from an
-        // onStartup plugin's first action) gets `<method>.completed` /
-        // `.failed` broadcast on the same bus the trigger engine listens to.
-        // Idempotent; mirrors Linux's `with_completion_bus(bus)` constructor
-        // pattern but applied via setter so we don't have to construct
-        // `eventBus` before `actionRegistry` (Swift property init order).
+        // Wire the registry's completion fan-out bus BEFORE anything registers a handler, so
+        // the very first dispatch (even a coctl racing socket startup or an onStartup plugin)
+        // broadcasts `<method>.completed` / `.failed` on the bus the trigger engine listens to.
+        // Idempotent; a setter because `eventBus` can't be built before `actionRegistry`
+        // (Swift property init order).
         actionRegistry.setEventBus(eventBus)
 
-        // PR 2 (Tier 2.3) registry seam — register first-party actions so the
-        // socket dispatcher can hand off to them via tryDispatch BEFORE the
-        // legacy switch fires. Plugin host (PR 3) and trigger engine (PR 5)
-        // will register additional actions through this same path.
+        // Register first-party actions so the socket dispatcher hands off via tryDispatch
+        // BEFORE the legacy switch fires.
         registerBuiltinActions()
 
-        // Daemon owns plugin host + registry. Daemon-down ⇒ plugin/registry
-        // actions surface `daemon_unavailable` (local engine still fires
-        // GUI-only triggers).
+        // The daemon owns plugin host + registry; with it down, plugin/registry actions surface
+        // `daemon_unavailable` (the local engine still fires GUI-only triggers).
         daemonClient = DaemonClient(
             socket: CopadPaths.daemonSocket(),
             capabilities: ["tab", "split", "webview", "background", "statusbar", "terminal", "agent.ui", "plugin.open", "search", "session"],
             eventBus: eventBus,
         )
-        // Capture engine on main actor so the @Sendable closure body has
-        // a sendable reference (CopadEngine itself is `@unchecked Sendable`).
+        // Capture the engine on the main actor: CopadEngine is `@unchecked Sendable`.
         let engine = copadEngine
         daemonClient?.cutoverHandler = { hostTriggers in
             engine.setEnabled(!hostTriggers)
@@ -123,17 +97,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             client.forward(method: method, params: params, completion: completion)
         }
-        // Daemon `Event` (notifications, plugin completion fan-out, etc.)
-        // republishes onto our local bus with a fresh bridge_id. The
-        // bridge_id marks the event as "already crossed" so PR 4b's
-        // outbound forwarder will skip it instead of echoing back.
-        // Local copadEngine still fires triggers from this republish —
-        // when daemon owns triggers (`host_triggers=true`), PR 4b cuts
-        // the local engine over to suppress double-fire.
-        // Capture `eventBus` directly — `AppDelegate` is `@MainActor`, so a
-        // `@Sendable` closure capturing `self` would violate isolation when
-        // invoked from `DaemonClient`'s reader thread. `EventBus` is
-        // `@unchecked Sendable` and broadcast is thread-safe.
+        // Daemon `Event`s (notifications, plugin completion fan-out) republish onto the local
+        // bus with a fresh bridge_id marking them "already crossed", so the outbound forwarder
+        // skips them instead of echoing. The local engine still fires triggers from the
+        // republish unless `host_triggers=true` cuts it over. Capture `eventBus` directly:
+        // `AppDelegate` is `@MainActor`, so a `@Sendable` closure capturing `self` would
+        // violate isolation on `DaemonClient`'s reader thread; `EventBus` is thread-safe.
         let bus = eventBus
         daemonClient?.inboundEventHandler = { type, source, data, origin in
             bus.broadcast(
@@ -144,8 +113,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 origin: origin,
             )
         }
-        // Install invoke handler BEFORE start() so the first inbound Invoke
-        // routes through handleCommand instead of being dropped.
         daemonClient?.invokeHandler = { [weak self] id, method, params, reply in
             guard let self else {
                 let line = (try? JSONSerialization.data(withJSONObject: [
@@ -156,9 +123,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             handleCommand(method: method, params: params, allowFallback: false, silentCompletion: true) { result in
-                // nil → unknown_method (handlers `completion(nil)` for both
-                // missing handlers and missing params); encoding it as
-                // ok:true would surface failures as silent daemon successes.
+                // nil is `unknown_method` (handlers `completion(nil)` for both missing handlers
+                // and missing params); encoding it as ok:true would surface failures as silent
+                // daemon successes.
                 let payload: [String: Any] = if let err = result as? RPCError {
                     ["id": id, "ok": false, "error": ["code": err.code, "message": err.message]]
                 } else if let result {
@@ -172,55 +139,40 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 {
                     reply(s + "\n")
                 } else {
-                    // Never silently drop a reply — daemon would wait until
-                    // its per-method timeout and the admission slot would
-                    // hold to the safety net.
+                    // Never silently drop a reply: the daemon would wait for its per-method
+                    // timeout and the admission slot would hold to the safety net.
                     let fallback = "{\"id\":\"\(id)\",\"ok\":false,\"error\":{\"code\":\"internal_error\",\"message\":\"failed to encode response for \(method)\"}}\n"
                     reply(fallback)
                 }
             }
         }
-        // `daemonClient.start()` is deliberately deferred until after the
-        // initial tab exists — see start call site below. An Invoke
-        // arriving before the GUI state is ready would silently no-op
-        // through the `guard let vc = tabVC` arm.
+        // The invoke handler is installed BEFORE `start()` so the first inbound Invoke routes
+        // through handleCommand. `start()` is deferred until the initial tab exists (see the
+        // call below): an Invoke arriving earlier would no-op through the `guard let vc = tabVC`
+        // arm.
 
-        // Initial load: parse failure falls back to `.defaults` so the
-        // app still starts — better than refusing to launch on a typo
-        // in the user's config. `handleConfigChange` (hot reload) takes
-        // the stricter path and preserves the previous live config.
+        // Initial load: a parse failure falls back to `.defaults` so the app still starts.
+        // `handleConfigChange` (hot reload) is stricter and keeps the previous live config.
         let config = (try? CopadConfig.load()) ?? .defaults
         let theme = CopadTheme.byName(config.themeName) ?? .default
 
-        // PR 5c (Tier 2.4) trigger engine via FFI — wire EventBus broadcasts
-        // (including plugin event.publish forwards) into the Rust trigger
-        // engine, which fires actions via the ActionRegistry callback.
-        // Order: registry must already exist (PR 2), supervisor must already
-        // have registered plugin provides[] (above) so triggers can target
-        // plugin actions on the very first event, config must be loaded so
-        // the [[triggers]] array is available.
+        // Trigger engine via FFI: wire EventBus broadcasts (including plugin event.publish
+        // forwards) into the Rust engine, which fires actions via the ActionRegistry callback.
+        // The registry must already exist, the supervisor must have registered plugin
+        // provides[] (so triggers can target plugin actions on the first event), and the config
+        // must be loaded for the [[triggers]] array.
         copadEngine.actionRegistry = actionRegistry
         eventBus.onBroadcast = { [weak copadEngine, contextService] kind, source, data, origin in
-            // EventBus.broadcast can fire from any thread (plugin reader
-            // thread for event.publish, main actor for tab.opened, etc.).
-            // dispatchEvent enters the Rust engine which has its own
-            // RwLock — safe to call from any thread. Log only when a
-            // trigger actually matches so heartbeat noise doesn't drown
-            // the useful signal. `source` plumbs the await-promotion
-            // trust stamp through (PR 7); registry-synthesized completion
-            // events arrive with source = "copad.action".
+            // EventBus.broadcast can fire from any thread (plugin reader thread, main actor);
+            // dispatchEvent enters the Rust engine, which has its own RwLock. Log only on a
+            // trigger match to keep heartbeat noise down. `source` carries the await-promotion
+            // trust stamp (registry-synthesized completions arrive as "copad.action").
             //
-            // PR 9 — apply-before-dispatch ordering. Linux's
-            // `Pump::pump_all` (`copad-linux/src/window.rs:589`) explicitly
-            // drains context first, THEN dispatches triggers, so a
-            // `panel.focused` trigger condition that references
-            // `{context.active_panel}` resolves to the just-focused panel
-            // rather than the previous one. macOS gets the same ordering
-            // by applying the event to ContextService BEFORE the engine
-            // sees it, then taking the post-apply snapshot to pass
-            // through FFI. ContextService is `@unchecked Sendable` with
-            // internal NSLock so off-main callers (plugin reader threads)
-            // are safe.
+            // Apply-before-dispatch: the event is applied to ContextService BEFORE the engine
+            // sees it, and the post-apply snapshot is passed through FFI, so a `panel.focused`
+            // trigger referencing `{context.active_panel}` resolves to the just-focused panel
+            // (Linux `Pump::pump_all`, copad-linux/src/window.rs). ContextService is
+            // `@unchecked Sendable` with an internal NSLock, so off-main callers are safe.
             contextService.apply(eventKind: kind, data: data)
             let context = contextService.snapshot()
             let n = copadEngine?.dispatchEvent(
@@ -239,10 +191,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             FileHandle.standardError.write(Data("[copad-engine] loaded \(count) trigger(s) from config.toml\n".utf8))
         }
 
-        // Tier 1.2 — custom keybindings. Install BEFORE menu bar + window
-        // so the monitor catches first-keystroke; built-in menu shortcuts
-        // still take precedence (menu-driven keyEquivalents fire before
-        // local monitors). Hot-reload calls `applyKeybindings` to swap.
+        // Custom keybindings. Install BEFORE menu bar + window so the monitor catches the
+        // first keystroke; menu keyEquivalents still take precedence over local monitors.
+        // Hot-reload calls `applyKeybindings`.
         applyKeybindings(config.keybindings)
         installKeybindingMonitor()
 
@@ -257,10 +208,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.title = "copad"
         window.center()
         window.isRestorable = false
-        // Let theme.background show through the titlebar instead of OS
-        // default chrome (black in dark mode, white in light). Force
-        // appearance based on background luminance so traffic-light
-        // buttons stay readable on dark themes like Catppuccin Mocha.
+        // Let theme.background show through the titlebar instead of OS chrome. Appearance is
+        // forced by background luminance so traffic lights stay readable on dark themes.
         window.titlebarAppearsTransparent = true
         window.appearance = NSAppearance(named: isDark(theme.background) ? .darkAqua : .aqua)
 
@@ -277,10 +226,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         tabVC = vc
         vc.eventBus = eventBus
         startAgentCockpitPump()
-        // "+" popover's plugin-row dispatch — same outcome as the
-        // `plugin.open` RPC. Errors stderr-log here (popover is
-        // fire-and-forget; surfacing an alert needs UX design we
-        // haven't tackled yet).
+        // "+" popover's plugin-row dispatch, same outcome as the `plugin.open` RPC. Errors
+        // are stderr-logged (the popover is fire-and-forget).
         vc.onOpenPlugin = { [weak self] name, panelName, mode in
             guard let self, let tab = tabVC else { return }
             let modeStr = switch mode {
@@ -293,11 +240,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Tier 4.2 — status bar modules. Loaded AFTER tabVC is built (it
-        // owns the StatusBarView) but BEFORE socket starts so the modules'
-        // initial exec doesn't race a coctl command that depends on
-        // module state. PluginManifestStore.discover() ran inside the
-        // supervisor too — second walk is cheap.
+        // Status bar modules: loaded after tabVC is built (it owns the StatusBarView) but
+        // BEFORE the socket starts, so initial exec doesn't race a coctl command depending on
+        // module state.
         if let bar = vc.statusBar, let client = daemonClient {
             let manifests = PluginManifestStore.discover()
             bar.loadModules(manifests, daemonClient: client, eventBus: eventBus)
@@ -305,11 +250,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         startSocketServer()
         startConfigWatcher()
-        // Decision #61 slice 6: give the restore path a factory to reopen a
-        // plugin panel by name (restore reopens the plugin's first panel).
-        // Lives here because plugin construction needs the manifest store +
-        // action registry the pane manager can't reach; MUST be set before the
-        // restore below. nil (plugin uninstalled) → explicit placeholder.
+        // Factory to reopen a plugin panel by name on restore (decision #61). Lives here
+        // because plugin construction needs the manifest store + action registry the pane
+        // manager can't reach; MUST be set before the restore below. nil (plugin uninstalled)
+        // gives an explicit placeholder.
         vc.pluginFactory = { [weak self, weak vc] name, panelName in
             guard let self, let vc,
                   let manifest = PluginManifestStore.discover().first(where: { $0.manifest.plugin.name == name })
@@ -327,41 +271,35 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 theme: vc.theme,
             )
         }
-        // Reopen the agent cockpit on restore (a `.cockpit` leaf). AppDelegate
-        // owns the cockpit model; track the panel so toggleCockpit dedupes.
+        // Reopen the agent cockpit on restore (a `.cockpit` leaf); track the panel so
+        // toggleCockpit dedupes.
         vc.cockpitFactory = { [weak self] in
             guard let self, let tabVC = self.tabVC else { return nil }
             let cockpit = CockpitViewController(model: self.agentCockpit, tabVC: tabVC)
             self.cockpitPanel = cockpit
             return cockpit
         }
-        // Session-persistence restore: if a snapshot exists, replay
-        // tabs + splits + per-leaf cwd; otherwise seed a single
-        // default terminal tab. MUST happen before the daemon starts
-        // (next line) so GUI-owned Invokes (tab.list, split.*) see
-        // the restored layout, and before any save-on-terminate path
-        // can overwrite the persisted snapshot with an empty one.
-        // Mirrors `copad-linux/src/window.rs` post-build sequence.
-        // Decision #64: restore the v3 flat session (tabs + splits + cwd). An
-        // old v1/v2 file is rejected by the loader → fresh terminal (wipe-fresh).
+        // Restore the v3 session (decision #64): replay tabs + splits + per-leaf cwd, else seed
+        // one terminal tab (an old v1/v2 file is rejected by the loader). MUST happen before
+        // the daemon starts so GUI-owned Invokes see the restored layout, and before any
+        // save-on-terminate can overwrite the snapshot with an empty one. Mirrors
+        // `copad-linux/src/window.rs`.
         if let snap = Session.load(), !snap.tabs.isEmpty {
             vc.restoreSession(snap)
         } else {
             vc.openInitialTab()
         }
 
-        // Start AFTER the initial tab exists so daemon Invokes for
-        // GUI-owned methods (tab.list, terminal.exec, split.*) resolve
-        // against a real pane instead of empty/no-op success.
+        // Start AFTER the initial tab exists so daemon Invokes for GUI-owned methods
+        // (tab.list, terminal.exec, split.*) resolve against a real pane.
         daemonClient?.start()
 
         if let path = config.backgroundPath {
             vc.applyBackground(path: path, tint: config.backgroundTint, opacity: config.backgroundOpacity)
         }
 
-        // Native wallpaper rotation: a static `image` is applied above;
-        // the first rotation tick then takes over (matches Linux's
-        // window.rs apply-at-start + arm sequence). No-op at interval 0.
+        // Native wallpaper rotation: a static `image` is applied above, then the first rotation
+        // tick takes over (as Linux's window.rs). No-op at interval 0.
         liveRotateInterval = config.rotateInterval
         if liveRotateInterval > 0 {
             rotateOnce()
@@ -371,17 +309,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Background rotation (Linux parity)
 
-    /// (Re)build the rotation timer from `liveRotateInterval`. 0 stops it.
-    /// Also the manual-change hook: `background.set`/`next`/`toggle` call
-    /// this so the countdown restarts after a manual pick (Linux's
-    /// `BackgroundLayer::arm_rotation`).
+    /// (Re)build the rotation timer from `liveRotateInterval`; 0 stops it. Manual
+    /// `background.set`/`next`/`toggle` call this too, restarting the countdown
+    /// (`BackgroundLayer::arm_rotation`).
     private func armRotation() {
         rotationTimer?.cancel()
         rotationTimer = nil
         guard liveRotateInterval > 0 else { return }
         let timer = DispatchSource.makeTimerSource(queue: .main)
-        // `.seconds(Int)` — clamp the UInt into Int range so an absurd
-        // config value can't overflow the conversion.
+        // `.seconds(Int)`: clamp the UInt so an absurd config value can't overflow.
         let secs = Int(min(liveRotateInterval, UInt(Int.max)))
         timer.schedule(deadline: .now() + .seconds(secs), repeating: .seconds(secs))
         timer.setEventHandler { [weak self] in self?.rotateOnce() }
@@ -389,9 +325,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         rotationTimer = timer
     }
 
-    /// One rotation tick: honor the shared mode flag, pick a random list
-    /// image, apply it as a list pick. No-op when deactive or the list is
-    /// missing/empty. Mirrors `BackgroundLayer::rotate_once`.
+    /// One rotation tick: honor the shared mode flag, pick a random list image and apply it as a
+    /// list pick. No-op when deactive or the list is missing/empty (`BackgroundLayer::rotate_once`).
     private func rotateOnce() {
         guard BackgroundRotator.isActive else { return }
         guard let img = BackgroundRotator.nextRandomImage(), let vc = tabVC else { return }
@@ -404,28 +339,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_: Notification) {
-        // Persist tabs + splits + cwd BEFORE engine shutdown so
-        // snapshot reads land while panels are still live. An empty
-        // snapshot (no terminal tabs left) clears any prior file so
-        // a stale layout doesn't surface on next launch — same
-        // contract as `copad-linux/src/window.rs`'s close handler.
-        // Decision #64: persist the v3 flat session. The debounced save covers
-        // mid-session crashes; this is the orderly-quit flush.
+        // Persist tabs + splits + cwd (v3, decision #64) BEFORE engine shutdown, while panels
+        // are live. An empty snapshot clears any prior file so a stale layout doesn't surface
+        // (as `copad-linux/src/window.rs`). The debounced save covers crashes; this is the
+        // orderly-quit flush.
         if let snap = tabVC?.snapshotSession() {
             if snap.tabs.isEmpty {
                 Session.clear()
             } else if Session.save(snap) {
-                // Same rule as the debounced path: GC only follows a commit.
                 TabViewController.gcHistoryBlobs(after: snap)
             }
         }
-        // Order matters:
-        // 1. Engine first — clears the C action callback so no in-flight
-        //    plugin event.publish can fire into a stale ActionRegistry.
-        // 2. Supervisor — sends `shutdown` to plugins so they stop
-        //    publishing further events.
-        // 3. Socket — stops accepting new coctl connections.
-        // 4. Config watcher — stops file watching.
+        // Order matters: (1) engine, clearing the C action callback so no in-flight
+        // event.publish fires into a stale ActionRegistry; (2) supervisor, sending `shutdown`
+        // to plugins; (3) socket; (4) config watcher.
         copadEngine.shutdown()
         tabVC?.statusBar?.shutdown()
         socketServer.stop()
@@ -441,25 +368,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         true
     }
 
-    /// Rec. 601 luminance over [0,1]; threshold 0.5 picks darkAqua for any
-    /// reasonably dark background. Used to align titlebar chrome (traffic
-    /// lights) with whatever theme.background the user is running.
+    /// Rec. 601 luminance over [0,1]; a 0.5 threshold picks darkAqua for any reasonably dark
+    /// background, aligning the traffic lights with theme.background.
     private func isDark(_ c: RGBColor) -> Bool {
         let lum = 0.299 * Double(c.r) + 0.587 * Double(c.g) + 0.114 * Double(c.b)
         return lum < 128
     }
 
-    /// Apply `[window] opacity` + `[window] blur` to the main window
-    /// (Ghostty model). Idempotent: safe to call on initial launch and
-    /// on hot-reload. When opacity = 1.0, removes any installed blur
-    /// view and restores opaque chrome.
-    ///
-    /// Layout: `NSVisualEffectView` becomes the contentView's bottom-most
-    /// sibling so it sits behind the TabViewController's root view. The
-    /// TabViewController's root is the existing contentView — we wrap
-    /// it in a container so the blur can layer beneath without
-    /// disturbing AutoLayout of any subview that assumes the controller's
-    /// view is the top-level container.
+    /// Apply `[window] opacity` + `[window] blur` to the main window (Ghostty model).
+    /// Idempotent; at opacity 1.0 it removes any blur view and restores opaque chrome. The
+    /// `NSVisualEffectView` becomes the bottom-most sibling behind the TabViewController's
+    /// root; the controller's view is wrapped in a container so the blur can layer beneath
+    /// without disturbing AutoLayout of subviews that assume it is the top-level container.
     private func applyWindowTransparency(_ window: NSWindow, config: CopadConfig, theme: CopadTheme) {
         let opacity = CGFloat(config.windowOpacity)
         let wantsTransparent = opacity < 1.0
@@ -467,18 +387,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         window.isOpaque = !wantsTransparent
         window.hasShadow = true
-        // backgroundColor alpha < 1 only takes effect when isOpaque = false.
-        // Setting it unconditionally keeps the chrome color consistent on
-        // the opacity = 1.0 path too.
+        // backgroundColor alpha < 1 only takes effect when isOpaque = false; set unconditionally
+        // so the chrome color is consistent at opacity 1.0.
         window.backgroundColor = bg
 
         installOrRemoveBlurView(window: window, enabled: wantsTransparent && config.windowBlur)
     }
 
-    /// Place an `NSVisualEffectView` as the bottom-most subview of the
-    /// window's contentView, sized to fill. Removes it when `enabled =
-    /// false`. Tagged with a unique identifier so we don't double-install
-    /// or accidentally remove an unrelated view.
     private func installOrRemoveBlurView(window: NSWindow, enabled: Bool) {
         guard let content = window.contentView else { return }
         let blurTag = "copad.blurView"
@@ -495,11 +410,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let blur = existing ?? {
             let v = NSVisualEffectView()
             v.identifier = NSUserInterfaceItemIdentifier(blurTag)
-            // `.hudWindow` reads as dark, dense vibrancy — pairs well
-            // with Catppuccin Mocha / dark themes. `.behindWindow`
-            // blends the desktop behind the window (Ghostty pattern);
-            // `.withinWindow` would only blur sibling windows of the
-            // same app, which is not what we want.
+            // `.hudWindow` reads as dark, dense vibrancy; `.behindWindow` blends the desktop
+            // behind the window (Ghostty pattern), while `.withinWindow` would only blur sibling
+            // windows of the same app.
             v.material = .hudWindow
             v.blendingMode = .behindWindow
             v.state = .active
@@ -562,9 +475,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         shellMenu.addItem(.separator())
 
-        // Tier 1.1 — pane focus navigation. Cmd+Shift+] / Cmd+Shift+[
-        // cycle DFS-forward / DFS-backward over leaves of the active
-        // tab's split tree. No-op on tabs with one pane.
         let nextPaneItem = NSMenuItem(title: "Next Pane", action: #selector(focusNextPane), keyEquivalent: "]")
         nextPaneItem.keyEquivalentModifierMask = [.command, .shift]
         nextPaneItem.target = self
@@ -584,10 +494,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             shellMenu.addItem(item)
         }
 
-        // Edit menu — Cmd+C/V/A route through NSResponder chain (target=nil)
-        // to SwiftTerm's @objc open copy:/paste:/selectAll: in MacTerminalView.
-        // Without this menu, those keyEquivalents never get dispatched and the
-        // first responder never sees them, so clipboard appears dead.
+        // Edit menu: Cmd+C/V/A route through the responder chain (target=nil) to the terminal
+        // view's copy:/paste:/selectAll:. Without this menu those keyEquivalents never
+        // dispatch and the clipboard appears dead.
         let editItem = NSMenuItem()
         mainMenu.addItem(editItem)
         let editMenu = NSMenu(title: "Edit")
@@ -655,7 +564,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Tab / Pane Actions
 
-    /// Ask for an SSH destination (in the window) and open its comux in a new tab, natively hosted.
     @objc private func openRemoteComuxPrompt() {
         tabVC?.promptOpenRemoteComux()
     }
@@ -705,8 +613,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Agent cockpit
 
-    /// Open the agent cockpit as a tab, or focus the existing one. The cockpit
-    /// view observes `agentCockpit`; the pump below keeps that model current.
+    /// Open the agent cockpit as a tab, or focus the existing one.
     @objc func toggleCockpit() {
         guard let tabVC else { return }
         if let existing = cockpitPanel, tabVC.activatePanel(id: existing.panelID) { return }
@@ -715,18 +622,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         _ = tabVC.newPluginPanelTab(cockpit)
     }
 
-    /// The single app-lifetime pump feeding the cockpit model. Reuses the
-    /// untyped `subscribe()` + kind-filter pattern from PluginPanelController
-    /// (Linux's `subscribe("*")` + filter). Agent kinds mutate the model;
-    /// panel.exited evicts; panel.focused acknowledges; every relevant event
-    /// then notifies observers so open cockpit views re-enumerate.
+    /// The single app-lifetime pump feeding the cockpit model: agent kinds mutate it,
+    /// panel.exited evicts, panel.focused acknowledges, and every relevant event notifies
+    /// observers so open cockpit views re-enumerate.
     private func startAgentCockpitPump() {
         let channel = eventBus.subscribe()
         let model = agentCockpit
-        // macOS publishes `tab.opened` locally (Linux uses `tab.created`); include
-        // both + close/rename so the cockpit re-enumerates on pane lifecycle. Title
-        // renames post `.terminalTitleChanged` (a NotificationCenter signal, not a
-        // bus event) — the cockpit view observes that separately.
+        // macOS publishes `tab.opened` locally (Linux uses `tab.created`); include both plus
+        // close/rename so the cockpit re-enumerates. Title renames post `.terminalTitleChanged`
+        // (NotificationCenter, not the bus), which the cockpit view observes separately.
         let kinds: Set<String> = [
             "claude.working", "claude.awaiting_input", "claude.session_stopped",
             "panel.exited", "panel.focused",
@@ -739,8 +643,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                       let type = obj["event"] as? String, kinds.contains(type)
                 else { continue }
                 let payload = obj["data"] as? [String: Any] ?? [:]
-                // Serial FIFO hop to the main actor so rapid transitions apply in
-                // arrival order (unstructured `Task`s do not preserve order).
+                // Serial FIFO hop to the main actor so transitions apply in arrival order
+                // (unstructured `Task`s don't preserve order).
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
                         switch type {
@@ -762,12 +666,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Find
 
-    /// Cmd+F / Cmd+G / Cmd+Shift+G dispatch. All three Find-menu
-    /// items route here; the `tag` carries an `NSFindPanelAction`
-    /// raw value telling us which one was hit (showFindPanel / next /
-    /// previous). Alacritty is the only macOS terminal backend; the
-    /// find bar is its own bottom-of-pane control. Non-terminal panes
-    /// (webview, plugin) silently no-op.
+    /// Cmd+F / Cmd+G / Cmd+Shift+G dispatch. The `tag` carries an `NSFindPanelAction` raw value
+    /// (showFindPanel / next / previous). Non-terminal panes silently no-op.
     @objc func performFindPanelAction(_ sender: NSMenuItem) {
         guard let panel = tabVC?.activePaneManager?.activePane else { return }
         guard let alacritty = panel as? AlacrittyTerminalViewController else { return }
@@ -795,22 +695,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Action Registry
 
-    /// First-party `system.*` actions that should be reachable through
-    /// the registry from day one. Plugin host (PR 3) and trigger engine
-    /// (PR 5) will register their own handlers via the same registry.
+    /// First-party `system.*` actions reachable through the registry.
     private func registerBuiltinActions() {
-        // system.ffi_test — proxy to CopadFFI.callJSON. Two purposes:
-        //   1. Proves the registry seam is reachable from `coctl call`,
-        //      end-to-end through SocketServer.dispatch.
-        //   2. Gives PR 5 (trigger engine via FFI) a smoke test target it
-        //      can dispatch as a registered action — same code path as a
-        //      plugin will use.
-        // Silent: this is a debug round-trip with no workflow meaning;
-        // firing `system.ffi_test.completed` would dirty the bus during
-        // FFI smoke testing without enabling any meaningful chain.
+        // system.ffi_test: proxy to CopadFFI.callJSON, a smoke target reachable from
+        // `coctl call` and registrable as a trigger action. Silent: a debug round-trip.
         actionRegistry.registerSilent("system.ffi_test") { params, completion in
-            // Pass through whatever the caller sent; if absent, send an
-            // empty object so the FFI side still gets a valid JSON object.
+            // Pass through the caller's params; send an empty object if absent so the FFI gets
+            // valid JSON.
             let payload = params.isEmpty ? ["caller": "system.ffi_test"] : params
             if let echoed = CopadFFI.callJSON(payload) {
                 completion(["echoed": echoed, "ffi_version": CopadFFI.version()])
@@ -822,12 +713,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // system.list_actions — introspection for diagnostics. Returns
-        // every name registered through the action registry. Mirrors
-        // Linux's debug behavior of being able to query "what actions
-        // exist right now". Silent because UIs that poll this on a timer
-        // would flood the bus with `.completed` events that never drive
-        // a meaningful trigger.
+        // system.list_actions: every registered name, for diagnostics. Silent because UIs
+        // polling it would flood the bus with `.completed` events.
         actionRegistry.registerSilent("system.list_actions") { [weak self] _, completion in
             guard let self else {
                 completion(RPCError(code: "no_app", message: "AppDelegate gone"))
@@ -839,12 +726,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             ])
         }
 
-        // PR 9 — `context.snapshot` introspection. Returns the live
-        // ContextService state ({active_panel, active_cwd}) — same wire
-        // shape Linux's `context.snapshot` ships. Silent because some
-        // tooling (status bar / agents) might poll this on a timer; firing
-        // `context.snapshot.completed` per poll would dwarf real workflow
-        // events on the bus.
+        // `context.snapshot`: the live ContextService state, same wire shape as Linux. Silent
+        // because tooling may poll it.
         actionRegistry.registerSilent("context.snapshot") { [weak self] _, completion in
             guard let self else {
                 completion(RPCError(code: "no_app", message: "AppDelegate gone"))
@@ -853,16 +736,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             completion(contextService.snapshot())
         }
 
-        // PR 8 — register `claude.start` through the registry so the
-        // trigger engine's C callback can reach it. Codex cross-review
-        // CRITICAL: macOS trigger callback dispatches exclusively via
-        // `ActionRegistry.tryDispatch` (no fallthrough to the legacy
-        // switch-arm). Without this registration the Vision Flow 3
-        // chain `git.worktree_add.completed → claude.start` would stall
-        // at the second arrow because `tryDispatch` returns false for
-        // unregistered actions. Noisy (not silent) so chained triggers
-        // can observe `claude.start.completed` for downstream steps if
-        // they want to.
+        // `claude.start` must be registered here: the trigger engine's C callback dispatches
+        // only via `ActionRegistry.tryDispatch` (no legacy-switch fallthrough), so without it
+        // the `git.worktree_add.completed -> claude.start` chain would stall. Noisy, not silent,
+        // so chains can observe `claude.start.completed`.
         actionRegistry.register("claude.start") { [weak self] params, completion in
             guard let self else {
                 completion(RPCError(code: "no_app", message: "AppDelegate gone"))
@@ -871,13 +748,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             ClaudeStart.dispatch(params: params, tabVC: tabVC, completion: completion)
         }
 
-        // panel.report_cwd — Linux/VTE equivalent: shells emit OSC 7 and
-        // VTE captures it natively. macOS alacritty backend doesn't
-        // surface OSC 7 + proc_pidinfo is EPERM on un-entitled builds,
-        // so the in-shell `copad-cwd` hook calls this action on every
-        // `chpwd` instead. params: `{"panel_id": "...", "cwd": "..."}`.
-        // Silent: shell prompts fire `chpwd` constantly; broadcasting
-        // `.completed` per cd would flood the bus.
+        // panel.report_cwd: the alacritty backend doesn't surface OSC 7 (Linux/VTE does) and
+        // proc_pidinfo is EPERM on un-entitled builds, so the in-shell `copad-cwd` hook calls
+        // this on every `chpwd`. params: `{"panel_id": "...", "cwd": "..."}`. Silent: prompts
+        // fire it constantly.
         actionRegistry.registerSilent("panel.report_cwd") { [weak self] params, completion in
             guard let self else {
                 completion(RPCError(code: "no_app", message: "AppDelegate gone"))
@@ -901,20 +775,15 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 completion(RPCError(code: "no_app", message: "TabViewController gone"))
                 return
             }
-            // Find the panel by id across all tabs / splits and update
-            // its tracked cwd. Both terminal backends carry a setter;
-            // non-terminal panels (webview, plugin) are silently
-            // ignored — the shell hook is shell-only by definition.
+            // Find the panel by id across all tabs / splits and update its tracked cwd;
+            // non-terminal panels are ignored (the hook is shell-only).
             let updated = tabVC.applyReportedCwd(panelID: panelID, cwd: cwd)
             completion(["updated": updated])
         }
 
-        // notify.show — mirror of Linux daemon registration
-        // (`copad-linux/src/window.rs:218`) so the macOS GUI's in-process
-        // trigger engine reaches the same `osascript` notifier even when
-        // the daemon isn't running. Silent: a desktop toast is a side-
-        // effect, not a workflow step; chained triggers should not depend
-        // on `notify.show.completed`.
+        // notify.show: mirror of the Linux daemon registration (`copad-linux/src/window.rs`) so
+        // the in-process trigger engine reaches the `osascript` notifier even without the
+        // daemon. Silent: a toast is a side effect, not a workflow step.
         actionRegistry.registerSilent("notify.show") { params, completion in
             guard let title = params["title"] as? String, !title.isEmpty else {
                 completion(RPCError(
@@ -956,11 +825,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 ))
                 return
             }
-            // osascript spawn is sync (~10 ms) — offload off the main
-            // thread so the toast doesn't stall any concurrent UI work,
-            // then bounce the completion back to main where the socket
-            // server expects it. LAST_ERROR is thread-local, so it must
-            // be read on the same thread that called the FFI.
+            // The osascript spawn is sync (~10 ms): offload it, then bounce the completion back
+            // to main where the socket server expects it. LAST_ERROR is thread-local, so read
+            // it on the thread that called the FFI.
             DispatchQueue.global(qos: .userInitiated).async {
                 let rc = title.withCString { titlePtr in
                     body.withCString { bodyPtr in
@@ -992,11 +859,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Config Watcher
 
     private func startConfigWatcher() {
-        // Route through `CopadConfig.configPath()` so XDG_CONFIG_HOME
-        // overrides also reach the watcher — otherwise the watcher would
-        // observe the default ~/.config/ path while Swift load, Rust
-        // daemon, coctl, and `copad --config-path` all use the XDG
-        // location, and edits there wouldn't trigger live reload.
+        // Route through `CopadConfig.configPath()` so XDG_CONFIG_HOME overrides reach the
+        // watcher too; the Swift load, Rust daemon, coctl and `copad --config-path` all use it.
         let configURL = CopadConfig.configPath()
         let watcher = ConfigWatcher(url: configURL)
         watcher.onChange = { [weak self] in self?.handleConfigChange() }
@@ -1005,9 +869,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleConfigChange() {
-        // Match Linux's reload semantics (`window.rs::connect_changed`):
-        // on parse failure, log and return early — the live config keeps
-        // rendering instead of getting reset to defaults on a typo.
+        // As Linux's `window.rs::connect_changed`: on parse failure log and return early, so the
+        // live config keeps rendering instead of resetting to defaults on a typo.
         let newConfig: CopadConfig
         do {
             newConfig = try CopadConfig.load()
@@ -1021,15 +884,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let window {
             applyWindowTransparency(window, config: newConfig, theme: newTheme)
         }
-        // Re-arm rotation with the (possibly changed) interval — arming at
-        // 0 stops the timer. A rotated wallpaper survives the reload via
-        // TabViewController.applyConfig's list-image guard.
+        // Re-arm rotation with the possibly changed interval (0 stops it). A rotated wallpaper
+        // survives via TabViewController.applyConfig's list-image guard.
         liveRotateInterval = newConfig.rotateInterval
         armRotation()
-        // Skip local trigger reload while daemon owns triggers. Daemon
-        // runs its own config watcher and would race our setTriggers.
-        // Local engine retains its previous trigger set, ready for cut-over
-        // restore on daemon disconnect.
+        // Skip the local trigger reload while the daemon owns triggers (it runs its own config
+        // watcher and would race our setTriggers). The local engine keeps its previous set for
+        // cut-over restore on daemon disconnect.
         if daemonClient?.hostTriggersActive == true {
             FileHandle.standardError.write(Data("[copad-engine] skipping local trigger reload — daemon owns triggers (host_triggers=true)\n".utf8))
         } else {
@@ -1038,12 +899,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 FileHandle.standardError.write(Data("[copad-engine] reloaded \(count) trigger(s) on config.toml change\n".utf8))
             }
         }
-        // Reload keybindings — hot-swap into the existing monitor's snapshot.
         applyKeybindings(newConfig.keybindings)
         eventBus.broadcast(event: "config.reloaded", data: ["theme": newTheme.name])
     }
 
-    // MARK: - Keybindings (Tier 1.2)
+    // MARK: - Keybindings
 
     private func applyKeybindings(_ raw: [String: String]) {
         keybindings = Keybindings.compile(raw)
@@ -1053,20 +913,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func installKeybindingMonitor() {
-        // .keyDown so we get repeats too; the local monitor returns the
-        // event when no binding matches, so the standard responder chain
-        // (menu shortcuts, terminal input) sees it normally. Returning nil
-        // swallows the event — only on a positive match.
+        // .keyDown so repeats arrive too. The monitor returns the event when no binding
+        // matches so the responder chain sees it; returning nil swallows it, only on a match.
         keybindingMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self else { return event }
             for binding in keybindings where Keybindings.matches(event, binding) {
                 Keybindings.dispatch(binding, registry: actionRegistry, socketPath: socketServer.path)
                 return nil
             }
-            // cmd+shift+1…9 / cmd+shift+0 jump tabs. Bare Option is left for the
-            // terminal (opt+digit conflicts with tmux, which reads Meta+digit).
-            // Only fires when that tab exists (else it falls through as a normal
-            // keystroke). User `[keybindings]` win.
+            // cmd+shift+1...9 / 0 jump tabs. Bare Option is left to the terminal (opt+digit
+            // conflicts with tmux Meta+digit). Only fires when that tab exists; user
+            // `[keybindings]` win.
             if let idx = commandShiftDigitTabIndex(event), let vc = tabVC, idx < vc.tabCount {
                 vc.switchTab(to: idx)
                 return nil
@@ -1078,10 +935,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Map a Cmd+Shift+digit event to a sub-tab index: cmd+shift+1…9 → 0…8,
-    /// cmd+shift+0 → 9 (the tenth). Returns nil unless Command+Shift are the ONLY
-    /// modifiers. Matched on keyCode, not character: Shift rewrites the digit's
-    /// character (Shift+1 → "!"), so `charactersIgnoringModifiers` can't be used.
+    /// Map a Cmd+Shift+digit event to a sub-tab index (1...9 -> 0...8, 0 -> 9). nil unless
+    /// Command+Shift are the ONLY modifiers. Matched on keyCode: Shift rewrites the character
+    /// (Shift+1 -> "!").
     private func commandShiftDigitTabIndex(_ event: NSEvent) -> Int? {
         let interesting: NSEvent.ModifierFlags = [.command, .control, .shift, .option]
         guard event.modifierFlags.intersection(interesting) == [.command, .shift] else { return nil }
@@ -1089,9 +945,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return digit == 0 ? 9 : digit - 1
     }
 
-    /// Layout-position keyCode → the digit it produces on the number row.
-    /// Derived from `Keybindings.nameToKeyCode` so a keyCode change flows through
-    /// both. Position-based, so it stays correct when Shift alters the character.
+    /// Layout-position keyCode -> the digit on the number row, derived from
+    /// `Keybindings.nameToKeyCode`. Position-based so it holds when Shift alters the character.
     private static let digitKeyCodeToValue: [UInt16: Int] = {
         var map: [UInt16: Int] = [:]
         for n in 0...9 {
@@ -1102,12 +957,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return map
     }()
 
-    /// Cmd+Shift+P, mac convention (VSCode/Zed). User keybindings already
-    /// run before this — a `cmd+shift+p` entry in `[keybindings]` shadows
-    /// the palette, mirroring Linux's "user binding wins" precedence.
-    /// keyCode source `Keybindings.nameToKeyCode` is shared so a future
-    /// rename / re-mapping flows through both the user-binding parser and
-    /// this built-in shortcut without divergence.
+    /// Cmd+Shift+P (VSCode/Zed convention). User keybindings run first, so a `cmd+shift+p`
+    /// entry shadows the palette, as Linux's "user binding wins". The keyCode comes from the
+    /// shared `Keybindings.nameToKeyCode`.
     private func matchesCommandPaletteShortcut(_ event: NSEvent) -> Bool {
         let interesting: NSEvent.ModifierFlags = [.command, .control, .shift, .option]
         let mods = event.modifierFlags.intersection(interesting)
@@ -1116,13 +968,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return event.keyCode == pCode
     }
 
-    /// Returns true when the palette opened (event must be swallowed).
-    /// Repeats and re-entry while a sheet is already attached return false
-    /// so the held key doesn't stack modal state. `attachedSheet` covers
-    /// the destructive-confirm alert window: when palette closes and the
-    /// `tab.close` alert opens, `commandPaletteController` is already nil
-    /// but the window still has the alert sheet attached — a second
-    /// `beginSheet` would break the modal invariant.
+    /// Returns true when the palette opened (the event must be swallowed). Repeats and re-entry
+    /// while a sheet is attached return false so a held key doesn't stack modal state;
+    /// `attachedSheet` also covers the `tab.close` confirm alert, which opens after the palette
+    /// closes (`commandPaletteController` is already nil) and a second `beginSheet` would break
+    /// the modal invariant.
     @MainActor
     private func openCommandPalette() -> Bool {
         guard
@@ -1138,10 +988,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             restoreFocus: restore,
             dispatch: { [weak self] method in
                 self?.handleCommand(method: method, params: [:]) { result in
-                    // Legacy switch arms `completion(nil)` for missing
-                    // params (e.g. `terminal.exec`, `tab.rename`); surface
-                    // those as a usable hint instead of silent no-op so
-                    // palette users learn the action needs params.
+                    // Legacy switch arms `completion(nil)` for missing params; surface a usable
+                    // hint instead of a silent no-op.
                     if let err = result as? RPCError {
                         FileHandle.standardError.write(Data("[copad] command_palette: \(method) failed: \(err.code) — \(err.message)\n".utf8))
                     } else if result == nil {
@@ -1166,20 +1014,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         socketServer.start()
     }
 
-    /// Linux-parity terminal panel resolver. Mirrors
-    /// `resolve_terminal` in copad-linux/src/socket.rs:1213.
-    ///
-    /// Priority:
-    ///   1. If `params["id"]` is given → look up that exact panel; emit
-    ///      `not_found` if no panel matches, `wrong_panel_type` if the
-    ///      panel exists but isn't a terminal (e.g. webview / plugin).
-    ///   2. Otherwise, prefer the active pane if it's a terminal.
-    ///   3. Otherwise, fall back to the first terminal anywhere across
-    ///      tabs (`firstTerminalPanel`).
-    ///   4. If none of the above produces a terminal → `no_terminal`.
-    ///
-    /// Error codes intentionally match Linux verbatim so coctl / agent
-    /// error handling can be backend-agnostic.
+    /// Linux-parity terminal panel resolver (`resolve_terminal` in
+    /// copad-linux/src/socket.rs). Priority: the panel named by `params["id"]` (`not_found`, or
+    /// `wrong_panel_type` if it isn't a terminal); else the active pane if a terminal; else the
+    /// first terminal across tabs (`firstTerminalPanel`); else `no_terminal`. Error codes match
+    /// Linux verbatim so coctl / agent error handling is backend-agnostic.
     private func resolveTerminalPanel(
         params: [String: Any],
         vc: TabViewController,
@@ -1202,13 +1041,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return .failure(RPCError(code: "no_terminal", message: "No terminal panel found"))
     }
 
-    /// Open a plugin-provided panel. Shared by the `plugin.open` RPC and
-    /// the `+` popover's plugin-panel rows so both surfaces reach the
-    /// same outcome with one source of truth.
-    ///
-    /// `mode` matches the RPC contract: "tab" (default) / "split_h" /
-    /// "split_v". An unknown value falls through to "tab" — same forgiving
-    /// shape as the inline implementation it replaces.
+    /// Open a plugin-provided panel, shared by the `plugin.open` RPC and the `+` popover's
+    /// plugin rows. `mode` is "tab" (default) / "split_h" / "split_v"; an unknown value falls
+    /// through to "tab".
     private func openPluginPanel(
         name: String,
         panelName: String,
@@ -1247,12 +1082,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         return .success(panelID)
     }
 
-    /// `allowFallback: false` makes the default arm return local
-    /// `unknown_method` instead of forwarding to daemon — required for
-    /// daemon-originated Invokes so they don't recurse back through the
-    /// fallback. `silentCompletion: true` suppresses local
-    /// `<method>.completed` fan-out for daemon-routed invokes (daemon
-    /// publishes that itself).
+    /// `allowFallback: false` makes the default arm return local `unknown_method` instead of
+    /// forwarding to the daemon, required for daemon-originated Invokes so they don't recurse.
+    /// `silentCompletion: true` suppresses local `<method>.completed` fan-out for daemon-routed
+    /// invokes (the daemon publishes that itself).
     private func handleCommand(
         method: String,
         params: [String: Any],
@@ -1266,12 +1099,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
         guard let vc = tabVC else { completion(nil); return }
 
-        // Browser RPCs pass through the shared core gate before any handler
-        // runs. `completion` is REPLACED, not merely wrapped, so the same rule
-        // is re-applied when the result comes back — several of these handlers
-        // answer from an async callback, and a read that was already in flight
-        // when a tab entered `protected` has to be suppressed rather than
-        // answered with a stale value.
+        // Browser RPCs pass through the shared core gate before any handler runs. `completion`
+        // is REPLACED, not wrapped, so the rule is re-applied on the result: several handlers
+        // answer from an async callback, and a read already in flight when a tab entered
+        // `protected` must be suppressed.
         var completion = completion
         switch browserGate(method: method, params: params, in: vc, completion: completion) {
         case .notBrowser:
@@ -1331,24 +1162,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             case let .success(panel): completion(panel.context(historyLines: historyLines))
             }
 
-        // Diagnostic, and the load-bearing half of the no-focus-theft audit.
-        //
-        // "Did the frontmost application change" is an endpoint check that
-        // misses focus moving WITHIN copad — a browser command that grabbed
-        // first responder would swallow the user's keystrokes while every
-        // system-level signal still looked clean. This reports what the app
-        // itself believes is focused, so a test can assert it is unchanged
-        // across a sweep of every browser command without touching global
-        // input state (which would mean typing into whatever the user has open).
+        // Diagnostic for the no-focus-theft audit. "Did the frontmost application change"
+        // misses focus moving WITHIN copad (a browser command grabbing first responder would
+        // swallow keystrokes while every system signal looks clean). This reports what the app
+        // believes is focused, so a test can assert it is unchanged across every browser
+        // command without touching global input state.
         case "window.focus_state":
             let window = NSApp.keyWindow ?? vc.view.window
             completion([
                 "key_window": window?.title ?? "",
                 "is_key": window?.isKeyWindow ?? false,
-                // `type(of: x as Any)` on an Optional reports `Optional<…>`,
-                // which is the same string for every responder and would make
-                // this diagnostic — and the audit built on it — unable to
-                // detect the change it exists to detect. Unwrap first.
+                // Unwrap first: `type(of: x as Any)` on an Optional reports `Optional<...>`, the
+                // same string for every responder, which would blind this diagnostic.
                 "first_responder": window?.firstResponder.map { String(describing: type(of: $0)) } ?? "none",
                 "active_tab": vc.activeIndex,
                 "active_pane": vc.activePaneID ?? "",
@@ -1396,11 +1221,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             vc.switchTab(to: index)
             completion(["ok": true])
 
-        // Focus one pane from anywhere and bring the app forward with it. Exists for the
-        // notification jump path: a toast raised by an agent inside a comux pane knows the
-        // `COPAD_PANEL_ID` of the copad tab hosting that comux, and activating the
-        // APPLICATION alone would land the user on whichever tab happened to be active.
-        // One call rather than `tab.list` + index arithmetic, because the tab list can
+        // Focus one pane from anywhere and bring the app forward, for the notification jump
+        // path: a toast raised by an agent in a comux pane knows the `COPAD_PANEL_ID` of the
+        // hosting copad tab, and activating the APPLICATION alone would land on whichever tab
+        // was active. One call rather than `tab.list` + index arithmetic, since the list can
         // change between the two.
         case "panel.focus":
             guard let panelID = params["panel_id"] as? String, !panelID.isEmpty else {
@@ -1416,15 +1240,12 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 NSApp.activate(ignoringOtherApps: true)
                 vc.view.window?.makeKeyAndOrderFront(nil)
             }
-            // `focused: false` is reported as a SUCCESSFUL call that found nothing, not an
-            // error: the caller's panel id may simply belong to another copad instance, and
-            // it needs to tell that apart from a broken request so it can fall back.
-            //
-            // `raised` is a SEPARATE outcome from `focused` because on Linux the two come
-            // apart — GTK under Wayland switches the tab but cannot bring its own window
-            // forward. AppKit can, so it is reported here, and the caller skips its
-            // compositor-level raise. Sending it explicitly rather than leaning on the
-            // reader's back-compat default keeps the default from becoming load-bearing.
+            // `focused: false` is a SUCCESSFUL call that found nothing, not an error: the
+            // panel id may belong to another copad instance, and the caller must tell that
+            // from a broken request. `raised` is separate because on Linux the two come apart
+            // (GTK under Wayland switches the tab but can't raise its window); AppKit can, so
+            // the caller skips its compositor-level raise. Sent explicitly so the reader's
+            // back-compat default doesn't become load-bearing.
             completion(["ok": true, "focused": focused, "raised": focused])
 
         case "tab.list":
@@ -1447,8 +1268,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             vc.splitActivePane(orientation: .vertical)
             completion(["ok": true])
 
-        // Tier 1.1 — pane focus navigation, also exposed over socket so
-        // coctl + triggers can drive it (not just menu Cmd+Shift+]).
         case "pane.focus_next":
             vc.focusNextPane(direction: 1)
             completion(["status": "ok"])
@@ -1486,7 +1305,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 alert.addButton(withTitle: action)
             }
             alert.beginSheetModal(for: win) { response in
-                // NSApplication.ModalResponse.alertFirstButtonReturn = 1000
                 let idx = response.rawValue - 1000
                 let chosen = actions.indices.contains(idx) ? actions[idx] : actions.last ?? "Deny"
                 completion(["action": chosen, "index": idx])
@@ -1502,8 +1320,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let tint = params["tint"] as? Double ?? 0.6
             let opacity = params["opacity"] as? Double ?? 1.0
             vc.applyBackground(path: path, tint: tint, opacity: opacity)
-            // A manual pick restarts the countdown so the timer doesn't
-            // replace it a moment later (Linux handle_bg_set parity).
+            // A manual pick restarts the countdown so the timer doesn't replace it a moment
+            // later (Linux handle_bg_set).
             armRotation()
             completion(["ok": true])
 
@@ -1516,9 +1334,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             vc.clearBackground()
             completion(["ok": true])
 
-        // Tier 1.3 — random wallpaper rotation. Same wire shape as Linux:
-        // both commands return `{status, mode}` so trigger configs can
-        // detect deactive state without parsing free-form messages.
+        // Same wire shape as Linux: both commands return `{status, mode}` so trigger configs can
+        // detect deactive state without parsing messages.
         case "background.next":
             guard BackgroundRotator.isActive else {
                 completion(["status": "ok", "mode": "deactive"])
@@ -1531,8 +1348,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 ))
                 return
             }
-            // Reuse the existing tint/opacity from the live state so a rotation
-            // doesn't bake the defaults if the user customized them.
             vc.applyBackground(
                 path: img,
                 tint: vc.currentBackgroundTint,
@@ -1559,10 +1374,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             armRotation()
             completion(["status": "ok", "mode": nowActive ? "active" : "deactive"])
 
-        // Delete the displayed list-picked wallpaper from disk AND the list
-        // file(s), then rotate. Only operates on rotation / `next` / `toggle`
-        // picks — a manually `set` image or `[background] image` is never
-        // deleted (Linux handle_bg_delete_current parity).
+        // Delete the displayed list-picked wallpaper from disk AND the list file(s), then
+        // rotate. Only rotation / `next` / `toggle` picks; a manually `set` image or
+        // `[background] image` is never deleted (Linux handle_bg_delete_current).
         case "background.delete_current":
             guard vc.currentBackgroundFromList, let img = vc.currentBackgroundPath else {
                 completion(RPCError(
@@ -1577,8 +1391,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 completion(RPCError(code: "io_error", message: "delete \(img): \(err.localizedDescription)"))
                 return
             } catch {
-                // NotFound — already gone, treat as success and continue to
-                // list removal + rotation.
+                // NotFound: already gone, continue to list removal + rotation.
             }
             BackgroundRotator.removeFromList(img)
             if let next = BackgroundRotator.nextRandomImage() {
@@ -1604,11 +1417,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 return URL(string: final)
             }
             let mode = params["mode"] as? String ?? "tab"
-            // `background: true` creates the copad tab without switching to
-            // it. `mode` keeps its original meaning — a new COPAD tab or a
-            // split — because changing what `mode: "tab"` does would silently
-            // break every existing caller. A tab inside an existing browser
-            // pane is `webview.tab.new`, which is a different question.
+            // `background: true` creates the copad tab without switching to it. `mode` keeps
+            // its meaning (a new COPAD tab or a split); changing `mode: "tab"` would break
+            // existing callers. A tab inside an existing browser pane is `webview.tab.new`.
             let background = params["background"] as? Bool ?? false
             switch mode {
             case "split_h":
@@ -1661,8 +1472,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
         case "webview.execute_js":
-            // Param name is `code` (Linux + copad-cli convention). Older callers that
-            // sent `script` get a fallback so existing macOS-only consumers don't break.
+            // Param name is `code` (Linux + copad-cli convention); `script` is accepted as a
+            // fallback for older macOS-only callers.
             guard let code = (params["code"] as? String) ?? (params["script"] as? String) else {
                 completion(RPCError(code: "invalid_params", message: "Missing 'code' param"))
                 return
@@ -1689,22 +1500,19 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
         case "webview.devtools":
-            // Linux accepts `action: show/close/attach/detach`. macOS WKWebView
-            // exposes no public API to programmatically open the inspector
-            // window — `developerExtrasEnabled` only enables the right-click
-            // → "Inspect Element" menu. We accept the action verb for protocol
-            // parity but treat show/attach/detach as "ensure enabled" and
-            // close as "no-op" (the user closes the inspector window manually).
+            // Linux accepts `action: show/close/attach/detach`. WKWebView has no public API to
+            // open the inspector; `developerExtrasEnabled` only enables right-click, Inspect
+            // Element. The verb is accepted for parity: show/attach/detach mean "ensure
+            // enabled", close is a no-op.
             let action = (params["action"] as? String) ?? "show"
             switch resolveBrowserTab(params, in: vc) {
             case let .failure(err): completion(err)
             case let .success(t):
                 switch action {
                 case "show", "attach", "detach", "toggle":
-                    // The TARGET tab's configuration, not the pane's active
-                    // one: every other page-level command honours `tab_id`, and
-                    // silently toggling a different tab's inspector would be a
-                    // surprise rather than a convenience.
+                    // The TARGET tab's configuration, not the pane's active one: every other
+                    // page-level command honours `tab_id`, and toggling a different tab's
+                    // inspector would be a surprise.
                     t.tab.toggleDevTools()
                     completion(["status": "ok"])
                 case "close":
@@ -1731,12 +1539,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 ])
             }
 
-        // Tier 4.3 — webview interaction. Each command builds the JS
-        // snippet (mirroring copad-linux/src/webview.rs::js) and runs it
-        // via the existing executeJS bridge. The JS returns a JSON string;
-        // we parse it back into `Any` so the wire format stays homogenous
-        // with Linux. Selector resolution is the same id/active fallback
-        // as the navigation commands.
+        // Webview interaction: each command builds the JS snippet (mirroring
+        // copad-linux/src/webview.rs::js) and runs it via the executeJS bridge; the JSON-string
+        // result is parsed back into `Any` so the wire format matches Linux.
         case "webview.query":
             guard let selector = params["selector"] as? String else {
                 completion(RPCError(code: "invalid_params", message: "Missing 'selector' param"))
@@ -1779,7 +1584,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             runWebViewJS(WebViewJS.fill(selector, value: value), params: params, in: vc, completion: completion)
 
         case "webview.scroll":
-            // selector optional; if absent, scroll viewport to (x, y).
             let selector = params["selector"] as? String
             let x = (params["x"] as? Int) ?? 0
             let y = (params["y"] as? Int) ?? 0
@@ -1788,10 +1592,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case "webview.page_info":
             runWebViewJS(WebViewJS.pageInfo(), params: params, in: vc, completion: completion)
 
-        // Backstop for the same set `browserGate` short-circuits above — kept so
-        // a future caller reaching this switch by another route still gets the
-        // truthful answer rather than `unknown_method`, which is
-        // indistinguishable from a typo.
+        // Backstop for the set `browserGate` short-circuits above, so a caller reaching this
+        // switch by another route still gets the truthful answer rather than `unknown_method`.
         case let m where Self.unimplementedBrowserMethods.contains(m):
             completion(RPCError(
                 code: "unsupported_capability",
@@ -1808,9 +1610,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                         ? s : "https://" + s
                     return URL(string: final)
                 }
-                // Background by DEFAULT here, unlike the toolbar's own new-tab:
-                // this method is reached by agents, and an agent opening a tab
-                // must not change what the human is looking at.
+                // Background by DEFAULT here, unlike the toolbar's new-tab: agents reach this
+                // method, and must not change what the human is looking at.
                 let background = params["background"] as? Bool ?? true
                 guard let tabID = t.pane.newTab(url: url, background: background) else {
                     completion(RPCError(
@@ -1826,19 +1627,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             switch resolveBrowserTab(params, in: vc) {
             case let .failure(err): completion(err)
             case let .success(t):
-                // A protected tab contributes BOOKKEEPING only.
-                //
-                // `tab.list` is classified `Meta` in core — an agent must always
-                // be able to discover that a tab exists and that it is
-                // protected — but url and title are page-derived, exactly what
-                // `webview.state` is refused for. Returning them here would
-                // have routed an OAuth code or a reset-token URL straight
-                // around the protection.
-                // Profile-wide, not per-tab. Sibling tabs share the
-                // authenticated session, so an agent could navigate one to a
-                // sensitive endpoint and read its URL back through this
-                // "metadata" method while `webview.state` refused the same
-                // read.
+                // A protected tab contributes BOOKKEEPING only. `tab.list` is `Meta` in core
+                // (an agent must always be able to discover that a tab exists and is
+                // protected), but url and title are page-derived, exactly what `webview.state`
+                // is refused for; returning them would route an OAuth code or reset-token URL
+                // around the protection. Profile-wide, not per-tab: sibling tabs share the
+                // authenticated session, so an agent could navigate one to a sensitive endpoint
+                // and read its URL back here.
                 let anyProtected = WebViewController.anyProtected
                 let list = t.pane.tabs.map { tab in
                     let isProtected = anyProtected || tab.tabMode == .protected
@@ -1881,9 +1676,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             case let .failure(err): completion(err)
             case let .success(t):
                 if let problem = t.pane.closeTab(id: tabID) {
-                    // Refusing the last tab is deliberate: closing the PANE is
-                    // the tab manager's job, and a pane with no tabs has no
-                    // coherent snapshot.
+                    // Refusing the last tab is deliberate: closing the PANE is the tab
+                    // manager's job, and a pane with no tabs has no coherent snapshot.
                     completion(RPCError(code: "refused", message: problem))
                 } else {
                     completion(["status": "ok", "remaining": t.pane.tabs.count])
@@ -1914,11 +1708,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             case let .failure(err): completion(err)
             case let .success(t):
                 let on = params["on"] as? Bool ?? true
-                // Answer only once the rebuild has finished. The transition
-                // tears the old web view down, awaits an async cache purge and
-                // builds a new one; replying early left `webView` nil, so an
-                // immediately-following `reload`/`navigate`/`click` — all of
-                // which protection ALLOWS — dereferenced it and crashed.
+                // Answer only once the rebuild has finished. The transition tears the old web
+                // view down, awaits an async cache purge and builds a new one; replying early
+                // left `webView` nil and a following `reload`/`navigate`/`click` (all allowed
+                // under protection) crashed.
                 t.tab.setProtected(on) {
                     completion([
                         "mode": t.tab.tabMode.rawValue,
@@ -1928,8 +1721,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
         case "browser.secret.list":
-            // Metadata only. `CredentialRef` has no field that could carry the
-            // secret, which is why this is safe to answer to an agent at all.
+            // Metadata only: `CredentialRef` has no field that could carry the secret, which is
+            // why this is safe to answer to an agent.
             let origin = params["origin"] as? String
             completion(["credentials": BrowserSecrets.list(origin: origin).map(\.wire)])
 
@@ -1949,17 +1742,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     switch result {
                     case let .failure(err): completion(err)
                     case let .success(selector):
-                        // The selector, never the value. There is no shape of
-                        // this response that carries the secret.
+                        // The selector, never the value; no shape of this response carries the
+                        // secret.
                         completion(["ok": true, "filled": [selector]])
                     }
                 }
             }
 
         case "browser.secret.save":
-            // The SECRET is read natively from the protected page — it is not a
-            // parameter, so an agent calling this never handles it and never
-            // sees it.
+            // The SECRET is read natively from the protected page, never a parameter, so an
+            // agent calling this never handles or sees it.
             guard let username = params["username"] as? String, !username.isEmpty else {
                 completion(RPCError(code: "invalid_params", message: "Missing 'username' param"))
                 return
@@ -1998,19 +1790,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 if let since = params["since"] as? Int { query["since"] = since }
                 if let contains = params["filter"] as? String { query["contains"] = contains }
                 if let level = params["level"] as? String { query["level"] = level }
-                // A `tab_id` in the params scopes the READ as well as the
-                // target, so "what did this background tab do" is answerable
-                // without selecting it.
+                // A `tab_id` scopes the READ as well as the target, so a background tab's
+                // activity is answerable without selecting it.
                 if let tabID = params["tab_id"] as? String, !tabID.isEmpty {
                     query["tab_id"] = tabID
                 }
                 let result = BrowserFFI.readLog(panelID: t.pane.panelID, query: query)
                 completion([
                     "records": result.records,
-                    // Declared on every response. Patching fetch/XHR is not a
-                    // packet log — subresources, sendBeacon, WebSocket frames
-                    // and service-worker traffic are invisible to it — so an
-                    // empty list must never be read as "no request was made".
+                    // Declared on every response: fetch/XHR patching is not a packet log
+                    // (subresources, sendBeacon, WebSocket frames and service-worker traffic
+                    // are invisible), so an empty list must never read as "no request was made".
                     "coverage": result.coverage,
                 ])
             }
@@ -2027,24 +1817,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             case let .failure(err): completion(err)
             case let .success(t):
                 let config = WKSnapshotConfiguration()
-                // Default rect = visible area at full resolution. Linux's
-                // SnapshotRegion::Visible matches this, modulo platform pixel
-                // density differences.
-                //
-                // Works on a BACKGROUND tab, which is the point: the B3 spike
-                // measured `takeSnapshot` on a web view in no window at all and
-                // it rendered correctly at the right size. Capturing a
-                // background tab therefore neither raises it nor disturbs what
-                // the user is looking at.
+                // Default rect = visible area at full resolution (Linux's
+                // SnapshotRegion::Visible, modulo pixel density). Works on a BACKGROUND tab
+                // (`takeSnapshot` was measured to render correctly with no window), so
+                // capturing it neither raises it nor disturbs the user.
                 t.tab.webView.takeSnapshot(with: config) { image, error in
                     if let error {
                         completion(RPCError(code: "snapshot_failed", message: error.localizedDescription))
                         return
                     }
                     guard let image, image.size.width > 1, image.size.height > 1 else {
-                        // A zero-sized snapshot means the view had no frame —
-                        // say so, rather than blaming the PNG encoder, which is
-                        // what sent the first investigation the wrong way.
+                        // A zero-sized snapshot means the view had no frame; say so rather than
+                        // blaming the PNG encoder.
                         completion(RPCError(
                             code: "snapshot_failed",
                             message: "the tab has no rendered size yet",
@@ -2067,10 +1851,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
 
         case "plugin.open":
-            // params: name (plugin name), panel (default "main"), mode
-            // (default "tab", also supports "split_h"/"split_v"). Mirrors
-            // the shape of `webview.open` so triggers + coctl scripts
-            // can use the same param vocabulary across panel types.
+            // params: name (plugin name), panel (default "main"), mode (default "tab", also
+            // "split_h"/"split_v"), the same vocabulary as `webview.open`.
             guard let name = params["name"] as? String else {
                 completion(RPCError(code: "invalid_params", message: "Missing 'name' param"))
                 return
@@ -2084,8 +1866,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 completion(error)
             }
 
-        // Tier 4.2 — status bar visibility toggles. Match Linux's
-        // `{visible: bool}` response shape.
         case "statusbar.show":
             if let bar = vc.statusBar {
                 completion(["visible": bar.setShown(true)])
@@ -2116,9 +1896,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Helper: resolve the target webview, evaluate the JS snippet, parse
-    /// the JSON-string result, and pass the parsed value to completion.
-    /// Linux's `run_js_command` does the same shape; this is its mirror.
+    /// Resolve the target webview, evaluate the JS snippet, parse the JSON-string result and
+    /// pass it to completion (Linux's `run_js_command`).
     private func runWebViewJS(
         _ js: String,
         params: [String: Any],
@@ -2134,13 +1913,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                     completion(RPCError(code: "js_error", message: error.localizedDescription))
                     return
                 }
-                // The JS snippets always JSON.stringify their result, so
-                // the WKWebView completion gives us a String here. Decode
-                // back into [String: Any] / [Any] / scalar.
+                // The snippets always JSON.stringify, so the completion gives a String; decode
+                // it back into [String: Any] / [Any] / scalar.
                 guard let str = result as? String else {
-                    // Fallback: hand the raw value back — covers JS that
-                    // accidentally returns a non-string (the Linux side
-                    // does the same passthrough).
+                    // Fallback: hand the raw value back for JS that returns a non-string (as
+                    // Linux does).
                     completion(["result": result ?? NSNull()])
                     return
                 }
@@ -2155,15 +1932,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Browser methods that are WIRED but not yet built on macOS.
-    ///
-    /// Registering them matters: a `coctl` script gets a truthful,
-    /// machine-readable "not implemented yet" instead of `unknown_method`, which
-    /// is indistinguishable from a typo. `webview.tab.protect` is here because
-    /// protected mode's enforcement half — rebuild the web view so no
-    /// agent-installed script survives, purge the origin's service workers and
-    /// code caches — is work unit B5, and a flag that LOOKS like protection
-    /// while only half of it exists would be worse than no flag at all.
+    /// Browser methods that are WIRED but not yet built on macOS. Registering them gives a
+    /// `coctl` script a machine-readable "not implemented yet" instead of `unknown_method`,
+    /// which looks like a typo.
     static let unimplementedBrowserMethods: Set<String> = [
         "webview.profile.list", "webview.profile.clear",
     ]
@@ -2177,27 +1948,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         case allowed(deliver: (Any?) -> Void)
     }
 
-    /// Ask `copad-core` whether a browser RPC may run, and prepare the delivery
-    /// path it must return through.
+    /// Ask `copad-core` whether a browser RPC may run (`browser::authorize`, reached over FFI
+    /// so Linux and macOS cannot answer differently), and prepare the delivery path.
     ///
-    /// The rule itself lives in Rust (`browser::authorize`) and is reached over
-    /// FFI, so Linux and macOS cannot answer this question differently — which
-    /// is the entire reason it is not implemented here.
+    /// Two checks: at dispatch (refuse before the handler runs) and at delivery (re-ask, since
+    /// `execute_js`, `screenshot`, `get_content` and the JS-snippet commands answer from an
+    /// async callback, and a read issued just before a tab entered `protected` must not hand
+    /// back the page).
     ///
-    /// Two checks, not one:
-    ///
-    /// 1. **At dispatch** — refuse before the handler runs.
-    /// 2. **At delivery** — re-ask, because `execute_js`, `screenshot`,
-    ///    `get_content` and the JS-snippet commands all answer from an async
-    ///    callback. Without the second check, a read issued a moment before a
-    ///    tab entered `protected` would still hand back the page.
-    ///
-    /// A permitted write additionally has its result replaced with a fixed
-    /// response. `click` reporting "ok" vs "not found" is a selector oracle —
-    /// an agent can probe `input[name=csrf][value^="a"]`, then `^="ab"`, and
-    /// read a protected page one character at a time through nothing but
-    /// allowed writes. The **error** is replaced too, for the same reason: a
-    /// refused-vs-succeeded distinction leaks exactly the same bit.
+    /// A permitted write has its result, and its error, replaced with a fixed response:
+    /// `click` reporting "ok" vs "not found" is a selector oracle (probing
+    /// `input[name=csrf][value^="a"]`, then `^="ab"`, reads a protected page one character at a
+    /// time), and a refused-vs-succeeded distinction leaks the same bit.
     private func browserGate(
         method: String,
         params: [String: Any],
@@ -2208,11 +1970,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             return .notBrowser
         }
 
-        // "Not built yet" is answered BEFORE the policy gate. `browser.secret.*`
-        // requires a protected target, and production tabs are never protected
-        // until B5 — so gating first would answer `requires_protected` and send
-        // the caller to `webview.tab.protect`, which is itself unimplemented.
-        // A truthful dead end beats a loop.
         if Self.unimplementedBrowserMethods.contains(method) {
             return .refused(RPCError(
                 code: "unsupported_capability",
@@ -2220,24 +1977,20 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             ))
         }
 
-        // A command with no resolvable target (`webview.open` creates one) is
-        // judged against the profile only. The target is captured WEAKLY so the
-        // delivery check below can re-read its mode rather than replaying a
-        // value that was true when dispatch happened.
+        // A command with no resolvable target (`webview.open` creates one) is judged against
+        // the profile only. The target is captured WEAKLY so the delivery check re-reads its
+        // mode.
         let target: BrowserTab? = switch resolveBrowserTab(params, in: vc) {
         case let .success(pair): pair.tab
         case .failure: nil
         }
         let hadTarget = target != nil
 
-        // `WebViewController.anyProtected`, not a walk over this window's panes.
-        // The capture, event and persistence paths all ask the registry, and a
-        // second implementation of the same predicate is a second implementation
-        // that can disagree — which the window-walk version already did once
-        // (see `profileHasProtectedTab`: a pane in an inactive copad tab has no
-        // `view.window`, so a window-based lookup answered "just this pane").
-        // One reading means the RPC gate cannot end up more permissive than the
-        // capture script it exists to be consistent with.
+        // `WebViewController.anyProtected`, not a walk over this window's panes: capture, event
+        // and persistence paths ask the registry, and a second implementation of the predicate
+        // can disagree (the window-walk did once; see `profileHasProtectedTab`: a pane in an
+        // inactive copad tab has no `view.window`). The RPC gate must not be more permissive
+        // than the capture script.
         let decision = BrowserFFI.authorize(
             method: method,
             mode: (target?.tabMode ?? .automation).rawValue,
@@ -2251,15 +2004,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         return .allowed(deliver: { [weak target, weak vc] result in
-            // Re-evaluate against the state as it is NOW. Reusing the mode
-            // captured at dispatch would authorize a result with state that is
-            // by definition stale — the whole reason this second check exists.
-            //
-            // Fail closed when the target or the window has gone away
-            // mid-flight: a pane that was torn down while its callback was in
-            // flight cannot be asked what mode it is in, and the profile scan
-            // only sees panels still in the window, so "not found" must not
-            // read as "was never protected".
+            // Re-evaluate against the state as it is NOW; the mode captured at dispatch is stale
+            // by definition. Fail closed when the target or window went away mid-flight: a torn
+            // down pane can't be asked its mode, and the profile scan only sees panels still in
+            // the window, so "not found" must not read as "was never protected".
             guard let vc else {
                 completion(RPCError(
                     code: "tab_closed",
@@ -2294,17 +2042,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         })
     }
 
-    /// Resolves the target TAB for a browser command.
-    ///
-    /// Two levels: `id` picks the pane (absent → the active pane), `tab_id`
-    /// picks the tab within it (absent → that pane's active tab). Every
-    /// page-level method takes a tab target, because selecting a tab in order
-    /// to operate on it would change what the user sees — so no operation may
-    /// require it.
-    ///
-    /// The target resolves ONCE, before any await. A caller that re-resolved
-    /// later could silently retarget onto a different tab if the list changed
-    /// underneath it; `tab_closed` is the honest answer instead.
+    /// Resolves the target TAB for a browser command: `id` picks the pane (absent: the active
+    /// pane), `tab_id` the tab within it (absent: that pane's active tab). Every page-level
+    /// method takes a tab target because selecting a tab to operate on it would change what the
+    /// user sees. It resolves ONCE, before any await, so a changed tab list can't silently
+    /// retarget; `tab_closed` is the honest answer.
     private func resolveBrowserTab(
         _ params: [String: Any],
         in vc: TabViewController,
@@ -2319,8 +2061,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             }
             pane = webVC
         } else {
-            // Linux's handlers require `id`; macOS keeps the lenient default
-            // per the parity plan (Tier 1.6) so existing coctl-without-id calls
+            // Linux's handlers require `id`; macOS defaults leniently so id-less coctl calls
             // keep working.
             guard let webVC = vc.activeWebView else {
                 return .failure(RPCError(
