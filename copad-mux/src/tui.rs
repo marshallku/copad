@@ -1,14 +1,8 @@
-//! The mux [`App`]: the authoritative `State` (layout authority) + one `PaneTerm`
-//! (real shell PTY) per terminal, plus the composition logic. It renders the whole
-//! workspace into a `Buffer` ([`App::render_to`]) and interprets keys
-//! ([`App::feed_key`]) — tmux-style prefix `Ctrl-b` then `%`/`"` split, `o`/arrows
-//! focus, `x` close, `c`/`n`/`p`/`&` tabs, `d` detach; plus prefix-less
-//! `Ctrl+Shift+arrow` nav and the `Ctrl-f` switcher.
-//!
-//! `App` is transport-agnostic: it owns no terminal I/O and no socket. The headless
-//! [`crate::server`] drives it (render → ship cell diffs; forwarded keys → feed_key)
-//! and the thin [`crate::client`] renders + forwards input, so the same App serves
-//! local and detached/reattached sessions.
+//! The mux [`App`]: the authoritative `State` plus one `PaneTerm` (real shell PTY) per
+//! terminal, the composition into a `Buffer` ([`App::render_to`]) and key interpretation
+//! ([`App::feed_key`]). `App` is transport-agnostic: it owns no terminal I/O and no socket.
+//! The headless [`crate::server`] drives it and the thin [`crate::client`] renders and forwards
+//! input.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -54,7 +48,6 @@ mod graph;
 mod host;
 pub use delegate::OverlayMarks;
 
-/// Direction for focus navigation with the arrow keys.
 #[derive(Clone, Copy)]
 enum FocusDir {
     Left,
@@ -63,23 +56,18 @@ enum FocusDir {
     Down,
 }
 
-/// One logged agent-turn event, shown in the notification center (`Ctrl-b a`).
 #[derive(Debug, Clone)]
 struct Notification {
     /// Monotonic within the server's life: the L0 `notif-read` target.
     id: u64,
-    /// Wall-clock `HH:MM` when it happened.
     when: String,
-    /// `"done"` (turn finished) or `"blocked"` (awaiting input).
     kind: &'static str,
     tool: String,
     space: String,
-    /// The TAB it came from, titled by the same rule the sidebar uses
-    /// ([`tab_display_title`]). A space can hold many agents, so the space name alone does
-    /// not answer "which one is asking me" — the question a notification exists to raise.
+    /// The TAB it came from, titled by [`tab_display_title`]: a space can hold many agents, so
+    /// the space name alone does not say which one is asking.
     tab: String,
     body: String,
-    /// The pane it came from — `Enter` in the center jumps here.
     terminal: TerminalId,
     /// Seen: by the same evidence that acknowledges a bell (a key or click while that pane
     /// is focused), or by jumping to it. Drives the `✉ N` chip and `Ctrl-b u`.
@@ -92,11 +80,9 @@ struct Notification {
 }
 
 /// A tab's display title: its custom name when it has a meaningful one, else its 1-based
-/// INDEX (`tab 2` — the `Ctrl-b <n>` that jumps there).
-///
-/// One rule, one place. The sidebar's agent rows and the notifications now both title a tab
-/// with it; two copies would drift, and a toast that names a tab differently from the row
-/// you then go looking for is worse than a toast that names no tab at all.
+/// index (`tab 2`, the `Ctrl-b <n>` that jumps there). One rule in one place: the sidebar's
+/// agent rows and notifications both use it, and a toast naming a tab differently from the row
+/// you then look for is worse than one naming no tab.
 fn tab_display_title(name: Option<&str>, index: usize) -> String {
     name.map(str::trim)
         .filter(|n| !n.is_empty())
@@ -104,11 +90,8 @@ fn tab_display_title(name: Option<&str>, index: usize) -> String {
         .unwrap_or_else(|| format!("tab {}", index + 1))
 }
 
-/// Where a notification came from: `tool · space/tab`.
-///
-/// Each part is dropped when it is unknown rather than rendered as an empty segment — a
-/// pane that could not be located must not produce a title ending in a bare `/`, which
-/// reads as a real but nameless tab.
+/// Where a notification came from: `tool · space/tab`. Unknown parts are dropped rather than
+/// rendered empty: an unlocated pane must not yield a title ending in a bare `/`.
 fn notify_title(tool: &str, space: &str, tab: &str) -> String {
     let place = match (space.is_empty(), tab.is_empty()) {
         (false, false) => format!("{space}/{tab}"),
@@ -123,12 +106,9 @@ fn notify_title(tool: &str, space: &str, tab: &str) -> String {
     }
 }
 
-/// One `Ctrl-f` agent row: `codex · working 4m — running: cargo test  (space · tab 2)`.
-///
-/// The detail is what the switcher is opened for — "working" does not distinguish an agent
-/// compiling for 40 seconds from one stuck in a retry loop. It is omitted entirely when there
-/// is no reading, so a row never carries a placeholder standing in for information we do not
-/// have.
+/// One `Ctrl-f` agent row: `codex · working 4m — running: cargo test  (space · tab 2)`. The
+/// detail is what the switcher is opened for ("working" cannot tell compiling from a retry
+/// loop); it is omitted entirely when there is no reading.
 fn agent_popup_text(
     tool: &str,
     status: &str,
@@ -148,19 +128,15 @@ fn agent_popup_text(
     }
 }
 
-/// One labelled reading on the top bar.
 pub struct HostPart {
     pub label: String,
     pub value: String,
     pub color: Color,
 }
 
-/// The host readout, as label/value pairs. A field with no reading produces NO part — the bar
-/// then shows less, rather than showing a zero that claims something about the machine.
-///
-/// Split out of the renderer so the composition is testable: `App` cannot be constructed in a
-/// unit test, and "does an unreadable GPU disappear" is exactly the kind of thing that would
-/// otherwise only be checked by looking at it.
+/// The host readout as label/value pairs. A field with no reading produces NO part, so the
+/// bar shows less rather than a zero that claims something about the machine. Split out of
+/// the renderer so the composition is testable.
 pub fn host_parts(m: &hostmetrics::HostMetrics) -> Vec<HostPart> {
     let mut out = Vec::new();
     let mut pct = |label: &str, v: Option<f64>| {
@@ -187,11 +163,10 @@ pub fn host_parts(m: &hostmetrics::HostMetrics) -> Vec<HostPart> {
     out
 }
 
-/// A divider being dragged: which branch, and by whom.
-///
-/// The branch is held by PATH rather than by an adjacent pane, because `SplitTree::resize`
-/// resolves deepest-first and a pane in an outer branch's `first` child can also sit inside a
-/// nested branch on the same axis — dragging the outer divider would move the inner one.
+/// A divider being dragged: which branch, and by whom. The branch is held by PATH rather than
+/// by an adjacent pane, because `SplitTree::resize` resolves deepest-first and a pane in an
+/// outer branch's `first` child can also sit inside a nested branch on the same axis, so
+/// dragging the outer divider would move the inner one.
 #[derive(Debug, Clone)]
 struct ResizeDrag {
     /// Where the branch lives. A drag applied to whatever tab happens to be active is how a
@@ -209,11 +184,9 @@ struct ResizeDrag {
     owner: ClientId,
 }
 
-/// Where a pointer sits inside a branch, as a 0..1 share of its extent.
-///
-/// The divider itself occupies a cell, so the usable span is `extent - 1`; dividing by the
-/// full extent would make the pane always a hair narrower than where the pointer is, and the
-/// error grows as panes get small.
+/// Where a pointer sits inside a branch, as a 0..1 share of its extent. The divider occupies a
+/// cell, so the usable span is `extent - 1`; dividing by the full extent would leave the pane a
+/// hair narrower than the pointer, and more so as panes shrink.
 fn drag_ratio(pos: u16, origin: u16, extent: u16) -> Option<f32> {
     let span = extent.checked_sub(1)?;
     if span == 0 {
@@ -222,43 +195,30 @@ fn drag_ratio(pos: u16, origin: u16, extent: u16) -> Option<f32> {
     Some(pos.saturating_sub(origin) as f32 / span as f32)
 }
 
-/// Max notifications retained in the center.
 const NOTIFY_LOG_CAP: usize = 100;
 
 /// Outcome lines kept between two L0 publications; a burst beyond this is not worth a host's
 /// attention line by line (the status topic still carries the latest).
 const FLASH_LOG_CAP: usize = 16;
 
-/// Max hook-ownership records kept before pruning to live panes (see
-/// [`App::claim_hook_kind`]).
 const HOOK_OWNED_CAP: usize = 512;
 
-/// Max attached-client pids remembered for window raising.
 const MAX_CLIENT_PIDS: usize = 16;
 
-/// What a click on a piece of chrome should do. Recorded per rendered chip/row so
-/// [`App::mouse_at`] can turn a click on the status bar or sidebar into navigation.
 #[derive(Clone)]
 enum ClickTarget {
-    /// A status-bar tab chip → select that tab in the active session.
     Tab(TabId),
-    /// A sidebar `spaces` row → switch to that session.
     Session(WorkspaceId),
-    /// A sidebar `agents` row → jump to that agent's pane (its session + tab + focus).
     Agent(TerminalId),
     /// The status-bar session pill. A left click is a no-op (switching to the already
     /// active session would steal the controller lease); it exists as a RIGHT-click
     /// context-menu anchor for session actions.
     SessionPill(WorkspaceId),
-    /// The status-bar usage/limits readout (`usage_layout = paged`). Wheel over it
-    /// pages the carousel; a left click advances one page (wrapping).
     Usage,
 }
 
-/// The notification center's box `(x0, y0, x1, y1)` and its `(row y, notification id)`s.
 type CenterHits = ((u16, u16, u16, u16), Vec<(u16, u64)>);
 
-/// A rectangular hit region (inclusive `x0..=x1`, `y0..=y1`) recorded during render.
 struct ClickZone {
     x0: u16,
     x1: u16,
@@ -267,30 +227,25 @@ struct ClickZone {
     target: ClickTarget,
 }
 
-/// An inline single-line text prompt (session name entry / rename), tmux `command-prompt`.
 #[derive(Clone, PartialEq, Eq)]
 enum PromptKind {
     /// `Ctrl-b C` step 2: create a session in this directory (picked in the browser) with
     /// the typed name (empty → auto `sN`). Esc goes back to the browser, not out.
     NewSessionIn(PathBuf),
-    /// `Ctrl-b W`: create a git worktree for the typed branch + a session in it.
     NewWorktree,
     /// `Ctrl-b $`: rename this session (empty → revert to its id). Captures the TARGET
     /// workspace so a session switch while the prompt is open can't retarget it.
     RenameSession(WorkspaceId),
     /// `Ctrl-b ,` (tmux rename-window): rename the active tab (empty → revert to its
-    /// process/index label). Captures the TARGET workspace + tab so a tab or session
-    /// switch (this client or a concurrent one) while the prompt is up can't retarget
-    /// or silently drop it.
+    /// process/index label). Captures the TARGET workspace + tab so a switch while the prompt
+    /// is up can't retarget or drop it.
     RenameTab(WorkspaceId, TabId),
-    /// `Ctrl-b T`: name this pane (empty clears).
     RenamePane(TerminalId),
 }
 
-/// A sidebar half scrolled BY HAND (wheel), plus the auto-anchor that was in effect at the
-/// time. When the anchor moves on its own — you switch session, or the focused agent
-/// changes — the override is ignored and the half snaps back to following the focus; a
-/// panel that silently stopped tracking you would be worse than one that never scrolled.
+/// A sidebar half scrolled BY HAND (wheel), plus the auto-anchor in effect at the time. When
+/// the anchor moves on its own (you switch session, the focused agent changes) the override
+/// is ignored and the half snaps back to following the focus.
 #[derive(Debug, Clone)]
 struct SidebarScroll {
     /// Index the half was scrolled to (a session index for `spaces`, an item index for
@@ -306,30 +261,24 @@ struct SidebarScroll {
 #[derive(Debug, Clone, Default)]
 struct HalfView {
     start: usize,
-    /// Highest start that still fills the window (0 when everything fits — nothing to scroll).
     max_start: usize,
-    /// Stable IDENTITY of the row the window auto-anchors on — a `WorkspaceId` for `spaces`,
-    /// a `TerminalId` for `agents` — and NOT its index. Under `sort_by = recent` the active
-    /// session sits at display index 0 permanently, so an index-keyed pin would compare
-    /// equal after every switch and never expire [codex S3a/C1].
+    /// Stable IDENTITY of the row the window auto-anchors on (a `WorkspaceId` for `spaces`, a
+    /// `TerminalId` for `agents`), not its index: under `sort_by = recent` the active session
+    /// sits at display index 0 permanently, so an index-keyed pin would never expire.
     anchor: Option<String>,
 }
 
-/// An agent pane's rolled-up status plus WHEN it entered it. The stamp is what lets the
-/// sidebar say `blocked 4m` rather than `blocked` — the difference between "needs me" and
-/// "has been waiting on me for a while", which is the whole reason to scan the list.
-///
-/// comux tracks the transition ITSELF rather than reading Claude's `statusUpdatedAt`, so
-/// Codex and anything else resolved by the screen-text fallback get the same readout.
+/// An agent pane's rolled-up status plus when it entered it, so the sidebar can say `blocked
+/// 4m`. comux tracks the transition itself rather than reading Claude's `statusUpdatedAt`, so
+/// Codex and screen-text-resolved agents get the same readout.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct AgentState {
     status: agentstate::AgentStatus,
     /// Monotonic instant the pane entered `status`; carried across refreshes while it holds.
     since: std::time::Instant,
-    /// The same moment as UNIX seconds, taken ONCE when the status is entered, for hosts that
-    /// render their own "4m". Derived from `since` on every publish it flapped between two
-    /// seconds (whole-second `now` minus whole-second elapsed), so the `agents` topic changed
-    /// twice a second and every host re-rendered its chrome for nothing.
+    /// The same moment as UNIX seconds, taken once when the status is entered, for hosts that
+    /// render their own "4m". Deriving it from `since` on every publish flapped between two
+    /// seconds and made the `agents` topic change twice a second.
     since_unix: i64,
     /// The mux-wide change counter ([`App::agent_seq`]) at the moment `status` was entered;
     /// carried forward with `since`. What `wait-agent --after-seq` compares against.
@@ -339,7 +288,6 @@ struct AgentState {
     pid: u32,
 }
 
-/// A turn finish waiting to be announced: the episode it belongs to and when it began.
 #[derive(Debug)]
 struct PendingDone {
     seq: u64,
@@ -348,7 +296,6 @@ struct PendingDone {
     body: String,
 }
 
-/// One sidebar/switcher agent row: where the agent pane lives + what it runs.
 struct AgentRow {
     /// Display title: the pane's TAB custom name when set (so multiple agents in one
     /// space stay distinguishable), else the session (space) name.
@@ -356,28 +303,20 @@ struct AgentRow {
     /// The session (space) name — kept alongside `title` so the switcher can filter on
     /// it and show it even when a tab name overrides the title.
     space: String,
-    /// What the agent was last seen DOING (`Bash: run the tests`), from `agentpoll`.
-    /// `None` means "no reading" — the row then looks exactly as it did before the poller
-    /// existed, rather than showing a placeholder or a stale value.
+    /// What the agent was last seen DOING (`Bash: run the tests`), from `agentpoll`. `None`
+    /// means no reading, not a placeholder.
     detail: Option<String>,
     /// The session the agent lives in, so a sidebar space GROUP HEADER can click through
     /// to it (the name alone is ambiguous — two sessions may share one).
     space_id: WorkspaceId,
-    /// The agent's foreground command (e.g. `claude` / `codex`).
     tool: String,
-    /// Rolled-up status: `working` / `ready` / `blocked` / `idle`.
     status: &'static str,
-    /// Whole seconds the agent has held `status` — rendered as `blocked 4m`.
     for_secs: u64,
-    /// The pane's terminal, so the row is clickable (jump to its pane).
     term: TerminalId,
     /// `ready` after a turn finish nobody has looked at yet ([`App::unseen_done`]).
     unseen: bool,
-    /// Other agents in the same worktree ([`App::agent_peers`]).
     peers: u32,
-    /// Context fill and spend, when there is a reading ([`App::agent_contexts`]).
     context: Option<AgentCtx>,
-    /// A `comux compact` is queued for it ([`App::compact_asks`]).
     compact: bool,
 }
 
@@ -430,14 +369,12 @@ impl AgentCtx {
         })
     }
 
-    /// Fill in percent, when the window is known.
     fn pct(&self) -> Option<f64> {
         self.window
             .filter(|w| *w > 0)
             .map(|w| self.used as f64 * 100.0 / w as f64)
     }
 
-    /// `62%` with a window, else the raw `131k`.
     fn short(&self) -> String {
         match self.pct() {
             Some(p) => format!("{p:.0}%"),
@@ -445,7 +382,6 @@ impl AgentCtx {
         }
     }
 
-    /// `124k/200k · $1.20 · $3.40/h` — what the switcher's preview adds after the gauge.
     fn long(&self) -> String {
         let mut out = match self.window {
             Some(w) => format!("{}/{}", fmt_tokens(self.used), fmt_tokens(w)),
@@ -484,7 +420,6 @@ fn accept_report(old: Option<&PushedUsage>, mut new: PushedUsage) -> PushedUsage
     new
 }
 
-/// `950`, `131k`, `1.2M`.
 fn fmt_tokens(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
@@ -512,27 +447,25 @@ impl AgentRow {
         }
     }
 
-    /// The tmx-style glyph + colour for the row (all width-1 shapes).
     fn glyph(&self) -> (&'static str, Color) {
         match self.shown_status() {
             "working" => ("●", CAT_GREEN),
             "done" => ("✓", CAT_GREEN),
             "ready" => ("◐", CAT_BLUE),
             "blocked" => ("▲", CAT_YELLOW),
-            _ => ("○", CAT_OVERLAY), // idle
+            _ => ("○", CAT_OVERLAY),
         }
     }
 }
 
-/// Outcome of [`App::create_worktree_session`]: a human status line and a non-fatal
-/// warning (a post-create hook failure — the worktree was still created) surfaced
-/// separately so BOTH the CLI response and the TUI toast report it.
+/// Outcome of [`App::create_worktree_session`]: a status line and a non-fatal warning (a
+/// post-create hook failure; the worktree was still created) so both the CLI response and the
+/// TUI report it.
 struct WorktreeCreated {
     message: String,
     warning: Option<String>,
 }
 
-/// State of the open inline prompt: what it will do + the text typed so far.
 struct Prompt {
     kind: PromptKind,
     buf: String,
@@ -543,41 +476,31 @@ struct Prompt {
 /// retarget them; execution re-validates ids against current state.
 #[derive(Clone)]
 enum MenuAction {
-    /// Open the rename-tab prompt for this tab.
     RenameTab(WorkspaceId, TabId),
-    /// Close this tab (rejected on the last tab, like `Ctrl-b &`).
     CloseTab(WorkspaceId, TabId),
     /// Create a new tab in this session (a no-op if it is no longer the active one —
     /// `new_tab` spawns into + switches the ACTIVE session, so running it after a
     /// concurrent session switch would land the tab somewhere else).
     NewTab(WorkspaceId),
-    /// Open the rename-session prompt for this session.
     RenameSession(WorkspaceId),
-    /// Open the new-session name prompt.
     NewSession,
-    /// Open the kill-session y/n confirm for this session.
     KillSession(WorkspaceId),
-    /// Jump to this agent's pane (session + tab + focus).
     JumpAgent(TerminalId),
     /// Queue (or, with `true`, withdraw) a compaction at the agent's next model request.
     Compact(TerminalId, bool),
 }
 
-/// A tmux `display-menu`-style context menu, opened by a RIGHT-click on chrome (tab
-/// chip / session pill / sidebar row). Two selection modes, matching tmux: hold the
-/// right button and RELEASE over an item to run it; or release elsewhere first, then
-/// left-click an item (or navigate with `j`/`k` + Enter, Esc/q closes). The box rect
-/// is fixed at open (clamped to the frame); any layout change closes the menu.
+/// A tmux `display-menu`-style context menu opened by a RIGHT-click on chrome. Two selection
+/// modes, as in tmux: hold the button and release over an item, or release elsewhere then
+/// left-click an item (or `j`/`k` + Enter; Esc/q closes). The box rect is fixed at open; any
+/// layout change closes it.
 struct Menu {
-    /// Title shown in the top border (the clicked thing's display name).
     title: String,
     items: Vec<(&'static str, MenuAction)>,
-    /// Box rect in frame cells (borders included).
     x0: u16,
     y0: u16,
     w: u16,
     h: u16,
-    /// Hover/keyboard-selected item index (`None` = nothing highlighted).
     sel: Option<usize>,
     /// The client whose right-click opened it: only its right-drag/-release drive the
     /// hold-mode selection (mirrors drag-selection ownership).
@@ -588,9 +511,7 @@ struct Menu {
 }
 
 impl Menu {
-    /// The item index at frame cell `(x, y)`, if it lands on an item row.
     fn item_at(&self, x: u16, y: u16) -> Option<usize> {
-        // Items occupy the interior rows (inside the border), full inner width.
         if x <= self.x0 || x >= self.x0 + self.w.saturating_sub(1) {
             return None;
         }
@@ -599,12 +520,11 @@ impl Menu {
     }
 }
 
-/// Place a context-menu box of `w`×`h` cells near the click at `(ax, ay)` inside a
-/// `cols`×`rows` frame: prefer opening BELOW-RIGHT of the pointer, flip ABOVE when the
-/// lower half has no room (the status bar case), and clamp into the frame either way.
+/// Place a context-menu box of `w`×`h` near the click at `(ax, ay)` in a `cols`×`rows` frame:
+/// below-right of the pointer, flipped above when the lower half has no room (the status bar
+/// case), clamped into the frame either way.
 fn menu_origin(ax: u16, ay: u16, w: u16, h: u16, cols: u16, rows: u16) -> (u16, u16) {
     let x0 = ax.min(cols.saturating_sub(w));
-    // Below needs rows ay+1 .. ay+h; above needs ay-h .. ay-1.
     let y0 = if ay + 1 + h <= rows {
         ay + 1
     } else {
@@ -613,36 +533,26 @@ fn menu_origin(ax: u16, ay: u16, w: u16, h: u16, cols: u16, rows: u16) -> (u16, 
     (x0, y0.min(rows.saturating_sub(h)))
 }
 
-/// A pending destructive action awaiting a `y`/`n` confirmation (tmux `confirm-before`).
-/// The target is captured at open time so a focus/session change while the prompt is up
-/// can't retarget it (codex review).
+/// A pending destructive action awaiting `y`/`n` (tmux `confirm-before`). The target is
+/// captured at open time so a focus/session change while the prompt is up can't retarget it.
 enum ConfirmAction {
-    /// Kill (remove) this workspace/session.
     KillSession(WorkspaceId),
-    /// `Ctrl-b x`: close this pane (tmux `confirm-before kill-pane`).
     ClosePane(WorkspaceId, PaneId),
-    /// `Ctrl-b &` (or `x` on a tab's last pane): close this tab.
     CloseTab(WorkspaceId, TabId),
 }
 
-/// An open confirm modal: a message + the action to run on `y`.
 struct Confirm {
     message: String,
     action: ConfirmAction,
 }
 
-/// A destination in the `Ctrl-f` fuzzy switcher.
 #[derive(Clone, PartialEq, Eq)]
 enum PopupTarget {
-    /// Switch to this session (workspace).
     Session(WorkspaceId),
-    /// Jump to this agent's pane (its session + tab + focus).
     Agent(TerminalId),
-    /// Select this tab of the attached session (`Ctrl-b f`, the tab overview).
     Tab(WorkspaceId, TabId),
 }
 
-/// One rendered row of the `Ctrl-f` switcher (post-filter).
 struct PopupRow {
     target: PopupTarget,
     glyph: &'static str,
@@ -660,7 +570,6 @@ struct PopupRow {
 enum PopupTab {
     Sessions,
     Agents,
-    /// The attached session's tabs, Alt-Tab style (`Ctrl-b f` opens on it).
     Tabs,
 }
 
@@ -668,7 +577,6 @@ impl PopupTab {
     /// The switcher's lists in Left/Right order — also the order a host's picker shows.
     const ALL: [PopupTab; 3] = [PopupTab::Sessions, PopupTab::Agents, PopupTab::Tabs];
 
-    /// The list's name, as the TUI's chips and a host's picker tabs show it.
     fn name(self) -> &'static str {
         match self {
             PopupTab::Sessions => "sessions",
@@ -681,14 +589,12 @@ impl PopupTab {
         Self::ALL.iter().position(|t| *t == self).unwrap_or(0)
     }
 
-    /// The list `delta` steps along, clamped at the ends like the old two-list Left/Right.
     fn step(self, delta: i32) -> PopupTab {
         let i = (self.index() as i32 + delta).clamp(0, Self::ALL.len() as i32 - 1);
         Self::ALL[i as usize]
     }
 }
 
-/// Which panes a `broadcast` goes to.
 struct BroadcastScope<'a> {
     session: Option<&'a str>,
     all: bool,
@@ -697,29 +603,21 @@ struct BroadcastScope<'a> {
     caller: Option<&'a str>,
 }
 
-/// Copy mode's own state (alacritty holds the cursor and the selection).
 struct CopyState {
-    /// Whether the alternate screen was up at entry; a swap since then ends copy mode.
     alt: bool,
-    /// An open search prompt: `(searching up, typed so far)`.
     prompt: Option<(bool, String)>,
-    /// The last search, for `n` / `N`.
     last: Option<(String, bool)>,
     /// The user has a selection up (`v`/`V`). If alacritty's selection disappears while this
     /// is set, a screen swap cleared it — possibly a round trip between two ticks, which the
     /// current-screen comparison cannot see — and a `y` would silently copy the cursor's line
     /// instead of what was selected. Copy mode ends instead.
     selecting: bool,
-    /// `f`/`F`/`t`/`T` was pressed and waits for its character: `(forward, till)`.
     pending_jump: Option<(bool, bool)>,
-    /// The last jump, for `;` (again) and `,` (reversed): `(char, forward, till)`.
     last_jump: Option<(char, bool, bool)>,
 }
 
-/// Pinned pane slots (`Ctrl-b m` / `Ctrl-b '`).
 const MARK_SLOTS: usize = 9;
 
-/// The one-key modal after `Ctrl-b m` / `Ctrl-b '`.
 enum MarkModal {
     /// Pin THIS pane — captured when the modal opened, so another client moving focus before
     /// the digit cannot redirect the pin.
@@ -727,7 +625,6 @@ enum MarkModal {
     Go,
 }
 
-/// A status-bar outcome line ([`App::flash`]).
 struct StatusMessage {
     text: String,
     error: bool,
@@ -741,10 +638,8 @@ const POPUP_PREVIEW_MIN_ROWS: u16 = 16;
 /// How long a status message stays up. Errors linger: they are the ones worth reading.
 const MESSAGE_SECS: u64 = 5;
 const ERROR_MESSAGE_SECS: u64 = 10;
-/// How often session start directories are re-probed (off-loop; see `DirProbe`).
 const DIR_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 
-/// The `Ctrl-f` fuzzy switcher state: which tab, the typed filter, the selected row.
 struct PopupState {
     tab: PopupTab,
     filter: String,
@@ -793,8 +688,6 @@ fn status_rank(status: &str) -> u8 {
     }
 }
 
-/// Keyboard-focus state for the always-on left sidebar (`Ctrl-b e`): which group
-/// (spaces/agents) + the selected row. Arrows navigate, Enter selects, Esc exits.
 struct SidebarFocus {
     tab: PopupTab,
     sel: usize,
@@ -803,17 +696,11 @@ struct SidebarFocus {
 /// `Ctrl-b C` step 1: pick the new session's directory by browsing (from `$HOME`). Step 2
 /// is the inline name prompt ([`PromptKind::NewSessionIn`]), seeded with the directory name.
 struct DirBrowser {
-    /// The directory being browsed.
     dir: PathBuf,
-    /// Its subdirectories: `None` while the listing thread runs, `Err` when unreadable.
     listing: Option<Result<dirbrowse::Listing, String>>,
-    /// The request id the browser is waiting on / showing; a late result for an older
-    /// navigation is dropped.
     req: u64,
-    /// Typed filter (or a `/…`·`~…` path to jump to).
     filter: String,
     sel: usize,
-    /// Select this child once the listing lands — the directory we just came up out of.
     reselect: Option<std::ffi::OsString>,
     /// The listing thread has been started. It starts on the server loop's next poll, not
     /// when the browser opens: a browser a host takes over right after the key (#172) must not
@@ -821,10 +708,7 @@ struct DirBrowser {
     started: bool,
 }
 
-/// The `Ctrl-b R` resume picker: past Claude/Codex conversations found on disk
-/// (`agentsessions`), newest first, fuzzy-filtered.
 struct ResumeState {
-    /// Fuzzy filter typed so far — matched against tool, prompt and path together.
     filter: String,
     sel: usize,
     /// `Ctrl-a`: also list non-interactive runs (`claude -p` / SDK, `codex exec`), which
@@ -832,36 +716,25 @@ struct ResumeState {
     all: bool,
     /// Conversation id → the pane already running it, sampled when the picker opened.
     /// Selecting a live conversation JUMPS to that pane instead of resuming a second copy.
-    /// Best-effort and local: it only sees this server's panes, so a conversation open in
-    /// another comux server or a bare terminal is invisible here, exactly as it is to a
-    /// hand-typed `claude --resume`.
+    /// Best-effort: it only sees this server's panes.
     live: HashMap<String, TerminalId>,
 }
 
-/// One rendered row of the resume picker (post-filter).
 #[derive(Clone)]
 struct ResumeRow {
     tool: agentsessions::Tool,
     id: String,
     cwd: Option<PathBuf>,
-    /// The prompt that opened the conversation (may be empty).
     title: String,
-    /// `3h` / `2d` — how long ago the transcript was last written.
     age: String,
-    /// The pane already running this conversation, if any.
     live: Option<TerminalId>,
 }
 
-/// What feeding one key to the app implies for the caller (the server loop).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyAction {
-    /// Keep the session going.
     Continue,
-    /// The user pressed the detach chord (`Ctrl-b d` / `Ctrl-b q`): the client should
-    /// leave, but the server + shells keep running.
+    /// The user pressed the detach chord: the client leaves, the server and shells keep running.
     Detach,
-    /// The user pressed the redraw chord (`Ctrl-b r`): force a full repaint to the client
-    /// that asked (server re-sends a `full` frame; the client clears + repaints).
     Redraw,
 }
 
@@ -869,7 +742,6 @@ pub enum KeyAction {
 /// can't span two clients.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Prefix {
-    /// `Ctrl-b` was pressed and the next chord resolves through the prefix table.
     armed: bool,
     /// After a repeatable binding (tmux `bind -r`): until this instant another repeatable
     /// prefix-table chord runs without the prefix. Any other key ends it and is handled as
@@ -878,7 +750,6 @@ pub struct Prefix {
 }
 
 impl Prefix {
-    /// An armed prefix, as if `Ctrl-b` was just pressed.
     pub fn armed() -> Prefix {
         Prefix {
             armed: true,
@@ -895,7 +766,6 @@ impl Prefix {
     }
 }
 
-/// The box-drawing glyph for a divider cell joined to dividers `up`/`down`/`left`/`right`.
 fn divider_glyph(up: bool, down: bool, left: bool, right: bool) -> &'static str {
     match (up || down, left || right) {
         (true, true) => match (up, down, left, right) {
@@ -911,7 +781,6 @@ fn divider_glyph(up: bool, down: bool, left: bool, right: bool) -> &'static str 
         },
         (true, false) => "│",
         (false, true) => "─",
-        // An isolated cell (a 1-cell gap): pick by nothing — vertical reads best.
         (false, false) => "│",
     }
 }
@@ -930,10 +799,8 @@ const BIG_DIGITS: [[&str; 5]; 10] = [
     ["###", "# #", "###", "  #", "###"],
 ];
 
-/// Height of the always-on bottom status bar (tmux-style).
 const STATUS_H: u16 = 1;
 
-/// Rows the optional top bar occupies.
 const TOP_H: u16 = 1;
 
 /// Below this many rows the top bar is suppressed whatever the config says — see
@@ -961,12 +828,8 @@ const CAT_OVERLAY: Color = Color::Rgb(0x6c, 0x70, 0x86);
 const CAT_GREEN: Color = Color::Rgb(0xa6, 0xe3, 0xa1);
 const CAT_PEACH: Color = Color::Rgb(0xfa, 0xb3, 0x87);
 const CAT_RED: Color = Color::Rgb(0xf3, 0x8b, 0xa8);
-/// Background tint for cells inside an in-progress drag-selection (Catppuccin surface2 —
-/// clearly lighter than the base so the selection is visible without hiding the glyphs).
 const SEL_BG: Color = Color::Rgb(0x58, 0x5b, 0x70);
 
-/// Color a usage gauge by how full it is: calm green under 70%, yellow warning
-/// from 70%, red alert from 90%.
 fn usage_threshold_color(pct: f64) -> Color {
     if pct >= 90.0 {
         CAT_RED
@@ -1001,7 +864,6 @@ fn ctx_gauge(c: &AgentCtx, room: usize) -> Option<(String, String, Color)> {
 /// Widest / narrowest context bar a row draws; below the minimum it shows only the label.
 const CTX_BAR_MAX: usize = 8;
 const CTX_BAR_MIN: usize = 3;
-/// The switcher preview's bar, which has the width the sidebar lacks.
 const CTX_BAR_PREVIEW: usize = 20;
 
 /// An in-progress mouse drag-selection (tmux-style copy). Lives only between button-down and
@@ -1013,16 +875,11 @@ struct Sel {
     /// bar / other panes are never included.
     term: TerminalId,
     owner: ClientId,
-    /// Where the drag started (pane-relative viewport cell `(col, row)`).
     anchor: (u16, u16),
-    /// The current drag position (clamped to the pane).
     head: (u16, u16),
-    /// True once the pointer actually moved — distinguishes a real selection from a plain
-    /// click (which just focuses and copies nothing).
     moved: bool,
 }
 
-/// A click remembered to count the next one at the same cell (double/triple click).
 struct LastClick {
     client: ClientId,
     term: TerminalId,
@@ -1032,11 +889,8 @@ struct LastClick {
     count: u8,
 }
 
-/// How quickly the next click must follow to count as a double/triple click.
 const MULTI_CLICK: Duration = Duration::from_millis(400);
 
-/// The multi-pane application: the authoritative layout `State` + a live shell per
-/// terminal. The local TUI is the single controller client (`ClientId(0)`).
 pub struct App {
     state: State,
     ws: WorkspaceId,
@@ -1044,31 +898,20 @@ pub struct App {
     panes: HashMap<TerminalId, PaneTerm>,
     cols: u16,
     rows: u16,
-    /// Neovim-style left panel toggle (`Ctrl-b s`). Honored only when the
-    /// terminal is at least `SIDEBAR_MIN_COLS` wide.
     sidebar: bool,
-    /// When `Some`, the `Ctrl-f` fuzzy switcher is open (filter + selected row); keys
-    /// drive it instead of the shells. Switches SESSIONS + jumps to AGENTS.
     popup: Option<PopupState>,
     /// Keyboard scrollback mode (`Ctrl-b [`): `Some(term)` binds the mode to the
     /// terminal it was entered on, so a focus change (click / another client) can't
     /// strand that pane scrolled-up. Keys scroll it; exit bottoms it. Shared state.
     scroll_pane: Option<TerminalId>,
-    /// What the last `render_to` saw of the focused pane's cursor: `(visible, shape)`.
     cursor_look: Cell<(bool, u8)>,
-    /// The preset each tab was last arranged in, so `next-layout` continues from it.
     tab_layout: HashMap<TabId, crate::model::LayoutPreset>,
-    /// `Ctrl-b q` (tmux `display-panes`): pane numbers are up until this instant, and a digit
-    /// focuses that pane.
     pane_numbers: Option<std::time::Instant>,
-    /// The focused pane as last seen, and per tab the one focused before it (tmux
-    /// `last-pane`).
     seen_focus: HashMap<TabId, PaneId>,
     prev_focus: HashMap<TabId, PaneId>,
     /// Lock mode (zellij's): the prefix-less bindings stand down so `Ctrl-f`, `Alt-1`… reach
     /// the program; the prefix still works, and `Ctrl-b Ctrl-g` unlocks.
     locked: bool,
-    /// Tabs whose typing goes to EVERY pane (tmux `synchronize-panes`).
     synced_tabs: HashSet<TabId>,
     /// Whether any attached client's terminal has focus (assumed until one says otherwise),
     /// and the pane last told it HAS focus (`ESC [ I`), for focus reporting.
@@ -1078,15 +921,11 @@ pub struct App {
     /// none, it is asked for no repo at all instead of running `git status` + `git diff`
     /// every few seconds per repo for nobody.
     attached: bool,
-    /// Per pane, how many of its bells have been relayed to the attached terminals.
     bell_relayed: HashMap<TerminalId, u64>,
     /// Copy-mode state that is not alacritty's (the search prompt, the last search, and the
     /// screen the mode was entered on). `Some` exactly when `scroll_pane` is.
     copy: Option<CopyState>,
-    /// A copy-mode yank waiting for the server to deliver (`take_key_copy`).
     key_copy: Option<String>,
-    /// Pids of currently attached clients, oldest first — the walk-up start point for
-    /// raising the right terminal window after a notification jump.
     client_pids: Vec<u32>,
     /// `(client pid, COPAD_SOCKET, COPAD_PANEL_ID)` for clients running inside a copad tab.
     client_copad: Vec<(u32, String, String)>,
@@ -1098,22 +937,16 @@ pub struct App {
     /// Unacknowledged = `count > seen`. See `MuxListener::bells` for why both sides count
     /// rather than flag.
     bell_seen: HashMap<TerminalId, u64>,
-    /// The logged agent-turn notifications (newest first), shown in the center.
     notifications: VecDeque<Notification>,
     /// `(pane, agent pid, kind)` triples whose notifications the agent's own hooks push
     /// (`comux notify`), so the status sweep must not toast them a second time. Keyed by
     /// pid, not pane alone: a later agent in the same pane is a different owner.
     hook_owned: HashSet<(TerminalId, u32, &'static str)>,
-    /// Phones registered for APNs pushes, and the worker that sends them (decisions #175).
     push_reg: crate::push::Registry,
     pusher: crate::push::Pusher,
-    /// When `Some(sel)`, the notification center (`Ctrl-b a`) is open at row `sel`.
     center: Option<usize>,
-    /// When `Some`, the resume picker (`Ctrl-b R`) is open.
     resume: Option<ResumeState>,
-    /// When `Some`, the new-session directory browser (`Ctrl-b C`) is open.
     browser: Option<DirBrowser>,
-    /// Where the browser's listing thread publishes; read by [`Self::poll_dir_listing`].
     dir_slot: dirbrowse::Slot,
     /// The newest listing request id. Monotonic for the server's life — NOT per browser —
     /// because a listing thread from a closed browser can still finish and publish later.
@@ -1124,9 +957,7 @@ pub struct App {
     /// Directory listings started for host-drawn browsers that have not returned yet
     /// (decisions #172): a dead mount strands each one, so they are capped.
     host_listings: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    /// When `dir_probe` was last refreshed (see [`Self::maybe_probe_session_dirs`]).
     dir_probed: Option<std::time::Instant>,
-    /// Where the detached transcript scanner publishes; read by [`Self::poll_agent_sessions`].
     sessions: agentsessions::Shared,
     /// The scan the picker renders. Copied out of `sessions` once per scan so rendering
     /// never touches the scanner's mutex, and kept across a rescan so reopening the picker
@@ -1139,35 +970,21 @@ pub struct App {
     scan_shown: Option<u64>,
     scan_deep: bool,
     scan_at: Option<std::time::Instant>,
-    /// Why the most recent pane spawn failed, recorded by [`Self::report_spawn_failure`]
-    /// so the control API can report the SAME reason the TUI toasted. The CLI handlers
-    /// detect failure by pane count and would otherwise only be able to say "could not
-    /// spawn a shell", hiding the one detail that makes it fixable (fd exhaustion).
-    /// Taken (not read) by whoever reports it, so a stale reason can't attach itself
-    /// to a later, unrelated failure.
+    /// Why the most recent pane spawn failed, recorded by [`Self::report_spawn_failure`] so the
+    /// control API reports the SAME reason the TUI flashed. The CLI handlers detect failure by
+    /// pane count and would otherwise only say "could not spawn a shell", hiding the fixable
+    /// detail (fd exhaustion). Taken, not read, so a stale reason can't attach to a later failure.
     last_spawn_error: Option<String>,
-    /// Env vars injected into every pane's shell (e.g. `COPAD_MUX_SOCK`), so a
-    /// shell inside a pane can control its own mux via `copad-mux ctl`.
     sock_env: Vec<(String, String)>,
     /// The active client's live values for [`Self::env_update`] (tmux `update-environment`).
     /// Set from the initiating client before its input is dispatched, so a pane it spawns
     /// inherits that client's SSH/display session rather than the one the server was born in.
     /// Seeded at boot from the daemon's own (pre-scrub) values so the first pane is unchanged.
     client_env: Vec<(String, String)>,
-    /// Variable names refreshed from the client (from `cfg.update_environment`); the filter
-    /// applied to any incoming client env before it lands in [`Self::client_env`].
     env_update: Vec<String>,
-    /// Per-terminal foreground-process label (agent / shell / command), refreshed
-    /// on a throttled cadence (`refresh_labels`), read by the sidebar/popup/CLI.
     labels: HashMap<TerminalId, procinfo::Label>,
-    /// When the labels were last refreshed (throttle the sweep to ~2 Hz).
     last_labels: std::time::Instant,
-    /// Cumulative count of process sweeps that failed outright (see
-    /// [`Self::label_sweeps_failed`]). Diagnostic only — never resets.
     label_sweeps_failed: u64,
-    /// Per-agent rolled-up status (working/ready/blocked/idle) + when it was entered,
-    /// refreshed at the label cadence from Claude's session file + a screen-text fallback
-    /// (`agentstate`).
     agent_statuses: HashMap<TerminalId, AgentState>,
     /// Mux-wide count of observed agent status changes; stamps each [`AgentState::seq`].
     /// Monotonic for the server's life, so a reading never repeats.
@@ -1181,14 +998,11 @@ pub struct App {
     /// The whole-minute bucket of each agent's time-in-status as last REPORTED to the
     /// render loop, so a roll can be turned into a repaint (see `refresh_agent_statuses`).
     agent_minutes: HashMap<TerminalId, u64>,
-    /// What `agentpoll` last reported each agent pane was DOING, as last reported to the
-    /// render loop. Compared — not just rendered — because `agent_rows` reads the poller
-    /// live: a hidden agent that changes tool while staying `Working` moves no other
-    /// compared value, so without this its sidebar detail would freeze once
-    /// `drain_pane_dirty` stopped repainting for hidden panes.
+    /// What `agentpoll` last reported each agent pane was doing, as last reported to the render
+    /// loop. Compared, not just rendered: `agent_rows` reads the poller live, so a hidden agent
+    /// that changes tool while Working moves no other compared value and its sidebar detail
+    /// would freeze.
     agent_details: HashMap<TerminalId, String>,
-    /// What each BLOCKED Claude agent waits for (its session file's `waitingFor`), from the
-    /// last sweep. Shown in place of the activity detail while blocked (`agent_rows`).
     agent_waits: HashMap<TerminalId, agentstate::Wait>,
     /// Per pane, the [`Self::agent_seq`] value at its last ACKNOWLEDGEMENT: a key or click on
     /// it, a jump to it, or reading one of its notifications (up to that notification's
@@ -1202,14 +1016,9 @@ pub struct App {
     /// [`Self::unseen_done`] panes as last reported to the render loop (an ack moves no other
     /// compared value).
     unseen_reported: std::collections::HashSet<TerminalId>,
-    /// How many OTHER agent panes run in the same git worktree as this one (by process cwd),
-    /// from the last sweep. Only panes with at least one peer are listed.
     agent_peers: HashMap<TerminalId, u32>,
-    /// Claude statusline reports per pane (`comux agent-report`), see [`PushedUsage`].
     agent_reports: HashMap<TerminalId, PushedUsage>,
-    /// Each agent's context fill and spend from the last sweep ([`AgentCtx::merge`]).
     agent_contexts: HashMap<TerminalId, AgentCtx>,
-    /// Compactions asked for and not yet claimed by the agent's PreCompact hook.
     compact_asks: HashMap<TerminalId, CompactAsk>,
     /// The last claim per pane, with the claiming hook's nonce, so that hook's retry is
     /// answered the same and nobody else's is.
@@ -1223,17 +1032,14 @@ pub struct App {
     /// Test seam: an agent pid's conversation id, in place of its session file.
     #[cfg(test)]
     test_sessions: HashMap<u32, String>,
-    /// Turn finishes waiting out `notify_settle_secs` before they are announced.
     pending_done: HashMap<TerminalId, PendingDone>,
-    /// The blocked episode each pane was last reminded about (one reminder per episode).
     reminded: HashMap<TerminalId, u64>,
     /// Tests: the reading the sweep takes for a pane instead of its session file and screen.
     #[cfg(test)]
     test_readings: HashMap<TerminalId, agentstate::Reading>,
-    /// Panes with an UNACKNOWLEDGED bell, as last reported to the render loop. Same reason
-    /// as `agent_details`: `bell()` / `bell_count()` are live reads that drive the `!`
-    /// markers and the mux-wide `! N`, and a bell rung in a hidden pane is precisely the
-    /// case that used to repaint only because that pane dirtied the frame.
+    /// Panes with an UNACKNOWLEDGED bell, as last reported to the render loop. Same reason as
+    /// `agent_details`: `bell()` is a live read, and a bell rung in a hidden pane moves no other
+    /// compared value.
     bells_reported: std::collections::HashSet<TerminalId>,
     /// The top bar's rendered host readings, as last reported to the render loop. Compared
     /// as what is DRAWN rather than raw floats, so a change below the printed precision does
@@ -1241,11 +1047,7 @@ pub struct App {
     /// 69.8% and 70.2% both print `70%` while crossing green→yellow, and comparing the
     /// strings alone would leave that severity stale.
     host_reported: Vec<(String, String, Color)>,
-    /// Per-session git branch (its focused pane's cwd) for the `spaces` subtitle,
-    /// refreshed at the label cadence.
     branches: HashMap<WorkspaceId, String>,
-    /// Monotonic counter for minting unique session (workspace) ids (`local` is the
-    /// first, so new sessions start at `s1`).
     next_session: u64,
     /// Per-session last-activated tick: the session MRU behind `sort_by = recent`, the
     /// switcher's preselection and the kill/exit fallback. Bumped by [`Self::track_nav`]
@@ -1255,32 +1057,20 @@ pub struct App {
     /// Per-tab last-activated tick on the same clock: the tab overview's Alt-Tab preselection
     /// (real recency — the nav history's back stack reorders on back/forward).
     tab_activity: HashMap<TabId, u64>,
-    /// Monotonic tick source for `session_activity` and `tab_activity`.
     activity_clock: u64,
-    /// The tab `note_arrival` last saw active, so a tab is bumped once per arrival.
     activity_tab: Option<TabId>,
     /// The session `track_nav` last saw attached, so it bumps `session_activity` once per
     /// arrival instead of on every input.
     activity_ws: Option<WorkspaceId>,
-    /// Back / forward / last navigation (decisions #140). Global, like the view it records.
     nav: navhist::NavHistory,
-    /// Pinned pane slots 1–9 (`Ctrl-b m` / `Ctrl-b '`, decisions #148), index = slot − 1.
     marks: [Option<TerminalId>; MARK_SLOTS],
-    /// An open one-key mark modal (`Ctrl-b m` / `Ctrl-b '`), waiting for the slot digit.
     mark_modal: Option<MarkModal>,
-    /// The active tab's zoom as `track_nav` last saw it, to resize PTYs once when it changes.
     last_zoom: Option<(WorkspaceId, TabId, Option<PaneId>)>,
-    /// When `Some`, an inline text prompt (new-session name / rename) is open and
-    /// captures keystrokes until Enter (commit) or Esc (cancel).
     prompt: Option<Prompt>,
-    /// When `Some`, a `y`/`n` confirm modal (e.g. kill-session) is open.
     confirm: Option<Confirm>,
-    /// When `Some`, a right-click context menu (tmux `display-menu`) is open.
     menu: Option<Menu>,
     /// A short outcome line for something the user just did (a failed spawn, a worktree
-    /// warning, `Ctrl-b <` with no history), shown in the status bar in place of the tab
-    /// chips until it expires. Replaces the desktop toast these used to need, which never
-    /// appeared at all under `COPAD_MUX_NOTIFY=0` or on a machine without a notifier.
+    /// warning), shown in the status bar in place of the tab chips until it expires.
     message: Option<StatusMessage>,
     /// When `Some(scroll)`, the `Ctrl-b ?` key help is open, scrolled `scroll` rows down
     /// (clamped at render, so a resize or a reload that shortens the list can't strand it).
@@ -1297,83 +1087,53 @@ pub struct App {
     /// Row at which the `agents` half started in the last composed frame — how a wheel
     /// event tells which half the pointer is over.
     sidebar_mid: Cell<u16>,
-    /// When `Some`, the sidebar has keyboard focus (`Ctrl-b e`) for in-place navigation.
     sidebar_focus: Option<SidebarFocus>,
     /// The client whose input is being fed draws its sidebar natively (its host claimed it);
     /// set by the server before every dispatch (decisions #181).
     key_client_native_sidebar: bool,
-    /// `Ctrl-b e` from such a client: its host is asked to focus its own sidebar.
     sidebar_focus_request: bool,
-    /// The effective user config (keybindings + options), loaded once at server start.
     cfg: MuxConfig,
     /// Clickable chrome regions (tab chips, sidebar rows), rebuilt every render so
     /// `mouse_at` can hit-test a click on the status bar / sidebar. Interior mutability
     /// because rendering is `&self`; only ever touched on the single main-loop thread.
     click_zones: RefCell<Vec<ClickZone>>,
-    /// The images the last composed frame shows (decisions #194), for graphics clients.
     image_runs: RefCell<Vec<crate::images::ScreenRun>>,
     /// The open notification center as last drawn: its box `(x0, y0, x1, y1)` (inclusive) and
     /// `(row y, notification id)` per visible entry — what a click on it hits.
     center_hits: RefCell<CenterHits>,
-    /// Shared usage/limits readout (`coctl usage --limits`), written by a background
-    /// poller thread (`usagepoll`), read into `usage_shown` at the label cadence.
+    /// Shared usage/limits readout written by the `usagepoll` thread, read into `usage_shown`
+    /// at the label cadence.
     usage_poll: usagepoll::Shared,
-    /// Shared "what is each agent doing" readings, written by the `agentpoll` thread and
-    /// read (never blocked on) when building agent rows.
     agent_poll: agentpoll::Shared,
-    /// The work graphs (decisions #204), read by the `graphpoll` thread.
     graph_poll: crate::graphpoll::Shared,
-    /// The serialised `graph` topic, while nothing it depends on moved.
     graph_cache: std::cell::RefCell<graph::GraphCache>,
-    /// Working-tree state per repo for the sidebar subtitle (`gitpoll`); idle unless started.
     git_poll: gitpoll::Shared,
-    /// Shared host CPU/memory/GPU/load reading, written by the `hostmetrics` poller.
     host_poll: hostmetrics::Shared,
-    /// Shared "update available" hint, written by the `versionpoll` thread
-    /// (server-only); read into `version_shown` at the label cadence.
     version_poll: versionpoll::Shared,
-    /// The update hint currently folded into the rendered status bar.
     version_shown: Option<VersionStatus>,
-    /// The usage snapshot currently folded into the rendered status bar; compared to
-    /// the shared handle so a change triggers a repaint through `maybe_refresh_labels`.
     usage_shown: Option<UsageSnapshot>,
-    /// Which carousel page the usage readout shows (`usage_layout = paged`). Advanced
-    /// by a wheel/click over the readout; clamped to the live page count at render.
     usage_page: usize,
-    /// Whether SOME attached client currently has the prefix armed — drives the `^b`
-    /// mode indicator in the status bar. The prefix itself stays strictly per-client
-    /// (a `Ctrl-b` on one client must not be completable by another's key); this is a
-    /// render-only summary the server recomputes each frame, because the composed frame
-    /// is shared by every client. Same precedent as an open context menu or a drag
-    /// selection: client-OWNED, but visible in everyone's view.
+    /// Whether SOME attached client has the prefix armed, driving the `^b` indicator. The prefix
+    /// itself stays strictly per-client; this is a render-only summary the server recomputes
+    /// each frame, because the composed frame is shared by every client (same precedent as an
+    /// open context menu or a drag selection).
     prefix_armed: bool,
     /// Chrome a host UI draws instead (L0 host-ready, decisions #166): `(sidebar, status)`.
     /// Set by the server only while EVERY attached client is claimed for it — the frame is
     /// shared, so hiding it for one client would hide it for all.
     host_hidden: (bool, bool),
-    /// Outcome lines since the server last published (each becomes an L0 `flash` event).
     flash_log: Vec<copad_mux_proto::Flash>,
-    /// The last notification id handed out.
     notif_seq: u64,
-    /// Overlays a host UI is showing instead of the TUI (decisions #170), by overlay id.
     delegated: HashMap<u64, delegate::Delegated>,
     overlay_seq: u64,
-    /// When the carousel last advanced — a manual page OR an auto-rotate tick resets
-    /// it, so `usage_rotate_secs` counts from the last change, not a fixed cadence
-    /// (a manual scroll never jumps again immediately after).
+    /// When the carousel last advanced; a manual page or an auto-rotate tick resets it, so
+    /// `usage_rotate_secs` counts from the last change.
     usage_rolled_at: std::time::Instant,
-    /// Last-seen alternate-screen bit per VISIBLE pane, polled every render by
-    /// [`Self::take_alt_screen_transition`]. Watching EITHER edge (primary↔alt) lets the
-    /// render loop force a full repaint whenever a full-screen app (nvim, less, …) enters
-    /// OR exits, wiping the incremental-diff residue the wholesale grid swap leaves behind
-    /// — and, importantly, giving a clean baseline to an OUTER terminal (Windows Terminal
-    /// over SSH, nested emulators) that can drop cells on such a large transition.
+    /// Last-seen alternate-screen bit per VISIBLE pane, polled by
+    /// [`Self::take_alt_screen_transition`]; either edge lets the render loop force a full
+    /// repaint.
     alt_screen: HashMap<TerminalId, bool>,
-    /// The in-progress mouse drag-selection, if any (tmux-style copy). `None` except between
-    /// a button-down and its button-up; the highlight only shows during the drag.
     selection: Option<Sel>,
-    /// The last plain left click in a pane whose program does not take the mouse, for
-    /// double-click (word) and triple-click (line) selection.
     last_click: Option<LastClick>,
     /// An in-progress divider drag. Client-OWNED like `selection`, and for the same reason:
     /// input is multi-client, so only the client that grabbed a divider may move or release
@@ -1396,7 +1156,6 @@ impl App {
         let mut state = State::new();
         let mut panes = HashMap::new();
         let client = ClientId(0);
-        // Before any pane exists, restored ones included.
         term::set_history_limit(cfg.history_limit);
 
         // The whitelist a client may refresh. `config::from_raw` already keeps
@@ -1464,8 +1223,6 @@ impl App {
             panes,
             cols,
             rows,
-            // Default from config (herdr-style always-on spaces + agents panel); still
-            // size-adaptive (hidden below sidebar_min_cols) and toggleable via Ctrl-b s.
             sidebar: cfg.sidebar,
             popup: None,
             scroll_pane: None,
@@ -1619,8 +1376,6 @@ impl App {
         env
     }
 
-    /// The shell command a toast click should run to land in `term`'s pane, or `None`
-    /// when the pane has no token (it predates the feature) or our own path is unknown.
     fn jump_action(&self, term: &TerminalId) -> Option<String> {
         let token = self.panes.get(term)?.pane_token()?;
         let exe = std::env::current_exe().ok()?;
@@ -1631,36 +1386,26 @@ impl App {
         ))
     }
 
-    /// Adopt an attaching/initiating client's environment as the source for future panes,
-    /// filtered to the configured whitelist. Called before dispatching that client's input.
     pub fn set_client_env(&mut self, env: Vec<(String, String)>) {
         self.client_env = filter_env(env, &self.env_update);
     }
 
-    /// Whether the client about to be fed draws its sidebar natively (decisions #181).
     pub fn set_key_client_native_sidebar(&mut self, native: bool) {
         self.key_client_native_sidebar = native;
     }
 
-    /// A `Ctrl-b e` that the client's host should handle by focusing its own sidebar.
     pub fn take_sidebar_focus_request(&mut self) -> bool {
         std::mem::take(&mut self.sidebar_focus_request)
     }
 
-    // --- reads off the authoritative state ---
-
-    /// Is the sidebar actually drawn? Toggled on AND wide enough (size-adaptive:
-    /// narrow / mobile widths fall back to the popup).
     fn sidebar_visible(&self) -> bool {
         self.sidebar && !self.host_hidden.0 && self.cols >= self.cfg.sidebar_min_cols
     }
 
-    /// Sidebar width in columns (configurable; a 1-col border is added to its right).
     fn sidebar_w(&self) -> u16 {
         self.cfg.sidebar_width
     }
 
-    /// Left x-offset of the pane grid (the sidebar reserves `sidebar_w` + 1 border).
     fn content_x(&self) -> u16 {
         if self.sidebar_visible() {
             self.sidebar_w() + 1
@@ -1669,7 +1414,6 @@ impl App {
         }
     }
 
-    /// Width available to the pane grid, right of the sidebar.
     fn content_cols(&self) -> u16 {
         if self.sidebar_visible() {
             self.cols.saturating_sub(self.sidebar_w() + 1)
@@ -1677,8 +1421,6 @@ impl App {
             self.cols
         }
     }
-
-    // --- tabs ---
 
     fn tab_ids(&self) -> Vec<TabId> {
         self.state
@@ -1691,14 +1433,10 @@ impl App {
         self.state.workspace(&self.ws).map(|w| w.active_tab.clone())
     }
 
-    // --- sessions (workspaces) ---
-
-    /// Session ids in CREATION order (stable; used by the `ctl` API for stable indices).
     fn session_ids(&self) -> Vec<WorkspaceId> {
         self.state.workspace_ids()
     }
 
-    /// A session's display name (its `name`, else its id).
     fn session_display_name(&self, wid: &WorkspaceId) -> String {
         self.state
             .workspace(wid)
@@ -1706,8 +1444,6 @@ impl App {
             .unwrap_or_else(|| wid.to_string())
     }
 
-    /// Session ids in the configured DISPLAY order (`sort_by`) — for the sidebar, the
-    /// `Ctrl-f` switcher, and `)`/`(` cycling. A stable sort keeps creation order on ties.
     fn sorted_session_ids(&self) -> Vec<WorkspaceId> {
         let mut ids = self.session_ids(); // creation order
         match self.cfg.sort_by {
@@ -1716,7 +1452,6 @@ impl App {
                 ids.sort_by_key(|w| self.session_display_name(w).to_lowercase())
             }
             SortBy::Recent => {
-                // Most-recently-switched-to first (0 = never activated → last).
                 ids.sort_by(|a, b| {
                     self.session_activity
                         .get(b)
@@ -1726,14 +1461,12 @@ impl App {
                 });
             }
             SortBy::Activity => {
-                // Sessions with an active agent (working/blocked) first.
                 ids.sort_by_key(|w| u8::from(!self.session_has_active_agent(w)));
             }
         }
         ids
     }
 
-    /// Does session `wid` have an agent that is working or blocked (not idle/ready)?
     fn session_has_active_agent(&self, wid: &WorkspaceId) -> bool {
         let Some(w) = self.state.workspace(wid) else {
             return false;
@@ -1758,8 +1491,6 @@ impl App {
         self.state.workspace_count()
     }
 
-    /// The active session's index within the DISPLAY (sorted) order — for sidebar
-    /// windowing centered on the active session.
     fn active_session_index(&self) -> usize {
         self.sorted_session_ids()
             .iter()
@@ -1767,7 +1498,6 @@ impl App {
             .unwrap_or(0)
     }
 
-    /// Does session `wid` host any classified AI agent (across all its tabs)?
     fn session_has_agent(&self, wid: &WorkspaceId) -> bool {
         let Some(w) = self.state.workspace(wid) else {
             return false;
@@ -1783,17 +1513,13 @@ impl App {
         })
     }
 
-    /// Top y-offset of the pane grid. Tabs live in the bottom status bar now, so
-    /// there is no top bar — the grid starts at row 0.
     fn content_y(&self) -> u16 {
         self.top_h()
     }
 
-    /// Rows the top bar occupies: `TOP_H` when it is enabled AND the terminal can spare them.
-    ///
-    /// The floor is not cosmetic. Every chrome row comes out of the pane grid, and at three
-    /// rows total a top bar plus the status bar would leave one row for the shell — so a
-    /// short terminal silently keeps its panes instead of honouring the config.
+    /// Rows the top bar occupies: `TOP_H` when enabled and the terminal can spare them. Every
+    /// chrome row comes out of the pane grid, and at three rows total a top bar plus the status
+    /// bar would leave one row for the shell, so a short terminal silently keeps its panes.
     fn top_h(&self) -> u16 {
         if self.cfg.top_bar && self.rows >= MIN_ROWS_FOR_TOP {
             TOP_H
@@ -1807,15 +1533,13 @@ impl App {
         if self.host_hidden.1 { 0 } else { STATUS_H }
     }
 
-    /// Height available to the pane grid, between the top bar and the bottom status bar.
     fn content_rows(&self) -> u16 {
         self.rows
             .saturating_sub(self.status_h())
             .saturating_sub(self.top_h())
     }
 
-    /// Placed rects for the active tab, tiling the content area (right of the
-    /// sidebar when it is visible). Rects are already offset by `content_x`.
+    /// Placed rects for the active tab, already offset by `content_x`.
     fn layout(&self) -> Vec<PaneRect> {
         let mut out = Vec::new();
         if let Some(w) = self.state.workspace(&self.ws)
@@ -1850,7 +1574,6 @@ impl App {
         format!(" {}{index}:{label}{status} ", self.slot_badge(term))
     }
 
-    /// The active tab's zoomed pane, if it is zoomed (decisions #146).
     fn active_zoom(&self) -> Option<PaneId> {
         let w = self.state.workspace(&self.ws)?;
         w.tab(&w.active_tab)?.zoom().cloned()
@@ -1867,7 +1590,6 @@ impl App {
         }
     }
 
-    /// `Ctrl-b z` / `comux zoom`: toggle the focused pane filling its tab.
     /// Swap, rotate, re-shape or spread the tab holding `at` (the focused pane when `None`).
     /// Returns what happened, for a flash or a CLI response.
     fn arrange(
@@ -1899,7 +1621,6 @@ impl App {
             })
             .map_err(|e| e.to_string())?;
         if let Rearrange::Preset(p) = op {
-            // `next-layout` continues from the last preset this tab was given.
             self.tab_layout.insert(tab.clone(), p);
         }
         // Whether the LAYOUT changed — not whether events came back: a tab that is not on
@@ -1995,7 +1716,6 @@ impl App {
         }
     }
 
-    /// `Ctrl-b Space` (tmux `next-layout`): the preset after the one this tab last got.
     fn next_layout(&mut self) -> Result<String, String> {
         let next = self
             .active_tab_id()
@@ -2004,7 +1724,6 @@ impl App {
         self.arrange(None, crate::state::Rearrange::Preset(next))
     }
 
-    /// Run a rearrangement from a key, saying what happened.
     fn arrange_key(&mut self, op: crate::state::Rearrange) {
         let out = self.arrange(None, op);
         self.flash_result(out);
@@ -2017,8 +1736,6 @@ impl App {
         }
     }
 
-    /// Move `at` (the focused pane when `None`) out into a new tab of its own, right after
-    /// its old one (tmux `break-pane`).
     fn break_pane(&mut self, at: Option<(WorkspaceId, PaneId)>) -> Result<String, String> {
         let (ws, pane) = match at {
             Some(a) => a,
@@ -2041,7 +1758,6 @@ impl App {
         Ok("moved the pane to a new tab".into())
     }
 
-    /// Move the active tab `delta` places along the tab bar.
     fn move_active_tab(&mut self, delta: i32) {
         let Some(w) = self.state.workspace(&self.ws) else {
             return;
@@ -2073,7 +1789,6 @@ impl App {
         Ok(())
     }
 
-    /// The active tab's dividers in screen coordinates — the grab targets for a resize drag.
     fn dividers(&self) -> Vec<crate::model::DividerRect> {
         let mut out = Vec::new();
         if let Some(w) = self.state.workspace(&self.ws)
@@ -2092,17 +1807,14 @@ impl App {
         out
     }
 
-    /// The divider under `(x, y)`, if any. Innermost first: nested dividers are emitted after
-    /// their ancestor and can only ever be BESIDE it, never on top, so order is not load-
-    /// bearing — but taking the last match keeps it deterministic if that ever changes.
+    /// The divider under `(x, y)`, if any. Takes the last match to stay deterministic: nested
+    /// dividers sit BESIDE their ancestor, never on top.
     fn divider_at(&self, x: u16, y: u16) -> Option<crate::model::DividerRect> {
         self.dividers()
             .into_iter()
             .rfind(|d| x >= d.x && x < d.x + d.cols && y >= d.y && y < d.y + d.rows)
     }
 
-    /// Move the dragged divider so it lands under the pointer. Returns whether anything
-    /// changed, so a drag that stays within one cell does not churn the revision.
     fn drag_divider(&mut self, x: u16, y: u16) -> bool {
         let Some(drag) = self.resize_drag.clone() else {
             return false;
@@ -2120,8 +1832,6 @@ impl App {
             self.resize_drag = None;
             return false;
         }
-        // Re-derive from the CURRENT layout: the branch's origin and extent move when the
-        // window is resized or another client splits mid-drag.
         let Some(d) = self
             .dividers()
             .into_iter()
@@ -2185,15 +1895,11 @@ impl App {
         self.panes.is_empty()
     }
 
-    /// Resize every hosted PTY to match its on-screen rect, so shell output wraps
-    /// at the right width (the layout is the source of truth for geometry). Also the
-    /// central hook where any LAYOUT change (split / pane-resize / close / tab / session)
-    /// cancels an in-progress drag-selection — its pane-relative coords are only valid for
-    /// the layout at button-down, so applying them to a resized snapshot would copy the
-    /// wrong range.
+    /// Resize every hosted PTY to match its on-screen rect. Also the central hook where any
+    /// layout change cancels an in-progress drag-selection, whose pane-relative coords are only
+    /// valid for the layout at button-down.
     fn sync_sizes(&mut self) {
         self.selection = None;
-        // Any layout/viewport change invalidates the menu's fixed box rect too.
         self.menu = None;
         for rect in self.layout() {
             if let Some(pt) = self.panes.get(&rect.terminal) {
@@ -2202,10 +1908,9 @@ impl App {
         }
     }
 
-    /// Apply any `Resized` geometry carried in `events` directly to the matching
-    /// PaneTerms. Needed for BACKGROUND sessions/tabs: `sync_sizes`/`reflow` only
-    /// touch the ACTIVE session's layout, but a reap in a background session
-    /// recomputes ITS surviving terminals (G3) — those PTYs must still be SIGWINCH'd.
+    /// Apply any `Resized` geometry in `events` directly to the matching PaneTerms. Needed for
+    /// BACKGROUND sessions/tabs: `sync_sizes`/`reflow` only touch the active session's layout,
+    /// but a reap or split elsewhere recomputes its terminals, which must still get SIGWINCH.
     fn apply_resized_events(&self, events: &[Event]) {
         for e in events {
             if let Event::Resized { terminals, .. } = e {
@@ -2218,16 +1923,11 @@ impl App {
         }
     }
 
-    /// Push the CONTENT-area size (terminal minus sidebar + tab-bar chrome) to the
-    /// authoritative `State` as the workspace viewport, then resize every PTY.
-    /// Keeping the viewport equal to the real pane area means the authoritative
-    /// geometry — and the `Resized` events a remote client will rely on — matches
-    /// the actual PTY sizes (G2), even as chrome toggles. Call this on any change
-    /// that alters the chrome footprint (terminal resize, sidebar toggle, tab
-    /// add/remove); a pure in-tab layout change (split/close/focus) can use
-    /// `sync_sizes` since the viewport is unchanged.
+    /// Push the content-area size (terminal minus sidebar and bar chrome) to `State` as the
+    /// workspace viewport, then resize every PTY, so authoritative geometry and `Resized` events
+    /// match the real PTY sizes. Call on any change to the chrome footprint (terminal resize,
+    /// sidebar toggle, tab add/remove); a pure in-tab layout change can use `sync_sizes`.
     fn reflow(&mut self) {
-        // Any chrome/layout change invalidates a drag-selection's pane-relative coords.
         self.selection = None;
         let cols = self.content_cols().max(1);
         let rows = self.content_rows().max(1);
@@ -2238,8 +1938,6 @@ impl App {
         });
         self.sync_sizes();
     }
-
-    // --- mutations (through the authoritative actor) ---
 
     fn split(&mut self, dir: Dir) {
         let Some(pane) = self.focused_pane() else {
@@ -2303,8 +2001,6 @@ impl App {
                 // session's active tab re-divides ITS geometry, which the PTYs must follow.
                 self.apply_resized_events(&events);
                 if focus {
-                    // tmux-style: focus the freshly created pane. Refused (and ignored) when
-                    // it is not in the tab on screen.
                     self.apply_focus(Command::FocusPane {
                         client: self.client,
                         pane: np,
@@ -2313,10 +2009,8 @@ impl App {
                 Some(nt)
             }
             Err(reason) => {
-                // PTY spawn failed — roll the split back so authoritative state
-                // never holds a pane without a matching PaneTerm (which would
-                // render blank + silently drop input). Closing `np` collapses the
-                // branch and refocuses the original pane.
+                // PTY spawn failed: roll the split back so state never holds a pane without a
+                // PaneTerm (it would render blank and drop input).
                 let _ = self.state.apply(Command::ClosePane {
                     origin,
                     workspace: ws.clone(),
@@ -2331,8 +2025,6 @@ impl App {
         made
     }
 
-    /// The authority a mutation of `ws` runs under: this client's lease for the session it
-    /// is attached to, the API's for any other (a CLI verb reaching a background session).
     fn origin_for(&self, ws: &WorkspaceId) -> Origin {
         if *ws == self.ws {
             Origin::Client(self.client)
@@ -2341,8 +2033,6 @@ impl App {
         }
     }
 
-    /// Grow/shrink the focused pane along an axis (`Right` = width, `Down` = height)
-    /// by nudging its split divider.
     fn resize_focused(&mut self, axis: Dir, grow: bool) {
         let Some(pane) = self.focused_pane() else {
             return;
@@ -2363,8 +2053,7 @@ impl App {
     }
 
     /// `Ctrl-b x` (tmux `kill-pane`): close the focused pane, after a `y/n` unless
-    /// `confirm_close = false`. On a tab's only pane it closes the TAB, as tmux kills the
-    /// window — it used to do nothing at all, silently.
+    /// `confirm_close = false`. On a tab's only pane it closes the TAB, as tmux kills the window.
     fn close_focused(&mut self) {
         let Some(pane) = self.focused_pane() else {
             return;
@@ -2440,14 +2129,11 @@ impl App {
                 self.panes.remove(terminal);
             }
         }
-        // `sync_sizes` only reaches the session on screen.
         self.apply_resized_events(&events);
         self.sync_sizes();
         Ok(())
     }
 
-    /// Create a new tab (a fresh single-pane layout) and switch to it, spawning its
-    /// shell. Rolls the tab back if the PTY can't spawn (never leave a blank tab).
     fn new_tab(&mut self) -> Option<TerminalId> {
         let ws = self.ws.clone();
         let cwd = self.session_dir(&ws).or_else(|| self.focused_cwd());
@@ -2462,19 +2148,15 @@ impl App {
     }
 
     /// Where a new tab in `ws` opens by default: the session's start directory (tmux
-    /// `session_path`), while it still exists. A `cd` in one of the session's panes does not
-    /// move it — that was the bug: every new tab followed whichever pane happened to be
-    /// focused. Existence comes from [`Self::dir_probe`], never a stat here — and it has to
-    /// be checked at all because a PTY spawned in a missing directory does NOT fail:
-    /// alacritty ignores the child's `chdir` error, so the shell would quietly start in the
-    /// server's own cwd.
+    /// `session_path`), while it still exists, so a `cd` in one pane does not move it. Existence
+    /// comes from [`Self::dir_probe`], never a stat here, and must be checked at all because a
+    /// PTY spawned in a missing directory does NOT fail: alacritty ignores the child's `chdir`
+    /// error, so the shell would quietly start in the server's own cwd.
     fn session_dir(&self, ws: &WorkspaceId) -> Option<PathBuf> {
         let dir = self.state.workspace(ws)?.dir.clone()?;
         self.dir_probe.usable(&dir).then_some(dir)
     }
 
-    /// Re-check every session's start directory off-loop, at most every
-    /// [`DIR_PROBE_INTERVAL`]. Called from the server loop.
     pub fn maybe_probe_session_dirs(&mut self) {
         let now = std::time::Instant::now();
         if self
@@ -2504,9 +2186,9 @@ impl App {
             argv,
             env,
         } = launch;
-        // Creating a tab makes it active, so it is a view transition like any other. Missing
-        // it left a hole that survived a round trip: create a tab and close it again while a
-        // divider is held, and every identity check passes on the way back.
+        // Creating a tab makes it active, so it is a view transition like any other: otherwise
+        // creating then closing a tab while a divider is held passes every identity check on the
+        // way back.
         if activate && *ws == self.ws {
             self.note_view_moved();
         }
@@ -2539,8 +2221,6 @@ impl App {
                 Some(term)
             }
             Err(reason) => {
-                // Spawn failed — close the just-created tab so state never holds a
-                // tab whose pane has no live terminal (blank render + dropped input).
                 let _ = self.state.apply(Command::CloseTab {
                     origin,
                     workspace: ws.clone(),
@@ -2550,15 +2230,12 @@ impl App {
                 None
             }
         };
-        // A new tab in the attached session may make the tab bar appear (1→2 tabs),
-        // shrinking the content height → re-derive the viewport, not just PTY sizes.
         if *ws == self.ws {
             self.reflow();
         }
         made
     }
 
-    /// Switch the active tab by `delta` (wrapping): `+1` next, `-1` previous.
     fn cycle_tab(&mut self, delta: i32) {
         let ids = self.tab_ids();
         if ids.len() < 2 {
@@ -2574,13 +2251,9 @@ impl App {
         self.sync_sizes();
     }
 
-    /// Switch to the tab at 0-based `index` (the tab bar shows 1-based labels, so
-    /// Make `tab` active in `ws`. THE one place a tab selection happens.
-    ///
-    /// Every caller funnels here so `note_view_moved` cannot be forgotten: the eager
-    /// cancellation of a divider drag has to cover EVERY successful view transition, and the
-    /// four sites that used to apply `SelectTab` by hand were exactly how a `cycle_tab` slipped
-    /// past it.
+    /// Make `tab` active in `ws`. THE one place a tab selection happens: every caller funnels
+    /// here so `note_view_moved` cannot be forgotten, since the eager cancellation of a divider
+    /// drag must cover every successful view transition.
     fn select_tab(&mut self, ws: WorkspaceId, tab: TabId) {
         let _ = self.state.apply(Command::SelectTab {
             origin: Origin::Client(self.client),
@@ -2590,23 +2263,18 @@ impl App {
         self.note_view_moved();
     }
 
-    /// Record that what the user is looking at has changed.
-    ///
-    /// A MONOTONIC counter, not a comparison of the current view: another client can cycle
-    /// A → B → A while you hold a divider, and every "are we still on the tab we grabbed in"
-    /// check passes on the way back — while your pointer has moved somewhere unrelated, so a
-    /// release would snap the divider to it.
-    /// EVERY path that changes which tab or session is on screen must call this: selecting a
-    /// tab, switching session, creating a tab (which activates it) and closing one (which
-    /// promotes a neighbour). Adding a fifth without calling it reopens the round-trip hole.
+    /// Record that what the user is looking at has changed. A MONOTONIC counter, not a
+    /// comparison of the current view: another client can cycle A -> B -> A while you hold a
+    /// divider and every "still on the tab we grabbed" check passes on the way back, though the
+    /// pointer has moved elsewhere. EVERY path that changes which tab or session is on screen
+    /// must call this: selecting a tab, switching session, creating a tab and closing one.
     fn note_view_moved(&mut self) {
         self.view_gen = self.view_gen.wrapping_add(1);
-        // A drag-selection is already invalidated by a view change; a divider drag now is too.
         self.selection = None;
         self.resize_drag = None;
     }
 
-    /// `Ctrl-b 1` → index 0). Out-of-range is ignored.
+    /// Select the tab at 0-based `index` (`Ctrl-b 1` is index 0). Out-of-range is ignored.
     fn select_tab_index(&mut self, index: usize) {
         if let Some(tab) = self.tab_ids().get(index).cloned() {
             let ws = self.ws.clone();
@@ -2615,7 +2283,6 @@ impl App {
         }
     }
 
-    /// Close the active tab (and reap its shells). Rejected when it is the last tab.
     fn close_active_tab(&mut self) {
         let Some(active) = self.active_tab_id() else {
             return;
@@ -2653,8 +2320,6 @@ impl App {
                 }
             }
         }
-        // Closing a tab may hide the tab bar (2→1 tabs), growing the content
-        // height → re-derive the viewport.
         self.reflow();
         Ok(())
     }
@@ -2681,9 +2346,6 @@ impl App {
         self.sync_sizes();
     }
 
-    // --- navigation history (decisions #140) ---
-
-    /// Where the view is right now: the attached session, its active tab, the focused pane.
     fn nav_loc(&self) -> Option<Loc> {
         let w = self.state.workspace(&self.ws)?;
         Some(Loc {
@@ -2734,8 +2396,6 @@ impl App {
         }
     }
 
-    /// Remember the pane focused before the current one, per tab, for `last-pane`. Sampled
-    /// where the navigation history is, so every path that moves focus is covered.
     fn track_pane_focus(&mut self) {
         let (Some(tab), Some(pane)) = (self.active_tab_id(), self.focused_pane()) else {
             return;
@@ -2749,7 +2409,6 @@ impl App {
         }
     }
 
-    /// The attached terminals gained or lost focus (any one focused counts as focused).
     /// The server's "is anyone attached", kept in step every loop pass.
     pub fn set_attached(&mut self, attached: bool) {
         self.attached = attached;
@@ -2830,7 +2489,6 @@ impl App {
         Some(format!("{title} — {session}"))
     }
 
-    /// `last-pane`: back to the pane focused before this one in the same tab.
     fn last_pane(&mut self) {
         let Some(tab) = self.active_tab_id() else {
             return;
@@ -2849,11 +2507,8 @@ impl App {
         }
     }
 
-    /// How long `Ctrl-b q` keeps the pane numbers up (tmux's `display-panes-time` is 1s,
-    /// which most people raise).
     const PANE_NUMBERS: Duration = Duration::from_millis(2000);
 
-    /// `Ctrl-b q`: number every pane of the tab; a digit within the window focuses it.
     fn display_panes(&mut self) {
         self.pane_numbers = Some(std::time::Instant::now() + Self::PANE_NUMBERS);
     }
@@ -2863,8 +2518,6 @@ impl App {
             .is_some_and(|until| std::time::Instant::now() < until)
     }
 
-    /// Bump the attached session's recency, once per arrival — and the active tab's, once per
-    /// arrival there.
     fn note_arrival(&mut self) {
         if let Some(tab) = self.active_tab_id()
             && self.activity_tab.as_ref() != Some(&tab)
@@ -2882,21 +2535,16 @@ impl App {
         self.activity_ws = Some(self.ws.clone());
     }
 
-    /// Live sessions, most recently attached first; never-attached ones (restored, or made
-    /// in the background) follow in creation order so every session stays reachable.
     fn mru_sessions(&self) -> Vec<WorkspaceId> {
         let mut ids = self.session_ids();
-        // Stable: ties (all the never-visited zeros) keep creation order.
         ids.sort_by_key(|w| std::cmp::Reverse(self.session_activity.get(w).copied().unwrap_or(0)));
         ids
     }
 
-    /// The session to land on when the attached one goes away: the most recent survivor.
     fn fallback_session(&self, dying: &WorkspaceId) -> Option<WorkspaceId> {
         self.mru_sessions().into_iter().find(|w| w != dying)
     }
 
-    /// [`Self::navigate`] from a key: an empty direction says so instead of doing nothing.
     fn navigate_or_say(&mut self, dir: control::NavDir) {
         if self.navigate(dir).is_none() {
             let what = match dir {
@@ -3020,9 +2668,6 @@ impl App {
         r
     }
 
-    // --- pinned slots (decisions #148) ---
-
-    /// Pin `term` to `slot` (1–9), replacing what was there; a pane lives in one slot only.
     fn set_mark(&mut self, slot: u8, term: &TerminalId) {
         if !(1..=MARK_SLOTS as u8).contains(&slot) || !self.panes.contains_key(term) {
             return;
@@ -3036,7 +2681,6 @@ impl App {
         self.flash(format!("pinned to slot {slot} (Ctrl-b ' {slot})"), false);
     }
 
-    /// Go to slot `slot`'s pane, wherever it is. An empty slot says so.
     fn goto_mark(&mut self, slot: u8) {
         match self.mark_target(slot) {
             Some(term) => self.jump_to_terminal(&term),
@@ -3047,13 +2691,11 @@ impl App {
         }
     }
 
-    /// The live pane in `slot`, if any.
     fn mark_target(&self, slot: u8) -> Option<TerminalId> {
         let t = self.marks.get((slot as usize).checked_sub(1)?)?.clone()?;
         self.panes.contains_key(&t).then_some(t)
     }
 
-    /// The slot `term` is pinned to, if any.
     fn slot_of(&self, term: &TerminalId) -> Option<u8> {
         self.marks
             .iter()
@@ -3061,14 +2703,12 @@ impl App {
             .map(|i| i as u8 + 1)
     }
 
-    /// `[2] ` for a pinned pane, empty otherwise — the badge rows and titles carry.
     fn slot_badge(&self, term: &TerminalId) -> String {
         self.slot_of(term)
             .map(|n| format!("[{n}] "))
             .unwrap_or_default()
     }
 
-    /// `session/tab` for a location, by display name — what `comux back` prints.
     fn loc_label(&self, loc: &Loc) -> String {
         let w = self.state.workspace(&loc.ws);
         let index = w
@@ -3084,7 +2724,6 @@ impl App {
         )
     }
 
-    /// Put the view at `loc`: its session, its tab, and its pane if that is still there.
     fn go_to_loc(&mut self, loc: &Loc) {
         self.switch_session(loc.ws.clone());
         let active = self.active_tab_id();
@@ -3102,10 +2741,7 @@ impl App {
         self.reflow();
     }
 
-    /// Move along the history. Returns where the view landed, or `None` when there is
-    /// nowhere to go in that direction.
     fn navigate(&mut self, dir: control::NavDir) -> Option<Loc> {
-        // Settle anything the input that led here did first (a click, then the key).
         self.track_nav();
         let state = &self.state;
         let valid = |l: &Loc| loc_live(state, l);
@@ -3115,20 +2751,16 @@ impl App {
             control::NavDir::Last => self.nav.last(valid),
         }?;
         self.go_to_loc(&target);
-        // The entry's pane may have died; record where the view ACTUALLY is.
         let landed = self.nav_loc()?;
         self.nav.settle(landed.clone());
         self.note_arrival();
         Some(landed)
     }
 
-    /// The working directory of the focused pane's shell, for inheriting into a new
-    /// session/tab/split (tmux `-c '#{pane_current_path}'`). `None` if unreadable.
     fn focused_cwd(&self) -> Option<PathBuf> {
         self.focused_terminal().and_then(|t| self.terminal_cwd(&t))
     }
 
-    /// The working directory of `term`'s shell. `None` if unreadable.
     fn terminal_cwd(&self, term: &TerminalId) -> Option<PathBuf> {
         self.panes
             .get(term)
@@ -3136,14 +2768,13 @@ impl App {
             .and_then(procinfo::process_cwd)
     }
 
-    /// Create a new session (a fresh single-pane workspace). `name` is the tmux-style
-    /// session name (`None` → shown by its `sN` id); `cwd` is the directory to start its
-    /// shell in (`None` → the server's cwd), which also becomes the session's start
-    /// directory. `switch` moves the attached view to it — a human creating a session wants
-    /// to be in it; an agent's `new-session --detached` must not move anybody. Returns the
-    /// new session's one terminal, so a caller never has to infer it from focus (which
+    /// Create a new session (a fresh single-pane workspace). `name` is the tmux-style name
+    /// (`None` shows its `sN` id); `cwd` is where its shell starts (`None` → the server's cwd)
+    /// and becomes the session's start directory. `switch` moves the attached view to it: a
+    /// human wants to be in it, an agent's `new-session --detached` must not move anybody.
+    /// Returns the new session's one terminal so a caller needn't infer it from focus (which
     /// `switch = false` leaves on the old session). Rolls the session back if the PTY can't
-    /// spawn (never leave a blank session).
+    /// spawn.
     fn new_session(
         &mut self,
         name: Option<String>,
@@ -3173,8 +2804,6 @@ impl App {
                 Some(term0)
             }
             Err(reason) => {
-                // Spawn failed — drop the just-created session so state never holds a
-                // session whose pane has no live terminal.
                 if let Some(terms) = self.state.remove_workspace(&id) {
                     for t in &terms {
                         self.panes.remove(t);
@@ -3186,21 +2815,17 @@ impl App {
         }
     }
 
-    /// Tell the user why a pane they just asked for did not appear: on the status-bar
-    /// message line (it used to be a desktop toast, which `COPAD_MUX_NOTIFY=0` or a machine
-    /// without a notifier silently swallowed), and in `last_spawn_error` for the control
-    /// API to report the same reason.
+    /// Tell the user why a pane they just asked for did not appear, on the status-bar message
+    /// line, and record it in `last_spawn_error` for the control API to report the same reason.
     fn report_spawn_failure(&mut self, what: &str, reason: &str) {
         self.last_spawn_error = Some(reason.to_string());
         self.flash(format!("{what} failed: {reason}"), true);
     }
 
-    /// Tell the user something about an action they just took, on the message line.
     fn report_note(&mut self, body: &str) {
         self.flash(body.to_string(), false);
     }
 
-    /// Show `text` in the status bar for a few seconds (see [`App::message`]).
     pub(crate) fn flash(&mut self, text: String, error: bool) {
         let secs = if error {
             ERROR_MESSAGE_SECS
@@ -3240,19 +2865,13 @@ impl App {
         false
     }
 
-    /// Drop any recorded spawn reason before attempting a new pane-creating mutation.
-    ///
-    /// Without this, a reason left behind by a TUI keypress sits in the field
-    /// indefinitely, and the next control request that fails for an entirely different
-    /// cause — one the actor rejected before any spawn was attempted — would take it and
-    /// report a descriptor problem that had nothing to do with it.
+    /// Drop any recorded spawn reason before a new pane-creating mutation. Otherwise a reason
+    /// left by a TUI keypress would be taken by the next control request that fails for a
+    /// different cause (one the actor rejected before any spawn) and misreport it.
     fn clear_spawn_error(&mut self) {
         self.last_spawn_error = None;
     }
 
-    /// The reason the last pane spawn failed, consumed for a control-API error line.
-    /// Falls back to the generic wording when a failure had no recorded reason (the
-    /// actor refused the mutation before any spawn was attempted).
     fn take_spawn_error(&mut self, what: &str) -> String {
         match self.last_spawn_error.take() {
             Some(reason) => format!("{what} failed: {reason}"),
@@ -3260,15 +2879,13 @@ impl App {
         }
     }
 
-    /// Set (or clear, with `None`) a session's display name.
     fn rename_session(&mut self, ws: &WorkspaceId, name: Option<String>) {
         self.state.set_workspace_name(ws, name);
     }
 
-    /// Set (or clear, with `None`) a tab's custom display name. The name takes display
-    /// precedence over the tab's foreground-process label (chips, sidebar agents, Ctrl-f).
-    /// Takes the owning workspace explicitly so a prompt committed after a session
-    /// switch still renames the tab it was opened on.
+    /// Set (or clear) a tab's custom display name, which takes display precedence over its
+    /// foreground-process label. Takes the owning workspace explicitly so a prompt committed
+    /// after a session switch still renames the tab it was opened on.
     fn rename_tab(&mut self, ws: &WorkspaceId, tab: &TabId, name: Option<String>) {
         self.state.set_tab_name(ws, tab, name);
     }
@@ -3307,15 +2924,15 @@ impl App {
         hits
     }
 
-    /// Create a git worktree for `branch` (sibling of the repo's MAIN worktree) and open
-    /// a comux session in it, switching to it — the `comux worktree create` core, shared
-    /// by the control API and the `Ctrl-b W` prompt. Returns `(worktree_path, status)`.
+    /// Create a git worktree for `branch` (sibling of the repo's MAIN worktree) and open a comux
+    /// session in it, switching to it. Shared by the control API and the `Ctrl-b W` prompt.
+    /// Returns `(worktree_path, status)`.
     ///
-    /// Identity is anchored on git, never the bare computed path (naming is
-    /// non-injective): if the target path is already a registered worktree for the SAME
-    /// branch we reuse/recover it; a different branch or a non-worktree directory there
-    /// is an error. The `git worktree add` is the sole durable side effect — a failing
-    /// post-create hook or session spawn is reported, never rolled back.
+    /// Identity is anchored on git, never the bare computed path (naming is non-injective): a
+    /// target path already registered as a worktree for the SAME branch is reused; a different
+    /// branch or a non-worktree directory there is an error. `git worktree add` is the sole
+    /// durable side effect; a failing post-create hook or session spawn is reported, never
+    /// rolled back.
     fn create_worktree_session(
         &mut self,
         branch: &str,
@@ -3343,7 +2960,6 @@ impl App {
             .iter()
             .find(|e| crate::worktree::canonical_or_lexical(&e.path) == wt_key)
         {
-            // A registered worktree already occupies the target path.
             if e.branch.as_deref() != Some(branch) {
                 return Err(format!(
                     "{} already holds branch '{}' — pick another branch name",
@@ -3358,7 +2974,6 @@ impl App {
                     wt.display()
                 ));
             }
-            // Recover: reuse a live session inside it, else open a fresh one.
             if let Some(wid) = self.sessions_in_path(&wt).into_iter().next() {
                 self.switch_session(wid);
                 return Ok(WorktreeCreated {
@@ -3380,7 +2995,6 @@ impl App {
             ));
         }
 
-        // Fresh worktree: `git worktree add` is the sole durable side effect.
         crate::worktree::add(&repo_root, &wt, branch, from)?;
         let script_err = self
             .cfg
@@ -3416,15 +3030,12 @@ impl App {
         }
     }
 
-    /// Open the kill-session confirm modal (`Ctrl-b X`, tmux `prefix X`) for the
-    /// active session.
     fn open_kill_session_confirm(&mut self) {
         self.open_kill_session_confirm_for(self.ws.clone());
     }
 
-    /// Open the kill-session confirm for a specific session (context menu can target a
-    /// non-active one). No-op when only one session exists (a mux always keeps ≥1).
-    /// Captures the TARGET workspace so a focus/session change while the prompt is up
+    /// Open the kill-session confirm for a specific session. No-op when only one session
+    /// exists. Captures the TARGET workspace so a focus/session change while the prompt is up
     /// can't retarget it.
     fn open_kill_session_confirm_for(&mut self, ws: WorkspaceId) {
         if self.state.workspace_count() <= 1 {
@@ -3457,11 +3068,10 @@ impl App {
         }
     }
 
-    /// Remove a session (workspace), reap its PTYs, and switch to a survivor if it was
-    /// active. Revalidates the target still exists and isn't the last session (it may
-    /// have changed between opening the confirm and pressing `y`). Returns whether the
-    /// session was actually removed — the key/menu paths ignore it (the confirm modal
-    /// already vetted the target), the control API reports it.
+    /// Remove a session, reap its PTYs, and switch to a survivor if it was active. Revalidates
+    /// that the target still exists and isn't the last session (it may have changed since the
+    /// confirm opened). Returns whether it was removed; the key/menu paths ignore it, the
+    /// control API reports it.
     fn kill_session(&mut self, wid: &WorkspaceId) -> bool {
         if self.state.workspace(wid).is_none() || self.state.workspace_count() <= 1 {
             return false;
@@ -3479,14 +3089,11 @@ impl App {
         true
     }
 
-    /// Open the new-session directory browser (`Ctrl-b C`) at `$HOME`.
     fn open_new_session_prompt(&mut self) {
         let home = home_dir();
         self.open_browser_at(home, None);
     }
 
-    /// Open (or re-point) the browser at `dir`, listing it off-loop. `reselect` names the
-    /// child to select once the listing lands.
     fn open_browser_at(&mut self, dir: PathBuf, reselect: Option<std::ffi::OsString>) {
         self.dir_req += 1;
         let req = self.dir_req;
@@ -3501,8 +3108,6 @@ impl App {
         });
     }
 
-    /// Adopt a finished directory listing that answers the browser's current request.
-    /// Returns whether the browser needs a repaint. Called from the server loop.
     pub fn poll_dir_listing(&mut self) -> bool {
         let Some(b) = self.browser.as_mut() else {
             return false;
@@ -3538,7 +3143,6 @@ impl App {
         true
     }
 
-    /// The browser's rows (empty while it is closed).
     fn browser_rows(&self) -> Vec<dirbrowse::Row> {
         let Some(b) = self.browser.as_ref() else {
             return Vec::new();
@@ -3551,7 +3155,6 @@ impl App {
         dirbrowse::rows(&b.dir, listing, &b.filter, &home_dir())
     }
 
-    /// Move the browser selection by `delta`, wrapping.
     fn browser_move(&mut self, delta: i32) {
         let n = self.browser_rows().len() as i32;
         if let Some(b) = self.browser.as_mut()
@@ -3577,7 +3180,6 @@ impl App {
         b.sel = 0;
     }
 
-    /// Go to the parent directory, selecting the one we came out of.
     fn browser_up(&mut self) {
         let Some(b) = self.browser.as_ref() else {
             return;
@@ -3619,8 +3221,6 @@ impl App {
         }
     }
 
-    /// Open the inline new-worktree prompt (`Ctrl-b W`): the typed text is the branch
-    /// for `worktree create`. Enter commits, Esc cancels.
     fn open_new_worktree_prompt(&mut self) {
         self.prompt = Some(Prompt {
             kind: PromptKind::NewWorktree,
@@ -3628,13 +3228,10 @@ impl App {
         });
     }
 
-    /// Open the inline rename prompt (`Ctrl-b $`) for the active session.
     fn open_rename_prompt(&mut self) {
         self.open_rename_prompt_for(self.ws.clone());
     }
 
-    /// Open the inline rename prompt for a specific session (context menu can target a
-    /// non-active one), seeded with its current name.
     fn open_rename_prompt_for(&mut self, ws: WorkspaceId) {
         let seed = self
             .state
@@ -3647,7 +3244,6 @@ impl App {
         });
     }
 
-    /// Open the inline rename-tab prompt (`Ctrl-b ,`) for the active tab.
     fn open_rename_tab_prompt(&mut self) {
         let Some(tab) = self.active_tab_id() else {
             return;
@@ -3655,8 +3251,6 @@ impl App {
         self.open_rename_tab_prompt_for(self.ws.clone(), tab);
     }
 
-    /// Open the inline rename-tab prompt for a specific tab (context menu can target a
-    /// non-active one), seeded with its current custom name.
     fn open_rename_tab_prompt_for(&mut self, ws: WorkspaceId, tab: TabId) {
         let seed = self
             .state
@@ -3670,7 +3264,6 @@ impl App {
         });
     }
 
-    /// `Ctrl-b T`: the inline prompt to name the focused pane, seeded with its name.
     fn open_rename_pane_prompt(&mut self) {
         let Some(term) = self.focused_terminal() else {
             return;
@@ -3686,7 +3279,6 @@ impl App {
         });
     }
 
-    /// Apply the open prompt on Enter: create (name → `None` when blank) or rename.
     fn commit_prompt(&mut self, p: Prompt) {
         let trimmed = p.buf.trim();
         let name = (!trimmed.is_empty()).then(|| trimmed.to_string());
@@ -3719,7 +3311,6 @@ impl App {
         }
     }
 
-    /// Switch to the next/previous session (wrapping): `+1` next, `-1` previous.
     fn cycle_session(&mut self, delta: i32) {
         // Cycle in the order the sidebar SHOWS when that order is stable, so `)` moves to the
         // row below. `recent` and `activity` reorder as you go (cycling `recent` would
@@ -3737,9 +3328,8 @@ impl App {
         self.switch_session(next);
     }
 
-    /// Jump to an agent pane that is BLOCKED (awaiting input) — switch to its session
-    /// and tab and focus it, cycling to the next blocked agent after the current focus
-    /// (the retired tmux `prefix+a` jump-to-attention).
+    /// Jump to a BLOCKED agent pane (awaiting input), cycling to the next one after the current
+    /// focus.
     fn jump_to_attention(&mut self) {
         let mut blocked: Vec<TerminalId> = self
             .agent_statuses
@@ -3753,8 +3343,6 @@ impl App {
         // Longest-waiting first: the queue order an attention key should walk. Ties (and the
         // ordering among equally old ones) fall back to the id so the cycle is stable.
         blocked.sort_by_key(|t| (self.agent_statuses.get(t).map(|s| s.since), t.to_string()));
-        // Cycle: the blocked agent immediately AFTER the current focus (wrapping), so
-        // repeated presses visit every one.
         let cur = self.focused_terminal();
         let target = match cur
             .as_ref()
@@ -3804,7 +3392,6 @@ impl App {
         self.panes.contains_key(&id).then_some(id)
     }
 
-    /// Where a terminal sits, for listings: `(tab id, tab name, tab index, pane index)`.
     fn tab_location(&self, term: &TerminalId) -> Option<(TabId, String, usize, usize)> {
         let (ws, tab, pane) = self.locate_terminal(term)?;
         let w = self.state.workspace(&ws)?;
@@ -3918,7 +3505,6 @@ impl App {
         control::Resp::created(session, tab, token)
     }
 
-    /// Every session and its tabs as the selector resolver sees them, in `session_ids` order.
     fn selector_snapshot(&self) -> SelectorSnap {
         self.session_ids()
             .into_iter()
@@ -4021,7 +3607,6 @@ impl App {
         }
     }
 
-    /// The pane at `index` of [`Self::index_tab`]'s tab: `(workspace, pane, its terminal)`.
     fn pane_at(
         &self,
         caller: Option<&str>,
@@ -4056,7 +3641,6 @@ impl App {
             .map(|(tid, _)| tid.clone())
     }
 
-    /// A live pane's token.
     fn token_of(&self, term: &TerminalId) -> Option<String> {
         self.panes
             .get(term)
@@ -4064,8 +3648,6 @@ impl App {
             .map(str::to_string)
     }
 
-    /// `(tab, owner terminal)` for every owned tab that still exists and whose owner pane is
-    /// still alive, in tab order.
     fn live_owners(&self) -> Vec<(TabId, TerminalId)> {
         self.state
             .workspace_ids()
@@ -4081,7 +3663,6 @@ impl App {
             .collect()
     }
 
-    /// The token of the pane that owns `tab`, while it lives.
     fn owner_token(&self, tab: &TabId) -> Option<String> {
         self.tab_owner.get(tab).and_then(|o| self.token_of(o))
     }
@@ -4096,14 +3677,9 @@ impl App {
     }
 
     /// The terminal-emulator process an attached client is running inside, for the CLI to
-    /// activate after a jump. Best-effort and app-level only: a pid identifies the
-    /// emulator, never which of its windows or native tabs holds the client.
-    ///
-    /// The most recently attached client wins — with several attached, that is the one the
-    /// user is most likely sitting at. A pid that no longer resolves to a terminal (it
-    /// exited, or its client was removed by a path that skipped bookkeeping) is skipped
-    /// rather than returned as `None`: the raise must not go dark because a stale entry
-    /// happens to sit on top.
+    /// activate after a jump. App-level only: a pid identifies the emulator, never which of its
+    /// windows or tabs holds the client. The most recently attached client wins; a pid that no
+    /// longer resolves is skipped so a stale entry on top can't make the raise go dark.
     fn raise_target(&self) -> Option<(u32, String)> {
         self.client_pids
             .iter()
@@ -4111,12 +3687,9 @@ impl App {
             .find_map(|pid| crate::winfocus::terminal_ancestor_live(*pid))
     }
 
-    /// Record that the client with `pid` is running inside a copad tab, and which one.
-    ///
-    /// This is what makes the notification jump land on the right TAB rather than merely
-    /// bringing copad forward. Keyed by client pid so it is dropped by the same
-    /// `forget_client_pid` that drops the raise target — a departed client must not leave a
-    /// panel id behind for a later jump to focus.
+    /// Record that the client with `pid` is running inside a copad tab, and which one, so the
+    /// notification jump lands on the right tab. Keyed by client pid so `forget_client_pid` drops
+    /// it with the raise target: a departed client must not leave a panel id behind.
     pub fn set_client_copad(&mut self, pid: u32, sock: String, panel: String) {
         self.client_copad.retain(|(p, _, _)| *p != pid);
         self.client_copad.push((pid, sock, panel));
@@ -4125,10 +3698,8 @@ impl App {
         }
     }
 
-    /// The copad tab hosting the most recently attached client, if any.
-    ///
-    /// Most-recent-first, matching [`Self::raise_target`]: with several clients attached the
-    /// one you just used is the one you meant.
+    /// The copad tab hosting the most recently attached client, if any (most recent first, like
+    /// [`Self::raise_target`]).
     fn copad_target(&self) -> Option<(String, String)> {
         let live: Vec<&(u32, String, String)> = self
             .client_copad
@@ -4138,8 +3709,6 @@ impl App {
         live.last().map(|(_, s, panel)| (s.clone(), panel.clone()))
     }
 
-    /// Record an attaching client's pid (most recent last) so [`Self::raise_target`] can
-    /// find its terminal. Called by the server on attach.
     pub fn set_client_pid(&mut self, pid: u32) {
         self.client_pids.retain(|p| *p != pid);
         self.client_pids.push(pid);
@@ -4148,22 +3717,15 @@ impl App {
         }
     }
 
-    /// Forget a client's pid on detach — a departed client's terminal must not be raised.
     pub fn forget_client_pid(&mut self, pid: u32) {
         self.client_pids.retain(|p| *p != pid);
         self.client_copad.retain(|(p, _, _)| *p != pid);
     }
 
-    /// The attached-client pids currently considered for a window raise, oldest first.
-    /// Observability for the detach paths (a stale entry here shadows the live client).
     pub fn raise_candidates(&self) -> &[u32] {
         &self.client_pids
     }
 
-    // --- control API (spec §3): applied on the main loop (single writer) ---
-
-    /// Handle one control request, mutating state as the sole writer. Returns the
-    /// wire response. Never blocks.
     pub fn handle_control(&mut self, req: &control::Req) -> control::Resp {
         let resp = self.handle_control_inner(req);
         self.track_nav();
@@ -4304,11 +3866,10 @@ impl App {
                         );
                     }
                 };
-                // `from` pins the split SOURCE by identity, in any tab of any session. Without
-                // it the focused pane is split, and focus is mutable: a script that lists, then
-                // splits, can have the pane created somewhere else entirely — and since a new
-                // pane inherits the source's cwd, the command it then runs executes in the
-                // wrong directory.
+                // `from` pins the split SOURCE by identity. Without it the focused pane is split, and
+                // focus is mutable: a script that lists, then splits, can have the pane created
+                // elsewhere, and since a new pane inherits the source's cwd its command would run in
+                // the wrong directory.
                 let (ws, pane) = match from {
                     Some(t) => match self
                         .resolve_pane_token(t)
@@ -4322,7 +3883,6 @@ impl App {
                         None => return Resp::err_code("not_found", "no focused pane"),
                     },
                 };
-                // Validate the launch before anything is split: a refusal must leave no pane.
                 let mut extra_env = Vec::with_capacity(env.len());
                 for kv in env {
                     match control::env_pair(kv) {
@@ -4347,8 +3907,6 @@ impl App {
                     env: extra_env,
                 };
                 self.clear_spawn_error();
-                // Name the pane we created, so no caller ever has to infer it by diffing
-                // listings (which a concurrent focus or tab change can defeat).
                 match self.split_at(&ws, pane, d, !no_focus, launch) {
                     Some(term) => self.created(&term),
                     None => Resp::err_code("spawn_failed", self.take_spawn_error("split")),
@@ -4515,7 +4073,6 @@ impl App {
                     },
                     None => None,
                 };
-                // Validate a spawn before anything is created: a refusal must leave no tab.
                 let mut extra_env = Vec::with_capacity(env.len());
                 for kv in env {
                     match control::env_pair(kv) {
@@ -4582,8 +4139,6 @@ impl App {
                     Ok(a) => a,
                     Err((c, m)) => return Resp::err_code(c, &m),
                 };
-                // A tab in another session is reached the way a jump reaches a pane: switch
-                // to its session, then select it.
                 self.switch_session(ws.clone());
                 self.select_tab(ws, tab);
                 self.sync_sizes();
@@ -4715,7 +4270,6 @@ impl App {
                 cwd,
                 detached,
             } => {
-                // Prefer the caller's cwd (CLI); fall back to the focused pane's.
                 let dir = cwd
                     .clone()
                     .map(PathBuf::from)
@@ -4953,8 +4507,6 @@ impl App {
                     self.jump_to_terminal(&created);
                 }
                 if r.ok {
-                    // Tab created and the fork command started — whether the agent then
-                    // succeeds is for the new tab to show.
                     r.message = Some(format!(
                         "opened a tab forking {} conversation {id}",
                         tool.bin()
@@ -5209,9 +4761,6 @@ impl App {
                 } else {
                     body.clone()
                 };
-                // Echo the attribution: a pushing hook otherwise has no way to tell a
-                // mis-addressed pane from a correctly addressed one, since the toast is
-                // the only other evidence and it is transient.
                 Resp::message(self.raise_notification(term, tool, kind, body))
             }
             Req::KillSession { index, target } => {
@@ -5290,20 +4839,14 @@ impl App {
                 self.worktree_rm(target, *force, *delete_branch, start)
             }
             Req::ReloadConfig => {
-                // Re-read mux.toml and swap the whole config (tmux `source-file`). Every
-                // live-read field takes effect on the next frame because rendering/input
-                // read straight off `self.cfg`: keymap, mouse, sidebar_width,
-                // sidebar_density, all usage_*, tab_labels, notify, scroll_step, sort_by,
-                // worktree — and ALSO
-                // restore_processes/restore_agent_sessions, which are read at SAVE time
-                // (see `snapshot_*` at ~3300), so a reloaded restore list governs the next
-                // autosave/shutdown-save. The genuinely frozen fields are the ones whose
-                // runtime copy lives OUTSIDE `self.cfg`: update_environment (a destructive
-                // one-time daemon env-scrub + per-connection frozen env) and the
-                // persistence toggle/cadence (persist/autosave_secs captured into run()
-                // loop vars) — hence the restart hint in the message. The live
-                // sidebar-visibility toggle (`self.sidebar`) is intentionally left alone so
-                // a reload never yanks a sidebar the user toggled with Ctrl-b s.
+                // Re-read mux.toml and swap the whole config (tmux `source-file`). Rendering and
+                // input read straight off `self.cfg`, so most fields apply on the next frame;
+                // restore_processes/restore_agent_sessions are read at SAVE time, so a reloaded list
+                // governs the next autosave. Frozen: update_environment (destructive one-time env
+                // scrub + per-connection frozen env) and the persist/autosave_secs toggle and
+                // cadence captured into run()'s loop vars, hence the restart hint in the message.
+                // The live sidebar-visibility toggle (`self.sidebar`) is left alone so a reload
+                // never yanks a sidebar toggled with Ctrl-b s.
                 let (cfg, warnings) = crate::config::MuxConfig::load();
                 self.cfg = cfg;
                 self.apply_history_limit();
@@ -5335,7 +4878,6 @@ impl App {
                         Some(tid) => tid,
                         None => return Resp::err_code("not_found", format!("unknown pane '{t}'")),
                     },
-                    // An index counts in the caller's tab when there is a caller.
                     None => match index {
                         Some(i) => match self.pane_at(caller.as_deref(), *i) {
                             Ok((_, _, Some(tid))) => tid,
@@ -5648,8 +5190,6 @@ impl App {
         }
     }
 
-    /// Enumerate the repo's worktrees (resolved from `start`) with a `live` flag for
-    /// worktrees a comux session is currently inside.
     fn worktree_list_infos(
         &self,
         start: Option<PathBuf>,
@@ -5729,9 +5269,6 @@ impl App {
         control::finish_branch_delete(&repo, &entry, delete_branch, force)
     }
 
-    /// Record whether any attached client has the prefix armed, for the status-bar
-    /// mode indicator. Called by the server each frame from the clients' own per-client
-    /// prefix flags — the render can't reach those, and the frame is shared anyway.
     /// Has this pane rung the bell since it was last acknowledged?
     pub fn bell(&self, tid: &TerminalId) -> bool {
         self.panes
@@ -5739,18 +5276,11 @@ impl App {
             .is_some_and(|p| p.bell_count() > self.bell_seen.get(tid).copied().unwrap_or(0))
     }
 
-    /// Acknowledge the focused pane's bells — the user just acted on this view.
-    ///
-    /// The evidence is a CLIENT ACTION (a key or a mouse event), not a frame we hope arrived.
-    /// That distinction is the whole design: earlier drafts tried to acknowledge when a frame
-    /// was composed, then when it was queued, then when a writer thread had flushed it, and
-    /// each boundary had a window where a bell could be cleared without anyone seeing it —
-    /// because "the server emitted a frame" is simply not evidence that a human looked. A
-    /// keypress is. It also gives the behaviour people expect: a bell clears when you go to
-    /// the pane, and one rung while you were away is still there when you come back.
-    ///
-    /// A pane that rings while you are typing in it (ambiguous tab-completion, which is most
-    /// bells) clears on your next keystroke, which is immediate in practice.
+    /// Acknowledge the focused pane's bells: the user just acted on this view. The evidence is a
+    /// client action (a key or mouse event), not a frame we hope arrived: acknowledging when a
+    /// frame was composed, queued or flushed each left a window where a bell cleared without
+    /// anyone seeing it, since an emitted frame is not evidence that a human looked. A bell rung
+    /// while you were away is still there when you come back.
     pub fn ack_focused_bell(&mut self) {
         let Some(tid) = self.focused_pane().and_then(|p| {
             self.state
@@ -5764,7 +5294,6 @@ impl App {
             self.bell_seen.insert(tid.clone(), count);
         }
         self.ack_agent(&tid, self.agent_seq);
-        // A notification from the pane being acted on has been seen, for the same reason.
         for n in self.notifications.iter_mut().filter(|n| n.terminal == tid) {
             n.read = true;
         }
@@ -5775,7 +5304,6 @@ impl App {
         }
     }
 
-    /// Acknowledge `term`'s agent episodes up to `upto` (see [`Self::agent_ack`]).
     fn ack_agent(&mut self, term: &TerminalId, upto: u64) {
         let e = self.agent_ack.entry(term.clone()).or_insert(0);
         *e = (*e).max(upto);
@@ -5798,18 +5326,15 @@ impl App {
         (matches && st.pid == pid).then_some(st.seq)
     }
 
-    /// Has `term`'s agent finished a turn nobody has looked at since?
     pub fn unseen_done(&self, term: &TerminalId) -> bool {
         self.done_episode
             .get(term)
             .is_some_and(|seq| !self.acked(term, *seq))
     }
 
-    /// How many panes anywhere in the mux have an unacknowledged bell.
-    ///
-    /// Rendered in the status bar because the per-tab and per-session markers cannot be a
-    /// guarantee: the ringing session's sidebar row can be outside the visible window, and
-    /// the sidebar can be hidden entirely on a narrow terminal. Same reasoning as `⚑N`.
+    /// How many panes anywhere in the mux have an unacknowledged bell. Shown in the status bar
+    /// because the per-tab and per-session markers can be off-window or hidden on a narrow
+    /// terminal (same reasoning as `⚑N`).
     pub fn bell_count(&self) -> usize {
         self.panes.keys().filter(|tid| self.bell(tid)).count()
     }
@@ -5824,30 +5349,24 @@ impl App {
         self.prefix_armed
     }
 
-    /// The label the status bar shows while the prefix is armed (`^b`), from the
-    /// CONFIGURED prefix chord rather than a hardcoded `Ctrl-b`.
     fn prefix_label(&self) -> String {
         self.cfg.keymap.prefix_chord.label()
     }
 
-    /// Route one key event through the mux (popup → prefix → direct-nav → shell).
-    /// Returns [`KeyAction::Detach`] on the detach chord. The `Ctrl-b` prefix state is
-    /// PER-CLIENT (`prefix`, owned by the caller) so a chord can't span connections
-    /// when several clients share input; the popup is shared workspace state.
+    /// Route one key event through the mux (popup, prefix, direct-nav, shell). Returns
+    /// [`KeyAction::Detach`] on the detach chord. The prefix state is per-client (owned by the
+    /// caller) so a chord can't span connections; the popup is shared workspace state.
     pub fn feed_key(&mut self, k: KeyEvent, prefix: &mut Prefix) -> KeyAction {
         let action = self.feed_key_inner(k, prefix);
         self.track_nav();
         action
     }
 
-    /// Feed one bracketed paste from a client (Cmd-V, or a file dropped on its window).
-    ///
-    /// With nothing in the way it goes to the focused pane AS a paste — re-bracketed when
-    /// that program asked for it — because that framing is the whole point: Claude Code
-    /// attaches a dropped image only when its path arrives pasted, not typed. When an
-    /// overlay owns input (a prompt, a picker, copy mode, …) or the prefix is armed, it is
-    /// replayed as the keystrokes a terminal without bracketed paste would have sent, so
-    /// pasting into a rename prompt keeps working exactly as before.
+    /// Feed one bracketed paste from a client. With nothing in the way it goes to the focused
+    /// pane as a paste (re-bracketed when that program asked for it): Claude Code attaches a
+    /// dropped image only when its path arrives pasted, not typed. When an overlay owns input or
+    /// the prefix is armed, it is replayed as the keystrokes a terminal without bracketed paste
+    /// would have sent.
     pub fn feed_paste(&mut self, text: &str, prefix: &mut Prefix) -> KeyAction {
         if prefix.armed || self.input_captured() {
             let mut action = KeyAction::Continue;
@@ -5888,14 +5407,12 @@ impl App {
     fn feed_key_inner(&mut self, k: KeyEvent, prefix: &mut Prefix) -> KeyAction {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
 
-        // An open inline prompt (new-session name / rename) captures all input: type
-        // to edit, Enter commits, Esc cancels. Shared state, so clear this client's
-        // pending prefix too.
+        // An open inline prompt captures all input: type to edit, Enter commits, Esc cancels.
+        // Clear this client's pending prefix too, since the prompt is shared state.
         if let Some(mut p) = self.prompt.take() {
             prefix.clear();
             match k.code {
                 KeyCode::Enter => self.commit_prompt(p),
-                // Naming a session you just browsed to: Esc steps back to the browser.
                 KeyCode::Esc => {
                     if let PromptKind::NewSessionIn(dir) = p.kind {
                         self.open_browser_at(dir, None);
@@ -5914,8 +5431,6 @@ impl App {
             return KeyAction::Continue;
         }
 
-        // A y/n confirm modal (kill-session) captures input while open: `y`/`Y`
-        // performs the captured action, anything else cancels.
         if let Some(cf) = self.confirm.take() {
             prefix.clear();
             if matches!(k.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
@@ -5924,7 +5439,6 @@ impl App {
             return KeyAction::Continue;
         }
 
-        // The mark modal takes ONE key: a slot digit acts, anything else cancels.
         if let Some(modal) = self.mark_modal.take() {
             prefix.clear();
             match (k.code, modal) {
@@ -5959,7 +5473,6 @@ impl App {
             return KeyAction::Continue;
         }
 
-        // The key help scrolls with j/k/arrows/PgUp/PgDn/g/G; any other key closes it.
         if let Some(scroll) = self.help {
             prefix.clear();
             let page = self.rows.saturating_sub(4).max(1) as usize;
@@ -5978,8 +5491,6 @@ impl App {
             return KeyAction::Continue;
         }
 
-        // An open right-click context menu captures input (tmux display-menu keys):
-        // `j`/`k`/arrows navigate, Enter runs the selection, anything else closes.
         if self.menu.is_some() {
             prefix.clear();
             match k.code {
@@ -5999,8 +5510,6 @@ impl App {
             return KeyAction::Continue;
         }
 
-        // Sidebar keyboard-focus mode (`Ctrl-b e`): hjkl/arrows navigate the spaces/agents
-        // lists (h/l or ←/→ switch group, j/k or ↑/↓ move), Enter selects, Esc/q exits.
         if self.sidebar_focus.is_some() {
             prefix.clear();
             match k.code {
@@ -6022,7 +5531,6 @@ impl App {
         if self.popup.is_some() {
             prefix.clear();
             match k.code {
-                // ↑/↓ (or Ctrl-n/p) move the list; ←/→ switch the sessions/agents tab.
                 KeyCode::Down => self.popup_move(1),
                 KeyCode::Up => self.popup_move(-1),
                 KeyCode::Char('n') if ctrl => self.popup_move(1),
@@ -6030,14 +5538,12 @@ impl App {
                 KeyCode::Left => self.popup_step(-1),
                 KeyCode::Right => self.popup_step(1),
                 KeyCode::Enter => self.popup_select(),
-                // Ctrl-r / F2: rename the selected session inline.
                 KeyCode::Char('r') if ctrl => self.popup_rename(),
                 KeyCode::Char('\u{12}') => self.popup_rename(),
                 KeyCode::F(2) => self.popup_rename(),
                 KeyCode::Esc | KeyCode::Char('\u{6}') => self.popup = None,
                 KeyCode::Char('f') if ctrl => self.popup = None, // Ctrl-f toggles closed
                 KeyCode::Backspace => self.popup_backspace(),
-                // Any other printable char extends the fuzzy filter.
                 KeyCode::Char(c) if !ctrl => self.popup_type(c),
                 _ => {}
             }
@@ -6109,7 +5615,6 @@ impl App {
             }
         }
 
-        // Notification center (`Ctrl-b a`) captures input while open.
         if self.center.is_some() {
             match k.code {
                 KeyCode::Char('j') | KeyCode::Down => self.center_move(1),
@@ -6124,16 +5629,14 @@ impl App {
             return KeyAction::Continue;
         }
 
-        // From here on, keys resolve through the configurable keymap (see `config.rs`).
-        // A key we never bind (function keys, etc.) can't form a chord — treat it as
-        // shell input (and disarm a dangling prefix).
+        // From here keys resolve through the configurable keymap. A key that can't form a chord
+        // is shell input (and disarms a dangling prefix).
         let Some(chord) = config::chord_of(&k) else {
             prefix.clear();
             self.key_to_focused(k);
             return KeyAction::Continue;
         };
 
-        // Prefix armed: the next chord is a prefix-table binding (or nothing).
         if prefix.armed {
             prefix.clear();
             if let Some(action) = self.cfg.keymap.prefix_action(&chord) {
@@ -6153,8 +5656,6 @@ impl App {
             return self.dispatch_prefixed(action, prefix);
         }
 
-        // Prefix-less: a global binding wins (incl. entering the prefix); otherwise the
-        // key is shell input.
         if let Some(action) = self
             .cfg
             .keymap
@@ -6171,7 +5672,6 @@ impl App {
         KeyAction::Continue
     }
 
-    /// Run a prefix-table action and, when it is repeatable, open the repeat window.
     fn dispatch_prefixed(&mut self, action: Action, prefix: &mut Prefix) -> KeyAction {
         if action.repeatable() && self.cfg.repeat_time > 0 {
             prefix.repeat_until =
@@ -6180,8 +5680,6 @@ impl App {
         self.dispatch(action)
     }
 
-    /// Execute a resolved keymap [`Action`]. Returns [`KeyAction::Detach`] for the
-    /// detach action, [`KeyAction::Continue`] otherwise.
     fn dispatch(&mut self, action: Action) -> KeyAction {
         use Action::*;
         match action {
@@ -6213,7 +5711,6 @@ impl App {
             FocusDown => self.focus_dir(FocusDir::Down),
             FocusUp => self.focus_dir(FocusDir::Up),
             FocusRight => self.focus_dir(FocusDir::Right),
-            // L/H widen/narrow (Right axis), J/K taller/shorter (Down axis).
             ResizeRight => self.resize_focused(Dir::Right, true),
             ResizeLeft => self.resize_focused(Dir::Right, false),
             ResizeDown => self.resize_focused(Dir::Down, true),
@@ -6288,7 +5785,6 @@ impl App {
         });
     }
 
-    /// Focus the nearest pane in a direction, by rect-center heuristic.
     fn focus_dir(&mut self, dir: FocusDir) {
         let rects = self.layout();
         let Some(cur_term) = self.focused_terminal() else {
@@ -6346,7 +5842,6 @@ impl App {
         }
     }
 
-    /// Where typed input goes: the focused pane, or every pane of a synchronized tab.
     fn input_targets(&self) -> Vec<TerminalId> {
         let synced = self
             .active_tab_id()
@@ -6362,7 +5857,6 @@ impl App {
         self.focused_terminal().into_iter().collect()
     }
 
-    /// `Ctrl-b S` (tmux `synchronize-panes`): toggle typing into every pane of this tab.
     fn toggle_sync(&mut self) {
         let Some(tab) = self.active_tab_id() else {
             return;
@@ -6383,14 +5877,9 @@ impl App {
         );
     }
 
-    // --- scrollback ---
-
-    /// Handle a forwarded mouse action at frame cell `(x, y)`: the wheel scrolls the
-    /// pane UNDER the cursor (falling back to the focused pane); a left click focuses
-    /// the pane under the cursor.
-    ///
-    /// Returns `Some(text)` only on a button-up that ends a real drag — the pane text the
-    /// server should ship to the initiating `client` as an OSC 52 clipboard copy.
+    /// Handle a forwarded mouse action at frame cell `(x, y)`. Returns `Some(text)` only on a
+    /// button-up that ends a real drag: the pane text the server should ship to the initiating
+    /// `client` as an OSC 52 clipboard copy.
     pub fn mouse_at(
         &mut self,
         client: ClientId,
@@ -6433,7 +5922,6 @@ impl App {
             self.center_mouse(x, y, kind);
             return None;
         }
-        // Right-button events + clicks on an OPEN menu belong to the context menu.
         match kind {
             MouseKind::RightClick | MouseKind::RightDrag | MouseKind::RightUp => {
                 return self.menu_mouse(client, x, y, kind);
@@ -6461,16 +5949,12 @@ impl App {
         match kind {
             MouseKind::ScrollUp | MouseKind::ScrollDown => {
                 let up = matches!(kind, MouseKind::ScrollUp);
-                // A wheel over the usage readout pages the carousel (up = previous,
-                // down = next; wraps) instead of scrolling a pane.
                 if matches!(self.click_target_at(x, y), Some(ClickTarget::Usage)) {
                     self.page_usage(if up { -1 } else { 1 });
                     return None;
                 }
-                // A wheel over the sidebar scrolls THAT half rather than falling through
-                // to the focused pane's scrollback, which is what it used to do — the
-                // pointer was nowhere near that pane. `content_x` is the first column
-                // right of the strip's border, so `x < content_x` is "inside the sidebar".
+                // A wheel over the sidebar scrolls THAT half. `content_x` is the first column right of
+                // the strip's border, so `x < content_x` is inside the sidebar.
                 if self.sidebar_visible()
                     && x < self.content_x()
                     && y >= self.content_y()
@@ -6479,8 +5963,6 @@ impl App {
                     self.scroll_sidebar(y >= self.sidebar_mid.get(), if up { -1 } else { 1 });
                     return None;
                 }
-                // The pane under the cursor, else the focused one (tmux forwards to the
-                // pane the pointer is over).
                 let rect = target.clone().or_else(|| {
                     let f = self.focused_terminal()?;
                     self.layout().into_iter().find(|r| r.terminal == f)
@@ -6488,8 +5970,6 @@ impl App {
                 if let Some(rect) = rect
                     && let Some(pt) = self.panes.get(&rect.terminal)
                 {
-                    // 1-based cell coords within the pane (clamped for the focused-pane
-                    // fallback, where the pointer can sit outside it).
                     let col = x.saturating_sub(rect.x).min(rect.cols.saturating_sub(1)) + 1;
                     let row = y.saturating_sub(rect.y).min(rect.rows.saturating_sub(1)) + 1;
                     if let Some(bytes) = pt.wheel_bytes(up, col, row) {
@@ -6497,7 +5977,6 @@ impl App {
                         // — forward it so its OWN scroll advances (Claude Code, less, nvim).
                         pt.input(&bytes);
                     } else {
-                        // No mouse app in the pane: scroll comux's own scrollback.
                         let lines = if up {
                             self.cfg.scroll_step
                         } else {
@@ -6515,8 +5994,6 @@ impl App {
                     .selection
                     .as_ref()
                     .is_some_and(|s| s.owner != client && s.moved);
-                // Chrome first: a click on a tab chip / sidebar row navigates. Only if
-                // it misses all zones does it fall through to click-to-focus a pane.
                 if let Some(t) = self.click_target_at(x, y) {
                     if !other_dragging {
                         self.selection = None; // a chrome click never starts a selection
@@ -6532,8 +6009,6 @@ impl App {
                         // Right-click menu anchor only — a left click must NOT
                         // re-attach to the active session (lease churn).
                         ClickTarget::SessionPill(_) => {}
-                        // A left click advances the carousel one page (wraps) — the
-                        // no-wheel fallback for paging the usage readout.
                         ClickTarget::Usage => self.page_usage(1),
                     }
                     return None;
@@ -6587,13 +6062,10 @@ impl App {
                 None
             }
             MouseKind::Drag => {
-                // A divider drag takes precedence: if this client grabbed one, every Drag is
-                // a resize until it releases.
                 if self.resize_drag.as_ref().map(|d| d.owner) == Some(client) {
                     self.drag_divider(x, y);
                     return None;
                 }
-                // Only the owning client extends its own selection.
                 let owner = self.selection.as_ref().map(|s| s.owner);
                 if owner != Some(client) {
                     return None;
@@ -6605,8 +6077,6 @@ impl App {
                     self.selection = None;
                     return None;
                 };
-                // CLAMP the pointer to the origin pane, so the selection can never extend into
-                // the sidebar / status bar / dividers / another pane.
                 let cx = x.clamp(rect.x, rect.x + rect.cols.saturating_sub(1));
                 let cy = y.clamp(rect.y, rect.y + rect.rows.saturating_sub(1));
                 if let Some(sel) = self.selection.as_mut() {
@@ -6624,7 +6094,6 @@ impl App {
                     self.resize_drag = None;
                     return None;
                 }
-                // Only the owner finishes its selection; a non-owner release is ignored.
                 if self.selection.as_ref().map(|s| s.owner) != Some(client) {
                     return None;
                 }
@@ -6639,8 +6108,6 @@ impl App {
                         self.last_click = None;
                         return None;
                     }
-                    // Otherwise count it: a double click selects the word, a triple click the
-                    // (wrapped) line, and copies it — tmux's `DoubleClick1Pane`/`TripleClick1Pane`.
                     let now = std::time::Instant::now();
                     let count = match &self.last_click {
                         Some(lc)
@@ -6670,7 +6137,6 @@ impl App {
                         line_bounds(&snap, sel.anchor.1)
                     };
                     let text = extract_selection(&snap, anchor, head);
-                    // Leave it highlighted until the next click or key, as a receipt.
                     self.selection = Some(Sel {
                         anchor,
                         head,
@@ -6679,30 +6145,24 @@ impl App {
                     });
                     return (!text.is_empty()).then_some(text);
                 }
-                // Extract from the CURRENT snapshot (WYSIWYG: copy what's highlighted now).
                 let rect = self.layout().into_iter().find(|r| r.terminal == sel.term)?;
                 let _ = rect; // presence check: the pane is still visible
                 let snap = self.panes.get(&sel.term)?.snapshot();
                 let text = extract_selection(&snap, sel.anchor, sel.head);
                 (!text.is_empty()).then_some(text)
             }
-            // Routed to `menu_mouse` by the early match above.
             MouseKind::RightClick | MouseKind::RightDrag | MouseKind::RightUp => None,
         }
     }
 
-    /// Cancel any in-progress drag-selection (its coords are only valid for the layout at
-    /// button-down). Called on layout mutations and on the owner's key input / disconnect.
     pub fn clear_selection(&mut self) {
         self.selection = None;
     }
 
-    /// Drop the selection — and any divider drag — belonging to `client` (its owner
-    /// detached).
-    ///
-    /// The drag matters as much as the selection: client ids are reused, so a drag left armed
-    /// by a client that vanished mid-gesture would be INHERITED by whoever next takes that id,
-    /// and their first click would yank a divider to it.
+    /// Drop the selection and any divider drag belonging to `client` (its owner detached). The
+    /// drag matters as much: client ids are reused, so a drag left armed by a vanished client
+    /// would be inherited by whoever next takes that id, and their first click would yank a
+    /// divider.
     pub fn clear_selection_of(&mut self, client: ClientId) {
         if self.selection.as_ref().is_some_and(|s| s.owner == client) {
             self.selection = None;
@@ -6712,8 +6172,6 @@ impl App {
         }
     }
 
-    /// The chrome action for a click at frame cell `(x, y)`, if it lands on a recorded
-    /// tab chip / sidebar row (first match wins).
     fn click_target_at(&self, x: u16, y: u16) -> Option<ClickTarget> {
         self.click_zones
             .borrow()
@@ -6722,10 +6180,8 @@ impl App {
             .map(|z| z.target.clone())
     }
 
-    /// Switch to a specific agent/pane by terminal id: its session, then its tab, then
-    /// focus it. Shared with sidebar agent-row clicks (cf. [`Self::jump_to_attention`]).
+    /// Switch to an agent/pane by terminal id: its session, then its tab, then focus it.
     fn jump_to_terminal(&mut self, term: &TerminalId) {
-        // Going to a pane is looking at it.
         self.ack_agent(term, self.agent_seq);
         if let Some((wid, tab, pane)) = self.locate_terminal(term) {
             self.switch_session(wid.clone());
@@ -6738,11 +6194,6 @@ impl App {
         }
     }
 
-    // --- context menu (right-click on chrome, tmux `display-menu`) ---
-
-    /// Handle a right-button event: down on chrome opens the menu (hold mode), drag
-    /// hovers its items, release over an item runs it — release elsewhere leaves the
-    /// menu open for left-click / keyboard selection (tmux behavior). Never copies.
     fn menu_mouse(&mut self, client: ClientId, x: u16, y: u16, kind: MouseKind) -> Option<String> {
         match kind {
             MouseKind::RightClick => {
@@ -6752,7 +6203,6 @@ impl App {
                 if self.prompt.is_some() || self.confirm.is_some() || self.browser.is_some() {
                     return None;
                 }
-                // A re-press on the open menu's items re-arms hold-release mode.
                 let mut handled = false;
                 if let Some(m) = self.menu.as_mut()
                     && m.owner == client
@@ -6784,7 +6234,6 @@ impl App {
                 {
                     match m.held.then(|| m.item_at(x, y)).flatten() {
                         Some(i) => fire = Some(m.items[i].1.clone()),
-                        // Released off the items: keep the menu, drop hold mode.
                         None => m.held = false,
                     }
                 }
@@ -6798,8 +6247,8 @@ impl App {
         None
     }
 
-    /// Build + open the context menu for a right-clicked chrome target at frame cell
-    /// `(x, y)`. Item targets are captured NOW (menu-open time), not at selection.
+    /// Build and open the context menu for a right-clicked chrome target. Item targets are
+    /// captured now (menu-open time), not at selection.
     fn open_menu(&mut self, client: ClientId, x: u16, y: u16, target: ClickTarget) {
         let (title, items): (String, Vec<(&'static str, MenuAction)>) = match target {
             // The usage readout has no context menu (v1) — a right-click on it is inert.
@@ -6848,7 +6297,6 @@ impl App {
                     .map(|l| l.text.clone())
                     .unwrap_or_else(|| "agent".to_string());
                 let mut items = vec![("jump to pane", MenuAction::JumpAgent(term.clone()))];
-                // Rename the agent's TAB — the alias shown for it in the sidebar.
                 if let Some((wid, tab, _)) = self.locate_terminal(&term) {
                     items.push(("rename tab", MenuAction::RenameTab(wid, tab)));
                 }
@@ -6865,7 +6313,6 @@ impl App {
                 (title, items)
             }
         };
-        // Box size: widest of items / bordered title, + 1-cell item padding each side.
         let inner = items
             .iter()
             .map(|(l, _)| l.width())
@@ -6914,8 +6361,6 @@ impl App {
         }
     }
 
-    /// Move the menu's keyboard selection by `delta`, wrapping. From no selection,
-    /// `j` enters at the top and `k` at the bottom.
     fn menu_move(&mut self, delta: i32) {
         if let Some(m) = self.menu.as_mut() {
             let n = m.items.len() as i32;
@@ -6930,14 +6375,11 @@ impl App {
         }
     }
 
-    /// Drop the context menu if it belongs to `client` (its owner disconnected).
     pub fn close_menu_of(&mut self, client: ClientId) {
         if self.menu.as_ref().is_some_and(|m| m.owner == client) {
             self.menu = None;
         }
     }
-
-    // --- copy mode (Ctrl-b [, decisions #147) ---
 
     fn enter_copy_mode(&mut self) {
         let Some(term) = self.focused_terminal() else {
@@ -6958,12 +6400,11 @@ impl App {
         self.scroll_pane = Some(term);
     }
 
-    /// End copy mode when its pane is gone or is now showing the OTHER screen than the one
-    /// it was entered on. Called every server tick (not only on keys), so copy mode never
-    /// lingers over a full-screen app that started while you were reading. Returns whether it
-    /// ended (a repaint). A swap there-and-back between ticks is benign: alacritty restores the
-    /// primary grid with its history, the vi cursor's position is valid in it again, and the
-    /// selection the swap cleared is simply gone.
+    /// End copy mode when its pane is gone or is now showing the OTHER screen than the one it
+    /// was entered on. Called every server tick, so copy mode never lingers over a full-screen
+    /// app that started while you were reading. Returns whether it ended. A swap there-and-back
+    /// between ticks is benign: alacritty restores the primary grid with its history, so the vi
+    /// cursor is valid in it again.
     pub fn reconcile_copy(&mut self) -> bool {
         let Some(term) = self.scroll_pane.clone() else {
             return false;
@@ -6984,7 +6425,6 @@ impl App {
         false
     }
 
-    /// The user's selection vanished without them clearing it (see `CopyState::selecting`).
     fn copy_selection_lost(&self, term: &TerminalId) -> bool {
         self.copy.as_ref().is_some_and(|c| c.selecting)
             && self
@@ -6993,7 +6433,6 @@ impl App {
                 .is_some_and(|p| !p.copy_has_selection())
     }
 
-    /// Bring every live pane to `cfg.history_limit` (new panes read it at spawn).
     fn apply_history_limit(&mut self) {
         if term::history_limit() == self.cfg.history_limit {
             return;
@@ -7037,7 +6476,6 @@ impl App {
                 }
                 KeyCode::Esc => {
                     keep = false;
-                    // Back to highlighting the search that was active before the prompt.
                     let last = self.copy.as_ref().and_then(|c| c.last.clone()).map(|l| l.0);
                     if let Some(pt) = self.panes.get(term) {
                         pt.copy_set_query(last);
@@ -7050,7 +6488,6 @@ impl App {
                 _ => {}
             }
             if keep {
-                // Incremental: every match on screen lights up as the query is typed.
                 if let Some(pt) = self.panes.get(term) {
                     pt.copy_set_query((!buf.is_empty()).then(|| buf.clone()));
                 }
@@ -7060,7 +6497,6 @@ impl App {
             }
             return;
         }
-        // `f`/`F`/`t`/`T` take the NEXT key as their character.
         if let Some((forward, till)) = self.copy.as_mut().and_then(|c| c.pending_jump.take()) {
             if let KeyCode::Char(ch) = k.code
                 && !ctrl
@@ -7104,13 +6540,11 @@ impl App {
             KeyCode::Char('d') if ctrl => pt.copy_scroll(-page),
             KeyCode::Char('b') if ctrl => pt.copy_scroll(page * 2),
             KeyCode::Char('f') if ctrl => pt.copy_scroll(-page * 2),
-            // One line at a time (tmux `scroll-up`/`scroll-down`).
             KeyCode::Char('y') if ctrl => pt.copy_scroll(1),
             KeyCode::Char('e') if ctrl => pt.copy_scroll(-1),
             KeyCode::Char('K') | KeyCode::Up => pt.copy_scroll(1),
             KeyCode::Char('J') | KeyCode::Down => pt.copy_scroll(-1),
             KeyCode::Char('g') => pt.copy_top(),
-            // Rectangle (tmux `rectangle-toggle`, vim's `Ctrl-v`).
             KeyCode::Char('v') if ctrl => {
                 let on = pt.copy_toggle_selection(term::SelKind::Block);
                 if let Some(c) = &mut self.copy {
@@ -7123,7 +6557,6 @@ impl App {
                 } else {
                     term::SelKind::Chars
                 };
-                // Space only ever BEGINS a selection (tmux `begin-selection`).
                 if k.code == KeyCode::Char(' ') && pt.copy_has_selection() {
                     return;
                 }
@@ -7181,7 +6614,6 @@ impl App {
                     Err(why) => self.flash(why.into(), true),
                 }
             }
-            // Esc clears a selection first (tmux); with none it leaves, like q and G.
             KeyCode::Esc => {
                 if pt.copy_clear_selection() {
                     if let Some(c) = &mut self.copy {
@@ -7197,7 +6629,6 @@ impl App {
         }
     }
 
-    /// Run one `f`/`F`/`t`/`T` jump, saying so when the character is not on the line.
     fn copy_jump(&mut self, term: &TerminalId, ch: char, forward: bool, till: bool, repeat: bool) {
         let found = self
             .panes
@@ -7218,7 +6649,6 @@ impl App {
         let Some(pt) = self.panes.get(term) else {
             return;
         };
-        // What is lit is always what `n`/`N` will find — whichever path started the search.
         pt.copy_set_query(Some(query.to_string()));
         match pt.copy_search(query, up) {
             term::SearchOutcome::Found => {}
@@ -7237,13 +6667,10 @@ impl App {
         }
     }
 
-    /// Text a copy-mode yank produced, for the server to send to the client whose key it was
-    /// (the same OSC 52 path a drag-copy takes). Taken, not read.
     pub fn take_key_copy(&mut self) -> Option<String> {
         self.key_copy.take()
     }
 
-    /// On-screen rows of a terminal (the page size for page scrolling).
     fn term_rows(&self, term: &TerminalId) -> u16 {
         self.layout()
             .into_iter()
@@ -7255,18 +6682,13 @@ impl App {
     pub fn resize(&mut self, cols: u16, rows: u16) {
         self.cols = cols;
         self.rows = rows;
-        // reflow derives the content-area viewport (minus chrome) and pushes it.
         self.reflow();
     }
 
-    // --- sidebar + popup ---
-
-    /// Toggle the neovim-style left panel (honored only when wide enough). The
-    /// pane content area shrinks/grows, so resize the PTYs to match.
-    /// Scroll one sidebar half by `delta` ITEMS (a session row, or an agent entry/group
-    /// header). Picks up from what the last frame actually rendered — the window start and
-    /// its ceiling both depend on the measured split, so only the render pass knows them.
-    /// A no-op when the half already fits, so a wheel there is not silently swallowed.
+    /// Scroll one sidebar half by `delta` items (a session row, or an agent entry/group header).
+    /// Picks up from what the last frame rendered, since the window start and its ceiling both
+    /// depend on the measured split. A no-op when the half already fits, so a wheel there is not
+    /// swallowed.
     fn scroll_sidebar(&mut self, agents_half: bool, delta: i32) {
         let view = if agents_half {
             self.agents_view.borrow().clone()
@@ -7290,7 +6712,6 @@ impl App {
 
     fn toggle_sidebar(&mut self) {
         self.sidebar = !self.sidebar;
-        // The content width changes → re-derive the viewport, not just PTY sizes.
         self.reflow();
     }
 
@@ -7394,9 +6815,8 @@ impl App {
         )
     }
 
-    /// The switcher rows for `tab` matching `filter`: SESSIONS (name + git branch) or
-    /// AGENTS (tool · status · space), fuzzy-filtered (subsequence, case-insensitive).
-    /// Left/Right switch the tab (owner's tmux `Ctrl-f` session switch + `prefix g` agents).
+    /// The switcher rows for `tab` matching `filter`, fuzzy-filtered (subsequence,
+    /// case-insensitive).
     fn popup_items(&self, tab: PopupTab, filter: &str) -> Vec<PopupRow> {
         let mut rows = Vec::new();
         let (op, filter) = split_status_op(filter);
@@ -7449,8 +6869,6 @@ impl App {
                         continue;
                     }
                     let (glyph, color) = row.glyph();
-                    // With a custom tab name the title differs from the space — show both
-                    // (the switcher is wide enough), and let the filter match either.
                     let mut place = if row.title == row.space {
                         row.space.clone()
                     } else {
@@ -7539,9 +6957,8 @@ impl App {
         rows
     }
 
-    /// Keep the switcher selection in range as its (filtered) row set changes. Returns
-    /// whether it moved (so the render loop repaints). Never closes on an empty result —
-    /// an over-narrow filter just shows the empty state.
+    /// Keep the switcher selection in range as its filtered rows change; returns whether it
+    /// moved. Never closes on an empty result.
     pub fn reconcile_popup(&mut self) -> bool {
         let Some((tab, filter)) = self.popup.as_ref().map(|p| (p.tab, p.filter.clone())) else {
             return false;
@@ -7551,7 +6968,6 @@ impl App {
         let Some(p) = &mut self.popup else {
             return false;
         };
-        // Follow the pinned row if it is still listed; else stay in range and re-pin.
         let found = p
             .pinned
             .as_ref()
@@ -7565,7 +6981,6 @@ impl App {
         moved
     }
 
-    /// Record the row now under `sel` as the one the user chose (see `PopupState::pinned`).
     fn popup_pin(&mut self) {
         let Some((tab, filter, sel)) = self
             .popup
@@ -7583,7 +6998,6 @@ impl App {
         }
     }
 
-    /// Switch the switcher tab (Left/Right), resetting the selection to the top.
     fn popup_tab(&mut self, to: PopupTab) {
         if let Some(p) = &mut self.popup {
             p.tab = to;
@@ -7599,14 +7013,12 @@ impl App {
         self.popup_pin();
     }
 
-    /// Left/Right: the neighbouring list (sessions · agents · tabs).
     fn popup_step(&mut self, delta: i32) {
         if let Some(to) = self.popup.as_ref().map(|p| p.tab.step(delta)) {
             self.popup_tab(to);
         }
     }
 
-    /// Move the switcher selection by `delta`, wrapping over the filtered rows.
     fn popup_move(&mut self, delta: i32) {
         let Some(p) = self.popup.as_ref() else {
             return;
@@ -7623,7 +7035,6 @@ impl App {
         self.popup_pin();
     }
 
-    /// Append `c` to the switcher filter (resets the selection to the top).
     fn popup_type(&mut self, c: char) {
         if let Some(p) = &mut self.popup {
             p.filter.push(c);
@@ -7632,7 +7043,6 @@ impl App {
         self.popup_pin();
     }
 
-    /// Delete the last filter char.
     fn popup_backspace(&mut self) {
         if let Some(p) = &mut self.popup {
             p.filter.pop();
@@ -7648,9 +7058,8 @@ impl App {
         self.popup_pin();
     }
 
-    /// Act on the selected row (switch session / jump to agent) and close the switcher.
-    /// With no matching row (over-narrow filter) Enter is a no-op — the switcher stays
-    /// open showing the empty state rather than closing on nothing.
+    /// Act on the selected row and close the switcher. With no matching row Enter is a no-op, so
+    /// the switcher stays open showing the empty state.
     fn popup_select(&mut self) {
         let Some(p) = self.popup.as_ref() else {
             return;
@@ -7684,8 +7093,6 @@ impl App {
         self.sync_sizes();
     }
 
-    /// Rename the SELECTED session from the switcher (Sessions tab): switch to it and open
-    /// the inline rename prompt. No-op on the Agents tab or an empty selection.
     fn popup_rename(&mut self) {
         let Some(p) = self.popup.as_ref() else {
             return;
@@ -7707,8 +7114,6 @@ impl App {
         self.open_rename_prompt();
     }
 
-    // --- resume picker (Ctrl-b R) ---
-
     /// Open the resume picker and ask for a scan. The list renders from the previous scan
     /// (if any) while the new one runs, so reopening never blanks to "scanning…".
     fn open_resume(&mut self) {
@@ -7722,12 +7127,10 @@ impl App {
         self.request_scan(false, false);
     }
 
-    /// Ask the detached scanner for a fresh transcript listing.
-    ///
-    /// `deep` also reads titles for headless transcripts (only the `Ctrl-a` view shows
-    /// them, and they cost most of the scan). `force` bypasses the freshness reuse — a
-    /// completed scan younger than [`SCAN_TTL`] that already covers what we need is reused
-    /// so flipping the scope back and forth doesn't re-walk two directory trees.
+    /// Ask the detached scanner for a fresh transcript listing. `deep` also reads titles for
+    /// headless transcripts (only the `Ctrl-a` view shows them, and they cost most of the scan).
+    /// `force` bypasses the reuse of a completed scan younger than [`SCAN_TTL`] that already
+    /// covers what we need.
     fn request_scan(&mut self, deep: bool, force: bool) {
         // Already scanning: adding another thread would just put two 256 MB reads in each
         // other's way (`Ctrl-r` held down, or a scope flip mid-scan). The outstanding one is
@@ -7760,7 +7163,6 @@ impl App {
         let Some(scan) = self.sessions.lock().ok().and_then(|g| g.as_ref().cloned()) else {
             return false;
         };
-        // Not what we asked for (a stale scan), or already on screen.
         if scan.req != self.scan_req || self.scan_shown == Some(scan.req) {
             return false;
         }
@@ -7793,7 +7195,6 @@ impl App {
         self.request_scan(deep, true);
     }
 
-    /// Edit the fuzzy filter: `Some(c)` appends, `None` backspaces. Resets the selection.
     fn resume_edit(&mut self, c: Option<char>) {
         if let Some(st) = &mut self.resume {
             match c {
@@ -7806,7 +7207,6 @@ impl App {
         }
     }
 
-    /// Move the selection by `delta`, wrapping over the filtered rows.
     fn resume_move(&mut self, delta: i32) {
         let n = self
             .resume
@@ -7821,7 +7221,6 @@ impl App {
         }
     }
 
-    /// Keep the selection in range after the row set changes under it (a scan landing).
     fn clamp_resume(&mut self) {
         let n = self
             .resume
@@ -7833,20 +7232,18 @@ impl App {
         }
     }
 
-    /// The rows to show: scan entries in recency order, hidden headless runs dropped unless
-    /// `all`, fuzzy-filtered over tool + prompt + path together (so `copad codex` narrows by
-    /// project AND tool).
+    /// The rows to show: scan entries in recency order, headless runs dropped unless `all`,
+    /// fuzzy-filtered over tool + prompt + path together.
     fn resume_rows(&self, st: &ResumeState) -> Vec<ResumeRow> {
         self.resume_rows_in(st, &self.sessions_shown)
     }
 
-    /// [`Self::resume_rows`] over any scan's entries (a host-drawn picker keeps its own).
     fn resume_rows_in(&self, st: &ResumeState, entries: &[agentsessions::Entry]) -> Vec<ResumeRow> {
         let now = std::time::SystemTime::now();
-        // Two tiers: rows whose text CONTAINS the query verbatim, then rows it merely
-        // scatters through. A subsequence match over a whole prompt plus a path hits almost
-        // everything (typing `copad` matched 26 of 61 rows), so without the split a typed
-        // word buries its own hits under coincidences. Recency order holds within each tier.
+        // Two tiers: rows whose text contains the query verbatim, then rows it merely scatters
+        // through. A subsequence match over a whole prompt plus a path hits almost everything, so
+        // without the split a typed word buries its hits under coincidences. Recency order holds
+        // within each tier.
         let mut exact = Vec::new();
         let mut fuzzy = Vec::new();
         for e in entries.iter().filter(|e| st.all || !e.headless) {
@@ -7893,8 +7290,6 @@ impl App {
         out
     }
 
-    /// Act on the selected row: jump to the pane already running that conversation, else
-    /// open it in a new tab. An empty selection (over-narrow filter) keeps the picker open.
     fn resume_select(&mut self) {
         let Some(row) = self
             .resume
@@ -7999,7 +7394,6 @@ impl App {
                 };
                 let better = match &best {
                     None => true,
-                    // On a tie, keep the user where they are rather than moving them.
                     Some((s, w)) => score > *s || (score == *s && wid == self.ws && w != &self.ws),
                 };
                 if better {
@@ -8032,8 +7426,6 @@ impl App {
         }
         out
     }
-
-    // --- sidebar keyboard focus (Ctrl-b e) ---
 
     /// Focus the sidebar for keyboard nav, revealing it if hidden. Falls back to the
     /// `Ctrl-f` switcher when the sidebar can't show (too narrow / mobile).
@@ -8086,7 +7478,6 @@ impl App {
         }
     }
 
-    /// Act on the focused sidebar row (switch session / jump to agent) and exit focus.
     fn sidebar_focus_select(&mut self) {
         let Some(f) = self.sidebar_focus.take() else {
             return;
@@ -8106,14 +7497,10 @@ impl App {
         }
     }
 
-    // --- notification center (Ctrl-b a) ---
-
     fn open_center(&mut self) {
         self.center = Some(0);
     }
 
-    /// Keep the center selection valid as notifications arrive/dismiss (called each
-    /// frame). Stays open (empty state) when the log is empty.
     pub fn reconcile_center(&mut self) -> bool {
         let before = self.center;
         if let Some(sel) = self.center {
@@ -8169,8 +7556,6 @@ impl App {
         }
     }
 
-    /// Jump to the selected notification's source pane (session + tab + focus) and
-    /// close the center.
     fn center_jump(&mut self) {
         if let Some(sel) = self.center
             && let Some(note) = self.notifications.get(sel).cloned()
@@ -8188,7 +7573,6 @@ impl App {
         self.reconcile_center();
     }
 
-    /// Unread notifications whose pane still exists.
     fn unread_count(&self) -> usize {
         self.notifications
             .iter()
@@ -8218,12 +7602,10 @@ impl App {
         }
     }
 
-    /// Close panes whose shell has exited (in ANY tab). Returns true if the app is
-    /// now empty (last pane of the last tab exited → quit). A tab whose last pane
-    /// exits is closed whole; other tabs keep running in the background.
-    /// Reap any exited shells, collapsing panes/tabs/sessions as needed. Returns
-    /// whether it CHANGED visible state (so the render loop repaints the removed pane);
-    /// the caller checks [`is_empty`](Self::is_empty) separately to decide whether to quit.
+    /// Reap exited shells in ANY tab, collapsing panes/tabs/sessions as needed. A tab whose last
+    /// pane exits is closed whole; other tabs keep running. Returns whether visible state
+    /// changed; the caller checks [`is_empty`](Self::is_empty) separately to decide whether to
+    /// quit.
     pub fn reap_exited(&mut self) -> bool {
         let changed = self.reap_exited_inner();
         if changed {
@@ -8246,7 +7628,6 @@ impl App {
         }
         for term in exited {
             let Some((wid, tab_id, pane)) = self.locate_terminal(&term) else {
-                // No longer in any session/tab (already collapsed) — drop the runtime.
                 self.panes.remove(&term);
                 continue;
             };
@@ -8266,7 +7647,6 @@ impl App {
                 .unwrap_or((true, 0));
 
             if !tab_is_single {
-                // The tab has other panes — collapse just this one.
                 match self.state.apply(Command::ClosePane {
                     origin: Origin::Api,
                     workspace: wid,
@@ -8288,7 +7668,6 @@ impl App {
                     }
                 }
             } else if ws_tab_count > 1 {
-                // Last pane of this tab, but other tabs survive — close the tab.
                 match self.state.apply(Command::CloseTab {
                     origin: Origin::Api,
                     workspace: wid,
@@ -8302,7 +7681,6 @@ impl App {
                                 }
                             }
                         }
-                        // Reflow the owning session's now-active tab (background-safe).
                         self.apply_resized_events(&evs);
                     }
                     Err(_) => {
@@ -8310,8 +7688,6 @@ impl App {
                     }
                 }
             } else if self.session_count() > 1 {
-                // Last pane of the last tab of a NON-last session — drop the whole
-                // session; if it was the active one, switch to another.
                 let was_active = self.ws == wid;
                 match self.state.remove_workspace(&wid) {
                     Some(terms) => {
@@ -8332,18 +7708,10 @@ impl App {
                 self.panes.remove(&term);
             }
         }
-        // Reaping may have closed a tab or session (changing chrome) → re-derive.
         self.reflow();
         true
     }
 
-    // --- render ---
-
-    /// Render the whole composite (panes + dividers + sidebar + tab bar + popup)
-    /// into `buf`, returning the desired cursor position (or `None` when a popup
-    /// captures input). Rendering targets a plain `Buffer` — not a `Frame` — so the
-    /// same code path serves both the local terminal and the (headless) server that
-    /// ships cell diffs to a remote client.
     /// Every pane tells its program the PTY size again (a graphics client brought pixels).
     pub fn reannounce_pane_sizes(&self) {
         for pt in self.panes.values() {
@@ -8351,7 +7719,6 @@ impl App {
         }
     }
 
-    /// The images the last [`render_to`](Self::render_to) left visible.
     pub fn image_runs(&self) -> Vec<crate::images::ScreenRun> {
         self.image_runs.borrow().clone()
     }
@@ -8363,8 +7730,6 @@ impl App {
         let focused_term = self.focused_terminal();
         let mut cursor_pos: Option<Position> = None;
 
-        // Rebuild clickable-chrome hit regions from scratch each frame (tab chips +
-        // sidebar rows push into this as they render).
         self.click_zones.borrow_mut().clear();
 
         // Images in the panes (decisions #194): their runs, and what the panes drew under them,
@@ -8377,7 +7742,6 @@ impl App {
         let mut titles: Vec<(u16, u16, u16, String, Style)> = Vec::new();
         let grid_top = self.content_y();
 
-        // 1) pane contents (inactive panes dimmed so the focused one stands out).
         for (pane_i, rect) in rects.iter().enumerate() {
             let Some(pt) = self.panes.get(&rect.terminal) else {
                 continue;
@@ -8396,7 +7760,6 @@ impl App {
                 };
                 let right = rect.x + rect.cols;
                 if rect.y > grid_top {
-                    // A pane below a split: its title sits on the divider row above it.
                     titles.push((rect.x + 1, rect.y - 1, right, text, st));
                 } else if let Some(x) = blank_title_slot(&snap, rect, text.width() as u16) {
                     titles.push((x, rect.y, right, text, st));
@@ -8421,7 +7784,6 @@ impl App {
                 if y >= area.height {
                     break;
                 }
-                // The selected column span for this row (if any), computed once per row.
                 let row_sel = sel_span.and_then(|(a, b)| sel_cols(a, b, rect.cols, ry as u16));
                 for (rx, cell) in row.iter().enumerate() {
                     if rx as u16 >= rect.cols {
@@ -8448,17 +7810,15 @@ impl App {
                         if !is_focused {
                             style = style.add_modifier(Modifier::DIM);
                         }
-                        // A selected cell gets the selection background (the leading cell of a
-                        // wide glyph tints both of its columns). Overrides the cell's own bg.
+                        // A selected cell gets the selection background (the leading cell of a wide
+                        // glyph tints both of its columns).
                         if row_sel.is_some_and(|(c0, c1)| rx as u16 >= c0 && rx as u16 <= c1) {
                             style = style.bg(SEL_BG);
                         }
-                        // Copy mode: its selection and its cursor, from the same snapshot.
                         if let Some(cv) = &snap.copy {
                             if cv.selected(ry as i32, rx as u16) {
                                 style = style.bg(SEL_BG);
                             } else if cv.matched(ry as i32, rx as u16) {
-                                // Search matches: yellow like tmux's `copy-mode-match-style`.
                                 style = style.bg(CAT_YELLOW).fg(CAT_BASE);
                             }
                             if cv.cursor == Some((rx as u16, ry as u16)) {
@@ -8492,7 +7852,6 @@ impl App {
 
         let under_images = crate::images::remember(&image_runs, buf);
 
-        // 2) dividers in the 1-cell gaps between panes; accent the focused pane's.
         let mut covered = vec![vec![false; area.width as usize]; area.height as usize];
         let mut focus_rect: Option<PaneRect> = None;
         for rect in &rects {
@@ -8510,12 +7869,8 @@ impl App {
         let content_rows = self.content_rows();
         for yy in 0..area.height {
             for xx in 0..area.width {
-                // The sidebar owns the left strip and the status bar owns the bottom
-                // row; don't paint dividers over either.
-                // Skip anything outside the pane grid: the top bar's rows, the sidebar's
-                // strip, the status bar. `yy < content_y` matters only because the grid no
-                // longer starts at row 0 — the top bar repaints over it today, so this is a
-                // correctness fix for TOP_H > 1 rather than a visible one.
+                // Skip anything outside the pane grid: the top bar's rows, the sidebar's strip and
+                // the status bar.
                 if yy < content_y
                     || yy >= content_y + content_rows
                     || xx < content_x
@@ -8523,9 +7878,8 @@ impl App {
                 {
                     continue;
                 }
-                // A divider cell joins the divider cells around it: `├` where a pane's bottom
-                // edge meets the vertical line beside it, `┼` where four panes meet — not a
-                // straight `│` or `─` broken at every crossing (tmux's border_set).
+                // A divider cell joins its neighbours: `├` where a pane's bottom edge meets the
+                // vertical line beside it, `┼` where four meet (tmux's border_set).
                 let is_div = |x: i32, y: i32| {
                     x >= content_x as i32
                         && y >= content_y as i32
@@ -8553,33 +7907,27 @@ impl App {
             }
         }
 
-        // 2b) pane titles, over the dividers they sit on.
         for (x, y, max_x, text, st) in &titles {
             put_str(buf, *x, *y, *max_x, text, *st);
         }
 
-        // 2c) `Ctrl-b q`: a big number in the middle of every pane.
         if self.pane_numbers_up() {
             self.render_pane_numbers(buf, &rects, focused_term.as_ref());
         }
 
-        // 3) the neovim-style left panel, over the reserved strip.
         if self.sidebar_visible() {
             self.render_sidebar(buf);
         }
 
-        // 4) the optional top bar (host machine readout), over the reserved top row.
         if self.top_h() > 0 {
             self.render_top_bar(buf);
         }
 
-        // 5) the always-on bottom status bar (session · tabs · scroll/agents/clock/host) —
-        // unless a host UI draws it (decisions #166).
+        // The bottom status bar, unless a host UI draws it (decisions #166).
         if self.status_h() > 0 {
             self.render_status_bar(buf);
         }
 
-        // 6) the Ctrl-f switcher popup / notification center, over everything.
         if self.popup.is_some() {
             self.render_popup(buf);
         }
@@ -8607,10 +7955,8 @@ impl App {
         }
         self.image_runs
             .replace(crate::images::uncovered(image_runs, &under_images, buf));
-        // Last, over everything every widget wrote: no cell may carry DIM and BOLD at once.
         resolve_dim_bold(buf);
 
-        // The shell cursor shows only when nothing modal is capturing input.
         if self.popup.is_none()
             && self.scroll_pane.is_none()
             && self.center.is_none()
@@ -8634,27 +7980,16 @@ impl App {
         self.cursor_look.get()
     }
 
-    /// The current viewport size (terminal size the app renders at).
     pub fn size(&self) -> (u16, u16) {
         (self.cols, self.rows)
     }
 
-    /// Refresh foreground-process labels at most ~2 Hz (throttled internally), so
-    /// the server loop can call it every tick without hammering `ps`.
-    /// Read+clear the dirty flag of EVERY hosted pane (must drain all, not short-circuit,
-    /// so no pane's pending change is lost), returning whether any pane's screen changed
-    /// since the last frame. The render loop ORs this into its dirty decision.
-    /// Collect any OSC 52 clipboard write a program in ANY pane made since the last call
-    /// (tmux `set-clipboard`). The clipboard has one slot, so on the rare tick where two
-    /// panes both wrote, only the latest survives — chosen by the write's sequence number,
-    /// NOT by `HashMap` traversal order, which is arbitrary.
-    ///
-    /// An empty payload is kept: OSC 52 with no data means "clear the clipboard", which is
-    /// a real operation a pane program can ask for.
-    ///
-    /// Every pane is drained even when the feature is off, so flipping `osc52` back on via
-    /// `comux reload` can't suddenly paste something a background pane wrote hours ago.
-    /// Read live off `self.cfg` for that same reason.
+    /// Collect any OSC 52 clipboard write a program in ANY pane made since the last call (tmux
+    /// `set-clipboard`). The clipboard has one slot, so when two panes wrote in one tick the
+    /// latest wins by write sequence number, not `HashMap` order. An empty payload is kept: OSC
+    /// 52 with no data means "clear the clipboard". Every pane is drained even when the feature
+    /// is off, so flipping `osc52` back on via `comux reload` can't paste something a background
+    /// pane wrote hours ago.
     pub fn drain_pane_clipboard(&mut self) -> Option<(u64, String)> {
         let mut latest: Option<(u64, String)> = None;
         for pt in self.panes.values() {
@@ -8676,28 +8011,17 @@ impl App {
         self.cfg.osc52.then_some((seq, text))
     }
 
-    /// Clear every pane's dirty flag, and report whether a VISIBLE one had advanced.
-    ///
-    /// The flag must be taken from every pane — a hidden pane that kept its flag would
-    /// report stale output the moment it was revealed — but only a pane in `self.layout()`
-    /// is on screen, and only those can justify recomposing the frame. This used to be
-    /// "any pane anywhere", which on a mux with dozens of panes meant a single background
-    /// agent's spinner drove the visible screen to recompose (new `Buffer`, per-client
-    /// diff, clone) at the full frame rate, forever.
-    ///
-    /// `layout()` is the visibility source of truth — `take_alt_screen_transition` uses
-    /// exactly it — and revealing a hidden pane goes through a mutation that dirties the
-    /// frame on its own, so nothing is lost on the switch.
-    ///
-    /// This is only sound because every VISIBLE value that is a live function of a hidden
-    /// pane is compared on the label cadence instead: agent status and detail
-    /// (`refresh_agent_statuses`), bells (`refresh_bells`), host metrics
-    /// (`refresh_host_metrics`), labels, branches, usage and version. Adding a new live
-    /// read of `self.panes` to a render path means adding its comparison there too.
+    /// Clear every pane's dirty flag and report whether a VISIBLE one advanced. Every flag must
+    /// be taken (a hidden pane that kept its flag would report stale output once revealed), but
+    /// only panes in `self.layout()` justify recomposing the frame; otherwise one background
+    /// agent's spinner would drive full-rate recomposes forever. Revealing a hidden pane goes
+    /// through a mutation that dirties the frame itself. This is only sound because every
+    /// visible value that is a live function of a hidden pane is compared on the label cadence
+    /// instead (agent status and detail, bells, host metrics, labels, branches, usage, version);
+    /// a new live read of `self.panes` in a render path needs its comparison there too.
     pub fn drain_pane_dirty(&self) -> bool {
         let mut visible: std::collections::HashSet<TerminalId> =
             self.layout().into_iter().map(|r| r.terminal).collect();
-        // The switcher's preview shows a pane that may be in a background session.
         visible.extend(self.popup_preview_terminal());
         let mut dirty = false;
         for (tid, pt) in &self.panes {
@@ -8709,22 +8033,14 @@ impl App {
         dirty
     }
 
-    /// Poll the VISIBLE panes' alternate-screen bits and report whether any just CROSSED the
-    /// primary↔alt boundary in EITHER direction — a full-screen app (nvim, less, htop, …)
-    /// entered or exited. The render loop reacts by forcing a full repaint so both the app's
-    /// first screen AND the restored primary screen are clean: during the app's life the
-    /// client's unicode-width render can desync from alacritty's grid on wide graphemes
-    /// (e.g. VS16 emoji), and either grid swap is where that residue shows; a full frame is
-    /// also the clean baseline an OUTER terminal (Windows Terminal over SSH, a nested
-    /// emulator) needs when it drops cells on such a large wholesale change. This updates the
-    /// stored per-pane state.
-    ///
-    /// Scoped to the active tab's panes (a background pane toggling alt-screen doesn't affect
-    /// the composed frame; when its tab is next shown the whole buffer recomposes anyway).
-    /// Detection is a per-render poll — alacritty applies `?1049h`/`?1049l` on its own reader
-    /// thread with no callback we can hook — so an app that enters AND exits within a single
-    /// render interval (e.g. `nvim +q` from a script) can be missed. That isn't the interactive
-    /// full-screen case the user hits, and the wholesale content change usually clears it.
+    /// Poll the visible panes' alternate-screen bits and report whether any crossed the
+    /// primary/alt boundary in either direction (a full-screen app entered or exited). The render
+    /// loop then forces a full repaint: during the app's life the client's unicode-width render
+    /// can desync from alacritty's grid on wide graphemes (e.g. VS16 emoji), and an outer
+    /// terminal that drops cells on such a wholesale change needs a clean baseline. Scoped to the
+    /// active tab's panes. Detection is a per-render poll (alacritty applies `?1049h`/`?1049l`
+    /// on its reader thread with no callback), so an app that enters and exits within one render
+    /// interval can be missed.
     pub fn take_alt_screen_transition(&mut self) -> bool {
         let visible: Vec<(TerminalId, bool)> = self
             .layout()
@@ -8885,19 +8201,9 @@ impl App {
         }
     }
 
-    /// Returns whether any chrome-affecting data (labels / agent statuses / branches)
-    /// actually CHANGED, so the render loop only recomposes when the sidebar/status bar
-    /// would differ (unchanged refreshes are free of a repaint).
-    ///
-    /// `min_interval` is the caller's throttle: this sweep enumerates every process on
-    /// the machine, so it — not the frame cadence — is what a long-lived server
-    /// actually spends its CPU on. The render loop passes a wider interval while
-    /// detached, where the only consumer left is the agent-turn notifier and nobody is
-    /// looking at the chrome it feeds.
-    /// Force the next [`Self::maybe_refresh_labels`] to actually sweep, whatever its
-    /// throttle. Called when a client attaches: while detached the sweep runs on a wide
-    /// interval, so the first frame would otherwise render tab labels and agent
-    /// statuses that are seconds stale.
+    /// Force the next [`Self::maybe_refresh_labels`] to actually sweep, whatever its throttle.
+    /// Called when a client attaches: while detached the sweep runs on a wide interval, so the
+    /// first frame would render stale tab labels and agent statuses.
     pub fn invalidate_labels(&mut self) {
         self.last_labels = std::time::Instant::now()
             .checked_sub(Duration::from_secs(60))
@@ -8920,16 +8226,10 @@ impl App {
         }
     }
 
-    /// Report whether the set of panes with an unacknowledged bell has moved.
-    ///
-    /// `bell()` and `bell_count()` are live reads off each `PaneTerm`'s atomic counter, so
-    /// nothing else on this cadence would notice a bell. It used to repaint anyway —
-    /// ringing produces PTY output, and `drain_pane_dirty` treated ANY pane's output as a
-    /// reason to recompose. Now that only visible panes do that, a bell rung in a hidden
-    /// pane needs its own comparison to reach the `!` markers and the mux-wide `! N`.
-    ///
-    /// The comparison is the per-pane SET, not the count: one pane ringing while another is
-    /// acknowledged in the same window leaves the total unchanged while both markers move.
+    /// Report whether the set of panes with an unacknowledged bell has moved. `bell()` is a live
+    /// read off each pane's atomic counter, so nothing else on this cadence would notice a bell
+    /// rung in a hidden pane. Compared as the per-pane SET, not the count: one pane ringing while
+    /// another is acknowledged leaves the total unchanged while both markers move.
     fn refresh_bells(&mut self) -> bool {
         let next: std::collections::HashSet<TerminalId> = self
             .panes
@@ -8956,12 +8256,9 @@ impl App {
         changed
     }
 
-    /// Report whether the top bar's host readings have moved.
-    ///
-    /// `render_top_bar` reads `hostmetrics::read` live off the poller thread, which is
-    /// another value that only ever repainted because some pane somewhere dirtied the frame.
-    /// Compared as what is actually DRAWN — text AND threshold colour — so a drift below the
-    /// printed precision costs nothing while a severity change still repaints.
+    /// Report whether the top bar's host readings have moved. Compared as what is drawn (text
+    /// and threshold colour), so drift below the printed precision costs nothing while a
+    /// severity change still repaints.
     fn refresh_host_metrics(&mut self) -> bool {
         // Nothing renders these when the bar is not on screen, so don't manufacture repaints
         // for them. `top_h()` rather than `cfg.top_bar`: the bar is also suppressed on a
@@ -8981,14 +8278,11 @@ impl App {
         changed
     }
 
-    /// Number of carousel pages the usage readout currently has (0 when hidden,
-    /// inline, or nothing visible). Recomputed from the live snapshot + config —
-    /// cheap (a handful of windows) and always consistent with what renders.
     fn usage_page_count(&self) -> usize {
-        // Mirror the render gate exactly (cols >= 100, not Off, paged, something
-        // visible) so auto-rotate/manual paging only act when the carousel actually
-        // shows — a hidden readout must not force needless repaints.
-        // A host drawing the status bar has its own room: the TUI's width gate is not its.
+        // Mirror the render gate (cols >= 100, not Off, paged, something visible) so auto-rotate
+        // and manual paging only act when the carousel shows; a hidden readout must not force
+        // repaints. A host drawing the status bar has its own room: the TUI's width gate is not
+        // its.
         if self.cfg.usage_layout != UsageLayout::Paged
             || self.cfg.usage == UsageStyle::Off
             || (self.cols < 100 && !self.host_hidden.1)
@@ -9007,9 +8301,6 @@ impl App {
         }
     }
 
-    /// Move the usage carousel by `delta` pages, wrapping. No-op when there's 0 or 1
-    /// page (nothing to page through). Resets the auto-rotate timer so a manual page
-    /// isn't immediately followed by an auto one.
     fn page_usage(&mut self, delta: i32) {
         let n = self.usage_page_count();
         if n <= 1 {
@@ -9019,11 +8310,9 @@ impl App {
         self.usage_rolled_at = std::time::Instant::now();
     }
 
-    /// How often each attached client should be told to silently repaint its whole screen
-    /// (`reconcile_secs`), or `None` when the self-heal is switched off.
-    ///
-    /// Read live off `self.cfg` rather than cached in the server loop, so `comux reload`
-    /// changes the cadence on the RUNNING server like every other render-affecting setting.
+    /// How often each attached client should silently repaint its whole screen
+    /// (`reconcile_secs`), or `None` when off. Read live off `self.cfg` so `comux reload`
+    /// changes the cadence on the running server.
     pub fn repaint_period(&self) -> Option<Duration> {
         match self.cfg.reconcile_secs {
             0 => None,
@@ -9031,12 +8320,10 @@ impl App {
         }
     }
 
-    /// Auto-rotate hook, called every render tick (~30 fps) by the server loop.
-    /// Advances the carousel one page when `usage_rotate_secs` has elapsed since the
-    /// last change AND there's more than one page; returns whether it advanced (→
-    /// repaint). Off (`usage_rotate_secs = 0`), single-page, and non-paged layouts
-    /// never roll. The cheap interval gate runs first so the hot path avoids
-    /// recomputing the page list every tick.
+    /// Auto-rotate hook, called every render tick (~30 fps) by the server loop. Advances the
+    /// carousel when `usage_rotate_secs` has elapsed and there is more than one page; returns
+    /// whether it advanced. The cheap interval gate runs first so the hot path avoids
+    /// recomputing the page list.
     pub fn maybe_auto_roll_usage(&mut self) -> bool {
         if !usage_should_roll(self.cfg.usage_rotate_secs, self.usage_rolled_at.elapsed()) {
             return false;
@@ -9052,10 +8339,8 @@ impl App {
         true
     }
 
-    /// Start the background usage/limits poller (server-only; see `usagepoll`).
-    /// Replaces the idle handle installed by `new` with a live one. Skipped when
-    /// `usage = "off"` so a disabled readout costs no `coctl`/network polling
-    /// (matching `COPAD_MUX_USAGE=0`).
+    /// Start the usage/limits poller (server-only; see `usagepoll`). Skipped when
+    /// `usage = "off"` so a disabled readout polls nothing (matching `COPAD_MUX_USAGE=0`).
     pub fn start_usage_poll(&mut self) {
         if self.cfg.usage == UsageStyle::Off {
             return;
@@ -9063,29 +8348,26 @@ impl App {
         self.usage_poll = usagepoll::spawn();
     }
 
-    /// Start the background host-metrics poller (server-only; see `hostmetrics`).
     pub fn start_host_poll(&mut self) {
         self.host_poll = hostmetrics::spawn();
     }
 
-    /// Start the background agent-activity poller (server-only; see `agentpoll`).
-    /// Unconditional: unlike the usage and update pollers it does no network I/O and stays
-    /// entirely idle — no wake work at all — until an agent pane exists to track.
+    /// Start the agent-activity poller (server-only). Unconditional: it does no network I/O and
+    /// stays idle until an agent pane exists to track.
     pub fn start_agent_poll(&mut self) {
         self.agent_poll = agentpoll::spawn();
     }
 
-    /// Start the git working-tree poller (server-only). `sidebar_git = false` never starts
-    /// it, so that setting forks no `git` at all.
+    /// Start the git working-tree poller (server-only). `sidebar_git = false` never starts it,
+    /// so that setting forks no `git`.
     pub fn start_git_poll(&mut self) {
         if self.cfg.sidebar_git {
             self.git_poll = gitpoll::spawn();
         }
     }
 
-    /// Start the background GitHub-release update checker (server-only; see
-    /// `versionpoll`). Skipped when `update_check = false` so a disabled check
-    /// costs no network polling (matching `COPAD_MUX_UPDATE_CHECK=0`).
+    /// Start the GitHub-release update checker (server-only; see `versionpoll`). Skipped when
+    /// `update_check = false` (matching `COPAD_MUX_UPDATE_CHECK=0`).
     pub fn start_version_poll(&mut self) {
         if !self.cfg.update_check {
             return;
@@ -9093,8 +8375,6 @@ impl App {
         self.version_poll = versionpoll::spawn();
     }
 
-    /// Fold the latest polled usage snapshot into `usage_shown`; returns whether it
-    /// changed (so the loop repaints the status bar). Poison-safe read.
     fn refresh_usage(&mut self) -> bool {
         let current = self.usage_poll.lock().map(|g| g.clone()).unwrap_or(None);
         if current != self.usage_shown {
@@ -9105,8 +8385,6 @@ impl App {
         }
     }
 
-    /// Fold the latest polled update hint into `version_shown`; returns whether it
-    /// changed (so the loop repaints the status bar). Poison-safe read.
     fn refresh_version(&mut self) -> bool {
         let current = self.version_poll.lock().map(|g| g.clone()).unwrap_or(None);
         if current != self.version_shown {
@@ -9158,7 +8436,6 @@ impl App {
         changed
     }
 
-    /// Refresh, then every subtitle joined — what the tests compare.
     #[cfg(test)]
     fn refresh_branches_for_test(&mut self) -> String {
         self.refresh_branches();
@@ -9167,13 +8444,9 @@ impl App {
         v.into_iter().cloned().collect::<Vec<_>>().join("|")
     }
 
-    /// Recompute each agent pane's status (working/ready/blocked/idle) from Claude's
-    /// session file + a screen-text fallback (`agentstate`). Agent panes only; the map
-    /// is rebuilt each pass so closed/reclassified panes drop out.
     fn refresh_agent_statuses(&mut self) -> bool {
         use agentstate::AgentStatus;
         let mut next = HashMap::new();
-        // Meaningful status TRANSITIONS to notify on (fired after the borrow ends).
         let mut events: Vec<(TerminalId, String, &'static str, String)> = Vec::new();
         // The activity poller is told which agents exist from HERE rather than sweeping the
         // process table itself: this loop already walks exactly the agent panes and holds
@@ -9229,7 +8502,6 @@ impl App {
                 prev.filter(|p| p.pid == label.pid).map(|p| p.status),
                 status,
             ) {
-                // turn just finished (was running, now parked at the prompt)
                 (Some(AgentStatus::Working), AgentStatus::Ready) => {
                     Some(("done", "turn finished".to_string()))
                 }
@@ -9276,8 +8548,6 @@ impl App {
                 status,
                 (std::time::Instant::now(), unix_now()),
             );
-            // A NEW status — including the first one seen for this pane, so an agent that
-            // reappears after losing its classification is a change — takes the next number.
             let seq = status_seq(prev, label.pid, status, &mut seq_counter);
             if finished {
                 self.done_episode.insert(tid.clone(), seq);
@@ -9293,12 +8563,9 @@ impl App {
                 },
             );
         }
-        // The sidebar renders time-in-status bucketed to whole minutes, and a BLOCKED
-        // agent — the one the attention band exists for — emits nothing, so no pane-dirty
-        // signal will ever fire when its bucket rolls. The loop's HH:MM tick does not
-        // cover it either: that fires on wall-clock minutes, not on the minute each
-        // agent's status began, so a row could sit a full bucket behind its neighbours.
-        // Report a roll as a change.
+        // The sidebar renders time-in-status bucketed to whole minutes, and a blocked agent emits
+        // nothing, so no pane-dirty signal fires when its bucket rolls; the loop's HH:MM tick is
+        // on wall-clock minutes, not on when each status began. Report a roll as a change.
         self.agent_seq = seq_counter;
         agentpoll::set_wanted(&self.agent_poll, wanted);
         self.set_graph_wants(&graph_agents);
@@ -9319,7 +8586,6 @@ impl App {
             || contexts != self.agent_contexts;
         self.agent_peers = peers;
         self.agent_contexts = contexts;
-        // A report outlives neither its pane nor its agent.
         self.agent_reports
             .retain(|tid, r| next.get(tid).is_some_and(|st| st.pid == r.pid));
         // Nor does a queued compaction — but only a CONFIRMED change drops it: an unreadable
@@ -9357,7 +8623,6 @@ impl App {
         self.agent_statuses = next;
         self.agent_details = details;
         self.agent_waits = waits;
-        // The marker lives exactly as long as the episode it was recorded for.
         let statuses = &self.agent_statuses;
         self.done_episode.retain(|tid, seq| {
             statuses
@@ -9365,8 +8630,8 @@ impl App {
                 .is_some_and(|st| st.status == AgentStatus::Ready && st.seq == *seq)
         });
 
-        // Fire desktop toasts (best-effort, non-blocking) — the server does this, so
-        // they arrive even while detached. Replaces the retired `~/.claude` notify hooks.
+        // Fire desktop toasts (best-effort, non-blocking) from the server, so they arrive even
+        // while detached.
         for (tid, tool, kind, body) in events {
             // An agent whose own hooks push this event kind (`comux notify`) owns it: the
             // hook knows the real moment, the sweep only infers it ~2 Hz later, and both
@@ -9376,8 +8641,6 @@ impl App {
             if self.hook_owns(&tid, kind) {
                 continue;
             }
-            // A finish is announced only once it has HELD (`notify_settle_secs`); see
-            // [`Self::raise_due_notifications`].
             if kind == "done" && self.cfg.notify_settle_secs > 0 {
                 if let Some(seq) = self.agent_statuses.get(&tid).map(|s| s.seq) {
                     self.pending_done.insert(
@@ -9398,11 +8661,10 @@ impl App {
         changed || raised
     }
 
-    /// Raise the notifications whose time has come: settled turn finishes, and reminders for
-    /// agents blocked too long. Both are bound to the agent EPISODE they were scheduled for,
-    /// so a status that moved, a replacement agent, or an acknowledgement (a key or click on
-    /// the pane, a jump to it, reading its notification) cancels them. Returns whether any
-    /// was raised (the center's unread chip must repaint).
+    /// Raise the notifications whose time has come: settled turn finishes and reminders for
+    /// agents blocked too long. Both are bound to the agent episode they were scheduled for, so
+    /// a moved status, a replacement agent or an acknowledgement cancels them. Returns whether
+    /// any was raised.
     fn raise_due_notifications(&mut self) -> bool {
         let mut raised = false;
         let settle = Duration::from_secs(self.cfg.notify_settle_secs.into());
@@ -9456,26 +8718,20 @@ impl App {
         raised
     }
 
-    /// Has `term`'s episode `seq` been acknowledged (see [`Self::agent_ack`])?
     fn acked(&self, term: &TerminalId, seq: u64) -> bool {
         self.agent_ack.get(term).copied().unwrap_or(0) >= seq
     }
 
-    /// Is this (pane, live agent pid, kind) already served by the agent's own hook?
     fn hook_owns(&self, term: &TerminalId, kind: &'static str) -> bool {
         let pid = self.labels.get(term).map(|l| l.pid).unwrap_or(0);
         self.hook_owned.contains(&(term.clone(), pid, kind))
     }
 
-    /// Record that the agent in `term` reports `kind` through its own hooks, so the
-    /// status sweep stops toasting that kind for it (see [`Self::hook_owns`]).
-    ///
-    /// Sweeps the process table FIRST. The claim is keyed by the agent's pid, and the
-    /// cached label is up to 500ms (attached) or 5s (detached) old — long enough that an
-    /// agent's first turn can be claimed under the pid of the shell that launched it. The
-    /// sweep would then look up the real agent pid, miss, and toast the event a second
-    /// time, which is exactly what ownership exists to prevent. A hook push is a
-    /// human-paced, rare event, so paying for one sweep here is cheap.
+    /// Record that the agent in `term` reports `kind` through its own hooks, so the status
+    /// sweep stops toasting that kind for it. Sweeps the process table first: the claim is
+    /// keyed by agent pid and the cached label is up to 500ms (attached) or 5s (detached) old,
+    /// long enough for a first turn to be claimed under the launching shell's pid, after which
+    /// the sweep would miss it and toast the event a second time.
     fn claim_hook_kind(&mut self, term: &TerminalId, kind: &'static str) {
         self.refresh_labels();
         let pid = self.labels.get(term).map(|l| l.pid).unwrap_or(0);
@@ -9498,13 +8754,10 @@ impl App {
         }
     }
 
-    /// Raise one agent notification: a desktop toast whose click jumps to the pane, plus
-    /// an entry in the in-app center (`Ctrl-b a`). Shared by the status sweep and the
-    /// `comux notify` push so both produce identical, jumpable notifications.
-    /// Returns the `tool · space/tab` attribution it used, so a caller can SEE where its
-    /// notification landed. A pushing hook (`comux notify`) has no other way to tell a
-    /// mis-addressed pane from a correctly addressed one — the toast is the only other
-    /// evidence and it is transient.
+    /// Raise one agent notification: a desktop toast whose click jumps to the pane, plus an
+    /// entry in the in-app center (`Ctrl-b a`). Shared by the status sweep and the `comux notify`
+    /// push. Returns the `tool · space/tab` attribution used, since a pushing hook has no other
+    /// way to tell a mis-addressed pane from a correct one.
     fn raise_notification(
         &mut self,
         term: TerminalId,
@@ -9576,14 +8829,12 @@ impl App {
         }
     }
 
-    /// Forget device tokens APNs reported dead. Called from the server loop.
     pub fn poll_push_dead(&mut self) {
         for d in self.pusher.take_dead() {
             self.push_reg.drop_dead(&d.token, d.generation);
         }
     }
 
-    /// A blocked agent's wait, as the wire carries it.
     fn agent_wait(&self, tid: &TerminalId) -> Option<copad_mux_proto::AgentWait> {
         self.agent_waits
             .get(tid)
@@ -9593,8 +8844,7 @@ impl App {
             })
     }
 
-    /// Number of agent panes currently BLOCKED (awaiting input) — the status-bar
-    /// attention count (`⚑N`), replacing the retired tmux `⚑N` chip.
+    /// Number of agent panes currently blocked (the status bar's `⚑N`).
     fn attention_count(&self) -> usize {
         self.agent_statuses
             .values()
@@ -9602,8 +8852,6 @@ impl App {
             .count()
     }
 
-    /// An agent pane's rolled-up status label for the sidebar (`idle` if unknown), plus
-    /// how many whole seconds it has held that status (0 when unknown).
     fn agent_status(&self, tid: &TerminalId) -> (&'static str, u64) {
         self.agent_statuses
             .get(tid)
@@ -9611,9 +8859,8 @@ impl App {
             .unwrap_or(("idle", 0))
     }
 
-    /// A one-line label for a pane row (index + short cwd basename if available).
-    /// Refresh every pane's foreground-process label from a single `ps` sweep
-    /// (throttled by the caller to ~2 Hz — never per frame).
+    /// Refresh every pane's foreground-process label from a single process sweep (throttled by
+    /// the caller to ~2 Hz, never per frame).
     fn refresh_labels(&mut self) -> bool {
         self.last_labels = std::time::Instant::now();
         let swept = procinfo::ProcTree::snapshot().map(|tree| {
@@ -9645,16 +8892,12 @@ impl App {
         changed
     }
 
-    /// How many process sweeps have FAILED outright since the server started (the
-    /// tree could not be read at all). Non-zero means labels are being carried
-    /// forward rather than refreshed; surfaced by `comux doctor` so the condition
-    /// that used to be an unexplained "my tab names vanished" is observable.
+    /// How many process sweeps have failed outright since the server started. Non-zero means
+    /// labels are being carried forward rather than refreshed; surfaced by `comux doctor`.
     pub fn label_sweeps_failed(&self) -> u64 {
         self.label_sweeps_failed
     }
 
-    /// The foreground command of a session's focused pane (its "what's happening"
-    /// subtitle), e.g. `claude` / `zsh` / `nvim`.
     fn session_focus_label(&self, wid: &WorkspaceId) -> String {
         let Some(w) = self.state.workspace(wid) else {
             return String::new();
@@ -9669,8 +8912,6 @@ impl App {
             .unwrap_or_default()
     }
 
-    /// Every agent pane across ALL sessions. The terminal id lets the sidebar make
-    /// each agent row clickable (jump to its pane).
     fn agent_rows(&self) -> Vec<AgentRow> {
         let mut out = Vec::new();
         for wid in self.state.workspace_ids() {
@@ -9679,12 +8920,9 @@ impl App {
             };
             let space = w.name.clone().unwrap_or_else(|| wid.to_string());
             for (ti, t) in w.tabs.iter().enumerate() {
-                // The tab's custom name titles its agent rows, so several agents in ONE
-                // space stay distinguishable (the reason tab rename exists). Unnamed
-                // tabs fall back to their 1-based INDEX rather than the space name: the
-                // sidebar already groups by space, so repeating it would render every
-                // agent in a space as the same untellable row — the index at least says
-                // which `Ctrl-b <n>` jumps there.
+                // The tab's custom name titles its agent rows so several agents in one space stay
+                // distinguishable. An unnamed tab falls back to its 1-based index (the `Ctrl-b <n>`
+                // that jumps there) rather than the space name, which the sidebar already groups by.
                 let tab_title = tab_display_title(t.name.as_deref(), ti);
                 for p in t.layout.panes() {
                     if let Some(tid) = t.layout.terminal_of(&p)
@@ -9717,8 +8955,6 @@ impl App {
         out
     }
 
-    /// The herdr-style left panel: `spaces` (sessions, top half) + `agents` (agent
-    /// panes with status·tool, bottom half). Always on when wide enough.
     fn render_sidebar(&self, buf: &mut Buffer) {
         let h = self.content_rows(); // between the top bar and the bottom status bar
         // The strip starts below the top bar when there is one. Every write below goes
@@ -9726,12 +8962,11 @@ impl App {
         // `y0 +`, so the body keeps using 0-based rows and there is exactly one place the
         // offset can be forgotten.
         let y0 = self.content_y();
-        // Transparent fill (default terminal bg) so a configured background image shows
-        // through the sidebar — the right-border `│` column is the only visual separator.
+        // Transparent fill so a configured background image shows through; the right-border `│`
+        // column is the only separator.
         let panel_bg = Color::Reset;
         let sidebar_w = self.sidebar_w();
 
-        // Fill the strip + the right border column (down to the status bar).
         for y in y0..y0 + h {
             for x in 0..sidebar_w {
                 if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
@@ -9747,8 +8982,6 @@ impl App {
             }
         }
 
-        // Display-width-aware writer that ADVANCES `x` (so a colored dot and the name
-        // after it don't overwrite each other). Clipped to the strip.
         let put = |buf: &mut Buffer, x: &mut u16, y: u16, s: &str, style: Style| {
             let y = y0 + y; // rows below are 0-based within the strip
             for ch in s.chars() {
@@ -9780,9 +9013,8 @@ impl App {
             .bg(panel_bg)
             .add_modifier(Modifier::BOLD);
         let sub_style = Style::default().fg(CAT_OVERLAY).bg(panel_bg);
-        // In compact mode a row's subtitle trails its name on the SAME line, right-aligned
-        // to the strip edge, and is dropped whole rather than truncated when the name
-        // already reaches it — a half-word of branch name is noise, not information.
+        // In compact mode a row's subtitle trails its name on the same line, right-aligned to the
+        // strip edge, and is dropped whole rather than truncated when the name already reaches it.
         let put_trailing = |buf: &mut Buffer, x: u16, y: u16, text: &str, style: Style| {
             // NOT offset here: it delegates to `put`, which already applies `y0`. Offsetting
             // in both would push every compact subtitle one row down.
@@ -9796,14 +9028,12 @@ impl App {
                 put(buf, &mut tx, y, text, style);
             }
         };
-        // The rule trailing an agents group header — darker than the muted text so the
-        // header reads as a divider, not as an agent row with a missing status dot.
+        // The rule trailing an agents group header, darker than muted text so it reads as a
+        // divider.
         let divider_style = Style::default().fg(CAT_SURFACE0).bg(panel_bg);
 
-        // ---- split the strip between the two halves ----
-        // Both halves are measured first so a half that needs less than its share hands
-        // the slack to the other (a fixed 50/50 wasted the spaces half on a 2-session /
-        // 12-agent setup, which is exactly the many-agents case the panel is for).
+        // Both halves are measured first so a half needing less than its share hands the slack
+        // to the other.
         let sids = self.sorted_session_ids();
         let agent_rows = self.agent_rows();
         let agent_items = agent_items(&agent_rows);
@@ -9818,15 +9048,14 @@ impl App {
         } else {
             blocked.len() as u32 + 1 // 1 compact row each + the closing rule
         };
-        // u32 accumulation so a pathological session/agent count can't overflow.
-        // `ask` is a half's total row demand at a given rows-per-entry.
+        // u32 so a pathological session/agent count can't overflow; `ask` is a half's row demand
+        // at a given rows-per-entry.
         let ask_spaces = |e: u16| 1 + e as u32 * sids.len() as u32;
         let ask_agents =
             |e: u16| 1 + want_band + agent_items.iter().map(|i| i.rows(e) as u32).sum::<u32>();
-        // `auto` needs to know WHICH half overflows, and that only falls out of the split —
-        // which in turn depends on the entry heights. Break the cycle by splitting once at
-        // the comfortable size, reading off who overflowed, then splitting for real. One
-        // extra round of arithmetic, and the outcome is deterministic.
+        // `auto` needs to know which half overflows, which only falls out of the split, which
+        // depends on the entry heights. Split once at the comfortable size to read off the
+        // overflow, then split for real.
         let probe = split_sidebar(h, ask_spaces(2), ask_agents(2), 2, 2);
         let entry_sp = self
             .cfg
@@ -9844,20 +9073,16 @@ impl App {
             entry_ag,
         );
 
-        // ---- spaces (top half) ----
         put(buf, &mut 0, 0, " spaces", header);
         let active_si = self.active_session_index();
-        // When the sidebar has keyboard focus on Sessions, center the window on the FOCUSED
-        // row (and highlight it) instead of the active session.
         let space_focus = match &self.sidebar_focus {
             Some(f) if f.tab == PopupTab::Sessions => Some(f.sel.min(sids.len().saturating_sub(1))),
             _ => None,
         };
         let space_center = space_focus.unwrap_or(active_si);
-        // Window the list so the centered session stays visible with many sessions; reserve
-        // a row for a "+N more" hint when truncated (the full list is in `Ctrl-f`). Only
-        // window when there's room for at least a session + hint (≥2 slots); otherwise show
-        // what fits with no fabricated/overlapping row.
+        // Window the list so the centered session stays visible, reserving a row for a "+N more"
+        // hint when truncated (the full list is in `Ctrl-f`). Only window with room for a session
+        // plus the hint (>= 2 slots); otherwise show what fits.
         let space_max = (mid.saturating_sub(1) / entry_sp) as usize;
         let space_total = sids.len();
         let (space_start, space_vis, space_trunc) = if space_total <= space_max || space_max < 2 {
@@ -9922,7 +9147,6 @@ impl App {
                 Style::default().fg(dot_color).bg(panel_bg),
             );
             put(buf, &mut x, y, " ", name_style);
-            // Ellipsis instead of a hard cut, leaving room for the bell marker after it.
             let bell_w = if self.cfg.bell && self.session_has_bell(sid) {
                 2
             } else {
@@ -9944,8 +9168,6 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 );
             }
-            // subtitle: git branch (herdr-style), falling back to the focused command
-            // when the cwd isn't a git repo.
             let sub = self
                 .branches
                 .get(sid)
@@ -9958,7 +9180,6 @@ impl App {
             } else {
                 put_trailing(buf, x, y, &sub, sub_style);
             }
-            // The whole entry clicks to switch to this session.
             self.click_zones.borrow_mut().push(ClickZone {
                 x0: 0,
                 x1: sidebar_w - 1,
@@ -9980,7 +9201,6 @@ impl App {
             );
         }
 
-        // ---- agents (bottom half) ----
         // ABSOLUTE screen row: it is compared against a raw mouse `y` to decide which half
         // the wheel is over.
         self.sidebar_mid.set(y0 + mid);
@@ -10003,12 +9223,9 @@ impl App {
             );
         }
         y += 1;
-        // ---- attention band ----
-        // Blocked agents are the ones that need a human RIGHT NOW, and in a long list they
-        // can sit anywhere. Pinning them in a compact 1-row band at the top makes them
-        // always visible WITHOUT reordering the list underneath (sorting by status would
-        // move rows out from under the pointer every time an agent changed state). They are
-        // deliberately shown twice: the band is the shortcut, the list below is the map.
+        // Pinned in a compact 1-row band so blocked agents are always visible without reordering
+        // the list (sorting by status would move rows out from under the pointer). Deliberately
+        // shown twice: the band is the shortcut, the list the map.
         let multi_space = agents_span_spaces(&agent_rows);
         let band_n = band_rows(h.saturating_sub(mid + 1), blocked.len(), entry_ag);
         if band_n > 0 {
@@ -10036,8 +9253,6 @@ impl App {
                     &who,
                     Style::default().fg(CAT_TEXT).bg(panel_bg),
                 );
-                // Right-align "how long it has been waiting" — the band is scanned down
-                // its right edge to find the one that has been blocked longest.
                 let waited = fmt_elapsed(row.for_secs);
                 if !waited.is_empty() {
                     let at = sidebar_w
@@ -10068,18 +9283,15 @@ impl App {
             }
             y += 1;
         }
-        // The agent whose pane is currently in focus (active session's focused pane), so
-        // it can be highlighted like the active `spaces` row — bright/bold name vs the
-        // dimmed siblings — instead of every agent looking identical.
+        // The agent whose pane is focused, highlighted like the active `spaces` row.
         let active_agent_term = self.focused_terminal();
         let agent_total = agent_rows.len();
         let agent_focus = match &self.sidebar_focus {
             Some(f) if f.tab == PopupTab::Agents => Some(f.sel.min(agent_total.saturating_sub(1))),
             _ => None,
         };
-        // Anchor the window on the keyboard-focused row, else on the agent whose pane is
-        // FOCUSED — parity with the spaces half centering on the active session. It used
-        // to pin at index 0, so the agent you were looking at could be off-window.
+        // Anchor the window on the keyboard-focused row, else on the agent whose pane is focused,
+        // as the spaces half does for the active session.
         let anchor_agent = agent_focus.or_else(|| {
             let t = active_agent_term.as_ref()?;
             agent_rows.iter().position(|r| &r.term == t)
@@ -10087,11 +9299,10 @@ impl App {
         let anchor = anchor_agent
             .and_then(|a| agent_items.iter().position(|i| i.is_agent(a)))
             .unwrap_or(0);
-        // Identity, not index: the pin below expires when the anchor MOVES, and a bare
-        // index can stay equal while pointing at a different agent. The anchor is TOTAL —
-        // with no agent focused it falls back to the active SESSION rather than `None`, or
-        // two different sessions whose focused panes are both shells would compare equal
-        // and carry a stale pin across the switch [codex S3a/C2].
+        // Identity, not index: the pin below expires when the anchor MOVES, and an index can stay
+        // equal while pointing at a different agent. Total: with no agent focused it falls back
+        // to the active session, or two sessions whose focused panes are both shells would
+        // compare equal and carry a stale pin across the switch.
         let anchor_id = anchor_agent
             .and_then(|a| agent_rows.get(a))
             .map(|r| r.term.to_string())
@@ -10099,10 +9310,9 @@ impl App {
         let heights: Vec<u16> = agent_items.iter().map(|i| i.rows(entry_ag)).collect();
         let avail = h.saturating_sub(y);
         let need: u32 = heights.iter().map(|&r| r as u32).sum();
-        // Reserve a row for the "+M more" hint when the list can't fit; the full list is
-        // in Ctrl-f. Never at the cost of the last ENTRY, though — on a strip short enough
-        // that the half is down to its floor (header + one 2-row entry), reserving the
-        // hint row would leave the hint and no agent at all [codex C1].
+        // Reserve a row for the "+M more" hint when the list can't fit (the full list is in
+        // Ctrl-f), but never at the cost of the last entry: at the half's floor (header + one
+        // entry) it would leave the hint and no agent.
         let budget = if need <= avail as u32 || avail < 3 {
             avail
         } else {
@@ -10132,8 +9342,6 @@ impl App {
             }
             let ai = match item {
                 AgentItem::Group(space, wid) => {
-                    // Dim space name + a rule to the edge: with agents from several
-                    // sessions in one flat list there was no way to tell which was which.
                     let mut gx = 1u16;
                     put(buf, &mut gx, y, space, sub_style);
                     put(buf, &mut gx, y, " ", sub_style);
@@ -10144,7 +9352,6 @@ impl App {
                             break; // no room left — never spin
                         }
                     }
-                    // The header clicks through to its session, like a `spaces` row.
                     self.click_zones.borrow_mut().push(ClickZone {
                         x0: 0,
                         x1: sidebar_w - 1,
@@ -10160,12 +9367,9 @@ impl App {
             let row = &agent_rows[ai];
             shown += 1;
             let is_focused = agent_focus == Some(ai);
-            // The active pane's agent — highlighted like the active `spaces` row.
             let is_active = active_agent_term.as_ref() == Some(&row.term);
             let (dot, scolor) = row.glyph();
             let mut x = 1u16;
-            // Keep the status colour on the dot; bold it for the focused agent so the
-            // icon reads as "selected" (mirrors the active space's brighter dot).
             put(
                 buf,
                 &mut x,
@@ -10186,13 +9390,11 @@ impl App {
                     .bg(Color::Cyan)
                     .add_modifier(Modifier::BOLD)
             } else if is_active {
-                // The pane you're looking at: bright + bold, like the active space name.
                 Style::default()
                     .fg(CAT_TEXT)
                     .bg(panel_bg)
                     .add_modifier(Modifier::BOLD)
             } else {
-                // Other agents: dimmed to subtext so the focused one stands out.
                 Style::default().fg(CAT_SUBTEXT).bg(panel_bg)
             };
             put(buf, &mut x, y, " ", name_style);
@@ -10225,7 +9427,6 @@ impl App {
                 // `ready 3m · claude      ━━━━╌╌ 62%`: the gauge sits flush right, and the
                 // tool name (which the tab chip already carries) is what gives way first.
                 let avail = sidebar_w.saturating_sub(5) as usize;
-                // A queued compaction leads the gauge's label: `⇣62%`.
                 let mark = if row.compact { "⇣" } else { "" };
                 let gauge = row
                     .context
@@ -10273,7 +9474,6 @@ impl App {
                 }
                 put_trailing(buf, x, y, &sub, sub_style);
             }
-            // The whole entry clicks to jump to this agent's pane.
             self.click_zones.borrow_mut().push(ClickZone {
                 x0: 0,
                 x1: sidebar_w - 1,
@@ -10296,18 +9496,14 @@ impl App {
         }
     }
 
-    /// The tab's CUSTOM display name (`Ctrl-b ,` / `comux rename-tab`), chip-truncated.
-    /// Takes display precedence over the process label in every `tab_labels` style.
     fn tab_custom_name(&self, tab_id: &TabId) -> Option<String> {
         let w = self.state.workspace(&self.ws)?;
         let name = w.tab(tab_id)?.name.as_deref()?.trim();
         (!name.is_empty()).then(|| clip_chip(name))
     }
 
-    /// The focused pane's foreground-command name for a tab (e.g. `claude` / `nvim`),
-    /// truncated to a chip-friendly width and cleaned of a login-shell leading `-`.
-    /// `None` when the tab / focused terminal has no resolved label yet, so the caller
-    /// falls back to the bare index. Used for the `name`/`both` tab-label styles.
+    /// The focused pane's foreground-command name for a tab (`claude`, `nvim`), chip-truncated
+    /// and without a login shell's leading `-`. `None` when no label is resolved yet.
     fn tab_focus_label(&self, tab_id: &TabId) -> Option<String> {
         let w = self.state.workspace(&self.ws)?;
         let t = w.tab(tab_id)?;
@@ -10320,8 +9516,6 @@ impl App {
         Some(clip_chip(name))
     }
 
-    /// Does any pane in `tab_id` currently run a classified AI agent?
-    /// Any pane in this tab with an unacknowledged bell.
     fn tab_has_bell(&self, id: &TabId) -> bool {
         self.state
             .workspace(&self.ws)
@@ -10355,7 +9549,6 @@ impl App {
         })
     }
 
-    /// Number of agent panes across the ACTIVE session (all its tabs).
     fn active_session_agent_count(&self) -> usize {
         let Some(w) = self.state.workspace(&self.ws) else {
             return 0;
@@ -10377,19 +9570,10 @@ impl App {
         n
     }
 
-    /// The always-on bottom status bar (Catppuccin Mocha, matching the owner's tmux):
-    /// LEFT = session pill + tab chips (active highlighted, agent `●`); RIGHT =
-    /// scroll flag · agent count · clock · host.
-    /// The optional top bar: how the HOST is doing (`cpu 12%  mem 59%  gpu 2%  load 2.36`).
-    ///
-    /// Deliberately a different question from the bottom bar, which is about the MUX (session,
-    /// tabs, agents, subscription limits). Splitting them is the reason to have a second bar
-    /// at all; duplicating the bottom bar's content up here would just cost a row.
-    ///
-    /// A reading that is absent is OMITTED, never drawn as `0%` or `--`: see `hostmetrics`.
-    /// When nothing at all is readable the bar is still drawn — it was asked for, and an
-    /// empty strip is a visible, diagnosable "no readings" rather than a layout that silently
-    /// changes height.
+    /// The optional top bar: how the HOST is doing (`cpu 12%  mem 59%  gpu 2%  load 2.36`), a
+    /// different question from the bottom bar, which is about the mux. A reading that is absent
+    /// is omitted, never drawn as `0%` or `--` (see `hostmetrics`). With nothing readable the
+    /// bar is still drawn, empty, so the layout height never silently changes.
     fn render_top_bar(&self, buf: &mut Buffer) {
         let w = buf.area.width;
         let y = 0u16;
@@ -10447,7 +9631,6 @@ impl App {
         let w = area.width;
         let y = area.height.saturating_sub(1);
 
-        // Fill the row (also lifts any wide-char skip flag left by a pane cell).
         for x in 0..w {
             if let Some(bc) = buf.cell_mut(Position::new(x, y)) {
                 bc.set_symbol(" ");
@@ -10485,7 +9668,6 @@ impl App {
             }
         };
 
-        // LEFT: session pill + tab chips.
         let mut x = 0u16;
         let sname = self
             .state
@@ -10514,13 +9696,11 @@ impl App {
         }
         put(buf, &mut x, " ", Style::default().bg(CAT_BASE));
 
-        // RIGHT cluster (attention · scroll · agents · clock · host) — built FIRST so the
-        // tab chips know how much width they may use before it.
+        // Right cluster, built first so the tab chips know how much width they may use.
         let mut segs: Vec<(String, Style)> = Vec::new();
-        // Prefix armed (`Ctrl-b` pressed, waiting for the chord) — FIRST, so it sits at
-        // the left edge of the right cluster where the eye already goes for mode flags.
-        // Transient by nature: the very next key resolves the chord and clears it, which
-        // is also why it is fine for it to briefly shrink the tab-chip window.
+        // Prefix armed (`Ctrl-b` pressed, waiting for the chord): first, at the left edge of the
+        // right cluster where the eye goes for mode flags. Transient, so briefly shrinking the
+        // tab-chip window is fine.
         if self.prefix_armed {
             segs.push((
                 format!(" {} ", self.prefix_label()),
@@ -10540,10 +9720,9 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        // Bells, mux-wide. The per-tab chip and per-session sidebar markers cannot be the
-        // guarantee — the ringing session's row can be outside the sidebar's visible window,
-        // and the sidebar can be hidden entirely on a narrow terminal. `!` is tmux's bell
-        // convention, and it reads as distinct from `⚑` (attention) and `●` (agents).
+        // Bells, mux-wide. The per-tab and per-session markers can't be the guarantee: the
+        // ringing row can be outside the sidebar window, or the sidebar hidden on a narrow
+        // terminal. `!` is tmux's bell convention.
         let bells = self.bell_count();
         if bells > 0 && self.cfg.bell {
             segs.push((
@@ -10633,7 +9812,6 @@ impl App {
         }
         let agents = self.active_session_agent_count();
         if agents > 0 {
-            // A space between the agent dot and the count so they don't read as one blob.
             segs.push((
                 format!(" ● {agents} "),
                 Style::default()
@@ -10642,9 +9820,7 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        // "Update available" hint — only present when the versionpoll thread has
-        // seen a release newer than this build. A passive nudge for users who
-        // installed via install-comux.sh; hidden entirely when up to date.
+        // Update hint: only when the versionpoll thread has seen a release newer than this build.
         if let Some(v) = &self.version_shown {
             segs.push((
                 format!(" ⬆ {} ", v.latest),
@@ -10654,14 +9830,11 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        // Usage/limits readout (Claude 5h+weekly · Codex weekly), left of the clock.
-        // `usage_layout = paged` (default) shows ONE window (or provider) at a time as a
-        // wheel-/click-paged carousel WITH a reset countdown and an `n/N` indicator;
-        // `inline` is the legacy single row of every window (no room for resets). The
-        // gauge (bar/text/off) is `usage`. Either layout only shows at cols >= 100 —
-        // it would crowd out tab chips on a narrow/mobile view (size-adaptive).
-        // `usage_zone` records the paged segment's seg-index span so the draw loop can
-        // register a `ClickTarget::Usage` hit region for wheel/click paging.
+        // Usage/limits readout, left of the clock. `paged` shows one window (or provider) at a
+        // time as a wheel-/click-paged carousel with a reset countdown and an `n/N` indicator;
+        // `inline` is a single row of every window. Either shows only at cols >= 100 so it does
+        // not crowd out tab chips. `usage_zone` records the paged segment's seg-index span so the
+        // draw loop can register a `ClickTarget::Usage` region.
         let mut usage_zone: Option<(usize, usize)> = None;
         if let Some(u) = &self.usage_shown
             && u.has_visible(self.cfg.usage_windows)
@@ -10669,8 +9842,6 @@ impl App {
             && self.cols >= 100
         {
             let pad = Style::default().bg(CAT_SURFACE0);
-            // Each window's gauge is colored by its utilization (green < 70 ≤ yellow
-            // < 90 ≤ red); labels/separators/resets stay muted. One segment per part.
             let push_parts = |segs: &mut Vec<(String, Style)>, parts: Vec<UsagePart>| {
                 for part in parts {
                     let (text, fg) = match part {
@@ -10749,7 +9920,6 @@ impl App {
                         if maxw > shown_w {
                             segs.push((" ".repeat(maxw - shown_w), pad));
                         }
-                        // `n/N` page indicator (only with >1 page); else a trailing pad.
                         if n > 1 {
                             segs.push((
                                 format!(" {}/{} ", idx + 1, n),
@@ -10776,9 +9946,6 @@ impl App {
         ));
         let right_total: u16 = segs.iter().map(|(s, _)| s.width() as u16).sum();
 
-        // TAB chips, windowed around the active tab so it STAYS VISIBLE when there are
-        // more tabs than fit (‹ / › flag hidden tabs). Agent tabs are yellow + carry a
-        // `● ` marker (spaced from the number); active is the mauve pill.
         let ids = self.tab_ids();
         let active = self.active_tab_id();
         let active_idx = active
@@ -10799,12 +9966,10 @@ impl App {
                 };
                 let dot = if agent { "● " } else { "" };
                 let n = i + 1;
-                // `tab_labels` picks number / process name / both. A CUSTOM name (`Ctrl-b ,`
-                // / `comux rename-tab`) takes precedence over the process label in every
-                // style — even `number` shows it (as `n:name`, keeping the jump index),
-                // since renaming is explicit intent to see that name. `name`/`both` fall
-                // back to the bare number when the pane has no resolved label yet (or a
-                // blank one), so a fresh tab is never an empty chip.
+                // `tab_labels` picks number / process name / both. A custom name (`Ctrl-b ,` /
+                // `comux rename-tab`) wins in every style (`number` shows `n:name`, keeping the jump
+                // index). `name`/`both` fall back to the bare number when the pane has no label yet,
+                // so a fresh tab is never an empty chip.
                 let custom = self.tab_custom_name(id);
                 let inner = match self.cfg.tab_labels {
                     TabLabels::Number => match custom {
@@ -10909,9 +10074,9 @@ impl App {
             put(buf, &mut x, "›", dim);
         }
 
-        // Draw the right cluster, right-aligned, never overwriting the left content.
-        // While drawing, capture the x-span of the paged usage segment (seg indices in
-        // `usage_zone`) and register it as a `ClickTarget::Usage` hit region for paging.
+        // Right cluster, right-aligned, never overwriting the left content. The paged usage
+        // segment's x-span (seg indices in `usage_zone`) is registered as a `ClickTarget::Usage`
+        // region.
         let mut rx = w.saturating_sub(right_total).max(x);
         let mut usage_x0: Option<u16> = None;
         for (i, (s, st)) in segs.iter().enumerate() {
@@ -10934,8 +10099,6 @@ impl App {
         }
     }
 
-    /// Centered `Ctrl-f` switcher over the panes: a bordered box listing panes with
-    /// a selection cursor.
     fn render_popup(&self, buf: &mut Buffer) {
         let Some(p) = self.popup.as_ref() else { return };
         let area = buf.area;
@@ -10945,7 +10108,6 @@ impl App {
         // Clamp bounds so `min <= max` even on tiny/narrow terminals (the popup
         // is the narrow/mobile fallback, so it must never panic there).
         let maxw = area.width.saturating_sub(2).max(1);
-        // Wide enough for a preview: the box takes most of the frame and splits.
         let preview = area.width >= POPUP_PREVIEW_MIN_COLS && area.height >= POPUP_PREVIEW_MIN_ROWS;
         let w = if preview {
             (area.width as u32 * 9 / 10) as u16
@@ -10960,19 +10122,16 @@ impl App {
         };
         let x0 = (area.width.saturating_sub(w)) / 2;
         let y0 = (area.height.saturating_sub(h)) / 2;
-        // Transparent interior (default terminal bg) so a background image shows through;
-        // only the border + selection highlights remain painted.
+        // Transparent interior so a background image shows through.
         let bg = Color::Reset;
         let border = Style::default().fg(Color::Cyan).bg(bg);
 
-        // Box background + border.
         draw_box(buf, x0, y0, w, h, border);
 
         let put = |buf: &mut Buffer, y: u16, x: u16, maxw: u16, s: &str, st: Style| {
             put_str(buf, x, y, x.saturating_add(maxw), s, st);
         };
 
-        // Title in the top border (with the key hints).
         put(
             buf,
             y0,
@@ -10987,7 +10146,6 @@ impl App {
 
         let inner_x = x0 + 2;
         let full_w = w.saturating_sub(4);
-        // With a preview the list keeps the left ~40% and the pane gets the rest.
         let inner_w = if preview {
             (full_w * 2 / 5).max(30).min(full_w)
         } else {
@@ -11008,7 +10166,6 @@ impl App {
             self.render_popup_preview(buf, target.as_ref(), px, y0 + 1, pw, h.saturating_sub(2));
         }
 
-        // Row 1: the lists (Left/Right switches), active one highlighted.
         let tab_hi = Style::default()
             .fg(Color::Black)
             .bg(Color::Cyan)
@@ -11029,7 +10186,6 @@ impl App {
             tx += lw;
         }
 
-        // Row 2: the fuzzy filter input with a block cursor.
         put(
             buf,
             y0 + 2,
@@ -11039,7 +10195,6 @@ impl App {
             Style::default().fg(CAT_TEXT).bg(bg),
         );
 
-        // Remaining rows: the filtered items, scrolled so the selection stays visible.
         let list_top = y0 + 3;
         let visible = (h.saturating_sub(4)) as usize; // borders + tab + filter lines
         if items.is_empty() {
@@ -11099,8 +10254,6 @@ impl App {
         }
     }
 
-    /// The terminal the switcher previews for `target`: an agent's own pane, or a session's
-    /// active tab's focused pane.
     fn preview_terminal(&self, target: &PopupTarget) -> Option<TerminalId> {
         match target {
             PopupTarget::Agent(t) => Some(t.clone()),
@@ -11127,9 +10280,6 @@ impl App {
         self.preview_terminal(&items.get(pinned_sel(p, &items))?.target)
     }
 
-    /// The agent readout under the switcher preview's header, as styled spans: the context
-    /// gauge with its counts and spend, then what the agent is doing or waiting for. Empty for
-    /// a pane with no agent reading.
     fn preview_agent_lines(&self, term: &TerminalId, w: usize) -> Vec<Vec<(String, Style)>> {
         let dim = Style::default().fg(CAT_OVERLAY);
         let mut out = Vec::new();
@@ -11172,7 +10322,6 @@ impl App {
         out
     }
 
-    /// The line above a preview: `space/tab · label status`.
     fn preview_header(&self, term: &TerminalId) -> String {
         match self.locate_terminal(term) {
             Some((wid, tab, _)) => {
@@ -11197,11 +10346,10 @@ impl App {
         }
     }
 
-    /// Draw the switcher's preview of `target` into `(x, y, w, h)`: a one-line header, then
-    /// the pane's CURRENT viewport (what it would show if you went there — scrolled-up panes
-    /// preview their scrollback), bottom-anchored on its content and cropped to the width.
-    /// Every cell of the region is written, so nothing the pane underneath drew (a wide
-    /// glyph's skipped spacer above all) survives inside it.
+    /// Draw the switcher's preview of `target` into `(x, y, w, h)`: a header, then the pane's
+    /// CURRENT viewport (a scrolled-up pane previews its scrollback), bottom-anchored and cropped
+    /// to the width. Every cell of the region is written so nothing the pane underneath drew (a
+    /// wide glyph's skipped spacer above all) survives inside it.
     fn render_popup_preview(
         &self,
         buf: &mut Buffer,
@@ -11279,7 +10427,6 @@ impl App {
                 }
                 let wide = cell.sym.width() >= 2;
                 if wide && xx + 1 >= x + w {
-                    // Its second column would fall outside the preview: drop it.
                     bc.set_symbol(" ");
                     continue;
                 }
@@ -11297,10 +10444,9 @@ impl App {
         }
     }
 
-    /// `Ctrl-b q` (tmux `display-panes`): each pane's 1-based number, drawn large in its
-    /// middle — peach for the focused pane, blue for the rest, like tmux's
-    /// `display-panes-active-colour` / `display-panes-colour`. A pane too small for the
-    /// 3×5 digits gets the plain number.
+    /// `Ctrl-b q` (tmux `display-panes`): each pane's 1-based number drawn large in its middle,
+    /// peach for the focused pane and blue for the rest. A pane too small for the 3×5 digits
+    /// gets the plain number.
     fn render_pane_numbers(
         &self,
         buf: &mut Buffer,
@@ -11362,9 +10508,6 @@ impl App {
         }
     }
 
-    /// The `Ctrl-b ?` help rows from the LIVE keymap: `(chords, description)`, with `None`
-    /// chords marking a section header. One row per action per table; tabs 1–9 fold into
-    /// one row when bound to consecutive digits.
     fn help_lines(&self) -> Vec<(Option<String>, String)> {
         let km = &self.cfg.keymap;
         let mut out = Vec::new();
@@ -11432,9 +10575,7 @@ impl App {
         out
     }
 
-    /// Rows the help box shows at once on this terminal.
     fn help_visible(&self) -> usize {
-        // Borders, and the frame's own status bar row.
         self.rows.saturating_sub(4) as usize
     }
 
@@ -11444,8 +10585,6 @@ impl App {
             .saturating_sub(self.help_visible().max(1))
     }
 
-    /// The status-bar hint while the prefix is armed: the most useful next keys, as bound
-    /// NOW. An action left unbound simply drops out, `?` included.
     fn prefix_hint_text(&self) -> String {
         use Action::*;
         let mut parts: Vec<(String, &'static str)> = Vec::new();
@@ -11471,7 +10610,6 @@ impl App {
                 continue;
             };
             match parts.last_mut() {
-                // `% " split`: the two splits share one noun.
                 Some((keys, s)) if *s == short => {
                     keys.push(' ');
                     keys.push_str(&c.label());
@@ -11486,7 +10624,6 @@ impl App {
             .join(" · ")
     }
 
-    /// The key help (`Ctrl-b ?`): a centered, scrollable list of the live keymap.
     fn render_help(&self, buf: &mut Buffer) {
         let Some(scroll) = self.help else { return };
         let area = buf.area;
@@ -11552,11 +10689,8 @@ impl App {
         }
     }
 
-    /// The notification center (`Ctrl-b a`): a centered box listing logged agent-turn
-    /// events, newest first — Enter jumps to the source pane, `d` dismisses.
-    /// The resume picker (`Ctrl-b R`): a centered box listing past Claude/Codex
-    /// conversations, newest first, with the fuzzy filter on top. Wider than the `Ctrl-f`
-    /// switcher because each row carries a prompt AND a path.
+    /// The resume picker (`Ctrl-b R`). Wider than the `Ctrl-f` switcher because each row
+    /// carries a prompt and a path.
     fn render_resume(&self, buf: &mut Buffer) {
         let Some(st) = self.resume.as_ref() else {
             return;
@@ -11575,7 +10709,6 @@ impl App {
 
         draw_box(buf, x0, y0, w, h, border);
 
-        // Display-width-aware writer (a Korean prompt is 2 columns per char): advances `x`.
         let right_edge = x0 + w - 1;
         let put = |buf: &mut Buffer, x: &mut u16, y: u16, s: &str, style: Style| {
             *x = put_str(buf, *x, y, right_edge, s, style);
@@ -11600,7 +10733,6 @@ impl App {
         let inner_x = x0 + 2;
         let inner_w = w.saturating_sub(4) as usize;
 
-        // Row 1: the fuzzy filter with a block cursor, and the match count on the right.
         let mut fx = inner_x;
         put(
             buf,
@@ -11648,7 +10780,6 @@ impl App {
         for (i, row) in rows_data.iter().enumerate().skip(start).take(visible) {
             let y = list_top + (i - start) as u16;
             let selected = i == st.sel;
-            // Right side first: it is fixed-size, and the prompt gets whatever is left.
             let path = row.cwd.as_deref().map(home_short).unwrap_or_default();
             let right = format!("{path} · {}", row.age);
             let glyph = if row.live.is_some() { "●" } else { "▪" };
@@ -11676,9 +10807,6 @@ impl App {
         }
     }
 
-    /// Draw the new-session directory browser: the directory being browsed + the filter on
-    /// top, then `.` (create here), `..`, and its subdirectories. Same box as the resume
-    /// picker.
     fn render_browser(&self, buf: &mut Buffer) {
         let Some(b) = self.browser.as_ref() else {
             return;
@@ -11778,8 +10906,6 @@ impl App {
         }
     }
 
-    /// Draw the inline single-line prompt (new-session name / rename) as a small
-    /// centered box with the typed text + a block cursor. Clamps on tiny terminals.
     fn render_prompt(&self, buf: &mut Buffer) {
         let Some(p) = self.prompt.as_ref() else {
             return;
@@ -11790,8 +10916,7 @@ impl App {
         let h = 3u16.min(area.height.max(1));
         let x0 = (area.width.saturating_sub(w)) / 2;
         let y0 = (area.height.saturating_sub(h)) / 2;
-        // Transparent interior (default terminal bg) so a background image shows through;
-        // only the border + selection highlights remain painted.
+        // Transparent interior so a background image shows through.
         let bg = Color::Reset;
         let border = Style::default().fg(CAT_MAUVE).bg(bg);
 
@@ -11818,8 +10943,6 @@ impl App {
             &title,
             border.add_modifier(Modifier::BOLD),
         );
-        // Text line with a trailing block cursor; right-truncate so the caret stays
-        // visible as the input grows past the box width.
         let inner_w = w.saturating_sub(4) as usize;
         let shown = tail_width(&format!("{}█", p.buf), inner_w);
         put(
@@ -11832,8 +10955,6 @@ impl App {
         );
     }
 
-    /// Draw the `y`/`n` confirm modal (kill-session) as a small centered box holding the
-    /// message. Reuses `render_prompt`'s box geometry; clamps on tiny terminals.
     fn render_confirm(&self, buf: &mut Buffer) {
         let Some(cf) = self.confirm.as_ref() else {
             return;
@@ -11845,8 +10966,7 @@ impl App {
         let h = 3u16.min(area.height.max(1));
         let x0 = (area.width.saturating_sub(w)) / 2;
         let y0 = (area.height.saturating_sub(h)) / 2;
-        // Transparent interior (default terminal bg) so a background image shows through;
-        // only the border + selection highlights remain painted.
+        // Transparent interior so a background image shows through.
         let bg = Color::Reset;
         let border = Style::default().fg(CAT_PEACH).bg(bg);
 
@@ -11862,9 +10982,6 @@ impl App {
         );
     }
 
-    /// Draw the right-click context menu at its fixed rect: a bordered box with the
-    /// clicked thing's name in the top border and one item per row (the hovered /
-    /// keyboard-selected one highlighted). Anchored near the click, not centered.
     fn render_menu(&self, buf: &mut Buffer) {
         let Some(m) = self.menu.as_ref() else { return };
         let area = buf.area;
@@ -11874,12 +10991,10 @@ impl App {
 
         draw_box(buf, x0, y0, w, h, border);
 
-        // Width-aware writer (a wide session/tab name must not corrupt the border).
         let put = |buf: &mut Buffer, x: u16, y: u16, max_x: u16, s: &str, st: Style| {
             put_str(buf, x, y, max_x, s, st);
         };
 
-        // Title in the top border.
         put(
             buf,
             x0 + 1,
@@ -11888,8 +11003,6 @@ impl App {
             &format!(" {} ", m.title),
             border.add_modifier(Modifier::BOLD),
         );
-        // Items: one per interior row, padded to the full inner width so the
-        // hover highlight reads as a bar.
         let inner_w = w.saturating_sub(2) as usize;
         for (i, (label, _)) in m.items.iter().enumerate() {
             let yy = y0 + 1 + i as u16;
@@ -11922,8 +11035,7 @@ impl App {
         let h = ((area.height as u32 * 3 / 5) as u16).clamp(6.min(maxh), maxh);
         let x0 = (area.width.saturating_sub(w)) / 2;
         let y0 = (area.height.saturating_sub(h)) / 2;
-        // Transparent interior (default terminal bg) so a background image shows through;
-        // only the border + selection highlights remain painted.
+        // Transparent interior so a background image shows through.
         let bg = Color::Reset;
         let border = Style::default().fg(CAT_MAUVE).bg(bg);
 
@@ -11965,7 +11077,6 @@ impl App {
             return;
         }
 
-        // Scroll the viewport so the selected row is always visible.
         let visible = h.saturating_sub(2) as usize; // rows between the borders
         let start = if visible > 0 && sel >= visible {
             sel + 1 - visible
@@ -12036,7 +11147,6 @@ fn loc_live(state: &State, l: &Loc) -> bool {
         .is_some_and(|w| w.tab(&l.tab).is_some())
 }
 
-/// Does the gap cell `(x, y)` border the focused rect (so its divider is accented)?
 fn divider_touches(fr: &PaneRect, x: u16, y: u16) -> bool {
     let in_y = y >= fr.y && y < fr.y + fr.rows;
     let in_x = x >= fr.x && x < fr.x + fr.cols;
@@ -12045,12 +11155,7 @@ fn divider_touches(fr: &PaneRect, x: u16, y: u16) -> bool {
     vert || horiz
 }
 
-/// Truncate a tab-chip label on DISPLAY width (max 12 cells; `comm` is already ≤15 on
-/// Linux but a long process or custom name still shouldn't dominate the bar), adding an
-/// ellipsis when clipped. Width-aware so CJK/emoji names truncate cleanly.
-/// `/Users/me/dev/copad` → `~/dev/copad`, so a row spends its width on the part that
-/// distinguishes it. Left alone when it isn't under `$HOME`.
-/// `$HOME`, else `/` — where the new-session browser opens.
+/// `$HOME`, else `/`: where the new-session browser opens.
 fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -12072,8 +11177,6 @@ fn home_short_in(path: &std::path::Path, home: Option<&std::path::Path>) -> Stri
     }
 }
 
-/// Truncate `s` to at most `max` DISPLAY columns (`…` marks the cut), so a CJK prompt in a
-/// picker row can't overrun its box the way a char count would.
 fn clip_width(s: &str, max: usize) -> String {
     if s.width() <= max {
         return s.to_string();
@@ -12095,7 +11198,6 @@ fn clip_width(s: &str, max: usize) -> String {
     out
 }
 
-/// Columns the help gives the key column before the description.
 const HELP_KEY_W: usize = 14;
 
 /// Push one action's help row, wrapping its chords onto continuation rows (description on the
@@ -12140,9 +11242,8 @@ fn fold_tab_range(tabs: &[(u8, String)]) -> Option<String> {
     conventional.then(|| format!("{stem}1–9"))
 }
 
-/// Draw an overlay box: a rounded-free single-line border in `border`, and a CLEARED interior
-/// (the default terminal background, so a background image shows through). Every overlay
-/// (switcher, resume picker, prompt, confirm, menu, notification center) draws through here.
+/// Draw an overlay box: a single-line border in `border` and a cleared interior (the default
+/// background, so a background image shows through). Every overlay draws through here.
 fn draw_box(buf: &mut Buffer, x0: u16, y0: u16, w: u16, h: u16, border: Style) {
     let area = buf.area;
     if w == 0 || h == 0 {
@@ -12176,12 +11277,9 @@ fn draw_box(buf: &mut Buffer, x0: u16, y0: u16, w: u16, h: u16, border: Style) {
     }
 }
 
-/// Write `s` at `(x, y)` by DISPLAY width, stopping before column `max_x` (exclusive).
-///
-/// A char count is wrong for any wide glyph: a Korean session name is 2 columns per char,
-/// so counting chars ran rows past the box border and misaligned the padding. A wide glyph
-/// that would straddle `max_x` is dropped rather than half-drawn, and its trailing cell is
-/// blanked + skipped so the client's diff stays in step. Returns the column after the text.
+/// Write `s` at `(x, y)` by display width, stopping before column `max_x` (exclusive). A wide
+/// glyph that would straddle `max_x` is dropped, and its trailing cell blanked and skipped so
+/// the client's diff stays in step. Returns the column after the text.
 fn put_str(buf: &mut Buffer, mut x: u16, y: u16, max_x: u16, s: &str, st: Style) -> u16 {
     for ch in s.chars() {
         let cw = UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
@@ -12209,10 +11307,9 @@ fn put_str(buf: &mut Buffer, mut x: u16, y: u16, max_x: u16, s: &str, st: Style)
     x
 }
 
-/// Fit `s` to EXACTLY `width` DISPLAY columns: clipped by columns, then padded with spaces.
-/// A `{:<width$}` counts chars, which left a CJK row's highlight bar short of the box edge;
-/// and clipping must happen here rather than in the writer, because a wide glyph dropped at
-/// the edge leaves one column the padding never reaches.
+/// Fit `s` to exactly `width` display columns: clipped, then padded with spaces. Clipping lives
+/// here rather than in the writer because a wide glyph dropped at the edge leaves one column
+/// the padding never reaches.
 fn pad_width(s: &str, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0usize;
@@ -12244,14 +11341,6 @@ fn tail_width(s: &str, max: usize) -> String {
     s[start..].to_string()
 }
 
-/// How closely a space's pane directory `pane` relates to `target`, the directory a
-/// conversation ran in. Higher is better; `None` = unrelated.
-///
-/// Both containment directions count, because either can be the space the user thinks of as
-/// "that project": a `/repo` conversation should find a space sitting in `/repo/src`, and a
-/// `/repo/src` conversation should find a space sitting at `/repo`. Among containing spaces
-/// the DEEPEST wins (closest to the conversation); among nested ones the SHALLOWEST does
-/// (`/repo` beats `/repo/a/b/c` for a `/repo` conversation).
 /// How well the resume picker's filter matches one row's text: `Some(0)` = the query appears
 /// verbatim, `Some(1)` = its chars appear in order (fzf-style), `None` = no match. An empty
 /// query matches everything at the top tier. Case-insensitive for ASCII, like `fuzzy_match`.
@@ -12268,9 +11357,8 @@ fn resume_rank(query: &str, hay: &str) -> Option<u8> {
     fuzzy_match(query, hay).then_some(1)
 }
 
-/// One picker row as a single padded line: `head` + as much of `title` as fits, then `right`
-/// pushed to the far edge. Padded to exactly `inner_w` display columns so the selection
-/// highlight covers the row, and never wider than that even with CJK text.
+/// One picker row as a single line padded to exactly `inner_w` display columns: `head`, as much
+/// of `title` as fits, then `right` flush to the edge.
 fn resume_line(head: &str, title: &str, right: &str, inner_w: usize) -> String {
     let right = clip_width(right, inner_w / 2);
     let avail = inner_w.saturating_sub(head.width() + right.width() + 2);
@@ -12279,6 +11367,10 @@ fn resume_line(head: &str, title: &str, right: &str, inner_w: usize) -> String {
     format!("{left}{}{right}", " ".repeat(pad))
 }
 
+/// Both containment directions count as "that project": a `/repo` conversation should find a
+/// space in `/repo/src`, and a `/repo/src` conversation a space at `/repo`. Among containing
+/// spaces the deepest wins; among nested ones the shallowest (`/repo` beats `/repo/a/b/c` for a
+/// `/repo` conversation).
 fn cwd_affinity(pane: &std::path::Path, target: &std::path::Path) -> Option<(u8, usize)> {
     let depth = pane.components().count();
     if pane == target {
@@ -12311,9 +11403,6 @@ fn clip_chip(name: &str) -> String {
     out
 }
 
-/// The human outcome message for a `reload` (tmux `source-file`): the reloaded path,
-/// any parse warnings (one per line), and the standing reminder that server-lifetime
-/// settings still need a restart. Pure so it can be asserted without spawning a server.
 fn reload_note(path: &std::path::Path, warnings: &[String]) -> String {
     let mut msg = format!("reloaded {}", path.display());
     if !warnings.is_empty() {
@@ -12331,9 +11420,8 @@ fn reload_note(path: &std::path::Path, warnings: &[String]) -> String {
     msg
 }
 
-/// Cheap gate for the usage carousel's auto-rotate: is it enabled and has the
-/// interval elapsed? `secs == 0` means off. Kept separate (and pure) so the hot
-/// 30 fps render tick avoids recomputing the page list until the interval is due.
+/// Cheap gate for the usage carousel's auto-rotate (`secs == 0` is off). Pure so the 30 fps
+/// render tick avoids recomputing the page list until the interval is due.
 fn usage_should_roll(secs: u32, elapsed: std::time::Duration) -> bool {
     secs != 0 && elapsed >= std::time::Duration::from_secs(secs as u64)
 }
@@ -12349,24 +11437,13 @@ fn wrap_page(cur: usize, delta: i32, n: usize) -> usize {
     (cur + delta).rem_euclid(n as i32) as usize
 }
 
-/// Drop `BOLD` from every composed cell that also carries `DIM`, so the two are never set
-/// together. DIM wins: an inactive pane is dimmed precisely to de-emphasise it, and a faint-bold
-/// cell is a combination terminals render inconsistently anyway.
-///
-/// This is not cosmetic — it dodges an asymmetry in ratatui's crossterm emit that otherwise
-/// produces permanent residue. `ModifierDiff` writes `NormalIntensity` (`ESC [ 22 m`) to remove
-/// DIM, and that sequence cancels BOLD as well; the mirror case is handled (removing BOLD while
-/// keeping DIM re-emits `Dim`) but removing DIM while KEEPING BOLD is not, so BOLD is silently
-/// dropped on the wire while ratatui's cached buffer still believes it is set — and a belief that
-/// does not match the screen is never repainted by an incremental diff. comux hits the transition
-/// constantly: `render_to` dims every inactive pane, so any row crossing from an inactive pane
-/// into a divider or the focused pane is exactly `DIM|BOLD -> BOLD`.
-///
-/// With the sets kept disjoint, `to` containing BOLD means BOLD lands in `added` and is re-emitted
-/// after the `NormalIntensity`, which is correct. A whole-buffer sweep rather than a fix at each
-/// call site because DIM is written by the pane loop, the sidebar's group headers and the status
-/// bar's muted labels, and the invariant has to hold no matter which of them ran.
-/// Guarded by `dim_and_bold_are_never_set_together`.
+/// Drop `BOLD` from every composed cell that also carries `DIM`. ratatui's crossterm emit
+/// removes DIM with `NormalIntensity` (`ESC [ 22 m`), which also cancels BOLD, and only the
+/// mirror case re-emits it. So a `DIM|BOLD -> BOLD` transition (an inactive pane into a divider
+/// or the focused pane) leaves ratatui believing BOLD is set when the screen lost it, and no
+/// incremental diff repaints that. DIM wins. A whole-buffer sweep because the pane loop, the
+/// sidebar's group headers and the status bar's muted labels all write DIM. Guarded by
+/// `dim_and_bold_are_never_set_together`.
 fn resolve_dim_bold(buf: &mut Buffer) {
     let (w, h) = (buf.area.width, buf.area.height);
     for y in 0..h {
@@ -12388,21 +11465,15 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Fold one process sweep into the pane-label map.
+/// Fold one process sweep into the pane-label map. `swept` is `None` when the sweep itself
+/// failed, else one answer per live pane, where a pane's `None` means it could not be
+/// resolved. Both levels RETAIN the previous label: an absent label drops the tab chip to a
+/// bare index, empties the sidebar agents list, clears the pane's agent status (swallowing the
+/// next turn-finished toast, which needs a known previous status) and makes an autosave write
+/// no agent restore command (`layout_to_persist` gates on the label).
 ///
-/// `swept` is `None` when the SWEEP ITSELF failed, and `Some(answer per live pane)`
-/// otherwise — where a pane's `None` means the sweep ran but could not resolve that
-/// one pane. Both levels RETAIN the previous label, because an absent label is never
-/// merely cosmetic: it drops the tab chip to a bare index, empties the sidebar agents
-/// list and `● N` counts, clears that pane's agent status (swallowing the next
-/// turn-finished/awaiting-input toast, which needs a KNOWN previous status), and makes
-/// an autosave landing in the window write a snapshot with NO agent restore command
-/// (`layout_to_persist` gates on the label), so the next server restart silently comes
-/// back as a bare shell. A whole-sweep failure used to blank all of that at once.
-///
-/// Returns `None` for a failed sweep (caller keeps its map untouched). On a successful
-/// sweep, panes absent from `swept` have been reaped and are dropped — so a retained
-/// label can only ever belong to a pane that still exists.
+/// Returns `None` for a failed sweep (the caller keeps its map). On success, panes absent from
+/// `swept` were reaped and are dropped, so a retained label always belongs to a live pane.
 fn merge_labels(
     prev: &HashMap<TerminalId, procinfo::Label>,
     swept: Option<Vec<(TerminalId, Option<procinfo::Label>)>>,
@@ -12448,10 +11519,9 @@ fn merge_env(base: &[(String, String)], over: &[(String, String)]) -> Vec<(Strin
     out
 }
 
-/// `env` plus a freshly minted `COPAD_MUX_PANE` identity — the `$TMUX_PANE` analogue a
-/// pane's own shell (and any hook running in it) uses to name itself back to comux. Every
+/// `env` plus a freshly minted `COPAD_MUX_PANE` identity (the `$TMUX_PANE` analogue). Every
 /// spawn path funnels through here so no pane is born anonymous; the restore path needs it
-/// most, since restored agent panes are exactly the ones that raise notifications.
+/// most, since restored agent panes are the ones that raise notifications.
 fn with_pane_token(mut env: Vec<(String, String)>) -> Vec<(String, String)> {
     env.retain(|(k, _)| k != term::PANE_TOKEN_ENV);
     env.push((term::PANE_TOKEN_ENV.to_string(), term::next_pane_token()));
@@ -12481,13 +11551,11 @@ fn restore_sessions(
     let mut active_ws: Option<WorkspaceId> = None;
 
     for (si, ps) in snap.sessions.iter().enumerate() {
-        // Phase 1: spawn+prune every tab OFF-STATE.
         let mut restored_tabs: Vec<RestoredTab> = Vec::new();
         let mut tab_paneterms: Vec<Vec<RestoredPane>> = Vec::new();
         // Parallel to `restored_tabs`: a pruned tab must not shift its owner onto the next.
         let mut tab_owner_refs: Vec<Option<u32>> = Vec::new();
         for (ti, pt) in ps.tabs.iter().enumerate() {
-            // Reject a suspiciously large tab outright (untrusted file).
             if pt.layout.leaf_count() > MAX_LEAVES_PER_TAB {
                 continue;
             }
@@ -12497,8 +11565,8 @@ fn restore_sessions(
                 restored_tabs.push(RestoredTab {
                     name: pt.name.clone(),
                     layout: spec,
-                    // Active-by-IDENTITY: flag the tab that was active by its ORIGINAL
-                    // index, so pruning earlier tabs can't misselect (codex review).
+                    // Active by identity: the original index, so pruning earlier tabs can't
+                    // misselect.
                     active: ti == ps.active_tab,
                 });
                 tab_paneterms.push(pts);
@@ -12506,10 +11574,9 @@ fn restore_sessions(
             }
         }
         if restored_tabs.is_empty() {
-            continue; // whole session died / empty → skip it
+            continue;
         }
 
-        // Phase 2: single atomic commit into State (mints ids, registers terminals).
         let idx = installed.len();
         let id = if idx == 0 {
             WorkspaceId::new("local")
@@ -12525,8 +11592,6 @@ fn restore_sessions(
             .map(PathBuf::from);
         state.set_workspace_dir(&id, dir);
 
-        // Phase 3: attach the already-spawned PaneTerms by the ids State minted (DFS order
-        // matches spawn order, since both walk the same pruned spec first-then-second).
         for (terms, pts) in per_tab_terms.into_iter().zip(tab_paneterms) {
             for (tid, (pane_term, pane_ref)) in terms.into_iter().zip(pts) {
                 if let Some(r) = pane_ref {
@@ -12573,22 +11638,18 @@ fn restore_sessions(
     })
 }
 
-/// What [`restore_sessions`] brought back.
 struct Restored {
     active: WorkspaceId,
     next_session: u64,
     owners: HashMap<TabId, TerminalId>,
-    /// `(slot 1–9, terminal)` pinned marks.
     marks: Vec<(u8, TerminalId)>,
 }
 
-/// A restored leaf's PTY and the owner `pane_ref` its leaf carried.
 type RestoredPane = (PaneTerm, Option<u32>);
 
-/// Spawn PTYs for a persisted layout, pruning any leaf whose shell can't spawn. Returns
-/// the pruned `LayoutSpec` (live leaves only) + the `PaneTerm`s in DFS pre-order, each with
-/// its leaf's owner `pane_ref`, or `None`
-/// if the whole subtree died. Enforces the depth cap and the shared pane `budget`.
+/// Spawn PTYs for a persisted layout, pruning leaves whose shell can't spawn. Returns the
+/// pruned spec and the `PaneTerm`s in DFS pre-order (each with its leaf's owner `pane_ref`),
+/// or `None` if the whole subtree died. Enforces the depth cap and the shared pane `budget`.
 fn spawn_layout(
     node: &PLayout,
     cols: u16,
@@ -12658,7 +11719,6 @@ fn spawn_layout(
                         pf,
                     ))
                 }
-                // One child died → collapse to the survivor (prune the dead branch).
                 (Some(one), None) | (None, Some(one)) => Some(one),
                 (None, None) => None,
             }
@@ -12666,11 +11726,9 @@ fn spawn_layout(
     }
 }
 
-/// The most messages one inbox holds; a full inbox drops its oldest and counts it.
 const INBOX_CAP: usize = 256;
 /// The largest message body. Anything bigger belongs in a `--result` file.
 const INBOX_BODY_MAX: usize = 16 * 1024;
-/// The longest `--result` path.
 const INBOX_RESULT_MAX: usize = 4096;
 /// The most serialized message bytes one `inbox` response carries — far below the client's
 /// response cap even for one maximal message escaped to six bytes a character.
@@ -12681,48 +11739,30 @@ const INBOX_BATCH_BYTES: usize = 1024 * 1024;
 struct Mailbox {
     next_seq: u64,
     msgs: VecDeque<control::InboxMsg>,
-    /// Dropped since the reader last acknowledged.
     dropped: u64,
 }
 
-/// What a split's new pane runs (`comux split … -- argv`): the split counterpart of
-/// [`TabLaunch`], for running a task inside an already-open tab.
 #[derive(Default)]
 struct PaneLaunch {
-    /// Overrides the split source's cwd.
     cwd: Option<PathBuf>,
-    /// Run this argv as the pane's process instead of a login shell (see [`spawn_argv`]).
     argv: Option<Vec<String>>,
-    /// Added to the pane's environment, after (so over) the usual pane variables.
     env: Vec<(String, String)>,
 }
 
-/// What a new tab runs, and where. The default is a login shell in the server's cwd, created
-/// behind the active tab.
 #[derive(Default)]
 struct TabLaunch {
     cwd: Option<PathBuf>,
-    /// Make it its session's active tab.
     activate: bool,
-    /// Run this argv as the pane's process instead of a login shell (see [`spawn_argv`]).
     argv: Option<Vec<String>>,
-    /// Added to the pane's environment, after (so over) the usual pane variables.
     env: Vec<(String, String)>,
 }
 
-/// The argv a `comux spawn` pane actually runs: `argv` handed to the user's login shell as
-/// POSITIONAL parameters — `$SHELL -l -i -c 'exec "$@"' comux-spawn <argv…>` — so PATH and
-/// profile apply exactly as in a normal pane, yet nothing is ever typed into a shell: no
-/// quoting, no line editor, no startup race that could eat or mangle the command.
-///
-/// `exec` makes the program the pane's process, so the pane ends when it does. `keep`
-/// instead runs it as a child, reports how it exited, and then becomes an interactive login
-/// shell, leaving the output (or the error) on screen. `-i` keeps an interrupted program from
-/// taking that shell down with it, and sources the same rc files a pane's shell does.
-///
-/// The `"$@"` script is POSIX; a shell that is not (fish, nu, …) is replaced by `/bin/sh` as
-/// the wrapper — the program still gets its argv verbatim, but that shell's own profile does
-/// not apply.
+/// The argv a `comux spawn` pane runs: `argv` handed to the user's login shell as positional
+/// parameters (`$SHELL -l -i -c 'exec "$@"' comux-spawn <argv…>`), so PATH and profile apply as
+/// in a normal pane while nothing is typed into a shell (no quoting, no startup race). `keep`
+/// runs it as a child instead, reports how it exited, then becomes an interactive login shell;
+/// `-i` keeps an interrupted program from taking that shell down. A non-POSIX shell (fish, nu,
+/// …) is replaced by `/bin/sh` as the wrapper, so its own profile does not apply.
 fn spawn_argv(shell: Option<&str>, argv: &[String], keep: bool) -> Vec<String> {
     const POSIX: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "mksh", "yash"];
     let posix = shell.filter(|sh| {
@@ -12773,13 +11813,9 @@ fn shell_quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', "'\\''"))
 }
 
-/// The start index of a vertical list window that keeps `active` visible when `total`
-/// items don't fit in `visible` rows (centers `active`, clamped to the ends).
-/// Update `prev` with the visible panes' current alt-screen bits and report whether any pane
-/// just CROSSED the primary↔alt boundary in EITHER direction (its bit flipped). Panes no
-/// longer visible are dropped from `prev` so a later re-appearance re-seeds cleanly (and can't
-/// spuriously fire). Split out as a pure function so the edge logic is unit-testable without a
-/// live PTY.
+/// Update `prev` with the visible panes' alt-screen bits and report whether any pane crossed
+/// the primary/alt boundary in either direction. Panes no longer visible are dropped so a
+/// later re-appearance re-seeds without firing.
 fn detect_alt_screen_transition(
     prev: &mut HashMap<TerminalId, bool>,
     visible: &[(TerminalId, bool)],
@@ -12795,7 +11831,6 @@ fn detect_alt_screen_transition(
     transitioned
 }
 
-/// Normalize two selection endpoints into `(start, end)` in reading order (row, then column).
 fn sel_bounds(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
     if (a.1, a.0) <= (b.1, b.0) {
         (a, b)
@@ -12804,9 +11839,8 @@ fn sel_bounds(a: (u16, u16), b: (u16, u16)) -> ((u16, u16), (u16, u16)) {
     }
 }
 
-/// The inclusive selected column range `[c0, c1]` for viewport `row` in a LINEAR selection
-/// `start..=end` over `cols`-wide rows (first row runs to the right edge, last row from the
-/// left edge, middle rows full-width). `None` if the row is outside the selection.
+/// The inclusive selected column range `[c0, c1]` for viewport `row` in a linear selection,
+/// or `None` if the row is outside it.
 fn sel_cols(start: (u16, u16), end: (u16, u16), cols: u16, row: u16) -> Option<(u16, u16)> {
     if cols == 0 || row < start.1 || row > end.1 {
         return None;
@@ -12817,15 +11851,11 @@ fn sel_cols(start: (u16, u16), end: (u16, u16), cols: u16, row: u16) -> Option<(
     Some((c0.min(last), c1.min(last)))
 }
 
-/// Extract the text of a linear selection from a pane snapshot (tmux-style copy). Skips
-/// wide-glyph trailing spacers (the grapheme lives on the leading cell), trims trailing
-/// whitespace per visual line, and joins rows with `\n` EXCEPT at a soft-wrap seam (a row
-/// alacritty marked `WRAPLINE` and selected to its right edge continues the same logical line).
-/// If `start` lands on a wide glyph's trailing spacer (the glyph's right half), snap it left to
-/// the leading cell — so a drag begun there includes AND highlights the whole glyph. Guarded on
-/// the previous cell being a genuine wide leading glyph, so a right-margin `LEADING_WIDE_CHAR_SPACER`
-/// (whose glyph is on the NEXT row) doesn't wrongly pull in an unrelated preceding cell. Shared by
-/// extraction and the render highlight so the tinted span and the copied text agree exactly.
+/// Snap `start` left to the leading cell when it lands on a wide glyph's trailing spacer, so
+/// a drag begun there includes and highlights the whole glyph. Guarded on the previous cell
+/// being a genuine wide leading glyph: a right-margin `LEADING_WIDE_CHAR_SPACER` has its glyph
+/// on the NEXT row. Shared by extraction and the render highlight so the tinted span and the
+/// copied text agree.
 fn sel_start_norm(snap: &crate::term::Snapshot, start: (u16, u16)) -> (u16, u16) {
     if start.0 > 0
         && let Some(row) = snap.cells.get(start.1 as usize)
@@ -12856,7 +11886,6 @@ fn word_bounds(snap: &crate::term::Snapshot, at: (u16, u16)) -> Option<((u16, u1
                 .is_none_or(|ch| WORD_STOPS.contains(ch))
     };
     let mut x = at.0 as usize;
-    // Clicked the right half of a wide glyph: start from the glyph itself.
     while x > 0 && row.get(x).is_some_and(|c| c.spacer) {
         x -= 1;
     }
@@ -12910,10 +11939,9 @@ fn extract_selection(snap: &crate::term::Snapshot, anchor: (u16, u16), head: (u1
                 }
                 line.push_str(&cell.sym);
             }
-            // A soft-wrap seam = this row (not the last) wraps into the next AND the selection
-            // reached its right edge. At a seam the row continues the SAME logical line, so keep
-            // its trailing space (trimming would fuse "word " + "next" → "wordnext") and emit no
-            // newline. Everywhere else, trim trailing whitespace and break the line.
+            // A soft-wrap seam (this row wraps into the next and the selection reached its right
+            // edge) continues the same logical line: keep the trailing space ("word " + "next")
+            // and emit no newline. Everywhere else, trim trailing whitespace and break the line.
             let soft = row < end.1
                 && snap.wrapped.get(row as usize).copied().unwrap_or(false)
                 && c1 + 1 >= cols;
@@ -12933,19 +11961,14 @@ fn extract_selection(snap: &crate::term::Snapshot, anchor: (u16, u16), head: (u1
     out
 }
 
-/// One row-group in the sidebar's `agents` half: a space header (1 row) or an agent
-/// entry (2 rows — name + `status · tool`). The two heights are why the agents half
-/// windows with [`window_start_var`] rather than the uniform [`list_window_start`].
+/// One row-group in the sidebar's `agents` half: a space header (1 row) or an agent entry.
+/// The mixed heights are why it windows with [`window_start_var`].
 enum AgentItem {
-    /// Space name + its session, emitted only when the agents span MORE than one space.
     Group(String, WorkspaceId),
-    /// Index into the `agent_rows()` vec.
     Agent(usize),
 }
 
 impl AgentItem {
-    /// `entry_h` is the configured rows-per-entry (`sidebar_density`); a group header is
-    /// always one row.
     fn rows(&self, entry_h: u16) -> u16 {
         match self {
             AgentItem::Group(..) => 1,
@@ -12953,37 +11976,30 @@ impl AgentItem {
         }
     }
 
-    /// Is this the entry for agent index `i`? (For locating the window anchor.)
     fn is_agent(&self, i: usize) -> bool {
         matches!(self, AgentItem::Agent(a) if *a == i)
     }
 }
 
-/// How many rows the attention band may take out of `region` — the agents half below its
-/// header — given how many agents are `blocked`. A quarter of the region, floored at one
-/// row, but never at the cost of the list's own floor: one entry (`entry_h` rows, per
-/// `sidebar_density`) plus the band's
-/// closing rule. A strip too short for both drops the BAND, not the map, since the list is
-/// what carries the focused-agent anchor [codex S2/C1].
+/// Rows the attention band may take from `region` (the agents half below its header) for
+/// `blocked` agents: a quarter of it, but never at the cost of the list's floor of one entry
+/// (`entry_h` rows) plus the band's closing rule. A strip too short drops the band, not the
+/// list, which carries the focused-agent anchor.
 fn band_rows(region: u16, blocked: usize, entry_h: u16) -> usize {
     let keep = 1 + entry_h; // the closing rule + one list entry
     let cap = ((region / 4).max(1) as usize).min(region.saturating_sub(keep) as usize);
     blocked.min(cap)
 }
 
-/// Do the agents live in more than one space? Decides both whether the list gets group
-/// headers and whether an attention-band row needs a `space/` prefix — the band is flat,
-/// so without it four `tab 2` rows from four sessions read identically.
-///
-/// `agent_rows()` yields agents grouped by space, so comparing neighbours is enough.
+/// Whether the agents live in more than one space. Decides the list's group headers and the
+/// attention band's `space/` prefix (the band is flat). `agent_rows()` groups by space, so
+/// comparing neighbours is enough.
 fn agents_span_spaces(rows: &[AgentRow]) -> bool {
     rows.windows(2).any(|w| w[0].space_id != w[1].space_id)
 }
 
-/// Interleave space group headers into the agent list. `agent_rows()` already yields
-/// agents grouped by space (it walks workspaces in order), so a header goes wherever the
-/// space CHANGES. Skipped entirely for a single space — the header would be pure noise
-/// and it costs a row that the agents themselves want.
+/// Interleave space group headers into the agent list wherever the space changes. Skipped for
+/// a single space, where a header would only cost an agent its row.
 fn agent_items(rows: &[AgentRow]) -> Vec<AgentItem> {
     let multi_space = agents_span_spaces(rows);
     let mut out = Vec::with_capacity(rows.len());
@@ -12998,32 +12014,24 @@ fn agent_items(rows: &[AgentRow]) -> Vec<AgentItem> {
     out
 }
 
-/// The row at which the sidebar's `agents` half starts, given what each half WANTS
-/// (its header + all its entries). A half that needs less than its share hands the
-/// slack to the other — the old fixed 50/50 spent half the strip on a 2-session list
-/// while 12 agents truncated to 7, which is the many-agents case the panel exists for.
-/// Falls back to an even split only when both halves overflow.
+/// The row where the sidebar's `agents` half starts, given what each half wants (its header
+/// plus all entries). A half needing less than its share hands the slack to the other; both
+/// overflowing splits evenly.
 fn split_sidebar(h: u16, want_spaces: u32, want_agents: u32, entry_sp: u16, entry_ag: u16) -> u16 {
-    // Each half's floor is its header plus one entry, so it scales with `sidebar_density`:
-    // a compact half needs 2 rows where a comfortable one needs 3.
+    // Each half's floor is its header plus one entry, so it scales with `sidebar_density`.
     let (floor_sp, floor_ag) = (1 + entry_sp, 1 + entry_ag);
     if h < floor_sp + floor_ag {
-        // Too short for either half to hold anything — keep the old split verbatim
-        // rather than an approximation of it [codex R2/C1].
+        // Too short for either half: the plain even split.
         return (h / 2).max(2);
     }
     let (h32, half) = (h as u32, (h / 2) as u32);
     let mid = if want_spaces <= half || want_spaces + want_agents <= h32 {
-        // Spaces fit within their share (or everything fits): give them exactly what
-        // they need and let the agents have the whole remainder.
         want_spaces
     } else if want_agents <= h32 - half {
-        // Mirror: a short agents list keeps its size, spaces absorb the slack.
         h32 - want_agents
     } else {
-        half // both overflow — split evenly
+        half
     };
-    // Always leave each half a header + one entry's worth of rows.
     (mid.min(h32) as u16).clamp(floor_sp, h - floor_ag)
 }
 
@@ -13051,10 +12059,8 @@ fn window_start_var(heights: &[u16], anchor: usize, avail: u16) -> usize {
         return 0;
     }
     let anchor = anchor.min(heights.len() - 1);
-    // Spend at most half the budget on items ABOVE the anchor — and never so much that the
-    // anchor itself no longer fits. Without the second cap a 2-row entry under a 1-row
-    // group header could be pushed out of a 2-row window by its own header, which is the
-    // opposite of what anchoring is for [codex C1].
+    // Spend at most half the budget above the anchor, and never so much that the anchor stops
+    // fitting: a 1-row group header must not push its 2-row entry out of a 2-row window.
     let cap = (avail / 2).min(avail.saturating_sub(heights[anchor]));
     let mut start = anchor;
     let mut above = 0u16;
@@ -13062,8 +12068,6 @@ fn window_start_var(heights: &[u16], anchor: usize, avail: u16) -> usize {
         start -= 1;
         above += heights[start];
     }
-    // If the tail from `start` leaves slack (anchor near the end of the list), pull the
-    // window further back so it stays full instead of trailing blank rows.
     let mut total: u16 = heights[start..]
         .iter()
         .fold(0u16, |a, &b| a.saturating_add(b));
@@ -13074,17 +12078,14 @@ fn window_start_var(heights: &[u16], anchor: usize, avail: u16) -> usize {
     start
 }
 
-/// Every session (id, name) and its tabs (id, name), for the selector resolver.
 type SelectorSnap = Vec<(WorkspaceId, Option<String>, Vec<(TabId, Option<String>)>)>;
 
-/// Why a session/tab address did not resolve: a [`control::Resp::code`] and a message.
 type AddrErr = (&'static str, String);
 
 fn addr_err(code: &'static str, msg: impl Into<String>) -> AddrErr {
     (code, msg.into())
 }
 
-/// Borrow a [`App::selector_snapshot`] as the resolver's view.
 fn selector_views(snap: &SelectorSnap) -> Vec<selector::SessionView<'_>> {
     snap.iter()
         .map(|(w, name, tabs)| selector::SessionView {
@@ -13098,20 +12099,12 @@ fn selector_views(snap: &SelectorSnap) -> Vec<selector::SessionView<'_>> {
         .collect()
 }
 
-/// The instant an agent has held `status` since: the previous stamp while the status
-/// HOLDS, else `now`. Extracted so the carry-forward is pinned by a test — the status map
-/// is rebuilt from scratch twice a second, and resetting the stamp on every pass would peg
-/// every readout at `0s` while looking perfectly correct.
-/// Now as UNIX seconds.
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-/// When the pane entered `status`, as (monotonic, UNIX seconds): the previous stamp while the
-/// status HOLDS — both halves, so the published wall-clock value never moves on its own —
-/// else `now`.
 /// For each pane, how many OTHER panes share its worktree; panes alone in theirs are left out.
 /// A linked worktree (`git worktree add`) is its own root, so agents split across the main
 /// checkout and a worktree of the same repo do not count as sharing.
@@ -13129,7 +12122,6 @@ fn worktree_peers(worktrees: &HashMap<TerminalId, PathBuf>) -> HashMap<TerminalI
         .collect()
 }
 
-/// A blocked agent's wait as a one-line detail: `approve Bash: git status`, `asks: pick a db`.
 fn wait_text(w: &agentstate::Wait) -> String {
     match w.kind {
         agentstate::WaitKind::Approval => format!("approve {}", w.what),
@@ -13138,7 +12130,6 @@ fn wait_text(w: &agentstate::Wait) -> String {
     }
 }
 
-/// The toast body for a block: loud for a permission, quiet for a question.
 fn blocked_body(wait: Option<&agentstate::Wait>) -> String {
     match wait {
         Some(w) if w.kind == agentstate::WaitKind::Approval => {
@@ -13156,8 +12147,9 @@ fn status_since(
     status: agentstate::AgentStatus,
     now: (std::time::Instant, i64),
 ) -> (std::time::Instant, i64) {
-    // A replacement agent starts its own clock, like `status_seq` starts its own episode — a
-    // new agent must not inherit "blocked 40m" from the one before it.
+    // The previous stamp while status and pid hold, both halves, so the published wall-clock
+    // value never moves on its own. A replacement agent starts its own clock and must not
+    // inherit "blocked 40m" from its predecessor.
     match prev {
         Some(p) if p.status == status && p.pid == pid => (p.since, p.since_unix),
         _ => now,
@@ -13183,12 +12175,9 @@ fn status_seq(
     }
 }
 
-/// Coarse "how long in this status" for a sidebar row: empty under a minute, then whole
-/// minutes, then hours. MINUTE granularity on purpose — a seconds-precise readout would
-/// recompose the frame (and re-diff it to every attached client) once a second forever,
-/// while the render loop's existing HH:MM rollover already guarantees a repaint at that
-/// cadence. The cost is that a bucket can be shown up to a minute late, which is invisible
-/// at this resolution.
+/// Coarse time-in-status for a sidebar row: empty under a minute, then whole minutes, then
+/// hours. Minute granularity on purpose: finer would recompose and re-diff the frame to every
+/// attached client once a second.
 fn fmt_elapsed(secs: u64) -> String {
     match secs {
         0..60 => String::new(),
@@ -13207,16 +12196,14 @@ fn list_window_start(total: usize, active: usize, visible: usize) -> usize {
     active.saturating_sub(visible / 2).min(total - visible)
 }
 
-/// Choose a contiguous window of tab chips to show when they don't all fit in `avail`
-/// columns, ALWAYS including `active` and expanding around it. Returns `(start, end,
-/// show_left_marker, show_right_marker)` — the `[start, end)` index range plus whether a
-/// `‹`/`›` overflow marker should flag hidden tabs on each side.
+/// Choose a contiguous window of tab chips that fits `avail` columns and always includes
+/// `active`. Returns `(start, end, show_left_marker, show_right_marker)`; the markers flag
+/// hidden tabs on each side.
 fn tab_window(widths: &[u16], active: usize, avail: u16) -> (usize, usize, bool, bool) {
     let n = widths.len();
     if n == 0 || avail == 0 {
         return (0, 0, false, false);
     }
-    // u32 accumulation so a huge tab count can't overflow u16.
     let total: u32 = widths.iter().map(|&w| w as u32).sum();
     if total <= avail as u32 {
         return (0, n, false, false); // everything fits — no window, no markers
@@ -13227,7 +12214,6 @@ fn tab_window(widths: &[u16], active: usize, avail: u16) -> (usize, usize, bool,
     let mut used = (widths[lo] as u32).min(inner);
     loop {
         let mut grew = false;
-        // Prefer growing right, then left, so the active tab keeps some trailing context.
         if hi + 1 < n && used + widths[hi + 1] as u32 <= inner {
             hi += 1;
             used += widths[hi] as u32;
@@ -13257,7 +12243,6 @@ fn resolve_cwd(cwd: Option<&str>) -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }
 
-/// Local `HH:MM` for the status-bar clock (via libc `localtime_r`, no chrono dep).
 fn local_hhmm() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -13272,8 +12257,7 @@ fn local_hhmm() -> String {
     format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
 }
 
-/// Local minute-of-day (`hour*60 + minute`), for the idle render loop to detect an
-/// `HH:MM` rollover. Falls back to a monotonic-ish value on error (never panics).
+/// Local minute-of-day, for the idle render loop to detect an `HH:MM` rollover.
 fn local_minute() -> u32 {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -13288,7 +12272,6 @@ fn local_minute() -> u32 {
     (tm.tm_hour.max(0) as u32) * 60 + tm.tm_min.max(0) as u32
 }
 
-/// The short hostname (before the first dot) for the status bar.
 fn hostname() -> String {
     let mut buf = [0u8; 256];
     // SAFETY: writing at most `buf.len()` bytes into our own buffer.
@@ -13403,9 +12386,8 @@ mod tests {
             (tid("t1"), label("claude", Kind::Agent)),
             (tid("t2"), label("zsh", Kind::Shell)),
         ]);
-        // The sweep itself failed: the caller must be told "no change" so the tab
-        // chips, sidebar agents list, agent statuses and the next autosave's restore
-        // commands all keep working off the last-known labels.
+        // A failed sweep reports no change, so chips, sidebar and the next autosave keep working
+        // off the last-known labels.
         assert!(merge_labels(&prev, None).is_none());
     }
 
@@ -13418,7 +12400,6 @@ mod tests {
         let next = merge_labels(
             &prev,
             Some(vec![
-                // t1 resolved to something new — the fresh answer wins.
                 (tid("t1"), Some(label("nvim", Kind::Other))),
                 // t2 missed this sweep (mid-exec / briefly a zombie) — retained, so
                 // its chip does not flicker back to a bare index for one frame.
@@ -13444,7 +12425,6 @@ mod tests {
         assert!(!next.contains_key(&tid("gone")));
     }
 
-    /// Build a snapshot from row strings (one cell per char, no wide chars, no wrap).
     fn snap(rows: &[&str]) -> Snapshot {
         let cells: Vec<Vec<CellSnap>> = rows
             .iter()
@@ -13478,12 +12458,10 @@ mod tests {
     #[test]
     fn reload_note_reports_path_warnings_and_restart_hint() {
         let path = std::path::Path::new("/home/u/.config/copad/mux.toml");
-        // Clean reload: path + restart hint, no warnings block.
         let clean = reload_note(path, &[]);
         assert!(clean.starts_with("reloaded /home/u/.config/copad/mux.toml"));
         assert!(!clean.contains("warnings:"));
         assert!(clean.contains("comux server restart"));
-        // With warnings: each is listed under a warnings header, hint still present.
         let warned = reload_note(
             path,
             &[
@@ -13526,7 +12504,6 @@ mod tests {
 
     #[test]
     fn sel_cols_linear_spans() {
-        // Single-row selection: just the [c0,c1] on that row.
         assert_eq!(sel_cols((2, 0), (5, 0), 10, 0), Some((2, 5)));
         assert_eq!(sel_cols((2, 0), (5, 0), 10, 1), None); // outside
         // Multi-row: first row runs to the right edge, middle full, last from the left.
@@ -13539,7 +12516,6 @@ mod tests {
     #[test]
     fn extract_selection_multiline_trims_trailing_ws() {
         let s = snap(&["hi   ", "yo   "]);
-        // Full both rows: trailing spaces trimmed, joined with a newline.
         assert_eq!(extract_selection(&s, (0, 0), (4, 1)), "hi\nyo");
     }
 
@@ -13605,7 +12581,6 @@ mod tests {
         let mut s = snap(&["abcde", "fgh  "]);
         s.wrapped[0] = true;
         assert_eq!(extract_selection(&s, (0, 0), (4, 1)), "abcdefgh");
-        // But a NON-wrapped row keeps the newline.
         s.wrapped[0] = false;
         assert_eq!(extract_selection(&s, (0, 0), (4, 1)), "abcde\nfgh");
     }
@@ -13630,27 +12605,22 @@ mod tests {
             &mut prev,
             &[(t.clone(), true)]
         ));
-        // Still in alt screen: no edge.
         assert!(!detect_alt_screen_transition(
             &mut prev,
             &[(t.clone(), true)]
         ));
-        // Leaves the alt screen: the true→false EXIT edge fires exactly once.
         assert!(detect_alt_screen_transition(
             &mut prev,
             &[(t.clone(), false)]
         ));
-        // Staying on the primary screen: no repeat fire.
         assert!(!detect_alt_screen_transition(
             &mut prev,
             &[(t.clone(), false)]
         ));
-        // Entering alt screen (false→true) fires the ENTER edge exactly once.
         assert!(detect_alt_screen_transition(
             &mut prev,
             &[(t.clone(), true)]
         ));
-        // Staying in alt screen: no repeat fire.
         assert!(!detect_alt_screen_transition(&mut prev, &[(t, true)]));
     }
 
@@ -13658,15 +12628,11 @@ mod tests {
     fn alt_screen_transition_drops_hidden_panes_and_never_fires_spuriously() {
         let mut prev = HashMap::new();
         let (a, b) = (tid("a"), tid("b"));
-        // Seed: pane a in alt screen (false→true enter edge fires once), pane b on primary.
-        // Then let both settle so no edge is pending.
         detect_alt_screen_transition(&mut prev, &[(a.clone(), true), (b.clone(), false)]);
         assert!(!detect_alt_screen_transition(
             &mut prev,
             &[(a.clone(), true), (b.clone(), false)]
         ));
-        // Pane a becomes hidden (only b visible): a is dropped from the store, and b staying on
-        // the primary screen must NOT be read as a transition.
         assert!(!detect_alt_screen_transition(
             &mut prev,
             &[(b.clone(), false)]
@@ -13695,7 +12661,6 @@ mod tests {
             kv(&[("DISPLAY", ":0"), ("SECRET", "x"), ("DISPLAY", ":1")]),
             &wl,
         );
-        // SECRET dropped; DISPLAY kept with the LAST value; SSH_CONNECTION absent (not added).
         assert_eq!(got, kv(&[("DISPLAY", ":1")]));
     }
 
@@ -13703,7 +12668,6 @@ mod tests {
     fn merge_env_overrides_then_appends() {
         let base = kv(&[("COPAD_MUX", "1"), ("DISPLAY", ":0")]);
         let over = kv(&[("DISPLAY", ":9"), ("SSH_CONNECTION", "1.2.3.4")]);
-        // DISPLAY overridden in place; SSH_CONNECTION appended; COPAD_MUX untouched.
         assert_eq!(
             merge_env(&base, &over),
             kv(&[
@@ -13750,8 +12714,7 @@ mod tests {
         assert_eq!(resume_rank("", "anything"), Some(0));
         assert_eq!(resume_rank("copad", "claude fix it ~/dev/copad"), Some(0));
         assert_eq!(resume_rank("COPAD", "~/dev/copad"), Some(0));
-        // Every char in order but not contiguous — a match, but a worse one. This is the
-        // coincidence that used to outrank real hits by sitting higher in recency order.
+        // Every char in order but not contiguous: a match, but a worse one.
         assert_eq!(resume_rank("copad", "claude open a pad ~/dev/x"), Some(1));
         assert_eq!(resume_rank("copad", "claude 확인해봐 ~/dev/manifest"), None);
         assert_eq!(resume_rank("zzq", "claude ~/dev/copad"), None);
@@ -13764,8 +12727,6 @@ mod tests {
         // A CJK title is 2 columns per char and must not push the row past its box.
         let line = resume_line(head, &"세션".repeat(40), "~/dev/copad · 3h", 60);
         assert_eq!(line.width(), 60);
-        // A short row is padded (so the selection highlight covers it) with the right-hand
-        // detail flush to the edge.
         let line = resume_line(head, "fix it", "~/x · 2d", 60);
         assert_eq!(line.width(), 60);
         assert!(line.ends_with("~/x · 2d"));
@@ -13776,19 +12737,15 @@ mod tests {
     fn cwd_affinity_prefers_the_closest_space_in_either_direction() {
         use std::path::Path;
         let target = Path::new("/u/dev/copad");
-        // Exact match beats everything.
         assert!(
             cwd_affinity(Path::new("/u/dev/copad"), target)
                 > cwd_affinity(Path::new("/u/dev"), target)
         );
-        // A space CONTAINING the conversation beats one nested inside it...
         assert!(
             cwd_affinity(Path::new("/u/dev"), target)
                 > cwd_affinity(Path::new("/u/dev/copad/copad-mux"), target)
         );
-        // ...and among containing spaces the deepest (closest) one wins.
         assert!(cwd_affinity(Path::new("/u/dev"), target) > cwd_affinity(Path::new("/u"), target));
-        // Among nested spaces the shallowest (closest) one wins.
         assert!(
             cwd_affinity(Path::new("/u/dev/copad/copad-mux"), target)
                 > cwd_affinity(Path::new("/u/dev/copad/copad-mux/src"), target)
@@ -13800,7 +12757,6 @@ mod tests {
 
     #[test]
     fn clip_width_counts_display_columns() {
-        // Korean is 2 columns per char: 4 chars = 8 columns, so 6 columns keeps 2 + `…`.
         assert_eq!(clip_width("세션목록", 8), "세션목록");
         assert_eq!(clip_width("세션목록", 6), "세션…");
         assert_eq!(clip_width("abcdef", 6), "abcdef");
@@ -13817,7 +12773,6 @@ mod tests {
         );
         assert_eq!(home_short_in(Path::new("/u/me"), home), "~");
         assert_eq!(home_short_in(Path::new("/opt/x"), home), "/opt/x");
-        // No HOME at all → the path is shown as-is rather than mangled.
         assert_eq!(home_short_in(Path::new("/u/me/x"), None), "/u/me/x");
     }
 
@@ -13825,9 +12780,9 @@ mod tests {
     fn usage_threshold_colors_by_severity() {
         assert_eq!(usage_threshold_color(0.0), CAT_GREEN);
         assert_eq!(usage_threshold_color(69.0), CAT_GREEN);
-        assert_eq!(usage_threshold_color(70.0), CAT_YELLOW); // 70% boundary → yellow
+        assert_eq!(usage_threshold_color(70.0), CAT_YELLOW);
         assert_eq!(usage_threshold_color(89.0), CAT_YELLOW);
-        assert_eq!(usage_threshold_color(90.0), CAT_RED); // 90% boundary → red
+        assert_eq!(usage_threshold_color(90.0), CAT_RED);
         assert_eq!(usage_threshold_color(100.0), CAT_RED);
     }
 
@@ -13841,7 +12796,6 @@ mod tests {
     fn tab_window_narrow_and_huge_are_safe() {
         assert_eq!(tab_window(&[4, 4, 4], 1, 0), (0, 0, false, false)); // no room
         assert_eq!(tab_window(&[], 0, 50), (0, 0, false, false)); // no tabs
-        // A huge tab count must not overflow the width accumulator (u32 internally).
         let many = vec![9u16; 40000];
         let (s, e, _, _) = tab_window(&many, 20000, 30);
         assert!(s <= 20000 && 20000 < e);
@@ -13853,72 +12807,45 @@ mod tests {
         let (start, end, ml, mr) = tab_window(&w, 8, 12);
         assert!(start <= 8 && 8 < end, "active 8 must be in [{start},{end})");
         assert!(ml, "tabs before the window → left marker");
-        // active is near the end, so nothing hidden on the right
         assert!(!mr || end < 10);
     }
 
     #[test]
-    /// The spaces half gets exactly what it needs when it fits, handing the whole
-    /// remainder to the agents — the case the old fixed 50/50 split wasted (a 29-row
-    /// strip with 2 sessions + 12 agents showed only 7 agents; now it shows 11).
     fn split_sidebar_gives_slack_to_the_crowded_half() {
-        // 2 sessions (1 + 2*2 = 5 rows) vs 12 agents (1 + 24 = 25): 30 > 29, but the
-        // spaces fit in their share, so they take 5 and agents get the other 24.
         assert_eq!(split_sidebar(29, 5, 25, 2, 2), 5);
-        // Mirror: 12 sessions vs 2 agents — agents keep their 5, spaces absorb 24.
         assert_eq!(split_sidebar(29, 25, 5, 2, 2), 24);
-        // Both overflow → even split (the old behaviour).
         assert_eq!(split_sidebar(29, 25, 25, 2, 2), 14);
-        // Everything fits with room to spare: spaces take theirs, agents get the rest.
         assert_eq!(split_sidebar(49, 3, 41, 2, 2), 3);
     }
 
     #[test]
-    /// Neither half may be starved below a header + one entry, and a strip too short to
-    /// reason about keeps the old even split.
     fn split_sidebar_reserves_a_minimum_for_both_halves() {
-        // 1 session (3 rows) but only 6 rows total: agents keep 3.
         assert_eq!(split_sidebar(6, 3, 99, 2, 2), 3);
-        // A huge spaces list can't push the agents header off the bottom.
         assert_eq!(split_sidebar(10, 99, 3, 2, 2), 7);
-        // Below the floor, fall back to the pre-adaptive `(h / 2).max(2)` verbatim.
         assert_eq!(split_sidebar(5, 3, 3, 2, 2), 2);
         assert_eq!(split_sidebar(1, 3, 3, 2, 2), 2);
     }
 
     #[test]
-    /// Variable-height windowing keeps the anchor visible and the window full — the
-    /// agents half mixes 1-row group headers with 2-row agent entries.
     fn window_start_var_centers_anchor_and_fills_the_window() {
         let h = [1u16, 2, 2, 1, 2, 2, 2]; // 2 groups + 5 agents = 12 rows
         assert_eq!(window_start_var(&h, 0, 12), 0); // everything fits
         assert_eq!(window_start_var(&h, 0, 6), 0); // anchor at the top
-        // Anchor at the end → clamp so the window stays full (items 3..7 = 7 rows > 6,
-        // so it starts at 4: rows 2+2+2 = 6).
         assert_eq!(window_start_var(&h, 6, 6), 4);
-        // Anchor in the middle: at most half the budget (3 rows) goes above it, so the
-        // window opens at item 2 (2 + 1 rows above the anchor) and the anchor still fits.
         assert_eq!(window_start_var(&h, 4, 6), 2);
         assert_eq!(window_start_var(&[], 0, 6), 0);
         assert_eq!(window_start_var(&h, 99, 0), 0);
     }
 
     #[test]
-    /// A compact half's floor is a header + ONE row, so `split_sidebar` must not reserve
-    /// the comfortable 3 rows for it — that would waste a row exactly where space is
-    /// scarcest, which is the whole reason to go compact.
     fn split_sidebar_floors_follow_the_entry_height() {
-        // Comfortable floors (3/3): 6 rows is the shortest strip that splits at all.
         assert_eq!(split_sidebar(6, 3, 99, 2, 2), 3);
-        // Compact floors (2/2): the same strip gives the crowded half a row back.
         assert_eq!(split_sidebar(6, 2, 99, 1, 1), 2);
         assert_eq!(split_sidebar(10, 99, 2, 1, 1), 8);
-        // Below the combined floor, the legacy fallback.
         assert_eq!(split_sidebar(3, 2, 2, 1, 1), 2);
     }
 
     #[test]
-    /// Compact entries halve what the agents list asks for, which is the point.
     fn agent_item_rows_track_the_entry_height() {
         let two = [arow("copad", "a"), arow("bots", "b")];
         let items = agent_items(&two); // header, a, header, b
@@ -13927,42 +12854,30 @@ mod tests {
     }
 
     #[test]
-    /// The band's reserve for the list shrinks with the entry it has to protect.
     fn band_rows_reserve_tracks_the_entry_height() {
-        // Comfortable: band + rule + a 2-row entry needs 4 rows.
         assert_eq!(band_rows(3, 5, 2), 0);
         assert_eq!(band_rows(4, 5, 2), 1);
-        // Compact: the same reserve is one row cheaper.
         assert_eq!(band_rows(3, 5, 1), 1);
         assert_eq!(band_rows(2, 5, 1), 0);
     }
 
     #[test]
-    /// The scroll ceiling: past it the window would trail blank rows instead of content.
     fn window_max_start_stops_where_the_tail_stops_filling() {
         let h = [1u16, 2, 2, 1, 2, 2, 2]; // 12 rows over 7 items
         assert_eq!(window_max_start(&h, 12), 0); // everything fits — nothing to scroll
         assert_eq!(window_max_start(&h, 99), 0);
-        // 6 rows of tail = items 4,5,6 (2+2+2); item 3 would make 7.
         assert_eq!(window_max_start(&h, 6), 4);
-        // 2 rows = the last item alone.
         assert_eq!(window_max_start(&h, 2), 6);
-        // Not even one item fits — clamp to the end rather than underflow.
         assert_eq!(window_max_start(&h, 1), 7);
         assert_eq!(window_max_start(&[], 6), 0);
     }
 
     #[test]
-    /// On a window barely big enough for one entry, the anchor still renders — its own
-    /// group header must not push it out (the half's floor is header + one entry).
     fn window_start_var_never_spends_the_anchors_own_rows_on_a_header() {
         let h = [1u16, 2, 1, 2];
-        // 2 rows: only the anchor entry fits, so the window opens ON it.
         assert_eq!(window_start_var(&h, 1, 2), 1);
         assert_eq!(window_start_var(&h, 3, 2), 3);
-        // 3 rows: room for the header above it too.
         assert_eq!(window_start_var(&h, 3, 3), 2);
-        // An anchor taller than the whole window can't fit either way — don't hang.
         assert_eq!(window_start_var(&h, 1, 1), 1);
     }
 
@@ -13984,11 +12899,9 @@ mod tests {
     }
 
     #[test]
-    /// Minute buckets, so the composed frame changes at most once a minute per agent
-    /// instead of once a second.
     fn fmt_elapsed_is_bucketed_to_minutes() {
         assert_eq!(fmt_elapsed(0), "");
-        assert_eq!(fmt_elapsed(59), ""); // under a minute says nothing
+        assert_eq!(fmt_elapsed(59), "");
         assert_eq!(fmt_elapsed(60), "1m");
         assert_eq!(fmt_elapsed(119), "1m");
         assert_eq!(fmt_elapsed(3599), "59m");
@@ -14021,7 +12934,6 @@ mod tests {
         // claim about the machine, and not `gpu --`, which still spends a column on absence.
         assert!(!rendered.iter().any(|r| r.starts_with("gpu")));
 
-        // A zero reading is a reading and must still appear.
         let idle = HostMetrics {
             gpu: Some(0.0),
             ..HostMetrics::default()
@@ -14057,8 +12969,6 @@ mod tests {
             ),
             "codex · working 4m — running: cargo test  (copad · tab 2)"
         );
-        // No detail: the row must look exactly as it did before the poller existed, with no
-        // placeholder standing in for information we do not have.
         assert_eq!(
             agent_popup_text("claude", "ready", 260, None, "copad · tab 1"),
             "claude · ready 4m  (copad · tab 1)"
@@ -14123,7 +13033,6 @@ mod tests {
             pid: 100,
         };
         let mut c = 5;
-        // Holding: same number, counter untouched.
         let held = status_seq(
             Some(st(AgentStatus::Working, 5)),
             100,
@@ -14131,7 +13040,6 @@ mod tests {
             &mut c,
         );
         assert_eq!((held, c), (5, 5));
-        // A change takes the next number.
         let moved = status_seq(
             Some(st(AgentStatus::Working, 5)),
             100,
@@ -14139,7 +13047,6 @@ mod tests {
             &mut c,
         );
         assert_eq!(moved, 6);
-        // A REPLACEMENT agent (new pid) in the same status is a change too.
         let replaced = status_seq(
             Some(st(AgentStatus::Ready, 6)),
             200,
@@ -14147,7 +13054,6 @@ mod tests {
             &mut c,
         );
         assert_eq!(replaced, 7);
-        // A first sighting is a change as well, and numbers are never reused.
         assert_eq!(status_seq(None, 100, AgentStatus::Ready, &mut c), 8);
         assert_eq!(status_seq(None, 100, AgentStatus::Ready, &mut c), 9);
     }
@@ -14171,25 +13077,17 @@ mod tests {
             status_since(Some(prev), 1, AgentStatus::Blocked, now),
             (then, 1_000)
         );
-        // Moved → restart the clock.
         assert_eq!(status_since(Some(prev), 1, AgentStatus::Ready, now), now);
-        // First sighting → start now.
         assert_eq!(status_since(None, 1, AgentStatus::Working, now), now);
-        // A replacement agent in the same status starts its own clock.
         assert_eq!(status_since(Some(prev), 2, AgentStatus::Blocked, now), now);
     }
 
     #[test]
-    /// The band is a shortcut layered over the list; it may never squeeze the list below
-    /// the one-entry floor stage 1 guarantees, so a short strip drops the band instead.
     fn band_rows_never_squeezes_the_list_below_one_entry() {
-        // Roomy: a quarter of the region, bounded by how many are actually blocked.
         assert_eq!(band_rows(28, 12, 2), 7);
         assert_eq!(band_rows(28, 3, 2), 3);
         assert_eq!(band_rows(28, 0, 2), 0);
-        // Tight: band + rule + one 2-row entry is exactly 4 rows.
         assert_eq!(band_rows(4, 5, 2), 1);
-        // Too tight for all three — the list wins.
         assert_eq!(band_rows(3, 5, 2), 0);
         assert_eq!(band_rows(0, 5, 2), 0);
     }
@@ -14209,8 +13107,6 @@ mod tests {
     }
 
     #[test]
-    /// Group headers appear where the space changes — but only when the agents actually
-    /// span more than one space, since a lone header just costs an agent its row.
     fn agent_items_groups_only_when_agents_span_spaces() {
         let one = [arow("copad", "a"), arow("copad", "b")];
         let items = agent_items(&one);
@@ -14219,14 +13115,12 @@ mod tests {
 
         let two = [arow("copad", "a"), arow("copad", "b"), arow("bots", "c")];
         let items = agent_items(&two);
-        // header, a, b, header, c
         assert_eq!(items.len(), 5);
         assert!(matches!(&items[0], AgentItem::Group(s, _) if s == "copad"));
         assert!(items[1].is_agent(0));
         assert!(items[2].is_agent(1));
         assert!(matches!(&items[3], AgentItem::Group(s, _) if s == "bots"));
         assert!(items[4].is_agent(2));
-        // Rows: 1 + 2 + 2 + 1 + 2
         assert_eq!(items.iter().map(|i| i.rows(2)).sum::<u16>(), 8);
     }
 
@@ -14241,9 +13135,7 @@ mod tests {
     #[test]
     fn shell_quote_neutralizes_metacharacters() {
         assert_eq!(shell_quote("claude"), "'claude'");
-        // A `;` inside an arg stays inside the quotes — not a command separator.
         assert_eq!(shell_quote("a; rm -rf /"), "'a; rm -rf /'");
-        // An embedded single quote is escaped.
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 
@@ -14260,13 +13152,9 @@ mod tests {
 
     #[test]
     fn menu_origin_flips_above_at_the_status_bar_and_clamps() {
-        // Plenty of room below → opens below-right of the pointer.
         assert_eq!(menu_origin(10, 2, 14, 5, 100, 24), (10, 3));
-        // Status-bar click (bottom row): no room below → flips fully above.
         assert_eq!(menu_origin(10, 23, 14, 5, 100, 24), (10, 18));
-        // Near the right edge → clamped left so the box fits.
         assert_eq!(menu_origin(95, 2, 14, 5, 100, 24), (86, 3));
-        // Tiny frame: clamps into bounds instead of overflowing.
         let (x0, y0) = menu_origin(0, 0, 14, 5, 10, 4);
         assert_eq!((x0, y0), (0, 0));
     }
@@ -14289,7 +13177,6 @@ mod tests {
             owner: crate::model::ClientId(1),
             held: true,
         };
-        // Interior rows y0+1..y0+3 hit items 0..2; borders and outside miss.
         assert_eq!(m.item_at(12, 19), Some(0));
         assert_eq!(m.item_at(12, 21), Some(2));
         assert_eq!(m.item_at(12, 18), None, "top border row");
@@ -14300,21 +13187,11 @@ mod tests {
     }
 }
 
-/// END-TO-END RENDER FIDELITY OF THE REAL COMPOSED SCREEN.
-///
-/// `term.rs`'s `render_repro` harness already drives compose → wire delta → client buffer →
-/// real ratatui emit → a reference emulator, and it is production-accurate. What it has never
-/// seen is the screen a user actually looks at: it composes ONE full-screen pane. The real
-/// [`App::render_to`] lays a sidebar, a split pane grid, divider columns and a status bar into
-/// a single buffer — and `ratatui::buffer::Buffer::diff`, which decides what gets shipped,
-/// carries its wide-glyph suppression state (`to_skip` / `invalidated`) across a FLAT buffer.
-/// That state therefore walks straight through every region boundary and every row boundary in
-/// the composed screen, which is precisely where a withheld cell would go unnoticed.
-///
-/// The invariant asserted here: **what the terminal ends up showing after the incremental
-/// relay must equal what it would show if the composed buffer were painted onto it from
-/// scratch.** Anything less is residue — a stale cell no later delta will ever correct, which
-/// is the failure mode this module exists to hunt.
+/// Render fidelity of the real composed screen. After the incremental relay (compose, wire
+/// delta, client buffer, ratatui emit) the reference terminal must equal the composed buffer
+/// painted from scratch; a difference is residue no later delta corrects. `Buffer::diff` carries
+/// wide-glyph suppression state across the flat buffer, so it crosses every region and row
+/// boundary of the composed screen.
 #[cfg(test)]
 mod app_render_fidelity {
     use super::*;
@@ -14415,12 +13292,8 @@ mod app_render_fidelity {
         next
     }
 
-    /// GROUND TRUTH: what a terminal shows when `buf` is painted onto it from scratch.
-    ///
-    /// Deliberately another alacritty screen rather than a direct read of the buffer, so BOTH
-    /// sides of the assertion pass through ONE width/style oracle. A direct read would compare
-    /// ratatui's model against alacritty's and fail on their known disagreements, which are not
-    /// the bug being hunted.
+    /// Ground truth: what a terminal shows when `buf` is painted onto it from scratch. It is
+    /// another alacritty screen so both sides of the assertion share one width/style oracle.
     fn painted_fresh(buf: &Buffer) -> Snapshot {
         let (cols, rows) = (buf.area.width, buf.area.height);
         let (mut t, mut p) = ref_term(cols, rows);
@@ -14440,14 +13313,10 @@ mod app_render_fidelity {
         cterm: Terminal<CrosstermBackend<Sink>>,
         ref_t: Term<VoidListener>,
         ref_p: Processor,
-        /// The server's `c.last` — the RAW composed buffer, never the client's normalized one.
-        /// Keeping it independent is what exposes a baseline that disagrees with what the
-        /// client actually holds.
+        /// The server's `c.last`, the RAW composed buffer, kept independent of the client's.
         server_last: Buffer,
-        /// The client's mirror of the screen.
         client: Buffer,
-        /// What the client believes is ON the terminal — its emit baseline, exactly as
-        /// `run_attached` keeps it now that the second diff is gone.
+        /// What the client believes is on the terminal: its emit baseline.
         painted: Buffer,
         first: bool,
     }
@@ -14470,8 +13339,6 @@ mod app_render_fidelity {
             }
         }
 
-        /// One server tick. Returns the composed buffer — the thing the client must end up
-        /// showing.
         fn tick(&mut self, app: &App) -> Buffer {
             let mut buf = Buffer::empty(self.area);
             let cursor = app.render_to(&mut buf).map(|p| (p.x, p.y));
@@ -14497,7 +13364,6 @@ mod app_render_fidelity {
                 }
             }
             self.server_last = buf.clone();
-            // `run_attached`: rebuild spacer structure, clear only on a `full` frame, emit.
             crate::client::fix_wide_spacers(&mut self.client);
             if full {
                 self.cterm.clear().expect("clear");
@@ -14512,8 +13378,7 @@ mod app_render_fidelity {
             buf
         }
 
-        /// Apply the silent full repaint (`FrameMsg::repaint`) — the self-heal. After it, the
-        /// screen must match the composed buffer even if it had drifted.
+        /// Apply the silent full repaint (`FrameMsg::repaint`).
         fn repaint(&mut self, cursor: Option<(u16, u16)>) {
             let src = self.client.clone();
             let view = (self.area.width, self.area.height);
@@ -14577,7 +13442,6 @@ mod app_render_fidelity {
             self.ref_p.advance(&mut self.ref_t, &bytes);
         }
 
-        /// The glyph the terminal is actually showing at `(x, y)`.
         fn screen_sym(&self, x: u16, y: u16) -> String {
             let snap = snapshot_grid(&self.ref_t);
             snap.cells[y as usize][x as usize].sym.clone()
@@ -14641,8 +13505,7 @@ mod app_render_fidelity {
         }
     }
 
-    /// No composed cell may carry DIM and BOLD together — see [`resolve_dim_bold`]. Checked on
-    /// every tick of the fuzz rather than once, because any widget could reintroduce it.
+    /// No composed cell may carry DIM and BOLD together; see [`resolve_dim_bold`].
     fn assert_no_dim_bold(buf: &Buffer) {
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
@@ -14822,17 +13685,14 @@ mod app_render_fidelity {
 
     #[test]
     fn a_silent_repaint_heals_a_screen_the_delta_pipeline_cannot() {
-        // What `reconcile_secs` buys, stated as a property. Corrupt the terminal behind comux's
-        // back and no number of further deltas repairs it — every buffer in the chain still
-        // agrees about that cell, so nothing is ever re-sent for it. That is precisely the
-        // residue a user ends up clearing by hand with `Ctrl-b r`. One silent repaint fixes it,
-        // and unlike `Ctrl-b r` it needs no `Clear` and therefore no visible flash.
+        // Corrupt the terminal behind comux's back: every buffer in the chain still agrees about
+        // that cell, so no delta repairs it. One silent repaint (`reconcile_secs`) does, without
+        // the `Clear` flash of `Ctrl-b r`.
         let app = build(&SHAPES[0]); // single pane: no clock or agent row to churn under us
         let mut relay = Relay::new(SHAPES[0].cols, SHAPES[0].rows);
         let composed = relay.tick(&app);
         relay.assert_shows(&composed, "baseline");
 
-        // A cell the composition keeps blank, well away from the shell's prompt.
         let (x, y) = (40u16, 15u16);
         assert_eq!(
             composed.cell(Position::new(x, y)).map(|c| c.symbol()),
@@ -14935,7 +13795,6 @@ mod app_render_fidelity {
     }
 }
 
-/// Creating panes somewhere the user is not looking must not move what they ARE looking at.
 #[cfg(test)]
 mod placement {
     use super::*;
@@ -14947,7 +13806,6 @@ mod placement {
         App::new(100, 30, Vec::new(), Vec::new(), cfg).expect("app")
     }
 
-    /// `(attached session, every session's (id, active tab, tab count))`.
     fn view(app: &App) -> (WorkspaceId, Vec<(WorkspaceId, TabId, usize)>) {
         let all = app
             .session_ids()
@@ -15004,7 +13862,6 @@ mod placement {
         assert_eq!(tab.name, "bg");
         assert_eq!(r.session.unwrap().id, after[1].0.to_string());
 
-        // Split the new background pane: still nothing visible moves.
         let token = r.pane.expect("token");
         let s = app.handle_control(&Req::Split {
             dir: "right".into(),
@@ -15029,7 +13886,6 @@ mod placement {
         assert_eq!(ws, ws_after);
         assert_eq!(before[0].1, after[0].1);
         assert_eq!(after[0].2, 2);
-        // The legacy shape still selects the new tab.
         assert!(app.handle_control(&new_tab(None, false)).ok);
         assert_ne!(view(&app).1[0].1, before[0].1);
     }
@@ -15143,8 +13999,6 @@ mod placement {
     }
 }
 
-/// `Ctrl-b C`'s directory browser, the session start directory it records, and the
-/// focus-free agent verbs (`new-session --detached`, `split -- argv`).
 #[cfg(test)]
 mod new_session_dir {
     use super::*;
@@ -15179,7 +14033,6 @@ mod new_session_dir {
         }
     }
 
-    /// Wait for the browser's off-loop listing to land.
     fn settle(app: &mut App) {
         for _ in 0..200 {
             app.poll_dir_listing();
@@ -15211,14 +14064,12 @@ mod new_session_dir {
             ]
         );
 
-        // Type to narrow, Enter descends into the best match.
         typed(&mut app, "be");
         key(&mut app, KeyCode::Enter);
         assert_eq!(browsing(&app), root.join("beta"));
         settle(&mut app);
         assert!(app.browser.as_ref().unwrap().filter.is_empty());
 
-        // Left goes back up and lands on the directory we came out of.
         key(&mut app, KeyCode::Left);
         settle(&mut app);
         assert_eq!(browsing(&app), root);
@@ -15228,14 +14079,12 @@ mod new_session_dir {
             dirbrowse::Row::Dir("beta".into())
         );
 
-        // Tab descends too; Backspace on an empty filter goes up.
         key(&mut app, KeyCode::Tab);
         assert_eq!(browsing(&app), root.join("beta"));
         key(&mut app, KeyCode::Backspace);
         assert_eq!(browsing(&app), root);
         settle(&mut app);
 
-        // A typed path jumps there.
         typed(&mut app, &format!("{}/beta/inner", root.display()));
         key(&mut app, KeyCode::Enter);
         assert_eq!(browsing(&app), root.join("beta/inner"));
@@ -15292,7 +14141,6 @@ mod new_session_dir {
         });
         assert!(r.ok, "{:?}", r.error);
         let ws = app.ws.clone();
-        // A session's own birth directory is known good without a probe.
         assert_eq!(app.session_dir(&ws).as_deref(), Some(a.as_path()));
 
         // Pretend the session started in `b` (so the focused pane, in `a`, differs). A dir
@@ -15303,7 +14151,6 @@ mod new_session_dir {
         let term = app.new_tab().expect("tab");
         assert_eq!(app.terminal_cwd(&term).as_deref(), Some(b.as_path()));
 
-        // Once the probe sees the start dir gone, a new tab falls back to the focused pane.
         std::fs::remove_dir_all(&b).unwrap();
         app.dir_probed = None;
         probe_until(&mut app, &ws, |d| d.is_none());
@@ -15313,7 +14160,6 @@ mod new_session_dir {
         let _ = std::fs::remove_dir_all(&a);
     }
 
-    /// Run the off-loop start-dir probe until `session_dir(ws)` satisfies `done`.
     fn probe_until(app: &mut App, ws: &WorkspaceId, done: impl Fn(Option<PathBuf>) -> bool) {
         for _ in 0..400 {
             app.dir_probed = None;
@@ -15354,7 +14200,6 @@ mod new_session_dir {
             Some(dir.as_path())
         );
 
-        // ...and it lists with its start dir.
         let l = app.handle_control(&Req::ListSessions);
         let row = l
             .sessions
@@ -15408,7 +14253,6 @@ mod new_session_dir {
         let made = app.resolve_pane_token(&s.pane.unwrap()).unwrap();
         assert_eq!(app.terminal_cwd(&made).as_deref(), Some(dir.as_path()));
 
-        // A refused launch splits nothing.
         for bad in [
             split(&token, &["true"], &["1X=y"], None),
             split(&token, &["a\0b"], &[], None),
@@ -15461,8 +14305,6 @@ mod new_session_dir {
     }
 }
 
-/// A-2: inside a pane, an index counts in the CALLER's tab, so `list` and every index verb
-/// agree for an agent in a tab the user is not looking at.
 #[cfg(test)]
 mod caller_index {
     use super::*;
@@ -15533,7 +14375,6 @@ mod caller_index {
             "no caller = the tab on screen"
         );
 
-        // Index 1 is the sibling — for capture as for list.
         let c = app.handle_control(&Req::CapturePane {
             target: None,
             index: Some(1),
@@ -15552,7 +14393,6 @@ mod caller_index {
         });
         assert!(s.ok, "{:?}", s.error);
 
-        // Focus moves within the background tab only.
         let f = app.handle_control(&Req::Focus {
             index: 0,
             caller: Some(agent.clone()),
@@ -15571,7 +14411,6 @@ mod caller_index {
         });
         assert!(rz.ok, "{:?}", rz.error);
 
-        // Close the sibling by index; the on-screen tab is untouched.
         let x = app.handle_control(&Req::Close {
             index: 1,
             caller: Some(agent.clone()),
@@ -15598,7 +14437,6 @@ mod caller_index {
     }
 }
 
-/// #8: tabs remember the pane that made them; children report into that pane's inbox.
 #[cfg(test)]
 mod owner_inbox {
     use super::*;
@@ -15616,7 +14454,6 @@ mod owner_inbox {
         app.token_of(&t).unwrap()
     }
 
-    /// A background tab owned by `owner`; returns its pane token and tab id.
     fn owned_tab(app: &mut App, owner: &str) -> (String, String) {
         let r = app.handle_control(&Req::NewTab {
             session: None,
@@ -15667,7 +14504,6 @@ mod owner_inbox {
         assert_eq!(tabs[0].id, tab);
         assert_eq!(tabs[0].owner.as_deref(), Some(parent.as_str()));
 
-        // An unknown owner creates nothing.
         let before = app.state.workspace(&app.ws).unwrap().tabs.len();
         let r = app.handle_control(&Req::NewTab {
             session: None,
@@ -15704,10 +14540,8 @@ mod owner_inbox {
         );
         assert!(inbox(&mut app, &parent, Some(first[0].seq)).is_empty());
 
-        // A tab without an owner has nobody to report to.
         let r = app.handle_control(&deliver("owner", Some(&parent), "x"));
         assert_eq!(r.code.as_deref(), Some("not_found"));
-        // Bad input is refused before anything is queued.
         let big = "x".repeat(INBOX_BODY_MAX + 1);
         assert_eq!(
             app.handle_control(&deliver(&parent, None, &big))
@@ -16006,7 +14840,6 @@ mod nav {
         app.handle_control(&Req::Nav { dir }).ok
     }
 
-    /// The attached session's display name.
     fn here(app: &App) -> String {
         app.session_display_name(&app.ws)
     }
@@ -16015,7 +14848,6 @@ mod nav {
         app.feed_key(KeyEvent::new(code, mods), prefix);
     }
 
-    /// `local`, then `a`, `b`, `c`, each attached as it is made.
     fn four_sessions(sort_by: SortBy) -> App {
         let mut app = app_with(sort_by);
         for n in ["a", "b", "c"] {
@@ -16116,7 +14948,6 @@ mod nav {
             KeyCode::Char('C'),
             KeyModifiers::SHIFT,
         );
-        // The browser's first row is "create here"; that opens the name prompt.
         key(&mut app, &mut prefix, KeyCode::Enter, KeyModifiers::NONE);
         app.prompt.as_mut().expect("name prompt").buf.clear();
         for c in "work".chars() {
@@ -16155,7 +14986,6 @@ mod nav {
         let mut app = app_with(SortBy::Created);
         new_session(&mut app, "a");
         new_session(&mut app, "b");
-        // A session made in the background never becomes attached.
         let r = app.handle_control(&Req::NewSession {
             name: Some("bg".into()),
             cwd: None,
@@ -16172,7 +15002,6 @@ mod nav {
         assert_eq!(names.len(), 4, "{names:?}");
     }
 
-    /// The selected switcher row's session.
     fn preselected(app: &App) -> String {
         let p = app.popup.as_ref().expect("open");
         match &app.popup_items(p.tab, &p.filter)[p.sel].target {
@@ -16189,7 +15018,6 @@ mod nav {
             select(&mut app, "a");
             app.open_popup();
             assert_eq!(preselected(&app), "b", "{sort:?}");
-            // Enter switches there: Ctrl-f Enter is the Alt-Tab toggle.
             let mut prefix = Prefix::default();
             key(&mut app, &mut prefix, KeyCode::Enter, KeyModifiers::NONE);
             assert_eq!(here(&app), "b", "{sort:?}");
@@ -16222,7 +15050,6 @@ mod nav {
         assert!(r.ok, "{:?}", r.error);
         let split = app.focused_terminal().unwrap();
         new_session(&mut app, "other");
-        // Back in `local`, the split pane is closed while we are away.
         assert!(
             app.handle_control(&Req::SelectSession {
                 index: Some(0),
@@ -16251,7 +15078,6 @@ mod nav {
         }
         select(&mut app, "alpha");
         app.cycle_session(1);
-        // Alphabetical: alpha, local, mid, zeta.
         assert_eq!(here(&app), "local");
         app.cycle_session(1);
         assert_eq!(here(&app), "mid");
@@ -16280,8 +15106,6 @@ mod overlay_width {
         buf.cell(Position::new(x, y)).unwrap().symbol().to_string()
     }
 
-    /// The overlay box whose top-left corner is the first `┌` at or after column `from`
-    /// on row `y` — `(x0, x1)`.
     fn box_cols(buf: &Buffer, y: u16) -> (u16, u16) {
         let x0 = (0..100)
             .find(|&x| sym(buf, x, y) == "┌")
@@ -16314,7 +15138,6 @@ mod overlay_width {
         for y in y0 + 1..bottom {
             assert_eq!(sym(&buf, x1, y), "│", "right border broken on row {y}");
         }
-        // The highlight bar reaches the border on the selected row (padding by width).
         let sel_y = (y0 + 1..bottom)
             .find(|&y| (x0..x1).any(|x| sym(&buf, x, y) == "▸"))
             .unwrap();
@@ -16342,7 +15165,6 @@ mod overlay_width {
                 .ok
             );
             app.open_popup();
-            // Select the Korean row (the switcher preselects the previous session).
             app.popup.as_mut().unwrap().sel = 1;
             let mut buf = Buffer::empty(Rect::new(0, 0, cols, 30));
             app.render_to(&mut buf);
@@ -16384,7 +15206,6 @@ mod overlay_width {
     fn width_helpers_count_columns() {
         assert_eq!(pad_width("한글", 6).width(), 6);
         assert_eq!(pad_width("abc", 2), "ab");
-        // A wide glyph that would straddle the edge is dropped and the gap padded.
         assert_eq!(pad_width("ab한", 3), "ab ");
         assert_eq!(tail_width("가나다█", 5), "나다█");
         assert_eq!(tail_width("abc", 10), "abc");
@@ -16508,7 +15329,6 @@ mod key_help {
             !lines.iter().any(|(k, _)| k.as_deref() == Some("1–9")),
             "the prefix table's tabs are not a range any more"
         );
-        // The global table's Alt-digits are still the conventional range.
         assert!(
             lines
                 .iter()
@@ -16591,11 +15411,9 @@ mod key_help {
         );
         std::thread::sleep(std::time::Duration::from_millis(100)); // let `stty raw` land
 
-        // A drag is comux's copy gesture: nothing reaches the app.
         app.mouse_at(ClientId(0), rect.x + 5, rect.y + 1, MouseKind::Click);
         app.mouse_at(ClientId(0), rect.x + 9, rect.y + 1, MouseKind::Drag);
         app.mouse_at(ClientId(0), rect.x + 9, rect.y + 1, MouseKind::Up);
-        // A plain click is forwarded as press+release at that cell (1-based).
         app.mouse_at(ClientId(0), rect.x + 2, rect.y + 1, MouseKind::Click);
         app.mouse_at(ClientId(0), rect.x + 2, rect.y + 1, MouseKind::Up);
 
@@ -16751,14 +15569,12 @@ mod agent_attention {
         app
     }
 
-    /// Pretend every pending finish began `secs` ago.
     fn age_pending(app: &mut App, secs: u64) {
         for p in app.pending_done.values_mut() {
             p.at -= Duration::from_secs(secs);
         }
     }
 
-    /// Pretend `term` entered its current status `secs` ago.
     fn age_status(app: &mut App, term: &TerminalId, secs: u64) {
         let st = app.agent_statuses.get_mut(term).unwrap();
         st.since -= Duration::from_secs(secs);
@@ -16810,7 +15626,6 @@ mod agent_attention {
         let rows = app.agent_rows();
         let row = rows.iter().find(|r| r.term == a).unwrap();
         assert_eq!(row.shared_marker(), "⇄2");
-        // One agent moves out: nobody shares any more.
         app.test_cwds.insert(b.clone(), dir.clone());
         sweep(&mut app, &b, 2, AgentStatus::Working);
         assert!(app.agent_peers.is_empty(), "{:?}", app.agent_peers);
@@ -16850,7 +15665,6 @@ mod agent_attention {
         sweep(&mut app, &t, 7, AgentStatus::Working);
         sweep(&mut app, &t, 7, AgentStatus::Ready);
         assert_eq!(count(&app, "done"), 0, "announced before it settled");
-        // The unseen marker does not wait: a flap clears it by itself.
         assert!(app.unseen_done(&t));
         age_pending(&mut app, 5);
         sweep(&mut app, &t, 7, AgentStatus::Ready);
@@ -16866,7 +15680,6 @@ mod agent_attention {
         new_session(&mut app, "elsewhere");
         sweep(&mut app, &t, 7, AgentStatus::Working);
         sweep(&mut app, &t, 7, AgentStatus::Ready);
-        // A Stop hook blocked the stop: straight back to work.
         sweep(&mut app, &t, 7, AgentStatus::Working);
         age_pending(&mut app, 5);
         sweep(&mut app, &t, 7, AgentStatus::Working);
@@ -16877,7 +15690,6 @@ mod agent_attention {
 
     #[test]
     fn looking_or_a_new_agent_cancels_a_pending_finish() {
-        // Acknowledged while settling: the user already saw it.
         let mut app = settling_app(3);
         let t = app.focused_terminal().unwrap();
         sweep(&mut app, &t, 7, AgentStatus::Working);
@@ -16890,7 +15702,6 @@ mod agent_attention {
             0,
             "announced a finish the user acknowledged"
         );
-        // A replacement agent in the pane: the episode is gone.
         let mut app = settling_app(3);
         let t = app.focused_terminal().unwrap();
         new_session(&mut app, "elsewhere");
@@ -16929,13 +15740,11 @@ mod agent_attention {
         );
         sweep(&mut app, &t, 7, AgentStatus::Blocked);
         assert_eq!(count(&app, "blocked"), 2, "one reminder per episode");
-        // A NEW block is a new episode and is reminded again.
         sweep(&mut app, &t, 7, AgentStatus::Working);
         sweep(&mut app, &t, 7, AgentStatus::Blocked);
         age_status(&mut app, &t, 11 * 60);
         sweep(&mut app, &t, 7, AgentStatus::Blocked);
         assert_eq!(count(&app, "blocked"), 4);
-        // An acknowledged block is not.
         sweep(&mut app, &t, 7, AgentStatus::Working);
         sweep(&mut app, &t, 7, AgentStatus::Blocked);
         app.jump_to_terminal(&t);
@@ -16946,7 +15755,6 @@ mod agent_attention {
             5,
             "reminded about a block the user went to"
         );
-        // And `0` turns reminders off.
         let mut app = self::app();
         app.cfg.notify_remind_mins = 0;
         let t = app.focused_terminal().unwrap();
@@ -16957,7 +15765,6 @@ mod agent_attention {
         assert_eq!(count(&app, "blocked"), 0);
     }
 
-    /// One sweep in which `term` runs agent `pid` and reads `status`.
     fn screen(app: &App) -> String {
         use ratatui::layout::Rect;
         let (cols, rows) = app.size();
@@ -16996,12 +15803,10 @@ mod agent_attention {
         assert_eq!(both.per_hour, Some(4.0));
         assert_eq!(both.short(), "12%");
         assert_eq!(both.long(), "124k/1.0M · $2.00 · $4.00/h");
-        // The push alone is enough for a row; the transcript alone shows the raw count.
         assert_eq!(AgentCtx::merge(None, Some(&p)).unwrap().used, 90_000);
         let bare = AgentCtx::merge(Some(poll), None).unwrap();
         assert_eq!((bare.short(), bare.pct()), ("124k".to_string(), None));
         assert_eq!(AgentCtx::merge(None, None), None);
-        // Under a minute there is no rate.
         let early = push(1, "s", Some(0.1), Some(20_000));
         assert_eq!(AgentCtx::merge(None, Some(&early)).unwrap().per_hour, None);
     }
@@ -17011,7 +15816,6 @@ mod agent_attention {
         let newer = accept_report(None, push(1, "s", Some(3.0), Some(600_000)));
         let late = accept_report(Some(&newer), push(1, "s", Some(2.5), Some(500_000)));
         assert_eq!((late.cost, late.duration_ms), (Some(3.0), Some(600_000)));
-        // A new conversation starts over.
         let fresh = accept_report(Some(&newer), push(1, "other", Some(0.2), Some(1_000)));
         assert_eq!(fresh.cost, Some(0.2));
     }
@@ -17040,7 +15844,6 @@ mod agent_attention {
             first.contains("62%") && first.contains("124k/200k"),
             "{first}"
         );
-        // The switcher row carries the fill flush right.
         let rows = app.popup_items(PopupTab::Agents, "");
         assert_eq!(rows[0].trail.as_ref().map(|t| t.0.as_str()), Some("62%"));
     }
@@ -17054,7 +15857,6 @@ mod agent_attention {
             .insert(t.clone(), push(7, "s", Some(1.0), None));
         sweep(&mut app, &t, 7, AgentStatus::Working);
         assert!(app.agent_reports.contains_key(&t));
-        // Without a resolved conversation to match, it is held but not shown.
         assert!(!app.agent_contexts.contains_key(&t));
         sweep(&mut app, &t, 8, AgentStatus::Working);
         assert!(
@@ -17102,7 +15904,6 @@ mod agent_attention {
             "single-use: a new ask finds nothing"
         );
         assert!(!app.agent_rows()[0].compact);
-        // Withdrawn before it is claimed.
         app.handle_control(&Req::Compact {
             target: target.clone(),
             cancel: false,
@@ -17144,7 +15945,6 @@ mod agent_attention {
         assert!(take(&mut app, "s3", "e"));
         app.test_sessions.insert(7, "s1".into());
         sweep(&mut app, &t, 7, AgentStatus::Working);
-        // A replacement agent drops a queued request.
         app.handle_control(&Req::Compact {
             target: target.clone(),
             cancel: false,
@@ -17248,7 +16048,6 @@ mod agent_attention {
         sweep(&mut app, &t, 7, AgentStatus::Working);
         sweep(&mut app, &t, 7, AgentStatus::Ready);
         assert!(app.unseen_done(&t));
-        // Back to work: the finish it marked is over.
         sweep(&mut app, &t, 7, AgentStatus::Working);
         assert!(!app.unseen_done(&t));
         // The next finish is a new episode, unseen again even though the pane was not acked.
@@ -17291,12 +16090,10 @@ mod agent_attention {
         sweep(&mut app, &t, 7, AgentStatus::Ready);
         let second = newest_notification(&app);
         assert_ne!(first, second);
-        // The old turn's notification says nothing about the new turn.
         assert_eq!(app.notif_read(Some(first)), 1);
         assert!(app.unseen_done(&t));
         assert_eq!(app.notif_read(Some(second)), 1);
         assert!(!app.unseen_done(&t));
-        // Dismissing it afterwards cannot make the turn unseen again.
         app.notifications.clear();
         assert!(!app.unseen_done(&t));
     }
@@ -17420,7 +16217,6 @@ mod switcher_preview {
         );
     }
 
-    /// One new session per name, returning each one's terminal.
     fn sessions(app: &mut App, names: &[&str]) -> Vec<TerminalId> {
         names
             .iter()
@@ -17491,13 +16287,11 @@ mod switcher_preview {
                 .collect()
         };
         assert_eq!(order(&app), vec![t[2].clone(), t[0].clone(), t[1].clone()]);
-        // Select `a` (working, row 1); then it turns blocked and moves to the top.
         app.popup_move(1);
         fake_agent(&mut app, &t[0], AgentStatus::Blocked);
         assert!(app.reconcile_popup(), "the index moved with the row");
         let p = app.popup.as_ref().unwrap();
         assert_eq!(order(&app)[p.sel], t[0], "still on `a`");
-        // ...and when it disappears the selection stays in range on something listed.
         app.labels.remove(&t[0]);
         app.reconcile_popup();
         let p = app.popup.as_ref().unwrap();
@@ -17621,7 +16415,6 @@ mod attention {
         app.raise_notification(t[0].clone(), "claude".into(), "done", "first".into());
         app.raise_notification(t[1].clone(), "claude".into(), "blocked", "second".into());
         assert_eq!(app.unread_count(), 2);
-        // Acting in an unrelated pane acknowledges nothing.
         app.ack_focused_bell();
         assert_eq!(app.unread_count(), 2);
         app.jump_unread();
@@ -17957,7 +16750,6 @@ mod zoom_titles {
             "the State geometry IS the zoomed size"
         );
         assert!(app.dividers().is_empty());
-        // Focusing the other pane unzooms, and the geometry goes back.
         assert!(
             app.handle_control(&Req::Focus {
                 index: 0,
@@ -18008,7 +16800,6 @@ mod zoom_titles {
             })
             .ok
         );
-        // From the zoomed pane's own shell: focus its sibling (index 0 in ITS tab).
         assert!(
             app.handle_control(&Req::Focus {
                 index: 0,
@@ -18103,7 +16894,6 @@ mod zoom_titles {
         };
         assert!(!render(&app).contains(" 0:"), "one pane: no titles");
         split(&mut app, "down");
-        // The lower pane's title sits on the divider row, whatever its first row holds.
         assert!(render(&app).contains(" 1:"), "{}", render(&app));
         app.cfg.pane_titles = false;
         assert!(!render(&app).contains(" 1:"));
@@ -18180,7 +16970,6 @@ mod copy_mode {
             "old lines dropped: {}",
             cap.text
         );
-        // Copy mode works again on the shorter history.
         enter(&mut app);
         typ(&mut app, "kkkkV");
         press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
@@ -18194,7 +16983,6 @@ mod copy_mode {
         assert!(app.scroll_pane.is_some());
         typ(&mut app, "?l12");
         press(&mut app, KeyCode::Enter, KeyModifiers::NONE);
-        // Lowercase query, uppercase text: the search is case-insensitive.
         typ(&mut app, "V");
         press(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
         let copied = app.take_key_copy().expect("a yank");
@@ -18293,7 +17081,6 @@ mod copy_mode {
         let term = app.focused_terminal().unwrap();
         let rows = app.term_rows(&term) as usize;
         let before = app.panes[&term].scroll_offset();
-        // Ctrl-u pages half a screen up and carries the cursor with it.
         press(&mut app, KeyCode::Char('u'), KeyModifiers::CONTROL);
         let after = app.panes[&term].scroll_offset();
         let half = (rows / 2).max(1);
@@ -18370,7 +17157,6 @@ mod marks {
         session(&mut app, "b");
         chord(&mut app, '\'', '2');
         assert_eq!(app.focused_terminal(), Some(a.clone()));
-        // ...and it was a jump like any other: `last` goes back.
         assert!(
             app.handle_control(&Req::Nav {
                 dir: control::NavDir::Last
@@ -18452,7 +17238,6 @@ mod marks {
             .ok
         );
         assert!(app.mark_target(5).is_none());
-        // A pinned pane that goes away empties its slot.
         app.set_mark(1, &a);
         app.panes.remove(&a);
         app.track_nav();
@@ -18514,7 +17299,6 @@ mod fork {
         let term = app.focused_terminal().unwrap();
         let token = app.panes[&term].pane_token().unwrap().to_string();
         let tabs = app.tab_ids().len();
-        // A plain shell pane (no label swept yet, or a non-agent label).
         assert_eq!(fork(&mut app, &token).code.as_deref(), Some("refused"));
         app.labels.insert(
             term.clone(),
@@ -18689,7 +17473,6 @@ mod prefix_keys {
         let km = &app.cfg.keymap;
         assert_eq!(km.prefix_action(&km.prefix_chord), Some(Action::SendPrefix));
         assert_eq!(bytes(&km.prefix_chord), Some(vec![0x01]));
-        // A shifted prefix keeps its Shift on the way into the pane.
         let shifted = config::parse_chord("S-Enter").unwrap();
         assert!(chord_key(&shifted).modifiers.contains(KeyModifiers::SHIFT));
         assert!(
@@ -18837,7 +17620,6 @@ mod prefix_keys {
             KeyModifiers::NONE,
         );
         assert_eq!(tabs(&app), 1);
-        // The session's last tab: no confirm, a word instead.
         prefixed(&mut app, &mut prefix, 'x');
         assert!(app.confirm.is_none());
         prefixed(&mut app, &mut prefix, '&');
@@ -18866,7 +17648,6 @@ mod copy_mode_vi {
         }
     }
 
-    /// A pane that printed `body` (via printf) and then a fresh marker.
     fn app_printing(body: &str) -> App {
         let app = app();
         let term = app.focused_terminal().unwrap();
@@ -18895,7 +17676,6 @@ mod copy_mode_vi {
         );
     }
 
-    /// Search up for `q` (Enter), leaving the cursor on its first character.
     fn goto(app: &mut App, q: &str) {
         typ(app, "?");
         typ(app, q);
@@ -18978,11 +17758,9 @@ mod copy_mode_vi {
         press(&mut app, KeyCode::Esc, KeyModifiers::NONE);
         let snap = app.panes[&term].snapshot();
         assert!(snap.copy.as_ref().unwrap().matches.is_empty());
-        // A committed search stays lit for n/N.
         goto(&mut app, "zz-");
         let snap = app.panes[&term].snapshot();
         assert!(!snap.copy.as_ref().unwrap().matches.is_empty());
-        // Leaving copy mode drops it.
         typ(&mut app, "q");
         assert!(app.panes[&term].snapshot().copy.is_none());
     }
@@ -19026,7 +17804,6 @@ mod copy_mode_vi {
         );
         // The copied line stays highlighted as a receipt (the server clears it on a key).
         assert!(app.selection.as_ref().is_some_and(|s| s.moved));
-        // `f` lands on an adjacent character too.
         let mut app = app_printing("ab");
         enter(&mut app);
         goto(&mut app, "ab");
@@ -19116,15 +17893,11 @@ mod arrange_keys {
                     .collect::<Vec<_>>(),
             );
         }
-        // even-horizontal: four columns on one row.
         assert!(seen[0].iter().all(|r| r.1 == seen[0][0].1));
-        // even-vertical: four rows in one column.
         assert!(seen[1].iter().all(|r| r.0 == seen[1][0].0));
-        // tiled: a 2×2 grid.
         let xs: std::collections::BTreeSet<_> = seen[4].iter().map(|r| r.0).collect();
         let ys: std::collections::BTreeSet<_> = seen[4].iter().map(|r| r.1).collect();
         assert_eq!((xs.len(), ys.len()), (2, 2));
-        // M-5 picks tiled outright; the status flash names it.
         prefixed(&mut app, KeyCode::Char('2'), KeyModifiers::ALT);
         prefixed(&mut app, KeyCode::Char('5'), KeyModifiers::ALT);
         let ys: std::collections::BTreeSet<_> = app.layout().iter().map(|r| r.y).collect();
@@ -19150,7 +17923,6 @@ mod arrange_keys {
             app.panes.contains_key(&moving),
             "the same live terminal, not a respawn"
         );
-        // A lone pane cannot be broken out.
         prefixed(&mut app, KeyCode::Char('B'), KeyModifiers::SHIFT);
         assert_eq!(app.state.workspace(&app.ws).unwrap().tabs.len(), 3);
     }
@@ -19170,7 +17942,6 @@ mod arrange_keys {
                 .collect()
         };
         let start = ids(&app);
-        // The third tab is active; S-Left moves it one place left.
         prefixed(&mut app, KeyCode::Left, KeyModifiers::SHIFT);
         assert_eq!(
             ids(&app),
@@ -19251,7 +18022,6 @@ mod pane_numbers {
         assert_eq!(app.focused_terminal().as_ref(), order.last());
         prefixed(&mut app, 'q');
         assert!(app.pane_numbers_up());
-        // Each pane shows its number in the middle, the focused one in peach.
         let mut buf = Buffer::empty(ratatui::layout::Rect::new(0, 0, 120, 40));
         app.render_to(&mut buf);
         let r = &app.layout()[2];
@@ -19265,7 +18035,6 @@ mod pane_numbers {
         press(&mut app, 'x');
         assert!(!app.pane_numbers_up());
         assert_eq!(app.focused_terminal().as_ref(), order.first());
-        // Timed out: the numbers come down on the next tick.
         prefixed(&mut app, 'q');
         app.pane_numbers = Some(std::time::Instant::now() - Duration::from_millis(1));
         assert!(app.maybe_expire_message());
@@ -19377,7 +18146,6 @@ mod lock_and_sync {
             KeyModifiers::CONTROL,
         );
         assert!(app.popup.is_none(), "locked, Ctrl-f is the program's");
-        // The prefix still works, and unlocks.
         key(
             &mut app,
             &mut prefix,
@@ -19434,7 +18202,6 @@ mod lock_and_sync {
         app.feed_paste("echo PASTE-MARK", &mut prefix);
         assert!(wait_for(&app, &first, "PASTE-MARK"));
         assert!(wait_for(&app, &second, "PASTE-MARK"));
-        // Off again: only the focused pane hears.
         key(
             &mut app,
             &mut prefix,
@@ -19645,10 +18412,8 @@ mod pane_names_and_keys {
             "control characters are dropped"
         );
         assert!(app.pane_title_text(&term, 2).contains("2:buildbox"));
-        // Saved with the layout, so a restore gets it back.
         let json = serde_json::to_string(&app.snapshot()).unwrap();
         assert!(json.contains("\"name\":\"buildbox\""), "{json}");
-        // The CLI form, and clearing it.
         let token = app.panes[&term].pane_token().unwrap().to_string();
         assert!(
             app.handle_control(&Req::RenamePane {
@@ -19695,7 +18460,6 @@ mod pane_names_and_keys {
             KeyModifiers::CONTROL,
         );
         assert_eq!(tabs(&app), before + 1, "the editor got a tab");
-        // The history went to a private file the editor reads.
         let dir = std::env::temp_dir();
         let token = app.panes[&term].pane_token().unwrap().to_string();
         let file = std::fs::read_dir(&dir)
@@ -19722,7 +18486,6 @@ mod pane_names_and_keys {
     }
 }
 
-/// The L0 host API's view of the app (decisions #166): topic values and chrome hiding.
 #[cfg(test)]
 mod host_api {
     use super::*;
@@ -19756,7 +18519,6 @@ mod host_api {
         assert!(s.tabs[1].active, "the new tab is focused");
         assert!(s.tabs[0].id.contains(":t"), "{}", s.tabs[0].id);
         assert!(!s.tabs[0].panes[0].token.is_empty());
-        // `select-tab` takes exactly that id back.
         let r = app.handle_control(&Req::SelectTab {
             index: None,
             target: Some(s.tabs[0].id.clone()),
@@ -19809,8 +18571,6 @@ mod host_api {
         assert_eq!(app.host_notifications().unread, 0);
     }
 
-    /// Opening a notification consumes it and every other one from its pane (owner: clicking
-    /// one used to leave it there); other panes' entries stay.
     #[test]
     fn opening_a_notification_removes_its_panes_entries() {
         let mut app = app();
@@ -19819,7 +18579,6 @@ mod host_api {
         app.raise_notification(first.clone(), "claude".into(), "done", "a".into());
         app.raise_notification(first.clone(), "claude".into(), "blocked", "b".into());
         app.raise_notification(second.clone(), "codex".into(), "done", "c".into());
-        // A host's row click: jump with consume.
         let token = app.token_of(&first).unwrap();
         assert!(
             app.handle_control(&Req::Jump {
@@ -19836,7 +18595,6 @@ mod host_api {
             .collect();
         assert_eq!(left, vec!["c"], "only the other pane's entry is left");
         assert_eq!(app.focused_terminal(), Some(first.clone()));
-        // A plain jump (sidebar agent row) does not consume.
         let t2 = app.token_of(&second).unwrap();
         assert!(
             app.handle_control(&Req::Jump {
@@ -19846,7 +18604,6 @@ mod host_api {
             .ok
         );
         assert_eq!(app.host_notifications().items.len(), 1);
-        // The TUI center: Enter on the selected entry consumes too.
         app.open_center();
         app.center_jump();
         assert!(app.host_notifications().items.is_empty());
@@ -19895,7 +18652,6 @@ mod host_api {
             r.ok && app.host_notifications().items.len() == 1,
             "a stale id removes nothing"
         );
-        // The center stays valid while entries go under it.
         app.open_center();
         app.center = Some(0);
         app.handle_control(&Req::NotifDismiss {
@@ -19907,8 +18663,6 @@ mod host_api {
         assert_eq!(app.center, Some(0), "open, empty");
     }
 
-    /// The center takes the mouse while open: a click on an entry opens it, a click outside
-    /// the box closes it, and nothing falls through to the panes.
     #[test]
     fn the_center_is_clickable_and_modal() {
         let mut app = app();
@@ -19920,7 +18674,6 @@ mod host_api {
         app.render_center(&mut buf);
         let ((x0, y0, x1, y1), rows) = app.center_hits.borrow().clone();
         assert_eq!(rows.len(), 1);
-        // Inside the box but not on a row: nothing happens, the center stays.
         app.center_mouse(x0 + 2, y1, MouseKind::Click);
         assert!(app.center.is_some());
         assert_eq!(app.focused_terminal(), Some(second.clone()));
@@ -19929,15 +18682,12 @@ mod host_api {
         assert!(app.center.is_none(), "opened");
         assert_eq!(app.focused_terminal(), Some(first));
         assert!(app.host_notifications().items.is_empty());
-        // Outside the box: closes.
         app.open_center();
         app.render_center(&mut buf);
         app.center_mouse(x1 + 1, y0, MouseKind::Click);
         assert!(app.center.is_none());
     }
 
-    /// Overlay delegation (decisions #170): an overlay the input opened goes to the host,
-    /// never into the frame, and the host's answer runs the TUI's own action.
     #[test]
     fn a_delegated_prompt_renames_through_the_tuis_own_commit() {
         let mut app = app();
@@ -20039,7 +18789,6 @@ mod host_api {
             claude_wk_reset: Some(far),
             codex_wk_reset: None,
         });
-        // The owner's config: weekly windows only, split by metric, rotating.
         app.cfg.usage_windows = crate::usagepoll::UsageWindows {
             claude_5h: false,
             claude_wk: true,
@@ -20073,7 +18822,6 @@ mod host_api {
                 .is_empty()
         );
         assert_eq!(u.page, 0);
-        // A native status bar pages it like the TUI's wheel, even on a narrow terminal.
         app.set_host_hidden(true, true);
         app.cols = 40;
         app.handle_control(&Req::UsagePage { delta: 1 });
@@ -20091,7 +18839,6 @@ mod host_api {
         assert!(app.take_sidebar_focus_request());
         assert!(!app.take_sidebar_focus_request(), "taken once");
         assert!(app.popup.is_none() && app.sidebar_focus.is_none());
-        // A plain terminal client keeps the TUI behaviour.
         app.set_key_client_native_sidebar(false);
         app.open_sidebar_focus();
         assert!(!app.take_sidebar_focus_request());
@@ -20120,7 +18867,6 @@ mod host_api {
             "nothing changed, nothing re-sent"
         );
 
-        // A new session shows up in the open switcher, under the same id.
         app.handle_control(&Req::NewSession {
             name: Some("later".into()),
             cwd: None,
@@ -20131,7 +18877,6 @@ mod host_api {
         assert_eq!(resent[0].0, id);
         assert!(rows_of(&resent[0].1).iter().any(|r| r.label == "later"));
 
-        // ^R on a session row: switch there and open its rename prompt.
         let later = app
             .host_tree()
             .sessions
@@ -20204,7 +18949,6 @@ mod host_api {
         d
     }
 
-    /// Wait for a host-drawn overlay's off-loop rows (decisions #172).
     fn landed(app: &mut App, id: u64) -> copad_mux_proto::OverlaySpec {
         for _ in 0..500 {
             if let Some((_, spec)) = app.poll_delegated().into_iter().find(|(i, _)| *i == id) {
@@ -20265,7 +19009,6 @@ mod host_api {
         assert!(tabs[1].rows.iter().any(|r| r.label == ".secret"));
         assert!(!tabs[0].rows.iter().any(|r| r.label == ".secret"));
         let alpha = row_id(&spec, "alpha");
-        // Descending answers this overlay and opens the next one for the same host.
         let (_, next) = app.overlay_result(id, Some(alpha), None);
         assert_eq!(next.len(), 1);
         let id2 = next[0].0;
@@ -20282,7 +19025,6 @@ mod host_api {
         let (changed, next) = app.overlay_result(id2, Some("open:here".into()), None);
         assert!(!changed && app.delegate_new_overlays(marks).is_empty());
         assert_eq!(next[0].0, id2, "still the same listing");
-        // "Create session here" opens comux's own name prompt, seeded with the directory.
         let marks = app.overlay_marks();
         let (changed, next) = app.overlay_result(id2, Some("here".into()), None);
         assert!(changed && next.is_empty());
@@ -20335,7 +19077,6 @@ mod host_api {
         assert!(rows_of(&sa).iter().any(|r| r.label == "only-in-a"));
         assert!(rows_of(&sb).iter().any(|r| r.label == "only-in-b"));
         assert!(!rows_of(&sa).iter().any(|r| r.label == "only-in-b"));
-        // An id from no snapshot of this overlay does nothing.
         assert_eq!(
             app.overlay_result(ia, Some("d:999".into()), None).1.len(),
             0
@@ -20398,7 +19139,6 @@ mod host_api {
             app.open_for_host("kill-session", None).is_err(),
             "the last session"
         );
-        // A TUI prompt another client has open is not replaced.
         app.open_rename_prompt();
         assert!(app.open_for_host("rename-session", None).is_err());
     }
@@ -20458,7 +19198,6 @@ mod tab_overview {
         press(app, &mut prefix, KeyCode::Enter, KeyModifiers::NONE);
     }
 
-    /// Tabs 1..3, visited 1 → 2 → 3 → 1: the previous tab is 3.
     fn three_tabs() -> (App, Vec<TabId>) {
         let mut app = app();
         let first = app.active_tab_id().unwrap();
@@ -20478,7 +19217,7 @@ mod tab_overview {
         assert_eq!(p.sel, 2, "the tab used before this one, not the next one");
         enter(&mut app);
         assert_eq!(app.active_tab_id(), Some(tabs[2].clone()));
-        prefixed(&mut app, 'w'); // tmux choose-window opens the same list
+        prefixed(&mut app, 'w');
         enter(&mut app);
         assert_eq!(app.active_tab_id(), Some(tabs[0].clone()));
     }
@@ -20502,7 +19241,6 @@ mod tab_overview {
             app.popup_items(PopupTab::Tabs, "@").is_empty(),
             "no tab has a blocked agent"
         );
-        // Left/Right walk the three lists and stop at the ends.
         app.open_popup();
         let mut prefix = Prefix::default();
         press(&mut app, &mut prefix, KeyCode::Right, KeyModifiers::NONE);
@@ -20544,7 +19282,6 @@ mod tab_overview {
         (*tab, tabs.clone(), selected.clone())
     }
 
-    /// Open the overview for a host and answer it with the row it preselected.
     fn host_pick_default(app: &mut App) {
         let marks = app.overlay_marks();
         app.open_for_host("tabs", None).unwrap();
@@ -20574,7 +19311,6 @@ mod tab_overview {
                 .all(|r| !r.pane.is_empty() && r.no_actions)
         );
 
-        // A live re-send stays on the tabs list and follows a new tab.
         let fourth = new_tab(&mut app, "docs");
         let (rid, again) = app.poll_delegated().remove(0);
         assert_eq!(rid, id);
@@ -20606,7 +19342,6 @@ mod tab_overview {
         let marks = app.overlay_marks();
         app.open_for_host("tabs", None).unwrap();
         let (id, _) = app.delegate_new_overlays(marks).remove(0);
-        // Another client moved this view to a different session meanwhile.
         app.handle_control(&Req::NewSession {
             name: Some("other".into()),
             cwd: None,

@@ -1,7 +1,6 @@
-//! The thin mux **client**: connects to the server (spawning one if none is
-//! running), forwards key/resize events, and blits the server's cell frames to the
-//! local terminal. Detaching (`Ctrl-b d`) or losing the connection just exits the
-//! client — the server + shells live on. This is what `copad-mux` (bare) runs.
+//! The thin mux client: connects to the server (spawning one if none is running), forwards
+//! key/resize events, and blits the server's cell frames to the local terminal. Detaching or
+//! losing the connection just exits the client; the server and shells live on.
 
 use std::io::{self, BufRead, BufReader, Read, Stdout, Write};
 use std::os::unix::net::UnixStream;
@@ -32,11 +31,9 @@ use crate::control::socket_path;
 use crate::proto::{ClientMsg, MouseKind, ServerMsg};
 
 /// Re-derive wide-char spacer cells so a client buffer (built from wire deltas that omit the
-/// trailing half of every wide glyph) matches the server's composed buffer exactly. For each
-/// row: the cell after a width≥2 symbol becomes a blank `skip` spacer; every other cell has its
-/// `skip` cleared. Using the SAME width function ratatui uses for its emit keeps the buffer
-/// self-consistent with how ratatui will render it — the fix for stale wide glyphs desyncing
-/// the row (see term.rs `relay_fidelity_pure_delta_churn`).
+/// trailing half of every wide glyph) matches the server's composed buffer: the cell after a
+/// width>=2 symbol becomes a blank `skip` spacer, every other cell has `skip` cleared. Uses the
+/// width function ratatui emits with (see term.rs `relay_fidelity_pure_delta_churn`).
 pub(crate) fn fix_wide_spacers(buf: &mut ratatui::buffer::Buffer) {
     let (w, h) = (buf.area.width, buf.area.height);
     for y in 0..h {
@@ -57,9 +54,8 @@ pub(crate) fn fix_wide_spacers(buf: &mut ratatui::buffer::Buffer) {
     }
 }
 
-/// A blank carrying `c`'s colours — used to erase a cell before writing a glyph that might not
-/// fit it. Keeps fg/bg/attributes so erasing does not flash the default background through a
-/// coloured region.
+/// A blank carrying `c`'s colours, so erasing a cell does not flash the default background
+/// through a coloured region.
 fn blank_like(c: &Cell) -> Cell {
     let mut b = Cell::EMPTY;
     b.set_symbol(" ");
@@ -69,51 +65,31 @@ fn blank_like(c: &Cell) -> Cell {
     b
 }
 
-/// Must this frame state the cursor's visibility, given what we last set it to (`None` = we have
-/// never set it) and what it should be?
-///
-/// Only on a change — except that "never set" counts as a change, because the alternate screen
-/// INHERITS whatever visibility the shell left behind. Treating unknown as shown is how a cursor
-/// hidden before comux started stays hidden for the whole session.
+/// Must this frame state the cursor's visibility, given what we last set (`None` = never set)?
+/// Only on a change, but "never set" counts as one: the alternate screen INHERITS the shell's
+/// visibility, so treating unknown as shown leaves a cursor hidden before comux started hidden.
 fn cursor_visibility_needs_stating(shown: Option<bool>, want: bool) -> bool {
     shown != Some(want)
 }
 
-/// Must the paint baseline be thrown away this frame?
-///
-/// `painted` is only a useful diff baseline while it describes what is actually ON the terminal.
-/// Three things invalidate it, and the middle one is easy to miss: a `full` frame clears the
-/// screen; a RESIZE clears it too (`Terminal::resize` does), even when the size ends up back
-/// where it started — a queued burst of resize events can read A -> B -> A within one input
-/// drain, and comparing the final size against `painted.area` sees no change while the screen
-/// has been blanked; and a view of a different size obviously cannot be compared cell for cell.
-/// Miss any of them and the next delta skips cells the terminal no longer has.
+/// Must the paint baseline be thrown away this frame? `painted` is only a useful baseline while
+/// it describes what is ON the terminal. A `full` frame clears the screen; so does a RESIZE
+/// (`Terminal::resize`), even when the size ends where it started (a queued burst can read
+/// A -> B -> A within one input drain); and a view of a different size cannot be compared cell
+/// for cell. Miss any and the next delta skips cells the terminal no longer has.
 fn baseline_is_stale(cleared: bool, resized: bool, painted: RRect, view: RRect) -> bool {
     cleared || resized || painted != view
 }
 
-/// Map the server's frame onto a viewport-sized ratatui buffer: the frame's cells at the
-/// top-left, blanks in the letterbox margin, and a blank in place of any glyph that would spill
-/// past the right edge.
-///
-/// The frame is composed at the SMALLEST attached client's size (tmux-style shared view), so it is
-/// routinely a different size from this terminal, in either direction:
-///
-///  * SMALLER — the ordinary case. The remainder is letterbox margin and must be blanked, or a
-///    margin cell the terminal lost would never come back.
-///  * BIGGER — the window after this terminal shrinks, since ratatui is resized at once while the
-///    server's frame catches up a tick later. Emitting the frame would address columns and rows
-///    past the edge.
-///
-/// And in that second window a TWO-COLUMN glyph can sit in the viewport's LAST column with its
-/// spacer outside, so printing it sends its second half off the edge — which the terminal answers
-/// by wrapping, and on the bottom row by scrolling the whole screen. Checking the glyph's starting
-/// coordinate is not enough; its WIDTH has to fit. The composition never does this to itself (a
-/// pane's last column can only hold a one-column symbol — see `term.rs::snapshot_grid`), which is
-/// why it only shows up across a resize.
-///
-/// The single definition of that mapping, shared by the client's draw and its silent repaint so
-/// the two cannot disagree, and used by the render-fidelity harness for the same reason.
+/// Map the server's frame onto a viewport-sized ratatui buffer: the frame's cells at the top-left,
+/// blanks in the letterbox margin, and a blank in place of any glyph that would spill past the
+/// right edge. The frame is composed at the SMALLEST attached client's size, so it differs from
+/// this terminal either way: smaller (the margin must be blanked or a lost margin cell never
+/// comes back) or bigger (right after this terminal shrinks, before the server catches up).
+/// Then a TWO-COLUMN glyph can sit in the last column with its spacer outside, and the terminal
+/// wraps (scrolling the screen on the bottom row), so its WIDTH has to fit, not just its start.
+/// The composition never does this itself (see `term.rs::snapshot_grid`). Shared by the draw, the
+/// silent repaint and the render-fidelity harness.
 pub(crate) fn blit_view(src: &Buffer, out: &mut Buffer) {
     let area = out.area;
     for y in 0..area.height {
@@ -125,7 +101,6 @@ pub(crate) fn blit_view(src: &Buffer, out: &mut Buffer) {
                 Some(sc) if x + 1 < area.width || UnicodeWidthStr::width(sc.symbol()) < 2 => {
                     *d = sc.clone();
                 }
-                // Letterbox margin, or a glyph with nowhere to put its second column.
                 _ => {
                     d.reset();
                 }
@@ -134,28 +109,12 @@ pub(crate) fn blit_view(src: &Buffer, out: &mut Buffer) {
     }
 }
 
-/// Re-emit every cell of `src` straight to the terminal, bypassing ratatui's incremental
-/// diff — the silent full repaint behind [`crate::proto::FrameMsg::repaint`].
-///
-/// Deliberately NOT `Terminal::clear` + draw. Clearing first flashes a blank frame, and that
-/// flicker — not its cost — is the whole reason the periodic self-heal had to ship disabled.
-/// Overwriting every cell with the content ratatui already believes is on screen is invisible,
-/// and it is precisely what heals a divergence between that belief and the real terminal: an
-/// outer emulator with its own damage tracking, a lossy link, or ratatui's wide-glyph
-/// suppression leaking across a row/pane boundary in its flat buffer. Once ratatui's cached
-/// buffer has drifted, the stale cell is "unchanged" forever and no delta will ever repaint it.
-///
-/// `skip` cells are left out, the same rule `Buffer::diff` applies: they are the trailing half
-/// of a wide glyph, already covered by printing the leading cell, and printing over one splits
-/// the glyph. ratatui's cached buffers are deliberately untouched — the content did not change,
-/// so its belief stays accurate and the next delta is still correct.
-/// Blit a server frame into `view` and emit every cell of it — what the paint path does when it
-/// has no trustworthy baseline (after a clear, or for the self-heal repaint).
-///
-/// Production reaches this by passing `None` to [`emit_view`] directly; this is the composition
-/// of the two production functions, kept for the tests and the render-fidelity harness so they
-/// exercise the real `blit_view` + `emit_view` rather than a restatement of them. Both prior
-/// harness bugs in this area came from modelling the client instead of calling it.
+/// Blit a server frame into a viewport-sized buffer and emit every cell: the paint path with no
+/// trustworthy baseline (after a clear, or the silent self-heal repaint behind
+/// [`crate::proto::FrameMsg::repaint`]). The repaint must not `Clear` first: that flash is why the
+/// periodic self-heal once shipped disabled. Production calls [`emit_view`] with `None`
+/// directly; this composition exists so tests and the render-fidelity harness exercise the real
+/// `blit_view` + `emit_view`.
 #[cfg(test)]
 pub(crate) fn repaint_all<W: Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
@@ -169,28 +128,14 @@ pub(crate) fn repaint_all<W: Write>(
     emit_view(terminal, None, &frame, cursor)
 }
 
-/// Emit `cur` to the terminal — every cell when `prev` is `None` (the silent full repaint), or
-/// just the cells that differ from `prev` (an ordinary frame).
+/// Emit `cur` to the terminal: every cell when `prev` is `None` (the silent full repaint), or
+/// just the cells that differ from `prev` (what is believed ON the terminal). This is the
+/// client's whole paint path, in place of `Terminal::draw`, so deltas and repaints position
+/// glyphs identically (two renderers placing text differently made output land, then jump).
 ///
-/// This is the client's whole paint path, replacing `Terminal::draw`. comux used to stack TWO
-/// incremental diffs: the server shipped `c.last.diff(&composed)`, and the client applied that to
-/// its mirror and then let ratatui diff AGAIN to decide what to write. Collapsing them was
-/// deferred in decisions #124 until a divergence showed up. One did, and it is visible: the two
-/// paths POSITION cells differently.
-///
-/// `CrosstermBackend::draw` omits the `MoveTo` between cells it believes are adjacent, so a run
-/// is placed by the terminal's own cursor advance — it trusts the terminal to have measured every
-/// glyph exactly as `unicode-width` did. The repaint has to re-anchor (one Nerd Font icon would
-/// otherwise skew a whole row, and the repaint would re-apply that skew on every tick). While the
-/// incremental path did not, the two disagreed about where the same text goes — so output landed
-/// in one place and the next repaint SNAPPED it somewhere else. Text appearing and then jumping
-/// sideways is not a cosmetic artefact of the self-heal; it is two renderers arguing.
-///
-/// Now there is one renderer. Diffing here also drops ratatui's `Buffer::diff`, whose wide-glyph
-/// suppression runs over a FLAT buffer and therefore leaks across row and pane boundaries in a
-/// composed screen — the hazard `term.rs::snapshot_grid`'s spacer invariant had to work around.
-/// This diff is per-cell and row-bounded, and it ships a wide glyph's leading cell (which covers
-/// both columns) while never printing over a spacer.
+/// The diff is per-cell and row-bounded, unlike `Buffer::diff`, whose wide-glyph suppression runs
+/// over a flat buffer and leaks across row and pane boundaries. It ships a wide glyph's leading
+/// cell and never prints over a spacer.
 pub(crate) fn emit_view<W: Write>(
     terminal: &mut Terminal<CrosstermBackend<W>>,
     prev: Option<&Buffer>,
@@ -199,79 +144,52 @@ pub(crate) fn emit_view<W: Write>(
 ) -> io::Result<()> {
     let (vw, vh) = (cur.area.width, cur.area.height);
     // Emit in SEGMENTS, cutting after any cell whose glyph is not plain ASCII.
-    //
-    // `CrosstermBackend::draw` omits the `MoveTo` between cells it believes are adjacent, so a run
-    // is positioned entirely by the terminal's OWN cursor advance — it trusts that the terminal
-    // measured every glyph the way `unicode-width` did. That is tolerable for the incremental
-    // path, whose runs are short and re-anchored constantly by the next diff. It is not tolerable
-    // here: a full repaint makes each row ONE run, so a single glyph the outer terminal measures
-    // differently shifts everything after it in that row — and because this repaint repeats on a
-    // timer, it would re-apply that shift every few seconds instead of being overwritten by the
-    // next delta. Turning a one-cell artefact into a permanently skewed row is the opposite of a
-    // self-heal.
-    //
-    // The everyday case is a Nerd Font / Powerline icon in a shell prompt: Private Use Area, one
-    // column by `unicode-width`, two in plenty of fonts. comux cannot see that disagreement — it
-    // lives in the outer terminal's font, not in any table we can read, which is also why the
-    // `app_render_fidelity` fuzz cannot catch it (its reference emulator shares alacritty's width
-    // table). So do not try to predict it: re-anchor after every glyph that could carry it.
-    // Starting a new `draw` call resets its cursor tracking, so each segment opens with a
-    // `MoveTo` — the damage is bounded to the one cell, and the next repaint CORRECTS the drift
-    // instead of entrenching it. ASCII needs no anchor; every terminal agrees it is one column.
-    // Owned cells, because the last-column guard below has to emit a blank that exists in no
-    // buffer. One small clone per EMITTED cell; a delta emits few, and the full repaint that
-    // emits many already allocates its frame.
+    // `CrosstermBackend::draw` positions a run by the terminal's own cursor advance, so a glyph
+    // the outer terminal measures differently from `unicode-width` (a Nerd Font / Powerline icon:
+    // one column here, two in many fonts) would shift the rest of a full-repaint row, and the
+    // timer-driven repaint would re-apply that skew forever. comux cannot see the disagreement
+    // (it lives in the outer terminal's font, which is also why the `app_render_fidelity` fuzz
+    // cannot catch it), so re-anchor with a fresh `draw` (which opens with a `MoveTo`) after
+    // every glyph that could carry it. ASCII needs no anchor.
+    // Owned cells, because the last-column guard below emits a blank that exists in no buffer.
     let mut segments: Vec<Vec<(u16, u16, Cell)>> = Vec::new();
     let mut seg: Vec<(u16, u16, Cell)> = Vec::new();
     for y in 0..vh {
         // Set after emitting a glyph that could occupy MORE columns than we think, so the next
-        // cell we would otherwise have skipped is repainted. Scoped to the row because the client
-        // runs with autowrap OFF (see `TermGuard::enter`): an overflow at the last column is
-        // clamped, not wrapped into the next row, so the damage stays inside its row.
+        // cell is repainted. Scoped to the row: autowrap is OFF (see `TermGuard::enter`), so an
+        // overflow at the last column is clamped, not wrapped into the next row.
         let mut repair_next = false;
         for x in 0..vw {
             let Some(c) = cur.cell(Position::new(x, y)) else {
                 continue;
             };
-            // Never print over a wide glyph's trailing half — the glyph before it already covers
-            // that column. (Skipping it also means `repair_next` survives to the first column we
-            // believe the glyph does NOT cover, which is the one that can have been clobbered.)
+            // Never print over a wide glyph's trailing half. Skipping it also lets `repair_next`
+            // survive to the first column the glyph does NOT cover, the one that can be clobbered.
             if c.skip {
                 continue;
             }
-            // An unchanged cell is not re-sent on an ordinary frame. `prev` is what we believe is
-            // ON THE TERMINAL, not what the server believes we hold, so this cannot inherit the
-            // server's baseline drifting away from reality.
+            // An unchanged cell is not re-sent on an ordinary frame. `prev` is what is ON THE
+            // TERMINAL, not what the server believes we hold.
             let unchanged = prev.is_some_and(|p| p.cell(Position::new(x, y)) == Some(c));
             if unchanged && !repair_next {
                 continue;
             }
             repair_next = false;
             let plain_ascii = c.symbol().len() == 1 && c.symbol().is_ascii();
-            // The LAST column cannot be repaired after the fact. With autowrap off a terminal
-            // that measures this glyph as two columns does not clamp it — it declines to write
-            // it at all (alacritty's `Handler::input` returns early), so whatever was there
-            // stays. `painted` would then record the glyph we never managed to draw and skip the
-            // cell forever, and a repaint could not remove it either. Erasing first makes the
-            // outcome independent of what was on screen: either the glyph lands, or the column
-            // is blank — the same thing a fresh paint would show, which is the property this
-            // whole emitter exists to guarantee.
+            // The LAST column cannot be repaired after the fact: with autowrap off a terminal that
+            // measures this glyph as two columns declines to write it (alacritty's
+            // `Handler::input` returns early), so the old content stays while `painted` records a
+            // glyph we never drew. Erasing first makes the outcome independent of what was there.
             if !plain_ascii && x + 1 == vw {
                 segments.push(vec![(x, y, blank_like(c))]);
             }
             seg.push((x, y, c.clone()));
             if !plain_ascii {
-                // Cut the run, so the NEXT cell is addressed with a `MoveTo` instead of being
-                // placed by the terminal's own cursor advance...
+                // Cut the run so the NEXT cell is addressed with a `MoveTo`...
                 segments.push(std::mem::take(&mut seg));
-                // ...and repaint that cell even if it did not change. Anchoring only fixes where
-                // the next emitted cell GOES; it does not undo what this glyph overwrote getting
-                // there. A one-column cell that becomes a Nerd Font icon the outer terminal draws
-                // two columns wide clobbers its neighbour, and if the neighbour is unchanged the
-                // delta would leave it clobbered until the next self-heal repaint restored it —
-                // which is precisely the "text lands, then jumps" the single emitter exists to
-                // remove. Repainting it here keeps the delta and the repaint showing the same
-                // screen.
+                // ...and repaint that cell even if unchanged: a one-column cell that becomes an
+                // icon drawn two columns wide clobbers its neighbour, which a pure delta would
+                // leave clobbered until the next self-heal repaint.
                 repair_next = true;
             }
         }
@@ -283,9 +201,8 @@ pub(crate) fn emit_view<W: Write>(
     for seg in &segments {
         backend.draw(seg.iter().map(|(x, y, c)| (*x, *y, c)))?;
     }
-    // `Backend::draw` leaves the cursor wherever it printed last; put it back where the frame
-    // wants it or the next keystroke echoes in the wrong place. Clamped to the viewport for the
-    // same reason the cells are.
+    // `Backend::draw` leaves the cursor where it printed last; put it back where the frame wants
+    // it, clamped to the viewport.
     if let Some((cx, cy)) = cursor
         && cx < vw
         && cy < vh
@@ -296,9 +213,8 @@ pub(crate) fn emit_view<W: Write>(
     Backend::flush(backend)
 }
 
-/// Standard base64 (RFC 4648, `+`/`/`, `=` padding) of arbitrary bytes — for the OSC 52
-/// clipboard payload. Hand-rolled to avoid a dependency for ~15 trivial, stable lines;
-/// round-trip-locked by a unit test so malformed padding can't slip through silently.
+/// Standard base64 (RFC 4648) of arbitrary bytes for the OSC 52 payload; hand-rolled to avoid a
+/// dependency.
 fn base64(input: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
@@ -323,10 +239,9 @@ fn base64(input: &[u8]) -> String {
     out
 }
 
-/// Set the system clipboard via OSC 52: `ESC ] 52 ; c ; <base64> BEL`. Written to stdout and
-/// flushed (before+after) so it doesn't interleave with a ratatui draw. Most terminals honor it
-/// (iTerm2/kitty/wezterm/alacritty); a terminal that ignores it simply doesn't copy (no error).
-/// NOTE: an ENCLOSING tmux/screen needs clipboard passthrough (`set-clipboard on`) to forward it.
+/// Set the system clipboard via OSC 52: `ESC ] 52 ; c ; <base64> BEL`, flushed before and after
+/// so it doesn't interleave with a ratatui draw. A terminal that ignores it simply doesn't copy;
+/// an ENCLOSING tmux/screen needs clipboard passthrough (`set-clipboard on`).
 fn write_osc52(text: &str) -> io::Result<()> {
     let mut out = io::stdout();
     out.flush()?;
@@ -334,22 +249,14 @@ fn write_osc52(text: &str) -> io::Result<()> {
     out.flush()
 }
 
-/// Ask the TERMINAL its true text-area size, bypassing the OS pty winsize (`TIOCGWINSZ`) — the
-/// recovery path when a stale winsize survives a sleep/wake that never propagated the new size to
-/// the remote pty (so `terminal.size()` keeps returning the OLD value). crossterm 0.28 silently
-/// DROPS the `CSI 8;h;w t` reply to a `CSI 18 t` query (its parser errors on the `t` final byte
-/// and clears the buffer — see `event/source/unix/tty.rs`), so that report can't be read through
-/// the event loop. Instead we use the report crossterm DOES parse: park the cursor far past the
+/// Ask the TERMINAL its true text-area size, bypassing the OS pty winsize: the recovery when a
+/// stale winsize survives a sleep/wake. crossterm 0.28 DROPS the `CSI 8;h;w t` reply to
+/// `CSI 18 t` (its parser errors on the `t` final byte), so instead park the cursor far past the
 /// bottom-right (the terminal clamps it to the real last cell), read where it landed via DSR
-/// (`crossterm::cursor::position`), then restore it. Size = clamped position + 1.
-/// `SavePosition`/`RestorePosition` round-trip to the same spot, so ratatui's cursor cache stays
-/// valid. Returns `None` if the terminal didn't respond or didn't clamp, so a non-conforming
-/// terminal can never inject a bogus giant size. Timing: a terminal that simply doesn't answer DSR
-/// bounds the call at crossterm's ~2s poll timeout (then `position()` returns `Err` → `None`); the
-/// only unbounded path is a PERSISTENT stdin poll error inside crossterm's retry loop, which means
-/// the fd is already broken and the client is dead regardless. Triggered only on the rare
-/// stale-size signals (focus regain / resume-from-sleep), so the 2s worst case is not hit in steady
-/// state.
+/// (`crossterm::cursor::position`) and restore it; size = clamped position + 1. Returns `None`
+/// if the terminal didn't respond or didn't clamp. A terminal that never answers DSR bounds the
+/// call at crossterm's ~2s poll timeout; it only runs on rare stale-size signals (focus regain,
+/// resume).
 fn probe_true_size() -> Option<(u16, u16)> {
     let mut out = io::stdout();
     execute!(out, SavePosition, MoveTo(PROBE_CORNER, PROBE_CORNER)).ok()?;
@@ -368,11 +275,9 @@ const PROBE_CORNER: u16 = 9998;
 /// so an unbounded dimension is a memory-exhaustion vector. 1000×1000 is already generous.
 const PROBE_MAX: u16 = 1000;
 
-/// Turn the clamped cursor position from [`probe_true_size`] into a `(cols, rows)` size, or `None`
-/// if it looks unreliable. Rejects any dimension at/above [`PROBE_MAX`] — which covers both the
-/// non-clamping terminal (echoes `PROBE_CORNER`) and any other absurd value — so a hostile or buggy
-/// terminal can never drive a giant allocation. Pure so the guard is unit-tested without a live
-/// terminal.
+/// Turn the clamped cursor position from [`probe_true_size`] into a `(cols, rows)` size, or
+/// `None` if unreliable: a dimension at/above [`PROBE_MAX`] is rejected, so a hostile or buggy
+/// terminal cannot drive a giant allocation. Pure so the guard is unit-testable.
 fn size_from_clamped_cursor(col: u16, row: u16) -> Option<(u16, u16)> {
     if col >= PROBE_MAX || row >= PROBE_MAX {
         return None;
@@ -380,27 +285,20 @@ fn size_from_clamped_cursor(col: u16, row: u16) -> Option<(u16, u16)> {
     Some((col.saturating_add(1).max(1), row.saturating_add(1).max(1)))
 }
 
-/// Restores the host terminal (raw mode off + leave alt screen) on drop — so a
-/// panic or an abrupt server exit never leaves the user's terminal wedged. Mouse
-/// capture is enabled lazily via [`TermGuard::enable_mouse`] when the server's `Hello`
-/// says so (server-authoritative), and disabled on drop only if it was enabled.
+/// Restores the host terminal (raw mode off, leave alt screen) on drop, so a panic or abrupt
+/// server exit never wedges it. Mouse capture is enabled lazily by `enable_mouse` and disabled
+/// on drop only if it was.
 struct TermGuard {
     mouse: bool,
     paste: bool,
-    /// We pushed kitty keyboard flags onto our terminal (popped on drop).
     keys: bool,
-    /// We changed the cursor shape (`DECSCUSR`) at some point; restored to the default on drop.
     cursor_shaped: bool,
-    /// We pushed the terminal's title (`CSI 22 t`) before setting our own; popped on drop.
     title_pushed: bool,
-    /// The terminal's `(fg, bg)`, read at attach (OSC 10/11), if it answered.
     colors: Option<(crate::proto::Rgb8, crate::proto::Rgb8)>,
     /// Keys the user typed while the colour probe was reading stdin that could not be put
     /// back on the terminal's input queue; sent as keys once the server is listening.
     typed: Vec<KeyEvent>,
-    /// The terminal answered a kitty graphics query (decisions #194).
     graphics: bool,
-    /// Images uploaded to the terminal, deleted from it on the way out.
     images_held: std::collections::HashSet<u32>,
 }
 
@@ -410,20 +308,13 @@ impl TermGuard {
         // First of all, while the terminal reports nothing on its own yet (focus reporting and
         // mouse capture come later) and before crossterm's reader exists: this reads stdin raw.
         let (colors, typed, graphics) = probe_colors();
-        // Focus reporting lets us re-probe the true terminal size when the window regains focus
-        // (e.g. after the display woke from sleep) — the sanctioned recovery for a stale OS
-        // winsize. Harmless on terminals that ignore it.
+        // Focus reporting lets us re-probe the true terminal size when the window regains focus.
         execute!(io::stdout(), EnterAlternateScreen, EnableFocusChange)?;
-        // Autowrap OFF (DECAWM, `ESC [ ? 7 l`) for the life of the alt screen.
-        //
-        // comux positions every cell itself and never relies on the terminal wrapping for it, so
-        // wrapping can only do damage. A glyph the outer terminal draws WIDER than we measured it
-        // — a Nerd Font icon in a prompt is the everyday case — would otherwise overflow the last
-        // column, and a wrapping terminal moves the WHOLE glyph to the next row, clobbering two
-        // cells there; in the bottom-right corner it scrolls the entire screen, which no amount
-        // of repainting cells can undo. With wrapping off the terminal clamps instead, so the
-        // worst a mismeasured glyph can do is cover its own row's neighbour — which `emit_view`
-        // repairs. Restored on the way out.
+        // Autowrap OFF (DECAWM) for the life of the alt screen. comux positions every cell itself,
+        // so wrapping can only do damage: a glyph the outer terminal draws WIDER than measured
+        // overflows the last column and a wrapping terminal moves the WHOLE glyph to the next row
+        // (and scrolls the screen from the bottom-right corner). With wrapping off it clamps, and
+        // `emit_view` repairs the neighbour. Restored on the way out.
         write!(io::stdout(), "\u{1b}[?7l")?;
         io::stdout().flush()?;
         let keys = enable_key_disambiguation();
@@ -440,9 +331,7 @@ impl TermGuard {
         })
     }
 
-    /// Turn on mouse capture (wheel scrollback + click-to-focus/navigate). Trade-off:
-    /// takes over native selection; most terminals let you hold Shift to bypass. Called
-    /// once when the server's `Hello { mouse: true }` arrives.
+    /// Turn on mouse capture; takes over native selection (most terminals let Shift bypass).
     fn enable_mouse(&mut self) -> io::Result<()> {
         if !self.mouse {
             execute!(io::stdout(), EnableMouseCapture)?;
@@ -451,10 +340,8 @@ impl TermGuard {
         Ok(())
     }
 
-    /// Ask our terminal for bracketed paste, so a paste or a dropped file reaches us as ONE
-    /// `Event::Paste` rather than a burst of keys — the only form in which the pane's program
-    /// can still tell it was pasted. Called once, when `Hello { paste: true }` says the server
-    /// can forward it.
+    /// Ask our terminal for bracketed paste, so a paste or dropped file reaches us as ONE
+    /// `Event::Paste`, the only form in which the pane's program can tell it was pasted.
     fn enable_paste(&mut self) -> io::Result<()> {
         if !self.paste {
             execute!(io::stdout(), EnableBracketedPaste)?;
@@ -495,11 +382,11 @@ impl Drop for TermGuard {
     }
 }
 
-/// Read our terminal's foreground and background (OSC 10/11 `?`), so panes asking for them —
-/// nvim's `background` detection, Claude Code's light/dark — get the real colours instead of
-/// silence. A DA1 query rides behind them as the sentinel every terminal answers, so one that
-/// ignores colour queries costs a round trip, not the timeout. Reads stdin RAW, so it runs
-/// before crossterm's event reader is ever started. `COPAD_MUX_COLOR_PROBE=0` skips it.
+/// Read our terminal's foreground and background (OSC 10/11 `?`) so panes asking for them (nvim
+/// `background`, Claude Code light/dark) get real colours. A DA1 query rides behind as the
+/// sentinel every terminal answers, so one that ignores colour queries costs a round trip, not
+/// the timeout. Reads stdin RAW, so it runs before crossterm's event reader starts.
+/// `COPAD_MUX_COLOR_PROBE=0` skips it.
 fn probe_colors() -> (
     Option<(crate::proto::Rgb8, crate::proto::Rgb8)>,
     Vec<KeyEvent>,
@@ -510,8 +397,7 @@ fn probe_colors() -> (
         return (None, Vec::new(), false);
     }
     let mut out = io::stdout();
-    // The kitty graphics query rides along too (decisions #194): a terminal that answers OK
-    // shows the images panes draw.
+    // The kitty graphics query rides along (decisions #194).
     if write!(
         out,
         "\u{1b}]10;?\u{1b}\\\u{1b}]11;?\u{1b}\\{GRAPHICS_QUERY}\u{1b}[c"
@@ -546,11 +432,10 @@ fn probe_colors() -> (
         }
         got.extend_from_slice(&chunk[..n as usize]);
     }
-    // A keystroke whose bytes straddle the DA1 reply would be cut in two: wait for the rest,
-    // exactly as crossterm's own parser would. A lone ESC gets a short window (nothing
-    // following it IS the Esc key, the rule every terminal parser uses); an `ESC [`/`ESC O`
-    // sequence or a UTF-8 scalar already begun is waited for until it completes — crossterm
-    // waits for those indefinitely too, and over SSH a key's bytes can arrive fragmented.
+    // A keystroke whose bytes straddle the DA1 reply would be cut in two: wait for the rest, as
+    // crossterm's parser would. A lone ESC gets a short window (nothing after it IS the Esc key);
+    // an `ESC [`/`ESC O` sequence or begun UTF-8 scalar is waited for until complete (over SSH a
+    // key's bytes can arrive fragmented).
     let started = Instant::now();
     while let Some(wait) = ends_mid_key(&without_replies(&got)) {
         let timeout = match wait {
@@ -582,11 +467,9 @@ fn probe_colors() -> (
     }
     let colors = osc_color(&got, b"10").zip(osc_color(&got, b"11"));
     let graphics = got.windows(GRAPHICS_OK.len()).any(|w| w == GRAPHICS_OK);
-    // Anything else read here is the user typing during the probe (the terminal reports
-    // nothing unasked yet). It belongs to the event reader, which has not started: put it back
-    // on the terminal's input queue (TIOCSTI — allowed for one's own controlling terminal on
-    // macOS, and on Linux with `legacy_tiocsti`), and where that is refused, decode what is
-    // left into keys the caller sends itself.
+    // Anything else read here is the user typing during the probe. It belongs to the event
+    // reader, which has not started: put it back on the input queue (TIOCSTI; allowed for one's
+    // own tty on macOS, on Linux with `legacy_tiocsti`), else decode it into keys the caller sends.
     let rest = without_replies(&got);
     let mut pushed = 0;
     for b in &rest {
@@ -617,7 +500,6 @@ fn cell_pixels() -> Option<(u16, u16)> {
     Some((ws.ws_xpixel / ws.ws_col, ws.ws_ypixel / ws.ws_row))
 }
 
-/// The kitty commands that upload an image (straight RGBA, zlib, base64 — `f=32,o=z`).
 fn upload_commands(up: &crate::proto::ImageUpload) -> Vec<u8> {
     let mut out = Vec::with_capacity(up.data.len() + 64);
     let chunks: Vec<&[u8]> = up.data.as_bytes().chunks(4096).collect();
@@ -665,11 +547,9 @@ fn place_images(
     out
 }
 
-/// Decode raw keyboard bytes into key events. Complete for what a terminal can send at this
-/// point: the probe runs before kitty keys, bracketed paste, mouse and focus reporting are
-/// turned on, so input is LEGACY keyboard encoding only — UTF-8 text, C0 controls, `Alt` as
-/// an ESC prefix, and the xterm CSI/SS3 forms of the cursor, editing and function keys with
-/// their modifier parameter.
+/// Decode raw keyboard bytes into key events. The probe runs before kitty keys, paste, mouse and
+/// focus reporting are on, so input is LEGACY encoding only: UTF-8, C0 controls, `Alt` as an ESC
+/// prefix, and the xterm CSI/SS3 cursor, editing and function keys with their modifier parameter.
 fn decode_typed(bytes: &[u8]) -> Vec<KeyEvent> {
     let mut out = Vec::new();
     let mut i = 0;
@@ -694,7 +574,6 @@ fn decode_typed(bytes: &[u8]) -> Vec<KeyEvent> {
                     continue;
                 }
                 Some(_) => {
-                    // Alt+key: decode the next key and mark it.
                     let inner = decode_typed(&bytes[i + 1..]);
                     if let Some(first) = inner.into_iter().next() {
                         let consumed = encoded_len(&bytes[i + 1..]);
@@ -744,8 +623,6 @@ fn decode_typed(bytes: &[u8]) -> Vec<KeyEvent> {
     out
 }
 
-/// One xterm CSI (`ESC [`) or SS3 (`ESC O`) key sequence, given its body (parameters and
-/// final byte). `None` for anything a keyboard does not send.
 fn decode_csi(body: &[u8], ss3: bool) -> Option<KeyEvent> {
     let (&fin, params) = body.split_last()?;
     let params = std::str::from_utf8(params).ok()?;
@@ -792,7 +669,6 @@ fn decode_csi(body: &[u8], ss3: bool) -> Option<KeyEvent> {
     Some(KeyEvent::new(code, mods))
 }
 
-/// The byte length of the UTF-8 scalar starting `bytes` (1 for anything malformed).
 fn encoded_len(bytes: &[u8]) -> usize {
     let n = match bytes.first() {
         Some(b) if *b >= 0xf0 => 4,
@@ -806,17 +682,12 @@ fn encoded_len(bytes: &[u8]) -> usize {
 /// How long a lone ESC at the end of the probe may still turn out to start a sequence.
 const LONE_ESC: Duration = Duration::from_millis(50);
 
-/// Why the probe's leftover bytes are not a whole key yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MidKey {
-    /// A lone ESC — the Esc key itself, unless more follows at once.
     LoneEsc,
-    /// An `ESC [` / `ESC O` sequence without its final byte, or a UTF-8 scalar missing
-    /// continuation bytes: only the front of a key still arriving.
     Begun,
 }
 
-/// Whether `buf` ends partway through a key, and how.
 fn ends_mid_key(buf: &[u8]) -> Option<MidKey> {
     if buf.last() == Some(&0x1b) {
         return Some(MidKey::LoneEsc);
@@ -827,7 +698,6 @@ fn ends_mid_key(buf: &[u8]) -> Option<MidKey> {
     {
         return Some(MidKey::Begun);
     }
-    // Walk back over continuation bytes to the lead byte and compare the lengths.
     let tail = buf.iter().rev().take_while(|b| **b & 0xc0 == 0x80).count();
     match buf.len().checked_sub(tail + 1).map(|i| buf[i]) {
         Some(lead) if lead >= 0xc0 && encoded_len(&[lead, 0x80, 0x80, 0x80]) > tail + 1 => {
@@ -837,15 +707,12 @@ fn ends_mid_key(buf: &[u8]) -> Option<MidKey> {
     }
 }
 
-/// `buf` minus the replies `probe_colors` asked for: the OSC 10/11 reports (BEL- or
-/// ST-terminated) and the DA1 reply.
 fn without_replies(buf: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(buf.len());
     let mut i = 0;
     while i < buf.len() {
         let rest = &buf[i..];
         if rest.starts_with(b"\x1b]10;") || rest.starts_with(b"\x1b]11;") {
-            // Up to and including BEL or ST; an unterminated one is dropped whole.
             let end = rest
                 .iter()
                 .enumerate()
@@ -858,7 +725,6 @@ fn without_replies(buf: &[u8]) -> Vec<u8> {
             i += end;
             continue;
         }
-        // A kitty graphics answer (`ESC _ G … ESC \`).
         if rest.starts_with(b"\x1b_G") {
             let end = rest
                 .windows(2)
@@ -883,7 +749,6 @@ fn without_replies(buf: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Whether `buf` holds a DA1 reply (`ESC [ ? … c`).
 fn da1_answered(buf: &[u8]) -> bool {
     buf.windows(3).enumerate().any(|(i, w)| {
         w == b"\x1b[?"
@@ -918,11 +783,9 @@ fn osc_color(buf: &[u8], code: &[u8]) -> Option<(u8, u8, u8)> {
     Some((it.next()??, it.next()??, it.next()??))
 }
 
-/// Ask our terminal for the kitty keyboard protocol's "disambiguate" reports when it speaks
-/// it (kitty, Ghostty, WezTerm, iTerm2, foot, …), so Shift+Enter, Ctrl+Enter, Ctrl+I vs Tab
-/// reach the server as distinct keys instead of the bytes a legacy terminal cannot tell
-/// apart. The server re-encodes each key for the pane it is for (`crate::keys`), so nothing
-/// changes for a pane that never asked. `COPAD_MUX_EXTENDED_KEYS=0` opts out.
+/// Ask our terminal for the kitty keyboard protocol's "disambiguate" reports when it speaks it,
+/// so Shift+Enter, Ctrl+Enter and Ctrl+I vs Tab reach the server as distinct keys. The server
+/// re-encodes each key for the pane it is for (`crate::keys`). `COPAD_MUX_EXTENDED_KEYS=0` opts out.
 fn enable_key_disambiguation() -> bool {
     if std::env::var("COPAD_MUX_EXTENDED_KEYS").is_ok_and(|v| v == "0") {
         return false;
@@ -943,33 +806,22 @@ fn enable_key_disambiguation() -> bool {
     .is_ok()
 }
 
-/// Connect to the running server, spawning a detached one if none answers, then run
-/// the attach loop until detach / server exit.
 pub fn run() -> io::Result<()> {
     run_with(AttachOpts::default())
 }
 
-/// How [`run_with`] should behave when nothing is listening on the socket.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct AttachOpts {
-    /// Refuse to birth a server; fail instead.
-    ///
-    /// Bare `comux` is connect-or-spawn, which is right for a human at a terminal and wrong
-    /// for anything supervised. A server BIRTHED by a daemon inherits that daemon's kernel
-    /// session and environment — and a long-lived supervisor has deliberately scrubbed the
-    /// volatile session vars out of its own (see `update_environment`), so such a server
-    /// would then own every pane the user ever opens with no desktop session behind it.
-    /// Nothing about that is visible after the fact; it can only be undone by killing the
-    /// server. A caller that cannot guarantee it is a human at a console sets this.
+    /// Refuse to birth a server; fail instead. A server BIRTHED by a daemon inherits that
+    /// daemon's kernel session and scrubbed environment (see `update_environment`) and would own
+    /// every pane the user opens with no desktop session behind it; only killing it undoes that.
+    /// A caller that cannot guarantee it is a human at a console sets this.
     pub no_spawn: bool,
 }
 
-/// [`run`], with explicit control over the connect-or-spawn decision.
 pub fn run_with(opts: AttachOpts) -> io::Result<()> {
-    // Print any config warnings NOW, before raw/alt-screen — an auto-spawned server's
-    // stderr is /dev/null, so this is the user's reliable view of config diagnostics.
-    // (The effective mouse setting is the SERVER's, delivered in its `Hello`; the client
-    // never applies its own local config to behavior — only surfaces its warnings.)
+    // Print config warnings NOW, before raw/alt-screen: an auto-spawned server's stderr is
+    // /dev/null. The effective mouse setting is the server's, delivered in its `Hello`.
     let (_cfg, warnings) = crate::config::MuxConfig::load();
     for w in &warnings {
         eprintln!("comux config: {w}");
@@ -983,14 +835,11 @@ pub fn run_with(opts: AttachOpts) -> io::Result<()> {
     run_attached(stream)
 }
 
-/// `comux proxy --stdio [--no-spawn]`: connect to the server (starting one, like bare
-/// `comux`, unless `--no-spawn`) and copy bytes both ways until either side closes.
-///
-/// This is how a host UI reaches a REMOTE comux: `ssh -T host comux proxy --stdio` is one
-/// socket connection, so a client opens one per role (render, L0). Nothing is printed on
-/// stdout before the bridge starts — the server's first line is the version handshake, and a
-/// stray line there (a login banner) is exactly what the host reports as a broken remote.
-/// Diagnostics go to stderr only. Returns the exit code.
+/// `comux proxy --stdio [--no-spawn]`: connect to the server (starting one unless `--no-spawn`)
+/// and copy bytes both ways until either side closes. This is how a host UI reaches a REMOTE
+/// comux (`ssh -T host comux proxy --stdio`). Nothing may be printed on stdout before the bridge
+/// starts: the server's first line is the version handshake, and a stray line (a login banner)
+/// reads as a broken remote. Diagnostics go to stderr only. Returns the exit code.
 pub fn run_proxy(args: &[String]) -> i32 {
     if !args.iter().any(|a| a == "--stdio") {
         eprintln!("usage: comux proxy --stdio [--no-spawn]");
@@ -1034,8 +883,6 @@ pub fn run_proxy(args: &[String]) -> i32 {
     }
 }
 
-/// The binding tag this client reports (decisions #166): `COPAD_MUX_HOST_TAG` when a host
-/// launched us with one (a copad remote tab, a test), else the copad tab we run in.
 fn host_tag(copad_host: Option<&(String, String)>) -> Option<String> {
     std::env::var("COPAD_MUX_HOST_TAG")
         .ok()
@@ -1043,11 +890,9 @@ fn host_tag(copad_host: Option<&(String, String)>) -> Option<String> {
         .or_else(|| copad_host.map(|(sock, panel)| copad_mux_proto::copad_tag(panel, sock)))
 }
 
-/// Connect to `sock` and fail if nothing answers, rather than starting a server.
-///
-/// Deliberately ONE attempt with no retry: the caller asked not to create a server, so there
-/// is nothing that could appear by waiting. The message names the socket because the usual
-/// cause is a caller resolving a different one than the server bound.
+/// Connect to `sock` and fail if nothing answers, rather than starting a server. ONE attempt, no
+/// retry: nothing can appear by waiting. The message names the socket because the usual cause is
+/// a caller resolving a different one than the server bound.
 fn connect_only(sock: &Path) -> io::Result<UnixStream> {
     UnixStream::connect(sock).map_err(|e| {
         io::Error::new(
@@ -1060,20 +905,18 @@ fn connect_only(sock: &Path) -> io::Result<UnixStream> {
     })
 }
 
-/// Connect to `sock`; if nothing is listening, spawn a server and retry with backoff.
-/// Re-spawns periodically during the wait: a server spawned while a PRIOR one is still
-/// shutting down loses the flock race and exits, so a single spawn can silently do nothing
-/// (e.g. right after `kill-server`). Re-spawning every ~500ms guarantees one eventually
-/// wins the freed flock. Only the flock winner binds; the losers exit harmlessly.
+/// Connect to `sock`; if nothing is listening, spawn a server and retry with backoff. Re-spawns
+/// every ~500ms during the wait: a server spawned while a PRIOR one is still shutting down loses
+/// the flock race and exits, so a single spawn can silently do nothing (e.g. right after
+/// `kill-server`). Only the flock winner binds.
 fn connect_or_spawn(sock: &Path) -> io::Result<UnixStream> {
     if let Ok(s) = UnixStream::connect(sock) {
         return Ok(s);
     }
-    // We're about to BIRTH a new server (no one was listening). A server started from an
-    // SSH session freezes that session's kernel context (logind seat / macOS bootstrap):
-    // per-pane `update_environment` refreshes the SSH/display ENV, but local-only
-    // privileges (polkit shutdown, GUI-app access like Claude in Chrome) follow where the
-    // server was born and can't be moved per-pane. Nudge the user once, before the spawn.
+    // About to BIRTH a server. One started from an SSH session freezes that session's kernel
+    // context (logind seat / macOS bootstrap): `update_environment` refreshes the ENV per pane,
+    // but local-only privileges (polkit shutdown, GUI-app access) follow where the server was
+    // born. Warn once.
     if std::env::var_os("SSH_CONNECTION").is_some()
         && std::env::var_os("COPAD_MUX_QUIET_SSH").is_none()
     {
@@ -1101,15 +944,12 @@ fn connect_or_spawn(sock: &Path) -> io::Result<UnixStream> {
     ))
 }
 
-/// Ensure a server is running at `sock` (spawn one detached + wait), WITHOUT attaching —
-/// for control commands like `new-session` that should start the mux if it isn't up yet
-/// (tmux `new-session` starts the server). Reuses [`connect_or_spawn`].
+/// Ensure a server is running at `sock` without attaching (tmux `new-session` starts the
+/// server). Reuses [`connect_or_spawn`].
 pub fn ensure_running(sock: &Path) -> io::Result<()> {
     connect_or_spawn(sock).map(|_| ())
 }
 
-/// Spawn `copad-mux server` detached (new session, stdio to /dev/null) so it outlives
-/// this client's terminal.
 fn spawn_server() -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(exe);
@@ -1138,9 +978,8 @@ fn send(w: &mut UnixStream, msg: &ClientMsg) -> io::Result<()> {
 }
 
 /// Drive ratatui's render area to `(cols, rows)` AND tell the server. With a `Viewport::Fixed`
-/// terminal, `resize` reallocates the buffers and clears the screen — a clean full repaint at the
-/// new size, independent of the (possibly stale) OS winsize — which is exactly what we want on any
-/// size change (real resize, missed-event poll, or true-size probe). Errors are swallowed: a failed
+/// terminal, `resize` reallocates the buffers and clears the screen: a clean full repaint at the
+/// new size, independent of the possibly stale OS winsize. Errors are swallowed; a failed
 /// resize/send self-corrects on the next size signal.
 fn apply_size(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
@@ -1152,7 +991,6 @@ fn apply_size(
     let _ = send(wr, &ClientMsg::Resize { cols, rows });
 }
 
-/// The attach loop: forward input, apply incoming frames, draw.
 fn run_attached(stream: UnixStream) -> io::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -1163,10 +1001,9 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
     }));
 
     let mut guard = TermGuard::enter()?;
-    // Fixed viewport (NOT Fullscreen): ratatui must not autoresize its render area to the OS
-    // winsize each draw, because the self-heal below can drive the area to the terminal's TRUE
-    // size while the OS winsize is still stale (sleep/wake). We own the size and apply it via
-    // `apply_size`. Seed from the OS size (correct at attach).
+    // Fixed viewport (NOT Fullscreen): ratatui must not autoresize to the OS winsize each draw,
+    // because the true-size probe can set the area while the OS winsize is still stale. We own
+    // the size via `apply_size`.
     let (tw, th) = ratatui::crossterm::terminal::size().unwrap_or((80, 24));
     let (mut cols, mut rows) = (tw.max(1), th.max(1));
     let backend = CrosstermBackend::new(io::stdout());
@@ -1190,13 +1027,12 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
         },
     )?;
 
-    // The server's `Hello` is always its first message. Consume it SYNCHRONOUSLY here —
-    // before the input loop starts — and reply with our `Env` so a fast pane-creation
-    // keystroke can never race ahead of the environment handshake (tmux update-environment).
-    // The SAME reader is then moved into the reader thread so no buffered bytes are lost.
+    // The server's `Hello` is always its first message. Consume it SYNCHRONOUSLY before the input
+    // loop and reply with our `Env`, so a fast pane-creation keystroke cannot race ahead of the
+    // environment handshake. The SAME reader moves into the reader thread so no buffered bytes
+    // are lost.
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut pending_first: Option<ServerMsg> = None;
-    // What the server's `Hello` said it understands (an older one says neither).
     let mut send_focus = false;
     {
         let mut line = String::new();
@@ -1224,14 +1060,12 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     if paste {
                         let _ = guard.enable_paste();
                     }
-                    // Server-authoritative: only now (not from local config) do we decide
-                    // whether to capture the mouse, so every client agrees with the server.
+                    // Server-authoritative: the mouse setting comes from `Hello`, not local config.
                     if mouse {
                         let _ = guard.enable_mouse();
                     }
-                    // Reply with our live values for exactly the vars the server asked for,
-                    // reading each via `var_os` (never `env::vars()`, which panics on a
-                    // non-UTF-8 entry) and keeping only those present and valid UTF-8.
+                    // Reply with our live values for exactly the vars asked, via `var_os`
+                    // (`env::vars()` panics on non-UTF-8), keeping only valid UTF-8.
                     let env: Vec<(String, String)> = update_environment
                         .into_iter()
                         .filter_map(|name| {
@@ -1240,10 +1074,8 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                                 .map(|v| (name, v))
                         })
                         .collect();
-                    // Copad exports both of these into every tab's shell, so a client
-                    // hosted by it can name the exact tab it occupies. Read here, in the
-                    // CLIENT, for the same reason the env above is: the server froze its own
-                    // environment at birth and may not even be running under a GUI.
+                    // Read here, in the CLIENT, like the env above: the server froze its
+                    // environment at birth and may not even run under a GUI.
                     let copad_host = std::env::var("COPAD_SOCKET")
                         .ok()
                         .zip(std::env::var("COPAD_PANEL_ID").ok())
@@ -1260,8 +1092,6 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     if colors && let Some((fg, bg)) = guard.colors {
                         let _ = send(&mut wr, &ClientMsg::Colors { fg, bg });
                     }
-                    // Images (decisions #194): only a terminal that answered the graphics query
-                    // and says its cell size, under a server that can put images in frames.
                     guard.graphics &= graphics;
                     match cell_pixels() {
                         Some((cell_width, cell_height)) if guard.graphics => {
@@ -1281,7 +1111,6 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     break;
                 }
                 Ok(ServerMsg::Bye) => return Ok(()),
-                // Shouldn't precede Hello, but forward anything else so no frame is lost.
                 Ok(other) => {
                     pending_first = Some(other);
                     break;
@@ -1291,8 +1120,6 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
         }
     }
 
-    // Reader thread: server frames → channel; dropping the sender on EOF signals the
-    // main loop (recv → Disconnected) that the server went away.
     let (tx, rx) = mpsc::channel::<ServerMsg>();
     {
         if let Some(m) = pending_first.take() {
@@ -1319,89 +1146,55 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
         });
     }
 
-    // Client-side framebuffer sized to the SERVER's frame — which may be SMALLER than
-    // this terminal when another attached client is smaller (tmux-style shared view).
-    // The margin is letterboxed blank. Starts as a placeholder until the first frame.
     let mut buf = Buffer::empty(RRect::new(0, 0, 1, 1));
     let mut have_frame = false;
     let mut cursor: Option<(u16, u16)> = None;
-    // A `full` frame means "repaint everything" (attach / resize / takeover / Ctrl-b r).
-    // Honor it by clearing the ratatui terminal before the next draw so its diff baseline
-    // is wiped and EVERY cell is re-emitted — otherwise a cell the real terminal lost
-    // (nested emulator, resize, alt-screen transition) lingers as a ghost.
+    // A `full` frame means "repaint everything": clear the ratatui terminal so its diff baseline
+    // is wiped, else a cell the real terminal lost lingers as a ghost.
     let mut force_clear = false;
-    // A SILENT full repaint is due: re-emit every cell without clearing (see `repaint_all`).
-    // Set by the server's periodic `FrameMsg::repaint` (`reconcile_secs`) and by the
-    // client-local timer below.
     let mut force_repaint = false;
-    // Our own record of what the terminal is showing — the single diff baseline now that the
-    // client no longer paints through `Terminal::draw` (see `emit_view`).
+    // Our record of what the terminal is showing: the single diff baseline (see `emit_view`).
     let mut painted = Buffer::empty(RRect::new(0, 0, 1, 1));
-    // Whether the cursor is currently shown, so show/hide is emitted on the edge only.
-    //
-    // `None` = UNKNOWN, which is the honest starting state and not an implementation detail:
-    // entering the alternate screen does not reset cursor visibility, so a shell that hid it
-    // (`printf '\033[?25l'; comux`) hands us an invisible cursor. Assuming "shown" there means
-    // the first frame matches, nothing is emitted, and the cursor never comes back — a
-    // regression against `Terminal::draw`, which asserted visibility on every frame that had a
-    // cursor. Unknown forces the first frame to state it either way.
+    // Whether the cursor is currently shown, so show/hide is emitted on the edge only. `None` =
+    // UNKNOWN: entering the alternate screen does not reset visibility, so assuming "shown" would
+    // leave a cursor the shell hid hidden forever.
     let mut cursor_shown: Option<bool> = None;
-    // The focused program's own wishes for the cursor (`?25l`, `DECSCUSR`), from the frame.
     let mut cursor_visible = true;
     let mut cursor_shape: u8 = 0;
-    // The shape we last told our terminal; `0` = its default, which is where we start.
     let mut shape_sent: u8 = 0;
-    // Images (decisions #194): the runs to place after every draw, commands to write before
-    // them (uploads, drops), and whether anything is placed now.
     let mut image_runs: Vec<crate::proto::ImageRun> = Vec::new();
     let mut image_commands: Vec<u8> = Vec::new();
     let mut images_placed = false;
-    // A resize has cleared the screen since the last paint (see `baseline_is_stale`).
     let mut resized = false;
-    // Client-local silent-repaint period, DEFAULT OFF — additive to the cadence the server
-    // drives, so a client whose OUTER emulator drifts faster than the rest can heal itself
-    // without changing `reconcile_secs` for every attached client.
-    //
-    // This is the old `COPAD_MUX_REDRAW_MS` self-heal, which had to default OFF because it
-    // did `Clear(All)` first and flashed a blank frame every tick. It no longer clears, so
-    // setting it now costs a repaint's worth of escapes and nothing visible.
+    // Client-local silent-repaint period, default OFF: additive to the server-driven cadence, so
+    // one client whose OUTER emulator drifts faster can heal itself without changing
+    // `reconcile_secs` for every client (`COPAD_MUX_REDRAW_MS`).
     let local_repaint = std::env::var("COPAD_MUX_REDRAW_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map_or(Duration::ZERO, Duration::from_millis);
     let mut last_repaint = Instant::now();
-    // Periodic winsize reconciliation. A terminal normally delivers a `CEvent::Resize` when it
-    // is resized, but that event can be LOST — crossterm coalescing a rapid burst, or an outer
-    // terminal that updated the tty's winsize without a clean SIGWINCH to us. When it is lost we
-    // keep composing at the STALE size and the status bar lands off the true bottom (reported
-    // over SSH from Windows Terminal after a sleep/wake). So once a second we re-read the tty size
-    // and adopt it WHEN IT CHANGES from the last value we saw — i.e. a genuine winsize update the
-    // OS got but we missed the event for. Comparing against the last OS value (not the render size)
-    // is deliberate: `probe_true_size` below can set the render size to a value the OS winsize does
-    // NOT yet agree with (a stale winsize), and this poll must not clobber that recovery back to the
-    // stale OS value — it stays quiet until the OS winsize genuinely moves. `last_os_size` seeds
-    // from the attach size (itself a TIOCGWINSZ read) and advances on every acknowledged OS change
-    // (this poll and `CEvent::Resize`), never on a probe. See docs/troubleshooting.md.
+    // Periodic winsize reconciliation: a `CEvent::Resize` can be LOST (crossterm coalescing a
+    // burst, or an outer terminal updating winsize without a clean SIGWINCH), leaving us
+    // composing at a STALE size (seen over SSH from Windows Terminal after sleep/wake). Once a
+    // second re-read the tty size and adopt it WHEN IT CHANGES from the last OS value seen.
+    // Comparing against the last OS value (not the render size) is deliberate:
+    // `probe_true_size` can set the render size ahead of a stale OS winsize, and this poll must
+    // not undo it. `last_os_size` advances on every acknowledged OS change (this poll and
+    // `CEvent::Resize`), never on a probe. See docs/troubleshooting.md.
     let size_poll = Duration::from_millis(1000);
     let mut last_size_poll = Instant::now();
     let mut last_os_size = (cols, rows);
-    // A deeper recovery for when the tty winsize itself is STALE — the sleep/wake case where the
-    // outer terminal never propagated the new size to the remote pty, so the OS size above keeps
-    // returning the OLD value and the 1s poll can't help. We instead ask the TERMINAL its true
-    // size directly (see `probe_true_size`), triggered by a `FocusGained` event: the window
-    // regaining focus is exactly when the user returns after a wake and when a stale size is
-    // likely, and it is delivered over SSH (unlike a suspend, which Rust's monotonic `Instant`
-    // can't even observe — it pauses across suspend — and which anyway never freezes THIS process
-    // when it is the far end of an SSH session whose local terminal slept). Bypasses the OS
-    // winsize entirely.
+    // Deeper recovery when the tty winsize itself is STALE (sleep/wake where the outer terminal
+    // never propagated the new size to the remote pty): ask the TERMINAL its true size (see
+    // `probe_true_size`), triggered by `FocusGained`, when the user returns after a wake. A
+    // suspend cannot be observed instead: `Instant` pauses across it.
 
     loop {
-        // 1) forward input
         let mut need_redraw = false;
-        // Any size change (event / poll / probe) updates cols+rows here, then a single
-        // `apply_size` at the end drives ratatui + the server once — no mid-drain flicker.
+        // Any size change updates cols+rows here; one `apply_size` at the end drives ratatui and
+        // the server.
         let mut size_changed = false;
-        // Set by a `FocusGained` event to run the true-size probe (1c) this iteration.
         let mut probe_needed = false;
         if event::poll(Duration::from_millis(16))? {
             loop {
@@ -1418,18 +1211,14 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                         let _ = send(&mut wr, &ClientMsg::Paste { text });
                     }
                     CEvent::Mouse(m) => {
-                        // Forward wheel + left-click at their cell; the server maps to
-                        // a pane (letterbox is top-left aligned, so coords pass through).
+                        // Forward wheel + left-click at their cell; the server maps to a pane (the
+                        // letterbox is top-left aligned, so coordinates pass through).
                         let kind = match m.kind {
                             MouseEventKind::ScrollUp => Some(MouseKind::ScrollUp),
                             MouseEventKind::ScrollDown => Some(MouseKind::ScrollDown),
                             MouseEventKind::Down(MouseButton::Left) => Some(MouseKind::Click),
-                            // Button-held motion + release drive the drag-selection (crossterm's
-                            // mouse capture enables button-event tracking, so these are reported).
                             MouseEventKind::Drag(MouseButton::Left) => Some(MouseKind::Drag),
                             MouseEventKind::Up(MouseButton::Left) => Some(MouseKind::Up),
-                            // Right button drives the chrome context menu (tmux display-menu:
-                            // hold → hover → release-to-select).
                             MouseEventKind::Down(MouseButton::Right) => Some(MouseKind::RightClick),
                             MouseEventKind::Drag(MouseButton::Right) => Some(MouseKind::RightDrag),
                             MouseEventKind::Up(MouseButton::Right) => Some(MouseKind::RightUp),
@@ -1448,18 +1237,15 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     }
                     CEvent::Resize(w, h) => {
                         let os = (w.max(1), h.max(1));
-                        // Gate on the OS value actually CHANGING, exactly like the 1s poll — so a
-                        // delayed/duplicate resize event carrying the stale winsize can't clobber a
-                        // `probe_true_size` recovery. Keeping `last_os_size` in step also stops the
-                        // poll from re-detecting this as a change and resending redundantly.
+                        // Gate on the OS value actually CHANGING, like the 1s poll, so a delayed
+                        // resize event carrying a stale winsize cannot clobber a `probe_true_size`
+                        // recovery.
                         if os != last_os_size {
                             last_os_size = os;
                             (cols, rows) = os;
                             size_changed = true;
                         }
                     }
-                    // Window regained focus (e.g. the display woke): the OS winsize may be stale,
-                    // so probe the terminal's true size below.
                     CEvent::FocusGained => {
                         probe_needed = true;
                         if send_focus {
@@ -1477,10 +1263,8 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
             }
         }
 
-        // 1b) reconcile a resize event we may have MISSED: re-read the tty size once a second and,
-        // if the OS winsize CHANGED since we last saw it (a genuine update whose event we missed),
-        // adopt it. Gated on the OS value moving — not on it differing from the render size — so a
-        // stale OS winsize can't undo a `probe_true_size` recovery (see `last_os_size` above).
+        // Reconcile a resize event we may have MISSED. Gated on the OS value moving, so a stale
+        // winsize cannot undo a `probe_true_size` recovery (see `last_os_size`).
         if last_size_poll.elapsed() >= size_poll {
             last_size_poll = Instant::now();
             if let Ok((w, h)) = ratatui::crossterm::terminal::size() {
@@ -1495,9 +1279,8 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
             }
         }
 
-        // 1c) deeper recovery: when a stale OS winsize is LIKELY (resume from sleep, or the window
-        // regaining focus), ask the terminal its true size directly and reconcile if it disagrees
-        // with what we track — recovering the case the tty-winsize poll above cannot see.
+        // When a stale OS winsize is LIKELY (focus regain), ask the terminal its true size and
+        // reconcile if it disagrees with what we track.
         if probe_needed
             && let Some((w, h)) = probe_true_size()
             && (w, h) != (cols, rows)
@@ -1506,16 +1289,14 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
             size_changed = true;
         }
 
-        // Drive ratatui + the server ONCE for whatever moved the size this iteration.
         if size_changed {
             apply_size(&mut terminal, &mut wr, cols, rows);
-            // `Terminal::resize` clears the screen, so the paint baseline is gone — whether or
-            // not the size ended up different from the one it already had.
+            // `Terminal::resize` clears the screen, so the paint baseline is gone even if the
+            // size ended up the same.
             resized = true;
             need_redraw = true;
         }
 
-        // 2) apply incoming frames (buffer follows the server's frame size)
         let mut dirty = false;
         loop {
             match rx.try_recv() {
@@ -1533,12 +1314,9 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                             c.apply_to(cell);
                         }
                     }
-                    // Rebuild wide-char spacer structure so the client buffer EXACTLY matches
-                    // the server's — the wire omits trailing spacer cells (ratatui's diff drops
-                    // the cell after a wide glyph), so without this a wide char that MOVED leaves
-                    // a stale width-2 glyph behind, and ratatui's own emit then skips the real
-                    // cell after it (a narrow char vanishes / the row shifts). See term.rs
-                    // `relay_fidelity_pure_delta_churn`.
+                    // Rebuild wide-char spacer structure so the client buffer matches the server's:
+                    // the wire omits trailing spacers, so a wide char that MOVED would leave a stale
+                    // width-2 glyph behind (see term.rs `relay_fidelity_pure_delta_churn`).
                     fix_wide_spacers(&mut buf);
                     // Uploads and drops keep their order even when frames are coalesced; the
                     // runs are the latest frame's.
@@ -1558,14 +1336,12 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     cursor_shape = f.cursor_shape;
                     have_frame = true;
                     dirty = true;
-                    // The server asked for a silent full repaint (self-heal). Sticky until the
-                    // draw below honours it, so a repaint frame coalesced with later deltas in
-                    // one drain is still acted on.
+                    // Sticky until the draw below honours it, so a repaint frame coalesced with
+                    // later deltas is still acted on.
                     force_repaint |= f.repaint;
                 }
-                // A drag-selection copy: set the SYSTEM clipboard via OSC 52 through this
-                // client's own terminal (works over SSH). A one-shot, non-rendering control —
-                // written straight to stdout (flushed) outside ratatui's draw.
+                // Drag-selection copy: set the clipboard via OSC 52 through this client's terminal
+                // (works over SSH), written straight to stdout outside ratatui's draw.
                 Ok(ServerMsg::Copy { text }) => {
                     let _ = write_osc52(&text);
                 }
@@ -1577,7 +1353,6 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                 Ok(ServerMsg::Title { text }) => {
                     let mut out = io::stdout();
                     if !guard.title_pushed {
-                        // Save the terminal's own title so detaching puts it back.
                         let _ = out.write_all(b"\x1b[22;0t");
                         guard.title_pushed = true;
                     }
@@ -1585,8 +1360,6 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
                     let _ = write!(out, "\u{1b}]2;{clean}\u{7}");
                     let _ = out.flush();
                 }
-                // Hello is consumed synchronously during the handshake above; a server
-                // never sends a second one, so this arm is unreachable in practice.
                 Ok(ServerMsg::Hello { .. }) => {}
                 Ok(ServerMsg::Bye) => return Ok(()),
                 // Only answer a Command / Ping, which this client never sends.
@@ -1600,30 +1373,24 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
             }
         }
 
-        // 3) draw — blit the server frame into this terminal's top-left, blanking the
-        // letterbox margin when our terminal is bigger than the shared (min) frame.
-        // Client-local silent repaint due (see `local_repaint`)? Drive a draw for it, so it
-        // still fires on a screen so idle that no frame is arriving at all.
+        // Blit the server frame into the top-left, blanking the letterbox margin. A client-local
+        // silent repaint drives a draw too, so it fires on a screen so idle that no frame arrives.
         if !local_repaint.is_zero() && last_repaint.elapsed() >= local_repaint {
             force_repaint = true;
             need_redraw = true;
         }
 
         if (dirty || need_redraw) && have_frame {
-            // A `full` frame resets the diff baseline: clear the screen + ratatui's cached
-            // previous-buffer so the upcoming draw re-emits every cell (no lingering ghost).
-            // This is the ONLY path that clears — its cells were applied over an EMPTY buffer,
-            // so whatever the clear does not wipe would linger. The self-heal repaint below
-            // never clears (that flash is what kept it disabled for a year).
+            // A `full` frame resets the diff baseline: clear so the draw re-emits every cell. This
+            // is the ONLY path that clears (its cells were applied over an EMPTY buffer); the
+            // self-heal repaint never does.
             let cleared = force_clear;
             if cleared {
                 terminal.clear()?;
                 force_clear = false;
             }
-            // What we believe is ON THE TERMINAL. Reset wherever the screen was blanked under
-            // us — a `full` frame's clear, and a resize (`Terminal::resize` clears too) — so the
-            // next emit repaints from a baseline that matches reality rather than one that
-            // merely matches the last frame.
+            // What we believe is ON THE TERMINAL. Reset wherever the screen was blanked under us
+            // (a `full` frame's clear, a resize).
             let view = RRect::new(0, 0, cols, rows);
             if baseline_is_stale(cleared, resized, painted.area, view) {
                 painted = Buffer::empty(view);
@@ -1631,22 +1398,18 @@ fn run_attached(stream: UnixStream) -> io::Result<()> {
             resized = false;
             let mut next = Buffer::empty(painted.area);
             blit_view(&buf, &mut next);
-            // One renderer: every cell after a clear or a self-heal repaint, otherwise just what
-            // changed — through the SAME emitter either way, so the two can never disagree about
-            // where a glyph goes. Showing the cursor only when the frame has one mirrors what
-            // `Terminal::draw` did.
+            // One renderer: every cell after a clear or self-heal repaint, otherwise just what
+            // changed, through the SAME emitter.
             let baseline = if cleared || force_repaint {
                 None
             } else {
                 Some(&painted)
             };
-            // Synchronized output (`?2026`): a terminal that supports it shows the frame only
-            // once it is complete, so a fast-scrolling pane never tears mid-frame; others ignore
-            // the unknown mode. Closed after the cursor is settled, below.
+            // Synchronized output (`?2026`): the frame shows only once complete, so fast scrolling
+            // never tears; terminals without it ignore the mode.
             write!(terminal.backend_mut(), "\u{1b}[?2026h")?;
             emit_view(&mut terminal, baseline, &next, cursor)?;
             painted = next;
-            // Images over the cells just drawn, then the cursor back where `emit_view` left it.
             if guard.graphics
                 && (!image_runs.is_empty() || images_placed || !image_commands.is_empty())
             {
@@ -1702,7 +1465,6 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    /// A `Write` sink we can read back, to assert on the exact escape bytes emitted.
     #[derive(Clone)]
     struct Sink(Rc<RefCell<Vec<u8>>>);
     impl io::Write for Sink {
@@ -1734,10 +1496,8 @@ mod tests {
         assert!(da1_answered(b"\x1b[?6c"));
         assert!(!da1_answered(b"\x1b]11;rgb:1e/1e/2e\x07"));
         assert!(!da1_answered(b"\x1b[?62;22"), "not finished yet");
-        // Whatever else arrived is kept for the event reader, in order.
         let mixed = b"ab\x1b]10;rgb:1/2/3\x07c\x1b]11;rgb:4/5/6\x1b\\\x1b[?62;22cd\x1b[A";
         assert_eq!(without_replies(mixed), b"abcd\x1b[A");
-        // …and what TIOCSTI refused is decoded into keys instead of being dropped.
         use ratatui::crossterm::event::{KeyCode, KeyModifiers};
         let keys: Vec<_> = decode_typed("aZ한\r\x03\x1bx\x1b[A\x7f".as_bytes())
             .into_iter()
@@ -1756,7 +1516,6 @@ mod tests {
                 (KeyCode::Backspace, KeyModifiers::NONE),
             ]
         );
-        // The C0 controls that are not letters.
         let keys: Vec<_> = decode_typed(b"\x00\x1c\x1f")
             .into_iter()
             .map(|k| (k.code, k.modifiers))
@@ -1769,7 +1528,6 @@ mod tests {
                 (KeyCode::Char('_'), KeyModifiers::CONTROL),
             ]
         );
-        // A key cut off by the end of the probe is waited for, not split.
         let short = Some(MidKey::LoneEsc);
         let begun = Some(MidKey::Begun);
         assert_eq!(ends_mid_key(b"a\x1b"), short, "maybe the Esc key itself");
@@ -1777,7 +1535,6 @@ mod tests {
         assert_eq!(ends_mid_key("한".as_bytes().split_last().unwrap().1), begun);
         assert_eq!(ends_mid_key(b"a\x1b[A"), None);
         assert_eq!(ends_mid_key("a한".as_bytes()), None);
-        // Every key a legacy keyboard sends, modifiers included.
         let keys: Vec<_> =
             decode_typed(b"\x1b[1;5D\x1bOP\x1b[15~\x1b[24;2~\x1b[3~\x1b[5~\x1b[Z\x1b[1;3H")
                 .into_iter()
@@ -1800,12 +1557,6 @@ mod tests {
 
     #[test]
     fn a_delta_repaints_the_neighbour_an_over_wide_glyph_can_clobber() {
-        // Anchoring fixes where the NEXT emitted cell goes; it does not undo what the glyph
-        // overwrote getting there. A one-column cell that becomes a Nerd Font icon the outer
-        // terminal draws two columns wide clobbers its neighbour — and if that neighbour did not
-        // change, a pure diff leaves it clobbered until the next self-heal repaint restores it.
-        // That restore IS the "text lands, then jumps" this emitter exists to remove, so the
-        // delta has to repaint the neighbour itself.
         let area = Rect::new(0, 0, 5, 1);
         let mut prev = Buffer::empty(area);
         prev.set_string(0, 0, "aXbcd", Style::default());
@@ -1840,11 +1591,9 @@ mod tests {
 
     #[test]
     fn the_last_column_is_erased_before_a_glyph_that_might_not_fit_it() {
-        // The one cell with no neighbour to repair. With autowrap off, a terminal that measures
-        // this glyph as two columns declines to write it at all rather than clamping — so the
-        // previous contents would survive, `painted` would record the glyph we never drew, and
-        // neither a later delta nor a repaint would ever touch the cell again. Erasing first
-        // makes the result the same whatever was there before.
+        // The one cell with no neighbour to repair: a terminal measuring this glyph as two columns
+        // declines to write it, so the old content would survive. Erasing first makes the result
+        // independent of it.
         let area = Rect::new(0, 0, 3, 1);
         let mut prev = Buffer::empty(area);
         prev.set_string(0, 0, "abX", Style::default());
@@ -1867,7 +1616,6 @@ mod tests {
             .unwrap_or_else(|| panic!("last column erased first: {out:?}"));
         let glyph = out.find('\u{e0b0}').expect("the glyph is still emitted");
         assert!(erase < glyph, "the erase comes BEFORE the glyph: {out:?}");
-        // A mid-row glyph needs no erase — it has a neighbour that gets repaired instead.
         let mut mid = Buffer::empty(area);
         mid.set_string(0, 0, "a\u{e0b0}X", Style::default());
         let sink2 = Sink(Rc::new(RefCell::new(Vec::new())));
@@ -1888,12 +1636,8 @@ mod tests {
 
     #[test]
     fn a_repair_never_crosses_a_row_boundary() {
-        // With autowrap off (see `TermGuard::enter`) a glyph that overflows the last column is
-        // clamped, not wrapped — so the damage stays inside its row and the first cell of the
-        // NEXT row needs no repair. Carrying the repair across the boundary would repaint a cell
-        // on every row for nothing, and would also be a half-measure for a hazard that is
-        // prevented rather than mitigated: a wrapping terminal moves the WHOLE glyph down, which
-        // costs two cells, and in the bottom-right corner scrolls the screen.
+        // Autowrap is off, so an overflow at the last column is clamped within its row: the next
+        // row's first cell needs no repair.
         let area = Rect::new(0, 0, 3, 2);
         let mut prev = Buffer::empty(area);
         prev.set_string(0, 0, "abX", Style::default());
@@ -1931,7 +1675,6 @@ mod tests {
         // optimised away as "already correct" — that is how the cursor stays gone all session.
         assert!(cursor_visibility_needs_stating(None, true));
         assert!(cursor_visibility_needs_stating(None, false));
-        // Afterwards it is edge-triggered, so an idle screen does not re-emit it every frame.
         assert!(!cursor_visibility_needs_stating(Some(true), true));
         assert!(!cursor_visibility_needs_stating(Some(false), false));
         assert!(cursor_visibility_needs_stating(Some(false), true));
@@ -1942,20 +1685,14 @@ mod tests {
     fn the_paint_baseline_is_thrown_away_whenever_the_screen_was_blanked() {
         use super::baseline_is_stale;
         let view = Rect::new(0, 0, 80, 24);
-        // Steady state: keep the baseline, or every frame becomes a full repaint.
         assert!(!baseline_is_stale(false, false, view, view));
-        // A `full` frame cleared the screen.
         assert!(baseline_is_stale(true, false, view, view));
-        // A different view size cannot be compared cell for cell.
         assert!(baseline_is_stale(
             false,
             false,
             Rect::new(0, 0, 80, 23),
             view
         ));
-        // THE easy one to miss: a queued burst of resize events can read A -> B -> A inside one
-        // input drain. The size ends up unchanged, so an area comparison sees nothing — but
-        // `Terminal::resize` ran and blanked the screen, so the baseline is a lie.
         assert!(
             baseline_is_stale(false, true, view, view),
             "a same-size resize still clears the screen"
@@ -1964,14 +1701,8 @@ mod tests {
 
     #[test]
     fn an_ordinary_frame_anchors_exactly_like_a_repaint_does() {
-        // This is the property whose absence the owner could SEE: `ls` output landing in one
-        // place and then jumping sideways a moment later.
-        //
-        // The incremental path used to paint through `Terminal::draw` — one unanchored run per
-        // row — while the self-heal repaint re-anchored after every non-ASCII glyph (it has to,
-        // or one Nerd Font icon skews a whole row on every tick). Two renderers that position
-        // the same text differently produce exactly that jump. There is one emitter now, so the
-        // anchoring is identical whether a frame is a delta or a full repaint.
+        // The visible bug this guards: `ls` output landing in one place then jumping sideways.
+        // Deltas and the repaint must anchor identically, which one emitter guarantees.
         let area = Rect::new(0, 0, 6, 1);
         let prev = Buffer::empty(area);
         let mut cur = Buffer::empty(area);
@@ -1995,7 +1726,6 @@ mod tests {
 
         let delta = emit(Some(&prev));
         let repaint = emit(None);
-        // Same anchors either way — the cell after the icon is addressed explicitly in BOTH.
         for (what, out) in [("delta", &delta), ("repaint", &repaint)] {
             assert!(
                 out.contains("\u{1b}[1;4H"),
@@ -2009,7 +1739,6 @@ mod tests {
             "a delta covering every cell must paint them exactly as a repaint would"
         );
 
-        // And it really is a diff — an unchanged cell is not re-sent.
         let quiet = {
             let sink = Sink(Rc::new(RefCell::new(Vec::new())));
             let mut term = Terminal::with_options(
@@ -2030,15 +1759,10 @@ mod tests {
 
     #[test]
     fn a_silent_repaint_re_anchors_after_a_glyph_the_terminal_may_measure_differently() {
-        // The repaint must never let ONE glyph skew the rest of a row.
-        //
-        // `CrosstermBackend::draw` positions a run of adjacent cells by the terminal's own cursor
-        // advance, emitting no `MoveTo` between them — it trusts the terminal to have measured
-        // every glyph exactly as `unicode-width` did. A full repaint makes each row one such run,
-        // so a Nerd Font / Powerline icon (Private Use Area: one column here, two in plenty of
-        // fonts) would shift everything after it — every few seconds, forever, because this
-        // repaint repeats. comux cannot read the outer terminal's font, so the only safe move is
-        // to re-anchor after any glyph that could carry the disagreement.
+        // One glyph must never skew the rest of a row on repaint: `CrosstermBackend::draw`
+        // positions adjacent cells by the terminal's own cursor advance, so an icon the font draws
+        // wider would shift the row on every tick. comux cannot read the font, so it re-anchors
+        // after any non-ASCII glyph.
         let area = Rect::new(0, 0, 6, 1);
         let mut buf = Buffer::empty(area);
         buf.set_string(0, 0, "ab\u{e0b0}cd", Style::default()); // U+E0B0 = the Powerline separator
@@ -2054,14 +1778,10 @@ mod tests {
         repaint_all(&mut term, &buf, (area.width, area.height), None).expect("repaint");
         let out = String::from_utf8(sink.0.borrow().clone()).expect("utf8");
 
-        // The cell AFTER the icon is addressed explicitly (1-based row 1, column 4) instead of
-        // being left to wherever the terminal's cursor ended up.
         assert!(
             out.contains("\u{1b}[1;4H"),
             "the cell after a non-ASCII glyph must be re-anchored: {out:?}"
         );
-        // ...and the plain-ASCII run before it is still emitted as one run, so the anchoring
-        // costs nothing on ordinary text.
         let first = out.find("\u{1b}[1;1H").expect("row start");
         let icon = out.find('\u{e0b0}').expect("icon emitted");
         assert!(
@@ -2087,9 +1807,8 @@ mod tests {
             String::from_utf8(sink.0.borrow().clone()).expect("utf8")
         };
 
-        // (1) The frame is BIGGER than the viewport — the window right after this terminal
-        // shrinks, when ratatui has been resized but the server's frame has not caught up.
-        // Emitting the frame would write past the edge and wrap.
+        // (1) The frame is BIGGER than the viewport (right after this terminal shrinks): emitting
+        // it would write past the edge and wrap.
         let mut big = Buffer::empty(Rect::new(0, 0, 6, 3));
         big.set_string(4, 2, "Z", Style::default());
         let out = paint(Rect::new(0, 0, 4, 2), &big, Some((5, 2)));
@@ -2102,10 +1821,8 @@ mod tests {
             "nothing may be addressed below the viewport's last row: {out:?}"
         );
 
-        // (1b) And a TWO-COLUMN glyph STARTING on the viewport's last column is just as bad,
-        // which checking only its starting coordinate misses: its second half goes off the edge,
-        // the terminal wraps, and on the bottom row it scrolls the whole screen. The composition
-        // never produces this; a retained frame across a shrink does.
+        // (1b) A TWO-COLUMN glyph STARTING on the last viewport column is just as bad: its second
+        // half goes off the edge and the terminal wraps. A retained frame across a shrink does this.
         let mut wide = Buffer::empty(Rect::new(0, 0, 6, 2));
         wide.set_string(0, 0, "가", Style::default()); // fully inside — must survive
         wide.set_string(3, 1, "가", Style::default()); // starts on the last viewport column
@@ -2116,9 +1833,6 @@ mod tests {
             "the glyph that fits is emitted and the one that would spill is not: {out:?}"
         );
 
-        // (2) The frame is SMALLER than the viewport — the ordinary letterbox, because the
-        // composition is sized to the SMALLEST attached client. The margin must be blanked, or a
-        // margin cell the terminal lost would never come back.
         let mut small = Buffer::empty(Rect::new(0, 0, 2, 1));
         small.set_string(0, 0, "ab", Style::default());
         let out = paint(Rect::new(0, 0, 4, 3), &small, None);
@@ -2135,11 +1849,9 @@ mod tests {
 
     #[test]
     fn a_silent_repaint_re_emits_every_cell_and_never_clears() {
-        // The two properties that let this run on a timer by default. (1) It re-emits
-        // EVERYTHING, including cells ratatui's diff believes are already correct — that
-        // belief is exactly what has gone stale. (2) It never clears: `Clear(All)` flashes a
-        // blank frame, and that flicker is the only reason the old periodic self-heal had to
-        // ship disabled.
+        // The two properties that let this run on a timer by default: it re-emits EVERYTHING
+        // (ratatui's belief that cells are correct is what went stale), and it never clears
+        // (`Clear(All)` flashes a blank frame).
         let area = Rect::new(0, 0, 6, 2);
         let mut buf = Buffer::empty(area);
         buf.set_string(0, 0, "ab", Style::default().fg(Color::Red));
@@ -2191,14 +1903,12 @@ mod tests {
             1,
             "the wide glyph is emitted once, its spacer skipped: {out:?}"
         );
-        // No clear of any flavour: `2J` (all), `1J`/`0J` (partial), `3J` (scrollback).
         for clear in ["[2J", "[1J", "[0J", "[3J", "[J"] {
             assert!(
                 !out.contains(clear),
                 "a silent repaint must not clear (found {clear}): {out:?}"
             );
         }
-        // And the cursor is put back where the frame wants it, not left after the last cell.
         assert!(
             out.contains("\u{1b}[2;4H"),
             "cursor restored to the frame position (1-based row 2, col 4): {out:?}"
@@ -2207,15 +1917,12 @@ mod tests {
 
     #[test]
     fn size_from_clamped_cursor_converts_and_guards() {
-        // A normal clamped bottom-right cell → size is position + 1.
         assert_eq!(size_from_clamped_cursor(79, 23), Some((80, 24)));
         assert_eq!(size_from_clamped_cursor(0, 0), Some((1, 1)));
-        // Just under the cap is accepted (the largest plausible real terminal).
         assert_eq!(
             size_from_clamped_cursor(PROBE_MAX - 1, PROBE_MAX - 1),
             Some((PROBE_MAX, PROBE_MAX))
         );
-        // A terminal that didn't clamp echoes the target corner back → rejected.
         assert_eq!(size_from_clamped_cursor(PROBE_CORNER, PROBE_CORNER), None);
         // Absurd values BELOW the corner but at/above the cap are also rejected — the
         // memory-exhaustion guard (else ~1e8 cells could reach Terminal::resize).
@@ -2226,7 +1933,6 @@ mod tests {
 
     #[test]
     fn base64_matches_known_vectors() {
-        // RFC 4648 test vectors + padding cases (0/1/2 trailing bytes).
         assert_eq!(base64(b""), "");
         assert_eq!(base64(b"f"), "Zg==");
         assert_eq!(base64(b"fo"), "Zm8=");
@@ -2234,7 +1940,6 @@ mod tests {
         assert_eq!(base64(b"foob"), "Zm9vYg==");
         assert_eq!(base64(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
-        // Non-ASCII payload (a drag-copy can contain UTF-8) encodes its bytes.
         assert_eq!(base64("가".as_bytes()), "6rCA");
     }
 
@@ -2250,10 +1955,7 @@ mod tests {
 
         let err = connect_only(&sock).expect_err("must not connect");
         assert_eq!(err.kind(), io::ErrorKind::NotConnected);
-        // The socket is the observable proof: a spawn would have bound it.
         assert!(!sock.exists(), "connect_only must not create {sock:?}");
-        // The message names the socket, because the usual cause is a caller resolving a
-        // different path than the server bound.
         assert!(
             err.to_string().contains(&sock.display().to_string()),
             "message must name the socket, got: {err}"
@@ -2277,7 +1979,6 @@ mod tests {
 
     #[test]
     fn attach_opts_default_still_spawns() {
-        // `run()` must keep the connect-or-spawn behaviour a human at a terminal relies on.
         assert!(!AttachOpts::default().no_spawn);
     }
 }

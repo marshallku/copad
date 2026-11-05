@@ -23,7 +23,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-/// Registrations kept; the oldest go first.
 const MAX_REGS: usize = 64;
 /// Pushes waiting for the worker; past it the oldest is dropped (a later one supersedes it).
 const QUEUE_CAP: usize = 64;
@@ -38,11 +37,9 @@ pub const DEFAULT_RELAY: &str = "https://aide-push.marshallku.dev";
 /// What a push shows when it can't be opened; the relay and Apple see only this.
 pub const PLACEHOLDER_TITLE: &str = "copad";
 pub const PLACEHOLDER_BODY: &str = "Agent notification";
-/// The envelope version the app checks for (`e2e` in the `push-register` reply).
 pub const E2E_VERSION: u32 = 1;
 const AAD_PREFIX: &[u8] = b"comux-push-v1\0";
 
-/// The team's own APNs key (`[push] apns_key`, `apns_key_id`, `apns_team_id`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushConfig {
     pub key_file: PathBuf,
@@ -50,13 +47,10 @@ pub struct PushConfig {
     pub team_id: String,
 }
 
-/// How pushes leave this server (`[push]` in mux.toml).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PushMode {
     Off,
-    /// Through the push relay at this base URL.
     Relay(String),
-    /// Straight to APNs with the team's key.
     Direct(PushConfig),
 }
 
@@ -76,7 +70,6 @@ impl PushMode {
     }
 }
 
-/// A relay URL: https, or http to this machine (tests, a local relay).
 pub fn check_relay_url(url: &str) -> Result<(), String> {
     let Ok(u) = reqwest::Url::parse(url) else {
         return Err(format!("push relay '{url}' is not a URL"));
@@ -102,12 +95,10 @@ pub enum ApnsEnv {
     Production,
 }
 
-/// One app install on one saved host entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reg {
     pub token: String,
     pub env: ApnsEnv,
-    /// The app's bundle id (`apns-topic`).
     pub topic: String,
     /// The app's id for the host entry it registered through: echoed in the payload so a tap
     /// opens THAT entry.
@@ -129,13 +120,11 @@ struct Stored {
     next: u64,
 }
 
-/// The registrations, persisted next to the session state file.
 pub struct Registry {
     path: PathBuf,
     st: Stored,
 }
 
-/// A `push-register` request.
 pub struct NewReg<'a> {
     pub token: &'a str,
     pub env: ApnsEnv,
@@ -145,7 +134,6 @@ pub struct NewReg<'a> {
     pub key: &'a str,
 }
 
-/// A device token: hex, as the app prints `deviceToken`.
 fn valid_token(t: &str) -> bool {
     (32..=200).contains(&t.len()) && t.bytes().all(|b| b.is_ascii_hexdigit())
 }
@@ -158,7 +146,6 @@ fn valid_word(s: &str, max: usize) -> bool {
 }
 
 impl Registry {
-    /// `comux-push.json` beside the state file.
     pub fn default_path() -> PathBuf {
         crate::persist::state_path().with_file_name("comux-push.json")
     }
@@ -179,7 +166,6 @@ impl Registry {
         self.st.regs.is_empty()
     }
 
-    /// Add or refresh `(token, host)`. Refused input is reported, never stored.
     pub fn register(&mut self, r: NewReg<'_>) -> Result<(), String> {
         let NewReg {
             token,
@@ -222,7 +208,6 @@ impl Registry {
         self.save()
     }
 
-    /// Forget `token` (for one host entry, or all of them).
     pub fn unregister(&mut self, token: &str, host: Option<&str>) -> Result<bool, String> {
         let token = token.to_ascii_lowercase();
         let before = self.st.regs.len();
@@ -285,7 +270,6 @@ impl Registry {
     }
 }
 
-/// Cut `s` to at most `max` bytes on a char boundary, marking the cut.
 fn clip(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -344,7 +328,6 @@ pub fn seal(key_b64: &str, host: &str, title: &str, body: &str, pane: &str) -> O
     Some(base64::engine::general_purpose::STANDARD.encode(out))
 }
 
-/// Same notification, same id: a newer one for the pane replaces one not yet delivered.
 pub fn collapse_id(host: &str, pane: &str) -> String {
     let d = ring::digest::digest(&ring::digest::SHA256, format!("{host}\0{pane}").as_bytes());
     d.as_ref()[..16]
@@ -370,7 +353,6 @@ pub fn payload(host: &str, sealed: &str) -> Vec<u8> {
     .unwrap_or_default()
 }
 
-/// The push relay's request (`POST /v1/notify`).
 fn relay_request(reg: &Reg, sealed: &str, collapse: &str) -> serde_json::Value {
     serde_json::json!({
         "token": reg.token,
@@ -385,7 +367,6 @@ fn relay_request(reg: &Reg, sealed: &str, collapse: &str) -> serde_json::Value {
     })
 }
 
-/// One push for the worker.
 pub struct Job {
     pub mode: PushMode,
     pub reg: Reg,
@@ -393,7 +374,6 @@ pub struct Job {
     pub collapse: String,
 }
 
-/// APNs (or the relay) said a token is gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Dead {
     pub token: String,
@@ -409,12 +389,10 @@ struct Shared {
     failed: AtomicU64,
 }
 
-/// The sending side the App holds. The worker thread starts on the first push.
 #[derive(Clone)]
 pub struct Pusher {
     shared: Arc<Shared>,
     started: Arc<std::sync::Once>,
-    /// APNs base URL override, for tests against a local server.
     base: Option<String>,
 }
 
@@ -440,7 +418,6 @@ impl Pusher {
         }
     }
 
-    /// Queue a push (never blocks; a full queue drops its oldest).
     pub fn push(&self, job: Job) {
         let shared = self.shared.clone();
         let base = self.base.clone();
@@ -459,7 +436,6 @@ impl Pusher {
         self.shared.ready.notify_one();
     }
 
-    /// Dead tokens reported since the last call.
     pub fn take_dead(&self) -> Vec<Dead> {
         self.shared
             .dead
@@ -468,7 +444,6 @@ impl Pusher {
             .unwrap_or_default()
     }
 
-    /// (sent, failed, dropped) since start.
     pub fn counts(&self) -> (u64, u64, u64) {
         (
             self.shared.sent.load(Ordering::Relaxed),
@@ -478,11 +453,9 @@ impl Pusher {
     }
 }
 
-/// What one send came to.
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
     Sent,
-    /// The token will never work again.
     Dead,
     /// Hold off: this device only, or everything, until the instant.
     Wait {
@@ -492,7 +465,6 @@ enum Outcome {
     Failed,
 }
 
-/// The relay's answer, by status and error code.
 fn relay_outcome(status: u16, code: &str, retry_after: Option<u64>) -> Outcome {
     let secs = retry_after.unwrap_or(60).clamp(1, 3600);
     match status {
@@ -510,7 +482,6 @@ fn relay_outcome(status: u16, code: &str, retry_after: Option<u64>) -> Outcome {
     }
 }
 
-/// The last six characters of a token: enough to tell devices apart in a log, not to send.
 fn tail(token: &str) -> &str {
     &token[token.len().saturating_sub(6)..]
 }
@@ -693,7 +664,6 @@ fn send_direct(
     }
 }
 
-/// A response that means the token will never work again.
 fn is_dead(status: u16, reason: &str) -> bool {
     status == 410
         || (status == 400 && (reason == "BadDeviceToken" || reason == "DeviceTokenNotForTopic"))
@@ -703,7 +673,6 @@ fn b64url(b: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b)
 }
 
-/// The provider token: ES256 over `{alg,kid}.{iss,iat}` with the team's `.p8` key.
 pub fn sign_jwt(cfg: &PushConfig) -> Result<String, String> {
     let pem = std::fs::read_to_string(&cfg.key_file)
         .map_err(|e| format!("APNs key {}: {e}", cfg.key_file.display()))?;
@@ -803,14 +772,12 @@ mod tests {
         assert_eq!(t.len(), 2, "one per token");
         let a = t.iter().find(|x| x.token == TOK_A).unwrap();
         assert_eq!(a.host, "host-2", "the entry registered last wins");
-        // Re-registering host-1 makes it the destination again.
         r.register(new(TOK_A, ApnsEnv::Sandbox, "com.x.app", "host-1", "phone"))
             .unwrap();
         assert_eq!(
             r.targets().iter().find(|x| x.token == TOK_A).unwrap().host,
             "host-1"
         );
-        // Persisted.
         assert_eq!(Registry::load(p.clone()).len(), 3);
         let _ = std::fs::remove_file(p);
     }
@@ -849,7 +816,6 @@ mod tests {
         assert!(r.is_empty());
     }
 
-    /// What the app's extension does (CryptoKit `AES.GCM.open` on the combined box).
     fn open(key_b64: &str, host: &str, sealed: &str) -> Option<serde_json::Value> {
         use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
         let key = parse_key(key_b64)?;
